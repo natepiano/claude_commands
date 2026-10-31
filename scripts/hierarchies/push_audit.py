@@ -4,6 +4,7 @@
 This module defines the audit's failed-check rule. Date-time ends are excluded;
 a date-only --until includes that local day. Ownership comes from current
 production tables and cannot reconstruct historical ownership.
+The report opens with a summary. Use --full to print the tables after it.
 """
 from __future__ import annotations
 
@@ -32,6 +33,8 @@ from scripts.production import production_units, showrunners
 STATE_DIR = Path.home() / ".local/state/notify"
 SESSION_CONFIG = SCRIPTS.parent / "config/hierarchies/sessions.toml"
 PUSHOVER_SEND = "scripts/notify/pushover.py send()"
+# Messaging policy c73a2d02 took effect when dde7ec2e merged.
+AGENT_TEXT_EXCEPTION_ENDED = datetime(2026, 10, 29, 3, 5, 59, tzinfo=timezone.utc)
 
 
 @dataclass(frozen=True)
@@ -162,7 +165,7 @@ class ApprovedPriorityTwo:
 @dataclass(frozen=True)
 class ApprovedRegisteredText:
     code_path: ClassVar[str] = PUSHOVER_SEND + ": registered text_id exception"
-    reason: ClassVar[str] = "recorded text id or registered rewrite outcome; current catalog membership and approval are not required"
+    reason: ClassVar[str] = "registered-text exception in force at delivery; recorded identity is evidence, not text approval"
 
 
 @dataclass(frozen=True)
@@ -301,7 +304,7 @@ def read_log[T](path: Path, parse: Callable[[log_records.JsonObject], T], proble
         lines = path.read_text(encoding="utf-8").splitlines()
     except (OSError, UnicodeError) as error:
         kind = "missing" if isinstance(error, FileNotFoundError) else "unreadable"
-        problems.append(log_records.SourceProblem(str(path), f"{kind}: {error}"))
+        problems.append(log_records.SourceProblem(str(path), f"{kind}: {error}", log_records.EventSource.PUSHES))
         return records
     for line_number, line in enumerate(lines, 1):
         if not line.strip():
@@ -310,7 +313,8 @@ def read_log[T](path: Path, parse: Callable[[log_records.JsonObject], T], proble
             value = cast(object, json.loads(line))
             records.append(parse(log_records.object_record(value)))
         except ValueError as error:
-            problems.append(log_records.SourceProblem(str(path), f"unreadable line {line_number}: {error}"))
+            problems.append(log_records.SourceProblem(str(path), f"unreadable line {line_number}: {error}",
+                log_records.EventSource.PUSHES, log_records.RowsSkipped(1)))
     return records
 
 
@@ -321,7 +325,7 @@ def read_owners(problems: list[log_records.SourceProblem]) -> ProductionOwnershi
     for instance in sorted(showrunners.NOTIFIER_STATE_DIR.glob("showrunner-*")):
         checked = showrunners.checked_doc(instance)
         if isinstance(checked, showrunners.NoCheckedDoc):
-            problems.append(log_records.SourceProblem(str(instance / "conf"), checked.reason))
+            problems.append(log_records.SourceProblem(str(instance / "conf"), checked.reason, log_records.SourceNotApplicable.ATTRIBUTION))
             continue
         slug = instance.name.removeprefix("showrunner-")
         exact_names[slug].add(slug)
@@ -336,16 +340,67 @@ def read_owners(problems: list[log_records.SourceProblem]) -> ProductionOwnershi
                     if name.endswith("-unit"):
                         session_aliases[name.removesuffix("-unit")].add(slug)
         except (OSError, UnicodeError, production_units.Refusal) as error:
-            problems.append(log_records.SourceProblem(str(checked.path), f"unreadable ownership source: {error}"))
+            problems.append(log_records.SourceProblem(str(checked.path), f"unreadable ownership source: {error}", log_records.SourceNotApplicable.ATTRIBUTION))
     return ProductionOwnership(
         {name: ShowrunnerOwner(next(iter(slugs))) for name, slugs in exact_names.items() if len(slugs) == 1},
         {name: ShowrunnerOwner(next(iter(slugs))) for name, slugs in session_aliases.items() if len(slugs) == 1})
 
 
+def read_config(path: Path) -> log_records.JsonObject:
+    with path.open("rb") as file:
+        return log_records.object_record(cast(object, tomllib.load(file)))
+
+
+@dataclass(frozen=True)
+class CoverageClaim:
+    intervals: tuple[log_records.Window, ...]
+    evidence: str
+
+
+def read_coverage(path: Path, now: datetime, problems: list[log_records.SourceProblem]) -> dict[str, CoverageClaim]:
+    try:
+        settings = read_config(path)
+    except (OSError, UnicodeError, ValueError) as error:
+        problems.append(log_records.SourceProblem(str(path), f"coverage config: {error}", log_records.SourceNotApplicable.CONFIG))
+        return {}
+    claims: dict[str, CoverageClaim] = {}
+    for key, value in settings.items():
+        try:
+            fields = log_records.object_record(value)
+            evidence = log_records.field_text(fields, "evidence")
+            if not evidence.strip() or set(fields) - {"since", "evidence", "gaps"}:
+                raise ValueError("expected since, nonempty evidence and optional gaps")
+            since = log_records.strict_time(fields.get("since"))
+            intervals = [(since, now)] if since < now else []
+            gaps = fields.get("gaps", [])
+            if not isinstance(gaps, list):
+                raise ValueError("gaps must be an array of tables")
+            for value in cast(list[object], gaps):
+                gap = log_records.object_record(value)
+                if set(gap) != {"from", "to", "reason"} or not log_records.field_text(gap, "reason").strip():
+                    raise ValueError("each gap needs from, to and a nonempty reason")
+                start, end = log_records.strict_time(gap["from"]), log_records.strict_time(gap["to"])
+                if start >= end:
+                    raise ValueError("gap from must precede to")
+                remaining: list[tuple[datetime, datetime]] = []
+                for left, right in intervals:
+                    if end <= left or start >= right:
+                        remaining.append((left, right))
+                    else:
+                        if left < start:
+                            remaining.append((left, start))
+                        if end < right:
+                            remaining.append((end, right))
+                intervals = remaining
+            claims[key] = CoverageClaim(tuple(log_records.Window(left, right) for left, right in intervals), evidence)
+        except (ValueError, TypeError, OverflowError) as error:
+            problems.append(log_records.SourceProblem(str(path), f"coverage config [{key}]: {error}", log_records.SourceNotApplicable.CONFIG))
+    return claims
+
+
 def read_sessions(path: Path, problems: list[log_records.SourceProblem]) -> TopLevelSessions:
     try:
-        with path.open("rb") as file:
-            settings = log_records.object_record(cast(object, tomllib.load(file)))
+        settings = read_config(path)
         if not settings:
             raise ValueError("expected at least one session table")
         sessions: list[TopLevelSession] = []
@@ -357,7 +412,7 @@ def read_sessions(path: Path, problems: list[log_records.SourceProblem]) -> TopL
             sessions.append(TopLevelSession(key, display_name))
         return TopLevelSessions(tuple(sessions))
     except (OSError, UnicodeError, ValueError) as error:
-        problems.append(log_records.SourceProblem(str(path), f"unreadable session config: {error}"))
+        problems.append(log_records.SourceProblem(str(path), f"unreadable session config: {error}", log_records.SourceNotApplicable.ATTRIBUTION))
         return TopLevelSessions(())
 
 
@@ -465,6 +520,8 @@ def sending_path(push: PushRecord, review: ReviewMatch) -> str:
 def classify(push: PushRecord, identity: TextIdentity, review: ReviewMatch) -> PushClassification:
     if push.priority is PushPriority.EMERGENCY:
         return ApprovedPriorityTwo()
+    if isinstance(identity, TextId) and identity.value == "nate.adhoc" and push.at >= AGENT_TEXT_EXCEPTION_ENDED:
+        return Unapproved(sending_path(push, review) + "; nate.adhoc exception ended 2026-10-29T03:05:59Z")
     if isinstance(identity, TextId) or push.outcome is PushOutcome.ORIGINAL_TEXT_SENT:
         return ApprovedRegisteredText()
     return Unapproved(sending_path(push, review))
@@ -534,7 +591,7 @@ def render(report: AuditReport) -> str:
     details = [log_records.MeasureRow(f"{entry.at.isoformat()} / {sender_label(entry.sender, report.sessions)} / {entry.title}",
                                  f"{type(entry.classification).__name__} / {text_label(entry.text_identity)}", 1,
                                  report.window.label,
-                                 f"{entry.classification.code_path}; {entry.classification.reason}; {entry.evidence.value}")
+                                 f"{entry.classification.code_path}; {entry.classification.reason}; {entry.evidence.value}", event_source=log_records.EventSource.PUSHES, quantity=log_records.Diagnostic(1))
                for entry in report.entries]
     grouped: dict[ShowrunnerAttribution, Counter[ClassificationType]] = defaultdict(Counter)
     for entry in report.entries:
@@ -543,20 +600,30 @@ def render(report: AuditReport) -> str:
     incomplete = "incomplete; " if report.problems else ""
     totals = [log_records.MeasureRow(owner_label(attribution, report.sessions), incomplete +
                                 "; ".join(f"{kind.__name__} {grouped[attribution][kind]}" for kind in CLASSIFICATIONS),
-                                count, report.window.label, source)
+                                count, report.window.label, source, event_source=log_records.EventSource.PUSHES, quantity=log_records.Diagnostic(count))
               for attribution, count in sorted(report.pushes_by_showrunner.items(),
                                                key=lambda item: owner_label(item[0], report.sessions))]
     overall = Counter(type(entry.classification) for entry in report.entries)
     totals.append(log_records.MeasureRow("all senders", incomplete + f"after failed check {len(report.entries)}; " +
                                     "; ".join(f"{kind.__name__} {overall[kind]}" for kind in CLASSIFICATIONS),
-                                    sum(report.pushes_by_showrunner.values()), report.window.label, source))
-    output = [log_records.table("Sends after failed text checks (n = 1 per delivered push)", details),
-              log_records.table("Totals per showrunner (current ownership; historical ownership may be missing)", totals),
-              "Neither notification log records a key. Text identity comes from the delivery footer or matched review."]
+                                    sum(report.pushes_by_showrunner.values()), report.window.label, source, event_source=log_records.EventSource.PUSHES, quantity=log_records.Diagnostic(len(report.entries))))
+    output = [log_records.blocks("Sends after failed text checks (n = 1 per delivered push)", details),
+              log_records.blocks("Totals per showrunner (current ownership; historical ownership may be missing)", totals),
+              log_records.wrap_text("Neither notification log records a key. Text identity comes from the delivery footer or matched review.")]
     if report.problems:
-        output.append(log_records.table("Source problems (counts can be incomplete)",
+        output.append(log_records.blocks("Source problems (counts can be incomplete)",
                                     log_records.source_problem_rows(report.problems, report.window)))
     return "\n\n".join(output)
+
+
+def report_summary(report: AuditReport, full: bool = False) -> str:
+    counts = Counter(type(entry.classification) for entry in report.entries)
+    return "\n".join(log_records.wrap_text(line) for line in [
+        f"Window: {report.window.label}.",
+        f"Pushes: {len(report.delivered_pushes)} delivered; {len(report.entries)} after a failed text check.",
+        "; ".join(f"{kind.__name__}: {counts[kind]}" for kind in CLASSIFICATIONS) + ".",
+        f"Source problems: {len(report.problems)}." + ("" if full else " Use --full to print the tables."),
+    ])
 
 
 def main(arguments: Sequence[str] = ()) -> int:
@@ -564,13 +631,18 @@ def main(arguments: Sequence[str] = ()) -> int:
     _ = parser.add_argument("command", choices=("report",))
     _ = parser.add_argument("--since", metavar="DATE_OR_TIME", default="")
     _ = parser.add_argument("--until", metavar="DATE_OR_TIME", default="")
+    _ = parser.add_argument("--full", action="store_true", help="print the tables after the summary")
     args = parser.parse_args(arguments)
     now = datetime.now(timezone.utc)
     try:
         window = log_records.window_bounds(cast(str, args.since), cast(str, args.until), now)
     except ValueError as error:
         parser.error(str(error))
-    print(render(audit(load_sources(STATE_DIR), window)))
+    report = audit(load_sources(STATE_DIR), window)
+    print(report_summary(report, full=cast(bool, args.full)))
+    if cast(bool, args.full):
+        print()
+        print(render(report))
     return 0
 
 

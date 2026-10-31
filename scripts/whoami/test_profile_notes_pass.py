@@ -17,6 +17,9 @@ from types import ModuleType
 from typing import cast, override
 from unittest.mock import patch
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib.test_agents_registry import write_registry
+
 from scripts.whoami import profile_notes_pass as profile
 
 
@@ -66,6 +69,7 @@ class ProfileNotesPassTests(unittest.TestCase):
             "SHOWRUNNERS_CONFIG": str(self.home / "showrunners.json"),
             "USER_ZONE": "UTC", "PYTHONDONTWRITEBYTECODE": "1",
         }, clear=True))
+        _ = write_registry(self.home / "agents.conf")
         pass_ = profile.load_pass()
         # Modules may already be imported by another suite. Replace only input paths.
         for entry in profile.state_copies(pass_):
@@ -85,10 +89,8 @@ class ProfileNotesPassTests(unittest.TestCase):
         )
         for module, attribute, value in paths:
             _ = self.enterContext(patch.object(module, attribute, value))
-        # Plain imports and package imports can refer to separate showrunner modules.
-        for module in (self.pass_.showrunners, import_module("showrunners")):
-            for attribute in ("CONFIG", "NOTIFIER_STATE_DIR", "SESSIONS_DIR", "SHOWRUNNER_STATE_DIR"):
-                _ = self.enterContext(patch.object(module, attribute, self.home / attribute))
+        for attribute in ("CONFIG", "NOTIFIER_STATE_DIR", "SESSIONS_DIR", "SHOWRUNNER_STATE_DIR"):
+            _ = self.enterContext(patch.object(self.pass_.showrunners, attribute, self.home / attribute))
         _ = self.enterContext(patch.object(import_module("scripts.message.process_table"), "PS", [str(self.bin / "ps")]))
         _ = (self.home / "showrunners.json").write_text(json.dumps({
             "threshold_percent": 2, "repeat_minutes": 30, "stall_minutes": 5,
@@ -122,6 +124,10 @@ class ProfileNotesPassTests(unittest.TestCase):
 
         signature = agent_notes.timer_usage_signature(accounts.claude_account_selection(), observe_workers_home())
         usage_store.save_timer_usage(signature, [], datetime.now(timezone.utc))
+        timer_save = next(entry for entry in profile.patch_list(self.pass_)
+                          if entry.owner is usage_store and entry.attribute == "save_timer_usage")
+        timer_save_name = f"{usage_store.__name__}.{timer_save.attribute}"
+        self.assertIn(timer_save_name, {entry.name for entry in profile.patch_list(self.pass_)})
         state = profile.state_path(self.pass_.pacer, "STATE_FILE")
         state.parent.mkdir(parents=True, exist_ok=True)
         _ = state.write_text('{"files":{},"buckets":{},"history":[],"windows":{}}')
@@ -139,7 +145,7 @@ class ProfileNotesPassTests(unittest.TestCase):
                                 for file, _, name in functions))
             self.assertEqual(measured.calls["agent_notes.write_note"], 1)
             self.assertEqual(measured.calls["codex_pacer.write_atomic"], 3)
-            self.assertEqual(measured.calls["usage_store.save_timer_usage"], 0)
+            self.assertEqual(measured.calls[timer_save_name], 0)
             self.assertGreater(measured.calls["scripts.accounts.refusal_watch._watch_lock"], 0)
             self.assertTrue(measured.children)
             self.assertTrue(all(isinstance(child.completion, profile.ChildCompleted) and child.wall_time(0.0) >= 0.0
@@ -248,6 +254,7 @@ class ProfileNotesPassTests(unittest.TestCase):
 
     def test_child_launch_options_cannot_substitute_executable_or_run_hooks(self) -> None:
         entry = next(entry for entry in profile.patch_list(self.pass_) if entry.mode == "child_launch")
+        command = ("ps", "-eo", "pid=,ppid=,comm=,args=")
         options: tuple[dict[str, object], ...] = (
             {"executable": "/bin/sh"}, {"shell": True},
             {"preexec_fn": lambda: None}, {"startupinfo": object()},
@@ -258,11 +265,13 @@ class ProfileNotesPassTests(unittest.TestCase):
                 "mac": "/nix/store/fixture-python/bin/python3", "natedev": "/nix/store/fixture-python/bin/python3"}))
             for kwargs in options:
                 with self.subTest(option=next(iter(kwargs))), self.assertRaises(OSError):
-                    _ = guarded(object(), ["ps", "-c", "touch /tmp/claude/probe-marker"], **kwargs)
+                    _ = guarded(object(), command, **kwargs)
             # Popen permits executable and shell as positional arguments too.
             with self.assertRaises(OSError):
-                _ = guarded(object(), ["ps", "-c", "touch /tmp/claude/probe-marker"], -1, "/bin/sh")
+                _ = guarded(object(), command, -1, "/bin/sh")
             self.assertEqual(started.call_count, 0)
+            _ = guarded(object(), command)
+            self.assertEqual(started.call_count, 1)
 
     def test_private_scratch_test_compares_resolved_paths(self) -> None:
         # Model macOS: spelling a path through /tmp differs from its resolved path.

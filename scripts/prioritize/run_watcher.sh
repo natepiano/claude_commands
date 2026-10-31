@@ -44,10 +44,6 @@ CONCURRENT_CHANGE_EXIT=3
 
 CANDIDATE_FILE=""
 POST_RUN_FILE=""
-# Set once a renumber pass has actually written issue notes, and never reset:
-# the locked loop can run several passes, and a later no-op must not cancel the
-# index refresh an earlier pass earned.
-RANKING_WRITE_OCCURRED=0
 
 umask 077
 if ! mkdir -p "$STATE_DIR" "$CACHE_DIR"; then
@@ -310,7 +306,6 @@ run_once() {
             return "$check_status"
         fi
         log "repaired generated ranking state without semantic input changes"
-        RANKING_WRITE_OCCURRED=1
         write_status "ok" "repaired" "score-and-rank-canonical" || true
         return 0
     fi
@@ -336,11 +331,6 @@ run_once() {
         write_status "error" "post-apply-check" "exit-$check_status" || true
         return "$check_status"
     fi
-
-    # Set here rather than at either return below: the apply has written notes
-    # by this point, and it stays true whether this pass goes on to commit its
-    # snapshot or bails out to a fresh pass because the inputs moved underneath.
-    RANKING_WRITE_OCCURRED=1
 
     POST_RUN_FILE="$(mktemp "$CACHE_DIR/.semantic-inputs.post-run.XXXXXX")" || {
         log "error: could not create post-run snapshot"
@@ -536,9 +526,9 @@ while true; do
     # Once per locked session, after the last pass, rather than inside run_once:
     # a coalesced rerun would otherwise pay for a full index refresh on every
     # pass, and only the final state of the notes is worth reconciling.
-    if (( RANKING_WRITE_OCCURRED == 1 )); then
-        refresh_vault_git_index
-    fi
+    # A previous process can stop after saving its snapshot and before this
+    # index-only step. Reconcile live filtered content even on a no-op rerun.
+    refresh_vault_git_index
 
     exit "$last_status"
 done

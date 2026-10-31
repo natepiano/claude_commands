@@ -13,6 +13,18 @@ BRANCH_NAME="${1:?Usage: push_pr_branch_and_merge.sh <branch-name>}"
 DEFAULT_BRANCH="$(gh repo view --json defaultBranchRef -q .defaultBranchRef.name)"
 CURRENT_BRANCH="$(git branch --show-current)"
 
+run_landed_hook() {
+  local landed_sha completed
+  landed_sha="$(git rev-parse HEAD)"
+  completed="$(git rev-parse --git-path post-push-completed)"
+  if [[ -f "$completed" && "$(cat "$completed")" == "$landed_sha" ]]; then
+    return 0
+  fi
+  bash "${SCRIPT_DIR}/post_push_hook.sh" "$DEFAULT_BRANCH" "$landed_sha"
+  printf '%s\n' "$landed_sha" > "$completed.tmp"
+  mv -f "$completed.tmp" "$completed"
+}
+
 if ! git check-ref-format --branch "$BRANCH_NAME" >/dev/null; then
   echo "ERROR: invalid branch name: ${BRANCH_NAME}" >&2
   exit 1
@@ -23,8 +35,18 @@ if [[ "$CURRENT_BRANCH" != "$DEFAULT_BRANCH" && "$CURRENT_BRANCH" != "$BRANCH_NA
   exit 1
 fi
 
+if [[ "$CURRENT_BRANCH" == "$DEFAULT_BRANCH" ]]; then
+  git fetch origin "refs/heads/${DEFAULT_BRANCH}:refs/remotes/origin/${DEFAULT_BRANCH}"
+fi
 if [[ "$CURRENT_BRANCH" == "$DEFAULT_BRANCH" && -z "$(git log --format="%h %s" "origin/${DEFAULT_BRANCH}..HEAD")" ]]; then
+  git merge --ff-only "origin/${DEFAULT_BRANCH}"
+  if [[ "$(git rev-parse HEAD)" != "$(git rev-parse "origin/${DEFAULT_BRANCH}")" ]]; then
+    echo "ERROR: ${DEFAULT_BRANCH} does not match origin/${DEFAULT_BRANCH}" >&2
+    exit 1
+  fi
   echo "Nothing to push."
+  # A prior run may have landed the merge but stopped before its hook finished.
+  run_landed_hook
   exit 0
 fi
 
@@ -106,4 +128,4 @@ else
 fi
 
 # The default branch has landed; run the repo's post-push hook, if it has one.
-bash "${SCRIPT_DIR}/post_push_hook.sh" "$DEFAULT_BRANCH" "$(git rev-parse HEAD)"
+run_landed_hook

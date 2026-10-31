@@ -200,6 +200,97 @@ class DirectorTurnWaitHookTests(unittest.TestCase):
                     finished = fixture.wait_events()[-1]
                     self.assertEqual((finished["event_type"], finished["wait_id"]), ("wait_finished", started["wait_id"]))
 
+    def assert_forwarded_reply_wait_outcome(
+        self, *, finishes: bool, forward: str = "pending",
+        record_count: int = 1, transport_newlines: bool = False,
+        sender_index: int = 4, declaration: str = "blocked: waiting on the showrunner",
+        reply: str = "The checkpoint is merged.", **record_changes: object,
+    ) -> None:
+        with director_wait_fixture() as fixture:
+            supplier_socket = str(fixture.root / "socket-0")
+            _ = (fixture.root / "current_socket").write_text(supplier_socket)
+            fixture.call(STOP, {"last_assistant_message": declaration}, 1010)
+            started, = fixture.wait_events()
+            marker = (fixture.run / "turn_wait.json").read_bytes()
+            replies = fixture.root / "state/message/postmaster/replies"
+            replies.mkdir(parents=True)
+            record: dict[str, object] = {
+                "at_ms": 1020000, "socket": "uds:" + supplier_socket,
+                "name": "renamed-showrunner", "session_id": "showrunner-id",
+                "senders": ["another-director", "director"], "body": reply,
+                # This director is the second intended recipient. The reply's
+                # filename counter and each forward's suffix are independent.
+                "targets": ["another-director", SESSION],
+                "forward": forward, "forwarded": [], **record_changes,
+            }
+            for index in range(record_count):
+                _ = (replies / f"1020000-{index + 1}.json").write_text(json.dumps(record))
+            text = ("Message from renamed-showrunner (their answer to one of another-director, director, "
+                    + "passed on by postmaster) [1020000-7]:\n\n" + reply)
+            if transport_newlines:
+                text = "\n" + text + "\n"
+            message = fixture.message(text, address="uds:" + str(fixture.root / f"socket-{sender_index}"),
+                                      name="postmaster")
+            fixture.call(PROMPT, {"prompt": message}, 1020)
+            if finishes:
+                # A repeated delivery must not finish another wait or append
+                # another finish to this one.
+                fixture.call(PROMPT, {"prompt": message}, 1030)
+                waits = fixture.wait_events()
+                self.assertEqual([wait["event_type"] for wait in waits], ["wait_started", "wait_finished"])
+                self.assertEqual(waits[1]["wait_id"], started["wait_id"])
+                self.assertEqual(waits[1]["phase_instance_id"], started["phase_instance_id"])
+                self.assertEqual(cast(dict[str, object], waits[1]["wait_end"])["epoch"], 1020)
+                self.assertFalse((fixture.run / "turn_wait.json").exists())
+            else:
+                self.assertEqual(fixture.wait_events(), [started])
+                self.assertEqual((fixture.run / "turn_wait.json").read_bytes(), marker)
+                # Rejection must leave the original wait usable by its actual
+                # supplier (or the expected showrunner's user-decision relay).
+                direct_reply = ("From the user (via the showrunner): Approved."
+                                if declaration.startswith("decision:") else reply)
+                fixture.call(PROMPT, {"prompt": fixture.message(direct_reply, address="uds:" + supplier_socket)}, 1040)
+                waits = fixture.wait_events()
+                self.assertEqual([wait["event_type"] for wait in waits], ["wait_started", "wait_finished"])
+                self.assertEqual(waits[1]["wait_id"], started["wait_id"])
+                self.assertFalse((fixture.run / "turn_wait.json").exists())
+
+    def test_pending_postmaster_record_ends_supplier_wait_before_forward_confirmation(self) -> None:
+        self.assert_forwarded_reply_wait_outcome(finishes=True)
+
+    def test_pending_forward_with_transport_newlines_preserves_original_body_newlines(self) -> None:
+        self.assert_forwarded_reply_wait_outcome(
+            finishes=True, transport_newlines=True, reply="\nThe checkpoint is merged.\n\n")
+
+    def test_done_postmaster_record_ends_supplier_wait_without_confirmed_targets(self) -> None:
+        self.assert_forwarded_reply_wait_outcome(finishes=True, forward="done")
+
+    def test_missing_postmaster_record_leaves_supplier_wait_open(self) -> None:
+        self.assert_forwarded_reply_wait_outcome(finishes=False, record_count=0)
+
+    def test_two_matching_postmaster_records_leave_supplier_wait_open(self) -> None:
+        self.assert_forwarded_reply_wait_outcome(finishes=False, record_count=2)
+
+    def test_postmaster_record_for_another_socket_leaves_supplier_wait_open(self) -> None:
+        self.assert_forwarded_reply_wait_outcome(finishes=False, socket="uds:/stale/supplier")
+
+    def test_postmaster_record_for_another_body_leaves_supplier_wait_open(self) -> None:
+        self.assert_forwarded_reply_wait_outcome(finishes=False, body="A different answer.")
+
+    def test_confirmed_forward_does_not_replace_intended_target_membership(self) -> None:
+        self.assert_forwarded_reply_wait_outcome(
+            finishes=False, forward="done", targets=["another-director"], forwarded=[SESSION])
+
+    def test_another_outer_sender_cannot_reuse_a_valid_postmaster_record(self) -> None:
+        self.assert_forwarded_reply_wait_outcome(finishes=False, sender_index=1)
+
+    def test_verified_forwarded_supplier_answer_does_not_end_a_user_wait(self) -> None:
+        self.assert_forwarded_reply_wait_outcome(finishes=False, declaration="decision: approve?")
+
+    def test_verified_forwarded_showrunner_user_relay_ends_the_user_wait(self) -> None:
+        self.assert_forwarded_reply_wait_outcome(
+            finishes=True, declaration="decision: approve?", reply="From the user (via the showrunner): Approved.")
+
     def test_separate_relay_with_the_suppliers_name_has_no_verified_origin(self) -> None:
         with director_wait_fixture() as fixture:
             fixture.call(STOP, {"last_assistant_message": "blocked: waiting on the showrunner"}, 1010)

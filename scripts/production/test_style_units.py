@@ -88,10 +88,11 @@ class StyleUnitsTests(unittest.TestCase):
                 [(str(proposal), state, ticket, built_at, updated_at)] * count,
             )
 
-    def refill(self, unit: str = "names-unit", *, split_at: str = "2026-10-28T11:30:00+00:00") -> None:
+    def refill(self, unit: str = "names-unit", *, split_at: str = "2026-10-28T11:30:00+00:00",
+               outcome: str = "waiting for structure: cargo-liner") -> None:
         with closing(sqlite3.connect(self.database)) as connection, connection:
             _ = connection.execute("INSERT INTO refill_results VALUES (?,?,?,?,?,?,?,?)", (
-                unit, "2026-10-28T13:45:00+00:00", "waiting for structure: cargo-liner", split_at, 1234, 20, 30, 16,
+                unit, "2026-10-28T13:45:00+00:00", outcome, split_at, 1234, 20, 30, 16,
             ))
 
     def render(self, units: list[live_units.LiveUnit] | None = None,
@@ -152,15 +153,32 @@ class StyleUnitsTests(unittest.TestCase):
 
     def test_headers_name_the_eta_and_finding_counts(self) -> None:
         self.assertEqual(self.render().splitlines()[:2], [
-            "| Unit | Ticket | Step | ETA | Findings built (24 h) | Findings left |",
-            "| --- | --- | --- | --- | --- | --- |",
+            "| Unit | Ticket | Step | ETA | Findings built | Last 24 h | Findings left |",
+            "| --- | --- | --- | --- | ---: | ---: | ---: |",
         ])
 
-    def test_idle_step_names_the_refill_outcome_and_ticket_keeps_its_time(self) -> None:
-        self.assertIn("| names | idle | idle | — | 0 (0) | 0 |", self.render())
-        self.refill()
-        self.assertIn("| names | idle — waiting for structure: cargo-liner (09:45) | "
-                      + "idle — waiting for structure: cargo-liner | — |", self.render())
+    def test_idle_without_a_refill_uses_idle_in_ticket_and_step(self) -> None:
+        self.assertEqual(self.render().splitlines()[2], "| names | idle | idle | — | 0 | 0 | 0 |")
+
+    def test_idle_step_shows_the_whole_refill_outcome_once_and_ticket_keeps_its_time(self) -> None:
+        outcomes = (
+            "waiting for structure: cargo-liner",
+            "waiting for sync: listed tui_pane names: main touched crates/tui_pane/src/a.rs, crates/tui_pane/Cargo.toml",
+        )
+        for outcome in outcomes:
+            with self.subTest(outcome=outcome):
+                with closing(sqlite3.connect(self.database)) as connection, connection:
+                    _ = connection.execute("DELETE FROM refill_results")
+                self.refill(split_at="", outcome=outcome)
+                row = self.render().splitlines()[2]
+                self.assertEqual(row, f"| names | idle (09:45) | idle — {outcome} | — | 0 | 0 | 0 |")
+                self.assertEqual(row.count(outcome), 1)
+
+    def test_built_and_recent_counts_have_separate_cells(self) -> None:
+        decision = self.decision("names", "names-unit")
+        self.findings(decision, "built", 56, built_at="2026-10-28T11:00:00+00:00")
+        self.findings(decision, "built", 1178, built_at="2026-10-20T11:00:00+00:00")
+        self.assertEqual(self.render().splitlines()[2], "| names | idle | idle | — | 1,234 | 56 | 0 |")
 
     def test_writing_step_uses_the_ticket_count_and_noun(self) -> None:
         for kind, noun in (("proposal", "finding"), ("listed", "site"), ("read", "file"), ("structure", "file")):
@@ -234,13 +252,13 @@ class StyleUnitsTests(unittest.TestCase):
 
     def test_eta_has_its_own_column_in_the_production_zone(self) -> None:
         output = self.render_open_step("test", eta="2026-10-28T16:15:00+02:00")
-        self.assertIn("| testing | 10:15 | 0 (0) |", output)
+        self.assertIn("| testing | 10:15 | 0 | 0 |", output)
         self.assertNotIn(" · ETA", output)
 
     def test_eta_column_shows_a_dash_without_a_valid_recorded_eta(self) -> None:
         for eta in ("", "invalid", "2026-10-28T16:15:00"):
             with self.subTest(eta=eta):
-                self.assertIn("| testing | — | 0 (0) |", self.render_open_step("test", eta=eta))
+                self.assertIn("| testing | — | 0 | 0 |", self.render_open_step("test", eta=eta))
 
     def test_eta_without_an_open_step_keeps_the_idle_step_and_its_own_column(self) -> None:
         record: dict[str, object] = {"plan": str(self.root / "plan.md"),
@@ -255,7 +273,7 @@ class StyleUnitsTests(unittest.TestCase):
         self.findings(decision, "built", built_at="2026-10-27T11:59:59+00:00")
         self.findings(decision, "built")
         self.findings(self.decision("types", "types-unit"), "built", built_at="2026-10-28T11:00:00+00:00")
-        self.assertIn("| 4 (2) |", self.render())
+        self.assertIn("| 4 | 2 |", self.render())
         self.assertIn("All families: 5 findings built", self.render())
 
     def test_left_names_approved_and_all_filed_counts_before_the_split_and_age(self) -> None:
@@ -300,7 +318,7 @@ class StyleUnitsTests(unittest.TestCase):
         with closing(sqlite3.connect(self.database)) as connection, connection:
             _ = connection.execute("INSERT INTO refill_results(unit,at,outcome,split_at) VALUES (?,'','',?)",
                                    ("names-unit", "2026-10-28T10:00:00+00:00"))
-        self.assertIn("| names | idle | idle | — | 0 (0) | "
+        self.assertIn("| names | idle | idle | — | 0 | 0 | "
                       + "0: ready 0 · changed 0 · structure 0 · other 0 (2 h) |", self.render())
 
     def test_a_built_finding_without_a_decision_uses_its_build_ticket_family(self) -> None:
@@ -308,7 +326,7 @@ class StyleUnitsTests(unittest.TestCase):
         self.findings(self.root / "missing.md", "built", 5, ticket=ticket, built_at="2026-10-28T11:00:00+00:00")
         self.findings(self.root / "missing.md", "filed", 7, ticket=ticket)
         self.findings(self.root / "missing.md", "built", 3, ticket="missing-ticket")
-        self.assertIn("| 5 (5) | 0 |", self.render())
+        self.assertIn("| 5 | 5 | 0 |", self.render())
 
     def test_total_with_a_rate_counts_all_families_once_and_uses_thousands_commas(self) -> None:
         names = self.decision("names", "names-unit")
@@ -322,7 +340,7 @@ class StyleUnitsTests(unittest.TestCase):
         output = self.render(units)
         self.assertEqual(output.splitlines()[-1], "All families: 1,334 findings built · 3,900 approved findings left · 1,300 built in the last 24 h · "
                          + "ETA at that rate 2026-10-31")
-        self.assertIn("| 1,234 (1,200) | 2,600 |", output)
+        self.assertIn("| 1,234 | 1,200 | 2,600 |", output)
 
     def test_total_names_all_filed_findings_and_uses_only_approved_findings_for_eta(self) -> None:
         names = self.decision("names", "names-unit")
@@ -339,8 +357,8 @@ class StyleUnitsTests(unittest.TestCase):
         _ = unanswered.write_text("---\nstatus: open\n---\n", encoding="utf-8")
         self.findings(unanswered, "filed")
         output = self.render([live_unit("names-unit", "names"), live_unit("types-unit", "types")])
-        self.assertIn("| names | idle | idle | — | 0 (0) | 1 |", output)
-        self.assertIn("| types | idle | idle | — | 0 (0) | 0 |", output)
+        self.assertIn("| names | idle | idle | — | 0 | 0 | 1 |", output)
+        self.assertIn("| types | idle | idle | — | 0 | 0 | 0 |", output)
         self.assertEqual(output.splitlines()[-1],
                          "All families: 0 findings built · 1 approved findings left of 2 filed · "
                          + "0 built in the last 24 h · no ETA: nothing built in 24 h")
@@ -351,7 +369,7 @@ class StyleUnitsTests(unittest.TestCase):
         _ = unreadable.write_bytes(b"\xff")
         self.findings(unreadable, "filed")
         output = self.render()
-        self.assertIn("| names | idle | idle | — | 0 (0) | 0 |", output)
+        self.assertIn("| names | idle | idle | — | 0 | 0 | 0 |", output)
         self.assertEqual(output.splitlines()[-1],
                          "All families: 0 findings built · 0 approved findings left of 2 filed · "
                          + "0 built in the last 24 h · no ETA: nothing built in 24 h")
@@ -379,7 +397,7 @@ class StyleUnitsTests(unittest.TestCase):
             output = self.render()
         self.assertEqual(output.splitlines()[-1],
                          "All families: 11 findings built · 16 approved findings left · 8 built in the last 24 h · ETA at that rate 2026-10-30")
-        self.assertIn("| 11 (8) | 16 |", output)
+        self.assertIn("| 11 | 8 | 16 |", output)
         self.assertEqual(self.database.read_bytes(), before)
 
     def test_legacy_ledgers_without_ticket_metadata_use_finding_time_read_only(self) -> None:
@@ -402,7 +420,7 @@ class StyleUnitsTests(unittest.TestCase):
                 before = database.read_bytes()
                 output = style_units.table([live_unit("names-unit")], {}, now=NOW, zone=ZONE,
                                            ledger_paths={"names-unit": database})
-                self.assertIn("| 3 (2) | 4 |", output)
+                self.assertIn("| 3 | 2 | 4 |", output)
                 self.assertEqual(output.splitlines()[-1],
                                  "All families: 3 findings built · 4 approved findings left · 2 built in the last 24 h · ETA at that rate 2026-10-30")
                 self.assertEqual(database.read_bytes(), before)
@@ -446,7 +464,7 @@ class StyleUnitsTests(unittest.TestCase):
                 before = database.read_bytes()
                 output = style_units.table([live_unit("names-unit")], {}, now=NOW, zone=ZONE,
                                            ledger_paths={"names-unit": database})
-                self.assertIn("| gone | idle | idle | — | 0 (0) | 0 |", output)
+                self.assertIn("| gone | idle | idle | — | 0 | 0 | 0 |", output)
                 self.assertEqual(database.read_bytes(), before)
         database = self.root / "absent" / "ledger.sqlite"
         output = style_units.table([live_unit("names-unit")], {}, now=NOW, zone=ZONE,
@@ -487,7 +505,7 @@ class StyleUnitsTests(unittest.TestCase):
         records: dict[str, object] = {"names-unit": {"unavailable": "plan cannot be read"}}
         with patch.object(style_ledger, "ledger_location", side_effect=AssertionError("the caller resolved the path")):
             output = self.render(records=records)
-        self.assertIn("| names | #42 · comments-name-code-constructs · cargo-liner · 3 findings | starting 3 findings | — | 0 (0) | 7 |", output)
+        self.assertIn("| names | #42 · comments-name-code-constructs · cargo-liner · 3 findings | starting 3 findings | — | 0 | 0 | 7 |", output)
 
     def test_session_cells_and_pipes_keep_the_phase_table_meaning(self) -> None:
         units = [live_unit("names-unit", "names|worker"), live_unit("types-unit")]

@@ -12,6 +12,8 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
+from scripts.lint.memory_test_support import fake_memory_readings
+
 
 # Hang guards allow for load 136 on natedev (2026-10-29).
 TEST_HANG_GUARD_SECS = 300
@@ -47,6 +49,7 @@ class DailiesHoldTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.scratch = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(mock.patch.dict(os.environ, fake_memory_readings(self.scratch)))
         # HOME puts the renderer's AGENTS_DIR and READINGS_LOG under this test directory.
         (self.scratch / "rust/hanadocs/agents").mkdir(parents=True)
         (self.scratch / ".local/state/agent-notes").mkdir(parents=True)

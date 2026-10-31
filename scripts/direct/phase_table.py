@@ -373,6 +373,13 @@ class NoteOwnership(NamedTuple):
     unit: str
 
 
+class ProductionIdentity(NamedTuple):
+    """The current slug and former names of one production."""
+
+    slug: str
+    former_slugs: tuple[str, ...]
+
+
 class NoteWithoutPhaseTableOwnership(NamedTuple):
     """A note cannot be identified as this script's output."""
 
@@ -1691,6 +1698,27 @@ def _note_ownership(path: Path) -> NoteOwnership | NoteWithoutPhaseTableOwnershi
     return NoteOwnership(production=production, unit=unit)
 
 
+def production_identity(production: Production) -> ProductionIdentity:
+    """Read the production names that can own its phase notes."""
+    try:
+        text = production.doc.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as error:
+        raise Refusal(f"cannot read production doc: {error}") from error
+    return ProductionIdentity(production.slug, showrunners.former_slugs(text))
+
+
+def _owns_note(
+    ownership: NoteOwnership | NoteWithoutPhaseTableOwnership,
+    production: ProductionIdentity,
+    unit: str,
+) -> bool:
+    return (
+        isinstance(ownership, NoteOwnership)
+        and ownership.unit == unit
+        and ownership.production in (production.slug, *production.former_slugs)
+    )
+
+
 def _production_slug_from_link(link: str) -> str:
     """Return the production slug named by a note's `production_file` link."""
     if link.startswith('"'):
@@ -1747,12 +1775,12 @@ def _production_file_link(document: Path, vault: Path) -> str:
 
 
 def _most_recent_owned_note(
-    vault_root: Path, ownership: NoteOwnership
+    vault_root: Path, production: ProductionIdentity, unit: str
 ) -> MostRecentOwnedPhaseNote | NoOwnedPhaseNote:
     matches = [
         path
         for path in vault_root.glob("*/*.md")
-        if _note_ownership(path) == ownership
+        if _owns_note(_note_ownership(path), production, unit)
     ]
     if not matches:
         return NoOwnedPhaseNote()
@@ -1837,16 +1865,16 @@ def _phase_note_lock(folder: Path) -> Generator[None]:
         os.close(descriptor)
 
 
-def _write_note(target: Path, content: str, ownership: NoteOwnership) -> None:
+def _write_note(target: Path, content: str, production: ProductionIdentity, unit: str) -> None:
     temporary: Path | None = None
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
         with _phase_note_lock(target.parent):
             target_existed = target.exists()
-            if target_existed and _note_ownership(target) != ownership:
+            if target_existed and not _owns_note(_note_ownership(target), production, unit):
                 raise Refusal(
                     "phase note target is not owned by "
-                    + f"{ownership.production}/{ownership.unit}: {target}"
+                    + f"{production.slug}/{unit}: {target}"
                 )
             with tempfile.NamedTemporaryFile(
                 "w",
@@ -1878,10 +1906,10 @@ def _write_note(target: Path, content: str, ownership: NoteOwnership) -> None:
 
 
 def _remove_stale_notes(
-    vault_root: Path, target: Path, ownership: NoteOwnership
+    vault_root: Path, target: Path, production: ProductionIdentity, unit: str
 ) -> None:
     for candidate in vault_root.glob("*/*.md"):
-        if candidate == target or _note_ownership(candidate) != ownership:
+        if candidate == target or not _owns_note(_note_ownership(candidate), production, unit):
             continue
         try:
             candidate.unlink()
@@ -1997,6 +2025,7 @@ def _archive_note(candidate: Path, vault_root: Path, slug: str) -> Path:
 def archive(production_doc: Path) -> list[Path]:
     """Move a production's generated phase notes into the vault's archive."""
     production = read_production(production_doc)
+    identity = production_identity(production)
     vault_root = _vault_root()
     if not vault_root.parent.exists():
         return []
@@ -2005,7 +2034,7 @@ def archive(production_doc: Path) -> list[Path]:
         ownership = _note_ownership(candidate)
         if (
             not isinstance(ownership, NoteOwnership)
-            or ownership.production != production.slug
+            or not _owns_note(ownership, identity, ownership.unit)
         ):
             continue
         archived.append(_archive_note(candidate, vault_root, production.slug))
@@ -2015,6 +2044,7 @@ def archive(production_doc: Path) -> list[Path]:
 def prune(production_doc: Path) -> None:
     """Archive generated notes for units no longer live in a production."""
     production = read_production(production_doc)
+    identity = production_identity(production)
     live_units = {
         unit_plan.unit for unit_plan in _production_unit_plans(production)
     }
@@ -2023,20 +2053,21 @@ def prune(production_doc: Path) -> None:
         ownership = _note_ownership(candidate)
         if (
             not isinstance(ownership, NoteOwnership)
-            or ownership.production != production.slug
+            or not _owns_note(ownership, identity, ownership.unit)
             or ownership.unit in live_units
         ):
             continue
         _ = _archive_note(candidate, vault_root, production.slug)
 
 
-def owned_notes(production: str, unit: str) -> list[Path]:
-    """The generated phase notes that name `unit` of `production` as their owner."""
-    owner = NoteOwnership(production=production, unit=unit)
-    return [candidate for candidate in sorted(_vault_root().glob("*/*.md")) if _note_ownership(candidate) == owner]
+def owned_notes(production: ProductionIdentity | str, unit: str) -> list[Path]:
+    """List a unit's notes; a legacy slug alone checks only that exact production name."""
+    identity = ProductionIdentity(production, ()) if isinstance(production, str) else production
+    return [candidate for candidate in sorted(_vault_root().glob("*/*.md"))
+            if _owns_note(_note_ownership(candidate), identity, unit)]
 
 
-def rename_unit(production: str, old: str, new: str) -> list[Path]:
+def rename_unit(production: ProductionIdentity, old: str, new: str) -> list[Path]:
     """Point a renamed unit's generated phase notes at its new id, so prune keeps them.
 
     Only the `unit:` key changes; the unit's next refresh rewrites the rest of each note.
@@ -2072,7 +2103,7 @@ def refresh(session_dir: Path) -> None:
     if not vault_root.parent.exists():
         return
     production = read_production(_production_document(record.plan, reference))
-    ownership = NoteOwnership(production=production.slug, unit=reference.unit)
+    identity = production_identity(production)
     try:
         showrunner = showrunners.current_name(production.slug)
     except OSError as error:
@@ -2084,13 +2115,13 @@ def refresh(session_dir: Path) -> None:
             raise Refusal("production Showrunner session must be one directory name")
         folder = vault_root / showrunner
     else:
-        previous = _most_recent_owned_note(vault_root, ownership)
+        previous = _most_recent_owned_note(vault_root, identity, reference.unit)
         if isinstance(previous, NoOwnedPhaseNote):
             raise Refusal(f"the showrunner of {production.slug} is not running")
         folder = previous.path.parent
     name = _phase_note_name(production.slug, reference.unit)
     target = folder / f"{name}.md"
-    if target.exists() and _note_ownership(target) != ownership:
+    if target.exists() and not _owns_note(_note_ownership(target), identity, reference.unit):
         raise Refusal(
             "phase note target is not owned by "
             + f"{production.slug}/{reference.unit}: {target}"
@@ -2106,9 +2137,10 @@ def refresh(session_dir: Path) -> None:
             record,
             production.zone,
         ),
-        ownership,
+        identity,
+        reference.unit,
     )
-    _remove_stale_notes(vault_root, target, ownership)
+    _remove_stale_notes(vault_root, target, identity, reference.unit)
 
 
 def _build_parser() -> argparse.ArgumentParser:

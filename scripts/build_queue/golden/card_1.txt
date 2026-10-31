@@ -1,0 +1,13 @@
+#1 of 32 · tool-based-ui · cables · work-lead · nextest · 11.5 GiB
+Folder /tmp/work. Waited 6 min (since 10:40). Likely start ~10:47.
+
+Next? Yes, it is first. It starts when the checks below pass.
+
+Waits on
+  ✓ queue order
+  ✗ build budget: 11.1 of 21.0 GiB held; needs 11.5; starts when held falls to 9.5
+  ✓ free memory 24.5 GiB; needs 20.5: this step 11.5 + earlyoom 3.0 + promised not yet used 6.0
+  ✗ memory pressure: full avg10 7.7 now; starts below 5.0
+
+Likely start ~10:47: 1st in line at 44 steps an hour, an estimate.
+  Each step moved up ahead of it adds about 1 min.

@@ -23,16 +23,18 @@ SETTINGS = '{"disableAgentView": true}'
 
 
 @final
-class FakeClient:
+class FakeClient(herdr.Herdr):
     """The herdr calls a restore makes, on a layout the test sets."""
 
     def __init__(self, rows: list[dict[str, object]]) -> None:
+        with mock.patch.object(herdr, "herdr_binary", return_value="fixture-herdr"):
+            super().__init__("agents")
         self.rows = rows
         self.started: list[tuple[str, str, list[str]]] = []
         self.closed: list[str] = []
         self.start_error: herdr.HerdrFailure | None = None
-        self.session = "agents"
 
+    @override
     def result(self, *arguments: str) -> dict[str, object]:
         if arguments[:2] == ("workspace", "list"):
             return {"workspaces": [{"workspace_id": "w1", "label": "demo"}]}
@@ -43,21 +45,21 @@ class FakeClient:
                 {"argv": ["claude", "-n", "alpha", "--model", "opus"], "pid": 4242, "cwd": "/work/alpha"}]}}
         raise AssertionError(arguments)
 
-    def panes(self) -> list[herdr.PaneIdentity]:
-        return [{"pane_id": str(row["pane_id"]), "label": cast(str | None, row.get("label"))} for row in self.rows]
-
+    @override
     def pane_activity(self, pane: str) -> herdr.PaneAtShell | herdr.PaneRunning:
         _ = pane
         return herdr.PaneAtShell()
 
+    @override
     def start_agent(self, name: str, pane: str, kind: str, agent_arguments: list[str],
-                    opening: herdr.NoOpeningPrompt, timeout_ms: int) -> herdr.PromptSubmissionNotRequired:
+                    opening: herdr.OpeningPrompt | herdr.NoOpeningPrompt, timeout_ms: int) -> herdr.PromptSubmissionNotRequired:
         _ = (kind, opening, timeout_ms)
         if self.start_error is not None:
             raise self.start_error
         self.started.append((name, pane, agent_arguments))
         return herdr.PromptSubmissionNotRequired()
 
+    @override
     def close_tab_of(self, pane: str) -> None:
         self.closed.append(pane)
 
@@ -69,7 +71,6 @@ class PaneRestoreTests(unittest.TestCase):
         self.root = Path()
         self.config = Path()
         self.opened: list[tuple[str, str, str, str, dict[str, str]]] = []
-        self.owned: list[str] = []
         self.live: list[str] = []
 
     @override
@@ -88,7 +89,6 @@ class PaneRestoreTests(unittest.TestCase):
                         mock.patch.object(pane_record, "RECORD_DIR", self.root / "herdr-panes"),
                         mock.patch.object(pane_record, "PROC", self.root / "proc"),
                         mock.patch.dict(os.environ, {"HOME": str(self.root)}),
-                        mock.patch.object(pane_restore, "all_session_records", self.records),
                         mock.patch.object(sessions, "live_sessions", self.live_sessions),
                         mock.patch.object(sessions, "running_sessions", list),
                         mock.patch.object(herdr, "open_tab", self.open_tab)):
@@ -97,9 +97,6 @@ class PaneRestoreTests(unittest.TestCase):
 
     def live_sessions(self) -> list[dict[str, str]]:
         return [{"sessionId": session_id} for session_id in self.live]
-
-    def records(self) -> list[dict[str, dict[str, str]]]:
-        return [{"session": {"session_id": session_id}} for session_id in self.owned]
 
     def open_tab(self, name: str, space: str, title: str, cwd: str, environment: dict[str, str]) -> str:
         self.opened.append((name, space, title, cwd, environment))
@@ -138,6 +135,17 @@ class PaneRestoreTests(unittest.TestCase):
             "--settings", SETTINGS])])
         self.assertEqual(client.closed, ["w1:p2"])
 
+    def test_stale_shutdown_state_does_not_prevent_restoring_a_stopped_pane(self) -> None:
+        state = self.root / "shutdown/account/sessions"
+        state.mkdir(parents=True)
+        _ = (state / "sid-alpha.json").write_text('{"session":{"session_id":"sid-alpha"}}')
+        self.entry()
+        with mock.patch.dict(os.environ, {"SHUTDOWN_STATE_DIR": str(state.parents[1])}):
+            code, output = self.run_restore(self.restored())
+        self.assertEqual(code, 0, output)
+        self.assertEqual(len(self.opened), 1)
+        self.assertIn("resumed sid-alpha", output)
+
     def test_a_pane_is_left_as_it_is_for_each_reason_and_named(self) -> None:
         cases: list[tuple[dict[str, object], str, str]] = [
             ({"ended": True}, "sid-alpha", "closed by hand"),
@@ -153,10 +161,6 @@ class PaneRestoreTests(unittest.TestCase):
                 self.assertEqual((code, self.opened), (0, []))
                 self.assertIn(reason, output)
         self.entry()
-        self.owned.append("sid-alpha")
-        _, output = self.run_restore(self.restored())
-        self.assertIn("a shutdown record owns it", output)
-        self.owned.clear()
         self.live.append("sid-alpha")
         _, output = self.run_restore(self.restored())
         self.assertIn("it already runs", output)
@@ -177,7 +181,7 @@ class PaneRestoreTests(unittest.TestCase):
             f"CLAUDE_CONFIG_DIR={self.config}\0SHOWRUNNER_UNIT=demo\0CLAUDE_CODE_OAUTH_TOKEN=secret\0".encode())
         (self.config / "sessions").mkdir()
         _ = (self.config / "sessions/4242.json").write_text(json.dumps({"pid": 4242, "sessionId": "sid-alpha"}))
-        client = FakeClient([{"pane_id": "w1:p2", "label": "alpha"}])
+        client = FakeClient([{"pane_id": "w1:p2", "label": "alpha", "workspace_id": "w1"}])
         with mock.patch.object(herdr, "Herdr", return_value=client), redirect_stdout(io.StringIO()):
             self.assertEqual(pane_record.seed("agents"), 0)
         entry = pane_record.read("agents")["w1:p2"]
@@ -195,7 +199,9 @@ class PaneRestoreTests(unittest.TestCase):
                 {"session_id": session_id, "reason": reason}), env=environment, capture_output=True, text=True,
                 check=False, timeout=60)
             self.assertEqual(ran.returncode, 0, ran.stderr)
-            self.assertEqual(pane_record.read("agents")["w1:p2"]["ended"], ended, (session_id, reason))
+            entry = pane_record.read("agents")["w1:p2"]
+            assert "ended" in entry
+            self.assertEqual(entry["ended"], ended, (session_id, reason))
 
 
 if __name__ == "__main__":

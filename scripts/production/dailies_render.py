@@ -60,7 +60,6 @@ import json
 import math
 import re
 import sys
-import unicodedata
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -72,9 +71,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_hold"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "mac_test"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "whoami"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
-import run_out
-import note_file
-from run_out import READINGS_LOG, Reading
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from atomic_file import write_text_atomic
+from scripts.lib.terminal_cells import terminal_width
+from scripts.whoami import run_out
+from scripts.whoami import note_file
+from scripts.whoami.run_out import READINGS_LOG, Reading
 from build_hold import ActiveHolders, HoldCycle, HoldState, KnownReleaseEta, NoHolders, Holder, ReleaseEntry, ReleaseRecordReadError, holder_directory, read_cycle, read_holders, release_record_error_line
 from mac_test import ActiveMacBlock, NoMacBlock, PendingMacBlock, ci_may_still_be_on, read_block, state_paths
 import urgency
@@ -581,7 +584,7 @@ def window_start(now: datetime, rows: list[Row]) -> datetime:
 
 
 def chart_width(lines: list[str]) -> int:
-    return max(display_width(line) for line in lines)
+    return max(terminal_width(line) for line in lines)
 
 
 def draw(now: datetime, rows: list[Row], style: ChartStyle) -> list[str]:
@@ -658,16 +661,11 @@ def draw_from(start: datetime, now: datetime, rows: list[Row], style: ChartStyle
         lines.append(f"{prefix}{''.join(cells).rstrip()}{arrow} {span}{hold}")
     # The axis ends with the widest row, so its labels never widen the chart.
     indent = label_width + start_width
-    reach = max((display_width(line) - indent for line in lines[1:]), default=0)
+    reach = max((terminal_width(line) - indent for line in lines[1:]), default=0)
     lines[0] = " " * indent + "".join(axis[: -(-reach // 2)]).rstrip()
     drawn = with_plans(lines, rows)
     # A note goes on last, so it moves neither the axis nor the plan column.
     return [drawn[0], *(f"{line}  {row.note}" if row.note else line for line, row in zip(drawn[1:], rows, strict=True))]
-
-
-def display_width(line: str) -> int:
-    """Terminal columns: wide characters, the coloured cells among them, take two."""
-    return sum(2 if unicodedata.east_asian_width(char) in "WF" else 1 for char in line)
 
 
 def with_plans(lines: list[str], rows: list[Row]) -> list[str]:
@@ -684,10 +682,10 @@ def with_plans(lines: list[str], rows: list[Row]) -> list[str]:
         for row in rows
         if row.plan is not None
     }
-    left = max(display_width(line) for line in lines) + PLAN_GAP
+    left = max(terminal_width(line) for line in lines) + PLAN_GAP
     text_width = max(len(text) for text in plans.values())
     # `100%` ends over the end line, so the axis is no wider than a row.
-    header = f"{lines[0]}{' ' * (left - display_width(lines[0]) + text_width + 2 + PLAN_BLOCKS - len(PLAN_FULL))}{PLAN_FULL}"
+    header = f"{lines[0]}{' ' * (left - terminal_width(lines[0]) + text_width + 2 + PLAN_BLOCKS - len(PLAN_FULL))}{PLAN_FULL}"
     drawn = [header]
     for line, row in zip(lines[1:], rows, strict=True):
         if row.plan is None:
@@ -695,7 +693,7 @@ def with_plans(lines: list[str], rows: list[Row]) -> list[str]:
             continue
         blocks = round(row.plan.percent / 10)
         bar = PLAN_FILL * blocks + " " * (PLAN_BLOCKS - blocks)
-        drawn.append(f"{line}{' ' * (left - display_width(line))}{plans[row.name]:>{text_width}} {bar}{PLAN_END}")
+        drawn.append(f"{line}{' ' * (left - terminal_width(line))}{plans[row.name]:>{text_width}} {bar}{PLAN_END}")
     return drawn
 
 
@@ -1265,7 +1263,7 @@ def read_chart(path: Path) -> str:
 
 def write_chart(path: Path, chart: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    _ = path.write_text(f"{CHART_KEY}={chart}\n")
+    write_text_atomic(path, f"{CHART_KEY}={chart}\n")
 
 
 def parse_report(value: object, chart: str) -> Report:
@@ -1421,7 +1419,7 @@ def save_state(path: Path, report: Report, resolved: dict[str, ResolvedEta],
             "held": unit.held,
             "first": first.isoformat() if first else None,
         }
-    _ = path.write_text(json.dumps(state, indent=2) + "\n")
+    write_text_atomic(path, json.dumps(state, indent=2) + "\n")
 
 
 def clock(moment: datetime, now: datetime, zone_name: str) -> str:
@@ -2089,11 +2087,15 @@ def main(arguments: list[str]) -> int:
         print(f"dailies_render: {error}", file=sys.stderr)
         return 2
     print("\n".join(render(report, previous, resolved, now, abbreviation, outstanding, at=at)))
-    if state_path is not None:
-        save_state(state_path, report, resolved, previous)
-    if log_path is not None:
-        with log_path.open("a") as log:
-            _ = log.write(log_line(report, resolved, now, abbreviation) + "\n")
+    try:
+        if state_path is not None:
+            save_state(state_path, report, resolved, previous)
+        if log_path is not None:
+            with log_path.open("a") as log:
+                _ = log.write(log_line(report, resolved, now, abbreviation) + "\n")
+    except OSError as error:
+        print(f"dailies_render: {error}", file=sys.stderr)
+        return 2
     return 0
 
 

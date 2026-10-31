@@ -9,7 +9,6 @@ import os
 import shlex
 import subprocess
 import sys
-import tempfile
 import unittest
 from contextlib import redirect_stderr
 from datetime import datetime, timedelta, timezone
@@ -18,286 +17,169 @@ from types import SimpleNamespace
 from typing import cast, override
 from unittest.mock import patch
 
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.accounts import accounts
 from scripts.production import add_showrunner
 import production_units
-import showrunners
-import usage_store
+from scripts.production import showrunners
+import showrunner_tree
+from scripts.whoami import usage_store
 import herdr as runtime
 from scripts.herdr import herdr
 from scripts.herdr.fake_herdr import CommandResponse
 
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
-
-SCRIPT = Path(__file__).with_name("add_showrunner.py")
-SHARED = herdr.SHARED_SESSION
-PARENT_SESSION = "11111111-2222-3333-4444-555555555555"
-STUB = '''#!__PYTHON__
-import json
-import os
-import subprocess
-import sys
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
-
-state = Path(os.environ["STUB_STATE"])
-name = Path(sys.argv[0]).name
-args = sys.argv[1:]
-with (state / "events.jsonl").open("a") as events:
-    events.write(json.dumps({"command": name, "args": args,
-                             "claude_env": sorted(key for key in os.environ if key.startswith("CLAUDE_"))}) + "\\n")
-if name == "systemd-run":
-    raise SystemExit(subprocess.run(args[3:], check=False).returncode)
-'''
-SESSIONS = '''import json, os, pathlib, sys
-command, target = sys.argv[1:]
-for path in pathlib.Path(os.environ["NOTIFIER_SESSIONS_DIR"]).glob("*.json"):
-    record = json.loads(path.read_text())
-    if command == "socket" and target == "session:" + record["sessionId"]:
-        print(record["messagingSocketPath"])
-        raise SystemExit(0)
-raise SystemExit(1)
-'''
-SEND = '''import json, os, sys
-with open(os.environ["TEST_SENT"], "a") as handle:
-    handle.write(json.dumps(sys.argv[1:]) + "\\n")
-'''
+from scripts.production.add_showrunner_test_support import AddShowrunnerFixture, SCRIPT, TEST_HANG_GUARD_SECS
 
 
-class AddShowrunnerTests(unittest.TestCase):
-    root: Path = Path()
-    state: Path = Path()
-    env: dict[str, str] = {}
-    on_start: dict[str, str] = {}
-    herdr_overrides: dict[str, CommandResponse] = {}
-    processes: list[subprocess.Popen[bytes]] = []
+from scripts.production import staff
+from scripts.production import completion_receipt
+from scripts.lib.atomic_file import write_text_atomic
+from scripts.message import sessions
 
+class AddShowrunnerTests(AddShowrunnerFixture):
     @override
     def setUp(self) -> None:
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
-        self.state = self.root / "stub"
-        self.state.mkdir()
-        bin_path = self.root / "bin"
-        bin_path.mkdir()
-        for name in ("systemd-run",):
-            stub = bin_path / name
-            _ = stub.write_text(STUB.replace("__PYTHON__", sys.executable), encoding="utf-8")
-            stub.chmod(0o755)
-        for name in ("home", "sessions"):
-            (self.root / name).mkdir()
-        _ = (self.root / "sessions.py").write_text(SESSIONS, encoding="utf-8")
-        _ = (self.root / "send.py").write_text(SEND, encoding="utf-8")
-        fake = bin_path / "submitting-herdr"
-        source = (SCRIPT.parents[1] / "herdr/fake_herdr.py").read_text()
-        source = source.replace('responses.get("default", {"stdout": "", "code": 0})',
-            'responses.get(" ".join(argv[2:4]), responses.get("default", {"stdout": "", "code": 0}))')
-        source = source.replace('raise SystemExit(main(sys.argv[1:]))', 'raise SystemExit(submitting_main(sys.argv[1:]))')
-        hook = r'''def submitting_main(argv):
-    result = main(argv)
-    if result == 0 and argv[2:4] == ["agent", "prompt"]:
-        from datetime import datetime, timezone
-        calls = [json.loads(line) for line in Path(os.environ["FAKE_HERDR_LOG"]).read_text().splitlines()]
-        start = next(row for row in reversed(calls) if row[:2] == argv[:2] and row[2:4] == ["agent", "start"])
-        flag = "--resume" if "--resume" in start else "--session-id"
-        session_id = start[start.index(flag) + 1]
-        config = next(value.split("=", 1)[1] for row in reversed(calls) for value in row
-                      if row[:2] == argv[:2] and value.startswith("CLAUDE_CONFIG_DIR="))
-        path = Path(config) / "projects/fixture" / (session_id + ".jsonl")
+        super().setUp()
+        _ = staff.ensure("showrunner", name="top")
+
+    def test_launch_passes_the_ensured_showrunner_staff_id_to_the_pane(self) -> None:
+        self.starts("kid-session", registers="kid")
+        result = self.run_command("kid")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        rows = [row for row in staff.find(kind="showrunner") if row.name == "kid"]
+        self.assertEqual(len(rows), 1)
+        opened = self.opened()
+        environment = dict(opened[index + 1].split("=", 1)
+                           for index, value in enumerate(opened) if value == "--env")
+        self.assertEqual(environment.get("STAFF_ID"), rows[0].id)
+
+    def test_existing_staff_parent_survives_a_stale_saved_parent_during_ensure(self) -> None:
+        self.timer("kid", "kid-session")
+        parent = staff.ensure("showrunner", name="other")
+        child = staff.ensure("showrunner", name="kid", parent=parent.id)
+        path = self.root / "showrunner/kid/parent"
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({"type": "user", "timestamp": datetime.now(timezone.utc).isoformat(),
-                                   "message": {"role": "user", "content": argv[-1]}}) + "\n")
-    return result
+        write_text_atomic(path, "top\n")
+        before = self.staff.staff_file.read_bytes(), path.read_bytes()
+        with (patch.dict(os.environ, self.env),
+              patch.object(showrunners, "NOTIFIER_STATE_DIR", self.root / "notifier")):
+            ensured = add_showrunner.ensure_staff_showrunner(production_units.read_production(self.doc("kid")), "top")
+        self.assertEqual(ensured, child)
+        self.assertEqual((self.staff.staff_file.read_bytes(), path.read_bytes()), before)
 
-'''
-        source = source.replace('if __name__ == "__main__":', hook + 'if __name__ == "__main__":')
-        _ = fake.write_text(source)
-        fake.chmod(0o755)
-        self.on_start = {}
-        self.herdr_overrides = {}
-        self.processes = []
-        self.addCleanup(self.close_processes)
-        self.env = {**{key: value for key, value in os.environ.items() if not key.startswith("CLAUDE_")},
-                    "HERDR_PLATFORM": "linux",
-                    "HOME": str(self.root / "home"), "STUB_STATE": str(self.state),
-                    "PATH": str(bin_path) + os.pathsep + os.environ.get("PATH", ""),
-                    "HERDR_BIN": str(fake),
-                    "SYSTEMD_RUN": str(fake),
-                    "SYSTEMCTL": str(fake),
-                    "HERDR_PROC": str(self.root / "proc"),
-                    "FAKE_HERDR_LOG": str(self.state / "herdr.jsonl"),
-                    "FAKE_HERDR_RESPONSES": str(self.state / "herdr-responses.json"),
-                    "NOTIFIER_STATE_DIR": str(self.root / "notifier"),
-                    "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
-                    "SHOWRUNNER_STATE_DIR": str(self.root / "showrunner"),
-                    "SHOWRUNNERS_SESSIONS": str(self.root / "sessions.py"),
-                    "SHOWRUNNERS_SEND": str(self.root / "send.py"), "TEST_SENT": str(self.root / "sent.jsonl"),
-                    # The parent runs the command, so its own session and account are in the caller's environment.
-                    "CLAUDE_CODE_SESSION_ID": PARENT_SESSION, "CLAUDE_CONFIG_DIR": str(self.root / "unit-account"),
-                    "ADD_SHOWRUNNER_WAIT_S": "0", "ADD_SHOWRUNNER_POLL_S": "0.01",
-                    "ADD_SHOWRUNNER_CLAUDE_JSON": str(self.root / "claude.json")}
-        # The folders these tests start sessions in are trusted; the trust tests change that.
-        self.trust(self.root, self.root / "kid-checkout", self.root / "elsewhere")
-        home = Path(self.env["HOME"])
-        (home / ".claude").mkdir()
-        _ = (home / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "main@example.invalid"}}))
-        notes = home / "notes"
-        notes.mkdir()
-        self.env["AGENT_NOTES_DIR"] = str(notes)
-        _ = (notes / "claude2.md").write_text("---\nlogin: main@example.invalid\n---\n")
-        now = datetime.now(timezone.utc)
-        file = home / ".local/state/agent-notes/usage.json"
-        file.parent.mkdir(parents=True)
-        _ = file.write_text(json.dumps({"main@example.invalid": {"weekly": {"left": 1,
-            "at": now.isoformat(), "resets": (now + timedelta(days=2)).isoformat()}}}))
-        with patch.dict(os.environ, self.env):
-            self.assertEqual(accounts.setup("claude2"), [])
-            _ = (accounts.account_dir("claude2") / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "main@example.invalid"}}))
-        _ = self.configure_groups()
-        self.timer("top", PARENT_SESSION)
-        self.live(PARENT_SESSION, "top")
+    def assert_dead_launch_recovers(self, *, transcript_exists: bool) -> None:
+        self.starts("kid-session", registers="kid")
+        with patch.object(add_showrunner, "launch", side_effect=RuntimeError("stopped after saving launch")):
+            with self.assertRaisesRegex(RuntimeError, "stopped after saving launch"):
+                _ = self.run_command("kid")
+        receipt = completion_receipt.read_receipt(self.root / "showrunner/kid/add_showrunner.json", staff.snapshot())
+        assert isinstance(receipt, completion_receipt.OwnedReceipt)
+        identity = add_showrunner.ShowrunnerLaunch.from_receipt(receipt.fields)
+        if transcript_exists:
+            transcript = identity.config_dir / "projects/fixture" / f"{identity.session_id}.jsonl"
+            transcript.parent.mkdir(parents=True, exist_ok=True)
+            write_text_atomic(transcript, '{}\n')
+        with patch.object(sessions, "session_liveness", return_value=sessions.SessionNotLive()):
+            recovered = self.run_command("kid")
+        self.assertEqual(recovered.returncode, 0, recovered.stdout + recovered.stderr)
+        starts = [row for row in self.herdr_calls() if row[2:4] == ["agent", "start"]]
+        self.assertEqual(len(starts), 1)
+        flag = "--resume" if transcript_exists else "--session-id"
+        self.assertEqual(starts[0][starts[0].index(flag) + 1], identity.session_id)
+        self.assertNotIn("--session-id" if transcript_exists else "--resume", starts[0])
+        prompt = f"/showrunner:produce {self.doc('kid')}" + (" resume" if transcript_exists else "")
+        self.assertEqual([row[-1] for row in self.herdr_calls() if row[2:4] == ["agent", "prompt"]], [prompt])
+        self.assertEqual(self.parent_of("kid"), "top")
 
-    def configure_groups(self, *, units: str = "claude2", showrunners: str = "claude2") -> Path:
-        path = Path(self.env["HOME"]) / ".local/state/accounts/groups.json"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        _ = path.write_text(json.dumps({"units": units, "showrunners": showrunners}))
-        return path
+    def test_dead_saved_launch_resumes_its_transcript_with_the_resume_prompt(self) -> None:
+        self.assert_dead_launch_recovers(transcript_exists=True)
 
-    def trust(self, *folders: Path, extra: dict[str, object] | None = None) -> None:
-        """The showrunner account's config, trusting exactly `folders`, with `extra` fields beside them."""
-        projects = {str(folder.resolve()): {"hasTrustDialogAccepted": True, "allowedTools": ["SECRET-TOOL"]}
-                    for folder in folders}
-        _ = (self.root / "claude.json").write_text(json.dumps({**(extra or {}), "projects": projects}), encoding="utf-8")
+    def test_dead_saved_launch_without_a_transcript_starts_its_reserved_session(self) -> None:
+        self.assert_dead_launch_recovers(transcript_exists=False)
 
-    def doc(self, slug: str) -> Path:
-        path = self.root / f"{slug}-production.md"
-        if not path.exists():
-            (self.root / f"{slug}-checkout").mkdir()
-            _ = path.write_text("\n".join([
-                f"# {slug}", "", f"- **Merge branch:** `{slug}`",
-                f"- **Showrunner checkout:** `{self.root / f'{slug}-checkout'}`",
-                f"- **Log:** `docs/plans/{slug}-log.md`", "- **User zone:** America/Los_Angeles",
-                "- **Updates:** every 15 minutes", "", "## Units", "", "| Unit | Plan |", "| --- | --- |", ""]),
-                encoding="utf-8")
-        return path
+    def assert_open_launch_recovers(self, prompt_submitted: bool) -> None:
+        self.starts("kid-session", registers="kid")
+        _ = self.on_start.pop(str(self.timer_conf("kid")))
+        if prompt_submitted:
+            with patch.object(add_showrunner, "showrunner_appeared", side_effect=RuntimeError("stopped before timer")):
+                with self.assertRaisesRegex(RuntimeError, "stopped before timer"):
+                    _ = self.run_command("kid")
+        else:
+            with patch.object(runtime.Herdr, "submit_opening_prompt", return_value=runtime.PromptNotSubmitted("pane busy")):
+                first = self.run_command("kid")
+            self.assertEqual(first.returncode, add_showrunner.SESSION_NOT_READY, first.stderr)
+        starts = sum(row[2:4] == ["agent", "start"] for row in self.herdr_calls())
+        self.assertEqual(starts, 1)
+        self.assertNotIn("TARGET=session:kid-session", self.timer_conf("kid").read_text())
 
-    def timer_conf(self, slug: str) -> Path:
-        return self.root / "notifier" / f"showrunner-{slug}" / "conf"
+        def register(slug: str) -> bool:
+            self.assertEqual(slug, "kid")
+            _ = self.timer_conf(slug).write_text(self.timer_text(slug, "kid-session"))
+            return True
 
-    def timer_text(self, slug: str, session: str) -> str:
-        return f"TARGET=session:{session}\nCHECK=zsh /x/production_check.sh {self.doc(slug)}\n"
+        with (patch.object(sessions, "session_liveness", return_value=sessions.LiveSessionProcess(12345)),
+              patch.object(runtime, "herdr_place_of", return_value=runtime.HerdrPlace("agents", "w1:p1")),
+              patch.object(add_showrunner, "showrunner_appeared", side_effect=register)):
+            recovered = self.run_command("kid")
+        self.assertEqual(recovered.returncode, 0, recovered.stdout + recovered.stderr)
+        self.assertEqual(sum(row[2:4] == ["agent", "start"] for row in self.herdr_calls()), starts)
+        self.assertEqual(self.parent_of("kid"), "top")
+        prompt_calls = sum(row[2:4] == ["agent", "prompt"] for row in self.herdr_calls())
+        self.assertEqual(prompt_calls, 1)
+        child = staff.by_path("kid")
+        parent = staff.by_path("top")
+        assert child is not None and parent is not None
+        self.assertEqual(child.parent, parent.id)
 
-    def timer(self, slug: str, session: str) -> None:
-        self.timer_conf(slug).parent.mkdir(parents=True)
-        _ = self.timer_conf(slug).write_text(self.timer_text(slug, session), encoding="utf-8")
+    def test_open_showrunner_recovers_before_its_timer_registers_without_second_launch(self) -> None:
+        self.assert_open_launch_recovers(True)
 
-    def close_processes(self) -> None:
-        for process in self.processes:
-            process.terminate()
-            _ = process.wait(timeout=TEST_HANG_GUARD_SECS)
+    def test_open_showrunner_submits_its_owed_prompt_without_second_launch(self) -> None:
+        self.assert_open_launch_recovers(False)
 
-    def record(self, session: str, name: str = "") -> tuple[str, str]:
-        """A live session's record: where it is kept and what it holds. Its name is read from a live process's;
-        a showrunner's name is its production's slug."""
-        process = subprocess.Popen(["sleep", "60"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        self.processes.append(process)
-        return (str(self.root / "sessions" / f"{process.pid}.json"),
-                json.dumps({"pid": process.pid, "name": name or f"{session}-name", "sessionId": session,
-                            "messagingSocketPath": str(self.root / f"{session}.sock")}))
+    def test_retired_showrunner_receipt_cannot_complete_a_new_add_request(self) -> None:
+        self.starts("kid-session", registers="kid")
+        first = self.run_command("kid")
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        child = staff.by_path("kid")
+        assert child is not None
+        _ = staff.retire(child.id)
+        second = self.run_command("kid")
+        self.assertEqual(second.returncode, 2, second.stdout + second.stderr)
+        self.assertNotIn("already started", second.stdout)
+        self.assertIsNone(staff.by_id(child.id))
 
-    def live(self, session: str, name: str = "") -> None:
-        path, text = self.record(session, name)
-        _ = Path(path).write_text(text, encoding="utf-8")
-
-    def starts(self, session: str, *, registers: str = "") -> None:
-        """The started session comes up as `session`, and registers `registers`'s update timer when named."""
-        path, text = self.record(session, registers)
-        self.on_start[path] = text
-        if registers:
-            self.on_start[str(self.timer_conf(registers))] = self.timer_text(registers, session)
-        for destination in self.on_start:
-            Path(destination).parent.mkdir(parents=True, exist_ok=True)
-        if registers and not self.timer_conf(registers).exists():
-            # Fake herdr writes files into existing folders. Before launch this
-            # timer belongs to an ended session, so it does not claim the child.
-            _ = self.timer_conf(registers).write_text(self.timer_text(registers, "not-started"))
-
-    def sent_to(self) -> list[str]:
-        path = self.root / "sent.jsonl"
-        if not path.exists():
-            return []
-        sent = [cast(list[str], json.loads(line)) for line in path.read_text(encoding="utf-8").splitlines()]
-        return [arguments[arguments.index("--to") + 1] for arguments in sent]
-
-    def run_command(self, slug: str, *extra: str, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
-        self.prepare_herdr(slug, *extra)
-        return subprocess.run([sys.executable, str(SCRIPT), "--production", str(self.doc(slug)),
-                               "--model", "opus", "--effort", "high", *extra],
-                              env=self.env, capture_output=True, text=True, check=False, cwd=cwd)
-
-    def prepare_herdr(self, slug: str, *extra: str) -> None:
-        """Fake herdr answers a launch of `slug`'s showrunner as a tab of the shared session, which has
-        a boot unit; the agent prompt brings the session up. While the shared session is live, it holds
-        a tab named `slug`."""
-        sessions = [herdr.SessionEntry(name=path.name.removeprefix("live-"), running=True, default=False,
-                    session_dir="/fixture", socket_path="/fixture/socket") for path in self.state.glob("live-*")]
-        responses: dict[str, CommandResponse | list[CommandResponse]] = {
-            "--session default session list --json": CommandResponse(code=0, stdout=json.dumps(
-                herdr.SessionListResult(sessions=sessions))),
-            f"--session {SHARED} status server": [CommandResponse(code=0, stdout="status: stopped\n"),
-                                                 CommandResponse(code=0, stdout="status: running\n")],
-            f"--user show -p FragmentPath --value herdr-{SHARED}.service": CommandResponse(
-                code=0, stdout=f"{self.env['HOME']}/.config/systemd/user/herdr-{SHARED}.service\n"),
-            f"--session {SHARED} workspace list": CommandResponse(
-                code=0, stdout=json.dumps({"result": {"workspaces": []}})),
-            f"--session {SHARED} pane list": CommandResponse(code=0, stdout=json.dumps({
-                "result": {"panes": [{"pane_id": "w1:p1", "tab_id": "w1:t1", "label": slug}]}})),
-            "default": CommandResponse(code=0, stdout=json.dumps({"result": {
-                "root_pane": {"pane_id": "w1:p1"}, "tab": {"tab_id": "w1:t1"}, "tabs": []}})),
-        }
-        responses[f"--session {SHARED} agent get w1:p1"] = CommandResponse(code=0, stdout=json.dumps({
-            "result": {"agent": {"agent_status": "idle", "interactive_ready": True}}}))
-        responses[f"--session {SHARED} pane read w1:p1 --source visible --format ansi"] = CommandResponse(
-            code=0, stdout="────────\n❯ \n────────")
-        prompt = f"/showrunner:produce {self.doc(slug)}" + (" resume" if "--resume" in extra else "")
-        responses[f"--session {SHARED} agent prompt w1:p1 {prompt}"] = CommandResponse(
-            code=0, stdout="", write_files={**self.on_start, str(self.state / f"live-{SHARED}"): ""})
-        responses.update(self.herdr_overrides)
-        _ = Path(self.env["FAKE_HERDR_RESPONSES"]).write_text(json.dumps(responses))
-
-    def events(self, command: str) -> list[dict[str, object]]:
-        path = self.state / "events.jsonl"
-        if not path.exists():
-            return []
-        records = [cast(dict[str, object], json.loads(line)) for line in path.read_text().splitlines()]
-        return [record for record in records if record["command"] == command]
-
-    def herdr_calls(self) -> list[list[str]]:
-        path = Path(self.env["FAKE_HERDR_LOG"])
-        return [cast(list[str], json.loads(line)) for line in path.read_text().splitlines()] if path.exists() else []
-
-    def started(self) -> list[str]:
-        return next(row for row in self.herdr_calls() if row[2:4] == ["agent", "start"])
-
-    def opened(self) -> list[str]:
-        return next(row for row in self.herdr_calls() if row[2:4] == ["workspace", "create"])
-
-    def parent_of(self, slug: str) -> str:
-        path = self.root / "showrunner" / slug / "parent"
-        return path.read_text(encoding="utf-8").strip() if path.exists() else ""
-
-    def refused(self, result: subprocess.CompletedProcess[str], cause: str) -> None:
-        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-        self.assertIn("add_showrunner:", result.stderr)
-        self.assertIn(cause, result.stderr)
-        self.assertFalse(any("workspace" in row or "server" in row or "agent" in row
-                             for row in self.herdr_calls()))
+    def test_add_showrunner_rerun(self) -> None:
+        self.starts("kid-session", registers="kid")
+        original = add_showrunner.ensure_staff_showrunner
+        for after in (False, True):
+            def interrupted(child: production_units.Production, caller: str) -> staff.StaffRow:
+                if after:
+                    _ = original(child, caller)
+                raise RuntimeError("stopped at staff step")
+            with patch.object(add_showrunner, "ensure_staff_showrunner", side_effect=interrupted):
+                with self.assertRaisesRegex(RuntimeError, "stopped at staff step"):
+                    _ = self.run_command("kid")
+            self.assertFalse(any(row[2:4] == ["agent", "start"] for row in self.herdr_calls()))
+        first = self.run_command("kid")
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        rows = staff.snapshot().rows
+        child = next(row for row in rows if row.name == "kid")
+        parent = next(row for row in rows if row.name == "top")
+        self.assertEqual(child.parent, parent.id)
+        data, edge = self.staff.staff_file.read_bytes(), self.parent_of("kid")
+        calls = sum(row[2:4] == ["agent", "start"] for row in self.herdr_calls())
+        again = self.run_command("kid")
+        self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+        self.assertIn("already started", again.stdout)
+        self.assertEqual((self.staff.staff_file.read_bytes(), self.parent_of("kid")), (data, edge))
+        self.assertEqual(sum(row[2:4] == ["agent", "start"] for row in self.herdr_calls()), calls)
 
     def test_new_showrunner_launches_on_picked_default_account_and_attaches_it(self) -> None:
         self.starts("kid-session", registers="kid")
-        result = self.run_command("kid")
+        result = self.run_command("kid", subprocess_cli=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(result.stdout.splitlines()[:2],
                          ["started kid: herdr session attach agents, workspace kid, tab kid", "kid now reports to top"])
@@ -336,20 +218,6 @@ class AddShowrunnerTests(unittest.TestCase):
         alone = self.run_command("other", "--resume", "abc-123")
         self.assertEqual(alone.returncode, 2)
         self.assertIn("--resume and --cwd go together", alone.stderr)
-
-    def named_account(self) -> Path:
-        with patch.dict(os.environ, self.env, clear=True):
-            notes = Path(self.env["AGENT_NOTES_DIR"])
-            _ = (notes / "claude3.md").write_text("---\nlogin: target@example.invalid\n---\n")
-            self.assertEqual(accounts.setup("claude3"), [])
-            directory = accounts.account_dir("claude3")
-            _ = (directory / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "target@example.invalid"}}))
-            # The trust checks use a separate fixture, so selection does not expose any live home.
-            _ = (directory / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "target@example.invalid"},
-                "projects": {str(self.root): {"hasTrustDialogAccepted": True},
-                             str(self.root / "kid-checkout"): {"hasTrustDialogAccepted": True}}}))
-        _ = self.configure_groups(showrunners="claude3")
-        return directory
 
     def test_showrunner_shared_tab_retries_enter_with_the_selected_session_transcript(self) -> None:
         child = production_units.read_production(self.doc("kid"))
@@ -412,6 +280,7 @@ class AddShowrunnerTests(unittest.TestCase):
                   patch.object(runtime, "shared_session", return_value="agents"),
                   patch.object(runtime, "start_server"), patch.object(runtime, "open_tab", return_value="destination:p1"),
                   patch.object(runtime, "start_agent", return_value=outcome) as start,
+                  patch.object(sessions, "session_liveness", return_value=sessions.SessionNotLive()),
                   patch.object(add_showrunner, "showrunner_appeared", return_value=True) as appeared,
                   redirect_stderr(io.StringIO()) as error):
                 code = add_showrunner.main(["--production", str(self.doc("kid")), "--model", "opus", "--effort", "high"])
@@ -588,16 +457,6 @@ class AddShowrunnerTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("CLAUDE_CONFIG_DIR=" + str(directory), self.opened())
 
-    def resume_record(self) -> None:
-        _ = (self.root / "sessions/resume.json").write_text(json.dumps({
-            "pid": 991001,
-            "sessionId": "abc-123",
-            "name": "kid",
-            "messagingSocketPath": "",
-            "updatedAt": 1,
-            "tmux": "",
-        }))
-
     def test_resume_uses_the_configured_showrunners_account(self) -> None:
         directory = self.named_account()
         child = production_units.read_production(self.doc("kid"))
@@ -612,7 +471,7 @@ class AddShowrunnerTests(unittest.TestCase):
         child = production_units.read_production(self.doc("kid"))
         with patch.dict(os.environ, self.env, clear=True), \
                 patch.object(add_showrunner, "running", return_value=False), \
-                patch.object(showrunners, "descendants_of", return_value=[]), \
+                patch.object(showrunner_tree, "descendants_of", return_value=[]), \
                 patch.object(add_showrunner, "herdr_tab_open", return_value=False) as destination:
             result = add_showrunner.checked(child, "top", config_dir=Path(self.env["HOME"]) / ".claude2")
         self.assertIsNone(result)
@@ -697,9 +556,8 @@ class AddShowrunnerTests(unittest.TestCase):
         self.herdr_overrides["--session default session list --json"] = CommandResponse(
             code=1, stdout="", stderr="fixture cannot list herdr sessions")
         result = self.run_command("kid")
-        self.refused(result, "herdr session list: fixture cannot list herdr sessions")
+        self.refused(result, "herdr session list: stderr: fixture cannot list herdr sessions")
         self.assertEqual(self.herdr_calls(), [["--session", "default", "session", "list", "--json"]])
-
 
     def test_child_opens_its_tab_in_a_shared_server_that_already_runs(self) -> None:
         self.herdr_overrides["--session agents status server"] = CommandResponse(
@@ -730,6 +588,8 @@ class AddShowrunnerTests(unittest.TestCase):
         edge = self.root / "showrunner" / "kid" / "parent"
         edge.parent.mkdir(parents=True)
         _ = edge.write_text("top\n", encoding="utf-8")
+        top = staff.ensure("showrunner", name="top")
+        _ = staff.ensure("showrunner", name="kid", parent=top.id)
         self.starts("abc-123")
         result = self.run_command("kid", "--resume", "abc-123", "--cwd", str(self.root), "--account", "claude2")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -759,20 +619,6 @@ class AddShowrunnerTests(unittest.TestCase):
         self.timer("kid", "some-session")
         self.refused(self.run_command("kid"), "cannot tell whether session:some-session is running: registry gone")
 
-    def flaky_registry(self, failures: int) -> None:
-        """Once the started session registers its timer, the registry cannot be read for `failures` looks."""
-        count = self.root / "registry-failures"
-        _ = (self.root / "flaky_sessions.py").write_text(
-            "import os, pathlib, runpy, sys\n"
-            + f"count, started = pathlib.Path({str(count)!r}), pathlib.Path({str(self.state / 'live-agents')!r})\n"
-            + "seen = int(count.read_text()) if count.exists() else 0\n"
-            + f"if started.exists() and seen < {failures}:\n"
-            + "    count.write_text(str(seen + 1))\n"
-            + "    print('one or more registry files could not be read', file=sys.stderr)\n"
-            + "    raise SystemExit(3)\n"
-            + f"runpy.run_path({str(self.root / 'sessions.py')!r}, run_name='__main__')\n", encoding="utf-8")
-        self.env["SHOWRUNNERS_SESSIONS"] = str(self.root / "flaky_sessions.py")
-
     def test_a_registry_unreadable_for_a_moment_during_the_wait_is_tried_again(self) -> None:
         self.flaky_registry(1)
         self.env["ADD_SHOWRUNNER_WAIT_S"] = "30"
@@ -785,25 +631,8 @@ class AddShowrunnerTests(unittest.TestCase):
         self.flaky_registry(1)
         self.env["ADD_SHOWRUNNER_WAIT_S"] = "300"
         self.starts("kid-session", registers="kid")
-        self.prepare_herdr("kid")
         polls = self.root / "polls.jsonl"
-        program = f'''import json, sys, time
-from pathlib import Path
-from types import SimpleNamespace
-sys.path.insert(0, {str(SCRIPT.parent)!r})
-import add_showrunner
-polls = Path({str(polls)!r})
-def wait(seconds):
-    with polls.open("a") as output:
-        output.write(json.dumps(seconds) + "\\n")
-add_showrunner.time = SimpleNamespace(monotonic=time.monotonic, time=time.time, sleep=wait)
-raise SystemExit(add_showrunner.main(sys.argv[2:]))
-'''
-        result = subprocess.run(
-            [sys.executable, "-c", program, str(SCRIPT), "--production", str(self.doc("kid")),
-             "--model", "opus", "--effort", "high"],
-            env=self.env, capture_output=True, text=True, check=False, timeout=300,
-        )
+        result = self.run_command("kid")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.parent_of("kid"), "top")
         self.assertEqual([json.loads(line) for line in polls.read_text().splitlines()], [0.01])
@@ -812,7 +641,7 @@ raise SystemExit(add_showrunner.main(sys.argv[2:]))
         environment = {key: value for key, value in self.env.items() if key != "ADD_SHOWRUNNER_POLL_S"}
         program = f"import sys; sys.path.insert(0, {str(SCRIPT.parent)!r}); import add_showrunner; print(add_showrunner.POLL_S)"
         result = subprocess.run([sys.executable, "-c", program], env=environment,
-                                capture_output=True, text=True, check=False, timeout=300)
+                                capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual((result.returncode, result.stdout), (0, "2.0\n"), result.stderr)
 
     def test_a_registry_still_unreadable_at_the_deadline_leaves_the_child_unattached(self) -> None:
@@ -839,8 +668,7 @@ raise SystemExit(add_showrunner.main(sys.argv[2:]))
     def test_each_refusal_names_its_cause_and_starts_nothing(self) -> None:
         notes = self.root / "notes.md"
         _ = notes.write_text("# notes\n", encoding="utf-8")
-        not_a_doc = subprocess.run([sys.executable, str(SCRIPT), "--production", str(notes), "--model", "opus",
-                                    "--effort", "high"], env=self.env, capture_output=True, text=True, check=False)
+        not_a_doc = self.invoke(["--production", str(notes), "--model", "opus", "--effort", "high"])
         self.assertEqual(not_a_doc.returncode, 2, not_a_doc.stdout + not_a_doc.stderr)
         self.assertIn("add_showrunner: ", not_a_doc.stderr)
         self.refused(self.run_command("top"), "top is this session's own production")
@@ -853,6 +681,10 @@ raise SystemExit(add_showrunner.main(sys.argv[2:]))
     def test_a_production_above_the_caller_is_refused(self) -> None:
         self.timer("middle", "middle-session")
         self.timer("grand", "grand-session")
+        grand = staff.ensure("showrunner", name="grand")
+        middle = staff.ensure("showrunner", name="middle", parent=grand.id)
+        top = next(row for row in staff.find(kind="showrunner") if row.name == "top")
+        _ = staff.move(top.id, middle.id)
         for child, parent in (("top", "middle"), ("middle", "grand")):
             edge = self.root / "showrunner" / child / "parent"
             edge.parent.mkdir(parents=True)

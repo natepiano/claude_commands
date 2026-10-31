@@ -11,17 +11,18 @@ from __future__ import annotations
 import os
 import sys
 from datetime import datetime
-from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 DEFAULT_ZONE = "America/New_York"
-CONF = Path(os.environ.get("USER_ZONE_CONF") or Path(__file__).resolve().parents[2] / "config/user_zone.conf")
+CONF = os.environ.get("USER_ZONE_CONF") or os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__)))), "config", "user_zone.conf")
 
 
-def _stored(path: Path) -> str:
+def stored_zone(path: str) -> str:
     """The file's `zone=` value. Empty when the file or the line is missing."""
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
+        with open(path, encoding="utf-8") as stream:
+            lines = stream.read().splitlines()
     except FileNotFoundError:
         return ""
     return next((line.split("=", 1)[1].strip() for line in lines if line.startswith("zone=")), "")
@@ -30,7 +31,7 @@ def _stored(path: Path) -> str:
 def user_zone_name() -> str:
     """The user's zone as an IANA name. Raises ValueError naming where an unknown one came from."""
     pinned = os.environ.get("USER_ZONE", "")
-    name = pinned or _stored(CONF) or DEFAULT_ZONE
+    name = pinned or stored_zone(CONF) or DEFAULT_ZONE
     try:
         _ = ZoneInfo(name)
     except (ZoneInfoNotFoundError, ValueError) as error:

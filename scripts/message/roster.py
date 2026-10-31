@@ -4,52 +4,112 @@
 from __future__ import annotations
 
 import argparse
-import contextlib
-import io
 import json
 import os
+import re
 import shlex
 import socket
 import subprocess
 import sys
-import time
 from collections.abc import Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, cast, override
+from types import ModuleType
+from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, cast
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS.parent))
-for _directory in (SCRIPTS / "production", SCRIPTS / "direct", SCRIPTS / "shutdown", SCRIPTS / "herdr", SCRIPTS / "whoami", SCRIPTS / "message", SCRIPTS / "lib"):
+for _directory in (SCRIPTS / "production", SCRIPTS / "direct", SCRIPTS / "herdr", SCRIPTS / "whoami", SCRIPTS / "message", SCRIPTS / "lib"):
     if str(_directory) not in sys.path:
         sys.path.insert(0, str(_directory))
 
-import production_units  # noqa: E402
 import remove_workers  # noqa: E402
 from worker_state import worker_ledger  # noqa: E402
-import showrunners  # noqa: E402
-import unit_lookup  # noqa: E402
+from scripts.production import showrunners  # noqa: E402
 import unit_runs  # noqa: E402
 import herdr  # noqa: E402
 import codex_daemon  # noqa: E402
 import process_table  # noqa: E402
+from scripts.astra import design_roles  # noqa: E402
+from scripts.production import staff
+from scripts.lib import names  # noqa: E402
+from scripts.lib.names import JobKey  # noqa: E402
 if TYPE_CHECKING:
     from ..accounts.role_map import role_map_command
-    from ..whoami import account, agent_accounts, note_file
+    from scripts.whoami import account, agent_accounts, note_file
 else:
+    import importlib.util
     from scripts.accounts.role_map import role_map_command
-    import account as account
-    import agent_accounts as agent_accounts
-    import note_file as note_file
-import remote as remote  # noqa: E402
-from sessions import SessionRecord, messaging_socket_exists, running_sessions  # noqa: E402
+
+    def _lazy_module(name: str) -> ModuleType:
+        """Label-only callers do not need account discovery dependencies."""
+        if name in sys.modules:
+            return sys.modules[name]
+        spec = importlib.util.find_spec(name)
+        if spec is None or spec.loader is None:
+            raise ImportError(name)
+        loader = importlib.util.LazyLoader(spec.loader)
+        spec.loader = loader
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        loader.exec_module(module)
+        return module
+
+    account = _lazy_module("scripts.whoami.account")
+    agent_accounts = _lazy_module("scripts.whoami.agent_accounts")
+    note_file = _lazy_module("scripts.whoami.note_file")
+from scripts.shutdown import remote as remote  # noqa: E402
+from sessions import SessionRecord, messaging_socket_exists  # noqa: E402
 
 Kind = Literal["claude", "codex"]
-Role = Literal["showrunner", "unit director", "worker", "freestanding"]
+Role = Literal["showrunner", "unit director", "worker", "freestanding", "astra-designer", "astra-reviewer"]
+WorkerRole = Literal["impl", "test", "fix", "review"]
 KNOWN_SLOT_ROLES = frozenset(("impl", "test", "fix", "review"))
 MESSAGEABLE_WORKER_STATUSES = frozenset(("running", "waiting_capacity"))
 
+
+from scripts.message.unit_labels import (
+    UnderShowrunner as UnderShowrunner,
+    RunsProduction as RunsProduction,
+    ProductionWithoutRunningShowrunner as ProductionWithoutRunningShowrunner,
+    NoShowrunner as NoShowrunner,
+    ShowrunnerRelationship as ShowrunnerRelationship,
+    UnderDirector as UnderDirector,
+    DirectsUnit as DirectsUnit,
+    NoDirector as NoDirector,
+    UnitWithoutRunningDirector as UnitWithoutRunningDirector,
+    DirectorRelationship as DirectorRelationship,
+    UnitLabels as UnitLabels,
+    make_labels as _unit_labels,
+    production_of as _production_of,
+    unit_of as _unit_of,
+    short_unit as _short_unit,
+    ProductionPlace as _ProductionPlace,
+    DirectorSession as _DirectorSession,
+    NoRunningDirector as _NoRunningDirector,
+    LiveRun as _LiveRun,
+    ClaudeDetails as _ClaudeDetails,
+    RunPlace as _RunPlace,
+    MeshWorker as _MeshWorker,
+    as_string as _as_string,
+    read_object as _read_object,
+    problem as _problem,
+    newest_sessions as _newest_sessions,
+    registered_showrunners as _registered_showrunners,
+    showrunner_ids as _showrunner_ids,
+    every_marked_unit as every_marked_unit,
+    production_places as _production_places,
+    unit_labels_for as unit_labels_for,
+    live_runs as _live_runs,
+    stopped_run_place as _stopped_run_place,
+    mesh_records as _mesh_records,
+    listed_mesh_worker as _listed_mesh_worker,
+)
+
+
+# Compatibility for callers of the full roster’s mark discovery boundary.
+_every_marked_unit = every_marked_unit
 
 @dataclass(frozen=True)
 class ThisMachine:
@@ -116,59 +176,34 @@ MessageReach = Messageable | CannotReceiveMessages
 
 
 @dataclass(frozen=True)
-class UnderShowrunner:
-    production: str
-    name: str
-    address: str
+class AssignmentUnrecorded:
+    """A legacy worker record has no assignment field."""
 
 
 @dataclass(frozen=True)
-class RunsProduction:
-    production: str
+class AssignmentUnreadable:
+    value: str
 
 
-@dataclass(frozen=True)
-class ProductionWithoutRunningShowrunner:
-    production: str
+WorkerRoleState = WorkerRole | AssignmentUnrecorded | AssignmentUnreadable
 
 
-@dataclass(frozen=True)
-class NoShowrunner:
-    """This session has no showrunner link."""
-
-
-ShowrunnerRelationship = (
-    RunsProduction
-    | UnderShowrunner
-    | ProductionWithoutRunningShowrunner
-    | NoShowrunner
-)
-
-
-@dataclass(frozen=True)
-class UnderDirector:
-    unit: str
-    name: str
-    address: str
-
-
-@dataclass(frozen=True)
-class DirectsUnit:
-    unit: str
-
-
-@dataclass(frozen=True)
-class NoDirector:
-    """This session has no unit-director link."""
-
-
-DirectorRelationship = DirectsUnit | UnderDirector | NoDirector
+def worker_role(record: Mapping[str, object]) -> WorkerRoleState:
+    if "role" not in record:
+        return AssignmentUnrecorded()
+    value = record["role"]
+    if isinstance(value, str) and value in KNOWN_SLOT_ROLES:
+        return value
+    return AssignmentUnreadable(str(value))
 
 
 @dataclass(frozen=True)
 class WorkerAssignment:
     slot_role: str
     session_dir: str
+    role: WorkerRoleState = AssignmentUnrecorded()
+    slot: str = ""
+    reviewer_type: Literal["code", "ui"] = "code"
 
 
 @dataclass(frozen=True)
@@ -176,7 +211,13 @@ class NotAWorker:
     """This session is not assigned to a worker."""
 
 
-Assignment = WorkerAssignment | NotAWorker
+@dataclass(frozen=True)
+class HeldDesignRole:
+    role: Literal["designer", "reviewer"]
+    mesh: str
+
+
+Assignment = WorkerAssignment | HeldDesignRole | NotAWorker
 
 
 @dataclass(frozen=True)
@@ -199,10 +240,15 @@ AccountAttribution = AccountLabel | AccountUnread | AccountAttributionUnavailabl
 
 
 @dataclass(frozen=True)
+class NotDaemonSession:
+    """This row has no local Codex daemon route."""
+
+
+@dataclass(frozen=True)
 class RosterEntry:
     machine: str
     kind: str
-    role: str
+    role: Role
     name: str
     status: str
     reach: MessageReach
@@ -213,6 +259,114 @@ class RosterEntry:
     thread: CodexThread | NoCodexThread = NoCodexThread()
     session: ClaudeSession | NoClaudeSession = NoClaudeSession()
     account: AccountAttribution = AccountUnread("not read")
+    daemon: codex_daemon.CodexDaemon | NotDaemonSession = NotDaemonSession()
+
+
+@dataclass(frozen=True)
+class JobNumber:
+    number: int
+
+
+@dataclass(frozen=True)
+class JobSlot:
+    slot: str
+
+
+@dataclass(frozen=True)
+class Unqualified:
+    """The job needs no holder qualifier."""
+
+
+JobQualifier = JobNumber | JobSlot | Unqualified
+
+
+@dataclass(frozen=True)
+class ShownJob:
+    job: JobKey
+    qualifier: JobQualifier
+
+
+@dataclass(frozen=True)
+class JobUnassigned:
+    reason: str
+
+
+@dataclass(frozen=True)
+class ProductionPart:
+    slug: str
+
+
+@dataclass(frozen=True)
+class NoProduction:
+    """The record has no production."""
+
+
+@dataclass(frozen=True)
+class UnitPart:
+    unit: str
+
+
+@dataclass(frozen=True)
+class NoUnit:
+    """The record has no unit."""
+
+
+@dataclass(frozen=True)
+class ShownName:
+    production: ProductionPart | NoProduction
+    unit: UnitPart | NoUnit
+    job: ShownJob | JobUnassigned
+    address: str
+
+    def render(self) -> str:
+        parts: list[str] = []
+        if isinstance(self.production, ProductionPart) and self.production.slug:
+            parts.append(self.production.slug)
+        if isinstance(self.unit, UnitPart) and self.unit.unit:
+            parts.append(_short_unit(self.unit.unit))
+        if isinstance(self.job, ShownJob):
+            loaded = names.runtime_names()
+            if not isinstance(loaded, names.Names):
+                return self.address
+            label = loaded.job(self.job.job)
+            qualifier = self.job.qualifier
+            if isinstance(qualifier, JobNumber):
+                label += f" {qualifier.number}"
+            elif isinstance(qualifier, JobSlot) and qualifier.slot:
+                label += f" {qualifier.slot}"
+            parts.append(label)
+        return " · ".join(parts) or self.address
+
+
+def shown_name(entry: RosterEntry) -> ShownName:
+    production, unit = _production(entry), _unit(entry)
+    job: ShownJob | JobUnassigned = JobUnassigned("freestanding session")
+    if entry.role == "showrunner":
+        job = ShownJob("showrunner", Unqualified())
+        unit = ""
+    elif entry.role == "unit director":
+        job = ShownJob("unit_director", Unqualified())
+    elif entry.role in ("astra-designer", "astra-reviewer"):
+        job = ShownJob("designer" if entry.role == "astra-designer" else "design_reviewer", Unqualified())
+    elif entry.role == "worker" and isinstance(entry.assignment, WorkerAssignment):
+        assignment = entry.assignment
+        record = str(Path(assignment.session_dir) / ("mesh_roster.json" if entry.kind == "codex" else "board.log")) if assignment.session_dir else entry.name
+        if isinstance(assignment.role, AssignmentUnrecorded):
+            job = JobUnassigned(f"assignment not recorded: {record}")
+        elif isinstance(assignment.role, AssignmentUnreadable):
+            job = JobUnassigned(f"assignment record not readable: {record}: {assignment.role.value}")
+        else:
+            slot = assignment.slot
+            pool = re.fullmatch(r"(code|ui)([0-9]+)", slot)
+            if assignment.role == "review" and pool:
+                job = ShownJob("ui_reviewer" if assignment.reviewer_type == "ui" else "code_reviewer",
+                               JobNumber(int(pool[2])))
+            else:
+                job = ShownJob("code_reviewer" if assignment.role == "review" else "worker",
+                               JobSlot(slot) if slot else Unqualified())
+    address = _address(entry) or _session_address(entry)
+    return ShownName(ProductionPart(production) if production else NoProduction(),
+                     UnitPart(unit) if unit else NoUnit(), job, address or entry.name)
 
 
 @dataclass(frozen=True)
@@ -221,12 +375,24 @@ class Roster:
     problems: list[str]
 
 
-SnapshotState = (MessageReach | ShowrunnerRelationship | DirectorRelationship | Assignment
-                 | CodexThread | NoCodexThread | ClaudeSession | NoClaudeSession | AccountAttribution)
-_SNAPSHOT_STATES: tuple[type[SnapshotState], ...] = (
+def unit_labels(entries: Iterable[RosterEntry]) -> dict[str, UnitLabels]:
+    labels: dict[str, UnitLabels] = {}
+    for entry in entries:
+        identity = _unit_labels(entry.name, entry.showrunner, entry.director)
+        if entry.kind == "claude" and isinstance(entry.session, ClaudeSession):
+            labels[entry.session.session_id] = identity
+        elif entry.kind == "codex" and isinstance(entry.thread, CodexThread):
+            labels[entry.thread.thread_id] = identity
+    return labels
+
+
+TaggedSnapshotState = (MessageReach | ShowrunnerRelationship | DirectorRelationship | NotAWorker
+                       | CodexThread | NoCodexThread | ClaudeSession | NoClaudeSession | AccountAttribution)
+SnapshotState = TaggedSnapshotState | WorkerAssignment | HeldDesignRole
+_SNAPSHOT_STATES: tuple[type[TaggedSnapshotState], ...] = (
     Messageable, CannotReceiveMessages, UnderShowrunner, RunsProduction,
     ProductionWithoutRunningShowrunner, NoShowrunner, UnderDirector, DirectsUnit,
-    NoDirector, WorkerAssignment, NotAWorker, CodexThread, NoCodexThread,
+    UnitWithoutRunningDirector, NoDirector, NotAWorker, CodexThread, NoCodexThread,
     ClaudeSession, NoClaudeSession, AccountLabel, AccountUnread, AccountAttributionUnavailable,
 )
 
@@ -234,21 +400,36 @@ _SNAPSHOT_STATES: tuple[type[SnapshotState], ...] = (
 class SnapshotEntry(TypedDict):
     machine: str
     kind: str
-    role: str
+    role: Role
     name: str
     status: str
     cwd: str
     reach: dict[str, str]
     showrunner: dict[str, str]
     director: dict[str, str]
-    assignment: dict[str, str]
+    assignment: dict[str, object]
     thread: dict[str, str]
     session: dict[str, str]
     account: NotRequired[dict[str, str]]
+    daemon: NotRequired[dict[str, str]]
 
 
-def _tagged_state(state: SnapshotState) -> dict[str, str]:
+def _tagged_state(state: TaggedSnapshotState) -> dict[str, str]:
     return {"tag": type(state).__name__, **cast(dict[str, str], asdict(state))}
+
+
+def _assignment_snapshot(assignment: Assignment) -> dict[str, object]:
+    if isinstance(assignment, NotAWorker):
+        return {"tag": "NotAWorker"}
+    if isinstance(assignment, HeldDesignRole):
+        return {"tag": "HeldDesignRole", "slot_role": "astra-" + assignment.role,
+                "session_dir": assignment.mesh}
+    role = assignment.role
+    encoded_role: object = role if isinstance(role, str) else {
+        "tag": type(role).__name__, **cast(dict[str, str], asdict(role))}
+    return {"tag": "WorkerAssignment", "slot_role": assignment.slot_role,
+            "session_dir": assignment.session_dir, "role": encoded_role,
+            "slot": assignment.slot, "reviewer_type": assignment.reviewer_type}
 
 
 def _snapshot_entry(entry: RosterEntry) -> SnapshotEntry:
@@ -256,8 +437,10 @@ def _snapshot_entry(entry: RosterEntry) -> SnapshotEntry:
         machine=entry.machine, kind=entry.kind, role=entry.role, name=entry.name,
         status=entry.status, cwd=entry.cwd, reach=_tagged_state(entry.reach),
         showrunner=_tagged_state(entry.showrunner), director=_tagged_state(entry.director),
-        assignment=_tagged_state(entry.assignment), thread=_tagged_state(entry.thread),
+        assignment=_assignment_snapshot(entry.assignment), thread=_tagged_state(entry.thread),
         session=_tagged_state(entry.session), account=_tagged_state(entry.account),
+        daemon=({"home": str(entry.daemon.home), "socket": str(entry.daemon.socket)}
+                if isinstance(entry.daemon, codex_daemon.CodexDaemon) else {}),
     )
 
 
@@ -280,6 +463,39 @@ def _snapshot_string(values: Mapping[str, object], key: str) -> str:
 def _decode_state(value: object) -> SnapshotState:
     values = _snapshot_object(value)
     tag = _snapshot_string(values, "tag")
+    if tag == "HeldDesignRole" or (tag == "WorkerAssignment"
+            and values.get("slot_role") in ("astra-designer", "astra-reviewer")):
+        if set(values) != {"tag", "slot_role", "session_dir"}:
+            raise ValueError("invalid fields for snapshot held design role")
+        label = _snapshot_string(values, "slot_role")
+        if label not in ("astra-designer", "astra-reviewer"):
+            raise ValueError("invalid snapshot held design role")
+        return HeldDesignRole("designer" if label == "astra-designer" else "reviewer",
+                              _snapshot_string(values, "session_dir"))
+    if tag == "WorkerAssignment":
+        required = {"tag", "slot_role", "session_dir"}
+        if not required <= set(values) or set(values) - required - {"role", "slot", "reviewer_type"}:
+            raise ValueError("invalid fields for snapshot worker assignment")
+        role: WorkerRoleState = AssignmentUnrecorded()
+        if "role" in values:
+            raw = values["role"]
+            if isinstance(raw, dict):
+                state = _snapshot_object(cast(object, raw))
+                if state == {"tag": "AssignmentUnrecorded"}:
+                    role = AssignmentUnrecorded()
+                elif set(state) == {"tag", "value"} and state["tag"] == "AssignmentUnreadable":
+                    role = AssignmentUnreadable(_snapshot_string(state, "value"))
+                else:
+                    raise ValueError("invalid snapshot worker assignment")
+            else:
+                role = worker_role({"role": raw})
+        reviewer_type = values.get("reviewer_type", "code")
+        if reviewer_type not in ("code", "ui"):
+            raise ValueError("invalid snapshot reviewer type")
+        return WorkerAssignment(_snapshot_string(values, "slot_role"),
+                                _snapshot_string(values, "session_dir"), role,
+                                _snapshot_string(values, "slot") if "slot" in values else "",
+                                reviewer_type)
     for state in _SNAPSHOT_STATES:
         if state.__name__ == tag:
             names = [field.name for field in fields(state)]
@@ -291,8 +507,8 @@ def _decode_state(value: object) -> SnapshotState:
 
 def _decode_entry(value: object) -> RosterEntry:
     values = _snapshot_object(value)
-    required = set(SnapshotEntry.__annotations__) - {"account"}
-    if not required <= set(values) or set(values) - required - {"account"}:
+    required = set(SnapshotEntry.__annotations__) - {"account", "daemon"}
+    if not required <= set(values) or set(values) - required - {"account", "daemon"}:
         raise ValueError("invalid snapshot entry fields")
     reach = _decode_state(values.get("reach"))
     showrunner = _decode_state(values.get("showrunner"))
@@ -302,6 +518,14 @@ def _decode_entry(value: object) -> RosterEntry:
     session = _decode_state(values.get("session"))
     attributed = (_decode_state(values["account"]) if "account" in values
                   else AccountAttributionUnavailable("peer sent no account"))
+    daemon: codex_daemon.CodexDaemon | NotDaemonSession = NotDaemonSession()
+    if "daemon" in values:
+        owner = _snapshot_object(values["daemon"])
+        if owner:
+            if set(owner) != {"home", "socket"}:
+                raise ValueError("invalid snapshot daemon fields")
+            daemon = codex_daemon.CodexDaemon(Path(_snapshot_string(owner, "home")),
+                                             Path(_snapshot_string(owner, "socket")))
     if not (isinstance(reach, Messageable | CannotReceiveMessages)
             and isinstance(showrunner, ShowrunnerRelationship)
             and isinstance(director, DirectorRelationship)
@@ -312,12 +536,15 @@ def _decode_entry(value: object) -> RosterEntry:
         raise ValueError("snapshot state is in the wrong field")
     if isinstance(attributed, AccountLabel):
         attributed = AccountLabel(note_file.canonical_label(attributed.label))
+    role = _snapshot_string(values, "role")
+    if role not in ("showrunner", "unit director", "worker", "freestanding", "astra-designer", "astra-reviewer"):
+        raise ValueError(f"unknown snapshot organizational role {role}")
     return RosterEntry(
         machine=_snapshot_string(values, "machine"), kind=_snapshot_string(values, "kind"),
-        role=_snapshot_string(values, "role"), name=_snapshot_string(values, "name"),
+        role=role, name=_snapshot_string(values, "name"),
         status=_snapshot_string(values, "status"), cwd=_snapshot_string(values, "cwd"),
         reach=reach, showrunner=showrunner, director=director, assignment=assignment,
-        thread=thread, session=session, account=attributed,
+        thread=thread, session=session, account=attributed, daemon=daemon,
     )
 
 
@@ -387,12 +614,7 @@ def _session_address(entry: RosterEntry) -> str:
 
 
 def _production(entry: RosterEntry) -> str:
-    if isinstance(
-        entry.showrunner,
-        (RunsProduction, UnderShowrunner, ProductionWithoutRunningShowrunner),
-    ):
-        return entry.showrunner.production
-    return ""
+    return _production_of(entry.showrunner)
 
 
 def _showrunner_name(entry: RosterEntry) -> str:
@@ -404,9 +626,7 @@ def _showrunner_address(entry: RosterEntry) -> str:
 
 
 def _unit(entry: RosterEntry) -> str:
-    if isinstance(entry.director, (DirectsUnit, UnderDirector)):
-        return entry.director.unit
-    return ""
+    return _unit_of(entry.director)
 
 
 def _director_name(entry: RosterEntry) -> str:
@@ -418,10 +638,14 @@ def _director_address(entry: RosterEntry) -> str:
 
 
 def _slot_role_for(entry: RosterEntry) -> str:
+    if isinstance(entry.assignment, HeldDesignRole):
+        return "astra-" + entry.assignment.role
     return entry.assignment.slot_role if isinstance(entry.assignment, WorkerAssignment) else ""
 
 
 def _session_dir(entry: RosterEntry) -> str:
+    if isinstance(entry.assignment, HeldDesignRole):
+        return entry.assignment.mesh
     return entry.assignment.session_dir if isinstance(entry.assignment, WorkerAssignment) else ""
 
 
@@ -442,6 +666,20 @@ class SerializedRosterEntry(TypedDict):
     slot_role: str
     session_dir: str
     thread: str | None
+    shown_name: str
+    job: dict[str, str]
+
+
+def serialized_job(job: ShownJob | JobUnassigned) -> dict[str, str]:
+    if isinstance(job, JobUnassigned):
+        return {"state": "unassigned", "reason": job.reason}
+    loaded = names.runtime_names()
+    if not isinstance(loaded, names.Names):
+        return {"state": "unassigned", "reason": names.error_text(loaded)}
+    qualifier = job.qualifier
+    text = (str(qualifier.number) if isinstance(qualifier, JobNumber)
+            else qualifier.slot if isinstance(qualifier, JobSlot) else "")
+    return {"state": "assigned", "key": job.job, "display": loaded.job(job.job), "qualifier": text}
 
 
 def _serialized_entry(entry: RosterEntry) -> SerializedRosterEntry:
@@ -463,51 +701,15 @@ def _serialized_entry(entry: RosterEntry) -> SerializedRosterEntry:
         "slot_role": _slot_role_for(entry),
         "session_dir": _session_dir(entry),
         "thread": entry.thread.thread_id if isinstance(entry.thread, CodexThread) else None,
+        "shown_name": shown_name(entry).render(),
+        "job": serialized_job(shown_name(entry).job),
     }
-
-
-@dataclass(frozen=True)
-class _ProductionPlace:
-    showrunner: UnderShowrunner | ProductionWithoutRunningShowrunner
-    director: DirectsUnit
-
-
-@dataclass(frozen=True)
-class _DirectorSession:
-    session_id: str
-
-
-@dataclass(frozen=True)
-class _NoRunningDirector:
-    """No live Claude session owns this run."""
-
-
-_RunDirector = _DirectorSession | _NoRunningDirector
-
-
-@dataclass(frozen=True)
-class _LiveRun:
-    path: Path
-    director: _RunDirector
-
-
-@dataclass(frozen=True)
-class _ClaudeDetails:
-    cwd: str
-    status: str
 
 
 @dataclass(frozen=True)
 class _WorkerPlace:
     run: _LiveRun
     worker_name: str
-
-
-@dataclass(frozen=True)
-class _RunPlace:
-    director: DirectorRelationship
-    showrunner: ShowrunnerRelationship
-    cwd: str
 
 
 @dataclass(frozen=True)
@@ -522,44 +724,6 @@ class _ReviewerProcessNotFound:
 
 
 _ReviewerProcessState = _ReviewerProcess | _ReviewerProcessNotFound
-
-
-class _MeshWorker(TypedDict, total=False):
-    port: int
-    thread_id: str
-    status: str
-    launcher_pid: int
-    role: str
-    lens: str
-    cwd: str
-    held_design_id: str
-    transferring_role: dict[str, object]
-    role_redirect: dict[str, object]
-
-
-def _as_string(value: object) -> str:
-    return value if isinstance(value, str) else ""
-
-
-def _read_object(path: Path) -> dict[str, object]:
-    parsed = cast("object", json.loads(path.read_text(encoding="utf-8")))
-    if not isinstance(parsed, dict):
-        raise ValueError("expected a JSON object")
-    return cast("dict[str, object]", parsed)
-
-
-def _problem(problems: list[str], source: str, error: BaseException | str) -> None:
-    detail = str(error).splitlines()[0] if str(error).splitlines() else type(error).__name__
-    message = f"{source}: {detail}"
-    if message not in problems:
-        problems.append(message)
-
-
-def _newest_sessions() -> list[SessionRecord]:
-    newest: dict[str, SessionRecord] = {}
-    for record in running_sessions():
-        _ = newest.setdefault(record["sessionId"], record)
-    return list(newest.values())
 
 
 def _raw_session_details(records: list[SessionRecord], problems: list[str]) -> dict[str, _ClaudeDetails]:
@@ -603,188 +767,6 @@ def _raw_session_details(records: list[SessionRecord], problems: list[str]) -> d
     return details
 
 
-def _registered_showrunners(
-    environment: Mapping[str, str], problems: list[str]
-) -> list[showrunners.Showrunner]:
-    state = Path(
-        environment.get(
-            "NOTIFIER_STATE_DIR", str(Path.home() / ".local/state/notifier")
-        )
-    )
-    sessions_directory = Path(
-        environment.get("NOTIFIER_SESSIONS_DIR", str(Path.home() / ".claude/sessions"))
-    )
-    showrunners.SESSIONS_DIR = sessions_directory
-    errors = io.StringIO()
-    try:
-        with contextlib.redirect_stderr(errors):
-            registered = showrunners.registered_showrunners(state)
-    except (OSError, ValueError) as error:
-        _problem(problems, "showrunners", error)
-        registered = []
-    for line in errors.getvalue().splitlines():
-        if line.strip():
-            _problem(problems, "showrunners", line.strip())
-    return registered
-
-
-def _showrunner_ids(
-    records: list[SessionRecord], registered: Iterable[showrunners.Showrunner]
-) -> dict[str, showrunners.Showrunner]:
-    found: dict[str, showrunners.Showrunner] = {}
-    for runner in registered:
-        if runner["socket"]:
-            match = next((record for record in records
-                          if record["messagingSocketPath"] == runner["socket"]), None)
-        else:
-            match = next((record for record in records
-                          if runner["session"] and record["name"] == runner["session"]), None)
-        if match is not None:
-            found[match["sessionId"]] = runner
-    return found
-
-
-class _ProductionUnitMarks(production_units.SessionMarks):
-    """Use the roster's known marks, retaining rows when those marks are unreadable."""
-
-    def __init__(self, slug: str, every: unit_lookup.MarkedProductions | OSError) -> None:
-        super().__init__(slug)
-        self._known: set[str] | OSError = (
-            every if isinstance(every, OSError)
-            else set(every.units.get(slug, {})) | set(every.faults.get(slug, {}))
-        )
-
-    @override
-    def has(self, unit: str) -> bool:
-        return isinstance(self._known, OSError) or unit in self._known
-
-
-def _production_rows(
-    doc: Path, slug: str, every: unit_lookup.MarkedProductions | OSError,
-) -> list[dict[str, str]]:
-    lines = doc.read_text(encoding="utf-8").splitlines()
-    marks = _ProductionUnitMarks(slug, every)
-    return [row for row in production_units.unit_table(lines) if not production_units.unit_is_retired(row, marks)]
-
-
-def _every_marked_unit() -> unit_lookup.MarkedProductions | OSError:
-    """Every production's marked units, or why the included hosts could not answer."""
-    try:
-        return unit_lookup.every_marked_unit()
-    except OSError as error:
-        return error
-
-
-def _production_places(
-    records: list[SessionRecord], details: Mapping[str, _ClaudeDetails],
-    registered: list[showrunners.Showrunner],
-    runner_ids: Mapping[str, showrunners.Showrunner], ledger_workers: set[str],
-    problems: list[str],
-) -> dict[str, _ProductionPlace]:
-    addresses = {runner["slug"]: f"session:{session_id}" for session_id, runner in runner_ids.items()}
-    places: dict[str, _ProductionPlace] = {}
-    # One read of every production's marks serves every showrunner below.
-    every = _every_marked_unit() if registered else unit_lookup.MarkedProductions({}, {})
-    # One process scan places every record; a scan per record took most of the roster's time.
-    record_places: dict[int, herdr.HerdrPlace] | None = None
-    for runner in registered:
-        doc = Path(runner["doc"])
-        runner_address = addresses.get(runner["slug"], "")
-        showrunner: UnderShowrunner | ProductionWithoutRunningShowrunner = (
-            UnderShowrunner(runner["slug"], runner["session"], runner_address)
-            if runner["session"] and runner_address
-            else ProductionWithoutRunningShowrunner(runner["slug"])
-        )
-        try:
-            if isinstance(every, OSError):
-                raise every
-            if fault := every.production_fault(runner["slug"]):
-                _problem(problems, f"unit hosts left out under {runner['slug']}", OSError(fault))
-            rows = _production_rows(doc, runner["slug"], every)
-            units = every.units.get(runner["slug"], {})
-        except (OSError, UnicodeError, ValueError, production_units.Refusal) as error:
-            _problem(problems, f"unit hosts for {runner['slug']} were not read", error)
-        else:
-            for row in rows:
-                unit_name = production_units.cell_value(row.get("Unit", ""))
-                marked = units.get(unit_name)
-                if marked is None:
-                    continue
-                place = _ProductionPlace(showrunner, DirectsUnit(unit_name))
-                if isinstance(marked.claude, unit_lookup.LiveClaude):
-                    _ = places.setdefault(marked.claude.session_id, place)
-                    continue
-                # A socketless director is still identified by its marked pane.
-                if record_places is None:
-                    record_places = herdr.herdr_places()
-                for record in records:
-                    same_place = record_places.get(record["pid"]) == marked.place
-                    if record["sessionId"] not in ledger_workers and same_place:
-                        _ = places.setdefault(record["sessionId"], place)
-                        break
-            continue
-        # Worktree ownership is a fallback only when neither host could be read.
-        try:
-            rows = _production_rows(doc, runner["slug"], every)
-        except (OSError, UnicodeError, ValueError, production_units.Refusal) as fallback_error:
-            _problem(problems, f"units in {doc}", fallback_error)
-            continue
-        for row in rows:
-            unit_name = production_units.cell_value(row.get("Unit", ""))
-            worktree = production_units.cell_value(row.get("Worktree", ""))
-            for record in records:
-                if (record["sessionId"] not in ledger_workers and worktree
-                        and details[record["sessionId"]].cwd == worktree):
-                    _ = places.setdefault(record["sessionId"], _ProductionPlace(showrunner, DirectsUnit(unit_name)))
-    return places
-
-
-def _read_run_markers(
-    active: Path, live_session_ids: set[str], by_path: dict[Path, _RunDirector], problems: list[str]
-) -> None:
-    """Add the run each live director's marker names."""
-    if not active.is_dir():
-        return
-    try:
-        markers = list(active.iterdir())
-    except OSError as error:
-        _problem(problems, f"unit run markers in {active}", error)
-        return
-    for marker in markers:
-        if marker.name not in live_session_ids:
-            continue
-        try:
-            lines = marker.read_text(encoding="utf-8").splitlines()
-            if lines and lines[0].strip():
-                by_path[Path(lines[0].strip()).resolve()] = _DirectorSession(marker.name)
-        except (OSError, UnicodeError) as error:
-            _problem(problems, f"unit run marker {marker}", error)
-
-
-def _live_runs(
-    roots: tuple[Path, ...], live_session_ids: set[str], problems: list[str]
-) -> list[_LiveRun]:
-    by_path: dict[Path, _RunDirector] = {}
-    heartbeats: list[Path] = []
-    for root in roots:
-        _read_run_markers(root / "active", live_session_ids, by_path, problems)
-        try:
-            heartbeats.extend(root.glob(f"*/{unit_runs.HEARTBEAT}"))
-        except OSError as error:
-            _problem(problems, f"unit runs in {root}", error)
-    now = time.time()
-    for heartbeat in heartbeats:
-        try:
-            if now - heartbeat.stat().st_mtime < unit_runs.LIVE_HEARTBEAT_SECS:
-                _ = by_path.setdefault(heartbeat.parent.resolve(), _NoRunningDirector())
-        except OSError as error:
-            _problem(problems, f"worker heartbeat {heartbeat}", error)
-    return [
-        _LiveRun(path, director)
-        for path, director in sorted(by_path.items(), key=lambda item: item[0])
-    ]
-
-
 def _worker_ledger(run: _LiveRun, problems: list[str]) -> list[tuple[str, str]]:
     path = run.path / remove_workers.LEDGER
     try:
@@ -804,18 +786,152 @@ def _worker_ledger(run: _LiveRun, problems: list[str]) -> list[tuple[str, str]]:
 
 
 def _slot_role(name: str) -> str:
+    """Read a slot identity for legacy launch records, never a job assignment."""
     candidate = name.rpartition("-")[2]
-    return candidate if candidate in KNOWN_SLOT_ROLES else "role unknown"
+    return candidate
 
 
-def _codex_slot_role(record: _MeshWorker) -> str:
-    role = _as_string(record.get("role"))
-    if not role:
-        return "no role"
-    if role not in KNOWN_SLOT_ROLES:
-        return "role unknown"
-    lens = _as_string(record.get("lens"))
-    return f"review ({lens})" if role == "review" and lens else role
+def _worker_slot(run: Path, name: str, record: Mapping[str, object], problems: list[str]) -> str:
+    """The recorded slot can contain hyphens and is independent of the address."""
+    if slot := _as_string(record.get("slot")):
+        return slot
+    fallback = _slot_role(name)
+    for path in sorted(run.glob("impl_worker_*.json")):
+        try:
+            launch = _read_object(path)
+        except (OSError, UnicodeError, ValueError) as error:
+            _problem(problems, f"worker launch {path}", error)
+            continue
+        if launch.get("name") == name:
+            return _as_string(launch.get("slot")) or fallback
+    return fallback
+
+
+def _worker_assignment(run: Path, slot: str, record: Mapping[str, object]) -> WorkerAssignment:
+    role = worker_role(record)
+    legacy_role = _as_string(record.get("role"))
+    if not legacy_role:
+        label = "no role"
+    elif legacy_role not in KNOWN_SLOT_ROLES:
+        label = "role unknown"
+    else:
+        lens = _as_string(record.get("lens"))
+        label = f"review ({lens})" if legacy_role == "review" and lens else legacy_role
+    return WorkerAssignment(label, str(run), role, slot)
+
+
+@dataclass(frozen=True)
+class _PoolReviewer:
+    reviewer_type: Literal["code", "ui"]
+    director: UnderDirector | NoDirector
+
+
+def _pool_root() -> Path:
+    return Path(os.environ.get("REVIEW_POOL_STATE", "~/.local/state/review-pool")).expanduser().resolve()
+
+
+def _pool_reviewers(path: Path) -> dict[str, _PoolReviewer]:
+    reviewers = _snapshot_object(_read_object(path).get("reviewers"))
+    result: dict[str, _PoolReviewer] = {}
+    for name, raw in reviewers.items():
+        reviewer = _snapshot_object(raw)
+        kind = reviewer.get("type")
+        if kind not in ("code", "ui"):
+            raise ValueError(f"invalid reviewer type for {name}")
+        lease = reviewer.get("lease")
+        unit = _snapshot_string(_snapshot_object(lease), "unit") if lease is not None else ""
+        result[name] = _PoolReviewer(kind, UnderDirector(unit, "", "") if unit else NoDirector())
+    return result
+
+
+def _pool_context(run: Path, name: str) -> tuple[ShowrunnerRelationship, DirectorRelationship, str]:
+    """A pool reviewer's current lease supplies its unit, never its mesh name."""
+    root = _pool_root()
+    try:
+        relative = run.resolve().relative_to(root)
+    except ValueError:
+        return NoShowrunner(), NoDirector(), ""
+    if len(relative.parts) != 3 or relative.parts[1] != "mesh":
+        return NoShowrunner(), NoDirector(), ""
+    slug = relative.parts[0]
+    try:
+        reviewer = _pool_reviewers(root / slug / "pool.json")[name]
+    except (OSError, UnicodeError, ValueError, KeyError):
+        return ProductionWithoutRunningShowrunner(slug), NoDirector(), ""
+    return ProductionWithoutRunningShowrunner(slug), reviewer.director, reviewer.reviewer_type
+
+
+def _held_location(holder: design_roles.Holder) -> tuple[ShowrunnerRelationship, DirectorRelationship]:
+    return (ProductionWithoutRunningShowrunner(holder.production_slug),
+            UnderDirector(holder.unit_name, "", "") if isinstance(holder, design_roles.UnitHolder) else NoDirector())
+
+
+def unit_worker_title(production: str, unit: str, job: JobKey, ordinal: int, address: str) -> str:
+    """Render a unit worker's title from its ledger placement; a second holder of a job gets a number."""
+    qualifier: JobQualifier = JobNumber(ordinal) if ordinal > 1 else Unqualified()
+    return ShownName(ProductionPart(production), UnitPart(unit), ShownJob(job, qualifier), address).render()
+
+
+def mesh_title(session_dir: str, name: str, record: Mapping[str, object]) -> str:
+    return mesh_shown_name(session_dir, name, record).render()
+
+
+def mesh_shown_name(session_dir: str, name: str, record: Mapping[str, object]) -> ShownName:
+    """Build a thread title with the same production and unit lookup as the roster."""
+    run = Path(session_dir)
+    if design_id := _as_string(record.get("held_design_id")):
+        held_role = record.get("held_role")
+        try:
+            design = design_roles.read_design(design_id)
+        except (OSError, UnicodeError, ValueError, TypeError):
+            return ShownName(NoProduction(), NoUnit(), JobUnassigned("design unreadable"), name)
+        if held_role not in ("designer", "reviewer"):
+            return ShownName(NoProduction(), NoUnit(), JobUnassigned("held role unreadable"), name)
+        showrunner, director = _held_location(design.holder)
+        return shown_name(RosterEntry(
+            machine="", kind="codex", role="astra-designer" if held_role == "designer" else "astra-reviewer",
+            name=name, status="", reach=Messageable(name), cwd=design.repository,
+            showrunner=showrunner, director=director, assignment=HeldDesignRole(held_role, session_dir)))
+    showrunner, director, reviewer_type = _pool_context(run, name)
+    if isinstance(showrunner, NoShowrunner):
+        problems: list[str] = []
+        records = _newest_sessions()
+        details = _raw_session_details(records, problems)
+        registered = _registered_showrunners(os.environ, problems)
+        places = (_production_places(records, details, registered,
+                                     _showrunner_ids(records, registered), set(), problems, record=staff.snapshot())
+                  if registered else {})
+        place = places.get(unit_runs.director(run))
+        if place is not None:
+            showrunner, director = place.showrunner, UnderDirector(place.director.unit, "", "")
+    assignment = _worker_assignment(run, _worker_slot(run, name, record, []), record)
+    if reviewer_type in ("code", "ui"):
+        assignment = WorkerAssignment(assignment.slot_role, session_dir, assignment.role, name,
+                                      reviewer_type)
+    entry = RosterEntry(machine="", kind="codex", role="worker", name=name, status="",
+                        reach=Messageable(name), cwd="", showrunner=showrunner,
+                        director=director, assignment=assignment)
+    # A detached, unplaced thread retains its existing address as its title.
+    if isinstance(showrunner, NoShowrunner) and isinstance(director, NoDirector):
+        return ShownName(NoProduction(), NoUnit(), JobUnassigned("no unit record"), name)
+    return shown_name(entry)
+
+
+def _claude_assignment(run: Path, name: str, problems: list[str]) -> WorkerAssignment:
+    """The launch names the slot; the board records its current assignment."""
+    slot = _slot_role(name)
+    legacy_label = slot if slot in KNOWN_SLOT_ROLES else "role unknown"
+    slot = _worker_slot(run, name, {}, problems)
+    try:
+        result = subprocess.run(["bash", str(SCRIPTS / "direct/board.sh"), "roles", str(run)],
+                                capture_output=True, text=True, timeout=5, check=True,
+                                stdin=subprocess.DEVNULL)
+        roles = dict(line.split("\t", 1) for line in result.stdout.splitlines() if "\t" in line)
+    except (OSError, subprocess.SubprocessError) as error:
+        _problem(problems, f"worker assignments {run}", error)
+        return WorkerAssignment(legacy_label, str(run), AssignmentUnreadable(str(error)), slot)
+    assignment = worker_role({"role": roles[slot]} if slot in roles else {})
+    return WorkerAssignment(legacy_label, str(run), assignment, slot)
 
 
 def _pid_alive(pid: int) -> bool:
@@ -836,10 +952,10 @@ def _run_place(
     production_places: Mapping[str, _ProductionPlace],
 ) -> _RunPlace:
     if isinstance(run.director, _NoRunningDirector):
-        return _RunPlace(NoDirector(), NoShowrunner(), "")
+        return _stopped_run_place(run.path)
     director = claude_entries.get(run.director.session_id)
     if director is None:
-        return _RunPlace(NoDirector(), NoShowrunner(), "")
+        return _stopped_run_place(run.path)
     place = production_places.get(run.director.session_id)
     unit = place.director.unit if place is not None else ""
     director_link = UnderDirector(unit, director.name, _session_address(director))
@@ -856,23 +972,6 @@ def _between_turns_reason(director: DirectorRelationship) -> str:
             return "between turns; its unit director resumes it"
         case _:
             return "between turns; no unit director is running"
-
-
-def _mesh_records(run: _LiveRun, problems: list[str]) -> dict[str, _MeshWorker]:
-    path = run.path / "mesh_roster.json"
-    if not path.exists():
-        return {}
-    try:
-        stored = _read_object(path)
-    except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as error:
-        _problem(problems, f"Codex roster {path}", error)
-        return {}
-    records: dict[str, _MeshWorker] = {}
-    for name, value in stored.items():
-        if isinstance(value, dict):
-            records[name] = cast("_MeshWorker", cast("object", value))
-    return records
-
 
 
 def _run_server_homes(run: _LiveRun) -> dict[int, Path]:
@@ -905,14 +1004,20 @@ def _codex_home_account(home: Path) -> AccountLabel | AccountUnread:
     return AccountLabel(identity.label) if isinstance(identity, agent_accounts.KnownCodexAccount) else AccountUnread(identity.reason)
 
 
-_HOME_ACCOUNT_UNCHECKED = account.HomeAccountUnchecked()
+@dataclass(frozen=True)
+class _ReadHomeAccount:
+    """Account attribution must read the home state when requested."""
+
+
+_HOME_ACCOUNT_UNCHECKED = _ReadHomeAccount()
 
 
 def _process_account(pid: int, kind: str, *,
-                     home_state: account.LegacyHomeLogin | account.ConfigOnlyHome | account.HomeAccountUnchecked = _HOME_ACCOUNT_UNCHECKED,
+                     home_state: account.LegacyHomeLogin | account.ConfigOnlyHome | account.HomeAccountUnchecked | _ReadHomeAccount = _HOME_ACCOUNT_UNCHECKED,
                      ) -> AccountLabel | AccountUnread:
     if kind == "claude":
-        identity = account.account_of(pid, home_state=home_state)
+        identity = account.account_of(pid, home_state=(account.HomeAccountUnchecked()
+                                      if isinstance(home_state, _ReadHomeAccount) else home_state))
         return AccountLabel(identity.label) if identity is not None else AccountUnread("process account could not be read")
     home = account.process_codex_home(pid)
     if isinstance(home, account.ProcessEnvironmentUnread):
@@ -979,6 +1084,7 @@ def _claude_entries(
     production_places: Mapping[str, _ProductionPlace], runs: list[_LiveRun],
     workers: Mapping[str, _WorkerPlace], *,
     home_state: account.LegacyHomeLogin | account.ConfigOnlyHome,
+    problems: list[str],
 ) -> dict[str, RosterEntry]:
     marker_directors = {
         run.director.session_id
@@ -1005,11 +1111,11 @@ def _claude_entries(
         elif session_id in workers:
             role = "worker"
             worker = workers[session_id]
-            assignment = WorkerAssignment(
-                _slot_role(worker.worker_name or record["name"]),
-                str(worker.run.path),
-            )
+            assignment = _claude_assignment(worker.run.path, worker.worker_name or record["name"], problems)
             run_director = worker.run.director
+            if isinstance(run_director, _NoRunningDirector):
+                place = _stopped_run_place(worker.run.path)
+                showrunner, director = place.showrunner, place.director
             director_entry = (
                 records_by_id.get(run_director.session_id)
                 if isinstance(run_director, _DirectorSession) else None
@@ -1144,7 +1250,7 @@ def _review_workers(
             cwd=_reviewer_cwd(process, place.cwd),
             showrunner=place.showrunner,
             director=place.director,
-            assignment=WorkerAssignment(slot_role, str(run.path)),
+            assignment=WorkerAssignment(slot_role, str(run.path), "review", lens or "review"),
             account=_process_account(process.pid, process.kind, home_state=home_state),
         ))
     return entries
@@ -1168,7 +1274,7 @@ def _unit_workers(
         place = _run_place(run, claude_entries, production_places)
         for name, record in sorted(_mesh_records(run, problems).items()):
             status = _as_string(record.get("status"))
-            if status == "ended" or record.get("transferring_role") or record.get("role_redirect") or record.get("held_design_id"):
+            if not _listed_mesh_worker(record):
                 continue
             thread_id = _as_string(record.get("thread_id"))
             if thread_id:
@@ -1193,7 +1299,7 @@ def _unit_workers(
                 cwd=cwd,
                 showrunner=place.showrunner,
                 director=place.director,
-                assignment=WorkerAssignment(_codex_slot_role(record), run_path),
+                assignment=_worker_assignment(Path(run_path), _worker_slot(run.path, name, record, problems), record),
                 thread=CodexThread(thread_id) if thread_id else NoCodexThread(),
                 account=_worker_account(run, record, server_homes),
             ))
@@ -1201,29 +1307,78 @@ def _unit_workers(
     return entries, worker_threads
 
 
-def _durable_roles(machine: str, claude: Mapping[str, RosterEntry], problems: list[str]) -> tuple[list[RosterEntry], set[str]]:
-    from scripts.guilds import roles
+def _pool_workers(
+    machine: str, claude_entries: Mapping[str, RosterEntry],
+    production_places: Mapping[str, _ProductionPlace], problems: list[str], known_threads: set[str],
+) -> tuple[list[RosterEntry], set[str]]:
+    """Discover pool reviewers even when their mesh is outside the unit runs."""
     entries: list[RosterEntry] = []
     threads: set[str] = set()
-    for path in sorted(roles.state_root().glob('*/design.json')):
+    directors = {
+        (place.showrunner.production, place.director.unit):
+            UnderDirector(place.director.unit, director.name, _session_address(director))
+        for session_id, place in production_places.items()
+        if (director := claude_entries.get(session_id)) is not None
+    }
+    root = _pool_root()
+    for path in sorted(root.glob("*/pool.json")):
         try:
-            design = roles.read_design(path.parent.name)
-            reach = roles.resolve_holder(design.holder)
-            session = claude.get(reach.session_id) if isinstance(reach, roles.HolderReach) else None
-            director: DirectorRelationship = NoDirector()
-            showrunner: ShowrunnerRelationship = ProductionWithoutRunningShowrunner(design.holder.production_slug)
-            if isinstance(design.holder, roles.UnitHolder):
+            reviewers = _pool_reviewers(path)
+            meshes = sorted((path.parent / "mesh").glob("*/mesh_roster.json"))
+        except (OSError, UnicodeError, ValueError) as error:
+            _problem(problems, f"review pool {path}", error)
+            continue
+        for mesh in meshes:
+            run = _LiveRun(mesh.parent, _NoRunningDirector())
+            homes = _run_server_homes(run)
+            for name, record in sorted(_mesh_records(run, problems).items()):
+                reviewer = reviewers.get(name)
+                status = _as_string(record.get("status"))
+                thread = _as_string(record.get("thread_id"))
+                if (reviewer is None or status == "ended" or record.get("transferring_role")
+                        or record.get("role_redirect") or not thread or thread in known_threads or thread in threads):
+                    continue
+                threads.add(thread)
+                assignment = _worker_assignment(run.path, name, {**record, "role": "review"})
+                director = reviewer.director
+                if isinstance(director, UnderDirector):
+                    director = directors.get((path.parent.name, director.unit), director)
+                entries.append(RosterEntry(
+                    machine=machine, kind="codex", role="worker", name=name,
+                    status=_worker_status(status),
+                    reach=(Messageable(f"worker:review-pool/{path.parent.name}/{run.path.name}/{name}")
+                           if status in MESSAGEABLE_WORKER_STATUSES else
+                           CannotReceiveMessages(_between_turns_reason(director))),
+                    cwd=_as_string(record.get("cwd")),
+                    showrunner=ProductionWithoutRunningShowrunner(path.parent.name),
+                    director=director,
+                    assignment=WorkerAssignment(assignment.slot_role, assignment.session_dir, "review",
+                                                name, reviewer.reviewer_type),
+                    thread=CodexThread(thread), account=_worker_account(run, record, homes)))
+    return entries, threads
+
+
+def _durable_roles(machine: str, claude: Mapping[str, RosterEntry], problems: list[str]) -> tuple[list[RosterEntry], set[str]]:
+    entries: list[RosterEntry] = []
+    threads: set[str] = set()
+    for path in sorted(design_roles.state_root().glob('*/design.json')):
+        try:
+            design = design_roles.read_design(path.parent.name)
+            reach = design_roles.resolve_holder(design.holder)
+            session = claude.get(reach.session_id) if isinstance(reach, design_roles.HolderReach) else None
+            showrunner, director = _held_location(design.holder)
+            if isinstance(design.holder, design_roles.UnitHolder):
                 director = UnderDirector(design.holder.unit_name, session.name if session else design.holder.unit_name,
-                                         f'session:{reach.session_id}' if isinstance(reach, roles.HolderReach) else '')
+                                         f'session:{reach.session_id}' if isinstance(reach, design_roles.HolderReach) else '')
                 if session:
                     showrunner = session.showrunner
             elif session:
                 showrunner = UnderShowrunner(design.holder.production_slug, session.name,
-                                              f'session:{reach.session_id}' if isinstance(reach, roles.HolderReach) else '')
-            mesh = roles.mesh_directory(design.placement.design_id)
+                                              f'session:{reach.session_id}' if isinstance(reach, design_roles.HolderReach) else '')
+            mesh = design_roles.mesh_directory(design.placement.design_id)
             roster = _read_object(mesh / 'mesh_roster.json') if (mesh / 'mesh_roster.json').exists() else {}
             for instance in design.roles:
-                if isinstance(instance.lifecycle, (roles.RoleNotOpened, roles.RoleEnded)):
+                if isinstance(instance.lifecycle, (design_roles.RoleNotOpened, design_roles.RoleEnded)):
                     continue
                 thread = instance.lifecycle.thread_id
                 if thread in threads:
@@ -1233,15 +1388,16 @@ def _durable_roles(machine: str, claude: Mapping[str, RosterEntry], problems: li
                     raise ValueError('durable roster entry is not an object')
                 entry = cast(dict[str, object], raw_entry)
                 if (entry.get('transferring_role') or entry.get('role_redirect')
-                        or roles.transfer_route(thread, design.placement.design_id)):
+                        or design_roles.transfer_route(thread, design.placement.design_id)):
                     continue
                 threads.add(thread)
                 status = _as_string(entry.get('status')) or type(instance.lifecycle).__name__
-                entries.append(RosterEntry(machine=machine, kind='codex', role='astra-' + instance.role,
+                entries.append(RosterEntry(machine=machine, kind='codex',
+                    role='astra-designer' if instance.role == 'designer' else 'astra-reviewer',
                     name=instance.name, status=status, reach=CannotReceiveMessages(
                         'held role; its holder adds pending messages to an authorized assignment'),
                     cwd=design.repository, showrunner=showrunner, director=director,
-                    assignment=WorkerAssignment('astra-' + instance.role, str(mesh)), thread=CodexThread(thread),
+                    assignment=HeldDesignRole(instance.role, str(mesh)), thread=CodexThread(thread),
                     account=AccountUnread('serving home not read')))
         except (OSError, ValueError, TypeError) as error:
             _problem(problems, 'durable role ' + str(path), error)
@@ -1301,26 +1457,35 @@ def _local_roster(environment: Mapping[str, str]) -> Roster:
     roots = unit_runs.run_roots(environment.get("ROSTER_RUN_ROOT"))
     runs = _live_runs(roots, {record["sessionId"] for record in records}, problems)
     workers = _ledger_workers(runs, records, problems)
-    production_places = _production_places(
-        records, details, registered, runner_ids, set(workers), problems
-    )
+    production_places: dict[str, _ProductionPlace] = {}
+    if registered:
+        try:
+            record = staff.snapshot()
+            production_places = _production_places(
+                records, details, registered, runner_ids, set(workers), problems, record=record
+            )
+        except staff.StaffUnreadable as error:
+            _problem(problems, "staff membership", error)
     claude = _claude_entries(
-        machine, records, details, runner_ids, production_places, runs, workers, home_state=home_state
+        machine, records, details, runner_ids, production_places, runs, workers,
+        home_state=home_state, problems=problems,
     )
     unit_workers, worker_threads = _unit_workers(
         machine, runs, claude, production_places, problems, home_state=home_state
     )
+    pool_workers, pool_threads = _pool_workers(machine, claude, production_places, problems, worker_threads)
+    unit_workers.extend(pool_workers)
+    worker_threads.update(pool_threads)
     durable_roles, durable_threads = _durable_roles(machine, claude, problems)
     unit_workers.extend(durable_roles)
     worker_threads.update(durable_threads)
-    daemon_socket = codex_daemon.daemon_socket(environment)
-    daemon = codex_daemon.loaded_sessions(daemon_socket)
-    daemon_home = daemon_socket.parent.parent
     codex_sessions: list[RosterEntry] = []
-    if isinstance(daemon, codex_daemon.DaemonUnreadable):
-        _problem(problems, "Codex daemon", daemon.reason)
-    else:
-        codex_sessions = [
+    for result in codex_daemon.read_daemons(environment):
+        owner, daemon = result.owner, result.sessions
+        if isinstance(daemon, codex_daemon.DaemonUnreadable):
+            _problem(problems, f"Codex daemon {agent_accounts.codex_home_display(owner.home)}", daemon.reason)
+            continue
+        codex_sessions.extend(
             RosterEntry(
                 machine=machine,
                 kind="codex",
@@ -1333,11 +1498,12 @@ def _local_roster(environment: Mapping[str, str]) -> Roster:
                 director=NoDirector(),
                 assignment=NotAWorker(),
                 thread=CodexThread(session.thread_id),
-                account=_codex_home_account(daemon_home),
+                account=_codex_home_account(owner.home),
+                daemon=owner,
             )
             for session in daemon
             if session.thread_id not in worker_threads
-        ]
+        )
     interactive = _herdr_codex_panes(machine)
     problems.extend(interactive.problems)
     entries = [*claude.values(), *unit_workers, *codex_sessions, *interactive.entries]
@@ -1374,7 +1540,6 @@ def peer_snapshot(environment: Mapping[str, str]) -> Roster | PeerNotReached:
     return Roster(result.entries, [f"{host}: {problem}" for problem in result.problems])
 
 
-
 def peer_roster(environment: Mapping[str, str]) -> Roster:
     result = peer_snapshot(environment)
     if isinstance(result, PeerNotReached):
@@ -1403,21 +1568,24 @@ def _home_shortened(path: str) -> str:
 
 
 def _entry_line(entry: RosterEntry, *, you: bool, context: bool) -> str:
-    name = entry.name
+    shown = shown_name(entry)
+    rendered = shown.render()
+    name = f"{rendered} [{shown.address}]" if rendered != shown.address else rendered
     if you:
         name += " (you)"
     if context:
         name += " (context)"
     details = [entry.kind, entry.status]
-    if entry.role == "worker":
-        details.append(_slot_role_for(entry))
+    if isinstance(shown.job, JobUnassigned):
+        details.append(shown.job.reason)
     unit = _unit(entry)
     if unit:
         details.append(unit)
     cwd = _home_shortened(entry.cwd)
     if cwd:
         details.append(cwd)
-    return f"{entry.role} {name} — {', '.join(details)}"
+    prefix = "" if entry.role == "worker" and isinstance(shown.job, ShownJob) else f"{entry.role} "
+    return f"{prefix}{name} — {', '.join(details)}"
 
 
 def _chosen_entries(

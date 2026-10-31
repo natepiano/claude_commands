@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 from scripts.whoami.note_file import note_name
 
 import io
@@ -15,7 +20,6 @@ import os
 import selectors
 import shlex
 import subprocess
-import sys
 import tempfile
 import time
 import unittest
@@ -23,21 +27,21 @@ import urllib.request
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import FrozenInstanceError, replace
 from datetime import datetime, timedelta, timezone, tzinfo
-from pathlib import Path
 from collections.abc import Callable, Generator, Iterator
-from typing import Literal, Self, TextIO, cast, final, override
+from typing import Literal, Self, TextIO, TypedDict, cast, final, override
 from unittest.mock import AsyncMock, MagicMock, call, patch
 from zoneinfo import ZoneInfo
 
+from scripts.accounts.home_test_support import scratch_account_home
 from scripts.accounts import accounts, next_moves, refusal_watch, refusals, role_map
 from scripts.accounts.nix_env_fake import fake_nix_loader, imports_with_nix_loader, installed_program
 from scripts.production import showrunners
 from scripts.agents import codex_mesh
 from scripts.message import roster
 from scripts.accounts import moves, worker_names
-import account
-import agent_accounts
-import usage_store
+from scripts.whoami import account
+from scripts.whoami import agent_accounts
+from scripts.whoami import usage_store
 import quota_alert
 from scripts.whoami import run_out
 
@@ -64,7 +68,6 @@ def named_environment(config_dir: Path) -> dict[str, str]:
 def setUpModule() -> None:
     _ = cast(object, unittest.enterModuleContext(patch.object(accounts, "import_module", side_effect=imports_with_nix_loader(fake_nix_loader()))))
     root = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory())).resolve()
-    _ = unittest.enterModuleContext(patch.object(showrunners, "NOTIFIER_STATE_DIR", root))
     _ = unittest.enterModuleContext(patch.object(accounts, "WORKERS_RUN_ROOTS", (root / "worker-runs",)))
     _ = unittest.enterModuleContext(patch.object(role_map, "is_role_map_host", return_value=True))
 
@@ -136,6 +139,25 @@ class RoleWriteTime(datetime):
         return cls(2026, 10, 8, tzinfo=timezone.utc).astimezone(tz)
 
 
+def provider_fixture_login(_login: str) -> bool:
+    """Keep provider-account fixtures distinct from test-contamination cases."""
+    return False
+
+
+class McpProjectFixture(TypedDict):
+    disabledMcpServers: list[str]
+
+
+class McpFixtureIdentity(TypedDict):
+    emailAddress: str
+
+
+class McpConfigurationFixture(TypedDict):
+    oauthAccount: McpFixtureIdentity
+    mcpServers: dict[str, object]
+    projects: dict[str, McpProjectFixture]
+
+
 @final
 class AccountsTests(unittest.TestCase):
     def __init__(self, methodName: str = "runTest") -> None:
@@ -162,14 +184,13 @@ class AccountsTests(unittest.TestCase):
         _ = notes.mkdir()
         environment = {
             "AGENT_NOTES_DIR": str(notes),
-            "HOME": str(self.home),
             "PATH": os.defpath,
             # The wall times these tests pass are Pacific; the user's zone setting must not change them.
             "USER_ZONE": "America/Los_Angeles",
         }
         environment_context: object = cast(
             object,
-            self.enterContext(patch.dict(os.environ, environment, clear=True)),
+            self.enterContext(scratch_account_home(self.home, environment)),
         )
         del environment_context
         _ = self.enterContext(patch.object(quota_alert, "STATE", self.root / "quota_alert.json"))
@@ -180,7 +201,6 @@ class AccountsTests(unittest.TestCase):
             agent_accounts, "codex_live", return_value=agent_accounts.Report("Codex", problem="Not logged in"),
         )))
         _ = self.enterContext(patch.object(accounts, "WORKERS_RUN_ROOTS", (self.root / "worker-runs",)))
-        _ = self.enterContext(patch.object(showrunners, "NOTIFIER_STATE_DIR", self.root / "notifier"))
         _ = self.enterContext(patch.object(agent_accounts, "prepare_codex_home",
             return_value=agent_accounts.CodexHomePrepared()))
         _ = self.enterContext(patch.object(codex_mesh, "retire_workers_servers", return_value=[]))
@@ -193,6 +213,8 @@ class AccountsTests(unittest.TestCase):
             "Claude", problem="Account unavailable (claude auth status failed)",
         ))
 
+    # Reserved fixtures model provider accounts in this status test.
+    @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_names_live_account_and_codex_refusal_destination_separately(self) -> None:
         from scripts.message import sessions
         self.login_directory("claude2", "main@example.invalid", default=True)
@@ -217,6 +239,8 @@ class AccountsTests(unittest.TestCase):
         self.assertIn("on refusal: codex3", output)
         self.assertTrue(output.splitlines()[0].startswith("| Folder"))
 
+    # Reserved fixtures model provider accounts in this status test.
+    @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_shows_each_owed_continuation_and_its_hold_reason(self) -> None:
         _ = self.workers_fixture()
         run = self.root / "worker-runs/run-one"
@@ -235,6 +259,8 @@ class AccountsTests(unittest.TestCase):
         self.assertIn("waiting for capacity", output)
         self.assertNotIn("run-one/done", output)
 
+    # Reserved fixtures model provider accounts in this status test.
+    @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_shows_owed_continuations_under_either_run_folder_name(self) -> None:
         _ = self.workers_fixture()
         roots = (self.root / "worker-runs", self.root / "former-worker-runs")
@@ -249,6 +275,8 @@ class AccountsTests(unittest.TestCase):
         self.assertIn("run-new/worker: continuation owed", output)
         self.assertIn("run-old/worker: continuation owed", output)
 
+    # Reserved fixtures model provider accounts in this status test.
+    @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_omits_owed_continuations_from_runs_without_a_live_mesh_server(self) -> None:
         _ = self.workers_fixture()
         for name, server in (("live", {"pid": 901}), ("dead", {"pid": 902}),
@@ -270,6 +298,8 @@ class AccountsTests(unittest.TestCase):
         for name in ("dead", "missing", "malformed", "invalid-pid"):
             self.assertNotIn(name + "/worker", output)
 
+    # Reserved fixtures model provider accounts in this status test.
+    @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_renders_requested_pending_confirmed_per_worker_and_failed_reason(self) -> None:
         common = moves.MoveCommon(at="2026-10-14T12:00:00+00:00", tool="codex", subject="workers", move_id="move-one")
         request: moves.RequestedMove = {**common, "kind": "requested", "from": "codex1", "to": "codex3",
@@ -290,6 +320,8 @@ class AccountsTests(unittest.TestCase):
         self.assertIn("pending", output)
         self.assertIn("2026-10-14 05:00", output)
 
+    # Reserved fixtures model provider accounts in this status test.
+    @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_limits_move_readout_to_last_ten_entries(self) -> None:
         for index in range(12):
             moves.append_move(moves.FailedMove(at="2026-10-14T12:00:00+00:00", tool="claude",
@@ -300,6 +332,8 @@ class AccountsTests(unittest.TestCase):
         for index in range(2, 12):
             self.assertIn(f"session-{index}", output)
 
+    # Reserved fixtures model provider accounts in this status test.
+    @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_renders_wait_end_no_room_and_room_again_in_user_zone(self) -> None:
         common = moves.MoveCommon(at="2026-10-14T12:00:00+00:00", tool="claude", subject="director: Director", move_id="wait-one")
         moves.append_move(moves.WaitedMove(**common, kind="waited", window="five_hour", reset="2026-10-14T12:19:00+00:00"))
@@ -313,6 +347,8 @@ class AccountsTests(unittest.TestCase):
         self.assertIn("no room until 2026-10-15T05:00", output)
         self.assertIn("room again: claude3", output)
 
+    # Reserved fixtures model provider accounts in this status test.
+    @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_shows_sessions_workers_and_moves_only_with_detail(self) -> None:
         _ = self.workers_fixture()
         from scripts.message import sessions
@@ -400,6 +436,8 @@ class AccountsTests(unittest.TestCase):
         path = Path(os.environ["AGENT_NOTES_DIR"]) / note_name(label)
         _ = path.write_text(f"---\nlogin: {login}\n---\n", encoding="utf-8")
 
+    # Reserved fixtures model provider accounts in this status test.
+    @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_notes_each_missing_group_and_uses_roles_for_configured_groups(self) -> None:
         self.login_directory("claude1", "unit@example.invalid")
         self.login_directory("claude3", "runner@example.invalid")
@@ -417,7 +455,7 @@ class AccountsTests(unittest.TestCase):
                 rows = [tuple(cell.strip() for cell in line.strip("|").split("|"))
                         for line in output.splitlines() if line.startswith("|")][2:]
                 for group in accounts.CLAUDE_GROUPS:
-                    note = f"accounts: {group} has no account; run accounts.py move {group} <claudeN>"
+                    note = f"{group}: not configured; the role map selects no account; run accounts.py move {group} <claudeN>"
                     missing = group not in configured
                     self.assertEqual(output.splitlines().count(note), int(missing))
                     self.assertEqual(problems.count(note), int(missing))
@@ -963,6 +1001,8 @@ class AccountsTests(unittest.TestCase):
         launch.assert_called_once()
         self.assertEqual(len(accounts.check("claude3")), 2)
 
+    # Reserved fixtures model provider accounts in this status test.
+    @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_exec_refuses_wrong_login_and_status_keeps_the_actual_identity(self) -> None:
         self.login_directory("claude2", "main@example.invalid", default=True)
         self.login_directory("claude3", "expected@example.invalid")
@@ -975,7 +1015,7 @@ class AccountsTests(unittest.TestCase):
         launch.assert_not_called()
         result = self.run_cli("status")
         self.assertRegex(result[1], r"\| ~/\.claude3 +\| claude3 +\|")
-        self.assertIn(line, result[1])
+        self.assertIn("claude3: wrong sign-in; " + line.removeprefix("accounts: "), result[1].splitlines())
         self.assertEqual(accounts.account_identity(accounts.account_dir("claude3")), agent_accounts.UnnotedLogin(self.home / ".claude3", "other@example.invalid"))
 
     def test_exec_repairs_broken_shared_links_before_launching_a_logged_out_account(self) -> None:
@@ -1103,6 +1143,8 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual(len(accounts.check("claude3")), 2)
         launch.assert_not_called()
 
+    # Reserved fixtures model provider accounts in this status test.
+    @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_reports_unreadable_notes_without_erasing_other_account_identities(self) -> None:
         self.login_directory("claude2", "main@example.invalid", default=True)
         self.login_directory("claude3", "unit@example.invalid")
@@ -1112,7 +1154,7 @@ class AccountsTests(unittest.TestCase):
         result = self.run_cli("status")
         self.assertEqual((result[0], result[2]), (0, ""))
         self.assertIn("with login: unit@example.invalid", result[1])
-        self.assertIn("could not read", result[1])
+        self.assertIn("cannot read", result[1])
         self.assertRegex(result[1], r"\| ~/\.claude4 +\| claude4 +\|")
         selection = accounts.claude_account_selection()
         self.assertEqual([named.identity.label for named in selection.named_accounts], ["claude2", "claude4"])
@@ -1128,7 +1170,7 @@ class AccountsTests(unittest.TestCase):
                     environment["RELAUNCH_SUPERVISED"] = "1"
                 else:
                     _ = environment.pop("RELAUNCH_SUPERVISED", None)
-                with (patch.dict(os.environ, environment, clear=True),
+                with (scratch_account_home(self.home, environment),
                       patch.object(sys.stdin, "isatty", return_value=tty),
                       patch.object(os, "execvpe") as launch):
                     accounts.exec_account("claude3", ["--resume", "conversation-id"])
@@ -2217,6 +2259,47 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual(link.lstat().st_ino, original_inode)
         self.assertEqual(seed.read_text(encoding="utf-8"), '{"keep": true}')
 
+    def test_setup_rerun_finishes_an_interrupted_seed_without_copying_identity(self) -> None:
+        class Killed(BaseException):
+            pass
+
+        _ = (self.home / ".claude.json").write_text(json.dumps({
+            "hasCompletedOnboarding": True,
+            "oauthAccount": {"emailAddress": "fixture@example.invalid"},
+            "projects": {"/fixture": {"hasTrustDialogAccepted": True, "lastSessionId": "private"}},
+        }))
+        expected = {"hasCompletedOnboarding": True,
+                    "projects": {"/fixture": {"hasTrustDialogAccepted": True}}}
+        destination = self.home / ".claude2" / ".claude.json"
+        with patch("scripts.lib.atomic_file.os.fsync", side_effect=Killed):
+            with self.assertRaises(Killed):
+                _ = self.run_cli("setup", "claude2")
+        dead_pid = 2**22 + 1  # above every system's process id ceiling
+        abandoned = destination.with_name(f".{destination.name}.{dead_pid}.abandoned.tmp")
+        _ = abandoned.write_text('{"hasCompletedOnboarding":')
+        abandoned.chmod(0o600)
+        self.assertTrue(abandoned.exists())
+
+        code, _, error = self.run_cli("setup", "claude2")
+
+        self.assertEqual((code, error), (0, ""))
+        self.assertFalse(abandoned.exists())
+        self.assertEqual(json.loads(destination.read_text()), expected)
+        self.assertEqual(destination.stat().st_mode & 0o777, 0o600)
+        self.assertEqual([path for path in destination.parent.iterdir()
+                          if path.is_file() and not path.is_symlink()], [destination])
+        _ = destination.write_bytes(b"")
+        self.assertEqual(self.run_cli("setup", "claude2")[0], 0)
+        self.assertEqual(json.loads(destination.read_text()), expected)
+        original = '{"oauthAccount": {"emailAddress": "keep@example.invalid"}}'
+        _ = destination.write_text(original)
+        self.assertEqual(self.run_cli("setup", "claude2")[0], 0)
+        self.assertEqual(destination.read_text(), original)
+        _ = abandoned.write_text("{}")
+        self.assertEqual(self.run_cli("setup", "claude2")[0], 0)
+        self.assertFalse(abandoned.exists())
+        self.assertEqual(destination.read_text(), original)
+
     def test_setup_refuses_each_linked_identity_entry_without_replacing_it(self) -> None:
         self.write_main_config()
         account_dir = self.home / ".claude2"
@@ -2418,10 +2501,14 @@ class AccountsTests(unittest.TestCase):
         )
         login_read.assert_not_called()
 
+    # Reserved fixtures model provider accounts in this status test.
+    @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_describes_accounts_without_creating_any(self) -> None:
         with patch.object(sys, "platform", "linux"):
             self.assert_status_describes_accounts_without_creating_any("run accounts.py cutover-home")
 
+    # Reserved fixtures model provider accounts in this status test.
+    @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_mac_status_describes_accounts_without_creating_any(self) -> None:
         with patch.object(sys, "platform", "darwin"):
             self.assert_status_describes_accounts_without_creating_any(accounts.MAC_HOME_LOGIN_STEP)
@@ -2441,13 +2528,16 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(stderr, "")
         self.assertNotRegex(stdout, r"\| ~/\.claude +\|")
-        self.assertIn(f"~/.claude holds a login; {home_step}", stdout)
+        self.assertIn(f"~/.claude: legacy login is stored; the home still holds a login; {home_step}", stdout)
         self.assertNotIn("unit directors", stdout)
-        self.assertNotIn("unclassified:", stdout)
-        self.assertNotIn("mcpServers:", stdout)
+        self.assertNotIn("unclassified entries", stdout)
+        self.assertNotIn("mcpServers differ", stdout)
+        self.assertNotIn(" where ~/.claude does not: ", stdout)
         self.assertEqual(set(self.home.iterdir()), before)
         self.assertFalse(any(self.home.glob(".claude[0-9]*")))
 
+    # Reserved fixtures model provider accounts in this status test.
+    @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_reports_an_account_directory_link_without_inspecting_it(
         self,
     ) -> None:
@@ -2464,21 +2554,683 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(stderr, "")
         self.assertIn(
-            f"accounts: {account_dir} is a link; "
-            + "an account dir must be a real directory",
+            f"claude2: cannot use {account_dir}; {account_dir} is a link; use a real private directory; run accounts.py setup claude2",
             stdout,
         )
         self.assertRegex(stdout, r"\| ~/\.claude2 +\| claude2 +\|")
-        self.assertNotIn("mcpServers:", stdout)
+        self.assertNotIn("mcpServers differ", stdout)
+        self.assertNotIn(" where ~/.claude does not: ", stdout)
         self.assertEqual(
             login_read.call_args_list,
             [call(self.main_dir)] * login_read.call_count,
         )
 
+    def assert_mcp_status_streams(self, *, tty: bool, helper_note: bool) -> None:
+        _ = agent_accounts.claude_config_file(self.main_dir).write_text(json.dumps({"mcpServers": {"brp": {}}}))
+        directory = self.home / ".claude2"
+        self.correct_links(directory)
+        self.write_note("claude2", "owner@notexample.com")
+        identity = directory / ".claude.json"
+        _ = identity.write_text(json.dumps({"oauthAccount": {"emailAddress": "owner@notexample.com"},
+                                          "mcpServers": {"account-only": {}}}))
+        names = cast(Callable[[Path, Path], accounts.ReadMcpConfiguration | accounts.UnreadableMcpConfiguration],
+                     getattr(accounts, "_mcp_server_names"))
+        note = "~/.claude2: mcpServers: - brp"
+
+        def read_names(path: Path, project: Path) -> accounts.ReadMcpConfiguration | accounts.UnreadableMcpConfiguration:
+            result = names(path, project)
+            # A nested reader can emit an advisory, as older MCP readers did.
+            if helper_note and path == identity:
+                print(note, file=sys.stderr)
+            return result
+
+        expected = (
+            "claude2 turns brp off in 1 project where ~/.claude does not: "
+            + "~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py mcp-projects claude2 brp off",
+            "claude2 turns account-only on in 1 project where ~/.claude does not: "
+            + "~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py mcp-projects claude2 account-only on",
+        )
+        for arguments in ((), ("status", "--json"), ("status", "--stored"), ("status", "--stored", "--json")):
+            with self.subTest(arguments=arguments, tty=tty, helper_note=helper_note):
+                stdout, stderr = io.StringIO(), io.StringIO()
+                with (redirect_stdout(stdout), redirect_stderr(stderr),
+                      patch.object(stderr, "isatty", return_value=tty),
+                      patch.object(accounts, "_mcp_server_names", side_effect=read_names),
+                      patch.object(subprocess, "run", side_effect=AssertionError("no real process")),
+                      patch.object(subprocess, "Popen", side_effect=AssertionError("no real process"))):
+                    result = accounts.main(list(arguments))
+                self.assertEqual(result, 0)
+                self.assertEqual(stderr.getvalue(), note + "\n" if tty and helper_note else "")
+                if "--json" in arguments:
+                    document = cast(dict[str, object], json.loads(stdout.getvalue()))
+                    for line in expected:
+                        self.assertIn(line, cast(list[str], document["problems"]))
+                else:
+                    for line in expected:
+                        self.assertIn(line, stdout.getvalue().splitlines())
+
+    def test_piped_status_keeps_mcp_problem_in_table_and_json(self) -> None:
+        self.assert_mcp_status_streams(tty=False, helper_note=False)
+
+    def test_piped_status_suppresses_nested_account_notes(self) -> None:
+        self.assert_mcp_status_streams(tty=False, helper_note=True)
+
+    def test_terminal_status_keeps_nested_account_notes(self) -> None:
+        self.assert_mcp_status_streams(tty=True, helper_note=True)
+
+    def test_cached_role_map_problem_keeps_time_and_actual_fetch_failure(self) -> None:
+        cache = role_map.role_map_cache_file()
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        _ = cache.write_text(json.dumps({"at": "2026-10-16T15:24:00+00:00", "map": {
+            "groups": {}, "workers": "codex1"}}))
+        for failure in (OSError("fixture transport failed"), role_map.RemoteCommandRefused("fixture refused"),
+                        ValueError("fixture bad answer")):
+            for flags in ((), ("--json",)):
+                with (self.subTest(failure=type(failure).__name__, flags=flags),
+                      patch.object(role_map, "is_role_map_host", return_value=False),
+                      patch.object(role_map, "ssh_role_map", side_effect=failure) as fetch):
+                    code, output, error = self.run_cli("status", *flags)
+                self.assertEqual((code, error), (0, ""))
+                fetch.assert_called_once()
+                lines = (cast(list[str], json.loads(output)["problems"]) if flags else output.splitlines())
+                problems = [line for line in lines if line.startswith("role map: using saved assignments;")]
+                self.assertEqual(len(problems), 1)
+                self.assertIn("2026-10-16", problems[0])
+                self.assertIn(str(failure), problems[0])
+                self.assertIn("restore access to natedev", problems[0])
+
+    def test_stored_role_map_problem_says_no_fetch_was_attempted(self) -> None:
+        cache = role_map.role_map_cache_file()
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        _ = cache.write_text(json.dumps({"at": "2026-10-16T15:24:00+00:00", "map": {
+            "groups": {}, "workers": "codex1"}}))
+        for flags in ((), ("--json",)):
+            with (self.subTest(flags=flags), patch.object(role_map, "is_role_map_host", return_value=False),
+                  patch.object(role_map, "ssh_role_map", side_effect=AssertionError("stored read fetched"))):
+                code, output, error = self.run_cli("status", "--stored", *flags)
+            self.assertEqual((code, error), (0, ""))
+            lines = (cast(list[str], json.loads(output)["problems"]) if flags else output.splitlines())
+            problems = [line for line in lines if line.startswith("role map: using saved assignments;")]
+            self.assertEqual(len(problems), 1)
+            self.assertIn("no fetch was attempted", problems[0])
+            self.assertIn("2026-10-16", problems[0])
+            self.assertNotIn("unreachable", problems[0])
+
+    def test_piped_status_replays_held_warning_before_the_final_error(self) -> None:
+        def failed_read(*_args: object, **_kwargs: object) -> accounts.StatusReading:
+            print("fixture warning before failure", file=sys.stderr)
+            raise accounts.AccountsError("accounts: fixture read failed")
+        with patch.object(accounts, "_read_status", side_effect=failed_read):
+            code, output, error = self.run_cli("status", "--json")
+        self.assertEqual((code, output), (1, ""))
+        self.assertIn("fixture warning before failure", error)
+        self.assertIn("fixture read failed", error)
+        self.assertLess(error.index("fixture warning"), error.index("fixture read failed"))
+
+    def test_piped_status_keeps_cache_warning_when_a_later_read_fails(self) -> None:
+        cache = role_map.role_map_cache_file()
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        _ = cache.write_text(json.dumps({"at": "2026-10-16T15:24:00+00:00", "map": {
+            "groups": {}, "workers": "codex1"}}))
+        with (patch.object(role_map, "is_role_map_host", return_value=False),
+              patch.object(role_map, "ssh_role_map", side_effect=OSError("fixture offline")),
+              patch.object(accounts, "group_accounts", side_effect=accounts.AccountsError("accounts: fixture later failure"))):
+            code, output, error = self.run_cli("status", "--json")
+        self.assertEqual((code, output), (1, ""))
+        self.assertIn("2026-10-16", error)
+        self.assertIn("fixture offline", error)
+        self.assertIn("fixture later failure", error)
+
+    def test_piped_status_keeps_read_diagnostics_when_rendering_fails(self) -> None:
+        cache = role_map.role_map_cache_file()
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        _ = cache.write_text(json.dumps({"at": "2026-10-16T15:24:00+00:00", "map": {
+            "groups": {}, "workers": "codex1"}}))
+        with (patch.object(role_map, "is_role_map_host", return_value=False),
+              patch.object(role_map, "ssh_role_map", side_effect=OSError("fixture offline")),
+              patch.object(accounts, "render_status_json", side_effect=accounts.AccountsError("accounts: fixture render failed"))):
+            code, output, error = self.run_cli("status", "--json")
+        self.assertEqual((code, output), (1, ""))
+        self.assertIn("2026-10-16", error)
+        self.assertIn("fixture offline", error)
+        self.assertIn("fixture render failed", error)
+
+    def test_piped_status_replays_render_warning_when_rendering_fails(self) -> None:
+        def render(_reading: accounts.StatusReading) -> str:
+            print("fixture render warning", file=sys.stderr)
+            raise accounts.AccountsError("accounts: fixture render failed")
+        with patch.object(accounts, "render_status_json", side_effect=render):
+            code, output, error = self.run_cli("status", "--stored", "--json")
+        self.assertEqual((code, output), (1, ""))
+        self.assertIn("fixture render warning", error)
+        self.assertIn("fixture render failed", error)
+
+    def test_piped_status_keeps_an_unrepresented_helper_warning(self) -> None:
+        original = accounts.account_statuses
+        def inspect() -> list[accounts.AccountStatus]:
+            print("usage store: could not claim the read; read without a hold", file=sys.stderr)
+            return original()
+        with patch.object(accounts, "account_statuses", side_effect=inspect):
+            code, output, error = self.run_cli("status", "--stored", "--json")
+        self.assertEqual((code, error), (0, ""))
+        lines = cast(list[str], json.loads(output)["problems"])
+        self.assertIn("accounts: read warning; usage store: could not claim the read; read without a hold", lines)
+
+    def test_piped_status_preserves_unknown_reader_and_renderer_warnings(self) -> None:
+        original = accounts.render_status_json
+        def render(reading: accounts.StatusReading) -> str:
+            print("fixture renderer warning", file=sys.stderr)
+            return original(reading)
+        with patch.object(accounts, "render_status_json", side_effect=render):
+            code, output, error = self.run_cli("status", "--stored", "--json")
+        self.assertEqual(code, 0)
+        self.assertIn("fixture renderer warning", error)
+        self.assertIsInstance(cast(object, json.loads(output)), dict)
+
+    def test_usage_store_warnings_stay_beside_good_readings(self) -> None:
+        def response(_request: object, **_options: object) -> io.BytesIO:
+            return io.BytesIO(b'{"seven_day":{"utilization":25,"resets_at":"2099-10-25T12:00:00Z"}}')
+
+        self.login_directory("claude2", "owner@notexample.com")
+        for failure in ("claim", "finish", "final", "recovered"):
+            for flags in ((), ("--json",)):
+                with self.subTest(failure=failure, flags=flags):
+                    usage_store.store_file().unlink(missing_ok=True)
+                    error = OSError("fixture store denied")
+                    with (patch.object(agent_accounts, "claude_live", new=self.read_claude_live),
+                          patch.object(agent_accounts, "command_json", return_value={"loggedIn": True,
+                              "email": "owner@notexample.com", "authMethod": "claude.ai"}),
+                          patch.object(agent_accounts, "claude_credentials", return_value={
+                              "claudeAiOauth": {"accessToken": "fixture"}}),
+                          patch.object(urllib.request, "urlopen", side_effect=response),
+                          patch.object(usage_store, "claim_read", side_effect=error) if failure == "claim" else
+                              patch.object(usage_store, "finish_read", side_effect=error) if failure in ("finish", "recovered") else
+                              patch.object(usage_store, "save", side_effect=error),
+                          patch.object(usage_store, "save", side_effect=error) if failure == "finish" else
+                              patch.object(sys, "dont_write_bytecode", True)):
+                        code, output, stderr = self.run_cli("status", *flags)
+                    self.assertEqual((code, stderr), (0, ""))
+                    if flags:
+                        document = cast(accounts.StatusDocument, json.loads(output))
+                        lines = document["problems"]
+                        self.assertTrue(any(row["weekly_left_percent"] == 75 for row in document["accounts"]))
+                    else:
+                        lines = output.splitlines()
+                        self.assertIn("75%", output)
+                    warnings = [line for line in lines if "usage store" in line]
+                    if failure == "recovered":
+                        self.assertEqual(warnings, [])
+                    else:
+                        self.assertTrue(warnings)
+                        self.assertTrue(any("fixture store denied" in line for line in warnings))
+                        self.assertTrue(any("without a hold" in line if failure == "claim" else "not saved" in line
+                                            for line in warnings))
+
+    def test_observed_warnings_survive_later_reads_and_render_failures(self) -> None:
+        self.login_directory("claude2", "fixture@notexample.com")
+        for diagnostic in ("cached map", "stored map", "claim", "save", "final save", "recovered save"):
+            for later in ("read", "render"):
+                for flags in ((), ("--json",)):
+                    with self.subTest(diagnostic=diagnostic, later=later, flags=flags):
+                        usage_store.store_file().unlink(missing_ok=True)
+                        cache = role_map.role_map_cache_file()
+                        cache.parent.mkdir(parents=True, exist_ok=True)
+                        _ = cache.write_text(json.dumps({"at": "2026-10-16T15:24:00+00:00", "map": {
+                            "groups": {}, "workers": "codex1"}}))
+                        warning = (agent_accounts.UsageClaimFailed("fixture claim denied") if diagnostic == "claim"
+                                   else agent_accounts.UsageSaveFailed("fixture per-read denied"))
+                        report = agent_accounts.Report("Claude", email="fixture@notexample.com",
+                            quotas=[agent_accounts.Quota("Weekly", 25, datetime(2099, 1, 1, tzinfo=timezone.utc))],
+                            usage_read_outcome=agent_accounts.UsageReadOutcome.OK,
+                            store_warnings=(warning,) if diagnostic in ("claim", "save", "recovered save") else ())
+                        def live(_directory: Path) -> agent_accounts.Report:
+                            if report.store_warnings:
+                                print(agent_accounts.usage_store_warning_line(warning), file=sys.stderr)
+                            print("fixture unmatched warning", file=sys.stderr)
+                            return report
+                        renderer = "render_status_json" if flags else "render_status_table"
+                        failure = accounts.AccountsError("accounts: fixture later failure")
+                        with (patch.object(agent_accounts, "claude_live", side_effect=live),
+                              patch.object(role_map, "is_role_map_host", return_value=False) if diagnostic.endswith("map") else
+                                  patch.object(role_map, "is_role_map_host", return_value=True),
+                              patch.object(role_map, "ssh_role_map", side_effect=OSError("fixture offline")),
+                              patch.object(usage_store, "save", side_effect=PermissionError("fixture final denied"))
+                                  if diagnostic in ("save", "final save") else patch.object(sys, "dont_write_bytecode", True),
+                              patch.object(accounts, "_status_row", side_effect=failure) if later == "read" and str(diagnostic) == "stored map" else
+                              patch.object(accounts, "group_accounts", side_effect=failure) if later == "read" else
+                                  patch.object(accounts, renderer, side_effect=failure)):
+                            code, output, error = self.run_cli("status", *(('--stored',) if str(diagnostic) == "stored map" else ()), *flags)
+                        self.assertEqual((code, output), (1, ""))
+                        self.assertTrue(error.rstrip().endswith("fixture later failure; check the account folders and role map"))
+                        if diagnostic.endswith("map"):
+                            expected_map = ("role map: using saved assignments; map saved at 2026-10-16 08:24 PDT; "
+                                + ("stored mode; no fetch was attempted; run accounts.py status to fetch current assignments"
+                                   if diagnostic == "stored map" else
+                                   "natedev fetch failed: fixture offline; restore access to natedev; run accounts.py status again"))
+                            self.assertIn(expected_map, error.splitlines())
+                        else:
+                            self.assertIn("fixture unmatched warning", error)
+                            if diagnostic == "recovered save":
+                                self.assertNotIn("not saved", error)
+                                self.assertNotIn("fixture per-read denied", error)
+                            else:
+                                reason = ("fixture claim denied" if diagnostic == "claim" else
+                                          "fixture per-read denied; fixture final denied" if diagnostic == "save" else
+                                          "fixture final denied")
+                                wrong = "usage store read continued without a hold" if diagnostic == "claim" else "usage store reading not saved"
+                                self.assertRegex(error, "claude2: " + wrong + "; " + reason
+                                    + r"; read at \d{4}-\d{2}-\d{2} \d{2}:\d{2} [A-Z]+; check the usage store file and its permissions; run accounts.py status again")
+                                self.assertEqual(error.count("claude2: usage store"), 1)
+
+    def test_terminal_warning_does_not_hide_a_different_final_save_failure(self) -> None:
+        self.login_directory("claude2", "fixture@notexample.com")
+        warning = agent_accounts.UsageSaveFailed("fixture per-read denied")
+        report = agent_accounts.Report("Claude", email="fixture@notexample.com",
+            usage_read_outcome=agent_accounts.UsageReadOutcome.OK, store_warnings=(warning,))
+        def live(_directory: Path) -> agent_accounts.Report:
+            print(agent_accounts.usage_store_warning_line(warning), file=sys.stderr)
+            return report
+        for tty in (False, True):
+            for later in ("merge", "render"):
+                for flags in ((), ("--json",)):
+                    output, error = io.StringIO(), io.StringIO()
+                    with (self.subTest(tty=tty, later=later, flags=flags), redirect_stdout(output), redirect_stderr(error),
+                          patch.object(error, "isatty", return_value=tty),
+                          patch.object(agent_accounts, "claude_live", side_effect=live),
+                          patch.object(usage_store, "save", side_effect=PermissionError("fixture final denied")),
+                          patch.object(usage_store, "merge", side_effect=accounts.AccountsError("accounts: fixture render failed"))
+                              if later == "merge" else patch.object(accounts, "render_status_json" if flags else "render_status_table",
+                                  side_effect=accounts.AccountsError("accounts: fixture render failed"))):
+                        code = accounts.main(["status", *flags])
+                    self.assertEqual((code, output.getvalue()), (1, ""))
+                    self.assertEqual(error.getvalue().splitlines().count(agent_accounts.usage_store_warning_line(warning)), int(tty))
+                    self.assertIn("fixture final denied; read at ", error.getvalue())
+                    self.assertTrue(error.getvalue().splitlines()[-1].startswith("accounts: fixture render failed;"))
+
+    def test_observed_role_problems_survive_the_next_role_inspection_failure(self) -> None:
+        self.write_note("claude3", "fixture@notexample.com")
+        path = role_map.groups_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        for mapped in (False, True):
+            _ = path.write_text(json.dumps({"units": "claude3"} if mapped else {}))
+            expected = ("claude3: not set up; no folder holds this account; affected roles: units; run accounts.py setup claude3"
+                        if mapped else "units: not configured; the role map selects no account; run accounts.py move units <claudeN>")
+            original = accounts.group_label
+            def selected(groups: accounts.GroupAccounts, group: accounts.ClaudeGroup) -> str | accounts.GroupNotConfigured:
+                if group == "showrunners":
+                    raise accounts.AccountsError("accounts: fixture next role failed")
+                return original(groups, group)
+            for flags in ((), ("--json",)):
+                with self.subTest(mapped=mapped, flags=flags), patch.object(accounts, "group_label", side_effect=selected):
+                    code, output, error = self.run_cli("status", "--stored", *flags)
+                self.assertEqual((code, output), (1, ""))
+                self.assertIn(expected, [line.removeprefix("* ") for line in error.splitlines()])
+                self.assertTrue(error.splitlines()[-1].startswith("accounts: fixture next role failed;"))
+
+    def test_failed_status_keeps_test_signin_advice_filtered(self) -> None:
+        self.login_directory("claude2", "fixture@example.invalid")
+        note = Path(os.environ["AGENT_NOTES_DIR"]) / "claude2.md"
+        _ = note.write_text("---\nname: fixture\n---\n")
+        groups = role_map.groups_file()
+        groups.parent.mkdir(parents=True, exist_ok=True)
+        _ = groups.write_text(json.dumps({"units": "claude2", "showrunners": "claude2"}))
+        original = accounts.group_label
+
+        def selected(groups: accounts.GroupAccounts, group: accounts.ClaudeGroup) -> str | accounts.GroupNotConfigured:
+            if group == "showrunners":
+                raise accounts.AccountsError("accounts: fixture later failure")
+            return original(groups, group)
+
+        for flags in ((), ("--json",)):
+            with self.subTest(flags=flags), patch.object(role_map, "is_role_map_host", return_value=True):
+                code, output, error = self.run_cli("status", "--stored", *flags)
+                self.assertEqual((code, error), (0, ""))
+                expected = (cast(accounts.StatusDocument, json.loads(output))["problems"] if flags
+                            else output.split("\n\n", 1)[1].strip().splitlines())
+                self.assertEqual(len(expected), 2)
+                self.assertTrue(any("test wrote" in line for line in expected))
+                for later in ("read", "render"):
+                    with (self.subTest(later=later),
+                          patch.object(accounts, "group_label", side_effect=selected) if later == "read" else
+                              patch.object(accounts, "render_status_json" if flags else "render_status_table",
+                                  side_effect=accounts.AccountsError("accounts: fixture later failure"))):
+                        code, output, error = self.run_cli("status", "--stored", *flags)
+                    self.assertEqual((code, output), (1, ""))
+                    self.assertCountEqual([line.removeprefix("* ") for line in error.splitlines()[:-1]], expected)
+                    self.assertFalse(any(text in error for text in ("account note", "setup claude2", "cutover-home")))
+                    self.assertEqual(error.splitlines()[-1],
+                        "accounts: fixture later failure; check the account folders and role map")
+
+    def test_failure_replay_keeps_the_workers_warning_before_the_later_codex_home_problem(self) -> None:
+        self.write_note("codex1", "fixture@example.invalid")
+        expected = [
+            "workers: not configured; the role map selects no account; run accounts.py set-role workers <codexN>",
+            "* codex1: not set up; no folder holds this account; run accounts.py setup codex1",
+            "units: not configured; the role map selects no account; run accounts.py move units <claudeN>",
+            "showrunners: not configured; the role map selects no account; run accounts.py move showrunners <claudeN>",
+            "accounts: fixture render failed; check the account folders and role map",
+        ]
+        for flags in ((), ("--json",)):
+            with (self.subTest(flags=flags), patch.object(role_map, "is_role_map_host", return_value=True),
+                  patch.object(accounts, "render_status_json" if flags else "render_status_table",
+                      side_effect=accounts.AccountsError("accounts: fixture render failed"))):
+                code, output, error = self.run_cli("status", "--stored", *flags)
+            self.assertEqual((code, output), (1, ""))
+            self.assertEqual(error.splitlines(), expected)
+
+    def write_mcp_configuration(self, directory: Path, servers: tuple[str, ...],
+                                projects: dict[str, list[str]]) -> Path:
+        """Write the effective-server cases beside this test's scratch identity."""
+        configuration = McpConfigurationFixture(
+            oauthAccount=McpFixtureIdentity(emailAddress="fixture@notexample.com"),
+            mcpServers={name: {} for name in servers},
+            projects={path: McpProjectFixture(disabledMcpServers=disabled)
+                      for path, disabled in projects.items()},
+        )
+        path = agent_accounts.claude_config_file(directory)
+        _ = path.write_text(json.dumps(configuration), encoding="utf-8")
+        return path
+
+    def assert_mcp_readout(self, expected: list[str]) -> None:
+        """Both readout forms preserve every independent server and direction."""
+        for flags in ((), ("--json",)):
+            with self.subTest(flags=flags):
+                code, output, error = self.run_cli("status", "--stored", *flags)
+                self.assertEqual((code, error), (0, ""))
+                lines = (cast(accounts.StatusDocument, json.loads(output))["problems"]
+                         if flags else output.splitlines())
+                self.assertFalse(any("mcpServers differ" in line for line in lines))
+                self.assertCountEqual([line for line in lines if line.startswith("claude2 turns ")], expected)
+
+    def test_mcp_readout_counts_three_disabled_projects_and_lists_them_without_writing(self) -> None:
+        self.login_directory("claude2", "fixture@notexample.com")
+        projects = [str(self.root / name) for name in ("project one", "project-two", "project-three")]
+        baseline = self.write_mcp_configuration(self.main_dir, ("brp",), {path: [] for path in projects})
+        config = self.write_mcp_configuration(self.home / ".claude2", ("brp",),
+                                              {path: ["brp"] for path in projects})
+        before = (baseline.read_bytes(), config.read_bytes())
+        command = "~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py mcp-projects claude2 brp off"
+        self.assert_mcp_readout([f"claude2 turns brp off in 3 projects where ~/.claude does not: {command}"])
+        # Execute the printed command's account CLI arguments in the scratch HOME.
+        code, output, error = self.run_cli(*shlex.split(command)[2:])
+        self.assertEqual((code, error), (0, ""))
+        self.assertCountEqual(output.splitlines(), projects)
+        self.assertEqual((baseline.read_bytes(), config.read_bytes()), before)
+
+    def test_mcp_printed_command_accepts_a_server_name_starting_with_a_dash(self) -> None:
+        self.login_directory("claude2", "fixture@notexample.com")
+        project = str(self.root / "project with spaces")
+        _ = self.write_mcp_configuration(self.main_dir, ("-brp",), {project: []})
+        _ = self.write_mcp_configuration(self.home / ".claude2", ("-brp",), {project: ["-brp"]})
+        code, output, error = self.run_cli("status", "--stored")
+        self.assertEqual((code, error), (0, ""))
+        prefix = "claude2 turns -brp off in 1 project where ~/.claude does not: "
+        lines = [line for line in output.splitlines() if line.startswith(prefix)]
+        self.assertEqual(len(lines), 1)
+        command = lines[0].removeprefix(prefix)
+        self.assertEqual(self.run_cli(*shlex.split(command)[2:]), (0, project + "\n", ""))
+        self.assertEqual(shlex.split(command)[2:], ["mcp-projects", "--", "claude2", "-brp", "off"])
+
+    def test_matching_mcp_configuration_has_no_difference_line_or_project_output(self) -> None:
+        self.login_directory("claude2", "fixture@notexample.com")
+        projects = {str(self.root / "on"): [], str(self.root / "off"): ["brp"]}
+        for directory in (self.main_dir, self.home / ".claude2"):
+            _ = self.write_mcp_configuration(directory, ("brp",), projects)
+        self.assert_mcp_readout([])
+        for direction in ("off", "on"):
+            self.assertEqual(self.run_cli("mcp-projects", "claude2", "brp", direction), (0, "", ""))
+
+    def test_mcp_project_in_one_file_compares_against_the_other_global_servers(self) -> None:
+        self.login_directory("claude2", "fixture@notexample.com")
+        project = str(self.root / "one-file-only")
+        for account_only, direction in ((True, "off"), (False, "on")):
+            with self.subTest(account_only=account_only):
+                _ = self.write_mcp_configuration(self.main_dir, ("brp",),
+                                                  {} if account_only else {project: ["brp"]})
+                _ = self.write_mcp_configuration(self.home / ".claude2", ("brp",),
+                                                  {project: ["brp"]} if account_only else {})
+                self.assert_mcp_readout([
+                    f"claude2 turns brp {direction} in 1 project where ~/.claude does not: "
+                    + f"~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py mcp-projects claude2 brp {direction}"])
+                self.assertEqual(self.run_cli("mcp-projects", "claude2", "brp", direction),
+                                 (0, project + "\n", ""))
+
+    def test_mcp_project_command_includes_baseline_only_paths_and_the_home_scope(self) -> None:
+        self.login_directory("claude2", "fixture@notexample.com")
+        project = str(self.root / "baseline-only")
+        _ = self.write_mcp_configuration(self.main_dir, ("brp",), {project: []})
+        _ = self.write_mcp_configuration(self.home / ".claude2", (), {})
+        self.assert_mcp_readout([
+            "claude2 turns brp off in 2 projects where ~/.claude does not: "
+            + "~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py mcp-projects claude2 brp off"])
+        code, output, error = self.run_cli("mcp-projects", "claude2", "brp", "off")
+        self.assertEqual((code, error), (0, ""))
+        self.assertCountEqual(output.splitlines(), ["~", project])
+
+    def test_mcp_project_disabled_in_both_files_is_not_reported(self) -> None:
+        self.login_directory("claude2", "fixture@notexample.com")
+        project = str(self.root / "both-off")
+        for directory in (self.main_dir, self.home / ".claude2"):
+            _ = self.write_mcp_configuration(directory, ("brp",), {project: ["brp"]})
+        self.assert_mcp_readout([])
+        self.assertEqual(self.run_cli("mcp-projects", "claude2", "brp", "off"), (0, "", ""))
+
+    def test_mcp_readout_keeps_a_separate_line_for_each_server(self) -> None:
+        self.login_directory("claude2", "fixture@notexample.com")
+        project = str(self.root / "two-servers")
+        _ = self.write_mcp_configuration(self.main_dir, ("brp", "docs"), {project: []})
+        _ = self.write_mcp_configuration(self.home / ".claude2", ("brp", "docs"), {project: ["brp", "docs"]})
+        self.assert_mcp_readout([
+            f"claude2 turns {server} off in 1 project where ~/.claude does not: "
+            + f"~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py mcp-projects claude2 {server} off"
+            for server in ("brp", "docs")])
+        for server in ("brp", "docs"):
+            self.assertEqual(self.run_cli("mcp-projects", "claude2", server, "off"), (0, project + "\n", ""))
+
+    def test_mcp_readout_keeps_opposite_directions_for_the_same_server(self) -> None:
+        self.login_directory("claude2", "fixture@notexample.com")
+        turned_on, turned_off = (str(self.root / name) for name in ("turned-on", "turned-off"))
+        _ = self.write_mcp_configuration(self.main_dir, ("brp",), {turned_on: ["brp"], turned_off: []})
+        _ = self.write_mcp_configuration(self.home / ".claude2", ("brp",), {turned_on: [], turned_off: ["brp"]})
+        self.assert_mcp_readout([
+            f"claude2 turns brp {direction} in 1 project where ~/.claude does not: "
+            + f"~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py mcp-projects claude2 brp {direction}"
+            for direction in ("off", "on")])
+        for direction, project in (("off", turned_off), ("on", turned_on)):
+            self.assertEqual(self.run_cli("mcp-projects", "claude2", "brp", direction), (0, project + "\n", ""))
+
+    def test_default_mcp_configuration_and_unreadable_baseline_are_reported(self) -> None:
+        self.login_directory("claude2", "fixture@notexample.com")
+        config = self.home / ".claude2/.claude.json"
+        _ = config.write_text(json.dumps({"oauthAccount": {"emailAddress": "fixture@notexample.com"},
+                                        "mcpServers": {"account-only": {}}}))
+        baseline = agent_accounts.claude_config_file(self.main_dir)
+        self.assertFalse((self.main_dir / ".claude.json").exists())
+        for readable in (True, False):
+            _ = baseline.write_text(json.dumps({"mcpServers": {"brp": {}}}) if readable else "{")
+            for flags in ((), ("--json",)):
+                with self.subTest(readable=readable, flags=flags):
+                    code, output, error = self.run_cli("status", "--stored", *flags)
+                    self.assertEqual((code, error), (0, ""))
+                    lines = (cast(accounts.StatusDocument, json.loads(output))["problems"] if flags else output.splitlines())
+                    if readable:
+                        self.assertIn("claude2 turns brp off in 1 project where ~/.claude does not: ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py mcp-projects claude2 brp off", lines)
+                        self.assertIn("claude2 turns account-only on in 1 project where ~/.claude does not: ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py mcp-projects claude2 account-only on", lines)
+                    else:
+                        self.assertTrue(any("MCP configuration" in line and "~/.claude.json" in line
+                                            and "Expecting property name" in line for line in lines))
+                        self.assertNotIn("mcpServers differ", output)
+                        self.assertNotIn("claude2 turns ", output)
+                        status = next(item for item in accounts.account_statuses() if item.label == "claude2")
+                        self.assertEqual(tuple(problem.path for problem in status.mcp_baseline_problems), (baseline,))
+
+    def test_mcp_comparison_uses_each_home_project_scope(self) -> None:
+        self.login_directory("claude2", "fixture@notexample.com")
+        baseline = agent_accounts.claude_config_file(self.main_dir)
+        config = self.home / ".claude2/.claude.json"
+        _ = baseline.write_text(json.dumps({"mcpServers": {"brp": {}}, "projects": {
+            str(self.main_dir): {"mcpServers": {"brp": {}}, "disabledMcpServers": ["brp"]}}}))
+        for enabled in (False, True):
+            _ = config.write_text(json.dumps({"oauthAccount": {"emailAddress": "fixture@notexample.com"},
+                "projects": {str(config.parent): {"mcpServers": {"brp": {}} if enabled else {}}}}))
+            for flags in ((), ("--json",)):
+                with self.subTest(enabled=enabled, flags=flags):
+                    code, output, error = self.run_cli("status", "--stored", *flags)
+                    self.assertEqual((code, error), (0, ""))
+                    lines = (cast(accounts.StatusDocument, json.loads(output))["problems"] if flags else output.splitlines())
+                    if enabled:
+                        self.assertIn("claude2 turns brp on in 1 project where ~/.claude does not: ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py mcp-projects claude2 brp on", lines)
+                        self.assertEqual(self.run_cli("mcp-projects", "claude2", "brp", "on"), (0, "~\n", ""))
+                    else:
+                        self.assertFalse(any("mcpServers differ" in line for line in lines))
+                        self.assertFalse(any(line.startswith("claude2 turns ") for line in lines))
+
+    def test_mcp_comparison_includes_a_session_project_outside_the_home(self) -> None:
+        self.login_directory("claude2", "fixture@notexample.com")
+        project = self.root / "session-project"
+        project.mkdir()
+        _ = agent_accounts.claude_config_file(self.main_dir).write_text(json.dumps({
+            "projects": {str(project): {"mcpServers": {"brp": {}}}}}))
+        identity = self.home / ".claude2/.claude.json"
+        for matching in (False, True):
+            _ = identity.write_text(json.dumps({"oauthAccount": {"emailAddress": "fixture@notexample.com"},
+                "projects": {str(project): {"mcpServers": {"brp": {}} if matching else {}}}}))
+            for flags in ((), ("--json",)):
+                with self.subTest(matching=matching, flags=flags):
+                    code, output, error = self.run_cli("status", "--stored", *flags)
+                    self.assertEqual((code, error), (0, ""))
+                    lines = (cast(accounts.StatusDocument, json.loads(output))["problems"] if flags else output.splitlines())
+                    if matching:
+                        self.assertFalse(any("mcpServers differ" in line for line in lines))
+                        self.assertFalse(any(line.startswith("claude2 turns ") for line in lines))
+                    else:
+                        self.assertIn("claude2 turns brp off in 1 project where ~/.claude does not: ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py mcp-projects claude2 brp off", lines)
+
+    def test_selected_roles_name_the_missing_account_cause_once(self) -> None:
+        for label in ("claude2", "claude3"):
+            self.write_note(label, "fixture@notexample.com")
+        path = role_map.groups_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        for different in (False, True):
+            _ = path.write_text(json.dumps({"units": "claude2", "showrunners": "claude3" if different else "claude2"}))
+            for flags in ((), ("--json",)):
+                with self.subTest(different=different, flags=flags):
+                    code, output, error = self.run_cli("status", "--stored", *flags)
+                    self.assertEqual((code, error), (0, ""))
+                    lines = (cast(accounts.StatusDocument, json.loads(output))["problems"] if flags
+                             else output.split("\n\n", 1)[1].strip().splitlines())
+                    expected = ["workers: not configured; the role map selects no account; run accounts.py set-role workers <codexN>"]
+                    for label in ("claude2", "claude3"):
+                        roles = "units" if label == "claude2" and different else "showrunners" if different else "units, showrunners" if label == "claude2" else ""
+                        expected.append(("" if flags else "* ") + f"{label}: not set up; no folder holds this account; "
+                            + (f"affected roles: {roles}; " if roles else "") + f"run accounts.py setup {label}")
+                    self.assertCountEqual(lines, expected)
+
+    def test_note_observation_is_shared_by_home_advice_and_real_role_selection(self) -> None:
+        self.login_directory("claude2", "fixture@notexample.com")
+        path = role_map.groups_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ = path.write_text(json.dumps({"units": "claude2", "showrunners": "claude2"}))
+        note = Path(os.environ["AGENT_NOTES_DIR"]) / "claude2.md"
+        read_text = Path.read_text
+        def read(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+            if path == note:
+                raise PermissionError("fixture note denied")
+            return read_text(path, encoding=encoding, errors=errors)
+
+        for fault in ("malformed", "missing", "unreadable"):
+            if fault == "missing":
+                note.unlink(missing_ok=True)
+                expected_note = (f"claude2: not selectable; claude2 has no account note at {note}; "
+                    + "add ~/rust/hanadocs/agents/claudeN.md with login: fixture@notexample.com; run accounts.py setup claude2")
+            else:
+                _ = note.write_text("---\nname: no login\n---\n")
+                expected_note = (f"claude2: cannot read {note}; fixture note denied; " if fault == "unreadable" else
+                    f"claude2: not selectable; {note} has no readable login in its frontmatter; ")
+                expected_note += "repair the account note with login: fixture@notexample.com; run accounts.py setup claude2"
+            expected = ["workers: not configured; the role map selects no account; run accounts.py set-role workers <codexN>", expected_note]
+            for flags in ((), ("--json",)):
+                with (self.subTest(fault=fault, flags=flags),
+                      patch.object(Path, "read_text", new=read) if fault == "unreadable" else
+                          patch.object(sys, "dont_write_bytecode", True)):
+                    code, output, error = self.run_cli("status", "--stored", *flags)
+                self.assertEqual((code, error), (0, ""))
+                lines = (cast(accounts.StatusDocument, json.loads(output))["problems"] if flags
+                         else output.split("\n\n", 1)[1].strip().splitlines())
+                self.assertCountEqual(lines, expected)
+
+    def test_failed_codex_save_and_render_keep_the_good_reading_diagnostic(self) -> None:
+        home = self.home / ".codex1"
+        home.mkdir()
+        self.write_note("codex1", "fixture@notexample.com")
+        report = agent_accounts.Report("Codex", email="fixture@notexample.com",
+            quotas=[agent_accounts.Quota("Weekly", 20, datetime(2099, 1, 1, tzinfo=timezone.utc))],
+            usage_read_outcome=agent_accounts.UsageReadOutcome.OK)
+        for flags in ((), ("--json",)):
+            with (patch.object(agent_accounts, "codex_email_on_disk", return_value="fixture@notexample.com"),
+                  patch.object(accounts, "_codex_home_login", return_value="fixture@notexample.com"),
+                  patch.object(accounts, "_codex_live", return_value=report),
+                  patch.object(usage_store, "save", side_effect=PermissionError("fixture final Codex save denied")),
+                  patch.object(accounts, "render_status_json" if flags else "render_status_table",
+                               side_effect=accounts.AccountsError("accounts: fixture render failed"))):
+                code, output, error = self.run_cli("status", *flags)
+            self.assertEqual((code, output), (1, ""))
+            self.assertRegex(error, r"codex1: usage store reading not saved; fixture final Codex save denied; read at [^\n]+; check the usage store file and its permissions; run accounts.py status again")
+            self.assertTrue(error.splitlines()[-1].startswith("accounts: fixture render failed;"))
+
+    def test_failed_status_restores_terminal_delivery_and_does_not_leak_to_next_command(self) -> None:
+        cache = role_map.role_map_cache_file()
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        _ = cache.write_text(json.dumps({"at": "2026-10-16T15:24:00+00:00", "map": {
+            "groups": {}, "workers": "codex1"}}))
+        output, error = io.StringIO(), io.StringIO()
+        with (redirect_stdout(output), redirect_stderr(error), patch.object(error, "isatty", return_value=True),
+              patch.object(role_map, "is_role_map_host", return_value=False),
+              patch.object(role_map, "ssh_role_map", side_effect=OSError("fixture transport denied")),
+              patch.object(accounts, "render_status_json", side_effect=accounts.AccountsError("accounts: fixture render failed"))):
+            code = accounts.main(["status", "--json"])
+        self.assertEqual((code, output.getvalue()), (1, ""))
+        self.assertEqual(error.getvalue().count("fixture transport denied"), 1)
+        self.assertTrue(error.getvalue().splitlines()[-1].startswith("accounts: fixture render failed;"))
+        code, output_text, error_text = self.run_cli("status", "--stored", "--json")
+        self.assertEqual((code, error_text), (0, ""))
+        self.assertNotIn("fixture transport denied", output_text)
+        self.assertNotIn("fixture render failed", output_text)
+
+    def test_mcp_compares_the_active_home_configuration_and_preserves_unreadability(self) -> None:
+        self.login_directory("claude2", "fixture@notexample.com")
+        _ = (self.main_dir / ".claude.json").write_text(json.dumps({"mcpServers": {"stale": {}}}))
+        _ = agent_accounts.claude_config_file(self.main_dir).write_text(json.dumps({"mcpServers": {"current": {}}}))
+        identity = self.home / ".claude2/.claude.json"
+        _ = identity.write_text(json.dumps({"oauthAccount": {"emailAddress": "fixture@notexample.com"},
+                                          "mcpServers": {"current": {}}}))
+        for flags in ((), ("--json",)):
+            code, output, error = self.run_cli("status", "--stored", *flags)
+            self.assertEqual((code, error), (0, ""))
+            self.assertNotIn("mcpServers differ", output)
+            self.assertNotIn("claude2 turns ", output)
+        _ = identity.write_text("{")
+        for flags in ((), ("--json",)):
+            code, output, error = self.run_cli("status", "--stored", *flags)
+            self.assertEqual((code, error), (0, ""))
+            self.assertIn("cannot read", output)
+            self.assertNotIn("mcpServers differ", output)
+            self.assertNotIn("claude2 turns ", output)
+
+    def test_piped_status_keeps_command_errors_on_stderr(self) -> None:
+        with patch.object(accounts, "_read_status", side_effect=accounts.AccountsError("accounts: fixture read failed")):
+            result, stdout, stderr = self.run_cli("status", "--stored", "--json")
+        self.assertEqual(result, 1)
+        self.assertEqual(stdout, "")
+        self.assertIn("fixture read failed", stderr)
+
+    # Reserved fixtures model provider accounts in this status test.
+    @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_detail_shows_unclassified_entries_and_mcp_difference(
         self,
     ) -> None:
         self.write_main_config()
+        _ = agent_accounts.claude_config_file(self.main_dir).write_text(json.dumps({"mcpServers": {"brp": {}}}))
         account_dir = self.home / ".claude2"
         self.correct_links(account_dir)
         _ = (account_dir / "mystery-cache").mkdir()
@@ -2510,8 +3262,9 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(stderr, "")
         self.assertRegex(stdout, r"\| ~/\.claude2 +\| claude2 +\|")
-        self.assertIn("\n~/.claude2: unclassified: mystery-cache\n", stdout)
-        self.assertIn("\n~/.claude2: mcpServers: - brp, + account-only\n", stdout)
+        self.assertIn("claude2: unclassified entries; mystery-cache; check these entries in ~/.claude2; keep private files in this home", stdout.splitlines())
+        self.assertIn("claude2 turns brp off in 1 project where ~/.claude does not: ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py mcp-projects claude2 brp off", stdout.splitlines())
+        self.assertIn("claude2 turns account-only on in 1 project where ~/.claude does not: ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py mcp-projects claude2 account-only on", stdout.splitlines())
 
     def test_claude_feedback_telemetry_and_atomic_write_temps_stay_private_after_setup(self) -> None:
         self.write_main_config()
@@ -2530,6 +3283,8 @@ class AccountsTests(unittest.TestCase):
             self.assertFalse((directory / name).is_symlink())
         self.assertEqual(temporary.read_text(encoding="utf-8"), "unfinished config")
 
+    # Reserved fixtures model provider accounts in this status test.
+    @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_unknown_claude_and_codex_entries_show_only_with_detail(self) -> None:
         self.login_directory("claude2", "main@example.invalid", default=True)
         self.login_directory("claude3", "spare@example.invalid")
@@ -2543,15 +3298,15 @@ class AccountsTests(unittest.TestCase):
             with self.subTest(arguments=arguments):
                 code, output, error = self.run_cli(*arguments)
                 self.assertEqual((code, error), (0, ""))
-                self.assertNotIn("unclassified:", output)
+                self.assertNotIn("unclassified entries", output)
                 self.assertNotIn("unknown-claude-entry", output)
                 self.assertNotIn("unknown-codex-entry", output)
 
         code, output, error = self.run_cli("--detail")
 
         self.assertEqual((code, error), (0, ""))
-        self.assertIn("~/.claude3: unclassified: unknown-claude-entry", output)
-        self.assertIn("~/.codex1: unclassified: unknown-codex-entry", output)
+        self.assertIn("claude3: unclassified entries; unknown-claude-entry; check these entries in ~/.claude3; keep private files in this home", output.splitlines())
+        self.assertIn("codex1: unclassified entries; unknown-codex-entry; check these entries in ~/.codex1; keep private files in this home", output.splitlines())
 
     def test_temp_sweep_deletes_only_old_regular_claude_write_temps_in_home_and_numbered_folders(self) -> None:
         now = datetime(2026, 10, 15, 12, tzinfo=timezone.utc)
@@ -2667,6 +3422,8 @@ class AccountsTests(unittest.TestCase):
         self.assertTrue(folder.is_symlink())
         self.assertEqual(temporary.read_text(encoding="utf-8"), "outside the sweep")
 
+    # Reserved fixtures model provider accounts in this status test.
+    @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_codex_unknown_entry_does_not_block_check_and_is_only_shown_in_detail(self) -> None:
         self.write_main_config()
         self.write_note("codex1", "worker@example.invalid")
@@ -2680,7 +3437,7 @@ class AccountsTests(unittest.TestCase):
         self.assertNotIn("unknown-codex-entry", output)
         code, output, error = self.run_cli("--detail")
         self.assertEqual((code, error), (0, ""))
-        self.assertIn("~/.codex1: unclassified: unknown-codex-entry", output)
+        self.assertIn("codex1: unclassified entries; unknown-codex-entry; check these entries in ~/.codex1; keep private files in this home", output.splitlines())
 
     def reading(
         self, login: str, five_hour: agent_accounts.Quota | None, weekly: agent_accounts.Quota,
@@ -2723,6 +3480,8 @@ class AccountsTests(unittest.TestCase):
         self.assertFalse(accounts.account_dir("claude1").exists())
         self.assertTrue(accounts.account_dir("claude2").exists())
 
+    # Reserved fixtures model provider accounts in this status test.
+    @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_hides_five_hour_cells_and_keeps_weekly_and_read(self) -> None:
         self.login_directory("claude2", "main@example.invalid", default=True)
         now = datetime.now(timezone.utc)
@@ -2748,6 +3507,8 @@ class AccountsTests(unittest.TestCase):
             "—", "—", read.astimezone(zone).strftime("%H:%M %Z"),
         ))
 
+    # Reserved fixtures model provider accounts in this status test.
+    @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_no_action_means_status(self) -> None:
         self.write_main_config()
         self.login_directory("claude2", "main@example.invalid", default=True)
@@ -2758,6 +3519,8 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual(stdout, self.run_cli("status")[1])
         self.assertRegex(stdout, r"\| ~/\.claude2 +\| claude2 +\|")
 
+    # Reserved fixtures model provider accounts in this status test.
+    @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_table_is_padded_markdown_and_a_folder_in_order_adds_no_line(self) -> None:
         self.write_main_config()
         self.login_directory("claude2", "main@example.invalid", default=True)
@@ -3449,6 +4212,8 @@ class AccountsTests(unittest.TestCase):
         self.assertTrue(error)
         self.assertEqual(next_moves.read_next_moves(), ())
 
+    # Reserved fixtures model provider accounts in this status test.
+    @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_table_displays_both_groups_on_the_same_account_in_group_order(self) -> None:
         self.login_directory("claude2", "shared@example.invalid")
         groups = accounts.groups_file()
@@ -3492,6 +4257,8 @@ class AccountsTests(unittest.TestCase):
             codex_startup=agent_accounts.CodexStartupFailure(failed_home, "accounts.py setup codex2"))
         return read, reset
 
+    # Reserved fixtures model provider accounts in this status test.
+    @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_explains_empty_account_rows_in_the_table_and_json_without_login_addresses(self) -> None:
         self.write_note("claude1", "absent@example.invalid")
         self.write_note("claude2", "signed-out@example.invalid")
@@ -3502,22 +4269,26 @@ class AccountsTests(unittest.TestCase):
         (self.home / ".claude3").symlink_to(target, target_is_directory=True)
         self.write_note("codex1", "missing-codex@example.invalid")
         expected = [
-            "* claude1: not set up: no folder holds this account",
-            "* claude2: not logged in",
-            "* claude3: its folder could not be read",
-            "* codex1: not set up: no folder holds this account",
+            "claude1: not set up; no folder holds this account; run accounts.py setup claude1",
+            f"claude2: not logged in; no readable sign-in is stored; run CLAUDE_CONFIG_DIR={shlex.quote(str(self.home / '.claude2'))} claude and /login",
+            "claude3: folder unavailable; its folder could not be read; run accounts.py setup claude3",
+            "codex1: not set up; no folder holds this account; run accounts.py setup codex1",
         ]
         # Some inventory callers have no check diagnostics. Status must still
         # explain each empty row, without reading the linked account folder.
-        with patch.object(accounts, "check", return_value=[]):
+        readiness = accounts.account_directory_readiness
+        def without_diagnostics(label: str) -> accounts.AccountDirectoryReadiness:
+            return replace(readiness(label), problems=(), state_source=accounts.NoObservedStateCause())
+
+        with patch.object(accounts, "account_directory_readiness", side_effect=without_diagnostics):
             code, table, error = self.run_cli("status", "--stored")
             self.assertEqual((code, error), (0, ""))
             code, output, error = self.run_cli("status", "--stored", "--json")
         self.assertEqual((code, error), (0, ""))
         problems = cast(list[str], json.loads(output)["problems"])
-        for note in expected:
-            self.assertEqual(table.splitlines().count(note), 1)
-            self.assertEqual(problems.count(note.removeprefix("* ")), 1)
+        for line in expected:
+            self.assertEqual(problems.count(line), 1)
+            self.assertEqual(table.splitlines().count("* " + line), 1)
         self.assertTrue(all(not problem.startswith("* ") for problem in problems))
         self.assertTrue(all("@" not in problem for problem in problems))
 
@@ -3531,9 +4302,9 @@ class AccountsTests(unittest.TestCase):
         self.write_note("codex1", "blocked@example.invalid")
         _ = (self.home / ".codex1").write_text("not a folder")
         expected = [
-            f"accounts: {directory} is not logged in",
-            f"accounts: {self.home / '.claude3'} is a link; an account dir must be a real directory",
-            "accounts: ~/.codex1 is not a directory",
+            f"claude2: not logged in; {directory} has no readable sign-in; run CLAUDE_CONFIG_DIR={shlex.quote(str(directory))} claude and /login",
+            f"claude3: cannot use {self.home / '.claude3'}; {self.home / '.claude3'} is a link; use a real private directory; run accounts.py setup claude3",
+            "codex1: cannot use ~/.codex1; ~/.codex1 is not a directory; use a real private directory; run accounts.py setup codex1",
         ]
         for arguments in (("status", "--stored"), ("status", "--stored", "--json")):
             with self.subTest(arguments=arguments):
@@ -3541,11 +4312,12 @@ class AccountsTests(unittest.TestCase):
                 self.assertEqual((code, error), (0, ""))
                 notes = (cast(list[str], json.loads(output)["problems"]) if "--json" in arguments
                          else output.split("\n\n", 1)[1].strip().splitlines())
-                for note in expected:
-                    self.assertEqual(notes.count(note), 1)
-                self.assertFalse(any(note.startswith(("* claude2:", "* claude3:", "* codex1:"))
-                                     for note in notes))
+                for line in expected:
+                    self.assertEqual(notes.count(line), 1)
+                self.assertFalse(any(note.startswith(("* claude2:", "* claude3:", "* codex1:")) for note in notes))
 
+    # Reserved fixtures model provider accounts in this status test.
+    @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_json_preserves_row_order_numeric_readings_roles_and_table_problems(self) -> None:
         read, reset = self.json_status_fixture()
         code, table, error = self.run_cli("status")
@@ -3587,6 +4359,8 @@ class AccountsTests(unittest.TestCase):
         changed = cast(list[dict[str, object]], json.loads(output)["accounts"])
         self.assertEqual([row["roles"] for row in changed[:4]], [[], [], ["units", "showrunners"], []])
 
+    # Reserved fixtures model provider accounts in this status test.
+    @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_json_and_table_refresh_the_same_stale_logins_once_each(self) -> None:
         self.login_directory("claude2", "stale@example.invalid")
         self.login_directory("claude3", "fresh@example.invalid")
@@ -3613,6 +4387,8 @@ class AccountsTests(unittest.TestCase):
                 self.live_reads.assert_called_once_with(accounts.account_dir("claude2"))
                 self.codex_reads.assert_awaited_once_with(codex_home)
 
+    # Reserved fixtures model provider accounts in this status test.
+    @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_stored_status_shows_old_readings_without_live_reads_subprocesses_or_network(self) -> None:
         self.login_directory("claude2", "old@example.invalid")
         self.write_note("codex1", "old-codex@example.invalid")
@@ -3885,6 +4661,8 @@ class AccountsTests(unittest.TestCase):
             ("~/.codex3", "codex3", "—"),
         ])
 
+    # Reserved fixtures model provider accounts in this status test.
+    @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_reports_a_not_set_up_codex_account_when_its_home_is_a_file(self) -> None:
         self.write_note("codex1", "spare@example.invalid")
         home = self.home / ".codex1"
@@ -3899,6 +4677,8 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual(home.read_text(), "obstruction")
         self.codex_reads.assert_not_awaited()
 
+    # Reserved fixtures model provider accounts in this status test.
+    @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_reports_a_not_set_up_codex_account_when_its_home_is_a_dangling_link(self) -> None:
         self.write_note("codex1", "spare@example.invalid")
         home = self.home / ".codex1"
@@ -3915,6 +4695,8 @@ class AccountsTests(unittest.TestCase):
         self.assertFalse(target.exists())
         self.codex_reads.assert_not_awaited()
 
+    # Reserved fixtures model provider accounts in this status test.
+    @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_logged_out_numbered_home_names_the_account_to_sign_in(self) -> None:
         self.write_note("codex1", "spare@example.invalid")
         (self.home / ".codex1").mkdir(mode=0o700)
@@ -3993,11 +4775,13 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual([row[3] for row in rows], ["80%", "5%"])
         self.assertEqual([row[6] for row in rows], ["7", "13"])
 
+    # Reserved fixtures model provider accounts in this status test.
+    @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_detail_prints_codex_check_problems_below_the_table(self) -> None:
         self.login_directory("claude2", "main@example.invalid", default=True)
         self.write_note("codex1", "spare@example.invalid")
         self.codex_login("spare@example.invalid", self.home / ".codex1")
-        self.assertNotIn("unclassified:", self.run_cli("status")[1])
+        self.assertNotIn("unclassified entries", self.run_cli("status")[1])
         _ = (self.home / ".codex1" / "unclassified-item").write_text("own")
 
         result, stdout, stderr = self.run_cli("--detail")
@@ -4066,6 +4850,8 @@ class AccountsTests(unittest.TestCase):
             self.assertEqual(accounts.renew_login("claude2"),
                              accounts.LoginRenewalFailed("usage still shows an expired login"))
 
+    # Reserved fixtures model provider accounts in this status test.
+    @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_damaged_login_renewal_state_reads_empty_and_status_renders(self) -> None:
         self.login_directory("claude2", "idle@example.invalid")
         usage_store.save([agent_accounts.Report("Claude", email="idle@example.invalid",
@@ -4084,6 +4870,8 @@ class AccountsTests(unittest.TestCase):
                     self.assertIn("login token expired; the next notes pass renews it", output)
         self.live_reads.assert_not_called()
 
+    # Reserved fixtures model provider accounts in this status test.
+    @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_expired_login_note_names_the_failed_probe_in_table_and_json(self) -> None:
         self.login_directory("claude2", "idle@example.invalid")
         at = datetime(2026, 10, 22, 15, 11, tzinfo=timezone.utc)
@@ -4092,7 +4880,7 @@ class AccountsTests(unittest.TestCase):
         path = accounts.login_renewals_file()
         path.parent.mkdir(parents=True, exist_ok=True)
         _ = path.write_text(json.dumps({"claude2": {"at": at.isoformat(), "outcome": "failed", "detail": "probe exited with status 7"}}))
-        note = "claude2: login token expired; a probe session at 08:11 failed; log in on it by hand"
+        note = "claude2: usage unavailable; login token expired; a probe session at 08:11 failed; log in on it by hand"
         code, output, error = self.run_cli("status", "--stored")
         self.assertEqual((code, error), (0, ""))
         self.assertIn("* " + note, output)
@@ -4101,6 +4889,8 @@ class AccountsTests(unittest.TestCase):
         self.assertIn(note, cast(list[str], cast(dict[str, object], json.loads(output))["problems"]))
         self.live_reads.assert_not_called()
 
+    # Reserved fixtures model provider accounts in this status test.
+    @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_failed_read_causes_show_old_date_star_and_one_footnote_until_a_good_read(self) -> None:
         self.login_directory("claude2", "idle@example.invalid")
         old = datetime(2001, 1, 2, 13, 29, tzinfo=timezone.utc)
@@ -4110,9 +4900,9 @@ class AccountsTests(unittest.TestCase):
             (agent_accounts.UsageReadOutcome.REFUSED_401,
              "the usage service did not accept this login; start a session on it to check it"),
             (agent_accounts.UsageReadOutcome.RATE_LIMITED_429,
-             "the usage service is busy, so this shows the reading from 05:29; next try in 2 min"),
+             "the usage service is busy; this shows the reading from 05:29; next try in 2 min"),
             (agent_accounts.UsageReadOutcome.ERROR,
-             "the usage read failed, so this shows the reading from 05:29; next try in 2 min"),
+             "the usage read failed; this shows the reading from 05:29; next try in 2 min"),
         )
         for outcome, reason in cases:
             with self.subTest(outcome=outcome):
@@ -4125,7 +4915,7 @@ class AccountsTests(unittest.TestCase):
                 row = next(line for line in output.splitlines() if "| claude2 " in line)
                 self.assertEqual(row.split("|")[-2].strip(), "01-02 05:29 PST*")
                 self.assertEqual([line for line in output.splitlines() if line.startswith("* ")],
-                                 [f"* claude2: {reason}"])
+                                 [f"* claude2: usage unavailable; {reason}"])
                 now = datetime.now(timezone.utc)
                 usage_store.save([self.reading("idle@example.invalid", None,
                     agent_accounts.Quota("Weekly", 10, now + timedelta(days=1)))], now)
@@ -4138,16 +4928,18 @@ class AccountsTests(unittest.TestCase):
         self.live_reads.assert_not_called()
         self.codex_reads.assert_not_awaited()
 
+    # Reserved fixtures model provider accounts in this status test.
+    @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_usage_failure_notes_name_the_service_and_retry_time_in_table_and_json(self) -> None:
         self.login_directory("claude2", "idle@example.invalid")
         at = datetime(2026, 10, 19, 15, 11, tzinfo=timezone.utc)
         cases = (
             (agent_accounts.UsageReadOutcome.RATE_LIMITED_429,
-             "the usage service is busy, so this shows the reading from 08:09; next try after 08:21",
-             "the usage service is busy and no reading is stored yet; next try after 08:21"),
+             "the usage service is busy; this shows the reading from 08:09; next try after 08:21",
+             "the usage service is busy; no reading is stored yet; next try after 08:21"),
             (agent_accounts.UsageReadOutcome.ERROR,
-             "the usage read failed, so this shows the reading from 08:09; next try in 2 min",
-             "the usage read failed and no reading is stored yet; next try in 2 min"),
+             "the usage read failed; this shows the reading from 08:09; next try in 2 min",
+             "the usage read failed; no reading is stored yet; next try in 2 min"),
             (agent_accounts.UsageReadOutcome.REFUSED_401,
              "the usage service did not accept this login; start a session on it to check it",
              "the usage service did not accept this login; start a session on it to check it"),
@@ -4169,7 +4961,7 @@ class AccountsTests(unittest.TestCase):
                         usage_store.write({"idle@example.invalid": usage})
                     code, output, error = self.run_cli("status", "--stored")
                     self.assertEqual((code, error), (0, ""))
-                    note = f"* claude2: {reason}"
+                    note = f"* claude2: usage unavailable; {reason}"
                     self.assertEqual([line for line in output.splitlines() if line.startswith("* ")], [note])
                     code, document, error = self.run_cli("status", "--json", "--stored")
                     self.assertEqual((code, error), (0, ""))
@@ -4179,6 +4971,8 @@ class AccountsTests(unittest.TestCase):
                     self.assertNotIn("refused", note)
         self.live_reads.assert_not_called()
 
+    # Reserved fixtures model provider accounts in this status test.
+    @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_a_held_refresh_keeps_the_stored_reading_and_failure_note(self) -> None:
         self.login_directory("claude2", "idle@example.invalid")
         at = datetime(2001, 1, 2, 13, 29, tzinfo=timezone.utc)
@@ -4192,9 +4986,11 @@ class AccountsTests(unittest.TestCase):
         code, output, error = self.run_cli("status")
         self.assertEqual((code, error), (0, ""))
         self.assertIn("01-02 05:29 PST*", output)
-        self.assertIn("the usage service is busy, so this shows the reading from 05:29; next try in 2 min", output)
+        self.assertIn("the usage service is busy; this shows the reading from 05:29; next try in 2 min", output)
         self.assertEqual(usage_store.store_file().read_bytes(), before)
 
+    # Reserved fixtures model provider accounts in this status test.
+    @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_first_identity_failure_after_upgrade_marks_the_old_reading(self) -> None:
         self.login_directory("claude2", "idle@example.invalid")
         old = datetime(2001, 1, 2, 13, 29, tzinfo=timezone.utc)
@@ -4209,10 +5005,12 @@ class AccountsTests(unittest.TestCase):
         row = next(line for line in output.splitlines() if "| claude2 " in line)
         self.assertEqual(row.split("|")[-2].strip(), "01-02 05:29 PST*")
         self.assertEqual([line for line in output.splitlines() if line.startswith("* ")],
-                         ["* claude2: the usage read failed, so this shows the reading from 05:29; next try in 2 min"])
+                         ["* claude2: usage unavailable; the usage read failed; this shows the reading from 05:29; next try in 2 min"])
         self.assertEqual(usage_store.load()["idle@example.invalid"].get("weekly"), window)
         self.live_reads.assert_called_once_with(directory)
 
+    # Reserved fixtures model provider accounts in this status test.
+    @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_failure_from_the_first_of_two_directories_marks_their_shared_login(self) -> None:
         login = "shared@example.invalid"
         self.login_directory("claude2", login)
@@ -4231,9 +5029,11 @@ class AccountsTests(unittest.TestCase):
         row = next(line for line in output.splitlines() if "| claude2 " in line)
         self.assertEqual(row.split("|")[-2].strip(), "01-02 05:29 PST*")
         self.assertEqual([line for line in output.splitlines() if line.startswith("* ")],
-                         ["* claude2: the usage read failed, so this shows the reading from 05:29; next try in 2 min"])
+                         ["* claude2: usage unavailable; the usage read failed; this shows the reading from 05:29; next try in 2 min"])
         self.live_reads.assert_not_called()
 
+    # Reserved fixtures model provider accounts in this status test.
+    @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_failed_read_today_keeps_the_short_time_and_marks_a_never_read_account(self) -> None:
         self.login_directory("claude2", "idle@example.invalid")
         self.login_directory("claude3", "never@example.invalid")
@@ -4250,6 +5050,8 @@ class AccountsTests(unittest.TestCase):
             [now.astimezone(ZoneInfo("America/Los_Angeles")).strftime("%H:%M %Z") + "*", "—*"])
         self.assertEqual(len([line for line in output.splitlines() if line.startswith("* ")]), 2)
 
+    # Reserved fixtures model provider accounts in this status test.
+    @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_failed_codex_start_keeps_its_last_good_read_time_and_shows_a_footnote(self) -> None:
         _, target = self.workers_fixture()
         old = datetime(2001, 1, 2, 13, 29, tzinfo=timezone.utc)
@@ -4263,9 +5065,11 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual((code, error), (0, ""))
         row = next(line for line in output.splitlines() if "| codex1 " in line)
         self.assertEqual(row.split("|")[-2].strip(), "01-02 05:29 PST*")
-        self.assertIn("* codex1: the usage read failed, so this shows the reading from 05:29; next try in 2 min", output)
+        self.assertIn("* codex1: usage unavailable; Codex did not start at ~/.codex1; this shows the reading from 05:29; run /showrunner:accounts setup codex1 and try again; next try in 2 min", output)
         self.assertIn("/showrunner:accounts setup codex1", row)
 
+    # Reserved fixtures model provider accounts in this status test.
+    @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_after_weekly_reset_explains_a_stale_login_without_reading_it_again(self) -> None:
         self.login_directory("claude2", "idle@example.invalid")
         read = datetime(2001, 1, 2, 13, 29, tzinfo=timezone.utc)
@@ -4420,7 +5224,7 @@ class AccountsTests(unittest.TestCase):
         later_home = self.root / "later home"
         _ = later_home.mkdir()
 
-        with patch.dict(os.environ, {"HOME": str(later_home)}):
+        with scratch_account_home(later_home, {}, clear=False):
             self.assertEqual(accounts.accounts_home(), later_home)
             self.assertEqual(accounts.main_config_dir(), later_home / ".claude")
 
@@ -4590,6 +5394,8 @@ class AccountsTests(unittest.TestCase):
         self.assertTrue(stderr.startswith("accounts: cannot select codex1 (~/.codex1): "), stderr)
         self.assertEqual(stderr.count("accounts: "), 1, stderr)
 
+    # Reserved fixtures model provider accounts in this status test.
+    @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_unrelated_io_and_value_errors_propagate_from_the_command(self) -> None:
         for error in (OSError("table write failed"), ValueError("invalid table data")):
             with self.subTest(error=error), patch.object(accounts, "status_report", side_effect=error):
@@ -5234,8 +6040,8 @@ class PickerTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.home = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
-        _ = cast(object, self.enterContext(patch.dict(os.environ, {
-            "HOME": str(self.home), "AGENT_NOTES_DIR": str(self.home / "notes"), "USER_ZONE": "UTC",
+        _ = cast(object, self.enterContext(scratch_account_home(self.home, {
+            "AGENT_NOTES_DIR": str(self.home / "notes"), "USER_ZONE": "UTC",
         }, clear=True)))
         (self.home / "notes").mkdir()
         _ = installed_program(self.home, "claude")
@@ -5399,6 +6205,8 @@ class PickerTests(unittest.TestCase):
                 self.assertEqual(rows[0]["move_id"], selection["move_id"])
                 self.assertEqual(rows[0]["cause"], selection["cause"])
 
+    # Reserved fixtures model provider accounts in this status test.
+    @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_lists_work_routing_separately_from_account_moves(self) -> None:
         self.codex("default", "worker@example.invalid")
         common = moves.MoveCommon(at=self.now.isoformat(), tool="codex", subject="workers", move_id="account-move")
@@ -5434,6 +6242,8 @@ class PickerTests(unittest.TestCase):
         self.assertIn("owner unknown", routing)
         self.assertNotIn("— open", routing)
 
+    # Reserved fixtures model provider accounts in this status test.
+    @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_detail_shows_scheduled_claude_routing_as_auto(self) -> None:
         self.codex("default", "worker@example.invalid")
         stamp = self.now.isoformat()
@@ -5594,17 +6404,17 @@ class PickerTests(unittest.TestCase):
         self.assertEqual(config.read_bytes(), original)
         self.assertFalse(accounts.roles_history_file().exists())
 
+    # Reserved fixtures model provider accounts in this status test.
+    @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_unnoted_claude_home_is_displayed_but_never_selected_or_a_destination(self) -> None:
         (self.home / "notes/claude2.md").unlink()
-        message = ("~/.claude2 — no account note, not selectable: add "
-                   "~/rust/hanadocs/agents/claudeN.md with login: main@example.invalid")
         self.assert_picked("claude3")
         picked = accounts.pick("claude", self.now, exclude=frozenset({"claude1", "claude3"}))
         self.assertIsInstance(picked, accounts.NoAccountWithRoom)
         self.assertEqual(accounts.placement("units", self.now, exclude=frozenset()).label, "claude3")
         code, stdout, stderr = self.group_cli("status")
         self.assertEqual((code, stderr), (0, ""))
-        self.assertIn(message, stdout)
+        self.assertIn(f"claude2: not selectable; claude2 has no account note at {self.home / 'notes/claude2.md'}; add ~/rust/hanadocs/agents/claudeN.md with login: main@example.invalid; run accounts.py setup claude2", stdout.splitlines())
         for command in (("move", "units", "claude2"), ("move", "some-session", "claude2"),
                         ("exec", "claude2"), ("move", "units", "default")):
             with self.subTest(command=command):
@@ -5615,6 +6425,8 @@ class PickerTests(unittest.TestCase):
         self.assertEqual((code, stderr), (0, ""), stdout)
         self.assertEqual(accounts.role_account("unit").dir, self.home / ".claude1")
 
+    # Reserved fixtures model provider accounts in this status test.
+    @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_legacy_group_for_an_unnoted_home_is_display_only_and_cannot_launch(self) -> None:
         path = self.groups(units="default")
         original = path.read_bytes()
@@ -5623,11 +6435,13 @@ class PickerTests(unittest.TestCase):
         self.assertEqual(accounts.group_label(groups, "units"), "home account unresolved")
         code, stdout, stderr = self.group_cli("status")
         self.assertEqual((code, stderr), (0, ""))
-        self.assertIn("~/.claude2 — no account note, not selectable", stdout)
+        self.assertIn(f"claude2: not selectable; claude2 has no account note at {self.home / 'notes/claude2.md'}; add ~/rust/hanadocs/agents/claudeN.md with login: main@example.invalid; run accounts.py setup claude2", stdout.splitlines())
         with self.assertRaisesRegex(accounts.AccountsError, "home account unresolved"):
             _ = accounts.role_account("unit")
         self.assertEqual(path.read_bytes(), original)
 
+    # Reserved fixtures model provider accounts in this status test.
+    @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_unnoted_codex_home_is_displayed_but_never_picked_or_assigned_to_workers(self) -> None:
         self.codex("default", "unnoted@example.invalid")
         self.codex("codex2", "spare@example.invalid")
@@ -5641,7 +6455,7 @@ class PickerTests(unittest.TestCase):
         self.assertIsInstance(picked, accounts.NoAccountWithRoom)
         code, stdout, stderr = self.group_cli("status")
         self.assertEqual((code, stderr), (0, ""))
-        self.assertIn(message, stdout)
+        self.assertIn("~/.codex: not selectable; this login has no account note; add ~/rust/hanadocs/agents/codexN.md with login: unnoted@example.invalid; then run accounts.py cutover-home <codexN>", stdout.splitlines())
         for command in (("swap", "workers", "codex1"), ("set-role", "workers", "codex1"),
                         ("swap", "workers", "default")):
             with self.subTest(command=command):
@@ -5804,6 +6618,8 @@ class PickerTests(unittest.TestCase):
         self.assertEqual(stored_group_labels(accounts.groups_file()), {"units": "claude1"})
         self.assertFalse(moved.called)
 
+    # Reserved fixtures model provider accounts in this status test.
+    @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_starts_with_the_table_and_keeps_groups_in_role_cells(self) -> None:
         _ = self.groups()
         code, output, error = self.group_cli("status")
@@ -6250,6 +7066,667 @@ class SharedStatusDocumentTests(unittest.TestCase):
             "credits": 13446, "use_credits": True, "read_at": "2026-10-16T18:00:00+00:00",
             "read_ok": True, "credits_in_use": False,
         })
+
+
+class StatusProblemCauseTests(unittest.TestCase):
+    """Status reports one cause and one repair for each home problem."""
+
+    home: Path = Path()
+
+    @override
+    def setUp(self) -> None:
+        self.home = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        _ = cast(object, self.enterContext(scratch_account_home(self.home, {
+            "AGENT_NOTES_DIR": str(self.home / "notes"),
+            "CODEX_HOME": str(self.home / ".codex"), "USER_ZONE": "UTC",
+        }, clear=True)))
+        _ = self.enterContext(patch.object(subprocess, "run", side_effect=AssertionError("no real child")))
+        _ = self.enterContext(patch.object(subprocess, "Popen", side_effect=AssertionError("no real child")))
+
+    def reading(self, login: str, *, noted: bool = False) -> accounts.StatusReading:
+        home = self.home / ".codex"
+        home.mkdir(exist_ok=True)
+        auth = home / "auth.json"
+        _ = auth.write_text("fixture sign-in")
+        at = datetime(2026, 10, 29, 1, 14, tzinfo=timezone.utc)
+        os.utime(auth, (at.timestamp(), at.timestamp()))
+        status = accounts.CodexStatus("~/.codex", home, True, True,
+            "codex1" if noted else accounts.NO_VALUE, login, "workers",
+            () if noted else (accounts.unnoted_home_line(home, login),), ())
+        usage = {usage_store.key("Codex", login): usage_store.StoredUsage(
+            read_outcome=agent_accounts.UsageReadOutcome.ERROR,
+            attempt_outcome=agent_accounts.UsageReadOutcome.ERROR, attempted_at=at.isoformat())}
+        with (patch.object(accounts, "account_statuses", return_value=[]),
+              patch.object(accounts, "codex_statuses", return_value=[status]),
+              patch.object(accounts, "role_account", return_value=accounts.CodexWorkersAccount("codex1", home)),
+              patch.object(accounts, "group_accounts", return_value=accounts.GroupAccounts()),
+              patch.object(accounts, "_stored_usage", return_value=usage),
+              patch.object(accounts, "_codex_home_login", return_value=login),
+              patch.object(accounts, "home_account_label", return_value="codex1"),
+              patch.object(account, "claude_account", return_value=None)):
+            return accounts.read_status(source=accounts.StoredUsageOnly())
+
+    def status_with(self, statuses: list[accounts.AccountStatus], codex: list[accounts.CodexStatus],
+                    usage: usage_store.StoredUsage, *, role_error: str = "", detail: bool = False) -> accounts.StatusReading:
+        workers = accounts.CodexWorkersAccount("codex1", self.home / ".codex1")
+        with (patch.object(accounts, "account_statuses", return_value=statuses),
+              patch.object(accounts, "codex_statuses", return_value=codex),
+              patch.object(accounts, "role_account", side_effect=accounts.AccountsError(role_error) if role_error else None,
+                           return_value=workers),
+              patch.object(accounts, "group_accounts", return_value=accounts.GroupAccounts()),
+              patch.object(accounts, "_stored_usage", return_value={
+                  usage_store.key("Claude", status.login): usage for status in statuses} | {
+                  usage_store.key("Codex", status.login): usage for status in codex}),
+              patch.object(accounts, "_codex_home_login", return_value=""),
+              patch.object(account, "claude_account", return_value=None)):
+            return accounts.read_status(source=accounts.StoredUsageOnly(), detail=detail)
+
+    def codex_inventory(self, *, linked: tuple[str, ...] = (), duplicate: bool = False) -> list[accounts.CodexStatus]:
+        notes = self.home / "notes"
+        notes.mkdir()
+        _ = (notes / "codex1.md").write_text("---\nlogin: fixture@notexample.com\n---\n")
+        homes = [self.home / ".codex1", *([self.home / ".codex2"] if duplicate else [])]
+        for home in homes:
+            home.mkdir()
+        for name in linked:
+            (homes[0] / name).symlink_to(self.home / "private-target")
+        def login_at(home: Path) -> str:
+            return "fixture@notexample.com" if home in homes else ""
+
+        def listed_homes(_workers_home: Path | agent_accounts.NoWorkersHome) -> list[Path]:
+            return list(homes)
+
+        with (patch.object(accounts, "_codex_home_login", side_effect=login_at),
+              patch.object(agent_accounts, "codex_homes", side_effect=listed_homes),
+              patch.object(agent_accounts, "codex_email_on_disk", side_effect=login_at),
+              patch.object(accounts, "_shared_link_problems", return_value=[])):
+            return accounts.codex_statuses(homes[0])
+
+    def assert_inventory_state_problems(self, fault: str, *, omit_direct: bool = False) -> None:
+        directory = self.home / ".claude2"
+        directory.mkdir()
+        main = self.home / ".claude"
+        main.mkdir()
+        for name in accounts.SHARED:
+            target = main / name
+            target.mkdir()
+            (directory / name).symlink_to(target, target_is_directory=True)
+        notes = self.home / "notes"
+        notes.mkdir()
+        _ = (notes / "claude2.md").write_text("---\nlogin: fixture@notexample.com\n---\n")
+        identity = directory / ".claude.json"
+        credentials = directory / ".credentials.json"
+        credentials.symlink_to(self.home / "private-target")
+        setup = "run accounts.py setup claude2"
+        login_step = f"run CLAUDE_CONFIG_DIR={directory} claude and /login"
+        private = (f"claude2: private file is linked; {credentials} is a link; "
+                   + f"identity stays in each account dir; use a private file in this home; {setup}")
+        expected = [private]
+        if fault == "malformed":
+            _ = identity.write_text("{")
+            expected.append(f"claude2: cannot read {identity}; Expecting property name enclosed in double quotes: line 1 column 2 (char 1); check the file and its permissions; {setup}")
+        elif fault == "invalid identity":
+            _ = identity.write_text('{"oauthAccount": []}')
+            expected.append(f"claude2: invalid sign-in; {identity} has an invalid oauthAccount identity; {login_step}")
+        elif fault == "linked identity":
+            identity.symlink_to(self.home / "identity-target")
+            expected.append(f"claude2: cannot use {identity}; {identity} is a link; use a real private directory; {setup}")
+        elif fault == "inaccessible folder":
+            expected = [f"claude2: cannot inspect {directory}; fixture denied; check the file and its permissions; {setup}"]
+        else:
+            _ = identity.write_text("{}")
+            expected.append(f"claude2: not logged in; {directory} has no readable sign-in; {login_step}")
+        original_stat = Path.stat
+
+        def stat_path(path: Path, *, follow_symlinks: bool = True) -> os.stat_result:
+            if fault == "inaccessible folder" and path == directory and follow_symlinks:
+                raise PermissionError("fixture denied")
+            return original_stat(path, follow_symlinks=follow_symlinks)
+
+        original_inspect = accounts._inspect_account_directory  # pyright: ignore[reportPrivateUsage]
+
+        def inspect(selected: accounts.NamedAccount, expected: accounts.AccountNote) -> accounts.AccountDirectoryReadiness:
+            with patch.object(Path, "stat", new=stat_path):
+                return original_inspect(selected, expected)
+
+        with patch.object(accounts, "_inspect_account_directory", side_effect=inspect):
+            statuses = accounts.account_statuses()
+        if omit_direct:
+            direct = statuses[0].state_source
+            diagnostics = tuple(text for text in statuses[0].problems if text != (
+                direct.diagnostic if isinstance(direct, accounts.ObservedStateCause) else f"accounts: {directory} is not logged in"))
+            statuses = [replace(statuses[0], problems=diagnostics)]
+            expected[-1] = f"* claude2: not logged in; no readable sign-in is stored; {login_step}"
+        reading = self.status_with(statuses, [], usage_store.StoredUsage())
+        expected.extend((
+            "units: not configured; the role map selects no account; run accounts.py move units <claudeN>",
+            "showrunners: not configured; the role map selects no account; run accounts.py move showrunners <claudeN>",
+        ))
+        self.assertCountEqual(reading.notes, expected)
+        terminal = accounts.render_status_table(reading).splitlines()
+        self.assertCountEqual(terminal[terminal.index("") + 1:], expected)
+        self.assertCountEqual(cast(list[str], json.loads(accounts.render_status_json(reading))["problems"]),
+            [line.removeprefix("* ") for line in expected])
+
+    def test_state_summary_stays_when_its_observed_diagnostic_is_absent(self) -> None:
+        self.assert_inventory_state_problems("malformed", omit_direct=True)
+
+    def test_logout_summary_without_a_source_stays_visible(self) -> None:
+        self.assert_inventory_state_problems("logout", omit_direct=True)
+
+    def test_unlinked_logout_summary_is_not_merged_with_a_direct_diagnostic(self) -> None:
+        directory = self.home / ".claude2"
+        directory.mkdir()
+        main = self.home / ".claude"
+        main.mkdir()
+        for name in accounts.SHARED:
+            (main / name).mkdir()
+            (directory / name).symlink_to(main / name, target_is_directory=True)
+        notes = self.home / "notes"
+        notes.mkdir()
+        _ = (notes / "claude2.md").write_text("---\nlogin: fixture@notexample.com\n---\n")
+        _ = (directory / ".claude.json").write_text("{}")
+        statuses = [replace(status, state_source=accounts.NoObservedStateCause()) for status in accounts.account_statuses()]
+        reading = self.status_with(statuses, [], usage_store.StoredUsage())
+        step = f"run CLAUDE_CONFIG_DIR={directory} claude and /login"
+        expected = [f"claude2: not logged in; {directory} has no readable sign-in; {step}",
+                    f"* claude2: not logged in; no readable sign-in is stored; {step}",
+                    "units: not configured; the role map selects no account; run accounts.py move units <claudeN>",
+                    "showrunners: not configured; the role map selects no account; run accounts.py move showrunners <claudeN>"]
+        self.assertCountEqual(reading.notes, expected)
+        document = cast(accounts.StatusDocument, json.loads(accounts.render_status_json(reading)))
+        self.assertCountEqual(document["problems"], [line.removeprefix("* ") for line in expected])
+
+    def test_malformed_identity_has_one_cause_and_keeps_private_file_fault(self) -> None:
+        self.assert_inventory_state_problems("malformed")
+
+    def test_invalid_identity_has_one_cause_and_keeps_private_file_fault(self) -> None:
+        self.assert_inventory_state_problems("invalid identity")
+
+    def test_linked_identity_has_one_cause_and_keeps_private_file_fault(self) -> None:
+        self.assert_inventory_state_problems("linked identity")
+
+    def test_inaccessible_folder_has_one_cause(self) -> None:
+        self.assert_inventory_state_problems("inaccessible folder")
+
+    def test_ordinary_logout_keeps_its_problem_and_private_file_fault(self) -> None:
+        self.assert_inventory_state_problems("logout")
+
+    def test_each_linked_private_file_keeps_its_own_status_repair(self) -> None:
+        statuses = self.codex_inventory(linked=("installation_id", "version.json"))
+        reading = self.status_with([], statuses, usage_store.StoredUsage())
+        for name in ("installation_id", "version.json"):
+            line = (f"codex1: private file is linked; {self.home / '.codex1' / name} is a link; "
+                    + "sign-in and home state stay in each account home; use a private file in this home; run accounts.py setup codex1")
+            self.assertIn(line, reading.notes)
+            self.assertIn(line, cast(list[str], json.loads(accounts.render_status_json(reading))["problems"]))
+
+    def test_test_signin_keeps_an_independent_linked_credentials_repair(self) -> None:
+        directory = self.home / ".claude2"
+        directory.mkdir()
+        _ = (directory / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "fixture@example.invalid"}}))
+        credentials = directory / ".credentials.json"
+        credentials.symlink_to(self.home / "private-target")
+        statuses = accounts.account_statuses()
+        reading = self.status_with(statuses, [], usage_store.StoredUsage())
+        linked = [line for line in reading.notes if "private file is linked" in line and str(credentials) in line]
+        self.assertEqual(len(linked), 1)
+        self.assertIn("use a private file in this home", linked[0])
+        self.assertTrue(any("test wrote" in line for line in reading.notes))
+        self.assertFalse(any("account note" in line or "setup claude2" in line or "cutover-home" in line for line in reading.notes))
+
+    def test_duplicate_home_diagnostic_is_one_line_when_both_rows_have_one_account(self) -> None:
+        statuses = self.codex_inventory(duplicate=True)
+        self.assertEqual([status.label for status in statuses], ["codex1", "codex1"])
+        reading = self.status_with([], statuses, usage_store.StoredUsage())
+        lines = [line for line in reading.notes if "login is stored in two homes" in line]
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(len(reading.notes), len(set(reading.notes)))
+
+    def test_duplicate_pairs_are_complete_and_stable_across_three_homes_and_both_producers(self) -> None:
+        notes = self.home / "notes"
+        notes.mkdir()
+        _ = (notes / "codex1.md").write_text("---\nlogin: fixture@notexample.com\n---\n")
+        homes = [self.home / name for name in (".codex", ".codex1", ".codex2")]
+        for home in homes:
+            home.mkdir()
+        def login(home: Path) -> str:
+            return "fixture@notexample.com" if home in homes else ""
+        observed: list[list[str]] = []
+        for order in (homes, list(reversed(homes))):
+            with (patch.object(accounts, "_codex_home_login", side_effect=login),
+                  patch.object(agent_accounts, "codex_email_on_disk", side_effect=login),
+                  patch.object(agent_accounts, "codex_homes", return_value=order),
+                  patch.object(accounts, "_codex_identity_homes", return_value=order),
+                  patch.object(accounts, "_shared_link_problems", return_value=[])):
+                inventory = accounts.codex_statuses(homes[0])
+            reading = self.status_with([], inventory, usage_store.StoredUsage())
+            expected = [
+                "units: not configured; the role map selects no account; run accounts.py move units <claudeN>",
+                "showrunners: not configured; the role map selects no account; run accounts.py move showrunners <claudeN>",
+            ]
+            for first, second in (("~/.codex", "~/.codex1"), ("~/.codex", "~/.codex2"), ("~/.codex1", "~/.codex2")):
+                expected.append(f"codex1: login is stored in two homes; {first} and {second} are logged in as fixture@notexample.com; two homes on one login break token refresh; keep each login in one home")
+            lines = list(reading.notes)
+            observed.append(sorted(lines))
+            self.assertCountEqual(lines, expected)
+            self.assertCountEqual(accounts.render_status_table(reading).split("\n\n", 1)[1].splitlines(), expected)
+            self.assertCountEqual(cast(accounts.StatusDocument, json.loads(accounts.render_status_json(reading)))["problems"], expected)
+        self.assertEqual(observed[0], observed[1])
+
+    def test_startup_observation_does_not_own_another_homes_service_failure(self) -> None:
+        statuses = self.codex_inventory(duplicate=True)
+        failed, other = statuses
+        read = datetime(2026, 10, 29, 1, 14, tzinfo=timezone.utc)
+        startup = agent_accounts.CodexStartupFailure(failed.home, "accounts.py setup codex1")
+        for outcome in (agent_accounts.UsageReadOutcome.OK, agent_accounts.UsageReadOutcome.ERROR,
+                        agent_accounts.UsageReadOutcome.REFUSED_401):
+            with self.subTest(outcome=outcome):
+                usage_store.save([agent_accounts.Report("Codex", email=failed.login,
+                    quotas=[agent_accounts.Quota("Weekly", 50, read + timedelta(days=3))])], read)
+                reports = [agent_accounts.Report("Codex", codex_startup=startup, problem=startup.problem),
+                    agent_accounts.Report("Codex", email=other.login, usage_read_outcome=outcome,
+                        quotas=[agent_accounts.Quota("Weekly", 50, read + timedelta(days=3))]
+                        if outcome == agent_accounts.UsageReadOutcome.OK else [])]
+                with (patch.object(accounts, "account_statuses", return_value=[]),
+                      patch.object(accounts, "codex_statuses", return_value=list(statuses)),
+                      patch.object(accounts, "_codex_live", side_effect=reports),
+                      patch.object(accounts, "role_account", return_value=accounts.CodexWorkersAccount("codex1", failed.home)),
+                      patch.object(accounts, "group_accounts", return_value=accounts.GroupAccounts()),
+                      patch.object(accounts, "_codex_home_login", return_value=""),
+                      patch.object(account, "claude_account", return_value=None)):
+                    reading = accounts.read_status()
+                at = reading.rows[0].read_at
+                self.assertIsInstance(at, datetime)
+                previous = f"this shows the reading from {cast(datetime, at):%H:%M}"
+                expected = [
+                    "units: not configured; the role map selects no account; run accounts.py move units <claudeN>",
+                    "showrunners: not configured; the role map selects no account; run accounts.py move showrunners <claudeN>",
+                    "* codex1: usage unavailable; Codex did not start at ~/.codex1; " + previous
+                        + "; run accounts.py setup codex1 and try again"
+                        + ("; next try in 2 min" if outcome == agent_accounts.UsageReadOutcome.ERROR else
+                           "; start a session on it to check it" if outcome == agent_accounts.UsageReadOutcome.REFUSED_401 else ""),
+                    "codex1: login is stored in two homes; ~/.codex1 and ~/.codex2 are logged in as fixture@notexample.com; two homes on one login break token refresh; keep each login in one home",
+                ]
+                if outcome != agent_accounts.UsageReadOutcome.OK:
+                    expected.append("* codex1: usage unavailable; " + (
+                        "the usage read failed; " + previous + "; next try in 2 min"
+                        if outcome == agent_accounts.UsageReadOutcome.ERROR else
+                        "the usage service did not accept this login; start a session on it to check it"))
+                terminal = accounts.render_status_table(reading).splitlines()
+                self.assertCountEqual(terminal[terminal.index("") + 1:], expected)
+                document = cast(dict[str, object], json.loads(accounts.render_status_json(reading)))
+                self.assertCountEqual(cast(list[str], document["problems"]),
+                    [line.removeprefix("* ") for line in expected])
+
+    def test_check_causes_merge_only_for_the_same_specific_file(self) -> None:
+        for kind in ("check", "usage", "identity"):
+            for same_object in (False, True):
+                with self.subTest(kind=kind, same_object=same_object):
+                    first = accounts.StatusProblem("codex1", "first fault",
+                        accounts.ProblemCause(cast(accounts.ProblemKind, kind), "first cause", accounts.CauseFile("/fixture/installation_id"), accounts.CauseAccount("codex1")),
+                        accounts.ProblemStep("first repair"))
+                    second = accounts.StatusProblem("codex1", "second fault",
+                        accounts.ProblemCause(cast(accounts.ProblemKind, kind), "second cause",
+                            accounts.CauseFile("/fixture/installation_id" if same_object else "/fixture/version.json"), accounts.CauseAccount("codex1")),
+                        accounts.ProblemStep("second repair"))
+                    self.assertEqual(len(accounts.merge_status_problems([first, second])), 1 if same_object else 2)
+
+    def test_independent_configuration_problems_each_keep_their_repair(self) -> None:
+        status = accounts.AccountStatus("~/.claude2", self.home / ".claude2", True, True, True,
+            "claude2", "owner@provider.io", "", (), ("mystery-cache",), accounts.McpServerDifferences((
+                accounts.McpServerDifference("brp", "off", ("~",)),
+                accounts.McpServerDifference("account-only", "on", ("~",)),
+            )))
+        reading = self.status_with([status], [], usage_store.StoredUsage(), detail=True)
+        expected = (
+            "claude2: unclassified entries; mystery-cache; check these entries in ~/.claude2; keep private files in this home",
+            "claude2 turns brp off in 1 project where ~/.claude does not: ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py mcp-projects claude2 brp off",
+            "claude2 turns account-only on in 1 project where ~/.claude does not: ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py mcp-projects claude2 account-only on",
+        )
+        problems = cast(list[str], json.loads(accounts.render_status_json(reading))["problems"])
+        for line in expected:
+            self.assertIn(line, reading.notes)
+            self.assertIn(line, problems)
+
+    def test_generic_service_error_is_independent_of_local_account_faults(self) -> None:
+        directory = self.home / ".claude2"
+        directory.mkdir()
+        _ = (directory / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "fixture@notexample.com"}}))
+        statuses = accounts.account_statuses()
+        reading = self.status_with(statuses, [], usage_store.StoredUsage(
+            read_outcome=agent_accounts.UsageReadOutcome.ERROR,
+            attempt_outcome=agent_accounts.UsageReadOutcome.ERROR))
+        line = "* claude2: usage unavailable; the usage read failed; no reading is stored yet; next try in 2 min"
+        self.assertIn(line, reading.notes)
+        self.assertIn(line, accounts.render_status_table(reading).splitlines())
+        self.assertIn(line.removeprefix("* "), cast(accounts.StatusDocument,
+            json.loads(accounts.render_status_json(reading)))["problems"])
+
+    def test_unreadable_note_keeps_independent_usage_failure_and_retry(self) -> None:
+        directory = self.home / ".claude2"
+        note = self.home / "notes/claude2.md"
+        status = accounts.AccountStatus("~/.claude2", directory, True, True, True,
+            "claude2", "owner@provider.io", "", (f"accounts: could not read {note}: denied",), (), accounts.McpServerDifferences())
+        usage = usage_store.StoredUsage(read_outcome=agent_accounts.UsageReadOutcome.RATE_LIMITED_429,
+            attempt_outcome=agent_accounts.UsageReadOutcome.RATE_LIMITED_429,
+            weekly=usage_store.StoredWindow(left=50, resets="2026-11-01T01:14:00+00:00", at="2026-10-29T01:14:00+00:00"), attempted_at="2026-10-29T01:20:00+00:00")
+        lines = self.status_with([status], [], usage).notes
+        self.assertTrue(any("cannot read" in line for line in lines))
+        self.assertIn("* claude2: usage unavailable; the usage service is busy; this shows the reading from 01:14; next try after 01:30", lines)
+
+    def test_test_signin_with_malformed_or_unreadable_note_has_only_delete_advice(self) -> None:
+        directory = self.home / ".claude2"
+        directory.mkdir()
+        main = self.home / ".claude"
+        main.mkdir()
+        for name in accounts.SHARED:
+            (main / name).mkdir()
+            (directory / name).symlink_to(main / name, target_is_directory=True)
+        identity = directory / ".claude.json"
+        _ = identity.write_text(json.dumps({"oauthAccount": {"emailAddress": "fixture@example.invalid"}}))
+        stamp = datetime(2026, 10, 29, 1, 14, tzinfo=timezone.utc).timestamp()
+        os.utime(identity, (stamp, stamp))
+        note = self.home / "notes/claude2.md"
+        note.parent.mkdir()
+        groups = role_map.groups_file()
+        groups.parent.mkdir(parents=True, exist_ok=True)
+        _ = groups.write_text(json.dumps({"units": "claude2", "showrunners": "claude2"}))
+        for contents in (b"---\nname: fixture\n---\n", b"\xff"):
+            with self.subTest(contents=contents):
+                _ = note.write_bytes(contents)
+                diagnostic = accounts._account_note("claude2")  # pyright: ignore[reportPrivateUsage]
+                assert isinstance(diagnostic, accounts.UnreadableAccountNote)
+                reading = accounts.read_status(source=accounts.StoredUsageOnly())
+                lines = reading.notes
+                self.assertEqual(len([line for line in lines if "test wrote" in line]), 1)
+                self.assertFalse(any("account note" in line or "setup claude2" in line
+                                     or "cutover-home" in line for line in lines))
+                expected = ["workers: not configured; the role map selects no account; run accounts.py set-role workers <codexN>",
+                            "claude2: test sign-in is stored; a test wrote ~/.claude2/.claude.json at 2026-10-29 01:14 UTC; delete ~/.claude2/.claude.json"]
+                self.assertCountEqual(accounts.render_status_table(reading).split("\n\n", 1)[1].strip().splitlines(), expected)
+                self.assertCountEqual(cast(accounts.StatusDocument, json.loads(accounts.render_status_json(reading)))["problems"], expected)
+
+    def test_startup_failure_stays_visible_when_another_home_reads_the_same_login(self) -> None:
+        first = self.home / ".codex1"
+        startup = agent_accounts.CodexStartupFailure(first, "accounts.py setup codex1")
+        statuses = [
+            accounts.CodexStatus("~/.codex1", first, True, True, "codex1", "owner@provider.io", "spare", (startup.problem,), (), startup),
+            accounts.CodexStatus("~/.codex2", self.home / ".codex2", True, True, "codex2", "owner@provider.io", "workers", (), ()),
+        ]
+        usage = usage_store.StoredUsage(read_outcome=agent_accounts.UsageReadOutcome.OK,
+            weekly=usage_store.StoredWindow(left=50, resets="2026-11-01T01:14:00+00:00", at="2026-10-29T01:14:00+00:00"))
+        reading = self.status_with([], statuses, usage)
+        for lines in (reading.notes, cast(list[str], json.loads(accounts.render_status_json(reading))["problems"])):
+            failures = [line for line in lines if "Codex did not start" in line]
+            self.assertEqual(len(failures), 1)
+            self.assertIn("~/.codex1", failures[0])
+            self.assertIn("reading from 01:14", failures[0])
+            self.assertIn("accounts.py setup codex1", failures[0])
+
+    def test_duplicate_identity_keeps_independent_rate_limit_and_its_times(self) -> None:
+        statuses: list[accounts.CodexStatus] = []
+        for number in (1, 2):
+            directory = self.home / f".codex{number}"
+            directory.mkdir()
+            note = self.home / f"notes/codex{number}.md"
+            note.parent.mkdir(exist_ok=True)
+            _ = note.write_text("---\nlogin: owner@provider.io\n---\n")
+        with (patch.object(accounts, "_codex_home_login", return_value="owner@provider.io"),
+              patch.object(accounts, "_codex_identity_homes", return_value=[self.home / ".codex1", self.home / ".codex2"]),
+              patch.object(accounts, "_shared_link_problems", return_value=[])):
+            for number in (1, 2):
+                label = f"codex{number}"
+                diagnostic = accounts._check_codex_home(label, self.home / ".codex1")  # pyright: ignore[reportPrivateUsage]
+                statuses.append(accounts.CodexStatus(f"~/.codex{number}", self.home / f".codex{number}",
+                    True, True, label, "owner@provider.io", "spare", tuple(diagnostic), ()))
+        usage = usage_store.StoredUsage(read_outcome=agent_accounts.UsageReadOutcome.RATE_LIMITED_429,
+            attempt_outcome=agent_accounts.UsageReadOutcome.RATE_LIMITED_429,
+            weekly=usage_store.StoredWindow(left=50, resets="2026-11-01T01:14:00+00:00", at="2026-10-29T01:14:00+00:00"),
+            attempted_at="2026-10-29T01:20:00+00:00")
+        lines = self.status_with([], statuses, usage).notes
+        for number in (1, 2):
+            self.assertIn(f"* codex{number}: usage unavailable; the usage service is busy; this shows the reading from 01:14; next try after 01:30", lines)
+        self.assertEqual(len([line for line in lines if "login is stored in two homes;" in line]), 1)
+        duplicate = next(line for line in lines if "login is stored in two homes;" in line)
+        self.assertIn("~/.codex1", duplicate)
+        self.assertIn("~/.codex2", duplicate)
+
+    def test_merge_drops_only_the_same_typed_cause_on_the_same_owner(self) -> None:
+        kinds: tuple[accounts.ProblemKind, ...] = ("usage", "access", "identity", "wrong login",
+            "signed out", "unreadable note", "unnoted", "startup", "test login", "role", "unclassified", "mcp servers", "check")
+        for first_kind in kinds:
+            for second_kind in kinds:
+                for same_account, same_home in ((False, False), (False, True), (True, False), (True, True)):
+                    with self.subTest(first=first_kind, second=second_kind, same_account=same_account, same_home=same_home):
+                        first = accounts.StatusProblem("claude2", "first diagnostic",
+                            accounts.ProblemCause(first_kind, "first cause", accounts.CauseFile("/fixture/first"), accounts.CauseAccount("claude2")),
+                            accounts.ProblemStep("first repair"))
+                        second = accounts.StatusProblem("roles", "second diagnostic",
+                            accounts.ProblemCause(second_kind, "second cause", accounts.CauseFile("/fixture/first" if same_home else "/fixture/second"),
+                                accounts.CauseAccount("claude2" if same_account else "claude3")),
+                            accounts.ProblemStep("second repair"), origin="role")
+                        merged = accounts.merge_status_problems([first, second])
+                        self.assertEqual(len(merged), 1 if first_kind == second_kind and same_account and same_home else 2)
+
+    def test_mapped_test_identity_never_gets_account_note_advice(self) -> None:
+        directory = self.home / ".claude2"
+        directory.mkdir()
+        main = self.home / ".claude"
+        main.mkdir()
+        for name in accounts.SHARED:
+            (main / name).mkdir()
+            (directory / name).symlink_to(main / name, target_is_directory=True)
+        identity = directory / ".claude.json"
+        _ = identity.write_text(json.dumps({"oauthAccount": {"emailAddress": "fixture@example.invalid"}}))
+        stamp = datetime(2026, 10, 29, 1, 14, tzinfo=timezone.utc).timestamp()
+        os.utime(identity, (stamp, stamp))
+        groups = role_map.groups_file()
+        groups.parent.mkdir(parents=True, exist_ok=True)
+        _ = groups.write_text(json.dumps({"units": "claude2", "showrunners": "claude2"}))
+        reading = accounts.read_status(source=accounts.StoredUsageOnly())
+        lines = reading.notes
+        self.assertEqual(len([line for line in lines if "test wrote" in line]), 1)
+        self.assertFalse(any("account note" in line for line in lines))
+        expected = ["workers: not configured; the role map selects no account; run accounts.py set-role workers <codexN>",
+                    "claude2: test sign-in is stored; a test wrote ~/.claude2/.claude.json at 2026-10-29 01:14 UTC; delete ~/.claude2/.claude.json"]
+        self.assertCountEqual(accounts.render_status_table(reading).split("\n\n", 1)[1].strip().splitlines(), expected)
+        self.assertCountEqual(cast(accounts.StatusDocument, json.loads(accounts.render_status_json(reading)))["problems"], expected)
+
+    def test_codex_startup_cause_keeps_reading_and_setup_in_one_line(self) -> None:
+        directory = self.home / ".codex1"
+        startup = agent_accounts.CodexStartupFailure(directory, "accounts.py setup codex1")
+        status = accounts.CodexStatus("~/.codex1", directory, True, True,
+            "codex1", "owner@provider.io", "workers", (startup.problem,), (), startup)
+        usage = usage_store.StoredUsage(read_outcome=agent_accounts.UsageReadOutcome.ERROR,
+            attempt_outcome=agent_accounts.UsageReadOutcome.ERROR, weekly=usage_store.StoredWindow(left=50, resets="2026-11-01T01:14:00+00:00", at="2026-10-29T01:14:00+00:00"))
+        lines = [line for line in self.status_with([], [status], usage).notes if "codex1:" in line]
+        self.assertEqual(len(lines), 1)
+        self.assertIn("Codex did not start", lines[0])
+        self.assertIn("reading from 01:14", lines[0])
+        self.assertIn("accounts.py setup codex1", lines[0])
+
+    def test_invalid_existing_claude_identity_requires_login_repair(self) -> None:
+        directory = self.home / ".claude2"
+        directory.mkdir()
+        identity = directory / ".claude.json"
+        _ = identity.write_text('{"oauthAccount": {}}')
+        status = accounts.AccountStatus("~/.claude2", directory, True, True, True,
+            "claude2", "", "", (f"accounts: {identity} has an invalid oauthAccount identity",), (), accounts.McpServerDifferences(),
+            state_source=accounts.account_directory_readiness("claude2").state_source)
+        lines = [line for line in self.status_with([status], [], usage_store.StoredUsage()).notes if "claude2:" in line]
+        self.assertEqual(len(lines), 1)
+        self.assertIn("/login", lines[0])
+        self.assertNotIn("accounts.py setup", lines[0])
+
+    def test_same_test_identity_in_two_codex_homes_keeps_both_delete_steps(self) -> None:
+        for index, name in enumerate((".codex", ".codex1")):
+            directory = self.home / name
+            directory.mkdir()
+            identity = directory / "auth.json"
+            payload = base64.urlsafe_b64encode(json.dumps({"email": "fixture@example.invalid"}).encode()).decode().rstrip("=")
+            _ = identity.write_text(json.dumps({"tokens": {"id_token": f"fixture.{payload}.fixture"}}))
+            stamp = datetime(2026, 10, 29, 1, 14 + index, tzinfo=timezone.utc).timestamp()
+            os.utime(identity, (stamp, stamp))
+        notes = self.home / "notes"
+        notes.mkdir()
+        _ = (notes / "codex1.md").write_text("---\nlogin: fixture@example.invalid\n---\n")
+        reading = accounts.read_status(source=accounts.StoredUsageOnly())
+        lines = [line for line in reading.notes if "test wrote" in line]
+        self.assertEqual(len(lines), 2)
+        for index, name in enumerate((".codex", ".codex1")):
+            self.assertTrue(any(f"delete ~/{name}/auth.json" in line and f"01:{14 + index} UTC" in line for line in lines))
+        expected = [
+            "workers: not configured; the role map selects no account; run accounts.py set-role workers <codexN>",
+            "units: not configured; the role map selects no account; run accounts.py move units <claudeN>",
+            "showrunners: not configured; the role map selects no account; run accounts.py move showrunners <claudeN>",
+            "codex1: test sign-in is stored; a test wrote ~/.codex/auth.json at 2026-10-29 01:14 UTC; delete ~/.codex/auth.json",
+            "codex1: test sign-in is stored; a test wrote ~/.codex1/auth.json at 2026-10-29 01:15 UTC; delete ~/.codex1/auth.json",
+            "codex1: login is stored in two homes; ~/.codex and ~/.codex1 are logged in as fixture@example.invalid; two homes on one login break token refresh; keep each login in one home",
+        ]
+        self.assertCountEqual(accounts.render_status_table(reading).split("\n\n", 1)[1].strip().splitlines(), expected)
+        self.assertCountEqual(cast(accounts.StatusDocument, json.loads(accounts.render_status_json(reading)))["problems"], expected)
+
+    def test_real_domains_keep_account_repairs_through_status(self) -> None:
+        for domain in ("notexample.com", "latest.io", "proton.me"):
+            with self.subTest(domain=domain):
+                lines = self.reading("fixture@" + domain).notes
+                self.assertFalse(any("test wrote" in line or "delete " in line for line in lines))
+                self.assertTrue(any("accounts.py cutover-home" in line and "add ~/rust" in line for line in lines))
+
+    def test_reserved_login_reports_the_test_file_and_write_time_without_account_steps(self) -> None:
+        for domain in ("invalid", "test", "example", "localhost", "one.invalid", "one.test",
+                       "one.example", "one.localhost", "example.com", "example.net", "example.org",
+                       "sub.example.com", "EXAMPLE.ORG."):
+            for noted in (False, True):
+                with self.subTest(domain=domain, noted=noted):
+                    reading = self.reading("mesh-fixture@" + domain, noted=noted)
+                    lines = [line for line in reading.notes if "test wrote" in line]
+                    self.assertEqual(len(lines), 1)
+                    line = lines[0]
+                    self.assertIn("auth.json", line)
+                    self.assertIn("2026-10-29 01:14 UTC", line)
+                    self.assertIn("delete ~/.codex/auth.json", line)
+                    self.assertFalse(any("cutover-home" in note or "add ~/rust" in note
+                                         for note in reading.notes))
+                    self.assertTrue(any("usage read failed" in note for note in reading.notes))
+                    problems = cast(list[str], json.loads(accounts.render_status_json(reading))["problems"])
+                    self.assertEqual(problems, [note.removeprefix("* ") for note in reading.notes])
+                    self.assertIn(line, accounts.render_status_table(reading))
+
+    def test_unnoted_legacy_login_merges_read_failure_and_keeps_both_repairs(self) -> None:
+        reading = self.reading("fixture@notexample.com")
+        lines = [line for line in reading.notes if "~/.codex" in line]
+        self.assertEqual(len(lines), 2)
+        self.assertIn("* ~/.codex: usage unavailable; the usage read failed; no reading is stored yet; next try in 2 min", lines)
+        lines = [line for line in lines if "no account note" in line]
+        self.assertEqual(len(lines), 1)
+        self.assertIn("no account note", lines[0])
+        self.assertIn("login: fixture@notexample.com", lines[0])
+        self.assertIn("accounts.py cutover-home", lines[0])
+        self.assertNotIn("usage read failed", lines[0])
+
+    def test_claude_test_signins_name_the_identity_file_in_each_home(self) -> None:
+        home = self.home / ".claude"
+        home.mkdir()
+        numbered = self.home / ".claude2"
+        numbered.mkdir()
+        identity = numbered / ".claude.json"
+        seed = self.home / ".claude.json"
+        for path in (identity, seed):
+            _ = path.write_text("fixture identity")
+            at = datetime(2026, 10, 29, 1, 14, tzinfo=timezone.utc).timestamp()
+            os.utime(path, (at, at))
+        status = accounts.AccountStatus("~/.claude2", numbered, True, True, True,
+            "claude2", "fixture@example.invalid", "", (), (), accounts.McpServerDifferences())
+        with (patch.object(accounts, "account_statuses", return_value=[status]),
+              patch.object(accounts, "codex_statuses", return_value=[]),
+              patch.object(accounts, "role_account", return_value=accounts.CodexWorkersAccount("codex1", self.home / ".codex1")),
+              patch.object(accounts, "group_accounts", return_value=accounts.GroupAccounts()),
+              patch.object(accounts, "_stored_usage", return_value={}),
+              patch.object(accounts, "_codex_home_login", return_value=""),
+              patch.object(account, "claude_account", return_value=account.Account("claude", "fixture@example.invalid", "claude2"))):
+            reading = accounts.read_status(source=accounts.StoredUsageOnly())
+        lines = [line for line in reading.notes if "test wrote" in line]
+        self.assertEqual(len(lines), 2)
+        self.assertTrue(any("delete ~/.claude.json" in line for line in lines))
+        self.assertTrue(any("delete ~/.claude2/.claude.json" in line for line in lines))
+        self.assertTrue(all("2026-10-29 01:14 UTC" in line for line in lines))
+        self.assertFalse(any("cutover-home" in line for line in reading.notes))
+
+    def test_unreadable_test_file_time_keeps_the_deletion_step(self) -> None:
+        with patch.object(Path, "stat", side_effect=PermissionError("fixture denied")):
+            problem = accounts.test_login_problem("~/.codex", self.home / ".codex/auth.json", timezone.utc)
+        line = accounts.render_status_problem(problem)
+        self.assertIn("file time could not be read", line)
+        self.assertIn("delete ~/.codex/auth.json", line)
+
+    def test_status_failure_uses_the_problem_renderer_without_changing_launch_errors(self) -> None:
+        reason = "accounts: cannot read role map from natedev; no usable map"
+        for args in (("status",), ("status", "--json")):
+            output, error = io.StringIO(), io.StringIO()
+            with (patch.object(accounts, "read_status", side_effect=accounts.AccountsError(reason)),
+                  redirect_stdout(output), redirect_stderr(error)):
+                self.assertEqual(accounts.main(list(args)), 1)
+            self.assertEqual(output.getvalue(), "")
+            self.assertTrue(error.getvalue().startswith("role map: unavailable;"))
+            self.assertIn("no usable map", error.getvalue())
+            self.assertIn("restore access", error.getvalue())
+        output, error = io.StringIO(), io.StringIO()
+        with (patch.object(accounts, "exec_account", side_effect=accounts.AccountsError(reason)),
+              redirect_stdout(output), redirect_stderr(error)):
+            self.assertEqual(accounts.main(["exec", "claude2"]), 2)
+        self.assertEqual(error.getvalue(), reason + "\n")
+
+    def test_non_address_values_are_not_test_logins(self) -> None:
+        for login in ("", "example.com", "owner", "owner@"):
+            self.assertFalse(accounts.is_test_login(login))
+
+    def test_check_problem_parts_keep_the_facts_and_an_action(self) -> None:
+        directory = self.home / ".claude2"
+        cases = (
+            (f"accounts: {directory} is missing", "access", "missing", "accounts.py setup claude2"),
+            (f"accounts: {directory} is not logged in", "signed out", "no readable sign-in", "/login"),
+            (f"accounts: could not read {directory}: permission denied", "access", "permission denied", "permissions"),
+            ("accounts: claude2 has no account note at /fixture/claude2.md", "note", "/fixture/claude2.md", "add the account note"),
+            ("accounts: ~/.claude2 is logged in as owner@example.invalid, not claude2", "wrong login", "owner@example.invalid", "/login"),
+            ("accounts: units has no account; run accounts.py move units <claudeN>", "role", "selects no account", "accounts.py move units"),
+            ("accounts: units is on claude2, which is not set up on this machine; run accounts.py setup claude2", "role", "claude2", "accounts.py setup claude2"),
+            ("accounts: cannot read role map from natedev; no usable map", "role", "no usable map", "restore access"),
+        )
+        for text, kind, fact, step in cases:
+            with self.subTest(kind=kind, fact=fact):
+                problem = accounts.status_check_problem(text, "claude2",
+                    setup="run accounts.py setup claude2", login="run claude and /login",
+                    access_paths=(str(directory),))
+                self.assertIsInstance(problem.cause, accounts.ProblemCause)
+                assert isinstance(problem.cause, accounts.ProblemCause)
+                self.assertEqual(problem.cause.kind, kind)
+                self.assertIn(fact, problem.cause.explanation)
+                self.assertIsInstance(problem.step, accounts.ProblemStep)
+                assert isinstance(problem.step, accounts.ProblemStep)
+                self.assertIn(step, problem.step.instruction)
+                self.assertEqual(accounts.render_status_problem(problem).split(":", 1)[0], problem.subject)
+
+    def test_account_state_merge_uses_the_cause_after_wording_changes(self) -> None:
+        directory = self.home / ".claude2"
+        directory.symlink_to(self.home / "missing-folder")
+        observed = accounts.account_directory_readiness("claude2").state_source
+        assert isinstance(observed, accounts.ObservedStateCause)
+        direct = accounts.StatusProblem("claude2", "new wording for the fault",
+            accounts.ProblemCause("access", "missing folder", key=observed.key), accounts.ProblemStep("run accounts.py setup claude2"))
+        summary = accounts.StatusProblem("claude2", "not set up", accounts.ProblemCause("access", "no folder"),
+            accounts.ProblemStep("run accounts.py setup claude2"), True, origin="account state", state_source=observed)
+        self.assertEqual(accounts.merge_status_problems([direct, summary]), [direct])
+
+    def test_all_problem_parts_use_one_renderer_and_named_absence_variants(self) -> None:
+        problem = accounts.StatusProblem("codex1", "usage unavailable",
+            accounts.ProblemCause("usage", "the service is busy"),
+            accounts.ProblemStep("next try after 01:24"), footnote=True)
+        self.assertEqual(accounts.render_status_problem(problem),
+            "* codex1: usage unavailable; the service is busy; next try after 01:24")
+        self.assertEqual(accounts.render_status_problem(accounts.StatusProblem("codex1", "check failed",
+            accounts.NoSeparateCause(), accounts.NoUserStep())), "codex1: check failed")
 
 
 if __name__ == "__main__":

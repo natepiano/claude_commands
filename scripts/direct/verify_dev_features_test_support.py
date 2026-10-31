@@ -10,6 +10,9 @@ import re
 import subprocess
 import sys
 from unittest.mock import patch
+from typing import override
+
+from scripts.direct.verify_examples_test_support import SeededExampleWorkspaceFixture
 
 
 VERIFY = Path(__file__).with_name("verify.sh")
@@ -64,3 +67,23 @@ def parse_dev_features(manifest: Path, environment: dict[str, str]) -> subproces
         os.chdir(directory)
     return subprocess.CompletedProcess([sys.executable, "-c", source, str(manifest)],
                                        status, stdout.getvalue(), stderr.getvalue())
+
+
+class DevFeatureFixture(SeededExampleWorkspaceFixture):
+    """Seed the private workspace once; retain real Bash and Cargo stub calls."""
+
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        builder = cls()
+        _ = builder.package(root=cls.fixture_seed)
+        cls.fixture_environment["NEXTEST_TEST_THREADS"] = "2"
+
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        isolate_verify_inputs(self.environment, self.root)
+
+    def clear_calls(self) -> None:
+        self.calls.unlink(missing_ok=True)

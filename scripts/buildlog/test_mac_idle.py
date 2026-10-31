@@ -25,8 +25,10 @@ import memory
 import sample
 if TYPE_CHECKING:
     from ..direct import step_record
+    from ..lint.memory_test_support import fake_memory_readings
 else:
     from scripts.direct import step_record
+    from scripts.lint.memory_test_support import fake_memory_readings
 from test_index import use_test_log
 
 use_test_log()
@@ -46,6 +48,7 @@ class MacIdleTests(unittest.TestCase):
         self.paths = mac_idle.MacIdlePaths(self.root / "watch", self.root / "mac", self.root / "sessions",
                                         self.root / "buildlog/admission", self.root / "proc", self.root / "registry")
         self.enterContext(mock.patch.dict(os.environ, {
+            **fake_memory_readings(self.root),
             "BUILDLOG_DIR": str(self.root / "buildlog"),
             "VERIFY_STEPS_DIR": str(self.root / "steps"),
             "VERIFY_PROC_ROOT": str(self.paths.proc),

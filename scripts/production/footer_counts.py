@@ -2,8 +2,8 @@
 
 The status line and the dailies report's own footer show it; no reply carries it (user,
 2026-10-18). Each count is the production's own: the showrunners above and below it count their
-own (user, 2026-10-27). Changes are the rows still to review that are the production's
-(change_review.scope_rows), proposals the issues and plan-backlog lines that /next proposal
+own (user, 2026-10-27). Changes are the production's open rows from its current and earlier
+lists (change_review.scope_rows), proposals the issues and plan-backlog lines that /next proposal
 lists for review (proposals_table.waiting_entries), and efficiency the proposed or deferred
 lines in its Efficiency ledger. Accepted plan-backlog lines are work in progress and do not count.
 """
@@ -90,9 +90,9 @@ def sources(doc: Path) -> list[Path]:
     changes.
     """
     try:
-        listed: Path | None = change_review.scope_list(doc)
+        listed = [item.path for item in change_review.scope_lists(change_review.scope_list(doc), doc)]
     except (change_review.ChangeReviewError, OSError):
-        listed = None
+        listed = []
     folder = proposals_folder.issues_folder(doc)
     try:
         queue = proposals_folder.ledger(doc)
@@ -100,7 +100,7 @@ def sources(doc: Path) -> list[Path]:
     except OSError:
         queue = None
         efficiency_queue = None
-    found = [doc, *(path for path in (listed, folder, queue, efficiency_queue) if path is not None)]
+    found = [doc, *listed, *(path for path in (folder, queue, efficiency_queue) if path is not None)]
     try:
         found.extend(issue.path for issue in proposals_folder.open_proposals(doc))
     except OSError:

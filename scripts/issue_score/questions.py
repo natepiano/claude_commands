@@ -3,12 +3,17 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Literal, TypedDict
+from typing import Literal, NotRequired, TypedDict
 
 
 @dataclass(frozen=True)
 class Supported:
     threshold: float
+
+
+@dataclass(frozen=True)
+class MinimumGap:
+    gap: float
 
 
 @dataclass(frozen=True)
@@ -21,9 +26,9 @@ class ReportOnly:
     pass
 
 
-ThresholdOutcome = Supported | Unsupported | ReportOnly
+ThresholdOutcome = Supported | MinimumGap | Unsupported | ReportOnly
 
-QUESTION_SET_VERSION = "4"
+QUESTION_SET_VERSION = "5"
 MODEL = "jev-1.14.0"
 BUDGET_USD = 20.0
 INPUT_USD_PER_MILLION = 0.042
@@ -35,17 +40,20 @@ THRESHOLDS: dict[str, ThresholdOutcome] = {
     "backlog_urgency": ReportOnly(),
     "backlog_effort": ReportOnly(),
     "category": Supported(0.90),
-    # Defined-area options: tune error .083 with .38 taken (2026-10-29).
-    "area": Supported(0.90),
+    # 62 areas, run 20261029T155801.891126Z-3015dbcf:
+    # plain averaged gap: tune 21% to user, 24.6% taken-wrong;
+    # held-out 19% to user, 25.3% taken-wrong. User confirms every value.
+    "area": MinimumGap(0.3),
 }
-# The user's per-field verdict after the blind preference test (2026-10-29):
+# The user's per-field verdict, including the area decision (2026-10-30):
 # Jev proposes these fields; the agent proposes every other field.
-JEV_FIELDS: frozenset[str] = frozenset({"backlog_goal", "backlog_impact", "backlog_alignment"})
+JEV_FIELDS: frozenset[str] = frozenset({"backlog_goal", "backlog_impact", "backlog_alignment", "area"})
 
 ERROR_TARGETS = {field: 0.1 for field in (
     "backlog_goal", "category", "area", "backlog_impact", "backlog_alignment",
 )}
 RISK_THRESHOLDS = tuple(percent / 100 for percent in range(40, 100, 5))
+RISK_GAPS = tuple(percent / 100 for percent in range(0, 100, 5))
 EVIDENCE_PRESENT = 0.7
 EVIDENCE_ABSENT = 0.3
 SPLIT_PROBABILITY = 0.25
@@ -177,11 +185,31 @@ class ScoreQuestion(TypedDict):
 Question = NoulQuestion | ChoiceQuestion | ScoreQuestion
 
 
+class AvailableRule(TypedDict):
+    name: str
+    summary: str
+    status: Literal["available"]
+
+
+class UnavailableRule(TypedDict):
+    name: str
+    status: Literal["missing"]
+
+
+class StyleState(TypedDict):
+    style_rules: list[AvailableRule | UnavailableRule]
+    style_crate: str
+    finding_count: int
+
+
 class IssueDescription(TypedDict):
     title: str
     project: str
     project_about: str
     body: str
+    style_rules: NotRequired[list[AvailableRule | UnavailableRule]]
+    style_crate: NotRequired[str]
+    finding_count: NotRequired[int]
 
 
 class IssueState(TypedDict):

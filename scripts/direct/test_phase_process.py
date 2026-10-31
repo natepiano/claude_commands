@@ -239,7 +239,7 @@ class TrialProcessTests(unittest.TestCase):
         with contextlib.redirect_stdout(output):
             process.render_trial(trials, (), WINDOW, "before")
         self.assertIn("NoFollowingPhase n=1", output.getvalue())
-        self.assertRegex(output.getvalue(), r"weighted director tokens, phase plus gap\s+0\s+—")
+        self.assertRegex(output.getvalue(), r"weighted tokens\s+0\s+—")
 
     def test_next_phase_must_start_with_the_same_hash(self) -> None:
         for next_start in (contract_event("phase_started", 120, phase="next", direct_hash=NEW_HASH),
@@ -383,8 +383,101 @@ class TrialProcessTests(unittest.TestCase):
         self.assertIn("ExposureNotRecorded: old event n=1", text)
         self.assertIn("NoFollowingPhase n=1", text)
         self.assertIn("NoCompaction n=1 phases", text)
-        self.assertRegex(text, r"weighted director tokens, phase plus gap\s+1\s+40\s+40\s+40\s+0")
+        self.assertRegex(text, r"(?m)^weighted tokens\s+1\s+40\s+40\s+40$")
         self.assertNotIn("999", text)
+
+    def test_trial_measures_fit_phone_with_large_counts_and_missing_records(self) -> None:
+        trial = process.select_trial_phases(trial_events(), WINDOW, ROUTE)[0]
+        absent = process.NotRecorded("fixture usage", "no token records")
+        measures = (
+            process.TrialMeasures(trial, process.TrialTokens(2_442_949.1, 20_100_000, 61_000, 1),
+                                  process.PhaseReloads(1, (2_700_000,))),
+            process.TrialMeasures(trial, absent, process.PhaseReloads(0, process.NoCompaction())),
+        )
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            process.render_trial((trial, trial), measures, WINDOW, "before")
+        text = output.getvalue()
+        section = text[text.index("Trial measures"):text.index("Context size after reload")].strip()
+        lines = section.splitlines()
+        for line in lines:
+            self.assertLessEqual(len(line), 60, line)
+        self.assertIn("eligible phases, natedev only", lines[0])
+        self.assertIn("Director tokens: phase plus gap; compactions: phase", section)
+        self.assertRegex(section, r"(?m)^weighted tokens\s+1\s+2\.4M\s+2\.4M\s+2\.4M$")
+        self.assertRegex(section, r"(?m)^raw input with caches\s+1\s+20\.1M\s+20\.1M\s+20\.1M$")
+        self.assertRegex(section, r"(?m)^raw output\s+1\s+61K\s+61K\s+61K$")
+        self.assertRegex(section, r"(?m)^compactions\s+2\s+0\.5\s+1\s+1$")
+        self.assertEqual([line for line in lines if line.startswith("not recorded:")], [
+            "not recorded: weighted tokens n=1", "not recorded: raw input with caches n=1",
+            "not recorded: raw output n=1",
+        ])
+        self.assertNotIn("not recorded", next(line for line in lines if line.startswith("measure")))
+        # Other tables retain their full values and missing-count column.
+        self.assertRegex(text, r"first request after contract Read result\s+1\s+2,700,000\s+2,700,000\s+2,700,000\s+0")
+
+    def test_trial_table_headings_are_no_wider_than_empty_measure_rows(self) -> None:
+        trial = process.select_trial_phases(trial_events()[:-1], WINDOW, ROUTE)[0]
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            process.render_trial((trial,), (), WINDOW, "before")
+        text = output.getvalue()
+        lines = text[text.index("Trial measures"):text.index("Context size after reload")].strip().splitlines()
+        row_width = min(len(line) for line in lines[3:])
+        for heading in lines[:3]:
+            self.assertLessEqual(len(heading), row_width, heading)
+        self.assertTrue(all(len(line) <= 60 for line in lines), lines)
+
+    def test_trial_measures_shorten_counts_at_thousand_and_million_boundaries(self) -> None:
+        trial = process.select_trial_phases(trial_events(), WINDOW, ROUTE)[0]
+        for value, expected in ((999.0, "999"), (1_000.0, "1K"), (54_998.0, "55K"),
+                                (999_999.0, "1.0M"), (1_000_000.0, "1.0M"), (2_700_000.0, "2.7M")):
+            with self.subTest(value=value):
+                measures = (process.TrialMeasures(trial, process.TrialTokens(value, int(value), int(value), 1),
+                                                  process.PhaseReloads(0, process.NoCompaction())),)
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    process.render_trial((trial,), measures, WINDOW, "before")
+                text = output.getvalue()
+                section = text[text.index("Trial measures"):text.index("Context size after reload")].strip()
+                self.assertRegex(section, rf"(?m)^weighted tokens\s+1\s+{re.escape(expected)}\s+{re.escape(expected)}\s+{re.escape(expected)}$")
+                self.assertNotIn("not recorded:", section)
+                self.assertTrue(all(len(line) <= 60 for line in section.splitlines()), section)
+
+    def test_trial_measures_fit_phone_with_billions_and_trillions(self) -> None:
+        trial = process.select_trial_phases(trial_events(), WINDOW, ROUTE)[0]
+        for value, expected in ((10_000_000_000, "10.0B"), (12_300_000_000, "12.3B"),
+                                (1_000_000_000_000, "1.0T"), (999_900_000_000_000, "999.9T")):
+            with self.subTest(value=value):
+                measures = (process.TrialMeasures(trial, process.TrialTokens(float(value), value, value, 1),
+                                                  process.PhaseReloads(0, process.NoCompaction())),)
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    process.render_trial((trial,), measures, WINDOW, "before")
+                text = output.getvalue()
+                section = text[text.index("Trial measures"):text.index("Context size after reload")].strip()
+                for label in ("weighted tokens", "raw input with caches", "raw output"):
+                    self.assertRegex(section, rf"(?m)^{label}\s+1\s+{re.escape(expected)}\s+{re.escape(expected)}\s+{re.escape(expected)}$")
+                for line in section.splitlines():
+                    self.assertLessEqual(len(line), 60, line)
+
+    def test_trial_measures_promote_counts_that_round_to_the_next_unit(self) -> None:
+        trial = process.select_trial_phases(trial_events(), WINDOW, ROUTE)[0]
+        for value, expected in ((999_499, "999K"), (999_500, "1.0M"), (999_999, "1.0M"),
+                                (999_949_999, "999.9M"), (999_950_000, "1.0B"),
+                                (999_999_999, "1.0B"), (999_949_999_999, "999.9B"),
+                                (999_950_000_000, "1.0T"), (999_999_999_999, "1.0T")):
+            with self.subTest(value=value):
+                measures = (process.TrialMeasures(trial, process.TrialTokens(float(value), value, value, 1),
+                                                  process.PhaseReloads(0, process.NoCompaction())),)
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    process.render_trial((trial,), measures, WINDOW, "before")
+                text = output.getvalue()
+                section = text[text.index("Trial measures"):text.index("Context size after reload")].strip()
+                for label in ("weighted tokens", "raw input with caches", "raw output"):
+                    self.assertRegex(section, rf"(?m)^{label}\s+1\s+{re.escape(expected)}\s+{re.escape(expected)}\s+{re.escape(expected)}$")
+                self.assertTrue(all(len(line) <= 60 for line in section.splitlines()), section)
 
     def test_cli_filters_fixture_units_and_exposure_and_reads_usage_through_gap(self) -> None:
         with tempfile.TemporaryDirectory(dir="/tmp/claude") as folder:
@@ -433,7 +526,7 @@ class TrialProcessTests(unittest.TestCase):
             self.assertIn("NoFollowingPhase n=1", text)
             self.assertIn("run/phase", text)
             self.assertNotIn("other/phase", text)
-            self.assertRegex(text, r"weighted director tokens, phase plus gap\s+1\s+45\s+45\s+45\s+0")
+            self.assertRegex(text, r"(?m)^weighted tokens\s+1\s+45\s+45\s+45$")
             self.assertRegex(text, r"first request after contract Read result\s+1\s+150\s+150\s+150\s+0")
 
     def test_trial_phase_time_uses_start_selected_eligible_phases_and_recorded_units(self) -> None:
@@ -529,7 +622,8 @@ class TrialProcessTests(unittest.TestCase):
                     self.assertIn("ExposureNotRecorded n=1", text)
                     self.assertIn("NoFollowingPhase n=1", text)
                     self.assertIn("SharedDirector n=2", text)
-                    self.assertRegex(text, r"weighted director tokens, phase plus gap\s+0\s+—\s+—\s+—\s+1")
+                    self.assertRegex(text, r"(?m)^weighted tokens\s+0\s+—\s+—\s+—$")
+                    self.assertIn("not recorded: weighted tokens n=1\n", text)
                     if not detail:
                         self.assertIn("Excluded from per-phase costs: mixed n=1", text)
                         self.assertIn("open unmixed n=1", text)

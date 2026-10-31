@@ -7,8 +7,9 @@ the kept pushes, oldest first, as they would have gone out, and prints how many.
 with the same non-empty key from the same source replaces the older kept one, so `off` posts
 only the newest. `on` with no end lasts until `off`; --until (a time in the user's zone,
 user_zone.py) or --for (a span: 1h, 45min, 1h30min) makes a transient systemd user timer that
-runs `off` then. `on` again replaces the end. If the end passes without the timer (natedev was
-off), the next push or silence.py call ends silence as `off` does.
+runs `off --timer UNIT` then, ending only the silence that still names it. `on` again replaces the
+end. If the end passes without the timer (natedev was off), the next push or silence.py call ends
+silence as `off` does.
 
 `drop --source S --key K` removes the kept pushes with that source and non-empty key, by the rule
 that makes a newer kept push replace an older one, and prints how many it removed. `send.py retire
@@ -182,15 +183,14 @@ def span_seconds(span: str) -> int | None:
 
 
 def timer_argv(until: datetime, unit: str) -> list[str]:
-    """The systemd-run command that runs `silence.py off` once, at `until`."""
+    """The systemd-run command that ends this timer's silence once, at `until`."""
     return ["systemd-run", "--user", "--collect", f"--unit={unit}",
             f"--on-calendar={until.astimezone(timezone.utc):%Y-%m-%d %H:%M:%S} UTC",
-            "--timer-property=AccuracySec=1s", str(PY), str(SILENCE), "off"]
+            "--timer-property=AccuracySec=1s", str(PY), str(SILENCE), "off", "--timer", unit]
 
 
-def stop_timer(unit: str | None, runner: Run) -> None:
-    if unit:
-        _ = runner(["systemctl", "--user", "stop", f"{unit}.timer"])
+def stop_timer(unit: str | None, runner: Run) -> int:
+    return runner(["systemctl", "--user", "stop", f"{unit}.timer"]) if unit else 0
 
 
 def past_end(record: SilenceRecord) -> bool:
@@ -266,8 +266,11 @@ def on(until: datetime | None, runner: Run) -> int:
         old = read_state()
         record: SilenceRecord = {"since": old["since"] if old else datetime.now(user_zone()).isoformat(),
                                  "until": until.isoformat() if until else None, "timer": unit, "auto": False}
+        if stop_timer(old["timer"] if old else None, runner) != 0:
+            _ = stop_timer(unit, runner)
+            print("silence: the old end timer could not be stopped; silence not changed", file=sys.stderr)
+            return 1
         write_state(record)
-    stop_timer(old["timer"] if old else None, runner)
     print(f"silence on from {shown(datetime.fromisoformat(record['since']))} {ends(record)}")
     return 0
 
@@ -281,32 +284,53 @@ def post_kept(push: KeptPush) -> int:
     return cast(PushChannel, cast(object, importlib.import_module("pushover"))).post_kept(push)
 
 
-def claim(when: Callable[[SilenceRecord], bool] | None = None) -> tuple[SilenceRecord | None, list[KeptPush]] | None:
-    """End silence and take the kept pushes, under the lock: two callers never take the same push.
+def claim(when: Callable[[SilenceRecord], bool] | None = None, *,
+          release_if_off: bool = False) -> tuple[SilenceRecord | None, list[KeptPush]] | None:
+    """End silence and read the kept pushes, leaving them saved until release posts them.
 
     With `when`, only a silence it accepts ends; otherwise nothing changes and the result is None.
+    `release_if_off` also claims leftover pushes when no silence is saved.
     """
     with locked():
         record = read_state()
-        if when is not None and (record is None or not when(record)):
+        if when is not None and ((record is None and not release_if_off)
+                                 or (record is not None and not when(record))):
             return None
         kept = read_kept()
         state_file().unlink(missing_ok=True)
-        kept_file().unlink(missing_ok=True)
     return record, kept
 
 
 def release(record: SilenceRecord | None, kept: list[KeptPush], runner: Run, deliver: Deliver, opening: str) -> int:
-    stop_timer(record["timer"] if record else None, runner)
-    failed = sum(deliver(push) != 0 for push in kept)
-    plural = "" if len(kept) == 1 else "es"
+    _ = stop_timer(record["timer"] if record else None, runner)
+    failed = attempted = 0
+    with locked():
+        pending = read_kept()
+        for push in kept:
+            # Another release may already have posted this push since claim read it.
+            if push not in pending:
+                continue
+            attempted += 1
+            if deliver(push) != 0:
+                failed += 1
+                continue
+            pending.remove(push)
+            temporary = kept_file().with_suffix(".tmp")
+            _ = temporary.write_text("".join(json.dumps(left) + "\n" for left in pending), encoding="utf-8")
+            _ = temporary.replace(kept_file())
+        if not pending:
+            kept_file().unlink(missing_ok=True)
+    plural = "" if attempted == 1 else "es"
     note = f"; {failed} failed, see ~/.local/state/notify/pushover.jsonl" if failed else ""
-    print(f"{opening}; {len(kept)} kept push{plural} delivered{note}", file=sys.stdout if opening == "silence off" else sys.stderr)
+    print(f"{opening}; {attempted} kept push{plural} delivered{note}", file=sys.stdout if opening == "silence off" else sys.stderr)
     return 1 if failed else 0
 
 
-def off(runner: Run, deliver: Deliver | None = None) -> int:
-    record, kept = cast(tuple[SilenceRecord | None, list[KeptPush]], claim())
+def off(runner: Run, deliver: Deliver | None = None, timer: str = "") -> int:
+    claimed = claim(lambda record: record["timer"] == timer, release_if_off=True) if timer else claim()
+    if claimed is None:
+        return 0
+    record, kept = claimed
     return release(record, kept, runner, deliver or post_kept, "silence off")
 
 
@@ -346,7 +370,8 @@ def main(argv: Sequence[str] | None = None, runner: Run = run, system: str | Non
     end = start.add_mutually_exclusive_group()
     _ = end.add_argument("--until", help='a time in the user\'s zone: "YYYY-MM-DD HH:MM"')
     _ = end.add_argument("--for", dest="span", help="a span: 1h, 45min, 1h30min")
-    _ = commands.add_parser("off", help="end silence and post the kept pushes")
+    stop = commands.add_parser("off", help="end silence and post the kept pushes")
+    _ = stop.add_argument("--timer", default="", help="end only the silence that names this timer")
     _ = commands.add_parser("status", help="say whether silence is on")
     _ = commands.add_parser("keep", help="pushover.py: keep the push JSON on stdin when silence is on")
     dropping = commands.add_parser("drop", help="send.py retire: remove the kept pushes with this source and key")
@@ -375,7 +400,7 @@ def main(argv: Sequence[str] | None = None, runner: Run = run, system: str | Non
             parser.error(f"{until_text} has already passed")
         return on(until, runner)
     if command == "off":
-        return off(runner)
+        return off(runner, timer=cast(str, options.timer))
     if command == "keep":
         push = parse_push(sys.stdin.read())
         if push is None:

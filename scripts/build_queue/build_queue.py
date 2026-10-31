@@ -1,140 +1,91 @@
 #!/usr/bin/env python3
-"""Show why build steps wait, or move one to the head of the memory queue."""
-
+"""Show the build queue, or one step's place and why it waits."""
 from __future__ import annotations
 
-import argparse
-from datetime import datetime
-from functools import lru_cache
+import json
 import os
 from pathlib import Path
 import sys
-from typing import assert_never
-from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from scripts.build_queue import head_facts
+from scripts.build_queue.queue_lines import Span, age as age, json_form, plain
+from scripts.build_queue.queue_view import QueueModel, field as field, render_view, step_labels as step_labels
 from scripts.lint import memory_admit
 from scripts.lib.user_zone import user_zone
-
-
-class QueueArguments(argparse.Namespace):
-    def __init__(self) -> None:
-        super().__init__()
-        self.command: str = ""
-        self.selector: str = ""
-
-
-def field(value: str) -> str:
-    return " ".join(value.split())
-
-
-def session_label(session_id: str, name: str) -> str:
-    return field(name) or session_id[:8] or "no session"
-
-
-def age(since: float, now: float) -> int:
-    return max(0, int((now - since) // 60))
-
-
-def reason_text(step: memory_admit.WaitingStep, view: memory_admit.QueueView, zone: ZoneInfo) -> str:
-    reason = step.reason
-    need = f"needs {step.need / memory_admit.GIB:.1f} GiB"
-    capacity = f"{need}; {view.available / memory_admit.GIB:.1f} free"
-    match reason:
-        case memory_admit.ReadingUnavailable():
-            return f"{need}; memory reading unavailable"
-        case memory_admit.MemoryPressure():
-            return memory_admit.pressure_text(reason)
-        case memory_admit.NeedsBuildBudget():
-            return (f"needs {reason.need / memory_admit.GIB:.1f} GiB; "
-                    + f"builds {reason.charged / memory_admit.GIB:.1f} of "
-                    + f"{reason.budget / memory_admit.GIB:.1f} GiB budget")
-        case memory_admit.NeedsMemory():
-            return (f"needs {reason.need / memory_admit.GIB:.1f} GiB; "
-                    + f"{reason.free / memory_admit.GIB:.1f} free; "
-                    + f"{view.reserve / memory_admit.GIB:.1f} kept for earlyoom")
-        case memory_admit.BehindHead():
-            return (f"{capacity}; behind {field(reason.head_name)} "
-                    + f"(waiting {age(reason.head_since, view.now)} min)")
-        case memory_admit.HeadAdmissionStatus():
-            return memory_admit.head_wait_text(reason, zone)
-        case memory_admit.ReadyForAdmission():
-            return f"{capacity}; ready for the next admission check"
-        case _:
-            assert_never(reason)
-
-
-def table_row(cells: list[str]) -> str:
-    return "| " + " | ".join(field(cell).replace("|", r"\|") for cell in cells) + " |"
-
-
-@lru_cache(maxsize=256)
-def memory_text(value: int) -> str:
-    return f"{value / memory_admit.GIB:.1f} GiB"
-
-
-@lru_cache(maxsize=512)
-def local_minute(minute: int, zone: ZoneInfo) -> str:
-    return f"{datetime.fromtimestamp(minute * 60, zone):%H:%M}"
-
-
-def render_queue(view: memory_admit.QueueView, zone: ZoneInfo) -> list[str]:
-    running_header = ["#", "Session", "Step", "Folder", "Promised", "Using", "Delta", "State"]
-    waiting_header = ["#", "Session", "Step", "Folder", "Waiting since", "Needs", "Reason"]
-    lines = ["**Running**", "", table_row(running_header), table_row(["---"] * len(running_header))]
-    promised_total, measured_total, position = 0, 0, 0
-    for step in view.running:
-        match step.measured:
-            case memory_admit.MeasuredMemory(bytes=used):
-                using, delta, state = memory_text(used), memory_text(step.promise - used), "measured"
-                measured_total += used
-            case memory_admit.PromisedMemory():
-                using, delta, state = "—", "—", "starting"
-            case memory_admit.GoneMemory():
-                continue
-            case _:
-                assert_never(step.measured)
-        position += 1
-        promised_total += step.promise
-        folder = step.folder.rstrip("/").rpartition("/")[2] or "unknown"
-        lines.append(table_row([str(position), field(step.session_name) or folder, step.step, folder,
-                                memory_text(step.promise), using, delta, state]))
-    if not position:
-        lines.append(table_row(["empty"] + [""] * (len(running_header) - 1)))
-    lines.extend(["", "**Waiting**", "", table_row(waiting_header), table_row(["---"] * len(waiting_header))])
-    for position, step in enumerate(view.waiting, 1):
-        since = local_minute(int(step.since // 60), zone)
-        folder = step.folder.rstrip("/").rpartition("/")[2] or "unknown"
-        lines.append(table_row([str(position), field(step.session_name) or folder, step.step, folder,
-                                f"{since} ({age(step.since, view.now)} min)",
-                                memory_text(step.need), reason_text(step, view, zone)]))
-    if not view.waiting:
-        lines.append(table_row(["empty"] + [""] * (len(waiting_header) - 1)))
-    lines.extend(["", f"Totals: promised {memory_text(promised_total)}; measured {memory_text(measured_total)}; "
-                  + f"free {memory_text(view.available)}; reserve {memory_text(view.reserve)}"])
-    return lines
+from scripts.message import unit_labels
 
 
 def caller() -> str:
-    return (os.environ.get("CODEX_THREAD_ID") or os.environ.get("CLAUDE_CODE_SESSION_ID")
-            or f"user:{os.environ.get('USER', 'unknown')}")
+    return os.environ.get("CODEX_THREAD_ID") or os.environ.get("CLAUDE_CODE_SESSION_ID") or ""
+
+
+def default_columns() -> int:
+    try:
+        columns = int(os.environ.get("COLUMNS", ""))
+    except ValueError:
+        columns = 0
+    if columns > 0:
+        return columns
+    if sys.stdout.isatty():
+        try:
+            columns = os.get_terminal_size(sys.stdout.fileno()).columns
+            if columns > 0:
+                return columns
+        except OSError:
+            pass
+    return 100
 
 
 def main() -> int:
+    import argparse
+
     parser = argparse.ArgumentParser(description=__doc__)
-    commands = parser.add_subparsers(dest="command")
-    bump = commands.add_parser("bump", help="move a waiting position, session or folder to the head")
-    _ = bump.add_argument("selector")
-    arguments = parser.parse_args(namespace=QueueArguments())
+    _ = parser.add_argument("--json", action="store_true")
+    _ = parser.add_argument("--columns", type=int)
+    _ = parser.add_argument("--you")
+    _ = parser.add_argument("words", nargs="*")
+    class Arguments(argparse.Namespace):
+        you: str = caller()
+        json: bool = False
+        columns: int = default_columns()
+        words: list[str] = []
+    arguments = parser.parse_args(namespace=Arguments())
+    if arguments.columns < 1:
+        parser.error("--columns must be positive")
+    words = arguments.words
+    if len(words) > 1 and (len(words) != 2 or words[0] != "bump"):
+        parser.error("use one selector, or bump <selector>")
+    if words == ["bump"]:
+        parser.error("bump needs a selector")
     try:
-        if arguments.command == "bump":
-            actor = caller()
-            moved = memory_admit.bump_waiter(arguments.selector, actor)
-            print(f"{field(actor)} moved {session_label(moved.session_id, moved.session_name)}: "
-                  + f"{field(moved.step)} in {field(moved.folder)} to the head; memory limits still apply")
+        if words and words[0] == "bump":
+            memory_admit.bump_waiter(words[1], caller())
+        reading = memory_admit.queue_read()
+        if isinstance(reading, memory_admit.QueueBusy):
+            if arguments.json:
+                print(json.dumps(json_form([(Span("queue busy; try again"),)], arguments.columns, 0)))
+            else:
+                print("queue busy; try again")
+            return 0
+        facts = head_facts.read_head_facts(reading) if words else memory_admit.NoWaiter()
+        ids = [step.session_id for step in (*reading.view.running, *reading.view.waiting)]
+        ids.extend(head_facts.session_ids(facts))
+        labels = unit_labels.unit_labels_for(ids, os.environ)
+        pace = head_facts.read_pace(reading.explanation.now) if words else head_facts.PaceUnavailable()
+        model = QueueModel(reading, labels, facts, pace, user_zone())
+        if words:
+            from scripts.build_queue.queue_card import render_selection
+
+            lines = render_selection(model, words[0], arguments.columns)
         else:
-            print("\n".join(render_queue(memory_admit.queue_view(), user_zone())))
+            lines = render_view(model, arguments.columns, colour=arguments.json, you=arguments.you)
+        print(json.dumps(json_form(lines, arguments.columns, reading.explanation.now),
+                         ensure_ascii=False, separators=(",", ":")) if arguments.json else plain(lines))
+    except memory_admit.BumpOff as error:
+        print(f"build queue: {error}")
+        return 3
     except (OSError, ValueError) as error:
         print(f"build queue: {error}", file=sys.stderr)
         return 2

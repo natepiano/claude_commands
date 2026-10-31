@@ -95,6 +95,14 @@ class AgentsLogTests(unittest.TestCase):
             datetime.fromtimestamp(ledger_stamp, timezone.utc),
         )
 
+    def test_rerun_assignment_survives_cli_append_and_show(self) -> None:
+        result = self.cli("append", "--id", "rerun-worker", "--role", "review", "--lens", "rerun")
+        self.assertEqual((result.returncode, result.stderr), (0, ""))
+        self.assertEqual(self.records()[0]["lens"], "rerun")
+        shown = self.cli("show", "--id", "rerun-worker")
+        self.assertEqual(shown.returncode, 0, shown.stderr)
+        self.assertIn("| rerun-worker | review | rerun |", shown.stdout)
+
     def test_state_directory_uses_the_environment_override(self) -> None:
         self.assertEqual(agents_log.state_dir(), self.state)
         with patch.dict(os.environ):

@@ -439,6 +439,33 @@ class ReviewPoolTests(unittest.TestCase):
             "name": f"code-template-{expected[:8]}", "thread_id": f"thread-code-template-{expected[:8]}",
             "prime_hash": expected}})
 
+    def test_code_standing_instructions_use_the_review_directory(self) -> None:
+        config = self.root / "config"
+        (config / "review").mkdir(parents=True)
+        (config / "review_pool").mkdir()
+        _ = (config / "review" / "code.md").write_text("Keep the unit's review context.\n", encoding="utf-8")
+        _ = (config / "review_pool" / "code.md").write_text("Old prompt must not be read.\n", encoding="utf-8")
+        with patch.dict(os.environ, {"REVIEW_POOL_CONFIG": ""}), \
+                patch.object(review_pool, "__file__", str(self.root / "scripts/direct/review_pool.py")):
+            self.assertEqual(review_pool.standing_prompt("production", "code"),
+                             b"Keep the unit's review context.\n")
+
+    def test_ui_standing_instructions_keep_the_ui_directory(self) -> None:
+        config = self.root / "config"
+        (config / "review_pool").mkdir(parents=True)
+        (config / "review").mkdir()
+        _ = (config / "review_pool" / "ui.md").write_text("Review the screens.\n", encoding="utf-8")
+        _ = (config / "review" / "ui.md").write_text("Wrong prompt must not be read.\n", encoding="utf-8")
+        guide = self.root / "ux"
+        guide.mkdir()
+        doc = self.root / "production.md"
+        _ = doc.write_text(f"- **UX guide:** `{guide}`\n", encoding="utf-8")
+        with patch.dict(os.environ, {"REVIEW_POOL_CONFIG": ""}), \
+                patch.object(review_pool, "__file__", str(self.root / "scripts/direct/review_pool.py")), \
+                patch.object(review_pool, "timer_docs", return_value={"production": doc}):
+            self.assertEqual(review_pool.standing_prompt("production", "ui"),
+                             f"Review the screens.\n\n## Rules\n\nUX guide: {guide.resolve()}\n".encode())
+
     def test_a_changed_base_prompt_primes_again_and_keeps_the_unit_s_reviewer(self) -> None:
         _ = self.base_prompt("code", "Review the code.\n")
         first = self.allocate()

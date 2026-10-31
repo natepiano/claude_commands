@@ -8,7 +8,7 @@ import unittest
 from typing import cast, final
 from unittest import mock
 
-from scripts.guilds import roles
+from scripts.astra import design_roles
 from scripts.direct import workers
 from scripts.production import rename_test_support as support
 from scripts.production.rename_test_support import NEW, OLD
@@ -150,23 +150,23 @@ runpy.run_path(sys.argv[0], run_name="__main__")
 
     def test_held_roles_move_to_the_new_slug_with_the_showrunner_and_each_unit(self) -> None:
         self.prepare_unit_moves()
-        config = self.root / "guilds.conf"
+        config = self.root / "design_roles.conf"
         self.write(config, "[ownership]\nhost=fixture-host\n")
-        self.env.update({"GUILD_CONFIG_FILE": str(config), "GUILD_ROLES_HOST": "fixture-host",
-                         "GUILD_ROLES_STATE": str(self.root / "state/guilds/roles"),
-                         "GUILD_OWNERSHIP_STATE": str(self.root / "state/guilds/ownership")})
+        self.env.update({"DESIGN_ROLES_CONFIG": str(config), "DESIGN_ROLES_HOST": "fixture-host",
+                         "DESIGN_ROLES_STATE": str(self.root / "state/astra/design-roles"),
+                         "DESIGN_OWNERSHIP_STATE": str(self.root / "state/astra/design-ownership")})
         old_unit, new_unit = self.unit_worktree(OLD, "alpha-unit"), self.unit_worktree(NEW, "alpha-unit")
-        showrunner = self.held_design("showrunner-repo", self.checkout, roles.ShowrunnerHolder(OLD))
-        unit = self.held_design("unit-repo", old_unit, roles.UnitHolder(OLD, "alpha-unit"))
+        showrunner = self.held_design("showrunner-repo", self.checkout, design_roles.ShowrunnerHolder(OLD))
+        unit = self.held_design("unit-repo", old_unit, design_roles.UnitHolder(OLD, "alpha-unit"))
         self.assert_success(self.run_rename("apply"))
         current, cwd = self.read_held(showrunner)
-        self.assertEqual(current.holder, roles.ShowrunnerHolder(NEW))
+        self.assertEqual(current.holder, design_roles.ShowrunnerHolder(NEW))
         self.assertEqual((current.repository, current.roles, cwd), (str(self.checkout), showrunner.roles, str(self.checkout)))
-        self.assertEqual(self.read_held(unit)[0].holder, roles.UnitHolder(OLD, "alpha-unit"))
+        self.assertEqual(self.read_held(unit)[0].holder, design_roles.UnitHolder(OLD, "alpha-unit"))
         self.assert_success(self.run_command("unit", NEW, "alpha-unit"))
         self.assert_unit_moved("alpha-unit")
         current, cwd = self.read_held(unit)
-        self.assertEqual(current.holder, roles.UnitHolder(NEW, "alpha-unit"))
+        self.assertEqual(current.holder, design_roles.UnitHolder(NEW, "alpha-unit"))
         self.assertEqual((current.repository, current.document, cwd), (str(new_unit), str(new_unit / "design.md"), str(new_unit)))
         self.assertEqual((current.roles, current.placement.generation), (unit.roles, 2))
 

@@ -25,9 +25,3 @@
   phase, measure the added time on the tile case and on one ordinary phase,
   and put both numbers in the plan. A replay that adds wall time on the
   critical path does not ship.
-- **Move the Astra roles out of `scripts/guilds/`** (showrunner, 2026-10-28).
-  After the heads are retired, `scripts/guilds/` holds only `roles.py`,
-  `test_roles.py` and what they import. A folder called guilds with no guilds
-  in it misleads the next agent. Move them to `scripts/roles/` or
-  `scripts/agents/`, with every caller (about 10 build-followups files and
-  other units' branches), once the sdlc merge queue is empty.

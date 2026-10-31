@@ -5,6 +5,7 @@ of the clock, so every file a test writes is old, ctime included, unless the tes
 from __future__ import annotations
 
 import io
+import fcntl
 import json
 import os
 import subprocess
@@ -12,7 +13,9 @@ import sys
 import tempfile
 import time
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
+from collections.abc import Generator, Iterator
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, cast, override
 from unittest import mock
@@ -129,8 +132,215 @@ class TmpSweepCase(unittest.TestCase):
         return [cast(dict[str, object], json.loads(line)) for line in lines]
 
 
+class CopyTests(TmpSweepCase):
+    now: float = 0.0
+
+    def copy(self, name: str, **fields: object) -> Path:
+        path = self.tmp / "copies" / "show-maker" / name
+        path.mkdir(parents=True)
+        record: dict[str, object] = {"task": "until:2000-01-01T0000Z", "owner_unit": "maker-unit"}
+        record.update(fields)
+        _ = write(path / scratch.RECORD, json.dumps(record))
+        self.enterContext(mock.patch.dict(os.environ, {"SCRATCH_COPIES_ROOT": str(self.tmp / "copies")}))
+        self.now += 8 * DAY
+        return path
+
+    def test_copy_entries_are_individual_and_empty_pair_goes_after_last_copy(self) -> None:
+        old = self.copy("old")
+        live = self.copy("live", task="gate:live")
+        result = self.sweep()
+        self.assertFalse(old.exists())
+        self.assertTrue(live.exists())
+        self.assertTrue(live.parent.exists())
+        self.assertIn(str(self.tmp / "copies"), result.kept[tmp_sweep.ROOT])
+        _ = write(live / scratch.RECORD, json.dumps({"task": "until:2000-01-01T0000Z"}))
+        self.now += 8 * DAY
+        _ = self.sweep()
+        self.assertFalse(live.parent.exists())
+        self.assertTrue((self.tmp / "copies").is_dir())
+
+    def test_dry_run_does_not_add_a_busy_mark_to_an_unregistered_copy(self) -> None:
+        path = self.copy("unknown")
+        (path / scratch.RECORD).unlink()
+        _ = self.sweep(True)
+        self.assertFalse((path / scratch.BUSY).exists())
+
+    def test_sweep_resumes_recordless_removal_and_does_not_keep_a_possible_parent(self) -> None:
+        parent = self.copy("parent")
+        child = self.copy("child", borrows_from=str(parent / ".git"))
+
+        def stopped_removal(folder: str) -> None:
+            (Path(folder) / scratch.RECORD).unlink()
+            raise OSError("stopped after record unlink")
+
+        with mock.patch.object(tmp_sweep, "delete_tree", side_effect=stopped_removal):
+            result = self.sweep()
+        self.assertTrue(result.failed)
+        self.assertFalse((child / scratch.RECORD).exists())
+        _ = self.sweep()
+        self.assertFalse(child.exists())
+        self.assertFalse(parent.exists())
+
+    def test_reused_path_with_unsaved_work_does_not_resume_the_old_copys_removal(self) -> None:
+        path = self.copy("reused")
+        descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+        self.addCleanup(os.close, descriptor)
+        delete_tree = tmp_sweep.delete_tree
+
+        def stopped_after_tree_removal(folder: str) -> None:
+            delete_tree(folder)
+            raise KeyboardInterrupt("stopped before removal certificate unlink")
+
+        with mock.patch.object(tmp_sweep, "delete_tree", stopped_after_tree_removal):
+            with self.assertRaises(KeyboardInterrupt):
+                _ = self.sweep()
+        self.assertFalse(path.exists())
+        self.assertTrue(scratch.removal_mark(path).is_file())
+        _ = self.copy("reused")
+        _ = subprocess.run(["git", "-C", str(path), "init", "-q"], check=True, capture_output=True)
+        scratch.exclude_copy_metadata(path)
+        _ = write(path / "ordinary", "new owner's unsaved work")
+        self.now += 8 * DAY
+        result = self.sweep()
+        self.assertTrue((path / "ordinary").is_file())
+        self.assertIn(str(path), result.kept[tmp_sweep.UNSAVED_WORK])
+        self.assertFalse(scratch.removal_mark(path).exists())
+
+    def test_busy_copy_keeps_even_without_a_record_and_rechecks_before_delete(self) -> None:
+        path = self.copy("busy")
+        (path / scratch.RECORD).unlink()
+        with (path / ".claude-busy").open("w") as holder:
+            fcntl.flock(holder, fcntl.LOCK_SH)
+            result = self.sweep()
+        self.assertTrue(path.is_dir())
+        self.assertTrue(any("busy" in reason and str(path) in paths for reason, paths in result.kept.items()))
+        _ = write(path / scratch.RECORD, json.dumps({"task": "until:2000-01-01T0000Z"}))
+        original = tmp_sweep.remove_entry
+        with (path / ".claude-busy").open("a") as holder:
+            def start_before_remove(entry: tmp_sweep.RemovableEntry, result: tmp_sweep.Sweep, dry_run: bool) -> bool:
+                fcntl.flock(holder, fcntl.LOCK_SH)
+                return original(entry, result, dry_run)
+            with mock.patch.object(tmp_sweep, "remove_entry", side_effect=start_before_remove):
+                _ = self.sweep()
+        self.assertTrue(path.is_dir())
+
+    def test_open_phase_and_unknown_records_survive_at_any_age(self) -> None:
+        run = self.tmp.parent / "run"
+        progress = write(run / "progress_history_state.json", json.dumps({"phase": {"id": "21", "status": "active"}}))
+        live = self.copy("phase", task="phase:maker-unit/21", run_dir=str(run), phase_id="21")
+        unknown = self.copy("unknown")
+        _ = (unknown / scratch.RECORD).write_text("bad json")
+        self.now += 30 * DAY
+        result = self.sweep(True)
+        self.assertTrue(live.is_dir())
+        self.assertTrue(unknown.is_dir())
+        self.assertNotIn(str(live), [entry["path"] for entry in result.deleted])
+        self.assertTrue(any("record" in reason and str(unknown) in paths for reason, paths in result.kept.items()))
+        _ = progress.write_text("bad progress")
+        result = self.sweep()
+        self.assertTrue(live.is_dir())
+        self.assertTrue(any("progress" in reason and str(live) in paths for reason, paths in result.kept.items()))
+
+    def test_landed_copy_needs_seven_idle_days_and_readable_target(self) -> None:
+        path = self.copy("landed", task="landed:maker-unit/work", land_target="origin/main",
+                         source_path=str(self.tmp / "copies" / "show-maker" / "landed"))
+        environment = {**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1"}
+        for arguments in (("init", "-q"),
+                          ("-c", "user.name=t", "-c", "user.email=t@t", "commit", "--allow-empty", "-qm", "base"),
+                          ("remote", "add", "origin", "https://example.invalid/repo.git"),
+                          ("update-ref", "refs/remotes/origin/work", "HEAD"),
+                          ("update-ref", "refs/remotes/origin/main", "HEAD")):
+            _ = subprocess.run(["git", "-C", str(path), *arguments], check=True, capture_output=True, env=environment)
+        scratch.exclude_copy_metadata(path)
+        self.now = time.time() + DAY
+        _ = self.sweep()
+        self.assertTrue(path.is_dir())
+        _ = subprocess.run(["git", "-C", str(path), "update-ref", "-d", "refs/remotes/origin/main"],
+                           check=True, capture_output=True, env=environment)
+        self.now += 30 * DAY
+        result = self.sweep()
+        self.assertTrue(path.is_dir())
+        self.assertTrue(any("land target" in reason and str(path) in paths for reason, paths in result.kept.items()))
+        _ = subprocess.run(["git", "-C", str(path), "update-ref", "refs/remotes/origin/main", "HEAD"],
+                           check=True, capture_output=True, env=environment)
+        _ = self.sweep()
+        self.assertFalse(path.exists())
+
+    def test_new_unsaved_work_between_scan_and_remove_keeps_copy(self) -> None:
+        path = self.copy("edited")
+        _ = subprocess.run(["git", "-C", str(path), "init", "-q"], check=True, capture_output=True)
+        scratch.exclude_copy_metadata(path)
+        original = tmp_sweep.remove_entry
+
+        def edit_before_remove(entry: tmp_sweep.RemovableEntry, result: tmp_sweep.Sweep, dry_run: bool) -> bool:
+            if entry.path == str(path):
+                _ = write(path / "ordinary", "unsaved work")
+            return original(entry, result, dry_run)
+
+        with mock.patch.object(tmp_sweep, "remove_entry", side_effect=edit_before_remove):
+            result = self.sweep()
+        self.assertTrue((path / "ordinary").is_file())
+        self.assertIn(str(path), result.kept[tmp_sweep.UNSAVED_WORK])
+
+    def test_borrowed_parent_stays_until_its_last_child_is_gone(self) -> None:
+        parent = self.copy("parent")
+        child = self.copy("child", task="gate:child", borrows_from=str(parent / ".git"))
+        result = self.sweep()
+        self.assertTrue(parent.is_dir())
+        self.assertTrue(child.is_dir())
+        self.assertTrue(any("borrow" in reason and str(parent) in paths for reason, paths in result.kept.items()))
+        _ = (child / scratch.RECORD).write_text(json.dumps({"task": "until:2000-01-01T0000Z",
+                                                           "borrows_from": str(parent / ".git")}))
+        _ = self.sweep()
+        self.assertTrue(parent.is_dir())
+        self.assertFalse(child.exists())
+        _ = self.sweep()
+        self.assertFalse(parent.exists())
+        self.assertFalse(child.exists())
+
+
 class IdleTests(TmpSweepCase):
+    def test_a_recent_entry_stops_the_scan_before_the_rest_is_loaded(self) -> None:
+        folder = write(self.tmp / "large" / "recent").parent
+        self.recent(folder / "recent")
+        with os.scandir(folder) as entries:
+            first = next(entries)
+        closed: list[bool] = []
+
+        def remaining_entries() -> Iterator[os.DirEntry[str]]:
+            yield first
+            self.fail("The scan loaded more entries after it could decide to keep this folder")
+
+        @contextmanager
+        def streamed_entries(_path: str) -> Generator[Iterator[os.DirEntry[str]]]:
+            try:
+                yield remaining_entries()
+            finally:
+                closed.append(True)
+
+        with mock.patch.object(os, "scandir", side_effect=streamed_entries):
+            result = tmp_sweep.last_change(str(folder), tmp_sweep.Limit(self.now - DAY, tmp_sweep.RECENT))
+
+        self.assertEqual(result, tmp_sweep.RECENT)
+        self.assertEqual(closed, [True])
+        self.assertTrue((folder / "recent").is_file())
+
+    def test_streamed_scan_counts_each_hard_linked_file_once(self) -> None:
+        folder = self.tmp / "linked"
+        source = write(folder / "first" / "output")
+        second = folder / "second"
+        second.mkdir()
+        os.link(source, second / "copy")
+        independent = write(second / "independent")
+
+        result = tmp_sweep.last_change(str(folder), tmp_sweep.Limit(self.now - DAY, tmp_sweep.RECENT))
+
+        self.assertIsInstance(result, tuple)
+        assert isinstance(result, tuple)
+        self.assertEqual(result[1], (source.stat().st_blocks + independent.stat().st_blocks) * 512)
+
     def test_an_idle_entry_goes_and_a_recent_one_stays(self) -> None:
+        self.now: float = time.time() + 8 * DAY
         idle = write(self.tmp / "shots" / "1.png")
         loose = write(self.tmp / "notes.txt")
         busy = write(self.tmp / "trace" / "deep" / "run.json")
@@ -144,6 +354,7 @@ class IdleTests(TmpSweepCase):
                          [str(self.tmp / "notes.txt"), str(self.tmp / "shots")])
 
     def test_a_folders_own_time_does_not_count_unless_it_is_empty(self) -> None:
+        self.now = time.time() + 8 * DAY
         touched = write(self.tmp / "touched" / "old.txt").parent
         self.recent(touched)
         empty = self.tmp / "empty"
@@ -154,6 +365,7 @@ class IdleTests(TmpSweepCase):
         self.assertTrue(empty.is_dir())
 
     def test_a_link_out_of_an_entry_is_not_followed(self) -> None:
+        self.now = time.time() + 8 * DAY
         outside = write(self.tmp.parent / "outside" / "kept")
         (write(self.tmp / "links" / "file").parent / "out").symlink_to(outside.parent)
         (self.tmp / "loose-link").symlink_to(outside)
@@ -163,6 +375,7 @@ class IdleTests(TmpSweepCase):
         self.assertTrue(outside.is_file())
 
     def test_a_read_only_folder_is_deleted(self) -> None:
+        self.now = time.time() + 8 * DAY
         locked = write(self.tmp / "store" / "nix" / "file").parent
         locked.chmod(0o500)
         self.addCleanup(lambda: locked.chmod(0o700) if locked.exists() else None)
@@ -179,6 +392,7 @@ class IdleTests(TmpSweepCase):
         self.assertEqual(result.kept[tmp_sweep.UNREADABLE], [str(self.tmp / "hidden")])
 
     def test_a_dry_run_deletes_nothing_and_logs_nothing(self) -> None:
+        self.now = time.time() + 8 * DAY
         idle = write(self.tmp / "shots" / "1.png")
         status, output = self.run_once(dry_run=True)
         self.assertEqual(status, 0)
@@ -187,8 +401,74 @@ class IdleTests(TmpSweepCase):
         self.assertFalse((self.state / tmp_sweep.LOG_NAME).exists())
 
 
+class OwnerEndTests(TmpSweepCase):
+    now: float = 0.0
+
+    def test_unknown_folder_waits_seven_days_and_logs_why(self) -> None:
+        for hours in (5, 6 * 24, 8 * 24):
+            with self.subTest(hours=hours):
+                folder = write(self.tmp / f"backup-{hours}" / "wip.patch").parent
+                self.now = time.time() + hours * 3600
+                result = self.sweep()
+                logged = tmp_sweep.record(result, False, self.now)
+                if hours < 7 * 24:
+                    self.assertTrue(folder.exists())
+                    self.assertIn(str(folder), logged["kept_paths"][
+                        "no record proves its owner ended, and it changed in the last 7 days"])
+                else:
+                    self.assertFalse(folder.exists())
+                    row = next(row for row in logged["deleted"] if row["path"] == str(folder))
+                    self.assertEqual(row.get("reason"), "no record proves its owner ended; unchanged for 7 days and unused")
+
+    def test_old_unknown_folder_in_use_stays(self) -> None:
+        folder = write(self.tmp / "backup" / "files.tar").parent
+        fake_process(self.proc, 10, cwd=str(folder))
+        self.now = time.time() + 8 * DAY
+        result = self.sweep()
+        self.assertTrue(folder.exists())
+        self.assertIn(str(folder) + ": pid 10 works in it", result.kept[tmp_sweep.IN_USE])
+
+    def test_run_without_end_evidence_waits_seven_days(self) -> None:
+        folder = write(self.unit / "unknown-run" / "board.log").parent
+        _ = write(folder / "director", ENDED_SESSION)
+        self.now = time.time() + 5 * 3600
+        result = self.sweep()
+        self.assertTrue(folder.exists())
+        self.assertIn(str(folder), result.kept[
+            "no record proves its owner ended, and it changed in the last 7 days"])
+        self.now += 8 * DAY
+        result = self.sweep()
+        self.assertFalse(folder.exists())
+        self.assertEqual(result.deleted[0].get("reason"),
+                         "no record proves its owner ended; unchanged for 7 days and unused")
+
+    def test_recorded_worker_end_still_allows_idle_run_removal(self) -> None:
+        folder = write(self.unit / "ended-run" / "board.log").parent
+        _ = write(folder / "mesh_roster.json", json.dumps({"impl": {"status": "ended"}}))
+        self.now = time.time() + 5 * 3600
+        result = self.sweep()
+        self.assertFalse(folder.exists())
+        self.assertEqual(result.deleted[0].get("reason"), "all recorded workers ended; idle and unused")
+
+    def test_top_level_file_and_link_wait_but_tempfile_does_not(self) -> None:
+        file = write(self.tmp / "backup.patch")
+        link = self.tmp / "backup-link"
+        link.symlink_to(file)
+        temporary = write(self.tmp / "tmpabcdefgh" / "file").parent
+        self.now = time.time() + 5 * 3600
+        _ = self.sweep()
+        self.assertTrue(file.exists())
+        self.assertTrue(link.is_symlink())
+        self.assertFalse(temporary.exists())
+        self.now += 8 * DAY
+        _ = self.sweep()
+        self.assertFalse(file.exists())
+        self.assertFalse(link.is_symlink())
+
+
 class ProcessUseTests(TmpSweepCase):
     def test_an_entry_a_process_works_in_holds_open_or_maps_stays(self) -> None:
+        self.now: float = time.time() + 8 * DAY
         worked = write(self.tmp / "worked" / "a").parent
         held = write(self.tmp / "held" / "deep" / "log")
         mapped = write(self.tmp / "mapped" / "lib.so")
@@ -219,6 +499,7 @@ class ProcessUseTests(TmpSweepCase):
 
 
     def test_with_no_proc_an_lsof_scan_shows_which_processes_use_an_entry(self) -> None:
+        self.now = time.time() + 8 * DAY
         idle = write(self.tmp / "idle" / "a")
         used = write(self.tmp / "used" / "a")
         self.proc.rmdir()
@@ -228,6 +509,35 @@ class ProcessUseTests(TmpSweepCase):
         self.assertFalse(idle.exists())
         self.assertTrue(used.is_file())
         self.assertEqual(result.kept[tmp_sweep.IN_USE], [f"{used.parent}: pid 42 works in it"])
+
+    def test_process_scan_distinguishes_known_empty_from_unavailable(self) -> None:
+        known = tmp_sweep.process_paths(str(self.proc), str(self.tmp) + os.sep)
+        self.assertIsInstance(known, tmp_sweep.ProcessUsesKnown)
+        assert isinstance(known, tmp_sweep.ProcessUsesKnown)
+        self.assertEqual(known.paths, [])
+        unavailable = tmp_sweep.process_paths(str(self.proc / "missing"), str(self.tmp) + os.sep)
+        self.assertIsInstance(unavailable, tmp_sweep.ProcessUsesUnavailable)
+        fake_process(self.proc, 17, cwd=str(self.tmp / "used"))
+        used = tmp_sweep.process_paths(str(self.proc), str(self.tmp) + os.sep)
+        assert isinstance(used, tmp_sweep.ProcessUsesKnown)
+        self.assertEqual(used.paths, [(str(self.tmp / "used"), 17, "works in it")])
+
+    def test_lsof_scan_has_explicit_known_and_unavailable_results(self) -> None:
+        for output in ("p17\nfcwd\nn/tmp/used\n", "p17\nfcwd\nn/elsewhere\n"):
+            with self.subTest(output=output):
+                completed = subprocess.CompletedProcess(tmp_sweep.LSOF, 1, output, "")
+                with mock.patch.object(subprocess, "run", return_value=completed):
+                    known = tmp_sweep.lsof_paths("/tmp/")
+                self.assertIsInstance(known, tmp_sweep.ProcessUsesKnown)
+                assert isinstance(known, tmp_sweep.ProcessUsesKnown)
+                expected = [("/tmp/used", 17, "works in it")] if "/tmp/used" in output else []
+                self.assertEqual(known.paths, expected)
+        empty = subprocess.CompletedProcess(tmp_sweep.LSOF, 1, "", "")
+        with mock.patch.object(subprocess, "run", return_value=empty):
+            self.assertIsInstance(tmp_sweep.lsof_paths("/tmp/"), tmp_sweep.ProcessUsesUnavailable)
+        for error in (OSError("no lsof"), subprocess.TimeoutExpired("lsof", 1)):
+            with self.subTest(error=type(error).__name__), mock.patch.object(subprocess, "run", side_effect=error):
+                self.assertIsInstance(tmp_sweep.lsof_paths("/tmp/"), tmp_sweep.ProcessUsesUnavailable)
 
     def test_lsof_output_names_how_each_process_uses_a_path(self) -> None:
         text = "p7\nfcwd\nn/tmp/a\nftxt\nn/tmp/b/lib\nf4\nn/tmp/c/log\nf5\nn/var/x\np8\nfmem\nn/tmp/d\n"
@@ -427,6 +737,7 @@ class OwnerTests(TmpSweepCase):
             [str(self.delegate), str(self.unit), str(self.delegate / "active"), str(self.unit / "active")]))
 
     def test_a_run_folder_stays_while_its_director_runs(self) -> None:
+        self.now: float = time.time() + 8 * DAY
         live = write(self.unit / "live" / "board.log").parent
         _ = write(live / "director", f"{LIVE_SESSION}\n")
         ended = write(self.delegate / "ended" / "board.log").parent
@@ -451,6 +762,7 @@ class OwnerTests(TmpSweepCase):
                          sorted([str(marked), str(ended)]))
 
     def test_a_run_folder_whose_history_opens_with_a_live_session_stays(self) -> None:
+        self.now = time.time() + 8 * DAY
         history = self.tmp.parent / "history"
         runs = {LIVE_SESSION: self.unit / "started", ENDED_SESSION: self.unit / "started-ended"}
         for session, run in runs.items():
@@ -491,6 +803,7 @@ class OwnerTests(TmpSweepCase):
         self.assertIn(str(large), [entry["path"] for entry in result.deleted])
 
     def test_an_unreadable_session_record_keeps_session_and_run_folders(self) -> None:
+        self.now = time.time() + 8 * DAY
         self.unreadable_sessions()
         session = write(self.project / ENDED_SESSION / "scratchpad" / "a")
         run = write(self.unit / "run" / "director", f"{ENDED_SESSION}\n")
@@ -519,7 +832,22 @@ class OwnerTests(TmpSweepCase):
 
 
 class LogTests(TmpSweepCase):
+    def test_log_retention_keeps_the_boundary_and_newer_records_in_order(self) -> None:
+        # Whole seconds keep the boundary exact after the ISO timestamp round trip.
+        now = float(int(self.now))
+        cutoff = now - tmp_sweep.LOG_KEEP_SECONDS
+        records = [{"at": datetime.fromtimestamp(at, UTC).isoformat(), "marker": marker}
+                   for at, marker in ((cutoff - 1, "expired"), (cutoff, "boundary"), (now - 60, "recent"))]
+        path = write(self.state / tmp_sweep.LOG_NAME,
+                     "".join(json.dumps(record) + "\n" for record in records))
+        current = tmp_sweep.record(tmp_sweep.Sweep(), False, now)
+
+        tmp_sweep.append_log(path, current, now)
+
+        self.assertEqual(self.log(), [*records[1:], current])
+
     def test_each_run_logs_what_went_and_why_the_rest_stayed(self) -> None:
+        self.now: float = time.time() + 8 * DAY
         _ = write(self.tmp / "shots" / "1.png")
         self.recent(write(self.tmp / "fresh.txt"))
         fake_process(self.proc, 10, cwd=str(write(self.tmp / "busy" / "a").parent))
@@ -538,8 +866,15 @@ class LogTests(TmpSweepCase):
         self.assertIsInstance(entry["freed_gib"], float)
 
     def test_a_run_waits_an_hour_after_the_last(self) -> None:
+        self.now = time.time() + 8 * DAY
         idle = write(self.tmp / "shots" / "1.png")
+        run = tmp_sweep.run
+
+        def fixture_run(dry_run: bool, now: float) -> int:
+            return run(dry_run, now, self.roots(), str(self.proc))
+
         with (mock.patch.object(tmp_sweep, "default_roots", return_value=self.roots()),
+              mock.patch.object(tmp_sweep, "run", side_effect=fixture_run),
               redirect_stdout(io.StringIO())):
             self.assertEqual(tmp_sweep.run_if_due(False, self.now), 0)
             self.assertFalse(idle.exists())
@@ -575,7 +910,8 @@ class RunFolderTests(TmpSweepCase):
         self.assertTrue(payload.is_file())
         self.assertTrue(roster.is_file())
 
-    def test_a_paused_unit_keeps_a_run_that_records_its_worktree(self) -> None:
+    def test_stale_pause_does_not_keep_a_dead_units_worktree(self) -> None:
+        self.now: float = time.time() + 8 * DAY
         worktree = self.tmp.parent / "worktree"
         payload = write(self.unit / "paused-unit" / "board.log")
         _ = write(payload.parent / "progress_history_state.json", json.dumps({"working_dir": str(worktree)}))
@@ -585,11 +921,12 @@ class RunFolderTests(TmpSweepCase):
         }))
         other = write(self.delegate / "ended" / "board.log")
         result = self.sweep()
-        self.assertTrue(payload.is_file())
+        self.assertFalse(payload.exists())
         self.assertFalse(other.exists())
-        self.assertIn(str(payload.parent), result.kept[tmp_sweep.RunKeepReason.SESSION_WORKTREE.value])
+        self.assertNotIn(str(payload.parent), result.kept.get(tmp_sweep.RunKeepReason.SESSION_WORKTREE.value, []))
 
-    def test_a_legacy_paused_unit_keeps_the_worktree_run(self) -> None:
+    def test_stale_legacy_pause_does_not_keep_a_dead_units_run(self) -> None:
+        self.now = time.time() + 8 * DAY
         worktree = self.tmp.parent / "legacy-worktree"
         payload = write(self.delegate / "legacy-unit" / "board.log")
         _ = write(payload.parent / "progress_history_state.json", json.dumps({"working_dir": str(worktree)}))
@@ -598,7 +935,7 @@ class RunFolderTests(TmpSweepCase):
                                             "progress": {"kind": "stopped"}}],
         }))
         _ = self.sweep()
-        self.assertTrue(payload.is_file())
+        self.assertFalse(payload.exists())
 
     def test_a_live_units_worktree_keeps_a_run_without_a_director_record(self) -> None:
         worktree = self.tmp.parent / "worktree"
@@ -612,7 +949,7 @@ class RunFolderTests(TmpSweepCase):
         self.assertTrue(payload.is_file())
 
     def test_unreadable_ownership_records_keep_the_run(self) -> None:
-        for name in ("mesh_roster.json", "progress_history_state.json", "director", "marker", "pause", "session"):
+        for name in ("mesh_roster.json", "progress_history_state.json", "director", "marker", "session"):
             with self.subTest(record=name):
                 payload = write(self.unit / name / "tmp" / "old" / "file")
                 run = payload.parents[2]
@@ -622,8 +959,6 @@ class RunFolderTests(TmpSweepCase):
                 elif name == "director":
                     broken = run / name
                     broken.mkdir()
-                elif name == "pause":
-                    broken = write(Path(os.environ["SHUTDOWN_STATE_DIR"]) / "account" / "sessions" / "bad.json", "{")
                 elif name == "session":
                     broken = write(Path(os.environ["NOTIFIER_SESSIONS_DIR"]) / "bad.json", "{")
                 else:
@@ -648,6 +983,27 @@ class RunFolderTests(TmpSweepCase):
 
 
 class HandCleanupTests(TmpSweepCase):
+    def test_stopped_plan_write_can_be_planned_again(self) -> None:
+        ended = self.ended_run("ended")
+        plan = self.tmp.parent / "plan.json"
+        with mock.patch.object(json, "dumps", side_effect=RuntimeError("stopped during serialization")):
+            with self.assertRaisesRegex(RuntimeError, "stopped during serialization"):
+                _ = tmp_sweep.write_cleanup_plan(plan, self.roots(), self.now, str(self.proc))
+        self.assertFalse(plan.exists())
+        self.assertEqual(tmp_sweep.write_cleanup_plan(plan, self.roots(), self.now, str(self.proc)), 0)
+        self.assertEqual(tmp_sweep.planned_removals(plan), [str(ended)])
+        before = plan.read_bytes()
+        with self.assertRaises(FileExistsError):
+            _ = tmp_sweep.write_cleanup_plan(plan, self.roots(), self.now, str(self.proc))
+        self.assertEqual(plan.read_bytes(), before)
+
+    def test_incomplete_legacy_plan_names_file_and_clear_action(self) -> None:
+        plan = self.tmp.parent / "plan.json"
+        _ = plan.write_text('{"version":')
+        with self.assertRaisesRegex(FileExistsError, str(plan) + ".*remove"):
+            _ = tmp_sweep.write_cleanup_plan(plan, self.roots(), self.now, str(self.proc))
+        self.assertEqual(plan.read_text(), '{"version":')
+
     def ended_run(self, name: str) -> Path:
         run = write(self.unit / name / "board.log").parent
         _ = write(run / "mesh_roster.json", json.dumps({"fix": {"status": "ended"}}))
@@ -917,6 +1273,7 @@ class WorkerAndGitTests(TmpSweepCase):
         self.assertIn(str(folder), result.kept[tmp_sweep.WORKER_USES])
 
     def test_only_mesh_run_cwd_keeps_a_working_folder(self) -> None:
+        self.now = time.time() + 8 * DAY
         folder = write(self.tmp / "scratch" / "listed" / "file").parent
         unrelated = write(self.tmp / "unrelated" / "file").parent
         run = self.live_worker(folder)

@@ -81,7 +81,7 @@ class TopLevelTests(unittest.TestCase):
         self, name: str, *, session_id: str = "", file_name: str = "",
         socket: str | None = "auto", pid: int = 12345,
         tmux: str = "", updated: int = 1,
-        role: str = "freestanding",
+        role: roster.Role = "freestanding",
         showrunner: roster.ShowrunnerRelationship = NO_SHOWRUNNER,
         director: roster.DirectorRelationship = NO_DIRECTOR,
     ) -> str:

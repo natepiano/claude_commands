@@ -59,8 +59,16 @@ if [[ "$DRY_RUN" == "--dry-run" ]]; then
   exit 0
 fi
 
-echo "  Creating tag: $TAG"
-git tag "$TAG"
+if git show-ref --verify --quiet "refs/tags/$TAG"; then
+  if [[ "$(git rev-parse "refs/tags/$TAG^{commit}")" != "$(git rev-parse HEAD)" ]]; then
+    echo "ERROR: tag $TAG already names another commit." >&2
+    exit 1
+  fi
+  echo "  Tag already created: $TAG"
+else
+  echo "  Creating tag: $TAG"
+  git tag "$TAG"
+fi
 
 echo "  Pushing branch: $BRANCH"
 git push -u origin "$BRANCH"

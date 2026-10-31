@@ -13,10 +13,10 @@ the backstop for the rest: folders that can hold work. A folder is loose when it
     a session scratchpad (/tmp/claude-<uid>), a run folder root, a scratch root, a folder that holds
     only folders, a verify.sh run folder or a tempfile folder, which the sweep judges.
 
-Only folders this user owns and idle for MIN_AGE_SECONDS are named. Idle time counts from the newest
-mtime of the folder and of what is in it, down to IDLE_DEPTH folders (target/, node_modules/ and
-.git/ passed over), and of each git repo's HEAD, index and HEAD log, so a commit counts. ctime never
-counts: systemd-tmpfiles-clean moves it every day.
+Only folders this user owns and idle for MIN_AGE_SECONDS are named. The initial scan includes
+folder mtimes and each git repo's HEAD, index and HEAD log, so a commit counts. The shared tmp-sweep
+change-time scan also checks mtime and ctime throughout the tree, so copying files with preserved
+mtimes starts a new idle period. Removal requires WIDE_IDLE_SECONDS (7 days) without a change.
 
 A named folder idle for REMOVE_AFTER_SECONDS is removed when all of these are true:
 
@@ -41,6 +41,8 @@ with --send, each maker session also gets one message that lists its folders.
 from __future__ import annotations
 
 import argparse
+import fcntl
+import hashlib
 import json
 import os
 import re
@@ -63,8 +65,8 @@ import scratch  # noqa: E402
 RUST_ROOTS_FILE = Path(__file__).resolve().parents[2] / "config" / "rust_roots.txt"
 RUST_SCRATCH_NAME = "scratch"
 MIN_AGE_SECONDS = 24 * 3600
-REMOVE_AFTER_SECONDS = 7 * 24 * 3600
-KEPT_NAMES = SYSTEM_TEMP_NAMES | {"unit", "delegate", "scratch", "repro", "session"}
+REMOVE_AFTER_SECONDS = tmp_sweep.WIDE_IDLE_SECONDS
+KEPT_NAMES = SYSTEM_TEMP_NAMES | {"unit", "delegate", "scratch", "repro", "session", "copies"}
 KEPT_PREFIXES = SYSTEM_TEMP_PREFIXES
 IDLE_DEPTH = 3
 # A folder with more entries than this inside IDLE_DEPTH is not read to the end, and stays.
@@ -218,18 +220,15 @@ def held(path: Path, holds: dict[str, scratch.Hold]) -> bool:
                for held_path, hold in holds.items())
 
 
-def process_uses(paths: list[Path], proc: str = tmp_sweep.PROC_DIR) -> dict[str, str] | None:
-    """How a process uses each path, from one /proc scan, or one lsof scan where /proc is missing;
-    None when neither can run."""
+def process_uses(paths: list[Path], proc: str = tmp_sweep.PROC_DIR) -> tmp_sweep.ProcessUsesKnown | tmp_sweep.ProcessUsesUnavailable:
+    """Process paths from /proc, or lsof where /proc is missing; unavailable when neither can run."""
     if not paths:
-        return {}
+        return tmp_sweep.ProcessUsesKnown([])
     prefixes = tuple(dict.fromkeys(str(path.parent) + os.sep for path in paths))
     found = tmp_sweep.process_paths(proc, prefixes)
-    if found is None:
-        found = tmp_sweep.lsof_paths(prefixes)
-    if found is None:
-        return None
-    return tmp_sweep.entry_uses(found, sorted({str(path.parent) for path in paths}))
+    if isinstance(found, tmp_sweep.ProcessUsesUnavailable):
+        return tmp_sweep.lsof_paths(prefixes)
+    return found
 
 
 def worktree_sources(path: Path) -> list[Path]:
@@ -252,15 +251,78 @@ def armed() -> bool:
     return (state_dir() / ARMED_NAME).is_file()
 
 
+@dataclass(frozen=True)
+class PendingWorktreePrune:
+    removed_path: Path
+    sources: list[Path]
+
+
+def read_pending_prune(record: Path) -> PendingWorktreePrune:
+    value = cast(object, json.loads(record.read_text()))
+    if isinstance(value, dict):
+        row = cast(dict[str, object], value)
+        path, sources = row.get("path"), row.get("sources")
+        if isinstance(path, str) and Path(path).is_absolute() and isinstance(sources, list):
+            entries = cast(list[object], sources)
+            if all(isinstance(source, str) and Path(source).is_absolute() for source in entries):
+                return PendingWorktreePrune(Path(path), [Path(str(source)) for source in entries])
+    raise ValueError(f"invalid pending prune record: {record}")
+
+
+def finish_pending_prune(record: Path, pending: PendingWorktreePrune) -> None:
+    for source in pending.sources:
+        try:
+            _ = source.stat()
+        except FileNotFoundError:
+            continue
+        _ = subprocess.run(["git", "--git-dir", str(source), "worktree", "prune"],
+                           capture_output=True, check=True)
+    record.unlink()
+
+
+def resume_pending_prunes() -> None:
+    directory = state_dir()
+    if not directory.exists():
+        return
+    with (directory / "prune.lock").open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        for record in directory.glob("*.prune"):
+            try:
+                pending = read_pending_prune(record)
+                # A partial delete must pass the normal removal checks again.
+                if not os.path.lexists(pending.removed_path):
+                    finish_pending_prune(record, pending)
+            except (OSError, ValueError, subprocess.SubprocessError) as error:
+                print(f"folder audit: pending prune {record}: {error}", file=sys.stderr)
+
+
 def remove(path: Path, changed: float, now: float) -> str:
     """Remove path and prune its worktrees; REMOVED, or why it stays."""
-    sources = worktree_sources(path)
-    try:
-        tmp_sweep.delete_tree(str(path))
-    except OSError as error:
-        return f"removal failed: {error}"
-    for source in sources:
-        _ = subprocess.run(["git", "--git-dir", str(source), "worktree", "prune"], capture_output=True, check=False)
+    directory = state_dir()
+    directory.mkdir(parents=True, exist_ok=True)
+    record = directory / (hashlib.sha256(os.fsencode(path)).hexdigest() + ".prune")
+    with (directory / "prune.lock").open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            sources = worktree_sources(path)
+            if record.exists():
+                previous = read_pending_prune(record)
+                if previous.removed_path != path:
+                    raise ValueError(f"pending prune path differs: {record}")
+                sources = list(dict.fromkeys(previous.sources + sources))
+            if sources:
+                temporary = record.with_suffix(".tmp")
+                try:
+                    _ = temporary.write_text(json.dumps({"path": str(path), "sources": [str(source) for source in sources]}))
+                    os.replace(temporary, record)
+                finally:
+                    temporary.unlink(missing_ok=True)
+            tmp_sweep.delete_tree(str(path))
+            if sources:
+                finish_pending_prune(record, PendingWorktreePrune(path, sources))
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            return f"removal failed: {error}"
+
     log = state_dir() / REMOVED_LOG
     try:
         log.parent.mkdir(parents=True, exist_ok=True)
@@ -281,15 +343,17 @@ def judge(found: list[tuple[Path, float]], now: float, removing: bool, proc: str
         return outcomes
     holds = scratch.holds()
     uses = process_uses(due, proc)
+    used_entries = (tmp_sweep.entry_uses(uses.paths, sorted({str(path.parent) for path in due}))
+                    if isinstance(uses, tmp_sweep.ProcessUsesKnown) else {})
     bound = bound_sockets(sockets)
     changed = dict(found)
     for path in due:
         if held(path, holds):
             outcomes[path] = HELD
-        elif uses is None:
+        elif isinstance(uses, tmp_sweep.ProcessUsesUnavailable):
             outcomes[path] = tmp_sweep.NO_PROC
-        elif str(path) in uses:
-            outcomes[path] = uses[str(path)]
+        elif str(path) in used_entries:
+            outcomes[path] = used_entries[str(path)]
         elif live_socket(path, bound):
             outcomes[path] = LIVE_SOCKET
         elif (git := tmp_sweep.git_work(path)) is not tmp_sweep.GitWork.SAVED:
@@ -356,7 +420,15 @@ def _mtime(path: Path) -> float:
 def audit(rust: Path, temps: list[Path], expected: frozenset[str] | None, now: float,
           files: list[Path] | None = None, removing: bool = False, proc: str = tmp_sweep.PROC_DIR,
           sockets: str = UNIX_SOCKETS) -> list[Loose]:
-    changes = {entry: last_change(entry) for entry in candidates(rust, temps, expected)}
+    if removing:
+        resume_pending_prunes()
+    changes: dict[Path, float | str] = {}
+    for entry in candidates(rust, temps, expected):
+        when = last_change(entry)
+        if isinstance(when, float):
+            change = tmp_sweep.last_change(str(entry), tmp_sweep.Limit(now - MIN_AGE_SECONDS, LISTED))
+            when = change if isinstance(change, str) else max(when, change[0])
+        changes[entry] = when
     found = [(entry, when) for entry, when in changes.items()
              if isinstance(when, float) and when and now - when >= MIN_AGE_SECONDS]
     outcomes = judge(found, now, removing, proc, sockets)

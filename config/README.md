@@ -11,17 +11,23 @@ an agent family; `[<function>.<family>]` maps each subtask to an
 `agent[:effort]` row; and `[<family>.agents]` catalogs each valid agent and its
 allowed efforts. Omit `:effort` to use the agent CLI's default.
 
-`config/agents.conf` holds the committed defaults. This machine's own rows go
-in the untracked `config/agents.local.conf`, which holds only the rows that
-differ; readers see them over the defaults, and a commit or merge never
-touches them. To move a full registry's local rows into the overlay, run
-`scripts/agents/agents_overlay.sh migrate --from <copy>`.
+`config/agents.conf` is the shared registry on both machines; there is no
+local override file. `/agent` and `/showrunner:effort` edit it atomically,
+then publish a `config(agents): …` commit containing only this path to origin.
+The writer fetches and fast-forwards before editing, and replays all pending
+local row changes on a newer remote tip if a push races another writer (three
+tries). Repeating an interrupted edit finishes its publication, even when the
+requested value is already in the local file. A lost push acknowledgement
+reconciles the accepted commit without creating another one.
+Other staged and unstaged work is preserved. Tests set
+`AGENTS_CONFIG_PUBLISH=0`; temporary registries never publish.
 
-Use `/agent` to view or edit assignments and rows; edits write the overlay. The Codex catalog is
-automatically synchronized from `~/.codex/config.toml` and
-`~/.codex/models_cache.json` by `scripts/agents/sync_codex_catalog.sh`. Its
-launchd job checks every five minutes and at login; the registry reader also
-synchronizes when either source is newer than the last successful sync. The
+The Codex catalog sync reads `~/.codex/config.toml` and
+`~/.codex/models_cache.json`. It adds models and efforts without removing
+anything another machine knows, and publishes only additions. Retired catalog
+models require an explicit edit to `[codex.agents]` in the shared registry;
+`/agent` does not delete catalog rows. The freshness check runs at login, every
+five minutes, and when a source is newer than the last successful sync. The
 Claude catalog is hand-maintained; the sync warns when the Claude CLI
 advertises a model alias that `[claude.agents]` does not yet list.
 

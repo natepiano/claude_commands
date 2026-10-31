@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from typing import Literal, cast
 from unittest import mock
@@ -29,9 +30,9 @@ def choice_answer(probabilities: dict[str, float]) -> client.ChoiceAnswer:
 
 class DecideTests(unittest.TestCase):
     def test_configured_tuning_policy_controls_certainty_at_the_measured_boundaries(self) -> None:
-        # Phase 4 adds the adopted defined-area threshold to the tuned policy.
+        # Area uses a top-two gap; other supported fields use probability thresholds.
         expected = {"backlog_goal": .4, "category": .9,
-                    "backlog_impact": .4, "backlog_alignment": .4, "area": .9}
+                    "backlog_impact": .4, "backlog_alignment": .4}
         for field, threshold in expected.items():
             with self.subTest(field=field):
                 self.assertEqual(questions.THRESHOLDS[field], decide.Supported(threshold))
@@ -39,8 +40,38 @@ class DecideTests(unittest.TestCase):
                 at = decide.FieldDecision("fixture", threshold, "unsure")
                 self.assertFalse(decide.is_sure(field, below))
                 self.assertTrue(decide.is_sure(field, at))
+        self.assertEqual(questions.THRESHOLDS["area"], decide.MinimumGap(.3))
         for field in ("backlog_urgency", "backlog_effort"):
             self.assertIsInstance(questions.THRESHOLDS[field], decide.ReportOnly)
+
+    def test_area_gap_uses_averaged_top_two_values_at_the_boundary_and_accepts_clear_winners(self) -> None:
+        for first, second, expected in (
+            ({"rendering": .6, "tooling": .1, "ui": .15, "audio": .1, "docs": .05},
+             {"rendering": .4, "tooling": .3, "ui": .15, "audio": .1, "docs": .05}, True),
+            ({"rendering": .499, "tooling": .201, "ui": .15, "audio": .1, "docs": .05},
+             {"rendering": .499, "tooling": .201, "ui": .15, "audio": .1, "docs": .05}, False),
+            ({"rendering": .5, "tooling": .1, "ui": .1, "audio": .1, "docs": .1, "networking": .1},
+             {"rendering": .5, "tooling": .1, "ui": .1, "audio": .1, "docs": .1, "networking": .1}, True),
+        ):
+            with self.subTest(first=first, second=second):
+                decision = decide.decide_choice(choice_answer(first), choice_answer(second), "area")
+                self.assertEqual(decision.probabilities, {name: (first[name] + second[name]) / 2 for name in first})
+                self.assertEqual(decision.value, "rendering")
+                self.assertEqual(decision.certainty, "sure" if expected else "unsure")
+                self.assertEqual(decide.is_sure("area", decision), expected)
+
+    def test_area_gap_never_overrides_split_or_disagreeing_order_guards(self) -> None:
+        clear = decide.decide_choice(choice_answer({"rendering": .9, "tooling": .1}),
+                                     choice_answer({"tooling": .1, "rendering": .9}), "area")
+        disagreement = decide.decide_choice(choice_answer({"rendering": .99, "tooling": .01}),
+                                            choice_answer({"tooling": .51, "rendering": .49}), "area")
+        self.assertTrue(decide.is_sure("area", clear))
+        self.assertAlmostEqual(disagreement.probabilities["rendering"] - disagreement.probabilities["tooling"], .48)
+        self.assertEqual(disagreement.certainty, "unsure")
+        for gap in (0., .3, .4):
+            for decision in (replace(clear, split=True), disagreement):
+                with self.subTest(gap=gap, decision=decision):
+                    self.assertFalse(decide.is_sure("area", decision, dict(questions.THRESHOLDS, area=decide.MinimumGap(gap))))
 
     def test_unsupported_area_never_becomes_sure_even_for_certain_choices_or_fallback(self) -> None:
         main = cast(client.Response, json.loads((FIXTURES / "main_response.json").read_text()))
@@ -104,9 +135,7 @@ class DecideTests(unittest.TestCase):
         for field in ("backlog_goal", "category", "area", "backlog_alignment", "backlog_impact"):
             with self.subTest(field=field):
                 result = decide.select_threshold(field, points)
-                self.assertIsInstance(result, decide.Supported)
-                if isinstance(result, decide.Supported):
-                    self.assertEqual(result.threshold, .55)
+                self.assertEqual(result, decide.MinimumGap(.55) if field == "area" else decide.Supported(.55))
 
     def test_threshold_selection_names_failure_and_report_only_outcomes(self) -> None:
         for points in ([decide.RiskPoint(.4, 1., .1001), decide.RiskPoint(.95, .1, .2)],
@@ -253,7 +282,7 @@ class DecideTests(unittest.TestCase):
         area = cast(client.Response, json.loads((FIXTURES / "area_response.json").read_text()))
         area["answers"]["area"] = choice_answer({"unfiled": .99, "rendering": .01})
         area["answers"]["area_reverse"] = choice_answer({"unfiled": .49, "rendering": .51})
-        for fits, origin, hint in ((.95, "choice", ""), (.1, "area_fallback", "unfiled")):
+        for fits, origin, hint in ((.95, "choice", ""), (.05, "area_fallback", "unfiled")):
             with self.subTest(fits=fits):
                 area["answers"]["area_fits"] = {"type": "noul", "noul": fits}
                 decision = decide.decide_answers(main["answers"], area["answers"])["area"]
@@ -269,17 +298,21 @@ class DecideTests(unittest.TestCase):
         decision = decide.decide_answers(main["answers"], area["answers"])["area"]
         self.assertEqual(decision.value, "rendering")
 
-    def test_absent_area_is_sure_at_the_adopted_threshold_despite_disagreeing_hint_orders(self) -> None:
+    def test_absent_area_gap_compares_unfiled_with_filed_instead_of_disagreeing_hint_orders(self) -> None:
         main = cast(client.Response, json.loads((FIXTURES / "main_response.json").read_text()))
         area = cast(client.Response, json.loads((FIXTURES / "area_response.json").read_text()))
-        area["answers"]["area_fits"] = {"type": "noul", "noul": .1}
         area["answers"]["area"] = choice_answer({"rendering": .9, "tooling": .1})
         area["answers"]["area_reverse"] = choice_answer({"tooling": .6, "rendering": .4})
-        decision = decide.decide_answers(main["answers"], area["answers"])["area"]
-        self.assertEqual(decision.value, "unfiled")
-        self.assertEqual(decision.certainty, "sure")
-        self.assertAlmostEqual(decision.confidence, .9)
-        self.assertEqual(decision.hint, "rendering")
+        for policy, fits, certainty in ((decide.MinimumGap(.3), .29, "sure"),
+                                       (decide.MinimumGap(.6), .2, "sure"),
+                                       (decide.MinimumGap(.6), .2001, "unsure")):
+            with self.subTest(policy=policy, fits=fits), mock.patch.dict(questions.THRESHOLDS, area=policy):
+                area["answers"]["area_fits"] = {"type": "noul", "noul": fits}
+                decision = decide.decide_answers(main["answers"], area["answers"])["area"]
+                self.assertEqual(decision.value, "unfiled")
+                self.assertEqual(decision.certainty, certainty)
+                self.assertAlmostEqual(decision.confidence, 1 - fits)
+                self.assertEqual(decision.hint, "rendering")
 
     def test_ambiguous_area_fit_and_disagreeing_orders_require_review(self) -> None:
         for fit, reverse in ((.5, {"tooling": .1, "rendering": .9}),

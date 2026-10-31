@@ -13,12 +13,12 @@ from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import BinaryIO, Literal, cast
+from typing import BinaryIO, Literal, cast, get_args
 
 Role = Literal["showrunner", "director", "impl", "test", "fix", "review", "worker", "interactive", "subagent"]
-Lens = Literal["adversary", "contract", "craft", "ux"]
+Lens = Literal["adversary", "contract", "craft", "ux", "rerun"]
 ROLES: tuple[Role, ...] = ("showrunner", "director", "impl", "test", "fix", "review", "worker", "interactive", "subagent")
-LENSES: tuple[Lens, ...] = ("adversary", "contract", "craft", "ux")
+LENSES = cast(tuple[Lens, ...], get_args(Lens))
 
 
 @dataclass(frozen=True)

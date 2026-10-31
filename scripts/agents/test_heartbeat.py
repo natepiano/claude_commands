@@ -13,8 +13,7 @@ import unittest
 from pathlib import Path
 from typing import cast
 
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
+from scripts.lib.test_hang_guard import LauncherHangGuard
 
 HEARTBEAT = Path(__file__).resolve().parent / "heartbeat.sh"
 WATCHER = HEARTBEAT.with_name("heartbeat_watch.sh")
@@ -62,6 +61,7 @@ class HeartbeatWatcherTests(unittest.TestCase):
     def test_stop_signals_close_the_output_pipes_and_reap_the_sleep(self) -> None:
         for stop_signal in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
             with self.subTest(signal=stop_signal), tempfile.TemporaryDirectory() as directory:
+                guard = LauncherHangGuard(f"heartbeat shutdown {stop_signal}")
                 root = Path(directory)
                 # The interval cannot finish naturally: its stand-in blocks on
                 # a pipe the parent keeps open but never releases. EOF therefore
@@ -87,11 +87,11 @@ class HeartbeatWatcherTests(unittest.TestCase):
                 )
                 try:
                     assert watcher.stdout is not None
-                    self.assertTrue(select.select([watcher.stdout], [], [], TEST_HANG_GUARD_SECS)[0],
+                    self.assertTrue(select.select([watcher.stdout], [], [], guard.remaining())[0],
                                     "the watcher's sleep child never started")
                     sleep_pid = int(cast(str, watcher.stdout.readline()))
                     watcher.send_signal(stop_signal)
-                    output, errors = watcher.communicate(timeout=TEST_HANG_GUARD_SECS)
+                    output, errors = watcher.communicate(timeout=guard.remaining())
                     self.assertEqual(watcher.returncode, 0, output + errors)
                     with self.assertRaises(ProcessLookupError,
                                            msg="the watcher's sleep child survived shutdown"):
@@ -103,7 +103,7 @@ class HeartbeatWatcherTests(unittest.TestCase):
                         os.killpg(watcher.pid, signal.SIGKILL)
                     except ProcessLookupError:
                         pass
-                    _ = watcher.communicate(timeout=TEST_HANG_GUARD_SECS)
+                    _ = watcher.communicate(timeout=guard.remaining())
 
 
 if __name__ == "__main__":

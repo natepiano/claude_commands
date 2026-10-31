@@ -8,12 +8,21 @@ import fcntl
 import os
 import subprocess
 import sys
-from collections.abc import Generator, Mapping
+from collections.abc import Callable, Generator, Mapping
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 import json
-from typing import cast
+from contextvars import ContextVar
+from uuid import uuid4
+from typing import Protocol, cast
+from importlib import import_module
+
+
+if __name__ == "launch_permission":
+    _ = sys.modules.setdefault("scripts.shutdown.launch_permission", sys.modules[__name__])
+elif __name__ == "scripts.shutdown.launch_permission":
+    _ = sys.modules.setdefault("launch_permission", sys.modules[__name__])
 
 
 @dataclass(frozen=True)
@@ -104,6 +113,155 @@ def launch_barrier() -> AbstractContextManager[None]:
     """Hold the barrier that serializes launch decisions with shutdown creation."""
     return _held_launch_barrier()
 
+
+
+class LaunchAdmissionRefused(OSError):
+    """A shutdown hold or unreadable state denies launching, including fallback."""
+
+
+class LaunchRevoked(OSError):
+    """A shutdown begun after admission withdrew permission to finish this launch."""
+
+
+@contextmanager
+def block_launches_during_shutdown() -> Generator[None, None, None]:
+    """Fence all accounts for a bounded shutdown; a dead caller releases the fence."""
+    root = shutdown_state_root()
+    root.mkdir(parents=True, exist_ok=True)
+    with (root / ".record.shutdown-admission.tmp").open("a+") as fence:
+        with launch_barrier():
+            try:
+                fcntl.flock(fence.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as error:
+                raise LaunchAdmissionRefused("machine-wide shutdown already in progress") from error
+        try:
+            yield
+        finally:
+            fcntl.flock(fence.fileno(), fcntl.LOCK_UN)
+
+
+def _require_open_launch_admission() -> None:
+    # The caller holds launch_barrier, so shutdown cannot install the fence
+    # between this check and publishing the new revocable claim.
+    with (shutdown_state_root() / ".record.shutdown-admission.tmp").open("a+") as fence:
+        try:
+            fcntl.flock(fence.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise LaunchAdmissionRefused("machine-wide shutdown in progress") from error
+        fcntl.flock(fence.fileno(), fcntl.LOCK_UN)
+
+
+class LaunchPaneHost(Protocol):
+    def close_agent(self, session: str, pane: str) -> None: ...
+
+
+@dataclass(frozen=True)
+class PendingSessionLaunch:
+    """An admitted launch that shutdown can revoke before it finishes."""
+
+    session_id: str
+    login: str
+    name: str
+    pid: int
+    herdr_session: str = ""
+    pane: str = ""
+
+
+@dataclass(frozen=True)
+class NoLaunchClaim:
+    """This caller is outside a shutdown-aware launch."""
+
+
+_CURRENT_LAUNCH: ContextVar[Path | NoLaunchClaim] = ContextVar("shutdown_launch", default=NoLaunchClaim())
+
+
+def _launch_fields(path: Path) -> dict[str, object]:
+    value = cast(object, json.loads(path.read_text(encoding="utf-8")))
+    if not isinstance(value, dict):
+        raise ValueError(f"unreadable launch claim: {path}")
+    return cast(dict[str, object], value)
+
+
+def _pending_launch(fields: dict[str, object]) -> PendingSessionLaunch:
+    texts = [fields.get(key, "") for key in ("session_id", "login", "name", "herdr_session", "pane")]
+    pid = fields.get("pid")
+    if not all(isinstance(value, str) for value in texts) or not isinstance(pid, int):
+        raise ValueError("unreadable pending session launch")
+    identity, login, name, session, pane = cast(list[str], texts)
+    return PendingSessionLaunch(identity, login, name, pid, session, pane)
+
+
+def pending_launches() -> tuple[PendingSessionLaunch, ...]:
+    """Read launch claims while the caller holds launch_barrier()."""
+    return tuple(_pending_launch(_launch_fields(path))
+                 for path in shutdown_state_root().glob(".record.launch-*.tmp"))
+
+
+def revoke_pending_launches(login: str, only: tuple[str, ...] = ()) -> tuple[PendingSessionLaunch, ...]:
+    """Revoke this account's launches; return exact panes for shutdown to close.
+
+    Call before shutdown's final inventory. A launch without a pane yet will
+    refuse when it publishes its pane, and close that pane itself.
+    """
+    revoked: list[PendingSessionLaunch] = []
+    with launch_barrier():
+        for path in shutdown_state_root().glob(".record.launch-*.tmp"):
+            fields = _launch_fields(path)
+            claim = _pending_launch(fields)
+            if claim.login.casefold() == login.casefold() and (not only or claim.session_id in only):
+                fields["revoked"] = True
+                _ = path.write_text(json.dumps(fields), encoding="utf-8")
+                revoked.append(claim)
+    return tuple(revoked)
+
+
+@contextmanager
+def admitted_launch(login: str, session_id: str, name: str,
+                    admit: Callable[[], None]) -> Generator[None, None, None]:
+    """Serialize only admission and its revocable claim, never agent startup."""
+    path = shutdown_state_root() / f".record.launch-{uuid4().hex}.tmp"
+    with launch_barrier():
+        _require_open_launch_admission()
+        parent = os.environ.get("SHUTDOWN_PARENT_LAUNCH_CLAIM", "")
+        if parent and _launch_fields(Path(parent)).get("revoked") is True:
+            raise LaunchRevoked("launch revoked by a newer shutdown")
+        admit()
+        _ = path.write_text(json.dumps(dict(login=login, session_id=session_id,
+            name=name, pid=os.getpid(), revoked=False)), encoding="utf-8")
+    token = _CURRENT_LAUNCH.set(path)
+    try:
+        yield
+    finally:
+        _CURRENT_LAUNCH.reset(token)
+        with launch_barrier():
+            fields = _launch_fields(path)
+            path.unlink()
+        if fields.get("revoked") is True:
+            claim = _pending_launch(fields)
+            if claim.pane:
+                host = cast(LaunchPaneHost, cast(object, import_module("herdr")))
+                host.close_agent(claim.herdr_session, claim.pane)
+            raise LaunchRevoked(f"{name}: launch revoked by a newer shutdown")
+
+
+
+def inherited_launch_claim() -> dict[str, str]:
+    """Carry a unit subprocess's admission across its account/preflight work."""
+    path = _CURRENT_LAUNCH.get()
+    return {} if isinstance(path, NoLaunchClaim) else {"SHUTDOWN_PARENT_LAUNCH_CLAIM": str(path)}
+
+def claim_launch_pane(session: str, pane: str) -> None:
+    """Expose only the new pane to a down begun during startup."""
+    path = _CURRENT_LAUNCH.get()
+    if isinstance(path, NoLaunchClaim):
+        return
+    with launch_barrier():
+        fields = _launch_fields(path)
+        fields.update(herdr_session=session, pane=pane)
+        _ = path.write_text(json.dumps(fields), encoding="utf-8")
+        revoked = fields.get("revoked") is True
+    if revoked:
+        raise LaunchRevoked("launch revoked by a newer shutdown")
 
 def _first_line(text: str) -> str:
     lines = text.splitlines()

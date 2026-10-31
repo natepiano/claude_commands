@@ -20,7 +20,7 @@ TEST_HANG_GUARD_SECS = 300
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.astra import astra_roles  # noqa: E402
-from scripts.guilds import roles  # noqa: E402
+from scripts.astra import design_roles  # noqa: E402
 
 SCRIPT = Path(__file__).with_name("astra_roles.py")
 
@@ -39,8 +39,8 @@ class AstraRolesTests(unittest.TestCase):
         self.mesh_run.mkdir()
         self.home.mkdir()
         self.environment = {**os.environ, "ASTRA_ROLES_STATE": str(self.state), "HOME": str(self.root),
-                            "GUILD_ROLES_STATE": str(self.root / "guild-roles"),
-                            "GUILD_OWNERSHIP_STATE": str(self.root / "guild-ownership")}
+                            "DESIGN_ROLES_STATE": str(self.root / "design-roles"),
+                            "DESIGN_OWNERSHIP_STATE": str(self.root / "design-ownership")}
         _ = self.environment.pop("CLAUDE_CODE_SESSION_ID", None)
         self.roster("running")
         _ = (self.mesh_run / "mesh_server.json").write_text(json.dumps({"codex_home": str(self.home)}))
@@ -65,15 +65,15 @@ class AstraRolesTests(unittest.TestCase):
 
     def test_durable_lifetime_round_trip_survives_failed_mesh_and_ends_only_with_its_instance(self) -> None:
         design_id = "00000000-0000-4000-8000-000000000066"
-        design = roles.HeldDesign(roles.DesignPlacement(design_id, "fixture-host", 2), "fixture-repo",
+        design = design_roles.HeldDesign(design_roles.DesignPlacement(design_id, "fixture-host", 2), "fixture-repo",
             str(self.root), str(self.root / "design.md"), "design", "2026-10-21T12:00:00+00:00",
-            roles.UnitHolder("demo", "design-unit"), roles.DesignUnbound(),
-            (roles.RoleInstance("designer", "lasting-alias", roles.RoleNeedsRecovery("thread-lasting", "server gone")),
-             roles.RoleInstance("reviewer", "unused-reviewer", roles.RoleNotOpened())))
+            design_roles.UnitHolder("demo", "design-unit"), design_roles.DesignUnbound(),
+            (design_roles.RoleInstance("designer", "lasting-alias", design_roles.RoleNeedsRecovery("thread-lasting", "server gone")),
+             design_roles.RoleInstance("reviewer", "unused-reviewer", design_roles.RoleNotOpened())))
         with mock.patch.dict(os.environ, self.environment), \
-                mock.patch.object(roles, "resolve_holder", return_value=roles.HolderReach("restarted-holder")):
-            roles._save(design)  # pyright: ignore[reportPrivateUsage]
-            mesh = roles.mesh_directory(design_id)
+                mock.patch.object(design_roles, "resolve_holder", return_value=design_roles.HolderReach("restarted-holder")):
+            design_roles._save(design)  # pyright: ignore[reportPrivateUsage]
+            mesh = design_roles.mesh_directory(design_id)
             mesh.mkdir(parents=True)
             _ = (mesh / "mesh_roster.json").write_text(json.dumps({"lasting-alias": {
                 "thread_id": "thread-lasting", "status": "failed"}}))
@@ -86,8 +86,8 @@ class AstraRolesTests(unittest.TestCase):
             live = astra_roles.live_roles()
             self.assertEqual([(entry["thread_id"], entry["manager"], entry["state"]) for entry in live],
                              [("thread-lasting", "restarted-holder", "idle")])
-            ended = replace(design, roles=(replace(design.roles[0], lifecycle=roles.RoleEnded("thread-lasting")), design.roles[1]))
-            roles._save(ended)  # pyright: ignore[reportPrivateUsage]
+            ended = replace(design, roles=(replace(design.roles[0], lifecycle=design_roles.RoleEnded("thread-lasting")), design.roles[1]))
+            design_roles._save(ended)  # pyright: ignore[reportPrivateUsage]
             self.assertEqual(astra_roles.live_roles(), [])
             self.assertFalse((self.state / "thread-lasting.json").exists())
 

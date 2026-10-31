@@ -83,16 +83,18 @@ class PendingRestart(TypedDict):
     config_dir: str
     pid: int
     proc_start: str
+    stop_request_sent: bool
 
 
 @dataclass(frozen=True)
 class StopComplete:
-    """The conductor recorded a completed stop for this exact process."""
+    """The exact process has exited."""
 
 
 @dataclass(frozen=True)
 class StopPending:
-    """The conductor has not yet confirmed the stop."""
+    """The original process still runs."""
+
 
 
 @dataclass(frozen=True)
@@ -230,14 +232,16 @@ def read_pending(value: object) -> NoPendingRestart | PendingRestart:
     login, name, cwd = fields.get("login"), fields.get("name"), fields.get("cwd")
     config_dir, pid, proc_start = fields.get("config_dir"), fields.get("pid"), fields.get("proc_start")
     kind = fields.get("kind")
+    stop_request_sent = fields.get("stop_request_sent", True)
     if (kind not in ("stopping", "launching") or not isinstance(login, str) or not login
             or not isinstance(name, str) or not isinstance(cwd, str) or not Path(cwd).is_absolute()
             or not isinstance(config_dir, str) or not Path(config_dir).is_absolute()
             or not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0
-            or not isinstance(proc_start, str) or not proc_start):
+            or not isinstance(proc_start, str) or not proc_start
+            or not isinstance(stop_request_sent, bool)):
         raise ValueError("invalid nix-heal pending restart; refusing an unproven relaunch")
     return PendingRestart(kind="launching" if kind == "launching" else "stopping", login=login, name=name, cwd=cwd,
-                          config_dir=config_dir, pid=pid, proc_start=proc_start)
+                          config_dir=config_dir, pid=pid, proc_start=proc_start, stop_request_sent=stop_request_sent)
 
 
 def read_history() -> dict[str, HealHistory]:
@@ -310,24 +314,11 @@ def alert(session: HealSession, history: HealHistory, reason: str) -> None:
 
 
 def stop_completion(session: HealSession, login: str) -> StopComplete | StopPending | StopRefused:
-    """Read the conductor's typed completion signal; down itself is asynchronous."""
-    sys.path.insert(0, str(SCRIPTS / "shutdown"))
-    from scripts.shutdown import record
-
-    saved = record.find_session(login, session.session_id)
-    if saved is None:
-        return StopPending()
-    owner = saved["session"]
-    if owner["pid"] != session.pid or owner["proc_start"] != session.proc_start or saved["then"] != "stop":
-        return StopRefused("shutdown record no longer belongs to this heal stop")
-    progress = saved["progress"]["kind"]
-    if progress == "stop failed" or record.stop_incomplete(saved):
-        return StopRefused("shutdown did not complete the session stop")
-    if progress in {"stopped", "already gone"} and sessions.process_start(session.pid) != session.proc_start:
-        return StopComplete()
-    if progress == "process identity lost":
-        return StopRefused("session process identity changed during shutdown")
-    return StopPending()
+    del login
+    observed = sessions.process_liveness(session.pid, session.proc_start)
+    if isinstance(observed, sessions.SessionLivenessUnknown):
+        return StopRefused(observed.reason)
+    return StopPending() if isinstance(observed, sessions.LiveSessionProcess) else StopComplete()
 
 
 def confirm_relaunch(session: HealSession, history: HealHistory) -> bool:
@@ -343,6 +334,21 @@ def confirm_relaunch(session: HealSession, history: HealHistory) -> bool:
         log(session, history, "restart", "nix shell missing; stopped session relaunched")
         return True
     return False
+
+
+def request_stop(session: HealSession, pending: PendingRestart, history: HealHistory,
+                 histories: dict[str, HealHistory]) -> bool:
+    from scripts.shutdown import stop_resume
+
+    result = stop_resume.stop(session.session_id)
+    if not isinstance(result, (stop_resume.Stopped, stop_resume.NotRunning)):
+        reason = result.reason if isinstance(result, stop_resume.StopFailed) else "no local session tab"
+        log(session, history, "refused", reason)
+        alert(session, history, reason)
+        return False
+    pending["stop_request_sent"] = True
+    save_history(histories)
+    return True
 
 
 def resume_pending(session: HealSession, pending: PendingRestart, history: HealHistory,
@@ -363,6 +369,15 @@ def resume_pending(session: HealSession, pending: PendingRestart, history: HealH
         return
     completion = stop_completion(session, pending["login"])
     if isinstance(completion, StopPending):
+        if not pending["stop_request_sent"]:
+            if sessions.process_start(session.pid) != session.proc_start:
+                history["pending"] = NoPendingRestart(kind="none")
+                reason = "unsent shutdown request lost its original session process; restart cancelled"
+                log(session, history, "refused", reason)
+                alert(session, history, reason)
+                return
+            if not request_stop(session, pending, history, histories):
+                return
         log(session, history, "pending", "waiting for shutdown stop completion")
         return
     if isinstance(completion, StopRefused):
@@ -383,21 +398,15 @@ def resume_pending(session: HealSession, pending: PendingRestart, history: HealH
     pending["kind"] = "launching"
     history["restart_at"] = time.time()
     save_history(histories)
-    command = [str(SCRIPTS / "lib/py"), str(SCRIPTS / "shutdown/shutdown.py"),
-               "restart", pending["login"], "--only", session.session_id, "--here"]
-    environment = dict(loaded.env)
-    environment[nix_env.HEAL_SESSION_ENV] = session.session_id
-    environment[nix_env.HEAL_DIRECTORY_ENV] = str(session.cwd.resolve())
+    from scripts.shutdown import stop_resume
     try:
-        result = subprocess.run(command, env=environment, capture_output=True, text=True,
-                                timeout=RELAUNCH_TIMEOUT_SECONDS, check=False)
-    except (OSError, subprocess.SubprocessError) as error:
-        reason = f"nix shell relaunch failed: {error}"
-        log(session, history, "refused", reason)
-        alert(session, history, reason)
+        result = stop_resume.resume(session.session_id, why="nix shell heal")
+    except (OSError, subprocess.TimeoutExpired) as error:
+        log(session, history, "refused", str(error))
+        alert(session, history, str(error))
         return
-    if result.returncode:
-        reason = (result.stderr or result.stdout).strip() or f"restart exit {result.returncode}"
+    if not isinstance(result, stop_resume.ClaudeUp):
+        reason = result.reason if isinstance(result, stop_resume.ResumeFailed) else "no local session tab"
         log(session, history, "refused", reason)
         alert(session, history, reason)
         return
@@ -467,16 +476,11 @@ def heal_one(session: HealSession, history: HealHistory, histories: dict[str, He
     history["restart_proc_start"] = session.proc_start
     history["healthy_since_restart"] = False
     pending = PendingRestart(kind="stopping", login=selected.login, name=session.name, cwd=str(session.cwd),
-                             config_dir=str(session.config_dir), pid=session.pid, proc_start=session.proc_start)
+                             config_dir=str(session.config_dir), pid=session.pid, proc_start=session.proc_start,
+                             stop_request_sent=False)
     history["pending"] = pending
     save_history(histories)
-    command = [str(SCRIPTS / "lib/py"), str(SCRIPTS / "shutdown/shutdown.py"), "down", selected.login,
-               "--here", "--only", session.session_id]
-    result = subprocess.run(command, capture_output=True, text=True, timeout=60, check=False)
-    if result.returncode:
-        reason = (result.stderr or result.stdout).strip() or f"shutdown exit {result.returncode}"
-        log(session, history, "refused", reason)
-        alert(session, history, reason)
+    if not request_stop(session, pending, history, histories):
         return
     resume_pending(session, pending, history, histories)
 

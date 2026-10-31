@@ -8,6 +8,7 @@ import sys
 import unittest
 from pathlib import Path
 from typing import cast, final
+from scripts.production import staff
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -18,6 +19,31 @@ from scripts.production.rename_unit_test_support import UnitRenameFixture, SCRIP
 
 @final
 class UnitRenameTests(UnitRenameFixture):
+    def test_rename_unit_preserves_staff_and_worker_identity(self) -> None:
+        row = next(row for row in staff.snapshot().find(kind="unit") if row.name == "alpha")
+        worker = staff.ensure("worker", name="impl1", parent=row.id)
+        self.assert_ok(self.rename("apply"))
+        self.assertEqual(staff.snapshot().by_id(row.id), staff.StaffRow(row.id, "unit", "gamma", row.parent))
+        self.assertEqual(staff.snapshot().by_id(worker.id), worker)
+        self.assertEqual(self.journal()["staff_id"], row.id)
+
+    def test_taken_staff_name_refuses_before_sources_change(self) -> None:
+        row = staff.snapshot().find(kind="showrunner")[0]
+        _ = staff.ensure("unit", name="gamma", parent=row.id)
+        before = self.snapshot()
+        failed = self.rename("apply")
+        self.assertEqual(failed.returncode, 2, failed.stderr)
+        self.assertIn("StaffRefused", failed.stderr)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_missing_staff_member_refuses_before_sources_change(self) -> None:
+        row = next(row for row in staff.snapshot().find(kind="unit") if row.name == "alpha")
+        _ = staff.retire(row.id)
+        before = self.snapshot()
+        failed = self.rename("apply")
+        self.assertEqual(failed.returncode, 2, failed.stderr)
+        self.assertEqual(self.snapshot(), before)
+
 
     def test_worker_migration_conflict_prints_a_refusal_without_a_traceback(self) -> None:
         result = subprocess.run([sys.executable, "-c", 'import runpy, sys\nfrom pathlib import Path\nsys.path.insert(0, str(Path(sys.argv[1]).resolve().parents[2]))\nfrom scripts.direct import workers\ndef unavailable(*args, **kwargs):\n    raise workers.WorkerUnavailable("worker ownership changed; rerun apply")\nworkers.move_unit = unavailable\nworkers.rename_unit = unavailable\nworkers.end_unit = unavailable\nsys.argv = sys.argv[1:]\nsys.path.insert(0, str(Path(sys.argv[0]).parent))\nrunpy.run_path(sys.argv[0], run_name="__main__")\n', str(SCRIPT), "apply", SLUG, "alpha", "gamma",
@@ -41,11 +67,13 @@ class UnitRenameTests(UnitRenameFixture):
         for session, panes in (("agents", {"w1:p2": "alpha-unit", "w1:p3": "beta-unit"}),
                                ("work", {"w2:p1": "alpha-unit"})):
             self.write(records / f"{session}.json", json.dumps(
-                {pane: {"environment": {"SHOWRUNNER_UNIT_ID": unit}} for pane, unit in panes.items()}))
+                {pane: {"session_id": f"session-{unit}", "written_at": "2026-10-30T09:00:00+00:00",
+                        "environment": {"SHOWRUNNER_UNIT_ID": unit}} for pane, unit in panes.items()}))
         self.assert_ok(self.rename("apply", "alpha-unit", "gamma-unit"))
         # The old pane's entry would resume the old name; the relaunched unit records its new pane.
         self.assertEqual(json.loads((records / "agents.json").read_text()),
-                         {"w1:p3": {"environment": {"SHOWRUNNER_UNIT_ID": "beta-unit"}}})
+                         {"w1:p3": {"session_id": "session-beta-unit", "written_at": "2026-10-30T09:00:00+00:00",
+                                    "environment": {"SHOWRUNNER_UNIT_ID": "beta-unit"}}})
         self.assertEqual(json.loads((records / "work.json").read_text()), {})
         new = self.rust / "claude-demo-gamma"
         self.assertFalse((self.rust / "claude-demo-alpha").exists())
@@ -85,6 +113,30 @@ class UnitRenameTests(UnitRenameFixture):
         self.assertIn("unit: gamma-unit", (self.root / "vault/showrunners/demo-sr/alpha-unit.md").read_text())
         self.assertIn("unit: alpha-unit", (self.root / "vault/showrunners/other-sr/alpha-unit.md").read_text())
         self.assertIs(self.journal()["done"], True)
+
+    def test_apply_renames_a_note_owned_by_a_former_production_slug(self) -> None:
+        self.write(self.doc, self.doc.read_text().replace(
+            "## Production Context\n",
+            "## Production Context\n\n- **Formerly:** `old-name`\n",
+            1,
+        ))
+        _ = self.git("add", str(self.doc))
+        _ = self.git("commit", "-m", "Record the former production name")
+        note = self.root / "vault/showrunners/demo-sr/alpha-unit.md"
+        self.write(note, note.read_text().replace(
+            "production: demo",
+            'production_file: "https://github.com/example/project/blob/main/docs/plans/old-name-production.md"',
+        ))
+        before = note.read_bytes()
+        unrelated = self.root / "vault/showrunners/other-sr/alpha-unit.md"
+        unrelated_before = unrelated.read_bytes()
+
+        result = self.rename("apply", "alpha-unit", "gamma-unit")
+
+        self.assert_ok(result)
+        self.assertEqual(note.read_bytes(), before.replace(b"unit: alpha-unit\n", b"unit: gamma-unit\n"))
+        self.assertEqual(unrelated.read_bytes(), unrelated_before)
+        self.assert_ok(self.rename("verify", "alpha-unit", "gamma-unit"))
 
     def test_mul_add_naming_keeps_the_underscore_id(self) -> None:
         self.assert_ok(self.rename("apply", "mul_add-unit", "fma"))

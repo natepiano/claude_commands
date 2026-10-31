@@ -7,6 +7,7 @@ from contextlib import redirect_stderr, redirect_stdout
 import fcntl
 from io import StringIO
 import json
+import hashlib
 import os
 import select
 import shlex
@@ -16,7 +17,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from typing import Callable, Literal, NamedTuple, Protocol, TypedDict, cast, final, override
+from typing import Callable, Literal, NamedTuple, NotRequired, Protocol, TypedDict, cast, final, override
 from unittest.mock import patch
 
 import feature_log
@@ -200,6 +201,7 @@ class AmendEvent(TypedDict):
     old_completed: str
     new_completed: str
     releases_added: list[str]
+    content: NotRequired[str]
 
 
 class ReleaseEvent(TypedDict):
@@ -1340,6 +1342,44 @@ class FeatureLogTests(unittest.TestCase):
         self.assertEqual(self.cli(["check"]), CliResult(0, "ok: 4 notes\n", ""))
         self.assert_no_temporary_files()
 
+    def test_later_amend_retries_its_event_after_the_note_was_saved(self) -> None:
+        self.assertEqual(self.cli(self.add_arguments(title="Rerun result")).status, 0)
+        prefix = ["amend", "--project", "hana", "--title", "Rerun result"]
+        self.assertEqual(self.cli([*prefix, "--summary", "Earlier summary."]).status, 0)
+        for field in ("summary", "behavior"):
+            with self.subTest(field=field):
+                arguments = [*prefix, f"--{field}", f"Later {field} survives a stop."]
+                before = len(self.events())
+                with patch.object(feature_log, "_append_event", side_effect=InterruptedError("before event")), \
+                        self.assertRaises(InterruptedError):
+                    _ = self.cli(arguments)
+                saved = self.note("hana", "rerun result").read_bytes()
+                retried = self.cli(arguments)
+                self.assertEqual(retried.status, 0, retried.stderr)
+                self.assertEqual(self.note("hana", "rerun result").read_bytes(), saved)
+                self.assertEqual(len(self.events()), before + 1)
+                event = self.events()[-1]
+                self.assertEqual(event["verb"], "amend")
+                if event["verb"] != "amend":
+                    self.fail("retry did not record the amendment")
+                self.assertEqual(event["fields"], [field])
+                self.assertEqual(event.get("content"), hashlib.sha256(saved).hexdigest())
+                self.assertEqual(self.cli(arguments).status, 0)
+                self.assertEqual(len(self.events()), before + 1)
+
+    def test_digest_retries_changes_when_printing_stops_before_the_cursor(self) -> None:
+        self.assertEqual(self.cli(self.add_arguments(title="Unseen result")).status, 0)
+        expected = self.cli(["digest"])
+        self.assertEqual(expected.status, 0, expected.stderr)
+        cursor = self.state / "digest.json"
+        expected_cursor = cursor.read_bytes()
+        cursor.unlink()
+        with patch.object(feature_log, "_print_digest", side_effect=InterruptedError("output stopped")), \
+                self.assertRaises(InterruptedError):
+            _ = self.cli(["digest"])
+        self.assertEqual(self.cli(["digest"]), expected)
+        self.assertEqual(cursor.read_bytes(), expected_cursor)
+
     def test_amend_updates_allowed_fields_appends_evidence_and_prunes_release(self) -> None:
         original_arguments = self.add_arguments(
             title="Amended Result",
@@ -1453,6 +1493,7 @@ class FeatureLogTests(unittest.TestCase):
                 "old_completed": "2026-10-01",
                 "new_completed": "2026-09-30",
                 "releases_added": [],
+                "content": hashlib.sha256(self.note("hana", title.lower()).read_bytes()).hexdigest(),
             },
         )
         self.assert_no_temporary_files()
@@ -1608,6 +1649,7 @@ class FeatureLogTests(unittest.TestCase):
                 "old_completed": "2026-10-01",
                 "new_completed": "2026-10-01",
                 "releases_added": ["hana_lagrange@2.3.4", "hana_lagrange@2.3.5-alpha.1"],
+                "content": hashlib.sha256(self.note("hana", title.lower()).read_bytes()).hexdigest(),
             },
         )
         note_before = path.read_bytes()
@@ -1671,6 +1713,7 @@ class FeatureLogTests(unittest.TestCase):
             "old_link": original["link"], "new_link": original["link"],
             "old_completed": "2026-10-01", "new_completed": "2026-10-01",
             "releases_added": ["hana_lagrange@Unreleased"],
+            "content": hashlib.sha256(self.note("hana", title.lower()).read_bytes()).hexdigest(),
         }
         self.assertEqual(self.events()[-1], event)
         self.assertEqual(len(self.events()), 2)
@@ -1697,12 +1740,17 @@ class FeatureLogTests(unittest.TestCase):
         original = feature_log.parse_note(path)
         before_note = path.read_bytes()
         summary = "Repair `pending` output without losing **its text**."
+        journal_note = original.copy()
+        journal_note["summary"] = summary
+        journal_note["kind"] = "fix"
+        journal_note["release"] = ["hana_lagrange@Unreleased"]
         event: AmendEvent = {
             "at": EVENT_TIME, "verb": "amend", "project": "hana",
             "title": title.lower(), "fields": ["summary", "kind", "release"],
             "backfill": True, "old_link": original["link"],
             "new_link": original["link"], "old_completed": TODAY,
             "new_completed": TODAY, "releases_added": ["hana_lagrange@Unreleased"],
+            "content": hashlib.sha256(feature_log.render_note(journal_note).encode()).hexdigest(),
         }
         write_note = cast(
             Callable[[Path, feature_log.Note], None], getattr(feature_log, "_write_note")
@@ -1821,6 +1869,7 @@ class FeatureLogTests(unittest.TestCase):
             "backfill": True, "old_link": original["link"], "new_link": original["link"],
             "old_completed": TODAY, "new_completed": TODAY,
             "releases_added": ["hana_liminal@1.2.3"],
+            "content": hashlib.sha256(self.note("hana", title.lower()).read_bytes()).hexdigest(),
         }
         self.assertEqual(self.events()[-1], event)
         self.assertEqual(len(self.events()), 2)
@@ -1912,6 +1961,7 @@ class FeatureLogTests(unittest.TestCase):
             "title": "shared result", "fields": ["release"], "backfill": True,
             "old_link": original["link"], "new_link": original["link"],
             "old_completed": TODAY, "new_completed": TODAY, "releases_added": releases,
+            "content": hashlib.sha256(self.note("hana", "shared result").read_bytes()).hexdigest(),
         }
         self.assertEqual(self.events()[-1], event)
         self.assert_no_temporary_files()
@@ -2063,6 +2113,7 @@ class FeatureLogTests(unittest.TestCase):
                             "old_link": original["link"], "new_link": new_link,
                             "old_completed": "2026-10-01", "new_completed": "2026-09-30",
                             "releases_added": [release],
+                            "content": hashlib.sha256(self.note("hana", original["title"]).read_bytes()).hexdigest(),
                         },
                     )
                     note_bytes = path.read_bytes()
@@ -2185,6 +2236,7 @@ class FeatureLogTests(unittest.TestCase):
                 "old_completed": "2026-10-01",
                 "new_completed": "2026-09-30",
                 "releases_added": ["hana_lagrange@1.2.3"],
+                "content": hashlib.sha256(self.note("hana", title.lower()).read_bytes()).hexdigest(),
             },
         )
         self.assertEqual(len(self.events()), 2)
@@ -2562,7 +2614,7 @@ class FeatureLogTests(unittest.TestCase):
             {
                 "at", "verb", "project", "title", "fields", "backfill",
                 "old_link", "new_link", "old_completed", "new_completed",
-                "releases_added",
+                "releases_added", "content",
             },
         )
         self.assertEqual(amend_event["fields"], ["summary"])

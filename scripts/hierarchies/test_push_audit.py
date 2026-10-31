@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from contextlib import redirect_stdout
 import ast
+import io
 import json
 import os
 from pathlib import Path
@@ -15,6 +17,8 @@ from unittest.mock import patch
 
 from scripts.hierarchies import push_audit as audit
 from scripts.hierarchies import log_records
+from scripts.hierarchies.test_log_records import phone_overflow_lines, read_report_blocks, summary_lines
+from scripts.production import showrunners
 
 
 JsonRecord = dict[str, object]
@@ -22,17 +26,19 @@ AUDIT_SCRIPT = Path(__file__).with_name("push_audit.py")
 SINCE = "2026-10-13T17:24:00-04:00"
 UNTIL = "2026-10-20T17:24:00-04:00"
 AT = "2026-10-15T12:00:00Z"
-REGISTERED_TEXT = "shutdown.stop_failed"
+REGISTERED_TEXT = "shutdown.restart_failed"
+AUDIT_SUMMARY_PREFIXES = ("Window:", "Pushes:", "ApprovedPriorityTwo:", "Source problems:")
 
 
 def detail_section(output: str) -> str:
-    return output.split("\n\nTotals per showrunner", 1)[0]
+    section = output[output.index("Sends after failed text checks"):].split("\n\nTotals per showrunner", 1)[0]
+    return " ".join(section.split())
 
 
 def total_cells(output: str) -> dict[str, list[str]]:
-    return {cells[0]: cells[1:] for line in output.splitlines()
-            if line.startswith(("showrunner / ", "machine service / ", "session / ", "all senders  "))
-            for cells in [re.split(r" {2,}", line)]}
+    return {row.measure: [row.value, str(row.n), row.window, row.source] for row in read_report_blocks(output)
+            if row.measure.startswith(("showrunner / ", "machine service / ", "session / "))
+            or row.measure == "all senders"}
 
 
 def session_names_in_literals(source: str, sessions: audit.TopLevelSessions) -> set[str]:
@@ -99,12 +105,173 @@ class PushAuditTest(unittest.TestCase):
             "NOTIFIER_STATE_DIR": str(self.home / ".local/state/notifier"),
         }
         result = subprocess.run(
-            [sys.executable, str(AUDIT_SCRIPT), "report", "--since", since, "--until", until],
+            [sys.executable, str(AUDIT_SCRIPT), "report", "--full", "--since", since, "--until", until],
             cwd=AUDIT_SCRIPT.parents[2], env=environment, capture_output=True, text=True,
             check=False, timeout=15,
         )
         self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
         return result.stdout
+
+    def test_coverage_claims_subtract_gaps_and_stop_at_the_command_time(self) -> None:
+        path = self.home / "coverage.toml"
+        _ = path.write_text(
+            '["notification history"]\nsince="2026-10-12T21:24:00Z"\nevidence="abc123 start logging"\n'
+            + '[["notification history".gaps]]\nfrom="2026-10-14T21:24:00Z"\n'
+            + 'to="2026-10-16T21:24:00Z"\nreason="writer stopped"\n'
+            + '[["notification history".gaps]]\nfrom="2026-10-15T21:24:00Z"\n'
+            + 'to="2026-10-17T21:24:00Z"\nreason="overlapping outage"\n'
+            + '[["notification history".gaps]]\nfrom="2026-10-19T21:24:00Z"\n'
+            + 'to="2026-10-25T21:24:00Z"\nreason="outage continues after this command"\n'
+        )
+        original = path.read_bytes()
+        problems: list[log_records.SourceProblem] = []
+        claims = audit.read_coverage(path, log_records.required_time(UNTIL), problems)
+        self.assertEqual(problems, [])
+        self.assertEqual(set(claims), {"notification history"})
+        claim = claims["notification history"]
+        self.assertEqual(claim.evidence, "abc123 start logging")
+        self.assertEqual([(interval.since, interval.until) for interval in claim.intervals], [
+            (log_records.required_time("2026-10-12T21:24:00Z"), log_records.required_time("2026-10-14T21:24:00Z")),
+            (log_records.required_time("2026-10-17T21:24:00Z"), log_records.required_time("2026-10-19T21:24:00Z")),
+        ])
+        self.assertEqual(path.read_bytes(), original)
+
+    def test_bad_coverage_entries_name_the_file_and_key_without_losing_good_claims(self) -> None:
+        path = self.home / "coverage.toml"
+        valid = '["notification history"]\nsince="2026-10-13T21:24:00Z"\nevidence="abc123 start logging"\n'
+        for invalid in (
+            'since="2026-10-13T21:24:00"\nevidence="offset missing"\n',
+            'since="bad time"\nevidence="bad stamp"\n',
+            'since="2026-10-13T21:24:00Z"\nevidence=" "\n',
+            'since="2026-10-13T21:24:00Z"\nevidence="ok"\nextra="invalid field"\n',
+            'since="2026-10-13T21:24:00Z"\nevidence="ok"\n'
+            + '[["merge history".gaps]]\nfrom="2026-10-17T00:00:00Z"\n'
+            + 'to="2026-10-16T00:00:00Z"\nreason="backward gap"\n',
+            'since="2026-10-13T21:24:00Z"\nevidence="ok"\n'
+            + '[["merge history".gaps]]\nfrom="2026-10-14T00:00:00Z"\n'
+            + 'to="2026-10-16T00:00:00Z"\nreason=" "\n',
+        ):
+            with self.subTest(entry=invalid):
+                _ = path.write_text(valid + '["merge history"]\n' + invalid)
+                problems: list[log_records.SourceProblem] = []
+                claims = audit.read_coverage(path, log_records.required_time(UNTIL), problems)
+                self.assertEqual(set(claims), {"notification history"})
+                self.assertEqual(claims["notification history"].intervals, (log_records.Window(
+                    log_records.required_time("2026-10-13T21:24:00Z"), log_records.required_time(UNTIL)),))
+                self.assertEqual(len(problems), 1)
+                self.assertEqual(problems[0].source, str(path))
+                self.assertIn("merge history", problems[0].reason)
+        _ = path.write_text("[")
+        problems = []
+        self.assertEqual(audit.read_coverage(path, log_records.required_time(UNTIL), problems), {})
+        self.assertEqual(len(problems), 1)
+        self.assertEqual(problems[0].source, str(path))
+        self.assertIn("coverage config", problems[0].reason)
+
+    def test_full_cli_omits_the_hint_and_summary_only_keeps_it(self) -> None:
+        self.save(self.pushes, [self.push("Delivered fixture")])
+        self.reviews.unlink()
+        with patch.object(audit, "STATE_DIR", self.logs), \
+                patch.object(showrunners, "NOTIFIER_STATE_DIR", self.home / "notifiers"), \
+                redirect_stdout(io.StringIO()) as captured:
+            self.assertEqual(audit.main(["report", "--since", SINCE, "--until", UNTIL]), 0)
+        summary = summary_lines(captured.getvalue(), AUDIT_SUMMARY_PREFIXES)
+        full = self.report()
+        full_summary = summary_lines(full, AUDIT_SUMMARY_PREFIXES)
+        self.assertEqual(summary[-1], "Source problems: 1. Use --full to print the tables.")
+        self.assertEqual(full_summary[-1], "Source problems: 1.")
+        self.assertEqual(full_summary[:-1], summary[:-1])
+        self.assertNotIn("Use --full", full)
+        self.assertIn("Totals per showrunner", full)
+
+    def test_two_window_audits_keep_earlier_reviews_silence_and_rewrites_available(self) -> None:
+        boundary = "2026-10-20T00:00:00Z"
+        before = log_records.Window(log_records.required_time("2026-10-13T00:00:00Z"),
+                                    log_records.required_time(boundary))
+        after = log_records.Window(before.until, log_records.required_time("2026-11-17T00:00:00Z"))
+        kept = {**self.push("Delayed across boundary", at="2026-10-19T12:00:00Z"),
+                "outcome": "kept: silence until tomorrow"}
+        delayed = {**self.push("Delayed across boundary", at="2026-10-21T12:00:00Z"),
+                   "outcome": "sent, kept during silence"}
+        rewritten: JsonRecord = {
+            **self.failed_review("Rewritten", at="2026-10-19T23:59:59Z"),
+            "verdict": "rewrite", "sent": {"title": "Rewritten", "body": "Corrected body"},
+        }
+        self.save(self.pushes, [
+            self.push("Before", at="2026-10-19T12:00:00Z"), kept,
+            self.push("Reviewed before boundary", at=boundary), delayed,
+            self.push("Rewritten", at=boundary, body="Corrected body"),
+            self.push("Later excluded", at=after.until.isoformat()),
+        ])
+        self.save(self.reviews, [
+            self.failed_review("Before", at="2026-10-19T12:00:00Z"),
+            self.failed_review("Reviewed before boundary", at="2026-10-19T23:59:59Z"),
+            self.failed_review("Delayed across boundary", at="2026-10-19T12:00:00Z"),
+            rewritten,
+            {**self.failed_review("Held agent", at=boundary, text_id="nate.adhoc"), "sent": None},
+        ])
+        original = {path: path.read_bytes() for path in (self.pushes, self.reviews)}
+        with patch.object(audit, "read_owners", return_value=audit.ProductionOwnership({}, {})):
+            sources = audit.load_sources(self.logs)
+        first, second = audit.audit(sources, before), audit.audit(sources, after)
+        self.assertEqual([push.title for push in first.delivered_pushes], ["Before"])
+        self.assertEqual([entry.title for entry in first.entries], ["Before"])
+        self.assertEqual([push.title for push in second.delivered_pushes],
+                         ["Reviewed before boundary", "Delayed across boundary", "Rewritten"])
+        self.assertEqual([entry.title for entry in second.entries],
+                         ["Reviewed before boundary", "Delayed across boundary"])
+        self.assertEqual([entry.evidence for entry in second.entries], [audit.FailedCheckEvidence.FAILED_RULES] * 2)
+        self.assertEqual(sum(second.pushes_by_showrunner.values()), 3)
+        self.assertEqual(audit.audit(sources, before), first)
+        self.assertEqual({path: path.read_bytes() for path in original}, original)
+
+    def test_agent_text_exception_ends_at_the_delivery_boundary(self) -> None:
+        for at, approved in (("2026-10-29T03:05:58Z", True),
+                             ("2026-10-29T03:05:59Z", False),
+                             ("2026-10-29T03:06:00Z", False)):
+            with self.subTest(delivered_at=at):
+                self.save(self.pushes, [self.push("Agent boundary", at=at, text_id="nate.adhoc")])
+                self.save(self.reviews, [self.failed_review("Agent boundary", at=at, text_id="nate.adhoc")])
+                output = self.report(since="2026-10-29T03:00:00Z", until="2026-10-29T04:00:00Z")
+                expected = "ApprovedRegisteredText" if approved else "Unapproved"
+                detail = detail_section(output)
+                self.assertIn(expected, detail)
+                self.assertNotIn("Unapproved" if approved else "ApprovedRegisteredText", detail)
+                self.assertIn("nate.adhoc (agent-written text)", detail)
+                self.assertIn("after failed check 1;", total_cells(output)["all senders"][0])
+                self.assertEqual(total_cells(output)["all senders"][1], "1")
+
+    def test_delivery_after_revocation_uses_delivery_time_despite_earlier_review(self) -> None:
+        self.save(self.pushes, [self.push("Review before boundary", at="2026-10-29T03:06:00Z",
+                                        text_id="nate.adhoc")])
+        self.save(self.reviews, [self.failed_review("Review before boundary", at="2026-10-29T03:05:58Z",
+                                                   text_id="nate.adhoc")])
+        output = self.report(since="2026-10-29T03:00:00Z", until="2026-10-29T04:00:00Z")
+        self.assertIn("Unapproved", detail_section(output))
+        self.assertNotIn("ApprovedRegisteredText", detail_section(output))
+        self.assertIn("nate.adhoc (agent-written text)", detail_section(output))
+        self.assertEqual(total_cells(output)["all senders"][:2], [
+            "after failed check 1; ApprovedPriorityTwo 0; ApprovedRegisteredText 0; Unapproved 1", "1"])
+
+    def test_held_agent_text_after_revocation_is_not_a_delivery(self) -> None:
+        self.save(self.pushes, [])
+        self.save(self.reviews, [{**self.failed_review("Held at boundary", at="2026-10-29T03:05:59Z",
+                                                      text_id="nate.adhoc"),
+                                  "sent": None, "detail": "not sent, failed review"}])
+        output = self.report(since="2026-10-29T03:00:00Z", until="2026-10-29T04:00:00Z")
+        self.assertNotIn("Held at boundary", detail_section(output))
+        self.assertEqual(total_cells(output)["all senders"][:2], [
+            "after failed check 0; ApprovedPriorityTwo 0; ApprovedRegisteredText 0; Unapproved 0", "0"])
+
+    def test_revoked_agent_text_keeps_priority_two_and_other_registered_exceptions(self) -> None:
+        at = "2026-10-29T03:05:59Z"
+        self.save(self.pushes, [self.push("Emergency agent", at=at, text_id="nate.adhoc", priority="2"),
+                                self.push("Other registered", at=at, text_id=REGISTERED_TEXT)])
+        self.save(self.reviews, [self.failed_review("Emergency agent", at=at, text_id="nate.adhoc", priority="2"),
+                                 self.failed_review("Other registered", at=at, text_id=REGISTERED_TEXT)])
+        output = self.report(since="2026-10-29T03:00:00Z", until="2026-10-29T04:00:00Z")
+        self.assertEqual(total_cells(output)["all senders"][:2], [
+            "after failed check 2; ApprovedPriorityTwo 1; ApprovedRegisteredText 1; Unapproved 0", "2"])
 
     def test_priority_two_send_names_its_exception(self) -> None:
         self.save(self.pushes, [self.push("Emergency fixture", priority="2",
@@ -113,8 +280,93 @@ class PushAuditTest(unittest.TestCase):
         output = self.report()
         self.assertIn("ApprovedPriorityTwo", detail_section(output))
         self.assertIn("hana", output)
-        self.assertIn("Emergency fixture", output)
+        self.assertIn("Emergency fixture", " ".join(output.split()))
         self.assertNotIn("Unapproved", detail_section(output))
+
+    def test_full_cli_preserves_long_detail_and_total_fields_in_phone_blocks(self) -> None:
+        title = "The completed fixture needs a decision about the next recorded phase and its user review"
+        records = [self.push(title, priority="2"),
+                   self.push("Registered fixture", text_id=REGISTERED_TEXT),
+                   self.push("Unapproved fixture")]
+        reviews = [self.failed_review(title, priority="2"),
+                   self.failed_review("Registered fixture", text_id=REGISTERED_TEXT),
+                   self.failed_review("Unapproved fixture")]
+        self.save(self.pushes, records)
+        self.save(self.reviews, reviews)
+        output = self.report()
+        details = [row for row in read_report_blocks(output) if row.measure.startswith("2026-10-15T12:00:00+00:00 /")]
+        self.assertEqual([row.measure for row in details], [
+            "2026-10-15T12:00:00+00:00 / hana / " + record["title"] for record in records
+            if isinstance(record["title"], str)
+        ])
+        self.assertEqual([row.value for row in details], [
+            "ApprovedPriorityTwo / free text", "ApprovedRegisteredText / " + REGISTERED_TEXT,
+            "Unapproved / free text",
+        ])
+        self.assertEqual([row.n for row in details], [1, 1, 1])
+        window = log_records.window_bounds(SINCE, UNTIL, log_records.required_time(UNTIL))
+        self.assertTrue(all(row.window == window.label for row in details))
+        parsed_reviews = [review for record in reviews for review in audit.parse_review(record)]
+        sources = audit.AuditSources([audit.parse_push(record) for record in records], parsed_reviews, [],
+                                    audit.ProductionOwnership({}, {}), audit.TopLevelSessions(()))
+        expected = audit.audit(sources, window)
+        self.assertEqual([row.source for row in details], [
+            f"{entry.classification.code_path}; {entry.classification.reason}; {entry.evidence.value}"
+            for entry in expected.entries
+        ])
+        self.assertEqual(total_cells(output)["all senders"][:2], [
+            "after failed check 3; ApprovedPriorityTwo 1; ApprovedRegisteredText 1; Unapproved 1", "3",
+        ])
+        self.assertEqual(phone_overflow_lines(output), [])
+        self.assertEqual(" ".join(output.split()).count("Neither notification log records a key."), 1)
+
+    def test_default_summary_matches_full_totals_and_has_no_table_rows(self) -> None:
+        self.save(self.pushes, [
+            self.push("Priority fixture", priority="2"),
+            self.push("Registered fixture", text_id=REGISTERED_TEXT),
+            self.push("Unapproved fixture"),
+            self.push("Passed fixture"),
+        ])
+        self.save(self.reviews, [
+            self.failed_review("Priority fixture", priority="2"),
+            self.failed_review("Registered fixture", text_id=REGISTERED_TEXT),
+            self.failed_review("Unapproved fixture"),
+        ])
+        output = io.StringIO()
+        with patch.object(audit, "STATE_DIR", self.logs), \
+                patch.object(showrunners, "NOTIFIER_STATE_DIR", self.home / "notifiers"), \
+                patch.dict(os.environ, {"USER_ZONE": "America/New_York"}), redirect_stdout(output):
+            result = audit.main(["report", "--since", SINCE, "--until", UNTIL])
+        self.assertEqual(result, 0)
+        summary = output.getvalue()
+        full = self.report()
+        self.assertEqual(summary_lines(full, AUDIT_SUMMARY_PREFIXES),
+                         [line.replace(" Use --full to print the tables.", "") for line in summary_lines(summary, AUDIT_SUMMARY_PREFIXES)])
+        self.assertEqual(len(summary_lines(summary, AUDIT_SUMMARY_PREFIXES)), 4)
+        self.assertIn("Window: 2026-10-13 17:24 EDT to 2026-10-20 17:24 EDT (end excluded).", summary_lines(summary, AUDIT_SUMMARY_PREFIXES))
+        self.assertIn("Pushes: 4 delivered; 3 after a failed text check.", summary_lines(summary, AUDIT_SUMMARY_PREFIXES))
+        self.assertIn("ApprovedPriorityTwo: 1; ApprovedRegisteredText: 1; Unapproved: 1.", summary_lines(summary, AUDIT_SUMMARY_PREFIXES))
+        self.assertIn("Source problems: 0. Use --full to print the tables.", summary_lines(summary, AUDIT_SUMMARY_PREFIXES))
+        self.assertEqual(phone_overflow_lines(summary), [])
+        self.assertNotIn("Sends after failed text checks", summary)
+        self.assertNotIn("Priority fixture", summary)
+        self.assertNotIn("Totals per showrunner", summary)
+        self.assertEqual(total_cells(full)["all senders"][:2], [
+            "after failed check 3; ApprovedPriorityTwo 1; ApprovedRegisteredText 1; Unapproved 1", "4",
+        ])
+
+    def test_summary_reports_missing_source_without_printing_tables(self) -> None:
+        self.reviews.unlink()
+        self.save(self.pushes, [self.push("Annotated fixture", priority="2",
+                                        outcome="sent, sent despite failed review: context")])
+        output = io.StringIO()
+        with patch.object(audit, "STATE_DIR", self.logs), \
+                patch.object(showrunners, "NOTIFIER_STATE_DIR", self.home / "notifiers"), redirect_stdout(output):
+            result = audit.main(["report", "--since", SINCE, "--until", UNTIL])
+        self.assertEqual(result, 0)
+        self.assertIn("Pushes: 1 delivered; 1 after a failed text check.", output.getvalue())
+        self.assertIn("Source problems: 1. Use --full to print the tables.", summary_lines(output.getvalue(), AUDIT_SUMMARY_PREFIXES))
+        self.assertNotIn("review.jsonl", output.getvalue())
 
     def test_registered_text_names_its_exception_and_id(self) -> None:
         self.save(self.pushes, [self.push("Registered fixture", text_id=REGISTERED_TEXT,
@@ -142,14 +394,14 @@ class PushAuditTest(unittest.TestCase):
         self.assertIn("Unapproved", detail_section(output))
         self.assertIn("hana", output)
         self.assertEqual(output.count("Neither notification log records a key."), 1)
-        self.assertIn("scripts/message/send.py user -> scripts/notify/pushover.py send()", output)
+        self.assertIn("scripts/message/send.py user -> scripts/notify/pushover.py send()", " ".join(output.split()))
         self.assertNotRegex(output, r"pushover\.py:\d+")
 
     def test_failed_review_evidence_does_not_require_outcome_annotation(self) -> None:
         self.save(self.pushes, [self.push("Historical fixture", priority="2")])
         self.save(self.reviews, [self.failed_review("Historical fixture", priority="2")])
         output = self.report()
-        self.assertIn("Historical fixture", output)
+        self.assertIn("Historical fixture", " ".join(output.split()))
         self.assertIn("ApprovedPriorityTwo", detail_section(output))
 
     def test_recorded_text_id_keeps_its_exception_after_removal_from_current_catalog(self) -> None:
@@ -357,11 +609,11 @@ class PushAuditTest(unittest.TestCase):
                          {audit.SessionWithoutProduction("first_session"): 1,
                           audit.SessionWithoutProduction("second_session"): 1})
         output = audit.render(report)
-        totals = [re.split(r" {2,}", line) for line in output.splitlines()
-                  if line.startswith("session / Personal work (no current production names it)  ")]
+        totals = [row for row in read_report_blocks(output)
+                  if row.measure == "session / Personal work (no current production names it)"]
         self.assertEqual(len(totals), 2)
-        self.assertEqual([cells[2] for cells in totals], ["1", "1"])
-        self.assertEqual({cells[1] for cells in totals},
+        self.assertEqual([row.n for row in totals], [1, 1])
+        self.assertEqual({row.value for row in totals},
                          {"ApprovedPriorityTwo 1; ApprovedRegisteredText 0; Unapproved 0",
                           "ApprovedPriorityTwo 0; ApprovedRegisteredText 0; Unapproved 0"})
         self.assertEqual(total_cells(output)["all senders"][1], "2")
@@ -576,7 +828,7 @@ class PushAuditTest(unittest.TestCase):
         self.save(self.pushes, [self.push(title, at=at, priority="2") for title, at in records])
         self.save(self.reviews, [self.failed_review(title, at=at, priority="2") for title, at in records])
         output = self.report(until="2026-10-20")
-        self.assertIn("Last local minute", output)
+        self.assertIn("Last local minute", " ".join(output.split()))
         self.assertNotIn("Next local day", output)
 
     def test_missing_log_reports_source_problem(self) -> None:

@@ -4,21 +4,28 @@ from __future__ import annotations
 import json
 import os
 import signal
+import shutil
+import sys
 import select
 import subprocess
 import tempfile
 import time
 import unittest
 from pathlib import Path
-from typing import cast, override
+from typing import ClassVar, cast, override
 from scripts.direct.wait_for_test_state import wait_until
-from scripts.direct.test_verify_mac_offload import RUSTC_STUB, stub_build_tool_path
+from scripts.direct.recorder_fixture import invoke_recorder
+from scripts.direct.local_release_wait import LocalReleaseEvents, local_release_waiter
+from scripts.direct.verify_mac_offload_test_support import RUSTC_STUB, stub_build_tool_path
 
 
 VERIFY = Path(__file__).with_name("verify.sh")
 
 
 BOARD = VERIFY.with_name("board.sh")
+
+# load 136 on natedev, 2026-10-29
+TEST_HANG_GUARD_SECS = 300
 
 
 Record = dict[str, object]
@@ -30,19 +37,40 @@ def restore_sigint() -> None:
 
 
 class VerifyTokenWaitFixture(unittest.TestCase):
-    temporary: tempfile.TemporaryDirectory[str]  # pyright: ignore[reportUninitializedInstanceVariable]
-
     root: Path  # pyright: ignore[reportUninitializedInstanceVariable]
 
     environment: dict[str, str]  # pyright: ignore[reportUninitializedInstanceVariable]
 
     started_groups: set[int] = set()
 
+    fixture_root: ClassVar[Path]
+    fixture_snapshot: ClassVar[Path]
+    fixture_environment: ClassVar[dict[str, str]]
+
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        temporary = tempfile.TemporaryDirectory(prefix="verify-token-")
+        cls.addClassCleanup(temporary.cleanup)
+        cls.fixture_root = Path(temporary.name) / "case"
+        cls.fixture_snapshot = Path(temporary.name) / "seed"
+        cls.fixture_root.mkdir()
+        builder = cls()
+        builder.root = cls.fixture_root
+        builder.build_fixture()
+        cls.fixture_environment = builder.environment.copy()
+        _ = shutil.copytree(cls.fixture_root, cls.fixture_snapshot, symlinks=True)
+        shutil.rmtree(cls.fixture_root)
+
     @override
     def setUp(self) -> None:
         self.started_groups = set()
-        self.temporary = tempfile.TemporaryDirectory()
-        self.root = Path(self.temporary.name)
+        self.root = self.fixture_root
+        _ = shutil.copytree(self.fixture_snapshot, self.root, symlinks=True)
+        self.addCleanup(shutil.rmtree, self.root)
+        self.environment = self.fixture_environment.copy()
+
+    def build_fixture(self) -> None:
         home = self.root / "home"
         home.mkdir()
         (home / ".claude").symlink_to(VERIFY.parent.parent.parent, target_is_directory=True)
@@ -129,9 +157,28 @@ esac
         # Admission must use this test's memory state, including pressure.
         pressure = self.root / "memory-pressure"
         _ = pressure.write_text("full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n")
-        # Polls recheck real fixture state; tests that need a blocked poll
-        # replace this with a marker and an explicit release event below.
-        _ = (stubs / "sleep").write_text("#!/bin/sh\nexit 0\n")
+        # Interpreter selection is independent of token ownership. Seed the
+        # shim's normal cache once rather than rediscovering Python per test.
+        interpreter = self.root / "cache" / "claude" / "python3-3.11"
+        interpreter.parent.mkdir()
+        _ = interpreter.write_text(sys.executable + "\n")
+        memory_event = self.root / "memory-event.py"
+        _ = memory_event.write_text(
+            "import os, sys\nfrom pathlib import Path\n"
+            + f"sys.path.insert(0, {str(VERIFY.parents[2])!r})\n"
+            + "from scripts.direct.wait_for_test_state import wait_until\n"
+            + "path = Path(os.environ['BUILDLOG_MEMINFO'])\n"
+            + "wait_until(lambda: len(values := path.read_text().split()) > 1 and values[1] != '0', path.parent, "
+            + f"timeout={TEST_HANG_GUARD_SECS})\n")
+        # Memory changes are events. Token retry tests may replace this stub
+        # with their own acquisition marker or clock advancement.
+        _ = (stubs / "sleep").write_text(
+            '#!/bin/sh\n'
+            + 'if [ "$1" = "${BUILDLOG_MEM_POLL_S:-5}" ]; then\n'
+            + '    read -r label available unit < "$BUILDLOG_MEMINFO"\n'
+            + '    if [ "$available" = 0 ]; then exec python3 "$TEST_MEMORY_EVENT"; fi\n'
+            + 'fi\nexit 0\n')
+        (stubs / "sleep").chmod(0o755)
         self.environment = {
             **{name: value for name, value in os.environ.items()
                if name not in {"UNIT_RUN_DIR", "UNIT_TEAM_ROLE", "CODEX_THREAD_ID",
@@ -139,6 +186,10 @@ esac
                and not name.startswith(("PLAN_DELEGATE_", "BASH_FUNC_"))},
             "PATH": stub_build_tool_path(stubs),
             "HOME": str(home),
+            # These tests supply the complete build toolchain; nix discovery is
+            # covered separately and need not spawn its two interpreters here.
+            "IN_NIX_SHELL": "pure",
+            "CLAUDE_PYTHON": "",
             "RUSTUP_HOME": str(self.root / "rustup"),
             "PACKAGE_ROOT": str(self.root),
             "CARGO_CALLS": str(self.root / "cargo-calls"),
@@ -153,6 +204,10 @@ esac
             "BUILDLOG_DIR": str(self.root / "buildlog"),
             "BUILDLOG_BUILDS_CGROUP": str(self.root / "cgroup"),
             "BUILDLOG_MEMINFO": str(meminfo),
+            # Two 12 GiB fallback promises fit this 48 GiB fixture. The host's
+            # 21 GiB budget would add an unrelated 120-second ramp wait before
+            # the test can observe the token handoff.
+            "BUILDLOG_BUILD_BUDGET_GIB": "48",
             "BUILDLOG_MEMORY_PRESSURE": str(pressure),
             "BUILDLOG_CI_CGROUP": str(self.root / "cgroup"),
             "BUILDLOG_ZRAM": str(self.root / "zram"),
@@ -177,6 +232,7 @@ esac
             "TEST_RELEASE": str(self.root / "release"),
             "TEST_WAIT_HELPER": str(VERIFY.parent / "wait_for_test_state.py"),
             "TEST_CARGO_PID": str(self.root / "cargo-pid"),
+            "TEST_MEMORY_EVENT": str(memory_event),
         }
 
     @override
@@ -184,7 +240,6 @@ esac
         for group in self.started_groups:
             self.end_group(group)
             self.assertEqual(self.live_group_processes(group), [], f"group {group} still runs")
-        self.temporary.cleanup()
 
     def live_group_processes(self, group: int) -> list[int]:
         """The live processes in the group, and in the session a started call leads.
@@ -217,7 +272,7 @@ esac
             os.killpg(group, signal.SIGKILL)
         except ProcessLookupError:
             pass
-        deadline = time.monotonic() + 300
+        deadline = time.monotonic() + TEST_HANG_GUARD_SECS
         while pids := self.live_group_processes(group):
             for pid in pids:
                 try:
@@ -245,6 +300,34 @@ esac
                 for descriptor in descriptors:
                     os.close(descriptor)
 
+    def record_phase(self, session: Path) -> None:
+        self.environment.update({"UNIT_HISTORY_DIR": str(self.root / "history"),
+                                 "UNIT_PHASE_ID": "6", "UNIT_SYNC_WRITES": "0",
+                                 "UNIT_PASS_OWNER": "launcher", "CODEX_THREAD_ID": "thread-impl",
+                                 "CLAUDE_PROBE_SESSION": ""})
+        for arguments in (
+            ["start-run", "--session-dir", str(session), "--working-dir", str(self.root),
+             "--main-family", "codex", "--main-model", "fixture", "--main-effort", "high",
+             "--main-session-id", "fixture-director"],
+            ["start-phase", "--session-dir", str(session), "--phase-id", "6", "--phase-title", "Resources"],
+        ):
+            result = invoke_recorder(arguments, self.environment, self.root)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        for slot in ("impl", "first", "second"):
+            arguments = ["start-pass", "--session-dir", str(session), "--phase-id", "6", "--pass-kind", "impl",
+                         "--activity", "verify", "--called-task", "direct.impl", "--called-family", "codex",
+                         "--called-model", "fixture", "--worker-name", f"fixture-{slot}"]
+            result = invoke_recorder(arguments, {**self.environment, "UNIT_TEAM_ROLE": slot}, self.root)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+        _ = (session / "mesh_roster.json").write_text(json.dumps({
+            f"fixture-{slot}": {"thread_id": f"thread-{slot}"} for slot in ("impl", "first", "second")}))
+
+    def phase_waits(self, session: Path) -> list[dict[str, object]]:
+        return [row for row in (cast(dict[str, object], json.loads(line)) for line in
+                (self.root / "history" / "runs" / f"{session.name}.jsonl").read_text().splitlines())
+                if str(row["event_type"]).startswith("wait_")]
+
     def records(self) -> list[Record]:
         return [record for path in (self.root / "buildlog").glob("*/*.jsonl")
                 for line in path.read_text().splitlines()
@@ -252,7 +335,7 @@ esac
 
     def verify(self, environment: dict[str, str]) -> subprocess.CompletedProcess[str]:
         return subprocess.run(["bash", str(VERIFY), "check", "sample"], cwd=self.root,
-                              env=environment, capture_output=True, text=True, check=False, timeout=300)
+                              env=environment, capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
 
     def wait_for_running(self, path: Path, process: subprocess.Popen[str] | subprocess.Popen[bytes]) -> None:
         wait_until(lambda: path.exists() or process.poll() is not None, path.parent, processes=(process,))
@@ -268,21 +351,22 @@ esac
                                        cwd=self.root, env=environment, stdout=stream,
                                        stderr=subprocess.STDOUT, start_new_session=True)
         self.started_groups.add(process.pid)
-        # The directory watch sees new files, not writes to this one, so poll it.
-        deadline = time.monotonic() + 300
-        while ("waiting for memory" not in errors.read_text(errors="replace")
-               and process.poll() is None and time.monotonic() < deadline):
-            time.sleep(0.01)
-        self.assertIn("waiting for memory", errors.read_text(errors="replace"))
+        self.wait_for_output(errors, "waiting for memory", process)
         self.assertIsNone(process.poll(), errors.read_text(errors="replace"))
         return process
 
     def wait_for_output(self, path: Path, text: str, process: subprocess.Popen[bytes]) -> None:
-        # The directory watch sees new files, not writes to this one, so poll it.
-        deadline = time.monotonic() + 300
-        while (text not in path.read_text(errors="replace")
-               and process.poll() is None and time.monotonic() < deadline):
-            time.sleep(0.01)
+        deadline = time.monotonic() + TEST_HANG_GUARD_SECS
+        with local_release_waiter(path.parent, path.parent) as events:
+            events.arm()
+            if isinstance(events, LocalReleaseEvents):
+                # Include MODIFY: the child keeps this log open while blocked.
+                _ = events.add_watch(events.descriptor, os.fsencode(path.parent), 0x00000FCA)
+            while text not in path.read_text(errors="replace") and process.poll() is None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                events.wait(remaining if isinstance(events, LocalReleaseEvents) else min(0.01, remaining))
         self.assertIn(text, path.read_text(errors="replace"))
 
     def build_stub(self, targets: list[dict[str, object]]) -> dict[str, str]:
@@ -307,7 +391,7 @@ esac
 
     def build(self, environment: dict[str, str], *words: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(["bash", str(VERIFY), "build", "sample", *words], cwd=self.root, env=environment,
-                              capture_output=True, text=True, check=False, timeout=300)
+                              capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
 
     def hold_environment(self, board: Path, wait_status: int) -> dict[str, str]:
         """A held natedev for the step's hold wait only.
@@ -320,8 +404,10 @@ esac
         holds.mkdir(exist_ok=True)
         _ = (holds / "holder.json").write_text("{}")
         stub = self.root / "build_targets_stub.py"
-        _ = stub.write_text(r"""import os, sys, time
+        _ = stub.write_text(r"""import os, sys
 from pathlib import Path
+sys.path.insert(0, os.environ["TEST_REPO"])
+from scripts.direct.wait_for_test_state import wait_until
 root = Path(os.environ["TEST_HOLD_ROOT"])
 if sys.argv[1] == "eligible":
     print("natedev_only test target")
@@ -333,13 +419,13 @@ if sys.argv[1] == "wait-local":
         _ = stream.write("wait-local\n")
     if count >= 1:
         (root / "hold-waiting").touch()
-        while not (root / "hold-release").exists():
-            time.sleep(0.01)
+        wait_until((root / "hold-release").exists, root)
         raise SystemExit(int(os.environ["TEST_HOLD_STATUS"]))
 """)
         return {**self.environment, "UNIT_RUN_DIR": str(board),
                 "UNIT_TEAM_ROLE": "impl", "BUILD_TARGETS_SCRIPT": str(stub),
-                "TEST_HOLD_ROOT": str(self.root), "TEST_HOLD_STATUS": str(wait_status)}
+                "TEST_HOLD_ROOT": str(self.root), "TEST_HOLD_STATUS": str(wait_status),
+                "TEST_REPO": str(VERIFY.parents[2])}
 
     def start_hold_waiter(self, environment: dict[str, str], output: Path) -> subprocess.Popen[bytes]:
         with output.open("wb") as stream:
@@ -387,7 +473,7 @@ if sys.argv[1] == "wait-local":
             self.started_groups.add(step_group)
 
             os.killpg(first.pid, interruption)
-            _ = first.wait(timeout=300)
+            _ = first.wait(timeout=TEST_HANG_GUARD_SECS)
             self.assertNotEqual(first.returncode, 0)
             self.assertFalse(lock.exists(), "interrupted verify kept its token")
             self.assertEqual(self.live_group_processes(step_group), [],
@@ -397,7 +483,7 @@ if sys.argv[1] == "wait-local":
         finally:
             _ = (self.root / "release").touch()
             self.end_group(first.pid)
-            _ = first.wait(timeout=300)
+            _ = first.wait(timeout=TEST_HANG_GUARD_SECS)
 
     def detach_environment(self, status: int) -> dict[str, str]:
         """A Codex worker's environment whose mesh_runs.py stub records its argv and exits `status`."""

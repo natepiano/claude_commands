@@ -24,7 +24,7 @@ CARGO_FINISHED = re.compile(r"^\s*Finished\b.*\btarget\(s\) in " + DURATION + r"
 # mend: "Finished in 0.25s (check: 0.25s, mend: 0.00s)". The check part is
 # its cargo build, the counterpart of cargo's own Finished line.
 MEND_FINISHED = re.compile(r"^\s*Finished in " + DURATION + r" \(check: " + DURATION + r", mend: " + DURATION + r"\)")
-CRATE = re.compile(r"^\s*(?:Compiling|Checking|Documenting) \S+ v\d")
+CRATE = re.compile(r"^\s*(?:Compiling|Checking|Documenting) (?P<crate>\S+) v\d")
 DIAGNOSTIC = re.compile(r"^(warning|error)(?:\[[\w:-]+\])?: ")
 NOT_DIAGNOSTIC = re.compile(
     r"generated \d+ warnings?|build failed|could not compile|aborting due to|test run failed"
@@ -65,6 +65,7 @@ class TestRow(TypedDict):
 class LogFacts(TypedDict):
     finished_s: float | None
     crates_compiled: int | None
+    compiled_crate_names: list[str] | None
     warnings: int | None
     errors: int | None
     tests_run: int | None
@@ -85,6 +86,7 @@ def no_facts() -> LogFacts:
     return {
         "finished_s": None,
         "crates_compiled": None,
+        "compiled_crate_names": None,
         "warnings": None,
         "errors": None,
         "tests_run": None,
@@ -303,7 +305,9 @@ def log_facts(step: str, text: str) -> LogFacts:
     facts["finished_s"] = finished
     facts["mend_check_s"] = mend_check
     facts["mend_s"] = mend
-    facts["crates_compiled"] = sum(1 for line in lines if CRATE.match(line))
+    names = [match.group("crate") for line in lines if (match := CRATE.match(line))]
+    facts["compiled_crate_names"] = names
+    facts["crates_compiled"] = len(names)
     facts["warnings"], facts["errors"] = diagnostics(lines)
     rows, summaries = test_results(lines)
     if summaries or step == "nextest":

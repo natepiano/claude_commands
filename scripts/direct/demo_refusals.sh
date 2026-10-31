@@ -18,7 +18,7 @@ export HOME="$scratch/home"
 export XDG_CACHE_HOME="$scratch/cache"
 export UNIT_HISTORY_DIR="$scratch/history" PLAN_DELEGATE_HISTORY_DIR="$scratch/history"
 export AGENTS_CONFIG_FILE="$scratch/agents.conf"
-export AGENTS_LOCAL_CONFIG_FILE="$scratch/agents.local.conf"
+export AGENTS_CONFIG_PUBLISH=0
 export UNIT_CONFIG="$scratch/direct.conf" PLAN_DELEGATE_CONFIG="$scratch/direct.conf"
 unset CLAUDE_CODE_SESSION_ID
 : > "$AGENTS_CONFIG_FILE"

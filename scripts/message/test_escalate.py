@@ -100,6 +100,18 @@ class EscalateTests(unittest.TestCase):
         self.assertNotIn("send ", self.log())
         self.assertEqual(self.run_script("due").stdout, "")
 
+    def test_close_retries_a_failed_emergency_cancellation_before_forgetting_the_hold(self) -> None:
+        _ = self.run_script("hold", "power", "--summary", "Power", "--text", "Power is out.",
+                            "--action", "save your work", "--minutes", "0", "--need", "blocked")
+        _ = self.run_script("due")
+        failed = self.run_script("close", "power", REFUSED="1")
+        self.assertIn("FAILED: the user was not reached", failed.stderr)
+        path = self.root / "state/held/power.json"
+        self.assertTrue(path.exists())
+        self.assertEqual(self.run_script("close", "power").stdout, "power: closed\n")
+        self.assertFalse(path.exists())
+        self.assertEqual(self.log().count("send retire --to user --from escalate --key escalate-power\n"), 2)
+
     def test_typing_before_the_hold_does_not_count(self) -> None:
         _ = self.run_script("typed")
         _ = self.hold()
@@ -191,6 +203,36 @@ class EscalateTests(unittest.TestCase):
         self.assertEqual(run.call_count, 2)
         command = cast(list[str], run.call_args.args[0])
         self.assertEqual(command[command.index("--to") + 1], "session:origin-session")
+
+    def test_due_retries_a_failed_review_result_relay_without_retrying_the_user_push(self) -> None:
+        reason = "HELD: not sent, failed review: reader-starts-cold"
+        with (patch.object(escalate, "STATE", self.root / "held review"),
+              patch.object(escalate, "schedule"), patch.object(escalate, "typed_at", return_value=0) as typed,
+              patch.object(escalate, "codex_account", return_value=UnknownCodexAccount(self.root, "offline")),
+              patch.object(subprocess, "run", side_effect=[
+                  subprocess.CompletedProcess([], 4, reason + "\n", ""),
+                  subprocess.CompletedProcess([], 3, "FAILED: relay unavailable\n", ""),
+                  subprocess.CompletedProcess([], 0, "SENT: to session\n", "")]) as run):
+            relay = escalate.HeldRelay(recipient="session:writer", key="original-question")
+            _ = escalate.hold("question", escalate.SessionPush("Build choice", "Choose a build",
+                              ActionRequired("Choose retry")), minutes=0, relays=(relay,))
+            settled = escalate.due(10**12)
+            self.assertTrue(settled[-1].failed)
+            self.assertIn("held result relay failed", settled[-1].line)
+            pending = escalate.read(escalate.held_path("question"))
+            assert isinstance(pending, escalate.HeldMessage)
+            self.assertEqual((pending.outcome, pending.review_reason), ("review_held", reason))
+            # Typing after the refusal must not discard the pending result.
+            typed.return_value = 10**12
+            self.assertEqual(escalate.due(10**12), [])
+            self.assertEqual(escalate.due(10**12), [])
+            finished = escalate.read(escalate.held_path("question"))
+            assert isinstance(finished, escalate.HeldMessage)
+            self.assertEqual((finished.outcome, finished.review_reason), ("review_held", ""))
+        self.assertEqual(run.call_count, 3)
+        self.assertEqual(run.call_args_list[1], run.call_args_list[2])
+        command = cast(list[str], run.call_args.args[0])
+        self.assertIn(reason, command[command.index("--text") + 1])
 
     def test_close_forgets_the_key_so_the_next_hold_waits_anew(self) -> None:
         _ = self.hold()

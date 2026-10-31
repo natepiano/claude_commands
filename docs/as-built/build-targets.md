@@ -15,7 +15,8 @@ Each machine that can run a build job is a build target with its own rules. nate
 
 ### Target state and eligibility: `scripts/build_targets/targets.py`
 
-- `target_state(target) -> TargetState` writes nothing and opens no connection. `TargetState = Free | Running(jobs: tuple[RunningJob, ...]) | Held(holder, reason, since, end: HoldEnd) | Unreachable(reason) | StateUnreadable(reason)`, with `RunningJob(what, since, idle: IdleSince(when) | NotSeenIdle)` and `HoldEnd = ExpiresAt(when) | ReleaseEstimated(when) | UntilReleased | AwaitingBlockRemoval`. All are frozen dataclasses.
+- `target_state(target) -> TargetState` writes nothing and opens no connection. `TargetState = Free | Running(jobs: tuple[RunningJob, ...]) | Held(holder, reason, since, end: HoldEnd, holder_session) | Unreachable(reason) | StateUnreadable(reason)`, with `RunningJob(what, since, idle: IdleSince(when) | NotSeenIdle, holder_session)`, `holder_session: HolderSession(session_id) | NoHolderSession` (default `NO_HOLDER_SESSION`) and `HoldEnd = ExpiresAt(when) | ReleaseEstimated(when) | UntilReleased | AwaitingBlockRemoval`. All are frozen dataclasses.
+- A `RunningJob`'s `holder_session` is the claim record's `holder_session`. natedev's `Held` carries the local hold key (the holder's Claude session id, or its given name when it is no live session); the Mac block's `Held` carries its `RecordedSession` name, else `NO_HOLDER_SESSION`.
 - natedev is `Held` while `build_hold.natedev_holds` finds a hold in force: `ReleaseEstimated` with an ETA, else `UntilReleased`. The last release removes its file at once and natedev becomes free. Old cycle records still identify files left by a completed hold.
 - The Mac is `Held` whenever a block record exists (`read_claim_block`, the same reader `claim` uses): `ExpiresAt` before its expiry, `AwaitingBlockRemoval` after it. It is `Running` when `mac_test.read_claims` finds a live claim (a kept remote claim counts as live), with one `RunningJob` per live claim, oldest first, otherwise `Free`. A claim file it cannot read, `claims/<repo>.json` or `run.json`, is `StateUnreadable`.
 - `StateUnreadable` carries the `OSError`, `UnicodeError` or `mac_test.StateReadError` text. `Unreachable` comes only from `build_targets.py status --probe`.
@@ -27,13 +28,14 @@ Every command checks holds through `target_state`. The sole holder may run its o
 
 | Command | Role |
 | --- | --- |
-| `status [--probe]` | One line per target through `format_state`, in the user's zone: `natedev: free`, `mac: held by <holder> since <HH:MM> until <HH:MM> — <why>`, `release expected <HH:MM>` for an eta, `mac: running <what> since <HH:MM>` (with `, idle since <HH:MM>` while the claim watcher has seen the Mac idle, from the claim's `idle_since`), one `running ...` part per job joined by `; `, `<name>: unreachable — <reason>`, `<name>: state unreadable — <error>`. `--probe` adds a read-only `ssh true` per `ssh` target (`offload.probe_reachability`). `/build:status` runs it. |
+| `status [--probe]` | One line per target through `format_state`, in the user's zone: `natedev: free`, `mac: held by <holder> since <HH:MM> until <HH:MM> — <why>`, `release expected <HH:MM>` for an eta, `mac: running <what> since <HH:MM>` (with `, idle since <HH:MM>` while the claim watcher has seen the Mac idle, from the claim's `idle_since`), one `running ...` part per job joined by `; `; a held or running part whose holder session resolves adds ` (showrunner <name>, unit <name>)` after `since <HH:MM>`, `<name>: unreachable — <reason>`, `<name>: state unreadable — <error>`. `--probe` adds a read-only `ssh true` per `ssh` target (`offload.probe_reachability`). `/build:status` runs it. |
 | `eligible --repo-root <p> --package <n> [--local <why>]` | One tab-separated line per target: name, `eligible`/`excluded`, reason (`-` when eligible), settings path (`-` for a local target). Errors print `build targets: <error>`, exit 2. |
 | `register-local --call-id <id> --pid <pid>` | A nonblocking hold check for routing. Stores no call record. |
 | `wait-local --call-id <id> [--pid <pid>] [--leave-hook <command>] [--caller <name>]` | Waits while a hold is in force; release events wake it at once, with 15 s polling as a fallback. Prints the holder once and the 2 h notice once. SIGINT and SIGTERM exit 130 and 143. From the second poll, a successful leave hook exits 75 for the free Mac. Records wait seconds and its PID for interruption, with no hold-cycle call record. |
 | `check-local [--caller <name>]` | A nonblocking hold check. Without a caller, records a refused launch session for its release notice. |
 | `interrupt-local --call-id <id> [--signal INT\|TERM]` | Signals a running `wait-local` for that call, checked by pid and process-start identity. |
 
+- `status` names who holds each target: `command_status` collects every `HolderSession` from the states, calls `roster.unit_labels_for` once for all of them ([session-roster.md](session-roster.md), "Unit labels"), and `format_state` / `running_job_text` add the suffix through `unit_label_suffix`. Showrunner and unit are short names, `—` for a missing relationship. No holder session, an unknown holder or a lookup that raises keeps the line without the suffix. A status run costs about 0.10 s more for the lookup (median 0.204 → 0.307 s); under machine load status timings vary from 0.3 to 2 s, so measure on a quiet machine. The suffix joins a claim to its holder by the recorded holder session, never by `what` and `since`, which can match a stale claim.
 - `BUILD_TARGETS_POLL_S` and `BUILD_TARGETS_ESCALATE_S` replace the 15 s re-check interval and the 2 h escalation; `BUILD_TARGETS_NOW` replaces the clock. All three are test overrides.
 
 ### Holds: `scripts/build_hold/build_hold.py`
@@ -74,6 +76,7 @@ Every command checks holds through `target_state`. The sole holder may run its o
 - `build_hold_nothing_held` returns 0 only when the holder directory (`BUILD_HOLD_DIR`, default `~/.local/state/build-hold`) is a readable, searchable directory with no entry at all (dot files and dangling links count), and the shell expands patterns unfiltered (no `noglob`, `GLOBIGNORE` or `failglob`). `BUILD_HOLD_DIR` set but empty, a missing directory, or any doubt returns 1, and the Python runs.
 - `build_hold_wait_local`, `build_hold_check_local`, `check_routing_hold` and the per-call `wait-local` in `verify.sh` all return through it before starting Python. With nothing held a local call starts no hold-check process anywhere, and an unreadable `config/build_targets.conf` stops only a `test` call (at `eligible`).
 - Every caller waits for natedev's hold, not only `verify.sh` (fixed 2026-10-19: cargo-port's `port-lint clippy` ran 5 hana clippy runs through a demo hold, load 134). `build_hold_applies` skips the wait only for `verify-mac`, for macOS (`OSTYPE` `darwin*`), and when the holder directory does not exist. A caller with no `verify` call id gets `BUILDLOG_HOLD_CALL_ID`, made once per shell in verify's form (`v<UTC stamp>-<pid>-<random>`) after `build_hold_nothing_held` says 1. It is not exported, so build log rows keep `call_id` null. `wait-local` and `check-local` get `--caller <BUILDLOG_CALLER or lint>`, and their lines start `lint (<caller>):` (or `lint:`) in place of `verify.sh:`; the waiting line ends `; waiting for the release.` The holder's own session still passes its hold (`caller_holds_only_own`).
+- Wait, check and launch lines name the oldest hold in force that the calling session does not own, with that hold's reason. A caller with no owning session sees the oldest hold. The own-hold check and the named hold use the same hold list.
 
 ### The launch gate: `scripts/hooks/pre-tool-use-brp-launch-gate.sh`
 
@@ -106,8 +109,8 @@ The runner, the claim and the block are covered in [mac-test-offload.md](mac-tes
 | --- | --- | --- |
 | `/build:hold` | `build_hold.py` | Hold or release natedev (default) or the Mac (`target mac`), check quiet, show holds. The protocol every holder follows. |
 | `/build:mac` | `mac_test.py` | Block, unblock, settle and show the Mac; audit which packages belong on it; claim it for a job of one's own (released after 15 idle minutes). |
-| `/build:status` | `build_targets.py status [--probe]` | Each target's state, read only. |
-| `/build:queue [bump <position\|session\|folder>]` | `build_queue.py` | Waiting steps in order with session, step, folder, local wait time and one reason, then running promises and measured use. `bump` moves one waiting step to the head for the next memory admission and records the caller and step in the build log. Memory limits still apply. |
+| `/build:status` | `build_targets.py status [--probe]` | Each target's state, read only, with the holder's showrunner and unit when its session is known. |
+| `/build:queue [<position\|session\|folder>]` | `build_queue.py` | A free/taken budget bar and one waiting row per step, with showrunner, unit, minutes waited and a size bar on the budget scale. `▸` marks the asking session. Row 1 shows `↑` for backfill, `↑ ≤N.N` for strict-window room or `⊘` when no room remains, its recorded window countdown and host holds. A selector opens step cards with each step’s admission checks. `queue_read()` uses the lock-free snapshot or a 0.5 s bounded lock; stale readings keep their time and an amber header, and unavailable readings show `queue busy; try again`. Bump is off and nothing can move a waiting step. |
 | `/build:report` | `buildlog report` | The build report: natedev's steps in its tables, the Mac's in its `### Mac` section, natedev's power-profile changes in `### Power profile`; see [build-report-session.md](build-report-session.md) and [build-followups.md](build-followups.md). |
 | `/build:mac_report` | `buildlog mac-report` | How often tests finish on the Mac when it is usable. |
 
@@ -122,10 +125,91 @@ Each command shows its script's output unchanged; each script answers in about a
 - `power_profile_section(connection, day)` emits `### Power profile` directly after the Test builds section. It reads natedev's power profile from the 60 s samples (`samples.power_profile` and `power_profile_since`, [buildlog-memory-stalls.md](buildlog-memory-stalls.md)):
   - `profile_changes(connection) -> list[ProfileChange]` walks natedev's samples with a non-NULL profile in time order and keeps the first sample of each run of one profile as `ProfileChange(at, profile)`, `at` being its `power_profile_since`, else the sample's own `at`. A later sample of the same profile with a newer `power_profile_since` is the daemon rewriting its file, not a change.
   - The section counts only changes before the end of the report day. It opens with `Profile now: <profile>, since <YYYY-MM-DD HH:MM:SS zone>.` for the latest of them. Then, for each change in the 7 days ending at the end of the report day, newest first: `Before <local time> (<previous profile>) vs after (<profile>):`, the earlier side reading `profile not recorded` when no change precedes it.
-  - The before window is the 7 days before the change, cut at the previous change; the after window runs to the next change or the end of the report day. `profile_step_durations(connection, start, end)` groups passing natedev steps (`natedev_step_predicate`, `status = 0`, `step <> 'sweep'`, known `duration_s`) by step kind, caller and rebuild class (`rebuild_bin(crates_compiled)`, `—` when NULL).
+  - The before window is the 7 days before the change, cut at the previous change; the after window runs to the next change or the end of the report day. `profile_step_durations(connection, start, end)` groups passing natedev steps (`natedev_step_predicate`, `status = 0`, `step <> 'sweep'`, known `duration_s`) by step kind, caller and rebuild class (`rebuild_bin(crates_compiled, warm)`, `—` when NULL).
   - The table is `Kind | Caller | Rebuild | Before runs | Before p50 | After runs | After p50 | Change`: one row per group with runs on both sides, the busiest after side first; Caller is `caller_label`, p50 is `nearest_rank`. Change is `(after − before) / before` as a signed whole percent, shown only with at least `MIN_PROFILE_RUNS` (10) runs on each side, else `—`. Its `Source:` line says load and time of day are not matched.
   - With no shared group the table is replaced by `No step ran with the same kind, caller and rebuild class on both sides.` A latest change older than the 7 days gives only the `Profile now:` line; with no profiled natedev sample the section is omitted.
 - Report layouts, the share lists, interval rules and the same-tree comparison are in [mac-test-offload.md](mac-test-offload.md) ("Build log and report", "Hold events and tree evidence").
+
+### Build output retained by the sweep
+
+`scripts/lint/sweep.py` keeps the configured free-space floor (300 GiB on natedev).
+When free space is below the floor, it takes only the shortfall. After orphaned
+copies, it takes output from idle targets in last-use order, oldest first,
+across all locations. `/tmp` targets have no special priority. A target's last
+use is the newer of its `.lint-sweep-used` stamp and its build units' last uses.
+Build locks, live processes and build holds still keep their targets out of the sweep.
+Candidate and size scans hold no cargo locks. Up to four target scans run
+together; combined inode accounting counts shared blocks once. The floor takes one target's locks
+without waiting, deletes its selected output, and releases the locks before
+moving on. A busy target, or one used since candidate discovery began, is skipped.
+File identity, size and mtime are checked before deletion; changed output stays.
+Removing a hard link in another target does not change this check.
+The pass stops when successful deletions cover
+the shortfall.
+
+The floor takes the least recently used idle target first, then orders build
+units within that target by use. Recent targets are not held back. After each
+scan that finds free space under the floor, it writes one `floor_scan`
+build-log row; a dry run writes none. The row records `at`, `free_after_scan` (bytes),
+`floor` (bytes), `shortfall` (bytes), and `idle_targets` in oldest-first order.
+Each idle target has `folder`, `last_use` (epoch seconds), and `bytes` (allocated
+file bytes measured in the scan). These rows keep the scan's capacity and use
+evidence for later replay.
+
+`recent_minutes=60` orders only build units inside one target under its budget:
+older units first, then recent units. Within each group, whole days since last
+use come first, then oldest compile time. Orphaned copies and the separate
+rustdoc index limit keep their existing rules.
+
+The timed tmp sweep keeps top-level `/tmp/claude` entries and direct
+`unit`/`delegate` run folders without recorded end evidence until they are
+unchanged for 7 days; top-level files and links also wait 7 days. All process,
+ownership and saved-work checks still apply. Its log names removals based on end
+evidence separately from the 7-day fallback and lists paths kept for lack of end
+evidence. Tempfile-named entries, invoke/verify logs and other roots keep their
+existing rules; hand cleanup still requires end evidence. Folder audit also uses
+the shared tree change-time check (mtime and ctime) and waits 7 days without a
+change, so a recent copy with preserved mtimes stays.
+
+Run `python3 scripts/lint/sweep.py rebuilds --days 7` to see cold rebuild
+compile-hours by clone kind and cause: `floor take`, `budget take`, `tmp sweep`
+or `none`. The command reads steps and trims from natedev's monthly build-log JSON lines, the
+journal and legacy `~/.local/state/lint-sweep/removals.jsonl`. It writes no report, index or sweep state. `BUILDLOG_DIR` selects a
+different build-log root.
+
+A cold step has `crates_compiled >= 50`. Its cause is the latest matching
+removal between the same workspace's previous step end and the cold step start.
+The workspace is `worktree` when set, otherwise `cwd`; it also sets the clone
+kind. A tmp sweep can match the workspace or working folder and their ancestors.
+The journal's `the floor took` lines name floor removals. A `lint sweep: removed`
+line for build units uses the budget header from the same journal stream;
+orphan cleanup does not count. `tmp sweep: deleted`
+lines name removed folders. The report groups gate and merge copies, phase
+clones, mktemp folders, scratchpad clones, scratch.py folders, other `/tmp`,
+`~/rust` worktrees, and other folders. Compile-hours use `finished_s`, with
+`duration_s` when that field is absent. The table also gives totals per day.
+
+Real budget and floor takes write one `sweep_trim` build-log row per affected
+target through `record.sweep_trim`. It records the host, absolute `folder`, UTC
+`at`, confirmed `bytes_freed`, `extent` (`whole` or `partial`) and `cause`
+(`budget take` or `floor take`). `whole` means none of the scanned build units
+or incremental directories remain. Only successful last-link unlinks count as
+freed bytes; artifacts still linked from a clone free nothing. The floor writes
+the row before releasing the target's locks. Orphan cleanup alone writes no
+trim, and dry runs write none. A write failure prints one line and does not fail
+the sweep.
+
+`sweep_trim` is the one record of a trim. `rebuilds` reads those rows through the
+same build-log reader as its steps and merges them with the journal and legacy
+`removals.jsonl` rows by path, cause and second. Nothing writes `removals.jsonl`;
+its read-only legacy source remains until 2026-12-05. `LINT_SWEEP_STATE_DIR`
+selects that legacy file's directory. The report reads sweep state without
+changing it.
+
+`none` means no matching evidence, including a workspace's first recorded step.
+It does not prove that no deletion occurred. Attribution uses recorded paths;
+it cannot connect an external custom target directory to a workspace when
+the log does not record that connection. Journal retention also limits the evidence.
 
 ## Invariants
 
@@ -142,6 +226,24 @@ Each command shows its script's output unchanged; each script answers in about a
 - Callers and `override_guard.sh` arrive in one commit: a tree with the callers and without the guard refuses every build. `mac_test.py` and `offload.py` run on the Mac too, so its checkout takes the same commit before the next Mac test.
 - `MACOSX_DEPLOYMENT_TARGET` stays at 12.0 or above and follows the value hana's development shell exports on the Mac; `offload.py` and `mac_run.sh` carry the same value.
 - A module added to `scripts/build_hold`, `scripts/build_targets`, `scripts/buildlog` or `scripts/lint` shares no name with one in the others: importing `build_hold`, `targets` or `offload` puts several of them on `sys.path`.
+
+### Copy records and lifetime
+
+Copies seed their own build folders. The unused per-repository Cargo folder
+helper was removed: the verify-copies measurement (2026-10-30, case D) spent
+68.7 of 69.0 s waiting on that folder's build lock. New copy records do not
+write its path; old records still load and the old field has no effect.
+The `style-sync-target` still outlives its production task and keeps
+`sync.lock` across checkout creation, lint and cleanup. The sweep still reads
+Cargo's general `build.build-dir` templates.
+
+`/tmp/claude/copies` is a kept root, with copies at `<pair>/<copy>`. The tmp sweep judges each copy separately and removes an empty pair; the folder audit and scratch guard keep the root. `scratch.register_copy` writes `.scratch.json` atomically with source path and commit, copy commit, target mode, seed source, borrowed git directory, owner unit, task, land target and copy identity. A phase record also names its run directory and phase id. Registration, renew, hand-over, task end and removal use one read/change/publish path under the copy's record lock. Only `.scratch.json` and `.claude-busy` are excluded in the copy's own Git exclude file; ordinary untracked files keep the copy.
+
+Record lookup returns `Registered`, `NotRegistered` or `UnreadableRecord(reason)`. A copy's lifetime is `Live(why)`, `Ended(evidence)` or `Unknown(reason)`; cleanup removes only `Ended` copies and names the repair reason for unknown state. An open phase keeps its copy at any age; the recorder's completed, stopped and error states end it. A `landed:<unit>/<branch>` copy ends only when `origin/<branch>` is an ancestor of its recorded land target (default `origin/main`) in the recorded source checkout, whose sessions keep its refs fresh, and all copy work is saved; cleanup never fetches. The tmp sweep then requires seven days without a change. A parent stays while an existing child record borrows its Git objects.
+
+Holders create `.claude-busy` and use a shared flock for the whole run. Judges and dry runs do not create the mark. `merge_gate.py --checkout <copy>` takes it before gate work, and scratch end, the tmp sweep and the floor sweep claim an exclusive lock without waiting, creating the mark when absent, and retain it through deletion. A holder checks the present mark and removal evidence before it starts work. Shared holders can run together; a process exit releases its lock. Hana can set the same mark in a target with `flock`, without importing these scripts. `scratch.py hand-over <path> --to <unit> --task <new-task>` replaces owner and the complete task atomically and keeps the path, so child alternates and recovery records retain valid paths. One task-field function clears the old end evidence, run directory, phase id and land target; a phase hand-over supplies `--run-dir` and derives its phase id from the new task, and a landed task can supply `--land-target`.
+
+Scratch end rechecks the task under the removal lock. A hold on a copy's ancestor judges each copy separately and removes only empty containers. Before deleting a copy, cleanup records removal evidence in its pair folder, outside the tree being removed; a rerun finishes a partial deletion even after its scratch record is gone, and that copy no longer keeps a borrowed parent. The certificate records the copy identity and its directory's device and inode; a new copy at the same path discards a stale certificate instead of inheriting its end evidence.
 
 ## Calibration / gotchas
 
@@ -179,3 +281,7 @@ Each command shows its script's output unchanged; each script answers in about a
 - **The deployment target, not an rpath.** One environment word fixes every crate in one place; crates that emit `-Wl,-rpath,/usr/lib/swift` cover only their own binaries.
 - **The power-profile comparison keys on the samples, like with like.** Every change the samples show gets a comparison, so no switch needs a hand-kept marker. Rows match step kind, caller and rebuild class so a cold build is never set against an edited-crate rebuild, and Change is withheld below 10 runs a side.
 - **One row per hold event, not per hold.** `forget` of one source file would otherwise leave half an interval. In-force state comes from the coordination records only, because an event can be lost.
+
+Removal-log append, retention and readers take a separate stable lock before opening the log; retention replaces a complete temporary file, so a stopped pass keeps the rows and the next append uses the current log.
+
+Before deleting a linked worktree, the folder audit saves its source repositories beside the removal log; a rerun prunes those sources after the folder is gone and removes the record only after every prune succeeds.

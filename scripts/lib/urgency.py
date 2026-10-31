@@ -52,6 +52,15 @@ _UNSAFE = re.compile(r"[^\w.-]+")
 Item = TypeVar("Item")
 
 
+# The /next word that adds every production below the showrunner's own.
+ALL_BELOW = "all-below"
+
+
+def scope_queue(name: str, below: bool) -> str:
+    """The pin name of a list: an all-below show keeps its own pin, so it never moves the default's."""
+    return f"{name}-{ALL_BELOW}" if below else name
+
+
 class UrgencyError(ValueError):
     """A level, due time or mark that cannot be read."""
 

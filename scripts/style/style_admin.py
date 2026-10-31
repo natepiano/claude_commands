@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+import tempfile
 from pathlib import Path
 from typing import cast
 
@@ -96,7 +98,7 @@ def remove_see_also_references(stem: str) -> tuple[int, int]:
         original = path.read_text()
         rewritten, removed = strip_frontmatter_see_also(original, stem)
         if removed:
-            _ = path.write_text(rewritten)
+            replace_text(path, rewritten)
             files_updated += 1
             references_removed += removed
     return files_updated, references_removed
@@ -117,9 +119,22 @@ def write_jsonl(path: Path, rows: list[HistoryRow]) -> None:
     if not rows:
         path.unlink(missing_ok=True)
         return
-    with path.open("w") as handle:
-        for row in rows:
-            _ = handle.write(json.dumps(row, sort_keys=True) + "\n")
+    replace_text(path, "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows))
+
+
+def replace_text(path: Path, text: str) -> None:
+    """Publish a complete rewrite without truncating the previous file."""
+    descriptor, filename = tempfile.mkstemp(prefix=f".{path.name}-", dir=path.parent)
+    temporary = Path(filename)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            _ = stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.chmod(path.stat().st_mode)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def update_history_for_rename(old_guideline_id: str, new_guideline_id: str) -> tuple[int, int]:
@@ -174,7 +189,7 @@ def update_markdown_wikilinks_for_rename(old_stem: str, new_stem: str) -> int:
         original = path.read_text()
         rewritten = replace_wikilinks_for_rename(original, old_stem, new_stem)
         if rewritten != original:
-            _ = path.write_text(rewritten)
+            replace_text(path, rewritten)
             updated += 1
     return updated
 
@@ -185,22 +200,26 @@ def update_markdown_wikilinks_for_delete(stem: str) -> int:
         original = path.read_text()
         rewritten = replace_wikilinks_for_delete(original, stem)
         if rewritten != original:
-            _ = path.write_text(rewritten)
+            replace_text(path, rewritten)
             updated += 1
     return updated
 
 
 def run_rename(old_name: str, new_name: str) -> None:
-    old_name = resolve_source_name(old_name)
+    old_name = (resolve_source_name(old_name) if (RUST_STYLE_DIR / old_name).exists()
+                or (RUST_STYLE_DIR / ensure_md_suffix(old_name)).exists() else ensure_md_suffix(old_name))
     new_name = ensure_md_suffix(new_name)
     source = RUST_STYLE_DIR / old_name
     target = RUST_STYLE_DIR / new_name
-    if target.exists():
+    if source.exists() and target.exists():
         raise SystemExit(f"Target style file already exists: {new_name}")
+    if not source.exists() and not target.is_file():
+        raise SystemExit(f"Source style file not found: {old_name}")
 
     old_guideline_id = f"rust/{old_name}"
     new_guideline_id = f"rust/{new_name}"
-    _ = source.rename(target)
+    if source.exists():
+        _ = source.rename(target)
     history_files, entries_updated = update_history_for_rename(old_guideline_id, new_guideline_id)
     wikilink_files = update_markdown_wikilinks_for_rename(Path(old_name).stem, Path(new_name).stem)
 
@@ -211,14 +230,15 @@ def run_rename(old_name: str, new_name: str) -> None:
 
 
 def run_delete(style_name: str) -> None:
-    style_name = resolve_source_name(style_name)
+    style_name = (resolve_source_name(style_name) if (RUST_STYLE_DIR / style_name).exists()
+                  or (RUST_STYLE_DIR / ensure_md_suffix(style_name)).exists() else ensure_md_suffix(style_name))
     source = RUST_STYLE_DIR / style_name
 
     guideline_id = f"rust/{style_name}"
     stem = Path(style_name).stem
     see_also_files, see_also_refs = remove_see_also_references(stem)
 
-    source.unlink()
+    source.unlink(missing_ok=True)
     history_files, entries_removed, runs_removed = update_history_for_delete(guideline_id)
     wikilink_files = update_markdown_wikilinks_for_delete(stem)
 

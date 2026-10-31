@@ -98,8 +98,8 @@ class RecordTests(unittest.TestCase):
         script = (
             "import sys\nfrom pathlib import Path\n"
             + "sys.path.insert(0, sys.argv[1])\nsys.path.insert(0, sys.argv[2])\n"
-            + "import record\nimport upgrade_record\nimport upgrade_report\n"
-            + "assert Path(record.__file__).resolve() == Path(sys.argv[2]) / 'record.py'\n"
+            + "import shutdown_record\nimport upgrade_record\nimport upgrade_report\n"
+            + "assert Path(shutdown_record.__file__).resolve() == Path(sys.argv[2]) / 'shutdown_record.py'\n"
             + "assert Path(upgrade_record.__file__).resolve() == Path(sys.argv[1]) / 'upgrade_record.py'\n"
             + "assert Path(upgrade_report.__file__).resolve() == Path(sys.argv[1]) / 'upgrade_report.py'\n"
         )

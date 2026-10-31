@@ -41,12 +41,12 @@ must not drift from it:
   is needed, attempt compaction above `UNIT_COMPACT_ABOVE_TOKENS` but
   continue after a failed attempt, press on after context overflow with
   `Continue where you stopped.`, open anew only when no open worker can take the
-  work, and end at `end_session.sh`. Reviews run on the unit's workers, or on the
-  production's review pool when its doc names one.
-- **Review pool** — a production's reusable reviewers, allocated by a script.
-  The first review of each type primes the pool; no unit runs it. Each reviewer
-  keeps its own thread of the reviews it did, and no file holds review memory.
-- **Reviewer** — a read-only Codex thread in that pool, named `code1`, `ui2`, etc.
+  work. The unit owns its reviewers too: `assign.sh --role review` resumes
+  `review`, then `review2` while the first is busy. Unit pause, move and end
+  apply to every worker.
+- **Reviewer** — a unit's read-only worker, role `review`. Its thread keeps
+  context across phases and plans; its standing instructions are in
+  `config/review/code.md`.
 - **Template** — a thread holding a type's standing prompt, forked into reviewers
   and never leased.
 - **Lease** — one reviewer's assignment to one unit's phase, cleared at phase end.
@@ -121,7 +121,6 @@ The production doc sits beside the source plan as `<source-stem>-production.md`.
   frontmatter (`date_created`, `date_modified` as `"[[YYYY-MM-DD]]"`, a `productions`
   list of production doc paths, `showrunner`), and every write moves `date_modified`
   and adds the writing production's doc to `productions`
-- **Review pool:** code (or `code, ui`); omit when the production has none
 - **Proposals:** <the issues folder the production files its proposals in, e.g.
   `~/rust/hanadocs/issues`>; `/showrunner:proposals` lists every open issue there tagged
   `proposal`; required for a style production, which files held changes there;
@@ -172,11 +171,7 @@ worktree again at the same path from the merge branch, resumes that session and 
 A retired unit keeps its row. Its Plan cell begins with `retired`, alone or inside
 an opening parenthesis, as in `(retired by the user 2026-10-07, worktree removed)`.
 The status script, the dailies, the waits and the stall watch then skip it. The word
-anywhere else in the cell changes nothing. With a **Review pool** line, the
-showrunner first runs
-`~/.claude/scripts/lib/py ~/.claude/scripts/direct/review_pool.py retire --production <slug> --unit <unit>`,
-which ends the unit's reviewers and prints their names. One still reviewing is
-named on stderr and left in place; run `retire` again once its review ends. A
+anywhere else in the cell changes nothing. A
 unit's plan run ending retires nothing, because the unit's next plan keeps
 the same reviewer.
 
@@ -307,8 +302,7 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
 
    Such a notice carries the third line: the verdict of the design check
    (`/unit:direct` → <UXReview/>) given on exactly the shots this notice sends
-   by a fresh check (the Claude helper, or the pooled UI reviewer once the
-   production has adopted it), taken from a build of `<hash>`. A verdict on
+   by the fresh Claude helper, taken from a build of `<hash>`. A verdict on
    other shots, or on a build from before a later change to what users see, is
    stale: re-shoot and re-judge before sending. Send the notice on a `pass`,
    or with each defect moved to a follow-up phase under item 7, named on the
@@ -458,17 +452,7 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
     and the shots are no worse than the merge branch. A fix the showrunner asks
     for comes after that checkpoint, unless the waiting unit needs it. This is
     packaging under `<DecisionEconomy/>`; state it in one line.
-16. **Review pool.** With a `**Review pool:**` line in the production doc, send
-    every code review through
-    `review.sh --pool code --lease <slug>/<unit>/<phase>` with the usual
-    positional arguments. The unit's reviewer is permanent: each review
-    resumes its thread, and the pool forks a second one only while two reviews
-    run at once. `<slug>` is the production doc's file name without
-    `-production.md`. A refusal `no primed code template: <cause>` means the
-    pool could not prime itself: send that review to an idle worker with
-    `--to`, and tell the showrunner the cause once.
-
-17. **Proposals.** A finished proposal you write is a hanadocs issue, filed
+16. **Proposals.** A finished proposal you write is a hanadocs issue, filed
     through `/issue` with tag `proposal`, `proposed_by` your unit's name, and
     its five ranking values proposed on a `Proposed ranking:` line. Send the
     showrunner its path and one line; there is no proposals index. When the
@@ -476,11 +460,11 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
     phases that cite it and add it to the plan's `> **Issues:**` line; your
     run marks it active and its end-of-run as-built pass closes it
     (`/showrunner:proposal`).
-18. **Change review.** Every change the user can see or check carries a
+17. **Change review.** Every change the user can see or check carries a
     `Change-Review:` line in its checkpoint (`/unit:checkpoint`). A change
     outside a checkpoint goes on the list through `/change_review add`. Never
     ask the user to check something directly.
-19. **Builds for the user.** Before a build goes to the user's machine, run
+18. **Builds for the user.** Before a build goes to the user's machine, run
     `assertion_guard.py --base main` in that repository (`/unit:direct`
     <UserBuildGuard/>). Exit 1 or 2 stops the hand-off.
 </ProductionUnit>

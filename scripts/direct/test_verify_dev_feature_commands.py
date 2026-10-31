@@ -10,11 +10,9 @@ from scripts.direct.verify_token_wait_test_support import VerifyTokenWaitFixture
 from scripts.direct.verify_dev_features_test_support import add_dev_features, isolate_verify_inputs
 
 
-class VerifyBuildDevFeatureTests(unittest.TestCase):
+class VerifyBuildDevFeatureTests(VerifyTokenWaitFixture):
     def test_debug_build_merges_work_order_example_and_repo_features_but_release_does_not(self) -> None:
-        fixture = VerifyTokenWaitFixture()
-        fixture.setUp()
-        self.addCleanup(fixture.tearDown)
+        fixture = self
         environment = fixture.build_stub([
             {"name": "sample-app", "kind": ["bin"]},
             {"name": "demo", "kind": ["example"], "required-features": ["extra"]},

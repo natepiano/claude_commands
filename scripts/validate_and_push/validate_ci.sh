@@ -64,10 +64,58 @@ worktree_has_changes() {
   ! git diff --quiet || ! git diff --cached --quiet || [ -n "$(git ls-files --others --exclude-standard)" ]
 }
 
-# Abort if the worktree is dirty (staged, unstaged, or untracked files).
+# Build a content proof without changing the caller's real index.
+worktree_tree() (
+  local temporary_index real_index
+  temporary_index="$(mktemp "$(git rev-parse --git-path validate-index).XXXXXX")"
+  trap 'rm -f "$temporary_index"' EXIT
+  temporary_git() {
+    GIT_INDEX_FILE="$temporary_index" git -c core.hooksPath=/dev/null "$@"
+  }
+  real_index="$(git rev-parse --git-path index)"
+  if [[ -f "$real_index" ]]; then
+    cp "$real_index" "$temporary_index" || return
+  else
+    rm -f "$temporary_index"
+    temporary_git read-tree HEAD || return
+  fi
+  temporary_git add -A || return
+  temporary_git write-tree
+)
+
+# HEAD alone cannot prove ownership of dirty content. Only the exact tree saved
+# after a completed formatter can be committed by a dirty rerun.
+AUTOFIX_STATE="$(git rev-parse --git-path validate-autofix)"
+save_autofix_state() {
+  printf '%s\n' "$*" > "${AUTOFIX_STATE}.tmp"
+  mv -f "${AUTOFIX_STATE}.tmp" "$AUTOFIX_STATE"
+}
+
+RESUME_AUTOFIX=0
 if worktree_has_changes; then
-  echo "!!! Cannot validate — there are uncommitted changes. Please commit or discard them first."
-  exit 1
+  saved_head="" saved_tree=""
+  if [[ -f "$AUTOFIX_STATE" ]]; then
+    read -r saved_head saved_tree < "$AUTOFIX_STATE"
+  fi
+  if [[ "$saved_head" != "$(git rev-parse HEAD)" ]]; then
+    echo "!!! Cannot validate — there are uncommitted changes. Please commit or discard them first."
+    exit 1
+  fi
+  current_tree="$(worktree_tree)"
+  if [[ -z "$saved_tree" ]]; then
+    echo "!!! Cannot validate — the formatter stopped before its output was recorded:" >&2
+    GIT_OPTIONAL_LOCKS=0 git status --short >&2
+    echo "Inspect git diff, then either discard with git checkout -- <paths> and rerun, or commit the changes yourself." >&2
+    exit 1
+  fi
+  if [[ "$saved_tree" != "$current_tree" ]]; then
+    echo "!!! Cannot validate — uncommitted changes outside the saved autofix output:" >&2
+    git diff --name-only "$saved_tree" "$current_tree" >&2
+    exit 1
+  fi
+  RESUME_AUTOFIX=1
+else
+  rm -f "$AUTOFIX_STATE"
 fi
 
 TAB="$(printf '\t')"
@@ -127,11 +175,20 @@ amend_fixes() {
 }
 
 run_autofix_step() {
-  local label="$1"
+  local label="$1" fixed_tree
   shift
+  save_autofix_state "$(git rev-parse HEAD)"
   run_step "$label" "$@"
+  fixed_tree="$(worktree_tree)"
+  save_autofix_state "$(git rev-parse HEAD)" "$fixed_tree"
   amend_fixes "$label"
+  rm -f "$AUTOFIX_STATE"
 }
+
+if [[ "$RESUME_AUTOFIX" -eq 1 ]]; then
+  amend_fixes "saved autofix"
+  rm -f "$AUTOFIX_STATE"
+fi
 
 # The repo builds cargo-mend when a workspace member is named cargo-mend —
 # true both for the standalone repo and for a workspace that holds it. Keyed on

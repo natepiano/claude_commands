@@ -19,9 +19,7 @@ UnitPlan = PlanFromRunRecord | NoRunRecord
 
 class UnitHost(TypedDict):
     kind: Literal["unit"]
-    production: str
     unit: str
-    doc: str
     session_name: str
     session_host: Literal["herdr"]
     plan: UnitPlan
@@ -29,9 +27,7 @@ class UnitHost(TypedDict):
 
 class LegacyTmuxUnitHost(TypedDict):
     kind: Literal["legacy tmux unit"]
-    production: str
     unit: str
-    doc: str
     session_name: str
 
 
@@ -374,14 +370,11 @@ def _parse_host(value: object, place: str, allow_unit: bool) -> Host:
         session_host = data.get("session_host", "tmux")
         if session_host not in ("tmux", "herdr"):
             raise InvalidInventory(f"{place}.session_host is invalid")
-        production = wire_string(wire_required(data, "production", place), f"{place}.production")
         unit = wire_string(wire_required(data, "unit", place), f"{place}.unit")
-        doc = wire_string(wire_required(data, "doc", place), f"{place}.doc")
         name = wire_string(wire_required(data, name_key, place), f"{place}.{name_key}")
         if session_host == "tmux" or kind == "legacy tmux unit":
-            return LegacyTmuxUnitHost(kind="legacy tmux unit", production=production,
-                                     unit=unit, doc=doc, session_name=name)
-        return UnitHost(kind="unit", production=production, unit=unit, doc=doc,
+            return LegacyTmuxUnitHost(kind="legacy tmux unit", unit=unit, session_name=name)
+        return UnitHost(kind="unit", unit=unit,
                         session_name=name, session_host="herdr",
                         plan=_parse_unit_plan(wire_required(data, "plan", place), f"{place}.plan"))
     if kind == "herdr":

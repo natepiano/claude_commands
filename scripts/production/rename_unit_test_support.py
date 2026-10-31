@@ -13,20 +13,24 @@ import subprocess
 import sys
 import tempfile
 import time
-import unittest
-from collections.abc import Callable
-from contextlib import closing
+from collections.abc import Callable, Generator
+from contextlib import closing, contextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING, ClassVar, cast, override
+from typing import TYPE_CHECKING, ClassVar, Literal, cast, override
 from unittest import mock
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 from scripts.herdr import fake_herdr
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.production.cli_fixture import invoke_cli
-
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+from scripts.production.rename_test_support import bind_staff_fixture
+from scripts.production.staff_test_support import StaffTestCase, unit_membership
+from scripts.shutdown import stop_resume
+from scripts.production import staff
+from scripts.lib.atomic_file import write_text_atomic
 
 import fake_showrunner
-import fake_unit_host
+from scripts.production import fake_unit_host
 import rename_unit
 import retire_unit
 import stall_watch
@@ -36,11 +40,11 @@ import progress_history
 
 if TYPE_CHECKING:
     from scripts.style import style_ledger
-    from scripts.shutdown import record as shutdown_record
+    from scripts.shutdown import shutdown_record
 else:
     import style_ledger
     # rename_unit puts the shutdown folder on the path.
-    import record as shutdown_record
+    import shutdown_record
 
 SCRIPT = Path(__file__).with_name("rename_unit.py")
 SLUG = "demo"
@@ -49,7 +53,7 @@ SLUG = "demo"
 TEST_HANG_GUARD_SECS = 300
 
 
-class UnitRenameFixture(unittest.TestCase):
+class UnitRenameFixture(StaffTestCase):
 
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
@@ -80,11 +84,13 @@ class UnitRenameFixture(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        super().setUp()
         # Git worktrees and production docs embed absolute paths. Each independent
         # copy returns to the seed's original path, with its own refs and origin.
         _ = shutil.copytree(self.fixture_snapshot, self.fixture_root)
         self.addCleanup(shutil.rmtree, self.fixture_root)
         self.bind_fixture(self.fixture_root)
+        bind_staff_fixture(self, self.env, {SLUG: ("alpha-unit", "mul_add-unit")})
         # These modules also bind paths at import time; environment changes alone
         # do not isolate their journals, locks, or stall-watch state.
         for module, name, value in (
@@ -121,8 +127,8 @@ class UnitRenameFixture(unittest.TestCase):
             # No waits by default: a test that needs one sets it.
             "RENAME_UNIT_STOP_WAIT": "0", "RENAME_UNIT_LIVE_WAIT": "0",
             "REVIEW_POOL_STATE": str(self.root / "state/review-pool"),
-            "GUILD_ROLES_STATE": str(self.root / "state/guilds/roles"),
-            "GUILD_OWNERSHIP_STATE": str(self.root / "state/guilds/ownership"),
+            "DESIGN_ROLES_STATE": str(self.root / "state/astra/design-roles"),
+            "DESIGN_OWNERSHIP_STATE": str(self.root / "state/astra/design-ownership"),
             "SHOWRUNNERS_CONFIG": str(config / "showrunners.json"),
             "UNIT_ACTIVE_DIR": str(self.root / "active"),
             "UNIT_HISTORY_DIR": str(self.root / "history"),
@@ -213,7 +219,7 @@ class UnitRenameFixture(unittest.TestCase):
 
     def write(self, path: Path, content: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        _ = path.write_text(content, encoding="utf-8")
+        write_text_atomic(path, content)
 
     def git(self, *arguments: str, cwd: Path | None = None) -> str:
         result = subprocess.run(["git", *arguments], cwd=cwd or self.checkout, env=self.env,
@@ -248,22 +254,68 @@ class UnitRenameFixture(unittest.TestCase):
 
         # These values are normally bound at interpreter startup. Rebind them for
         # each invocation, including tests that change the shutdown stand-in.
-        with (mock.patch.object(rename_unit, "SHUTDOWN", Path(self.env.get("RENAME_UNIT_SHUTDOWN")
-                                                               or str(SCRIPT.parents[1] / "shutdown/shutdown.py"))),
-              mock.patch.object(rename_unit, "STOP_WAIT_SECONDS", float(self.env["RENAME_UNIT_STOP_WAIT"])),
+        with (self.shutdown_boundary(),
               mock.patch.object(rename_unit, "LIVE_WAIT_SECONDS", float(self.env["RENAME_UNIT_LIVE_WAIT"])),
               mock.patch.object(retire_unit, "MAC_CLAIMS", self.home / ".local/state/mac-test/claims"),
               mock.patch.object(subprocess, "run", run)):
             return invoke_cli(rename_unit, lambda: rename_unit.main(arguments), arguments,
                               self.env, cwd or self.checkout, production_state=True)
 
+    @contextmanager
+    def shutdown_boundary(self) -> Generator[None]:
+        """Use the same recording stop fake for in-process and child-process apply."""
+        with (mock.patch.object(rename_unit, "SHUTDOWN", Path(self.env.get("RENAME_UNIT_SHUTDOWN")
+                                                               or str(SCRIPT.parents[1] / "shutdown/shutdown.py"))),
+              mock.patch.object(stop_resume, "stop", side_effect=self.stop_session)):
+            yield
+
+    def stop_session(self, identity: str) -> stop_resume.Stopped:
+        rename_unit.run_shutdown("stop", identity)
+        return stop_resume.Stopped(identity, 1)
+
     def start_apply(self) -> subprocess.Popen[str]:
         """apply in the background, so the test can act as the shutdown path while it waits."""
-        process = subprocess.Popen([sys.executable, str(SCRIPT), "apply", SLUG, "alpha", "gamma", "--scratch",
-                                    str(self.root / "scratch")], cwd=self.checkout, env=self.env,
+        bootstrap = ("import sys; from pathlib import Path; "
+                     + f"sys.path.insert(0, {str(SCRIPT.parents[2])!r}); "
+                     + "from scripts.production.rename_unit_test_support import apply_in_fixture; "
+                     + "raise SystemExit(apply_in_fixture(Path(sys.argv[1])))")
+        process = subprocess.Popen([sys.executable, "-c", bootstrap, str(self.root)],
+                                   cwd=self.checkout, env=self.env,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         self.addCleanup(process.kill)
         return process
+
+    def dead_server_watcher(self, worktree: Path, folder: Path) -> subprocess.Popen[str]:
+        """A literal sh watcher of another worktree's run, blocked until signalled after its server dies."""
+        server = subprocess.Popen([sys.executable, "-c", "import sys; print('ready', flush=True); sys.stdin.read()"],
+                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        self.addCleanup(server.wait, timeout=TEST_HANG_GUARD_SECS)
+        self.addCleanup(server.kill)
+        assert server.stdin is not None and server.stdout is not None
+        self.addCleanup(server.stdin.close)
+        self.addCleanup(server.stdout.close)
+        _ = self.wait_for_output(server, "ready")
+        folder.mkdir(parents=True)
+        self.write(folder / "progress_history_state.json", json.dumps({"working_dir": str(worktree.parent / "another-worktree")}))
+        self.write(folder / "mesh_server.json", json.dumps({"pid": server.pid, "port": 51101}))
+        # The sleep stand-in reports entry and blocks on a pipe. No elapsed time decides when
+        # the server dies or whether the watcher releases the worktree.
+        script = ('sleep() { printf "sleeping\\n"; read -r wake; }; '
+                  'while kill -0 "$1" 2>/dev/null; do sleep "$5"; '
+                  '"$4" "$0" idle-stop --session-dir "$3" --pid "$1" --port "$2" && exit 0; done')
+        watcher = subprocess.Popen(["sh", "-c", script,
+            str(SCRIPT.parents[1] / "agents/codex_mesh.py"), str(server.pid), "51101", str(folder),
+            sys.executable, "300"], cwd=worktree, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            text=True, start_new_session=True)
+        self.addCleanup(watcher.wait, timeout=TEST_HANG_GUARD_SECS)
+        self.addCleanup(watcher.kill)
+        assert watcher.stdin is not None and watcher.stdout is not None
+        self.addCleanup(watcher.stdin.close)
+        self.addCleanup(watcher.stdout.close)
+        _ = self.wait_for_output(watcher, "sleeping")
+        server.kill()
+        _ = server.wait(timeout=TEST_HANG_GUARD_SECS)
+        return watcher
 
     def wait_for(self, ready: Callable[[], bool]) -> None:
         """Wait for a stand-in's file event; elapsed time is only a hang guard."""
@@ -280,7 +332,9 @@ class UnitRenameFixture(unittest.TestCase):
             readable, _, _ = select.select([process.stdout], [], [], remaining)
             self.assertTrue(readable, f"timed out waiting for {expected!r}")
             chunk = os.read(process.stdout.fileno(), 1)
-            self.assertTrue(chunk, f"stdout closed before {expected!r}: {output!r}")
+            if not chunk:
+                stdout, stderr = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+                self.fail(f"stdout closed before {expected!r}: {output!r}{stdout}; {stderr}")
             output.extend(chunk)
             if chunk == b"\n" and expected in output.decode():
                 return output.decode()
@@ -314,6 +368,8 @@ class UnitRenameFixture(unittest.TestCase):
             f"| alpha-unit | docs/plans/alpha.md | `{self.rust / 'claude-demo-alpha'}` | demo-alpha |",
             f"| names-unit | `{plan}` | `{worktree}` | demo-names |")
         self.write(self.doc, text)
+        parent = next(row for row in staff.snapshot().find(kind="showrunner") if row.name == SLUG)
+        _ = staff.ensure("unit", name="names", parent=parent.id)
         for directory in (self.checkout, worktree):
             self.write(directory / plan, "# Names\n\n> **Production:** demo (names-unit)\n"
                        + "> **Standing:** style_plan.py\n\nnames-unit history stays.\n")
@@ -335,35 +391,22 @@ class UnitRenameFixture(unittest.TestCase):
             )
         return worktree, plan, database
 
-    def seed_record(self, progress: str = "stopped", name: str = "alpha", host_session: str = "demo-alpha", *,
+    def seed_record(self, progress: Literal["waiting", "ready", "stopped"] = "stopped", name: str = "alpha", host_session: str = "demo-alpha", *,
                     unit: str = "alpha-unit", slug: str = SLUG) -> Path:
-        """A stopped unit's shutdown record, as `shutdown.py down` leaves it."""
+        """A stopped unit's shutdown record, from before the conductor was removed."""
         old = self.rust / "claude-demo-alpha"
-        session: dict[str, object] = {
-            "session_id": "sid-alpha", "config_dir": str(self.home / ".claude"), "pid": 4242, "proc_start": "1",
-            "name": name, "cwd": f"{old}/sub", "status": "idle", "updated_at": 0, "probe": False,
-            "model": {"kind": "no reply yet"},
-            "checkout": {"kind": "git", "path": str(old), "head": {"kind": "branch", "name": "demo-alpha"},
-                         "upstream": {"kind": "tracking", "ahead": 0}, "dirty": []},
-            "run_dirs": [], "codex_servers": [], "timers": [], "kind": "unit",
-            "host": {"kind": "unit", "production": slug, "unit": unit, "doc": str(self.doc),
-                     "session_name": host_session, "session_host": "herdr",
-                     "plan": {"kind": "plan", "path": f"{old}/docs/plans/alpha.md"}}}
-        saved: dict[str, object] = {
-            "login": "owner@example.com", "label": "claude2", "machine": "natedev",
-            "requested_at": "2026-10-09T21:49:10+00:00", "request_id": "request",
-            "requested_by": {"kind": "terminal"}, "hold": "session", "then": "stop", "force": "wait for ready",
-            "alerts": "none", "probe": False, "session": session, "workers": [], "timers": [],
-            "settle_message": {"kind": "not sent"}, "where": {"kind": "not said"},
-            "progress": {"kind": progress, "at": "2026-10-09T21:50:00+00:00"}, "stop_issues": [], "trail": [],
-            "codex_seats": [{"run_dir": str(self.root / "runs/r1"), "seat": "impl", "role": "impl",
-                             "thread_id": "thread-impl", "turn_live": True, "launcher_command": [
-                                 "bash", "/scripts/direct/implement.sh", "--to", "impl", str(self.root / "runs/r1"),
-                                 str(old), "/runs/r1/prompt.md", "impl", "task", "impl", "working", "0", "impl"]}]}
+        saved = fake_unit_host.stopped_record(self.home / ".claude", old,
+            name=name, cwd=old / "sub", production=slug, unit=unit, doc=self.doc,
+            host_session=host_session, branch="demo-alpha", plan=old / "docs/plans/alpha.md", progress=progress)
+        saved["codex_seats"] = [{"run_dir": str(self.root / "runs/r1"), "seat": "impl", "role": "impl",
+                                 "thread_id": "thread-impl", "turn_live": True, "launcher_command": [
+                                     "bash", "/scripts/direct/implement.sh", "--to", "impl", str(self.root / "runs/r1"),
+                                     str(old), "/runs/r1/prompt.md", "impl", "task", "impl", "working", "0", "impl"]}]
         self.write(self.root / "runs/r1/impl.resume-prompt.md", "Continue the task you were on.\n")
         with mock.patch.dict(os.environ, self.env):
-            self.assertTrue(shutdown_record.create_session(cast(shutdown_record.SessionShutdown, cast(object, saved))))
+            self.assertTrue(shutdown_record.create_session(saved))
         log = self.root / "shutdown-calls.jsonl"
+        self.write(log, "")
         stub = self.root / "fake_shutdown.py"
         self.write(stub, "import json, os, sys\nwith open(os.environ['RENAME_UNIT_SHUTDOWN_LOG'], 'a') as log:\n"
                    + "    _ = log.write(json.dumps(sys.argv[1:]) + '\\n')\n")
@@ -375,20 +418,38 @@ class UnitRenameFixture(unittest.TestCase):
         directory = self.home / ".local/state/shutdown/owner@example.com/sessions"
         return cast(dict[str, object], json.loads((directory / "sid-alpha.json").read_text()))
 
+    def record_live_launch(self) -> None:
+        pane_record.write("demo-alpha-unit", pane_record.PaneLaunch(
+            pane_id="w1:p1", session_id="sid-alpha", config_dir=str(self.home / ".claude4"),
+            cwd=str(self.rust / "claude-demo-alpha"), name="alpha", model="sonnet",
+            remote_control=True, environment={"SHOWRUNNER_UNIT": "demo", "SHOWRUNNER_UNIT_ID": "alpha-unit"},
+            flags_read=True, ended=False, written_at="2026-10-30T22:00:00+00:00"))
+
     def mark_live(self, unit: str, session_id: str, name: str = "") -> Callable[[], None]:
         """A live Claude in a herdr session marked as `unit` of this production; the result ends it.
 
         The session and its pane label are called `name`, the unit's stem when it is empty.
         """
         name = name or unit.removesuffix("-unit")
+        row = unit_membership(SLUG, unit)
         held = fake_showrunner.write_session(self.root / "state/sessions", name, session_id)
         self.addCleanup(held.close)
         fake_unit_host.write(self.env, [fake_unit_host.HostedUnit(
-            f"demo-{unit}", "w1:p1", {"SHOWRUNNER_UNIT": SLUG, "SHOWRUNNER_UNIT_ID": unit}, label=name)])
-        fake_unit_host.place_process(self.env, os.getpid(), "w1:p1")
+            f"demo-{unit}", "w1:p1", {"SHOWRUNNER_UNIT": SLUG, "SHOWRUNNER_UNIT_ID": unit,
+                                    "STAFF_ID": row.id}, label=name)])
+        fake_unit_host.place_process(self.env, os.getpid(), "w1:p1", exec_shell=True)
 
         def end() -> None:
             held.close()
             fake_unit_host.write(self.env, [])
         return end
 
+
+
+def apply_in_fixture(root: Path) -> int:
+    """Run apply with real process output and the existing fixture's stop boundary."""
+    fixture = UnitRenameFixture()
+    fixture.bind_fixture(root)
+    fixture.env = dict(os.environ)
+    with fixture.shutdown_boundary():
+        return rename_unit.main(["apply", SLUG, "alpha", "gamma", "--scratch", str(root / "scratch")])

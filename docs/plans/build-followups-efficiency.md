@@ -13,7 +13,7 @@ Showrunner of build-followups, 2026-10-28 (measured by builds-unit):
 ## Delegation Context
 
 - **Project:** `~/.claude` config repo. The unit director names the worktree and branch git reports at dispatch in every Work Order.
-- **Project started:** 2026-10-28
+- **Project started:** 2026-10-28T00:02:06-04:00
 - **Stack:** Python 3 standard library checked by basedpyright; Claude Code command hooks registered in `settings.json`.
 - **Layout:** hooks and their tests in `scripts/hooks/`; the interpreter shim `scripts/lib/py`; hook registration in `settings.json` (`hooks` key); as-built docs in `docs/as-built/`.
 - **Baseline (natedev, 2026-10-28, child CPU user+sys per run of each registered command, Bash payload):** PreToolUse 357 ms (6 Python hooks: heredoc-guard 39, tool-output-read 38, showrunner-move-guard 64, change-review-gate 134, checkpoint-doc-gate 29, scratch-guard 54); PostToolUse 142 ms (berth_post_bash.sh 8, random-ack.sh 10, context-usage 59, banned-words 64); Stop 248 ms (direct-continue 57, conversation-pause 39, prose-banned-words 60, herdr_tab_title 91). About 0.5 s of CPU per Bash call and 0.25 s per Stop. The unit director's bench script feeds one payload to each command N times and reads `RUSAGE_CHILDREN`; the final numbers come from N=20 runs before and after on the same machine.
@@ -103,3 +103,32 @@ Showrunner of build-followups, 2026-10-28 (measured by builds-unit):
 **Tests** (`scripts/lib/test_nix_env.py`, real `git`): a `git worktree add` of a repo below the fake `~/rust`, made outside the trusted roots, is approved and loads; a plain `git clone` outside the roots is not approved; a hand-written `.git` file that points at a trusted repo's real worktree entry, from another folder, is not approved; a worktree of a repo outside the roots is not approved.
 
 **Acceptance:** `python3 -m unittest scripts.lib.test_nix_env scripts.lib.test_nix_env_launches scripts.lib.test_nix_env_integration` passes from the repo root; basedpyright clean on the changed files; `docs/as-built/nix-shell-launch.md` states the rule.
+
+### Phase 10 — Rerun repairs a stopped berth_fix launch and a stopped heal restart  · status: done
+
+**Source:** showrunner of natedev, 2026-10-29: the efficiency-unit rows of the rerun sweep (`docs/plans/sdlc-rerun-sweep.md`, main 4dfc4dce). Each row is a stop or a failure that leaves state a rerun does not repair.
+
+**Defects and fixes:**
+1. `scripts/berth_fix/launch.sh:107` — the new session id is saved before Claude starts. If the launch stops before Claude starts (for example the environment check fails), the rerun uses `-r` for a conversation that was never made. Fix: use `-r <id>` only when the recorded conversation's transcript exists in the account's project history (`${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/<encoded worktree>/<id>.jsonl`); otherwise start again with `--session-id <same id>`.
+2. `scripts/berth_fix/launch.sh:116` — a stop after `git worktree move` and before the project-history move leaves the history at the old path; the rerun returns early because the new worktree exists. Fix: the history move is its own step that each launch runs, whether or not the worktree exists, and it uses the same account project folder as fix 1.
+3. `scripts/nix_env/heal.py:472` — a stop after the pending stop is saved and before `shutdown.py down` runs leaves a pending stop with no shutdown record; every later sweep waits at line 365 with no end. Fix: the pending stop records when its request was sent. A resumed pending stop with no sent mark and no shutdown record sends the request again while the same process (pid and start time) is alive; if that process is gone, it clears the pending stop and alerts. No pending stop waits with no end.
+
+**Tests:** each fix has a test that stops at the named line (a failure injected there) and then reruns, and proves the rerun repairs the state: `scripts/lib/test_nix_env_launches.py` or the existing berth_fix launch tests for 1 and 2, `scripts/nix_env/test_heal.py` for 3.
+
+**Acceptance:** the touched test modules and their callers' suites pass; basedpyright clean on changed Python files.
+
+**Residual (review, minor follow-up):** if `shutdown.py down` itself stops after `settle.begin()` writes the shutdown record and before its conductor starts, the heal stop keeps `stop_request_sent: false` with a record present, and a rerun of `down` skips the existing record (`settle.py:819`, an accounts-unit row of the same sweep). The repair belongs in settle's rerun of an unfinished record, not in heal.
+
+### Phase 11 — verify.sh loads the nix environment with one helper start, and both helpers import less  · status: done
+
+**Source:** showrunner of natedev, 2026-10-30 (measured by builds' verify unit): verify.sh starts `scripts/lib/nix_env.py` (96 ms CPU per start) and `scripts/lib/user_zone.py` (37 ms) on every verify step, on both machines. Give each a cheap entry path with fewer imports, keep one implementation of each (no copy), measure before and after at the parent commit.
+
+**Baseline (natedev, 2026-10-30, parent 8c53e312, child CPU user+sys, mean of 30 runs):** `python3 -c pass` 14.2 ms, `python3 -S -c pass` 9.2 ms; `lib/py nix_env.py ensure <dir with no .envrc>` 49 ms; `lib/py nix_env.py ensure ~/rust/cargo-liner` 126 ms, of which `direnv export json` is 75 ms and `direnv allow` 2 ms; `python3 user_zone.py` 26.5 ms. Outside a nix shell, verify.sh runs `nix_env.py ensure`, then a second Python only to read `IN_NIX_SHELL` from its JSON, then `nix_env.py exec`, which runs direnv export again: about 270 ms in a repo with an `.envrc`, 67 ms without. Own imports (`-X importtime`): nix_env.py — dataclasses 10.5 ms (inspect 9.2), subprocess 5.0, json 4.5, pathlib 2.4, typing 2.4; user_zone.py — pathlib 6.8 ms, zoneinfo 3.6.
+
+#### As-built
+
+Outside a nix shell, `scripts/direct/verify.sh` makes one `nix_env.py exec` of itself under `lib/py -S`: one Python start and one direnv export, down from three and two. `nix_env.py exec` sets `NIX_ENV_ENVRC` to the resolved envrc for `Loaded` and removes it for `NoEnvrc`. On the re-run verify.sh prints the notice when `IN_NIX_SHELL` is set, refuses with one line when it is empty and `NIX_ENV_ENVRC` is set, and goes on silently when both are empty.
+
+`nix_env.py` results are `NamedTuple`s; `subprocess`, `shlex` and `json` import only where used, and `Mapping` is a type-checking import. `user_zone.CONF` is a `str` and `user_zone.stored_zone(path)` is the one zone reader; `zone.py` `stored` calls it. `user_clock` runs `python3 -S`. `docs/as-built/nix-shell-launch.md` describes the flow.
+
+**Result (natedev, 2026-10-30, child CPU user+sys, mean of 30 runs, parent 8c53e312 → this phase):** `verify.sh` with an unknown verb outside a nix shell: repo with an `.envrc` 649.3 → 468.0 ms, repo without 446.1 → 383.8 ms. `user_zone.py` in `user_clock`'s call form: 26.0 → 16.8 ms. The `verify.sh` numbers include its later `build_targets.py` start, which this phase does not change.

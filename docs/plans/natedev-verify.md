@@ -2,7 +2,7 @@
 
 > **Status: IMPLEMENTATION PLAN — phased, direct-ready.** Owner of `verify.sh`, its final pass, its cache, its lint and test scope, its speed and the Mac test code; first change: cut the Python helper start time in each verify run.
 
-> **Production: natedev** — unit `verify-unit`; production doc `docs/plans/natedev-production.md`
+> **Production: builds** — unit `verify-unit`; production doc `docs/plans/builds-production.md`
 
 ## Source
 
@@ -60,6 +60,7 @@ i need changes to verify
 3. **One `cargo metadata` parse per run.** `MEMBER_PY`, `EXAMPLE_FEATURES_PY`, `TEST_TARGETS_PY`, `BUILD_TARGETS_PY`, `UNTESTED_EXAMPLES_PY` and the `workspace_root` read at 2777 each start Python and parse the same metadata JSON. Replace them with one helper module `scripts/direct/verify_metadata.py` that reads the metadata once and prints every value the run needs as `NAME=value` lines (shell-quoted with `shlex.quote`), which `verify.sh` reads with one `eval` or a `while read` loop. Each old `-c` constant goes away. Edge: a verb that needs no metadata (`doc` early exits, the query path at line 183) must not start the new helper.
 4. **Slow imports in this unit's helpers.** For `final_pass.py`, `step_record.py` and `local_release_wait.py`: where `-X importtime` shows a module import over 30 ms that only some subcommands need, move the import into that subcommand. For helpers owned by other units (`record.py`, `mac_idle.py`, `build_targets.py`, `progress_history.py`): write the measured cost and the proposed fix into the phase report and the checkpoint notice for the showrunner to route; do not edit them.
 5. **Merge repeated per-step calls** only where the trace shows two calls of this unit's helpers always run back to back with no shell work between them (candidate: `step_record.py state` then `remove`); give the helper one subcommand that does both.
+6. builds 2026-10-29 (hana's showrunner, organon 21:4x EDT): `token_wait_note` reads `locks/cargo.d/holder` with `read -r holder < … || holder=""`. The holder file has no trailing newline (`w74`), so `read` returns 1 after it fills `holder`, and the `||` clears it: the log says "it came free just now" while w74 holds the lock. Keep the value `read` fills when it returns non-zero at end of file (check every `read` of a board file in verify.sh for the same form). Test: a holder file `w74` with no newline gives "w74 holds it".
 
 Done when the trace on the same runs shows ≤ 2 s CPU of helper starts per step. If the floor sits above 2 s only because of other units' helpers, the phase ends with this unit's share removed and the rest named per owner.
 
@@ -80,7 +81,19 @@ Done when the trace on the same runs shows ≤ 2 s CPU of helper starts per step
 
 **Acceptance gate:** merge gate `--tests-only` green on a tree merged with `origin/natedev`; basedpyright `0 errors, 0 warnings` on `scripts/direct scripts/mac_test` and every caller module; `bash -n` clean; the before/after trace table in the phase report shows ≤ 2 s CPU of helper starts per step for this unit's share, with the other owners' remaining cost named.
 
-### Phase 2 — Cancel a test or lint run when the tree changes under it  · status: todo
+### Phase 1b — Refuse a step with a failing exit, and read a process start on the Mac  · status: todo
+
+**Origin:** builds showrunner order 2026-10-30 03:5x EDT, a wrong-result defect from hana (trunk P170 board, 02:53 EDT). Runs in this worktree right after Phase 1, which owns the same files; ahead of Phase 7.
+
+**Defect:** on the Mac, `verify.sh`'s step recorder (`step_record.py process_start`) reads `/proc/<pid>/stat`, which Darwin does not have. The step is refused, but the wrapper exits 0, so the failure reads as a pass.
+
+**Fix:** (1) a refused step exits non-zero on every host, at the one place the wrapper turns a refusal into its exit status. (2) Process start comes from one shared helper in `scripts/lib/` that works on Linux (`/proc/<pid>/stat` field 22) and Darwin (`ps -o lstart=` under `LC_ALL=C TZ=UTC`, based on `message/sessions.py process_start`'s tested form) with one return type. `scripts/lib/` belongs to natedev: builds approved the path as outside this unit's Owns (03:5x); the checkpoint notice names it in its also-touches line. `step_record.py` and the inline readers in `scripts/direct/verify.sh` and `scripts/direct/board.sh` use it; no second copy. The other copies (`message/sessions.py`, `build_hold/build_hold.py`, `lint/memory_admit.py`, `lint/tmp_sweep.py`, `production/retire_unit.py`) go to their owners through builds after 1b merges: build_hold, memory_admit and tmp_sweep to resources; sessions.py and retire_unit.py to natedev.
+
+**Files:** `scripts/lib/process_start.py` (new), its test, `scripts/direct/step_record.py`, `scripts/direct/verify.sh`, `scripts/direct/board.sh`, `scripts/direct/test_step_record.py`.
+
+**Acceptance gate:** a test for each fix: a refused step makes `verify.sh` exit non-zero (a fake process root with no `stat`); the helper reads a start on Darwin (faked `sys.platform` and `ps`) and on Linux, and both reads agree with the record's stale check. basedpyright 0/0/0 on changed files; the merge gate passes. Hana is told when it lands.
+
+### Phase 2 — Cancel a test or lint run when the tree changes under it  · status: done
 
 **Depends on:** none (runs beside Phase 1 in its own worktree; the second to land merges the first in `scripts/direct/verify.sh`).
 
@@ -158,7 +171,7 @@ Done when the trace on the same runs shows ≤ 2 s CPU of helper starts per step
 
 **Acceptance gate:** merge gate `--tests-only` green; basedpyright `0 errors, 0 warnings` on changed files and callers; a test shows `test hana --filter native_rate` with filtered history promised that history's p90, without history the floor rule, and an unfiltered run unchanged.
 
-### Phase 4 — Promise a fresh test run only its test memory  · status: todo
+### Phase 4 — Promise a fresh test run only its test memory  · status: done
 
 **Depends on:** Phase 3 (same function). Runs in Phase 3's worktree `/home/natepiano/worktrees/claude-build-followups-verify-memory`, branch `natedev-verify-memory`, after Phase 3's checkpoint.
 
@@ -176,6 +189,7 @@ Done when the trace on the same runs shows ≤ 2 s CPU of helper starts per step
 4. A compile run keeps Phase 3's promise. Full-suite compile runs are unchanged.
 5. Report the fresh and compile promises for `test hana --filter native_rate` from real history, before and after.
 6. Showrunner 2026-10-29 (hana's trunk found it): the lint cache key leaves out the assertion guard's base (Phase 5 picks it), so after origin/HEAD moved, lint replayed an old recorded failure. Put the guard base commit, and any other input the guard reads, in the lint key. A test moves origin/HEAD and sees lint re-run.
+7. builds 2026-10-29 (hana's writer found it, 12:10 EDT): (a) the assertion guard reads `Assertion-Change:` rulings only from `UNIT_SESSION_DIR`, and a Codex mesh worker has only `UNIT_RUN_DIR`, so it never sees the rulings; (b) the lint key must change when those rulings change. One reading of the rulings folders — `UNIT_SESSION_DIR` and `UNIT_RUN_DIR`, each when set — feeds both the guard's `--rulings` and the lint key. Tests: a run with only `UNIT_RUN_DIR` reads a ruling there; adding a ruling re-runs a cached failed lint.
 
 **Files:**
 - `scripts/lint/memory_admit.py` — the fresh-run rule and promise
@@ -256,3 +270,162 @@ Done when the trace on the same runs shows ≤ 2 s CPU of helper starts per step
 **Constraints from prior phases:** Phase 5's base order stays as it is. Never change origin/HEAD in tests.
 
 **Acceptance gate (showrunner bump):** basedpyright `0 errors, 0 warnings` on changed files; the guard and hook test files pass; tests show a merge whose other parent removed assertions passes, our own removal on a merge still blocks, and the hook and the guard return the same answer for a staged commit with a ruling in its `-F` file.
+
+### Phase 6a — Take the newer of the upstream base and the production merge-branch base  · status: done
+
+**Origin:** showrunner bump 2026-10-29 19:5x, ticket 108 from cargo-liner-style-names-unit. Branch `natedev-verify-base` from origin/builds, worktree `claude-build-followups-verify-base`; lands ahead of the open phases.
+
+**Defect:** `default_base` takes `merge-base HEAD @{upstream}`. In a style unit worktree `@{upstream}` is the unit's own pushed branch, while refill fast-forwards the worktree to `style/main`. Commits that came in from `style/main` then count as the unit's change, and lint fails on six `assert_eq!` that values-unit phase 77 (b1408dc8) removed in cargo-mend `fixes/facade_redirect/module_aliases.rs:223-282`.
+
+**Fix (ruling):** for every unit, with no style-only branch in the code, the base is the newer of `merge-base HEAD @{upstream}` and `merge-base HEAD origin/<merge branch>`. The merge branch comes from the production doc's `Merge branch` field (`production_units.production_field`), for the production whose Units table lists this worktree (or, failing that, this branch). No production match or no such remote ref leaves the upstream base alone. An explicit `--base` / `VERIFY_ASSERTION_BASE` still wins.
+
+**Files:** `scripts/direct/assertion_guard.py`, `scripts/direct/test_assertion_guard.py`, `docs/as-built/phase-checks.md` (its guard row still says "origin's default branch").
+
+**Acceptance gate:** basedpyright `0 errors, 0 warnings` on changed files; the guard tests pass, with one that reproduces ticket 108 (upstream behind, worktree fast-forwarded to the merge branch, the merge branch's removed assertions do not block, our own still do); the merge gate passes.
+
+### Phase 6b — Pair an assertion whose literal became a named constant, and read no test start inside a string literal  · status: done
+
+#### As-built
+
+Checkpoint db889600 on `natedev-verify-base`, merged into builds as ee2f8c80.
+
+- The assertion guard pairs a removed literal assertion with its replacement when the literal became a bare `const` name in the same file. The `const` has one literal value and one binding in that file. The guard reads each side's file at that side's own git revision, never the working tree.
+- A pair needs an exact `&str` / `&'static str` string (plain or raw), `char` or `bool` literal, or an unsigned number with a type the guard can prove (a suffix, or the default `i32` / `f64`). A range endpoint in the second argument of a trusted `matches!` also pairs.
+- All other forms stay as written and still report `removed`: statics, imported and qualified names, composed constants (`concat!`, arithmetic, a `const` set to another `const`), byte strings, signed numbers, and names inside nested macros.
+- The guard fails closed. When it cannot be certain of a binding, it refuses to pair and blocks: non-ASCII code, `r#` identifiers, `extern crate … as`, incomplete macro paths, trusted macro names that are imported or bound again, `macro_use`, item and statement macros (`include!`), and `#[path]` / `cfg_attr(path)` modules. A glob import (`use x::*`), seen or not, can only refuse a pair.
+- The test-owner scan skips text inside string literals (plain, raw, byte, Python triple-quoted) and comments, so `pub fn` text in a fixture string does not start a test.
+- The production merge-branch match skips Units rows marked retired or removed.
+- Real cargo-liner commits: 7a4fb6b8 pairs all 14 former removals (0 blocking); b1408dc8 pairs all 6; 2520c27d has 0 blocking removals and 2 nonblocking notes for values inside a nested `vec!`.
+
+**Files:**
+- `scripts/direct/assertion_guard.py` — constant table, binding census, refusal rules, literal-aware test-owner scan.
+- `scripts/direct/assertion_guard_test_support.py` — shared fixture repo helpers.
+- `scripts/direct/test_assertion_guard_revisions.py` — pairing across git revisions, refusals, glob census.
+- `scripts/direct/test_assertion_guard_strings.py` — string and comment skips, macro and byte-string refusals.
+- `docs/as-built/phase-checks.md` — the guard row lists the forms that pair and the forms that refuse.
+
+**Binds later work:** the "Pair a literal with an imported crate constant" follow-up in `docs/plans/natedev-verify-next.md` takes the imported and exotic forms that refuse here. Four tests carry Assertion-Change lines for the narrower pairing: `test_literal_constants_pair_across_git_revisions`, `test_constants_composed_of_literals_pair_without_resolving_runtime_calls`, `test_imported_constants_use_each_sides_revision`, `test_visible_and_unknown_globs_take_part_in_file_binding_census`.
+
+**Gotchas:** a pair that the guard cannot prove must block, not pass; every new form needs a refusal test first. Shadowing in Rust (function-local `mod`, inner `use`, type aliases, generic parameters, `include!`) makes a bare name mean a different value, so the census counts every binding of the name in the file.
+
+**Ruled out:** evaluating `concat!` or arithmetic in a `const` — a constant pairs only when its value is one literal.
+
+### Phase 6c — Name a removed assertion by the test that holds it, not by a nested function  · status: done
+
+#### As-built
+
+- `name_tests(findings, sources, code)` in `assertion_guard.py` gives each finding the name of the innermost test that encloses its line. An assertion after or inside a nested helper carries the test name, and an `Assertion-Change: <path>::<test>` ruling names that test.
+- `enclosing_tests(rows, rust)` returns `TestScope(first, last, name)` items. Python uses `ast` to find `test_*` functions. Rust walks masked code for `fn` items marked by `TEST_MARK` (`#[test]`, `tokio::test`, `async_std::test`, `rstest`, `test_case`) and pairs their braces. A nested helper's scope ends where its body ends.
+- A line outside every test keeps the name of the nearest `def` or `fn` above it. A Python syntax error or unbalanced Rust braces gives no test scopes, so all names in that file use this rule.
+- `aggregate_test_removals(findings)` folds each `removed` finding of a removed test into the one `test removed` finding for that test and sets `Finding.removed_assertions`. The report prints `(N assertions)`. `run()` calls it once, after the intersection across all bases.
+- `finding_identity` excludes the owner name, so the base intersection does not depend on naming. The report keeps the first base's name.
+
+**Files:**
+- `scripts/direct/assertion_guard.py` — `TestScope`, `enclosing_tests`, `name_tests`, `aggregate_test_removals`, `Finding.removed_assertions`
+- `scripts/direct/assertion_guard_test_support.py` — shared repo fixtures and guard helpers
+- `scripts/direct/test_assertion_guard_revisions.py`, `scripts/direct/test_assertion_guard_strings.py` — owner and aggregation tests for Python and Rust
+
+**Gotchas:** Aggregate only after every base is compared. Aggregation per base drops a removal that only one base holds. Rust test bounds come from masked code, so `RUST_LITERAL` must hide every string form (`r`, `br`, `cr` raw strings). A brace in an unmasked literal moves a test scope.
+
+### Phase 7 — Keep the cargo token through a long lint, and keep a run's queue place when the Mac is taken  · status: todo
+
+**Depends on:** none. Urgent, ahead of Phases 1, 2 and 4. Runs in `/home/natepiano/worktrees/claude-build-followups-verify-guard`, branch `natedev-verify-token` (from origin/natedev d41fbd8c).
+
+#### Work Order
+
+**Source:** natedev and builds showrunners, 2026-10-29, from hana. (1) Lint run 20261029T062917-3558291-d939 (`verify.sh lint hana`, 06:29-12:37 EDT) lost the cargo token before fmt and exited 125. verify.sh holds the token with `--hold 3600` and never renews it, and board.sh reclaims an expired hold while its holder lives (board.log: "12:33:40 [splash] claim: token cargo reclaimed from panels after its hold expired"). clippy ran past the hour because the tree key hashes verify.sh's own file. The ~/.claude main checkout moved verify.sh three times during the run, so the fix loop saw "changed" and ran two more passes (the last took 3801 s), and `cache_record` printed a false "tree changed" notice. `lint_failure_is_the_tree` counts 125 as the tree's lint failure. (2) widget run 20261029T070857-3319484-a8ef left the memory wait 12 times on an unlocked `mac_test.py free-now` read. Each time it lost the real claim to another hana step, ran `run_nextest` again without `BUILDLOG_MEM_WAIT_SINCE`, and queued at the back.
+
+**Goal:** a run that holds the cargo token never loses it between or during its steps; a change to verify's own scripts never makes a run do more work or print a tree-changed notice; a run that does not get the Mac keeps its memory-queue place.
+
+**Spec:**
+
+1. While verify.sh holds the cargo token, it renews the hold before each step and from a background loop while a step runs (well inside the hold), and stops renewing when it releases. Use `board.sh renew`; add `--pid` to `cmd_renew` so verify renews for its holder pid.
+2. The fix loop's "did the fixes change anything" check and the tree-changed notice use tree content only, not the hashes of verify.sh, invoke.sh or lint.conf. The pass-record key may keep them.
+3. `lint_failure_is_the_tree` never counts status 125, or any lost-token status, as the tree's lint failure.
+4. In `run_local_test`, the first memory-wait start (`BUILDLOG_MEM_WAIT_FROM`) carries through a call file to every later `run_nextest` as `BUILDLOG_MEM_WAIT_SINCE`, so a run whose Mac claim failed keeps its queue place. The recorded memory wait (`BUILDLOG_MEM_WAIT_S`, the build record's `mem_wait_s`) counts from that first start, so a run that rejoined 12 times records its whole wait, not the last part (builds, 2026-10-29, from resources-unit: widget's 4 h 34 min wait recorded 1428 s).
+5. board.sh `lock_stale_reason` never reclaims an expired hold while `holder_pid` is alive and its `owned` group record still matches; a dead holder is still freed.
+6. One decision point for the Mac: the memory wait's leave hook takes the Mac claim under `state.lock` (as `claim_once` does) and hands the held claim to the runner, instead of reading `free-now`. A step leaves the wait only when it already holds the Mac; a refused claim keeps waiting in place.
+7. Script hashes stay in the pass-record (cache) key, so a lint result does not survive a lint-script change (builds, 2026-10-29).
+
+**Files:**
+- `scripts/direct/verify.sh` — specs 1-4
+- `scripts/direct/board.sh` — spec 5 and renew --pid (owner: natedev; name it in the notice)
+- `scripts/mac_test/mac_test.py`, `scripts/mac_test/offload.py` — spec 6 claim handoff
+- `scripts/lint/memory_gate.sh` — spec 6 leave hook (owner: resources-unit; trial-merge against origin/builds-resources)
+- `scripts/direct/test_verify_token_renew.py` — new: regressions for specs 1-6
+
+**Workers:** 1 writer (the idle cancel test worker, `claude-build-followups-verify-cancel-test`, slot `test`), source and tests.
+
+**Constraints:** never change origin/HEAD in tests. builds approved the board.sh, mac_test.py, offload.py and memory_gate.sh edits (2026-10-29); memory_admit.py stays read only.
+
+**Acceptance gate:** `bash -n`; basedpyright `0 errors, 0 warnings` on the new test file; `python3 -m unittest discover -s scripts/direct -p 'test_verify*.py'` passes; regressions show: a step that runs past the hold keeps the token; a verify.sh content change during lint runs no extra fix pass and prints no notice; 125 is not cached as a lint FAIL; a failed Mac claim reuses the first wait start.
+
+### Phase 8 — Name the holder of what a wait is on  · status: todo
+
+**Depends on:** sdlc phases-unit Phase 11 merged on builds (adds `start-wait --holder-*` and `wait-holder`; builds tells verify-unit, ETA 18:30 EDT). Needed by hierarchies' wait experiment.
+
+#### Work Order
+
+**Source:** sdlc hand-off, approved by builds 2026-10-29.
+
+**Goal:** every wait verify.sh records names who holds what it waits on.
+
+**Spec:**
+
+1. `phase_wait_start` passes the holder to `progress_history.py start-wait`: `--holder-resource-kind slot|memory --holder-resource <slot name | memory pool> --holder-session <session id>`, or `--holder-unit <unit>` when only the unit is known. All flags or none; none records `HolderNotNamed`.
+2. The holder is: for a slot, the board token owner; for memory, the owner of the reservation that blocks admission (a read function in `memory_admit.py`, resources-unit's); for a build hold, the hold's holder.
+3. When the holder changes during the same wait, call `progress_history.py wait-holder --session-dir <dir> --wait-id <id>` with the same flags.
+4. Tests: one per resource kind, a holder change mid-wait, and the no-holder case.
+
+**Files:**
+- `scripts/direct/verify.sh` — holder lookup and the two calls
+- `scripts/direct/test_verify_wait_holder.py` — new
+- `scripts/lint/memory_admit.py` — read only here: resources-unit's 45e60cc9 on builds-resources (merged to builds by the showrunner before this phase). `python3 scripts/lint/memory_admit.py blocker --waiter <waiter file>` prints one JSON line `{"session_id","session_name","pool":"memory"}`, or `{"unit"}` when only a systemd unit is known, or `{}`; exit 2 when the waiter file is gone. On the existing `check` poll, `BUILDLOG_MEM_BLOCKER=1` adds the same JSON as pipe field 16 (field 19 with `BUILDLOG_MEM_DETAIL=1`); a `|` in a name comes escaped. Use the `check` field inside the memory wait loop (no extra process per poll); without the opt-in the output is unchanged
+
+**Workers:** 1 writer + 1 tester.
+
+**Acceptance gate:** merge gate `--tests-only` green on a tree merged with origin/builds; basedpyright 0/0 on changed files and callers.
+
+### Phase 11 — Judge a merge commit against both of its parents, also when a base is given  · status: done
+
+#### As-built
+
+Checkpoint 49a471ca on `natedev-verify-base`.
+
+- `assertion_guard.py` `commit_bases(repo, selected_bases=("HEAD",), *, head="", staged=True) -> tuple[str, ...]` is the one bases function. It keeps the selected bases in order (each through `default_base`; an empty selection uses the branch default), adds each non-first parent of every merge in `<base>..<head or HEAD>`, adds the `MERGE_HEAD` entries when `staged`, and keeps only the parents that `git merge-base --independent` lists, so repeated merges of one trunk add one base. With no arguments it is the commit hook's HEAD/index comparison.
+- `run` calls only `commit_bases(repo, tuple(args.bases), head=args.head, staged=args.staged)`. A finding blocks only when it shows against every base, so a merged-in trunk's removals never block and our own removal after a merge still does, with `--base`, `VERIFY_ASSERTION_BASE` or the default. `verify.sh` passes `VERIFY_ASSERTION_BASE` unchanged.
+- Real case: `assertion_guard.py --repo ~/rust/hana --head f08af7de59 --base f8b6c546ba` prints no blocking line (was 120); against fork 25d64d92 it reports 58, lfo's own removals (was 403).
+
+**Files:**
+- `scripts/direct/assertion_guard.py` — `commit_bases`, `run`
+- `scripts/direct/test_assertion_guard.py` — `MergeBaseSelectionTests`: explicit fork base ignores trunk removals, still blocks our removal after a merge, two trunk merges then a commit, `--head` takes that revision's parents
+- `scripts/direct/test_assertion_guard_revisions.py` — the two `MergeAssertionTests` explicit-base cases expect exit 0 and no `test_incoming removed:` line
+- `docs/as-built/phase-checks.md` — guard row: explicit or default bases, merged-in parents, pending merge heads, findings against every base
+
+**Binds later work:** later guard changes reuse `commit_bases` unchanged and add no second bases path.
+
+**Gotchas:** f08af7de59's first parent is the earlier merge b997a8038a, not f8b6c546ba; a base at f8b6c546ba still crosses one trunk merge.
+
+**Ruled out:** a new setting, flag or skip for merges; parent discovery wider than the non-first parents of merges in the judged range.
+
+### Phase 12 — Pair an assertion whose local binding was renamed  · status: done
+
+#### As-built
+
+Checkpoint 48859c93 on `natedev-verify-base`.
+
+- `assertion_guard.py` pairs a Rust assertion whose only change is a renamed local `let` binding, also across a rustfmt rewrap. `touched_assertions` calls `binding_renames(sources, code, constants)` once. For each test that `enclosing_tests` finds once on each side, `prove_binding_rename(old_rows, new_rows, scope) -> BindingRename | NoBindingRename` compares the whole test token by token (`rust_tokens`, on the shared `lexical_spans` lexer). The proof holds only when every token difference is one bijection of plain `let` names, each bound once on its side and absent from the other side, so binding values must also be token-equal. `BindingRename.rewrite` maps the new names back to the old ones in each new-side assertion of that test before matching.
+- The proof reuses the Phase 6b census. `ConstantTable` adds `local_declarations` (plain `let [mut] name [: T] =`), `function_bodies` and `local_renames_refused`; `refuse_environment()` sets `refuse_all` and `local_renames_refused`. An untrusted macro inside another function does not refuse a local rename (`pairing_code_is_certain(code, function_bodies)`); constant pairing keeps its file-wide refusal.
+- These forms refuse the proof, and normal matching runs: shadowing; patterns; function and closure parameters; a generic signature, a nested function or any attribute inside the test; a literal on either side that holds `{name` for a mapped name; a mapped name inside a macro other than the assert family; member, path, field, label, type and `as` positions; a use before the binding's statement ends or inside a nested block; split or merged maps; the Phase 6b file refusals (`macro_rules`, a trusted-macro import, an unresolved glob, uncertain code); every Python file.
+- Real case: the staged `8dd754b1` diff from `~/rust/cargo-liner-style-names` at its parent, with no `Assertion-Change:` lines, prints `assertion guard: no removed or weaker assertions`.
+
+**Files:**
+- `scripts/direct/assertion_guard.py` — `RustToken`, `rust_tokens`, `BindingRename`, `NoBindingRename`, `prove_binding_rename`, `rename_references_are_plain`, `binding_renames`; `ConstantTable.local_declarations`, `function_bodies`, `local_renames_refused`, `refuse_environment`
+- `scripts/direct/test_assertion_guard_revisions.py` — `BindingRenameTests`: the two real shapes, a rename plus another change, each refusal form, Python renames stay `removed`
+- `docs/as-built/phase-checks.md` — guard row: plain local `let` renames pair, and the forms that refuse
+
+**Binds later work:** a rename proof change goes in `prove_binding_rename` and reuses `rust_tokens` and the census; no second tokenizer or matcher.
+
+**Gotchas:** a refused proof does not block by itself: normal matching runs, so an in-place edit of one assertion stays a non-blocking `changed` note.
+
+**Ruled out:** pairing a renamed function parameter (a test attribute such as `#[rstest]` picks a fixture by parameter name); Python renames; a block for every refused proof.

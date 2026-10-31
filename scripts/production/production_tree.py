@@ -5,8 +5,8 @@
 exits 0. A manager and a showrunner, unit director or Claude worker member are Claude Code session
 ids; a Codex worker member is its thread id, since a Codex worker has no Claude session. The edges:
 
-- a showrunner to each child showrunner, role `showrunner`, from the showrunner parent files;
-- a showrunner to each unit director marked with its production, role `unit`;
+- a showrunner to each child showrunner, role `showrunner`, from the staff record;
+- a showrunner to each live unit director, role `unit`, with its parent from the staff record;
 - a unit director to each Codex worker of its run, with the worker's role from `mesh_roster.json`;
 - a unit director to each Claude worker of its run, its member that worker's Claude session id and
   its role the one `board.sh roles` reports for its slot;
@@ -22,7 +22,8 @@ Runs are found by scanning both run roots, not through the session markers: a di
 independent phases side by side, each in its own run folder, and its one marker names only one of
 them. A run's director is the one `unit_runs.director` reads from the run folder.
 
-Only local records are read, nothing over ssh. An edge is printed while its member runs on this
+Staff membership is read once from its owner; session and worker records are local.
+An edge is printed while its member runs on this
 machine; its manager may run on another one, since cargo-handler joins session ids across machines,
 so a showrunner is named by its production's update timer wherever it runs. cargo-handler polls this every 30
 seconds, so it never prompts and answers well under a second. A source that cannot be read
@@ -38,14 +39,18 @@ import sys
 from pathlib import Path
 from typing import Literal, TypedDict, cast
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "message"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.astra import astra_roles  # noqa: E402
-import showrunners  # noqa: E402
+from scripts.production import staff, staff_sources
+from scripts.production import showrunners  # noqa: E402
+import showrunner_tree
 import unit_lookup  # noqa: E402
 import unit_runs  # noqa: E402
 from sessions import running_sessions  # noqa: E402
+import roster  # noqa: E402
 
 Role = Literal["showrunner", "unit", "impl", "test", "review", "fix", "astra-designer", "astra-reviewer"]
 WORKER_ROLES: tuple[Role, ...] = ("impl", "test", "review", "fix")
@@ -107,29 +112,39 @@ def showrunner_sessions() -> dict[str, str]:
     return found
 
 
-def showrunner_edges(sessions: dict[str, str], running: set[str]) -> list[Edge]:
+def showrunner_edges(sessions: dict[str, str], running: set[str], record: staff.StaffSnapshot) -> list[Edge]:
     return [
         Edge(manager=sessions[parent], member=sessions[child], role="showrunner")
-        for child, parent in sorted(showrunners.edges(set(sessions)).items())
+        for child, parent in sorted(showrunner_tree.edges(set(sessions), record=record).items())
         if sessions[child] in running
     ]
 
 
-def marked_units() -> unit_lookup.MarkedProductions | None:
+def marked_units(*, record: staff.StaffSnapshot | None = None) -> unit_lookup.MarkedProductions | None:
     try:
-        return unit_lookup.every_marked_unit()
+        return unit_lookup.every_marked_unit(record=record)
     except OSError as error:
         _warn(f"unit marks unreadable: {error}")
         return None
 
 
-def unit_edges(sessions: dict[str, str], running: set[str], marked: unit_lookup.MarkedProductions) -> list[Edge]:
+def unit_edges(sessions: dict[str, str], running: set[str], marked: unit_lookup.MarkedProductions,
+               record: staff.StaffSnapshot) -> list[Edge]:
+    managers: dict[staff.StaffId, str] = {}
+    for slug, row in staff_sources.showrunner_members(record).items():
+        if slug in sessions:
+            managers[row.id] = sessions[slug]
     edges: list[Edge] = []
     for slug, units in sorted(marked.units.items()):
-        manager = sessions.get(slug, "")
         for unit in sorted(units):
             claude = units[unit].claude
-            if manager and isinstance(claude, unit_lookup.LiveClaude) and claude.session_id in running:
+            if not isinstance(claude, unit_lookup.LiveClaude) or claude.session_id not in running:
+                continue
+            found = staff_sources.member(staff_sources.ObservedUnit(unit, units[unit].staff_id), record)
+            if isinstance(found, staff_sources.NoSuchMember) or found.row.parent is None:
+                continue
+            manager = managers.get(found.row.parent, "")
+            if manager:
                 edges.append(Edge(manager=manager, member=claude.session_id, role="unit"))
     return edges
 
@@ -147,20 +162,20 @@ def _server_running(run: Path) -> bool:
     return True
 
 
-def _worker_role(name: str, entry: dict[str, object]) -> Role | None:
-    """The roster's role, else the role its name ends with, as older rosters name workers."""
-    role = entry.get("role")
-    suffix = name.rpartition("-")[2]
-    return next((known for known in WORKER_ROLES if known in (role, suffix)), None)
+def _worker_role(entry: dict[str, object]) -> roster.WorkerRoleState:
+    """The stored assignment; a name supplies no assignment."""
+    return roster.worker_role(entry)
 
 
 def _codex_edges(director: str, run: Path) -> list[Edge]:
     edges: list[Edge] = []
-    for name, value in sorted(_json_object(run / ROSTER_FILE).items()):
+    records = _json_object(run / ROSTER_FILE)
+    for name in sorted(records):
+        value = records[name]
         entry = cast(dict[str, object], value) if isinstance(value, dict) else {}
         thread = entry.get("thread_id")
-        role = _worker_role(name, entry)
-        if isinstance(thread, str) and thread and role and entry.get("status") not in ENDED_STATUSES:
+        role = _worker_role(entry)
+        if isinstance(thread, str) and thread and isinstance(role, str) and entry.get("status") not in ENDED_STATUSES:
             edges.append(Edge(manager=director, member=thread, role=role))
     return edges
 
@@ -286,10 +301,20 @@ def worker_edges(running: set[str], astra_threads: set[str] | None = None) -> li
 def tree() -> list[Edge]:
     running = {record["sessionId"] for record in running_sessions()}
     sessions = showrunner_sessions()
-    marked = marked_units()
+    marked = None
     astra = astra_edges()
-    managed: list[Edge] = [*unit_edges(sessions, running, marked), *reviewer_edges(running, marked)] if marked is not None else []
-    return [*showrunner_edges(sessions, running), *managed,
+    showrunner: list[Edge] = []
+    directors: list[Edge] = []
+    try:
+        record = staff.snapshot()
+        marked = marked_units(record=record)
+        showrunner = showrunner_edges(sessions, running, record)
+        if marked is not None:
+            directors = unit_edges(sessions, running, marked, record)
+    except staff.StaffUnreadable as error:
+        _warn(f"staff unreadable: {error}")
+    reviewers = reviewer_edges(running, marked) if marked is not None else []
+    return [*showrunner, *directors, *reviewers,
             *worker_edges(running, {edge["member"] for edge in astra}), *astra]
 
 

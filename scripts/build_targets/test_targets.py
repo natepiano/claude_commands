@@ -279,18 +279,18 @@ class TargetStateTests(IsolatedTargetTest):
     def test_local_eta_is_expected_release(self) -> None:
         self.write_holder(END.isoformat())
         self.assertEqual(targets.target_state(targets.LocalTarget("natedev", "linux")),
-                         targets.Held("hana", "render checks", SINCE, targets.ReleaseEstimated(END)))
+                         targets.Held("hana", "render checks", SINCE, targets.ReleaseEstimated(END), targets.HolderSession("hana")))
 
     def test_local_without_eta_is_held_until_release(self) -> None:
         self.write_holder()
         self.assertEqual(targets.target_state(targets.LocalTarget("natedev", "linux")),
-                         targets.Held("hana", "render checks", SINCE, targets.UntilReleased()))
+                         targets.Held("hana", "render checks", SINCE, targets.UntilReleased(), targets.HolderSession("hana")))
 
     def test_past_local_eta_does_not_release_hold(self) -> None:
         eta = NOW - timedelta(minutes=1)
         self.write_holder(eta.isoformat())
         self.assertEqual(targets.target_state(targets.LocalTarget("natedev", "linux")),
-                         targets.Held("hana", "render checks", SINCE, targets.ReleaseEstimated(eta)))
+                         targets.Held("hana", "render checks", SINCE, targets.ReleaseEstimated(eta), targets.HolderSession("hana")))
 
     def test_mac_without_block_or_claim_is_free(self) -> None:
         self.assertEqual(targets.target_state(self.mac()), targets.Free())
@@ -298,7 +298,7 @@ class TargetStateTests(IsolatedTargetTest):
     def test_mac_active_block_expires_at_recorded_time(self) -> None:
         self.write_block()
         self.assertEqual(targets.target_state(self.mac()),
-                         targets.Held("hana", "render checks", SINCE, targets.ExpiresAt(END)))
+                         targets.Held("hana", "render checks", SINCE, targets.ExpiresAt(END), targets.HolderSession("hana-session")))
 
     def claim_mac(self) -> tuple[int, str]:
         args = mac_test.CliArguments()
@@ -323,7 +323,7 @@ class TargetStateTests(IsolatedTargetTest):
         block = self.mac_state / "block.json"
         before = block.read_bytes()
         state = targets.target_state(self.mac())
-        self.assertEqual(state, targets.Held("hana", "render checks", SINCE, targets.AwaitingBlockRemoval()))
+        self.assertEqual(state, targets.Held("hana", "render checks", SINCE, targets.AwaitingBlockRemoval(), targets.HolderSession("hana-session")))
         self.assertEqual(block.read_bytes(), before)
         self.assertEqual(self.claim_mac(), (10, "blocked by hana: render checks\n"))
 
@@ -355,7 +355,7 @@ class TargetStateTests(IsolatedTargetTest):
     def test_mac_block_expires_at_current_time(self) -> None:
         self.write_block(NOW)
         state = targets.target_state(self.mac())
-        self.assertEqual(state, targets.Held("hana", "render checks", SINCE, targets.AwaitingBlockRemoval()))
+        self.assertEqual(state, targets.Held("hana", "render checks", SINCE, targets.AwaitingBlockRemoval(), targets.HolderSession("hana-session")))
         self.assertEqual(self.claim_mac(), (10, "blocked by hana: render checks\n"))
 
     def test_live_claim_is_running(self) -> None:
@@ -379,6 +379,20 @@ class TargetStateTests(IsolatedTargetTest):
                 targets.RunningJob("nextest hana", SINCE, targets.NOT_SEEN_IDLE),
                 targets.RunningJob("nextest cargo-liner", later, targets.IdleSince(END)),
             )))
+
+    def test_identical_running_descriptions_keep_each_claims_holder_session(self) -> None:
+        for name, session_id in (("first", "report-session"), ("second", "inspector-session")):
+            self.write_claim(f"claims/{name}.json")
+            path = self.mac_state / "claims" / f"{name}.json"
+            record = cast(dict[str, object], json.loads(path.read_text()))
+            record["holder_session"] = session_id
+            _ = path.write_text(json.dumps(record))
+        with mock.patch.object(mac_test, "process_start_time", return_value="test-run-start"):
+            state = targets.target_state(self.mac())
+        self.assertEqual(state, targets.Running((
+            targets.RunningJob("nextest hana", SINCE, targets.NOT_SEEN_IDLE, targets.HolderSession("report-session")),
+            targets.RunningJob("nextest hana", SINCE, targets.NOT_SEEN_IDLE, targets.HolderSession("inspector-session")),
+        )))
 
     def test_ended_repository_claim_leaves_only_live_jobs(self) -> None:
         record: ClaimRecord = {
@@ -418,7 +432,7 @@ class TargetStateTests(IsolatedTargetTest):
         self.write_claim()
         with mock.patch("mac_test.process_start_time", return_value="test-run-start"):
             self.assertEqual(targets.target_state(self.mac()),
-                             targets.Held("hana", "render checks", SINCE, targets.ExpiresAt(END)))
+                             targets.Held("hana", "render checks", SINCE, targets.ExpiresAt(END), targets.HolderSession("hana-session")))
 
     def test_retained_expired_block_precedes_live_claim(self) -> None:
         self.write_block(NOW - timedelta(seconds=1))
@@ -533,7 +547,7 @@ class TargetStateTests(IsolatedTargetTest):
         self.assertEqual(targets.target_state(self.mac()), targets.Free())
         self.write_block()
         self.assertEqual(targets.target_state(self.mac()),
-                         targets.Held("hana", "render checks", SINCE, targets.ExpiresAt(END)))
+                         targets.Held("hana", "render checks", SINCE, targets.ExpiresAt(END), targets.HolderSession("hana-session")))
 
 
 class ValueTests(unittest.TestCase):

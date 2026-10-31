@@ -1,5 +1,8 @@
 # Review pool
 
+The pool no longer takes reviews. Unit directors use `assign.sh --role review`.
+The code and historical procedures below remain until the next phase removes them.
+
 ## What it is
 
 Each production has its own pool of long-lived, read-only Codex reviewers. A unit that needs a review calls a script, which hands it a reviewer at once. Each unit has a permanent reviewer per type: its first review forks one from the type's template, and every later review resumes that same thread, so the reviewer keeps building context about the unit's work across phases and plans. When every reviewer of the unit is busy, the pool forks the unit's newest reviewer, and the fork stays as the unit's second reviewer. A reviewer ends only when its unit is retired, `migrate` finds its unit gone, or the pool stops. A second reviewer type judges screenshots; it runs in shadow beside the Claude design-check helper until the user adopts it.
@@ -11,15 +14,15 @@ Each production has its own pool of long-lived, read-only Codex reviewers. A uni
 | File | Role |
 | --- | --- |
 | `scripts/direct/review_pool.py` | The pool CLI: templates, reviewers, unit leases, re-pointing, retire, migrate, stop, and the standing prompt each template is primed from |
-| `scripts/direct/review.sh` | The review launcher; its `--pool` path allocates, runs and records one review turn |
+| `scripts/direct/review.sh` | Uses unit reviewers; legacy code flags are ignored and UI flags refuse |
 | `scripts/direct/review_pool_report.py` | The cost and quality report over turn records, and `--shadow` |
 | `scripts/agents/codex_mesh.py` | The Codex mesh; `prime`, `fork`, `set-instructions` and three `follow` flags exist for the pool |
-| `config/review_pool/code.md` | Standing instructions of the code reviewer |
+| `config/review/code.md` | Standing instructions of the code reviewer |
 | `config/review_pool/ui.md` | Standing instructions of the UI reviewer |
 | `commands/unit/direct.md` | The unit director's side: pool form of each review launch, <UXReview/> |
 | `docs/direct/dual_review.md` | Pool prompt opening, pool launch call, cancel through the slot file |
 | `docs/direct/phase_end.md` | States that a pooled reviewer belongs to the unit and stays at phase end |
-| `docs/production_format.md` | Words, the `**Review pool:**` line, `retire` before a unit is marked retired, <ProductionUnit/> items 3 and 16 |
+| `docs/production_format.md` | Defines unit-owned reviewers and the unit lifecycle |
 | `commands/showrunner/produce.md` | `retire` for a retired unit, `stop` at wrap |
 
 ### State
@@ -110,7 +113,7 @@ Lens `ux` with no pool is accepted. From there the launcher:
 3. For `ui`, reads `${SESSION_DIR}/ux_shots_${PASS_INDEX}.txt`, one path per line, into `--image` arguments. An unreadable file (`ERROR: UI shots file is unreadable: <path>.`) or one with no paths (`ERROR: UI shots file has no paths: <path>.`) exits 1 before allocation.
 4. Runs `review_pool.py allocate --production <slug> --type <type> --unit <unit> --phase <phase> --pass <pass_index> [--lens L] --pid $$`. A failure prints `ERROR: pool allocation failed: <the pool's last stderr line>; see <log>.` and exits 1 with no turn; the log is `review_agent_<N>[_<lens>]-pool.log`.
 5. Takes `reviewer`, `mesh_dir`, `thread_id`, `lease_ordinal` and `prime_hash` from the allocation line. Its slot is `pool_<reviewer>`: exported as `UNIT_TEAM_ROLE` and written as one line to the slot file, since the slot is known only after allocation and the unit director needs it to cancel.
-7. Claims the reviewer in the pool's `mesh_dir` (`can-follow --claim-pid $$`), compacting it first when its recorded context is an integer over `UNIT_COMPACT_ABOVE_TOKENS` (100000 in `config/direct.conf`). Roster, compaction, claim and claim release use the pool's `mesh_dir`; status file, findings, agent log, heartbeat, board and pass stay in the unit's `${SESSION_DIR}`.
+7. Claims the reviewer in the pool's `mesh_dir` (`can-follow --claim-pid $$`), compacting it first when its recorded context is an integer over `UNIT_COMPACT_ABOVE_TOKENS` (100000 in `config/direct.conf`). Compaction exit 3 (live turn) or 4 (roster changed) refuses the follow-up; exit 4 advises inspection and same-thread `reopen` when idle. Other compaction failures allow the follow-up. Roster, compaction, claim and claim release use the pool's `mesh_dir`; status file, findings, agent log, heartbeat, board and pass stay in the unit's `${SESSION_DIR}`.
 8. Records the review pass under its slot, except for lens `ux` (`record_pass_start` returns at once, with a pool and without one): the unit director's `UX review` activity already carries that time, and a pass would count it twice. An early launch defers the pass until its sentinel file appears, as on the assigned path; it checks for the file every `UNIT_EARLY_POLL_SECS` (default 5 s; tests set it small).
 9. Runs `codex_mesh.py follow --session-dir <mesh_dir> --to <reviewer> --claim-pid $$ --role review [--lens L] --cwd "${WORKING_DIR}" --read-only [--image …] --message-file … --summary-file <findings> --reply-file … --log-file … --model … --effort … --service-tier …` with the review model, effort and tier.
 10. After the turn, checks that the working tree is unchanged, counts the findings, writes `reviewed` or `error` to the status file and closes the pass (`finish-pass --status completed` or `error`).
@@ -148,7 +151,7 @@ A `--pool` launch and a `--to` launch each write one new file per attempt, inclu
 
 ### Prompts
 
-A reviewer's standing instructions come from its template, or from its latest re-point, and reach every turn of its thread. `config/review_pool/code.md` holds the role line, the Three Gods sentence, `type_design.md` verbatim and the Rust style guide's rule headings with each rule's file path. `config/review_pool/ui.md` holds the UI reviewer's whole procedure: the role line, the Three Gods sentence, the UX checklist with each rule file's name, the judging steps (shrink each shot, check that the shots cover every state the context names, propose canonical candidates only for empty slots, measure contrast and text size with `measure_text.py`, normalise sizes to a 1440×900 window, confirm each defect against the rule's included text) and the report format (`Verdict: pass | defects`, the `| Shot | Rule | Defect | Fix |` table, canonical candidates). It tells the reviewer not to load command or rule files; the rule texts come with the standing prompt (Review unit director and review memory). Neither file holds review memory.
+A reviewer's standing instructions come from its template, or from its latest re-point, and reach every turn of its thread. `config/review/code.md` holds the role line, the Three Gods sentence, `type_design.md` verbatim and the Rust style guide's rule headings with each rule's file path. `config/review_pool/ui.md` holds the UI reviewer's whole procedure: the role line, the Three Gods sentence, the UX checklist with each rule file's name, the judging steps (shrink each shot, check that the shots cover every state the context names, propose canonical candidates only for empty slots, measure contrast and text size with `measure_text.py`, normalise sizes to a 1440×900 window, confirm each defect against the rule's included text) and the report format (`Verdict: pass | defects`, the `| Shot | Rule | Defect | Fix |` table, canonical candidates). It tells the reviewer not to load command or rule files; the rule texts come with the standing prompt (Review unit director and review memory). Neither file holds review memory.
 
 On every design check the unit director writes two prompts (<UXReview/> step 3): `${SESSION_DIR}/ux_prompt_<pass>_helper.md`, the Claude helper's prompt that points at `commands/ux_eval.md`, and `ux_prompt_<pass>_pool.md`, which opens "Judge these shots by your standing instructions, which hold the rules and the report format:" and carries the shots, scale, context and production rules. The pool is launched with the pool file, so a pooled UI turn reads no rule or command file; it may still read `measure_text.py`'s source for its flags.
 
@@ -156,7 +159,7 @@ A pool code review prompt opens with the pooled-reviewer line (unit, phase, `Re-
 
 ### Priming
 
-No unit runs the pool, and no file holds review memory. Each permanent reviewer keeps its own thread of the reviews it did (user, 2026-10-19: "each individual reviewer needs to manage it's own reviews"). `review_pool.standing_prompt` builds a type's prompt on every allocate, from `REVIEW_POOL_CONFIG` (default `config/review_pool/`):
+No unit runs the pool, and no file holds review memory. Each permanent reviewer keeps its own thread of the reviews it did (user, 2026-10-19: "each individual reviewer needs to manage it's own reviews"). `review_pool.standing_prompt` builds a type's prompt on every allocate. Each type has a default base file: `code` uses `config/review/code.md`; `ui` uses `config/review_pool/ui.md`. A non-empty `REVIEW_POOL_CONFIG` replaces the folder for both types, so the base file is `<REVIEW_POOL_CONFIG>/<type>.md`. The prompt contains:
 
 - `code`: `code.md`.
 - `ui`, in order:
@@ -256,7 +259,7 @@ A rule stated with its mechanism above is not repeated here.
 **Numbers**
 
 - The prompt cache is per thread. First request after a new fork: 12,372 uncached / 11,392 cached / 8 output = 12,982 weighted tokens; on a thread that already held the prompt, 212 / 23,552 / 9 = 1,435. A fork took 0.189 s. This is one measured pair (2026-10-12, Codex CLI 0.162.1, `gpt-6.1-sol` weights uncached 1, cached 0.05, output 5; the run is recorded in `docs/as-built/review-pool-probes.md`), not a standing guarantee of cache behavior.
-- `config/review_pool/code.md` stays under 7 KB. `ui.md` holds the whole judging procedure and measures 8,376 bytes; `standing/ui.md` adds every rule's full text.
+- `config/review/code.md` stays under 7 KB. `ui.md` holds the whole judging procedure and measures 8,376 bytes; `standing/ui.md` adds every rule's full text.
 - A pooled UI turn with the rules in its standing prompt (2026-10-13: scratch pool, hana guide, 30 rules, one stored shot) read neither `ux_eval.md` nor a rule file, `--shadow` gave `pool missed defects: 0`, and it cost 79,903 weighted tokens in 6 requests against 102,264 in 8 for a turn that read them.
 
 **Mesh**
@@ -303,7 +306,7 @@ A reason given beside its mechanism above is not repeated here.
 - **Names are never reused.** A process still attached to a retired thread can point a reused name back at it.
 - **A failed `stop` keeps the `stopping` marker.** Clearing it would leave no later `stop` able to reach the ended lifetime's server.
 - **The launcher leaves its pass open on a signal.** If it closed the pass, the unit director's cancel call would fail on a closed pass.
-- **The pool prompt says `As in your standing instructions.` and names no file.** A reviewer holds the text it was last pointed at, which `config/review_pool/code.md` may no longer match.
+- **The pool prompt says `As in your standing instructions.` and names no file.** A reviewer holds the text it was last pointed at, which `config/review/code.md` may no longer match.
 - **Cost comes from the usage store.** It already holds every request with its model, time and compactions for both machines, so reading rollout files through `scripts/usage/rollouts.py` was ruled out.
 - **The pooled UI reviewer's standing prompt holds the rule texts.** A prompt that names `commands/ux_eval.md` and the rule files has them read again on every turn; with the texts standing, the turn reads none and cost about 22% fewer weighted tokens (Numbers).
 - **Design decisions come from the production's repository, never from the guide.** It is the file the helper's `ux_eval.md` reads; taking it from the guide would make the helper and the pool judge against different exceptions.
@@ -333,3 +336,12 @@ A reason given beside its mechanism above is not repeated here.
 - `scripts/agents/test_codex_mesh.py`, with a fake app-server, covers `prime`, `fork`, `set-instructions`, `reset`, the three `follow` flags, and standing instructions restored on resume, fork, compact and a replaced thread.
 - `scripts/production/test_review_unit_phase.py` (3 tests): the standing phase reads as `1 of 1`, running; a resume adds no run and no phase; shutdown finishes the run while the plan heading stays `todo`.
 - `scripts/direct/test_progress_history.py` covers the `UX review` activity's time.
+
+
+Reviewer transfer takes unit ledgers before the pool lock, then the shared
+worker lifecycle locks for the source reviewer and destination worker in sorted
+`(session, name)` order. The lifecycle fence covers source identity validation,
+queue transfer and writer release through destination publication and recovery.
+Inbox acquisition during adoption remains nonblocking. Ordinary worker turn
+watching never holds the lifecycle lock; the lock order is ledger, design/pool,
+lifecycle, inbox, roster.

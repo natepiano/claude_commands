@@ -27,8 +27,8 @@ from typing import Literal, NotRequired, TypedDict, cast
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.accounts import accounts  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
-import agent_accounts  # noqa: E402
-import note_file  # noqa: E402
+from scripts.whoami import agent_accounts  # noqa: E402
+from scripts.whoami import note_file  # noqa: E402
 
 # The alias loop in the nixos shell module reads the notes folder; its path is the marker.
 ALIAS_LOOP_MARKER = "hanadocs/agents/claude"

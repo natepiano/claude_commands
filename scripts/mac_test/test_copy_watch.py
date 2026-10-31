@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
+import select
 import signal
 import subprocess
 import sys
@@ -151,6 +152,24 @@ class LineKindTests(unittest.TestCase):
         for line, kind in cases.items():
             with self.subTest(line=line):
                 self.assertEqual(copy_watch.line_kind(line), kind)
+
+
+class WakeupTests(unittest.TestCase):
+    def test_unknown_repository_checks_parent_within_one_second(self) -> None:
+        with mock.patch.object(os, "getppid", return_value=100) as parent:
+            wakeup = copy_watch.Wakeup(7)
+
+            def parent_exits(readers: list[int], writers: list[int], errors: list[int],
+                             timeout: float) -> tuple[list[int], list[int], list[int]]:
+                self.assertEqual((readers, writers, errors), ([7], [], []))
+                self.assertLessEqual(timeout, 1.0)
+                parent.return_value = 200
+                return ([], [], [])
+
+            with mock.patch.object(select, "select", side_effect=parent_exits) as sleep:
+                report = copy_watch.wait_for_stop(wakeup)
+            self.assertEqual(sleep.call_count, 1)
+            self.assertEqual(report, copy_watch.WatchReport("", 0.0, 0, ""))
 
 
 class StepProgressTests(unittest.TestCase):
@@ -344,6 +363,11 @@ class CopyWatchProcessTests(unittest.TestCase):
         return self.step
 
     def start_watcher(self, modes: str, *, filter_run: bool = False, call_started: str = "1000.5") -> None:
+        arguments = self.watcher_arguments(filter_run=filter_run, call_started=call_started)
+        self.watcher = subprocess.Popen(arguments, env={**self.environment, "TEST_COPY_MODES": modes},
+                                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+
+    def watcher_arguments(self, *, filter_run: bool = False, call_started: str = "1000.5") -> list[str]:
         arguments = [
             sys.executable, str(SCRIPT),
             "--info", str(self.info), "--result", str(self.result), "--runner", str(self.runner),
@@ -353,8 +377,7 @@ class CopyWatchProcessTests(unittest.TestCase):
         if filter_run:
             arguments.append("--filter-run")
         arguments += ["--", "--no-fail-fast", "--workspace"]
-        self.watcher = subprocess.Popen(arguments, env={**self.environment, "TEST_COPY_MODES": modes},
-                                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        return arguments
 
     def wait_until(self, condition: Callable[[], bool], what: str) -> None:
         deadline = time.monotonic() + HANG_GUARD_S
@@ -561,6 +584,56 @@ class CopyWatchProcessTests(unittest.TestCase):
         _ = watcher.communicate(timeout=HANG_GUARD_S)
         self.assertLess(time.monotonic() - started, 5.0)
         self.assertEqual(self.result.read_text(), "copy=\ncopy_s=\ncopy_count=\nnatedev_s_at_end=\n")
+
+    def assert_parent_loss_stops_watcher(self, *, running_copy: bool) -> None:
+        if not running_copy:
+            claims = self.state / "claims"
+            claims.mkdir(parents=True)
+            _ = (claims / "repo.json").write_text(self.environment["TEST_BUSY_CLAIM"])
+        _ = self.start_step()
+        self.result = self.root / "removed-results" / "result"
+        self.result.parent.mkdir()
+        # The watcher and its runner inherit this parent's output pipe. EOF
+        # proves they closed it; cleanup owns only this new process group.
+        parent: subprocess.Popen[str] = subprocess.Popen([
+            sys.executable, "-c",
+            "import signal, subprocess, sys\n"
+            + "child = subprocess.Popen(sys.argv[1:])\n"
+            + "print(child.pid, flush=True)\n"
+            + "signal.pause()\n",
+            *self.watcher_arguments(),
+        ], env={**self.environment, "TEST_COPY_MODES": "hold"},
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, start_new_session=True)
+        try:
+            assert parent.stdout is not None
+            watcher_pid = int(cast(str, parent.stdout.readline()))
+            _ = (self.root / "compile").write_text("go\n")
+            if running_copy:
+                self.wait_until((self.root / "runner-ready").exists, "the copy to run")
+            else:
+                self.wait_until(self.candidate().exists, "the watcher to be ready")
+            self.result.parent.rmdir()
+            started = time.monotonic()
+            parent.kill()
+            output, _ = parent.communicate(timeout=4.0)
+            self.assertLess(time.monotonic() - started, 4.0)
+            self.assertNotIn("Traceback", output)
+            self.assertTrue(self.result.exists())
+            self.assertFalse(self.candidate().exists(), f"watcher {watcher_pid} left its candidate")
+            if running_copy:
+                self.assertTrue((self.root / "runner-stopped").exists())
+        finally:
+            try:
+                os.killpg(parent.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            _ = parent.communicate(timeout=HANG_GUARD_S)
+
+    def test_parent_killed_ends_the_watcher_at_once(self) -> None:
+        self.assert_parent_loss_stops_watcher(running_copy=False)
+
+    def test_parent_killed_stops_a_running_copy(self) -> None:
+        self.assert_parent_loss_stops_watcher(running_copy=True)
 
 
 if __name__ == "__main__":

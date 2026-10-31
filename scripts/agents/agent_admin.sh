@@ -4,6 +4,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/agents_config.sh"
+# Every edit below publishes through agents_registry_store; no separate writer.
 
 # Unique skill names (the functions in [assignments]), sorted.
 list_skills() {

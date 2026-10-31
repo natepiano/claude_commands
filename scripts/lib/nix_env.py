@@ -8,16 +8,14 @@ No envrc means the caller's environment is retained, without running direnv.
 """
 from __future__ import annotations
 
-import json
 import os
-import shlex
 import stat
-import subprocess
 import sys
-from collections.abc import Mapping
-from dataclasses import dataclass
 from pathlib import Path
-from typing import cast
+from typing import TYPE_CHECKING, NamedTuple, cast
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
 
 if __name__ == "nix_env":
     _ = sys.modules.setdefault("scripts.lib.nix_env", sys.modules[__name__])
@@ -31,19 +29,16 @@ HEAL_SESSION_ENV = "NIX_HEAL_PREPARED_SESSION"
 HEAL_DIRECTORY_ENV = "NIX_HEAL_PREPARED_DIRECTORY"
 
 
-@dataclass(frozen=True)
-class Loaded:
+class Loaded(NamedTuple):
     env: dict[str, str]
     envrc: Path
 
 
-@dataclass(frozen=True)
-class NoEnvrc:
+class NoEnvrc(NamedTuple):
     env: dict[str, str]
 
 
-@dataclass(frozen=True)
-class Refused:
+class Refused(NamedTuple):
     reason: str
 
 
@@ -116,19 +111,33 @@ def ensure(directory: Path, base_env: Mapping[str, str] = os.environ) -> Loaded 
         environment = dict(base_env)
         if envrc is None:
             return NoEnvrc(environment)
+        # Avoid subprocess's startup cost when no envrc needs loading.
+        import subprocess
+
         trusted = trusted_envrc(envrc)
         commands = (["direnv", "allow", str(envrc)], ["direnv", "export", "json"]) if trusted else (
             ["direnv", "export", "json"],)
         exported = ""
-        for command in commands:
-            result = subprocess.run(command, cwd=directory, env=environment, capture_output=True,
-                                    text=True, timeout=TIMEOUT_SECONDS, check=False)
-            if result.returncode:
-                reason = last_line(result.stderr, f"direnv exit {result.returncode}")
-                if not trusted and any(word in result.stderr.lower() for word in ("not allowed", "blocked", "denied")):
-                    reason += "; run " + shlex.join(["direnv", "allow", str(envrc)])
-                return Refused(f"nix_env: {directory}: {reason}")
-            exported = result.stdout
+        try:
+            for command in commands:
+                result = subprocess.run(command, cwd=directory, env=environment, capture_output=True,
+                                        text=True, timeout=TIMEOUT_SECONDS, check=False)
+                if result.returncode:
+                    reason = last_line(result.stderr, f"direnv exit {result.returncode}")
+                    if not trusted and any(word in result.stderr.lower() for word in ("not allowed", "blocked", "denied")):
+                        # Pay shlex's startup cost only for an explicit approval hint.
+                        import shlex
+
+                        reason += "; run " + shlex.join(["direnv", "allow", str(envrc)])
+                    return Refused(f"nix_env: {directory}: {reason}")
+                exported = result.stdout
+        except subprocess.TimeoutExpired as error:
+            detail = error.stderr
+            stderr = detail.decode(errors="replace") if isinstance(detail, bytes) else detail or ""
+            return Refused(f"nix_env: {directory}: " + last_line(stderr, "direnv timed out after 600 s"))
+        # Pay JSON's startup cost only when decoding an envrc export.
+        import json
+
         # direnv's no-update path succeeds without emitting an export object.
         diff: object = json.loads(exported) if exported.strip() else {}
         if not isinstance(diff, dict):
@@ -146,10 +155,6 @@ def ensure(directory: Path, base_env: Mapping[str, str] = os.environ) -> Loaded 
         if not environment.get("IN_NIX_SHELL"):
             return Refused(f"nix_env: {directory}: .envrc loaded but no nix shell (IN_NIX_SHELL unset)")
         return Loaded(environment, envrc)
-    except subprocess.TimeoutExpired as error:
-        detail = error.stderr
-        stderr = detail.decode(errors="replace") if isinstance(detail, bytes) else detail or ""
-        return Refused(f"nix_env: {directory}: " + last_line(stderr, "direnv timed out after 600 s"))
     except (OSError, ValueError) as error:
         return Refused(f"nix_env: {directory}: " + last_line(str(error), type(error).__name__))
 
@@ -160,6 +165,9 @@ def main(arguments: list[str]) -> int:
         if isinstance(outcome, Refused):
             print(outcome.reason, file=sys.stderr)
             return 1
+        # Pay JSON's startup cost only when the CLI serializes an environment.
+        import json
+
         print(json.dumps(outcome.env))
         return 0
     if len(arguments) >= 2 and arguments[0] == "exec":
@@ -171,6 +179,10 @@ def main(arguments: list[str]) -> int:
         if isinstance(outcome, Refused):
             print(outcome.reason, file=sys.stderr)
             return 1
+        if isinstance(outcome, Loaded):
+            outcome.env["NIX_ENV_ENVRC"] = str(outcome.envrc.resolve())
+        else:
+            _ = outcome.env.pop("NIX_ENV_ENVRC", None)
         try:
             os.execvpe(program, arguments[1:], outcome.env)
         except OSError as error:

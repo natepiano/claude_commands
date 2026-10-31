@@ -9,13 +9,17 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import NamedTuple, cast
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from scripts.lib.process_failure import failure_detail
 from production_units import Production, read_production
 from production_units import Refusal, cell_value
-from merge_checkpoint import CodeCheckpoint, MergeEntry, git, merge_branch_history
+from merge_checkpoint import CodeCheckpoint, MergeEntry, git, merge_branch_history, merge_lock
 
 
 class CiDue(NamedTuple):
@@ -78,7 +82,7 @@ def command(step: str, *argv: str, cwd: Path | None = None) -> subprocess.Comple
 
 def required(result: subprocess.CompletedProcess[str], step: str) -> str:
     if result.returncode:
-        raise PointFailure(step, result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}")
+        raise PointFailure(step, failure_detail(result))
     return result.stdout.strip()
 
 
@@ -145,24 +149,57 @@ def ci_start(production: Production, state_dir: Path, no_ci: bool, cancel_prior:
         report("ci start", "ok", "skipped: no CI")
         return
     script = Path(os.environ.get("CI_POINTS_VALIDATE_SCRIPT", str(Path.home() / ".claude/scripts/validate_and_push/validate_and_push.sh")))
-    history = merge_branch_history(production.checkout, production.merge_branch)
+    tip = branch_tip(production)
+    origin = required(git(production.checkout, "remote", "get-url", "origin"), "ci start")
+    push_origin = required(git(production.checkout, "remote", "get-url", "--push", "origin"), "ci start")
+    history = merge_branch_history(production.checkout, tip)
     last_code = next((entry for entry in history.entries if isinstance(entry, MergeEntry) and isinstance(entry.kind, CodeCheckpoint)), None)
     checkpoint = (f"{last_code.unit} phase {last_code.phase}" if isinstance(last_code, MergeEntry)
                   else "production wrap")
-    argv = ("bash", str(script), "--to", production.merge_branch, "--fix-commit",
-            f"ci({production.slug}): validation fixes after {checkpoint}")
-    if cancel_prior:
-        argv += ("--cancel-prior",)
-    result = command("validation", *argv, cwd=production.checkout)
-    if result.returncode:
-        raise PointFailure("validation", result.stderr.strip() or result.stdout.strip() or "validation failed")
-    report("validation", "ok", "local validation passed")
-    run = handoff(result.stdout)
-    tip = branch_tip(production)
-    if run.tip != tip:
-        raise PointFailure("ci start", f"validation ran on {run.tip}; merge branch tip is {tip}")
-    write_json(state_dir / "ci_run.json", {"repo": run.repo, "run_id": run.run_id, "tip": run.tip})
-    report("ci start", "ok", f"run {run.run_id} on {run.tip} ({run.repo})")
+    state_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="ci-point-", dir=state_dir.resolve()) as temporary:
+        checkout = Path(temporary) / "checkout"
+        _ = required(command("ci start", "git", "clone", "--shared", "--no-checkout", "--",
+                             str(production.checkout.resolve()), str(checkout)), "ci start")
+        _ = required(git(checkout, "remote", "set-url", "origin", origin), "ci start")
+        _ = required(git(checkout, "remote", "set-url", "--push", "origin", push_origin), "ci start")
+        _ = required(git(checkout, "checkout", "--detach", tip), "ci start")
+        # A checkout can set its commit identity locally instead of globally.
+        for key in ("user.name", "user.email"):
+            identity = git(production.checkout, "config", "--get", key)
+            if identity.returncode == 0:
+                _ = required(git(checkout, "config", key, identity.stdout.strip()), "ci start")
+        argv = ("env", f"CARGO_TARGET_DIR={checkout / 'target'}", "bash", str(script.resolve()),
+                "--validate-only", "--fix-commit",
+                f"ci({production.slug}): validation fixes after {checkpoint}")
+        result = command("validation", *argv, cwd=checkout)
+        if result.returncode:
+            raise PointFailure("validation", failure_detail(result))
+        validated = required(git(checkout, "rev-parse", "HEAD"), "ci start")
+        push = ("env", f"PUSH_TARGET_BRANCH={production.merge_branch}", f"CI_VALIDATED_BASE={tip}",
+                f"CANCEL_PRIOR={str(cancel_prior).lower()}", "bash",
+                str(script.resolve().with_name("push_direct.sh")))
+        with merge_lock(production.checkout, production.slug):
+            _ = required(git(production.checkout, "fetch", "--no-tags", str(checkout), validated), "validation")
+            if validated != tip:
+                current_branch = required(git(production.checkout, "branch", "--show-current"), "validation")
+                if branch_tip(production) != tip or current_branch != production.merge_branch:
+                    raise PointFailure("validation", "merge branch moved during validation")
+                _ = required(git(production.checkout, "merge", "--ff-only", validated), "validation")
+            published = required(command("validation", *push, "--publish-only", validated,
+                                         cwd=production.checkout), "validation")
+        publication = published.splitlines()[-1].split() if published else []
+        if len(publication) != 2 or publication[1] not in ("pushed", "contained"):
+            raise PointFailure("ci start", "push did not provide a published commit; rerun ci start")
+        followed = required(command("ci start", *push, "--follow-published", *publication,
+                                    cwd=production.checkout), "ci start")
+        run = handoff(followed)
+        if publication[1] == "contained":
+            report("validation", "ok", f"validated {tip}; no push; following {run.tip}")
+        else:
+            report("validation", "ok", f"validated {validated}; fast-forward push to origin/{production.merge_branch}")
+        write_json(state_dir / "ci_run.json", {"repo": run.repo, "run_id": run.run_id, "tip": run.tip})
+        report("ci start", "ok", f"run {run.run_id} on {run.tip} ({run.repo})")
 
 
 def run_view(run: CiRun, checkout: Path) -> dict[str, object]:
@@ -223,7 +260,7 @@ def review_watch(production: Production, state_dir: Path) -> WatchFirstAlert | W
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         watch_result = command("watch", sys.executable, str(review_script), "watch")
         if watch_result.returncode not in (0, 3):
-            raise PointFailure("watch", watch_result.stderr.strip() or watch_result.stdout.strip())
+            raise PointFailure("watch", failure_detail(watch_result))
         line = watch_result.stdout.strip()
         if watch_result.returncode != 3:
             return WatchBelowThreshold(line)

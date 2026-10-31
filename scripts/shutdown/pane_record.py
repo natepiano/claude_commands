@@ -30,22 +30,24 @@ import os
 import subprocess
 import sys
 import tempfile
-from collections.abc import Generator, Mapping, Sequence
+from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TypedDict, cast
+from typing import NotRequired, TypedDict, cast
 
 SCRIPTS = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(SCRIPTS / "herdr"))
 sys.path.insert(0, str(SCRIPTS / "lib"))
 sys.path.insert(0, str(SCRIPTS / "whoami"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 import herdr  # noqa: E402
 from probe_session import PROBE_ENV  # noqa: E402
 
 RECORD_DIR = Path(os.environ.get("HERDR_PANE_RECORD_DIR") or Path.home() / ".local/state/herdr-panes")
 # The launch environment a resume must give back. Credentials never enter the record.
-KEPT_NAMES = frozenset({"ENABLE_TOOL_SEARCH", PROBE_ENV})
+KEPT_NAMES = frozenset({"ENABLE_TOOL_SEARCH", "STAFF_ID", PROBE_ENV})
 KEPT_PREFIXES = ("SHOWRUNNER_",)
 # Claude flags whose value the resume repeats; every other argument stays out of the record.
 NAME_FLAGS = frozenset({"-n", "--name"})
@@ -65,7 +67,7 @@ class PaneLaunch(TypedDict):
     environment: dict[str, str]
     # False when the launch flags could not be read: a restore refuses it.
     flags_read: bool
-    ended: bool
+    ended: NotRequired[bool]
     written_at: str
 
 
@@ -73,13 +75,56 @@ def record_path(session: str) -> Path:
     return RECORD_DIR / f"{session}.json"
 
 
+def _read_entries(session: str) -> dict[str, object]:
+    path = record_path(session)
+    try:
+        value = cast(object, json.loads(path.read_text(encoding="utf-8")))
+    except FileNotFoundError:
+        return {}
+    except ValueError as error:
+        raise ValueError(f"{path}: {error}") from error
+    if not isinstance(value, dict):
+        raise ValueError(f"{path}: pane records must be an object")
+    return cast(dict[str, object], value)
+
+
+def read_strict(session: str) -> dict[str, PaneLaunch]:
+    """Read validated launch evidence; only an absent file means there are no entries."""
+    entries = _read_entries(session)
+    for pane_id, value in entries.items():
+        location = f"{record_path(session)}: pane {pane_id}"
+        if not isinstance(value, dict):
+            raise ValueError(f"{location}: launch must be an object")
+        launch = cast(dict[str, object], value)
+        environment = launch.get("environment")
+        if (not isinstance(launch.get("session_id"), str)
+                or not isinstance(launch.get("written_at"), str)
+                or not isinstance(environment, dict)
+                or not all(isinstance(name, str) and isinstance(setting, str)
+                           for name, setting in cast(dict[object, object], environment).items())):
+            raise ValueError(f"{location}: expected session_id and written_at strings and a string environment")
+    return cast(dict[str, PaneLaunch], entries)
+
+
 def read(session: str) -> dict[str, PaneLaunch]:
     """The session's entries by pane id; an absent or unreadable file reads as none."""
     try:
-        value = cast(object, json.loads(record_path(session).read_text(encoding="utf-8")))
+        return cast(dict[str, PaneLaunch], _read_entries(session))
     except (OSError, ValueError):
         return {}
-    return cast(dict[str, PaneLaunch], value) if isinstance(value, dict) else {}
+
+
+def launches() -> list[PaneLaunch]:
+    """Read retained launches through the same per-session reader as restore."""
+    return [entry for path in RECORD_DIR.glob("*.json") for entry in read(path.stem).values()]
+
+
+def launch_for_session(session_id: str) -> PaneLaunch | None:
+    """Read a conversation's newest launch, including account moves and intentional exits."""
+    matches = [entry for entry in launches() if entry["session_id"] == session_id]
+    if not matches:
+        return None
+    return max(matches, key=lambda entry: entry["written_at"])
 
 
 @contextmanager
@@ -143,18 +188,32 @@ def _environment(parts: Sequence[bytes]) -> dict[str, str]:
 
 def _mac_record(pid: int) -> tuple[list[str], dict[str, str]]:
     # Imported here: the Linux hook never needs the account module.
-    from account import kern_procargs2, procargs2_parts
+    from scripts.whoami.account import kern_procargs2, procargs2_parts
 
     parts = procargs2_parts(kern_procargs2(pid), _needed)
     return list(parts.arguments), parts.environment
 
 
-def _parent(pid: int) -> int:
-    if sys.platform == "darwin":
-        result = subprocess.run(["ps", "-o", "ppid=", "-p", str(pid)], capture_output=True, text=True, check=False)
+def _process_stat(process: Path) -> list[str]:
+    return (process / "stat").read_text().rsplit(")", 1)[1].split()
+
+
+def process_parent(pid: int) -> int:
+    """Read the OS parent; callers decide how unavailable evidence is handled."""
+    if (os.environ.get("HERDR_PLATFORM") or sys.platform) == "darwin":
+        result = subprocess.run([os.environ.get("HERDR_PS", "ps"), "-o", "ppid=", "-p", str(pid)],
+                                capture_output=True, text=True, check=True, timeout=5)
         return int(result.stdout)
-    stat = (PROC / str(pid) / "stat").read_text()
-    return int(stat.rsplit(")", 1)[1].split()[1])
+    return int(_process_stat(Path(os.environ.get("HERDR_PROC") or PROC) / str(pid))[1])
+
+
+def pane_shell_pid(place: herdr.HerdrPlace) -> int:
+    info = herdr.json_object(herdr.Herdr(place.session).result(
+        "pane", "process-info", "--pane", place.pane).get("process_info"), "pane process info")
+    shell = info.get("shell_pid")
+    if isinstance(shell, bool) or not isinstance(shell, int) or shell <= 0:
+        raise ValueError("pane process info: expected a positive shell_pid")
+    return shell
 
 
 def _arguments(pid: int) -> list[str]:
@@ -168,9 +227,9 @@ def claude_arguments(pid: int) -> list[str]:
     """The argv of the nearest Claude process above `pid`; empty when none is found."""
     for _ in range(ANCESTOR_LIMIT):
         try:
-            pid = _parent(pid)
+            pid = process_parent(pid)
             arguments = _arguments(pid)
-        except (OSError, ValueError, IndexError):
+        except (OSError, ValueError, IndexError, subprocess.SubprocessError):
             return []
         if herdr.is_claude_process(arguments):
             return arguments
@@ -224,11 +283,13 @@ def _conversation_of(config_dir: str, pid: int) -> str:
     return session_id if isinstance(session_id, str) else ""
 
 
-def seed(session: str) -> int:
+def seed(session: str, *, select: Callable[[herdr.PaneIdentity], bool] | None = None) -> int:
     """Write the entry of each pane whose foreground runs Claude; name each pane it cannot read."""
     client = herdr.Herdr(session)
     for pane in client.panes():
         pane_id = pane["pane_id"]
+        if select is not None and not select(pane):
+            continue
         context = f"herdr {session}:{pane_id} process info"
         info = herdr.json_object(client.result("pane", "process-info", "--pane", pane_id).get("process_info"), context)
         processes = [herdr.json_object(item, context) for item in herdr.json_items(info.get("foreground_processes"), context)]

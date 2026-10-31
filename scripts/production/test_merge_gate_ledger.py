@@ -14,14 +14,14 @@ from contextlib import redirect_stdout
 from unittest import mock
 from zoneinfo import ZoneInfo
 from scripts.production import merge_gate
-from scripts.production.affected_modules import CertifiedBase, FullSuite
+from scripts.production.affected_modules import CertifiedBase, FullSuite, NoCertifiedBase
 from scripts.buildlog.store import host_name
-from scripts.production.merge_gate_test_support import EXPECTED_SUITES, MergeGateFixture, SUITE_MODULE, gate_suites
+from scripts.production.merge_gate_test_support import FIXTURE_FOLDERS, MergeGateFixture, SUITE_MODULE, gate_suites
 
 
 @final
 class MergeGateLedgerTests(MergeGateFixture):
-    @gate_suites(*EXPECTED_SUITES)
+    @gate_suites(*FIXTURE_FOLDERS)
     def test_clean_pass_records_tree_commit_host_time_checkout_suites_and_source(self) -> None:
         result = self.run_gate("--tests-only")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -68,6 +68,32 @@ class MergeGateLedgerTests(MergeGateFixture):
         when = datetime.fromisoformat(cast(str, record["at"])).astimezone(
             ZoneInfo("America/New_York")).strftime("%Y-%m-%d %H:%M:%S %Z")
         self.assertIn(f"tests reused from {cast(str, record['tree'])[:12]} ({when}, tests-only, {self.checkout})", second.stdout)
+
+    def test_a_changed_suite_set_cannot_reuse_or_certify_an_old_full_pass(self) -> None:
+        first = self.run_gate("--tests-only")
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        original, = self.pass_records()
+        self.write(self.checkout / "scripts" / "added_folder" / "test_added.py", SUITE_MODULE)
+        _ = self.commit(self.checkout, "new test folder")
+        tree = merge_gate.clean_test_tree(self.checkout)
+        folders = sorted([*self.suites, "added_folder"])
+        ledger = merge_gate.PassedTreeLedger(self.checkout, "tests-only", tree, folders)
+        with mock.patch.dict(os.environ, self.environment):
+            # The old full pass cannot certify an ancestor after a folder is added.
+            self.assertIsInstance(ledger.certified_base(), NoCertifiedBase)
+            # A pass from the old gate could have this same tree but omit its new folder.
+            original["tree"] = self.git(self.checkout, "rev-parse", "HEAD^{tree}")
+            self.write(ledger.path, json.dumps(original) + "\n")
+            self.assertFalse(ledger.reuse())
+            self.assertIsInstance(ledger.certified_base(), NoCertifiedBase)
+        self.clear_gate_events()
+        result = self.run_gate("--tests-only")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("tests reused from", result.stdout)
+        self.assertIn("full suite: no certified base", result.stdout)
+        starts = [(row["suite"], row["module"]) for row in self.module_events() if row["event"] == "start"]
+        self.assertCountEqual(starts, [("hooks", "test_first.py"), ("added_folder", "test_added.py")])
+        self.assertEqual(self.pass_records()[-1]["suites"], folders)
 
     def test_checkpoint_reuses_unit_tree_and_still_runs_types_and_checks_settings(self) -> None:
         first = self.run_gate("--tests-only", "--repo", str(self.unit))
@@ -183,7 +209,8 @@ class MergeGateLedgerTests(MergeGateFixture):
 
     @gate_suites("lib", "hooks")
     def test_base_search_uses_only_newest_full_same_host_suite_ancestor_and_accepts_legacy_records(self) -> None:
-        ledger = merge_gate.PassedTreeLedger(self.checkout, "tests-only", merge_gate.clean_test_tree(self.checkout))
+        ledger = merge_gate.PassedTreeLedger(self.checkout, "tests-only", merge_gate.clean_test_tree(self.checkout),
+                                            sorted(self.suites))
         with mock.patch.dict(os.environ, self.environment):
             ledger.record_pass(FullSuite("no certified base"))
             original = self.pass_records()[0]
@@ -320,7 +347,6 @@ class MergeGateLedgerTests(MergeGateFixture):
 
                 output = io.StringIO()
                 with mock.patch.dict(os.environ, self.environment), \
-                        mock.patch.object(merge_gate, "TEST_SUITES", ("hooks",)), \
                         mock.patch.object(merge_gate, "finish_gate_job", side_effect=finish_and_change), redirect_stdout(output):
                     run = merge_gate.run_suites(self.checkout)
                 self.assertTrue(run.passed, output.getvalue())

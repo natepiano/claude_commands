@@ -19,12 +19,15 @@ from typing import cast, override
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from scripts.accounts.home_test_support import scratch_account_home
 from scripts.accounts import accounts, role_map
 from scripts.accounts.nix_env_fake import fake_nix_loader, imports_with_nix_loader
 from scripts.message import sessions
 from scripts.whoami import agent_accounts
 from scripts.whoami.test_agent_accounts import ServiceKeychain, folder_service
-import account
+from scripts.whoami import account
 
 
 def file_state(path: Path) -> tuple[int, int, int, int, int, int]:
@@ -41,7 +44,7 @@ class HomeCutoverTests(unittest.TestCase):
         self.home = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         _ = cast(object, self.enterContext(patch.object(accounts, "import_module", side_effect=imports_with_nix_loader(fake_nix_loader()))))
         _ = self.enterContext(patch.object(sys, "platform", "linux"))
-        self.enterContext(patch.dict(os.environ, {"HOME": str(self.home),
+        self.enterContext(scratch_account_home(self.home, {
             "AGENT_NOTES_DIR": str(self.home / "notes")}, clear=True))
         (self.home / ".claude").mkdir()
         (self.home / "notes").mkdir()
@@ -278,8 +281,8 @@ class CodexHomeCutoverTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.home = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
-        _ = cast(object, self.enterContext(patch.dict(os.environ, {
-            "HOME": str(self.home), "AGENT_NOTES_DIR": str(self.home / "notes")}, clear=True)))
+        _ = cast(object, self.enterContext(scratch_account_home(self.home, {
+            "AGENT_NOTES_DIR": str(self.home / "notes")}, clear=True)))
         _ = self.enterContext(patch.object(role_map, "is_role_map_host", return_value=True))
         self.process_lister = accounts.list_codex_home_processes
         _ = self.enterContext(patch.object(accounts, "list_codex_home_processes", return_value=[]))
@@ -681,17 +684,48 @@ class CodexHomeCutoverTests(unittest.TestCase):
         self.assertIsInstance(accounts.resolve_history_label("~/.claude", "2026-01-01T00:00:00Z"),
                               accounts.HistoricalAccountUnresolved)
 
+    def test_status_reports_one_test_signin_cause_for_an_unnoted_legacy_codex_home(self) -> None:
+        (self.home / "notes/codex2.md").unlink()
+        at = datetime(2026, 10, 29, 1, 14, tzinfo=timezone.utc).timestamp()
+        os.utime(self.source / "auth.json", (at, at))
+        with (patch.object(accounts, "_stored_usage", return_value={}),
+              patch.object(agent_accounts, "user_zone", return_value=timezone.utc)):
+            reading = accounts.read_status(source=accounts.StoredUsageOnly())
+        lines = [line for line in reading.notes if "~/.codex" in line]
+        self.assertEqual(len(lines), 1)
+        self.assertIn("a test wrote ~/.codex/auth.json at 2026-10-29 01:14 UTC", lines[0])
+        self.assertIn("delete ~/.codex/auth.json", lines[0])
+        self.assertNotIn("cutover-home", lines[0])
+        self.assertNotIn("agents/codexN.md", lines[0])
+        self.assertTrue((self.source / "auth.json").exists())
+
+    def test_status_merges_ordinary_unnoted_legacy_codex_repairs_without_changing_launch_error(self) -> None:
+        (self.home / "notes/codex2.md").unlink()
+        original = accounts.unnoted_home_line(self.source, "codex-cutover@example.invalid")
+        # This reserved fixture models a provider login, without a real address.
+        with (patch.object(accounts, "_stored_usage", return_value={}),
+              patch.object(accounts, "is_test_login", return_value=False)):
+            reading = accounts.read_status(source=accounts.StoredUsageOnly())
+        lines = [line for line in reading.notes if "~/.codex" in line]
+        self.assertEqual(len(lines), 1)
+        self.assertIn("this login has no account note", lines[0])
+        self.assertIn("add ~/rust/hanadocs/agents/codexN.md with login: codex-cutover@example.invalid", lines[0])
+        self.assertIn("accounts.py cutover-home <codexN>", lines[0])
+        self.assertEqual(accounts.unnoted_home_line(self.source, "codex-cutover@example.invalid"), original)
+
     def test_status_names_legacy_login_only_until_cutover_and_omits_signed_out_default_row(self) -> None:
-        with patch.object(accounts, "_stored_usage", return_value={}):
+        # This reserved address models a normal provider login for cutover.
+        with (patch.object(accounts, "_stored_usage", return_value={}),
+              patch.object(accounts, "is_test_login", return_value=False)):
             before = accounts.status_report()
-            self.assertIn("~/.codex holds a login; run accounts.py cutover-home codex2", before)
+            self.assertIn("~/.codex still holds a login; run accounts.py cutover-home codex2", before)
             self.assertEqual(self.run_cutover(), 0)
             after = accounts.status_report()
-            self.assertNotIn("~/.codex holds a login", after)
+            self.assertNotIn("~/.codex still holds a login", after)
             self.assertNotIn("~/.codex", [row.folder for row in accounts.codex_statuses(self.target)])
             self.assertIn("~/.codex2", after)
             self.assertEqual(self.run_cutover(undo=True), 0)
-            self.assertIn("~/.codex holds a login; run accounts.py cutover-home codex2", accounts.status_report())
+            self.assertIn("~/.codex still holds a login; run accounts.py cutover-home codex2", accounts.status_report())
 
 
 class CodexCutoverProcessListingTests(unittest.TestCase):
@@ -779,7 +813,7 @@ class MacHomeCutoverTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.home = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
-        self.enterContext(patch.dict(os.environ, {"HOME": str(self.home),
+        self.enterContext(scratch_account_home(self.home, {
             "AGENT_NOTES_DIR": str(self.home / "notes")}, clear=True))
         self.keychain = CutoverKeychain()
         _ = self.enterContext(patch.object(subprocess, "run", side_effect=self.keychain.run))
@@ -1027,7 +1061,7 @@ class MacHomeCutoverTests(unittest.TestCase):
         for stop_after in range(1, len(mutations) + 1):
             with self.subTest(step=stop_after), tempfile.TemporaryDirectory() as directory:
                 self.home = Path(directory).resolve()
-                with patch.dict(os.environ, {"HOME": str(self.home), "AGENT_NOTES_DIR": str(self.home / "notes")}):
+                with scratch_account_home(self.home, {"AGENT_NOTES_DIR": str(self.home / "notes")}, clear=False):
                     self.keychain.entries.clear()
                     self.keychain.calls.clear()
                     self.initialize_home()

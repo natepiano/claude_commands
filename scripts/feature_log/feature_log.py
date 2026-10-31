@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 import json
+import hashlib
 import os
 import re
 import shlex
@@ -16,10 +17,11 @@ from collections.abc import Generator
 from contextlib import contextmanager
 from datetime import date, datetime
 from pathlib import Path
-from typing import Callable, Literal, NamedTuple, NoReturn, TypedDict, cast
+from typing import Callable, Literal, NamedTuple, NoReturn, NotRequired, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from user_zone import user_zone  # noqa: E402
+from atomic_file import write_text_atomic  # noqa: E402
 
 
 class ProjectSpec(NamedTuple):
@@ -196,6 +198,7 @@ class AmendEvent(TypedDict):
     old_completed: str
     new_completed: str
     releases_added: list[str]
+    content: NotRequired[str]
 
 
 class ReleaseEvent(TypedDict):
@@ -984,25 +987,12 @@ def locked() -> Generator[None, None, None]:
 
 def _write_note(path: Path, note: Note) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.tmp")
-    try:
-        _ = temporary.write_text(render_note(note), encoding="utf-8")
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
+    write_text_atomic(path, render_note(note))
 
 
 def _write_json(path: Path, value: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.tmp")
-    try:
-        _ = temporary.write_text(
-            json.dumps(value, separators=(",", ":"), ensure_ascii=False) + "\n",
-            encoding="utf-8",
-        )
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
+    write_text_atomic(path, json.dumps(value, separators=(",", ":"), ensure_ascii=False) + "\n")
 
 
 def _event_time() -> str:
@@ -1058,6 +1048,7 @@ def _amend_event(
         "old_completed": old["completed_date"],
         "new_completed": updated["completed_date"],
         "releases_added": sorted(set(updated["release"]) - set(old["release"])),
+        "content": hashlib.sha256(render_note(updated).encode("utf-8")).hexdigest(),
     }
 
 
@@ -1190,10 +1181,11 @@ def _parse_event(line: str, line_number: int) -> FeatureLogEvent:
             }
         _require_json_keys(
             value,
-            legacy_keys | {"old_link", "new_link", "old_completed", "new_completed", "releases_added"},
+            legacy_keys | {"old_link", "new_link", "old_completed", "new_completed", "releases_added"}
+            | (frozenset({"content"}) if "content" in value else frozenset[str]()),
             "amend event",
         )
-        return {
+        event: AmendEvent = {
             "at": _json_string(value.get("at"), "event at"),
             "verb": "amend",
             "project": _json_string(value.get("project"), "event project"),
@@ -1206,6 +1198,9 @@ def _parse_event(line: str, line_number: int) -> FeatureLogEvent:
             "new_completed": _json_string(value.get("new_completed"), "event new_completed"),
             "releases_added": _json_string_list(value.get("releases_added"), "event releases_added"),
         }
+        if "content" in value:
+            event["content"] = _json_string(value["content"], "amend content")
+        return event
     raise FeatureLogError(f"events.jsonl line {line_number} has unknown verb {verb}")
 
 
@@ -1845,7 +1840,11 @@ def _run_amend(arguments: argparse.Namespace) -> int:
             changed.append("evidence")
 
         if not changed:
-            if not _event_recorded("amend", note["project"], note["title"]):
+            content = hashlib.sha256(render_note(note).encode("utf-8")).hexdigest()
+            previous = next((event for event in reversed(_read_events())
+                             if event["verb"] == "amend" and event["project"] == note["project"]
+                             and event["title"] == note["title"]), None)
+            if previous is None or previous.get("content") != content:
                 _append_event(_amend_event(note, note, backfill, requested_fields))
             print(f"unchanged: {_relative(path)}")
             return 0
@@ -2241,8 +2240,10 @@ def _run_digest(arguments: argparse.Namespace) -> int:
         else:
             since_label = _digest_time_label(_event_time())
         cursor_value: DigestCursor = {"line": len(events), "at": _event_time()}
+        result = _print_digest(selected, since_label)
+        _ = sys.stdout.flush()
         _write_json(state_dir() / "digest.json", cursor_value)
-    return _print_digest(selected, since_label)
+    return result
 
 
 def _github_slug(remote: str) -> str | None:

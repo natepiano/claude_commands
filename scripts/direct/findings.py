@@ -67,6 +67,7 @@ from typing import TypedDict, cast
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import unit_runs  # noqa: E402
 from scripts.history.rounds import phase_rounds  # noqa: E402
+from scripts.usage.agents_log import LENSES as REVIEW_LENSES  # noqa: E402
 
 # What history written before the rename records for a finding a worker caught.
 FORMER_WORKER = "delegate"
@@ -83,9 +84,6 @@ SEVERITIES = ("blocker", "minor", "nit")
 FIRST_ROUND_GATING = ("blocker", "minor")
 LATER_ROUND_GATING = ("blocker",)
 
-# Every lens a finding can name. A closed set for the reason review.sh closes
-# its own: a misspelt lens would be stored, and every count by lens would miss it.
-REVIEW_LENSES = ("adversary", "contract", "craft", "ux")
 # What `--lens` took when the broad review had two lenses; it means
 # adversary,contract, and the ledger keeps the word its callers already write.
 LEGACY_BOTH_LENS = "both"
@@ -1085,8 +1083,11 @@ def _close_route(args: argparse.Namespace) -> None:
     state = _read_state(session_dir, now, _arg_string(args, "phase"))
     source = _required_text(args, "from")
     parts = source.split(":")
-    if len(parts) != 3 or any(not part.strip() for part in parts):
-        raise SystemExit("--from must be <run id>:<phase instance id>:<finding id>")
+    if len(parts) != 3 or not parts[0].strip() or not parts[2].strip():
+        raise SystemExit(
+            "--from must be <run id>:<phase instance id>:<finding id> or <run id>::<finding id>; "
+            + "run id and finding id must not be empty"
+        )
     if _history_file(session_dir) is None:
         raise SystemExit("Start a recorded run before closing routed work")
     _append_event(session_dir, state, {

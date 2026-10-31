@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 import os
 import tempfile
 import unittest
@@ -9,7 +10,9 @@ from pathlib import Path
 from typing import cast, final, override
 from unittest.mock import patch
 
-import note_file
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from scripts.whoami import note_file
 
 
 @final

@@ -3,182 +3,100 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/../lib/test_agents_registry.sh"
 TEST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/agents-config.XXXXXX")"
 trap 'rm -rf "$TEST_DIR"' EXIT
 
 AGENTS_CONFIG_FILE="$TEST_DIR/agents.conf"
-AGENTS_LOCAL_CONFIG_FILE="$TEST_DIR/agents.local.conf"
+AGENTS_CONFIG_PUBLISH=0
 CODEX_CONFIG_FILE="$TEST_DIR/codex.toml"
 CODEX_MODELS_CACHE_FILE="$TEST_DIR/models.json"
 CODEX_CATALOG_SYNC_STATE_FILE="$TEST_DIR/last_success"
-export AGENTS_CONFIG_FILE AGENTS_LOCAL_CONFIG_FILE CODEX_CONFIG_FILE
+export AGENTS_CONFIG_FILE AGENTS_CONFIG_PUBLISH CODEX_CONFIG_FILE
 export CODEX_MODELS_CACHE_FILE CODEX_CATALOG_SYNC_STATE_FILE
 
 touch "$CODEX_CATALOG_SYNC_STATE_FILE"
 
 write_fixture() {
-    # Model editable machine rows above immutable, empty defaults. Deleting a
-    # local override is different from trying to delete a committed default.
-    : > "$AGENTS_CONFIG_FILE"
-    cp "$1" "$AGENTS_LOCAL_CONFIG_FILE"
+    cp "$1" "$AGENTS_CONFIG_FILE"
 }
 
-cat > "$TEST_DIR/base.conf" <<'EOF'
-[assignments]
-alpha=codex
-alpha.claude_task=claude
-bare=codex
-bare_catalog=codex
-bare_catalog_effort=codex
-missing_set=codex
-bad_agent=codex
-bad_effort=codex
-empty_effort=codex
-switchable=codex
-assignable=codex
-editable=codex
-literal=codex
-literalxwork=claude
+write_test_registry "$TEST_DIR/base.conf" --replace-provided-sections --replace-section claude.families \
+    assignments/alpha=codex \
+    assignments/alpha.claude_task=claude \
+    assignments/bare=codex \
+    assignments/bare_catalog=codex \
+    assignments/bare_catalog_effort=codex \
+    assignments/missing_set=codex \
+    assignments/bad_agent=codex \
+    assignments/bad_effort=codex \
+    assignments/empty_effort=codex \
+    assignments/switchable=codex \
+    assignments/assignable=codex \
+    assignments/editable=codex \
+    assignments/literal=codex \
+    assignments/literalxwork=claude \
+    alpha.codex/work=gpt-test:high \
+    alpha.claude/claude_task=opus:max \
+    bare.codex/work=gpt-test \
+    bare_catalog.codex/work=gpt-bare \
+    bare_catalog_effort.codex/work=gpt-bare:high \
+    bad_agent.codex/work=gpt-missing:high \
+    bad_effort.codex/work=gpt-test:xhigh \
+    empty_effort.codex/work=gpt-test: \
+    switchable.codex/work=gpt-test:high \
+    switchable.claude/work=opus:max \
+    switchable.claude/broken=missing:max \
+    assignable.codex/work=gpt-test:high \
+    assignable.claude/work=opus:max \
+    'editable.codex/work=gpt-test:high    # alias: edit' \
+    editable.claude/work=opus:max \
+    literal.codex/work=gpt-test:high \
+    literal.claude/work=opus:max \
+    codex.agents/gpt-test=low,medium,high \
+    codex.agents/gpt-bare= \
+    'codex.agents/gpt\bs=low' \
+    codex.agents/collide=low \
+    claude.agents/opus=low,medium,high,max \
+    claude.agents/collide=low
 
-[alpha.codex]
-work=gpt-test:high
+write_test_registry "$TEST_DIR/list.conf" --replace-provided-sections \
+    assignments/override=codex \
+    assignments/override.work=claude \
+    override.codex/work=gpt-test:high \
+    override.claude/work=opus:max \
+    codex.agents/gpt-test=low,medium,high \
+    claude.agents/opus=low,medium,high,max
 
-[alpha.claude]
-claude_task=opus:max
+write_test_registry "$TEST_DIR/switchall.conf" --replace-provided-sections \
+    assignments/one=codex \
+    assignments/one.work=codex \
+    'assignments/two=codex    # trailing comment' \
+    one.codex/work=gpt-test:high \
+    one.claude/work=opus:max \
+    two.codex/work=gpt-test:high \
+    two.claude/work=opus:max \
+    codex.agents/gpt-test=low,medium,high \
+    claude.agents/opus=low,medium,high,max
 
-[bare.codex]
-work=gpt-test
-
-[bare_catalog.codex]
-work=gpt-bare
-
-[bare_catalog_effort.codex]
-work=gpt-bare:high
-
-[bad_agent.codex]
-work=gpt-missing:high
-
-[bad_effort.codex]
-work=gpt-test:xhigh
-
-[empty_effort.codex]
-work=gpt-test:
-
-[switchable.codex]
-work=gpt-test:high
-
-[switchable.claude]
-work=opus:max
-broken=missing:max
-
-[assignable.codex]
-work=gpt-test:high
-
-[assignable.claude]
-work=opus:max
-
-[editable.codex]
-work=gpt-test:high    # alias: edit
-
-[editable.claude]
-work=opus:max
-
-[literal.codex]
-work=gpt-test:high
-
-[literal.claude]
-work=opus:max
-
-[codex.agents]
-gpt-test=low,medium,high
-gpt-bare=
-gpt\bs=low
-collide=low
-
-[claude.agents]
-opus=low,medium,high,max
-collide=low
-EOF
-
-cat > "$TEST_DIR/list.conf" <<'EOF'
-[assignments]
-override=codex
-override.work=claude
-
-[override.codex]
-work=gpt-test:high
-
-[override.claude]
-work=opus:max
-
-[codex.agents]
-gpt-test=low,medium,high
-
-[claude.agents]
-opus=low,medium,high,max
-EOF
-
-cat > "$TEST_DIR/switchall.conf" <<'EOF'
-[assignments]
-one=codex
-one.work=codex
-two=codex    # trailing comment
-
-[one.codex]
-work=gpt-test:high
-
-[one.claude]
-work=opus:max
-
-[two.codex]
-work=gpt-test:high
-
-[two.claude]
-work=opus:max
-
-[codex.agents]
-gpt-test=low,medium,high
-
-[claude.agents]
-opus=low,medium,high,max
-EOF
-
-cat > "$TEST_DIR/model.conf" <<'EOF'
-[assignments]
-one=claude
-one.work=claude
-two=claude    # trailing comment
-friend=caller
-
-[one.codex]
-work=gpt-test:high
-bare=gpt-test
-
-[one.claude]
-work=opus:max
-bare=opus
-
-[two.codex]
-work=gpt-test:medium    # alias: w
-
-[two.claude]
-work=opus:max
-
-[friend.codex]
-work=gpt-test:high
-
-[friend.claude]
-work=opus:max
-
-[codex.agents]
-gpt-test=low,medium,high
-gpt-new=low,medium,high
-gpt-low=low
-
-[claude.agents]
-opus=low,medium,high,max
-sonnet=low,medium,high,max
-EOF
+write_test_registry "$TEST_DIR/model.conf" --replace-provided-sections \
+    assignments/one=claude \
+    assignments/one.work=claude \
+    'assignments/two=claude    # trailing comment' \
+    assignments/friend=caller \
+    one.codex/work=gpt-test:high \
+    one.codex/bare=gpt-test \
+    one.claude/work=opus:max \
+    one.claude/bare=opus \
+    'two.codex/work=gpt-test:medium    # alias: w' \
+    two.claude/work=opus:max \
+    friend.codex/work=gpt-test:high \
+    friend.claude/work=opus:max \
+    codex.agents/gpt-test=low,medium,high \
+    codex.agents/gpt-new=low,medium,high \
+    codex.agents/gpt-low=low \
+    claude.agents/opus=low,medium,high,max \
+    claude.agents/sonnet=low,medium,high,max
 
 write_fixture "$TEST_DIR/base.conf"
 source "$SCRIPT_DIR/agents_config.sh"
@@ -196,17 +114,7 @@ assert_fails() {
     fi
 }
 
-# Overlay writers preserve rows, while section order and comments belong to
-# the committed defaults. Compare the effective records, including every row,
-# so an unexpected change outside the requested edit still fails the test.
-registry_records() {
-    awk '
-        { sub(/#.*/, ""); gsub(/^[[:space:]]+|[[:space:]]+$/, "") }
-        /^\[/ { section = $0; next }
-        NF { print section " " $0 }
-    ' | LC_ALL=C sort
-}
-
+# Compare every semantic row so edits outside the requested target fail.
 assert_registry_matches() {
     diff -u <(registry_records < "$1") <(agents_registry_text | registry_records)
 }
@@ -215,41 +123,27 @@ test_model_families() (
     # Keep these fixtures separate from the legacy mutation cases below. A
     # generated family row may lag the cache until the next catalog sync.
     AGENTS_CONFIG_FILE="$TEST_DIR/families.conf"
-    AGENTS_LOCAL_CONFIG_FILE="$TEST_DIR/families.local.conf"
     # /agent sources the resolver in a child; keep the freshness gate closed
     # so these effort-less cache fixtures exercise resolution alone.
     AGENTS_CONFIG_TIER_ONLY=1
     export AGENTS_CONFIG_TIER_ONLY
-    cat > "$AGENTS_CONFIG_FILE" <<'EOF'
-[assignments]
-launch=codex
-launch.claude=claude
-
-[launch.codex]
-work=sol:xhigh
-bare=sol
-pinned=gpt-6.9-sol:high
-bad=sol:max
-undeclared=terra:high
-
-[launch.claude]
-claude=haiku:high
-
-[codex.agents]
-gpt-6.9-sol=high,max
-gpt-6.10-sol=medium,high,xhigh
-gpt-9-sol=high,max
-gpt-6-terra=high
-
-[codex.families]
-sol=gpt-6.9-sol
-
-[claude.agents]
-haiku=low,medium,high,xhigh,max
-
-[claude.families]
-haiku=haiku
-EOF
+    write_test_registry "$AGENTS_CONFIG_FILE" --replace-provided-sections \
+        assignments/launch=codex \
+        assignments/launch.claude=claude \
+        launch.codex/work=sol:xhigh \
+        launch.codex/bare=sol \
+        launch.codex/pinned=gpt-6.9-sol:high \
+        launch.codex/bad=sol:max \
+        launch.codex/undeclared=terra:high \
+        launch.claude/claude=haiku:high \
+        codex.agents/gpt-6.9-sol=high,max \
+        codex.agents/gpt-6.10-sol=medium,high,xhigh \
+        codex.agents/gpt-9-sol=high,max \
+        codex.agents/gpt-6-terra=high \
+        codex.families/sol=gpt-6.9-sol \
+        codex.families/terra \
+        claude.agents/haiku=low,medium,high,xhigh,max \
+        claude.families/haiku=haiku
     cat > "$CODEX_MODELS_CACHE_FILE" <<'EOF'
 {"models":[
   {"slug":"gpt-6.10-sol","visibility":"list"},
@@ -284,14 +178,16 @@ EOF
     [[ "$family_display" == *" word=sol"* && "$family_display" == *" agent=gpt-6.10-sol "* ]] \
         || fail "/agent did not display both the family word and its current slug"
 
-    # Missing, malformed and hidden-only caches must never fall back to the
+    # Unreadable and hidden-only caches must never fall back to the
     # previously generated family row. Explicit slugs remain usable offline.
     no_model_message="no Codex model for 'sol' in ~/.codex/models_cache.json; run codex once to refresh the cache, or name the full slug"
-    for cache_state in other-family hidden-only missing malformed unreadable; do
+    for cache_state in other-family hidden-only missing empty malformed unreadable; do
+        expected_error="the models cache could not be read: $CODEX_MODELS_CACHE_FILE"
         case "$cache_state" in
-            other-family) printf '%s\n' '{"models":[{"slug":"gpt-6-astra","visibility":"list"}]}' > "$CODEX_MODELS_CACHE_FILE" ;;
-            hidden-only) printf '%s\n' '{"models":[{"slug":"gpt-9-sol","visibility":"hide"}]}' > "$CODEX_MODELS_CACHE_FILE" ;;
+            other-family) printf '%s\n' '{"models":[{"slug":"gpt-6-astra","visibility":"list"}]}' > "$CODEX_MODELS_CACHE_FILE"; expected_error="$no_model_message" ;;
+            hidden-only) printf '%s\n' '{"models":[{"slug":"gpt-9-sol","visibility":"hide"}]}' > "$CODEX_MODELS_CACHE_FILE"; expected_error="$no_model_message" ;;
             missing) rm -f "$CODEX_MODELS_CACHE_FILE" ;;
+            empty) : > "$CODEX_MODELS_CACHE_FILE" ;;
             malformed) printf '%s\n' '{invalid' > "$CODEX_MODELS_CACHE_FILE" ;;
             unreadable)
                 printf '%s\n' '{"models":[{"slug":"gpt-6.10-sol","visibility":"list"}]}' > "$CODEX_MODELS_CACHE_FILE"
@@ -305,8 +201,11 @@ EOF
         fi
         resolve_status=0
         stderr_out="$(agents_resolve launch.work 2>&1 >/dev/null)" || resolve_status=$?
-        [[ "$resolve_status" -eq 1 && "$stderr_out" == *"$no_model_message"* ]] \
+        [[ "$resolve_status" -eq 1 && "$stderr_out" == *"$expected_error"* ]] \
             || fail "$cache_state cache did not refuse sol with the named recovery message: $stderr_out"
+        if [[ "$expected_error" != "$no_model_message" && "$stderr_out" == *"no Codex model"* ]]; then
+            fail "$cache_state cache was mistaken for a missing model"
+        fi
         agents_resolve launch.pinned || fail "full slug required a usable cache ($cache_state)"
         [[ "$AGENT_MODEL" == gpt-6.9-sol && "$AGENT_EFFORT" == high ]] \
             || fail "offline full slug resolved incorrectly ($cache_state)"
@@ -323,47 +222,25 @@ test_model_families
 
 test_family_repairs() (
     AGENTS_CONFIG_FILE="$TEST_DIR/family-repairs.conf"
-    AGENTS_LOCAL_CONFIG_FILE="$TEST_DIR/family-repairs.local.conf"
     CODEX_MODELS_CACHE_FILE="$TEST_DIR/family-repairs.json"
     AGENTS_CONFIG_TIER_ONLY=1
     export AGENTS_CONFIG_TIER_ONLY
-    : > "$AGENTS_CONFIG_FILE"
-    cat > "$AGENTS_LOCAL_CONFIG_FILE" <<'EOF'
-[assignments]
-direct=codex
-probe=codex
-dormant=claude
-
-[direct.codex]
-impl=gpt-6.1-sol:xhigh
-review=gpt-6.1-sol:high
-
-[direct.claude]
-impl=haiku:high
-review=haiku:max
-
-[probe.codex]
-work=sol:high
-
-[dormant.codex]
-work=gpt-6.1-sol:high
-
-[dormant.claude]
-work=haiku:high
-
-[codex.agents]
-gpt-6.1-sol=high,xhigh,max
-gpt-6.01-sol=high,xhigh,max
-
-[codex.families]
-sol=gpt-6.1-sol
-
-[claude.agents]
-haiku=low,medium,high,xhigh,max
-
-[claude.families]
-haiku=haiku
-EOF
+    write_test_registry "$AGENTS_CONFIG_FILE" --replace-provided-sections \
+        assignments/direct=codex \
+        assignments/probe=codex \
+        assignments/dormant=claude \
+        direct.codex/impl=gpt-6.1-sol:xhigh \
+        direct.codex/review=gpt-6.1-sol:high \
+        direct.claude/impl=haiku:high \
+        direct.claude/review=haiku:max \
+        probe.codex/work=sol:high \
+        dormant.codex/work=gpt-6.1-sol:high \
+        dormant.claude/work=haiku:high \
+        codex.agents/gpt-6.1-sol=high,xhigh,max \
+        codex.agents/gpt-6.01-sol=high,xhigh,max \
+        codex.families/sol=gpt-6.1-sol \
+        claude.agents/haiku=low,medium,high,xhigh,max \
+        claude.families/haiku=haiku
     # A newly visible release cannot launch until its catalog row is known.
     cat > "$CODEX_MODELS_CACHE_FILE" <<'EOF'
 {"models":[
@@ -412,11 +289,11 @@ EOF
 
     agents_set_assignment dormant claude
     rm "$CODEX_MODELS_CACHE_FILE"
-    no_model_message="no Codex model for 'sol' in ~/.codex/models_cache.json; run codex once to refresh the cache, or name the full slug"
+    no_model_message="the models cache could not be read: $CODEX_MODELS_CACHE_FILE"
     admin_output="$(bash "$SCRIPT_DIR/agent_admin.sh" dormant)" \
         || fail "missing cache blocked status for a function running on Claude"
     dormant_display="$(printf '%s\n' "$admin_output" | awk '/^task=dormant.work family=codex /')"
-    [[ "$dormant_display" == *"sol (unresolved: $no_model_message)"* && "$dormant_display" == *"active=no"* ]] \
+    [[ "$dormant_display" == *"sol (unresolved: $no_model_message"* && "$dormant_display" == *"active=no"* ]] \
         || fail "status omitted the unresolved dormant family and its recovery reason: $admin_output"
     [[ "$admin_output" == *"task=dormant.work family=claude agent=haiku effort=high active=yes"* \
         && "$admin_output" == *"# current family: claude"* ]] \
@@ -425,7 +302,7 @@ EOF
     [[ "$AGENT_MODEL" == haiku ]] || fail "Claude launch used the dormant family"
     admin_output="$(bash "$SCRIPT_DIR/agent_admin.sh" probe)" \
         || fail "missing cache blocked status for an active family row"
-    [[ "$admin_output" == *"sol (unresolved: $no_model_message)"* ]] \
+    [[ "$admin_output" == *"sol (unresolved: $no_model_message"* ]] \
         || fail "active family status did not show its resolution failure"
     resolve_status=0
     stderr_out="$(agents_resolve probe.work 2>&1 >/dev/null)" || resolve_status=$?
@@ -468,13 +345,13 @@ stderr_out="$(agents_resolve bare_catalog_effort.work 2>&1 >/dev/null || true)"
 [[ "$stderr_out" != *"is not allowed for family"* ]] || fail "empty-effort catalog agent with effort failed as an unknown-agent error"
 
 before="$TEST_DIR/before.conf"
-agents_registry_text > "$before"
+agents_registry_text | sed 's/[[:space:]]*#.*$//' > "$before"
 assert_fails "invalid assignment set" agents_set_assignment switchable claude
 assert_registry_matches "$before" || fail "rejected assignment changed the registry"
 
 before="$TEST_DIR/assignable-before.conf"
 expected="$TEST_DIR/assignable-expected.conf"
-agents_registry_text > "$before"
+agents_registry_text | sed 's/[[:space:]]*#.*$//' > "$before"
 sed 's/^assignable=codex$/assignable=claude/' "$before" > "$expected"
 agents_set_assignment assignable claude
 assert_registry_matches "$expected" || fail "successful assignment changed rows other than its assignment"
@@ -484,13 +361,13 @@ agents_resolve assignable.work
 
 before="$TEST_DIR/editable-before.conf"
 expected="$TEST_DIR/editable-expected.conf"
-agents_registry_text > "$before"
+agents_registry_text | sed 's/[[:space:]]*#.*$//' > "$before"
 assert_fails "invalid row agent" agents_set_row editable.work nosuch:high
 assert_registry_matches "$before" || fail "rejected row agent changed the registry"
 assert_fails "invalid row effort" agents_set_row editable.work gpt-test:max
 assert_registry_matches "$before" || fail "rejected row effort changed the registry"
 awk '/^\[/ { editing = ($0 == "[editable.codex]") }
-     editing { sub(/^work=gpt-test:high$/, "work=gpt-bare") }
+     editing { sub(/^work=gpt-test:high([[:space:]]*#.*)?$/, "work=gpt-bare") }
      { print }' "$before" > "$expected"
 agents_set_row editable.work gpt-bare
 assert_registry_matches "$expected" || fail "successful row edit changed rows other than its target"
@@ -499,7 +376,7 @@ agents_resolve editable.work
 agents_set_row editable.work gpt-test:high
 assert_registry_matches "$before" || fail "row edit reversal changed registry rows"
 awk '/^\[/ { editing = ($0 == "[editable.codex]") }
-     editing && $0 == "work=gpt-test:high" { print "work=gpt\\bs:low"; next }
+     editing && /^work=gpt-test:high([[:space:]]*#.*)?$/ { print "work=gpt\\bs:low"; next }
      { print }' "$before" > "$expected"
 agents_set_row editable.work 'gpt\bs:low'
 assert_registry_matches "$expected" || fail "row edit did not preserve a literal backslash in the agent name"
@@ -507,7 +384,7 @@ assert_registry_matches "$expected" || fail "row edit did not preserve a literal
 write_fixture "$TEST_DIR/base.conf"
 before="$TEST_DIR/infer-before.conf"
 expected="$TEST_DIR/infer-expected.conf"
-agents_registry_text > "$before"
+agents_registry_text | sed 's/[[:space:]]*#.*$//' > "$before"
 
 # The agent names its own family: a claude agent edits the claude row even
 # though the function is assigned to codex, and reports the row as dormant.
@@ -538,7 +415,7 @@ agents_set_row alpha.claude_task opus:high
 
 write_fixture "$TEST_DIR/base.conf"
 before="$TEST_DIR/reject-before.conf"
-agents_registry_text > "$before"
+agents_registry_text | sed 's/[[:space:]]*#.*$//' > "$before"
 
 assert_fails "agent in two catalogs" agents_set_row editable.work collide:low
 assert_registry_matches "$before" || fail "ambiguous agent changed the registry"
@@ -573,7 +450,7 @@ printf '%s\n' "$assignment_list" | grep -q '^task=override.work family=claude ' 
 write_fixture "$TEST_DIR/switchall.conf"
 before="$TEST_DIR/switchall-before.conf"
 expected="$TEST_DIR/switchall-expected.conf"
-agents_registry_text > "$before"
+agents_registry_text | sed 's/[[:space:]]*#.*$//' > "$before"
 sed -e 's/^one=codex$/one=claude/' \
     -e 's/^one\.work=codex$/one.work=claude/' \
     -e 's/^two=codex$/two=claude/' \
@@ -588,7 +465,7 @@ agents_set_all_assignments codex
 assert_registry_matches "$before" || fail "switch-all reversal changed registry rows"
 
 before="$TEST_DIR/switchall-reject.conf"
-agents_registry_text > "$before"
+agents_registry_text | sed 's/[[:space:]]*#.*$//' > "$before"
 assert_fails "unknown family" agents_set_all_assignments nosuch
 assert_registry_matches "$before" || fail "unknown family changed the registry"
 stderr_out="$(agents_set_all_assignments nosuch 2>&1 >/dev/null || true)"
@@ -598,7 +475,7 @@ stderr_out="$(agents_set_all_assignments nosuch 2>&1 >/dev/null || true)"
 # codex-only functions in this fixture are pinned and do not cause it.
 write_fixture "$TEST_DIR/base.conf"
 before="$TEST_DIR/switchall-base.conf"
-agents_registry_text > "$before"
+agents_registry_text | sed 's/[[:space:]]*#.*$//' > "$before"
 assert_fails "switch-all with a missing set" agents_set_all_assignments claude
 assert_registry_matches "$before" || fail "rejected switch-all changed the registry"
 stderr_out="$(agents_set_all_assignments claude 2>&1 >/dev/null || true)"
@@ -611,7 +488,7 @@ stderr_out="$(agents_set_all_assignments claude 2>&1 >/dev/null || true)"
 write_fixture "$TEST_DIR/model.conf"
 before="$TEST_DIR/model-before.conf"
 expected="$TEST_DIR/model-expected.conf"
-agents_registry_text > "$before"
+agents_registry_text | sed 's/[[:space:]]*#.*$//' > "$before"
 sed -e 's/^one=claude$/one=codex/' \
     -e 's/^one\.work=claude$/one.work=codex/' \
     -e 's/^two=claude$/two=codex/' \
@@ -673,29 +550,15 @@ AGENT_EFFORT=""
 [[ "$(agents_claude_args)" == "--model opus" ]] || fail "claude args without effort are wrong"
 
 # `caller` resolves through the agent running the shell, never through a switch.
-cat > "$TEST_DIR/caller.conf" <<'EOF'
-[assignments]
-friend=caller
-plain=codex
-
-[friend.codex]
-work=gpt-test:high
-
-[friend.claude]
-work=opus:max
-
-[plain.codex]
-work=gpt-test:high
-
-[plain.claude]
-work=opus:max
-
-[codex.agents]
-gpt-test=low,medium,high
-
-[claude.agents]
-opus=low,medium,high,max
-EOF
+write_test_registry "$TEST_DIR/caller.conf" --replace-provided-sections --replace-section claude.families \
+    assignments/friend=caller \
+    assignments/plain=codex \
+    friend.codex/work=gpt-test:high \
+    friend.claude/work=opus:max \
+    plain.codex/work=gpt-test:high \
+    plain.claude/work=opus:max \
+    codex.agents/gpt-test=low,medium,high \
+    claude.agents/opus=low,medium,high,max
 write_fixture "$TEST_DIR/caller.conf"
 unset AGENTS_CALLER_FAMILY CODEX_THREAD_ID CLAUDE_CODE_SESSION_ID
 
@@ -716,7 +579,7 @@ agents_resolve plain.work
 [[ "$AGENT_FAMILY" == "codex" ]] || fail "a fixed assignment beside a caller stopped resolving"
 
 before="$TEST_DIR/caller-before.conf"
-agents_registry_text > "$before"
+agents_registry_text | sed 's/[[:space:]]*#.*$//' > "$before"
 assert_fails "switching a caller function" agents_set_assignment friend codex
 assert_registry_matches "$before" || fail "rejected caller switch changed the registry"
 stderr_out="$(agents_set_assignment friend codex 2>&1 >/dev/null || true)"
@@ -753,37 +616,19 @@ AGENTS_CALLER_FAMILY=codex agents_set_row friend.work opus:max
 [[ "$AGENT_ROW_ACTIVE" == "no" ]] || fail "row edit for the other family was reported live under a caller"
 
 # Only a codex row gets a speed tier: Claude's fast mode bills extra usage.
-cat > "$TEST_DIR/tier.conf" <<'EOF'
-[assignments]
-tiered=codex
-tiered.claude_task=claude
-untiered=codex
-mistyped=codex
-
-[tiered.codex]
-work=gpt-test:high
-
-[tiered.claude]
-claude_task=opus:max
-
-[tiered.options]
-codex_service_tier=fast
-
-[untiered.codex]
-work=gpt-test:high
-
-[mistyped.codex]
-work=gpt-test:high
-
-[mistyped.options]
-codex_service_tier=fsat
-
-[codex.agents]
-gpt-test=low,medium,high
-
-[claude.agents]
-opus=low,medium,high,max
-EOF
+write_test_registry "$TEST_DIR/tier.conf" --replace-provided-sections \
+    assignments/tiered=codex \
+    assignments/tiered.claude_task=claude \
+    assignments/untiered=codex \
+    assignments/mistyped=codex \
+    tiered.codex/work=gpt-test:high \
+    tiered.claude/claude_task=opus:max \
+    tiered.options/codex_service_tier=fast \
+    untiered.codex/work=gpt-test:high \
+    mistyped.codex/work=gpt-test:high \
+    mistyped.options/codex_service_tier=fsat \
+    codex.agents/gpt-test=low,medium,high \
+    claude.agents/opus=low,medium,high,max
 write_fixture "$TEST_DIR/tier.conf"
 
 agents_resolve tiered.work
@@ -814,58 +659,31 @@ assignment_list="$(agents_list_assignments tiered)"
 
 # Setting the tier at each level. `resting` runs claude, so its tier is stored
 # and dormant; `clauded` has no codex set, so nothing is written for it.
-cat > "$TEST_DIR/tierset.conf" <<'EOF'
-[assignments]
-kept=codex
-bare=codex
-resting=claude
-friend=caller
-clauded=claude
-
-[kept.codex]
-work=gpt-test:high
-check=gpt-test:high
-
-[kept.claude]
-work=opus:max
-check=opus:max
-
-[kept.options]
-codex_mesh=1    # another launch flag
-codex_service_tier=flex    # tuned
-
-[bare.codex]
-work=gpt-test:high
-
-[bare.claude]
-work=opus:max
-
-# ── next block ──
-[resting.codex]
-work=gpt-test:high
-
-[resting.claude]
-work=opus:max
-
-[friend.codex]
-work=gpt-test:high
-
-[friend.claude]
-work=opus:max
-
-[clauded.claude]
-work=opus:max
-
-[codex.agents]
-gpt-test=low,medium,high
-
-[claude.agents]
-opus=low,medium,high,max
-EOF
+write_test_registry "$TEST_DIR/tierset.conf" --replace-provided-sections \
+    assignments/kept=codex \
+    assignments/bare=codex \
+    assignments/resting=claude \
+    assignments/friend=caller \
+    assignments/clauded=claude \
+    kept.codex/work=gpt-test:high \
+    kept.codex/check=gpt-test:high \
+    kept.claude/work=opus:max \
+    kept.claude/check=opus:max \
+    'kept.options/codex_mesh=1    # another launch flag' \
+    'kept.options/codex_service_tier=flex    # tuned' \
+    bare.codex/work=gpt-test:high \
+    bare.claude/work=opus:max \
+    resting.codex/work=gpt-test:high \
+    resting.claude/work=opus:max \
+    friend.codex/work=gpt-test:high \
+    friend.claude/work=opus:max \
+    clauded.claude/work=opus:max \
+    codex.agents/gpt-test=low,medium,high \
+    claude.agents/opus=low,medium,high,max
 write_fixture "$TEST_DIR/tierset.conf"
 before="$TEST_DIR/tierset-before.conf"
 expected="$TEST_DIR/tierset-expected.conf"
-agents_registry_text > "$before"
+agents_registry_text | sed 's/[[:space:]]*#.*$//' > "$before"
 
 # A function without an options section gets one after its last row.
 awk '{ print }
@@ -970,22 +788,12 @@ admin_first_line() {
 assert_registry_matches "$expected" || fail "agent_admin.sh inherit did not clear every key"
 
 # `pace` takes the pacer's fresh decision, and default when it is stale or absent.
-cat > "$TEST_DIR/pace.conf" <<'EOF'
-[assignments]
-paced=codex
-
-[paced.codex]
-work=gpt-test:high
-
-[paced.options]
-codex_service_tier=pace
-
-[codex.agents]
-gpt-test=low,medium,high
-
-[claude.agents]
-opus=low,medium,high,max
-EOF
+write_test_registry "$TEST_DIR/pace.conf" --replace-provided-sections \
+    assignments/paced=codex \
+    paced.codex/work=gpt-test:high \
+    paced.options/codex_service_tier=pace \
+    codex.agents/gpt-test=low,medium,high \
+    claude.agents/opus=low,medium,high,max
 write_fixture "$TEST_DIR/pace.conf"
 CODEX_PACER_TIER_FILE="$TEST_DIR/pacer-tier"
 printf 'fast\n' > "$CODEX_PACER_TIER_FILE"
@@ -1005,32 +813,18 @@ agents_set_service_tier pace paced
 
 # Production has only a Claude set. Every-function switches keep it, while a
 # direct switch of production must refuse before changing a byte.
-cat > "$TEST_DIR/production.conf" <<'EOF'
-[assignments]
-ordinary=claude
-production=claude
-codex_only=codex
-
-[ordinary.codex]
-work=gpt-old:high
-
-[ordinary.claude]
-work=opus:high
-
-[production.claude]
-director=opus:xhigh
-
-[codex_only.codex]
-work=gpt-old:high
-
-[codex.agents]
-gpt-old=low,medium,high
-gpt-test=low,medium,high
-
-[claude.agents]
-opus=low,medium,high,xhigh
-sonnet=low,medium,high,xhigh
-EOF
+write_test_registry "$TEST_DIR/production.conf" --replace-provided-sections \
+    assignments/ordinary=claude \
+    assignments/production=claude \
+    assignments/codex_only=codex \
+    ordinary.codex/work=gpt-old:high \
+    ordinary.claude/work=opus:high \
+    production.claude/director=opus:xhigh \
+    codex_only.codex/work=gpt-old:high \
+    codex.agents/gpt-old=low,medium,high \
+    codex.agents/gpt-test=low,medium,high \
+    claude.agents/opus=low,medium,high,xhigh \
+    claude.agents/sonnet=low,medium,high,xhigh
 
 admin() {
     AGENTS_CONFIG_FILE="$AGENTS_CONFIG_FILE" CODEX_CONFIG_FILE="$CODEX_CONFIG_FILE" \

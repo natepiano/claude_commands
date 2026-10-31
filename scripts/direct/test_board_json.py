@@ -10,7 +10,8 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from contextlib import ExitStack
+from collections.abc import Generator
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -19,8 +20,9 @@ from unittest.mock import patch
 
 from scripts.direct import board_json
 from scripts.lib import unit_runs
-from scripts.production import fake_showrunner, showrunners
+from scripts.production import fake_showrunner, showrunner_parent, showrunner_tree, staff
 from scripts.production.cli_fixture import invoke_cli
+from scripts.production.staff_test_support import isolated_staff_file, production_membership
 import unit_table_cells
 
 
@@ -107,6 +109,8 @@ class BoardJsonTests(unittest.TestCase):
             "XDG_STATE_HOME": str(self.root / "state"),
             "STYLE_LEDGER_STATE_DIR": str(self.root / "style-ledgers"),
         }
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", self.environment))
+        production_membership("fixture")
 
     def production(self, slug: str = "show", *, running: bool = True,
                    unit_name: str = "alpha-unit") -> ProductionFixture:
@@ -138,6 +142,7 @@ class BoardJsonTests(unittest.TestCase):
             )
             self.addCleanup(held.close)
         self.production_count += 1
+        production_membership(slug, unit_name)
         return fixture
 
     def plan(self, fixture: ProductionFixture, *, gate: str = "", all_done: bool = False) -> None:
@@ -158,9 +163,14 @@ class BoardJsonTests(unittest.TestCase):
         )), encoding="utf-8")
 
     def attach(self, child: str, parent: str) -> None:
+        self.move_parent(child, parent)
         directory = self.showrunner_state / child
         directory.mkdir(parents=True, exist_ok=True)
         _ = (directory / "parent").write_text(f"{parent}\n", encoding="utf-8")
+
+    def move_parent(self, child: str, parent: str = "") -> None:
+        rows = {row.name: row.id for row in staff.find(kind="showrunner")}
+        _ = staff.move(rows[child], rows[parent] if parent else None)
 
     def standing_plan(self, fixture: ProductionFixture, *, phase_id: str = "alpha-unit-63",
                       title: str = "Fix names") -> None:
@@ -258,7 +268,9 @@ class BoardJsonTests(unittest.TestCase):
         directory.mkdir(exist_ok=True)
         _ = (directory / "mesh_roster.json").write_text(json.dumps({
             "alpha-impl": {"slot": "1", "role": "impl", "status": "running",
-                           "thread_id": "thread-one", "turn_id": "turn-one"},
+                           "thread_id": "thread-one", "turn_id": "turn-one",
+                           "model": "legacy-identity", "effort": "low",
+                           "turn_model": "fixture-turn-model", "turn_effort": "high"},
             "alpha-test": {"slot": "test", "role": "test", "status": "idle",
                            "thread_id": "thread-test", "turn_id": "turn-test"},
         }), encoding="utf-8")
@@ -276,11 +288,9 @@ class BoardJsonTests(unittest.TestCase):
         )
         return directory
 
-    def invoke(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+    @contextmanager
+    def source_readers(self) -> Generator[None]:
         with ExitStack() as scope:
-            _ = scope.enter_context(patch.object(
-                unit_runs, "run_roots", return_value=(self.run_root, self.former_root),
-            ))
             # Both import spellings occur in production scripts; rebind their
             # import-time path constants, without replacing the registry reader.
             for name in ("showrunners", "scripts.production.showrunners"):
@@ -291,6 +301,11 @@ class BoardJsonTests(unittest.TestCase):
                         ("SESSIONS", self.session_script), ("SHOWRUNNER_STATE_DIR", self.showrunner_state),
                     ):
                         _ = scope.enter_context(patch.object(module, field, value))
+            yield
+
+    def invoke(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        with self.source_readers(), patch.object(
+                unit_runs, "run_roots", return_value=(self.run_root, self.former_root)):
             return invoke_cli(
                 board_json, lambda: board_json.main(list(arguments)), list(arguments),
                 self.environment, self.root,
@@ -437,9 +452,7 @@ class BoardJsonTests(unittest.TestCase):
         expected_watch = sorted(str(path.resolve()) for path in (
             self.notifier, self.showrunner_state, child_state,
         ))
-        runners = showrunners
-        with patch.object(runners, "NOTIFIER_STATE_DIR", self.notifier), \
-                patch.object(runners, "SHOWRUNNER_STATE_DIR", self.showrunner_state):
+        with self.source_readers():
             for operation in ("attach", "detach"):
                 with self.subTest(operation=operation):
                     # Give each actual filesystem operation room to advance mtime,
@@ -453,9 +466,12 @@ class BoardJsonTests(unittest.TestCase):
 
                     if operation == "attach":
                         self.assertFalse((child_state / "parent").exists())
-                        runners.attach(child.slug, root.slug)
+                        self.move_parent(child.slug, root.slug)
+                        showrunner_parent.attach(child.slug, root.slug)
                     else:
-                        self.assertEqual(runners.detach(child.slug), root.slug)
+                        record = staff.snapshot()
+                        self.move_parent(child.slug)
+                        self.assertEqual(showrunner_parent.detach(child.slug, record=record), root.slug)
                     self.assertGreater(child_state.stat().st_mtime_ns, watched_mtime)
 
                     response, documents = self.generate("--cwd", str(root.checkout))
@@ -485,7 +501,7 @@ class BoardJsonTests(unittest.TestCase):
         self.attach(grandchild.slug, child.slug)
         # The tree lookup can outlive a registry entry while its timer is removed.
         # Keep real board generation and registry reads; vary only that boundary.
-        with patch.object(showrunners, "descendants_of",
+        with patch.object(showrunner_tree, "descendants_of",
                           return_value=[child.slug, "unregistered", grandchild.slug]):
             response, documents = self.generate("--production", root.slug)
 
@@ -1297,7 +1313,7 @@ class BoardJsonTests(unittest.TestCase):
         self.assertEqual(set(workers), {"1", "test"})
         self.assertEqual(workers["1"]["role"], "impl")
         self.assertEqual(workers["1"]["state"], "running")
-        self.assertEqual(workers["1"]["model"], "codex/fixture-model")
+        self.assertEqual(workers["1"]["model"], "codex/fixture-turn-model:high")
         doing = str(workers["1"]["doing"])
         self.assertTrue(doing.startswith("building "), doing)
         self.assertLessEqual(len(doing), 80)

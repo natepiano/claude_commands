@@ -20,6 +20,7 @@ import os
 import sys
 import tomllib
 from collections.abc import Callable
+from hashlib import sha256
 from pathlib import Path
 from typing import cast
 
@@ -103,9 +104,12 @@ def built_rules(remote: str) -> str:
     return built
 
 
-def refresh(running: set[str], reload: Callable[[str], None]) -> bool:
-    """Write the override when it differs from the build of the downloaded rules, then `reload` each
-    running herdr session so that it reads the new rules. True when the override was written.
+def refresh(running: set[str], reload: Callable[[str], bool]) -> bool:
+    """Build the override and reload sessions that have not confirmed its current version.
+
+    Return True when the override was written. The callback returns True only
+    for a confirmed reload. Failed sessions retry on the next pass; an
+    interruption before the receipt is written retries the whole running set.
 
     With no downloaded rules there is nothing to build on. A rules change that the edits no longer
     fit keeps the old override, which still holds the fix, and names the change on stderr.
@@ -120,15 +124,37 @@ def refresh(running: set[str], reload: Callable[[str], None]) -> bool:
         print(f"herdr detection rules: kept the old override: {error}", file=sys.stderr)
         return False
     target = override_path()
+    written = True
     try:
         if target.read_text(encoding="utf-8") == built:
-            return False
+            written = False
     except FileNotFoundError:
         pass
+    # A matching override alone does not prove that every server loaded it.
+    # Keep successful reloads for this version so adding one session does not
+    # reset detection in sessions already using it.
+    receipt = target.with_suffix(".loaded")
+    version = sha256(built.encode("utf-8")).hexdigest()
+    try:
+        loaded = receipt.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        loaded = []
+    confirmed = set(loaded[1:]) if not written and loaded[:1] == [version] else set[str]()
+    pending = running - confirmed
+    if not written and not pending:
+        return False
     target.parent.mkdir(parents=True, exist_ok=True)
-    staged = target.with_name(f".{target.name}.{os.getpid()}")
-    _ = staged.write_text(built, encoding="utf-8")
-    _ = staged.replace(target)
-    for session in sorted(running):
-        reload(session)
-    return True
+    # Invalidate a prior receipt before replacing the file or reloading. An
+    # interrupted batch must not reuse an older confirmation of the same content.
+    receipt.unlink(missing_ok=True)
+    if written:
+        staged = target.with_name(f".{target.name}.{os.getpid()}")
+        _ = staged.write_text(built, encoding="utf-8")
+        _ = staged.replace(target)
+    for session in sorted(pending):
+        if reload(session):
+            confirmed.add(session)
+    staged_receipt = receipt.with_name(f".{receipt.name}.{os.getpid()}")
+    _ = staged_receipt.write_text("\n".join([version, *sorted(confirmed)]) + "\n", encoding="utf-8")
+    _ = staged_receipt.replace(receipt)
+    return written

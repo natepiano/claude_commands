@@ -30,7 +30,9 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import NamedTuple, cast
 
-import showrunners
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from scripts.production import showrunners
 from production_units import Refusal
 from issues import Issue
 from proposal_issue import AwaitingApproval, InProgress, ProposalProgress, proposal_progress

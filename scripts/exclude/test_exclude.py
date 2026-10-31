@@ -1,12 +1,14 @@
 """Tests for exclude.sh: a path counts as excluded only when git then ignores it, and a refusal changes nothing."""
 from __future__ import annotations
 
-import os
 import subprocess
-import tempfile
+import sys
 import unittest
 from pathlib import Path
 from typing import override
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib.rerun_test_support import ScriptRepositoryTestCase
 
 SCRIPT = Path(__file__).with_name("exclude.sh")
 ALLOWLIST = "*\n!docs/\n!docs/**\n"
@@ -15,22 +17,15 @@ EXCLUDED = "EXCLUDED: Added handoff.md to .git/info/exclude\n"
 REFUSED = f"Error: {DOC} is NOT excluded: .gitignore:3:!docs/** re-includes it\n"
 
 
-class ExcludeTests(unittest.TestCase):
+class ExcludeTests(ScriptRepositoryTestCase):
     repo: Path = Path()
     environment: dict[str, str] = {}
 
     @override
     def setUp(self) -> None:
-        self.repo = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        # No repository from the caller's environment, and no ignore rules from the user's own git config.
-        self.environment = {name: value for name, value in os.environ.items() if not name.startswith("GIT_")}
-        self.environment.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
-        _ = self.git("init", "--quiet")
+        super().setUp()
 
-    def run_in_repo(self, *command: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(command, cwd=self.repo, env=self.environment, capture_output=True, text=True,
-                              check=False)
-
+    @override
     def git(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         return self.run_in_repo("git", *arguments)
 
@@ -72,6 +67,20 @@ class ExcludeTests(unittest.TestCase):
                          (0, "UNTRACKED: Removed handoff.md from git tracking (local file kept)\n" + EXCLUDED))
         self.assertEqual(self.git("ls-files").stdout, "")
         self.assertTrue(self.ignored("handoff.md"))
+
+    def test_an_existing_ignore_rule_finishes_a_failed_untracking_on_rerun(self) -> None:
+        self.track("handoff.md")
+        self.fail_git("rm", "--cached")
+        stopped = self.exclude("handoff.md")
+        self.assertEqual(stopped.returncode, 1)
+        self.assertIn("could not untrack", stopped.stderr)
+        self.assertEqual(self.git("ls-files").stdout, "handoff.md\n")
+        finished = self.exclude("handoff.md")
+        self.assertEqual(finished.returncode, 0, finished.stderr)
+        self.assertIn("UNTRACKED:", finished.stdout)
+        self.assertEqual(self.git("ls-files").stdout, "")
+        self.assertEqual(self.listed().count("handoff.md\n"), 1)
+        self.assertTrue((self.repo / "handoff.md").is_file())
 
     def test_a_path_the_gitignore_re_includes_is_refused_and_not_listed(self) -> None:
         self.allowlist()

@@ -129,13 +129,18 @@ def changed_paths(root: Path, baseline: Baseline) -> list[str]:
             != after.get(path, clean_entries(after_heads, path))]
 
 
-def other_phases_paths(session_dir: Path, phase: str, paths: list[str]) -> dict[str, list[str]]:
+def other_phases_paths(session_dir: Path, phase: str, paths: list[str],
+                       root: Path | phase_reservation.AllPhaseWorktrees =
+                       phase_reservation.ALL_PHASE_WORKTREES) -> dict[str, list[str]]:
     """The changed paths each other open phase's files list owns, when the reviewed phase is open beside it."""
     phases = phase_reservation.open_phases(session_dir)
     reviewed = phase_reservation.phase_directory_name(phase)
     if len(phases) < 2 or reviewed not in {open_phase.phase for open_phase in phases}:
         return {}
-    owned = phase_reservation.attribute(phases, paths).by_phase
+    attribution = phase_reservation.attribute(phases, paths, root)
+    if isinstance(attribution, phase_reservation.NoOpenPhaseHere):
+        return {}
+    owned = attribution.by_phase
     return {owner.phase: scopes for owner, scopes in owned.items() if owner.phase != reviewed}
 
 
@@ -151,7 +156,7 @@ def baseline_command(args: argparse.Namespace) -> int:
 def changes_command(args: argparse.Namespace) -> int:
     root = toplevel(cast(str, args.root))
     changed = changed_paths(root, read_baseline(cast(str, args.baseline)))
-    others = other_phases_paths(Path(cast(str, args.session_dir)), cast(str, args.phase), changed)
+    others = other_phases_paths(Path(cast(str, args.session_dir)), cast(str, args.phase), changed, root)
     for owner, scopes in sorted(others.items()):
         print(f"review tree: open phase {owner}'s files changed during the review: {' '.join(scopes)}",
               file=sys.stderr)

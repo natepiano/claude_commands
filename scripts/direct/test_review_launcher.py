@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+
 import unittest
 from scripts.direct import review_launcher_test_support as support
 from contextlib import ExitStack
 from scripts.direct.local_release_wait import IntervalReleasePolling
 from pathlib import Path
-from scripts.direct.review_launcher_test_support import TEST_HANG_GUARD_SECS as TEST_HANG_GUARD_SECS
 from typing import cast
 import json
 import os
@@ -20,6 +21,17 @@ from scripts.direct.wait_for_test_state import wait_until
 
 
 class ReviewLauncherPassTests(support.ReviewLauncherFixture):
+    def test_rerun_lens_uses_review_slot_and_its_own_findings_file(self) -> None:
+        session = self.start_implementation("rerun-slot")
+        self.finish_implementation(session)
+        result = subprocess.run(self.review_command(session, "rerun", ""),
+                                env=self.environment(), capture_output=True, text=True,
+                                check=False, timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((session / "review_findings_1_rerun.txt").read_text(), "No findings.\n")
+        events = [event for event in self.pass_events(session.name) if event.get("pass_kind") == "review"]
+        self.assertEqual([event.get("team_slot") for event in events], ["review", "review"])
+
     def test_named_review_phase_reaches_verification_environment(self) -> None:
         session = self.start_implementation("review-phase-environment")
         self.finish_implementation(session)
@@ -175,7 +187,7 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
             [
                 "bash", str(self.review_script.with_name("implement.sh")),
                 "--to", worker, str(session_dir), str(self.working_dir),
-                str(self.prompt_file), "implementation", "write the repair",
+                str(self.prompt_file), "impl", "write the repair",
                 "impl", "writing the repair", "0", "review2",
             ],
             check=False,
@@ -254,6 +266,35 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
             (session_dir / "review_status").read_text(encoding="utf-8"), "reviewed\n"
         )
 
+    def test_without_a_named_worker_the_unit_reviewer_runs_and_keeps_its_thread(self) -> None:
+        session_dir = self.start_implementation("fresh")
+        self.finish_implementation(session_dir)
+
+        result = subprocess.run(
+            ["bash", str(self.review_script), "--pool", "code", "--lease", "builders:3:broad:1",
+             *self.review_command(session_dir, "", "")[2:]],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=self.environment(),
+            timeout=TEST_HANG_GUARD_SECS,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        events = (session_dir / "mesh_events.txt").read_text().splitlines()
+        self.assertIn("follow", events)
+        records = cast(dict[str, dict[str, object]], json.loads((session_dir / "mesh_roster.json").read_text()))
+        self.assertEqual(len(records), 1)
+        self.assertEqual(next(iter(records.values()))["role"], "review")
+        self.assertEqual(self.turn_records(session_dir)[0]["arm"], "own")
+        self.assertEqual(
+            (session_dir / "review_findings_1.txt").read_text(encoding="utf-8"),
+            "No findings.\n",
+        )
+        self.assertEqual(
+            (session_dir / "review_status").read_text(encoding="utf-8"), "reviewed\n"
+        )
+
     def test_paused_reviewer_receives_followup_on_its_recorded_thread(self) -> None:
         session_dir = self.start_implementation("paused-review")
         self.finish_implementation(session_dir)
@@ -292,6 +333,27 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
         )
         board = (session_dir / "board.log").read_text(encoding="utf-8")
         self.assertIn(f"compacted {worker}: 100001 -> 12000 tokens", board)
+
+    def test_a_compaction_roster_conflict_stops_review_before_claim_or_follow(self) -> None:
+        session_dir = self.start_implementation("compact-roster-changed")
+        self.finish_implementation(session_dir)
+        worker = self.open_worker(session_dir, context_tokens=100001)
+        original = (session_dir / "mesh_roster.json").read_bytes()
+        (session_dir / "compact_roster_changed").touch()
+
+        result = self.run_assigned_review(session_dir, worker)
+
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("roster changed during compaction", result.stderr)
+        self.assertIn("reopen", result.stderr)
+        self.assertEqual((session_dir / "mesh_events.txt").read_text().splitlines(), ["compact"])
+        self.assertEqual((session_dir / "mesh_roster.json").read_bytes(), original)
+        self.assertFalse((session_dir / "follow_message.txt").exists())
+        self.assertFalse((session_dir / "review_status").exists())
+        self.assertFalse((session_dir / "review_findings_1.txt").exists())
+        board = (session_dir / "board.log").read_text(encoding="utf-8")
+        self.assertIn("follow-up not sent", board)
+        self.assertNotIn("continuing follow-up", board)
 
     def test_review_of_an_unmeasured_worker_does_not_compact_again(self) -> None:
         session_dir = self.start_implementation("unmeasured-review")

@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-from scripts.whoami.note_file import note_name
-
+import sys
 import asyncio
 import base64
 import json
@@ -14,16 +13,19 @@ import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
-from scripts.accounts import accounts, role_map
-from scripts.production import showrunners
 from typing import cast, override
 from unittest.mock import MagicMock, call, patch
 from zoneinfo import ZoneInfo
 
-import agent_accounts
-import note_file
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.whoami.note_file import note_name
+from scripts.accounts import accounts, role_map
+from scripts.production import showrunners
+
+from scripts.whoami import agent_accounts
+from scripts.whoami import note_file
 import whoami
-from agent_accounts import (
+from scripts.whoami.agent_accounts import (
     CheckedNamedClaudeAccount,
     ClaudeAccountsInUse,
     CodexAccountResult,

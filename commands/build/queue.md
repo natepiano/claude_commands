@@ -1,7 +1,13 @@
 ---
-description: Show running and waiting build steps, or move a waiting step to the head. Args - `[bump <position|session|folder>]`.
+description: Show the build budget and waiting steps, or one step's place and why it waits. Args - `[<position|session|folder>|close]`.
 ---
 
-Run `python3 ~/.claude/scripts/build_queue/build_queue.py $ARGUMENTS`. Show its output as is: Running table first, Waiting table second, including `empty` rows and the totals line. Do not replace the tables with a summary. Sessions show names, with short folder names when unknown. Delta is promised minus using; starting steps show `—` until a reading exists. Each waiting row states its reason; times use the user's zone.
+Run `~/.claude/scripts/lib/py ~/.claude/scripts/build_queue/build_queue.py $ARGUMENTS`. Show the output as is inside a `text` code block.
 
-`bump <position|session|folder>` moves one waiting step to the head for the next admission. Any session or the user may run it. Memory limits still apply. An unknown or ambiguous match changes nothing; use its position, full session id, session name, folder path or folder name. The result and build log name who moved which step. Use `/build:status` for holds and target state.
+The budget bar shows free (`░`) and taken (`█`) GiB. Each waiting step has one row with its showrunner, unit, step, minutes waited and a size bar on the same scale. `▸` marks your session's steps. On row 1, `↑ ≤N.N` lets younger steps use that many GiB in a strict window, `⊘` holds them when no room remains, and `↑` allows backfill; the countdown ends at the next window change. `low memory`, `pressure` or `no reading` names a host hold.
+
+`/build:queue <position|session|folder>` shows matching step cards: whether each is next, who is ahead and why it waits. `build-why` keeps the head's full recorded history and release advice.
+
+With `unit-board@nate-local`, the pane refreshes every 10 seconds and redraws the countdown every second without running the script. `close` closes it. Run `/reload-plugins` in sessions started before the mod change.
+
+`bump <position|session|folder>` moves nothing and exits 3 with one stdout line and no stderr: `build queue: bump is off; nothing can move a waiting step`. Waiting steps that fit keep room in queue order; a younger step held by that room shows `behind older step <label>`. Use `/build:status` for holds and target state.

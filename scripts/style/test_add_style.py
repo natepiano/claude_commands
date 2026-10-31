@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.lib.test_agents_registry import write_registry
+
 import json
 import os
 import shlex
@@ -25,6 +27,7 @@ from production_units import read_production
 from production_units import production_field
 from scripts.accounts.accounts import NamedAccount
 from scripts.herdr import herdr
+from scripts.production.staff_test_support import fixture_showrunner_name, isolated_staff_file, showrunner_relationship
 
 SCRIPT = Path(add_style.__file__)
 STUB = '''import json
@@ -32,6 +35,9 @@ import os
 import shlex
 import sys
 from pathlib import Path
+
+sys.path.insert(0, os.environ["STYLE_TEST_CHECKOUT"])
+from scripts.production.staff_test_support import fixture_showrunner_name, showrunner_relationship
 
 arguments = sys.argv[1:]
 name = Path(sys.argv[0]).name
@@ -62,12 +68,15 @@ elif name == "launch.py":
     parent = state / slug / "parent"
     parent.parent.mkdir(parents=True, exist_ok=True)
     parent.write_text(os.environ["TEST_PARENT_SLUG"] + "\\n")
+    showrunner_relationship(fixture_showrunner_name(slug, doc), os.environ["TEST_PARENT_SLUG"])
 elif arguments[0] == "detach":
     (state / arguments[1] / "parent").unlink()
+    showrunner_relationship(arguments[1])
 elif arguments[0] == "attach":
     parent = state / arguments[1] / "parent"
     parent.parent.mkdir(parents=True, exist_ok=True)
     parent.write_text(arguments[2] + "\\n")
+    showrunner_relationship(arguments[1], arguments[2])
 else:
     raise SystemExit(2)
 '''
@@ -154,7 +163,9 @@ class AddStyleTests(unittest.TestCase):
             "TEST_PARENT_SLUG": "parent",
             "TEST_LIVE_SESSIONS": str(self.root / "live-sessions"),
             "TEST_STYLE_SYNC": str(self.root / "style_sync.py"),
+            "STYLE_TEST_CHECKOUT": str(SCRIPT.parents[2]),
         }
+        _ = self.enterContext(isolated_staff_file(self.root / "staff/staff.json", self.env))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, self.env)))
         _ = self.enterContext(mock.patch.object(style_rules, "NATE_STYLE_DIR", rule_root))
         self.parent = self.parent_doc("parent")
@@ -180,6 +191,7 @@ class AddStyleTests(unittest.TestCase):
         timer = self.root / "notifier" / f"showrunner-{slug}" / "conf"
         timer.parent.mkdir(parents=True, exist_ok=True)
         _ = timer.write_text(f"TARGET=session:{slug}\nCHECK=zsh /x/production_check.sh {shlex.quote(str(path))}\n")
+        _ = showrunner_relationship(fixture_showrunner_name(slug, path))
         return path
 
     def run_bootstrap(self, *arguments: str, parent: Path | None = None, success: bool = True) -> subprocess.CompletedProcess[str]:
@@ -216,6 +228,37 @@ class AddStyleTests(unittest.TestCase):
             _ = (member / "src/lib.rs").write_text("pub fn member() {}\n")
         _ = self.git("add", "--all")
         _ = self.git("commit", "-q", "-m", "Add workspace packages")
+
+    def interrupted_bootstrap_publish(self, path: Path) -> None:
+        injection = """import atomic_file
+real_replace = atomic_file.os.replace
+def interrupted_replace(source, destination):
+    if Path(destination) == Path(os.environ["TEST_STOP_FILE"]):
+        raise OSError("stopped before publish")
+    return real_replace(source, destination)
+atomic_file.os.replace = interrupted_replace
+"""
+        stopped_bootstrap = BOOTSTRAP.replace("real_run_script =", injection + "\nreal_run_script =", 1)
+        with mock.patch.dict(self.env, {"TEST_STOP_FILE": str(path)}), mock.patch.dict(
+            globals(), {"BOOTSTRAP": stopped_bootstrap}
+        ):
+            stopped = self.run_bootstrap(success=False)
+        self.assertEqual(stopped.returncode, 2, stopped.stderr)
+        self.assertIn("stopped before publish", stopped.stderr)
+        self.assertFalse(path.exists())
+        finished = self.run_bootstrap()
+        self.assertEqual(finished.returncode, 0, finished.stderr)
+        self.assertEqual(read_production(self.doc).merge_branch, "style/main")
+        self.assertEqual(len(list((self.checkout / add_style.PLAN_DIRECTORY).glob("*.md"))), 4)
+        self.assertIn("## Units", self.doc.read_text())
+        self.assertIn("## Phases", (self.checkout / add_style.PLAN_DIRECTORY / "sample-style-names-unit.md").read_text())
+        self.assertEqual(sum(call["command"] == "launch.py" for call in self.calls()), 1)
+
+    def test_interrupted_first_production_doc_publish_reruns_bootstrap(self) -> None:
+        self.interrupted_bootstrap_publish(self.doc)
+
+    def test_interrupted_first_unit_plan_publish_reruns_bootstrap(self) -> None:
+        self.interrupted_bootstrap_publish(self.checkout / add_style.PLAN_DIRECTORY / "sample-style-names-unit.md")
 
     def test_pilot_rows_and_package_scopes_are_ready_before_the_showrunner_launches(self) -> None:
         self.add_workspace_packages()
@@ -584,10 +627,7 @@ class AddStyleTests(unittest.TestCase):
         )
         before = self.git("status", "--porcelain", "--untracked-files=all"), self.git("show-ref"), self.doc.read_text()
         agent_config = self.root / "agents.conf"
-        _ = agent_config.write_text(
-            "[assignments]\nproduction=claude\n\n[production.claude]\ndirector=opus:xhigh\n\n"
-            + "[claude.agents]\nopus=low,medium,high,xhigh\n",
-        )
+        _ = write_registry(agent_config, {'assignments': {'production': 'claude'}, 'production.claude': {'director': 'opus:xhigh'}, 'claude.agents': {'opus': 'low,medium,high,xhigh'}})
         catalog_sync = self.root / "catalog-synced"
         catalog_sync.touch()
 

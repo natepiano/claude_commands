@@ -6,8 +6,6 @@ from __future__ import annotations
 import json
 import sys
 import signal
-import dailies_render
-from cli_fixture import invoke_cli
 import os
 import subprocess
 import tempfile
@@ -19,6 +17,9 @@ from typing import ClassVar, TypedDict, cast, final, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+import dailies_render
+from cli_fixture import invoke_cli
 from dailies_render import (NoLastReportedEta, StateClear, StateRefused,
                             check_render_state, last_report, load_state)
 
@@ -243,14 +244,16 @@ from pathlib import Path
 from types import ModuleType
 sys.path.insert(0, str(Path.cwd()))
 from cli_fixture import invoke_cli
-assert "showrunners" not in sys.modules
+assert "scripts.production.showrunners" not in sys.modules
 assert "dailies_render" not in sys.modules
 caller = Path.home()
 caller_path = sys.path.copy()
 command = ModuleType("fixture_command")
 command.__file__ = "fixture_command.py"
 def paths(home):
-    import dailies_render, showrunners, note_file
+    import dailies_render
+    from scripts.production import showrunners
+    from scripts.whoami import note_file
     assert dailies_render.CHART_CONF == home / ".local/state/showrunner/dailies.conf"
     assert note_file.notes_dir() == home / "rust/hanadocs/agents"
     assert dailies_render.READINGS_LOG == home / ".local/state/agent-notes/readings.jsonl"
@@ -889,6 +892,33 @@ class EtaResolutionTests(unittest.TestCase):
             saved = cast(dict[str, object], json.loads(state_path.read_text(encoding="utf-8")))
             logged = log_path.read_text(encoding="utf-8") if log_path.exists() else ""
         return result, saved, logged
+
+    def test_interrupted_state_publish_preserves_first_eta_and_same_command_reruns(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            source = Path(scratch) / "input.json"
+            state = Path(scratch) / "state.json"
+            fields = report(held=False)
+            fields["units"] = [{**unit(False), "eta": {"time": "11:20", "percent": 60}}]
+            _ = source.write_text(json.dumps(fields), encoding="utf-8")
+            previous = {"widget-enhancements": {
+                "phase": "Phase 2 of 3: small text reads clearly", "eta": "2026-10-04T11:20:00",
+                "eta_text": "11:20", "held": None, "first": "2026-10-04T11:20:00"}}
+            original = json.dumps(previous)
+            _ = state.write_text(original, encoding="utf-8")
+            arguments = [str(source), "--at", AT, "--state", str(state)]
+            expected = run(arguments, scratch)
+            self.assertEqual(expected.code, 0, expected.error)
+            complete_state = state.read_bytes()
+            _ = state.write_text(original, encoding="utf-8")
+            with mock.patch("atomic_file.os.replace", side_effect=OSError("stopped while saving")):
+                stopped = run(arguments, scratch)
+            self.assertNotEqual(stopped.code, 0)
+            self.assertEqual(state.read_text(), original)
+            finished = run(arguments, scratch)
+            self.assertEqual(finished, expected)
+            self.assertEqual(state.read_bytes(), complete_state)
+            self.assertEqual(load_state(state)["widget-enhancements"].first,
+                             datetime.fromisoformat("2026-10-04T11:20:00"))
 
     def test_unchanged_eta_uses_saved_moment_in_report_chart_state_and_log(self) -> None:
         fields = report(held=False)

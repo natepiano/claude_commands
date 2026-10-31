@@ -3,278 +3,255 @@
 from __future__ import annotations
 
 import contextlib
+from dataclasses import replace
 import io
 import json
 import os
-import re
-import subprocess
 import sys
-import tempfile
 import unittest
 from pathlib import Path
-from typing import cast, final, override
+from typing import final, override
 from unittest import mock
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import fake_unit_host
 import production_lifecycle
-import showrunners
+from scripts.production import showrunners
+import showrunner_tree
+import showrunner_parent
 from production_units import read_production
 from fake_unit_host import HostedUnit
 
 
-# Script completion deadlines only bound hangs; startup can be slow under load.
-SCRIPT = Path(__file__).with_name("production_lifecycle.py")
-STUB = '''#!__PYTHON__
-import os
-from pathlib import Path
-import sys
-
-state = Path(os.environ["LIFECYCLE_TEST_STATE"])
-name = Path(sys.argv[0]).name
-with (state / "calls").open("a") as output:
-    output.write(name + " " + " ".join(sys.argv[1:])
-                 + (" cwd=" + os.getcwd() if name == "cargo-berth" else "") + "\\n")
-if name == "ssh":
-    print("rc=" + (state / "mac-rc").read_text().strip() if (state / "mac-rc").exists() else "rc=0")
-    raise SystemExit(0)
-if name == "cargo-berth" and sys.argv[1:2] == ["board"]:
-    print((state / "reservations.json").read_text() if (state / "reservations.json").exists() else
-          '{"output_contract_version": 1, "verb": "board", "status": "unconfigured", "payload": {"kind": "no_facts"}}')
-    raise SystemExit(int((state / "board-exit").read_text()) if (state / "board-exit").exists() else 4)
-if name in ("notifier.sh", "showrunners.py", "cargo-berth", "py"):
-    raise SystemExit(0)
-raise SystemExit(99)
-'''
-# The session records and the message sender showrunners.py reads: nothing real is looked up or sent.
-SESSIONS = '''import json, os, pathlib, sys
-command, target = sys.argv[1:]
-for path in pathlib.Path(os.environ["NOTIFIER_SESSIONS_DIR"]).glob("*.json"):
-    record = json.loads(path.read_text())
-    if command == "socket" and target == "session:" + record["sessionId"]:
-        print(record["messagingSocketPath"])
-        raise SystemExit(0)
-raise SystemExit(1)
-'''
-SEND = '''import json, os, sys
-with open(os.environ["TEST_SENT"], "a") as handle:
-    handle.write(json.dumps(sys.argv[1:]) + "\\n")
-'''
+from scripts.production import production_doc, staff
+from scripts.production.staff_test_support import unit_membership
+from scripts.production.production_lifecycle_test_support import LifecycleFixture, SCRIPT
 
 
 @final
-class LifecycleTests(unittest.TestCase):
-    def __init__(self, methodName: str = "runTest") -> None:
-        super().__init__(methodName)
-        self.root = Path()
-        self.origin = Path()
-        self.checkout = Path()
-        self.alpha = Path()
-        self.beta = Path()
-        self.doc = Path()
-        self.log = Path()
-        self.state = Path()
-        self.home = Path()
-        self.phase_table_vault = Path()
-        self.env: dict[str, str] = {}
+class ProductionNameTests(unittest.TestCase):
+    def test_shared_reader_returns_the_trimmed_heading_name(self) -> None:
+        lines = ["# Another document", "# Production —  example  ", "# Production — later"]
+        self.assertEqual(production_doc.production_name(lines), production_doc.ProductionName("example"))
+        self.assertEqual(production_lifecycle.production_name(lines), "example")
 
+    def test_shared_reader_reports_a_missing_production_heading(self) -> None:
+        self.assertEqual(production_doc.production_name(["# Another document"]),
+                         production_doc.ProductionNameNotRecorded("production doc lacks its name"))
+
+    def test_empty_heading_is_a_recorded_name_and_remains_valid_for_lifecycle(self) -> None:
+        lines = ["# Production — "]
+        self.assertEqual(production_doc.production_name(lines), production_doc.ProductionName(""))
+        self.assertEqual(production_lifecycle.production_name(lines), "")
+
+    def test_lifecycle_missing_heading_keeps_its_stop_fields(self) -> None:
+        with self.assertRaises(production_lifecycle.LifecycleStop) as stopped:
+            _ = production_lifecycle.production_name(["# Another document"])
+        self.assertEqual((stopped.exception.step, stopped.exception.state, stopped.exception.detail),
+                         ("input", "failed", "production doc lacks its name"))
+
+
+@final
+class LifecycleTests(LifecycleFixture):
     @override
     def setUp(self) -> None:
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
-        self.origin = self.root / "origin.git"
-        self.checkout = self.root / "checkout"
-        self.alpha = self.root / "alpha"
-        self.beta = self.root / "beta"
-        self.doc = self.checkout / "docs/plans/example-production.md"
-        self.log = self.checkout / "production.log"
-        self.state = self.root / "state"
-        self.home = self.root / "home"
-        self.phase_table_vault = self.root / "vault" / "showrunners"
-        self.state.mkdir()
-        self.home.mkdir()
-        self.phase_table_vault.parent.mkdir()
-        bin_path = self.root / "bin"
-        bin_path.mkdir()
-        for name in ("claude", "systemd-run", "ssh", "nix", "gh", "zsh", "cargo-berth"):
-            self.stub(bin_path / name)
-        for relative in (".claude/scripts/message/notifier.sh",
-                         ".claude/scripts/production/showrunners.py",
-                         ".claude/scripts/lib/py"):
-            self.stub(self.home / relative)
-        self.env = {**os.environ, "HOME": str(self.home), "LIFECYCLE_TEST_STATE": str(self.state),
-                    "PATH": str(bin_path) + os.pathsep + os.environ.get("PATH", ""),
-                    "CLAUDE_CODE_SESSION_ID": "test-showrunner",
-                    "SHOWRUNNER_SESSION": "environment-showrunner",
-                    "NOTIFIER_STATE_DIR": str(self.state / "notifier"),
-                    "NOTIFIER_SESSIONS_DIR": str(self.state / "sessions"),
-                    "PHASE_TABLE_VAULT": str(self.phase_table_vault),
-                    "SHOWRUNNER_STATE_DIR": str(self.state / "showrunner"),
-                    "SHOWRUNNERS_SESSIONS": str(self.root / "sessions.py"),
-                    "SHOWRUNNERS_SEND": str(self.root / "send.py"), "TEST_SENT": str(self.state / "sent.jsonl")}
-        self.env.update(fake_unit_host.environment(self.root))
-        self.write(self.root / "sessions.py", SESSIONS)
-        self.write(self.root / "send.py", SEND)
-        self.checkout.mkdir()
-        _ = self.git("init", "--bare", str(self.origin), cwd=self.root)
-        _ = self.git("init", "-b", "main", cwd=self.checkout)
-        _ = self.git("config", "user.name", "Lifecycle Test")
-        _ = self.git("config", "user.email", "lifecycle@example.invalid")
-        _ = self.git("remote", "add", "origin", str(self.origin))
-        self.write(self.checkout / "README.md", "base\n")
-        self.write(self.checkout / "docs/plans/alpha.md", "# Alpha plan\n")
-        self.write(self.checkout / "docs/plans/beta.md", "# Beta plan\n")
-        self.production_doc("planned")
-        _ = self.git("add", ".")
-        _ = self.git("commit", "-m", "initial production plan")
-        _ = self.git("push", "-u", "origin", "main")
+        super().setUp()
+        _ = self.staff.write_document({"schema": 1, "rows": []})
+        _ = self.enterContext(mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", self.state / "notifier"))
 
-    def stub(self, path: Path) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        self.write(path, STUB.replace("__PYTHON__", sys.executable))
-        path.chmod(0o644 if path.name == "showrunners.py" else 0o755)
-
-    def write(self, path: Path, content: str) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        _ = path.write_text(content, encoding="utf-8")
-
-    def git(self, *args: str, cwd: Path | None = None) -> str:
-        process = subprocess.run(["git", *args], cwd=cwd or self.checkout, env=self.env,
-                                 capture_output=True, text=True, check=False)
-        self.assertEqual(process.returncode, 0, (args, process.stdout, process.stderr))
-        return process.stdout.strip()
-
-    def production_doc(self, status: str, *, promote: str = "", close_out: str = "") -> None:
-        lines = [
-            "# Production — example", "",
-            f"> **Status: PRODUCTION — {status}.** Example production.",
-            "", "## Production Context", "",
-            "- **Merge branch:** `production`",
-            f"- **Showrunner checkout:** `{self.checkout}`",
-            "- **Showrunner session:** old-showrunner",
-            "- **Log:** `production.log`",
-            "- **User zone:** America/Los_Angeles",
-            "- **Updates:** every 15 minutes",
-            "- **Push:** git",
-        ]
-        if promote:
-            lines.append(f"- **Promote:** {promote}")
-        lines.extend([
-            "", "## Units", "",
-            "| Unit | Plan | Worktree | Branch | Session | Port | Owns |",
-            "| --- | --- | --- | --- | --- | --- | --- |",
-            f"| alpha-unit | docs/plans/alpha.md | `{self.alpha}` | alpha-branch | alpha | — | `alpha.txt` |",
-            f"| beta-unit | docs/plans/beta.md | `{self.beta}` | beta-branch | beta | — | `beta.txt` |",
-            "", "## Close-out", "",
-        ])
-        if close_out:
-            lines.append(close_out)
-        lines.extend(["", "## Production rules", "", "- No CI, smoke launch, Mac run, or validate_and_push.sh."])
-        self.write(self.doc, "\n".join(lines) + "\n")
-
-    def running(self) -> None:
-        _ = self.git("switch", "-c", "production")
-        self.production_doc("running")
-        _ = self.git("add", str(self.doc))
-        _ = self.git("commit", "-m", "production(example): plans for 2 units")
-        _ = self.git("push", "-u", "origin", "production")
-        _ = self.git("worktree", "add", "-b", "alpha-branch", str(self.alpha), "production")
-        _ = self.git("worktree", "add", "-b", "beta-branch", str(self.beta), "production")
-        _ = self.git("push", "origin", "alpha-branch", "beta-branch")
-        common_dir = Path(self.git("rev-parse", "--git-common-dir"))
-        with (self.checkout / common_dir / "info/exclude").open("a", encoding="utf-8") as output:
-            _ = output.write("production.log\n")
-        self.write(self.log, "# Production log — example\n\n### STATE\nold state\n")
-
-    def run_lifecycle(self, action: str, *extra: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run([sys.executable, str(SCRIPT), action, "--production", str(self.doc),
-                               *extra], cwd=self.checkout, env=self.env, capture_output=True,
-                              text=True, check=False, timeout=300)
-
-    def assert_step(self, result: subprocess.CompletedProcess[str], state: str) -> None:
-        self.assertRegex(result.stdout, rf"(?m)^[\w-]+: {state} — .+")
-        self.assertEqual(result.returncode, 0 if state == "ok" else 2,
-                         result.stdout + result.stderr)
-
-    def assert_no_ci_skips(self, output: str) -> None:
-        steps = cast(list[str], re.findall(r"(?m)^([\w-]+): ok — skipped: no CI$", output))
-        for name in ("ci", "smoke", "mac"):
-            self.assertTrue(any(name in step.lower() for step in steps), output)
-
-    def side_commit(self, worktree: Path, branch: str, unit: str, phase: str,
-                    *, shrink: bool = False) -> tuple[str, str]:
-        relative = f"{unit}-{phase}{'-shrink' if shrink else ''}.txt"
-        self.write(worktree / relative, relative + "\n")
-        _ = self.git("add", relative, cwd=worktree)
-        _ = self.git("commit", "-m", relative, cwd=worktree)
-        commit = self.git("rev-parse", "HEAD", cwd=worktree)
-        _ = self.git("push", "origin", branch, cwd=worktree)
-        subject = f"Merge {unit} phase {phase}{' shrink' if shrink else ''} ({commit[:7]}) into production"
-        _ = self.git("merge", "--no-ff", "-m", subject, branch)
-        return commit, self.git("rev-parse", "HEAD")
-
-    def merge_tip(self) -> str:
-        self.write(self.checkout / "merge-only.txt", "merge\n")
-        _ = self.git("add", "merge-only.txt")
-        _ = self.git("commit", "-m", "merge work")
-        _ = self.git("push", "origin", "production")
-        return self.git("rev-parse", "HEAD")
-
-    def promotion_checkout(self, name: str) -> Path:
-        destination = self.root / name
-        _ = self.git("clone", "-b", "main", str(self.origin), str(destination), cwd=self.root)
-        _ = self.git("config", "user.name", "Lifecycle Test", cwd=destination)
-        _ = self.git("config", "user.email", "lifecycle@example.invalid", cwd=destination)
-        return destination
-
-    def showrunner(self, slug: str, *, live: bool = False) -> None:
-        """An update timer for `slug`'s showrunner, and with `live` a running session it is addressed to."""
-        doc = self.root / f"{slug}-production.md"
-        self.write(doc, f"# {slug}\n")
-        self.write(self.state / "notifier" / f"showrunner-{slug}" / "conf",
-                   f"TARGET=session:{slug}-session\nCHECK=zsh /x/production_check.sh {doc}\n")
-        if live:
-            # This test's own process stands in for the session's: it is alive while the lifecycle runs.
-            self.write(self.state / "sessions" / f"{os.getpid()}.json",
-                       json.dumps({"pid": os.getpid(), "name": f"{slug}-name", "sessionId": f"{slug}-session",
-                                   "messagingSocketPath": str(self.root / f"{slug}.sock")}))
-
+    @override
     def reports_to(self, child: str, parent: str) -> Path:
-        path = self.state / "showrunner" / child / "parent"
-        self.write(path, parent + "\n")
+        path = super().reports_to(child, parent)
+        if "example" in (child, parent):
+            self.write(self.state / "notifier/showrunner-example/conf",
+                       f"TARGET=session:example-session\nCHECK=zsh /x/production_check.sh {self.doc}\n")
+        rows = {row.name: row for row in staff.find(kind="showrunner")}
+        parent_name = "old-showrunner" if parent == "example" else parent
+        child_name = "old-showrunner" if child == "example" else child
+        above = rows.get(parent_name)
+        if above is None:
+            above = staff.ensure("showrunner", name=parent_name)
+        below = rows.get(child_name)
+        if below is None:
+            _ = staff.ensure("showrunner", name=child_name, parent=above.id)
+        elif below.parent != above.id:
+            _ = staff.move(below.id, above.id)
         return path
 
-    def sent(self) -> list[list[str]]:
-        path = self.state / "sent.jsonl"
-        if not path.exists():
-            return []
-        return [cast(list[str], json.loads(line)) for line in path.read_text(encoding="utf-8").splitlines()]
+    def test_wrap_child_check_follows_staff_parent_despite_stale_parent_file(self) -> None:
+        self.merged_units()
+        self.showrunner("kid", live=True)
+        _ = self.reports_to("kid", "example")
+        child = next(row for row in staff.find(kind="showrunner") if row.name == "kid")
+        _ = staff.move(child.id, None)
+        result = self.run_lifecycle("wrap", "--no-ci")
+        self.assert_step(result, "ok")
+        self.assertEqual((self.state / "showrunner/kid/parent").read_text(), "example\n")
 
-    def merged_units(self) -> None:
-        self.running()
-        _ = self.side_commit(self.alpha, "alpha-branch", "alpha-unit", "1")
-        _ = self.side_commit(self.beta, "beta-branch", "beta-unit", "1")
-        _ = self.git("push", "origin", "production")
+    def staff_tree(self) -> tuple[staff.StaffRow, staff.StaffRow, staff.StaffRow, staff.StaffRow]:
+        self.merged_units()
+        top = staff.ensure("showrunner", name="top")
+        runner = staff.ensure("showrunner", name="old-showrunner", parent=top.id)
+        alpha = staff.ensure("unit", name="alpha", parent=runner.id)
+        beta = staff.ensure("unit", name="beta", parent=runner.id)
+        child = staff.ensure("showrunner", name="kid", parent=runner.id)
+        for slug in ("top", "kid"):
+            self.showrunner(slug, live=slug == "top")
+        _ = self.reports_to("example", "top")
+        _ = self.reports_to("kid", "example")
+        return runner, alpha, beta, child
 
-    def calls(self) -> str:
-        return (self.state / "calls").read_text() if (self.state / "calls").exists() else ""
+    def finish_interrupted_wrap(self, retire_showrunner: bool) -> None:
+        runner, alpha, beta, child = self.staff_tree()
+        target = runner.id if retire_showrunner else alpha.id
+        original = staff.retire
+        def interrupted(staff_id: staff.StaffId) -> staff.StaffRow | None:
+            row = original(staff_id)
+            if staff_id == target:
+                raise OSError("stopped after staff retirement")
+            return row
+        with mock.patch.object(staff, "retire", side_effect=interrupted):
+            first = self.run_lifecycle("wrap", "--no-ci")
+        self.assertEqual(first.returncode, 2, first.stdout + first.stderr)
+        self.assertTrue((self.state / "showrunner/example/wrap_release.json").exists())
+        with mock.patch.object(showrunner_tree, "edges_to_release", side_effect=AssertionError("capture read twice")):
+            result = self.run_lifecycle("wrap", "--no-ci")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for row in (runner, alpha, beta):
+            self.assertIsNone(staff.by_id(row.id))
+        self.assertEqual(staff.by_id(child.id), replace(child, parent=None))
+        self.assertEqual(len(self.sent()), 1)
+        data, document = self.staff.staff_file.read_bytes(), self.doc.read_bytes()
+        result = self.run_lifecycle("wrap", "--no-ci")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((self.staff.staff_file.read_bytes(), self.doc.read_bytes()), (data, document))
+        self.assertEqual(len(self.sent()), 1)
 
-    def write_phase_note(self, name: str, production: str, unit: str) -> Path:
-        note = self.phase_table_vault / "showrunner" / f"{name}.md"
-        self.write(
-            note,
-            "\n".join(
-                (
-                    "---",
-                    "phase_table: true",
-                    f"production: {production}",
-                    f"unit: {unit}",
-                    "---",
-                    "",
-                    f"# {name}",
-                    "",
-                )
-            ),
-        )
-        return note
+    def test_wrap_rerun(self) -> None:
+        self.finish_interrupted_wrap(False)
+
+    def test_wrap_rerun_after_showrunner_retirement_keeps_the_release_capture(self) -> None:
+        self.finish_interrupted_wrap(True)
+
+    def test_wrap_with_workers_retires_pending_ids_on_an_already_wrapped_retry(self) -> None:
+        runner, alpha, beta, child = self.staff_tree()
+        worker = staff.ensure("worker", name="impl1", parent=alpha.id)
+        result = self.run_lifecycle("wrap", "--no-ci")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn(worker.id, result.stdout)
+        self.assertEqual(staff.by_id(alpha.id), alpha)
+        self.assertEqual(staff.by_id(worker.id), worker)
+        self.assertIsNone(staff.by_id(beta.id))
+        self.assertEqual(staff.by_id(child.id), replace(child, parent=None))
+        self.assertEqual(staff.snapshot().pending_retire, tuple(sorted((runner.id, alpha.id))))
+        self.assertIn("wrapped", self.doc.read_text())
+        _ = staff.retire(worker.id)
+        result = self.run_lifecycle("wrap", "--no-ci")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIsNone(staff.by_id(alpha.id))
+        self.assertIsNone(staff.by_id(runner.id))
+        self.assertEqual(staff.snapshot().pending_retire, ())
+
+    def permanent_staff_tree(self) -> tuple[staff.StaffRow, staff.StaffRow, staff.StaffRow, staff.StaffRow, staff.StaffRow]:
+        runner, alpha, beta, child = self.staff_tree()
+        permanent = staff.ensure("unit", name="nightly", parent=runner.id)
+        text = self.doc.read_text().replace("## Close-out", "| nightly-unit | permanent | /not-here | nightly | — | — | — |\n\n## Close-out")
+        self.write(self.doc, text)
+        _ = self.git("add", str(self.doc))
+        _ = self.git("commit", "-m", "record permanent unit")
+        return runner, alpha, beta, child, permanent
+
+    def test_permanent_wrap_keeps_unit_and_showrunner_but_roots_every_showrunner_edge(self) -> None:
+        runner, alpha, beta, child, permanent = self.permanent_staff_tree()
+        result = self.run_lifecycle("wrap", "--no-ci")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(permanent.name, result.stdout)
+        self.assertIn(runner.name, result.stdout)
+        self.assertEqual(staff.by_id(permanent.id), permanent)
+        self.assertIsNone(staff.by_id(alpha.id))
+        self.assertIsNone(staff.by_id(beta.id))
+        self.assertEqual(staff.by_id(runner.id), replace(runner, parent=None))
+        self.assertEqual(staff.by_id(child.id), replace(child, parent=None))
+        self.assertEqual(staff.snapshot().pending_retire, ())
+
+    def test_permanent_wrap_rerun_reads_the_capture_after_unit_retirement(self) -> None:
+        runner, alpha, beta, child, permanent = self.permanent_staff_tree()
+        original = staff.retire
+        def interrupted(staff_id: staff.StaffId) -> staff.StaffRow | None:
+            row = original(staff_id)
+            if staff_id == alpha.id:
+                raise OSError("stopped after staff retirement")
+            return row
+        with mock.patch.object(staff, "retire", side_effect=interrupted):
+            first = self.run_lifecycle("wrap", "--no-ci")
+        self.assertEqual(first.returncode, 2, first.stdout + first.stderr)
+        with mock.patch.object(showrunner_tree, "edges_to_release", side_effect=AssertionError("capture read twice")):
+            result = self.run_lifecycle("wrap", "--no-ci")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(staff.by_id(permanent.id), permanent)
+        self.assertEqual(staff.by_id(runner.id), replace(runner, parent=None))
+        self.assertEqual(staff.by_id(child.id), replace(child, parent=None))
+        self.assertIsNone(staff.by_id(beta.id))
+        self.assertEqual(len(self.sent()), 1)
+        before = self.staff.staff_file.read_bytes(), self.doc.read_bytes()
+        self.assertEqual(self.run_lifecycle("wrap", "--no-ci").returncode, 0)
+        self.assertEqual((self.staff.staff_file.read_bytes(), self.doc.read_bytes()), before)
+        self.assertEqual(len(self.sent()), 1)
+
+    def test_wrap_release_retry_does_not_repeat_a_persisted_notice(self) -> None:
+        self.assert_release_notice_retry(reported_failure=False)
+
+    def test_wrap_release_keeps_failed_delivery_out_of_the_capture(self) -> None:
+        self.assert_release_notice_retry(reported_failure=True)
+
+    def test_wrap_uses_delivery_status_even_when_the_line_has_no_failure_prefix(self) -> None:
+        _ = self.staff_tree()
+        with (mock.patch.dict(os.environ, self.env),
+              mock.patch.object(showrunners, "SHOWRUNNER_STATE_DIR", self.state / "showrunner"),
+              mock.patch.object(showrunners, "tell_others",
+                                return_value=showrunners.NoticeDelivery(("delivery unavailable",), failed=("top",))),
+              contextlib.redirect_stdout(io.StringIO())):
+            _ = production_lifecycle.capture_release("example")
+            with self.assertRaisesRegex(production_lifecycle.LifecycleStop, "delivery unavailable"):
+                production_lifecycle.release_edges("example")
+            self.assertEqual(production_lifecycle.capture_release("example").told, ())
+
+    def assert_release_notice_retry(self, *, reported_failure: bool) -> None:
+        _ = self.staff_tree()
+        calls: list[str] = []
+        def tell(texts: dict[str, str], key: str) -> showrunners.NoticeDelivery:
+            target, = texts
+            self.assertEqual(key, f"showrunner-tree:{'example' if target == 'top' else target}")
+            calls.append(target)
+            if target == "kid" and calls.count("kid") == 1:
+                if reported_failure:
+                    return showrunners.NoticeDelivery(("could not tell kid: unavailable",), failed=("kid",))
+                raise OSError("second notice failed")
+            return showrunners.NoticeDelivery((f"told {target}",))
+        with mock.patch.dict(os.environ, self.env), mock.patch.object(
+                showrunners, "SHOWRUNNER_STATE_DIR", self.state / "showrunner"), mock.patch.object(
+                showrunners, "tell_others", side_effect=tell), contextlib.redirect_stdout(io.StringIO()):
+            _ = production_lifecycle.capture_release("example")
+            error = production_lifecycle.LifecycleStop if reported_failure else OSError
+            reason = "could not tell kid: unavailable" if reported_failure else "second notice failed"
+            with self.assertRaisesRegex(error, reason):
+                production_lifecycle.release_edges("example")
+            self.assertEqual(production_lifecycle.capture_release("example").told, ("top",))
+            production_lifecycle.release_edges("example")
+            production_lifecycle.release_edges("example")
+        self.assertEqual(calls, ["top", "kid", "kid"])
+        self.assertFalse((self.state / "showrunner/example/parent").exists())
+        self.assertFalse((self.state / "showrunner/kid/parent").exists())
+
+    def test_in_process_cli_matches_process_output_and_status(self) -> None:
+        for arguments in (("load", "--no-ci", "--resume"), ("wrap", "--no-ci"),
+                          ("promote-main", "--no-ci", "--ci-green", "abc")):
+            with self.subTest(arguments=arguments):
+                process = self.run_lifecycle_process(*arguments)
+                direct = self.run_lifecycle(*arguments)
+                self.assertEqual((direct.returncode, direct.stdout, direct.stderr),
+                                 (process.returncode, process.stdout, process.stderr))
 
     def test_load_holds_checkout_on_other_branch(self) -> None:
         self.running()
@@ -339,6 +316,9 @@ class LifecycleTests(unittest.TestCase):
 
     def test_load_finds_each_unit_session_by_its_mark_whatever_it_is_called(self) -> None:
         self.running()
+        with mock.patch.dict(os.environ, self.env):
+            self.staff.register_production("example", self.doc)
+        _ = unit_membership("old-showrunner", "beta-unit")
         fake_unit_host.write(self.env, [
             HostedUnit("alpha", "w1:p1", {}),
             HostedUnit("renamed-since-launch", "w2:p1", {
@@ -511,6 +491,16 @@ class LifecycleTests(unittest.TestCase):
         self.assertIn("smoke-launch: ok", passed.stdout)
         self.assertEqual(self.git("rev-parse", "main", cwd=self.origin), tip)
 
+    def test_showrunner_instructions_explain_stop_resume_and_account_move(self) -> None:
+        commands = Path(__file__).parents[2] / "commands/showrunner"
+        for name in ("produce.md", "move.md"):
+            with self.subTest(command=name):
+                text = (commands / name).read_text(encoding="utf-8")
+                for command in ("agents stop", "agents resume", "accounts.py move"):
+                    self.assertIn(command, text)
+                self.assertIn("--why", text)
+                self.assertNotIn("<PauseForMove>", text)
+
     def test_produce_names_live_ci_and_smoke_steps(self) -> None:
         command = Path(__file__).parents[2] / "commands/showrunner/produce.md"
         text = command.read_text(encoding="utf-8")
@@ -649,13 +639,13 @@ class LifecycleTests(unittest.TestCase):
             zone="America/New_York", doc=str(child_doc),
         )
         production = read_production(self.doc)
-        with (mock.patch.object(showrunners, "stored_children", return_value=("kid",)),
+        with (mock.patch.object(showrunner_tree, "stored_children", return_value=("kid",)),
               mock.patch.object(showrunners, "registered_showrunners", return_value=[child]),
-              mock.patch.object(showrunners, "detach") as detach,
-              mock.patch.object(showrunners, "tell_others", return_value=[]) as tell,
+              mock.patch.object(showrunner_parent, "detach") as detach,
+              mock.patch.object(showrunners, "tell_others", return_value=showrunners.NoticeDelivery()) as tell,
               contextlib.redirect_stdout(io.StringIO())):
             with self.assertRaises(production_lifecycle.LifecycleStop) as stopped:
-                production_lifecycle.wrap(production, self.doc.read_text().splitlines(), True,
+                _ = production_lifecycle.wrap(production, self.doc.read_text().splitlines(), True,
                                           production_lifecycle.VerdictMissing(),
                                           production_lifecycle.VerdictMissing(), ())
             detach.assert_not_called()
@@ -880,6 +870,34 @@ class LifecycleTests(unittest.TestCase):
         self.assertIn(relative, moved)
         self.assertEqual(self.git("rev-parse", "HEAD"), self.git("rev-parse", "origin/production"))
 
+    def test_same_wrap_command_finishes_after_the_doc_was_moved(self) -> None:
+        self.running()
+        _ = self.side_commit(self.alpha, "alpha-branch", "alpha-unit", "1")
+        _ = self.side_commit(self.beta, "beta-branch", "beta-unit", "1")
+        kept = self.checkout / "productions/example-production.md"
+        kept.parent.mkdir()
+        _ = self.git("mv", str(self.doc), str(kept))
+        _ = self.git("commit", "-m", "keep the doc in productions/")
+        _ = self.git("push", "origin", "production")
+        self.doc = kept
+        real_checked = production_lifecycle.checked
+
+        def stop_at_commit(checkout: Path, step: str, *arguments: str) -> str:
+            if step == "wrap" and arguments[:1] == ("add",):
+                raise OSError("stopped after mv")
+            return real_checked(checkout, step, *arguments)
+
+        with mock.patch.object(production_lifecycle, "checked", stop_at_commit):
+            stopped = self.run_lifecycle("wrap", "--no-ci")
+        self.assertEqual(stopped.returncode, 2, stopped.stdout)
+        self.assertFalse(kept.exists())
+        finished = self.run_lifecycle("wrap", "--no-ci")
+        self.assert_step(finished, "ok")
+        self.assertIn("| Next | close herdr sessions |", finished.stdout)
+        self.assertEqual(self.git("status", "--porcelain"), "")
+        self.assertEqual(self.git("rev-parse", "HEAD"), self.git("rev-parse", "origin/production"))
+        self.assertIn("wrapped", (self.checkout / "archive/checkout/example/example-production.md").read_text())
+
     def test_wrap_names_herdr_sessions_for_close_out(self) -> None:
         self.merged_units()
         result = self.run_lifecycle("wrap", "--no-ci")
@@ -976,6 +994,8 @@ class LifecycleTests(unittest.TestCase):
 
         self.assert_step(result, "ok")
         self.assertFalse(parent.exists())
+        child = next(row for row in staff.find(kind="showrunner") if row.name == "kid")
+        self.assertIsNone(child.parent)
         self.assertIn("children: ok — detached kid; now root; told kid", result.stdout)
         [sent] = self.sent()
         self.assertEqual(sent[sent.index("--to") + 1], f"uds:{self.root / 'kid.sock'}")

@@ -133,8 +133,68 @@ reason = "Legacy SQL migration input value removed after copying rows."
 [[terms]]
 name = "review pool"
 kind = "record"
-defined_in = "docs/production_format.md#Words"
+defined_in = "docs/as-built/review-pool.md"
 other_names = []
+retired = ["review pool"]
+
+
+
+
+
+[[terms.kept_contexts]]
+path = "docs/as-built/review-pool-probes.md"
+text = "# Review pool mesh probes"
+reason = "Current pool compatibility; the pool removal deletes this kept context and its use."
+
+[[terms.kept_contexts]]
+path = "docs/as-built/review-pool.md"
+text = "# Review pool"
+reason = "Current pool compatibility; the pool removal deletes this kept context and its use."
+
+[[terms.kept_contexts]]
+path = "docs/as-built/review-pool.md"
+text = "`**Review pool:** code` (or `code, ui`) in a production doc's Production Context switches the pool on for that production; the first review of each type primes it. Every code review of every unit then goes to the unit's reviewer with `--pool code --lease <slug>/<unit>/<phase>`; the UI pool is used on every design check. Without the line, reviews go to the unit's own workers with `--to`."
+reason = "Current pool compatibility; the pool removal deletes this kept context and its use."
+
+[[terms.kept_contexts]]
+path = "docs/as-built/review-pool.md"
+text = "With `ui` on the production's `**Review pool:**` line, every design check in <UXReview/> (steps 3, 5 and 6, rechecks and notice checks included) also runs the pooled UI reviewer on the same shots with its own prompt file (Prompts), after the unit director writes the shot paths to `${SESSION_DIR}/ux_shots_${PASS_INDEX}.txt`:"
+reason = "Current pool compatibility; the pool removal deletes this kept context and its use."
+
+[[terms.kept_contexts]]
+path = "docs/as-built/review-pool.md"
+text = "- With no `**Review pool:**` line in the production doc, and outside a production, every command behaves as it did without the pool. `review.sh`'s `--slot` and fresh paths are unchanged; `--to` gains only the turn record and the signal traps that mark it `canceled`."
+reason = "Current pool compatibility; the pool removal deletes this kept context and its use."
+
+[[terms.kept_contexts]]
+path = "scripts/message/roster.py"
+text = "review pool "
+reason = "Current pool compatibility; the pool removal deletes this kept context and its use."
+
+[[terms.kept_contexts]]
+path = "scripts/production/rename.py"
+text = "6. review pool "
+reason = "Current pool compatibility; the pool removal deletes this kept context and its use."
+
+[[terms.kept_contexts]]
+path = "scripts/production/retire_unit.py"
+text = "cannot read the review pool: "
+reason = "Current pool compatibility; the pool removal deletes this kept context and its use."
+
+[[terms.kept_contexts]]
+path = "scripts/production/transfer_unit.py"
+text = "review pool: "
+reason = "Current pool compatibility; the pool removal deletes this kept context and its use."
+
+[[terms.kept_contexts]]
+path = "scripts/production/transfer_unit.py"
+text = "(the review pool is unreadable: "
+reason = "Current pool compatibility; the pool removal deletes this kept context and its use."
+
+[[terms.kept_contexts]]
+path = "scripts/production/transfer_unit.py"
+text = "review pool "
+reason = "Current pool compatibility; the pool removal deletes this kept context and its use."
 
 [[terms]]
 name = "reviewer"
@@ -305,3 +365,15 @@ name = "ETA"
 kind = "record"
 defined_in = "commands/unit/eta.md#Steps"
 other_names = ["phase ETA"]
+
+[[terms]]
+name = "held design role"
+kind = "role"
+defined_in = "docs/as-built/long-lived-workers.md#Why roles outlive runs"
+other_names = ["guild", "guild head"]
+retired = ["guild", "guilds", "guild head", "guild heads"]
+
+[terms.inflected_forms]
+"held design role" = ["held design roles"]
+guild = ["guilds"]
+"guild head" = ["guild heads"]

@@ -27,6 +27,14 @@ STATE_HISTORY = (
     # Copies of queued prompt texts, which the pause hook matches exactly against each prompt that
     # comes in; the session's next stop rebuilds them from its wakeups. A rewrite breaks the match.
     "conversation-pause/scheduled-prompts/",
+    # Pane launch snapshots: forget_unit drops the old director; other panes keep their last launch
+    # until SessionStart rewrites it. Missing panes are ignored by pane_record's reader.
+    "herdr-panes/",
+    # lint/sweep.py records target deletion times, expiring absent roots and entries older than a day.
+    "lint-sweep/target-deletes.json",
+    # buildlog/mac_idle.py owns these registrations. Only a live pid/start and a current waiting
+    # step record admit a call; its repo comes from that step, not this saved launch snapshot.
+    "mac-idle/calls/",
 )
 # Under a production's own state folder.
 PRODUCTION_HISTORY = ("log-backups/", "dailies_last.json", "rename_unit.json", "rename.json")
@@ -73,7 +81,7 @@ def _tracked(checkout: Path) -> set[Path]:
 
 def _history(path: Path, roots: Roots, tracked: set[Path]) -> bool:
     try:
-        relative = path.relative_to(roots.state / "guilds/roles")
+        relative = path.relative_to(roots.state / "astra/design-roles")
         if len(relative.parts) > 2 and relative.parts[1] in ("prompts", "replies"):
             return True
         if len(relative.parts) == 2 and relative.parts[1] in ("adoption.json", "transfer.json"):
@@ -107,6 +115,32 @@ def shown(path: Path, state: Path) -> str:
     return "(masked)" if _under(path, state, ("shutdown/",)) else str(path)
 
 
+def _showrunner_live_text(text: str) -> str:
+    """Keep name fields and unknown fields; only the reader's known note text is history."""
+    fields = cast(dict[str, object], json.loads(text))
+    # judgment_state reads units[].unit as names. Keep merges_held live too; its
+    # entries name held merges. The remaining known text describes past decisions.
+    for name, note_fields in {
+        "units": ("phase", "wait"),
+        "next": (),
+        "open_for_user": ("text", "question"),
+        "report_to_user": ("text",),
+    }.items():
+        entries = fields.get(name)
+        if not isinstance(entries, list):
+            continue
+        live: list[object] = []
+        for entry in cast(list[object], entries):
+            if isinstance(entry, str) and name in ("next", "open_for_user"):
+                continue
+            if isinstance(entry, dict):
+                entry = {key: value for key, value in cast(dict[str, object], entry).items()
+                         if key not in note_fields or not isinstance(value, str)}
+            live.append(entry)
+        fields[name] = live
+    return json.dumps(fields)
+
+
 def sweep(values: tuple[str, ...], roots: Roots) -> list[str]:
     """The unclassified files that still hold one of the old names, each as a failure line."""
     pattern = token_pattern(values)
@@ -122,8 +156,14 @@ def sweep(values: tuple[str, ...], roots: Roots) -> list[str]:
             text = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
+        if path.name == "showrunner_state.json" and (path in roots.live_files or (
+                path.parent.name == "session" and path.parent.parent.parent == roots.state / "showrunner")):
+            try:
+                text = _showrunner_live_text(text)
+            except (ValueError, TypeError, AttributeError):
+                pass
         try:
-            relative = path.relative_to(roots.state / "guilds/roles")
+            relative = path.relative_to(roots.state / "astra/design-roles")
             if path.name == "design.json":
                 fields = cast(dict[str, object], json.loads(text))
                 role_entries = fields.get("roles")

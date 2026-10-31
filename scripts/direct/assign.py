@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 import json
+import itertools
 import os
 import re
 import signal
@@ -19,11 +20,13 @@ from types import FrameType
 from typing import NoReturn, cast, final
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib.process_failure import failure_detail
 from scripts.agents import codex_mesh
 from scripts.direct import workers
 from scripts.direct.worker_state import worker_claim_lock, worker_record_path
-from scripts.guilds import roles as guild_roles
+from scripts.astra import design_roles
 from scripts.lib import unit_runs
+from scripts.usage.agents_log import LENSES
 
 SCRIPTS = Path(__file__).resolve().parent
 PYTHON = str(SCRIPTS / "../lib/py")
@@ -105,7 +108,7 @@ def parse_arguments() -> Arguments:
         _ = parser.add_argument("--" + option, default="")
     _ = parser.add_argument("--prompt", required=True)
     _ = parser.add_argument("--cwd", default=str(Path.cwd()))
-    _ = parser.add_argument("--lens", choices=("adversary", "contract", "craft", "ux"), default="")
+    _ = parser.add_argument("--lens", choices=LENSES, default="")
     _ = parser.add_argument("--pass", dest="pass_number", type=int, default=1)
     _ = parser.add_argument("--image", action="append", default=[])
     args = parser.parse_args(namespace=Arguments())
@@ -224,6 +227,7 @@ class Dispatch:
     stage_cancel: socket.socket | None = None
     stage_errors: list[str] = field(default_factory=list)
     stage_message: str = ""
+    started_at: float = field(default_factory=time.time)
 
     def mesh_call(self, verb: str, *options: str, capture: bool = False,
                   check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -334,21 +338,15 @@ def claim_worker(dispatch: Dispatch) -> WorkerClaim:
         record = read_roster(dispatch.run, dispatch.worker)
         if not record or record.get("adopted_to"):
             refuse(f"{dispatch.worker}: worker is missing or adopted")
-        args = dispatch.args
         identity_path = worker_record_path(dispatch.run, dispatch.worker, dispatch.worker, role=dispatch.role)
         identity = read_object(identity_path)
         slot = text(identity.get("slot")) or dispatch.worker
-        model = text(identity.get("model")) or text(record.get("model")) or dispatch.model
-        effort = text(record.get("effort")) or dispatch.effort
+        model = text(identity.get("model")) or dispatch.model
         expected = {"name": dispatch.worker, "slot": slot, "family": dispatch.family,
                     "model": model, "worker_id": record.get("thread_id")}
         _ = identity.pop("role", None)
         if (identity and identity != expected) or not record.get("thread_id"):
             refuse(f"{dispatch.worker} has no matching durable worker identity for slot {slot}")
-        if (args.model and model != dispatch.model
-                or (args.effort or ":" in args.model) and effort != dispatch.effort):
-            refuse(f"{dispatch.worker}: requested {dispatch.model}:{dispatch.effort}, "
-                   + f"worker identity is {model}:{effort}")
         if not identity:
             _ = identity_path.write_text(json.dumps(expected))
         claim_path = dispatch.run / f"impl_claim_{slot}.json"
@@ -374,11 +372,11 @@ def claim_worker(dispatch: Dispatch) -> WorkerClaim:
                 else:
                     refuse(f"{dispatch.worker} is already implementing")
             _ = status_path.write_text("error\n")
-        if record.get("transferring_role") or record.get("role_redirect") or guild_roles.transfer_route(
+        if record.get("transferring_role") or record.get("role_redirect") or design_roles.transfer_route(
                 text(record.get("thread_id")), text(record.get("held_design_id"))):
             refuse(f"{dispatch.worker}: TransferringRole; use its destination holder")
         if record.get("held_design_id"):
-            refuse(f"{dispatch.worker}: held roles resume through roles.py")
+            refuse(f"{dispatch.worker}: held roles resume through design_roles.py")
         config = Path(os.environ.get("UNIT_CONFIG", str(Path.home() / ".claude/config/direct.conf")))
         match = re.search(r"^UNIT_COMPACT_ABOVE_TOKENS=(\d+)", config.read_text(), re.M) if config.is_file() else None
         threshold = int(match.group(1)) if match else 0
@@ -388,11 +386,15 @@ def claim_worker(dispatch: Dispatch) -> WorkerClaim:
         if isinstance(context_tokens, int) and context_tokens > threshold:
             compact = dispatch.mesh_call("compact", capture=True, check=False)
             if compact.returncode:
-                detail = (compact.stderr.strip() or compact.stdout.strip() or f"exit {compact.returncode}").splitlines()[-1]
+                detail = failure_detail(compact, lines=1).replace("\n", "; ")
                 if compact.returncode == 3:
                     dispatch.board(slot, "status", f"launcher: {dispatch.worker} still has a live turn after compaction: {detail}; follow-up not sent")
                     refuse(f"{dispatch.worker} still has a live turn after compaction; end the worker "
                            + f"(codex_mesh.py end --to {dispatch.worker}) and start a fresh one")
+                if compact.returncode == codex_mesh.COMPACT_ROSTER_CHANGED:
+                    dispatch.board(slot, "status", f"launcher: {detail}; follow-up not sent")
+                    refuse(f"{dispatch.worker}: roster changed during compaction; follow-up not sent; "
+                           + f"inspect the worker and use codex_mesh.py reopen --to {dispatch.worker} if idle")
                 dispatch.board(slot, "status", f"launcher: compaction failed for {dispatch.worker}: {detail}; continuing follow-up")
             else:
                 dispatch.board(slot, "status", f"launcher: {compact.stdout.strip() or f'compacted {dispatch.worker}'}")
@@ -400,7 +402,8 @@ def claim_worker(dispatch: Dispatch) -> WorkerClaim:
             _ = dispatch.mesh_call("reopen", capture=True)
         dispatch.claim_follow()
         _ = claim_path.write_text(json.dumps({"pid": os.getpid(), "worker": dispatch.worker, "turn_id": ""}))
-        return WorkerClaim(identity_path, slot, model, effort)
+        # Each turn runs at the caller's model:effort (agents.conf default or explicit override).
+        return WorkerClaim(identity_path, slot, dispatch.model, dispatch.effort)
 
 
 def stage_two_submitted(receipts: Path, message: str) -> bool:
@@ -414,13 +417,54 @@ def stage_two_submitted(receipts: Path, message: str) -> bool:
     return False
 
 
+def record_review(dispatch: Dispatch, completed: bool, summary: Path) -> None:
+    """Keep each launcher's review evidence, including a recorded zero."""
+    if dispatch.role != "review":
+        return
+    state = object_map(cast(object, json.loads((dispatch.run / "progress_history_state.json").read_text())))
+    phase = object_map(state.get("phase"))
+    for candidate in cast(list[object], state.get("open_phases", [])):
+        item = object_map(candidate)
+        if item.get("id") == dispatch.phase:
+            phase = item
+            break
+    record = read_roster(dispatch.run, dispatch.worker)
+    raised = len(re.findall(r"^\s*\d+[.)]\s+", summary.read_text(), re.MULTILINE))
+    store = workers.ledger_for_run(dispatch.run)
+    evidence: dict[str, object] = {
+        "arm": "own", "pool": store.path.parent.name, "unit": store.path.stem,
+        "phase": dispatch.phase, "phase_instance_id": phase.get("instance_id", ""),
+        "history_file": state.get("history_file", ""), "reviewer": dispatch.worker,
+        "thread_id": record.get("thread_id", ""), "lens": dispatch.args.lens,
+        "kind": "ux" if dispatch.args.lens == "ux" else "broad" if dispatch.args.pass_number == 1 and dispatch.args.lens else "closure",
+        "pass": dispatch.args.pass_number, "started_at": int(dispatch.started_at),
+        "finished_at": time.time(), "status": "reviewed" if completed else "error",
+        "raised": raised, "lease_ordinal": 0, "prime_hash": "",
+    }
+    root = unit_runs.history_root() / "review_turns" / dispatch.run.name
+    root.mkdir(parents=True, exist_ok=True)
+    for sequence in itertools.count():
+        try:
+            output = (root / f"{int(dispatch.started_at)}-{os.getpid()}-{sequence}.json").open("x", encoding="utf-8")
+        except FileExistsError:
+            continue
+        with output:
+            json.dump(evidence, output)
+            _ = output.write("\n")
+        break
+
+
 def settle_dispatch(dispatch: Dispatch, code: int, completed: bool, shown: str,
                     status: Path, summary: Path, reply: Path) -> int:
     """Completed work wins; otherwise ownership loss precedes refusal or failure."""
     record = read_roster(dispatch.run, dispatch.worker)
+    if dispatch.args.early_ready:
+        lens_suffix = f"_{dispatch.args.lens}" if dispatch.args.lens else ""
+        _ = (status.parent / f"review_status{lens_suffix}").write_text("reviewed\n" if completed else "error\n")
     if not completed and record.get("adopted_to"):
         destination = text(record["adopted_to"])
         _ = status.write_text("handed_off\n")
+        record_review(dispatch, False, summary)
         _ = summary.write_text(f"{shown}: handed off to {destination}; completion unknown\n")
         print(f"handed off: {dispatch.worker} to {destination}; completion unknown")
         return 4
@@ -429,6 +473,7 @@ def settle_dispatch(dispatch: Dispatch, code: int, completed: bool, shown: str,
         code = 1
     if not summary.read_text().strip() and reply.exists():
         _ = summary.write_text(reply.read_text())
+    record_review(dispatch, completed, summary)
     if shown not in summary.read_text():
         _ = summary.write_text(shown + "\n\n" + summary.read_text())
     if dispatch.args.summary:
@@ -455,6 +500,10 @@ def execute(dispatch: Dispatch, paths: list[str]) -> int:
     reply = phase_dir / f"{dispatch.role}_reply{suffix}.txt"
     _ = summary.write_text("")
     _ = status.write_text("running\n")
+    if args.early_ready:
+        lens_suffix = f"_{args.lens}" if args.lens else ""
+        _ = (phase_dir / f"review_status{lens_suffix}").write_text("reviewing\n")
+        _ = (phase_dir / f"review_pid{lens_suffix}").write_text(f"{os.getpid()}\n")
     try:
         dispatch.claim = claim_worker(dispatch)
     except SystemExit as error:
@@ -480,8 +529,12 @@ def execute(dispatch: Dispatch, paths: list[str]) -> int:
     follow = [PYTHON, MESH, "follow", "--session-dir", str(dispatch.run), "--to", dispatch.worker,
               "--claim-pid", str(os.getpid()), "--role", dispatch.role, "--cwd", str(dispatch.cwd),
               "--message-file", str(message), "--summary-file", str(summary), "--reply-file", str(reply),
-              "--log-file", str(log), "--model", dispatch.model, "--effort", dispatch.effort,
+              "--log-file", str(log),
               "--task", f"direct.{dispatch.role}", "--service-tier", dispatch.tier]
+    if args.model:
+        follow += ["--model", args.model]
+    if args.effort:
+        follow += ["--effort", args.effort]
     if dispatch.role == "review":
         follow += ["--read-only"]
     if args.lens:

@@ -14,6 +14,7 @@ import json
 import os
 import re
 import stat
+import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass, field
@@ -754,38 +755,35 @@ def _assert_issue_membership_unchanged(plan: RankingPlan) -> None:
         )
 
 
-def _atomic_write(path: Path, content: bytes, mode: int) -> None:
-    """Overwrite ``path`` in place, preserving its inode and creation date.
-
-    Editing the existing file—rather than replacing it with a renamed temp
-    file—keeps the same inode, so the macOS creation date and every other
-    identity-bound attribute survive without a SetFile call. Only mtime is
-    nudged one millisecond within its New York date so Obsidian invalidates its
-    metadata cache while obsidian_knife still sees the same date_modified value.
-
-    The write is deliberately not crash-atomic: a reader that catches the brief
-    mid-write window may observe a partial file. The next deterministic apply
-    rewrites the canonical content, so the exposure self-heals.
-    """
-    before = path.lstat()
-
-    file_descriptor = os.open(path, os.O_WRONLY | os.O_NOFOLLOW)
-    with os.fdopen(file_descriptor, "wb") as handle:
-        os.fchmod(handle.fileno(), mode)
-        _ = handle.write(content)
-        handle.flush()
-        _ = handle.truncate()
-
-    os.utime(
-        path,
-        ns=(before.st_atime_ns, _refreshed_mtime_ns(before.st_mtime_ns)),
-        follow_symlinks=False,
+def _atomic_write(
+    path: Path, content: bytes, mode: int, *, preserve_dates: bool = True
+) -> None:
+    """Publish a complete, synced replacement; keep note dates before publishing."""
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.prioritize-", dir=path.parent
     )
-    refreshed = os.lstat(path)
-    if refreshed.st_mtime_ns == before.st_mtime_ns:
-        raise OSError(f"cannot refresh Obsidian metadata cache for {path}")
-    if _operational_date(refreshed.st_mtime_ns) != _operational_date(before.st_mtime_ns):
-        raise OSError(f"cannot preserve modified calendar date for {path}")
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            os.fchmod(handle.fileno(), mode)
+            _ = handle.write(content)
+            handle.flush()
+            if preserve_dates:
+                before = path.lstat()
+                if not stat.S_ISREG(before.st_mode):
+                    raise OSError(f"not a regular note: {path}")
+                if sys.platform == "darwin":
+                    created = datetime.fromtimestamp(before.st_birthtime)
+                    command = ["/usr/bin/SetFile", "-d", created.strftime("%m/%d/%Y %H:%M:%S"), str(temporary)]
+                    try:
+                        _ = subprocess.run(command, check=True, capture_output=True)
+                    except subprocess.CalledProcessError as error:
+                        raise OSError(f"{command!r} exited {error.returncode}") from error
+                os.utime(temporary, ns=(before.st_atime_ns, _refreshed_mtime_ns(before.st_mtime_ns)))
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _rollback(written: Sequence[PlannedChange]) -> list[str]:
@@ -842,28 +840,9 @@ def _write_rankings(plan: RankingPlan) -> None:
     try:
         if path.exists() and path.read_bytes() == content:
             return
-        file_descriptor, temporary_name = tempfile.mkstemp(
-            prefix=f".{path.name}.prioritize-", dir=path.parent
-        )
-        temporary_path: str | None = temporary_name
-        try:
-            with os.fdopen(file_descriptor, "wb") as temporary:
-                _ = temporary.write(content)
-                temporary.flush()
-                os.fsync(temporary.fileno())
-            os.replace(temporary_path, path)
-            temporary_path = None
-        finally:
-            if temporary_path is not None:
-                try:
-                    os.unlink(temporary_path)
-                except FileNotFoundError:
-                    pass
+        _atomic_write(path, content, 0o644, preserve_dates=False)
     except OSError as error:
-        print(
-            f"warning: could not write rankings export {path}: {error}",
-            file=sys.stderr,
-        )
+        raise ApplyError(f"could not write rankings export {path}: {error}") from error
 
 
 def apply_plan(plan: RankingPlan) -> None:
@@ -956,7 +935,7 @@ def _argument_parser() -> argparse.ArgumentParser:
     _ = mode.add_argument(
         "--check",
         action="store_true",
-        help="return 1 when the mechanical state is not canonical",
+        help="return 1 when note ranks or the rankings export are not canonical",
     )
     _ = parser.add_argument(
         "--require-complete",
@@ -987,7 +966,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         if check:
             mode = "check + require-complete" if require_complete else "check"
             print_plan(plan, mode=mode)
-            return 1 if plan.changes or (
+            export = plan.scope.vault / RANKINGS_FILENAME
+            export_current = export.is_file() and export.read_bytes() == _rankings_content(plan)
+            return 1 if plan.changes or not export_current or (
                 require_complete and plan.needs_prioritization
             ) else 0
         mode = (

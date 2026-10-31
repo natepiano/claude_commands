@@ -289,20 +289,20 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
             if path not in snapshots:
                 snapshots[path] = read_snapshot(path, now, decision_folder, decisions)
         open_steps = steps.result()
-    lines = ["| Unit | Ticket | Step | ETA | Findings built (24 h) | Findings left |",
-             "| --- | --- | --- | --- | --- | --- |"]
+    lines = ["| Unit | Ticket | Step | ETA | Findings built | Last 24 h | Findings left |",
+             "| --- | --- | --- | --- | ---: | ---: | ---: |"]
     for unit in units:
         snapshot = snapshots[paths[unit.unit].resolve()] if unit.unit in paths else LedgerSnapshot()
         family = rules.style_family(unit.unit)
         counts = snapshot.counts.get(family, FamilyCounts()) if isinstance(family, str) else FamilyCounts()
         ticket = snapshot.tickets.get(unit.unit, NoTicket())
         refill = snapshot.refills.get(unit.unit)
-        idle = f"idle — {refill.outcome} ({clock(refill.at, zone)})" if refill else "idle"
+        idle = f"idle ({clock(refill.at, zone)})" if refill else "idle"
         idle_step = f"idle — {refill.outcome}" if refill else "idle"
         left = left_cell(counts.left, counts.filed, snapshot.splits.get(unit.unit, style_ledger.NoSplitRecorded()), now)
         cells = (unit_table_cells.session_cell(unit), ticket_cell(ticket) if isinstance(ticket, Ticket) else idle,
                  format_step(open_steps[unit.unit], ticket, idle_step), eta_cell(records.get(unit.unit), zone),
-                 f"{counts.built:,} ({counts.recent:,})", left)
+                 f"{counts.built:,}", f"{counts.recent:,}", left)
         lines.append("| " + " | ".join(unit_table_cells.escaped(cell) for cell in cells) + " |")
     all_counts = [counts for snapshot in snapshots.values() for counts in snapshot.counts.values()]
     totals = FamilyCounts(sum(counts.built for counts in all_counts), sum(counts.left for counts in all_counts),

@@ -23,7 +23,7 @@ export interface BoardEta {
   fix_done: number; fix_running: number;
 }
 export type BoardStep = [state: string, what: string, started: BoardTime, took_seconds: number];
-export interface BoardWorker { slot: string; role: string; state: string; model: string; doing: string }
+export interface BoardWorker { slot: string; role: string; state: string; model: string; effort?: string; doing: string }
 export interface PlanPhase { kind: 'plan'; id: string; of: number; title: string }
 export interface TicketPhase { kind: 'ticket'; id: string; title: string; merged: number }
 export interface BoardUnit {

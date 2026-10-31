@@ -11,13 +11,17 @@ from pathlib import Path
 from typing import cast, final, override
 from unittest import mock
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import change_review
 import footer_counts
 import next_item
 import proposal_issue
 import proposals_folder
-import showrunners
+from scripts.production import showrunners
+import showrunner_tree
+from scripts.production import staff
 from footer_counts import FooterCounts
 
 LIST = """# Change review
@@ -89,16 +93,19 @@ class FooterCountsTests(unittest.TestCase):
         self.tree = {}
         self.below = {}
         _ = self.enterContext(mock.patch.object(showrunners, "timer_docs", side_effect=lambda: self.tree))
-        _ = self.enterContext(mock.patch.object(showrunners, "descendants_of",
+        _ = self.enterContext(mock.patch.object(showrunner_tree, "descendants_of",
                                                 side_effect=self.productions_below))
         # Each production below a root reports to that root.
-        _ = self.enterContext(mock.patch.object(showrunners, "edges", side_effect=self.parents))
+        _ = self.enterContext(mock.patch.object(showrunner_tree, "edges", side_effect=self.parents))
 
-    def parents(self, slugs: set[str] | None = None) -> dict[str, str]:
-        del slugs
+    def parents(self, slugs: set[str] | None = None, *,
+                record: staff.StaffSnapshot | None = None) -> dict[str, str]:
+        del slugs, record
         return {child: parent for parent, children in self.below.items() for child in children}
 
-    def productions_below(self, slug: str) -> list[str]:
+    def productions_below(self, slug: str, *,
+                          record: staff.StaffSnapshot | None = None) -> list[str]:
+        del record
         return self.below.get(slug, [])
 
     def doc(self, *fields: str) -> Path:

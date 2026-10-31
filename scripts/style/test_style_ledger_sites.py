@@ -13,6 +13,7 @@ from contextlib import closing
 from typing import cast, final
 from unittest import mock
 import style_ledger
+import rules
 from approved_renames import AppliedInCode, BindingRename, RenameNotApplied, binding_rename_check
 import declarations
 import style_footprint
@@ -26,6 +27,68 @@ TEST_HANG_GUARD_SECS = 300
 
 @final
 class StyleLedgerSitesTests(LedgerTestCase):
+    def assert_hidden_enclosing_move_refused(self, prefix: str) -> None:
+        header = "macro_rules! declarations {\n    () => {\n"
+        work = "            fn work() {\n                let old = 791;\n            }\n"
+        source = (header + "        " + prefix + " fn first() {\n" + work
+                  + "        }\n        " + prefix + " fn second() {}\n    };\n}\n")
+        line = source.splitlines().index("                let old = 791;") + 1
+        ledger, _, finding = self.site_fixture(source=source, line=line)
+        moved = (header + "        " + prefix + " fn first() {}\n        " + prefix
+                 + " fn second() {\n" + work + "        }\n    };\n}\n")
+        tip = self.commit_tip(ledger, {PARENT_FILE: moved})
+        with self.subTest(proof="strict"):
+            self.assertIsInstance(self.strict_site(ledger, finding, tip), style_ledger.NeedsJudgment)
+        with self.subTest(proof="public"):
+            self.assertIsInstance(ledger.finding_site(finding, tip), style_ledger.NeedsJudgment)
+
+    def test_site_refuses_dollar_visibility_owner_move(self) -> None:
+        self.assert_hidden_enclosing_move_refused("$vis")
+
+    def test_site_refuses_unknown_qualifier_chain_owner_move(self) -> None:
+        self.assert_hidden_enclosing_move_refused('unrecognized another pub(crate) unsafe extern "C"')
+
+    def test_site_refuses_two_identifier_owner_move(self) -> None:
+        self.assert_hidden_enclosing_move_refused("alpha beta")
+
+    def test_site_refuses_macro_fragment_owner_move(self) -> None:
+        self.assert_hidden_enclosing_move_refused("$name:ident")
+
+    def test_site_refuses_path_prefix_owner_move(self) -> None:
+        self.assert_hidden_enclosing_move_refused("unknown::modifier")
+
+    def assert_expression_boundary_carries(self, expression: str) -> None:
+        source = "fn work() {\n    " + expression + "\n    let old = 791;\n}\n"
+        ledger, _, finding = self.site_fixture("types", source=source, line=3, before="old", kind="type")
+        tip = self.commit_tip(ledger, {PARENT_FILE: "fn sibling() {}\n" + source})
+        self.assertEqual(self.strict_site(ledger, finding, tip), style_ledger.UnchangedSite(PARENT_FILE, 4))
+        self.assertEqual(ledger.finding_site(finding, tip), style_ledger.UnchangedSite(PARENT_FILE, 4))
+        # A context finding still needs judgment when another line in its item changes.
+        tip = self.commit_tip(ledger, {PARENT_FILE: source.replace(expression, expression + " changed();")})
+        self.assertIsInstance(self.strict_site(ledger, finding, tip), style_ledger.NeedsJudgment)
+        self.assertIsInstance(ledger.finding_site(finding, tip), style_ledger.NeedsJudgment)
+
+    def test_site_carries_none_match_arm_boundary(self) -> None:
+        self.assert_expression_boundary_carries("match x { None => 1, Some(_) => 2 };")
+
+    def test_site_carries_wildcard_match_arm_boundary(self) -> None:
+        self.assert_expression_boundary_carries("match x { _ => 1 };")
+
+    def test_site_carries_struct_literal_field_boundary(self) -> None:
+        self.assert_expression_boundary_carries("let pair = Pair { a: 1 };")
+
+    def test_site_carries_compound_assignment_boundary(self) -> None:
+        self.assert_expression_boundary_carries("x += 1;")
+
+    def test_site_carries_cast_boundary(self) -> None:
+        self.assert_expression_boundary_carries("x as T;")
+
+    def test_site_carries_range_boundary(self) -> None:
+        self.assert_expression_boundary_carries("x..y;")
+
+    def test_site_carries_comma_boundary(self) -> None:
+        self.assert_expression_boundary_carries("collect! { x, };")
+
     def test_context_site_refuses_deleted_same_file_duplicate_in_original_crate_scope(self) -> None:
         source = "fn first() {\n    consume(791);\n}\nfn duplicate() {\n    consume(791);\n}\n"
         ledger, _, finding = self.site_fixture("types", rule_name="no-duplicate-implementations",
@@ -107,6 +170,10 @@ class StyleLedgerSitesTests(LedgerTestCase):
 
     def test_site_follow_preserves_line_evidence_and_pinned_fields_without_restamping_cells(self) -> None:
         ledger, rule, finding = self.site_fixture()
+        # Keep the historical rule readable when both original pins are validated.
+        _ = subprocess.run(["git", "init", "-q", str(self.rule_dir.parent)], check=True)
+        _ = subprocess.run(["git", "-C", str(self.rule_dir.parent), "hash-object", "-w",
+                            str(self.rule_dir / "site-rule.md")], check=True, capture_output=True)
         # A substantive rule edit must remain separate coverage work after the follow.
         _ = (self.rule_dir / "site-rule.md").write_text((self.rule_dir / "site-rule.md").read_text() + "New requirement\n")
         tip = self.commit_tip(ledger, {PARENT_FILE: "// inserted\nfn work() {\n    let old = 791;\n}\nfn sibling() {}\n"})
@@ -192,15 +259,16 @@ class StyleLedgerSitesTests(LedgerTestCase):
 
 
     def test_context_site_rejects_changed_explicit_reads(self) -> None:
-        ledger, rule, finding = self.site_fixture("modules", kind="restructure", scope="crate")
+        ledger, rule, finding = self.site_fixture("modules", kind="restructure", scope="crate", keep_ticket_open=True)
         self.record_reads(rule, PARENT_FILE, ledger.synced_commit(), (self.sources[1],), verdict="held", ticket="judge-1")
+        ledger.ticket_drop("judge-1")
         tip = self.commit_tip(ledger, {PARENT_FILE: "fn sibling() {}\n" + (self.repo / PARENT_FILE).read_text(),
                                        self.sources[1]: "fn changed_dependency() {}\n"})
         self.assertIsInstance(self.strict_site(ledger, finding, tip), style_ledger.NeedsJudgment)
 
 
     def test_site_follow_rejects_late_pre_deletion_judgment_after_identical_restore(self) -> None:
-        ledger, rule, finding = self.site_fixture()
+        ledger, rule, finding = self.site_fixture(keep_ticket_open=True)
         source = (self.repo / PARENT_FILE).read_text()
         before = ledger.synced_commit()
         deletion = self.commit_tip(ledger, {PARENT_FILE: None})
@@ -212,6 +280,7 @@ class StyleLedgerSitesTests(LedgerTestCase):
         # Recorded after restoration, but still judges the pre-deletion file.
         ledger.record(rule, PARENT_FILE, before, self.blob(rule), "held", ticket="judge-1", worker="late",
                       input_scope=style_ledger.DeclaredInputScope.RULE)
+        ledger.ticket_drop("judge-1")
         self.assertIsInstance(self.strict_site(ledger, finding, tip), style_ledger.NeedsJudgment)
         _ = ledger.follow_declarations([finding.finding_id], tip, lambda _: True)
         self.assertEqual(ledger.named_held([finding.finding_id])[0].follow, style_ledger.NotFollowed())
@@ -268,15 +337,15 @@ class StyleLedgerSitesTests(LedgerTestCase):
         self.assertIsInstance(ledger.finding_site(finding, tip), style_ledger.NeedsJudgment)
 
 
-    def test_site_proof_rejects_partly_unreadable_item_parse(self) -> None:
+    def test_site_proof_ignores_unreadable_sibling_owner(self) -> None:
         ledger, _, finding = self.site_fixture()
         source = (self.repo / PARENT_FILE).read_text()
         tip = self.commit_tip(ledger, {PARENT_FILE: source + "fn sibling() {}\n"})
         self.assertIsInstance(ledger.finding_site(finding, tip), style_ledger.UnchangedSite)
         tip = self.commit_tip(ledger, {PARENT_FILE: source + "mod nested { unsupported; }\n"})
-        self.assertIsInstance(ledger.finding_site(finding, tip), style_ledger.NeedsJudgment)
+        self.assertIsInstance(ledger.finding_site(finding, tip), style_ledger.UnchangedSite)
         _ = ledger.follow_declarations([finding.finding_id], tip, lambda _: True)
-        self.assertEqual(ledger.named_held([finding.finding_id])[0].follow, style_ledger.NotFollowed())
+        self.assertEqual(ledger.named_held([finding.finding_id])[0].follow, style_ledger.FollowedDeclaration(PARENT_FILE, 2, tip))
 
 
     def test_site_proof_rejects_non_utf8_pinned_rule_text(self) -> None:
@@ -299,6 +368,51 @@ class StyleLedgerSitesTests(LedgerTestCase):
         self.assertEqual(ledger.named_held([finding.finding_id])[0].follow, style_ledger.NotFollowed())
 
 
+    def test_binding_carry_ignores_withdrawn_types_evidence_under_a_surviving_names_ticket(self) -> None:
+        source = "fn f() {\n    let old = input;\n    consume(old);\n}\n"
+        ledger, _, base = self.binding_ticket(source, ((2, "old", "fresh"),))
+        path = self.sources[0]
+        types = self.rule("withdrawn-types", "tier: C\nfamily: types\ninput_scope: file\n")
+        _ = ledger.hold(types, path, 2, source.splitlines()[1], "type", "u32", "Count", self.blob(types), "outside")
+        ledger.record(types, path, base, self.blob(types), "held", ticket="outside", worker="held")
+        rule_file = self.rule_dir / "withdrawn-types.md"
+        _ = rule_file.write_text(rule_file.read_text() + "New types requirement.\n")
+        _ = ledger.withdraw_superseded({item.rule_id: item for item in rules.load_rules(self.repo)})
+        self.write(path, source.replace("old", "fresh"))
+        checkpoint = self.commit("Rename after unrelated types withdrawal")
+        ledger.set_tip(checkpoint, "main")
+        ledger.ticket_checkpoint("names-1", checkpoint)
+        ticket, = ledger.proposal_tickets()
+        try:
+            carry = ledger.binding_carry_forward(ticket, checkpoint)
+        except IndexError:
+            self.fail("binding carry selected an inactive judgment id without its evidence")
+        self.assertEqual(carry, style_ledger.BindingCarryForward())
+        self.assertEqual(ledger.ticket_merge("names-1"), ())
+
+    def test_removed_barrier_survives_rule_generations_and_identical_file_restoration(self) -> None:
+        ledger, rule, original = self.removed_ticket()
+        path = self.sources[0]
+        content = (self.repo / path).read_text()
+        (self.repo / path).unlink()
+        deleting = self.commit("Delete cell")
+        self.record_removed(ledger, rule, path, deleting)
+        rule_file = self.rule_dir / "read.md"
+        original_rule = rule_file.read_text()
+        _ = rule_file.write_text(original_rule + "Body B.\n")
+        _ = ledger.withdraw_superseded({item.rule_id: item for item in rules.load_rules(self.repo)})
+        _ = rule_file.write_text(original_rule)
+        _ = ledger.withdraw_superseded({item.rule_id: item for item in rules.load_rules(self.repo)})
+        self.write(path, content)
+        restored = self.commit("Restore byte-identical file")
+        ledger.set_tip(restored, "main")
+        ledger.record(rule, path, original, self.blob(rule), "clean", ticket="outside",
+                      input_scope=style_ledger.DeclaredInputScope.RULE)
+        self.assertNotEqual(next(cell for cell in ledger.cells(rule) if cell.path == path).state, "current")
+        ledger.record(rule, path, restored, self.blob(rule), "clean", ticket="outside",
+                      input_scope=style_ledger.DeclaredInputScope.RULE)
+        self.assertEqual(next(cell for cell in ledger.cells(rule) if cell.path == path).state, "current")
+
     def test_binding_carry_restamps_types_and_follows_open_sites_through_reflow(self) -> None:
         source = "fn f() {\n    let old = input;\n    consume(old);\n}\n"
         ledger, _, base = self.binding_ticket(source, ((2, "old", "fresh"),))
@@ -308,12 +422,12 @@ class StyleLedgerSitesTests(LedgerTestCase):
         ledger.ticket_add("types-1", "types", "read", "types", "crates/alpha", [path], [types])
         ledger.ticket_assign("types-1", "main")
         _ = ledger.ticket_base("types-1")
-        ledger.ticket_drop("types-1")
         findings = tuple(ledger.hold(types, path, line, source.splitlines()[line - 1], "type", "u32", "Count",
                                      self.blob(types), "types-1") for line in (2, 3))
         ledger.file_held(findings[1].finding_id, self.root / "types.md")
         ledger.record(types, path, base, self.blob(types), "held", ticket="types-1", worker="judge",
                       input_scope=style_ledger.DeclaredInputScope.RULE)
+        ledger.ticket_drop("types-1")
         crate_types = self.rule("crate-types", "tier: C\nfamily: types\ninput_scope: crate\n")
         reads_types = self.rule("reads-types", "tier: C\nfamily: types\ninput_scope: crate\n")
         for rule in (crate_types, reads_types):

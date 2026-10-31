@@ -8,6 +8,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from collections.abc import Iterator
@@ -44,6 +45,7 @@ class SessionLookupTests(ShutdownTestCase):
         self.addCleanup(self.socket.close)
         self.socket_path = Path(self.enterContext(short_socket_directory())) / "live.sock"
         self.socket.bind(str(self.socket_path))
+        _ = self.enterContext(mock.patch.object(time, "sleep"))
 
     def record(
         self, filename: str, *, pid: int | None = None, name: str = "agent",
@@ -353,6 +355,46 @@ class SessionLookupTests(ShutdownTestCase):
             self.assertEqual(read.unreadable, (self.sessions,))
             self.assertEqual(read.entries, ())
             self.assertEqual(sessions.live_sessions(), [])
+
+    def test_registry_file_removed_after_listing_is_absent_not_unreadable(self) -> None:
+        self.record("vanished.json")
+        original = Path.read_text
+        def read(path: Path) -> str:
+            if path == self.sessions / "vanished.json":
+                path.unlink(missing_ok=True)
+                raise FileNotFoundError(path)
+            return original(path)
+        with (mock.patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(self.sessions)}),
+              mock.patch.object(Path, "read_text", read)):
+            registry = sessions.read_registry()
+            self.assertEqual(registry, sessions.RegistryRead((), ()))
+            self.record("vanished.json")
+            self.assertEqual(sessions.session_liveness("absent"), sessions.SessionNotLive())
+            self.record("vanished.json")
+            self.assertEqual(sessions.main(["sessions.py", "id", "absent"]), 1)
+
+    def test_registry_rewrite_is_reread_by_the_shared_reader(self) -> None:
+        self.record("rewriting.json")
+        path = self.sessions / "rewriting.json"
+        valid = path.read_text()
+        for direct in (True, False):
+            with self.subTest(direct=direct), mock.patch.object(Path, "read_text", side_effect=["", "{", valid]) as read:
+                with mock.patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(self.sessions)}):
+                    if direct:
+                        result = sessions.read_session(path)
+                    else:
+                        registry = sessions.read_registry()
+                        self.assertEqual(len(registry.entries), 1)
+                        result = registry.entries[0].record
+                self.assertNotIsInstance(result, sessions.UnreadableSessionRecord)
+                self.assertEqual(read.call_count, 3)
+
+    def test_persistently_unreadable_registry_read_has_only_three_tries(self) -> None:
+        with mock.patch.object(Path, "read_text", side_effect=PermissionError("denied")) as read, \
+             mock.patch.object(time, "sleep") as sleep:
+            self.assertEqual(sessions.read_session(self.sessions / "bad.json"), sessions.UnreadableSessionRecord.FOUND)
+        self.assertEqual(read.call_count, 3)
+        self.assertEqual(sleep.call_args_list, [mock.call(0.05), mock.call(0.05)])
 
     def test_registry_read_keeps_good_records_and_names_each_bad_record(self) -> None:
         self.record("good.json", name="kept")

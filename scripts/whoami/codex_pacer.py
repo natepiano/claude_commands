@@ -51,7 +51,7 @@ from typing import Protocol, TypedDict, cast
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import agents_registry  # noqa: E402
 
-from note_file import InvalidReset, KnownReset, NoResetKnown, reset_time
+from scripts.whoami.note_file import InvalidReset, KnownReset, NoResetKnown, reset_time
 
 STATE_DIR = Path(os.environ.get("CODEX_PACER_STATE_DIR", Path.home() / ".local" / "state" / "codex-pacer"))
 SESSIONS = Path.home() / ".codex" / "sessions"

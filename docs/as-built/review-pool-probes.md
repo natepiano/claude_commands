@@ -1,5 +1,8 @@
 # Review pool mesh probes
 
+The pool no longer takes reviews. Unit directors use `assign.sh --role review`.
+The code and historical procedures below remain until the next phase removes them.
+
 Run on 2026-10-12, Codex CLI 0.162.1, from this worktree. All model turns used
 `gpt-6.1-sol`, effort `low`, and the inherited default service tier. The initial
 run used nine explicit model turns and one compaction. The repair rerun used

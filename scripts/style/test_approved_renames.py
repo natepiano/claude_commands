@@ -8,7 +8,9 @@ import style_footprint
 from approved_renames import (AppliedCheck, AppliedInCode, ApprovedRename, BindingProof, BindingRename, BindingScope,
                               Declarations, FileReader, FileRename, Folder, MissingFile, NoAppliedCheck, NoBindingRename,
                               NoBindingScope, NoFileRename, RenameNotApplied, UncertainScan, applied_check,
-                              approved_rename, binding_rename, binding_rename_check, binding_scope, declaration_sites, file_rename)
+                              approved_rename, binding_rename, binding_rename_check, binding_scope, resolution_scope, declaration_sites, file_rename,
+                              refactor_rename, rename_declaration, RenameDeclaration,
+                              pattern_binding_check, PatternBindingCollision, DistinctPatternBindings)
 
 
 def files(sources: dict[str, str]) -> FileReader:
@@ -275,6 +277,22 @@ class FileRenameTests(unittest.TestCase):
 
 
 class BindingRenameTests(unittest.TestCase):
+    def test_resolution_candidate_does_not_relax_the_ledger_proof(self) -> None:
+        for header, cause in (("type old = usize;", "old name also occurs as an item or type"),
+                              ("fn g() { let fresh = 2; }", "new name already occurs in file")):
+            source = header + "\nfn f() {\n let old = 1;\n let _ = old + 1;\n}\n"
+            rename = BindingRename(3, source.splitlines()[2], "old", "fresh")
+            self.assertEqual(binding_scope(source, rename), NoBindingScope(cause))
+            self.assertIsInstance(resolution_scope(source, rename), BindingScope)
+            proof = binding_rename_check("src/lib.rs", source, source.replace("let old", "let fresh"), (rename,))
+            self.assertEqual(proof.refusals[rename], cause)
+            self.assertFalse(proof.explained)
+
+    def test_resolution_candidate_keeps_a_glob_hidden_by_the_new_name_refusal(self) -> None:
+        source = "use provider::*; fn g() { let fresh = 2; }\nfn f() {\n let old = 1;\n}\n"
+        rename = BindingRename(3, source.splitlines()[2], "old", "fresh")
+        self.assertEqual(resolution_scope(source, rename), NoBindingScope("file contains a glob import"))
+
     def prove(self, source: str, edited: str, line: int = 2, old: str = "old", new: str = "fresh") -> BindingProof:
         rename = BindingRename(line, source.splitlines()[line - 1], old, new)
         return binding_rename_check("src/lib.rs", source, edited, (rename,))
@@ -643,3 +661,32 @@ class BindingRenameTests(unittest.TestCase):
 
 if __name__ == "__main__":
     _ = unittest.main()
+
+
+class RefactorDeclarationTests(unittest.TestCase):
+    def test_qualified_pair_is_available_only_to_the_refactor(self) -> None:
+        pair = refactor_rename("rename", "Record::old", "Record::number", 1, "struct Record { old: usize }")
+        self.assertIsInstance(pair, BindingRename)
+        self.assertIsInstance(binding_rename("rename", "Record::old", "Record::number", 1, ""), NoBindingRename)
+        assert isinstance(pair, BindingRename)
+        self.assertIsInstance(rename_declaration(pair.text, pair), RenameDeclaration)
+
+    def test_f001_sibling_parameters_and_same_pattern_collide(self) -> None:
+        for source in ("fn f(old: usize, number: usize) {}",
+                       "fn f(old: usize, r#number: usize) {}",
+                       "fn f() { let closure = |old: usize, number: usize| {}; }",
+                       "fn f() { let (old, number) = (1, 2); }"):
+            pair = BindingRename(1, source, "old", "number")
+            declaration = rename_declaration(source, pair)
+            assert isinstance(declaration, RenameDeclaration)
+            collision = pattern_binding_check(source, declaration, pair)
+            self.assertIsInstance(collision, PatternBindingCollision)
+            assert isinstance(collision, PatternBindingCollision)
+            self.assertIn("'number'", collision.reason)
+
+    def test_separate_parameter_lists_are_not_pattern_collisions(self) -> None:
+        source = "fn f(old: usize) {}\nfn g(number: usize) {}"
+        pair = BindingRename(1, source.splitlines()[0], "old", "number")
+        declaration = rename_declaration(source, pair)
+        assert isinstance(declaration, RenameDeclaration)
+        self.assertIsInstance(pattern_binding_check(source, declaration, pair), DistinctPatternBindings)

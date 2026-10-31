@@ -1,4 +1,4 @@
-"""Keep saved guild evidence and aliases while checking every live rename route."""
+"""Keep saved design-role evidence and aliases while checking every live rename route."""
 from __future__ import annotations
 
 import json
@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.production import unit_rename_sweep as sweep  # noqa: E402
 
 
-class GuildRenameSweepTests(unittest.TestCase):
+class DesignRoleRenameSweepTests(unittest.TestCase):
     root: Path = Path()
     state: Path = Path()
     design: Path = Path()
@@ -23,9 +23,9 @@ class GuildRenameSweepTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.state = self.root / "state"
-        self.design = self.state / "guilds/roles/design-one"
+        self.design = self.state / "astra/design-roles/design-one"
         self.design.mkdir(parents=True)
-        _ = cast(object, self.enterContext(patch.dict(os.environ, {"GUILD_ROLES_STATE": str(self.design.parent)})))
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"DESIGN_ROLES_STATE": str(self.design.parent)})))
 
     def write(self, relative: str, value: object) -> Path:
         path = self.design / relative
@@ -41,6 +41,28 @@ class GuildRenameSweepTests(unittest.TestCase):
         _ = self.write("prompts/first.md", {"member": "demo-old", "document": "/fixture/old-checkout/design.md"})
         _ = self.write("replies/first.md", "Evidence from demo-old-unit")
         self.assertEqual(self.failures(), [])
+
+    def test_pane_snapshots_deletion_history_and_idle_registrations_keep_their_owners_names(self) -> None:
+        for relative, value in (
+            ("herdr-panes/agents.json", {"w1:p1": {"cwd": "/fixture/old-checkout",
+                "name": "demo-old", "environment": {"SHOWRUNNER_UNIT_ID": "demo-old-unit"}}}),
+            ("lint-sweep/target-deletes.json", {"/fixture/old-checkout/target": 1793300000.0}),
+            ("mac-idle/calls/6b748ec1.json", {"call_id": "demo-old:check", "pid": 42, "start": "10",
+                "repo": "/fixture/old-checkout", "package": "demo-old", "session": "sid"}),
+        ):
+            with self.subTest(path=relative):
+                path = self.state / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                original = json.dumps(value)
+                _ = path.write_text(original, encoding="utf-8")
+                self.assertEqual(self.failures(), [])
+                self.assertEqual(path.read_text(), original)
+                # An explicitly live file still takes precedence over the snapshot classification.
+                self.assertTrue(any(str(path) in failure for failure in self.failures((path,))))
+                path.unlink()
+        unknown = self.state / "mac-idle/unclassified.json"
+        _ = unknown.write_text(json.dumps({"repo": "/fixture/old-checkout"}))
+        self.assertTrue(any(str(unknown) in failure for failure in self.failures()))
 
     def test_mesh_aliases_keep_identity_without_exempting_live_fields(self) -> None:
         record = self.write("design.json", {"aliases": ["demo-old"], "holder": {

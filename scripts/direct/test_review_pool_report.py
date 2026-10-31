@@ -245,6 +245,15 @@ class ReviewPoolReportTests(unittest.TestCase):
         self.assertEqual(lines[incomplete + 1], expected, text)
         self.assertEqual(sum(line.startswith("began with a compaction:") for line in lines), 1, text)
 
+    def test_quality_counts_rerun_findings_as_code_review(self) -> None:
+        path = self.record("rerun", raised=1)
+        record = cast(dict[str, object], json.loads(path.read_text()))
+        record["lens"] = "rerun"
+        _ = path.write_text(json.dumps(record))
+        _ = self.rollout("thread-pool", usage(15, 100))
+        self.events(self.finding(lens="rerun"))
+        self.quality_row(self.report("--quality"), 1, 1, 1, 100, 0)
+
     def test_known_request_costs_group_by_kind_and_lease_ordinal(self) -> None:
         cases: list[tuple[str, Literal["pool", "own"], Literal["broad", "closure", "ux"], int, int, int, int]] = [
             ("pool-broad-a", "pool", "broad", 1, 60, 100, 5),

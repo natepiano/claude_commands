@@ -340,6 +340,22 @@ class CrateConstantTests(unittest.TestCase):
         self.assertEqual(result.edits, ())
         self.assertEqual(result.refusals, (bulk.ConstantRefusal('first', 'finding is not in an ordinary crate module'),))
 
+    def test_complete_target_coverage_refuses_every_unproved_module_route(self) -> None:
+        routes = {
+            '#[path="worker.rs"] mod worker;': 'attributed module route',
+            '#[cfg(test)] pub(crate) mod worker;': 'attributed module route',
+            'mod nested { mod worker; }': 'nonordinary module route',
+            'macro_rules! load { () => { mod worker; } }': 'opaque module source',
+            'include!("worker.rs");': 'include loader',
+        }
+        for route, reason in routes.items():
+            with self.subTest(route=route):
+                snapshot = bulk.CrateSources('src/lib.rs', {
+                    'src/lib.rs': route + '\n', 'src/worker.rs': 'fn run() {}\n',
+                })
+                with self.assertRaisesRegex(ValueError, reason):
+                    _ = bulk.crate_module_paths(snapshot)
+
     def test_named_ledger_prose_with_preservation_notes(self) -> None:
         source = 'fn run() -> &\'static str {\n    "bisect_refs"\n}\n'
         snapshot = bulk.CrateSources('src/lib.rs', {'src/lib.rs': 'mod git;\n', 'src/git/mod.rs': 'mod checkout;\n', 'src/git/checkout.rs': source})
@@ -425,6 +441,18 @@ class CrateConstantTests(unittest.TestCase):
 
 
 class RepairTests(unittest.TestCase):
+    def test_configured_target_root_preserves_literal_type_and_value(self) -> None:
+        source = 'pub fn run() {\n    let value: u16 = 42;\n}\n'
+        snapshot = bulk.CrateSources('src/entry.rs', {'src/entry.rs': 'mod worker;\n', 'src/worker.rs': source})
+        finding = Finding('configured', 'src/worker.rs', 2, source.splitlines()[1],
+                          'Add `const LIMIT: u16 = 42;` in constants.rs.')
+        result = bulk.apply_crate_constants(snapshot, (finding,))
+        self.assertEqual(result.refusals, ())
+        self.assertEqual(len(result.kept), 1)
+        self.assertIs(result.kept[0].type_proof, bulk.TypeProof.ANNOTATION)
+        self.assertIn('pub(super) const LIMIT: u16 = 42;', next(edit.edited for edit in result.edits if edit.created))
+        self.assertIsInstance(bulk.crate_constant_check(snapshot, result.edits, (finding,)), bulk.ConstantsProved)
+
     def extraction(self, statement: str, kind: str = 'usize', value: str = '42') -> tuple[bulk.CrateSources, Finding]:
         source = 'fn run() {\n    ' + statement + '\n}\n'
         finding = Finding('repair', 'src/worker.rs', 2, source.splitlines()[1],

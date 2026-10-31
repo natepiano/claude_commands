@@ -9,18 +9,16 @@ import subprocess
 import sys
 import unittest
 from pathlib import Path
-from typing import TYPE_CHECKING, cast, override
+from typing import cast, override
 from unittest import mock
 
-from scripts.build_hold.test_hold_applies import REFUSAL, TemporaryHoldTest
-
-if TYPE_CHECKING:
-    from ..build_hold import build_hold
-else:
-    import build_hold
+from scripts.build_hold.test_hold_applies import REFUSAL
+from scripts.hooks.build_hold_guard_test_support import TemporaryGuardTest, hold_applies, invoke_hook
 
 HOOK = Path(__file__).with_name("pre-tool-use-build-hold-guard.py")
 FRONT = HOOK.with_suffix(".sh")
+# load 136 on natedev, 2026-10-29
+TEST_HANG_GUARD_SECS = 300
 CARGO_BUILDS = ("build", "b", "check", "c", "clippy", "test", "t", "nextest", "run", "r",
                 "bench", "doc", "d", "rustc", "rustdoc", "fix", "install", "mend", "miri")
 MERGE_GATE_COMMANDS = (
@@ -38,29 +36,11 @@ MERGE_GATE_COMMANDS = (
 MERGE_GATE_REFUSAL = REFUSAL + " The merge gate waits for the hold to end. Run it after the release."
 
 
-class TemporaryGuardTest(TemporaryHoldTest):
-    @override
-    def setUp(self) -> None:
-        with mock.patch("tempfile.tempdir", str(HOOK.resolve().parents[2])):
-            super().setUp()
-
-    @override
-    def releasing(self, *keys: str) -> None:
-        super().releasing(*keys)
-        # A release removes its holder file before it sends any notice.
-        with mock.patch.object(build_hold, "start_recorder"), mock.patch.object(build_hold, "notify_release", return_value=""):
-            for key in keys:
-                _ = build_hold.release_cycle(self.holders, key)
-
-
 class BuildHoldGuardTest(TemporaryGuardTest):
     def run_hook(self, command: str | list[str], tool: str = "Bash", session: str = "caller") -> str:
         payload = {"session_id": session, "hook_event_name": "PreToolUse", "cwd": str(self.root),
                    "tool_name": tool, "tool_input": {"command": command}}
-        done = subprocess.run(["bash", str(FRONT)], input=json.dumps(payload),
-                              capture_output=True, text=True, check=True,
-                              env={**os.environ, "CLAUDE_PYTHON": sys.executable})
-        return done.stdout
+        return invoke_hook(json.dumps(payload))
 
     def assert_denied(self, command: str | list[str], reason: str = REFUSAL) -> None:
         response = cast(dict[str, dict[str, str]], json.loads(self.run_hook(command)))
@@ -262,20 +242,10 @@ class BuildHoldGuardTest(TemporaryGuardTest):
              "natedev build hold decision cannot be read: RuntimeError: cycle reader failed no decision"),
         ):
             with self.subTest(exception=exception):
-                driver = '''import runpy, sys
-from unittest import mock
-sys.path.insert(0, sys.argv[2])
-import hold_applies
-error = getattr(hold_applies, sys.argv[3]) if sys.argv[3] == "HoldStateReadError" else RuntimeError
-with mock.patch.object(hold_applies, "hold_applies", side_effect=error(sys.argv[4])):
-    runpy.run_path(sys.argv[1], run_name="__main__")
-'''
-                done = subprocess.run(
-                    [sys.executable, "-c", driver, str(HOOK), str(HOOK.parents[1] / "build_hold"), exception, message],
-                    input=json.dumps({"tool_name": "Bash", "tool_input": {"command": "cargo build"}}),
-                    capture_output=True, text=True, check=True,
-                )
-                response = cast(dict[str, dict[str, str]], json.loads(done.stdout))
+                error = hold_applies.HoldStateReadError if exception == "HoldStateReadError" else RuntimeError
+                with mock.patch.object(hold_applies, "hold_applies", side_effect=error(message)):
+                    output = invoke_hook(json.dumps({"tool_name": "Bash", "tool_input": {"command": "cargo build"}}))
+                response = cast(dict[str, dict[str, str]], json.loads(output))
                 self.assertEqual(response["hookSpecificOutput"], {
                     "hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": reason,
                 })
@@ -291,6 +261,20 @@ with mock.patch.object(hold_applies, "hold_applies", side_effect=error(sys.argv[
         self.hold()
         self.assertEqual(self.run_hook("cargo build", tool="Write"), "")
 
+    def test_shell_front_matches_the_real_reader(self) -> None:
+        self.hold()
+        for command, session in (("cargo check", "caller"),
+                                 ("python3 merge_gate.py --tests-only", "caller"),
+                                 ("cargo metadata", "caller"), ("verify.sh check", "caller"),
+                                 (["cargo", "check"], "caller")):
+            with self.subTest(command=command, session=session):
+                payload = json.dumps({"session_id": session, "tool_name": "Bash",
+                                      "tool_input": {"command": command}})
+                done = subprocess.run(["bash", str(FRONT)], input=payload, capture_output=True,
+                                      text=True, check=True, timeout=TEST_HANG_GUARD_SECS,
+                                      env={**os.environ, "CLAUDE_PYTHON": sys.executable})
+                self.assertEqual(done.stdout, invoke_hook(payload))
+
     def test_fast_paths_do_not_import_hold_code(self) -> None:
         for has_hold, command in ((False, "cargo build"), (True, "cargo metadata"), (True, "pwd"),
                                   (True, "verify.sh check")):
@@ -298,7 +282,7 @@ with mock.patch.object(hold_applies, "hold_applies", side_effect=error(sys.argv[
                 self.hold()
             payload = {"tool_name": "Bash", "tool_input": {"command": command}}
             done = subprocess.run([sys.executable, "-v", str(HOOK)], input=json.dumps(payload),
-                                  capture_output=True, text=True, check=True)
+                                  capture_output=True, text=True, check=True, timeout=TEST_HANG_GUARD_SECS)
             self.assertEqual(done.stdout, "")
             self.assertNotIn("import 'hold_applies'", done.stderr)
             self.assertNotIn("import 'build_targets'", done.stderr)
@@ -306,7 +290,7 @@ with mock.patch.object(hold_applies, "hold_applies", side_effect=error(sys.argv[
 
     def test_invalid_payload_denies_when_the_decision_cannot_be_read(self) -> None:
         for raw in ("{", "null"):
-            done = subprocess.run([sys.executable, str(HOOK)], input=raw, capture_output=True, text=True, check=True)
+            done = subprocess.run([sys.executable, str(HOOK)], input=raw, capture_output=True, text=True, check=True, timeout=TEST_HANG_GUARD_SECS)
             response = cast(dict[str, dict[str, str]], json.loads(done.stdout))
             self.assertEqual(response["hookSpecificOutput"]["permissionDecision"], "deny")
             self.assertIn("natedev build hold decision cannot be read:",
@@ -341,7 +325,7 @@ exit "$GUARD_STATUS"
         }))
 
     def run_front(self, raw: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(["bash", str(self.front)], input=raw, capture_output=True, text=True, check=False)
+        return subprocess.run(["bash", str(self.front)], input=raw, capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
 
     def assert_no_python(self, raw: str) -> None:
         done = self.run_front(raw)

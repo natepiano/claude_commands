@@ -10,8 +10,10 @@ import socket
 import subprocess
 import time
 import unittest
+from collections.abc import Generator, Iterator
+from contextlib import contextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING, override
+from typing import TYPE_CHECKING, cast, override
 
 import unittest.mock
 
@@ -60,6 +62,7 @@ class FolderAuditTests(unittest.TestCase):
     root: Path = Path()
     rust: Path = Path()
     temp: Path = Path()
+    recorded_ctimes: dict[str, float] = {}
 
     @override
     def setUp(self) -> None:
@@ -68,9 +71,92 @@ class FolderAuditTests(unittest.TestCase):
         self.temp = self.root / "tmp"
         self.rust.mkdir()
         self.temp.mkdir()
+        self.recorded_ctimes = {}
+        scan = os.scandir
+
+        @contextmanager
+        def recorded_scan(path: str | int | os.PathLike[str]) -> Generator[Iterator[os.DirEntry[str]]]:
+            with scan(path) as entries:
+                if isinstance(path, int):
+                    yield entries
+                    return
+                recorded: list[os.DirEntry[str]] = []
+                for entry in entries:
+                    info = entry.stat(follow_symlinks=False)
+                    fields = list(info)
+                    fields[9] = self.recorded_ctimes.get(entry.path, info.st_mtime)
+                    fake = unittest.mock.Mock(wraps=entry)
+                    fake.configure_mock(**{"stat.return_value": os.stat_result(fields, {"st_blocks": info.st_blocks})})
+                    fake.name = entry.name
+                    fake.path = entry.path
+                    recorded.append(cast(os.DirEntry[str], fake))
+                yield iter(recorded)
+
+        _ = self.enterContext(unittest.mock.patch.object(os, "scandir", side_effect=recorded_scan))
         state = self.root / "state"
         self.enterContext(unittest.mock.patch.dict(os.environ, {"FOLDER_SWEEP_STATE_DIR": str(state),
                                                                 "SCRATCH_HOLDS": str(state / "holds.json")}))
+
+    def test_copies_root_keeps_an_old_open_phase_copy(self) -> None:
+        import json
+        copy = folder(self.temp / "copies" / "show-maker" / "21-gate", 30)
+        _ = (copy / scratch.RECORD).write_text(json.dumps({"task": "phase:maker-unit/21"}))
+        age(self.temp / "copies", 30)
+        proc = self.root / "proc"
+        proc.mkdir()
+        _ = folder_audit.audit(self.rust, [self.temp], frozenset[str](), time.time(), files=[],
+                               removing=True, proc=str(proc), sockets=str(self.root / "unix"))
+        self.assertTrue(copy.is_dir())
+
+    def test_copied_folder_needs_seven_days_since_its_last_metadata_change(self) -> None:
+        now = time.time()
+        proc = self.root / "proc"
+        proc.mkdir()
+        copied = folder(self.temp / "copied-backup", 8)
+        old = folder(self.temp / "old-backup", 8)
+        self.recorded_ctimes[str(copied / "file")] = now - 5 * 3600
+        self.recorded_ctimes[str(old / "file")] = now - 8 * DAY
+        found = folder_audit.audit(self.rust, [self.temp], frozenset[str](), now, files=[],
+                                   removing=True, proc=str(proc), sockets=str(self.root / "unix"))
+        self.assertTrue(copied.is_dir())
+        self.assertFalse(old.exists())
+        self.assertIn((old, folder_audit.REMOVED), [(entry.path, entry.outcome) for entry in found])
+
+    def test_process_uses_distinguishes_known_empty_from_unavailable(self) -> None:
+        proc = self.root / "proc"
+        proc.mkdir()
+        candidate = self.temp / "candidate"
+        for paths in ([], [candidate]):
+            with self.subTest(paths=paths):
+                with unittest.mock.patch.object(tmp_sweep, "lsof_paths", side_effect=AssertionError("unexpected fallback")):
+                    known = folder_audit.process_uses(paths, str(proc))
+                self.assertIsInstance(known, tmp_sweep.ProcessUsesKnown)
+                assert isinstance(known, tmp_sweep.ProcessUsesKnown)
+                self.assertEqual(known.paths, [])
+        with unittest.mock.patch.object(tmp_sweep, "LSOF", (str(self.root / "no-lsof"),)):
+            unavailable = folder_audit.process_uses([candidate], str(self.root / "no-proc"))
+        self.assertIsInstance(unavailable, tmp_sweep.ProcessUsesUnavailable)
+
+    def test_unavailable_process_uses_keeps_due_folders(self) -> None:
+        candidate = folder(self.temp / "candidate", 8)
+        now = time.time()
+        with (unittest.mock.patch.object(tmp_sweep, "LSOF", (str(self.root / "no-lsof"),)),
+              unittest.mock.patch.object(folder_audit, "remove", side_effect=AssertionError("removed without a process scan"))):
+            outcomes = folder_audit.judge([(candidate, now - 8 * DAY)], now, True,
+                                         proc=str(self.root / "no-proc"), sockets=str(self.root / "no-sockets"))
+        self.assertEqual(outcomes[candidate], tmp_sweep.NO_PROC)
+        self.assertTrue(candidate.exists())
+
+    def test_lsof_fallback_keeps_used_folders_and_judges_unused_folders(self) -> None:
+        used = folder(self.temp / "used", 8)
+        idle = folder(self.temp / "idle", 8)
+        now = time.time()
+        output = f"p42\nfcwd\nn{used}\n"
+        completed = subprocess.CompletedProcess(tmp_sweep.LSOF, 1, output, "")
+        with unittest.mock.patch.object(subprocess, "run", return_value=completed):
+            outcomes = folder_audit.judge([(used, now - 8 * DAY), (idle, now - 8 * DAY)], now, False,
+                                         proc=str(self.root / "no-proc"), sockets=str(self.root / "no-sockets"))
+        self.assertEqual(outcomes, {used: "pid 42 works in it", idle: folder_audit.WOULD_REMOVE})
 
     def test_the_roots_file_ignores_comments_and_blank_lines(self) -> None:
         roots = self.root / "rust_roots.txt"
@@ -170,6 +256,57 @@ class FolderAuditTests(unittest.TestCase):
         self.assertEqual(len(log), 1)
         self.assertEqual(folder_audit.main(["disarm"]), 0)
         self.assertFalse(folder_audit.armed())
+
+    def test_rerun_prunes_source_after_stop_following_delete(self) -> None:
+        source = self.root / "source"
+        source.mkdir()
+        git(source, "init", "-q")
+        git(source, "commit", "-q", "--allow-empty", "-m", "c")
+        worktree = self.rust / "stopped-worktree"
+        git(source, "worktree", "add", "-q", "--detach", str(worktree), "HEAD")
+        delete = tmp_sweep.delete_tree
+        def stop(path: str) -> None:
+            delete(path)
+            raise RuntimeError("stopped before prune")
+        with unittest.mock.patch.object(tmp_sweep, "delete_tree", side_effect=stop):
+            with self.assertRaisesRegex(RuntimeError, "stopped before prune"):
+                _ = folder_audit.remove(worktree, 0, 1000)
+        self.assertFalse(worktree.exists())
+        proc = self.root / "proc"
+        proc.mkdir()
+        _ = folder_audit.audit(self.rust, [], frozenset[str](), 1001, files=[], removing=True,
+                               proc=str(proc), sockets=str(self.root / "unix"))
+        listed = subprocess.run(["git", "-C", str(source), "worktree", "list"],
+                                capture_output=True, text=True, check=True).stdout
+        self.assertNotIn(str(worktree), listed)
+        self.assertFalse(list(folder_audit.state_dir().glob("*.prune")))
+
+    def test_missing_source_finishes_removal_and_clears_prune_record(self) -> None:
+        candidate = folder(self.rust / "missing-source-worktree")
+        source = self.root / "gone.git"
+        with unittest.mock.patch.object(folder_audit, "worktree_sources", return_value=[source]):
+            result = folder_audit.remove(candidate, 0, 1000)
+        self.assertEqual(result, folder_audit.REMOVED)
+        self.assertFalse(candidate.exists())
+        self.assertFalse(list(folder_audit.state_dir().glob("*.prune")))
+        self.assertIn(str(candidate), (folder_audit.state_dir() / folder_audit.REMOVED_LOG).read_text())
+
+    def test_failed_existing_source_keeps_record_until_source_is_gone(self) -> None:
+        candidate = folder(self.rust / "failed-prune-worktree")
+        source = self.root / "invalid.git"
+        source.mkdir()
+        with unittest.mock.patch.object(folder_audit, "worktree_sources", return_value=[source]):
+            result = folder_audit.remove(candidate, 0, 1000)
+        self.assertTrue(result.startswith("removal failed:"))
+        self.assertFalse(candidate.exists())
+        records = list(folder_audit.state_dir().glob("*.prune"))
+        self.assertEqual(len(records), 1)
+        before = records[0].read_bytes()
+        folder_audit.resume_pending_prunes()
+        self.assertEqual(records[0].read_bytes(), before)
+        source.rmdir()
+        folder_audit.resume_pending_prunes()
+        self.assertFalse(records[0].exists())
 
     def test_a_removed_linked_worktree_is_pruned_from_its_source(self) -> None:
         source = self.root / "source"

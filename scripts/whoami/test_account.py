@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import base64
 import io
 import json
 import os
@@ -17,6 +16,7 @@ from typing import override
 from unittest.mock import patch
 
 from scripts.whoami import account, agent_accounts
+from scripts.whoami.account_test_support import write_codex_auth
 
 
 STATUS_LINE = Path(__file__).parents[1] / "statusline" / "statusline.jq"
@@ -47,14 +47,7 @@ class AccountTests(unittest.TestCase):
         _ = path.write_text(json.dumps({"oauthAccount": {"emailAddress": login}}))
 
     def write_codex_auth(self, home: Path, login: str) -> None:
-        claims = (
-            base64.urlsafe_b64encode(json.dumps({"email": login}).encode())
-            .decode()
-            .rstrip("=")
-        )
-        _ = (home / "auth.json").write_text(
-            json.dumps({"tokens": {"id_token": f"header.{claims}.signature"}})
-        )
+        write_codex_auth(home, login)
 
     def write_note(self, name: str, login: str) -> None:
         _ = (self.notes / name).write_text(

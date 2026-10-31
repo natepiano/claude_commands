@@ -1,6 +1,8 @@
 """Tests for setting every unit director's effort and the launch row together."""
 from __future__ import annotations
 
+from scripts.lib.test_agents_registry import write_registry
+
 import contextlib
 import io
 import json
@@ -22,6 +24,7 @@ from unit_effort import Ready, Skipped
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import agents_registry  # noqa: E402
+from scripts.production.staff_test_support import isolated_staff_file, unit_membership
 
 RULE_TOP = "──── review-pool ──────────"
 RULE = "───────────────────────────"
@@ -69,12 +72,11 @@ class UnitEffortTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         self.records = self.root / "sessions"
         self.records.mkdir()
         self.registry = self.root / "agents.conf"
-        _ = self.registry.write_text(
-            "[assignments]\nproduction=claude\n\n[production.claude]\ndirector=opus:xhigh\n\n"
-            + "[claude.agents]\nopus=low,medium,high,xhigh,max\n", encoding="utf-8")
+        _ = write_registry(self.registry, {'assignments': {'production': 'claude'}, 'production.claude': {'director': 'opus:xhigh'}, 'claude.agents': {'opus': 'low,medium,high,xhigh,max'}})
         _ = (self.root / "herdr-responses.json").write_text(json.dumps({"default": {"code": 0, "stdout": '{"sessions": []}'}}))
         synced = self.root / "catalog-sync-success"
         synced.touch()
@@ -96,6 +98,9 @@ class UnitEffortTests(unittest.TestCase):
             HostedUnit("trunk", "w3:p1", {"SHOWRUNNER_UNIT": "tool-based-ui", "SHOWRUNNER_UNIT_ID": "trunk-unit"}, screen("❯ \x1b[2mtry this\x1b[22m")),
             HostedUnit("notes", "w4:p1", {}, EMPTY),
         ]
+        for unit in units:
+            if "SHOWRUNNER_UNIT_ID" in unit.marks:
+                _ = unit_membership(unit.marks["SHOWRUNNER_UNIT"], unit.marks["SHOWRUNNER_UNIT_ID"])
         fake_unit_host.write(os.environ, units)
         for index, unit in enumerate(units):
             _ = (self.records / f"{unit.session}.json").write_text(json.dumps({

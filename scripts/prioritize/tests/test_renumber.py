@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
-from typing import final, override
+from typing import NamedTuple, final, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
@@ -19,6 +19,7 @@ PRIORITIZE_DIR = Path(__file__).parents[1]
 sys.path.insert(0, str(SCRIPTS_DIR))
 sys.path.insert(0, str(PRIORITIZE_DIR))
 from prioritize import renumber
+import writer_lock  # pyright: ignore[reportImplicitRelativeImport]
 
 
 GOALS = """# prioritization goals
@@ -314,9 +315,9 @@ class RenumberTests(unittest.TestCase):
 
         after = path.stat()
         self.assertNotEqual(path.read_bytes(), original)
-        # In-place edit keeps the same inode; that is what preserves the
-        # creation date without a SetFile call.
-        self.assertEqual(after.st_ino, before.st_ino)
+        # Publishing complete bytes replaces the inode; SetFile preserves the
+        # creation date on the replacement before it becomes visible.
+        self.assertNotEqual(after.st_ino, before.st_ino)
         self.assertEqual(int(after.st_birthtime), int(before.st_birthtime))
         observed_delta = after.st_mtime_ns - before.st_mtime_ns
         self.assertNotEqual(observed_delta, 0)
@@ -554,6 +555,82 @@ class RenumberTests(unittest.TestCase):
 
         self.assertEqual(first.read_bytes(), originals[first])
         self.assertEqual(second.read_bytes(), originals[second])
+
+    def test_an_interrupted_shorter_note_write_leaves_the_source_intact_for_rerun(self) -> None:
+        original = issue_text(generated=(999999999, 999999999), body="# Body\nkeep every byte\n")
+        path = self.fixture.add("shorter.md", original)
+        plan = renumber.build_plan(self.fixture.scope)
+        self.assertLess(len(plan.changes[0].updated), len(original.encode()))
+        with mock.patch.object(os, "fsync", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                renumber.apply_plan(plan)
+        self.assertEqual(path.read_text(), original)
+        renumber.apply_plan(renumber.build_plan(self.fixture.scope))
+        self.assertEqual(path.read_bytes(), plan.changes[0].updated)
+        self.assertTrue(path.read_text().endswith("keep every byte\n"))
+        self.assertEqual(renumber.build_plan(self.fixture.scope).changes, ())
+
+    def test_a_creation_date_failure_during_rollback_does_not_skip_other_notes(self) -> None:
+        paths = [self.fixture.add(f"note-{number}.md", issue_text()) for number in range(3)]
+        originals = {path: path.read_bytes() for path in paths}
+        plan = renumber.build_plan(self.fixture.scope)
+        first, second, third = [change.source.path for change in plan.changes]
+        atomic_write = renumber._atomic_write  # pyright: ignore[reportPrivateUsage]
+
+        class NoteDates(NamedTuple):
+            st_mode: int
+            st_birthtime: float
+            st_atime_ns: int
+            st_mtime_ns: int
+
+        def fail_one_restoration(path: Path, content: bytes, mode: int) -> None:
+            if path == third:
+                raise OSError("stop after two note updates")
+            if path == second and content == originals[second]:
+                metadata = path.stat()
+                dates = NoteDates(metadata.st_mode, metadata.st_mtime, metadata.st_atime_ns, metadata.st_mtime_ns)
+                with mock.patch.object(sys, "platform", "darwin"), mock.patch.object(
+                    Path, "lstat", return_value=dates
+                ), mock.patch.object(subprocess, "run", side_effect=subprocess.CalledProcessError(7, "SetFile")):
+                    atomic_write(path, content, mode)
+                return
+            atomic_write(path, content, mode)
+
+        errors = io.StringIO()
+        with mock.patch.object(renumber, "_atomic_write", fail_one_restoration), mock.patch.object(
+            renumber, "PRODUCTION_SCOPE", self.fixture.scope
+        ), mock.patch.object(writer_lock, "acquire_writer_lock", contextlib.nullcontext), contextlib.redirect_stderr(errors):
+            result = renumber.main(["--apply"])
+        self.assertEqual(result, 2)
+        self.assertEqual(first.read_bytes(), originals[first])
+        self.assertNotEqual(second.read_bytes(), originals[second])
+        self.assertEqual(third.read_bytes(), originals[third])
+        self.assertEqual(errors.getvalue().count("could not restore"), 1)
+        self.assertIn("SetFile", errors.getvalue())
+        self.assertIn("exited 7", errors.getvalue())
+        self.assertNotIn("Traceback", errors.getvalue())
+
+    def test_a_failed_rankings_export_fails_apply_and_is_completed_on_rerun(self) -> None:
+        _ = self.fixture.add("issue.md", issue_text())
+        replace = os.replace
+        export = self.fixture.vault / renumber.RANKINGS_FILENAME
+
+        def fail_export(source: str | os.PathLike[str], destination: str | os.PathLike[str]) -> None:
+            if Path(destination) == export:
+                raise OSError("export unavailable")
+            replace(source, destination)
+
+        with mock.patch.object(renumber, "PRODUCTION_SCOPE", self.fixture.scope), mock.patch.object(
+            writer_lock, "acquire_writer_lock", contextlib.nullcontext
+        ), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            with mock.patch.object(os, "replace", fail_export):
+                self.assertEqual(renumber.main(["--apply"]), 2)
+            self.assertEqual(renumber.build_plan(self.fixture.scope).changes, ())
+            self.assertFalse(export.exists())
+            self.assertEqual(renumber.main(["--check"]), 1)
+            self.assertEqual(renumber.main(["--apply"]), 0)
+            self.assertEqual(renumber.main(["--check"]), 0)
+        self.assertEqual(len(export.read_text().splitlines()), 1)
 
     def test_apply_detects_concurrent_change_to_unwritten_issue(self) -> None:
         stable = self.fixture.add("alpha.md", issue_text(generated=(15, 1)))

@@ -1312,6 +1312,32 @@ def distribution_row(name: str, values: Sequence[float], absent: int,
             formatter(summary.total), str(absent))
 
 
+def trial_count(value: float) -> str:
+    if value < 1_000:
+        return count(value)
+    for scale, suffix, precision in ((1_000, "K", 0), (1_000_000, "M", 1),
+                                     (1_000_000_000, "B", 1)):
+        scaled = value / scale
+        if round(scaled, precision) < 1_000:
+            return f"{scaled:.{precision}f}{suffix}"
+    return f"{value / 1_000_000_000_000:.1f}T"
+
+
+def render_trial_measures(measures: Sequence[tuple[str, Sequence[float], int]]) -> None:
+    # The report already states the window. Keep these headings on the phone.
+    print("\nTrial measures — eligible phases, natedev only")
+    print("Director tokens: phase plus gap; compactions: phase")
+    columns = ("measure", "n phases", "median", "p90", "total")
+    rows = [distribution_row(name, values, absent, trial_count)[:-1] for name, values, absent in measures]
+    widths = [max(len(row[index]) for row in [columns, *rows]) for index in range(len(columns))]
+    for row in [columns, *rows]:
+        print("  ".join(cell.ljust(width) if index == 0 else cell.rjust(width)
+                        for index, (cell, width) in enumerate(zip(row, widths))))
+    for name, _, absent in measures:
+        if absent:
+            print(f"not recorded: {name} n={absent}")
+
+
 def item_rows(items: Sequence[RankedItem], formatters: Sequence[Callable[[float], str]]) -> list[tuple[str, ...]]:
     return [(item.label, str(item.n), *("not recorded" if isinstance(value, NotRecorded) else formatter(value)
                                       for value, formatter in zip(item.values, formatters))) for item in items]
@@ -1623,11 +1649,12 @@ def render_trial(trials: Sequence[TrialPhase], measures: Sequence[TrialMeasures]
     for name in ("NoFollowingPhase", "SharedDirector"):
         _ = exclusions.setdefault(name, 0)
     print("Phase-plus-gap exclusions (states can overlap): " + "; ".join(f"{name} n={n}" for name, n in sorted(exclusions.items())))
-    table("Trial measures — eligible phases, natedev only", ("measure", "n phases", "median", "p90", "total", "not recorded"),
-          [distribution_row("weighted director tokens, phase plus gap", weighted, len(rows) - len(weighted), count),
-           distribution_row("raw input including caches, phase plus gap", [float(cost.raw_input) for cost in tokens], len(rows) - len(tokens), count),
-           distribution_row("raw output, phase plus gap", [float(cost.output) for cost in tokens], len(rows) - len(tokens), count),
-           distribution_row("compactions per phase", [float(reload.compactions) for reload in reloads], len(rows) - len(reloads), count)], window)
+    render_trial_measures([
+        ("weighted tokens", weighted, len(rows) - len(weighted)),
+        ("raw input with caches", [float(cost.raw_input) for cost in tokens], len(rows) - len(tokens)),
+        ("raw output", [float(cost.output) for cost in tokens], len(rows) - len(tokens)),
+        ("compactions", [float(reload.compactions) for reload in reloads], len(rows) - len(reloads)),
+    ])
     table("Context size after reload — raw input including caches", ("measure", "n reloads", "median", "p90", "total", "not recorded"),
           [distribution_row("first request after contract Read result", sizes, len(contexts) - len(sizes), count)], window)
     print(f"Reload states: NoCompaction n={sum(isinstance(reload.contexts, NoCompaction) for reload in reloads)} phases; "

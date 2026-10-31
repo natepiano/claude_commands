@@ -86,6 +86,8 @@ class MemoryRecordTests(unittest.TestCase):
             "import sys; from pathlib import Path; sys.path.insert(0, sys.argv[1]); "
             "import sample, cli; proc = Path(sys.argv[2]); "
             "sample.MEMINFO = proc / 'meminfo'; sample.PRESSURE = proc / 'pressure'; "
+            "sample.CPU_PRESSURE = proc / 'cpu_pressure'; sample.IO_PRESSURE = proc / 'io_pressure'; "
+            "sample.STAT = proc / 'stat'; "
             "sample.BOOT_ID = proc / 'boot_id'; sys.exit(cli.main(['sample']))"
         )
         env = self.env(BUILDLOG_BUILDS_CGROUP=str(builds), BUILDLOG_CI_CGROUP=str(self.base / "absent-ci"),

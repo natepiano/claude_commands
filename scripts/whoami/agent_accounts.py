@@ -44,12 +44,6 @@ from typing import Literal, Protocol, TypedDict, cast
 from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-# Sibling scripts and package callers must share the same account identity classes.
-if __name__ == "agent_accounts":
-    _ = sys.modules.setdefault("scripts.whoami.agent_accounts", sys.modules[__name__])
-elif __name__ == "scripts.whoami.agent_accounts":
-    _ = sys.modules.setdefault("agent_accounts", sys.modules[__name__])
-
 from scripts.lib.user_zone import user_zone as setting_zone  # noqa: E402
 
 
@@ -351,6 +345,25 @@ class UnknownUsageLogin:
     """The caller has no login to use if the identity read fails."""
 
 
+@dataclass(frozen=True)
+class UsageClaimFailed:
+    reason: str
+
+
+@dataclass(frozen=True)
+class UsageSaveFailed:
+    reason: str
+
+
+UsageStoreWarning = UsageClaimFailed | UsageSaveFailed
+
+
+def usage_store_warning_line(warning: UsageStoreWarning) -> str:
+    if isinstance(warning, UsageClaimFailed):
+        return f"usage store: could not claim the read; {warning.reason}; read without a hold"
+    return f"usage store: could not save the read; {warning.reason}; keep the live report"
+
+
 @dataclass
 class Report:
     """One tool's account. `problem` replaces the account lines; `quota_problem` follows them."""
@@ -374,6 +387,7 @@ class Report:
     usage_read_outcome: UsageReadOutcome = UsageReadOutcome.ERROR
     usage_read_claim: UsageReadClaim | UsageReadUnclaimed = field(default_factory=UsageReadUnclaimed)
     last_known_login: KnownUsageLogin | UnknownUsageLogin = field(default_factory=UnknownUsageLogin)
+    store_warnings: tuple[UsageStoreWarning, ...] = ()
 
     @property
     def weekly_reset(self) -> datetime | None:
@@ -796,8 +810,9 @@ def claude_live(config_dir: Path | None = None, *, use_disk_identity: bool = Fal
             raise RuntimeError("usage login unavailable")
         try:
             claim = store.claim_read(report.email, datetime.now(timezone.utc))
-        except (OSError, ValueError):
-            print("usage store: could not claim the read; read without a hold", file=sys.stderr)
+        except (OSError, ValueError) as error:
+            report.store_warnings += (UsageClaimFailed(str(error)),)
+            print(usage_store_warning_line(report.store_warnings[-1]), file=sys.stderr)
         else:
             if isinstance(claim, UsageReadHeld):
                 report.usage_read_outcome = UsageReadOutcome.HELD
@@ -822,8 +837,9 @@ def claude_live(config_dir: Path | None = None, *, use_disk_identity: bool = Fal
         if report.email and isinstance(claim, UsageReadClaim):
             try:
                 store.finish_read(report.email, claim, report)
-            except (OSError, ValueError):
-                print("usage store: could not save the read; keep the live report", file=sys.stderr)
+            except (OSError, ValueError) as error:
+                report.store_warnings += (UsageSaveFailed(str(error)),)
+                print(usage_store_warning_line(report.store_warnings[-1]), file=sys.stderr)
     return report
 
 

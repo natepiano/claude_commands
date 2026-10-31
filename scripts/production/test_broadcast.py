@@ -1,6 +1,9 @@
 """Prove group membership, sender identity, and one concurrent delivery per address."""
 from __future__ import annotations
 
+from scripts.lib import names
+from scripts.lib.test_names import fixture_names
+
 import io
 import json
 import os
@@ -42,7 +45,7 @@ if to == os.environ.get("REFUSED") or len(list(root.glob("started-*"))) < int(os
 
 
 def entry(
-    name: str, address: str, *, role: str = "freestanding", kind: str = "claude",
+    name: str, address: str, *, role: roster.Role = "freestanding", kind: str = "claude",
     showrunner: roster.ShowrunnerRelationship = NO_SHOWRUNNER,
     director: roster.DirectorRelationship = NO_DIRECTOR,
     thread: roster.CodexThread | roster.NoCodexThread = NO_CODEX_THREAD,
@@ -68,6 +71,7 @@ class BroadcastTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        _ = self.enterContext(patch.object(names, "load_names", return_value=fixture_names()))
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         _ = (self.root / "send.py").write_text(SEND_STUB, encoding="utf-8")
         _ = (self.root / "ps").write_text("", encoding="utf-8")
@@ -90,6 +94,8 @@ class BroadcastTests(unittest.TestCase):
             + "os.environ['LOG'] = os.environ['PEER_LOG']; os.environ['TOGETHER'] = '1'\n"
             + f"sys.path.insert(0, {str(Path(__file__).resolve().parent)!r})\n"
             + "import broadcast, roster\n"
+            + "from scripts.lib import names\nfrom scripts.lib.test_names import fixture_names\n"
+            + "names.load_names = lambda: fixture_names()\n"
             + "broadcast.SEND = Path(os.environ.get('BROADCAST_SEND') or os.environ['SAFE_PEER_SEND'])\n"
             + "roster.machine_name = lambda: 'mac'\n"
             + "roster.roster = lambda environment, scope: roster.RosterSnapshot.decode(os.environ['SSH_SNAPSHOT']).result\n"
@@ -192,6 +198,72 @@ class BroadcastTests(unittest.TestCase):
             self.assertIn("unit director", text)
             self.assertIn("agent", text)
 
+    def test_configured_director_display_changes_report_without_changing_recipients(self) -> None:
+        with patch.object(names, "runtime_names", return_value=fixture_names(director="coordinator")):
+            result, output, errors = self.run_main("--units", "fixture update")
+        self.assertEqual((result, errors), (0, ""), output)
+        self.assertIn("show · trunk · coordinator [session:id-trunk] - sent", output)
+        self.assertEqual(set(self.sent_texts()), {"session:id-trunk"})
+        self.assertEqual(self.rows[2].role, "unit director")
+
+    def test_audience_display_rename_changes_empty_report_without_changing_selection(self) -> None:
+        self.rows = []
+        original = fixture_names()
+        configured = names.Names(original.jobs, {**original.audiences, "showrunners": ("production leads", "showrunners")})
+        with patch.object(names, "runtime_names", return_value=configured):
+            result, output, errors = self.run_main("--showrunners", "fixture update")
+        self.assertEqual((result, errors), (0, ""), output)
+        self.assertIn("production leads - none on this machine", output)
+        self.assertEqual(self.sent_texts(), {})
+
+    def test_report_shows_each_job_and_address_once(self) -> None:
+        result, output, errors = self.run_main("--all", "stop")
+        self.assertEqual((result, errors), (0, ""), output)
+        lines = output.splitlines()[:-2]
+        self.assertIn("session:id-ups - sent", lines)
+        self.assertIn("codex:thread-window - sent", lines)
+        self.assertIn("show · trunk · unit director [session:id-trunk] - sent", lines)
+        self.assertIn("show · showrunner [session:id-hana] - sent", lines)
+        for line in lines:
+            self.assertNotIn("[session:id-ups]", line)
+            self.assertNotIn("[codex:thread-window]", line)
+            self.assertLessEqual(line.count("unit director"), 1)
+            self.assertLessEqual(line.count("showrunner"), 1)
+
+    def test_audiences_use_organizational_role_even_when_names_and_jobs_disagree(self) -> None:
+        base = self.rows[0]
+        rows = [
+            replace(base, name="misleading-impl", role="showrunner"),
+            replace(base, name="code6", role="unit director",
+                    showrunner=roster.UnderShowrunner("show", "runner", "session:runner")),
+            replace(base, name="showrunner", role="worker", assignment=roster.WorkerAssignment(
+                "review", "/run", "review", "code6"),
+                    director=roster.UnderDirector("roles-unit", "director", "session:director")),
+            replace(base, name="unit-director", role="freestanding"),
+            replace(base, name="held-designer", kind="codex", role="astra-designer",
+                    assignment=roster.HeldDesignRole("designer", "/held")),
+            replace(base, name="held-reviewer", kind="codex", role="astra-reviewer",
+                    assignment=roster.HeldDesignRole("reviewer", "/held")),
+        ]
+        for group, expected in ((broadcast.Showrunners(), {"misleading-impl"}),
+                                (broadcast.UnitDirectors(), {"code6"}),
+                                (broadcast.Workers(), {"showrunner"}),
+                                (broadcast.WorkersOfUnit("session:director", "roles-unit", "fixture"), {"showrunner"}),
+                                (broadcast.Agents(), {"showrunner", "unit-director"}),
+                                (broadcast.TopLevel(), {"misleading-impl", "unit-director"}),
+                                (broadcast.AllRoles(), {row.name for row in rows})):
+            with self.subTest(group=group):
+                self.assertEqual({row.name for row in rows if broadcast.selects(group, row)}, expected)
+
+    def test_delivery_prints_shown_name_beside_unchanged_address(self) -> None:
+        worker = replace(self.rows[4], assignment=roster.WorkerAssignment("test", "/fixture/run", "test", "test"))
+        self.rows = [worker]
+        result, output, errors = self.run_main("--workers", "finish")
+        self.assertEqual((result, errors), (0, ""), output)
+        self.assertIn("show · trunk · worker test", output)
+        self.assertIn("worker:run-a/fps-impl", output)
+        self.assertEqual(set(self.sent_texts()), {"worker:run-a/fps-impl"})
+
     def test_a_registry_file_that_cannot_be_read_is_skipped(self) -> None:
         self.problems = ["sessions/broken.json: invalid JSON"]
         result, output, errors = self.run_main("--all", "stop")
@@ -214,7 +286,7 @@ class BroadcastTests(unittest.TestCase):
         self.assertEqual(set(self.sent_texts()), {"session:id-trunk"})
         self.assertTrue(self.sent_texts()["session:id-trunk"].startswith("A\n\n"))
         self.assertEqual(output.splitlines()[:-2], [
-            "trunk - unit director - sent", "showrunners - none on this machine",
+            "show · trunk · unit director [session:id-trunk] - sent", "showrunners - none on this machine",
         ])
         self.assertRegex(output.splitlines()[-2], r"^1 sent in \d+ s$")
 
@@ -257,7 +329,7 @@ class BroadcastTests(unittest.TestCase):
         self.assertEqual((result, errors), (0, ""), output)
         self.assertEqual(set(self.sent_texts()), {"session:id-hana"})
         self.assertTrue(self.sent_texts()["session:id-hana"].startswith("runners\n\n"))
-        self.assertEqual(output.splitlines()[:-2], ["hana - showrunner - sent"])
+        self.assertEqual(output.splitlines()[:-2], ["show · showrunner [session:id-hana] - sent"])
 
     def test_each_role_gets_its_own_version(self) -> None:
         result, output, errors = self.run_main("--showrunners", "count your agents", "--units", "finish your agents")
@@ -298,8 +370,8 @@ class BroadcastTests(unittest.TestCase):
             "--showrunners", "stop", "--units", "stop", REFUSED="session:id-trunk",
         )
         self.assertEqual(result, 1)
-        self.assertIn("trunk - unit director - NOT sent: QUEUED: relay timed out after 40 s", output)
-        self.assertIn("hana - showrunner - sent", output)
+        self.assertIn("show · trunk · unit director [session:id-trunk] - NOT sent: QUEUED: relay timed out after 40 s", output)
+        self.assertIn("show · showrunner [session:id-hana] - sent", output)
 
     def test_any_other_arguments_print_the_usage(self) -> None:
         for arguments in ([], ["--everyone", "a"], ["--all"], ["--all", "a", "--units"],
@@ -570,7 +642,7 @@ class BroadcastTests(unittest.TestCase):
         self.assertCountEqual([command[1] for command in peer], ["session:mac-claude", "codex:mac-thread"])
         self.assertTrue(all("--here" in command for command in peer))
         self.assertTrue(all(command[command.index("--text") + 1].startswith("agents\n\n") for command in peer))
-        self.assertIn("mac: Mac Claude - freestanding - sent", output)
+        self.assertIn("mac: session:mac-claude - sent", output)
         self.assertIn("fixture and mac", output.splitlines()[-1])
         self.assertEqual(len(self.ssh_calls()), 1)
 
@@ -677,7 +749,7 @@ class BroadcastTests(unittest.TestCase):
     def test_a_recipient_disappearing_after_roster_read_is_never_looked_up_on_peer(self) -> None:
         result, output, errors = self.run_main("--units", "finish", REFUSED="session:id-trunk")
         self.assertEqual(result, 1, errors)
-        self.assertIn("trunk - unit director - NOT sent", output)
+        self.assertIn("show · trunk · unit director [session:id-trunk] - NOT sent", output)
         self.assertEqual(self.ssh_calls(), [])
         self.assertEqual(len(self.sends()), 1)
         self.assertIn("--here", self.sends()[0])

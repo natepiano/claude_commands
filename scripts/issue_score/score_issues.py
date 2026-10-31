@@ -11,9 +11,13 @@ from datetime import datetime, timezone
 import fnmatch
 import hashlib
 import json
+import math
+import os
 from pathlib import Path
+import stat
 import sys
 from threading import Event
+from tempfile import NamedTemporaryFile
 from typing import cast
 from uuid import uuid4
 
@@ -24,21 +28,13 @@ if __package__ in (None, ""):
 from scripts.issue_score import client, decide, questions, vault
 from scripts.issue_score import experiment as wording
 from scripts.issue_score.blind import blind, blind_score
-from scripts.issue_score.evaluate import Split, compare, in_split
-from scripts.issue_score.records import FailedIssue, RequestPayload, ScoredIssue, ScoreRun, STATE_DIR
+from scripts.issue_score.evaluate import Split, compare, in_split, load_run
+from scripts.issue_score.records import (AgentProposal, AgentProposals, AwaitingAgentProposals, FailedIssue,
+                                        ReadyForBandRouting, Reassessment, RequestPayload, ReviewRow,
+                                        ScoredIssue, ScoreRun, STATE_DIR)
+from scripts.prioritize import renumber
 
 WORKERS = 8
-
-PROJECT_NAMES = {
-    "bei": "bevy_enhanced_input", "biz": "biz", "brp": "bevy_brp_mcp",
-    "bwm": "bevy_window_manager", "cargo-berth": "cargo-berth",
-    "cargo-liner": "cargo-liner", "cargo-mend": "cargo-mend", "cargo-port": "cargo-port",
-    "conduit": "hana_conduit", "diegetic": "hana_diegetic", "fairy_dust": "fairy_dust",
-    "hana": "hana", "lading": "hana_lading", "lagrange": "bevy_lagrange",
-    "liminal": "hana_liminal", "nateroids": "nateroids", "panorbit": "bevy_panorbit_camera",
-    "rust-template": "rust-template",
-}
-
 
 @dataclass(frozen=True)
 class GoalCandidate:
@@ -82,6 +78,7 @@ def content_hash(issue: vault.Issue, areas: Sequence[str], definitions: Mapping[
     """Hash content plus area context, excluding all current field labels."""
     text = json.dumps({"title": issue.title, "project": issue.project,
                        "body": issue.body, "areas": areas,
+                       "style_inputs": asdict(issue.style_inputs),
                        "area_definitions": {area: definitions[area] for area in areas if area in definitions}},
                       sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
@@ -153,6 +150,8 @@ def _issue_judgments(issue: vault.Issue, areas: list[str], model: str, state_dir
             "answers": {"main": selected_main, "area": selected_area},
             "decided_fields": _decided_fields(selected_main, selected_area),
         }
+        if isinstance(issue.style_inputs, vault.StyleInputs):
+            record["style_inputs"] = issue.style_inputs.model_state()
         if variants:
             record["variant_set"] = variant
             record["variant_definitions"] = variants.get(variant, {})
@@ -218,14 +217,15 @@ def experiment(variants: wording.VariantSets, only: str = "*", limit: int = 0, *
 def score(only: str = "*", limit: int = 0, *, issues_dir: Path = vault.ISSUES_DIR,
           state_dir: Path = STATE_DIR, model: str = questions.MODEL,
           split: Split = "all", fresh: bool = False,
-          area_definitions_path: Path = vault.AREA_DEFINITIONS_PATH) -> ScoreRun:
+          area_definitions_path: Path = vault.AREA_DEFINITIONS_PATH,
+          rules_dirs: tuple[Path, ...] = vault.STYLE_RULES_DIRS) -> ScoreRun:
     if limit < 0:
         raise ValueError("--limit must be nonnegative")
     state_dir = state_dir.expanduser().resolve()
     if state_dir.is_relative_to(vault.VAULT_ROOT.resolve()) or state_dir.is_relative_to(issues_dir.resolve()):
         raise ValueError("Result files must be outside the issue vault")
-    issues = vault.load_open_issues(issues_dir)
-    areas = vault.area_vocabulary(issues)
+    issues = vault.load_scoring_issues(issues_dir, rules_dirs=rules_dirs)
+    areas = vault.area_vocabulary(vault.load_open_issues(issues_dir))
     definitions = vault.load_area_definitions(area_definitions_path)
     selected = [issue for issue in issues if in_split(issue.path, split) and (fnmatch.fnmatch(issue.path.name, only)
                 or fnmatch.fnmatch(issue.path.stem, only) or fnmatch.fnmatch(str(issue.path), only))]
@@ -324,24 +324,9 @@ def _ranking_field(field_name: str, decision: decide.FieldDecision) -> str:
     return _proposal_field(field_name, replace(decision, value=value, probabilities={}))
 
 
-def propose(project: str, title: str, body: str = "", *, issues_dir: Path = vault.ISSUES_DIR,
-            state_dir: Path = STATE_DIR, model: str = questions.MODEL,
-            area_definitions_path: Path = vault.AREA_DEFINITIONS_PATH) -> str:
-    """Render a single-valued ranking and separate unsure alternatives without writing them."""
-    if project not in PROJECT_NAMES:
-        raise ValueError(f"Unknown project shorthand: {project}")
-    issue = vault.Issue(Path("__new_issue__.md"), title, PROJECT_NAMES[project], body, {})
-    # Validate context before loading the vocabulary or making either request.
-    _ = vault.build_state(issue)
-    state_dir = state_dir.expanduser().resolve()
-    if state_dir.is_relative_to(vault.VAULT_ROOT.resolve()) or state_dir.is_relative_to(issues_dir.resolve()):
-        raise ValueError("Result files must be outside the issue vault")
-    areas = vault.area_vocabulary(vault.load_open_issues(issues_dir))
-    definitions = vault.load_area_definitions(area_definitions_path)
-    record = _score_issue(issue, areas, model, state_dir, Event(), definitions)
-    main = record["answers"]["main"]["answers"]
-    area = record["answers"]["area"]["answers"]
-    decisions = decide.decide_answers(main, area)
+def _proposal_lines(main: Mapping[str, client.Answer], decisions: Mapping[str, decide.FieldDecision], *,
+                    single_valued: bool = True) -> str:
+    """Keep ranking values single-valued and each goal's alignment in its choices."""
     goal_state = _proposal_goal(main, decisions)
     alternatives: list[str] = []
     if isinstance(goal_state, ResolvedGoal):
@@ -356,15 +341,276 @@ def propose(project: str, title: str, body: str = "", *, issues_dir: Path = vaul
         if "backlog_goal" not in questions.JEV_FIELDS:
             goal_text += " (agent proposes)"
         alternatives.append(f"goal {goal_text}")
-    parts = [f"goal {_ranking_field('backlog_goal', decisions['backlog_goal'])}",
-             f"alignment {_ranking_field('backlog_alignment', first_goal.alignment)}"]
+    render = _ranking_field if single_valued else _proposal_field
+    parts = [f"goal {render('backlog_goal', decisions['backlog_goal'])}",
+             f"alignment {render('backlog_alignment', first_goal.alignment)}"]
     for name, label in (("backlog_impact", "impact"), ("backlog_urgency", "urgency"),
                         ("backlog_effort", "effort"), ("category", "category"), ("area", "area")):
-        parts.append(f"{label} {_ranking_field(name, decisions[name])}")
+        parts.append(f"{label} {render(name, decisions[name])}")
         if decisions[name].certainty == "unsure":
             alternatives.append(f"{label} {_proposal_field(name, decisions[name])}")
     ranking = " · ".join(parts)
     return ranking + ("\nAlternatives: " + " · ".join(alternatives) if alternatives else "")
+
+
+def propose(project: str, title: str, body: str = "", *, issues_dir: Path = vault.ISSUES_DIR,
+            state_dir: Path = STATE_DIR, model: str = questions.MODEL,
+            area_definitions_path: Path = vault.AREA_DEFINITIONS_PATH,
+            project_bases_dir: Path = vault.PROJECT_BASES_DIR) -> str:
+    """Render a single-valued ranking and separate unsure alternatives without writing them."""
+    project_names = vault.load_project_names(project_bases_dir)
+    if project not in project_names:
+        raise ValueError(f"Unknown project shorthand: {project}")
+    issue = vault.Issue(Path("__new_issue__.md"), title, project_names[project], body, {})
+    _ = vault.build_state(issue)
+    state_dir = state_dir.expanduser().resolve()
+    if state_dir.is_relative_to(vault.VAULT_ROOT.resolve()) or state_dir.is_relative_to(issues_dir.resolve()):
+        raise ValueError("Result files must be outside the issue vault")
+    areas = vault.area_vocabulary(vault.load_open_issues(issues_dir))
+    definitions = vault.load_area_definitions(area_definitions_path)
+    record = _score_issue(issue, areas, model, state_dir, Event(), definitions)
+    main = record["answers"]["main"]["answers"]
+    decisions = decide.decide_answers(main, record["answers"]["area"]["answers"])
+    return _proposal_lines(main, decisions)
+
+
+def _review_difference(current: Mapping[str, str], proposed: Mapping[str, str]) -> float:
+    return float(sum(abs(current[name].count("⭐") - value.count("⭐")) if name in vault.RATING_FIELDS
+                     else int(current[name] != value) for name, value in proposed.items()))
+
+
+def _review_cell(value: str) -> str:
+    return value.replace("|", "\\|").replace("\n", "<br>")
+
+
+def _review_band(value: float) -> str:
+    return "Score >= 20" if value >= 20 else "Score 10–19" if value >= 10 else "Score < 10"
+
+
+def _agent_proposals(path: Path, run_id: str) -> dict[str, AgentProposal]:
+    if not path.exists():
+        return {}
+    raw = cast(object, json.loads(path.read_text(encoding="utf-8")))
+    if not isinstance(raw, dict):
+        raise ValueError(f"{path}: expected an agent proposals object")
+    data = cast(dict[str, object], raw)
+    if data.get("run_id") != run_id or not isinstance(data.get("issues"), list):
+        raise ValueError(f"{path}: expected run_id {run_id} and an issues list")
+    result: dict[str, AgentProposal] = {}
+    for raw_entry in cast(list[object], data["issues"]):
+        if not isinstance(raw_entry, dict):
+            raise ValueError(f"{path}: expected an agent proposal object")
+        entry = cast(dict[str, object], raw_entry)
+        issue_path, digest, fields = entry.get("issue_path"), entry.get("content_hash"), entry.get("fields")
+        if not isinstance(issue_path, str) or not isinstance(digest, str) or not isinstance(fields, dict):
+            raise ValueError(f"{path}: each proposal needs issue_path, content_hash and fields")
+        values = cast(dict[str, object], fields)
+        if not all(isinstance(value, str) for value in values.values()) or issue_path in result:
+            raise ValueError(f"{path}: duplicate issue or non-text agent proposal")
+        result[issue_path] = {"issue_path": issue_path, "content_hash": digest,
+                              "fields": cast(dict[str, str], values)}
+    return result
+
+
+def _agent_value(field: str, value: str, areas: Sequence[str]) -> str:
+    value = vault.plain(value)
+    if field in vault.RATING_FIELDS:
+        valid = 1 <= len(value) <= 5 and value == "⭐" * len(value)
+    elif field == "backlog_goal":
+        valid = value in questions.GOAL_LABELS.values()
+    elif field == "category":
+        valid = value in questions.CATEGORIES or value == "unfiled"
+    elif field == "area":
+        value = vault.normalize_area(value)
+        valid = value in areas or value == "unfiled"
+    else:
+        valid = False
+    if not valid:
+        raise ValueError(f"Invalid agent proposal for {field}: {value}")
+    return value
+
+
+def _write_agent_proposals(path: Path, form: AgentProposals) -> None:
+    """Replace the reviewer's form only after its complete JSON is durable."""
+    with NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                            prefix=path.name + ".", delete=False) as handle:
+        temporary = Path(handle.name)
+        try:
+            _ = handle.write(json.dumps(form, ensure_ascii=False, indent=2) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
+    try:
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _provisional_score(values: Mapping[str, str], goals_path: Path, goals: dict[str, renumber.Goal]) -> float:
+    if not goals:
+        content = goals_path.read_bytes()
+        metadata = goals_path.stat()
+        source = renumber.SourceFile(goals_path, content, stat.S_IMODE(metadata.st_mode),
+                                     (metadata.st_dev, metadata.st_ino, metadata.st_size, metadata.st_mtime_ns, metadata.st_ctime_ns),
+                                     hashlib.sha256(content).hexdigest())
+        try:
+            goals.update({goal.value: goal for goal in renumber.parse_goals(source)})
+        except renumber.PlanningError as error:
+            raise ValueError(str(error)) from None
+    goal_label = values["backlog_goal"]
+    if goal_label not in goals:
+        raise ValueError(f"Unknown backlog_goal for provisional score: {goal_label}")
+    return float(renumber.calculate_score(goals[goal_label], {field: values[field].count("⭐") for field in vault.RATING_FIELDS}))
+
+
+def reassess(run_id: str, *, issues_dir: Path = vault.ISSUES_DIR, state_dir: Path = STATE_DIR,
+             area_definitions_path: Path = vault.AREA_DEFINITIONS_PATH,
+             rules_dirs: tuple[Path, ...] = vault.STYLE_RULES_DIRS,
+             goals_path: Path = vault.VAULT_ROOT / "prioritization goals.md") -> Path:
+    """Rebuild saved judgments under today's policy; write review artifacts only."""
+    name = run_id.removesuffix(".jsonl")
+    if not name or Path(name).name != name or name in (".", ".."):
+        raise ValueError("run-id must be a run filename without a directory")
+    state_dir = state_dir.expanduser().resolve()
+    if state_dir.is_relative_to(vault.VAULT_ROOT.resolve()) or state_dir.is_relative_to(issues_dir.resolve()):
+        raise ValueError("Review files must be outside the issue vault")
+    reports = state_dir / "reports"
+    agent_path = reports / (name + "-agent-proposals.json")
+    agent_entries = _agent_proposals(agent_path, name)
+    agent_form: AgentProposals = {"run_id": name, "issues": []}
+    goals: dict[str, renumber.Goal] = {}
+    run = load_run(state_dir / "runs" / (name + ".jsonl"), allow_partial_last_line=True)
+    issues = vault.load_scoring_issues(issues_dir, rules_dirs=rules_dirs)
+    by_path = {str(issue.path): issue for issue in issues}
+    # Approval changes labels, including the live vocabulary. Keep the request's
+    # vocabulary so an interrupted label batch can still use the same review.
+    vocabularies: list[list[str]] = []
+    for record in run.scored.values():
+        state = record["payloads"]["area"]["state"]
+        if "areas" not in state:
+            raise ValueError("Saved area request has no area vocabulary; rescore needed")
+        saved_areas = state["areas"]
+        vocabularies.append(saved_areas)
+    areas = list(vocabularies[0]) if vocabularies else []
+    if any(vocabulary != areas for vocabulary in vocabularies):
+        raise ValueError("Run has inconsistent area vocabularies; rescore needed")
+    definitions = vault.load_area_definitions(area_definitions_path)
+    labels = vault.load_rated_issues(issues_dir)
+    skips = {str(skipped.path): skipped.reason for skipped in labels.skipped}
+    rows: list[ReviewRow] = []
+    failed: list[FailedIssue] = []
+    unscored: list[str] = []
+    displays: dict[str, str] = {}
+    for issue in issues:
+        path = str(issue.path)
+        if path in run.failed:
+            failed.append({"issue_path": path, "error": run.failed[path]})
+            continue
+        if path not in run.scored:
+            unscored.append(path)
+            continue
+        record = run.scored[path]
+        digest = content_hash(issue, areas, definitions)
+        if record["content_hash"] != digest or record["question_set_version"] != questions.QUESTION_SET_VERSION:
+            failed.append({"issue_path": path, "error": "content hash or question version changed; rescore needed"})
+            continue
+        main = record["answers"]["main"]["answers"]
+        decisions = decide.decide_answers(main, record["answers"]["area"]["answers"])
+        current = {field: issue.labels.get(field, "") for field in questions.THRESHOLDS}
+        proposed = {field: _proposal_value(field, decision.value) for field, decision in decisions.items()}
+        taken = [field for field, decision in decisions.items()
+                 if field in questions.JEV_FIELDS and decide.is_sure(field, decision)]
+        missing = [rule.name for rule in issue.style_inputs.rules if isinstance(rule, vault.MissingStyleRule)] if isinstance(issue.style_inputs, vault.StyleInputs) else []
+        reason = skips.get(path, "")
+        group = "default-rated" if reason == "style ratings match proposal formula" else "unrated" if reason else "rated"
+        agent_values: dict[str, str] = {}
+        routing: AwaitingAgentProposals | ReadyForBandRouting
+        if group != "rated":
+            required = [field for field in decisions if field not in questions.JEV_FIELDS]
+            if path in agent_entries:
+                entry = agent_entries[path]
+                if entry["content_hash"] != digest:
+                    raise ValueError(f"{path}: agent proposal content hash changed; rescore needed")
+                for field, value in entry["fields"].items():
+                    if field not in required:
+                        raise ValueError(f"{path}: agent proposal field is Jev-proposed or unknown: {field}")
+                    if value.strip():
+                        agent_values[field] = _agent_value(field, value, list(definitions))
+            agent_form["issues"].append({"issue_path": path, "content_hash": digest,
+                                         "fields": {field: agent_values.get(field, "") for field in required}})
+            missing_fields = [field for field in required if field not in agent_values]
+            if missing_fields:
+                routing = {"status": "awaiting-agent-proposals", "missing_fields": missing_fields}
+            else:
+                score = _provisional_score({**proposed, **agent_values}, goals_path, goals)
+                routing = {"status": "ready", "score": score, "band": _review_band(score)}
+        else:
+            try:
+                score = float(issue.labels.get("backlog_score", ""))
+            except ValueError:
+                score = _provisional_score(current, goals_path, goals)
+            if not math.isfinite(score):
+                raise ValueError(f"{path}: backlog_score must be finite")
+            routing = {"status": "ready", "score": score, "band": _review_band(score)}
+        rows.append({"issue_path": path, "content_hash": digest, "group": group, "current": current,
+                     "proposed": proposed, "agent_proposed": agent_values, "routing": routing,
+                     "taken": taken, "user": [field for field in decisions if field not in taken],
+                     "missing_rules": missing, "difference": _review_difference(current, proposed)})
+        displays[path] = _proposal_lines(main, decisions, single_valued=False)
+    rows.sort(key=lambda row: (0 if row["group"] != "rated" else 1, -row["difference"], row["issue_path"]))
+    complete = not failed and not unscored
+    review: Reassessment = {"run_id": name, "area_vocabulary": areas, "area_definitions": definitions,
+                            "complete": complete, "rows": rows, "failed": failed, "unscored": unscored}
+    lines = [f"# Reassessment: {name}" + (" (partial)" if not complete else ""), "",
+             f"Scored: {len(rows)}; failed: {len(failed)}; unscored: {len(unscored)}.", "",
+             "Taken fields use JEV_FIELDS and the current sure rule. All other fields require the user's confirmation.",
+             f"For unrated/default-rated issues, fill {agent_path} with agent proposals, then rerun reassess to assign provisional scores and /prioritize bands.",
+             "Jev's values marked (agent proposes) are hints, not agent choices. Provisional scores use Jev's proposed values and the explicit agent choices; the user confirms unsure values.", ""]
+    for heading, grouped in (("Unrated and default-rated — review first", [row for row in rows if row["group"] != "rated"]),
+                             ("Rated issues — largest differences first", [row for row in rows if row["group"] == "rated"])):
+        lines += ["## " + heading, "", "| Issue | Current | Jev proposal | Agent proposal | Taken | User picks |", "| --- | --- | --- | --- | --- | --- |"]
+        for row in grouped:
+            issue = by_path[row["issue_path"]]
+            current_text = " · ".join(f"{field} {value or '(missing)'}" for field, value in row["current"].items())
+            missing_text = " MissingStyleRule: " + ", ".join(row["missing_rules"]) if row["missing_rules"] else ""
+            agent_text = " · ".join(f"{field} {value}" for field, value in row["agent_proposed"].items()) or "none"
+            cells = [f"[{issue.title}]({issue.path}) ({row['group']})", current_text, displays[str(issue.path)] + missing_text, agent_text,
+                     ", ".join(row["taken"]) or "none", ", ".join(row["user"]) or "none"]
+            lines.append("| " + " | ".join(_review_cell(cell) for cell in cells) + " |")
+        lines.append("")
+    lines += ["## Taken", "", "Unrated/default-rated first; values below remain subject to explicit approval before writing.", ""]
+    for row in rows:
+        lines.append(f"- {row['issue_path']}: " + ", ".join(f"{field}={row['proposed'][field]}" for field in row["taken"]))
+    lines += ["", "## Awaiting agent proposals", ""]
+    for row in rows:
+        routing = row["routing"]
+        if routing["status"] == "awaiting-agent-proposals":
+            lines.append(f"- {row['issue_path']}: " + ", ".join(routing["missing_fields"]))
+    lines += ["", "## Routed to user by band", "", "Walk these choices with /prioritize. Unrated/default-rated scores are provisional until the user confirms the values.", ""]
+    for band in ("Score >= 20", "Score 10–19", "Score < 10"):
+        lines += ["### " + band, ""]
+        for row in rows:
+            routing = row["routing"]
+            if routing["status"] == "ready" and routing["band"] == band:
+                lines.append(f"- {row['issue_path']} (score {routing['score']:g}): " + ", ".join(row["user"]))
+        lines.append("")
+    high = [row for row in rows if row["routing"]["status"] == "ready" and row["routing"]["band"] == "Score >= 20"]
+    lines += ["## Score >= 20 — field results", "", f"Issues: {len(high)}. Evaluate this group separately from the whole backlog.", "",
+              "| Field | Taken | Routed to user | Changed from current |", "| --- | --- | --- | --- |"]
+    for field in questions.THRESHOLDS:
+        taken_count = sum(field in row["taken"] for row in high)
+        changed = sum(row["current"][field] != row["proposed"][field] for row in high)
+        lines.append(f"| {field} | {taken_count} | {len(high) - taken_count} | {changed} |")
+    lines += ["", "## Failed issues", ""] + [f"- {item['issue_path']}: {item['error']}" for item in failed]
+    lines += ["", "## Unscored issues", ""] + [f"- {path}" for path in unscored]
+    reports.mkdir(parents=True, exist_ok=True)
+    _write_agent_proposals(agent_path, agent_form)
+    result_path = reports / (name + "-reassess.md")
+    _ = result_path.with_suffix(".json").write_text(json.dumps(review, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    _ = result_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return result_path
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -374,7 +620,7 @@ def main(argv: list[str] | None = None) -> int:
     _ = propose_command.add_argument("--project", required=True, help="Project shorthand from /issue")
     _ = propose_command.add_argument("--title", required=True)
     _ = propose_command.add_argument("--body-file", default="", help="UTF-8 issue body file")
-    score_command = commands.add_parser("score", help="Score open non-style issues")
+    score_command = commands.add_parser("score", help="Score every open issue, including style proposals")
     _ = score_command.add_argument("--only", default="*", help="Issue filename or path glob")
     _ = score_command.add_argument("--limit", type=int, default=0, help="Maximum issues; 0 means all")
     _ = score_command.add_argument("--split", choices=("tune", "holdout", "all"), default="all")
@@ -384,6 +630,8 @@ def main(argv: list[str] | None = None) -> int:
     _ = compare_command.add_argument("--split", choices=("tune", "holdout", "all"), default="all")
     _ = compare_command.add_argument("--repeat", default="", help="Second run ID for the repeat check")
     _ = compare_command.add_argument("--baseline", default="", help="Compare both runs on one shared cohort")
+    reassess_command = commands.add_parser("reassess", help="Review saved answers for every open issue")
+    _ = reassess_command.add_argument("run_id")
     experiment_command = commands.add_parser("experiment", help="Fresh paired wording questions on tuning issues")
     _ = experiment_command.add_argument("--variants", required=True, help="JSON variant sets")
     _ = experiment_command.add_argument("--only", default="*")
@@ -402,6 +650,9 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "compare":
             print(compare(args.run_id, split=args.split, repeat_run_id=args.repeat, baseline_run_id=args.baseline))
+            return 0
+        if args.command == "reassess":
+            print(reassess(args.run_id))
             return 0
         if args.command == "experiment":
             runs = experiment(wording.load_variants(Path(args.variants)), args.only, args.limit)
