@@ -95,7 +95,7 @@ class UnitStatusFixture(unittest.TestCase):
         for name in ("production_units.py", "live_units.py", "showrunners.py", "unit_lookup.py", "unit_marks.py", "unit_names.py", "staff.py", "session_pane.py"):
             _ = shutil.copy2(SCRIPT.with_name(name), script.with_name(name))
         (root / "scripts/herdr").mkdir()
-        for name in ("herdr.py", "place.py"):
+        for name in ("herdr.py", "place.py", "pane_launch.py"):
             _ = shutil.copy2(SCRIPT.parents[1] / "herdr" / name, root / "scripts/herdr" / name)
         (root / "scripts/shutdown").mkdir()
         for name in ("pane_record.py", "remote.py"):

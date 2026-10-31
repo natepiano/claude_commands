@@ -29,6 +29,7 @@ for dependency in ("shutdown", "herdr", "message", "whoami", "lib"):
 import herdr
 import pane_record
 from scripts.shutdown import folder_trust
+from scripts.production import unit_marks
 from scripts.shutdown.stop_results import (
     Stopped as Stopped, NotRunning as NotRunning, StopFailed as StopFailed,
     ClaudeUp as ClaudeUp, MoveHandedOff as MoveHandedOff, ResumeFailed as ResumeFailed,
@@ -242,6 +243,7 @@ def resume(session: str, *, why: str, to: str | None = None, requester: str = ""
             return ResumeFailed(identity, "Claude was closed by hand")
         if not entry.get("flags_read", False):
             return ResumeFailed(identity, "pane launch flags are unknown")
+        entry = unit_marks.record_membership(entry)
         from inventory import codex_seats
         import unit_runs
 
