@@ -15,6 +15,7 @@ from typing import TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "shutdown"))
 import pane_record  # noqa: E402
+from scripts.production import unit_marks  # noqa: E402
 
 
 class HookInput(TypedDict, total=False):
@@ -34,8 +35,8 @@ def main() -> None:
         return
     session = environment.get("HERDR_SESSION") or "default"
     arguments = pane_record.claude_arguments(os.getpid())
-    pane_record.write(session, pane_record.launch(pane_id, session_id, payload.get("cwd") or os.getcwd(),
-                                                  environment, arguments))
+    pane_record.write(session, unit_marks.record_membership(pane_record.launch(
+        pane_id, session_id, payload.get("cwd") or os.getcwd(), environment, arguments)))
 
 
 if __name__ == "__main__":

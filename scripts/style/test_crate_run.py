@@ -183,7 +183,46 @@ class CrateRunTests(CargoProjectTests):
         self.assertTrue(all(not record["selected"] for record in self.batch.read()["crates"].values()))
         result = self.advance("beta")
         self.assertEqual(result["crates"]["beta"]["stage"], crates.CrateStage.ABANDONED)
+        self.assertEqual(result["crates"]["beta"].get("error"), "no selected findings")
         self.assertEqual(self.commands.calls, [])
+
+    def test_empty_selection_names_holding_tickets_and_finding_count_per_crate(self) -> None:
+        self.freeze()
+        findings = self.authority.held_findings(ledger_api.AllHeldFindings())
+        primary = next(finding for finding in findings if finding.path == "src/lib.rs")
+        assert isinstance(primary.state, ledger_api.Filed)
+        self.authority.ticket_add("read-2", "read", "read", "names", ".", [primary.path],
+                                  [self.definition.rule_id])
+        self.authority.ticket_assign("read-2", "main")
+        _ = self.authority.ticket_base("read-2")
+        source = (self.repo / primary.path).read_text().splitlines()
+        second = self.authority.hold(self.definition.rule_id, primary.path, 3, source[2],
+                                     "rename", "old", "value", self.definition.blob, "read-2")
+        file_blocked = self.authority.hold(self.definition.rule_id, primary.path, 1, source[0],
+                                           "rename", "run", "execute", self.definition.blob, "read-2")
+        for finding in (second, file_blocked):
+            self.authority.file_held(finding.finding_id, primary.state.proposal)
+        self.authority.ticket_drop("read-2")
+        other = next(finding for finding in findings if finding.path == "beta/src/lib.rs")
+        for ticket, finding in (("holder-a-1", primary), ("holder-b-1", second), ("other-crate-1", other)):
+            filed = self.authority.named_held((finding.finding_id,))[0]
+            assert isinstance(filed.state, ledger_api.Filed)
+            self.authority.ticket_add(ticket, ticket.rsplit("-", 1)[0], "proposal", "names", ".",
+                                      [filed.path], [filed.rule], proposal=str(filed.state.proposal),
+                                      finding_ids=(filed.finding_id,))
+        batch = crates.CrateRun(self.authority, "held")
+        batch.create(self.definition, self.tree, self.destination)
+        # Abandonment consumes the frozen selection evidence, not another ledger query.
+        with mock.patch.object(self.authority, "proposal_tickets", side_effect=AssertionError("must reuse skip data")):
+            result = batch.advance("bulk_sample")
+            other_result = batch.advance("beta")
+        record = result["crates"]["bulk_sample"]
+        self.assertEqual(record["selected"], [])
+        self.assertEqual(record["stage"], crates.CrateStage.ABANDONED)
+        self.assertEqual(record.get("error"),
+                         "no selected findings: 3 findings held by open tickets: holder-a-1, holder-b-1")
+        self.assertEqual(other_result["crates"]["beta"].get("error"),
+                         "no selected findings: 1 finding held by open tickets: other-crate-1")
 
     def test_one_crate_failure_releases_only_its_claims_and_the_other_proceeds(self) -> None:
         self.freeze()
@@ -482,17 +521,96 @@ class CrateRunTests(CargoProjectTests):
             result = self.advance("bulk_sample")
         self.assertEqual(result["crates"]["bulk_sample"]["stage"], crates.CrateStage.INTEGRATED)
 
-    def test_aliased_include_loader_refuses_unproved_ownership(self) -> None:
-        _ = (self.repo / "beta/src/lib.rs").write_text(
-            'use std::include_str as source; const CODE: &str = source!("../../src/lib.rs");\n')
-        _ = self.git("add", ".")
-        _ = self.git("commit", "-qm", "aliased loader")
-        owners = crates.SourceOwnership(self.repo, self.git("rev-parse", "HEAD"),
-                                        rules.workspace_members({
+    def ownership(self) -> crates.SourceOwnership:
+        return crates.SourceOwnership(self.repo, self.git("rev-parse", "HEAD"), rules.workspace_members({
             "Cargo.toml": (self.repo / "Cargo.toml").read_text(),
             "beta/Cargo.toml": (self.repo / "beta/Cargo.toml").read_text()}))
-        with self.assertRaisesRegex(bulk.BulkRenameError, "possibly aliased"):
-            owners.require(".", ("src/lib.rs",))
+
+    def test_include_words_used_as_data_are_not_loaders(self) -> None:
+        _ = (self.repo / "beta/src/lib.rs").write_text(
+            '\n'.join(('use std::include_str as source;',
+                       'fn inspect(include: &str) {',
+                       '    let _ = include == "include!(dynamic) #[path = dynamic]";',
+                       '    let _ = object.include; object.include_str();',
+                       '    // include!(dynamic) #[path = dynamic]',
+                       '}', 'const RAW: &str = r#"include_bytes!(unknown)"#;')))
+        _ = self.git("add", ".")
+        _ = self.git("commit", "-qm", "loader names as data")
+        owners = self.ownership()
+        self.assertEqual(dict(owners.uncertain), {})
+        owners.require(".", ("src/lib.rs",))
+        owners.require("beta", ("beta/src/lib.rs",))
+
+    def test_unreachable_uncertainty_does_not_refuse_selected_crate(self) -> None:
+        _ = (self.repo / "beta/src/lib.rs").write_text('include!(concat!(env!("OUT_DIR"), "/code.rs"));\n')
+        _ = self.git("add", ".")
+        _ = self.git("commit", "-qm", "unreachable loader")
+        owners = self.ownership()
+        owners.require(".", ("src/lib.rs",))
+        self.assertNotIn("beta/src/lib.rs", owners.reachable(("src/lib.rs",)))
+        with self.assertRaisesRegex(bulk.BulkRenameError, "beta/src/lib.rs: nonliteral include"):
+            owners.require("beta", ("beta/src/lib.rs",))
+
+    def test_literal_edge_reaches_uncertainty_but_unrelated_file_stays_owned(self) -> None:
+        _ = (self.repo / "src/uncertain.rs").write_text('include_bytes!(dynamic);\n')
+        _ = (self.repo / "src/loader.rs").write_text('include_str!("uncertain.rs");\n')
+        _ = self.git("add", ".")
+        _ = self.git("commit", "-qm", "reachable uncertainty")
+        owners = self.ownership()
+        owners.require(".", ("src/lib.rs",))
+        self.assertIn("src/uncertain.rs", owners.reachable(("src/loader.rs",)))
+        with self.assertRaisesRegex(bulk.BulkRenameError, "src/uncertain.rs: nonliteral include_bytes"):
+            owners.require(".", ("src/loader.rs",))
+
+    def test_reachable_uncertain_file_is_refused_alone_and_published_to_ledger(self) -> None:
+        _ = (self.repo / "src/uncertain.rs").write_text(
+            (self.repo / "src/lib.rs").read_text() + 'include!(dynamic);\n')
+        _ = self.git("add", ".")
+        _ = self.git("commit", "-qm", "uncertain finding file")
+        self.base, self.tree = self.git("rev-parse", "HEAD"), self.git("rev-parse", "HEAD^{tree}")
+        _ = self.git("update-ref", self.destination, self.base)
+        self.authority.set_tip(self.base)
+        self.freeze(shared_proposal=True, paths=("src/lib.rs", "src/uncertain.rs"))
+        result = self.advance("bulk_sample")
+        record = result["crates"]["bulk_sample"]
+        self.assertEqual(record["stage"], crates.CrateStage.INTEGRATED)
+        proof = self.batch.result(record)
+        self.assertEqual(proof["paths"], ["src/lib.rs"])
+        self.assertEqual(len(proof["findings"]), 1)
+        self.assertEqual(len(proof["refusals"]), 1)
+        reason = next(iter(proof["refusals"].values()))
+        self.assertIn("src/uncertain.rs: nonliteral include", reason)
+        assert "tickets" in record
+        ticket = next(iter(record["tickets"].values()))
+        self.assertEqual([row.reason for row in self.authority.bulk_refusals(ticket)], [reason])
+        self.assertIn("let number", self.git("show", self.destination + ":src/lib.rs"))
+        self.assertIn("let old", self.git("show", self.destination + ":src/uncertain.rs"))
+
+    def test_final_uncertain_loader_refuses_only_its_edit_group(self) -> None:
+        _ = (self.repo / "src/second.rs").write_bytes((self.repo / "src/lib.rs").read_bytes())
+        _ = self.git("add", ".")
+        _ = self.git("commit", "-qm", "two finding files")
+        self.base, self.tree = self.git("rev-parse", "HEAD"), self.git("rev-parse", "HEAD^{tree}")
+        _ = self.git("update-ref", self.destination, self.base)
+        self.authority.set_tip(self.base)
+        self.freeze(shared_proposal=True, paths=("src/lib.rs", "src/second.rs"))
+        def loader(checkout: Path, base: str, planned: run.PlannedEdits,
+                   intent: run.WorkspaceIntent, runner: run.Runner,
+                   boundary: Callable[[Path, str], None], /) -> crates.ValidatedEdits:
+            result = fixture_execute(checkout, base, planned, intent, runner, boundary)
+            if "src/second.rs" in result.paths:
+                path = checkout / "src/second.rs"
+                _ = path.write_text(path.read_text() + 'include_str!(dynamic);\n')
+            return result
+        result = self.batch.advance("bulk_sample", renamed, self.commands, available, loader)
+        record = result["crates"]["bulk_sample"]
+        self.assertEqual(record["stage"], crates.CrateStage.INTEGRATED)
+        proof = self.batch.result(record)
+        self.assertEqual(proof["paths"], ["src/lib.rs"])
+        self.assertEqual(len(proof["refusals"]), 1)
+        self.assertIn("src/second.rs: nonliteral include_str", next(iter(proof["refusals"].values())))
+        self.assertEqual(self.git("show", self.destination + ":src/second.rs"),
+                         self.git("show", self.base + ":src/second.rs"))
 
     def test_package_named_integration_has_distinct_retained_refs_after_resume(self) -> None:
         manifest_path = self.repo / "beta/Cargo.toml"

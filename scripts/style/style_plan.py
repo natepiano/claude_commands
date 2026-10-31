@@ -124,6 +124,7 @@ class FamilySelection(Enum):
 @dataclass(frozen=True)
 class PhaseWritten:
     ticket_id: str
+    unclassified: int = field(default=0, compare=False)
 
 
 @dataclass(frozen=True)
@@ -243,6 +244,9 @@ def ticket_sync_check(changes: MainChanges | UnknownMainChanges, files: tuple[st
 def ticket_sync_wait(ledger: style_ledger.Ledger, changes: MainChanges | UnknownMainChanges,
                      kind: str, crate: str, rule: str, files: tuple[str, ...],
                      findings: tuple[style_ledger.HeldFinding, ...] = ()) -> WaitingForSync | SyncNotNeeded:
+    # Structure tickets read source and never edit it, even when main has moved.
+    if kind == "structure":
+        return SyncNotNeeded()
     # Only the selected proposal needs a footprint at main, where new callers may have appeared.
     if isinstance(changes, MainChanges) and changes.paths and findings:
         try:
@@ -1119,7 +1123,7 @@ def verify_ticket(repo: Path, ticket_id: str) -> int:
         snapshot = style_footprint.worktree_commit(repo)
         tree = git(repo, "rev-parse", f"{snapshot}^{{tree}}").strip()
         sources = style_footprint.RevisionTree(repo, snapshot)
-        changed = git(repo, "diff", "--name-only", "--no-renames", "-z", ticket["base"], snapshot).split("\0")
+        changed = ledger.ticket_changed_paths(ticket, snapshot)
         if any(path.endswith((".rs", "Cargo.toml", "Cargo.lock")) and sources.crate(path) != ticket["crate"]
                for path in changed if path):
             raise style_ledger.LedgerError(f"{ticket_id}: verification crosses crate boundaries")
@@ -1399,8 +1403,9 @@ _STRUCTURE_LIMITS = BatchLimits(6, 3000, 5)
 def read_slices(repo: Path, tip: str, files: tuple[str, ...], limits: BatchLimits = _READ_LIMITS) -> tuple[tuple[str, ...], ...]:
     """Keep directories together, splitting only an oversized directory."""
     directories: dict[str, list[str]] = defaultdict(list)
-    lengths = {path: len(git(repo, "show", f"{tip}:{path}").splitlines()) for path in files}
-    for path in sorted(files):
+    present = style_proposals.files_at(repo, tip, files)
+    lengths = {path: len(git(repo, "show", f"{tip}:{path}").splitlines()) for path in present}
+    for path in sorted(present):
         directories[str(PurePosixPath(path).parent)].append(path)
     groups: list[tuple[str, ...]] = []
     for directory in sorted(directories, key=lambda path: PurePosixPath(path).parts):
@@ -1552,9 +1557,9 @@ def _tickets_from(repo: Path, ledger: style_ledger.Ledger, busy: BusyFiles, fami
                 manifest = str(PurePosixPath(crate) / "Cargo.toml")
                 ticketed = tuple(cell for cell in structure if cell not in refill.judged_at_base)
                 manifest_cells = tuple(cell for cell in ticketed if cell.path == crate)
-                file_cells = tuple(cell for cell in ticketed if cell.path != crate and not busy.contains(cell.path))
+                file_cells = tuple(cell for cell in ticketed if cell.path != crate)
                 available = {cell.path for cell in file_cells}
-                if manifest_cells and not busy.contains(manifest):
+                if manifest_cells:
                     available.add(manifest)
                 sites_by_rule = {rule_id: ledger.listed_sites(rule_id, crate)
                                  for rule_id in sorted({cell.rule for cell in structure})}
@@ -2438,7 +2443,7 @@ def _select_phase(
             if isinstance(checkpoint, WaitingForMerge):
                 return checkpoint
         if (index == 0 and in_scope and not uncertain and not ranked
-                and not any(busy.contains(path) for path in edits.of_ticket(ticket))):
+                and (ticket["kind"] == "structure" or not any(busy.contains(path) for path in edits.of_ticket(ticket)))):
             origin = ledger.ticket_origin(ticket["id"])
             findings = edits.ticket_findings(origin) if isinstance(origin, style_ledger.ApprovedProposal) else ()
             checkpoint = checkpoint_selection(predecessor, ledger, changes, edits.of_ticket(ticket), findings)
@@ -2466,6 +2471,68 @@ def _select_phase(
     if queued:
         unbuilt = {issue.path: _unbuilt_findings(ledger, issue.path) for issue in decisions
                    if issue.value("style_rule") in definitions}
+    def take_reads(candidates: tuple[TicketSelection, ...], reason: str = borrow_reason) -> PhaseWritten | WaitingForMerge | WaitingForSync | NoAvailableWork:
+        overlap_wait: WaitingForMerge | NoCheckpointBlock = NoCheckpointBlock()
+        for selected in candidates:
+            checkpoint = checkpoint_selection(predecessor, ledger, changes, selected.files)
+            if isinstance(checkpoint, WaitingForMerge):
+                overlap_wait = checkpoint
+                continue
+            # Code-changing tickets wait for these inputs; a structure read judges the unit's current source.
+            changed: list[UnsyncedChange] = ([unsynced[path] for path in selected.files if path in unsynced]
+                       if selected.kind != "structure" else [])
+            if changed:
+                print(f"waiting for sync: {' '.join(filter(None, (selected.kind, selected.crate, selected.rule)))}: "
+                      + changed[0].line(tip))
+                continue
+            sync = ticket_sync_wait(ledger, changes, selected.kind, selected.crate, selected.rule, selected.files)
+            if isinstance(sync, WaitingForSync):
+                return sync
+            ticket_id = ledger.next_ticket_id(unit)
+            ledger.ticket_add(ticket_id, unit, selected.kind, selected.family, selected.crate, list(selected.files),
+                              list(selected.rules), selected.rule, [dict(rule=site.rule, path=site.path, line=site.line, text=site.text) for site in selected.sites],
+                              cells=selected.cells)
+            ledger.ticket_assign(ticket_id, branch)
+            write_phase(ledger, next(ticket for ticket in ledger.ticket_open(unit) if ticket["state"] == "assigned"), plan, text, reason)
+            return PhaseWritten(ticket_id)
+        return overlap_wait if isinstance(overlap_wait, WaitingForMerge) else NoAvailableWork()
+
+    def blocking_reads(refill: RefillCells) -> tuple[TicketSelection, ...]:
+        pending: dict[str, list[style_ledger.Cell]] = defaultdict(list)
+        for cell in refill.cells:
+            if (cell.state in ("open", "stale") and cell.family is not None and cell.family != "modules"
+                    and (family == "modules" or cell.family == family)
+                    and cell.family in scopes and crate_in_scope(scopes[cell.family], cell.crate)
+                    and crate_in_scope(scope, cell.crate)):
+                pending[cell.crate].append(cell)
+        blockers = tuple(cell for cell in refill.cells if cell.tier == "D" and cell.state in ("open", "stale")
+                         and any(blocked_by_structure(other, (cell,)) for other in pending[cell.crate]))
+        if not blockers:
+            return ()
+        modules_refill = (refill if family == "modules" else
+                          _refill_cells(ledger, refill.cells, base, "modules", scope, {}, definitions))
+        keys = {(cell.rule, cell.path) for cell in blockers}
+        candidates = tuple(ticket for ticket in _tickets_from(
+            repo, ledger, busy, "modules", scope, scopes, modules_refill, first_files)
+            if ticket.kind == "structure" and keys.intersection(ticket.cells))
+        covered = {key for ticket in candidates for key in ticket.cells}
+        for cell in blockers:
+            if (cell.rule, cell.path) in covered:
+                continue
+            path = str(PurePosixPath(cell.crate) / "Cargo.toml") if cell.path == cell.crate else cell.path
+            cause = ("judged at unit base; merge the style branch first"
+                     if cell in modules_refill.judged_at_base else "no eligible structure ticket")
+            print(f"structure stays with modules: {cell.rule} {path}: {cause}")
+        return candidates
+
+    if selection == FamilySelection.OWN and family == "modules":
+        refill = _refill_cells(ledger, cells, base, family, scope, waits, definitions)
+        priority = blocking_reads(refill)
+        if priority:
+            result = take_reads(priority)
+            if isinstance(result, PhaseWritten):
+                return result
+
     # One line for each waiting file that holds the unit's own work: a pending cell in scope or an unbuilt finding.
     own = {cell.path for cell in cells if cell.family == family and cell.state in ("open", "stale")
            and crate_in_scope(scope, cell.crate)} | {finding.path for findings in unbuilt.values() for finding in findings}
@@ -2525,9 +2592,9 @@ def _select_phase(
         findings = tuple(finding for finding in kept
                          if finding.finding_id not in left and (selection == FamilySelection.OWN
                              or not style_ledger.rule_changed_since_judged(finding, definitions)))
-        # The gone-file and moved-site waives read only the findings whose declaration the step could not read.
+        # File presence is current even for a previously read declaration; moved-site proof needs only unread findings.
         unread_findings = tuple(finding for finding in findings if finding.finding_id not in read)
-        present = style_proposals.files_at(repo, tip, tuple(sorted({finding.path for finding in unread_findings})))
+        present = style_proposals.files_at(repo, tip, tuple(sorted({finding.path for finding in findings})))
         moved = sites.destinations(tuple(finding for finding in unread_findings if finding.path in present))
         by_file: dict[str, list[style_ledger.HeldFinding]] = defaultdict(list)
         gone: dict[str, list[str]] = defaultdict(list)
@@ -2550,7 +2617,7 @@ def _select_phase(
             # Dry-run follow proves the original row; only the selection location is
             # projected. Ask the shared site gate for that proof, rather than asking
             # it to reread a projected row that has not been written to the ledger.
-            if finding.finding_id not in read and finding.path not in present:
+            if finding.path not in present:
                 gone[f"{finding.path} is not in synced commit {tip}"].append(finding.finding_id)
             elif finding.finding_id in moved:
                 gone[f"{finding.path} site moved to {moved[finding.finding_id]} in synced commit {tip}"].append(finding.finding_id)
@@ -2637,68 +2704,6 @@ def _select_phase(
             members = tuple(finding for path in available if style_proposals.crate_for(directories, path) == crate
                             for finding in by_file[path])
             candidates_from_decisions.append(BuildableDecision(issue.path, definition, crate, members))
-    def take_reads(candidates: tuple[TicketSelection, ...], reason: str = borrow_reason) -> PhaseWritten | WaitingForMerge | WaitingForSync | NoAvailableWork:
-        overlap_wait: WaitingForMerge | NoCheckpointBlock = NoCheckpointBlock()
-        for selected in candidates:
-            checkpoint = checkpoint_selection(predecessor, ledger, changes, selected.files)
-            if isinstance(checkpoint, WaitingForMerge):
-                overlap_wait = checkpoint
-                continue
-            # The ticket's sites and cells were read at the synced tip, so a file a commit on the unit base changed waits.
-            changed = [unsynced[path] for path in selected.files if path in unsynced]
-            if changed:
-                print(f"waiting for sync: {' '.join(filter(None, (selected.kind, selected.crate, selected.rule)))}: "
-                      + changed[0].line(tip))
-                continue
-            sync = ticket_sync_wait(ledger, changes, selected.kind, selected.crate, selected.rule, selected.files)
-            if isinstance(sync, WaitingForSync):
-                return sync
-            ticket_id = ledger.next_ticket_id(unit)
-            ledger.ticket_add(ticket_id, unit, selected.kind, selected.family, selected.crate, list(selected.files),
-                              list(selected.rules), selected.rule, [dict(rule=site.rule, path=site.path, line=site.line, text=site.text) for site in selected.sites],
-                              cells=selected.cells)
-            ledger.ticket_assign(ticket_id, branch)
-            write_phase(ledger, next(ticket for ticket in ledger.ticket_open(unit) if ticket["state"] == "assigned"), plan, text, reason)
-            return PhaseWritten(ticket_id)
-        return overlap_wait if isinstance(overlap_wait, WaitingForMerge) else NoAvailableWork()
-
-    def blocking_reads(refill: RefillCells) -> tuple[TicketSelection, ...]:
-        pending: dict[str, list[style_ledger.Cell]] = defaultdict(list)
-        for cell in refill.cells:
-            if (cell.state in ("open", "stale") and cell.family is not None and cell.family != "modules"
-                    and (family == "modules" or cell.family == family)
-                    and cell.family in scopes and crate_in_scope(scopes[cell.family], cell.crate)
-                    and crate_in_scope(scope, cell.crate)):
-                pending[cell.crate].append(cell)
-        blockers = tuple(cell for cell in refill.cells if cell.tier == "D" and cell.state in ("open", "stale")
-                         and any(blocked_by_structure(other, (cell,)) for other in pending[cell.crate]))
-        if not blockers:
-            return ()
-        modules_refill = (refill if family == "modules" else
-                          _refill_cells(ledger, refill.cells, base, "modules", scope, {}, definitions))
-        keys = {(cell.rule, cell.path) for cell in blockers}
-        candidates = tuple(ticket for ticket in _tickets_from(
-            repo, ledger, busy, "modules", scope, scopes, modules_refill, first_files)
-            if ticket.kind == "structure" and keys.intersection(ticket.cells))
-        covered = {key for ticket in candidates for key in ticket.cells}
-        for cell in blockers:
-            if (cell.rule, cell.path) in covered:
-                continue
-            path = str(PurePosixPath(cell.crate) / "Cargo.toml") if cell.path == cell.crate else cell.path
-            cause = ("file busy" if busy.contains(path) else "judged at unit base; merge the style branch first"
-                     if cell in modules_refill.judged_at_base else "no eligible structure ticket")
-            print(f"structure stays with modules: {cell.rule} {path}: {cause}")
-        return candidates
-
-    if selection == FamilySelection.OWN and family == "modules":
-        refill = _refill_cells(ledger, cells, base, family, scope, waits, definitions)
-        priority = blocking_reads(refill)
-        if priority:
-            result = take_reads(priority)
-            if isinstance(result, PhaseWritten):
-                if closed:
-                    style_proposals.renumber()
-                return result
     if candidates_from_decisions:
         batch = fill_decision_batch(repo, tip, tuple(candidates_from_decisions), family)
         ticket_id = ledger.next_ticket_id(unit)
@@ -2879,8 +2884,10 @@ def next_phase(unit: str, plan: Path, repo: Path) -> NextPhase:
         # The catalog read above serves reconciliation and both refill passes.
         def select(busy: BusyFiles) -> PhaseWritten | NoAvailableWork | WaitingForStructure | MergeStyleBranchFirst | WaitingForSync | WaitingForMerge:
             try:
-                return select_family_work(ledger, unit, row.branch, plan, repo, doc, text, scope, busy, settings.first_files,
-                                     definitions, changes_on_main, predecessor)
+                result = select_family_work(ledger, unit, row.branch, plan, repo, doc, text, scope, busy, settings.first_files,
+                                            definitions, changes_on_main, predecessor)
+                # Keep catalog diagnostics with the result while its ledger is already open.
+                return replace(result, unclassified=len(ledger.unclassified_rules())) if isinstance(result, PhaseWritten) else result
             except (OSError, ValueError, style_ledger.LedgerError, subprocess.CalledProcessError) as error:
                 if isinstance(predecessor, WaitingCheckpoint):
                     return WaitingForMerge(predecessor.ticket_id, predecessor.commit, f"footprint unknown: {error}")
@@ -3302,6 +3309,13 @@ def main(argv: list[str]) -> int:
             return 0
         result = next_phase(args.unit, args.plan, args.repo)
         style_ledger.record_refill(args.repo, args.unit, refill_outcome(result))
+        # Catalog warnings still apply when a read can start immediately.
+        if isinstance(result, PhaseWritten | WaitingForSync | WaitingForStructure):
+            unclassified = result.unclassified
+        else:
+            unclassified = 0
+        if unclassified:
+            print(f"unclassified: {unclassified} rules — pull nate_style", file=sys.stderr)
         if isinstance(result, WaitingForSync | WaitingForMerge | WaitingForStructure | MergeStyleBranchFirst) and result.families:
             print("no available work: " + ", ".join(f"{item.family} {' '.join(item.reason.split())}" for item in result.families))
         match result:
@@ -3317,15 +3331,11 @@ def main(argv: list[str]) -> int:
             case berth_board.BoardUnavailable(reason):
                 print(f"board unavailable: {reason}")
                 return 4
-            case WaitingForSync(unclassified, reason):
+            case WaitingForSync(_, reason):
                 print("waiting for sync" + (f": {reason}" if reason else ""))
-                if unclassified:
-                    print(f"unclassified: {unclassified} rules — pull nate_style", file=sys.stderr)
                 return 3
-            case WaitingForStructure(crates, unclassified):
+            case WaitingForStructure(crates, _):
                 print(f"waiting for structure: {', '.join(crates)}")
-                if unclassified:
-                    print(f"unclassified: {unclassified} rules — pull nate_style", file=sys.stderr)
                 return 3
             case MergeStyleBranchFirst(cell_count, unit_tip, style_branch):
                 print(f"merge the style branch first: {cell_count} cell{'' if cell_count == 1 else 's'} judged at {unit_tip[:7]} "

@@ -146,6 +146,26 @@ class PaneRestoreTests(unittest.TestCase):
         self.assertEqual(len(self.opened), 1)
         self.assertIn("resumed sid-alpha", output)
 
+    def test_restore_supplies_the_staff_owners_session_labels_to_the_new_tab(self) -> None:
+        from scripts.production import staff, unit_marks, showrunners
+
+        parent = staff.StaffRow(staff.StaffId("s123456789aa"), "showrunner", "demo", None)
+        owner = staff.StaffRow(staff.StaffId("s123456789ab"), "unit", "alpha", parent.id)
+        document = "# Production — demo\n\n## Units\n\n| Unit | Plan |\n| --- | --- |\n| `alpha-unit` | standby |\n"
+        source = showrunners.ShowrunnerSource(
+            showrunners.Timer("demo", "session:runner", self.root / "demo.md", "UTC"), document)
+        self.entry(environment={"STAFF_ID": owner.id})
+        membership = unit_marks.LaunchMembership(staff.StaffSnapshot((parent, owner)),
+            unit_marks.MemberSources({"demo": source}, ()))
+        with mock.patch.object(unit_marks.LaunchMembership, "read", return_value=membership):
+            code, output = self.run_restore(self.restored())
+        self.assertEqual(code, 0, output)
+        self.assertEqual(len(self.opened), 1)
+        environment = self.opened[0][4]
+        self.assertEqual({key: environment.get(key) for key in herdr.MEMBER_MARKS}, {
+            "STAFF_ID": owner.id, "SHOWRUNNER_UNIT": "demo", "SHOWRUNNER_UNIT_ID": "alpha-unit"})
+        self.assertEqual(environment["CLAUDE_CONFIG_DIR"], str(self.config))
+
     def test_a_pane_is_left_as_it_is_for_each_reason_and_named(self) -> None:
         cases: list[tuple[dict[str, object], str, str]] = [
             ({"ended": True}, "sid-alpha", "closed by hand"),

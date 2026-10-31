@@ -25,14 +25,14 @@ sys.path.insert(0, str(MESSAGE.parents[1]))
 import herdr  # noqa: E402
 import sessions  # noqa: E402
 from herdr import HerdrPlace  # noqa: E402
-from sessions import SessionRecord, UnreadableSessionRecord, live_session, read_session  # noqa: E402
+from sessions import SessionRecord, live_session, sessions_dir as sessions_dir  # noqa: E402
 from scripts.production import staff  # noqa: E402
 from scripts.lib import unit_runs  # noqa: E402
 
 USAGE = "usage: unit_lookup.py list <production slug> | pane <production slug> <unit>"
 
 
-from unit_marks import (
+from scripts.production.unit_marks import (
     PRODUCTION_MARK as PRODUCTION_MARK,
     UNIT_MARK as UNIT_MARK,
     ShowrunnerMember as ShowrunnerMember,
@@ -223,10 +223,6 @@ def run_state(worktree: Path) -> UnitState:
     return read_run_states().state(worktree)
 
 
-def sessions_dir() -> Path:
-    return Path(os.environ.get("NOTIFIER_SESSIONS_DIR") or Path.home() / ".claude/sessions")
-
-
 class RecordsRead(NamedTuple):
     """Every session record was readable."""
 
@@ -245,16 +241,6 @@ def _place_of(pid: int, places: dict[int, HerdrPlace]) -> HerdrPlace | None:
     return None if isinstance(placement, herdr.NotInHerdr) else placement
 
 
-def _pid_runs(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except PermissionError:
-        return True
-    except (ProcessLookupError, OverflowError):
-        return False
-    return True
-
-
 class UnreadAt(NamedTuple):
     """Records that could not be read: the panes they belong to, and whether any names no process."""
 
@@ -271,36 +257,25 @@ def _claudes(processes: list[herdr.HerdrProcess], *,
     many exit at once. It makes only its own pane unknown, never every pane.
     """
     places = {process.pid: process.place for process in processes}
-    entries: Iterable[Path | SessionRecord]
-    if running is None:
-        try:
-            entries = sorted(path for path in sessions_dir().iterdir() if path.suffix == ".json")
-        except OSError as error:
-            return {}, UnreadAt({}, RecordsPartlyUnread(f"cannot list session records: {error}"))
-    else:
-        entries = running
+    entries: Iterable[SessionRecord]
     newest: dict[int, tuple[int, LiveClaude]] = {}
     unread: dict[HerdrPlace, str] = {}
     unplaced: RecordsRead | RecordsPartlyUnread = RecordsRead()
-    for entry in entries:
-        if isinstance(entry, Path):
-            path = entry
-            record = read_session(path)
-            if isinstance(record, UnreadableSessionRecord):
-                pid = int(path.stem) if path.stem.isdigit() else None
-                if pid is not None and (not path.exists() or not _pid_runs(pid)):
-                    continue
-                # A record that Claude is writing reads complete a moment later.
-                record = read_session(path)
-                if isinstance(record, UnreadableSessionRecord):
-                    place = None if pid is None else _place_of(pid, places)
-                    if pid is None:
-                        unplaced = RecordsPartlyUnread("one or more session records could not be read")
-                    elif place is not None:
-                        unread[place] = f"the session record of pid {pid} could not be read"
-                    continue
-        else:
-            record = entry
+    if running is None:
+        registry = sessions.read_registry()
+        if sessions.sessions_dir() in registry.unreadable:
+            return {}, UnreadAt({}, RecordsPartlyUnread("cannot list session records"))
+        entries = (item.record for item in registry.entries)
+        for path in registry.unreadable:
+            pid = int(path.stem) if path.stem.isdigit() else None
+            place = None if pid is None else _place_of(pid, places)
+            if pid is None:
+                unplaced = RecordsPartlyUnread("one or more session records could not be read")
+            elif place is not None:
+                unread[place] = f"the session record of pid {pid} could not be read"
+    else:
+        entries = running
+    for record in entries:
         if not live_session(record):
             # A running registered Claude with no messaging socket cannot be
             # called absent. Preserve the existing fail-closed unknown state.

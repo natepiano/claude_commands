@@ -13,7 +13,7 @@ import subprocess
 import sys
 from collections.abc import Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from types import ModuleType
 from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, cast
@@ -373,6 +373,11 @@ def shown_name(entry: RosterEntry) -> ShownName:
 class Roster:
     entries: list[RosterEntry]
     problems: list[str]
+    warnings: list[str] = field(default_factory=list)
+
+    @property
+    def diagnostics(self) -> list[str]:
+        return [*self.problems, *(f'warning: {warning}' for warning in self.warnings)]
 
 
 def unit_labels(entries: Iterable[RosterEntry]) -> dict[str, UnitLabels]:
@@ -557,20 +562,24 @@ class RosterSnapshot:
     def encode(self) -> str:
         return json.dumps({"tag": "RosterSnapshot", "entries": [
             _snapshot_entry(entry) for entry in self.result.entries
-        ], "problems": self.result.problems})
+        ], "problems": self.result.problems,
+            **({"warnings": self.result.warnings} if self.result.warnings else {})})
 
     @classmethod
     def decode(cls, text: str) -> RosterSnapshot:
         values = _snapshot_object(cast(object, json.loads(text)))
         entries, problems = values.get("entries"), values.get("problems")
+        warnings = values.get("warnings", [])
         if (values.get("tag") != "RosterSnapshot" or not isinstance(entries, list)
                 or not isinstance(problems, list)):
             raise ValueError("not a roster snapshot")
         raw_problems = cast(list[object], problems)
         if not all(isinstance(problem, str) for problem in raw_problems):
             raise ValueError("snapshot problems must be strings")
+        if not isinstance(warnings, list) or not all(isinstance(warning, str) for warning in cast(list[object], warnings)):
+            raise ValueError("snapshot warnings must be strings")
         return cls(Roster([_decode_entry(entry) for entry in cast(list[object], entries)],
-                          cast(list[str], raw_problems)))
+                          cast(list[str], raw_problems), cast(list[str], warnings)))
 
 
 def cannot_receive_message_text(entry: RosterEntry) -> str:
@@ -1358,7 +1367,7 @@ def _pool_workers(
     return entries, threads
 
 
-def _durable_roles(machine: str, claude: Mapping[str, RosterEntry], problems: list[str]) -> tuple[list[RosterEntry], set[str]]:
+def _durable_roles(machine: str, claude: Mapping[str, RosterEntry], warnings: list[str]) -> tuple[list[RosterEntry], set[str]]:
     entries: list[RosterEntry] = []
     threads: set[str] = set()
     for path in sorted(design_roles.state_root().glob('*/design.json')):
@@ -1400,7 +1409,7 @@ def _durable_roles(machine: str, claude: Mapping[str, RosterEntry], problems: li
                     assignment=HeldDesignRole(instance.role, str(mesh)), thread=CodexThread(thread),
                     account=AccountUnread('serving home not read')))
         except (OSError, ValueError, TypeError) as error:
-            _problem(problems, 'durable role ' + str(path), error)
+            _problem(warnings, 'durable role ' + str(path), error)
     return entries, threads
 
 
@@ -1449,6 +1458,7 @@ def machine_name() -> str:
 def _local_roster(environment: Mapping[str, str]) -> Roster:
     home_state = account.home_account_state()
     problems: list[str] = []
+    warnings: list[str] = []
     machine = machine_name()
     records = _newest_sessions()
     details = _raw_session_details(records, problems)
@@ -1476,7 +1486,7 @@ def _local_roster(environment: Mapping[str, str]) -> Roster:
     pool_workers, pool_threads = _pool_workers(machine, claude, production_places, problems, worker_threads)
     unit_workers.extend(pool_workers)
     worker_threads.update(pool_threads)
-    durable_roles, durable_threads = _durable_roles(machine, claude, problems)
+    durable_roles, durable_threads = _durable_roles(machine, claude, warnings)
     unit_workers.extend(durable_roles)
     worker_threads.update(durable_threads)
     codex_sessions: list[RosterEntry] = []
@@ -1507,7 +1517,7 @@ def _local_roster(environment: Mapping[str, str]) -> Roster:
     interactive = _herdr_codex_panes(machine)
     problems.extend(interactive.problems)
     entries = [*claude.values(), *unit_workers, *codex_sessions, *interactive.entries]
-    return Roster(entries, problems)
+    return Roster(entries, problems, warnings)
 
 
 @dataclass(frozen=True)
@@ -1537,7 +1547,8 @@ def peer_snapshot(environment: Mapping[str, str]) -> Roster | PeerNotReached:
     except (ValueError, TypeError):
         detail = (done.stderr or "invalid roster snapshot").strip().splitlines()
         return PeerNotReached(host, detail[0] if detail else "invalid roster snapshot")
-    return Roster(result.entries, [f"{host}: {problem}" for problem in result.problems])
+    return Roster(result.entries, [f"{host}: {problem}" for problem in result.problems],
+                  [f"{host}: {warning}" for warning in result.warnings])
 
 
 def peer_roster(environment: Mapping[str, str]) -> Roster:
@@ -1557,7 +1568,8 @@ def roster(environment: Mapping[str, str], scope: RosterScope) -> Roster:
                 peer = pool.submit(peer_roster, environment)
                 local = _local_roster(environment)
                 other = peer.result()
-            return Roster([*local.entries, *other.entries], [*local.problems, *other.problems])
+            return Roster([*local.entries, *other.entries], [*local.problems, *other.problems],
+                          [*local.warnings, *other.warnings])
 
 
 def _home_shortened(path: str) -> str:
@@ -1727,10 +1739,11 @@ def main(argv: list[str]) -> int:
         print(json.dumps({
             "entries": [_serialized_entry(entry) for entry in entries],
             "problems": result.problems,
+            **({"warnings": result.warnings} if result.warnings else {}),
         }))
     else:
         _print_text(entries, contexts, sender_identity(os.environ))
-    for problem in result.problems:
+    for problem in result.diagnostics:
         print(f"could not read: {problem}", file=sys.stderr)
     return 1 if result.problems else 0
 
