@@ -331,6 +331,33 @@ class LedgerTestCase(unittest.TestCase):
             ).fetchone())
         return row[0]
 
+    def checkpointed_decision_ticket(self) -> tuple[style_ledger.Ledger, str, Path, tuple[str, ...], str]:
+        """A checkpointed proposal that applied both of its approved enum renames."""
+        rule, issue, ids = self.decision_findings()
+        ledger = self.ledger()
+        ledger.set_tip(self.initial_tip, "main")
+        ledger.ticket_add("names-1", "names", "proposal", "names", "crates/alpha", list(self.sources[:2]), [rule],
+                          proposal=str(issue), finding_ids=ids)
+        ledger.ticket_assign("names-1", "main")
+        for path in self.sources[:2]:
+            self.write(path, "pub enum Outcome { New }\n")
+        checkpoint = self.commit("Apply both approved renames")
+        ledger.set_tip(checkpoint, "main")
+        ledger.ticket_checkpoint("names-1", checkpoint)
+        return ledger, rule, issue, ids, checkpoint
+
+    def withdrawn_checkpointed_ticket(self) -> tuple[style_ledger.Ledger, str, Path, tuple[str, ...], str]:
+        """Reproduce the old withdrawal transaction's durable evidence after a checkpoint."""
+        ledger, rule, issue, ids, checkpoint = self.checkpointed_decision_ticket()
+        ledger.ticket_drop("names-1")
+        with closing(sqlite3.connect(ledger.database)) as connection, connection:
+            _ = connection.execute("UPDATE tickets SET updated_at='withdrawal-time' WHERE id='names-1'")
+            _ = connection.executemany(
+                "UPDATE held_findings SET state='withdrawn',build_ticket='',updated_at='withdrawal-time' WHERE finding_id=?",
+                [(id,) for id in ids])
+            _ = connection.executemany("INSERT INTO rule_body_withdrawals VALUES (?,?)", [(id, "new-body") for id in ids])
+        return ledger, rule, issue, ids, checkpoint
+
     def assert_build_time_survives_reading(self, ledger: style_ledger.Ledger, finding_id: str) -> None:
         self.assertEqual(self.built_time(ledger, finding_id), "2026-10-27T10:00:00+00:00")
         with mock.patch.object(style_ledger, "_now", return_value="2026-10-28T11:00:00+00:00"):
