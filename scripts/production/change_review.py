@@ -74,6 +74,8 @@ from enum import Enum
 from pathlib import Path
 from typing import TypeVar, cast
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 from atomic_file import write_text_atomic  # noqa: E402
 import scratch  # noqa: E402
@@ -215,7 +217,7 @@ def _git(repo: Path, *arguments: str) -> str:
 
 def registered_productions() -> Iterable[Path]:
     """Production docs named by the registered update timers."""
-    import showrunners
+    from scripts.production import showrunners
 
     return showrunners.timer_docs().values()
 
@@ -625,7 +627,7 @@ def pending(path: Path) -> list[dict[str, str]]:
 
 def scope_list(doc: Path) -> Path:
     """The list that takes the production's rows: the one its Change review line names, else its root's."""
-    import showrunners
+    from scripts.production import showrunners
     import showrunner_tree
 
     slug = slug_of(doc)
@@ -1092,7 +1094,7 @@ def production_doc(production: str) -> Path:
     """The production doc given; without one, the calling showrunner's."""
     if production:
         return Path(production).expanduser()
-    import showrunners  # only the actions that name a production read the update timers
+    from scripts.production import showrunners  # only the actions that name a production read the update timers
 
     found = showrunners.production_of(os.environ.get("CLAUDE_CODE_SESSION_ID", ""))
     if found is None:
@@ -1106,7 +1108,7 @@ def showrunner_of(doc: Path) -> str:
     A child production's rows go to its root's list. The name is the root showrunner's session
     name as it is now, never the production slug, so it is read only while that showrunner runs.
     """
-    import showrunners
+    from scripts.production import showrunners
     import showrunner_tree
 
     try:
@@ -1166,7 +1168,7 @@ def foreign_units(production: Path) -> set[str]:
 
     Empty when the productions cannot be read: drift then counts every checkpoint.
     """
-    import showrunners
+    from scripts.production import showrunners
     import showrunner_tree
 
     try:
@@ -1317,7 +1319,7 @@ def _run(options: CommandLine) -> int:
         case "showrunner":
             print(showrunner_of(production_doc(options.production)))
         case "backfill-production":
-            import showrunners
+            from scripts.production import showrunners
 
             docs = list(showrunners.timer_docs().values())
             lists = [Path(options.list).expanduser()] if options.list else sorted(LISTS.glob(f"{PREFIX}*.md"))

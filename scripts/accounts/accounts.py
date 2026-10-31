@@ -38,13 +38,13 @@ _ = sys.modules.setdefault("scripts.accounts.accounts", sys.modules[__name__])
 sys.path.insert(0, str(REPOSITORY_ROOT))
 sys.path.insert(0, str(SCRIPTS / "whoami"))
 
-import account  # noqa: E402
-from account import ResolvedHistoryLabel as ResolvedHistoryLabel, HistoricalAccountUnresolved as HistoricalAccountUnresolved  # noqa: E402
+from scripts.whoami import account  # noqa: E402
+from scripts.whoami.account import ResolvedHistoryLabel as ResolvedHistoryLabel, HistoricalAccountUnresolved as HistoricalAccountUnresolved  # noqa: E402
 from scripts.lib import atomic_file, unit_runs  # noqa: E402
 from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
-import agent_accounts  # noqa: E402
-import note_file  # noqa: E402
-import usage_store  # noqa: E402
+from scripts.whoami import agent_accounts  # noqa: E402
+from scripts.whoami import note_file  # noqa: E402
+from scripts.whoami import usage_store  # noqa: E402
 from scripts.accounts import refusals  # noqa: E402
 from scripts.accounts import moves, worker_names, role_map  # noqa: E402
 from scripts.accounts.refusals import (  # noqa: E402
@@ -427,8 +427,7 @@ class AccountStatus:
     role: str
     problems: tuple[str, ...]
     unclassified: tuple[str, ...]
-    missing_mcp_servers: tuple[str, ...]
-    extra_mcp_servers: tuple[str, ...]
+    mcp_differences: McpServerDifferences
     state_source: ObservedStateCause | NoObservedStateCause = field(default_factory=NoObservedStateCause)
     note_source: ObservedStateCause | NoObservedStateCause = field(default_factory=NoObservedStateCause)
     mcp_baseline_problems: tuple[UnreadableMcpConfiguration, ...] = ()
@@ -481,6 +480,8 @@ class CommandLine(argparse.Namespace):
     as_json: bool = False
     stored: bool = False
     change: str = ""
+    server: str = ""
+    direction: McpDirection = "off"
 
 
 
@@ -3564,10 +3565,31 @@ class ProjectMcpServers:
     names: frozenset[str]
 
 
+McpDirection = Literal["off", "on"]
+
+
+@dataclass(frozen=True)
+class McpServerDifference:
+    """The scopes where one server changes in one direction."""
+
+    server: str
+    direction: McpDirection
+    projects: tuple[str, ...]
+
+
 @dataclass(frozen=True)
 class McpServerDifferences:
-    missing: tuple[str, ...] = ()
-    extra: tuple[str, ...] = ()
+    entries: tuple[McpServerDifference, ...] = ()
+
+
+@dataclass(frozen=True)
+class McpConfigurationInspection:
+    """The comparison and faults from inspecting both configurations safely."""
+
+    differences: McpServerDifferences
+    account_is_safe_to_inspect: bool
+    baseline_problems: tuple[UnreadableMcpConfiguration, ...]
+    account_problems: tuple[UnreadableMcpConfiguration, ...]
 
 
 def _mcp_server_names(config_file: Path, project: Path) -> ReadMcpConfiguration | UnreadableMcpConfiguration:
@@ -3604,15 +3626,43 @@ def _mcp_differences(baseline: ReadMcpConfiguration | UnreadableMcpConfiguration
     baseline_projects = {scope.path: scope.names for scope in baseline.projects}
     current_projects = {scope.path: scope.names for scope in current.projects}
     homes = {str(main_config_dir().resolve()), str(directory.resolve())}
-    comparisons = [(baseline.names, current.names), *((baseline_projects.get(path, baseline.global_names),
-        current_projects.get(path, current.global_names)) for path in baseline_projects.keys() | current_projects.keys()
+    comparisons = [("~", baseline.names, current.names), *((path, baseline_projects.get(path, baseline.global_names),
+        current_projects.get(path, current.global_names)) for path in sorted(baseline_projects.keys() | current_projects.keys())
         if path not in homes)]
-    missing: set[str] = set()
-    extra: set[str] = set()
-    for before, after in comparisons:
-        missing.update(before - after)
-        extra.update(after - before)
-    return McpServerDifferences(tuple(sorted(missing)), tuple(sorted(extra)))
+    projects: dict[tuple[str, McpDirection], list[str]] = {}
+    for path, before, after in comparisons:
+        for server in before - after:
+            projects.setdefault((server, "off"), []).append(path)
+        for server in after - before:
+            projects.setdefault((server, "on"), []).append(path)
+    return McpServerDifferences(tuple(McpServerDifference(server, direction, tuple(paths))
+        for (server, direction), paths in sorted(projects.items())))
+
+
+def _inspect_mcp_configuration(directory: Path) -> McpConfigurationInspection:
+    baseline = _mcp_server_names(agent_accounts.claude_config_file(main_config_dir()), main_config_dir())
+    config_file = directory / ".claude.json"
+    account_is_safe_to_inspect = not directory.is_symlink() and not config_file.is_symlink()
+    current = _mcp_server_names(config_file, directory) if account_is_safe_to_inspect else baseline
+    return McpConfigurationInspection(
+        _mcp_differences(baseline, current, directory), account_is_safe_to_inspect,
+        (baseline,) if isinstance(baseline, UnreadableMcpConfiguration) else (),
+        (current,) if account_is_safe_to_inspect and isinstance(current, UnreadableMcpConfiguration) else (),
+    )
+
+
+def mcp_projects(label: str, server: str, direction: McpDirection) -> tuple[str, ...]:
+    """Read the differing scopes without changing either configuration."""
+    directory = account_dir(label)
+    inspection = _inspect_mcp_configuration(directory)
+    if not inspection.account_is_safe_to_inspect:
+        raise AccountsError(f"accounts: cannot inspect linked MCP configuration for {label}")
+    if not directory.is_dir():
+        raise AccountsError(f"accounts: {label} is not set up; run accounts.py setup {label}")
+    for configuration in (*inspection.baseline_problems, *inspection.account_problems):
+        raise AccountsError(f"accounts: cannot read MCP configuration {configuration.path}: {configuration.reason}")
+    return next((entry.projects for entry in inspection.differences.entries
+                 if entry.server == server and entry.direction == direction), ())
 
 
 def _existing_named_accounts() -> list[NamedAccount]:
@@ -3631,42 +3681,34 @@ def _existing_named_accounts() -> list[NamedAccount]:
 def _status_for(config_dir: Path, folder: str, named: NamedAccount, problems: list[str],
                 state_source: ObservedStateCause | NoObservedStateCause = NO_OBSERVED_STATE_CAUSE,
                 note_source: ObservedStateCause | NoObservedStateCause = NO_OBSERVED_STATE_CAUSE) -> AccountStatus:
-    baseline = _mcp_server_names(agent_accounts.claude_config_file(main_config_dir()), main_config_dir())
-    account_is_safe_to_inspect = not config_dir.is_symlink() and not (
-        (config_dir / ".claude.json").is_symlink()
-    )
+    mcp = _inspect_mcp_configuration(config_dir)
     # A named folder keeps its own label whatever login it holds; `problems` names a mismatch.
     label = named.label
     login = ""
-    if account_is_safe_to_inspect:
+    if mcp.account_is_safe_to_inspect:
         identity = account_identity(config_dir)
         if isinstance(identity, (agent_accounts.NumberedAccount, agent_accounts.UnnotedLogin)):
             login = identity.login
             if isinstance(identity, agent_accounts.UnnotedLogin):
                 problems.append(unnoted_home_line(config_dir, identity.login))
-        config_file = config_dir / ".claude.json"
-        current = _mcp_server_names(config_file, config_dir)
         unclassified = _unclassified(config_dir)
     else:
-        current = baseline
         unclassified = ()
-    differences = _mcp_differences(baseline, current, config_dir)
     return AccountStatus(
         folder=folder,
         config_dir=config_dir,
         is_named_account=True,
         is_set_up=True,
-        account_is_safe_to_inspect=account_is_safe_to_inspect,
+        account_is_safe_to_inspect=mcp.account_is_safe_to_inspect,
         label=label,
         login=login,
         role="",
         problems=tuple(problems),
         unclassified=unclassified,
-        missing_mcp_servers=differences.missing,
-        extra_mcp_servers=differences.extra,
+        mcp_differences=mcp.differences,
         state_source=state_source,
         note_source=note_source,
-        mcp_baseline_problems=(baseline,) if isinstance(baseline, UnreadableMcpConfiguration) else (),
+        mcp_baseline_problems=mcp.baseline_problems,
     )
 
 
@@ -3706,8 +3748,7 @@ def account_statuses() -> list[AccountStatus]:
             role=NO_VALUE,
             problems=(),
             unclassified=(),
-            missing_mcp_servers=(),
-            extra_mcp_servers=(),
+            mcp_differences=McpServerDifferences(),
         ))
     return statuses
 
@@ -4133,19 +4174,27 @@ class OwnProblemCause:
 
 
 @dataclass(frozen=True)
+class McpServerCause:
+    """One server and direction remain independent of other MCP faults."""
+
+    server: str
+    direction: McpDirection
+
+
+@dataclass(frozen=True)
 class ProblemCauseKey:
     """One cause on one account or home, shared by its symptoms."""
 
     kind: ProblemKind
     account: CauseAccount | NoCauseAccount
-    location: CauseFile | DuplicateLoginHomes | UsageServiceFailure | NoCauseFile
+    location: CauseFile | DuplicateLoginHomes | UsageServiceFailure | McpServerCause | NoCauseFile
 
 
 @dataclass(frozen=True)
 class ProblemCause:
     kind: ProblemKind
     explanation: str
-    location: CauseFile | DuplicateLoginHomes | UsageServiceFailure | NoCauseFile = NoCauseFile()
+    location: CauseFile | DuplicateLoginHomes | UsageServiceFailure | McpServerCause | NoCauseFile = NoCauseFile()
     account: CauseAccount | NoCauseAccount = NoCauseAccount()
     key: ProblemCauseKey | OwnProblemCause = OwnProblemCause()
 
@@ -4175,6 +4224,9 @@ class StatusProblem:
 
 
 def render_status_problem(problem: StatusProblem) -> str:
+    if isinstance(problem.cause, ProblemCause) and isinstance(problem.cause.location, McpServerCause):
+        line = f"{problem.subject} {problem.wrong}"
+        return line + ": " + problem.step.instruction if isinstance(problem.step, ProblemStep) else line
     parts = [f"{problem.subject}: {problem.wrong}"]
     if isinstance(problem.cause, ProblemCause):
         parts.append(problem.cause.explanation)
@@ -4388,11 +4440,16 @@ def _status_problems(status: AccountStatus | CodexStatus, *, detail: bool, zone:
         problems.append(StatusProblem(subject, "unclassified entries", ProblemCause("unclassified", ", ".join(status.unclassified)),
             ProblemStep(f"check these entries in {status.folder}; keep private files in this home")))
     if isinstance(status, AccountStatus):
-        differences = [*(f"- {name}" for name in status.missing_mcp_servers), *(f"+ {name}" for name in status.extra_mcp_servers)]
-        if differences:
-            problems.append(StatusProblem(subject, "mcpServers differ from ~/.claude",
-                ProblemCause("mcp servers", ", ".join(differences)),
-                ProblemStep(f"check mcpServers in {status.folder}/.claude.json against {_codex_folder(agent_accounts.claude_config_file(main_config_dir()))}")))
+        for difference in status.mcp_differences.entries:
+            count = len(difference.projects)
+            scopes = "project" if count == 1 else "projects"
+            arguments = (status.label, difference.server, difference.direction)
+            command = ("~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py mcp-projects "
+                       + shlex.join(("--", *arguments) if any(value.startswith("-") for value in arguments) else arguments))
+            problems.append(StatusProblem(subject,
+                f"turns {difference.server} {difference.direction} in {count} {scopes} where ~/.claude does not",
+                ProblemCause("mcp servers", ", ".join(difference.projects),
+                    McpServerCause(difference.server, difference.direction)), ProblemStep(command)))
     bound: list[StatusProblem] = []
     for problem in problems:
         if isinstance(problem.cause, ProblemCause):
@@ -4415,7 +4472,7 @@ def _status_cause_account(status: AccountStatus | CodexStatus) -> CauseAccount |
 
 
 def _status_cause_key(status: AccountStatus | CodexStatus, kind: ProblemKind,
-                      specific: CauseFile | DuplicateLoginHomes | UsageServiceFailure | NoCauseFile = NO_CAUSE_FILE) -> ProblemCauseKey:
+                      specific: CauseFile | DuplicateLoginHomes | UsageServiceFailure | McpServerCause | NoCauseFile = NO_CAUSE_FILE) -> ProblemCauseKey:
     if not isinstance(specific, NoCauseFile):
         return ProblemCauseKey(kind, NoCauseAccount() if isinstance(specific, DuplicateLoginHomes)
                                else _status_cause_account(status), specific)
@@ -4792,7 +4849,7 @@ def read_status(*, source: UsageSource = REFRESH_STALE_USAGE, detail: bool = Fal
         if not line.strip() or line in represented or line in diagnostics.delivered:
             continue
         mcp = re.fullmatch(r"~/(\.claude[0-9]+): mcpServers: .*", line)
-        if mcp and any(note.startswith(mcp[1][1:] + ": mcpServers differ") for note in notes):
+        if mcp and any(note.startswith(mcp[1][1:] + " turns ") and " where ~/.claude does not: " in note for note in notes):
             continue
         notes.append(render_status_problem(StatusProblem("accounts", "read warning",
             ProblemCause("warning", line), NoUserStep())))
@@ -4990,6 +5047,10 @@ def _parser() -> argparse.ArgumentParser:
     for action in ("setup", "check"):
         command = commands.add_parser(action)
         _ = command.add_argument("label")
+    mcp_command = commands.add_parser("mcp-projects", help="list projects where an account's MCP server differs")
+    _ = mcp_command.add_argument("label")
+    _ = mcp_command.add_argument("server")
+    _ = mcp_command.add_argument("direction", choices=("off", "on"))
     cutover = commands.add_parser("cutover-home")
     _ = cutover.add_argument("label", nargs="?", default="")
     _ = cutover.add_argument("--undo", action="store_true")
@@ -5114,6 +5175,10 @@ def main(argv: list[str]) -> int:
             return 0
         if options.detail and options.action != "status":
             raise AccountsError("--detail goes only with no action")
+        if options.action == "mcp-projects":
+            for path in mcp_projects(options.label, options.server, options.direction):
+                print(path)
+            return 0
         if options.action == "placement":
             print(placement_report())
             return 0

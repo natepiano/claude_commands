@@ -1,6 +1,7 @@
 """Claude session warnings, Codex log markers and legacy notice cleanup."""
 from __future__ import annotations
 
+import sys
 import tempfile
 import subprocess
 import os
@@ -13,11 +14,13 @@ from pathlib import Path
 from typing import cast, override
 from unittest.mock import patch
 
-import agent_accounts
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from scripts.whoami import agent_accounts
 from scripts.whoami import note_file
 from scripts.whoami.agent_accounts import KnownCodexAccount, UnknownCodexAccount
 import five_hour
-from agent_accounts import CodexHomeSource, CodexRateLimits, Quota, Report
+from scripts.whoami.agent_accounts import CodexHomeSource, CodexRateLimits, Quota, Report
 from scripts.accounts import accounts, role_map
 
 import escalate  # five_hour puts scripts/message on the path
@@ -27,7 +30,8 @@ import sessions
 from quota_alert import Config, Showrunner
 from user_action import NoActionRequired
 
-RESETS = (datetime.now(timezone.utc) + timedelta(days=1)).replace(hour=21, minute=20, second=0, microsecond=0)
+NOW = datetime(2026, 10, 15, 18, 20, tzinfo=timezone.utc)
+RESETS = NOW.replace(hour=21)
 CONFIG = cast(Config, cast(object, {
     "threshold_percent": 2, "repeat_minutes": 30, "stall_minutes": 5, "faults_to": "hana", "always": ["natedev"],
 }))
@@ -80,15 +84,14 @@ class WatchTests(unittest.TestCase):
     def watch(self, reports: list[Report]) -> list[str]:
         home = self.state / ".codex"
         identity = KnownCodexAccount(home, "fixture@example.invalid", "codex1")
-        now = datetime.now(timezone.utc)
         for live in reports:
             if live.tool == "Codex":
                 live.email = identity.login
                 live.source = CodexHomeSource(home)
         readings = quota_alert.CodexAlertPassReadings(
             accounts.CodexWorkersAccount(label="codex1", home=home), identity,
-            tuple(quota_alert.CodexHomeReading(home, live, now) for live in reports if live.tool == "Codex"))
-        return five_hour.watch(reports, codex_readings=readings)
+            tuple(quota_alert.CodexHomeReading(home, live, NOW) for live in reports if live.tool == "Codex"))
+        return five_hour.watch(reports, now=NOW, codex_readings=readings)
 
     def test_claude_accounts_keep_independent_low_spells_across_passes_and_recovery(self) -> None:
         low = Report("Claude", email="low@example.invalid", five_hour=Quota("5-hour", 82, RESETS))
@@ -359,13 +362,13 @@ class OutgoingNoticeTests(unittest.TestCase):
 class AccountHoldTests(unittest.TestCase):
     root: Path = Path()
     sent: list[str] = []
-    now: datetime = datetime.now(timezone.utc)
+    now: datetime = NOW
 
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.sent = []
-        self.now = datetime.now(timezone.utc)
+        self.now = NOW
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"HOME": str(self.root), "AGENT_NOTES_DIR": str(self.root)})))
         _ = self.enterContext(patch.object(role_map, "is_role_map_host", return_value=True))
         _ = self.enterContext(patch.object(role_map, "ssh_role_map", side_effect=AssertionError("unexpected ssh")))
@@ -399,18 +402,18 @@ class AccountHoldTests(unittest.TestCase):
 
     def test_swap_cancels_outgoing_and_legacy_holds_without_recovery_and_keeps_other_tools(self) -> None:
         a = self.readings(1)
-        _ = five_hour.watch([a.checked_homes[0].report], codex_readings=a)
+        _ = five_hour.watch([a.checked_homes[0].report], now=self.now, codex_readings=a)
         _ = escalate.hold("five-hour-codex", escalate.SessionPush("Old Codex", "old", NoActionRequired(), "note"))
         _ = escalate.hold("five-hour-claude", escalate.SessionPush("Claude", "other", NoActionRequired(), "note"))
         self.sent.clear()
         b = self.readings(2, None)
-        _ = five_hour.watch([b.checked_homes[0].report], codex_readings=b)
+        _ = five_hour.watch([b.checked_homes[0].report], now=self.now, codex_readings=b)
         self.assertEqual(self.sent, [])
         held = [escalate.read(path) for path in (escalate.STATE / "held").glob("*.json")]
         current = [entry for entry in held if isinstance(entry, escalate.HeldMessage)]
         self.assertEqual([entry.summary for entry in current], ["Claude"])
         low_b = self.readings(2)
-        lines = five_hour.watch([low_b.checked_homes[0].report], codex_readings=low_b)
+        lines = five_hour.watch([low_b.checked_homes[0].report], now=self.now, codex_readings=low_b)
         self.assertEqual(len(lines), 1)
         self.assertIn("codex2", lines[0])
         self.assertEqual(self.sent, [])
@@ -419,7 +422,7 @@ class AccountHoldTests(unittest.TestCase):
         with (patch.object(send, "STATE", self.root / "messages"),
               patch.object(sessions, "live_sessions", return_value=[])):
             a = self.readings(1)
-            _ = five_hour.watch([a.checked_homes[0].report], codex_readings=a)
+            _ = five_hour.watch([a.checked_homes[0].report], now=self.now, codex_readings=a)
             # This queued relay predates log-only Codex notices; new watches never enqueue it.
             send.enqueue(send.Message("hana", "quota_alert", "", "old Codex warning", "5-hour codex1"),
                          "offline", self.now)
@@ -430,19 +433,19 @@ class AccountHoldTests(unittest.TestCase):
                 _ = send.retire(command[command.index("--to") + 1], "quota_alert", command[command.index("--key") + 1])
                 return subprocess.CompletedProcess(command, 0, "", "")
             with patch.object(subprocess, "run", side_effect=retire):
-                self.assertEqual(five_hour.watch([], codex_readings=b), [])
+                self.assertEqual(five_hour.watch([], now=self.now, codex_readings=b), [])
             self.assertEqual(send.read_queue(send.queue_path("hana")), [])
 
     def test_unknown_selected_identity_preserves_warning_records_and_sends_nothing(self) -> None:
         a = self.readings(1)
-        _ = five_hour.watch([a.checked_homes[0].report], codex_readings=a)
+        _ = five_hour.watch([a.checked_homes[0].report], now=self.now, codex_readings=a)
         before = {path.name: path.read_text() for path in five_hour.STATE.glob("*.notice")}
         self.sent.clear()
         b = self.readings(2, None)
         assert isinstance(b.workers, accounts.CodexWorkersAccount)
         unknown = quota_alert.CodexAlertPassReadings(b.workers,
             UnknownCodexAccount(b.workers.home, "unreadable login"), b.checked_homes)
-        _ = five_hour.watch([], codex_readings=unknown)
+        _ = five_hour.watch([], now=self.now, codex_readings=unknown)
         self.assertEqual(self.sent, [])
         self.assertTrue(before)
         self.assertEqual({path.name: path.read_text() for path in five_hour.STATE.glob("*.notice")}, before)
@@ -452,17 +455,17 @@ class AccountHoldTests(unittest.TestCase):
             pass
 
         a = self.readings(1)
-        _ = five_hour.watch([], codex_readings=a)
+        _ = five_hour.watch([], now=self.now, codex_readings=a)
         markers = list(five_hour.STATE.glob("five-hour-codex-*.notice"))
         self.assertEqual(len(markers), 1)
         b = self.readings(2, None)
         with (patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "", "failed")),
               patch.object(escalate, "close", side_effect=Killed)):
             with self.assertRaises(Killed):
-                _ = five_hour.watch([], codex_readings=b)
+                _ = five_hour.watch([], now=self.now, codex_readings=b)
         self.assertEqual(markers[0].read_text(), "codex1")
         with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as retire:
-            self.assertEqual(five_hour.watch([], codex_readings=b), [])
+            self.assertEqual(five_hour.watch([], now=self.now, codex_readings=b), [])
         self.assertEqual(retire.call_count, 2)
         self.assertTrue(all(call.args[0][-1] == "5-hour codex1" for call in retire.call_args_list))
         self.assertFalse(markers[0].exists())
@@ -474,7 +477,7 @@ class AccountHoldTests(unittest.TestCase):
         readings = quota_alert.CodexAlertPassReadings(a.workers, a.selected_account,
             (*a.checked_homes, quota_alert.CodexHomeReading(spare.source.home, spare, self.now))
             if isinstance(spare.source, CodexHomeSource) else a.checked_homes)
-        _ = five_hour.watch([a.checked_homes[0].report, spare], codex_readings=readings)
+        _ = five_hour.watch([a.checked_homes[0].report, spare], now=self.now, codex_readings=readings)
         self.assertEqual(self.sent, [])
         self.assertFalse(list((escalate.STATE / "held").glob("*.json")))
 

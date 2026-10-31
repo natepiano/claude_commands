@@ -28,10 +28,10 @@ CODEX_PACER_TIER_FILE="${CODEX_PACER_TIER_FILE:-$HOME/.local/state/codex-pacer/t
 
 # Resolve the signed-in workers account rather than an inherited CODEX_HOME.
 agents_workers_home() {
-    "$AGENTS_CONFIG_DIR/../lib/py" - "$AGENTS_CONFIG_DIR/../whoami" <<'PY'
+    "$AGENTS_CONFIG_DIR/../lib/py" - "$AGENTS_CONFIG_DIR/../.." <<'PY'
 import sys
 sys.path.insert(0, sys.argv[1])
-from agent_accounts import workers_home
+from scripts.whoami.agent_accounts import workers_home
 try:
     print(workers_home())
 except (OSError, ValueError) as error:

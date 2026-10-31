@@ -34,6 +34,8 @@ import json
 import os
 import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from typing import cast
 
 from context_usage import (
@@ -124,7 +126,7 @@ def build_context(tokens: int, window: int | None, is_subagent: bool, showrunner
 def showrunner_state(session_id: str) -> Path | None:
     """The state file of the showrunner whose update timer names this session, else None."""
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "production"))
-    import showrunners
+    from scripts.production import showrunners
 
     doc = showrunners.production_of(session_id) if session_id else None
     if doc is None:

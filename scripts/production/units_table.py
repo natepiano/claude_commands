@@ -16,8 +16,10 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import cast
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 import live_units
-import showrunners
+from scripts.production import showrunners
 from production_units import Refusal, cell_value, production_field, unit_table
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "direct"))

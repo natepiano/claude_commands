@@ -2,21 +2,23 @@
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 from scripts.production import staff_sources
 import io
 import json
 import os
 import subprocess
-import sys
 import tempfile
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from contextlib import redirect_stderr, redirect_stdout
-from pathlib import Path
 from typing import cast, override
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scripts.whoami.note_file import note_name
@@ -25,11 +27,10 @@ import inventory
 import shutdown_record
 import sessions
 import settle
-import showrunners
+from scripts.production import showrunners
 import launch_permission
-from importlib import import_module
-import account
-import agent_accounts
+from scripts.whoami import account
+from scripts.whoami import agent_accounts
 from scripts.accounts import accounts, refusals
 from scripts.accounts.move_test_support import FakeSessionMoves, MoveCall
 from scripts.shutdown import stop_resume
@@ -59,8 +60,7 @@ class AccountMoveTests(ShutdownTestCase):
             "NOTIFIER_STATE_DIR": str(self.root / "notifier"),
         })))
         del context
-        _ = self.enterContext(patch.object(import_module("showrunners"), "NOTIFIER_STATE_DIR", self.root / "notifier"))
-        _ = self.enterContext(patch.object(import_module("scripts.production.showrunners"), "NOTIFIER_STATE_DIR", self.root / "notifier"))
+        _ = self.enterContext(patch.object(showrunners, "NOTIFIER_STATE_DIR", self.root / "notifier"))
         _ = self.enterContext(patch.object(agent_accounts, "user_zone", return_value=timezone.utc))
         self.moves = FakeSessionMoves()
         _ = self.enterContext(patch.object(stop_resume, "move_sessions", side_effect=self.moves))

@@ -13,8 +13,13 @@ from unittest.mock import call, patch
 from collections.abc import Callable
 from typing import cast
 
+
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 import roles_audit as audit
-import showrunners
+from scripts.production import showrunners
 from scripts.lib.test_names import NAMES_TOML
 
 

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 import math
@@ -37,6 +37,74 @@ class Window:
         return f"{start} to {end} (end excluded)"
 
 
+class EventSource(Enum):
+    BUILDS = "buildlog"
+    TOKENS = "usage ledger"
+    PHASES = "phase history"
+    WAITS = "wait history"
+    ISSUES = "issue history"
+    MERGES = "merge history"
+    PUSHES = "notification history"
+    MESSAGES = "message history"
+    RECEIPTS = "merge receipts"
+
+
+class SourceNotApplicable(Enum):
+    STATE = "present state"
+    CONFIG = "configuration"
+    ATTRIBUTION = "attribution"
+    UNSPECIFIED = "source not specified"
+
+
+@dataclass(frozen=True)
+class TimedAmount:
+    at: datetime
+    amount: float = 1
+
+
+@dataclass(frozen=True)
+class EventValue:
+    amount: float
+    unit: str = ""
+    events: tuple[TimedAmount, ...] = ()
+    population: tuple[datetime, ...] = ()
+    wait_rate: bool = False
+    partial: bool = False
+
+
+@dataclass(frozen=True)
+class Fraction:
+    numerator: float
+    denominator: float
+    percent: bool = False
+    partial: bool = False
+
+
+@dataclass(frozen=True)
+class NotRecorded:
+    reason: str
+
+
+@dataclass(frozen=True)
+class Snapshot:
+    amount: float | Fraction | NotRecorded
+    visibility_changed: bool = False
+
+
+@dataclass(frozen=True)
+class Diagnostic:
+    amount: float
+    reason: str = ""
+
+
+@dataclass(frozen=True)
+class Statistic:
+    amounts: tuple[float, ...]
+
+
+Quantity = EventValue | Fraction | NotRecorded | Snapshot | Diagnostic | Statistic
+
+
 @dataclass(frozen=True)
 class MeasureRow:
     measure: str
@@ -44,12 +112,28 @@ class MeasureRow:
     n: int
     window: str
     source: str
+    event_source: EventSource | SourceNotApplicable = field(default=SourceNotApplicable.UNSPECIFIED, compare=False)
+    quantity: Quantity = field(default=NotRecorded("typed value not recorded"), compare=False)
+    comparison_name: str = field(default="", compare=False)
+    detail: bool = field(default=False, compare=False)
+
+
+@dataclass(frozen=True)
+class SourceUnreadable:
+    pass
+
+
+@dataclass(frozen=True)
+class RowsSkipped:
+    count: int
 
 
 @dataclass(frozen=True)
 class SourceProblem:
     source: str
     reason: str
+    event_source: EventSource | SourceNotApplicable = SourceNotApplicable.UNSPECIFIED
+    kind: SourceUnreadable | RowsSkipped = SourceUnreadable()
 
 
 def field_text(record: JsonObject, key: str) -> str:
@@ -75,12 +159,28 @@ def field_flag(record: JsonObject, key: str) -> bool:
     return value
 
 
+def iso_time(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def strict_time(value: object) -> datetime:
+    if isinstance(value, datetime):
+        at = value
+    elif isinstance(value, str):
+        at = iso_time(value)
+    else:
+        raise ValueError("timestamp must be ISO text with a UTC offset")
+    if at.utcoffset() is None:
+        raise ValueError("timestamp must include a UTC offset")
+    return at
+
+
 def moment(value: object) -> RecordedTime:
     try:
         if isinstance(value, (int, float)) and not isinstance(value, bool):
             return datetime.fromtimestamp(value, timezone.utc)
         if isinstance(value, str) and value:
-            at = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            at = iso_time(value)
             return at.replace(tzinfo=user_zone()) if at.tzinfo is None else at
     except (ValueError, OverflowError, OSError):
         pass
@@ -108,7 +208,8 @@ def object_record(value: object) -> JsonObject:
 
 
 def source_problem_rows(problems: Sequence[SourceProblem], window: Window) -> list[MeasureRow]:
-    return [MeasureRow("source unavailable", problem.reason, 0, window.label, problem.source) for problem in problems]
+    return [MeasureRow("source unavailable", problem.reason, 0, window.label, problem.source, problem.event_source,
+        Diagnostic(problem.kind.count, problem.reason) if isinstance(problem.kind, RowsSkipped) else NotRecorded(problem.reason)) for problem in problems]
 
 
 def wrap_text(text: str, *, initial_indent: str = "", subsequent_indent: str = "") -> str:
@@ -164,3 +265,10 @@ def window_bounds(since_text: str, until_text: str, now: datetime) -> Window:
     if since >= until:
         raise ValueError("--since must precede the end of --until")
     return Window(since, until)
+
+
+def parse_window(text: str) -> Window:
+    parts = text.split("..")
+    if len(parts) != 2 or not all(parts):
+        raise ValueError("a compare window is START..END")
+    return window_bounds(parts[0], parts[1], datetime.now(timezone.utc))

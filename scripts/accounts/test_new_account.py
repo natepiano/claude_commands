@@ -13,9 +13,12 @@ from pathlib import Path
 from typing import cast, override
 from unittest.mock import patch
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from scripts.accounts.home_test_support import scratch_account_home
 from scripts.accounts import accounts, new_account
-import agent_accounts
-import note_file
+from scripts.whoami import agent_accounts
+from scripts.whoami import note_file
 
 
 def shipped_color_expectations(text: str) -> tuple[str, str, bytes]:
@@ -62,8 +65,8 @@ class NewAccountTests(unittest.TestCase):
         self.notes.mkdir()
         self.nixos.parent.mkdir()
         _ = self.nixos.write_text("claude1 = \"...\";\n", encoding="utf-8")
-        environment: object = cast(object, self.enterContext(patch.dict(os.environ, {
-            "AGENT_NOTES_DIR": str(self.notes), "HOME": str(self.home), "PATH": os.defpath,
+        environment: object = cast(object, self.enterContext(scratch_account_home(self.home, {
+            "AGENT_NOTES_DIR": str(self.notes), "PATH": os.defpath,
         }, clear=True)))
         del environment
         _ = (self.home / ".claude.json").write_text("{}", encoding="utf-8")
