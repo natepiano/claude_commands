@@ -198,6 +198,26 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 
 **Ruled out:** dropping `--cleanup-only` from `worker_owners.py` (a reopened worker can be ended again).
 
+### Phase 6b — The full baseline measure prints each repeated wait row once, and a table names its window and source once  · status: done
+
+#### As-built
+
+- `log_records.blocks` heads each table with the most common window and the most common source (`Counter.most_common`; a tie takes the first seen). A heading field prints only when 2 or more rows share it. A row prints `window:` or `source:` only when its value differs from the heading. `compare` prints through `blocks`, so it takes the same rule.
+- `measure.collapse_wait_rows(rows, source, identity_kind)` groups UncertainCoverage, attribution-miss, unresolved-origin and source-problem rows by (measure, value) into one row. Its n and its Diagnostic amount are the count of phases or waits. Its source is `<source>; phases: <ids>` or `<source>; waits: <ids>`, with every id, in text and `--json`.
+- `candidate_summary` lists each candidate once, in first-seen order. A candidate with no working directory prints `cwd=not recorded`.
+- Live: `baseline --full` falls from 11826 to 4319 lines; the 2026-10-22..29 window falls from 7521 to 3782.
+
+**Files:**
+- `scripts/hierarchies/log_records.py` — the table heading rule in `blocks`.
+- `scripts/hierarchies/measure.py` — `collapse_wait_rows`, `candidate_summary`, `WaitCandidate.label`.
+- `scripts/hierarchies/test_log_records.py`, `scripts/hierarchies/test_measure.py` — heading, tie, no shared value, collapsed rows and their amounts.
+
+**Binds later work:** In `--full` text a table heading names its common window and source once, and a collapsed wait row's n counts phases or waits, with every id in its source.
+
+**Gotchas:** A reason's "(N times)" is the producer's recorded text (progress_history.py `_read_waits`), not text from measure.py, and prints as recorded. Collapsed rows and the heading rule change display only, not what is measured.
+
+**Ruled out:** an id-list cap in text output; renaming the recorded "(N times)" text in measure.py.
+
 ### Phase 6 — The four-week review: which waits slow Hana, which links helped, and which trial steps stay  · status: todo
 **Depends on:** Phase 6a's checkpoint (`compare`), and the checkpoints of Phases 3, 4 and 5, and the three review records: the Phase 3 and Phase 5 re-runs, which the unit director runs on 2026-11-12 (two weeks after both merged into sdlc as 3c5dea67 on 2026-10-29) and records in the design doc under Steps 1 and 4 (the push-audit re-run also confirms that `measure.py` and `push_audit.py` agree; each re-run record holds the report's source-problem lines, because both reports exit 0 with source problems), Phase 12's checkpoint (merged before the 2026-11-12 re-run), Phase 15's checkpoint (`compare` prints through its `blocks`), and four weeks from the experiment start in design doc Step 2: the first day on which each holder producer (builds' `verify.sh`, models-unit's `codex_mesh.py`) has recorded a `NamedHolder`, read live from `progress_history.py waits`. At Phase 10's checkpoint (bece20e1) neither had, and Step 2 says `start not set`; the unit director sets the start and the review date when both have. Also models-unit's checkpoint that adds `codex_mesh.py end --cleanup-only` (routed from Phase 6a), merged into sdlc, and one `worker_owners.py end` run after that merge: until then every cleanup retry exits 2, so `end_cleanup_pending` counts the missing flag, not a held worker. The phase starts on the latest of these dates, never before.
 
@@ -228,7 +248,7 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 
 **State:** none.
 
-**Constraints from prior phases:** as Phase 6a, plus Phase 6a's As-built. Results quotes `compare`'s markers as printed: an unknown saved snapshot stays `not recorded`; a `RowsSkipped` problem keeps the good counts and adds `; incomplete: N rows skipped`; a `SourceUnreadable` problem keeps its unavailable-source reason. `codex_mesh.py` is models-unit's file; this phase never edits it.
+**Constraints from prior phases:** as Phase 6a, plus the As-builts of Phases 6a and 6b. In `--full` text a table heading names its common window and source once, and a collapsed wait row's n counts phases or waits, with every id in its source. Results quotes `compare`'s markers as printed: an unknown saved snapshot stays `not recorded`; a `RowsSkipped` problem keeps the good counts and adds `; incomplete: N rows skipped`; a `SourceUnreadable` problem keeps its unavailable-source reason. `codex_mesh.py` is models-unit's file; this phase never edits it.
 
 **Acceptance gate:** Results holds real numbers for each step, judged on the measure and review point each of Phases 3–5 names; the F007 and unknown saved value tests pass on rendered `compare` output; unit tests, per-slot `basedpyright` (`0 errors, 0 warnings, 0 notes`) and merge gate green when code changed. **Measure and review point:** this phase is the review point for Steps 1, 2 and 4. Step 4's keep-or-drop reads `worker_owners.py report` `end_cleanup_pending` and the cleanup outcomes in `ends.jsonl` beside the ownerless-worker count: a worker ended with its cleanup still pending is not released capacity. At phase end the unit director sends the showrunner the Results and the keep-or-drop list as one question for the user.
 
