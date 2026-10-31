@@ -17,22 +17,17 @@
 #   TZ           the user's zone, as user_zone.py reads it: USER_ZONE, else the
 #                zone= line of USER_ZONE_CONF or config/user_zone.conf, else
 #                user_zone.py's default. jq's strflocaltime writes reset times in it.
-#   showrunners  the session ids every showrunner's update timer targets: the
-#                TARGET line of each notifier showrunner-<slug>/conf, which
-#                notifier.sh's write_conf always writes first.
-#   showrunner   the unit director's live showrunner record text, selected
-#                through SHOWRUNNER_UNIT's notifier TARGET, or empty.
-#                NOTIFIER_STATE_DIR and NOTIFIER_SESSIONS_DIR override the
-#                notifier and session folders. jq ignores damaged record text.
-#                Its name is read each refresh without reopening the record.
+#   staff        the current staff rows, from STAFF_FILE or the shared staff.json.
+#                jq joins STAFF_ID, else the unique normalized session name, just
+#                as session_labels.StaffLabels does. No role comes from the env.
 #   counts       "<session id> <counts line>" lines: each showrunner's `For you: …`
 #                row, from the cache counts_row.py keeps in
 #                <showrunner state>/counts/<slug>. A cache is rebuilt only when a
 #                file it names is newer than it, or its deferred question's time
 #                has come; SHOWRUNNER_STATE_DIR overrides the state folder.
-# jq renders the session name, role and path, then the account, model, tokens and
+# jq renders the staff name, role and path, then the account, model, tokens and
 # quota windows, then the session's counts row, each part in its counts.<type> color;
-# a unit director with a live showrunner name reads "<session> unit for <name>".
+# a unit director reads "<unit> unit for <staff parent name>".
 
 config="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 account=
@@ -44,6 +39,9 @@ if [ "$config" = "$HOME/.claude" ] && [ -f "$HOME/.claude.json" ] && [ -r "$HOME
 fi
 legacy_home=
 [ "$config" != "$HOME/.claude" ] || legacy_home=1
+
+staff="${STAFF_FILE:-$HOME/.local/state/staff/staff.json}"
+[ -f "$staff" ] && [ -r "$staff" ] || staff=/dev/null
 
 labels="$HOME/.local/state/agent-notes/by-label.json"
 [ -r "$labels" ] || labels=/dev/null
@@ -63,7 +61,6 @@ export TZ="${zone:-America/New_York}"
 # NixOS's glibc finds zone files only through TZDIR; a bare environment would get UTC.
 [ -n "${TZDIR:-}" ] || [ ! -d /etc/zoneinfo ] || export TZDIR=/etc/zoneinfo
 
-showrunners=
 counts=
 # zsh otherwise aborts on an empty notifier glob before jq can render the line.
 [ -z "${ZSH_VERSION:-}" ] || setopt nonomatch
@@ -74,7 +71,6 @@ for conf in "${NOTIFIER_STATE_DIR:-$HOME/.local/state/notifier}"/showrunner-*/co
   { read -r target < "$conf"; } 2>/dev/null
   case $target in
     TARGET=session:?*)
-      showrunners="$showrunners ${target#TARGET=session:}"
       instance=${conf%/conf}
       cache="${SHOWRUNNER_STATE_DIR:-$HOME/.local/state/showrunner}/counts/${instance##*/showrunner-}"
       fresh=
@@ -101,36 +97,6 @@ for conf in "${NOTIFIER_STATE_DIR:-$HOME/.local/state/notifier}"/showrunner-*/co
   esac
 done
 
-showrunner=
-if [ -n "${SHOWRUNNER_UNIT:-}" ] && [ -z "${UNIT_TEAM_ROLE:-${PLAN_DELEGATE_TEAM_ROLE:-}}" ]; then
-  target=
-  { read -r target < "${NOTIFIER_STATE_DIR:-$HOME/.local/state/notifier}/showrunner-$SHOWRUNNER_UNIT/conf"; } 2>/dev/null
-  case $target in
-    TARGET=session:?*)
-      showrunner_id=${target#TARGET=session:}
-      for session in "${NOTIFIER_SESSIONS_DIR:-$HOME/.claude/sessions}"/*.json; do
-        session_line=
-        if [ -n "${ZSH_VERSION:-}" ]; then
-          { session_line=$(<"$session"); } 2>/dev/null
-        else
-          { IFS= read -r session_line < "$session"; } 2>/dev/null
-        fi
-        case $session_line in
-          *'"sessionId":"'"$showrunner_id"'"'*)
-            pid=${session##*/}
-            pid=${pid%.json}
-            case $pid in ''|*[!0-9]*) continue ;; esac
-            if kill -0 "$pid" 2>/dev/null; then
-              showrunner=$session_line
-              break
-            fi
-            ;;
-        esac
-      done
-      ;;
-  esac
-fi
-
 # This session's own record names it: Claude Code runs the status line command, so its pid is $PPID.
 # jq checks the record's session id against the session's own, so a reused pid names nobody.
 own=
@@ -143,7 +109,7 @@ own=
 } 2>/dev/null
 
 # shellcheck disable=SC2154 # statusline is set by the command that sources this.
-exec jq -r --arg pwd "$PWD" --arg account "$account" --arg showrunners "$showrunners" \
+exec jq -r --arg pwd "$PWD" --arg account "$account" \
   --arg legacy_home "$legacy_home" --rawfile home_config "$home_config" \
-  --arg showrunner "$showrunner" --arg own "$own" --arg counts "$counts" --slurpfile labels "$labels" \
+  --rawfile staff "$staff" --arg own "$own" --arg counts "$counts" --slurpfile labels "$labels" \
   --rawfile colors "$colors" -f "$statusline/statusline.jq"

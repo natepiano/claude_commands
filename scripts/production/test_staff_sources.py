@@ -4,7 +4,6 @@ from __future__ import annotations
 import io
 import json
 import os
-import subprocess
 import unittest
 from collections import Counter
 from contextlib import redirect_stderr, redirect_stdout
@@ -28,7 +27,6 @@ import herdr
 from scripts.production import showrunners
 import showrunner_tree
 import production_units
-from unit_lookup import member_sources
 
 
 class StaffSourcesTests(StaffTestCase):
@@ -138,34 +136,8 @@ class StaffSourcesTests(StaffTestCase):
                 self.assertEqual(reads.call_count, 1)
                 inputs = cast(list[str], value["inputs"])
                 self.assertIn(str(config), inputs)
-                for path in inputs:
-                    self.assertFalse(path.startswith(("/proc/", "/dev/", "/usr/share/zoneinfo/")), path)
+                self.assert_no_system_inputs(inputs)
 
-    def test_pool_lease_distinguishes_unleased_resolved_and_unresolved_units_before_json(self) -> None:
-        _ = self.production("sdlc", "models-unit")
-        pool = self.pool_reviewer("sdlc", "code1", "thread-pool")
-        _ = self.seed()
-        states: list[object] = []
-        for leased_unit in ("", "models-unit", "missing-unit"):
-            fields = cast(dict[str, object], json.loads(pool.read_text()))
-            reviewer = cast(dict[str, dict[str, object]], fields["reviewers"])["code1"]
-            reviewer["lease"] = {"unit": leased_unit, "ordinal": 1} if leased_unit else None
-            self.write_json(pool, fields)
-            scan = staff_sources._WorkerSources(staff.snapshot(), member_sources())  # pyright: ignore[reportPrivateUsage]
-            with redirect_stderr(io.StringIO()) as problems:
-                observations = scan.collect()
-            observation = next(item for item in observations if item.name == "code1")
-            self.assertIsInstance(observation.pool, staff_sources.ReviewPoolLease)
-            assert isinstance(observation.pool, staff_sources.ReviewPoolLease)
-            states.append(observation.pool.serves)
-            if leased_unit == "missing-unit":
-                self.assertIn("missing-unit", problems.getvalue())
-        self.assertEqual([type(state).__name__ for state in states],
-                         ["PoolUnleased", "PoolServesUnit", "PoolLeaseUnresolved"])
-        unit = staff.by_path("sdlc/models")
-        assert unit is not None
-        self.assertEqual(getattr(states[1], "staff_id"), unit.id)
-        self.assertEqual(getattr(states[2], "unit"), "missing-unit")
 
     def test_finished_and_adopted_rosters_cannot_override_the_live_ledger_worker(self) -> None:
         _ = self.production("sdlc", "models-unit")
@@ -197,6 +169,25 @@ class StaffSourcesTests(StaffTestCase):
         self.assertEqual(reviewer["identity"], {"codex": "thread-current"})
         self.assertIn(str(ledger), cast(list[str], value["inputs"]))
 
+    def test_adhoc_ledger_of_a_dot_named_worktree_takes_its_holder_run_without_a_name_error(self) -> None:
+        _ = self.production("sdlc", "models-unit")
+        _ = self.session_record("session-sdlc", "sdlc")
+        _ = self.session_record("session-models", "models-unit")
+        self.pane("w1:models", session_id="session-models", environment={
+            "SHOWRUNNER_UNIT": "sdlc", "SHOWRUNNER_UNIT_ID": "models-unit"})
+        run = self.worker_run("sdlc", "models-unit", "session-models")
+        # A worktree named `.claude` gives the adhoc ledger stem `.claude-<digest>`.
+        _ = self.ledger_worker(run, "adhoc", ".claude-3314ec0bf589", "review", "review", "thread-adhoc")
+        _, errors = self.seed()
+        self.assertNotIn("name must contain", errors)
+        with redirect_stderr(io.StringIO()) as live_errors:
+            members = cast(list[dict[str, object]], staff_sources.live()["members"])
+        self.assertNotIn("name must contain", live_errors.getvalue())
+        unit = next(member for member in members if member["kind"] == "unit")
+        reviewer = next(member for member in members if member["kind"] == "worker")
+        self.assertEqual((reviewer["name"], reviewer["parent"]), ("review", unit["id"]))
+        self.assertEqual(reviewer["identity"], {"codex": "thread-adhoc"})
+
     def test_live_owner_ignores_a_newer_launch_whose_session_has_ended(self) -> None:
         _ = self.production("sdlc", "models-unit")
         _ = self.seed()
@@ -220,24 +211,22 @@ class StaffSourcesTests(StaffTestCase):
             "SHOWRUNNER_UNIT": "sdlc", "SHOWRUNNER_UNIT_ID": "models-unit"})
         run = self.worker_run("sdlc", "models-unit", "session-models")
         roster = self.roster_worker(run, "impl", "fix", "thread-roster")
-        pool = self.pool_reviewer("sdlc", "code1", "thread-pool", unit="models-unit")
         astra = self.astra_worker(run, "sdlc-handler-astra-reviewer", "thread-astra", "session-sdlc")
         design = self.worker_design("sdlc", "sdlc-handler-astra-designer", "thread-design")
         self.assertEqual(list(Path(os.environ["UNIT_WORKERS_STATE"]).rglob("*.json")), [])
         _ = self.seed()
         members = cast(list[dict[str, object]], staff_sources.live()["members"])
         workers = {cast(str, member["name"]): member for member in members if member["kind"] == "worker"}
-        self.assertEqual(set(workers), {"impl", "code1", "sdlc-handler-astra-reviewer", "sdlc-handler-astra-designer"})
+        self.assertEqual(set(workers), {"impl", "sdlc-handler-astra-reviewer", "sdlc-handler-astra-designer"})
         self.assertEqual(workers["impl"]["role"], "fix")
-        for name, thread in (("impl", "thread-roster"), ("code1", "thread-pool"),
+        for name, thread in (("impl", "thread-roster"),
                              ("sdlc-handler-astra-reviewer", "thread-astra"),
                              ("sdlc-handler-astra-designer", "thread-design")):
             self.assertEqual(workers[name]["identity"], {"codex": thread})
         root = next(member for member in members if member["name"] == "sdlc")
-        self.assertEqual(workers["code1"]["parent"], root["id"])
         self.assertEqual(workers["sdlc-handler-astra-reviewer"]["parent"], root["id"])
         inputs = cast(list[str], staff_sources.live()["inputs"])
-        for path in (roster, pool, astra, design):
+        for path in (roster, astra, design):
             self.assertIn(str(path), inputs)
 
     def test_unreadable_astra_owner_does_not_seed_a_permanent_unit_owned_duplicate(self) -> None:
@@ -262,25 +251,6 @@ class StaffSourcesTests(StaffTestCase):
         _ = self.seed()
         self.assertEqual(self.staff_file.read_bytes(), before)
 
-    def test_malformed_pool_reports_its_path_and_preserves_readable_workers(self) -> None:
-        _ = self.production("sdlc", "models-unit")
-        _ = self.session_record("session-sdlc", "sdlc")
-        _ = self.session_record("session-models", "models-unit")
-        self.pane("w1:models", session_id="session-models", environment={
-            "SHOWRUNNER_UNIT": "sdlc", "SHOWRUNNER_UNIT_ID": "models-unit"})
-        run = self.worker_run("sdlc", "models-unit", "session-models")
-        _ = self.ledger_worker(run, "sdlc", "models-unit", "impl", "impl", "thread-impl")
-        pool = self.pool_reviewer("sdlc", "code1", "thread-pool")
-        self.write_json(pool, {"generation": 1, "templates": {}, "reviewers": []})
-        _, errors = self.seed()
-        self.assertIn(str(pool), errors)
-        worker = next(row for row in staff.find(kind="worker") if row.name == "impl")
-        with redirect_stderr(io.StringIO()) as problems:
-            value = staff_sources.live()
-        self.assertIn(str(pool), problems.getvalue())
-        members = cast(list[dict[str, object]], value["members"])
-        self.assertEqual(next(member["identity"] for member in members if member["id"] == worker.id),
-                         {"codex": "thread-impl"})
 
     def test_live_inputs_include_the_remote_owner_record_and_exclude_process_and_system_reads(self) -> None:
         _ = self.tree()
@@ -295,14 +265,21 @@ class StaffSourcesTests(StaffTestCase):
                 self.assertEqual(reads.call_count, 1)
                 inputs = cast(list[str], value["inputs"])
                 self.assertIn(str(self.staff_file), inputs)
-                for path in inputs:
-                    self.assertFalse(path.startswith(("/proc/", "/dev/", "/usr/share/zoneinfo/")), path)
+                self.assert_no_system_inputs(inputs)
         self.assertEqual(len(self.ssh_commands()), 1)
 
     def seed(self, *, dry_run: bool = False) -> tuple[str, str]:
         with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
             staff_sources.seed(dry_run=dry_run)
         return output.getvalue(), errors.getvalue()
+
+    def assert_no_system_inputs(self, inputs: list[str]) -> None:
+        # The test's own temp root may sit under /dev/shm (the gate sets TMPDIR there).
+        root = f"{self.root}/"
+        for path in inputs:
+            if path.startswith(root):
+                continue
+            self.assertFalse(path.startswith(("/proc/", "/dev/", "/usr/share/zoneinfo/")), path)
 
     def test_worker_seed_imports_ledger_and_roster_once_and_keeps_replacement_identity(self) -> None:
         _ = self.production("sdlc", "models-unit")
@@ -339,10 +316,9 @@ class StaffSourcesTests(StaffTestCase):
         _ = self.production("sdlc", "models-unit")
         run = self.worker_run("sdlc", "models-unit", "session-models")
         ledger = self.ledger_worker(run, "sdlc", "models-unit", "impl", "impl", "thread-impl")
-        pool = self.pool_reviewer("sdlc", "code1", "thread-pool", unit="models-unit")
         astra = self.astra_worker(run, "sdlc-handler-astra-reviewer", "thread-astra", "session-sdlc")
         _ = self.seed()
-        for path in (ledger, run / "mesh_roster.json", pool, astra):
+        for path in (ledger, run / "mesh_roster.json", astra):
             original = path.read_text()
             with self.subTest(path=path):
                 write_text_atomic(path, "{broken")
@@ -355,7 +331,7 @@ class StaffSourcesTests(StaffTestCase):
                 self.assertTrue(errors.getvalue().strip())
                 write_text_atomic(path, original)
 
-    def test_live_staff_command_keeps_pool_ownership_identity_and_all_input_paths(self) -> None:
+    def test_live_staff_command_keeps_worker_identity_and_all_input_paths(self) -> None:
         doc = self.production("sdlc", "models-unit")
         self.pane("w1:runner", session_id="session-sdlc", environment={})
         self.pane("w1:models", session_id="session-models", environment={
@@ -367,7 +343,6 @@ class StaffSourcesTests(StaffTestCase):
         run = self.worker_run("sdlc", "models-unit", "session-models")
         ledger = self.ledger_worker(run, "sdlc", "models-unit", "impl", "impl", "thread-impl")
         _ = self.ledger_worker(run, "sdlc", "models-unit", "test", "test", "session-test", family="claude")
-        pool = self.pool_reviewer("sdlc", "code1", "thread-pool", unit="models-unit", busy_pid=os.getpid())
         astra = self.astra_worker(run, "sdlc-handler-astra-reviewer", "thread-astra", "session-sdlc")
         _ = self.seed()
         before = self.staff_file.read_bytes()
@@ -377,7 +352,7 @@ class StaffSourcesTests(StaffTestCase):
         self.assertEqual(reads.call_count, 1)
         document = cast(dict[str, object], json.loads(output.getvalue()))
         self.assertEqual(set(document), {"schema", "inputs", "members"})
-        self.assertEqual(document["schema"], 2)
+        self.assertEqual(document["schema"], 3)
         members = cast(list[dict[str, object]], document["members"])
         by_name = {cast(str, member["name"]): member for member in members}
         by_identity = {tuple(cast(dict[str, str], member["identity"]).items()): member for member in members}
@@ -389,18 +364,13 @@ class StaffSourcesTests(StaffTestCase):
         for name, identity in (("impl", {"codex": "thread-impl"}), ("test", {"claude": "session-test"})):
             self.assertEqual(by_name[name]["parent"], unit["id"])
             self.assertEqual(by_name[name]["identity"], identity)
-            self.assertNotIn("pool", by_name[name])
-        reviewer = by_identity[(("codex", "thread-pool"),)]
-        self.assertEqual(reviewer["parent"], root["id"])
-        self.assertEqual(reviewer["pool"], {"state": "busy", "serves": unit["id"]})
         designer = by_identity[(("codex", "thread-astra"),)]
         self.assertEqual(designer["parent"], root["id"])
         self.assertEqual(designer["role"], "astra-reviewer")
         ids = {member["id"] for member in members}
         self.assertEqual(len(ids), len(members))
         for member in members:
-            self.assertEqual(set(member), {"id", "kind", "name", "parent", "role", "identity"}
-                             | ({"pool"} if member is reviewer else set()))
+            self.assertEqual(set(member), {"id", "kind", "name", "parent", "role", "identity"})
             self.assertIn(member["role"], {"showrunner", "unit", "impl", "test", "review", "fix", "astra-designer", "astra-reviewer"})
             self.assertTrue(member["parent"] in ids or member is root)
             self.assertEqual(member["parent"] is None, member is root)
@@ -408,7 +378,7 @@ class StaffSourcesTests(StaffTestCase):
         inputs = cast(list[str], document["inputs"])
         self.assertTrue(all(Path(path).is_absolute() for path in inputs))
         self.assertEqual(len(inputs), len(set(inputs)))
-        for path in (self.staff_file, doc, ledger, pool, astra, run / "mesh_roster.json", *registry,
+        for path in (self.staff_file, doc, ledger, astra, run / "mesh_roster.json", *registry,
                      Path(os.environ["NOTIFIER_STATE_DIR"]) / "showrunner-sdlc" / "conf",
                      pane_record.record_path(herdr.shared_session())):
             self.assertIn(str(path), inputs)
@@ -423,29 +393,6 @@ class StaffSourcesTests(StaffTestCase):
         self.assertEqual(replaced["identity"], {"codex": "thread-replacement"})
         self.assertEqual(self.staff_file.read_bytes(), before)
 
-    def test_live_pool_busy_state_follows_the_pid_without_changing_staff(self) -> None:
-        _ = self.production("sdlc", "models-unit")
-        _ = self.session_record("session-sdlc", "sdlc")
-        pool = self.pool_reviewer("sdlc", "code1", "thread-pool", unit="models-unit", busy_pid=os.getpid())
-        _ = self.seed()
-        before = self.staff_file.read_bytes()
-        states: list[str] = []
-        with subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()"], stdin=subprocess.PIPE) as busy:
-            value = cast(dict[str, object], json.loads(pool.read_text()))
-            reviewers = cast(dict[str, dict[str, object]], value["reviewers"])
-            reviewers["code1"]["busy_pid"] = busy.pid
-            self.write_json(pool, value)
-            pool_before = pool.read_bytes()
-            for finished in (False, True):
-                if finished:
-                    _ = busy.communicate(timeout=PROCESS_TIMEOUT)
-                document = cast(dict[str, object], json.loads(self.cli("show", "--json", "--live").stdout))
-                members = cast(list[dict[str, object]], document["members"])
-                member = next(member for member in members if member.get("identity") == {"codex": "thread-pool"})
-                states.append(cast(str, cast(dict[str, object], member["pool"])["state"]))
-                self.assertEqual(pool.read_bytes(), pool_before)
-        self.assertEqual(states, ["busy", "idle"])
-        self.assertEqual(self.staff_file.read_bytes(), before)
 
     def test_seed_preserves_recorded_moves_despite_stale_sources(self) -> None:
         old = staff.ensure("showrunner", name="old")

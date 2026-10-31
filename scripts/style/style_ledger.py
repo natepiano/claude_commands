@@ -28,6 +28,9 @@ from pathlib import Path, PurePosixPath
 from types import TracebackType
 from typing import Concatenate, Literal, TypedDict, cast
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
+from issues import Issue, frontmatter
+
 from git_process import (CheckCouldNotRun as CheckCouldNotRun, GitReadFailed as GitReadFailed,
                          LedgerError as LedgerError, GitExitAnswers, SUCCESS_ONLY, run_git)
 
@@ -2775,17 +2778,28 @@ class Ledger:
         return tuple(pair for kind, before, after, line, text in rows
                      if isinstance(pair := binding_rename(kind, before, after, line, text), BindingRename))
 
-    def bulk_release(self, id: str, reasons: Mapping[str, str]) -> tuple[BulkRefusal, ...]:
+    def ticket_refuse(self, id: str, findings: Sequence[str], by: str, reason: str) -> tuple[BulkRefusal, ...]:
+        """Release a person's named findings while keeping every contributing decision buildable."""
+        if not by.strip() or not reason.strip():
+            raise LedgerError("ticket refuse requires a non-empty --by and --reason")
+        if not findings:
+            raise LedgerError("ticket refuse requires at least one finding")
+        return self.bulk_release(id, dict.fromkeys(findings, reason), keep_decisions=True)
+
+    def bulk_release(self, id: str, reasons: Mapping[str, str], *, keep_decisions: bool = False) -> tuple[BulkRefusal, ...]:
         """Record refusals and release only those findings, atomically; repeated refusals change nothing.
 
-        Each finding stays filed under its decision. Removing ticket membership prevents merge-time checks from
-        counting it as part of this batch, and clearing build_ticket makes it available to an ordinary ticket.
+        Each finding keeps its filed or waived state. Removing ticket membership prevents merge-time checks from
+        counting it as part of this batch, and clearing build_ticket makes filed findings available to an ordinary
+        ticket. A person's refusal must leave a filed finding of each decision's rule in the ticket.
         """
         if any(not reason.strip() for reason in reasons.values()):
             raise LedgerError("bulk refusal requires a reason")
         with self._connection:
             _ = self._connection.execute("BEGIN IMMEDIATE")
-            ticket = self.bulk_ticket(id)
+            ticket = self._ticket(id)
+            if ticket["kind"] != "proposal" or ticket["state"] not in ("assigned", "checkpointed"):
+                raise LedgerError(f"{id}: refusal requires an assigned or checkpointed proposal ticket")
             recorded = self.bulk_refusals(id)
             known = {row.finding_id for row in recorded}
             pending = {identity: reason for identity, reason in reasons.items() if identity not in known}
@@ -2794,8 +2808,15 @@ class Ledger:
             for identity in pending:
                 finding = self._held(identity)
                 if (identity not in ticket["finding_ids"] or finding.build_ticket != BuildTicket(id)
-                        or not isinstance(finding.state, Filed)):
-                    raise LedgerError(f"{identity}: finding is not filed under bulk ticket {id}")
+                        or not isinstance(finding.state, Filed | Waived)):
+                    raise LedgerError(f"{identity}: finding does not belong to ticket {id}")
+            if keep_decisions:
+                remaining = self.named_held(tuple(identity for identity in ticket["finding_ids"] if identity not in pending))
+                for issue in self.ticket_proposals(id):
+                    rule = Issue(issue, frontmatter(issue)).value("style_rule")
+                    if not any(isinstance(finding.state, Filed) and finding.state.proposal == issue
+                               and base_rule(finding.rule) == rule for finding in remaining):
+                        raise LedgerError(f"{id}: refusal leaves issue {issue} without a finding of its rule {rule}")
             now = _now()
             for identity, reason in pending.items():
                 _ = self._connection.execute("INSERT INTO bulk_refusals VALUES (?,?,?,?)", (identity, id, reason, now))
@@ -3037,6 +3058,22 @@ class Ledger:
             raise LedgerError(f"{ticket['id']}: empty pipeline footprint")
         return frozenset(files)
 
+    def ticket_changed_paths(self, ticket: TicketRecord, end: str) -> frozenset[str]:
+        """Paths touched by this ticket's own non-merge commits, excluding imported style work.
+
+        End may be a worktree snapshot, so uncommitted ticket edits count as well. Keep reverted paths:
+        they were touched by the ticket even when its endpoint trees happen to match.
+        """
+        if not ticket["base"]:
+            raise LedgerError(f"{ticket['id']}: changed paths require a ticket base")
+        style_tip = self._style_branch_tip()[1]
+        revisions = (end, f"^{ticket['base']}", *((f"^{style_tip}",) if style_tip else ()))
+        paths = _git_bytes(self.repo, "log", "--no-merges", "--name-only", "--no-renames", "-z",
+                           "--format=", *revisions, "--").stdout
+        if paths and not paths.endswith(b"\0"):
+            raise LedgerError("unreadable changed paths")
+        return frozenset(os.fsdecode(path) for path in paths.split(b"\0") if path)
+
     def _check_ticket_pair(self, predecessor: TicketRecord, successor: TicketRecord) -> None:
         """Reprove disjointness from fresh rows and resolved tips; any uncertainty refuses the transaction."""
         try:
@@ -3058,13 +3095,7 @@ class Ledger:
             footprints: list[frozenset[str]] = []
             for ticket in (predecessor, successor):
                 end = ticket["checkpoint"] or live[successor["branch"]]
-                # Neither inherited predecessor work nor imported style work belongs to this ticket.
-                revisions = (end, f"^{ticket['base']}", *((f"^{style_tip}",) if style_tip else ()))
-                paths = _git_bytes(self.repo, "log", "--no-merges", "--name-only", "--no-renames", "-z",
-                                   "--format=", *revisions, "--").stdout
-                if paths and not paths.endswith(b"\0"):
-                    raise LedgerError("unreadable changed paths")
-                actual = frozenset(os.fsdecode(path) for path in paths.split(b"\0") if path)
+                actual = self.ticket_changed_paths(ticket, end)
                 footprints.append(self._pipeline_footprint(ticket, trees) | actual)
             waiting, selected = footprints
             overlap = ((waiting & protected_ticket_files(selected, crates))
@@ -6873,6 +6904,8 @@ class LedgerArguments(argparse.Namespace):
     proposal: str = ""
     state: HeldStateName | None = None
     finding_ids: str = "[]"
+    finding: list[str] = []
+    reason: str = ""
     site: str = ""
     idea: str = ""
     # `held built` takes more than one --id only with --commit.
@@ -6987,7 +7020,7 @@ def main() -> None:
         _ = command.add_argument("--repo", required=True)
     for name, actions in (
         ("unit", ("rename",)),
-        ("ticket", ("add", "assign", "checkpoint", "restore-checkpoint", "merge", "drop", "open", "yield")),
+        ("ticket", ("add", "assign", "checkpoint", "restore-checkpoint", "merge", "drop", "open", "yield", "refuse")),
         ("handoff", ("add", "send", "reroute", "merged", "pending")),
         ("tip", ("seen", "done")),
         ("held", ("add", "replace", "file", "waive", "built", "list")),
@@ -7023,6 +7056,10 @@ def main() -> None:
                     _ = command.add_argument("--phase", default="")
                 elif action == "yield":
                     _ = command.add_argument("--path", required=True)
+                elif action == "refuse":
+                    _ = command.add_argument("--finding", action="append", required=True)
+                    _ = command.add_argument("--by", required=True)
+                    _ = command.add_argument("--reason", required=True)
             elif name == "handoff":
                 if action != "pending":
                     _ = command.add_argument("--checkpoint", required=True)
@@ -7134,6 +7171,9 @@ def main() -> None:
                 elif args.action == "yield":
                     for finding_id in ledger.ticket_yield(args.id, args.path):
                         print(f"yielded {finding_id}: it stays filed for a later ticket")
+                elif args.action == "refuse":
+                    _ = ledger.ticket_refuse(args.id, args.finding, args.by or "", args.reason)
+                    print(f"{args.id}: named findings refused; remaining findings kept")
                 else:
                     for ticket in ledger.ticket_open(args.unit):
                         print(json.dumps(ticket, sort_keys=True))

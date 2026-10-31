@@ -70,7 +70,6 @@ class ProductionTreeTests(StaffTestCase):
             mock.patch.object(unit_runs, "RUN_ROOT", self.root / "unit"),
             mock.patch.object(unit_runs, "FORMER_RUN_ROOT", self.root / "delegate"),
             mock.patch.object(production_tree, "_server_running", side_effect=server_recorded),
-            mock.patch.object(production_tree, "pool_root", return_value=self.root / "review-pool"),
         ):
             _ = self.enterContext(patch)
 
@@ -125,7 +124,7 @@ class ProductionTreeTests(StaffTestCase):
             "STAFF_ID": row.id, "SHOWRUNNER_UNIT": "natedev", "SHOWRUNNER_UNIT_ID": "one",
         })
         with (mock.patch.object(production_tree, "running_sessions", return_value=[record(DIRECTOR)]),
-              mock.patch.object(unit_lookup, "observed_unit_marks", return_value=(
+              mock.patch.object(unit_lookup, "observed_staff_marks", return_value=(
                   ("natedev", replace(unit(DIRECTOR, "one"), staff_id=row.id)),
               ))):
             edges = production_tree.tree()
@@ -133,7 +132,7 @@ class ProductionTreeTests(StaffTestCase):
 
     def test_complete_tree_with_child_productions_reads_one_staff_snapshot(self) -> None:
         with (mock.patch.object(staff, "snapshot", wraps=staff.snapshot) as reads,
-              mock.patch.object(unit_lookup, "observed_unit_marks", return_value=()),
+              mock.patch.object(unit_lookup, "observed_staff_marks", return_value=()),
               mock.patch.object(production_tree, "running_sessions", return_value=[record(RUNNER), record(CHILD_RUNNER)])):
             edges = production_tree.tree()
         self.assertIn({"manager": RUNNER, "member": CHILD_RUNNER, "role": "showrunner"}, edges)
@@ -301,29 +300,6 @@ class ProductionTreeTests(StaffTestCase):
         self.assertEqual(production_tree._worker_role({"role": "designer"}),  # pyright: ignore[reportPrivateUsage]
                          roster.AssignmentUnreadable("designer"))
 
-    def test_each_leased_pool_reviewer_reports_to_its_running_unit_director(self) -> None:
-        pool = self.root / "review-pool" / "main" / "pool.json"
-        pool.parent.mkdir(parents=True)
-        _ = pool.write_text(json.dumps({
-            "generation": 1, "next_index": 5,
-            "templates": {"code": {"thread_id": "thread-template"}},
-            "reviewers": {
-                "code1": {"type": "code", "thread_id": "thread-busy", "lease": {"unit": "one", "ordinal": 1},
-                          "busy_pid": os.getpid()},
-                "design2": {"type": "design", "thread_id": "thread-idle", "lease": {"unit": "one", "ordinal": 2},
-                            "busy_pid": None},
-                "code3": {"type": "code", "thread_id": "thread-free", "lease": None, "busy_pid": None},
-                "code4": {"type": "code", "thread_id": "thread-stopped", "lease": {"unit": "two", "ordinal": 1},
-                          "busy_pid": None},
-            },
-        }))
-        edges = self.session_tree({RUNNER, DIRECTOR}, {"main": {"one": unit(DIRECTOR, "one"), "two": unit(OLD_DIRECTOR, "two")}})
-        self.assertEqual([edge for edge in edges if edge["role"] == "review"], [
-            {"manager": DIRECTOR, "member": "thread-busy", "role": "review", "unit": "one",
-             "thread_id": "thread-busy", "state": "busy", "type": "code"},
-            {"manager": DIRECTOR, "member": "thread-idle", "role": "review", "unit": "one",
-             "thread_id": "thread-idle", "state": "idle", "type": "design"},
-        ])
 
     def test_a_manager_on_another_machine_keeps_its_edges(self) -> None:
         _ = self.run_folder("unit", DIRECTOR, {"a-impl": {"thread_id": "thread-impl", "role": "impl", "status": "running"}}, server=False)
@@ -345,7 +321,7 @@ class ProductionTreeTests(StaffTestCase):
         edges = self.session_tree({RUNNER}, {"main": {"one": unit(DIRECTOR, "one")}})
         self.assertEqual(edges, [])
 
-    def test_unreadable_unit_marks_keep_the_other_edges(self) -> None:
+    def test_unreadable_staff_marks_keep_the_other_edges(self) -> None:
         with mock.patch.object(production_tree, "running_sessions", return_value=[record(RUNNER), record(CHILD_RUNNER)]), \
                 mock.patch.object(unit_lookup, "every_marked_unit", side_effect=OSError("herdr: gone")), \
                 contextlib.redirect_stderr(io.StringIO()) as errors:

@@ -63,7 +63,7 @@ class StylePlanTests(StylePlanFixture):
         self.assertEqual(ticket["finding_ids"], [])
         self.assertIsInstance(self.ledger().proposal_findings(issue)[0].build_ticket, style_ledger.NoBuildTicket)
 
-    def test_modules_takes_approved_decision_when_unsynced_file_holds_blocking_structure_read(self) -> None:
+    def test_modules_reads_blocking_structure_despite_unsynced_source_changes(self) -> None:
         plan = self.modules_unit()
         structure = self.rule("structure", "tier: D\nfamily: modules\ninput_scope: file\n")
         _ = self.values_unit()
@@ -75,13 +75,83 @@ class StylePlanTests(StylePlanFixture):
         for path in self.sources[1:]:
             self.record(values, path, self.tip)
 
-        with mock.patch.object(style_plan, "unsynced_changes", return_value={
-                self.sources[0]: style_plan.UnsyncedChange(self.sources[0], self.tip)}):
+        with (mock.patch.object(style_plan, "unsynced_changes", return_value={
+                self.sources[0]: style_plan.UnsyncedChange(self.sources[0], self.tip)}),
+              mock.patch.object(style_plan, "main_changes", return_value=style_plan.MainChanges(
+                  self.tip, frozenset({self.sources[0]})))):
             ticket = self.select_for_family("modules", plan)
 
         self.assertEqual((ticket["kind"], ticket["family"], ticket["files"]),
-                         ("proposal", "modules", [self.sources[2]]))
-        self.assertEqual(ticket["finding_ids"], [self.ledger().proposal_findings(issue)[0].finding_id])
+                         ("structure", "modules", [self.sources[0]]))
+        self.assertEqual(ticket["finding_ids"], [])
+        self.assertIsInstance(self.ledger().proposal_findings(issue)[0].build_ticket, style_ledger.NoBuildTicket)
+
+    def test_modules_reads_held_structure_files_and_manifest(self) -> None:
+        plan = self.modules_unit()
+        structure = self.rule("structure", "tier: D\nfamily: modules\ninput_scope: file\n")
+        _ = self.rule("manifest", "tier: D\nfamily: modules\ninput_scope: manifest\n")
+        _ = self.values_unit()
+        _ = self.rule("values", "tier: C\nfamily: values\ninput_scope: file\n")
+        self.sync()
+        ledger = self.ledger()
+        ledger.ticket_add("values-unit-1", "values-unit", "read", "modules", "crates/alpha",
+                          [self.sources[0]], [structure])
+        ledger.ticket_assign("values-unit-1", "style/main")
+        branch = self.git("rev-parse", "demo-style-modules")
+        # Board reservations and the other ticket's held paths both allow a source read.
+        board = self.board("crates/alpha/Cargo.toml", *self.sources[:2])
+        busy = style_plan.busy_files(self.repo, self.doc, ledger, "modules-unit", board)
+        self.assertIn(self.sources[0], busy.paths)
+        self.assertTrue(busy.contains("crates/alpha/Cargo.toml"))
+        with mock.patch.object(berth_board, "read_board", return_value=board):
+            ticket = self.select_for_family("modules", plan)
+        self.assertEqual((ticket["kind"], ticket["files"]),
+                         ("structure", ["crates/alpha/Cargo.toml", *self.sources[:2]]))
+        self.assertEqual(self.git("rev-parse", "demo-style-modules"), branch)
+        self.assertEqual(ledger.ticket_open("values-unit")[0]["state"], "assigned")
+
+    def test_modules_reads_blocking_structure_before_scanning_decision_footprints(self) -> None:
+        plan = self.modules_unit()
+        structure = self.rule("structure", "tier: D\nfamily: modules\ninput_scope: file\n")
+        _ = self.values_unit()
+        _ = self.rule("values", "tier: C\nfamily: values\ninput_scope: file\n")
+        self.sync()
+        _ = self.borrowing_decision(structure, "modules", self.sources[2])
+        with mock.patch.object(style_plan.EditedFiles, "of", side_effect=AssertionError("decision footprint read")):
+            ticket = self.select_for_family("modules", plan)
+        self.assertEqual((ticket["kind"], ticket["files"]), ("structure", list(self.sources[:2])))
+
+    def test_structure_selection_omits_a_deleted_file_from_an_older_cell_snapshot(self) -> None:
+        structure = self.rule("structure", "tier: D\nfamily: modules\ninput_scope: file\n")
+        self.sync()
+        ledger = self.ledger()
+        cells = tuple(ledger.cells(structure))
+        deleted = self.sources[0]
+        _ = self.git("rm", deleted)
+        tip = self.commit()
+        ledger.set_tip(tip, "style/main")
+        # The old snapshot still names the deleted file; eligibility and size use the current tip.
+        with mock.patch.object(ledger, "cells", return_value=cells):
+            tickets = style_plan.candidate_tickets(self.repo, ledger, style_plan.BusyFiles(self.board(), frozenset()),
+                                                   "modules", base=style_plan.NoUnitBranch())
+        self.assertEqual({path for ticket in tickets for path in ticket.files}, set(self.sources[1:]))
+
+    def test_refill_checks_current_file_presence_even_after_a_declaration_read(self) -> None:
+        plan = self.modules_unit()
+        read = self.rule("read", "tier: D\nfamily: modules\ninput_scope: file\n")
+        self.sync()
+        issue = self.borrowing_decision(read, "modules", self.sources[0])
+        self.finish_judging()
+        finding, = self.ledger().proposal_findings(issue)
+        _ = self.git("rm", finding.path)
+        self.commit_to_every_checkout()
+        # A prior declaration reading cannot make a file missing at today's tip buildable.
+        follow = style_proposals.FollowRun(style_ledger.DeclarationReading(
+            self.tip, (style_ledger.DeclarationInPlace(finding),)), (), ())
+        with mock.patch.object(style_proposals, "run_follow", return_value=follow):
+            ticket = self.select_for_family("modules", plan)
+        self.assertIsInstance(self.ledger().proposal_findings(issue)[0].state, style_ledger.Waived)
+        self.assertNotIn(finding.path, ticket["files"])
 
     def test_modules_keeps_approved_decisions_first_without_blocked_cells(self) -> None:
         plan = self.modules_unit()
