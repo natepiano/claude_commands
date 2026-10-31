@@ -4,6 +4,7 @@
   buildlog query [--json] "<SQL>"   bring the index up to date, run SQL read-only
   buildlog schema                   tables, columns, views and example queries
   buildlog report [YYYY-MM-DD]      one day (default today) as markdown: each kind by caller, then a summary
+  buildlog moments [YYYY-MM-DD]     before/after build moments, read-only
   buildlog mac-report [--hours N]    Mac test outcomes over the last N hours and three local days
   buildlog reindex                  rebuild the index from the JSON lines
   buildlog tree-key [DIR]           the tree key of DIR's worktree (default the current folder; treekey.py)
@@ -202,6 +203,23 @@ def day_report(args: list[str]) -> int:
     return 0
 
 
+def moments_report(args: list[str]) -> int:
+    day = args[0] if args else date.today().isoformat()
+    try:
+        if len(args) > 1:
+            raise ValueError("too many dates")
+        _ = date.fromisoformat(day)
+    except ValueError:
+        print("usage: buildlog moments [YYYY-MM-DD]", file=sys.stderr)
+        return 2
+    connection = index.read_only()
+    try:
+        print("\n".join(report.moments_section(connection, day)))
+    finally:
+        connection.close()
+    return 0
+
+
 def screenshot_hourly() -> int:
     command = Path(__file__).resolve().parents[1] / "shot_report" / "shot_report.py"
     return subprocess.run(
@@ -244,6 +262,8 @@ def main(argv: list[str]) -> int:
         return schema()
     if command == "report":
         return day_report(rest)
+    if command == "moments":
+        return moments_report(rest)
     if command == "usage-hours":
         if len(rest) > 1:
             print("usage: buildlog usage-hours [YYYY-MM-DD]", file=sys.stderr)

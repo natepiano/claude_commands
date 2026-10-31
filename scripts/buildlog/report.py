@@ -22,6 +22,7 @@ import index
 import disk
 import health
 import memory
+import moments
 import store
 import sync
 import rust_release
@@ -1255,79 +1256,183 @@ def profile_changes(connection: sqlite3.Connection) -> list[ProfileChange]:
 
 
 def profile_step_durations(
-    connection: sqlite3.Connection, start: datetime, end: datetime,
+    connection: sqlite3.Connection, start: datetime, end: datetime, *, hana_only: bool = False,
 ) -> dict[tuple[str, str, str], list[float]]:
     """Group passing steps by the kind, caller and rebuild class we compare."""
     groups: dict[tuple[str, str, str], list[float]] = {}
-    for kind, caller, crates, duration, warm in fetch(
+    hana_ids = moments.hana_step_ids(connection, start, end) if hana_only else frozenset[str]()
+    for step_id, kind, caller, crates, duration, warm in fetch(
         connection,
-        f"SELECT step, caller, crates_compiled, duration_s, {warm_step_clause()} FROM steps"
-        + " WHERE julianday(started_at) >= julianday(?) AND julianday(started_at) < julianday(?)"
+        f"SELECT id, step, caller, crates_compiled, duration_s, {warm_step_clause()} FROM steps"
+        + " WHERE started_at >= ? AND started_at < ?"
+        + " AND julianday(started_at) >= julianday(?) AND julianday(started_at) < julianday(?)"
         + f" AND {natedev_step_predicate()} AND status = 0 AND step <> 'sweep'"
         + " AND duration_s IS NOT NULL",
-        start.isoformat(), end.isoformat(),
+        (start.astimezone(UTC).date() - timedelta(days=1)).isoformat(),
+        (end.astimezone(UTC).date() + timedelta(days=2)).isoformat(), start.isoformat(), end.isoformat(),
     ):
+        if hana_only and str(step_id) not in hana_ids:
+            continue
         rebuild = rebuild_bin(cast(int, crates), bool(warm)) if crates is not None else "—"
         key = (str(kind), str(caller), rebuild)
         groups.setdefault(key, []).append(cast(float, duration))
     return groups
 
 
-def power_profile_section(connection: sqlite3.Connection, day: str) -> list[str]:
-    """Compare like steps on each side of the recent observed profile changes."""
-    zone = user_zone()
-    end = datetime.combine(date.fromisoformat(day) + timedelta(days=1), datetime.min.time(), zone).astimezone(UTC)
-    changes = [change for change in profile_changes(connection) if call_time(change.at) < end]
-    if not changes:
-        return []
+def rate_text(value: float | moments.RateUnavailable, row: moments.RateRow) -> str:
+    if isinstance(value, moments.RateUnavailable):
+        return "—"
+    suffix = {"hours": " h", "runs": "", "percent": "%", "per_phase": " /phase"}[row.unit]
+    return f"{value:.1f}{suffix}"
 
-    latest = changes[-1]
-    lines = ["### Power profile", "", f"Profile now: {latest.profile}, since {local_time(latest.at)}.", ""]
-    window_start = end - timedelta(days=7)
-    for position in range(len(changes) - 1, -1, -1):
-        change = changes[position]
-        at = call_time(change.at)
-        if at < window_start:
+
+def rate_with_baseline(value: float | moments.RateUnavailable, row: moments.RateRow,
+                       baseline: moments.SdlcBaseline | moments.NoSdlcBaseline,
+                       side: moments.ComparisonSide, days: float) -> str:
+    text = rate_text(value, row)
+    if isinstance(value, moments.RateUnavailable) or isinstance(baseline, moments.NoSdlcBaseline):
+        return text
+    for figure in baseline.figures:
+        if figure.key != row.key or figure.side != side:
             continue
-        before_start = at - timedelta(days=7)
-        before_profile = "profile not recorded"
-        if position:
-            previous = changes[position - 1]
-            before_start = max(before_start, call_time(previous.at))
-            before_profile = previous.profile
-        after_end = min(end, call_time(changes[position + 1].at)) if position + 1 < len(changes) else end
-        before = profile_step_durations(connection, before_start, at)
-        after = profile_step_durations(connection, at, after_end)
-        rows: list[list[str]] = []
-        for key in sorted(before.keys() & after.keys(), key=lambda key: (-len(after[key]), key)):
-            before_runs, after_runs = before[key], after[key]
-            before_p50 = nearest_rank(before_runs, 50)
-            after_p50 = nearest_rank(after_runs, 50)
-            difference = "—"
-            if len(before_runs) >= MIN_PROFILE_RUNS and len(after_runs) >= MIN_PROFILE_RUNS and before_p50 > 0:
-                difference = f"{(after_p50 - before_p50) / before_p50:+.0%}".replace("-", "−")
-            kind, caller, rebuild = key
-            rows.append([
-                kind, caller_label(caller, "natedev", 1), rebuild,
-                str(len(before_runs)), seconds(before_p50), str(len(after_runs)), seconds(after_p50), difference,
-            ])
-        lines += [
-            f"Before {local_time(change.at)} ({before_profile}) vs after ({change.profile}):",
-            "",
-        ]
-        if not rows:
-            lines += ["No step ran with the same kind, caller and rebuild class on both sides.", ""]
+        divisor = days if figure.basis == "total" else 1.0
+        if isinstance(figure.value, moments.SdlcRange):
+            low, high = figure.value.low / divisor, figure.value.high / divisor
+            different = value < low * 0.95 or value > high * 1.05
+            quoted = f"{low:.1f}–{high:.1f}"
+        else:
+            expected = figure.value / divisor
+            different = abs(value - expected) > abs(expected) * 0.05
+            quoted = f"{expected:.1f}"
+        if different:
+            return f"{text} (sdlc {quoted})"
+    return text
+
+
+def moment_rate_table(before: moments.WindowRates, after: moments.WindowRates,
+                      moment: moments.BuildMoment) -> list[str]:
+    lines = ["| Rate | Before/day | After/day | Change |", "|---|--:|--:|--:|"]
+    for row in moments.RATE_ROWS:
+        if moment.scope == "hana" and row.scope != "hana":
             continue
-        lines += [
-            "| Kind | Caller | Rebuild | Before runs | Before p50 | After runs | After p50 | Change |",
-            "|---|---|---|--:|--:|--:|--:|--:|",
-            *("| " + " | ".join(row) + " |" for row in rows),
-            "Source: natedev steps that passed, the 7 days before the change against the time since, up to the next change;"
-            + f" p50 is the nearest rank; Change is shown only with at least {MIN_PROFILE_RUNS} runs on each side."
-            + " Load and time of day are not matched.",
-            "",
-        ]
+        left, right = before.rates[row.key], after.rates[row.key]
+        change = "—"
+        if isinstance(left, float) and isinstance(right, float) and left > 0:
+            change = f"{(right-left)/left:+.0%}".replace("-", "−")
+        # Moment 1's quoted week is compared below against the full week,
+        # rather than against this adjacent-moment slice.
+        baseline = (moments.NoSdlcBaseline() if isinstance(moment.baseline, moments.SdlcBaseline)
+                    and moment.baseline.window == "week" else moment.baseline)
+        lines.append("| " + " | ".join((row.label,
+            rate_with_baseline(left, row, baseline, "before", before.days),
+            rate_with_baseline(right, row, baseline, "after", after.days), change)) + " |")
+    before_thin = " (thin)" if before.days < 1 else ""
+    after_thin = " (thin)" if after.days < 1 else ""
+    lines += [f"Before: {before.days:.3f} days{before_thin}; after: {after.days:.3f} days{after_thin}.", ""]
     return lines
+
+
+def moment_p50_table(before: dict[tuple[str, str, str], list[float]],
+                     after: dict[tuple[str, str, str], list[float]]) -> list[str]:
+    rows: list[list[str]] = []
+    for key in sorted(before.keys() & after.keys(), key=lambda key: (-len(after[key]), key)):
+        before_runs, after_runs = before[key], after[key]
+        before_p50, after_p50 = nearest_rank(before_runs, 50), nearest_rank(after_runs, 50)
+        difference = "—"
+        if len(before_runs) >= MIN_PROFILE_RUNS and len(after_runs) >= MIN_PROFILE_RUNS and before_p50 > 0:
+            difference = f"{(after_p50 - before_p50) / before_p50:+.0%}".replace("-", "−")
+        kind, caller, rebuild = key
+        rows.append([kind, caller_label(caller, "natedev", 1), rebuild,
+                     str(len(before_runs)), seconds(before_p50), str(len(after_runs)), seconds(after_p50), difference])
+    if not rows:
+        return ["No step ran with the same kind, caller and rebuild class on both sides.", ""]
+    return [
+        "| Kind | Caller | Rebuild | Before runs | Before p50 | After runs | After p50 | Change |",
+        "|---|---|---|--:|--:|--:|--:|--:|",
+        *("| " + " | ".join(row) + " |" for row in rows),
+        "Source: natedev steps that passed, the 7 days before the change against the time since, up to the next change;"
+        + f" p50 is the nearest rank; Change is shown only with at least {MIN_PROFILE_RUNS} runs on each side."
+        + " Load and time of day are not matched.", "",
+    ]
+
+
+def report_end(day: str, now: datetime) -> datetime:
+    """The report's elapsed horizon, capped at the requested local day's end."""
+    day_end = datetime.combine(date.fromisoformat(day) + timedelta(days=1), datetime.min.time(), user_zone())
+    return min(now, day_end).astimezone(UTC)
+
+
+def moments_section(connection: sqlite3.Connection, day: str) -> list[str]:
+    """One comparison window rule for build interventions and observed profiles."""
+    end = report_end(day, datetime.now(UTC))
+    profiles = [change for change in profile_changes(connection) if call_time(change.at) < end]
+    events = (*moments.MOMENTS, *(moments.BuildMoment(call_time(change.at), change.profile, "all") for change in profiles))
+    windows = moments.comparison_windows(events, end)
+    if not windows and not profiles:
+        return []
+    lines = ["### Before and after", ""]
+    if profiles:
+        latest = profiles[-1]
+        lines += [f"Profile now: {latest.profile}, since {local_time(latest.at)}.", ""]
+    if not windows:
+        return lines
+    lines += [
+        "Natedev only. " + moments.HANA_DEFINITION,
+        "Run hours count every step kind, sweep included; wait hours sum mem_wait_s.",
+        "Hana nextest and clippy rows count steps; failed is status <> 0, as a percentage of all hana nextest steps.",
+        "Reruns: start 0–10 min after the previous nextest end in the same folder (cwd without /target/verify-doc).",
+        "Queue-hidden repeats: submit (start − mem_wait_s) at most 600 s after the previous nextest end in that folder, different call_id, no lower bound.",
+        "Same-worker reruns: consecutive nextest steps in the same session, submit at most 60 min after the previous end, no lower bound; after a pass means both passed, fail then fail means both failed. Hours count the later step.",
+        "Load ratios divide hana nextest or clippy counts by phase_finished events in natedev's progress history whose working_dir matches the hana name patterns; the Mac's phases are not counted. Repeated phase_instance_id counts once.",
+        "Clone rebuilds: hana nextest with crates_compiled >= 300; clone repeats are the percentage whose previous nextest in the same session was also a clone rebuild ending at most 4 h before, no lower bound.",
+        "Per-day = total ÷ window days; percentages and /phase ratios are not divided by days. A window shorter than 1 day is thin; — means no denominator.",
+        "Windows: before covers 7 days cut at the previous moment; after ends at the next moment or report end. Pair histories and hana classification use each measured window.", "",
+    ]
+    phases = moments.phase_events()
+    rates: dict[tuple[datetime, datetime], moments.WindowRates] = {}
+    p50_groups: dict[tuple[datetime, datetime, bool], dict[tuple[str, str, str], list[float]]] = {}
+
+    def measured(start: datetime, finish: datetime) -> moments.WindowRates:
+        key = start, finish
+        if key not in rates:
+            rates[key] = moments.window_rates(connection, start, finish, phases=phases)
+        return rates[key]
+
+    def grouped(start: datetime, finish: datetime, hana_only: bool) -> dict[tuple[str, str, str], list[float]]:
+        key = start, finish, hana_only
+        if key not in p50_groups:
+            p50_groups[key] = profile_step_durations(connection, start, finish, hana_only=hana_only)
+        return p50_groups[key]
+
+    ascending = sorted((event for event in events if event.at < end), key=lambda event: event.at)
+    for window in windows:
+        moment = window.moment
+        prior = [event for event in ascending if event.at < moment.at]
+        before_name = prior[-1].name if prior else "profile not recorded"
+        lines += [f"#### {moment.name}", "",
+                  f"Before {local_time(moment.at.isoformat())} ({before_name}) vs after ({moment.name}):", "",
+                  f"Windows: before {local_time(window.before_start.isoformat())} to {local_time(moment.at.isoformat())}; "
+                  + f"after to {local_time(window.after_end.isoformat())}.", ""]
+        lines += moment_p50_table(grouped(window.before_start, moment.at, moment.scope == "hana"),
+                                  grouped(moment.at, window.after_end, moment.scope == "hana"))
+        before, after = measured(window.before_start, moment.at), measured(moment.at, window.after_end)
+        lines += moment_rate_table(before, after, moment)
+        if isinstance(moment.baseline, moments.SdlcBaseline):
+            if moment.baseline.window == "week":
+                week = measured(moment.at - timedelta(days=7), moment.at)
+                lines += ["7-day baseline before Moment 1 (uncut):", "",
+                          "| Rate | Before/day |", "|---|--:|"]
+                for row in moments.RATE_ROWS:
+                    lines.append(f"| {row.label} | " + rate_with_baseline(
+                        week.rates[row.key], row, moment.baseline, "before", week.days) + " |")
+                lines += [f"Natedev hana phases in the baseline: {week.phase_count}.", ""]
+            lines += [*moment.baseline.notes, ""]
+    return lines
+
+
+def power_profile_section(connection: sqlite3.Connection, day: str) -> list[str]:
+    """Compatibility entry point for the generalized comparison section."""
+    return moments_section(connection, day)
 
 
 def day_range(day: str) -> tuple[str, str]:
@@ -1749,10 +1854,9 @@ def ci_freshness(day: str) -> str:
         return "; CI never polled"
     newest = max(polled, key=lambda state: datetime.fromisoformat(state.polled_at.replace("Z", "+00:00")))
     now = datetime.now(user_zone())
-    day_end = datetime.combine(date.fromisoformat(day) + timedelta(days=1), datetime.min.time(), user_zone())
-    horizon = min(now, day_end)
+    horizon = report_end(day, now)
     at = datetime.fromisoformat(newest.polled_at.replace("Z", "+00:00")).astimezone(user_zone())
-    if day_end < now and at >= day_end:
+    if horizon < now and at >= horizon:
         return ""
     stale = at < horizon - timedelta(seconds=CI_STALE_AFTER_S)
     if not stale and isinstance(newest, ci.CompletedPoll):
@@ -2151,7 +2255,7 @@ def report(connection: sqlite3.Connection, day: str, *, usage_day: str | None = 
     lines += (
         calls
         + test_builds_section(connection, day)
-        + power_profile_section(connection, day)
+        + moments_section(connection, day)
         + tests_by_target_lines(test_calls)
         + mac_section(connection, day)
         + mac_copies_lines(copies)

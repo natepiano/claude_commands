@@ -355,7 +355,7 @@ class ReportTests(unittest.TestCase):
         lines = self.render().splitlines()
         start = lines.index("### Test builds (temporary)")
         next_section = next(line for line in lines[start + 1:] if line.startswith("### "))
-        self.assertEqual(next_section, "### Power profile")
+        self.assertEqual(next_section, "### Before and after")
 
     def test_mac_rows_leave_natedev_sections_and_failed_steps_unchanged(self) -> None:
         self.write(
@@ -3240,7 +3240,8 @@ class PowerProfileTests(unittest.TestCase):
 
     def rows(self, lines: list[str]) -> list[list[str]]:
         return [[cell.strip() for cell in line.strip("|").split("|")]
-                for line in lines if line.startswith("| ") and not line.startswith("| Kind |")]
+                for line in lines if line.startswith("| ") and not line.startswith("| Kind |")
+                and len(line.strip("|").split("|")) == 8]
 
     def profiled(self, at: str, profile: str = "performance", since: str | None = None) -> Record:
         return sample(at, power_profile=profile, power_profile_since=since)
@@ -3338,12 +3339,15 @@ class PowerProfileTests(unittest.TestCase):
                  caller="verify", crates_compiled=1),
         )
         lines = self.section()
-        self.assertEqual([line for line in lines if line], [
-            "### Power profile",
+        self.assertEqual([line for line in lines if line and (
+            line.startswith(("### ", "Profile now:", "Before ", "No step ran")))], [
+            "### Before and after",
             "Profile now: performance, since 2026-10-13 12:00:00 UTC.",
             "Before 2026-10-13 12:00:00 UTC (profile not recorded) vs after (performance):",
             "No step ran with the same kind, caller and rebuild class on both sides.",
         ])
+        self.assertEqual(self.rows(lines), [])
+        self.assertFalse(any(line.startswith("Source: natedev steps that passed") for line in lines))
 
     def test_p50_uses_nearest_rank_rather_than_interpolated_median(self) -> None:
         records = [self.profiled("2026-10-13T12:00:00.000Z")]
@@ -3411,9 +3415,10 @@ class PowerProfileTests(unittest.TestCase):
         self.write(self.profiled("2026-10-06T00:01:00.000Z", since=since),
                    self.profiled("2026-10-13T12:00:00.000Z", since="2026-10-13T11:00:00.000Z"))
         lines = self.section()
-        self.assertEqual([line for line in lines if line], [
-            "### Power profile", "Profile now: performance, since 2026-10-06 00:00:00 UTC.",
+        self.assertEqual([line for line in lines if line and line.startswith(("### ", "Profile now:", "Before "))], [
+            "### Before and after", "Profile now: performance, since 2026-10-06 00:00:00 UTC.",
         ])
+        self.assertEqual(self.rows(lines), [])
 
     def test_no_profiled_natedev_sample_omits_section(self) -> None:
         self.write(sample(STAMP), sample("2026-10-13T12:00:00.000Z", host="macbook", power_profile="balanced"))
