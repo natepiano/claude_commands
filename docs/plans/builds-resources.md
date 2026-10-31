@@ -933,7 +933,7 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
 - Skip one argument per option: it files `--redirect-warnings <file>` under the file.
 
 ### Phase 29 — The floor sweep keeps targets used in the last hours  · status: todo
-**Depends on:** Phase 33 (checkpointed, `5c9b01fd`, same file `scripts/lint/sweep.py`) and Phase 34 (it removes the unused shared build folder and changes `scratch.py`, `test_sweep.py` and `build-targets.md` first). Spec 1 (the replay) changes no repository file and can start at once. Merge `origin/builds` first. Global order: Phases 21, 16, 25, 30, 28, 4, 24, 32, 31 and 33 are checkpointed; serial memory chain 26 → 15 → 27 → 20 → 11 → 17 → 18 → 19 → 8; **34** then **29** run beside the chain and join before 11.
+**Depends on:** Phase 33 (checkpointed, `5c9b01fd`, same file `scripts/lint/sweep.py`) and Phase 34 (checkpointed, `efccbe4e`: it removed the unused shared build folder and changed `scratch.py`, `test_sweep.py` and `build-targets.md`). Spec 1 (the replay) changes no repository file and can start at once. Merge `origin/builds` first. Global order: Phases 21, 16, 25, 30, 28, 4, 24, 32, 31, 33 and 34 are checkpointed; serial memory chain 26 → 15 → 27 → 20 → 11 → 17 → 18 → 19 → 8; **29** runs beside the chain and joins before 11.
 
 #### Work Order
 
@@ -1072,29 +1072,19 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
 
 ### Phase 34 — The unused shared build folder goes  · status: done
 
-Follow-up of the Phase 4 reversal. On 2026-10-30 the builds showrunner reversed its 02:42 word: the verify-copies measurement (case D) spent 68.7 of 69.0 s waiting on the shared folder's build lock, so the copies rule picks seed and `copies.py` has no shared mode. `scratch.shared_build_folder` has no consumer, so it goes.
+#### As-built
 
-**Depends on:** Phases 31 and 33 checkpoints (checkpointed, `04e4cee2` and `5c9b01fd`). Phase 29 waits for this phase (same files, `test_sweep.py` and `build-targets.md`).
-
-#### Work Order
-
-**Goal:** no code, test or as-built text names a shared Cargo build folder per repository; `style_sync.py`'s own `style-sync-target` and the sweep's general Cargo `build.build-dir` template reading stay unchanged.
-
-**Spec:**
-
-1. Remove `scratch.shared_build_folder`, `SharedBuildFolder`, `NoSharedBuildFolder` and the `SCRATCH_SHARED_BUILD_ROOT` setting from `scripts/lib/scratch.py`. Keep `mark_cargo_cache`, `USE_STAMP`, `CACHE_TAG`, `STYLE_TARGET_NAME` and `STYLE_LOCK_NAME` when another caller uses them; remove any that only the shared folder used.
-   Also remove the unused producer: `scratch.register_copy` takes `shared_target` and writes it into every new copy record (`scratch.py` :238-244). Drop the parameter and the field write, and its shared-mode test setup. Readers keep loading old copy records that still carry `shared_target` (ignore the field; do not fail on it).
-2. Remove their tests in `scripts/lib/test_scratch.py` and `test_sweep.py` (`test_helper_created_shared_folder_is_discovered_without_rustc_info_or_copy_record`). Keep a sweep test that a target with no rustc info and no copy record is still found, if no other test pins that. Add one test that a copy record written before this phase, with a `shared_target` field, still loads.
-3. Correct `docs/as-built/build-targets.md` ("Copy records and lifetime") and plan Phase 4's as-built to say the shared folder was removed.
+- No code, test or as-built text names a shared Cargo build folder per repository. The verify-copies measurement spent 68.7 of 69.0 s waiting on the shared folder's build lock, so the copies rule picks seed and `copies.py` has no shared mode.
+- `scratch.py` has no `shared_build_folder`, `SharedBuildFolder`, `NoSharedBuildFolder` or `SCRATCH_SHARED_BUILD_ROOT`. `scratch.register_copy` takes no `shared_target` and new copy records carry no such field.
+- Readers load old copy records that still carry `shared_target` and ignore the field.
+- `style_sync.py`'s own `style-sync-target` and the sweep's general Cargo `build.build-dir` template reading are unchanged.
 
 **Files:**
-- `scripts/lib/scratch.py`, `scripts/lib/test_scratch.py` — Specs 1 and 2.
-- `scripts/lint/test_sweep.py` — Spec 2.
-- `docs/as-built/build-targets.md` — Spec 3.
-- `docs/plans/builds-resources.md` — Spec 3, Phase 4's as-built text only (the director makes this edit at the checkpoint; workers do not edit the plan).
+- `scripts/lib/scratch.py` — copy records and cache markers; no shared folder.
+- `scripts/lib/test_scratch.py` — `test_copy_record_with_a_legacy_shared_target_still_loads` pins the legacy-field read.
+- `scripts/lint/test_sweep.py` — no shared-folder discovery test.
+- `docs/as-built/build-targets.md` — "Copy records and lifetime" says each copy has its own build folder.
 
-**Workers:** `1 writer`
+**Gotchas:** a grep for `shared_target` in `scripts` also finds unrelated account-link (`test_accounts.py`) and style-sync names; only the legacy-record test in `test_scratch.py` refers to copy records.
 
-**Acceptance gate:**
-- `python3 -m unittest discover -s scripts/lib -p test_scratch.py` and `-s scripts/lint -p test_sweep.py` pass; basedpyright on the changed Python files reads `0 errors, 0 warnings, 0 notes`; `grep -rn 'shared_build_folder\|shared_target' scripts docs/as-built` finds only the old-record test and unrelated account-link and style-sync names.
-- Change-Review line: none — an unused helper goes; nothing on screen changes.
+**Ruled out:** a shared per-repository build folder for verify copies — its build lock serializes the copies.

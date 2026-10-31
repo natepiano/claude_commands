@@ -26,7 +26,7 @@
 
 - [ ] **Record the Cargo cache folder each build used so trims can be matched to affected builds**
   - Target: report-unit's step recorder and attribution, `scripts/lint/sweep.py`, and their tests
-  - Why needed: copies seed their own build folders (builds reversed the shared build folder on 2026-10-30; Phase 34 removes it), and intermediate Cargo build folders still lack lasting repository and build attribution
+  - Why needed: copies seed their own build folders (builds reversed the shared build folder on 2026-10-30; Phase 34 removed it, `efccbe4e`), and intermediate Cargo build folders still lack lasting repository and build attribution
   - Completion condition: step records keep the repository identity and the actual target and build folder, independent of copy lifetime; the rebuild report links a later build to a trim through that recorded folder; missing attribution stays an explicit unknown; Phase 17's cache-history predictor reads this record and adds no second mapping
   - Revealed by: Phase 4 (builds showrunner 2026-10-30: next; waits on report-unit 4f); amended after the shared-folder reversal (Phase 31 review)
 
