@@ -108,12 +108,12 @@ class MoveTest(unittest.TestCase):
             self.assertTrue(self.old.exists())
             return stop_resume.Stopped(identity, 1)
 
-        def resume(identity: str, *, why: str) -> stop_resume.Resumed:
+        def resume(identity: str, *, why: str) -> stop_resume.ClaudeUp:
             self.assertEqual(identity, "s-1")
             self.assertEqual(why, "showrunner checkout moved")
             self.assertFalse(self.old.exists())
             self.assertTrue(self.new.exists())
-            return stop_resume.Resumed(identity, "w1:p1", "claude2")
+            return stop_resume.ClaudeUp(identity, "w1:p1", "claude2")
 
         with (mock.patch.object(stop_resume, "stop", side_effect=stop) as stopped,
               mock.patch.object(stop_resume, "resume", side_effect=resume) as resumed,
@@ -128,7 +128,7 @@ class MoveTest(unittest.TestCase):
         with (mock.patch.object(unit_move, "processes_inside", return_value=[os.getpid()]),
               mock.patch.object(rename_checkout, "_session_records", return_value=[]),
               mock.patch.object(stop_resume, "stop", return_value=stop_resume.Stopped("s-1", 1)),
-              mock.patch.object(stop_resume, "resume", return_value=stop_resume.Resumed("s-1", "p1", "claude2")) as resumed):
+              mock.patch.object(stop_resume, "resume", return_value=stop_resume.ClaudeUp("s-1", "p1", "claude2")) as resumed):
             rename_checkout.checkout("demo")
         self.assertFalse(self.old.exists())
         self.assertTrue(self.new.exists())

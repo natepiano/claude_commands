@@ -2406,7 +2406,7 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertEqual(result.session_ids, ("off-target",))
         self.assertEqual(len(self.moves.calls), 1)
         self.assertEqual(self.moves.calls, [MoveCall("off-target", "claude3", "checkpoint move")])
-        self.assertIn("off-target: resumed on claude3", result.stdout)
+        self.assertIn("off-target: Claude is up on claude3", result.stdout)
 
     def test_units_group_failed_request_returns_group_named_failure(self) -> None:
         _ = self.owner("off-target", host="unit")
@@ -2462,7 +2462,7 @@ class RefusalWatchTests(unittest.TestCase):
         _ = self.owner("unit", host="unit")
         _ = self.transcript("unit")
         original = accounts.move_sessions
-        def requested(ids: tuple[str, ...], target: str, *, why: str) -> tuple[stop_resume.Resumed | stop_resume.MoveHandedOff | accounts.SessionMoveRefused, ...]:
+        def requested(ids: tuple[str, ...], target: str, *, why: str) -> tuple[stop_resume.ClaudeUp | stop_resume.MoveHandedOff | accounts.SessionMoveRefused, ...]:
             self.assertEqual(stored_group_labels(path)["units"], target)
             return original(ids, target, why=why)
         with patch.object(accounts, "move_sessions", side_effect=requested):
@@ -3296,8 +3296,8 @@ class RefusalWatchTests(unittest.TestCase):
         _, actual, _ = self.cli()
         self.assertEqual("\n".join(line for line in preview.splitlines()[1:]
             if ": would check the shutdown hold" not in line) + "\n",
-            "\n".join(line for line in actual.splitlines() if ": resumed on " not in line) + "\n")
-        self.assertEqual(len([line for line in actual.splitlines() if ": resumed on " in line]), 2)
+            "\n".join(line for line in actual.splitlines() if ": Claude is up on " not in line) + "\n")
+        self.assertEqual(len([line for line in actual.splitlines() if ": Claude is up on " in line]), 2)
         self.assertEqual(len(self.moves.calls), 2)
         self.assertTrue(all(command.target == "claude2" for command in self.moves.calls))
 
@@ -3440,8 +3440,8 @@ class RefusalWatchTests(unittest.TestCase):
         _ = self.owner("first", host="herdr")
         _ = self.owner("second", host="herdr")
         _ = self.owner("unit", host="unit")
-        requested = (stop_resume.Resumed("first", "w1:p1", "claude3"),
-                     stop_resume.Resumed("second", "w1:p2", "claude3"))
+        requested = (stop_resume.ClaudeUp("first", "w1:p1", "claude3"),
+                     stop_resume.ClaudeUp("second", "w1:p2", "claude3"))
         with patch.object(accounts, "move_sessions", return_value=requested) as move:
             result = accounts.move_group("showrunners", "claude3", why="weekly refusal")
         self.assertIsInstance(result, accounts.GroupMoveStarted)

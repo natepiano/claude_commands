@@ -299,7 +299,7 @@ class AccountMoveTests(ShutdownTestCase):
         self.assertIsInstance(result, accounts.MoveStarted)
         self.assertEqual(self.moves.calls, [MoveCall("move-id", "claude3", "weekly limit")])
         assert isinstance(result, accounts.MoveStarted)
-        self.assertEqual(result.stdout.splitlines()[-1], "move-id: resumed on claude3 in w1:p1")
+        self.assertEqual(result.stdout.splitlines()[-1], "move-id: Claude is up on claude3 in w1:p1 (0.0 s)")
         self.assertEqual(result.returncode, 0)
         self.assertEqual(shutdown_record.all_session_records(), [])
 
@@ -351,7 +351,7 @@ class AccountMoveTests(ShutdownTestCase):
         self.assertEqual(self.moves.batches, [["first", "second"]])
         self.assertEqual(accounts.group_accounts().get("showrunners"), "claude3")
         assert isinstance(result, accounts.GroupMoveStarted)
-        self.assertEqual(sum("resumed on" in line for line in result.stdout.splitlines()), 2)
+        self.assertEqual(sum("Claude is up on" in line for line in result.stdout.splitlines()), 2)
 
     def test_move_sessions_continues_after_one_member_fails_and_refuses_workers(self) -> None:
         base = self.current_listing()[0]
@@ -361,7 +361,7 @@ class AccountMoveTests(ShutdownTestCase):
             outcomes = accounts.move_sessions(("failed", "ok", "worker", "missing"), "claude3", why="retry")
         self.assertEqual([call.session_id for call in self.moves.calls], ["failed", "ok"])
         self.assertEqual([accounts.move_result_line(item) for item in outcomes], [
-            "failed: not moved: stop refused", "ok: resumed on claude3 in w1:p1",
+            "failed: not moved: stop refused", "ok: Claude is up on claude3 in w1:p1 (0.0 s)",
             "worker: not moved: workers move with their unit director", "missing: not moved: session is not live on this machine"])
 
     def test_group_preview_and_empty_selection_do_not_move(self) -> None:

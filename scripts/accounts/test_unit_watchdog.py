@@ -195,7 +195,7 @@ class UnitWatchdogTests(unittest.TestCase):
                 current = restart.relaunch_session(saved, dry_run=False, desktop_state=restart.DesktopLaunchState())
             return subprocess.CompletedProcess(argv, 0 if current["progress"]["kind"] == "restarting" else 1, "", "")
         old_resume = (stop_resume.SessionNotFound(source.session["session_id"]) if pane_missing else
-                      stop_resume.Resumed(source.session["session_id"], "fixture-pane", source.label))
+                      stop_resume.ClaudeUp(source.session["session_id"], "fixture-pane", source.label))
         with (patch.object(stop_resume, "resume", return_value=old_resume),
               patch.object(subprocess, "run", side_effect=command),
               patch.object(restart, "_run", side_effect=launch),

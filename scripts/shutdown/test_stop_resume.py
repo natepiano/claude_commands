@@ -9,6 +9,7 @@ import sys
 import tempfile
 import time
 import unittest
+from collections.abc import Callable
 from contextlib import redirect_stdout
 from pathlib import Path
 from threading import Barrier, Lock, local
@@ -43,6 +44,8 @@ class StopResumeTests(unittest.TestCase):
         self.wait = Mock()
         self.start = Mock(return_value="")
         self.seed = Mock(return_value=0)
+        self.detach = Mock()
+        self.real_detach = stop_resume._detach  # pyright: ignore[reportPrivateUsage]
         self.clock = ResumeClock()
         self.launched: set[str] = set()
 
@@ -64,6 +67,7 @@ class StopResumeTests(unittest.TestCase):
         _ = self.enterContext(patch.object(time, "sleep", self.advance))
         _ = self.enterContext(patch("unit_runs.held", return_value=[]))
         _ = self.enterContext(patch.object(pane_record, "seed", self.seed))
+        _ = self.enterContext(patch.object(stop_resume, "_detach", self.detach))
 
     def advance(self, seconds: float) -> None:
         self.clock.elapsed += seconds
@@ -90,26 +94,48 @@ class StopResumeTests(unittest.TestCase):
                                  "agent_session": {"kind": "id", "value": "sid-beta"}})
         pane_record.write("agents", second)
 
+    def alive_until_kill(self, _pid: int, _generation: str) -> sessions.LiveSessionProcess | sessions.SessionNotLive:
+        return (sessions.LiveSessionProcess(123) if call(123, signal.SIGKILL) not in self.kill.call_args_list
+                else sessions.SessionNotLive())
+
+    def test_stop_returns_as_soon_as_term_takes_effect(self) -> None:
+        self.live.return_value = sessions.LiveSessionProcess(123)
+        def exits_soon(_pid: int, _generation: str) -> sessions.LiveSessionProcess | sessions.SessionNotLive:
+            return sessions.LiveSessionProcess(123) if self.clock.elapsed < 0.1 else sessions.SessionNotLive()
+        self.process.side_effect = exits_soon
+        self.assertEqual(stop_resume.stop("alpha"), stop_resume.Stopped("sid-alpha", 123))
+        self.assertLessEqual(self.clock.elapsed, 0.1)
+        self.assertEqual(self.kill.call_args_list, [call(123, signal.SIGTERM)])
+
+    def test_seed_reads_only_the_selected_session_pane(self) -> None:
+        self.add_beta()
+        _ = stop_resume.stop("alpha")
+        self.seed.assert_called_once()
+        select = cast(Callable[[herdr.PaneIdentity], bool], self.seed.call_args.kwargs["select"])
+        self.assertEqual([pane["pane_id"] for pane in self.client.panes() if select(pane)], ["w1:p2"])
+
     def test_a_stopped_tab_resumes_by_id_or_label_from_its_launch_entry(self) -> None:
         self.client.rows[0]["agent_session"] = None
         for session in ("sid-alpha", "alpha"):
             self.launched.clear()
-            self.assertEqual(stop_resume.resume(session, why="maintenance"), stop_resume.Resumed("sid-alpha", "w1:p2", "claude3"))
+            self.assertEqual(stop_resume.resume(session, why="maintenance"), stop_resume.ClaudeUp("sid-alpha", "w1:p2", "claude3"))
         self.assertEqual(stop_resume.resume("sid-other", why="maintenance"), stop_resume.SessionNotFound("sid-other"))
 
     def test_a_new_session_herdr_has_no_id_for_is_found_through_the_launches_read_first(self) -> None:
         self.client.rows[0]["agent_session"] = None
         pane_record.record_path("agents").unlink()
-        def seed(_session: str) -> int:
+        def seed(_session: str, *, select: Callable[[herdr.PaneIdentity], bool]) -> int:
+            self.assertEqual({pane["pane_id"] for pane in self.client.panes() if select(pane)}, {"w1:p2"})
             pane_record.write("agents", self.entry)
             return 0
         self.seed.side_effect = seed
         self.assertEqual(stop_resume.move_sessions(["alpha"], "claude4", why="limit"),
-                         [stop_resume.Resumed("sid-alpha", "w1:p2", "claude4")])
+                         [stop_resume.ClaudeUp("sid-alpha", "w1:p2", "claude4")])
 
     def test_launches_are_read_while_claude_runs_before_any_stop(self) -> None:
         order: list[str] = []
-        def seed(_session: str) -> int:
+        def seed(_session: str, *, select: Callable[[herdr.PaneIdentity], bool]) -> int:
+            self.assertEqual({pane["pane_id"] for pane in self.client.panes() if select(pane)}, {"w1:p2"})
             order.append("seed")
             return 0
         self.seed.side_effect = seed
@@ -133,7 +159,8 @@ class StopResumeTests(unittest.TestCase):
         before = {path: path.read_bytes() for path in self.root.rglob("*") if path.is_file()}
         self.assertEqual(stop_resume.stop("alpha"), stop_resume.Stopped("sid-alpha", 123))
         self.assertEqual(self.kill.call_args_list, [call(123, signal.SIGTERM), call(123, signal.SIGKILL)])
-        cast(Mock, cast(Mock, self.wait.return_value).wait).assert_called_once_with(2.0)
+        self.assertTrue(all(0 < invocation.args[0] <= 0.1
+                            for invocation in cast(Mock, cast(Mock, self.wait.return_value).wait).call_args_list))
         self.assertEqual({path: path.read_bytes() for path in self.root.rglob("*") if path.is_file()}, before)
         self.start.assert_not_called()
 
@@ -145,26 +172,25 @@ class StopResumeTests(unittest.TestCase):
 
     def test_registry_removal_does_not_resume_until_the_saved_process_exits(self) -> None:
         self.live.side_effect = [sessions.LiveSessionProcess(123), sessions.SessionNotLive(), sessions.SessionNotLive()]
-        self.process.side_effect = [sessions.LiveSessionProcess(123)] * 3 + [sessions.SessionNotLive()]
+        self.process.side_effect = self.alive_until_kill
         def start(*_command: str) -> str:
-            self.assertEqual(self.process.call_count, 4, "registry deletion is not process exit")
+            self.assertGreater(self.process.call_count, 4, "registry deletion is not process exit")
             self.assertEqual(self.kill.call_args_list, [call(123, signal.SIGTERM), call(123, signal.SIGKILL)])
             return ""
         self.start.side_effect = start
         self.assertEqual(stop_resume.move("alpha", "claude4", why="limit"),
-                         stop_resume.Resumed("sid-alpha", "w1:p2", "claude4"))
+                         stop_resume.ClaudeUp("sid-alpha", "w1:p2", "claude4"))
 
     def test_stop_confirms_exit_after_kill(self) -> None:
         self.live.return_value = sessions.LiveSessionProcess(123)
-        self.process.side_effect = [sessions.LiveSessionProcess(123)] * 3 + [sessions.SessionNotLive()]
+        self.process.side_effect = self.alive_until_kill
         self.assertEqual(stop_resume.stop("alpha"), stop_resume.Stopped("sid-alpha", 123))
-        self.assertEqual(self.process.call_count, 4)
+        self.assertGreater(self.process.call_count, 4)
         self.assertEqual(self.kill.call_args_list, [call(123, signal.SIGTERM), call(123, signal.SIGKILL)])
 
     def test_a_process_still_alive_after_kill_fails_and_never_resumes(self) -> None:
         self.live.return_value = sessions.LiveSessionProcess(123)
-        with patch.object(stop_resume, "monotonic", side_effect=[10.0, 10.0, 15.0]):
-            result = stop_resume.move("alpha", "claude4", why="limit")
+        result = stop_resume.move("alpha", "claude4", why="limit")
         self.assertIsInstance(result, stop_resume.StopFailed)
         assert isinstance(result, stop_resume.StopFailed)
         self.assertIn("123", result.reason)
@@ -174,7 +200,7 @@ class StopResumeTests(unittest.TestCase):
     def test_self_move_hands_off_the_whole_batch_without_signalling(self) -> None:
         self.add_beta()
         for platform in ("linux", "darwin"):
-            with self.subTest(platform=platform), patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "sid-alpha"}), patch.object(sys, "platform", platform), patch.object(subprocess, "run", return_value=subprocess.CompletedProcess[str]([], 0, "", "")) as run, patch.object(subprocess, "Popen") as popen:
+            with self.subTest(platform=platform), patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "sid-alpha"}), patch.object(stop_resume, "_detach", wraps=self.real_detach), patch.object(sys, "platform", platform), patch.object(subprocess, "run", return_value=subprocess.CompletedProcess[str]([], 0, "", "")) as run, patch.object(subprocess, "Popen") as popen:
                 self.client.rows[0]["agent_session"] = None
                 result = stop_resume.move_sessions(["beta", "alpha"], "claude4", why="limit", warn_seconds=3)
                 self.assertEqual(result, [stop_resume.MoveHandedOff("sid-beta"), stop_resume.MoveHandedOff("sid-alpha")])
@@ -203,7 +229,7 @@ class StopResumeTests(unittest.TestCase):
             result = stop_resume.main(["batch", "--target", "claude4", "--why", "limit", "--log", str(log), "alpha", "missing"])
         self.assertEqual(result, 1)
         self.assertEqual(len(log.read_text().splitlines()), 2)
-        self.assertIn('"result": "Resumed"', log.read_text())
+        self.assertIn('"result": "ClaudeUp"', log.read_text())
         self.assertIn('"result": "SessionNotFound"', log.read_text())
         self.start.assert_called_once()
         self.assertEqual(self.kill.call_args_list, [call(123, signal.SIGTERM)])
@@ -212,7 +238,7 @@ class StopResumeTests(unittest.TestCase):
         popen.assert_not_called()
 
     def test_failed_handoff_reports_failure_without_signalling(self) -> None:
-        with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "sid-alpha"}), patch.object(sys, "platform", "linux"), patch.object(subprocess, "run", side_effect=OSError("service manager unavailable")):
+        with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "sid-alpha"}), patch.object(stop_resume, "_detach", wraps=self.real_detach), patch.object(sys, "platform", "linux"), patch.object(subprocess, "run", side_effect=OSError("service manager unavailable")):
             result = stop_resume.move_sessions(["alpha"], "claude4", why="limit")
         self.assertEqual(result, [stop_resume.StopFailed("alpha", "cannot hand off move: service manager unavailable")])
         self.kill.assert_not_called()
@@ -258,7 +284,7 @@ class StopResumeTests(unittest.TestCase):
         self.entry["environment"].update(HERDR_PANE_ID="w9:p9", HERDR_WORKSPACE_ID="w9")
         pane_record.write("agents", self.entry)
         result = stop_resume.resume("alpha", why="maintenance")
-        self.assertEqual(result, stop_resume.Resumed("sid-alpha", "w1:p2", "claude3"))
+        self.assertEqual(result, stop_resume.ClaudeUp("sid-alpha", "w1:p2", "claude3"))
         self.start.assert_called_once()
         command = self._typed(cast(tuple[str, ...], self.start.call_args.args))
         self.assertEqual(command[:4], ("pane", "run", "w1:p2", "env"))
@@ -266,7 +292,8 @@ class StopResumeTests(unittest.TestCase):
         self.assertIn("HERDR_PANE_ID=w1:p2", command)
         self.assertEqual(command[4:6], ("-u", "HERDR_TAB_ID"))
         self.assertIn("HERDR_WORKSPACE_ID=w1", command)
-        self.assertEqual(self.clock.elapsed, stop_resume.STAY_SECONDS)
+        self.assertLess(self.clock.elapsed, 1.0)
+        self.detach.assert_called_once()
         index = command.index("exec")
         self.assertTrue(command[index - 1].endswith("accounts/accounts.py"))
         self.assertEqual(command[index + 1:-1], ("claude3", "--resume", "sid-alpha", "-n", "alpha",
@@ -286,31 +313,84 @@ class StopResumeTests(unittest.TestCase):
         self.assertEqual(self.clock.elapsed, 60.0)
         self.assertEqual({invocation.args[2] for invocation in self.start.call_args_list}, {"w1:p2"})
 
-    def test_a_start_that_exits_retries_in_the_same_pane_and_stays_up(self) -> None:
-        def observed(_session: str) -> sessions.LiveSessionProcess | sessions.SessionNotLive:
-            if self.start.call_count == 0 or (self.start.call_count == 1 and self.clock.elapsed >= 1.0):
-                return sessions.SessionNotLive()
-            return sessions.LiveSessionProcess(456)
-        with patch.object(sessions, "session_liveness", side_effect=observed):
-            result = stop_resume.resume("alpha", why="maintenance")
-        self.assertEqual(result, stop_resume.Resumed("sid-alpha", "w1:p2", "claude3"))
-        self.assertEqual(self.start.call_count, 2)
-        self.assertEqual(self.clock.elapsed, 11.0)
-        self.assertEqual([invocation.args[2] for invocation in self.start.call_args_list], ["w1:p2", "w1:p2"])
+    def test_resume_returns_before_the_stay_window_and_detaches_its_generation(self) -> None:
+        result = stop_resume.resume("alpha", why="maintenance")
+        self.assertLess(self.clock.elapsed, stop_resume.STAY_SECONDS)
+        self.assertIsInstance(result, stop_resume.ClaudeUp)
+        arguments = cast(list[str], self.detach.call_args.args[0])
+        self.assertEqual(arguments[:3], ["stay", "--session", "sid-alpha"])
+        self.assertEqual(arguments[arguments.index("--pid") + 1], "456")
+        self.assertIn("generation-1", arguments)
+        self.start.assert_called_once()
 
-    def test_three_early_exits_report_failure_instead_of_resumed(self) -> None:
-        starts: list[float] = []
-        def start(*_command: str) -> str:
-            starts.append(self.clock.elapsed)
-            return ""
-        def observed(_session: str) -> sessions.LiveSessionProcess | sessions.SessionNotLive:
-            return (sessions.LiveSessionProcess(456) if starts and self.clock.elapsed - starts[-1] < 1.0
-                    else sessions.SessionNotLive())
-        self.start.side_effect = start
-        with patch.object(sessions, "session_liveness", side_effect=observed):
-            result = stop_resume.resume("alpha", why="maintenance")
-        self.assertEqual(result, stop_resume.ResumeFailed("sid-alpha", "ended after 1 s"))
-        self.assertEqual(starts, [0.0, 1.0, 2.0])
+    def test_detached_stay_check_alerts_on_early_exit_without_restarting(self) -> None:
+        def exits_soon(_pid: int, _generation: str) -> sessions.LiveSessionProcess | sessions.SessionNotLive:
+            return sessions.LiveSessionProcess(456) if self.clock.elapsed < 1.0 else sessions.SessionNotLive()
+        self.process.side_effect = exits_soon
+        with patch.object(stop_resume, "_early_exit") as alert:
+            cause = stop_resume._check_stay("sid-alpha", "w1:p2", "claude3", 456, "generation-1")  # pyright: ignore[reportPrivateUsage]
+        self.assertIn("ended after", cause)
+        self.assertLess(self.clock.elapsed, stop_resume.STAY_SECONDS)
+        alert.assert_called_once_with("sid-alpha", "w1:p2", "claude3", cause)
+        self.start.assert_not_called()
+
+    def test_early_exit_tells_showrunner_pushes_except_probe_and_enters_watchdog(self) -> None:
+        from scripts.production import showrunners, staff_sources
+        from scripts.accounts import unit_watchdog
+        import quota_alert
+        self.entry["environment"]["SHOWRUNNER_UNIT_ID"] = "alpha-unit"
+        for probe in (False, True):
+            self.entry["environment"]["CLAUDE_PROBE_SESSION"] = "1" if probe else "0"
+            pane_record.write("agents", self.entry)
+            with (patch.object(staff_sources, "unit_parent", return_value=staff_sources.UnitProduction("demo", str(self.root / "production.md"))),
+                  patch.object(showrunners, "tell") as tell, patch.object(quota_alert, "tell_user") as push,
+                  patch.object(unit_watchdog, "run", return_value=[]) as recovery):
+                stop_resume._early_exit("sid-alpha", "w1:p2", "claude3", "ended after 1 s")  # pyright: ignore[reportPrivateUsage]
+                tell.assert_called_once()
+                self.assertIn("ended after 1 s", tell.call_args.args)
+                self.assertEqual(push.call_count, 0 if probe else 1)
+                recovery.assert_called_once()
+
+    def test_non_unit_early_exit_tells_only_the_requesting_showrunner(self) -> None:
+        from scripts.production import showrunners
+        import quota_alert
+        # The requester's registry is independent of the resumed session's mark.
+        with (patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "sid-requester"}),
+              patch.object(showrunners, "production_of", return_value=self.root / "requester-production.md") as lookup,
+              patch.object(stop_resume, "_detach", wraps=self.real_detach) as detach,
+              patch.object(subprocess, "run"), patch.object(subprocess, "Popen"),
+              patch.object(showrunners, "tell") as tell,
+              patch.object(showrunners, "tell_others") as broadcast,
+              patch.object(quota_alert, "tell_user") as push):
+            _ = stop_resume.resume("alpha", why="maintenance")
+            invocation = cast(list[str], (detach.call_args.args[0]))
+            # Read the actual detached command, after _detach appends the requester.
+            platform_call = cast(Mock, subprocess.Popen if sys.platform == "darwin" else subprocess.run)
+            command = cast(list[str], platform_call.call_args.args[0])
+            arguments = command[command.index("stay"):]
+            self.assertEqual(invocation[0], "stay")
+            self.assertIn("--requester", arguments)
+            self.assertEqual(arguments[arguments.index("--requester") + 1], "requester")
+            lookup.assert_called_once_with("sid-requester")
+            log = self.root / "stay.log"
+            self.process.return_value = sessions.SessionNotLive()
+            arguments[arguments.index("--log") + 1] = str(log)
+            result = stop_resume.main(arguments)
+            self.assertEqual(result, 1)
+            tell.assert_called_once()
+            self.assertEqual(tell.call_args.args[0], "requester")
+            broadcast.assert_not_called()
+            push.assert_called_once()
+
+    def test_detached_self_move_keeps_the_requester_for_its_stay_child(self) -> None:
+        log = self.root / "requested-batch.log"
+        with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "sid-requester"}):
+            result = stop_resume.main(["batch", "--requester", "requester", "--target", "claude4",
+                                       "--why", "limit", "--log", str(log), "alpha"])
+            self.assertEqual(os.environ.get("CLAUDE_CODE_SESSION_ID", ""), "")
+        self.assertEqual(result, 0)
+        arguments = cast(list[str], self.detach.call_args.args[0])
+        self.assertEqual(arguments[arguments.index("--requester") + 1], "requester")
 
     def test_saved_entry_finds_an_unlabelled_pane_with_empty_or_stale_herdr_id(self) -> None:
         self.client.rows[0]["label"] = None
@@ -319,7 +399,7 @@ class StopResumeTests(unittest.TestCase):
                 self.launched.clear()
                 self.client.rows[0]["agent_session"] = agent
                 self.assertEqual(stop_resume.resume("sid-alpha", why="maintenance"),
-                                 stop_resume.Resumed("sid-alpha", "w1:p2", "claude3"))
+                                 stop_resume.ClaudeUp("sid-alpha", "w1:p2", "claude3"))
 
     def test_saved_entry_never_selects_a_different_live_conversation(self) -> None:
         self.client.rows[0]["agent_session"] = {"kind": "id", "value": "another-live-session"}
@@ -334,7 +414,7 @@ class StopResumeTests(unittest.TestCase):
         missing["pane_id"] = "w1:p-missing"
         pane_record.write("agents", missing)
         self.assertEqual(stop_resume.resume("sid-alpha", why="maintenance"),
-                         stop_resume.Resumed("sid-alpha", "w1:p2", "claude3"))
+                         stop_resume.ClaudeUp("sid-alpha", "w1:p2", "claude3"))
 
     def test_resume_refuses_a_mismatched_entry_but_does_not_wait_for_idle(self) -> None:
         self.entry["session_id"] = "sid-other"
@@ -346,20 +426,20 @@ class StopResumeTests(unittest.TestCase):
         self.live.return_value = sessions.SessionNotLive()
         pane_record.write("agents", self.entry)
         with patch.object(self.client, "pane_activity", side_effect=AssertionError("no idle gate")):
-            self.assertEqual(stop_resume.resume("alpha", why="maintenance"), stop_resume.Resumed("sid-alpha", "w1:p2", "claude3"))
+            self.assertEqual(stop_resume.resume("alpha", why="maintenance"), stop_resume.ClaudeUp("sid-alpha", "w1:p2", "claude3"))
 
     def test_move_stops_then_runs_the_target_account_in_the_same_pane(self) -> None:
         self.live.side_effect = [sessions.LiveSessionProcess(123), sessions.SessionNotLive(), sessions.SessionNotLive()]
         self.process.side_effect = [sessions.LiveSessionProcess(123), sessions.SessionNotLive()]
         result = stop_resume.move("alpha", "claude4", why="weekly limit")
-        self.assertEqual(result, stop_resume.Resumed("sid-alpha", "w1:p2", "claude4"))
+        self.assertEqual(result, stop_resume.ClaudeUp("sid-alpha", "w1:p2", "claude4"))
         self.assertEqual(self.kill.call_args_list, [call(123, signal.SIGTERM)])
         command = self._typed(cast(tuple[str, ...], self.start.call_args.args))
         self.assertEqual(command[command.index("exec") + 1], "claude4")
         self.assertIn("moved from claude3 to claude4", command[-1])
 
     def test_move_of_a_stopped_session_resumes_but_a_failed_stop_does_not(self) -> None:
-        self.assertEqual(stop_resume.move("alpha", "claude4", why="limit"), stop_resume.Resumed("sid-alpha", "w1:p2", "claude4"))
+        self.assertEqual(stop_resume.move("alpha", "claude4", why="limit"), stop_resume.ClaudeUp("sid-alpha", "w1:p2", "claude4"))
         self.start.reset_mock()
         self.launched.clear()
         self.live.return_value = sessions.SessionLivenessUnknown("identity unreadable")
@@ -374,8 +454,13 @@ class StopResumeTests(unittest.TestCase):
 
     def test_batch_stops_all_before_any_resume_and_uses_each_own_pane(self) -> None:
         self.add_beta()
-        both_stopping = Barrier(2, timeout=3)
-        both_resuming = Barrier(2, timeout=3)
+        third = pane_record.launch("w1:p6", "sid-gamma", str(self.root),
+            {"CLAUDE_CONFIG_DIR": str(self.root / ".claude3")}, ["claude", "-n", "gamma"])
+        pane_record.write("agents", third)
+        self.client.rows.append({"pane_id": "w1:p6", "label": "gamma", "workspace_id": "w1",
+                                 "agent_session": {"kind": "id", "value": "sid-gamma"}})
+        both_stopping = Barrier(3, timeout=3)
+        both_resuming = Barrier(3, timeout=3)
         stopped: list[str] = []
         lock = Lock()
         def stop_one(session: str) -> stop_resume.Stopped:
@@ -384,35 +469,36 @@ class StopResumeTests(unittest.TestCase):
                 stopped.append(session)
             return stop_resume.Stopped(session, 123)
         def run(*_command: str) -> str:
-            self.assertCountEqual(stopped, ["sid-alpha", "sid-beta"])
+            self.assertCountEqual(stopped, ["sid-alpha", "sid-beta", "sid-gamma"])
             _ = both_resuming.wait()
             return ""
         self.start.side_effect = run
         with patch.object(stop_resume, "_stop", side_effect=stop_one):
-            results = stop_resume.move_sessions(["sid-alpha", "sid-beta"], "claude4", why="limit")
-        self.assertEqual(results, [stop_resume.Resumed("sid-alpha", "w1:p2", "claude4"),
-                                   stop_resume.Resumed("sid-beta", "w1:p4", "claude4")])
+            results = stop_resume.move_sessions(["sid-alpha", "sid-beta", "sid-gamma"], "claude4", why="limit")
+        self.assertEqual(results, [stop_resume.ClaudeUp("sid-alpha", "w1:p2", "claude4"),
+                                   stop_resume.ClaudeUp("sid-beta", "w1:p4", "claude4"),
+                                   stop_resume.ClaudeUp("sid-gamma", "w1:p6", "claude4")])
         calls = [self._typed(cast(tuple[str, ...], invocation.args)) for invocation in self.start.call_args_list]
         self.assertEqual({args[2]: args[args.index("--resume") + 1] for args in calls},
-                         {"w1:p2": "sid-alpha", "w1:p4": "sid-beta"})
+                         {"w1:p2": "sid-alpha", "w1:p4": "sid-beta", "w1:p6": "sid-gamma"})
 
     def test_batch_failures_do_not_stop_other_members(self) -> None:
         def stop_one(session: str) -> stop_resume.NotRunning:
             if session == "stop-error":
                 raise OSError("cannot signal")
             return stop_resume.NotRunning(session)
-        def resume_one(session: str, *, why: str, to: str) -> stop_resume.Resumed | stop_resume.SessionNotFound:
+        def resume_one(session: str, *, why: str, to: str) -> stop_resume.ClaudeUp | stop_resume.SessionNotFound:
             self.assertEqual(why, "limit")
             if session == "resume-error":
                 raise OSError("cannot run")
             if session == "gone-tab":
                 return stop_resume.SessionNotFound(session)
-            return stop_resume.Resumed(session, "own-pane", to)
+            return stop_resume.ClaudeUp(session, "own-pane", to)
         with patch.object(stop_resume, "_stop", side_effect=stop_one), patch.object(stop_resume, "resume", side_effect=resume_one):
             results = stop_resume.move_sessions(["stop-error", "resume-error", "gone-tab", "good"], "claude4", why="limit")
         self.assertEqual(results, [stop_resume.StopFailed("stop-error", "cannot signal"),
             stop_resume.ResumeFailed("resume-error", "cannot run"),
-            stop_resume.ResumeFailed("gone-tab", "session has no tab after stop"), stop_resume.Resumed("good", "own-pane", "claude4")])
+            stop_resume.ResumeFailed("gone-tab", "session has no tab after stop"), stop_resume.ClaudeUp("good", "own-pane", "claude4")])
 
     def test_warning_precedes_all_stops_and_is_limited_to_fifteen_seconds(self) -> None:
         events: list[str] = []
@@ -421,7 +507,7 @@ class StopResumeTests(unittest.TestCase):
         def stop_one(session: str) -> stop_resume.StopFailed:
             self.assertCountEqual(events, ["warn first", "warn second"])
             return stop_resume.StopFailed(session, "fixture")
-        with patch.object(stop_resume, "_warn_session", side_effect=warn), patch.object(stop_resume, "_stop", side_effect=stop_one), patch.object(stop_resume, "monotonic", side_effect=[100.0, 102.0]):
+        with patch.object(stop_resume, "_warn_session", side_effect=warn), patch.object(stop_resume, "_stop", side_effect=stop_one), patch.object(stop_resume, "monotonic", side_effect=[100.0, 100.0, 102.0]):
             results = stop_resume.move_sessions(["first", "second"], "claude4", why="limit", warn_seconds=15)
             self.assertEqual(len(results), 2)
             with self.assertRaises(ValueError):

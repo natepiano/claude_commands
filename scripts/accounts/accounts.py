@@ -3015,7 +3015,7 @@ class SessionMoveRefused:
     reason: str
 
 
-def move_sessions(ids: tuple[str, ...], target: str, *, why: str) -> tuple[stop_resume.Resumed | stop_resume.MoveHandedOff | SessionMoveRefused, ...]:
+def move_sessions(ids: tuple[str, ...], target: str, *, why: str) -> tuple[stop_resume.ClaudeUp | stop_resume.MoveHandedOff | SessionMoveRefused, ...]:
     """Stop and resume each selected local owner through the shared move API."""
     from scripts.shutdown import stop_resume
 
@@ -3042,10 +3042,10 @@ def move_sessions(ids: tuple[str, ...], target: str, *, why: str) -> tuple[stop_
             refused[identity] = SessionMoveRefused(identity, "already on " + checked.destination.label)
         else:
             eligible.append(identity)
-    outcomes: dict[str, stop_resume.Resumed | stop_resume.MoveHandedOff | SessionMoveRefused] = dict(refused)
+    outcomes: dict[str, stop_resume.ClaudeUp | stop_resume.MoveHandedOff | SessionMoveRefused] = dict(refused)
     results = stop_resume.move_sessions(eligible, checked.destination.label, why=why)
     for identity, result in zip(eligible, results):
-        if isinstance(result, (stop_resume.Resumed, stop_resume.MoveHandedOff)):
+        if isinstance(result, (stop_resume.ClaudeUp, stop_resume.MoveHandedOff)):
             outcomes[identity] = result
         else:
             reason = ("session has no tab on this machine" if isinstance(result, stop_resume.SessionNotFound)
@@ -3054,14 +3054,14 @@ def move_sessions(ids: tuple[str, ...], target: str, *, why: str) -> tuple[stop_
     return tuple(outcomes[identity] for identity in selected)
 
 
-def move_result_line(result: stop_resume.Resumed | stop_resume.MoveHandedOff | SessionMoveRefused) -> str:
+def move_result_line(result: stop_resume.ClaudeUp | stop_resume.MoveHandedOff | SessionMoveRefused) -> str:
     if isinstance(result, SessionMoveRefused):
         return f"{result.session_id}: not moved: {result.reason}"
     from scripts.shutdown import stop_resume
 
     if isinstance(result, stop_resume.MoveHandedOff):
         return f"{result.session_id}: moving now"
-    return f"{result.session_id}: resumed on {result.account} in {result.pane_id}"
+    return stop_resume.claude_up_line(result)
 
 
 @dataclass(frozen=True)
@@ -3197,7 +3197,7 @@ def move_preview_line(member: ListedSession, target: str) -> str:
     return f"{member.name}: {member.session_id} · stop, then resume on {target} (from {session_account_label(member)})"
 
 
-def _move_output(results: tuple[stop_resume.Resumed | stop_resume.MoveHandedOff | SessionMoveRefused, ...],
+def _move_output(results: tuple[stop_resume.ClaudeUp | stop_resume.MoveHandedOff | SessionMoveRefused, ...],
                  notices: tuple[str, ...]) -> tuple[str, str, int]:
     stdout = "".join(line + "\n" for line in notices)
     stderr = ""

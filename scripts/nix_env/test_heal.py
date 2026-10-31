@@ -126,10 +126,10 @@ class HealTests(NixFixture):
         def stop(identity: str) -> stop_resume.Stopped | stop_resume.StopFailed:
             result = cast(subprocess.CompletedProcess[str], run(["shared-api", "stop_resume", "stop", "test-account", "--here", "--only", identity]))
             return stop_resume.Stopped(identity, self.session.pid) if result.returncode == 0 else stop_resume.StopFailed(identity, result.stderr)
-        def resume(identity: str, *, why: str) -> stop_resume.Resumed | stop_resume.ResumeFailed:
+        def resume(identity: str, *, why: str) -> stop_resume.ClaudeUp | stop_resume.ResumeFailed:
             self.assertEqual(why, "nix shell heal")
             result = cast(subprocess.CompletedProcess[str], run(["shared-api", "stop_resume", "resume", "test-account", "--only", identity, "--here"]))
-            return stop_resume.Resumed(identity, "fixture-pane", "claude3") if result.returncode == 0 else stop_resume.ResumeFailed(identity, result.stderr)
+            return stop_resume.ClaudeUp(identity, "fixture-pane", "claude3") if result.returncode == 0 else stop_resume.ResumeFailed(identity, result.stderr)
         _ = self.enterContext(patch.object(stop_resume, "stop", side_effect=stop))
         _ = self.enterContext(patch.object(stop_resume, "resume", side_effect=resume))
         return held, ensure, run

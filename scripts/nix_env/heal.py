@@ -405,7 +405,7 @@ def resume_pending(session: HealSession, pending: PendingRestart, history: HealH
         log(session, history, "refused", str(error))
         alert(session, history, str(error))
         return
-    if not isinstance(result, stop_resume.Resumed):
+    if not isinstance(result, stop_resume.ClaudeUp):
         reason = result.reason if isinstance(result, stop_resume.ResumeFailed) else "no local session tab"
         log(session, history, "refused", reason)
         alert(session, history, reason)

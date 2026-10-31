@@ -976,8 +976,8 @@ def _dispatch(options: CommandLine) -> int:
         if isinstance(result, (stop_resume.StopFailed, stop_resume.ResumeFailed)):
             print(f"{result.session_id}: {options.command} failed: {next(iter(result.reason.splitlines()), 'unknown error')}")
             return 1
-        if isinstance(result, stop_resume.Resumed):
-            print(f"{result.session_id}: resumed in {result.pane_id} on {result.account}")
+        if isinstance(result, stop_resume.ClaudeUp):
+            print(stop_resume.claude_up_line(result))
         elif isinstance(result, stop_resume.Stopped):
             print(f"{result.session_id}: stopped pid {result.pid}")
         else:

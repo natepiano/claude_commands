@@ -14,6 +14,8 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import pane_record
+import herdr
+from test_pane_restore import FakeClient
 from scripts.whoami import account  # noqa: E402  Imported before a test sets the platform to the Mac: urllib checks it on import.
 
 HOOK = Path(__file__).resolve().parent.parent / "hooks/session-start-pane-record.py"
@@ -62,6 +64,21 @@ class PaneRecordTests(unittest.TestCase):
 
     def entries(self) -> dict[str, dict[str, object]]:
         return cast(dict[str, dict[str, object]], json.loads((self.records / "agents.json").read_text()))
+
+    def test_seed_process_info_reads_only_selected_panes_and_defaults_to_all(self) -> None:
+        client = FakeClient([{"pane_id": pane, "workspace_id": "w1"} for pane in ("w1:p1", "w1:p2", "w2:p1")])
+        original = client.result
+        def result(*arguments: str) -> dict[str, object]:
+            return {"process_info": {"foreground_processes": []}} if arguments[:2] == ("pane", "process-info") else original(*arguments)
+        info = mock.Mock(side_effect=result)
+        with mock.patch.object(herdr, "Herdr", return_value=client), mock.patch.object(client, "result", info):
+            _ = pane_record.seed("agents", select=lambda pane: pane["pane_id"] == "w1:p2")
+            self.assertEqual([invocation for invocation in info.call_args_list if invocation.args[:2] == ("pane", "process-info")],
+                             [mock.call("pane", "process-info", "--pane", "w1:p2")])
+            info.reset_mock()
+            _ = pane_record.seed("agents")
+            self.assertEqual([invocation for invocation in info.call_args_list if invocation.args[:2] == ("pane", "process-info")],
+                             [mock.call("pane", "process-info", "--pane", pane) for pane in ("w1:p1", "w1:p2", "w2:p1")])
 
     def test_shared_parent_reader_reads_linux_comm_with_parentheses(self) -> None:
         process = self.root / "proc/42"

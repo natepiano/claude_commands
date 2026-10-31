@@ -11,7 +11,7 @@ import sys
 import subprocess
 import time
 from collections.abc import Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stdout
@@ -22,6 +22,7 @@ from typing import cast
 from uuid import uuid4
 
 SCRIPTS = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(SCRIPTS.parent))
 for dependency in ("shutdown", "herdr", "message", "whoami", "lib"):
     sys.path.insert(0, str(SCRIPTS / dependency))
 
@@ -56,10 +57,11 @@ class StopFailed:
 
 
 @dataclass(frozen=True)
-class Resumed:
+class ClaudeUp:
     session_id: str
     pane_id: str
     account: str
+    elapsed_seconds: float = field(default=0.0, compare=False)
 
 
 @dataclass(frozen=True)
@@ -111,17 +113,23 @@ def _same_claude(pid: int, started: str) -> bool:
     return isinstance(identity, sessions.LiveSessionProcess)
 
 
-def _record_launches() -> None:
-    """Read each running Claude's launch now: a hand-resumed tab has no entry, and a stopped Claude cannot say."""
+def _record_launches(selected: list[str]) -> None:
+    """Seed only selected panes while their Claude still exposes its launch flags."""
     try:
+        client = herdr.Herdr(herdr.shared_session())
+        entries = pane_record.read(client.session)
+        def selected_pane(pane: herdr.PaneIdentity) -> bool:
+            entry = entries.get(pane["pane_id"])
+            return (pane["session_id"] in selected or pane.get("label") in selected
+                    or entry is not None and entry["session_id"] in selected)
         with redirect_stdout(StringIO()):
-            _ = pane_record.seed(herdr.shared_session())
+            _ = pane_record.seed(client.session, select=selected_pane)
     except (OSError, ValueError, herdr.HerdrFailure):
         pass  # Resume names the session it cannot start; the stop still goes ahead.
 
 
 def stop(session: str) -> Stopped | NotRunning | StopFailed | SessionNotFound:
-    _record_launches()
+    _record_launches([session])
     return _stop(session)
 
 
@@ -146,7 +154,14 @@ def _stop(session: str) -> Stopped | NotRunning | StopFailed | SessionNotFound:
         if not _same_claude(live.pid, started):
             return NotRunning(identity)
         os.kill(live.pid, signal.SIGTERM)
-        _ = Event().wait(STOP_GRACE_SECONDS)
+        deadline = monotonic() + STOP_GRACE_SECONDS
+        while _same_claude(live.pid, started):
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                break
+            _ = Event().wait(min(0.1, remaining))
+        else:
+            return Stopped(identity, live.pid)
         if _same_claude(live.pid, started):
             os.kill(live.pid, signal.SIGKILL)
             deadline = monotonic() + KILL_GRACE_SECONDS
@@ -222,7 +237,8 @@ def _start_session(tab: herdr.TabSession, entry: pane_record.PaneLaunch, account
     client.run_in_pane(tab.pane_id, command)
 
 
-def resume(session: str, *, why: str, to: str | None = None) -> Resumed | ResumeFailed | SessionNotFound:
+def resume(session: str, *, why: str, to: str | None = None, requester: str = "") -> ClaudeUp | ResumeFailed | SessionNotFound:
+    began = monotonic()
     identity = session
     try:
         tab = _tab_of(session)
@@ -269,42 +285,107 @@ def resume(session: str, *, why: str, to: str | None = None) -> Resumed | Resume
             if isinstance(live, sessions.SessionNotLive):
                 reason = "never started"
                 continue
-            started = monotonic()
-            while isinstance(live, sessions.LiveSessionProcess):
-                remaining = STAY_SECONDS - (monotonic() - started)
-                if remaining <= 0:
-                    return Resumed(identity, tab.pane_id, label)
-                time.sleep(min(0.5, remaining))
-                live = sessions.session_liveness(identity)
-            if isinstance(live, sessions.SessionLivenessUnknown):
-                return ResumeFailed(identity, live.reason)
-            reason = f"ended after {monotonic() - started:g} s"
+            generation = sessions.process_start(live.pid)
+            if not generation:
+                return ResumeFailed(identity, f"process identity unreadable for pid {live.pid}")
+            _detach(["stay", "--session", identity, "--pane", tab.pane_id,
+                     "--account", label, "--pid", str(live.pid), "--generation", generation,
+                     *(["--requester", requester] if requester else [])], "stay")
+            return ClaudeUp(identity, tab.pane_id, label, monotonic() - began)
         return ResumeFailed(identity, reason)
-    except (OSError, ValueError, herdr.HerdrFailure) as error:
+    except (OSError, ValueError, herdr.HerdrFailure, subprocess.SubprocessError) as error:
         return ResumeFailed(identity, str(error))
 
 
-MoveResult = Resumed | MoveHandedOff | StopFailed | ResumeFailed | SessionNotFound
+MoveResult = ClaudeUp | MoveHandedOff | StopFailed | ResumeFailed | SessionNotFound
 
 
-def _handoff_batch(selected: list[str], target: str, why: str, warn_seconds: int) -> None:
-    """Keep the batch coordinator outside every session it will stop."""
+def _detach(arguments: list[str], task: str) -> None:
+    """One detached process boundary for batch coordination and the post-start check."""
+    from scripts.production import showrunners
+
+    # Capture the registry identity before the child loses the caller's session id.
+    if "--requester" not in arguments:
+        requester = showrunners.own_slug()
+        options = ["--requester", requester]
+        boundary = arguments.index("--") if "--" in arguments else len(arguments)
+        arguments = [*arguments[:boundary], *options, *arguments[boundary:]]
     logs = shutdown_state_root() / "logs"
     logs.mkdir(parents=True, exist_ok=True)
-    log = logs / f"move-{uuid4().hex}.log"
+    log = logs / f"{task}-{uuid4().hex}.log"
     environment = dict(os.environ)
     _ = environment.pop("CLAUDE_CODE_SESSION_ID", None)
-    command = [sys.executable, str(Path(__file__).resolve()), "batch", "--target", target,
-               "--why", why, "--warn-seconds", str(warn_seconds), "--log", str(log), "--", *selected]
+    command = [sys.executable, str(Path(__file__).resolve()), arguments[0], "--log", str(log), *arguments[1:]]
     if sys.platform == "darwin":
         _ = subprocess.Popen(command, env=environment, start_new_session=True,
                              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     else:
-        # The user manager has its own environment; unset the caller there too.
         _ = subprocess.run(["systemd-run", "--user", "--collect", "--quiet", "--no-block",
                             "env", "-u", "CLAUDE_CODE_SESSION_ID", *command],
                            env=environment, stdin=subprocess.DEVNULL, capture_output=True,
                            text=True, check=True, timeout=15)
+
+
+def _handoff_batch(selected: list[str], target: str, why: str, warn_seconds: int) -> None:
+    # Options precede the positional list so session names cannot become options.
+    _detach(["batch", "--target", target, "--why", why, "--warn-seconds", str(warn_seconds),
+             "--", *selected], "move")
+
+
+def _check_stay(identity: str, pane: str, account: str, pid: int, generation: str, requester: str = "") -> str:
+    """Observe the started generation after the command returns; recovery belongs to the watchdog."""
+    began = monotonic()
+    while _same_claude(pid, generation):
+        remaining = STAY_SECONDS - (monotonic() - began)
+        if remaining <= 0:
+            return ""
+        time.sleep(min(0.1, remaining))
+    cause = f"{identity}: ended after {monotonic() - began:g} s"
+    if requester:
+        _early_exit(identity, pane, account, cause, requester=requester)
+    else:
+        _early_exit(identity, pane, account, cause)
+    return cause
+
+
+def _early_exit(identity: str, pane: str, account: str, cause: str, *, requester: str = "") -> None:
+    from scripts.production import showrunners, staff_sources
+    from scripts.accounts import unit_watchdog
+    from scripts.notify.push_texts import render
+    from datetime import datetime, timezone
+    import quota_alert
+    from probe_session import PROBE_ENV
+    from restart_support import local_machine
+
+    entry = pane_record.read(herdr.shared_session()).get(pane)
+    environment = entry["environment"] if entry and entry["session_id"] == identity else {}
+    unit = environment.get("SHOWRUNNER_UNIT_ID", "")
+    try:
+        slug = (staff_sources.unit_parent(unit, identity).slug if unit else
+                requester or environment.get("SHOWRUNNER_UNIT", ""))
+        if slug:
+            print(showrunners.tell(slug, f"resume-ended-{identity}-{uuid4().hex}", cause))
+        else:
+            delivery = showrunners.tell_others(
+                {runner["slug"]: cause for runner in showrunners.registered_showrunners()},
+                f"resume-ended-{identity}-{uuid4().hex}")
+            for line in delivery.lines:
+                print(line)
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        print(f"{identity}: could not tell showrunner: {error}")
+    try:
+        if environment.get(PROBE_ENV) != "1":
+            _ = quota_alert.tell_user(render("shutdown.restart_failed", account=account, machine=local_machine(),
+                                            stopped=identity, cause=cause))
+    finally:
+        if unit:
+            for line in unit_watchdog.run(datetime.now(timezone.utc), dry_run=False):
+                print(line)
+
+
+def claude_up_line(result: ClaudeUp) -> str:
+    return (f"{result.session_id}: Claude is up on {result.account} in {result.pane_id} "
+            f"({result.elapsed_seconds:.1f} s)")
 
 
 def _warn_session(session: str, target: str, why: str, seconds: int) -> None:
@@ -317,14 +398,16 @@ def _warn_session(session: str, target: str, why: str, seconds: int) -> None:
         capture_output=True, timeout=15, check=False)
 
 
-def move_sessions(sessions: list[str], target: str, *, why: str, warn_seconds: int = 0) -> list[MoveResult]:
+def move_sessions(sessions: list[str], target: str, *, why: str, warn_seconds: int = 0,
+                  requester: str = "") -> list[MoveResult]:
     """Interrupt all selected sessions before resuming any; isolate each failure."""
     if not 0 <= warn_seconds <= 15:
         raise ValueError("warn_seconds must be between 0 and 15")
     selected = list(dict.fromkeys(sessions))
     if not selected:
         return []
-    _record_launches()  # Herdr learns a new session's id late; the launch entry knows it now.
+    began = monotonic()
+    _record_launches(selected)  # Herdr learns a new session's id late; the launch entry knows it now.
     caller = os.environ.get("CLAUDE_CODE_SESSION_ID")
     if caller:
         try:
@@ -352,7 +435,12 @@ def move_sessions(sessions: list[str], target: str, *, why: str, warn_seconds: i
                 stopped.append(future.result())
             except Exception as error:
                 stopped.append(StopFailed(session, str(error)))
-        resumes = {index: pool.submit(resume, result.session_id, why=why, to=target)
+        def resume_moved(identity: str) -> ClaudeUp | ResumeFailed | SessionNotFound:
+            result = (resume(identity, why=why, to=target, requester=requester) if requester else
+                      resume(identity, why=why, to=target))
+            return replace(result, elapsed_seconds=monotonic() - began) if isinstance(result, ClaudeUp) else result
+
+        resumes = {index: pool.submit(resume_moved, result.session_id)
                    for index, result in enumerate(stopped) if isinstance(result, (Stopped, NotRunning))}
         outcomes: list[MoveResult] = []
         for index, result in enumerate(stopped):
@@ -458,21 +546,35 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     batch = commands.add_parser("batch")
+    _ = batch.add_argument("--requester", default="")
     _ = batch.add_argument("--target", required=True)
     _ = batch.add_argument("--why", required=True)
     _ = batch.add_argument("--warn-seconds", type=int, default=0)
     _ = batch.add_argument("--log", type=Path, required=True)
     _ = batch.add_argument("sessions", nargs="+")
+    stay = commands.add_parser("stay")
+    for option in ("session", "pane", "account", "generation"):
+        _ = stay.add_argument("--" + option, required=True)
+    _ = stay.add_argument("--requester", default="")
+    _ = stay.add_argument("--pid", type=int, required=True)
+    _ = stay.add_argument("--log", type=Path, required=True)
     args = parser.parse_args(argv)
     # Even a directly invoked batch must not hand itself off a second time.
     _ = os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
     log = cast(Path, args.log)
+    if cast(str, args.command) == "stay":
+        with log.open("a", encoding="utf-8") as output, redirect_stdout(output):
+            cause = _check_stay(cast(str, args.session), cast(str, args.pane), cast(str, args.account),
+                                cast(int, args.pid), cast(str, args.generation), cast(str, args.requester))
+            _ = output.write(cause + "\n")
+        return int(bool(cause))
     with log.open("a", encoding="utf-8") as output:
         results = move_sessions(cast(list[str], args.sessions), cast(str, args.target),
-                                why=cast(str, args.why), warn_seconds=cast(int, args.warn_seconds))
+                                why=cast(str, args.why), warn_seconds=cast(int, args.warn_seconds),
+                                requester=cast(str, args.requester))
         for result in results:
             _ = output.write(json.dumps({"result": type(result).__name__, **asdict(result)}) + "\n")
-    return int(any(not isinstance(result, Resumed) for result in results))
+    return int(any(not isinstance(result, ClaudeUp) for result in results))
 
 
 if __name__ == "__main__":
