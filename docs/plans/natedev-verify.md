@@ -380,7 +380,7 @@ Checkpoint db889600 on `natedev-verify-base`, merged into builds as ee2f8c80.
 
 **Gotchas:** an empty lint code key means a cache miss, never a hit.
 
-### Phase 10 — A stopped verify run ends all of its processes  · status: todo
+### Phase 10 — A stopped verify run ends all of its processes  · status: done
 
 **Depends on:** Phase 9 (same file: `verify.sh`); it is this phase's baseline.
 

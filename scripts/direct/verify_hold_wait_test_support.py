@@ -22,8 +22,11 @@ from unittest import mock
 
 from scripts.build_hold import build_hold
 from scripts.direct.recorder_fixture import invoke_recorder
-from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, CallRecord, CARGO_STUB
+from scripts.direct.verify_mac_offload_test_support import (
+    VerifyMacOffloadFixture, CallRecord, CARGO_STUB, processes_carrying, reap, wait_for_marker_exit,
+)
 from scripts.direct.local_release_wait import LocalReleaseEvents, local_release_waiter
+from scripts.lint import memory_admit
 
 
 VERIFY = Path(__file__).with_name("verify.sh")
@@ -270,6 +273,45 @@ class VerifyHoldWaitFixture(unittest.TestCase):
 
     def stop_process(self, process: subprocess.Popen[str]) -> None:
         self.fixture.stop_verify(process)
+
+    def start_memory_queued_lint(self) -> subprocess.Popen[str]:
+        """Use the real checker and ledger with memory that never permits a step."""
+        _ = Path(self.fixture.environment["BUILDLOG_MEMINFO"]).write_text(
+            "MemTotal: 67108864 kB\nMemAvailable: 0 kB\n")
+        _ = Path(self.fixture.environment["LINT_CONFIG_READER"]).write_text(
+            # Trace to a dedicated copy of the run-log pipe so command
+            # substitutions can still capture the real checker's protocol.
+            'lint_config_enabled() {\n'
+            + '    [[ "$1" == clippy ]] || return 1\n'
+            + '    exec {trace_fd}>&2; BASH_XTRACEFD=$trace_fd; set -x\n'
+            + '}\n'
+            + 'lint_config_skip_notice() { :; }\n')
+        self.fixture.environment.update({
+            "UNIT_RUN_DIR": str(self.fixture.board), "BUILDLOG_SYNC": "1",
+            "BUILDLOG_MEM_POLL_S": "3600", "LINT_SKIP_SWEEP": "1",
+        })
+        process = self.start("lint", "sample")
+        # A deliberately red signal test must still reap its leaked children.
+        self.addCleanup(reap, self.fixture.child_marker())
+        self.wait_for_call(process, "waiting for memory since")
+        return process
+
+    def memory_queue_pids(self) -> set[int]:
+        with mock.patch.dict(os.environ, self.fixture.environment):
+            return {step.pid for step in memory_admit.queue_view().waiting}
+
+    def owned_process_snapshot(self) -> str:
+        pids = processes_carrying(self.fixture.child_marker())
+        if not pids:
+            return "<none>"
+        result = subprocess.run(
+            ["ps", "-o", "pid,ppid,pgid,sid,stat,ignored,args", "-p", ",".join(map(str, sorted(pids)))],
+            capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS,
+        )
+        return result.stdout
+
+    def wait_for_owned_exit(self, timeout: float) -> set[int]:
+        return wait_for_marker_exit(self.fixture.child_marker(), timeout)
 
     def wait_for_call(self, process: subprocess.Popen[str], announcement: str = VERIFY_WAITING) -> None:
         self.wait_for_waiting_diagnostic(process, announcement)
