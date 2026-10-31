@@ -12,12 +12,10 @@ from pathlib import Path
 from typing import cast
 import json
 import os
-import hashlib
 from unittest.mock import patch
 import subprocess
 import sys
 import tempfile
-from typing import override
 from scripts.direct import wait_for_test_state
 from scripts.direct.wait_for_test_state import wait_until
 
@@ -33,114 +31,6 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
                                 text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertFalse(slot.exists())
-
-    @override
-    def environment(self) -> dict[str, str]:
-        environment = super().environment()
-        environment["FAST_TRACK_REVIEW_PROMPT"] = str(self.root / "received-fast-track-prompt.md")
-        return environment
-
-    def prepare_fast_track_review(self, name: str) -> tuple[Path, dict[str, str], str]:
-        session = self.start_implementation(name)
-        self.finish_implementation(session)
-        state_path = session / "progress_history_state.json"
-        state = cast(dict[str, object], json.loads(state_path.read_text()))
-        state["unit"] = "alpha-unit"
-        _ = state_path.write_text(json.dumps(state))
-        _ = (self.working_dir / "fast-fix.txt").write_text(f"already pushed fast fix {name}\n")
-        for arguments in (["add", "fast-fix.txt"],
-                          ["-c", "user.name=Review Test", "-c", "user.email=review@example.invalid",
-                           "commit", "-m", "fast-track(alpha-unit): repair the sample"]):
-            _ = subprocess.run(["git", *arguments], cwd=self.working_dir, check=True, capture_output=True)
-        tip = subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.working_dir,
-                             check=True, capture_output=True, text=True).stdout.strip()
-        environment = self.environment()
-        directory = Path(environment["FAST_TRACK_STATE_DIR"])
-        directory.mkdir(exist_ok=True)
-        row = {"unit": "alpha-unit", "commit": tip, "why": "repair the sample",
-               "patch_sha256": hashlib.sha256(b"sample fix").hexdigest(),
-               "time": "2026-10-31T12:00:00+00:00", "review": "pending"}
-        _ = (directory / "records.jsonl").write_text(json.dumps(row) + "\n")
-        # Keep the real command and its imports; only its fixture entry path changes.
-        command = self.root / "scripts/production/fast_track.py"
-        real_command = Path(__file__).resolve().parents[1] / "production/fast_track.py"
-        _ = command.write_text("import os, sys\nos.execv(sys.executable, [sys.executable, "
-                               + repr(str(real_command)) + ", *sys.argv[1:]])\n")
-        agent = self.root / "scripts/agents/agent_exec.sh"
-        with agent.open("a") as output:
-            _ = output.write('cp "$4" "$FAST_TRACK_REVIEW_PROMPT"\n')
-        return session, environment, tip
-
-    def fast_track_review_rows(self) -> list[dict[str, object]]:
-        return [cast(dict[str, object], json.loads(line)) for line in
-                (self.root / "fast-track-state/records.jsonl").read_text().splitlines()]
-
-    def test_each_broad_review_receives_pending_fast_fix_diffs_and_marks_the_snapshot(self) -> None:
-        for lens in ("contract", "adversary"):
-            with self.subTest(lens=lens):
-                session, environment, tip = self.prepare_fast_track_review("fast-track-" + lens)
-                result = subprocess.run(self.review_command(session, lens, ""), env=environment,
-                                        capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
-                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                prompt = Path(environment["FAST_TRACK_REVIEW_PROMPT"]).read_text()
-                self.assertIn(tip, prompt)
-                self.assertIn("diff --git a/fast-fix.txt b/fast-fix.txt", prompt)
-                self.assertIn("+already pushed fast fix", prompt)
-                row, = self.fast_track_review_rows()
-                self.assertEqual(row["review"], "reviewed")
-                self.assertIn(lens, str(row["review_pass"]))
-                self.assertIn("1", str(row["review_pass"]))
-
-    def test_broad_lenses_and_retry_keep_the_same_fast_fix_snapshot(self) -> None:
-        session, environment, tip = self.prepare_fast_track_review("shared-fast-track-pass")
-        command = self.review_command(session, "contract", "")
-        first = subprocess.run(command, env=environment, capture_output=True, text=True,
-                               timeout=TEST_HANG_GUARD_SECS)
-        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
-        later = {**self.fast_track_review_rows()[0], "commit": "1" * 40,
-                 "patch_sha256": hashlib.sha256(b"next pass fix").hexdigest(), "review": "pending"}
-        records = self.root / "fast-track-state/records.jsonl"
-        with records.open("a") as output:
-            _ = output.write(json.dumps(later) + "\n")
-        for lens in ("adversary", "contract"):
-            with self.subTest(lens=lens):
-                result = subprocess.run(self.review_command(session, lens, ""), env=environment,
-                                        capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
-                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                prompt = Path(environment["FAST_TRACK_REVIEW_PROMPT"]).read_text()
-                self.assertIn(tip, prompt)
-                self.assertIn("+already pushed fast fix", prompt)
-                self.assertNotIn(str(later["commit"]), prompt)
-        reviewed, pending = self.fast_track_review_rows()
-        self.assertEqual(reviewed["review"], "reviewed")
-        self.assertEqual(pending["review"], "pending")
-
-    def test_failed_review_keeps_fast_fix_pending(self) -> None:
-        session, environment, _ = self.prepare_fast_track_review("fast-track-red")
-        with (self.root / "scripts/agents/agent_exec.sh").open("a") as output:
-            _ = output.write("exit 9\n")
-        result = subprocess.run(self.review_command(session, "contract", ""), env=environment,
-                                capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
-        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-        row, = self.fast_track_review_rows()
-        self.assertEqual(row["review"], "pending")
-
-    def test_successful_review_does_not_mark_a_fast_fix_added_after_dispatch(self) -> None:
-        session, environment, tip = self.prepare_fast_track_review("fast-track-snapshot")
-        later = {**self.fast_track_review_rows()[0], "commit": "1" * 40,
-                 "patch_sha256": hashlib.sha256(b"later fix").hexdigest()}
-        late_path = self.root / "late-fast-fix.jsonl"
-        _ = late_path.write_text(json.dumps(later) + "\n")
-        environment["FAST_TRACK_LATE_RECORD"] = str(late_path)
-        environment["FAST_TRACK_RECORDS"] = str(self.root / "fast-track-state/records.jsonl")
-        with (self.root / "scripts/agents/agent_exec.sh").open("a") as output:
-            _ = output.write('cat "$FAST_TRACK_LATE_RECORD" >> "$FAST_TRACK_RECORDS"\n')
-        result = subprocess.run(self.review_command(session, "contract", ""), env=environment,
-                                capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        first, second = self.fast_track_review_rows()
-        self.assertEqual((first["commit"], first["review"]), (tip, "reviewed"))
-        self.assertEqual(second["review"], "pending")
 
     def test_rerun_lens_uses_review_slot_and_its_own_findings_file(self) -> None:
         session = self.start_implementation("rerun-slot")

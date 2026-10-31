@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Generator, Mapping, Sequence
-from contextlib import closing, contextmanager
-import fcntl
+from contextlib import closing
 import json
 import os
 import select
@@ -19,7 +17,7 @@ from types import ModuleType
 import unittest
 from unittest import mock
 from pathlib import Path
-from typing import IO, ClassVar, NamedTuple, cast, override
+from typing import ClassVar, NamedTuple, cast, override
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 import process_group
@@ -153,6 +151,7 @@ if name == "basedpyright":
 
 BUMP_TEST_STUB = STUB + '''
 import subprocess
+import uuid
 sys.path.insert(0, __TEST_REPOSITORY__)
 from scripts.direct.wait_for_test_state import wait_for_file
 from scripts.message import sessions
@@ -166,8 +165,7 @@ run = {"cwd": str(Path.cwd()), "head": git("rev-parse", "HEAD"),
        "branch": subprocess.run(["git", "symbolic-ref", "-q", "HEAD"], capture_output=True, text=True).stdout.strip(),
        "gate_pid": gate_pid, "gate_start": sessions.process_start(gate_pid),
        "session": os.getsid(0), "stdin_closed": os.read(0, 1) == b""}
-# A red command is retried inside the same gate. Observe runners, not attempts.
-path = state / "gate-runs" / f"{gate_pid}-{run['gate_start']}.json"
+path = state / "gate-runs" / (uuid.uuid4().hex + ".json")
 temporary = path.with_suffix(".pending")
 temporary.write_text(json.dumps(run))
 temporary.replace(path)
@@ -500,22 +498,6 @@ class MergeCheckpointFixture(unittest.TestCase):
                         + "    print('fixture clone refused', file=sys.stderr)\n    raise SystemExit(1)\n"
                         + f"os.execv({git!r}, [{git!r}, *sys.argv[1:]])\n")
 
-    @contextmanager
-    def refuse_bump_gate_launch(self) -> Generator[None]:
-        original = subprocess.Popen
-
-        def launch(command: Sequence[str], *, stdin: int | None = None,
-                   stdout: int | IO[str] | None = None, stderr: int | IO[str] | None = None,
-                   cwd: str | Path | None = None, env: Mapping[str, str] | None = None,
-                   text: bool = False, start_new_session: bool = False) -> subprocess.Popen[str] | subprocess.Popen[bytes]:
-            if any(Path(word).name == "bump_gate.py" for word in command):
-                raise OSError("fixture gate launch refused")
-            return original(command, stdin=stdin, stdout=stdout, stderr=stderr, cwd=cwd, env=env,
-                            text=text, start_new_session=start_new_session)
-
-        with mock.patch.object(subprocess, "Popen", side_effect=launch):
-            yield
-
     def move_bump_recipients(self) -> None:
         for path in (self.root / "sessions").glob("*.json"):
             row = cast(dict[str, object], json.loads(path.read_text()))
@@ -548,12 +530,6 @@ class MergeCheckpointFixture(unittest.TestCase):
     def bump_gate_record(self, tip: str) -> dict[str, object]:
         path = merge_checkpoint.checkpoint_step_record(self.checkout, tip, "bump-gate")
         return cast(dict[str, object], json.loads(path.read_text()))
-
-    def assert_main_push_lock_available(self) -> None:
-        common = Path(self.git("rev-parse", "--path-format=absolute", "--git-common-dir"))
-        with (common / "main-push.lock").open("a") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            fcntl.flock(lock, fcntl.LOCK_UN)
 
     def wait_bump_result(self, tip: str) -> dict[str, object]:
         path = merge_checkpoint.checkpoint_step_record(self.checkout, tip, "bump-gate")

@@ -316,8 +316,7 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
    better run as its own unit goes to the showrunner as a proposed split
    (phases, files, shared files, merge order), never to the user.
 4. **The merge branch is the showrunner's.** Never merge into it or push it.
-   Push only your own branch except <FastTrack/> (`commands/unit/fast_track.md`);
-   <PushCheckpoint/> does it at each checkpoint.
+   Push only your own branch; <PushCheckpoint/> does it at each checkpoint.
    <PeriodicCI/> and <CICleanup/> do not run in a unit; the showrunner runs CI
    on the merge branch.
 5. **One more commit kind.** Besides checkpoints, a unit director merges the
