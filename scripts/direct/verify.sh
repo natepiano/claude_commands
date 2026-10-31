@@ -39,7 +39,8 @@
 # changed during the run records nothing.
 # Records outlive worker sessions and are pruned after 14 days on each write.
 #
-# The lint stages — mend, fmt, clippy fix, fmt, clippy judgment — use
+# The lint stages — mend, fmt, taplo, clippy judgment, then fixes and fmt
+# only after a failed judgment, followed by another judgment — use
 # config/lint.conf (edit it with /lint_config). Taplo fmt --check always runs
 # at the workspace root. A gated-off check prints a SKIPPED line and exits 0.
 # Scope is never configurable. cargo check, cargo nextest and the checkpoint
@@ -67,9 +68,9 @@
 # unchanged tree fails the same way (one worker ran 12 in a row on 2026-10-01).
 # A failed `test` is never recorded (tests flake), nor a run cut short by a
 # usage error, the sandbox or a kill. A lint failure is not recorded when the
-# third clippy fix and format pass still changed the tree. The judged tree is
-# the tree when the run starts, or for `lint` the tree invoke_clippy_fix and formatting leave
-# for clippy judgment. A run that ends on any other tree (for `test`,
+# third clippy fix and format pass still changed the tree. Each clippy judgment
+# reads the tree left by mend and formatting, or by the repair loop when the
+# first judgment fails. A run that ends on any other tree (for `test`,
 # any other part of it the package is built from) records nothing: an edit
 # landed while it ran, and its verdict belongs to neither tree.
 # A test or lint run outside a worker session is never cached.
@@ -111,9 +112,10 @@
 #   verify.sh lint <package>               mend --fix, nightly fmt of the package
 #                                          and the members that differ from HEAD,
 #                                          workspace taplo fmt --check,
-#                                          workspace clippy fix, fmt, then clippy
-#                                          judgment on all targets with all features
-#                                          (warnings denied)
+#                                          workspace clippy judgment on all targets
+#                                          with all features (warnings denied);
+#                                          only on failure: clippy fix, fmt, then
+#                                          judgment again
 #                                          — cargo stages gated by config/lint.conf;
 #                                          taplo always checks TOML formatting
 #   verify.sh lint --workspace [--check]   the same gate with fmt over all members;
@@ -1334,6 +1336,14 @@ finish_tree_watch() {
     cancel_tree_run
     [[ -z "$TREE_WATCH_DIR" ]] || rm -rf "$TREE_WATCH_DIR"
     TREE_WATCH_DIR=""
+}
+
+# Both lint judgments record the tree they read and preserve the tool status.
+judge_lint_clippy() {
+    start_tree_watch
+    clippy_status=0
+    invoke_clippy --workspace --all-targets --all-features --keep-going || clippy_status=$?
+    finish_tree_watch
 }
 
 # Git's staged tree identity. A private copy avoids updating the real index's
@@ -3099,7 +3109,7 @@ case "$CMD" in
             fi
             exit "$lint_status"
         fi
-        # Order: mend, fmt, taplo, clippy fix, fmt, clippy judgment.
+        # Order: mend, fmt, taplo, clippy judgment; repair and judge again only on failure.
         # Cargo stages are gated by lint.conf; the Taplo check always runs.
         # mend passes --all-targets because it needs the test and example
         # targets to see every import and visibility site. It covers the
@@ -3181,24 +3191,24 @@ case "$CMD" in
         fi
         if lint_config_enabled clippy; then
             [[ "$PKG" != --workspace ]] || echo 'style-lint: clippy start'
-            clippy_tree_before="$(tree_key)"
-            for ((clippy_fix_pass=1; HOLD_LINT == 0 && clippy_fix_pass<=3; clippy_fix_pass++)); do
-                invoke_clippy_fix --workspace --all-targets --all-features --keep-going || true
-                fmt_cargo "${FMT_SCOPE[@]}"
-                clippy_tree_after="$(tree_key)"
-                if [[ -n "$clippy_tree_before" && "$clippy_tree_before" == "$clippy_tree_after" ]]; then
-                    break
-                fi
-                # An empty key cannot prove that the tree stopped changing.
-                if (( clippy_fix_pass == 3 )); then
-                    CLIPPY_FIX_LIMIT_REACHED=1
-                fi
-                clippy_tree_before="$clippy_tree_after"
-            done
-            start_tree_watch
-            clippy_status=0
-            invoke_clippy --workspace --all-targets --all-features --keep-going || clippy_status=$?
-            finish_tree_watch
+            judge_lint_clippy
+            if (( clippy_status != 0 )); then
+                clippy_tree_before="$(tree_key)"
+                for ((clippy_fix_pass=1; HOLD_LINT == 0 && clippy_fix_pass<=3; clippy_fix_pass++)); do
+                    invoke_clippy_fix --workspace --all-targets --all-features --keep-going || true
+                    fmt_cargo "${FMT_SCOPE[@]}"
+                    clippy_tree_after="$(tree_key)"
+                    if [[ -n "$clippy_tree_before" && "$clippy_tree_before" == "$clippy_tree_after" ]]; then
+                        break
+                    fi
+                    # An empty key cannot prove that the tree stopped changing.
+                    if (( clippy_fix_pass == 3 )); then
+                        CLIPPY_FIX_LIMIT_REACHED=1
+                    fi
+                    clippy_tree_before="$clippy_tree_after"
+                done
+                judge_lint_clippy
+            fi
             (( clippy_status == 0 )) || exit "$clippy_status"
             [[ "$PKG" != --workspace ]] || echo 'style-lint: clippy passed'
         else

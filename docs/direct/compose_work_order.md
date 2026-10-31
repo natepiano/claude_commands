@@ -81,6 +81,7 @@ that builds the wrong thing.
   scoped `verify.sh`, and a folder-wide basedpyright line to one line per
   slot over its own files; the unit director retains live smoke ownership.
 - Three Gods: <WritePromptContract/> item 9's section, verbatim.
+- Build rules: <WritePromptContract/> item 10's section, verbatim.
 
 Do not open code to fill a plan gap. Name the gap and let review catch its
 effect. Mark the dispatch as assembled from the Work Order without research.
