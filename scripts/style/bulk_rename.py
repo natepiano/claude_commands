@@ -460,8 +460,15 @@ class RustAnalyzer:
         if self.request("textDocument/prepareRename", params) is None:
             raise BulkRenameError("rust-analyzer refused prepareRename")
         value = self.request("textDocument/rename", {**params, "newName": new})
-        return workspace_edits(value, path, text, self.versions[path], self.documents, self.versions,
-                               lambda target: self.sources.read(target).source)
+        workspace = workspace_edits(value, path, text, self.versions[path], self.documents, self.versions,
+                                    lambda target: self.sources.read(target).source)
+        token = next(span for span in self.sources.tokens(text).spans if span.start == offset)
+        line = text.count("\n", 0, offset) + 1
+        rename = BindingRename(line, text.splitlines()[line - 1], token.token.value, new)
+        declaration = rename_declaration(text, rename)
+        if isinstance(declaration, RenameDeclaration) and declaration.scope.kind not in {"field", "variant", "item"}:
+            return preserve_shorthand_field_labels(self.sources, workspace, rename)
+        return workspace
 
     def definitions(self, path: Path, text: str, offsets: tuple[int, ...]) -> tuple[DefinitionResolution, ...]:
         """Pipeline one file's definition requests; one deadline bounds the entire round."""
@@ -875,6 +882,56 @@ def text_name_guard(server: RenameServer, document: DocumentEdits, rename: Bindi
             raise BulkRenameError("rename changes serialized or externally visible literal text")
 
 
+@dataclass(frozen=True)
+class ShorthandFieldLabel:
+    """One token that names both a record field and its local value or pattern binding."""
+
+    span: style_footprint.TokenSpan
+
+    def binding_edits(self, new: str) -> tuple[SourceEdit, SourceEdit]:
+        # Keeping the insertion separate maps the old binding boundary to the value,
+        # including when this shorthand is the renamed pattern's declaration.
+        return (SourceEdit(self.span.start, self.span.start, self.span.token.value + ": "),
+                SourceEdit(self.span.start, self.span.end, new))
+
+
+def rename_edit_site(parsed: BindingText, edit: SourceEdit) -> ShorthandFieldLabel | SourceEdit:
+    """Classify only an entire existing shorthand token, using the shared token spans."""
+    for i, span in enumerate(parsed.spans):
+        if (span.start == edit.start and span.end == edit.end
+                and parsed.words[parsed.parents.get(i, i)] == "{"
+                and style_footprint.shorthand_field(parsed.words, i)):
+            return ShorthandFieldLabel(span)
+    return edit
+
+
+def preserve_shorthand_field_labels(sources: RunSourceIndex, workspace: WorkspaceRename,
+                                    rename: BindingRename) -> WorkspaceRename:
+    """A local rename changes the value side, never the record's field label.
+
+    Some analyzer edits (notably inside macro arguments) replace the bare token.
+    Split both bare replacements and already expanded fields into the same edit
+    pair so the existing offset and reference proof also handles pattern bindings.
+    """
+    documents: list[DocumentEdits] = []
+    for document in workspace.documents:
+        parsed = sources.tokens(document.source)
+        edits: list[SourceEdit] = []
+        for edit in document.edits:
+            site = rename_edit_site(parsed, edit)
+            if (isinstance(site, ShorthandFieldLabel) and site.span.token.value == rename.old
+                    and site.binding_edits(rename.new)[0] not in document.edits):
+                words = tuple(span.token.value for span in sources.tokens(edit.text).spans)
+                if (words == (rename.new,) and edit.text == rename.new
+                        or words == (rename.old, ":", rename.new)
+                        and re.fullmatch(re.escape(rename.old) + r"\s*:\s*" + re.escape(rename.new), edit.text)):
+                    edits.extend(site.binding_edits(rename.new))
+                    continue
+            edits.append(edit)
+        documents.append(replace(document, edits=tuple(edits)))
+    return WorkspaceRename(tuple(documents))
+
+
 def public_edit_guard(document: DocumentEdits, rename: BindingRename) -> None:
     if not published_crate(crate_directory(document.path)):
         return
@@ -882,6 +939,9 @@ def public_edit_guard(document: DocumentEdits, rename: BindingRename) -> None:
     for i, span in enumerate(parsed.spans):
         if span.token.kind != "identifier" or not any(edit.start <= span.start < edit.end for edit in document.edits):
             continue
+        site = rename_edit_site(parsed, SourceEdit(span.start, span.end, rename.new))
+        if isinstance(site, ShorthandFieldLabel) and site.binding_edits(rename.new)[0] in document.edits:
+            continue  # The label is preserved; the edited value is still resolution-checked.
         line = document.source.count("\n", 0, span.start) + 1
         scope = BindingScope("item", i, ((i, i + 1),))
         if not public_declaration(parsed, scope):
