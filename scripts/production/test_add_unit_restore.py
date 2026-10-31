@@ -31,7 +31,7 @@ import herdr
 from scripts.herdr.fake_herdr import CommandResponse
 
 
-from add_unit_test_support import AddUnitTestCase, configure_test_zone, SHARED, SUBMITTED_PROMPT
+from add_unit_test_support import AddUnitTestCase, ObservedUnitLaunch, configure_test_zone, SHARED, SUBMITTED_PROMPT
 
 
 def setUpModule() -> None:
@@ -528,15 +528,7 @@ class AddUnitRestoreTests(AddUnitTestCase):
                 stderr=subprocess.PIPE,
             )
 
-        def launch(
-            _request: add_unit.UnitLaunch,
-            _director: add_unit.DirectorAgent,
-            _prompt: str,
-            _selected: accounts.ClaudeLaunchAccount,
-            *, target: str = "", model: str = "", autocompact_window: str = "",
-        ) -> herdr.PromptSubmitted:
-            self.assertEqual(target, "claude2" if isinstance(_request.session, add_unit.ResumedSession) else "")
-            self.assertEqual((model, autocompact_window), ("", ""))
+        def launch(_request: add_unit.UnitLaunch, _prompt: str) -> herdr.PromptSubmitted:
             self.assertIsNotNone(creator)
             if creator is None:
                 self.fail("shutdown creator did not start")
@@ -572,7 +564,7 @@ class AddUnitRestoreTests(AddUnitTestCase):
             patch.object(add_unit, "commit_unit"),
             patch.object(add_unit, "ensure_worktree"),
             patch.object(add_unit, "record_scheduled_restore_prompt"),
-            patch.object(add_unit, "launch_session", side_effect=launch),
+            patch.object(add_unit, "launch_session", side_effect=ObservedUnitLaunch(self, launch)),
             patch.object(add_unit, "wait_for_remote_control") as wait,
             patch.object(add_unit, "record"),
             patch.dict(os.environ, self.env),
