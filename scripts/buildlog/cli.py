@@ -4,19 +4,22 @@
   buildlog query [--json] "<SQL>"   bring the index up to date, run SQL read-only
   buildlog schema                   tables, columns, views and example queries
   buildlog report [YYYY-MM-DD]      one day (default today) as markdown: each kind by caller, then a summary
+  buildlog moments [YYYY-MM-DD]     before/after build moments, read-only
   buildlog mac-report [--hours N]    Mac test outcomes over the last N hours and three local days
   buildlog reindex                  rebuild the index from the JSON lines
   buildlog tree-key [DIR]           the tree key of DIR's worktree (default the current folder; treekey.py)
   buildlog sync                     exchange records with the Mac (natedev's hourly job)
   buildlog sync pause <why>         pause Mac contact while hourly keeps running
   buildlog sync resume              resume Mac contact
+  buildlog vault                    fast-forward the Mac's hanadocs vault
   buildlog ci                       record new GitHub Actions run attempts
   buildlog launches                 collect example build and start times from Claude Code
   buildlog disk                     measure disk usage for the next report
   buildlog sample                   record memory counters and check for idle Mac test waits
   buildlog snapshot                 record slice and zram counters now
   buildlog memory START END         report memory between offset-bearing instants
-  buildlog hourly                   sync, ci, screenshot scan, then Rust release check
+  buildlog usage-hours [YYYY-MM-DD]  measured memory, CPU, disk and free pool tokens over 24 h
+  buildlog hourly                   sync, vault pull, ci, screenshot scan, then Rust release check
   buildlog backfill-verify [LEDGER] copy verify.sh's old events.jsonl ledger in, once
 
 Records live in ~/.local/state/buildlog (BUILDLOG_DIR moves it); see store.py.
@@ -48,6 +51,7 @@ import sample
 import store
 import sync
 import treekey
+import vault_pull
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from user_zone import user_zone_name  # noqa: E402
@@ -193,7 +197,24 @@ def day_report(args: list[str]) -> int:
     _ = index.update()
     connection = index.read_only()
     try:
-        print(report.report(connection, day))
+        print(report.report(connection, day, usage_day=day if args else ""))
+    finally:
+        connection.close()
+    return 0
+
+
+def moments_report(args: list[str]) -> int:
+    day = args[0] if args else date.today().isoformat()
+    try:
+        if len(args) > 1:
+            raise ValueError("too many dates")
+        _ = date.fromisoformat(day)
+    except ValueError:
+        print("usage: buildlog moments [YYYY-MM-DD]", file=sys.stderr)
+        return 2
+    connection = index.read_only()
+    try:
+        print("\n".join(report.moments_section(connection, day)))
     finally:
         connection.close()
     return 0
@@ -210,7 +231,7 @@ def screenshot_hourly() -> int:
 
 def hourly() -> int:
     status = 0
-    for name, job in (("sync", sync.sync), ("ci", ci.ci),
+    for name, job in (("sync", sync.sync), ("vault", vault_pull.vault), ("ci", ci.ci),
                       ("screenshot", screenshot_hourly), ("rust release", rust_release.check_release)):
         try:
             status |= job()
@@ -241,6 +262,25 @@ def main(argv: list[str]) -> int:
         return schema()
     if command == "report":
         return day_report(rest)
+    if command == "moments":
+        return moments_report(rest)
+    if command == "usage-hours":
+        if len(rest) > 1:
+            print("usage: buildlog usage-hours [YYYY-MM-DD]", file=sys.stderr)
+            return 2
+        try:
+            if rest:
+                _ = date.fromisoformat(rest[0])
+        except ValueError:
+            print("usage: buildlog usage-hours [YYYY-MM-DD]", file=sys.stderr)
+            return 2
+        _ = index.update()
+        connection = index.read_only()
+        try:
+            print(report.usage_hours(connection, rest[0] if rest else ""))
+        finally:
+            connection.close()
+        return 0
     if command == "mac-report":
         return mac_report.main(rest)
     if command == "launches":
@@ -270,6 +310,11 @@ def main(argv: list[str]) -> int:
         return 2
     if command == "ci":
         return ci.ci()
+    if command == "vault":
+        if rest:
+            print("usage: buildlog vault", file=sys.stderr)
+            return 2
+        return vault_pull.vault()
     if command == "disk":
         try:
             disk.write_snapshot(disk.snapshot())
@@ -283,7 +328,7 @@ def main(argv: list[str]) -> int:
             return 2
         taken = sample.sample()
         try:
-            _ = memory.write_snapshot(taken.at, taken.host)
+            _ = memory.write_snapshot(taken.at, taken.host, taken.slices)
         except (OSError, ValueError) as error:
             print(f"buildlog sample: memory snapshot unavailable: {error}", file=sys.stderr)
         if taken.host == "natedev":
