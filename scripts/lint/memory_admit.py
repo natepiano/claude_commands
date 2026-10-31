@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import fcntl
-from contextlib import closing
+from contextlib import AbstractContextManager, closing
 import importlib
 import io
 import json
@@ -17,7 +17,7 @@ import subprocess
 import sys
 import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from contextlib import redirect_stderr
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
@@ -61,6 +61,9 @@ class BuildLogStore(Protocol):
     def host_name(self) -> str: ...
     def utc_iso(self, epoch: float) -> str: ...
     def append_line(self, path: Path, record: object) -> None: ...
+    def locked_append(self, path: Path) -> AbstractContextManager[BinaryIO]: ...
+    def append_locked(self, handle: BinaryIO, record: object) -> None: ...
+    def whole_rows(self, handle: BinaryIO, start: int) -> Iterator[dict[str, object]]: ...
     def host_file(self, host: str, epoch: float) -> Path: ...
 
 
@@ -1027,24 +1030,32 @@ class GateProfile:
         return "full"
 
 
+def anonymous_history_rows(source: Path | BinaryIO) -> Iterator[dict[str, object]]:
+    """Read whole anonymous-history rows; an open handle must already be locked."""
+    if isinstance(source, Path):
+        with source.open("rb") as handle:
+            fcntl.flock(handle, fcntl.LOCK_SH)
+            yield from anonymous_history_rows(handle)
+        return
+    yield from store.whole_rows(source, 0)
+
+
 def gate_estimate(cap_bytes: int, host: str, now: datetime, root: Path) -> GateEstimate:
     """Read the gate's one peak history, without using cargo estimates."""
     cutoff = now - timedelta(days=HISTORY_DAYS)
     peaks: list[int] = []
     try:
-        with (root / "admission/anon_peaks.jsonl").open() as lines:
-            for line in lines:
-                try:
-                    row = cast(dict[str, object], json.loads(line))
-                    if row.get("host") != host or row.get("step") != "merge-gate":
-                        continue
-                    peak, ended = row.get("anon_peak_bytes"), row.get("ended_at")
-                    if not isinstance(peak, int) or peak <= 0 or not isinstance(ended, str):
-                        continue
-                    if cutoff <= datetime.fromisoformat(ended.replace("Z", "+00:00")) <= now:
-                        peaks.append(peak)
-                except (ValueError, TypeError, AttributeError):
+        for row in anonymous_history_rows(root / "admission/anon_peaks.jsonl"):
+            try:
+                if row.get("host") != host or row.get("step") != "merge-gate":
                     continue
+                peak, ended = row.get("anon_peak_bytes"), row.get("ended_at")
+                if not isinstance(peak, int) or peak <= 0 or not isinstance(ended, str):
+                    continue
+                if cutoff <= datetime.fromisoformat(ended.replace("Z", "+00:00")) <= now:
+                    peaks.append(peak)
+            except (ValueError, TypeError, AttributeError):
+                continue
     except FileNotFoundError:
         pass
     return MeasuredGatePeak(percentile(peaks), len(peaks)) if peaks else NoGateHistory(cap_bytes)
@@ -1224,24 +1235,22 @@ def expected_peak(repository: Repository, step: str, host: str, now: datetime, r
     # to 2026-10-28 on that fallback; the measured doc p90 over all repos was 4.15 GiB.
     pooled: list[int] = []
     try:
-        with (root / "admission/anon_peaks.jsonl").open() as lines:
-            for line in lines:
-                try:
-                    item = cast(dict[str, object], json.loads(line))
-                    if ((item.get("host"), item.get("step")) == (host, step)
-                            and item.get("test_scope", "full") == scope
-                            and (item.get("repo_identity") or item.get("repo") not in GENERIC_REPO_NAMES)
-                            and (test_threads is None or item.get("test_threads") == test_threads)
-                            and cutoff <= str(item.get("ended_at", "")) < before):
-                        peak = item.get("anon_peak_bytes")
-                        if isinstance(peak, int) and peak > 0:
-                            pooled.append(peak)
-                            if (item.get("repo_identity") == repository.key
-                                    or (not item.get("repo_identity") and repository.legacy_name
-                                        and item.get("repo") == repository.legacy_name)):
-                                measured.append(peak)
-                except (ValueError, TypeError, AttributeError):
-                    continue
+        for item in anonymous_history_rows(root / "admission/anon_peaks.jsonl"):
+            try:
+                if ((item.get("host"), item.get("step")) == (host, step)
+                        and item.get("test_scope", "full") == scope
+                        and (item.get("repo_identity") or item.get("repo") not in GENERIC_REPO_NAMES)
+                        and (test_threads is None or item.get("test_threads") == test_threads)
+                        and cutoff <= str(item.get("ended_at", "")) < before):
+                    peak = item.get("anon_peak_bytes")
+                    if isinstance(peak, int) and peak > 0:
+                        pooled.append(peak)
+                        if (item.get("repo_identity") == repository.key
+                                or (not item.get("repo_identity") and repository.legacy_name
+                                    and item.get("repo") == repository.legacy_name)):
+                            measured.append(peak)
+            except (ValueError, TypeError, AttributeError):
+                continue
     except OSError:
         pass
     if len(measured) >= 5:
@@ -1321,30 +1330,28 @@ def build_peaks(repository: RepositoryIdentity, host: str, now: datetime, root: 
     joined = False
     peaks: list[BuildPeak] = []
     try:
-        with (root / "admission/anon_peaks.jsonl").open() as lines:
-            for line in lines:
-                try:
-                    item = cast(dict[str, object], json.loads(line))
-                    if not history_matches_repository(item, repository) or item.get("host") != host or item.get("step") != "build":
-                        continue
-                    ended_at = datetime.fromisoformat(str(item.get("ended_at", "")))
-                    peak = item.get("anon_peak_bytes")
-                    if not cutoff <= ended_at < now or not isinstance(peak, int) or peak <= 0:
-                        continue
-                    shape = recorded_build_shape(item.get("shape"))
-                    if isinstance(shape, NoBuildShape) and "shape" not in item:
-                        if not joined:
-                            joins = index_shapes(root / store.INDEX_NAME, host, "build", cutoff, now)
-                            joined = True
-                        shape = joins.get((str(item.get("call_id", "")), "build"), NoBuildShape())
-                    if isinstance(shape, NoBuildShape):
-                        continue
-                    need = item.get("need")
-                    peaks.append(BuildPeak(shape, peak, ended_at,
-                                           need if isinstance(need, int) and need > 0 else 0,
-                                           history_outcome(item.get("outcome"))))
-                except (ValueError, TypeError, AttributeError):
+        for item in anonymous_history_rows(root / "admission/anon_peaks.jsonl"):
+            try:
+                if not history_matches_repository(item, repository) or item.get("host") != host or item.get("step") != "build":
                     continue
+                ended_at = datetime.fromisoformat(str(item.get("ended_at", "")))
+                peak = item.get("anon_peak_bytes")
+                if not cutoff <= ended_at < now or not isinstance(peak, int) or peak <= 0:
+                    continue
+                shape = recorded_build_shape(item.get("shape"))
+                if isinstance(shape, NoBuildShape) and "shape" not in item:
+                    if not joined:
+                        joins = index_shapes(root / store.INDEX_NAME, host, "build", cutoff, now)
+                        joined = True
+                    shape = joins.get((str(item.get("call_id", "")), "build"), NoBuildShape())
+                if isinstance(shape, NoBuildShape):
+                    continue
+                need = item.get("need")
+                peaks.append(BuildPeak(shape, peak, ended_at,
+                                       need if isinstance(need, int) and need > 0 else 0,
+                                       history_outcome(item.get("outcome"))))
+            except (ValueError, TypeError, AttributeError):
+                continue
     except OSError:
         pass
     return peaks
@@ -1494,36 +1501,34 @@ def filtered_peak(repository: RepositoryIdentity, step: str, host: str, now: dat
     compile_peaks: list[int] = []
     compile_index: list[int] = []
     try:
-        with (root / "admission/anon_peaks.jsonl").open() as lines:
-            for line in lines:
-                try:
-                    item = cast(dict[str, object], json.loads(line))
-                    own = (item.get("repo_identity") == repository.key
-                           or (not item.get("repo_identity") and repository.legacy_name
-                               and item.get("repo") == repository.legacy_name))
-                    if (not own or item.get("host") != host
-                            or not cutoff <= str(item.get("ended_at", "")) < before):
-                        continue
-                    peak = item.get("anon_peak_bytes")
-                    if not isinstance(peak, int) or peak <= 0:
-                        continue
-                    sample_package = item.get("package", "")
-                    if (item.get("step") in ("check", "build")
-                            and (sample_package == package
-                                 or (not sample_package and package == repository.name))):
-                        compile_peaks.append(peak)
-                    if (item.get("step") != step or item.get("test_scope") != "filtered"
-                            or sample_package != package
-                            or (width is not None and item.get("test_threads") != width)):
-                        continue
-                    measured.append(peak)
-                    names = item.get("filters")
-                    if (filters and isinstance(names, list)
-                            and all(isinstance(name, str) for name in cast(list[object], names))
-                            and tuple(sorted(set(cast(list[str], names)))) == filters):
-                        exact.append(peak)
-                except (ValueError, TypeError, AttributeError):
+        for item in anonymous_history_rows(root / "admission/anon_peaks.jsonl"):
+            try:
+                own = (item.get("repo_identity") == repository.key
+                       or (not item.get("repo_identity") and repository.legacy_name
+                           and item.get("repo") == repository.legacy_name))
+                if (not own or item.get("host") != host
+                        or not cutoff <= str(item.get("ended_at", "")) < before):
                     continue
+                peak = item.get("anon_peak_bytes")
+                if not isinstance(peak, int) or peak <= 0:
+                    continue
+                sample_package = item.get("package", "")
+                if (item.get("step") in ("check", "build")
+                        and (sample_package == package
+                             or (not sample_package and package == repository.name))):
+                    compile_peaks.append(peak)
+                if (item.get("step") != step or item.get("test_scope") != "filtered"
+                        or sample_package != package
+                        or (width is not None and item.get("test_threads") != width)):
+                    continue
+                measured.append(peak)
+                names = item.get("filters")
+                if (filters and isinstance(names, list)
+                        and all(isinstance(name, str) for name in cast(list[object], names))
+                        and tuple(sorted(set(cast(list[str], names)))) == filters):
+                    exact.append(peak)
+            except (ValueError, TypeError, AttributeError):
+                continue
     except OSError:
         pass
     if exact:
@@ -1728,28 +1733,26 @@ def fresh_test_peak(repository: RepositoryIdentity, step: str, host: str, now: d
     measured: list[int] = []
     measured_exact: list[int] = []
     try:
-        with (root / "admission/anon_peaks.jsonl").open() as lines:
-            for line in lines:
-                try:
-                    item = cast(dict[str, object], json.loads(line))
-                    call_id = item.get("call_id")
-                    own = (item.get("repo_identity") == repository.key
-                           or (not item.get("repo_identity") and repository.legacy_name
-                               and item.get("repo") == repository.legacy_name))
-                    if (not own or item.get("host") != host or item.get("step") != step
-                            or not cutoff <= str(item.get("ended_at", "")) < before
-                            or not isinstance(call_id, str) or call_id not in calls
-                            or item.get("test_scope", scope) != scope
-                            or item.get("package", package) != package
-                            or (width is not None and item.get("test_threads") != width)):
-                        continue
-                    peak = item.get("anon_peak_bytes")
-                    if isinstance(peak, int) and peak > 0:
-                        measured.append(peak)
-                        if calls[call_id]:
-                            measured_exact.append(peak)
-                except (ValueError, TypeError, AttributeError):
+        for item in anonymous_history_rows(root / "admission/anon_peaks.jsonl"):
+            try:
+                call_id = item.get("call_id")
+                own = (item.get("repo_identity") == repository.key
+                       or (not item.get("repo_identity") and repository.legacy_name
+                           and item.get("repo") == repository.legacy_name))
+                if (not own or item.get("host") != host or item.get("step") != step
+                        or not cutoff <= str(item.get("ended_at", "")) < before
+                        or not isinstance(call_id, str) or call_id not in calls
+                        or item.get("test_scope", scope) != scope
+                        or item.get("package", package) != package
+                        or (width is not None and item.get("test_threads") != width)):
                     continue
+                peak = item.get("anon_peak_bytes")
+                if isinstance(peak, int) and peak > 0:
+                    measured.append(peak)
+                    if calls[call_id]:
+                        measured_exact.append(peak)
+            except (ValueError, TypeError, AttributeError):
+                continue
     except OSError:
         pass
     for values, source in ((measured_exact, "measured"), (indexed_exact, "buildlog"),
@@ -2524,7 +2527,7 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
             head.waiter["priority_since"] = now.timestamp()
             for head_path, head_row in waiting:
                 if head_path != mine and head_row is head.waiter:
-                    write_admission_record(head_path, head_row)
+                    write_text_atomic(head_path, json.dumps(head_row, separators=(",", ":")))
         override = snapshot_head_override(override,
             [(path, row) for path, row in waiting if path != mine] + ([(mine, waiter)] if argv else []))
         decision = queue_decision(available, total, waiter, candidates, running, head, pressure,
@@ -2549,7 +2552,7 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
             waiter["step"], waiter["folder"] = identity["step"], identity["folder"]
             if isinstance(profile, GateProfile):
                 waiter["folder"] = profile.worktree
-            write_admission_record(mine, waiter)
+            write_text_atomic(mine, json.dumps(waiter, separators=(",", ":")))
         if decision.state == "admit" and isinstance(recovery, RecoveryStarts):
             write_recovery(directory, replace(recovery, next_start_at=now.timestamp() + RECOVERY_START_SECONDS))
         if argv and decision.state == "admit":
@@ -2569,7 +2572,7 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
                     row["shape"] = build_shape(argv).key
                 if isinstance(profile.repository, RepositoryIdentity):
                     row["repo_identity"] = profile.repository.key
-                write_admission_record(path, row)
+                write_text_atomic(path, json.dumps(row, separators=(",", ":")))
                 reservation = Reserved(path)
             else:
                 reservation = NotReserved("untracked")
@@ -3022,15 +3025,6 @@ def bump_waiter(_selector: str, _actor: str) -> NoReturn:
     raise BumpOff("only the user can bump; bump is off until /showrunner:bump sets queue priority")
 
 
-def write_admission_record(path: Path, row: object) -> None:
-    temporary = path.with_name(path.name + ".tmp")
-    try:
-        _ = temporary.write_text(json.dumps(row, separators=(",", ":")))
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
 def cancel_waiter(pid: int, root: Path | None = None) -> None:
     """Remove this caller's queue place when its in-process wait stops."""
     root = root if root is not None else store.root()
@@ -3061,41 +3055,30 @@ def finalize_reservation(path: Path, row: Reservation, outcome: FinalOutcome, no
         if isinstance(status, int):
             intent["status"] = status
         row["finalization"] = intent
-        write_admission_record(path, row)
+        write_text_atomic(path, json.dumps(row, separators=(",", ":")))
     intent = row["finalization"]
     result: HistoryRecorded | NoHistoryRecorded = NoHistoryRecorded()
     history_path = path.parent / "anon_peaks.jsonl"
-    recorded = False
     if intent["peak"] > 0 and intent["scoped"]:
-        try:
-            with history_path.open() as lines:
-                for line in lines:
-                    try:
-                        previous = cast(object, json.loads(line))
-                        if (isinstance(previous, dict)
-                                and cast(dict[str, object], previous).get("reservation_id") == intent["reservation_id"]):
-                            recorded = True
-                            break
-                    except ValueError:
-                        continue
-        except FileNotFoundError:
-            pass
-    if intent["peak"] > 0 and intent["scoped"] and not recorded:
-        history: dict[str, object] = {
-            "host": store.host_name(), "repo": row["repo"], "step": row["step"],
-            "reservation_id": intent["reservation_id"],
-            "worktree": row["worktree"], "anon_peak_bytes": intent["peak"], "outcome": intent["outcome"], "need": row["need"],
-            "test_threads": row.get("test_threads"), "call_id": row.get("call_id"),
-            "repo_identity": row.get("repo_identity"), "test_scope": row.get("test_scope", "full"),
-            "package": row.get("package", ""), "filters": row.get("filters", []),
-            "ended_at": intent["ended_at"],
-        }
-        if "status" in intent:
-            history["status"] = intent["status"]
-        if "shape" in row:
-            history["shape"] = row["shape"]
-        store.append_line(history_path, history)
-    if intent["peak"] > 0 and intent["scoped"]:
+        # The store repairs an unfinished tail before the identity lookup.
+        with store.locked_append(history_path) as handle:
+            recorded = any(previous.get("reservation_id") == intent["reservation_id"]
+                           for previous in anonymous_history_rows(handle))
+            if not recorded:
+                history: dict[str, object] = {
+                    "host": store.host_name(), "repo": row["repo"], "step": row["step"],
+                    "reservation_id": intent["reservation_id"],
+                    "worktree": row["worktree"], "anon_peak_bytes": intent["peak"], "outcome": intent["outcome"], "need": row["need"],
+                    "test_threads": row.get("test_threads"), "call_id": row.get("call_id"),
+                    "repo_identity": row.get("repo_identity"), "test_scope": row.get("test_scope", "full"),
+                    "package": row.get("package", ""), "filters": row.get("filters", []),
+                    "ended_at": intent["ended_at"],
+                }
+                if "status" in intent:
+                    history["status"] = intent["status"]
+                if "shape" in row:
+                    history["shape"] = row["shape"]
+                store.append_locked(handle, history)
         result = HistoryRecorded()
     maximum.unlink(missing_ok=True)
     path.with_suffix(".wave").unlink(missing_ok=True)

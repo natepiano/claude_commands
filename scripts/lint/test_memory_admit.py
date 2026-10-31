@@ -17,13 +17,13 @@ import tempfile
 import threading
 import time
 import unittest
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from concurrent.futures import ThreadPoolExecutor
 import contextlib
 from contextlib import closing, redirect_stdout
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Protocol, TextIO, cast, override
+from typing import BinaryIO, Literal, Protocol, TextIO, cast, override
 from unittest import mock
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
@@ -56,11 +56,52 @@ MEMORY_GATE = Path(__file__).with_name("memory_gate.sh")
 HANA = gate.RepositoryIdentity("https://example.org/nate/hana", "hana", "hana")
 RELEASE_BUILD = ["cargo", "build", "--release", "--features=bevy/trace_chrome", "--bin", "hana"]
 RELEASE_SHAPE = build_shape(RELEASE_BUILD)
+HistoryAppendStop = Literal["before newline", "inside UTF-8"]
+HISTORY_APPEND_STOPS: tuple[HistoryAppendStop, ...] = ("before newline", "inside UTF-8")
 
 
 def buildlog_rows(root: Path) -> list[dict[str, object]]:
     return [cast(dict[str, object], json.loads(line)) for path in root.glob("*/*.jsonl")
             for line in path.read_text().splitlines()]
+
+
+def assert_unfinished_history_ignored(test: unittest.TestCase, path: Path,
+                                     read: Callable[[], object]) -> None:
+    """Every estimate must retain its whole samples and leave repair to the writer."""
+    whole = path.read_bytes()
+    sample = cast(dict[str, object], json.loads(whole.splitlines()[-1]))
+    sample["note"] = "build stopped at \u0394"
+    encoded = json.dumps(sample, ensure_ascii=False).encode()
+    expected = read()
+    for name, tail in (("before newline", encoded),
+                       ("inside UTF-8", encoded[:encoded.index("\u0394".encode()) + 1])):
+        with test.subTest(tail=name):
+            contents = whole + tail
+            _ = path.write_bytes(contents)
+            try:
+                test.assertEqual(read(), expected, "an unfinished row is not another history sample")
+                test.assertEqual(path.read_bytes(), contents, "an estimate must not repair history")
+            finally:
+                _ = path.write_bytes(whole)
+
+
+@contextlib.contextmanager
+def stop_history_append(history_store: object, tail: HistoryAppendStop
+                        ) -> Generator[None]:
+    """Stop the real serializer's write; admission and sweep share this fixture."""
+    append = cast(Callable[[BinaryIO, object], None], getattr(history_store, "append_locked"))
+
+    def interrupted_append(handle: BinaryIO, row: object) -> None:
+        def write_prefix(fd: int, data: bytes) -> None:
+            end = len(data) - 1 if tail == "before newline" else data.index("\u0394".encode()) + 1
+            _ = os.write(fd, data[:end])
+            raise OSError("injected stop inside history append")
+
+        with patch.object(history_store, "_write_all", side_effect=write_prefix):
+            append(handle, row)
+
+    with patch.object(history_store, "append_locked", side_effect=interrupted_append):
+        yield
 
 
 def setUpModule() -> None:
@@ -187,6 +228,10 @@ class HistoryTests(unittest.TestCase):
     def peak(self) -> gate.ExpectedPeak:
         return gate.expected_peak(HANA, "nextest", self.host, NOW, self.root)
 
+    def test_unfinished_rows_do_not_change_the_full_suite_estimate(self) -> None:
+        self.add_measured(5)
+        assert_unfinished_history_ignored(self, self.admission / "anon_peaks.jsonl", self.peak)
+
     def test_measured_overrides_index_at_five(self) -> None:
         self.add_index()
         self.add_measured(4)
@@ -282,6 +327,13 @@ class FilteredPromiseTests(unittest.TestCase):
     def promise(self, filters: tuple[str, ...] = ("native_rate",)) -> gate.ExpectedPeak:
         return gate.expected_peak(HANA, "nextest", self.host, NOW, self.root,
                                   scope="filtered", package="hana", filters=filters)
+
+    def test_unfinished_rows_do_not_change_the_filtered_estimate(self) -> None:
+        self.samples([3 * GIB], filters=("native_rate",))
+        assert_unfinished_history_ignored(
+            self, self.root / "admission/anon_peaks.jsonl",
+            lambda: gate.filtered_peak(HANA, "nextest", self.host, NOW, self.root,
+                                       None, ("native_rate",), "hana"))
 
     def test_exact_filter_set_uses_its_p90_regardless_of_name_order(self) -> None:
         self.samples([number * GIB for number in range(1, 11)], filters=("render", "native_rate"))
@@ -637,6 +689,14 @@ class FreshTestPromiseTests(unittest.TestCase):
         self.previous_build()
         self.assertTrue(self.fresh())
         self.assertEqual(self.promise(), gate.ExpectedPeak(9 * GIB // 4, "measured", 10))
+
+    def test_unfinished_rows_do_not_change_the_fresh_test_estimate(self) -> None:
+        self.samples([3 * GIB])
+        assert_unfinished_history_ignored(
+            self, self.root / "admission/anon_peaks.jsonl",
+            lambda: gate.fresh_test_peak(HANA, "nextest", self.host, NOW, self.root, None,
+                                         "filtered", ("native_rate",), "hana",
+                                         gate.ExpectedPeak(10 * GIB, "measured", 10)))
 
     def test_fresh_exact_filter_set_is_sorted_and_precedes_broader_package_history(self) -> None:
         self.samples([2 * GIB], filters=("render", "native_rate"))
@@ -1421,6 +1481,12 @@ class BuildPromiseFixture(MemoryQueueFixture):
 
 
 class BuildShapePromiseTests(BuildPromiseFixture):
+    def test_unfinished_rows_do_not_enter_build_shape_history(self) -> None:
+        self.sample(3)
+        assert_unfinished_history_ignored(
+            self, self.root / "admission/anon_peaks.jsonl",
+            lambda: gate.build_peaks(HANA, "test-host", NOW, self.root))
+
     def test_builds_without_same_shape_history_keep_the_unfactored_fallback(self) -> None:
         for arguments in (RELEASE_BUILD, ["cargo", "build", "--bin", "hana"]):
             shape = build_shape(arguments)
@@ -1659,6 +1725,47 @@ class BuildLifetimePromiseTests(BuildPromiseFixture):
 
 
 class BuildFinalizerTests(BuildPromiseFixture):
+    def test_interrupted_history_append_keeps_one_row_and_the_original_outcome(self) -> None:
+        history = self.root / "admission/anon_peaks.jsonl"
+        for tail in HISTORY_APPEND_STOPS:
+            for cleanup in ("release", "owner gone"):
+                with self.subTest(tail=tail, cleanup=cleanup):
+                    path = self.build_reservation(sidecar=True)
+                    row = cast(dict[str, object], json.loads(path.read_text()))
+                    row["worktree"] = "hana-\u0394"
+                    _ = path.write_text(json.dumps(row))
+                    _ = path.with_suffix(".max").write_text(str(10 * GIB))
+                    if cleanup == "owner gone":
+                        _ = self.processes.pop(100, None)
+                    with stop_history_append(store, tail), self.assertRaises(OSError):
+                        if cleanup == "release":
+                            gate.release(path, 137, self.root)
+                        else:
+                            _ = self.build_check(argv=["cargo", "check"])
+                    self.assertTrue(path.exists(), "a cut-short row must retain its reservation")
+                    # Retry through the other entry point; the saved outcome must win.
+                    if cleanup == "release":
+                        _ = self.processes.pop(100, None)
+                        probe = self.build_check(argv=["cargo", "check"])
+                        if isinstance(probe.reservation, gate.Reserved):
+                            gate.release(probe.reservation.path, 0, self.root)
+                    else:
+                        gate.release(path, 0, self.root)
+                    store.append_line(history, {"unrelated": True})
+                    gate.release(path, 0, self.root)
+                    contents = history.read_bytes()
+                    self.assertTrue(contents.endswith(b"\n"))
+                    rows = [cast(dict[str, object], json.loads(line)) for line in contents.splitlines()]
+                    recorded = [item for item in rows if "reservation_id" in item]
+                    self.assertEqual(len(recorded), 1)
+                    self.assertEqual((recorded[0]["outcome"], recorded[0]["anon_peak_bytes"],
+                                      recorded[0]["worktree"]),
+                                     ("killed" if cleanup == "release" else "owner_gone", 10 * GIB, "hana-\u0394"))
+                    self.assertEqual(rows[-1], {"unrelated": True})
+                    self.assertFalse(path.exists())
+                    history.unlink()
+                    self.processes[100] = "first"
+
     @contextlib.contextmanager
     def stop_before_reservation_removal(self, path: Path) -> Generator[None, None, None]:
         unlink = Path.unlink
@@ -1703,7 +1810,7 @@ class BuildFinalizerTests(BuildPromiseFixture):
             self.fail("fixture build must be admitted")
         path = result.reservation.path
         _ = path.with_suffix(".max").write_text(str(int(15.76 * GIB)))
-        with patch.object(store, "append_line", side_effect=OSError("history is temporarily unavailable")), \
+        with patch.object(store, "append_locked", side_effect=OSError("history is temporarily unavailable")), \
              contextlib.suppress(OSError):
             gate.release(path, 137, self.root)
         self.assertTrue(path.exists())
@@ -2043,6 +2150,15 @@ class BuildNeedBasisTests(BuildPromiseFixture):
 
 
 class GateProfileTests(MemoryQueueFixture):
+    def test_unfinished_rows_do_not_change_the_gate_estimate(self) -> None:
+        history = gate.admission_dir(self.root) / "anon_peaks.jsonl"
+        _ = history.write_text(json.dumps({
+            "step": "merge-gate", "host": "host", "anon_peak_bytes": 3 * GIB,
+            "ended_at": store.utc_iso(HISTORY_AT.timestamp()),
+        }) + "\n")
+        assert_unfinished_history_ignored(
+            self, history, lambda: gate.gate_estimate(4 * GIB, "host", NOW, self.root))
+
     @override
     def setUp(self) -> None:
         super().setUp()

@@ -1117,7 +1117,7 @@ The replay script and its report (Spec 5) live in the run folder, not in the rep
 
 **Ruled out:** a unit label rule in `admit_head` apart from the queue view's `waiter_unit_name`.
 
-### Phase 33 — A history row counts only when it is whole  · status: todo
+### Phase 33 — A history row counts only when it is whole  · status: done
 
 Follow-up of Phase 24 (finding F010, landed out under the landing rule) and Phase 4 (the trim-recovery partial append). Astra review 2026-10-30 (`/tmp/claude/astra/20261030T162735Z-3304113/review.md`): report-unit's Phase 6 cuts a cut-short tail back to the last newline before the next append, but a reader that counts a complete JSON object with no newline as recorded then loses that row to the cut, and a write stopped inside a UTF-8 character raises before any repair runs.
 

@@ -24,6 +24,7 @@ from unittest import mock
 from zoneinfo import ZoneInfo
 
 import sweep
+from test_memory_admit import HISTORY_APPEND_STOPS, stop_history_append
 if TYPE_CHECKING:
     from . import memory_admit
     from ..build_hold import build_hold
@@ -899,6 +900,184 @@ class ReclamationTests(SweepCase):
 
 
 class FloorTests(SweepCase):
+    def test_interrupted_trim_append_is_recovered_as_one_whole_row(self) -> None:
+        causes: tuple[Literal["budget take", "floor take"], ...] = ("budget take", "floor take")
+        for tail in HISTORY_APPEND_STOPS:
+            for cause in causes:
+                with self.subTest(tail=tail, cause=cause):
+                    base = self.base()
+                    tree, output = cargo_target(base / "clone-\u0394", "shared", APP, time.time() - DAY)
+                    deleted_at = 1_790_000_000.0
+                    account = sweep.remove_entry(str(output))
+                    take = sweep.TrimTake(str(tree.parent), cause, 0, at=deleted_at,
+                                          bytes_freed=account.bytes, removed=account.removed)
+                    take.save()
+                    with stop_history_append(store, tail), redirect_stderr(io.StringIO()):
+                        self.assertFalse(take.publish())
+                    self.assertTrue(sweep.trim_intent_path(str(tree.parent)).exists())
+                    for _ in range(2):
+                        sweep.recover_pending_trims()
+                    log = store.host_file(store.host_name(), deleted_at)
+                    store.append_line(log, {"unrelated": True})
+                    row, = self.trim_rows()
+                    self.assertEqual((row["folder"], row["cause"], row["bytes_freed"], row["at"]),
+                                     (str(tree.parent), cause, account.bytes, store.utc_iso(deleted_at)))
+                    self.assertTrue(log.read_bytes().endswith(b"\n"))
+                    self.assertFalse(sweep.trim_intent_path(str(tree.parent)).exists())
+
+    def test_trim_retry_uses_the_whole_row_boundary_before_an_unfinished_old_tail(self) -> None:
+        base = self.base()
+        tree, output = cargo_target(base, "shared", APP, time.time() - DAY)
+        deleted_at = 1_790_000_000.0
+        log = store.host_file(store.host_name(), deleted_at)
+        store.append_line(log, {"unrelated": True})
+        whole = log.read_bytes()
+        with log.open("ab") as handle:
+            _ = handle.write(b'{"stopped_old_row":"' + b"x" * 4096)
+        account = sweep.remove_entry(str(output))
+        take = sweep.TrimTake(str(tree.parent), "floor take", 0, at=deleted_at,
+                              bytes_freed=account.bytes, removed=account.removed)
+        take.save()
+        intent = sweep.trim_intent_path(str(tree.parent))
+        unlink = Path.unlink
+
+        def stop_before_forgetting(file: Path, missing_ok: bool = False) -> None:
+            if file == intent:
+                raise InterruptedError("stop after publishing the trim")
+            unlink(file, missing_ok=missing_ok)
+
+        with mock.patch.object(Path, "unlink", stop_before_forgetting), self.assertRaises(InterruptedError):
+            _ = take.publish()
+        sweep.recover_pending_trims()
+        row, = self.trim_rows()
+        self.assertEqual((row["folder"], row["bytes_freed"]), (str(tree.parent), account.bytes))
+        self.assertTrue(log.read_bytes().startswith(whole))
+        self.assertFalse(intent.exists())
+
+    def pending_trim(self, target: Path, output: Path, at: float) -> sweep.TrimTake:
+        observed = output.stat()
+        take = sweep.TrimTake(str(target), "floor take", 1, at=at)
+        take.pending = [sweep.PendingUnlink(str(output), observed.st_dev, observed.st_ino,
+                                          observed.st_blocks * 512, observed.st_nlink, False)]
+        take.group_paths = [str(output)]
+        take.save()
+        return take
+
+    def test_recreated_renamed_and_linked_outputs_count_as_removed_without_reclaim_credit(self) -> None:
+        for change in ("recreated", "renamed", "outside hard link"):
+            with self.subTest(change=change):
+                base = self.base()
+                tree, output = cargo_target(base, "shared", APP, time.time() - DAY)
+                deleted_at = 1_790_000_000.0
+                take = self.pending_trim(tree.parent, output, deleted_at)
+                survivor = base / "saved-inode"
+                if change == "outside hard link":
+                    os.link(output, survivor)
+                    # The intent must also retain the link count seen before the unlink.
+                    take = self.pending_trim(tree.parent, output, deleted_at)
+                    output.unlink()
+                else:
+                    _ = output.rename(survivor)
+                    if change == "recreated":
+                        _ = write(output)
+                with mock.patch.object(time, "time", return_value=deleted_at + DAY):
+                    recovered = take.recover()
+                    self.assertIsInstance(recovered, sweep.UnconfirmedReclaim)
+                    if not isinstance(recovered, sweep.UnconfirmedReclaim):
+                        self.fail("a name change cannot confirm that its inode's blocks were reclaimed")
+                    self.assertEqual((recovered.removed, recovered.paths), (1, (str(output),)))
+                    self.assertEqual(take.unconfirmed_paths, [str(output)])
+                    self.assertEqual(take.removed, 1, "the old name was removed even if Cargo reused it")
+                    self.assertEqual(take.bytes_freed, 0, "a missing name does not prove that blocks were freed")
+                    self.assertTrue(take.publish())
+                row, = self.trim_rows()
+                self.assertEqual((row["bytes_freed"], row["at"]), (0, store.utc_iso(deleted_at)))
+                self.assertTrue(survivor.exists())
+                self.assertEqual(output.exists(), change == "recreated")
+
+    def test_recovery_publishes_saved_deletion_time_before_unlocking_the_target(self) -> None:
+        base = self.base()
+        tree, output = cargo_target(base, "shared", APP, time.time() - DAY)
+        _ = (tree / ".cargo-lock").touch()
+        deleted_at = 1_790_000_000.0
+        _ = self.pending_trim(tree.parent, output, deleted_at)
+        output.unlink()
+        unlock = sweep.release
+        observed_unlocks: list[list[int]] = []
+
+        def release_after_publication(held: list[int]) -> None:
+            if held:
+                row, = self.trim_rows()
+                self.assertEqual(row["at"], store.utc_iso(deleted_at))
+                self.assertFalse(sweep.trim_intent_path(str(tree.parent)).exists())
+                observed_unlocks.append(list(held))
+            unlock(held)
+
+        with (mock.patch.object(sweep, "release", side_effect=release_after_publication),
+              mock.patch.object(time, "time", return_value=deleted_at + DAY)):
+            sweep.recover_pending_trims()
+        self.assertEqual(len(observed_unlocks), 1)
+
+    def test_unpublishable_intent_time_is_set_aside_before_a_later_take(self) -> None:
+        for caller in ("recovery", "take"):
+            with self.subTest(caller=caller):
+                base = self.base()
+                tree, output = cargo_target(base, "shared", APP, time.time() - DAY)
+                take = sweep.TrimTake(str(tree.parent), "floor take", 0,
+                                      at=1790000000000, removed=1)
+                take.save()
+                intent = sweep.trim_intent_path(str(tree.parent))
+                broken = intent.read_bytes()
+                errors = io.StringIO()
+                with redirect_stderr(errors):
+                    if caller == "recovery":
+                        sweep.recover_pending_trims()
+                        sweep.recover_pending_trims()
+                    self.assertEqual(self.take(base, tree.parent, "floor"), 0)
+                damaged, = intent.parent.glob(intent.name + ".damaged-*")
+                self.assertEqual(damaged.read_bytes(), broken)
+                self.assertEqual(errors.getvalue().count("could not recover"), 1)
+                self.assertFalse(intent.exists())
+                self.assertFalse(output.exists())
+                row, = self.trim_rows()
+                self.assertEqual(row["folder"], str(tree.parent))
+
+    def test_damaged_trim_outcome_names_the_preserved_intent(self) -> None:
+        base = self.base()
+        tree, _ = cargo_target(base, "shared", APP, time.time() - DAY)
+        intent = sweep.trim_intent_path(str(tree.parent))
+        intent.parent.mkdir(parents=True)
+        broken = b'{}'
+        _ = intent.write_bytes(broken)
+        with redirect_stderr(io.StringIO()):
+            result = sweep.load_trim_for_recovery(intent)
+        self.assertIsInstance(result, sweep.DamagedTrimIntentSetAside)
+        if not isinstance(result, sweep.DamagedTrimIntentSetAside):
+            self.fail("damaged trim recovery must name its preserved intent")
+        self.assertEqual(result.path.read_bytes(), broken)
+        self.assertTrue(result.path.name.startswith(intent.name + ".damaged-"))
+        self.assertFalse(intent.exists())
+
+    def test_bad_trim_intent_is_reported_once_and_does_not_block_a_later_take(self) -> None:
+        base = self.base()
+        tree, output = cargo_target(base, "shared", APP, time.time() - DAY)
+        intent = sweep.trim_intent_path(str(tree.parent))
+        intent.parent.mkdir(parents=True)
+        broken = b'{"target":'
+        _ = intent.write_bytes(broken)
+        errors = io.StringIO()
+        with redirect_stderr(errors):
+            sweep.recover_pending_trims()
+            sweep.recover_pending_trims()
+            self.assertEqual(self.take(base, tree.parent, "floor"), 0)
+        self.assertEqual(errors.getvalue().count("could not recover"), 1)
+        self.assertFalse(output.exists())
+        row, = self.trim_rows()
+        self.assertEqual(row["folder"], str(tree.parent))
+        self.assertFalse(intent.exists())
+        self.assertTrue(any(path.read_bytes() == broken for path in intent.parent.iterdir() if path.is_file()),
+                        "the invalid intent must be kept aside for inspection")
+
     def take(self, base: Path, target: Path, caller: str) -> int:
         if caller == "floor":
             return self.hold(base, 10 * GIB, [10 * GIB - 1, 10 * GIB])[0]
