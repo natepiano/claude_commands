@@ -96,12 +96,11 @@ def waiting_moves(model: QueueModel, position: int) -> tuple[head_facts.BumpReco
 
 
 def is_moved(model: QueueModel, position: int) -> bool:
-    return (isinstance(model.facts, head_facts.HeadFacts) and isinstance(model.facts.bumps, head_facts.BumpHistory)
-            and has_move_priority(model, position))
+    return has_move_priority(model, position)
 
 
 def has_move_priority(model: QueueModel, position: int) -> bool:
-    return model.reading.ordered[position - 1][1].get("bump_order", 0) < 0
+    return model.reading.ordered[position - 1][1].get("priority_rank", 1) == 0
 
 
 def pressure_check(pressure: gate.Pressure, model: QueueModel) -> tuple[bool, str]:
@@ -227,7 +226,7 @@ def render_view(model: QueueModel, columns: int, *, colour: bool = False, you: s
     explanation = model.reading.explanation
     head, host = explanation.head, explanation.host
     budget_bytes = (host.budget if isinstance(host, gate.HostAvailable) else
-                    head.budget.budget if isinstance(head, gate.HeadExplanation) else gate.BUILD_BUDGET_BYTES)
+                    head.budget.budget if isinstance(head, gate.HeadExplanation) else gate.build_budget_bytes())
     budget = budget_bytes / gate.GIB
     taken = explanation.totals.charged / gate.GIB
     free = max(0.0, budget - taken)
@@ -273,6 +272,9 @@ def render_view(model: QueueModel, columns: int, *, colour: bool = False, you: s
               + pad_right(cut_tail("unit", unit_width), unit_width) + " " + pad_right("step", 7) + " "
               + pad_left("min", minutes_width) + " need", "inactive"),),
     ]
+    priority = head_facts.priority_text(explanation.priority)
+    if priority:
+        lines.insert(2, (Span(priority),))
     for index, (step, (show, unit), bar) in enumerate(zip(waiting, names, bars)):
         tone = "warning" if index == 0 else "inactive"
         row: Line = (

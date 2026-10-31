@@ -117,14 +117,15 @@ def queue_read_fixture(view: gate.QueueView) -> gate.QueueRead:
         step.promise, step.measured.bytes if isinstance(step.measured, gate.MeasuredMemory) else 0,
         gate.build_charge(step.measured), gate.charge_basis(step.measured)) for step in view.running if not isinstance(step.measured, gate.GoneMemory))
     first: gate.HeadExplanation | gate.NoWaiter = gate.NoWaiter()
+    budget = gate.build_budget_bytes()
     host: gate.HostAvailable | gate.ReadingUnavailable = gate.HostAvailable(
-        view.available, gate.UnknownHostTotal(), view.reserve, 21 * gate.GIB, gate.NoPressureHold())
+        view.available, gate.UnknownHostTotal(), view.reserve, budget, gate.NoPressureHold())
     if view.waiting:
         step = view.waiting[0]
         reason = step.reason
         row: gate.Waiter = {"pid": step.pid, "start_time": "", "need": step.need, "since": step.since}
         order = gate.head_window(row, view.now)
-        decision = gate.AdmissionDecision("admit", step.need + view.reserve, view.promised, view.reserve, 0)
+        decision = gate.AdmissionDecision("admit", step.need + view.reserve, view.promised, view.reserve, 0, budget=budget)
         if isinstance(reason, gate.HeadAdmissionStatus):
             decision, order = reason.decision, reason.backfill
         elif isinstance(reason, gate.NeedsBuildBudget):
@@ -132,19 +133,19 @@ def queue_read_fixture(view: gate.QueueView) -> gate.QueueRead:
                 0, charged=reason.charged, budget=reason.budget, budget_passes=False)
         elif isinstance(reason, gate.NeedsMemory):
             decision = gate.AdmissionDecision("hold", reason.threshold, reason.growth, reason.reserve,
-                0, free_passes=False)
+                0, budget=budget, free_passes=False)
         elif isinstance(reason, gate.MemoryPressure):
             decision = gate.AdmissionDecision("hold", step.need + view.reserve, view.promised,
-                                                      view.reserve, 0, pressure=reason)
+                                                      view.reserve, 0, pressure=reason, budget=budget)
         elif isinstance(reason, gate.ReadingUnavailable):
             host = reason
         first = gate.HeadExplanation(step, gate.NeedSourceNotRecorded(), decision,
             *gate.decision_checks(decision, step.need, view.available),
-            order, False, gate.NoBump())
+            order, False)
     followers: list[gate.LineWaiter] = []
     for step in view.waiting[1:]:
         own = gate.decide(view.available, gate.UnknownHostTotal(), step.need, [],
-                          limits=gate.AdmissionLimits(21 * gate.GIB, view.reserve))
+                          limits=gate.AdmissionLimits(budget, view.reserve))
         followers.append(gate.LineWaiter(step, own.state == "admit", own,
                                          *gate.decision_checks(own, step.need, view.available)))
     explanation = gate.QueueExplanation(view.now, host, running,
@@ -172,6 +173,14 @@ def head_reading(*, since: float = HEAD_NOW - 600, now: float = HEAD_NOW,
     return replace(reading, ordered=[(Path("123-123.waiting"), row)])
 
 
+def with_waiting_process(reading: gate.QueueRead, step: gate.WaitingStep, start: str) -> gate.QueueRead:
+    """Add a waiting row and its recorded process identity to the same snapshot."""
+    row: gate.Waiter = {"pid": step.pid, "start_time": start, "need": step.need,
+                        "since": step.since, "session_id": step.session_id, "step": step.step}
+    return replace(reading, ordered=[*reading.ordered, (Path(f"{step.pid}-{start}.waiting"), row)],
+                   view=replace(reading.view, waiting=(*reading.view.waiting, step)))
+
+
 
 class QueueFixture(ExitStack):
     """Private files for every renderer, card and CLI fixture consumer."""
@@ -190,6 +199,7 @@ class QueueFixture(ExitStack):
                             "BUILDLOG_BUILD_BUDGET_GIB": "21", "USER_ZONE": "America/New_York"})
         self.enter_context(mock.patch.dict(os.environ, environment))
         self.labels: dict[str, UnitLabels] = {}
+        _ = self.enter_context(mock.patch.object(gate, "priority_labels", return_value=self.labels))
         self.paths: list[Path] = []
         self.moves: list[bytes] = []
         self.reservation: Path = self.directory / "900-900.reservation"
@@ -205,7 +215,7 @@ class QueueFixture(ExitStack):
                 "since": since, "session_id": session_id, "session_name": session,
                 "step": step, "folder": folder}
             if position <= 2:
-                row.update(bump_order=-3 + position, priority_since=NOW - 12)
+                row.update(priority_since=NOW - 12)
             self.paths.append(self.write_waiter(row))
         self.labels["id-widget"] = UnitLabels("widget-enhancements-title", "tool-based-ui", "widget")
         self.labels["id-widget-director"] = UnitLabels("widget", "tool-based-ui", "widget")
@@ -213,6 +223,8 @@ class QueueFixture(ExitStack):
         self.moves = [self.move(1, NOW - 372, 27), self.move(2, NOW - 372, 27),
             bump_line(NOW - 192, session="id-widget", step="nextest", folder="/tmp/widget",
                       actor="id-widget-director", old_position=29), self.move(1, NOW - 12, 1)]
+        self.write_json(self.directory / "queue_priority.json", {"unit": "cables", "why": "captured priority",
+            "set_at": NOW - 12, "set_by": "user"})
         write_bumps(NOW, self.moves)
         self.write_pace([NOW - 3600 + index * 80 for index in range(44)])
 
@@ -319,4 +331,4 @@ class AdmissionLogTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        self.enterContext(mock.patch.dict(os.environ, {"BUILDLOG_DIR": str(self.root)}))
+        self.enterContext(mock.patch.dict(os.environ, {"BUILDLOG_DIR": str(self.root), "BUILDLOG_BUILD_BUDGET_GIB": "21"}))
