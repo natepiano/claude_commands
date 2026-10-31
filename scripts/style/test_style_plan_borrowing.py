@@ -15,6 +15,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import style_plan
+import berth_board
 import unit_plans
 import style_proposals
 import rules
@@ -150,9 +151,11 @@ class StylePlanTests(StylePlanFixture):
         _ = self.rule("structure", "tier: D\nfamily: modules\n")
         self.sync()
         output = io.StringIO()
-        with redirect_stdout(output):
+        with (redirect_stdout(output), mock.patch.object(berth_board, "read_board", return_value=self.board(*self.sources))):
             code = style_plan.main(["next-phase", "--unit", "names-unit", "--plan", str(self.plan), "--repo", str(self.repo)])
         self.assertEqual(code, 3)
+        self.assertIn("structure stays with modules:", output.getvalue())
+        self.assertIn("file busy", output.getvalue())
         self.assertIn("no available work:", output.getvalue())
         diagnostic = next(line for line in output.getvalue().splitlines() if line.startswith("no available work:"))
         for family in style_plan.FAMILIES:
