@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import override
-from unittest.mock import patch
+from unittest.mock import ANY, call, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "herdr"))
@@ -19,7 +19,7 @@ import herdr  # noqa: E402
 import herdr_tab_title  # noqa: E402
 from herdr_tab_title import StopPayload  # noqa: E402
 
-REAL_RETITLE = herdr.Herdr.retitle
+REAL_RETITLE = herdr.Herdr.retitle_in_place
 
 
 class HerdrTabTitleTests(unittest.TestCase):
@@ -42,7 +42,7 @@ class HerdrTabTitleTests(unittest.TestCase):
         self.record(41, "session-a", "showrunner-fixer")
         self.record(42, "session-b", "send-relay", entrypoint="sdk-cli")
         self.retitled, self.fault = [], False
-        _ = self.enterContext(patch.object(herdr.Herdr, "retitle", autospec=True, side_effect=self.fake_retitle))
+        _ = self.enterContext(patch.object(herdr.Herdr, "retitle_in_place", autospec=True, side_effect=self.fake_retitle))
 
     def fake_retitle(self, _client: herdr.Herdr, pane: str, title: str) -> bool:
         self.retitled.append((pane, title))
@@ -95,19 +95,25 @@ class HerdrTabTitleTests(unittest.TestCase):
         tab: dict[str, object] = {"tab_id": "w3:t2", "label": "showrunner-fixer"}
 
         def result(_client: herdr.Herdr, *arguments: str) -> dict[str, object]:
-            return {"panes": [pane]} if arguments == ("pane", "list") else {"tabs": [tab]}
+            if arguments == ("pane", "list"):
+                return {"panes": [pane]}
+            if arguments == ("workspace", "list"):
+                return {"workspaces": [{"workspace_id": "w3", "label": "demo"}]}
+            return {"tabs": [tab]}
 
         def run(_client: herdr.Herdr, *arguments: str) -> str:
             target = pane if arguments[0] == "pane" else tab
             target["label"] = arguments[-1]
             return ""
 
-        with (patch.object(herdr.Herdr, "retitle", new=REAL_RETITLE),
+        with (patch.object(herdr.Herdr, "retitle_in_place", new=REAL_RETITLE),
               patch.object(herdr.Herdr, "result", autospec=True, side_effect=result) as reads,
               patch.object(herdr.Herdr, "run", autospec=True, side_effect=run) as writes,
               patch.object(herdr.Herdr, "order_tabs", return_value={}) as ordered,
-              patch.object(herdr.Herdr, "save_layout") as saved,
-              patch.object(herdr, "saved_layout", return_value=herdr.SavedLayout(at=0.0, workspaces=[]))):
+              patch.object(herdr, "_write_layout") as saved,
+              patch.object(herdr, "saved_layout", return_value=herdr.SavedLayout(at=0.0,
+                  workspaces=[herdr.SavedSpace(name="demo", seen=0.0,
+                      tabs=[herdr.SavedName(name="showrunner-fixer", seen=0.0)])]))):
             self.assertFalse(herdr_tab_title.sync({"session_id": "session-a"}, environment))
             self.assertEqual(reads.call_count, 2)
             writes.assert_not_called()
@@ -118,8 +124,13 @@ class HerdrTabTitleTests(unittest.TestCase):
             self.assertEqual(pane["label"], "renamed-director")
             self.assertEqual(tab["label"], "renamed-director")
             self.assertEqual(writes.call_count, 2)
-            ordered.assert_called_once()
-            saved.assert_called_once()
+            ordered.assert_not_called()
+            self.assertEqual(writes.call_args_list, [
+                call(ANY, "pane", "rename", "w3:p7", "renamed-director"),
+                call(ANY, "tab", "rename", "w3:t2", "renamed-director")])
+            saved.assert_called_once_with("agents", herdr.SavedLayout(at=0.0,
+                workspaces=[herdr.SavedSpace(name="demo", seen=0.0,
+                    tabs=[herdr.SavedName(name="renamed-director", seen=0.0)])]))
 
     def test_showrunner_title_uses_session_name_after_session_rename(self) -> None:
         state = self.records.parent / "notifier"

@@ -114,9 +114,9 @@ the folder goes in `/tmp/claude/scratch`. The row's verdict removes both.
 
 ## verdict
 
-A verdict that says `works` or `fine` and no word of failure (`not`, `still`,
-`broken` and the like) lands the row, such as "okay c17 works"; any other
-returns it to its unit. In a Hana or `~/.claude` production, the showrunner first runs the
+A verdict beginning `works` or `fine`, after optional `okay`/`ok` and a row id
+(`c17`), lands the row. Case and later words do not affect the result; any
+other start returns it to its unit. In a Hana or `~/.claude` production, the showrunner first runs the
 feature-log step of `/showrunner:produce` → `<CloseChangeReview/>`; a failure
 there leaves the row open. Then:
 

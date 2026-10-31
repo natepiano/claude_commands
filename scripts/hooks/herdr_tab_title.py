@@ -2,7 +2,7 @@
 
 A launcher titles the tab with the name it gives the session. A later `/rename` changes only
 the session record, so at the end of each turn this hook updates both names
-and orders changed tabs again. It acts only in a pane of the shared herdr
+in place, preserving every tab's identity and position. It acts only in a pane of the shared herdr
 session, and it never stops the turn: a fault leaves the title as it was.
 """
 
@@ -48,7 +48,7 @@ def sync(payload: StopPayload, environment: Mapping[str, str]) -> bool:
     name = current_name(session_id)
     if not name:
         return False
-    return herdr.Herdr(shared).retitle(pane, name)
+    return herdr.Herdr(shared).retitle_in_place(pane, name)
 
 
 def main() -> int:

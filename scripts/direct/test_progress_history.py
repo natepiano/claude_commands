@@ -7249,8 +7249,7 @@ with patch.object(fcntl, "flock", admission):
     def restart_fallback_arguments(self, session: Path, worker: str, kind: str) -> list[str]:
         # Import the shutdown CLI in a child: it has its own script import roots.
         fallback_program = """import sys
-from pathlib import Path
-sys.path.insert(0, str(Path.cwd() / 'scripts/shutdown'))
+sys.path.insert(0, sys.argv[5])
 import restart
 seat = restart.PausedSeat(run_dir=sys.argv[1], seat=sys.argv[2], role=sys.argv[3],
     thread_id='paused-thread', turn_live=True, launcher_command=[])
@@ -7258,7 +7257,7 @@ print(restart._resume_worker_command(seat, sys.argv[4]))
 """
         built = subprocess.run(
             [sys.executable, "-c", fallback_program, str(session), worker, kind,
-             str(self.working_dir)],
+             str(self.working_dir), str(SCRIPT.parent.parent / "shutdown")],
             check=False, capture_output=True, text=True,
         )
         self.assertEqual(built.returncode, 0, built.stderr)

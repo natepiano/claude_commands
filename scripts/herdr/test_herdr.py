@@ -1380,6 +1380,7 @@ class HerdrTests(unittest.TestCase):
         isolated = self.root / "isolated/scripts/herdr"
         isolated.mkdir(parents=True)
         _ = shutil.copy2(Path(herdr.__file__), isolated / "herdr.py")
+        _ = shutil.copy2(Path(herdr.__file__).with_name("place.py"), isolated / "place.py")
         library = isolated.parent / "lib"
         library.mkdir()
         _ = shutil.copy2(Path(herdr.__file__).resolve().parents[1] / "lib/nix_env.py", library / "nix_env.py")
@@ -2337,6 +2338,33 @@ class HerdrTests(unittest.TestCase):
         self.assertEqual(acted, [["pane", "move", "w1:p3", "--new-tab", "--workspace", "w1"], ["tab", "rename", "w1:t4", "alpha"],
                                  ["pane", "move", "w1:p2", "--new-tab", "--workspace", "w1"], ["tab", "rename", "w1:t5", "delta"],
                                  ["tab", "focus", "w1:t5"], ["workspace", "focus", "w2"]])
+
+    def test_retitle_preserves_neighbour_ids_and_saved_order(self) -> None:
+        from scripts.hooks import herdr_tab_title
+        self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": [
+            {"pane_id": "w1:p2", "tab_id": "w1:t2", "workspace_id": "w1", "label": "old-name"},
+            {"pane_id": "w1:p3", "tab_id": "w1:t3", "workspace_id": "w1", "label": "neighbour"}]}}))
+        self.configure_herdr(["tab", "list", "--workspace", "w1"], json.dumps({"result": {"tabs": [
+            {"tab_id": "w1:t2", "label": "old-name"}, {"tab_id": "w1:t3", "label": "neighbour"}]}}))
+        self.configure_herdr(["workspace", "list"], json.dumps({"result": {"workspaces": [
+            {"workspace_id": "w1", "label": "demo"}]}}))
+        saved = herdr.SavedLayout(at=1.0, workspaces=[herdr.SavedSpace(
+            name="demo", seen=1.0, tabs=[herdr.SavedName(name="neighbour", seen=1.0),
+                herdr.SavedName(name="old-name", seen=1.0)])])
+        with (patch.object(herdr, "saved_layout", return_value=saved),
+              patch.object(herdr, "_write_layout") as written,
+              patch.object(herdr.Herdr, "order_tabs", return_value={}) as ordered,
+              patch.object(herdr, "shared_session", return_value="fixture"),
+              patch.object(herdr_tab_title, "current_name", return_value="new-name")):
+            self.assertTrue(herdr_tab_title.sync({"session_id": "sid-alpha"},
+                {"HERDR_SESSION": "fixture", "HERDR_PANE_ID": "w1:p2"}))
+        ordered.assert_not_called()
+        self.assertEqual([command[2:] for command in self.commands() if command[3:4] == ["rename"]],
+                         [["pane", "rename", "w1:p2", "new-name"], ["tab", "rename", "w1:t2", "new-name"]])
+        self.assertEqual([command for command in self.commands() if command[2:4] == ["pane", "move"]], [])
+        self.assertTrue(written.called)
+        layout = cast(herdr.SavedLayout, written.call_args.args[1])
+        self.assertEqual([tab["name"] for tab in layout["workspaces"][0]["tabs"]], ["neighbour", "new-name"])
 
     def test_retitle_names_the_pane_and_tab_then_orders_only_on_a_change(self) -> None:
         self.configure_herdr(["tab", "list", "--workspace", "w1"], json.dumps({"result": {"tabs": [
@@ -3572,6 +3600,7 @@ class HerdrTests(unittest.TestCase):
         })
         _ = self.process(13, 10, ["/bin/codex"], {"HERDR_PANE_ID": "pane-codex"})
         import unit_lookup as lookup
+        import unit_marks
 
         def current_slug(slug: str) -> str:
             return slug
@@ -3582,7 +3611,7 @@ class HerdrTests(unittest.TestCase):
               }]),
               patch.object(lookup, "_claudes", return_value=(
                   {12: live}, lookup.UnreadAt({}, lookup.RecordsRead()))),
-              patch.object(lookup, "_lookup_slug", side_effect=current_slug),
+              patch.object(unit_marks, "lookup_slug", side_effect=current_slug),
               patch.object(roster, "_process_account", return_value=roster.AccountLabel("codex2")),
               patch.object(herdr, "_process_sessions", wraps=PROCESS_SESSIONS) as scans):
             def read_callers() -> tuple[object, object, object]:

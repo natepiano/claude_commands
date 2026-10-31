@@ -394,10 +394,11 @@ class StylePlanFixture(unittest.TestCase):
             _ = connection.execute("INSERT OR IGNORE INTO sync_waits (unit,since,token) VALUES ('names-unit','2026-01-01T00:00:00+00:00','seed-wait')")
             connection.commit()
 
-    def approved_decision(self, rule: str, files: tuple[str, ...], kind: style_ledger.FindingKind) -> Path:
+    def approved_decision(self, rule: str, files: tuple[str, ...], kind: style_ledger.FindingKind,
+                          *, name: str = "decision") -> Path:
         folder = self.root / "issues"
         folder.mkdir(exist_ok=True)
-        issue = folder / "decision.md"
+        issue = folder / (name + ".md")
         with style_ledger.open_ledger(self.repo) as ledger:
             blob = next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == rule)
             for path in files:
@@ -405,7 +406,8 @@ class StylePlanFixture(unittest.TestCase):
                 ledger.file_held(finding.finding_id, issue)
         _ = issue.write_text("---\nstatus: open\ntags: [proposal, style]\nunit: names-unit\nplan: approved\n"
                              + f"style_rule: {rule}\nstyle_crate: crates/alpha\nstyle_rule_blob: {blob}\n---\n")
-        _ = self.doc.write_text(self.doc.read_text().replace("## Units", f"- **Proposals:** {folder}\n\n## Units"))
+        if "**Proposals:**" not in self.doc.read_text():
+            _ = self.doc.write_text(self.doc.read_text().replace("## Units", f"- **Proposals:** {folder}\n\n## Units"))
         return issue
 
     def commit_to_every_checkout(self) -> None:
@@ -413,6 +415,43 @@ class StylePlanFixture(unittest.TestCase):
         for checkout in (self.style, self.unit):
             _ = self.git("merge", "--ff-only", "main", cwd=checkout)
         self.sync()
+
+    def buildable_decisions(self, issues: tuple[Path, ...]) -> tuple[style_plan.BuildableDecision, ...]:
+        """Read approved fixture decisions for focused tests of the shared batch admission."""
+        definitions = {item.rule_id: item for item in rules.load_rules(self.repo)}
+        with self.ledger() as ledger:
+            findings = tuple((issue, ledger.proposal_findings(issue)) for issue in issues)
+        return tuple(style_plan.BuildableDecision(issue, definitions[members[0].rule], "crates/alpha", members)
+                     for issue, members in findings)
+
+    def verification_ticket(self) -> str:
+        """An assigned crate-alpha ticket with its base saved for package verification."""
+        rule = self.rule("read")
+        self.sync()
+        ticket_id = "names-unit-1"
+        with self.ledger() as ledger:
+            ledger.ticket_add(ticket_id, "names-unit", "read", "names", "crates/alpha", [self.sources[0]], [rule])
+            ledger.ticket_assign(ticket_id, "demo-style-names")
+            _ = ledger.ticket_base(ticket_id)
+        return ticket_id
+
+    def combined_decision_ticket(self) -> tuple[tuple[Path, Path], str]:
+        """An assigned ticket holding one type finding from each of two approved decisions in crate alpha."""
+        rule = self.rule("combined-decisions")
+        self.sync()
+        issues = (self.approved_decision(rule, (self.sources[0],), "type", name="a-primary"),
+                  self.approved_decision(rule, (self.sources[1],), "type", name="b-secondary"))
+        ticket_id = "names-unit-1"
+        with self.ledger() as ledger:
+            findings = tuple(finding for issue in issues for finding in ledger.proposal_findings(issue))
+            for issue in issues:
+                identities = ", ".join(finding.finding_id for finding in ledger.proposal_findings(issue))
+                _ = issue.write_text(issue.read_text().replace("\n---\n", f"\nstyle_findings: [{identities}]\n---\n", 1))
+            ledger.ticket_add(ticket_id, "names-unit", "proposal", "names", "crates/alpha", list(self.sources[:2]),
+                              [rule], proposal=str(issues[0]), proposals=issues,
+                              finding_ids=tuple(finding.finding_id for finding in findings))
+            ledger.ticket_assign(ticket_id, "demo-style-names")
+        return issues, ticket_id
 
     def finish_judging(self) -> None:
         """Drop fixture judge tickets after their final writes and before selecting work."""

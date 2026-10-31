@@ -16,6 +16,7 @@ from typing import NamedTuple, cast
 
 # Under the state root: logs, reports and archives that keep a unit's old names as history.
 STATE_HISTORY = (
+    "staff/staff.json.before-",
     "shutdown/", "nightly-review/", "message/log.jsonl", "message/relay/", "message/keys.json",
     "message/queue/", "message/postmaster/replies/", "notify/", "accounts/moves.jsonl", "showrunner/outstanding/",
     "unit-history/runs/", "unit-history/review_turns/", "plan-delegate/runs/", "plan-delegate/review_turns/", "model-study/", "claude-model-study/",
@@ -27,9 +28,6 @@ STATE_HISTORY = (
     # Copies of queued prompt texts, which the pause hook matches exactly against each prompt that
     # comes in; the session's next stop rebuilds them from its wakeups. A rewrite breaks the match.
     "conversation-pause/scheduled-prompts/",
-    # Pane launch snapshots: forget_unit drops the old director; other panes keep their last launch
-    # until SessionStart rewrites it. Missing panes are ignored by pane_record's reader.
-    "herdr-panes/",
     # lint/sweep.py records target deletion times, expiring absent roots and entries older than a day.
     "lint-sweep/target-deletes.json",
     # buildlog/mac_idle.py owns these registrations. Only a live pid/start and a current waiting

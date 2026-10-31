@@ -18,6 +18,7 @@ import rename_unit
 
 
 from scripts.production.rename_unit_test_support import UnitRenameFixture, SLUG
+from scripts.production.staff_test_support import unit_membership
 
 
 @final
@@ -94,6 +95,8 @@ class UnitRenameStyleTests(UnitRenameFixture):
                    "EVERY=15\nTARGET=session:test-showrunner\nCHECK="
                    + shlex.join(["zsh", "/scripts/production_check.sh", str(doc)]) + "\n")
         self.env["STYLE_LEDGER_STATE_DIR"] = str(self.root / "state/style")
+        _ = unit_membership(slug, f"{slug}-names-unit")
+        self.director.configure(slug, f"{slug}-names-unit", worktree)
         before = self.snapshot()
 
         result = self.invoke(
@@ -110,11 +113,15 @@ class UnitRenameStyleTests(UnitRenameFixture):
         _ = self.seed_record(name="names", host_session=f"{slug}-names", unit="names-unit", slug=slug)
         self.write(self.doc, self.doc.read_text().replace("| alpha-unit |", "| names-unit |"))
         worktree = str(self.rust / "claude-demo-alpha")
+        row = unit_membership(slug, "names-unit")
+        self.director.configure(slug, "names-unit", Path(worktree), name="names")
         rename = rename_unit.UnitRename(
             slug, "names-unit", f"{slug}-names-unit", str(self.doc), str(self.checkout), SLUG,
             f"{slug}-names", f"{slug}-names", worktree, worktree, "", str(self.root / "scratch"),
-            account="owner@example.com", session_id="sid-alpha")
+            account="claude4", session_id="sid-alpha", pane_session="agents", pane_id="w1:p1",
+            terminal_id="terminal-alpha", tab_id="w1:t1")
 
+        rename.staff_id = row.id
         with mock.patch.dict(os.environ, self.env):
             rename_unit._restart_record(rename, lambda: None)  # pyright: ignore[reportPrivateUsage]
 
@@ -129,8 +136,10 @@ class UnitRenameStyleTests(UnitRenameFixture):
             SLUG, "alpha-unit", "beta-unit", str(self.doc), str(self.checkout), SLUG,
             "demo-alpha", "demo-beta", str(self.rust / "claude-demo-alpha"),
             str(self.rust / "claude-demo-beta"), "", str(self.root / "scratch"),
-            account="owner@example.com", session_id="sid-alpha")
+            account="claude4", session_id="sid-alpha", pane_session="agents", pane_id="w1:p1",
+            terminal_id="terminal-alpha", tab_id="w1:t1")
 
+        rename.staff_id = unit_membership(SLUG, "alpha-unit").id
         with mock.patch.dict(os.environ, self.env):
             rename_unit._restart_record(rename, lambda: None)  # pyright: ignore[reportPrivateUsage]
 

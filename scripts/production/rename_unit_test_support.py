@@ -14,9 +14,11 @@ import sys
 import tempfile
 import time
 from collections.abc import Callable, Generator
+from datetime import datetime, timezone, tzinfo
+from enum import Enum
 from contextlib import closing, contextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING, ClassVar, Literal, cast, override
+from typing import TYPE_CHECKING, ClassVar, Literal, cast, final, override
 from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -26,6 +28,7 @@ from scripts.production.cli_fixture import invoke_cli
 from scripts.production.rename_test_support import bind_staff_fixture
 from scripts.production.staff_test_support import StaffTestCase, unit_membership
 from scripts.shutdown import stop_resume
+import sessions
 from scripts.production import staff
 from scripts.lib.atomic_file import write_text_atomic
 
@@ -53,6 +56,183 @@ SLUG = "demo"
 TEST_HANG_GUARD_SECS = 300
 
 
+@final
+class RetainedDirector:
+    """Record shell commands and process generations in the existing pane-shell fixture."""
+
+    def __init__(self, case: UnitRenameFixture) -> None:
+        import herdr
+        import unit_lookup
+        import unit_move
+        lookup = unit_lookup.marked_unit
+        lookup_all = unit_lookup.marked_units
+        observed = unit_lookup.observed_unit_marks
+        inside = unit_move.processes_inside
+        session_liveness = sessions.session_liveness
+        self.case = case
+        entries = pane_record.read("agents")
+        prior = entries.get("w1:p1")
+        worktree = Path(prior["cwd"]).parent if prior else case.rust / "claude-demo-alpha"
+        unit = prior["environment"]["SHOWRUNNER_UNIT_ID"] if prior else "alpha-unit"
+        slug = prior["environment"]["SHOWRUNNER_UNIT"] if prior else SLUG
+        self.pane = fake_unit_host.PaneShellFixture(case, worktree,
+            Path(case.env["HERDR_PROC"]), live=True, slug=slug, unit=unit, env=case.env)
+        self.starts: list[list[str]] = []
+        self.stops: list[str] = []
+        self.orders: list[str] = []
+        self.generation = 1
+        self.pane_title = "alpha"
+        self.tab_title = "alpha"
+        self.ids: tuple[tuple[str, str, str], ...] = (("w1:p1", "terminal-alpha", "w1:t1"),
+                    ("w1:p2", "terminal-neighbour", "w1:t2"))
+        run = herdr.Herdr.run
+        order = herdr.Herdr.order_tabs
+
+        def ordered(client: herdr.Herdr, workspace: str, saved: herdr.SavedLayout) -> dict[str, str]:
+            self.orders.append(workspace)
+            return order(client, workspace, saved)
+
+        def command(client: herdr.Herdr, *arguments: str) -> str:
+            reply = run(client, *arguments)
+            if arguments[:2] == ("pane", "rename"):
+                self.pane_title = arguments[3]
+            elif arguments[:2] == ("tab", "rename"):
+                self.tab_title = arguments[3]
+            elif arguments[:2] == ("pane", "run"):
+                argv = shlex.split(arguments[3])
+                self.starts.append(argv)
+                self.generation += 1
+                entry = pane_record.read("agents")["w1:p1"]
+                self.pane.unit = entry["environment"]["SHOWRUNNER_UNIT_ID"]
+                self.pane.worktree = Path(entry["cwd"])
+                self.pane.found = unit_lookup.MarkedUnit(self.pane.unit,
+                    unit_lookup.LiveClaude(entry["name"], entry["session_id"], "/fixture/socket", self.pane.director),
+                    self.pane.place)
+                fake_unit_host.process(self.pane.environment, self.pane.shell, 991000, ["zsh"],
+                    self.pane.marks(), session=self.pane.shell, cwd=self.pane.worktree)
+                self.pane.parent(self.pane.shell)
+            if arguments[:2] in (("pane", "rename"), ("tab", "rename"), ("pane", "run")):
+                self.publish()
+            return reply
+
+        def liveness(identity: str) -> sessions.LiveSessionProcess | sessions.SessionNotLive | sessions.SessionLivenessUnknown:
+            found = self.pane.found
+            entry = pane_record.read("agents").get("w1:p1")
+            if entry is not None and identity == entry["session_id"]:
+                return (sessions.LiveSessionProcess(self.pane.director) if found is not None
+                        and isinstance(found.claude, unit_lookup.LiveClaude) else sessions.SessionNotLive())
+            return session_liveness(identity)
+
+        _ = case.enterContext(mock.patch.object(herdr.Herdr, "run", command))
+        _ = case.enterContext(mock.patch.object(herdr.Herdr, "order_tabs", ordered))
+        _ = case.enterContext(mock.patch.object(herdr, "shared_session", return_value="agents"))
+        _ = case.enterContext(mock.patch.object(case, "stop_session", side_effect=self.stop))
+        _ = case.enterContext(mock.patch.object(sessions, "session_liveness", side_effect=liveness))
+        def generation(pid: int) -> str:
+            case.assertEqual(pid, self.pane.director)
+            return str(self.generation)
+
+        from scripts.whoami import account
+        _ = case.enterContext(mock.patch.object(sessions, "process_start", side_effect=generation))
+        _ = case.enterContext(mock.patch.object(account, "process_config_dir",
+            return_value=account.ConfiguredClaudeFolder(case.home / ".claude4")))
+        _ = case.enterContext(mock.patch.object(stop_resume, "_detach"))
+        def marked(slug: str, unit: str) -> unit_lookup.MarkedUnit | None:
+            return self.pane.marked_unit(slug, unit) if (slug, unit) == (self.pane.slug, self.pane.unit) else lookup(slug, unit)
+        def marked_units(slug: str) -> dict[str, unit_lookup.MarkedUnit]:
+            return {**lookup_all(slug), **self.pane.marked_units(slug)}
+        def marks() -> list[tuple[str, unit_lookup.MarkedUnit]]:
+            others = [pair for pair in observed() if pair[1].place != self.pane.place]
+            found = self.pane.found
+            return [*others, (self.pane.slug, found)] if found is not None else others
+        def processes(path: Path) -> list[int]:
+            return sorted(set(inside(path)) | set(self.pane.inside_pids(path)))
+        _ = case.enterContext(mock.patch.object(unit_lookup, "marked_unit", side_effect=marked))
+        _ = case.enterContext(mock.patch.object(unit_lookup, "marked_units", side_effect=marked_units))
+        _ = case.enterContext(mock.patch.object(unit_lookup, "observed_unit_marks", side_effect=marks))
+        _ = case.enterContext(mock.patch.object(unit_move, "processes_inside",
+            side_effect=processes))
+        self.configure(slug, unit, worktree, name=prior["name"] if prior else "alpha",
+                       session_id=prior["session_id"] if prior else "sid-alpha", live=True)
+
+    def configure(self, slug: str, unit: str, worktree: Path, *, name: str = "", live: bool = False,
+                  session_id: str = "sid-alpha") -> None:
+        import unit_lookup
+        row = unit_membership(slug, unit)
+        self.pane.slug, self.pane.unit, self.pane.worktree = slug, unit, worktree
+        self.pane_title = self.tab_title = name or unit.removesuffix("-unit")
+        config = self.case.home / ".claude4"
+        worktree.mkdir(parents=True, exist_ok=True)
+        (worktree / "sub").mkdir(exist_ok=True)
+        self.case.write(config / ".claude.json", json.dumps({"projects": {
+            str(worktree): {"hasTrustDialogAccepted": True},
+            str(worktree / "sub"): {"hasTrustDialogAccepted": True}}}))
+        pane_record.write("agents", pane_record.PaneLaunch(pane_id="w1:p1", session_id=session_id,
+            config_dir=str(config), cwd=str(worktree / "sub"), name=self.pane_title, model="sonnet",
+            remote_control=True, environment={"SHOWRUNNER_UNIT": slug, "SHOWRUNNER_UNIT_ID": unit, "STAFF_ID": row.id},
+            flags_read=True, ended=False, written_at="2026-10-31T11:00:00+00:00"))
+        self.pane.found = unit_lookup.MarkedUnit(unit,
+            unit_lookup.LiveClaude(self.pane_title, session_id, "/fixture/socket", self.pane.director)
+            if live else unit_lookup.ClaudeNotRunning(), self.pane.place)
+        self.pane.parent(self.pane.shell)
+        if not live:
+            self.pane.stopped()
+        self.publish()
+
+    def reset(self) -> None:
+        """Restore process observations after saved_fixture restores the isolated files."""
+        import unit_lookup
+        self.pane_title = self.tab_title = "alpha"
+        self.pane.unit, self.pane.worktree = "alpha-unit", self.case.rust / "claude-demo-alpha"
+        self.pane.parent(self.pane.shell)
+        self.pane.found = unit_lookup.MarkedUnit("alpha-unit",
+            unit_lookup.LiveClaude("alpha", "sid-alpha", "/fixture/socket", self.pane.director), self.pane.place)
+        self.starts.clear()
+        self.stops.clear()
+        self.orders.clear()
+
+    def stop(self, identity: str) -> stop_resume.Stopped:
+        self.stops.append(identity)
+        self.pane.stopped()
+        self.publish()
+        return stop_resume.Stopped(identity, self.pane.director)
+
+    def publish(self) -> None:
+        import unit_lookup
+        live = self.pane.found
+        conversation = (live.claude.session_id if live is not None and isinstance(live.claude, unit_lookup.LiveClaude) else None)
+        path = Path(self.case.env["FAKE_HERDR_RESPONSES"])
+        responses = cast(dict[str, object], json.loads(path.read_text()))
+        responses["--session agents pane process-info --pane w1:p1"] = {"code": 0,
+            "stdout": json.dumps({"result": {"process_info": {"shell_pid": self.pane.shell,
+                "foreground_process_group_id": self.pane.director if conversation else self.pane.shell,
+                "foreground_processes": [{"name": "claude", "pid": self.pane.director}] if conversation else [{"name": "zsh"}]}}})}
+        for arguments, key, rows in (
+            ("pane list", "panes", [{"pane_id": pane, "terminal_id": terminal, "tab_id": tab,
+                "workspace_id": "w1", "label": self.pane_title if pane == "w1:p1" else "neighbour",
+                "agent_session": {"value": conversation} if conversation and pane == "w1:p1" else None}
+                for pane, terminal, tab in self.ids]),
+            ("tab list --workspace w1", "tabs", [{"tab_id": tab,
+                "label": self.tab_title if pane == "w1:p1" else "neighbour"} for pane, _, tab in self.ids]),
+            ("workspace list", "workspaces", [{"workspace_id": "w1", "label": self.pane.slug, "active_tab_id": "w1:t1"}]),
+        ):
+            responses[f"--session agents {arguments}"] = {"code": 0, "stdout": json.dumps({"result": {key: rows}})}
+        content = json.dumps(responses)
+        if path.read_text() != content:
+            self.case.write(path, content)
+
+
+class FixtureClock(datetime):
+    @classmethod
+    @override
+    def now(cls, tz: tzinfo | None = None) -> datetime:
+        return datetime(2026, 10, 31, 11, 0, tzinfo=timezone.utc).astimezone(tz)
+
+
+class DirectorFixtureState(Enum):
+    ABSENT = "no retained director configured"
+
+
 class UnitRenameFixture(StaffTestCase):
 
     def __init__(self, methodName: str = "runTest") -> None:
@@ -65,6 +245,17 @@ class UnitRenameFixture(StaffTestCase):
         self.doc: Path = Path()
         self.state: Path = Path()
         self.env: dict[str, str] = {}
+        self.director_state: RetainedDirector | DirectorFixtureState = DirectorFixtureState.ABSENT
+
+    retained_by_default: ClassVar[bool] = True
+    @property
+    def director(self) -> RetainedDirector:
+        assert isinstance(self.director_state, RetainedDirector), "configure the retained director first"
+        return self.director_state
+
+    @director.setter
+    def director(self, value: RetainedDirector) -> None:
+        self.director_state = value
 
     fixture_root: ClassVar[Path]
     fixture_snapshot: ClassVar[Path]
@@ -94,6 +285,8 @@ class UnitRenameFixture(StaffTestCase):
         # These modules also bind paths at import time; environment changes alone
         # do not isolate their journals, locks, or stall-watch state.
         for module, name, value in (
+            (rename_unit, "datetime", FixtureClock),
+            (pane_record, "datetime", FixtureClock),
             (progress_history, "SESSION_ROOTS", (self.root / "sessions",)),
             (pane_record, "RECORD_DIR", self.home / ".local/state/herdr-panes"),
             (pane_record, "PROC", self.root / "proc"),
@@ -104,6 +297,11 @@ class UnitRenameFixture(StaffTestCase):
             (stall_watch, "PROJECTS_DIR", self.home / ".claude/projects"),
         ):
             _ = self.enterContext(mock.patch.object(module, name, value))
+
+        if self.retained_by_default:
+            self.director = RetainedDirector(self)
+            _ = self.director.stop("sid-alpha")
+            self.director.stops.clear()
 
     def bind_fixture(self, root: Path) -> None:
         self.root = root
@@ -238,6 +436,13 @@ class UnitRenameFixture(StaffTestCase):
 
     def invoke(self, arguments: list[str], *, cwd: Path | None = None,
                refuse: str = "") -> subprocess.CompletedProcess[str]:
+        if self.retained_by_default:
+            entries = pane_record.read("agents")
+            entry = entries.get("w1:p1")
+            if entry is not None and self.director.pane.unit != entry["environment"].get("SHOWRUNNER_UNIT_ID"):
+                self.director.configure(entry["environment"]["SHOWRUNNER_UNIT"],
+                    entry["environment"]["SHOWRUNNER_UNIT_ID"], Path(entry["cwd"]).parent,
+                    name=entry["name"], session_id=entry["session_id"])
         original_run = cast(Callable[..., subprocess.CompletedProcess[str]], subprocess.run)
 
         def run(command: list[str], *args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
@@ -264,13 +469,10 @@ class UnitRenameFixture(StaffTestCase):
     @contextmanager
     def shutdown_boundary(self) -> Generator[None]:
         """Use the same recording stop fake for in-process and child-process apply."""
-        with (mock.patch.object(rename_unit, "SHUTDOWN", Path(self.env.get("RENAME_UNIT_SHUTDOWN")
-                                                               or str(SCRIPT.parents[1] / "shutdown/shutdown.py"))),
-              mock.patch.object(stop_resume, "stop", side_effect=self.stop_session)):
+        with mock.patch.object(stop_resume, "stop", side_effect=self.stop_session):
             yield
 
     def stop_session(self, identity: str) -> stop_resume.Stopped:
-        rename_unit.run_shutdown("stop", identity)
         return stop_resume.Stopped(identity, 1)
 
     def start_apply(self) -> subprocess.Popen[str]:
@@ -389,12 +591,15 @@ class UnitRenameFixture(StaffTestCase):
                 [("names-unit-1", "names-unit", "merged"), ("names-unit-2", "names-unit", "assigned"),
                  ("names-unit-3", "names-unit", "queued")],
             )
+        self.director.configure(SLUG, "names-unit", worktree)
         return worktree, plan, database
 
     def seed_record(self, progress: Literal["waiting", "ready", "stopped"] = "stopped", name: str = "alpha", host_session: str = "demo-alpha", *,
                     unit: str = "alpha-unit", slug: str = SLUG) -> Path:
         """A stopped unit's shutdown record, from before the conductor was removed."""
         old = self.rust / "claude-demo-alpha"
+        if self.retained_by_default and slug == SLUG and unit == "alpha-unit":
+            self.director.configure(slug, unit, old, name=name)
         saved = fake_unit_host.stopped_record(self.home / ".claude", old,
             name=name, cwd=old / "sub", production=slug, unit=unit, doc=self.doc,
             host_session=host_session, branch="demo-alpha", plan=old / "docs/plans/alpha.md", progress=progress)
@@ -407,11 +612,13 @@ class UnitRenameFixture(StaffTestCase):
             self.assertTrue(shutdown_record.create_session(saved))
         log = self.root / "shutdown-calls.jsonl"
         self.write(log, "")
-        stub = self.root / "fake_shutdown.py"
-        self.write(stub, "import json, os, sys\nwith open(os.environ['RENAME_UNIT_SHUTDOWN_LOG'], 'a') as log:\n"
-                   + "    _ = log.write(json.dumps(sys.argv[1:]) + '\\n')\n")
-        self.env["RENAME_UNIT_SHUTDOWN"] = str(stub)
-        self.env["RENAME_UNIT_SHUTDOWN_LOG"] = str(log)
+        import herdr
+        start_session = stop_resume._start_session  # pyright: ignore[reportPrivateUsage]
+        def record_start(tab: herdr.TabSession, entry: pane_record.PaneLaunch, account: str, message: str) -> None:
+            with log.open("a") as calls:
+                _ = calls.write(json.dumps(["resume", entry["session_id"]]) + "\n")
+            start_session(tab, entry, account, message)
+        _ = self.enterContext(mock.patch.object(stop_resume, "_start_session", side_effect=record_start))
         return log
 
     def record(self) -> dict[str, object]:
@@ -419,11 +626,7 @@ class UnitRenameFixture(StaffTestCase):
         return cast(dict[str, object], json.loads((directory / "sid-alpha.json").read_text()))
 
     def record_live_launch(self) -> None:
-        pane_record.write("demo-alpha-unit", pane_record.PaneLaunch(
-            pane_id="w1:p1", session_id="sid-alpha", config_dir=str(self.home / ".claude4"),
-            cwd=str(self.rust / "claude-demo-alpha"), name="alpha", model="sonnet",
-            remote_control=True, environment={"SHOWRUNNER_UNIT": "demo", "SHOWRUNNER_UNIT_ID": "alpha-unit"},
-            flags_read=True, ended=False, written_at="2026-10-30T22:00:00+00:00"))
+        self.director.configure(SLUG, "alpha-unit", self.rust / "claude-demo-alpha", live=True)
 
     def mark_live(self, unit: str, session_id: str, name: str = "") -> Callable[[], None]:
         """A live Claude in a herdr session marked as `unit` of this production; the result ends it.
@@ -431,6 +634,15 @@ class UnitRenameFixture(StaffTestCase):
         The session and its pane label are called `name`, the unit's stem when it is empty.
         """
         name = name or unit.removesuffix("-unit")
+        if self.retained_by_default and unit == self.director.pane.unit:
+            worktree = self.home / "worktrees" / unit.removesuffix("-unit")
+            if not worktree.exists():
+                worktree = self.rust / "claude-demo-alpha"
+            self.director.configure(SLUG, unit, worktree, name=name, live=True, session_id=session_id)
+            def stopped() -> None:
+                self.director.pane.stopped()
+                self.director.publish()
+            return stopped
         row = unit_membership(SLUG, unit)
         held = fake_showrunner.write_session(self.root / "state/sessions", name, session_id)
         self.addCleanup(held.close)
@@ -451,5 +663,6 @@ def apply_in_fixture(root: Path) -> int:
     fixture = UnitRenameFixture()
     fixture.bind_fixture(root)
     fixture.env = dict(os.environ)
+    fixture.director = RetainedDirector(fixture)
     with fixture.shutdown_boundary():
         return rename_unit.main(["apply", SLUG, "alpha", "gamma", "--scratch", str(root / "scratch")])

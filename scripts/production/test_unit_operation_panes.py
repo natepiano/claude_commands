@@ -19,6 +19,7 @@ import retire_unit
 import shutdown_record
 import unit_lookup
 from rename_state import RenameRefused
+from unit_operation_test_support import PaneClosingOperation
 
 
 @final
@@ -46,8 +47,15 @@ class UnitOperationPaneTests(unittest.TestCase):
         self.saved = stopped_record(self.root, self.worktree)
         self.assertTrue(shutdown_record.create_session(self.saved))
 
-    def target(self) -> rename_unit.UnitRename:
-        return rename_unit.UnitRename('demo','alpha-unit','gamma-unit','','','','','',str(self.worktree),'','','')
+    def target(self) -> PaneClosingOperation:
+        panes = herdr.Herdr(self.pane.place.session).panes()
+        pane = next(row for row in panes if row['pane_id'] == self.pane.place.pane)
+        terminal_id = pane.get('terminal_id', '')
+        self.assertTrue(terminal_id, 'the generic close target records its original terminal')
+        return PaneClosingOperation(
+            self.pane.slug, self.pane.unit, self.pane.unit, self.worktree,
+            self.saved['label'], self.saved['session']['session_id'],
+            self.pane.place.session, self.pane.place.pane, terminal_id)
 
     def stop(self) -> None:
         def records(_target: rename_unit.StopTarget) -> list[shutdown_record.SessionShutdown]:

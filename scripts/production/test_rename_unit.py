@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 
 from scripts.production.rename_unit_test_support import UnitRenameFixture, SCRIPT, SLUG, TEST_HANG_GUARD_SECS
+import pane_record
 
 
 @final
@@ -66,12 +67,24 @@ class UnitRenameTests(UnitRenameFixture):
         records = self.home / ".local/state/herdr-panes"
         for session, panes in (("agents", {"w1:p2": "alpha-unit", "w1:p3": "beta-unit"}),
                                ("work", {"w2:p1": "alpha-unit"})):
-            self.write(records / f"{session}.json", json.dumps(
-                {pane: {"session_id": f"session-{unit}", "written_at": "2026-10-30T09:00:00+00:00",
-                        "environment": {"SHOWRUNNER_UNIT_ID": unit}} for pane, unit in panes.items()}))
+            path = records / f"{session}.json"
+            entries = cast(dict[str, object], json.loads(path.read_text())) if path.exists() else {}
+            entries.update({pane: {"session_id": f"session-{unit}", "written_at": "2026-10-30T09:00:00+00:00",
+                                  "environment": {"SHOWRUNNER_UNIT_ID": unit}} for pane, unit in panes.items()})
+            self.write(path, json.dumps(entries))
+        original = pane_record.read("agents")["w1:p1"]
         self.assert_ok(self.rename("apply", "alpha-unit", "gamma-unit"))
-        # The old pane's entry would resume the old name; the relaunched unit records its new pane.
-        self.assertEqual(json.loads((records / "agents.json").read_text()),
+        primary = pane_record.read("agents")["w1:p1"]
+        self.assertEqual((primary["cwd"], primary["name"], primary["environment"]["SHOWRUNNER_UNIT_ID"]),
+                         (str(self.home / "worktrees/gamma/sub"), "gamma", "gamma-unit"))
+        for field in ("session_id", "config_dir"):
+            self.assertEqual(primary[field], original[field])
+        self.assertEqual(primary["environment"]["STAFF_ID"], original["environment"]["STAFF_ID"])
+        snapshots = cast(dict[str, object], json.loads((records / "agents.json").read_text()))
+        self.assertIn("w1:p1", snapshots)
+        del snapshots["w1:p1"]
+        # Every other pane's old launch must be forgotten; beta remains unchanged.
+        self.assertEqual(snapshots,
                          {"w1:p3": {"session_id": "session-beta-unit", "written_at": "2026-10-30T09:00:00+00:00",
                                     "environment": {"SHOWRUNNER_UNIT_ID": "beta-unit"}}})
         self.assertEqual(json.loads((records / "work.json").read_text()), {})
@@ -139,6 +152,7 @@ class UnitRenameTests(UnitRenameFixture):
         self.assert_ok(self.rename("verify", "alpha-unit", "gamma-unit"))
 
     def test_mul_add_naming_keeps_the_underscore_id(self) -> None:
+        self.director.configure(SLUG, "mul_add-unit", self.rust / "claude-demo-mul-add")
         self.assert_ok(self.rename("apply", "mul_add-unit", "fma"))
         self.assertIn(f"| fma-unit | docs/plans/mul-add.md | `{self.home / 'worktrees/fma'}` | fma |",
                       self.doc.read_text())
@@ -192,7 +206,7 @@ class UnitRenameTests(UnitRenameFixture):
         self.write(run, run.read_text() + json.dumps(
             {"event_type": "phase_started", "phase_instance_id": "p2", "phase_id": "2"}) + "\n")
 
-        self.assert_refused(self.rename("apply"), "gamma-unit is not running")
+        self.assert_ok(self.rename("apply"))
 
         new = self.home / "worktrees/gamma"
         self.assertEqual((new / "work.md").read_text(), "phase work\nmore, not committed\n")

@@ -26,7 +26,7 @@ class UnitRenameWaitsTests(UnitRenameFixture):
     @unittest.skipIf(sys.platform == "darwin", "the Mac reads working directories with lsof")
     def test_verify_fails_while_a_process_works_in_the_old_worktree(self) -> None:
         _ = self.seed_record()
-        self.assert_refused(self.rename("apply"), "gamma-unit is not running")
+        self.assert_ok(self.rename("apply"))
         _ = self.mark_live("gamma-unit", "sid-alpha")
         old = self.rust / "claude-demo-alpha"
         old.mkdir()
@@ -68,9 +68,9 @@ class UnitRenameWaitsTests(UnitRenameFixture):
         stdout, stderr = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertIn("merge lock: waiting — a merge gate or a unit rename is writing demo's merge branch",
                       waited + stdout)
-        # The fake restart starts nothing; every step before verify ran once the gate was done.
-        self.assertIn("gamma-unit is not running", stderr)
-        self.assertEqual(self.journal()["step"], 10)
+        self.assertEqual(process.returncode, 0, stdout + stderr)
+        self.assertEqual(self.journal()["step"], 11)
+        self.assertIs(self.journal()["done"], True)
 
     def test_a_running_unit_plans_and_apply_stops_it_through_the_shutdown_path(self) -> None:
         log = self.seed_record()

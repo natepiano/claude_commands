@@ -42,6 +42,18 @@ class DesignRoleRenameSweepTests(unittest.TestCase):
         _ = self.write("replies/first.md", "Evidence from demo-old-unit")
         self.assertEqual(self.failures(), [])
 
+    def test_staff_backup_is_history_but_the_current_record_is_live(self) -> None:
+        directory = self.state / "staff"
+        directory.mkdir()
+        backup = directory / "staff.json.before-20261031T113237Z"
+        original = json.dumps({"schema": 1, "rows": [{"name": "demo-old"}]})
+        _ = backup.write_text(original)
+        self.assertEqual(self.failures(), [])
+        self.assertEqual(backup.read_text(), original)
+        live = directory / "staff.json"
+        _ = live.write_text(original)
+        self.assertTrue(any(str(live) in failure for failure in self.failures()))
+
     def test_pane_snapshots_deletion_history_and_idle_registrations_keep_their_owners_names(self) -> None:
         for relative, value in (
             ("herdr-panes/agents.json", {"w1:p1": {"cwd": "/fixture/old-checkout",
@@ -55,7 +67,10 @@ class DesignRoleRenameSweepTests(unittest.TestCase):
                 path.parent.mkdir(parents=True, exist_ok=True)
                 original = json.dumps(value)
                 _ = path.write_text(original, encoding="utf-8")
-                self.assertEqual(self.failures(), [])
+                if relative == "herdr-panes/agents.json":
+                    self.assertTrue(any(str(path) in failure for failure in self.failures()))
+                else:
+                    self.assertEqual(self.failures(), [])
                 self.assertEqual(path.read_text(), original)
                 # An explicitly live file still takes precedence over the snapshot classification.
                 self.assertTrue(any(str(path) in failure for failure in self.failures((path,))))

@@ -668,7 +668,9 @@ message.
 
 <CloseChangeReview>
 When the user gives a change-review verdict, in any production. A verdict
-beginning `works` or `fine` lands the row; any other returns it to its unit.
+beginning `works` or `fine`, after optional `okay`/`ok` and a row id (`c17`),
+lands the row. Case and later words do not affect the result; any other start
+returns it to its unit.
 
 1. **Feature log.** Only when the production's project closes out by change
    review: Hana (`~/rust/hana`, `~/rust/hana_catalyst`) and `~/.claude`. Other

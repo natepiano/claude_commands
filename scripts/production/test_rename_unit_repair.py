@@ -7,7 +7,6 @@ from typing import cast
 from unittest import mock
 
 from scripts.production import staff
-from scripts.production import fake_unit_host
 from scripts.production.rename_test_support import legacy_staff_journal
 from scripts.production.rename_rerun_test_support import saved_fixture
 from scripts.production.rename_unit_test_support import SLUG, UnitRenameFixture
@@ -51,9 +50,8 @@ class UnitRenameRepairTests(UnitRenameFixture):
     def test_same_name_plan_repairs_a_wrong_tab_when_paths_and_session_match(self) -> None:
         self.assert_ok(self.rename("apply", "alpha", "alpha"))
         _ = self.mark_live("alpha-unit", "sid-alpha", name="alpha")
-        fake_unit_host.write(self.env, [fake_unit_host.HostedUnit(
-            "demo-alpha-unit", "w1:p1", {"SHOWRUNNER_UNIT": SLUG, "SHOWRUNNER_UNIT_ID": "alpha-unit"},
-            label="old-tab")])
+        self.director.pane_title = self.director.tab_title = "old-tab"
+        self.director.publish()
         before = self.snapshot()
         planned = self.rename("plan", "alpha", "alpha")
         self.assert_ok(planned)
@@ -80,6 +78,7 @@ class UnitRenameRepairTests(UnitRenameFixture):
         legacy_staff_journal(path)
         unit = next(row for row in staff.snapshot().find(kind="unit") if row.name == "gamma")
         _ = staff.retire(unit.id)
+        self.director.configure(SLUG, "mul_add-unit", self.rust / "claude-demo-mul-add")
         before = self.snapshot()
         self.assert_ok(self.rename("plan", "mul_add", "multiply"))
         self.assertEqual(self.snapshot(), before)
@@ -90,6 +89,7 @@ class UnitRenameRepairTests(UnitRenameFixture):
         saved = self.journal()
         saved.update(staff_id="s00000000000", done=False, step=0)
         self.write(path, json.dumps(saved))
+        self.director.configure(SLUG, "mul_add-unit", self.rust / "claude-demo-mul-add")
         before = self.snapshot()
         self.assert_ok(self.rename("plan", "mul_add", "multiply"))
         self.assertEqual(self.snapshot(), before)
@@ -100,6 +100,7 @@ class UnitRenameRepairTests(UnitRenameFixture):
         retired_id = staff.StaffId(cast(str, self.journal()["staff_id"]))
         _ = staff.retire(retired_id)
         self.assertIsNone(staff.snapshot().by_id(retired_id))
+        self.director.configure(SLUG, "mul_add-unit", self.rust / "claude-demo-mul-add")
         successor = next(row for row in staff.snapshot().find(kind="unit") if row.name == "mul_add")
         with saved_fixture(self.root) as restore:
             for done in (True, False):
@@ -133,6 +134,7 @@ class UnitRenameRepairTests(UnitRenameFixture):
 
     def test_staff_showrunner_name_wins_over_a_retired_slug_alias(self) -> None:
         parent = next(row for row in staff.snapshot().find(kind="showrunner") if row.name == SLUG)
+        self.director.configure(SLUG, "alpha-unit", self.rust / "claude-demo-alpha")
         _ = staff.rename(parent.id, "natedev")
         self.write(self.doc, self.doc.read_text().replace("- **Log:**", "- **Showrunner session:** `natedev`\n- **Log:**"))
         _ = self.git("add", str(self.doc))

@@ -108,8 +108,7 @@ _LINE = re.compile(rf"^{TRAILER}:\s*(?P<value>.*)$", re.MULTILINE)
 _COVERS = re.compile(rf"^{TRAILER}-Covers:\s*(?P<sha>[0-9a-f]{{7,40}})\s*$", re.MULTILINE)
 _NUMBER = re.compile(r"^\| C(\d+) \|", re.MULTILINE)
 _ROW = re.compile(r"^[A-Z]\d+$")
-_LANDS = re.compile(r"\b(works|fine)\b", re.IGNORECASE)
-_FAILS = re.compile(r"\b(not|no|never|still|fails?|failed|broken|wrong|doesn't|don't|isn't)\b", re.IGNORECASE)
+_LANDS = re.compile(r"^\s*(?:(?:okay|ok)\s+)?(?:c\d+\s+)?(?:works|fine)\b", re.IGNORECASE)
 # A cell boundary is a `|` that _cell did not escape.
 _BOUNDARY = re.compile(r"(?<!\\)\|")
 _CHECKPOINT = re.compile(r"^checkpoint\((?P<branch>[^)]+)\):")
@@ -961,9 +960,9 @@ def describe(row: dict[str, str]) -> str:
 
 
 def lands(verdict: str) -> bool:
-    """A verdict that says `works` or `fine` and no word of failure (`not`, `still`, `broken` ...) lands
-    the row ("okay c17 works"); any other returns it to its unit."""
-    return _LANDS.search(verdict) is not None and _FAILS.search(verdict) is None
+    """Land on an opening `works` or `fine`, after optional `okay`/`ok` and row id.
+    Case and later words do not affect the result; any other start returns the row."""
+    return _LANDS.match(verdict) is not None
 
 
 def _to_review(path: Path, lines: list[str], row: str) -> tuple[list[str], int]:

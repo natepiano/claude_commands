@@ -431,6 +431,11 @@ class ApprovedProposal:
     finding_ids: tuple[str, ...]
     widened: tuple[str, ...] = ()
     base: str = ""
+    other_issues: tuple[Path, ...] = ()
+
+    @property
+    def issues(self) -> tuple[Path, ...]:
+        return (self.issue, *self.other_issues)
 
 
 @dataclass(frozen=True)
@@ -2135,6 +2140,13 @@ MIGRATIONS = {
             LEFT JOIN rule_generations r ON r.rule={base_rule_sql('j.rule')}
             WHERE j.verdict='removed' OR j.generation=coalesce(r.generation,0);
     """,
+    31: """
+        CREATE TABLE IF NOT EXISTS ticket_proposals (
+            ticket TEXT NOT NULL REFERENCES tickets(id), proposal TEXT NOT NULL,
+            PRIMARY KEY(ticket, proposal)
+        );
+        INSERT OR IGNORE INTO ticket_proposals SELECT id,proposal FROM tickets WHERE kind='proposal';
+    """,
 }
 
 
@@ -2464,6 +2476,7 @@ class Ledger:
         proposal: str = "", cells: tuple[tuple[str, str], ...] = (),
         finding_ids: tuple[str, ...] = (),
         *, batch_owner: BatchOwner | UnbatchedTicket = UNBATCHED_TICKET,
+        proposals: tuple[Path, ...] = (),
     ) -> None:
         if kind == "listed" and (not rule or rule not in rules or rule.endswith("#uncovered")):
             raise LedgerError(f"{id}: listed ticket requires its canonical rule in rules")
@@ -2481,6 +2494,7 @@ class Ledger:
         finding_ids = tuple(sorted(set(finding_ids)))
         files = [self._path(path) for path in files]
         crate = self._path(crate)
+        decisions = tuple(sorted(set((Path(proposal), *proposals)))) if proposal else ()
 
         def added() -> bool:
             """Whether the ticket exists with these fields; refuses other fields, or findings a proposal cannot build."""
@@ -2489,6 +2503,8 @@ class Ledger:
                 previous = self._ticket(id)
                 if self.ticket_batch_owner(id) != batch_owner:
                     raise LedgerError(f"{id}: ticket already exists with a different batch owner")
+                if self.ticket_proposals(id) != decisions:
+                    raise LedgerError(f"{id}: ticket already exists with different proposal decisions")
                 if (previous["unit"], previous["kind"], previous["family"], previous["crate"], previous["files"], previous["rules"], previous["rule"], previous["sites"], previous["proposal"], previous["cells"], previous["finding_ids"]) != (unit, kind, family, crate, files, rules, rule, sites or [], proposal, [list(cell) for cell in cells], list(finding_ids)):
                     raise LedgerError(f"{id}: ticket already exists in state {previous['state']} with different fields")
                 return True
@@ -2499,15 +2515,22 @@ class Ledger:
                 if not proposal or not findings:
                     raise LedgerError(f"{id}: proposal requires filed findings")
                 for finding in findings:
-                    if not isinstance(finding.state, Filed) or str(finding.state.proposal) != proposal:
+                    if not isinstance(finding.state, Filed) or finding.state.proposal not in decisions:
                         raise LedgerError(f"{id}: proposal requires filed findings; {finding.finding_id} is not filed to {proposal}")
                     if isinstance(finding.build_ticket, BuildTicket):
                         owner = self._ticket(finding.build_ticket.ticket)
                         if owner["state"] not in FINAL_TICKET_STATES:
                             raise LedgerError(f"{finding.finding_id}: build ticket {owner['id']} already holds finding")
+                if {finding.state.proposal for finding in findings if isinstance(finding.state, Filed)} != set(decisions):
+                    raise LedgerError(f"{id}: each proposal decision must hold a ticket finding")
                 if set(files) != {finding.path for finding in findings} or set(rules) != {finding.rule for finding in findings}:
                     raise LedgerError(f"{id}: proposal files and rules must match its filed findings")
-            elif proposal or finding_ids:
+                if len(decisions) > 1:
+                    snapshot = self._tip(self.synced_commit())
+                    if any(snapshot.crate(finding.path) != crate or self._component_rule(finding.rule).family != family
+                           for finding in findings):
+                        raise LedgerError(f"{id}: combined decisions must share one family and crate")
+            elif proposal or finding_ids or proposals:
                 raise LedgerError(f"{id}: proposal findings are for proposal tickets only")
             return False
 
@@ -2540,6 +2563,8 @@ class Ledger:
                     (id, unit, kind, family, rule, crate, json.dumps(files), json.dumps(sites or []),
                      json.dumps(rules), json.dumps(pins, sort_keys=True), now, now, proposal, json.dumps(cells), json.dumps(finding_ids)),
                 )
+                _ = self._connection.executemany("INSERT INTO ticket_proposals VALUES (?,?)",
+                                                 [(id, str(decision)) for decision in decisions])
                 if isinstance(batch_owner, BatchOwner):
                     _ = self._connection.execute(
                         "INSERT INTO ticket_batch_owners VALUES (?,?)", (id, batch_owner.batch),
@@ -3027,7 +3052,10 @@ class Ledger:
             footprints: list[frozenset[str]] = []
             for ticket in (predecessor, successor):
                 end = ticket["checkpoint"] or live[successor["branch"]]
-                paths = _git_bytes(self.repo, "diff", "--name-only", "--no-renames", "-z", ticket["base"], end).stdout
+                # Neither inherited predecessor work nor imported style work belongs to this ticket.
+                revisions = (end, f"^{ticket['base']}", *((f"^{style_tip}",) if style_tip else ()))
+                paths = _git_bytes(self.repo, "log", "--no-merges", "--name-only", "--no-renames", "-z",
+                                   "--format=", *revisions, "--").stdout
                 if paths and not paths.endswith(b"\0"):
                     raise LedgerError("unreadable changed paths")
                 actual = frozenset(os.fsdecode(path) for path in paths.split(b"\0") if path)
@@ -3552,7 +3580,22 @@ class Ledger:
         if ticket["kind"] != "proposal":
             return SelectedByCoverage(ticket["base"])
         return ApprovedProposal(Path(ticket["proposal"]), ticket["unit"], tuple(ticket["finding_ids"]),
-                                tuple(widened["path"] for widened in ticket["widened"]), ticket["base"])
+                                tuple(widened["path"] for widened in ticket["widened"]), ticket["base"],
+                                tuple(issue for issue in self.ticket_proposals(id) if str(issue) != ticket["proposal"]))
+
+    def ticket_crate(self, id: str) -> str:
+        """The crate whose work the ticket builds or judges."""
+        return self._ticket(id)["crate"]
+
+    def ticket_proposals(self, id: str) -> tuple[Path, ...]:
+        """Every decision a ticket builds, including the primary decision of a legacy ticket."""
+        rows = cast(list[tuple[str]], self._connection.execute(
+            "SELECT proposal FROM ticket_proposals WHERE ticket=? ORDER BY proposal", (id,),
+        ).fetchall())
+        if rows:
+            return tuple(Path(row[0]) for row in rows)
+        proposal = self._ticket(id)["proposal"]
+        return (Path(proposal),) if proposal else ()
 
     def proposal_tickets(self) -> tuple[TicketRecord, ...]:
         rows = cast(list[tuple[str]], self._connection.execute(
@@ -3564,7 +3607,7 @@ class Ledger:
         """The merged tickets of the proposal whose checkpoint the synced commit does not hold."""
         commit = self.synced_commit()
         return tuple(ticket for ticket in self.proposal_tickets()
-                     if ticket["state"] == "merged" and Path(ticket["proposal"]) == proposal
+                     if ticket["state"] == "merged" and proposal in self.ticket_proposals(ticket["id"])
                      and not self._is_ancestor(ticket["checkpoint"], commit))
 
     @_ticket_operation("drop")

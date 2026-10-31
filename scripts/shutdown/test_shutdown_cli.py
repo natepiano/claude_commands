@@ -38,6 +38,7 @@ import sessions
 import remote_control
 import shutdown
 import restart_support
+import remote
 from push_texts import RenderedPush
 import restart as restart_work
 from scripts.whoami.account import Account, UnreadableAccount
@@ -263,7 +264,7 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
         _ = self.recovery("recoverable")
         with (patch.object(inventory, "snapshot_inventory", return_value=inventory.CompleteInventory(
                 "natedev", {}, {})), patch.object(restart_support, "record_time", return_value=JANUARY),
-              patch.object(restart_support, "local_machine", return_value="snapshot-host"),
+              patch.object(remote, "local_machine", return_value="snapshot-host"),
               redirect_stdout(io.StringIO())):
             self.assertEqual(shutdown.main(["snapshot"]), 0)
         saved = shutdown_store.read_snapshot(LOGIN)
@@ -659,13 +660,14 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
         self.assertIn("shutdown records not reached", error.getvalue())
         self.assertIn("agents restart --here", error.getvalue())
 
-    def test_in_session_no_account_keeps_own_account_for_down_status_and_restart(self) -> None:
+    def test_in_session_status_keeps_own_account_and_restart_covers_all_sources(self) -> None:
         selected = Account('claude', LOGIN, LABEL)
         report = inventory.Inventory(machine='natedev', login=LOGIN, label=LABEL, sessions=[], unattributed=[])
-        with patch.dict(os.environ, {'CLAUDE_CODE_SESSION_ID': 'caller-id'}), patch.object(shutdown, 'own_claude_account', return_value=selected), patch.object(shutdown, 'inventory', return_value=report), patch.object(shutdown, '_terminal_accounts', side_effect=AssertionError('expanded accounts')), patch.object(restart_work, 'restart', return_value=0) as resume, redirect_stdout(io.StringIO()):
+        with patch.dict(os.environ, {'CLAUDE_CODE_SESSION_ID': 'caller-id'}), patch.object(shutdown, 'own_claude_account', return_value=selected), patch.object(shutdown, 'inventory', return_value=report), patch.object(shutdown, '_terminal_accounts', return_value=shutdown.TerminalAccountSelection((selected,))) as selected_accounts, patch.object(restart_work, 'restart', return_value=0) as resume, redirect_stdout(io.StringIO()):
             self.assertEqual(shutdown.main(['status', '--here', '--json']), 0)
             self.assertEqual(shutdown.main(['restart', '--here']), 0)
-        self.assertEqual(resume.call_args.args[0], restart_work.AccountNotNamed())
+        self.assertEqual(resume.call_args.args[0], restart_work.AccountNamed(LOGIN))
+        selected_accounts.assert_called_once()
 
 
 
@@ -731,16 +733,16 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
                 peer = inventory.Inventory(machine=peer_machine, login=LOGIN, label=LABEL,
                                            sessions=[saved["session"]], unattributed=[])
 
-                def remote(arguments: list[str]) -> tuple[int, str]:
+                def read_peer(arguments: list[str]) -> tuple[int, str]:
                     if arguments == ["status", LOGIN, "--json", "--here"]:
                         return 0, json.dumps(peer)
                     self.assertEqual(arguments, ["records", "--json", "--here"])
                     return 0, json.dumps([saved])
 
-                with (patch.object(restart_support, "local_machine", return_value=local_machine),
+                with (patch.object(remote, "local_machine", return_value=local_machine),
                       patch.object(shutdown, "other_machine", return_value=peer_machine),
                       patch.object(shutdown, "inventory", return_value=local),
-                      patch.object(shutdown, "run_remote", side_effect=remote) as remote_read,
+                      patch.object(shutdown, "run_remote", side_effect=read_peer) as remote_read,
                       patch.object(shutdown, "named_claude_account", return_value=Account("claude", LOGIN, LABEL)),
                       patch.object(restart_work, "_owner_liveness",
                                    side_effect=AssertionError("peer liveness must come from its inventory")),
@@ -1379,7 +1381,7 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
         self.assertEqual(self.run_cli(LOGIN, "--restart-of", "session-123"), (0, "alpha is held by a shutdown (since 2026-10-09 14:49 PDT)\n", ""))
 
     def test_removed_writer_verbs_are_rejected(self) -> None:
-        removed = ("down", "now", "ready", "cancel", "conduct", "follow", "begin", "refresh", "retry-stop", "claim-stop", "close-failed-stop")
+        removed = ("now", "ready", "cancel", "conduct", "follow", "begin", "refresh", "retry-stop", "claim-stop", "close-failed-stop")
         for verb in removed:
             with self.subTest(verb=verb), redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as raised:
                 _ = shutdown.main([verb, LOGIN])

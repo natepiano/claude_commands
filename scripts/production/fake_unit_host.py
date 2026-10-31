@@ -197,7 +197,15 @@ class PaneShellFixture:
 
     @property
     def found(self) -> unit_lookup.MarkedUnit | None:
-        return self._found if (Path(self.environment["HERDR_PROC"]) / str(self.shell)).exists() else None
+        import unit_lookup
+        process_root = Path(self.environment["HERDR_PROC"])
+        if not (process_root / str(self.shell)).exists():
+            return None
+        found = self._found
+        if (found is not None and isinstance(found.claude, unit_lookup.LiveClaude)
+                and not (process_root / str(found.claude.pid)).exists()):
+            return unit_lookup.MarkedUnit(self.unit, unit_lookup.ClaudeNotRunning(), self.place)
+        return found
 
     @found.setter
     def found(self, value: unit_lookup.MarkedUnit | None) -> None:
@@ -302,40 +310,43 @@ def record_shutdown(case: unittest.TestCase, pane: PaneShellFixture, path: Path,
     import rename_unit
     import shutdown_record
     import unit_lookup
-    import herdr
     stopped_event = threading.Event()
     initial = cast(dict[str, object], json.loads(path.read_text()))
     if cast(dict[str, object], initial['progress']).get('kind') == 'stopped':
         stopped_event.set()
     pane.environment['RENAME_UNIT_STOP_WAIT'] = str(TEST_HANG_GUARD_SECS)
 
-    def shutdown(*arguments: str) -> None:
-        pane.stop_calls.append(' '.join(arguments))
-        if arguments[0] == 'stop':
-            pane.stopped()
-            fields = cast(dict[str, str], json.loads(path.read_text()))
-            def stopped(saved: shutdown_record.SessionShutdown) -> None:
-                saved['progress'] = {'kind':'stopped','at':'2026-10-09T21:50:00+00:00'}
-                saved['stop_issues'] = []
-            _ = shutdown_record.update_session(fields['login'], 'sid-alpha', stopped)
-            stopped_event.set()
-        elif arguments[0] == 'restart':
-            pane.slug, pane.unit, name = destination
-            pane.place = herdr.HerdrPlace('restored', 'w2:p1')
-            write(pane.environment, [HostedUnit(pane.place.session, pane.place.pane,
-                  {'SHOWRUNNER_UNIT':pane.slug, 'SHOWRUNNER_UNIT_ID':pane.unit}, label=name)])
-            pane.shell = 991001
-            pane.found = unit_lookup.MarkedUnit(pane.unit,
-                unit_lookup.LiveClaude(name, 'sid-alpha', '/fixture/socket', pane.shell), pane.place)
-        else:
-            raise AssertionError(f'unexpected shutdown: {arguments}')
-
     from scripts.shutdown import stop_resume
+    resume_session = cast(Callable[..., stop_resume.ClaudeUp | stop_resume.ResumeFailed | stop_resume.SessionNotFound], stop_resume.resume)
+    stop_session = cast(object, getattr(case, "stop_session", None))
+
     def stop(identity: str) -> stop_resume.Stopped:
-        shutdown("stop", identity)
+        pane.stop_calls.append("stop " + identity)
+        if callable(stop_session):
+            _ = cast(Callable[[str], stop_resume.Stopped], stop_session)(identity)
+        else:
+            pane.stopped()
+        fields = cast(dict[str, str], json.loads(path.read_text()))
+        def stopped(saved: shutdown_record.SessionShutdown) -> None:
+            saved["progress"] = {"kind": "stopped", "at": "2026-10-09T21:50:00+00:00"}
+            saved["stop_issues"] = []
+        _ = shutdown_record.update_session(fields["login"], identity, stopped)
+        stopped_event.set()
         return stop_resume.Stopped(identity, pane.director)
-    _ = case.enterContext(mock.patch.object(stop_resume, 'stop', side_effect=stop))
-    _ = case.enterContext(mock.patch.object(rename_unit, 'run_shutdown', side_effect=shutdown))
+
+    def resume(identity: str, **options: object) -> stop_resume.ClaudeUp | stop_resume.ResumeFailed | stop_resume.SessionNotFound:
+        pane.stop_calls.append("resume " + identity)
+        result = resume_session(identity, **options)
+        if isinstance(result, stop_resume.ClaudeUp):
+            pane.slug, pane.unit, name = destination
+            pane.found = unit_lookup.MarkedUnit(pane.unit,
+                unit_lookup.LiveClaude(name, identity, "/fixture/socket", pane.director), pane.place)
+        return result
+
+    _ = case.enterContext(mock.patch.object(stop_resume, "stop", side_effect=stop))
+    if hasattr(case, "stop_session"):
+        _ = case.enterContext(mock.patch.object(case, "stop_session", side_effect=stop))
+    _ = case.enterContext(mock.patch.object(stop_resume, "resume", side_effect=resume))
     def wait_for_stop(_seconds: float) -> None:
         case.assertTrue(stopped_event.wait(TEST_HANG_GUARD_SECS), 'fake shutdown did not publish its stop')
     _ = case.enterContext(mock.patch.object(rename_unit, 'time',

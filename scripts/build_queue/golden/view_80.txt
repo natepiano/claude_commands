@@ -1,0 +1,38 @@
+Build queue · 10:46
+
+                                                   free 4.4 │ taken 16.6
+budget 21.0                                        ░░░░█████████████████
+
+ # showrunner        unit              step    min need
+ 1▸tool-based-ui     cables            nextest   6 ██████▊ 6.8 ↑ ≤14.2 9:18
+ 2▸tool-based-ui     cables            nextest   6 ███████████▌ 11.5
+ 3 tool-based-ui     hana-migration    mend     39 ███████▋ 7.6
+ 4 cargo-liner       berth             clippy   37 ██▉ 2.9
+ 5 tool-based-ui     cables            mend     36 ███████▋ 7.6
+ 6 tool-based-ui     lfo               nextest  35 ██████████▊ 10.8
+ 7 cargo-liner-style modules           doc      35 ███▌ 3.5
+ 8 cargo-liner-style —                 nextest  33 █▊ 1.8
+ 9 performance       metrics-gathering mend     32 ███████▋ 7.6
+10 tool-based-ui     —                 clippy   31 ██████▊ 6.8
+11 cargo-liner-style types             doc      31 ███▌ 3.5
+12 tool-based-ui     geometry-material nextest  30 █ 1.0
+13 tool-based-ui     trunk             doc      30 ████▍ 4.4
+14 cargo-liner       handler           clippy   30 ███ 3.0
+15 tool-based-ui     demo              clippy   27 ██████▊ 6.8
+16 tool-based-ui     trunk             doc      24 ████▍ 4.4
+17 cargo-liner       port              mend     24 ███▎ 3.2
+18 cargo-liner       port              nextest  24 █▊ 1.8
+19 tool-based-ui     inspectors        nextest  21 ███████████▌ 11.5
+20 tool-based-ui     demo              mend     20 ███████▋ 7.6
+21 tool-based-ui     startup           nextest  14 ██████████▊ 10.8
+22 tool-based-ui     geometry-material clippy   14 ██████▏ 6.1
+23 tool-based-ui     hana-migration    nextest  10 ████████████▏ 12.1
+24 performance       metrics-gathering nextest  10 ████████████▏ 12.1
+25 cargo-liner       handler           nextest   9 █▊ 1.8
+26 performance       metrics-gathering nextest   8 ████████▌ 8.5
+27 performance       benchmark         nextest   8 ████████████▏ 12.1
+28 cargo-liner       tile              nextest   6 ██████████▊ 10.8
+29 tool-based-ui     lfo               nextest   3 █ 1.0
+30 tool-based-ui     trunk             nextest   2 ██████████▊ 10.8
+31 tool-based-ui     fastest           clippy    1 ██████▊ 6.8
+32 tool-based-ui     assembly          clippy    0 ██████▊ 6.8

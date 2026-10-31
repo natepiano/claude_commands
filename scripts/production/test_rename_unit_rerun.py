@@ -14,6 +14,8 @@ from scripts.production.rename_unit_test_support import UnitRenameFixture
 from scripts.production.rename_test_support import legacy_staff_journal, stop_at_staff_write
 from scripts.production.rename_rerun_test_support import final_files, saved_fixture
 import rename_unit
+from scripts.shutdown import stop_resume
+import pane_record
 
 
 @final
@@ -89,38 +91,39 @@ class UnitRenameRerunTests(UnitRenameFixture):
                     self.assertIs(self.journal()["done"], True)
                     self.assertEqual(self.outcome(), expected)
 
-    def test_resume_after_restart_before_relaunch_progress_save(self) -> None:
+    def test_resume_after_shared_resume_before_progress_save(self) -> None:
         self.env.update(GIT_AUTHOR_DATE="2026-10-29T12:00:00Z", GIT_COMMITTER_DATE="2026-10-29T12:00:00Z")
         _ = self.seed_record()
-        shutdown = rename_unit.run_shutdown
-        live: list[Callable[[], None]] = []
-
-        def restart(*arguments: str) -> None:
-            shutdown(*arguments)
-            # The private shutdown stand-in publishes the live unit only once.
-            if not live:
-                live.append(self.mark_live("gamma-unit", "sid-alpha"))
-
+        entry = pane_record.read("agents")["w1:p1"]
+        entry["ended"] = True
+        entry["restart_after_down"] = True
+        pane_record.write("agents", entry)
+        resume = cast(Callable[..., stop_resume.ClaudeUp | stop_resume.ResumeFailed | stop_resume.SessionNotFound], stop_resume.resume)
         with saved_fixture(self.root) as restore:
-            with mock.patch.object(rename_unit, "run_shutdown", side_effect=restart):
-                self.assert_ok(self.rename("apply"))
+            self.assert_ok(self.rename("apply"))
             expected = self.outcome()
-            # Remove the live fixture socket before restoring the saved files.
-            end = live.pop()
-            end()
             restore()
-            def interrupted(*arguments: str) -> None:
-                restart(*arguments)
+            self.director.reset()
+            launches = len(self.director.starts)
+
+            def interrupted(identity: str, **options: object) -> stop_resume.ClaudeUp | stop_resume.ResumeFailed | stop_resume.SessionNotFound:
+                result = resume(identity, **options)
+                self.assertIsInstance(result, stop_resume.ClaudeUp)
+                resumed = pane_record.read("agents")["w1:p1"]
+                self.assertIs(resumed.get("ended"), False)
+                self.assertNotIn("restart_after_down", resumed)
                 raise OSError("stopped after restart")
 
-            with mock.patch.object(rename_unit, "run_shutdown", side_effect=interrupted):
+            with mock.patch.object(stop_resume, "resume", side_effect=interrupted):
                 failed = self.rename("apply")
             self.assert_refused(failed, "stopped after restart")
             self.assertEqual(self.journal()["step"], 9)
-            self.assertEqual(len(live), 1)
-            with mock.patch.object(rename_unit, "run_shutdown", side_effect=restart):
-                self.assert_ok(self.rename("apply"))
-            self.assertEqual(len(live), 1, "rerun must not launch another Claude")
+            self.assertEqual(len(self.director.starts), launches + 1)
+            self.assert_ok(self.rename("apply"))
+            self.assertEqual(len(self.director.starts), launches + 1, "rerun must not launch another Claude")
+            resumed = pane_record.read("agents")["w1:p1"]
+            self.assertIs(resumed.get("ended"), False)
+            self.assertNotIn("restart_after_down", resumed)
             self.assertIs(self.journal()["done"], True)
             self.assertEqual(self.outcome(), expected)
 

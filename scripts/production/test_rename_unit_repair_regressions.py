@@ -80,6 +80,7 @@ class UnitRenameRepairRegressions(UnitRenameFixture):
         recorder = self.root / "sessions/mul/progress_history_state.json"
         self.write(recorder, json.dumps({"history_file": str(run), "working_dir": str(old),
                                         "worktree": old.name, "branch": "mul_add"}))
+        self.director.configure(SLUG, "mul_add-unit", old)
         self.assert_ok(self.rename("plan", "mul_add", "mul_add"))
         self.assert_ok(self.rename("apply", "mul_add", "mul_add"))
         self.assertFalse(old.exists())
@@ -118,7 +119,7 @@ class UnitRenameRepairRegressions(UnitRenameFixture):
         self.assertNotIn("rename unit alpha-unit to alpha-unit", planned.stdout)
         self.assertIn("Units row", planned.stdout)
         self.assertIn("demo-alpha -> alpha", planned.stdout)
-        self.assertIn("10. already matches: no shutdown record to relaunch", planned.stdout)
+        self.assertIn("resume alpha-unit in its retained pane", planned.stdout)
         _ = self.canonical_alpha()
         unchanged = self.rename("plan", "alpha", "alpha")
         self.assert_ok(unchanged)

@@ -40,6 +40,11 @@ class MoveHandedOff:
 
 
 @dataclass(frozen=True)
+class DownHandedOff:
+    session_id: str
+
+
+@dataclass(frozen=True)
 class ResumeFailed:
     session_id: str
     reason: str
@@ -51,6 +56,19 @@ class SessionNotFound:
 
 
 MoveResult = ClaudeUp | MoveHandedOff | StopFailed | ResumeFailed | SessionNotFound
+DownResult = Stopped | NotRunning | DownHandedOff | StopFailed | SessionNotFound
+
+
+def down_result_line(result: DownResult) -> str:
+    if isinstance(result, Stopped):
+        return f"{result.session_id}: stopped"
+    if isinstance(result, NotRunning):
+        return f"{result.session_id}: already down"
+    if isinstance(result, DownHandedOff):
+        return f"{result.session_id}: stopping in detached batch"
+    if isinstance(result, SessionNotFound):
+        return f"{result.name}: failed: no local tab"
+    return f"{result.session_id}: failed: {result.reason}"
 
 
 def claude_up_line(result: ClaudeUp) -> str:

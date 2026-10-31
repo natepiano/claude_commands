@@ -11,6 +11,8 @@ import tempfile
 import threading
 import unittest
 from contextlib import redirect_stdout
+from dataclasses import replace
+from functools import cached_property
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, final, override
 from unittest import mock
@@ -78,39 +80,40 @@ class FakeProcess(NamedTuple):
 
 
 @final
-class RunProcessTests(unittest.TestCase):
+class RunProcessTests(UnitRenameFixture):
     """What a stopped unit's runs leave in its worktree. The processes are records: nothing real is signalled."""
 
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
-        self.root = Path()
-        self.worktree = Path()
+        self.unit_worktree = Path()
         self.processes: dict[int, FakeProcess] = {}
         self.signalled: list[int] = []
 
     @override
     def setUp(self) -> None:
+        super().setUp()
+        # Bind the complete plan before installing the fake worker-process inventory.
+        _ = self.rename_target
         _ = self.enterContext(isolated_parents())
         PARENTS["alpha-unit"] = staff_sources.UnitProduction(SLUG, "/fixture/demo-production.md")
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        self.worktree = self.root / "claude-demo-alpha"
+        self.unit_worktree = self.rust / "claude-demo-alpha"
         other = self.root / "claude-demo-beta"
-        mine = self.run_folder("run-a", self.worktree)
+        mine = self.run_folder("run-a", self.unit_worktree)
         theirs = self.run_folder("run-b", other)
         lint = ["python3", "mesh_runs.py", "supervise", str(self.run_record(mine, "lint", 101))]
         _ = self.run_record(mine, "test", 104)
         self.processes = {
             # The unit's detached lint run: the supervisor leads its session, verify.sh and tee are in it.
-            101: FakeProcess(self.worktree, 101, lint),
-            102: FakeProcess(self.worktree, 101, ["bash", "verify.sh", "lint", "pkg"]),
-            103: FakeProcess(self.worktree, 101, ["tee", "-a", "run.log"]),
+            101: FakeProcess(self.unit_worktree, 101, lint),
+            102: FakeProcess(self.unit_worktree, 101, ["bash", "verify.sh", "lint", "pkg"]),
+            103: FakeProcess(self.unit_worktree, 101, ["tee", "-a", "run.log"]),
             # The idle-stop watcher of the run's stopped app-server, and its sleep.
-            201: FakeProcess(self.worktree, 201, self.watcher(mine)),
-            202: FakeProcess(self.worktree, 201, ["sleep", "300"]),
+            201: FakeProcess(self.unit_worktree, 201, self.watcher(mine)),
+            202: FakeProcess(self.unit_worktree, 201, ["sleep", "300"]),
             # A record whose pid now names another process; another unit's watcher; the user's shell.
-            104: FakeProcess(self.worktree, 104, ["cargo", "build"]),
-            203: FakeProcess(self.worktree, 203, self.watcher(theirs)),
-            900: FakeProcess(self.worktree, 900, ["zsh"]),
+            104: FakeProcess(self.unit_worktree, 104, ["cargo", "build"]),
+            203: FakeProcess(self.unit_worktree, 203, self.watcher(theirs)),
+            900: FakeProcess(self.unit_worktree, 900, ["zsh"]),
             # Another unit's detached run, in its own worktree.
             301: FakeProcess(other, 301, ["python3", "mesh_runs.py", "supervise",
                                           str(self.run_record(theirs, "lint", 301))]),
@@ -137,7 +140,7 @@ class RunProcessTests(unittest.TestCase):
 
     def run_record(self, folder: Path, label: str, pid: int) -> Path:
         path = folder / retire_unit.DETACHED_RUNS / f"{label}.json"
-        _ = path.write_text(json.dumps({"status": "running", "pid": pid, "label": label, "cwd": str(self.worktree)}))
+        _ = path.write_text(json.dumps({"status": "running", "pid": pid, "label": label, "cwd": str(self.unit_worktree)}))
         return path
 
     def watcher(self, folder: Path) -> list[str]:
@@ -168,21 +171,24 @@ class RunProcessTests(unittest.TestCase):
             self.signalled.append(pid)
             del self.processes[pid]
 
-    def rename(self) -> rename_unit.UnitRename:
-        return rename_unit.UnitRename(SLUG, "alpha-unit", "gamma-unit", "", "", SLUG, "demo-alpha", "gamma",
-                                      str(self.worktree), str(self.root / "claude-demo-gamma"), "", "")
+    @cached_property
+    def rename_target(self) -> rename_unit.UnitRename:
+        return rename_unit.plan(SLUG, "alpha", "gamma", self.root / "scratch")
+
+    def stop_target(self) -> rename_unit.UnitRename:
+        return replace(self.rename_target)
 
     def stop(self) -> str:
         output = io.StringIO()
         with redirect_stdout(output):
-            rename_unit.stop_unit(self.rename(), lambda: None)
+            rename_unit.stop_unit(self.stop_target(), lambda: None)
         return output.getvalue()
 
     def test_rename_refuses_a_paused_workers_live_command_inside_the_worktree_without_signalling(self) -> None:
         run = self.root / "runs" / "run-a"
         record = run / retire_unit.DETACHED_RUNS / "lint.json"
-        _ = record.write_text(json.dumps({"status": "running", "pid": 101, "worker": "w7", "cwd": str(self.worktree)}))
-        _ = (run / "progress_history_state.json").write_text(json.dumps({"working_dir": str(self.worktree),
+        _ = record.write_text(json.dumps({"status": "running", "pid": 101, "worker": "w7", "cwd": str(self.unit_worktree)}))
+        _ = (run / "progress_history_state.json").write_text(json.dumps({"working_dir": str(self.unit_worktree),
             "production": SLUG, "unit": "alpha-unit"}))
         with mock.patch.dict(os.environ, {"UNIT_WORKERS_STATE": str(self.root / "unit-workers")}):
             store = workers.UnitWorkerLedger(workers.ledger_path(SLUG, "alpha-unit"))
@@ -203,9 +209,9 @@ class RunProcessTests(unittest.TestCase):
                 with self.subTest(folder=folder, shell=shell):
                     arguments = self.watcher(folder)
                     arguments[0], arguments[4] = shell, "555"
-                    self.processes[203] = FakeProcess(self.worktree, 203, arguments)
-                    self.processes[204] = FakeProcess(self.worktree, 203, ["sleep", "300"])
-                    found = retire_unit.run_processes(self.worktree, [203, 204])
+                    self.processes[203] = FakeProcess(self.unit_worktree, 203, arguments)
+                    self.processes[204] = FakeProcess(self.unit_worktree, 203, ["sleep", "300"])
+                    found = retire_unit.run_processes(self.unit_worktree, [203, 204])
                     self.assertEqual(set(found), {203, 204})
                     for name in found.values():
                         self.assertIn("app-server watcher 203 of dead server 555", name)
@@ -217,8 +223,8 @@ class RunProcessTests(unittest.TestCase):
             (self.root / "elsewhere/run-a", set()), (self.root / "gone", set()))
         for folder, expected in cases:
             with self.subTest(folder=folder):
-                self.processes[203] = FakeProcess(self.worktree, 203, self.watcher(folder))
-                self.assertEqual(set(retire_unit.run_processes(self.worktree, [203])), expected)
+                self.processes[203] = FakeProcess(self.unit_worktree, 203, self.watcher(folder))
+                self.assertEqual(set(retire_unit.run_processes(self.unit_worktree, [203])), expected)
         self.assertEqual(self.signalled, [])
 
     def test_dead_server_watcher_requires_the_mesh_entry_point_and_valid_server_pid(self) -> None:
@@ -228,8 +234,8 @@ class RunProcessTests(unittest.TestCase):
                 arguments = self.watcher(self.root / "gone")
                 arguments[4] = "555"
                 arguments[index] = value
-                self.processes[203] = FakeProcess(self.worktree, 203, arguments)
-                self.assertEqual(retire_unit.run_processes(self.worktree, [203]), {})
+                self.processes[203] = FakeProcess(self.unit_worktree, 203, arguments)
+                self.assertEqual(retire_unit.run_processes(self.unit_worktree, [203]), {})
         self.assertEqual(self.signalled, [])
 
     def test_the_stop_ends_the_runs_supervisor_and_watcher_and_leaves_the_rest(self) -> None:
@@ -240,13 +246,13 @@ class RunProcessTests(unittest.TestCase):
         self.assertIn("of the app-server watcher 201 of run run-a", printed)
         # What the unit's runs do not own still blocks the move.
         with self.assertRaisesRegex(RenameRefused, r"^processes 104, 203, 900 work inside "):
-            rename_unit._check_stopped(self.rename())  # pyright: ignore[reportPrivateUsage]
+            rename_unit._check_stopped(self.stop_target())  # pyright: ignore[reportPrivateUsage]
 
     def test_with_only_its_runs_left_the_stopped_unit_can_move(self) -> None:
         for pid in (104, 203, 900):
             del self.processes[pid]
         _ = self.stop()
-        rename_unit._check_stopped(self.rename())  # pyright: ignore[reportPrivateUsage]
+        rename_unit._check_stopped(self.stop_target())  # pyright: ignore[reportPrivateUsage]
         self.assertEqual(sorted(self.processes), [301, 302])
 
     def test_a_process_that_outlives_its_sigterm_refuses_the_rename(self) -> None:
@@ -261,8 +267,8 @@ class RunProcessTests(unittest.TestCase):
         and, when it is 0, ends them. The calls come back."""
         folder = self.root / "runs" / "run-a"
         _ = (folder / "mesh_server.json").write_text(json.dumps({"pid": 501, "port": 51101}))
-        self.processes = {501: FakeProcess(self.worktree, 501, ["codex", "app-server", "--listen", "ws://x"]),
-                          502: FakeProcess(self.worktree, 501, ["codex-code-mode-host"])}
+        self.processes = {501: FakeProcess(self.unit_worktree, 501, ["codex", "app-server", "--listen", "ws://x"]),
+                          502: FakeProcess(self.unit_worktree, 501, ["codex-code-mode-host"])}
         calls: list[list[str]] = []
 
         def mesh(argv: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
@@ -278,11 +284,11 @@ class RunProcessTests(unittest.TestCase):
     def test_the_stop_ends_the_runs_app_server_and_its_seats(self) -> None:
         """The real case: modules-unit's 8-hour app-server and its code-mode host refused step 1."""
         calls = self.serve(0)
-        rename_unit.check_stoppable(self.rename())
+        rename_unit.check_stoppable(self.stop_target())
         printed = self.stop()
         self.assertEqual([call[2:] for call in calls], [["stop", "--pause", "--session-dir", str(self.root / "runs" / "run-a")]])
         self.assertIn("stopped: app-server pid 501 of run run-a", printed)
-        rename_unit._check_stopped(self.rename())  # pyright: ignore[reportPrivateUsage]
+        rename_unit._check_stopped(self.stop_target())  # pyright: ignore[reportPrivateUsage]
 
     def test_an_app_server_its_stop_misses_gets_sigterm_with_its_children(self) -> None:
         _ = self.serve(1)
@@ -297,16 +303,16 @@ class RunProcessTests(unittest.TestCase):
         former = self.root / "delegate"
         folder = former / "run-old"
         (folder / retire_unit.DETACHED_RUNS).mkdir(parents=True)
-        _ = (folder / unit_runs.STATE_FILE).write_text(json.dumps({"working_dir": str(self.worktree)}))
+        _ = (folder / unit_runs.STATE_FILE).write_text(json.dumps({"working_dir": str(self.unit_worktree)}))
         record = self.run_record(folder, "lint-old", 401)
-        self.processes = {401: FakeProcess(self.worktree, 401, ["python3", "mesh_runs.py", "supervise", str(record)]),
-                          402: FakeProcess(self.worktree, 401, ["bash", "verify.sh", "lint", "pkg"])}
+        self.processes = {401: FakeProcess(self.unit_worktree, 401, ["python3", "mesh_runs.py", "supervise", str(record)]),
+                          402: FakeProcess(self.unit_worktree, 401, ["bash", "verify.sh", "lint", "pkg"])}
         self.enterContext(mock.patch.dict(os.environ, {"RETIRE_UNIT_RUN_ROOT": ""}))
         _ = self.enterContext(mock.patch.object(unit_runs, "RUN_ROOT", self.root / "unit"))
         _ = self.enterContext(mock.patch.object(unit_runs, "FORMER_RUN_ROOT", former))
         output = io.StringIO()
         with redirect_stdout(output):
-            rename_unit._check_stopped(self.rename())  # pyright: ignore[reportPrivateUsage]
+            rename_unit._check_stopped(self.stop_target())  # pyright: ignore[reportPrivateUsage]
         self.assertEqual(sorted(self.signalled), [401, 402])
         self.assertIn("of the run supervisor 401 of lint-old in run run-old", output.getvalue())
 

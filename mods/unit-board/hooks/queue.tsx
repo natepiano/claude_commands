@@ -1,63 +1,18 @@
-import { span, wrapLine } from './board';
-import type { BoardLine, PaneElements } from './board';
-import { cellWidth } from './geometry';
-import type { QueueSnapshot } from '../types/queue';
+import type { PaneElements } from './board';
+import type { QueueLines } from '../types/queue';
 
-function tableLines(header: string[], rows: string[][], width: number): BoardLine[] {
-  if (!rows.length) return [[span('empty')]];
-  const sizes = header.map((heading, index) =>
-    rows.reduce((size, row) => Math.max(size, cellWidth(row[index] ?? '')), cellWidth(heading)));
-  if (sizes.reduce((sum, size) => sum + size, 0) + (sizes.length - 1) * 2 <= width) {
-    const line = (cells: string[], bold = false) => header.map((_, index) => {
-      const cell = cells[index] ?? '';
-      const padding = ' '.repeat(sizes[index]! - cellWidth(cell));
-      const numeric = ['#', 'Promised', 'Using', 'Delta', 'Waiting since', 'Needs', 'Free'].includes(header[index]!);
-      const aligned = numeric ? padding + cell : cell + padding;
-      return span(aligned + (index === header.length - 1 ? '' : '  '), 'default', bold ? 'bold' : 'fact');
-    });
-    return [line(header, true), ...rows.map(row => line(row))];
-  }
-  return rows.flatMap((row, index) => [
-    ...(index ? [[span('')]] : []),
-    ...header.flatMap((heading, cell) => {
-      const label = `${heading}: `;
-      const value = row[cell] ?? '';
-      const numeric = ['#', 'Promised', 'Using', 'Delta', 'Waiting since', 'Needs', 'Free'].includes(heading);
-      if (numeric && cellWidth(label) + cellWidth(value) <= width) {
-        return [[span(label, 'default', 'bold'),
-          span(' '.repeat(width - cellWidth(label) - cellWidth(value)) + value)]];
-      }
-      return wrapLine([span(label, 'default', 'bold'), span(value)], width, 2);
-    }),
-  ]);
-}
-
-export function queueLines(snapshot: QueueSnapshot, columns: number): BoardLine[] {
-  const width = Math.max(1, Math.floor(columns));
-  const lines = [
-    ...wrapLine([span('Running', 'default', 'bold')], width),
-    ...tableLines(snapshot.running_header, snapshot.running, width),
-    [span('')],
-  ];
-  if (snapshot.head.text) lines.push(...wrapLine([span(snapshot.head.text, snapshot.head.tone)], width));
-  lines.push(...wrapLine([span('Waiting', 'default', 'bold')], width),
-    ...tableLines(snapshot.waiting_header, snapshot.waiting, width), [span('')]);
-  const totals = snapshot.totals;
-  lines.push(...wrapLine([span(`Totals: promised ${totals.promised}; measured ${totals.measured}; `
-    + `free ${totals.free}; reserve ${totals.reserve}`)], width));
-  for (const problem of snapshot.problems) {
-    lines.push(...wrapLine([span(`Roster: ${problem}; Showrunner and Unit show — for unmatched steps`, 'warning')], width));
-  }
-  return lines;
-}
-
-export function QueueView(elements: PaneElements, columns: number, snapshot: QueueSnapshot) {
+/** Layout belongs to Python. Only the recorded countdown changes between reads. */
+export function QueueView(elements: PaneElements, columns: number, data: QueueLines, now = data.as_of) {
   const { Box, Text } = elements;
-  return <Box flexDirection="column">
-    {queueLines(snapshot, columns).map(line => <Box flexDirection="row" flexShrink={0}>
-      {line.map(part => part.tone === 'default'
-        ? <Text bold={part.kind === 'bold'}>{part.text}</Text>
-        : <Text color={part.tone} bold={part.kind === 'bold'}>{part.text}</Text>)}
+  return <Box flexDirection="column" width={columns} overflow="hidden">
+    {data.lines.map(line => <Box flexDirection="row" flexShrink={0} height={1} overflow="hidden">
+      {line.map(part => {
+        const left = part.until === undefined ? undefined : Math.max(0, Math.floor(part.until - now));
+        const text = left === undefined ? part.text : `${Math.floor(left / 60)}:${String(left % 60).padStart(2, '0')}`;
+        return <Text wrap="truncate" bold={part.bold ?? false}
+          {...(!part.tone || part.tone === 'default' ? {} : { color: part.tone })}
+          {...(!part.background || part.background === 'default' ? {} : { backgroundColor: part.background })}>{text}</Text>;
+      })}
     </Box>)}
   </Box>;
 }

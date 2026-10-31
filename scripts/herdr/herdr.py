@@ -38,9 +38,11 @@ from typing import TYPE_CHECKING, NamedTuple, NotRequired, TypedDict, TypeVar, c
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from process_failure import failure_detail
 import nix_env as nix_env
+from place import HerdrPlace as HerdrPlace
 
 if TYPE_CHECKING:
     from scripts.production import staff
@@ -572,12 +574,6 @@ class WaitTimedOut:
 
 
 @dataclass(frozen=True)
-class HerdrPlace:
-    session: str
-    pane: str
-
-
-@dataclass(frozen=True)
 class TabWithPane:
     """The identities returned when a live pane moves into a new tab."""
 
@@ -745,6 +741,7 @@ class SessionListResult(TypedDict):
 
 class PaneIdentity(TypedDict):
     pane_id: str
+    tab_id: NotRequired[str]
     terminal_id: NotRequired[str]
     label: NotRequired[str | None]
     workspace_id: str
@@ -1102,10 +1099,14 @@ class Herdr:
                           if agent_session is not None else None)
             if session_id is not None and not isinstance(session_id, str):
                 raise HerdrFailure("herdr pane agent session value: expected text or null")
-            panes.append({"pane_id": json_text(pane.get("pane_id"), "herdr pane id"), "label": label,
-                          "terminal_id": json_text(pane.get("terminal_id", ""), "herdr terminal id"),
-                          "workspace_id": json_text(pane.get("workspace_id"), "herdr pane workspace id"),
-                          "session_id": session_id})
+            identity: PaneIdentity = {
+                "pane_id": json_text(pane.get("pane_id"), "herdr pane id"), "label": label,
+                "terminal_id": json_text(pane.get("terminal_id", ""), "herdr terminal id"),
+                "workspace_id": json_text(pane.get("workspace_id"), "herdr pane workspace id"),
+                "session_id": session_id}
+            if "tab_id" in pane:
+                identity["tab_id"] = json_text(pane.get("tab_id"), "herdr tab id")
+            panes.append(identity)
         return panes
 
     def lookup(self, label: str) -> PaneFound | NoPane | SeveralPanes:
@@ -1281,7 +1282,15 @@ class Herdr:
         _write_layout(self.session, merged_layout(saved_layout(self.session), live, time.time()))
 
     def retitle(self, pane: str, title: str) -> bool:
-        """Give the tab and pane the session's current name.
+        """Give the tab and pane the session's current name, then restore tab order."""
+        return self._retitle(pane, title, preserve_tabs=False)
+
+    def retitle_in_place(self, pane: str, title: str) -> bool:
+        """Change existing labels and the saved title without moving or replacing tabs."""
+        return self._retitle(pane, title, preserve_tabs=True)
+
+    def _retitle(self, pane: str, title: str, *, preserve_tabs: bool) -> bool:
+        """Share label changes between ordered and identity-preserving title updates.
 
         False when both already carry it, after two reads and no change.
         """
@@ -1297,13 +1306,22 @@ class Herdr:
         shown = next((item.get("label") for item in tabs if item.get("tab_id") == tab), None)
         if shown == title and row.get("label") == title:
             return False
+        if preserve_tabs:
+            spaces = [json_object(item, "herdr workspace") for item in json_items(
+                self.result("workspace", "list").get("workspaces"), "herdr workspace list")]
+            space = next((item for item in spaces if item.get("workspace_id") == workspace), None)
+            if space is None:
+                raise HerdrFailure(f"no workspace {workspace!r}")
+            old_titles = frozenset(value for value in (shown, row.get("label")) if isinstance(value, str))
+            rename_saved_tab(self.session, json_text(space.get("label"), "herdr workspace label"), old_titles, title)
         if row.get("label") != title:
             _ = self.run("pane", "rename", pane, title)
         if shown != title:
             _ = self.run("tab", "rename", tab, title)
-        with _LayoutLock(self.session):
-            _ = self.order_tabs(workspace, saved_layout(self.session))
-            self.save_layout()
+        if not preserve_tabs:
+            with _LayoutLock(self.session):
+                _ = self.order_tabs(workspace, saved_layout(self.session))
+                self.save_layout()
         return True
 
     def move_pane_to_tab(self, pane: str, workspace: str, title: str) -> TabWithPane:

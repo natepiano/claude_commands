@@ -6,6 +6,19 @@ import unittest
 from scripts.direct.assertion_guard_test_support import AssertionFindingFixture
 
 class AssertionStringTests(AssertionFindingFixture):
+    def test_c_and_byte_strings_do_not_extend_test_scope(self) -> None:
+        for literal in ('cr#"a" { b"#', 'cr"a { b"', 'cr###"a" { b"###',
+                        'c"a { b"', r'c"a\" { b"', 'b"a { b"', 'br#"a" { b"#'):
+            with self.subTest(literal=literal):
+                before = ("#[test]\nfn test_cstr() {\n"
+                          + f"    let _source = {literal};\n}}\n"
+                          + "fn outside_helper() {\n    assert_eq!(1, 1);\n}\n")
+                self.change("value.rs", before, before.replace("    assert_eq!(1, 1);\n", ""))
+                _ = self.assert_finding(self.guard("--rulings", "-", stdin=(
+                    "Assertion-Change: value.rs::test_cstr — Approved test removal.\n")),
+                    "value.rs", "removed", "outside_helper")
+
+
     def test_unreadable_code_refuses_constant_pairing(self) -> None:
         for syntax in ("fn é() {}", "fn r#helper() {}", "extern crate std as harmless;"):
             for in_glob in (False, True):

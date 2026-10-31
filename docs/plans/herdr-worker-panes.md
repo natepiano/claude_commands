@@ -370,43 +370,31 @@ Split from 3f by the plan review (2026-10-30): the journal still guards work tha
 
 **Depends on:** Phase 3f
 
-#### Work Order
+#### As-built
 
-**Goal:** a production's units come from the staff rows, and every unit and showrunner launch carries its row's `STAFF_ID`.
-
-**Spec:**
-
-1. **Identity first.** Phase 4 item 3 ships here, because this join needs it: `add_unit.py`, `add_showrunner.py` and `resume_unit.py` set `STAFF_ID=<row id>`; `STAFF_ID` joins `pane_record.KEPT_NAMES`; `herdr.unmarked_environment` drops it.
-2. **Membership.** `unit_lookup.py` (`marked_units`, `marked_unit`, `group_marked_units`, `session_unit_marks`, `_herdr_marked`), `production_units.py` (`live_unit_table`, `retired_units`, `unit_is_retired`) and `live_units.py` read `find(kind="unit", parent=<showrunner id>)`. Panes join by `STAFF_ID`. The Units table stops carrying the parent and keeps the Worktree and Plan cells. `production_tree.unit_edges` already reads row parents; leave it.
-3. **One compatibility boundary for old panes.** A pane with no `STAFF_ID` joins by its `SHOWRUNNER_UNIT_ID` name alone, through `staff_sources.member`, and ignores its production mark, which a transfer leaves stale. Two rows with that name give a problem line and no match. This fallback goes with the importer on 2026-11-13 (Phase 16).
-4. **One snapshot-aware resolver.** `staff_sources` imports `production_units`, which imports `unit_lookup`, so lower readers cannot import it. The row-parent answer moves to one function that takes the caller's `StaffSnapshot`, below `production_units` in the import order, and `staff_sources.unit_parent` calls it. A run makes one owner read.
+- Unit membership comes from the staff record. `production_units` (`live_unit_table(lines, slug, *, record)`), `unit_lookup` (`marked_units(slug, *, record)`, `marked_unit`), `dailies_input` and the roster `SessionMarks` take one `StaffSnapshot`. A run makes one owner read. The name lookup is scoped to one production and has no global fallback.
+- Unit and showrunner launches carry `STAFF_ID=<row id>` (`add_unit`, `add_showrunner`; `resume_unit` gets its row from `add_unit.ensure_staff_unit`). `STAFF_ID` is in `pane_record.KEPT_NAMES` and `herdr.MEMBER_MARKS`, and `herdr.unmarked_environment` drops it. Panes join rows by `STAFF_ID`.
+- A pane with no `STAFF_ID` joins by its `SHOWRUNNER_UNIT_ID` name alone through `staff_sources.member(selector, record)` and ignores its production mark. Two rows with that name give a problem line and no match.
+- `unit_lookup.unit_parent(unit, session_id, *, record, sources)` is the one snapshot-aware row-parent resolver. `staff_sources.unit_parent(unit, session_id)` calls it with `staff.snapshot()`.
+- `rename_unit.stop_unit` journals `pane_session`, `pane_id`, `terminal_id` and `StopIdentityEvidence` (`RECORDED` | `LEGACY_UNKNOWN`). Recovery is one decision, `_stopped_pane`, over one `Herdr.panes()` read and a fresh `pane_activity`. It refuses a moved pane, a duplicate terminal, another conversation, foreground work or a missing terminal id; the user settles the pane by hand and runs the rename again.
+- An unreadable herdr pane list keeps the launch-time place.
 
 **Files:**
-- `scripts/production/unit_lookup.py`
-- `scripts/production/production_units.py`
-- `scripts/production/live_units.py`
-- `scripts/production/staff_sources.py`
-- `scripts/production/add_unit.py`
-- `scripts/production/add_showrunner.py`
-- `scripts/production/resume_unit.py`
-- `scripts/shutdown/pane_record.py`
-- `scripts/herdr/herdr.py`
-- `scripts/production/staff_test_support.py`
-- `scripts/production/test_unit_lookup.py`
-- `scripts/production/test_live_units.py`
-- `scripts/production/test_staff_sources.py`
-- `scripts/production/test_add_unit.py`
-- `scripts/production/test_add_showrunner.py`
-- `scripts/shutdown/test_pane_record.py`
-- `scripts/herdr/test_herdr.py`
+- `scripts/production/unit_lookup.py`, `production_units.py`, `staff_sources.py`, `roster.py`, `dailies_input.py` — unit membership from the staff record
+- `scripts/production/add_unit.py`, `add_showrunner.py` — launches set `STAFF_ID`
+- `scripts/shutdown/pane_record.py`, `scripts/herdr/herdr.py` — `STAFF_ID` kept in launch records, dropped from unmarked environments
+- `scripts/production/rename_unit.py` — rename journal pane identity and stop recovery
+- `scripts/herdr/fake_herdr.py`, `scripts/production/fake_unit_host.py` — fakes follow herdr 0.9.5 identity rules; the fake has no agent-stop command
+- `scripts/production/test_rename_unit_pane_shell.py` — stop recovery refusals
 
-**Workers:** `1 writer + 1 tester` — `impl`: the unit-reader APIs, their callers, the launches and the resolver. `test`: the regression tests, and it alone changes `staff_test_support.py`.
+**Binds later work:** A rename of a live unit reads the journal identity shape; a legacy journal with a pending stop refuses with "settle the pane by hand". Worker panes and split-tab shutdown track a pane across a move by `terminal_id`, and close a pane only after a fresh `pane_activity` reads `PaneAtShell`. The replacement for `production_tree.py` keeps the one-owner-read-per-run rule. The no-`STAFF_ID` fallback goes away with the importer on 2026-11-13.
 
-**State:** `STAFF_ID` in pane launch records.
+**Gotchas:**
+- herdr 0.9.5: an agent exit clears the pane conversation id. `terminal_id` is stable, one per pane. A cross-workspace move changes the pane id, but processes keep the old pane id in their environment. herdr has no `herdr agent stop`.
+- `Herdr.panes()` turns an omitted `terminal_id` into `""`. An empty `terminal_id` is incomplete evidence, never absence.
+- A transfer leaves the pane production mark stale, so the name fallback must not read it.
 
-**Constraints from prior phases:** 3c staff row parents and `showrunner_tree`; the cargo-handler contract stays byte-identical. `staff_test_support.showrunner_relationship` is the one fixture for a showrunner edge, and `showrunner_tree`'s snapshot-taking functions are the one way to read the tree: a run takes one snapshot.
-
-**Acceptance gate:** basedpyright 0/0 on changed files and callers; tests for a legacy pane with no `STAFF_ID`, an offline unit, and a transferred unit whose pane has a stale production mark; an import test that loads `unit_lookup` and `staff_sources` in both orders; one owner read per run on the Mac (fake `ssh` log); `test_staff*`, `test_unit_lookup*`, `test_live_units*`, `test_add_*`, `test_pane*`, `test_herdr*` suites pass.
+**Ruled out:** pane id as identity across a move; a global name fallback outside the production.
 
 ### Phase 3h — Staff readers switch (batch 3: stall watch and review pool)  · status: todo
 
@@ -569,7 +557,12 @@ Inserted 2026-10-30. User (via the sdlc showrunner): "production_tree.py must go
 
 **Owners:** `codex_mesh.py` and `workers.py` are the models unit's: herdr workers write the call sites, and models reviews the diff before the merge. `stop` / `_mark_all_roster_ended` overlaps models' open follow-up F024, so tell models before that function changes. `stop_resume.py` and `shutdown.py` are the shutdown unit's: shutdown writes its side against the herdr resolver (name or staff id → Claude session | Codex worker | not found), on its branch after its p7 merges (p7 deletes `stop.py` and `stop_session`). The handler reader is handler-unit's.
 
-**Files:** to be listed at phase start from the open and end points above and a search for `production_tree`.
+**Files:**
+- `scripts/production/staff.py` — `ensure_worker`, worker `retire`, `WorkerName.parse`, worker parents, `show --json --live`
+- `scripts/production/staff_sources.py` — the rerun-safe worker seed read from the unit ledgers, rosters, review pool and Astra records
+- `scripts/production/staff_test_support.py`
+- `scripts/production/test_staff.py`
+- `scripts/production/test_staff_sources.py`
 
 **Acceptance gate:** no file names `production_tree`; the affected suites pass; basedpyright 0/0; the real handler pane shows every session and worker correct after a real unit move and a real new worker; one real Codex worker is stopped and resumed by name and by staff id.
 
@@ -1078,7 +1071,7 @@ On failure, before it resumes the worker on the source account, the move proves 
 
 **State:** none.
 
-**Constraints from prior phases:** Phase 1 `staff.find`, `by_id`, `by_path`; Phase 2 `staff.snapshot() -> StaffSnapshot` (one record read; it raises `StaffUnreadable`, also for a malformed record) and `staff_sources.member(selector, record) -> MemberFound | NoSuchMember`, by `STAFF_ID` first, then by name; Phase 4 every unit and showrunner pane carries its `STAFF_ID`, so `member` matches by id; Phase 16 moved the showrunner tree (`parent_of`, `children_of`, `tree_lines`, `production_tree.py`) to the rows, and `production_lifecycle.py` `refuse_running_children` calls `children_of`. `staff_test_support.showrunner_relationship` is the one fixture for a showrunner edge, and `showrunner_tree`'s snapshot-taking functions are the one way to read the tree: a run takes one snapshot. Phases 3g to 3i moved `live_units`, `stall_watch`, `board_json`, `waste_watch` and `unit_lookup`; Reference's old exclusion of seed-source readers no longer applies to `unit_lookup`; `production_tree.unit_edges` already reads row parents.
+**Constraints from prior phases:** Phase 1 `staff.find`, `by_id`, `by_path`; Phase 2 `staff.snapshot() -> StaffSnapshot` (one record read; it raises `StaffUnreadable`, also for a malformed record) and `staff_sources.member(selector, record) -> MemberFound | NoSuchMember`, by `STAFF_ID` first, then by name; Phase 4 every unit and showrunner pane carries its `STAFF_ID`, so `member` matches by id; Phase 16 moved the showrunner tree (`parent_of`, `children_of`, `tree_lines`, `production_tree.py`) to the rows, and `production_lifecycle.py` `refuse_running_children` calls `children_of`. `staff_test_support.showrunner_relationship` is the one fixture for a showrunner edge, and `showrunner_tree`'s snapshot-taking functions are the one way to read the tree: a run takes one snapshot. Phases 3g to 3i moved `live_units`, `stall_watch`, `board_json`, `waste_watch` and `unit_lookup`; Reference's old exclusion of seed-source readers no longer applies to `unit_lookup`; `production_tree.unit_edges` already reads row parents. Phase 3g moved `roster.py` SessionMarks unit membership and `dailies_input.units_from_doc` to one staff snapshot per run.
 
 **Acceptance gate:** basedpyright 0/0 on changed files and every caller module; each moved reader's tests green; problem tests: an unreachable owner (the fake `ssh` fails), a malformed record and a missing member each give a problem line that names the cause, and no empty list; a run makes one `snapshot()` call; full gate green. No rerun test: these readers write nothing (Invariants → Rerun-safe tools).
 

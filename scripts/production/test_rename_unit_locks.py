@@ -52,9 +52,10 @@ class UnitRenameLockTests(UnitRenameFixture):
 
     def test_record_relaunch_and_verify_resume_without_the_merge_lock(self) -> None:
         log = self.seed_record()
-        self.assert_refused(self.rename("apply"), "gamma-unit is not running")
+        self.assert_ok(self.rename("apply"))
         before = log.read_text()
         journal = self.journal()
+        journal["done"] = False
         journal["step"] = 8  # Resume at the shutdown-record step, after all git writes.
         self.write(self.state / SLUG / "rename_unit.json", json.dumps(journal))
         # A gate may have unrelated changes in progress in the showrunner checkout.
@@ -67,11 +68,10 @@ class UnitRenameLockTests(UnitRenameFixture):
                 if process.poll() is None:
                     process.kill()
                     _ = process.communicate(timeout=5)
-            self.assertEqual(process.returncode, 1, output + errors)
-            self.assertIn("gamma-unit is not running", errors)
+            self.assertEqual(process.returncode, 0, output + errors)
             self.assertNotIn("merge lock: waiting", output)
-            self.assertEqual(self.journal()["step"], 10)
-            self.assertEqual(len(log.read_text().splitlines()), len(before.splitlines()) + 1)
+            self.assertEqual(self.journal()["step"], 11)
+            self.assertEqual(log.read_text(), before, "the live retained conversation needs no new launch")
             _ = self.mark_live("gamma-unit", "sid-alpha")
             process = self.start_apply()
             try:

@@ -60,7 +60,6 @@ import json
 import math
 import re
 import sys
-import unicodedata
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -75,6 +74,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from atomic_file import write_text_atomic
+from scripts.lib.terminal_cells import terminal_width
 from scripts.whoami import run_out
 from scripts.whoami import note_file
 from scripts.whoami.run_out import READINGS_LOG, Reading
@@ -584,7 +584,7 @@ def window_start(now: datetime, rows: list[Row]) -> datetime:
 
 
 def chart_width(lines: list[str]) -> int:
-    return max(display_width(line) for line in lines)
+    return max(terminal_width(line) for line in lines)
 
 
 def draw(now: datetime, rows: list[Row], style: ChartStyle) -> list[str]:
@@ -661,16 +661,11 @@ def draw_from(start: datetime, now: datetime, rows: list[Row], style: ChartStyle
         lines.append(f"{prefix}{''.join(cells).rstrip()}{arrow} {span}{hold}")
     # The axis ends with the widest row, so its labels never widen the chart.
     indent = label_width + start_width
-    reach = max((display_width(line) - indent for line in lines[1:]), default=0)
+    reach = max((terminal_width(line) - indent for line in lines[1:]), default=0)
     lines[0] = " " * indent + "".join(axis[: -(-reach // 2)]).rstrip()
     drawn = with_plans(lines, rows)
     # A note goes on last, so it moves neither the axis nor the plan column.
     return [drawn[0], *(f"{line}  {row.note}" if row.note else line for line, row in zip(drawn[1:], rows, strict=True))]
-
-
-def display_width(line: str) -> int:
-    """Terminal columns: wide characters, the coloured cells among them, take two."""
-    return sum(2 if unicodedata.east_asian_width(char) in "WF" else 1 for char in line)
 
 
 def with_plans(lines: list[str], rows: list[Row]) -> list[str]:
@@ -687,10 +682,10 @@ def with_plans(lines: list[str], rows: list[Row]) -> list[str]:
         for row in rows
         if row.plan is not None
     }
-    left = max(display_width(line) for line in lines) + PLAN_GAP
+    left = max(terminal_width(line) for line in lines) + PLAN_GAP
     text_width = max(len(text) for text in plans.values())
     # `100%` ends over the end line, so the axis is no wider than a row.
-    header = f"{lines[0]}{' ' * (left - display_width(lines[0]) + text_width + 2 + PLAN_BLOCKS - len(PLAN_FULL))}{PLAN_FULL}"
+    header = f"{lines[0]}{' ' * (left - terminal_width(lines[0]) + text_width + 2 + PLAN_BLOCKS - len(PLAN_FULL))}{PLAN_FULL}"
     drawn = [header]
     for line, row in zip(lines[1:], rows, strict=True):
         if row.plan is None:
@@ -698,7 +693,7 @@ def with_plans(lines: list[str], rows: list[Row]) -> list[str]:
             continue
         blocks = round(row.plan.percent / 10)
         bar = PLAN_FILL * blocks + " " * (PLAN_BLOCKS - blocks)
-        drawn.append(f"{line}{' ' * (left - display_width(line))}{plans[row.name]:>{text_width}} {bar}{PLAN_END}")
+        drawn.append(f"{line}{' ' * (left - terminal_width(line))}{plans[row.name]:>{text_width}} {bar}{PLAN_END}")
     return drawn
 
 

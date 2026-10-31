@@ -11,17 +11,14 @@ import sys
 import unittest
 from pathlib import Path
 from typing import TYPE_CHECKING, cast, final
+from types import FrameType
 from unittest.mock import patch
 import rename_unit
-import add_unit
 from scripts.shutdown import stop_resume
-from scripts.accounts import accounts
-from scripts.production.cli_fixture import parse_arguments
 if TYPE_CHECKING:
-    from scripts.shutdown import pane_record, shutdown_record
+    from scripts.shutdown import pane_record
 else:
     import pane_record
-    import shutdown_record
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -31,108 +28,84 @@ import fake_showrunner
 import fake_unit_host
 
 from scripts.production.rename_unit_test_support import UnitRenameFixture
+from scripts.production.rename_rerun_test_support import saved_fixture
 from scripts.production import staff
 
 
 @final
 class UnitRenameSessionsTests(UnitRenameFixture):
+    real_resume: Callable[..., stop_resume.ClaudeUp | stop_resume.ResumeFailed | stop_resume.SessionNotFound] = staticmethod(stop_resume.resume)
 
-    def test_recordless_relaunch_real_add_unit_joins_parent_operation(self) -> None:
-        rename = rename_unit.plan("demo", "alpha", "gamma", self.root / "scratch")
-        rename.session_id = "sid-alpha"
-        self.write(self.doc, self.doc.read_text().replace(
-            "alpha-unit | docs/plans/alpha.md", "gamma-unit | standby"))
-        run = cast(Callable[..., subprocess.CompletedProcess[str]], subprocess.run)
-        children: list[subprocess.CompletedProcess[str]] = []
+    def test_retained_resume_joins_parent_operation(self) -> None:
+        resume = cast(Callable[..., stop_resume.ClaudeUp | stop_resume.ResumeFailed | stop_resume.SessionNotFound], stop_resume.resume)
+        rename_pid = os.getpid()
+        def lock_wait_timeout(number: int, frame: FrameType | None) -> None:
+            raise AssertionError(f"rename waited on its held staff operation (signal {number}, {frame})")
+        with staff.operation():
+            held_fds = staff.operation_fds()
+            self.assertTrue(held_fds)
+            def in_process(identity: str, **options: object) -> stop_resume.ClaudeUp | stop_resume.ResumeFailed | stop_resume.SessionNotFound:
+                self.assertEqual(os.getpid(), rename_pid)
+                self.assertEqual(staff.operation_fds(), held_fds)
+                with staff.operation():
+                    self.assertIsNotNone(staff.by_path("demo/gamma"))
+                return resume(identity, **options)
+            previous_handler = signal.signal(signal.SIGALRM, lock_wait_timeout)
+            previous_timer = signal.setitimer(signal.ITIMER_REAL, 10)
+            try:
+                with (patch.dict(self.env, {"STAFF_OPERATION_FD": str(held_fds[0])}),
+                      patch.object(stop_resume, "resume", side_effect=in_process) as resumed):
+                    self.assert_ok(self.rename("apply"))
+            finally:
+                _ = signal.setitimer(signal.ITIMER_REAL, *previous_timer)
+                _ = signal.signal(signal.SIGALRM, previous_handler)
+        resumed.assert_called_once()
+        self.assertEqual(resumed.call_args.args, ("sid-alpha",))
+        self.assertEqual(cast(stop_resume.RetainedPaneResume, resumed.call_args.kwargs["retained"]).pane_id, "w1:p1")
+        self.assertEqual(len(self.director.starts), 1)
 
-        def launch(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
-            self.assertEqual(command[:2], [sys.executable, str(Path(add_unit.__file__))])
-            # The real entry acquires staff.operation before parsing --help. Stop
-            # there so this regression cannot launch or stop a live director.
-            child = run([*command, "--help"], timeout=3, **options)
-            children.append(child)
-            return child
-
-        with (patch.dict(os.environ, self.env), staff.operation(),
-              patch.object(rename_unit, "_unit_records", return_value=[]),
-              patch.object(rename_unit, "_await_live") as observed,
-              patch.object(subprocess, "run", side_effect=launch)):
-            rename_unit._relaunch(rename, lambda: None)  # pyright: ignore[reportPrivateUsage]
-            self.assertTrue(staff.operation_fds())
-        self.assertEqual(len(children), 1)
-        self.assertEqual(children[0].returncode, 0, children[0].stderr)
-        self.assertIn("--production", children[0].stdout)
-        observed.assert_called_once_with(rename)
-
-    def test_restart_child_joins_parent_operation_and_clears_session_identity(self) -> None:
-        child_entry = self.root / "restart_lock_probe.py"
+    def test_retained_launch_joins_parent_operation_and_clears_session_identity(self) -> None:
+        self.env["CLAUDE_CODE_SESSION_ID"] = "parent-session"
+        self.assert_ok(self.rename("apply"))
+        command = list(self.director.starts[0])
         checkout = Path(__file__).resolve().parents[2]
-        self.write(child_entry, f"""import os, sys
-sys.path.insert(0, {str(checkout)!r})
-from scripts.production import staff
-assert 'CLAUDE_CODE_SESSION_ID' not in os.environ
-with staff.operation():
-    staff.ensure('showrunner', name='restart-child')
-""")
-        run = cast(Callable[..., subprocess.CompletedProcess[str]], subprocess.run)
+        index = command.index(str(checkout / "scripts/accounts/accounts.py"))
+        command[index:] = ["-c", "import os; print('CLAUDE_CODE_SESSION_ID' in os.environ)"]
+        child = subprocess.run(command, env=self.env, capture_output=True, text=True, timeout=3, check=False)
+        self.assertEqual(child.returncode, 0, child.stdout + child.stderr)
+        self.assertEqual(child.stdout.strip(), "False")
 
-        def launch(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
-            options["timeout"] = 3
-            return run(command, **options)
-
-        with (patch.dict(os.environ, {**self.env, "CLAUDE_CODE_SESSION_ID": "parent-session"}),
-              staff.operation(), patch.object(rename_unit, "SHUTDOWN", child_entry),
-              patch.object(subprocess, "run", side_effect=launch)):
-            rename_unit.run_shutdown("restart", "--only", "fixture-session")
-            self.assertIsNotNone(staff.by_path("restart-child"))
-            self.assertTrue(staff.operation_fds())
-
-    def test_recordless_rename_relaunch_is_a_valid_add_unit_request(self) -> None:
-        rename = rename_unit.plan("demo", "alpha", "gamma", self.root / "scratch")
-        rename.session_id = "sid-alpha"
-        for mode in ("docs/plans/alpha.md", "standby", "permanent"):
-            with self.subTest(mode=mode):
-                text = self.doc.read_text().replace("alpha-unit | docs/plans/alpha.md", "gamma-unit | " + mode)
-                self.write(self.doc, text)
-                def launch(command: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
-                    options = parse_arguments(add_unit.main, command[2:])
-                    self.assertIsNotNone(options)
-                    assert options is not None
-                    request = add_unit.launch_request(options)
-                    self.assertIsInstance(request.session, add_unit.ResumedSession)
-                    self.assertEqual(request.unit_id, "gamma-unit")
-                    return subprocess.CompletedProcess(command, 0, "", "")
-                with (patch.object(shutdown_record, "find_session", return_value=None),
-                      patch.object(subprocess, "run", side_effect=launch),
-                      patch.object(rename_unit, "_await_live") as observed):
-                    rename_unit._relaunch(rename, lambda: None)  # pyright: ignore[reportPrivateUsage]
-                observed.assert_called_once_with(rename)
-                self.write(self.doc, text.replace("gamma-unit | " + mode, "alpha-unit | docs/plans/alpha.md"))
+    def test_retained_rename_resumes_each_plan_mode(self) -> None:
+        with saved_fixture(self.root) as restore:
+            for mode in ("docs/plans/alpha.md", "standby", "permanent"):
+                with self.subTest(mode=mode):
+                    restore()
+                    self.director.reset()
+                    self.write(self.doc, self.doc.read_text().replace("alpha-unit | docs/plans/alpha.md", "alpha-unit | " + mode))
+                    _ = self.git("add", str(self.doc))
+                    _ = self.git("commit", "--allow-empty", "-m", "unit plan mode")
+                    with patch.object(stop_resume, "resume", wraps=stop_resume.resume) as resumed:
+                        self.assert_ok(self.rename("apply"))
+                    resumed.assert_called_once()
+                    entry = pane_record.read("agents")["w1:p1"]
+                    self.assertEqual((entry["environment"]["SHOWRUNNER_UNIT_ID"], entry["session_id"]),
+                                     ("gamma-unit", "sid-alpha"))
+                    self.assertEqual(cast(stop_resume.RetainedPaneResume, resumed.call_args.kwargs["retained"]).pane_id, "w1:p1")
 
     def finish_recordless_apply(self) -> None:
-        run = cast(Callable[..., subprocess.CompletedProcess[str]], subprocess.run)
-        launches: list[list[str]] = []
-        def launch(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
-            if len(command) > 1 and command[1] == str(Path(add_unit.__file__)):
-                parsed = parse_arguments(add_unit.main, command[2:])
-                self.assertIsNotNone(parsed)
-                assert parsed is not None
-                self.assertEqual((cast(str, parsed.account), cast(str, parsed.resume), cast(str, parsed.name)), ("claude4", "sid-alpha", "gamma-unit"))
-                request = add_unit.launch_request(parsed)
-                with (patch.object(accounts, "prepared_account", return_value=accounts.PreparedAccount({}, frozenset())),
-                      patch.object(accounts, "claude_account_dir", return_value=self.home / ".claude4"),
-                      patch.object(accounts, "account_for_group_launch", side_effect=AssertionError("must keep launch account"))):
-                    self.assertEqual(add_unit.account_for_launch(request, cast(str, parsed.account)).label, "claude4")
-                # The journal must already contain the launch identity when a child starts.
-                self.assertEqual((self.journal()["account"], self.journal()["session_id"]), ("claude4", "sid-alpha"))
-                launches.append(command)
-                _ = self.mark_live("gamma-unit", "sid-alpha")
-                return subprocess.CompletedProcess(command, 0, "", "")
-            return run(command, **options)
-        with patch.object(subprocess, "run", side_effect=launch):
+        resume = cast(Callable[..., stop_resume.ClaudeUp | stop_resume.ResumeFailed | stop_resume.SessionNotFound], stop_resume.resume)
+        def launch(identity: str, **options: object) -> stop_resume.ClaudeUp | stop_resume.ResumeFailed | stop_resume.SessionNotFound:
+            entry = pane_record.read("agents")["w1:p1"]
+            self.assertEqual((Path(entry["config_dir"]).name, identity, entry["name"]),
+                             (".claude4", "sid-alpha", "gamma"))
+            self.assertEqual((self.journal()["account"], self.journal()["session_id"]), ("claude4", "sid-alpha"))
+            self.assertEqual(options["retained"], stop_resume.RetainedPaneResume("w1:p1", "terminal-alpha", entry["config_dir"]))
+            return resume(identity, **options)
+        with patch.object(stop_resume, "resume", side_effect=launch) as launched:
             result = self.rename("apply")
         self.assert_ok(result)
-        self.assertEqual(len(launches), 1)
+        self.assertEqual(launched.call_count, 1)
+        self.assertEqual(len(self.director.starts), 1)
         self.assertIs(self.journal()["done"], True)
 
     def recordless_stop(self) -> Callable[[str], stop_resume.Stopped]:
@@ -195,7 +168,7 @@ with staff.operation():
         with (patch.object(self, "stop_session") as stop,
               patch.object(os, "kill") as kill):
             self.assert_refused(self.rename("apply"),
-                                "alpha-unit: session sid-alpha has no pane launch account or shutdown record")
+                                "pane launch entry does not match the conversation")
         stop.assert_not_called()
         self.assertTrue(all(call.args[1] == 0 for call in kill.call_args_list),
                         "refused apply must send no process-changing signal")
@@ -203,13 +176,12 @@ with staff.operation():
 
     def moved_unit_with_leftover_marks(self) -> None:
         _ = self.seed_record()
-        self.assert_refused(self.rename("apply"), "gamma-unit is not running")
+        self.assert_ok(self.rename("apply"))
         fake_unit_host.write(self.env, [
-            fake_unit_host.HostedUnit("old", "w3:p3Y", {"SHOWRUNNER_UNIT": "demo", "SHOWRUNNER_UNIT_ID": "alpha-unit"}),
-            fake_unit_host.HostedUnit("moved", "w4:p1", {"SHOWRUNNER_UNIT": "demo", "SHOWRUNNER_UNIT_ID": "gamma-unit"}, label="gamma")])
-        held = fake_showrunner.write_session(self.root / "state/sessions", "gamma", "sid-alpha")
-        self.addCleanup(held.close)
-        fake_unit_host.place_process(self.env, os.getpid(), "w4:p1")
+            fake_unit_host.HostedUnit("agents", "w1:p1", self.director.pane.marks(), label="gamma"),
+            fake_unit_host.HostedUnit("old", "w3:p3Y", {"SHOWRUNNER_UNIT": "demo", "SHOWRUNNER_UNIT_ID": "alpha-unit"})])
+        self.director.pane.parent(self.director.pane.shell)
+        self.director.publish()
         fake_unit_host.process(self.env, 991030, 991000, ["python3", "-m", "unittest"],
                                {"HERDR_PANE_ID": "w3:p3Y", "SHOWRUNNER_UNIT": "demo", "SHOWRUNNER_UNIT_ID": "alpha-unit"})
 
@@ -229,11 +201,10 @@ with staff.operation():
     def test_a_stopped_unit_relaunches_from_its_rewritten_record(self) -> None:
         log = self.seed_record()
         result = self.rename("apply")
-        # The fake restart starts nothing, so verify finds the unit not running and holds the journal open.
-        self.assert_refused(result, "gamma-unit is not running")
-        self.assertEqual((self.journal()["step"], self.journal()["claimed"]), (10, False))
+        self.assert_ok(result)
+        self.assertEqual((self.journal()["step"], self.journal()["claimed"]), (11, False))
         self.assertEqual([json.loads(line) for line in log.read_text().splitlines()],
-                         [["restart", "--only", "sid-alpha", "--here"]])
+                         [["resume", "sid-alpha"]])
         saved = self.record()
         session = cast(dict[str, object], saved["session"])
         host = cast(dict[str, object], session["host"])
@@ -253,7 +224,7 @@ with staff.operation():
 
     def test_a_session_with_its_own_name_takes_the_new_name(self) -> None:
         _ = self.seed_record(name="builder-report")
-        self.assert_refused(self.rename("apply"), "gamma-unit is not running")
+        self.assert_ok(self.rename("apply"))
         self.assertEqual(cast(dict[str, object], self.record()["session"])["name"], "gamma")
         self.assertEqual(self.journal()["old_session"], "builder-report")
 
@@ -265,7 +236,7 @@ with staff.operation():
         self.assertIn("Claude session builder-report -> alpha", planned.stdout)
         self.assertIn("branch demo-alpha -> alpha", planned.stdout)
         self.assertIn(str(self.home / "worktrees/alpha"), planned.stdout)
-        self.assert_refused(self.rename("apply", "builder-report", "alpha"), "alpha-unit is not running")
+        self.assert_ok(self.rename("apply", "builder-report", "alpha"))
         session = cast(dict[str, object], self.record()["session"])
         self.assertEqual((session["name"], cast(dict[str, object], session["host"])["session_name"]),
                          ("alpha", "alpha"))
@@ -277,21 +248,26 @@ with staff.operation():
         self.assert_ok(self.rename("apply", "builder-report", "alpha"))
         self.assertEqual(self.journal()["done"], True)
 
+    def resume_with_old_session_name(self, identity: str, **options: object) -> stop_resume.ClaudeUp | stop_resume.ResumeFailed | stop_resume.SessionNotFound:
+        result = self.real_resume(identity, **options)
+        _ = self.mark_live("gamma-unit", "sid-alpha", name="builder-report")
+        return result
+
     def test_verify_fails_while_the_old_session_name_is_live(self) -> None:
         _ = self.seed_record(name="builder-report")
-        self.assert_refused(self.rename("apply"), "gamma-unit is not running")
-        _ = self.mark_live("gamma-unit", "sid-alpha", name="builder-report")
-        result = self.rename("apply")
+        self.real_resume = cast(Callable[..., stop_resume.ClaudeUp | stop_resume.ResumeFailed | stop_resume.SessionNotFound], stop_resume.resume)
+        with patch.object(stop_resume, "resume", side_effect=self.resume_with_old_session_name):
+            result = self.rename("apply")
         self.assert_refused(result, "gamma-unit's session is named builder-report, not gamma")
         self.assertIn("is still labelled builder-report", result.stderr)
 
     def test_a_verify_that_passes_closes_the_journal(self) -> None:
         _ = self.seed_record(name="builder-report")
-        self.assert_refused(self.rename("apply"), "gamma-unit is not running")
-        end = self.mark_live("gamma-unit", "sid-alpha", name="builder-report")
-        self.assert_refused(self.rename("apply"), "gamma-unit's session is named builder-report, not gamma")
+        self.real_resume = cast(Callable[..., stop_resume.ClaudeUp | stop_resume.ResumeFailed | stop_resume.SessionNotFound], stop_resume.resume)
+        with patch.object(stop_resume, "resume", side_effect=self.resume_with_old_session_name):
+            self.assert_refused(self.rename("apply"), "gamma-unit's session is named builder-report, not gamma")
+        self.assert_refused(self.rename("verify"), "gamma-unit's session is named builder-report, not gamma")
         self.assertEqual(self.journal()["done"], False)
-        end()
         _ = self.mark_live("gamma-unit", "sid-alpha")
         self.assert_ok(self.rename("verify"))
         self.assertEqual(self.journal()["done"], True)

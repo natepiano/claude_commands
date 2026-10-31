@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import errno
+import io
 import sqlite3
 import subprocess
 import sys
 import unittest
-from contextlib import closing
+from contextlib import closing, redirect_stdout
 from pathlib import Path
 from typing import final
 from unittest import mock
@@ -15,6 +16,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import style_plan
+import style_proposals
 
 import berth_board
 import rules
@@ -26,6 +28,91 @@ from unit_plans import AllCrates
 
 @final
 class StylePlanTests(StylePlanFixture):
+    def values_unit(self) -> Path:
+        worktree = self.root / "values"
+        _ = self.git("worktree", "add", "-q", "-b", "demo-style-values", str(worktree))
+        plan = worktree / "docs/style-production/units/values-unit.md"
+        plan.parent.mkdir(parents=True)
+        _ = plan.write_text(self.plan_header().replace("names-unit", "values-unit"))
+        _ = self.doc.write_text(self.doc.read_text() +
+                                f"| values-unit | docs/style-production/units/values-unit.md | {worktree} | demo-style-values |\n")
+        return plan
+
+    def select_for_family(self, family: rules.Family, plan: Path) -> style_ledger.TicketRecord:
+        self.finish_judging()
+        output = io.StringIO()
+        with mock.patch.object(style_proposals, "proposal_command"), redirect_stdout(output):
+            code = style_plan.main(["next-phase", "--unit", family + "-unit", "--plan", str(plan),
+                                    "--repo", str(self.repo)])
+        self.assertEqual(code, 0, output.getvalue())
+        ticket, = self.ledger().ticket_open(family + "-unit")
+        return ticket
+
+    def test_modules_reads_blocking_structure_before_approved_decisions(self) -> None:
+        plan = self.modules_unit()
+        structure = self.rule("structure", "tier: D\nfamily: modules\ninput_scope: file\n")
+        _ = self.values_unit()
+        _ = self.rule("values", "tier: C\nfamily: values\ninput_scope: file\n")
+        self.sync()
+        issue = self.borrowing_decision(structure, "modules", self.sources[2])
+
+        ticket = self.select_for_family("modules", plan)
+
+        self.assertEqual((ticket["kind"], ticket["family"], ticket["files"]),
+                         ("structure", "modules", list(self.sources[:2])))
+        self.assertEqual(ticket["finding_ids"], [])
+        self.assertIsInstance(self.ledger().proposal_findings(issue)[0].build_ticket, style_ledger.NoBuildTicket)
+
+    def test_modules_takes_approved_decision_when_unsynced_file_holds_blocking_structure_read(self) -> None:
+        plan = self.modules_unit()
+        structure = self.rule("structure", "tier: D\nfamily: modules\ninput_scope: file\n")
+        _ = self.values_unit()
+        values = self.rule("values", "tier: C\nfamily: values\ninput_scope: file\n")
+        self.sync()
+        issue = self.borrowing_decision(structure, "modules", self.sources[2])
+        for path in (self.sources[1], self.sources[3]):
+            self.record(structure, path, self.tip)
+        for path in self.sources[1:]:
+            self.record(values, path, self.tip)
+
+        with mock.patch.object(style_plan, "unsynced_changes", return_value={
+                self.sources[0]: style_plan.UnsyncedChange(self.sources[0], self.tip)}):
+            ticket = self.select_for_family("modules", plan)
+
+        self.assertEqual((ticket["kind"], ticket["family"], ticket["files"]),
+                         ("proposal", "modules", [self.sources[2]]))
+        self.assertEqual(ticket["finding_ids"], [self.ledger().proposal_findings(issue)[0].finding_id])
+
+    def test_modules_keeps_approved_decisions_first_without_blocked_cells(self) -> None:
+        plan = self.modules_unit()
+        structure = self.rule("structure", "tier: D\nfamily: modules\ninput_scope: file\n")
+        self.sync()
+        issue = self.borrowing_decision(structure, "modules", self.sources[2])
+
+        ticket = self.select_for_family("modules", plan)
+
+        self.assertEqual((ticket["kind"], ticket["family"], ticket["files"]),
+                         ("proposal", "modules", [self.sources[2]]))
+        self.assertEqual(ticket["finding_ids"], [self.ledger().proposal_findings(issue)[0].finding_id])
+
+    def test_values_takes_its_blocking_structure_before_borrowing_a_proposal(self) -> None:
+        plan = self.values_unit()
+        values = self.rule("values", "tier: C\nfamily: values\ninput_scope: file\n")
+        structure = self.rule("structure", "tier: D\nfamily: modules\ninput_scope: file\n")
+        names = self.rule("read")
+        self.sync()
+        for path in self.sources:
+            self.record(names, path, self.tip)
+        issue = self.borrowing_decision(names, "names", self.sources[2])
+
+        ticket = self.select_for_family("values", plan)
+
+        self.assertEqual((ticket["kind"], ticket["family"], ticket["rules"], ticket["files"]),
+                         ("structure", "modules", [structure], list(self.sources[:2])))
+        self.assertNotIn(values, ticket["rules"])
+        self.assertIsInstance(self.ledger().proposal_findings(issue)[0].build_ticket, style_ledger.NoBuildTicket)
+        self.assertIn("Borrowed from modules: values has no buildable work (waiting for structure).", plan.read_text())
+
     def test_refill_blob_failures_do_not_reissue_held_cells(self) -> None:
         read = self.rule("read", "tier: C\nfamily: names\ninput_scope: crate\n")
         self.sync()

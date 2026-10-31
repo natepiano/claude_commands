@@ -67,7 +67,7 @@ class UnitRenameVerifyTests(UnitRenameFixture):
                              tabs=[herdr.SavedName(name="alpha", seen=118.0)]),
         ])
         self.write(path, json.dumps(layout))
-        self.assert_refused(self.rename("apply"), "gamma-unit is not running")
+        self.assert_ok(self.rename("apply"))
         with patch.dict(os.environ, self.env):
             saved = herdr.saved_layout(herdr.shared_session())
         expected = herdr.SavedLayout(at=123.0, workspaces=[

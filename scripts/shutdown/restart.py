@@ -99,6 +99,7 @@ from shutdown_record import (  # noqa: E402
 )
 import shutdown_record as recovery_store  # noqa: E402
 import launch_permission as restore_permission  # noqa: E402
+import remote  # noqa: E402
 from remote import other_machine, run_remote  # noqa: E402
 import sessions  # noqa: E402
 from sessions import (  # noqa: E402
@@ -120,7 +121,6 @@ class ShutdownServices(Protocol):
                             summary: str, text: str) -> SessionShutdown: ...
 
     def record_time(self) -> str: ...
-    def local_machine(self) -> str: ...
     def elapsed_text(self, seconds: int) -> str: ...
     def stopped_sessions_text(self, count: int) -> str: ...
     def shutdown_command(self, *arguments: str) -> str: ...
@@ -1681,7 +1681,7 @@ def clear_running_on_target(records: list[SessionShutdown]) -> TargetCheck:
     for record in records:
         if (recovery_store.legacy_tmux_leftovers(record)
                 or record["progress"]["kind"] not in NOT_BACK_PROGRESS
-                or record["machine"].casefold() != restart_support.local_machine().casefold()):
+                or record["machine"].casefold() != remote.local_machine().casefold()):
             remaining.append(record)
             continue
         observed_at = time.time()
@@ -3067,6 +3067,82 @@ def _read_all_restore_sources() -> ReadableRestoreSources:
     return ReadableRestoreSources(records, snapshots, failures)
 
 
+def launch_account(entry: pane_record.PaneLaunch) -> Account | FailedSessionRestart:
+    """Resolve a retained launch's account, including the default Claude home."""
+    from scripts.accounts import accounts
+    from scripts.whoami import account
+
+    try:
+        directory = Path(entry["config_dir"]).expanduser()
+        label = accounts.claude_config_label(directory)
+        if label != "claude":
+            return named_claude_account(label)
+        resolved = account.claude_account(directory)
+        if resolved is None:
+            raise OSError(f"account in {directory} is unreadable")
+        return resolved
+    except (OSError, ValueError) as error:
+        return FailedSessionRestart(entry["name"] or entry["session_id"], str(error))
+
+
+def restart_launches(login: str = "", ids: tuple[str, ...] = (), *, all_accounts: bool = True) -> list[pane_record.PaneLaunch]:
+    """Consider pending down intents and live launches for restart or an idle result."""
+    selected: list[pane_record.PaneLaunch] = []
+    for entry in pane_record.latest_launches().values():
+        if ids and entry["session_id"] not in ids and entry["name"] not in ids:
+            continue
+        if not entry.get("restart_after_down", False):
+            if entry.get("ended", False) or not isinstance(
+                    sessions.session_liveness(entry["session_id"]), sessions.LiveSessionProcess):
+                continue
+        if not all_accounts:
+            account = launch_account(entry)
+            if isinstance(account, FailedSessionRestart) or account.login.casefold() != login.casefold():
+                continue
+        selected.append(entry)
+    return selected
+
+
+def _restore_retained_launches(entries: list[pane_record.PaneLaunch], *, dry_run: bool,
+                          failures: list[FailedSessionRestart]) -> int:
+    restarted = 0
+    server_ready = False
+    for entry in entries:
+        identity, name = entry["session_id"], entry["name"] or entry["session_id"]
+        try:
+            account = launch_account(entry)
+            if isinstance(account, FailedSessionRestart):
+                raise OSError(account.reason)
+            live = sessions.session_liveness(identity)
+            if isinstance(live, sessions.LiveSessionProcess):
+                if not dry_run and (entry.get("ended", False) or entry.get("restart_after_down", False)):
+                    pane_record.resumed(herdr.shared_session(), entry["pane_id"], identity)
+                print(f"{name}: already running; skipped")
+                continue
+            if isinstance(live, sessions.SessionLivenessUnknown):
+                raise OSError(live.reason)
+            if not entry.get("restart_after_down", False):
+                print(f"{name}: no restart pending; skipped")
+                continue
+            if dry_run:
+                print(f"{name}: would resume from agents down on {Path(entry['config_dir']).name.removeprefix('.')}")
+                continue
+            if not server_ready:
+                _ = herdr.restore_server(herdr.shared_session(), 60_000, session_kind=_command_security_session())
+                server_ready = True
+            outcome = stop_resume.resume(identity, why="agents restart after agents down", restore_missing=True)
+            if isinstance(outcome, stop_resume.ClaudeUp):
+                print(stop_resume.claude_up_line(outcome))
+                restarted += 1
+                continue
+            reason = outcome.reason if isinstance(outcome, stop_resume.ResumeFailed) else "no pane launch entry"
+        except (OSError, ValueError, herdr.HerdrFailure) as error:
+            reason = str(error)
+        print(f"{name}: restart failed: {reason}")
+        failures.append(FailedSessionRestart(name, reason))
+    return restarted
+
+
 def _up(login: str, dry_run: bool, only: Iterable[str] = (), *,
         session_kind: herdr.SecuritySession | herdr.SessionKindNotRead = _SESSION_KIND_NOT_READ,
         all_accounts: bool = False) -> MachineRestartResult:
@@ -3077,16 +3153,27 @@ def _up(login: str, dry_run: bool, only: Iterable[str] = (), *,
         for line in migrate(login):
             print(line)
     ids = tuple(only)
+    down_entries = restart_launches(login, ids, all_accounts=all_accounts)
     if all_accounts:
         sources_read = _read_all_restore_sources()
         all_records, snapshots = sources_read.records, sources_read.snapshots
-        choices = _restore_choices(all_records, snapshots)
         recovery_failures = sources_read.failures
     else:
         all_records = session_records(login)
         snapshots = all_snapshots()
-        choices = _restore_choices(all_session_records(), snapshots)
         recovery_failures: list[FailedSessionRestart] = []
+    legacy_ids = {saved["session"]["session_id"] for saved in all_records}
+    legacy_ids.update(entry["session"]["session_id"] for snapshot in snapshots for entry in snapshot["sessions"])
+    down_entries = [entry for entry in down_entries
+                    if entry.get("restart_after_down", False) or entry["session_id"] not in legacy_ids]
+    down_ids = frozenset(entry["session_id"] for entry in down_entries)
+    all_records = [saved for saved in all_records if saved["session"]["session_id"] not in down_ids]
+    snapshots = [snapshot.copy() for snapshot in snapshots]
+    for snapshot in snapshots:
+        snapshot["sessions"] = [entry for entry in snapshot["sessions"]
+                                if entry["session"]["session_id"] not in down_ids]
+    choices = _restore_choices(all_records if all_accounts else [saved for saved in all_session_records()
+                               if saved["session"]["session_id"] not in down_ids], snapshots)
     sources: dict[str, RecoverySnapshot] = {}
     recorded = {saved["session"]["session_id"]: saved for saved in all_records}
     live_observed_at = time.time()
@@ -3231,8 +3318,10 @@ def _up(login: str, dry_run: bool, only: Iterable[str] = (), *,
         for record in finished:
             print(f"{record['machine']}: {record['session']['name']} is already running on {record.get('target') or record['label']}")
     refused: list[RestartRefusal] = []
-    local_ids = {saved["session"]["session_id"] for saved in all_records} | snapshot_ids
-    for identity, name in restart_support.unrecorded_local_sessions(login, tuple(item for item in ids if item not in snapshot_ids), all_records).items():
+    local_ids = {saved["session"]["session_id"] for saved in all_records} | snapshot_ids | down_ids
+    for identity, name in restart_support.unrecorded_local_sessions(login, tuple(item for item in ids if item not in snapshot_ids and item not in down_ids), all_records).items():
+        if identity in down_ids:
+            continue
         local_ids.add(identity)
         refusal = RestartNoShutdown(kind="no shutdown", session_id=identity, name=name)
         refused.append(refusal)
@@ -3288,15 +3377,17 @@ def _up(login: str, dry_run: bool, only: Iterable[str] = (), *,
         eligible = [record for record in eligible if record["session"]["session_id"] not in dropped]
         records = [record for record in records if record["session"]["session_id"] not in dropped]
     label = eligible[0]["label"] if eligible else hold_outcome.hold["label"] if isinstance(hold_outcome, AccountHeld) else "all accounts" if all_accounts else login
-    machine = eligible[0]["machine"] if eligible else hold_outcome.hold["machine"] if isinstance(hold_outcome, AccountHeld) else restart_support.local_machine()
+    machine = eligible[0]["machine"] if eligible else hold_outcome.hold["machine"] if isinstance(hold_outcome, AccountHeld) else remote.local_machine()
+    down_restarted = _restore_retained_launches(down_entries, dry_run=dry_run, failures=recovery_failures)
     if not eligible and not codex_entries:
         if not ids and not dry_run and isinstance(hold_outcome, AccountHeld) and not any(
             item["request_id"] == hold_outcome.hold["request_id"] for item in all_records
         ):
             clear_finished_account_hold(login)
-        if not records and not recovery_failures and not ids:
+        if not records and not recovery_failures and not ids and not down_entries:
             print(f"nothing to restore for {label}")
-        result = MachineRestartResult(machine, label, "partial" if recovery_failures else "nothing",
+        result = MachineRestartResult(machine, label, "partial" if recovery_failures else "done" if down_restarted else "nothing",
+            restarted=down_restarted,
             failed=len(recovery_failures), failed_sessions=tuple(recovery_failures),
             refused=refused, local_session_ids=frozenset(local_ids), elapsed_seconds=time.monotonic() - started_at)
         if recovery_failures and not dry_run:
@@ -3347,7 +3438,7 @@ def _up(login: str, dry_run: bool, only: Iterable[str] = (), *,
                 except (OSError, ValueError) as error:
                     recovery_failures.append(FailedSessionRestart(account_login, _error_reason(error)))
         result = replace(_machine_result(attempted, machine, label), elapsed_seconds=time.monotonic() - started_at)
-        result = replace(result, restarted=result.restarted + codex_restarted)
+        result = replace(result, restarted=result.restarted + codex_restarted + down_restarted)
         if manual_sessions:
             result = replace(result, status="partial", manual=result.manual + len(manual_sessions), manual_sessions=(*result.manual_sessions, *manual_sessions))
         if recovery_failures:
@@ -3390,8 +3481,8 @@ def up_result(login: str, dry_run: bool = False, only: Iterable[str] = (), *,
             if notify and result.status == "partial":
                 _notify_local_restart(login, result, ids, identities)
         except (InvalidRecord, OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
-            print(f"{restart_support.local_machine()}: restart failed: {error}")
-            result = MachineRestartResult(restart_support.local_machine(), login, "partial", failed=1)
+            print(f"{remote.local_machine()}: restart failed: {error}")
+            result = MachineRestartResult(remote.local_machine(), login, "partial", failed=1)
     return PeerRestartResult(machine=result.machine, label=result.label,
         outcome="partial" if result.failed else result.status,
         lines=output.getvalue().splitlines(), no_remote_control=[], refused=list(result.refused))
@@ -3441,7 +3532,7 @@ def up(login: str, dry_run: bool = False, only: Iterable[str] = ()) -> int:
         result = _up(login, dry_run, only)
         return result.exit_status
     except (InvalidRecord, OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
-        print(f"{restart_support.local_machine()}: restart failed: {error}")
+        print(f"{remote.local_machine()}: restart failed: {error}")
         return 1
 
 
@@ -3563,7 +3654,7 @@ def _not_back_records(login: str, ids: tuple[str, ...]) -> list[SessionShutdown]
     except (InvalidRecord, OSError, ValueError):
         return []
     return [saved for saved in records
-            if saved["machine"] == restart_support.local_machine()
+            if saved["machine"] == remote.local_machine()
             and saved["progress"]["kind"] in {"restart failed", "manual restart"}
             and (not ids or saved["session"]["session_id"] in ids)
             and not restart_failed_session_running(saved)]
@@ -3714,9 +3805,9 @@ def send_failure_pushes(
 
 def _local_alert_sources(login: str) -> dict[str, str]:
     identities = {saved["session"]["name"]: saved["session"]["session_id"] for saved in session_records(login)
-                  if saved["machine"].casefold() == restart_support.local_machine().casefold()}
+                  if saved["machine"].casefold() == remote.local_machine().casefold()}
     for snapshot in all_snapshots():
-        if snapshot["login"].casefold() == login.casefold() and snapshot["machine"].casefold() == restart_support.local_machine().casefold():
+        if snapshot["login"].casefold() == login.casefold() and snapshot["machine"].casefold() == remote.local_machine().casefold():
             identities.update({entry["session"]["name"]: entry["session"]["session_id"]
                                for entry in snapshot["sessions"] if entry["agent"] == "claude"})
     return identities
@@ -3798,7 +3889,7 @@ def restart(
     ) as error:
         print(f"shutdown: restart failed: {error}", file=sys.stderr)
         local = MachineRestartResult(
-            restart_support.local_machine(),
+            remote.local_machine(),
             selected.label,
             "partial",
             failed=1,
