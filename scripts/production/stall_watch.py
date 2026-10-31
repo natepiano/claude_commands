@@ -1054,7 +1054,7 @@ def tick(now: float, *, deadline: float = math.inf) -> None:
             slug = showrunners.production_slug(configured["doc"])
             lines = Path(configured["doc"]).read_text(encoding="utf-8").splitlines()
             live = {production_units.cell_value(cells.get("Unit", "")): production_units.cell_value(cells.get("Worktree", ""))
-                    for cells in production_units.live_unit_table(lines, slug)}
+                    for cells in unit_lookup.live_unit_table(lines, slug)}
             marked = unit_lookup.marked_units(slug)
         except (OSError, UnicodeError, ValueError, production_units.Refusal) as error:
             print(f"stall-watch: {configured['slug']}: its units are not watched: {error}", file=sys.stderr)
