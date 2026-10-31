@@ -933,54 +933,23 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
 - Skip one argument per option: it files `--redirect-warnings <file>` under the file.
 
 ### Phase 29 — The floor sweep keeps targets used in the last hours  · status: done
-**Depends on:** Phase 33 (checkpointed, `5c9b01fd`, same file `scripts/lint/sweep.py`) and Phase 34 (checkpointed, `efccbe4e`: it removed the unused shared build folder and changed `scratch.py`, `test_sweep.py` and `build-targets.md`). Spec 1 (the replay) changes no repository file and can start at once. Merge `origin/builds` first. Global order: Phases 21, 16, 25, 30, 28, 4, 24, 32, 31, 33 and 34 are checkpointed; serial memory chain 26 → 15 → 27 → 20 → 11 → 17 → 18 → 19 → 8; **29** runs beside the chain and joins before 11.
 
-#### Work Order
+#### As-built
 
-**Goal (corrected by the builds ruling, 2026-10-30):** the disk floor takes the least recently used idle target first, with no recency window, and each scan under the floor writes one `floor_scan` build-log row: the free space after the scan, the floor, the shortfall and the idle targets oldest first (folder, last use, bytes). The replay showed the window could not change the order: a target used inside the window is always newer than every target outside it, so the old window key and the last-use key always agreed and the order was least recently used first at any N. So the floor has no `floor_recent_hours` key and no window, the docs make no savings claim, and `recent_minutes` orders only the units inside one target at its budget. The `floor_scan` rows measure what the floor takes, for the cold builds below. Specs 1–4 below are the original order; the ruling replaces Spec 2's window and key, Spec 3's window tests and Spec 4's N.
-
-**Original goal:** the floor sweep takes no target used in the last N hours while older targets can meet the floor, so a clone that waits hours between builds keeps its build output. (The shared hana folder budget left this phase: builds reversed the shared build folder on 2026-10-30, and Phase 34 removes it; copies seed their own build folders.) Measurement (natedev, 2026-10-27 13:00 to 2026-10-30 10:05 EDT; `/tmp/claude/unit/abea5ffb-4b99-499e-ae41-7ebb04630f9f/cold_builds/cause_66.md` and `report.md` there): 127 builds compiled 400 or more crates in a tree that had built the same command at the same commit before. 75 of them (1,189 compile min) came after a floor take of that tree's target between the two builds, 42 of these (791 min) with no other build between. 17 (243 min) came after a budget take. `hold_floor` takes idle clone targets first and keeps only targets used in the last 60 min (`recent_minutes`) for last, so a clone that waits more than 1 h between builds loses its output first.
-
-**Spec:**
-
-- **Set by the replay.** Spec 1 sets one value: N (hours). Write it in neither code nor `config/lint.conf` before the replay report names it. Tests use their own fixture values.
-
-1. **Replay first (no code change).** The replay script and its report go in the run folder (`phases/29/`), not in the repository. Run each command with `nice -n 19`.
-   - **Sources.** The natedev build log (`~/.local/state/buildlog/natedev/2026-10.jsonl` step rows), the journal's floor lines (`journalctl --output=json --grep='lint sweep:'`: `under the … floor; choosing from <K> target dirs (<size>)` and `the floor took <size> from <target>, last used <when>`), `~/.local/state/lint-sweep/removals.jsonl` (rows from 2026-10-29 15:31) and the build log's `sweep_trim` rows (Phase 4). The evidence folder holds extracts and scripts to reuse (`steps.jsonl`, `journal_small.jsonl`, `same_commit.py`, `step_sizes.py`, `unit_mtimes.py`); `report.md` §4 gives their method and limits. Use the evidence window, so the counts compare with its 75 builds and 1,189 min.
-   - **N.** Candidates: 1 h (today's 60 min), 2, 4, 6, 12 and 24 h. A recorded floor take meets the floor from older targets at N when the idle targets last used more than N h before the take held at least the take's shortfall (the floor minus the free space after the scan). A target's size at a take comes from the take lines where they name it. Otherwise the replay estimates it from the working sets (the stat-only method of `report.md` §4.7: `unit_mtimes.py`, `step_sizes.py`; they read no file, so atimes stay) of the steps that ran in it since its last take, and the report names each estimate. N is the largest candidate at which every recorded take in the window meets the 300 GiB floor from older targets. A take that older targets could not cover even at 1 h counts against no candidate; the report names it. Per candidate, the report gives the takes that would also need recent targets, and the cold builds (of the 75) and compile minutes (of the 1,189) it stops. A build is stopped at N when its tree's target was used less than N h before the take that came before it.
-   - The report names N and the compile minutes N saves in the window and per day.
-2. **The floor keeps recent targets last.** At `31c3ee3e`, `hold_floor` (`scripts/lint/sweep.py` :2270) sorts groups by (target used within `recent_minutes`, target last use, `unit_age`) (:2357-2359). So targets used within the window already go last, and among them the oldest goes first. `main` (:2820) reads `recent_minutes` once (:2843-2846) and gives it to two readers with two meanings: the floor's target order (`hold_floor`, :2855) and the budget sweep's unit order inside one target (`sweep` :1607, through `sweep_workspace` :2851). The replay measures only the floor's window. So the floor gets its own key, `floor_recent_hours`, in `[sweep]` of `config/lint.conf`, and `recent_minutes` keeps only the budget's unit order, at 60. Each key has one meaning and one reader; neither is a copy of the other.
-   - `main` reads `floor_recent_hours` once, beside `recent_minutes`, and gives it to `hold_floor` in place of `recent_minutes`. The order key keeps its form: targets used in the last N hours are taken last, after every older target. When only recent targets are left and the floor is still short, they go oldest first, as today.
-   - The config line is the one place for N; the code has no default for it. `hold_floor` runs only when `floor_bytes` (:1809) finds a floor. Then a missing or malformed `floor_recent_hours` stops the sweep with exit 2 and a line that names the key, as a malformed floor does (:2847-2850). With no floor key, no N is read.
-   - Change the text that says `recent_minutes` orders targets: the sweep.py header (:54-66, `Targets used within recent_minutes (60 by default) go last`) and the `[sweep]` comment in `config/lint.conf` (:60-61, `Applies to target order at the disk floor and unit order within a budget.`).
-3. **Tests** in `scripts/lint/test_sweep.py`, with fixture values:
-   - A floor take with one target used within N h and one older target whose output meets the shortfall: the older target is taken and the recent one stays.
-   - A shortfall larger than all older targets: every older target goes, then the recent targets go oldest first (two recent targets with different last uses; the older one goes first).
-   - `main` gives `hold_floor` the `floor_recent_hours` value of a fixture `lint.conf`, and gives the budget sweep `recent_minutes`. With a floor set, a missing or malformed `floor_recent_hours` exits 2 with a line that names the key. With no floor key, the sweep runs without it.
-   - The existing floor, budget and `budget_bytes` tests stay as gates (`test_floor_keeps_recent_tmp_output_when_an_older_rust_target_meets_the_floor`, `test_floor_orders_old_tmp_and_rust_targets_by_last_use`, `test_floor_takes_recent_output_when_older_output_cannot_meet_the_floor`, `test_budget_keeps_recent_output_when_older_output_meets_the_budget`, `test_budget_takes_recent_output_when_older_output_cannot_meet_the_budget`). This Work Order approves changing `test_floor_only_skips_the_workspace_and_holds_the_configured_floor`, which asserts that `hold_floor` gets `recent_minutes`; put one `Assertion-Change:` line in the summary.
-4. **Docs.** `docs/as-built/build-targets.md`, Build output retained by the sweep (the paragraph that starts `recent_minutes=60 in [sweep]`): the floor's rule with `floor_recent_hours` and its value N, the replay that set N, and `recent_minutes` for the budget's unit order only. `docs/as-built/build-memory-admission.md`, the floor Order bullet: replace its `recent_minutes=60 …` sentences with one pointer to `build-targets.md` → Build output retained by the sweep, so the rule has one home.
-
-**Constraints from prior phases:**
-- Phase 3: the floor order (target last use, then `unit_age`), the per-target cargo locks, and one `recent_minutes` value for the floor's target order and the budget's unit order. Spec 2 splits that value.
-- Phase 9 and Phase 33: a take credits only confirmed reclaimed bytes (`ConfirmedDeletion`; Phase 33 keeps unresolved reclamation in a named state); this phase does not change that. Phase 33's trim write-ahead intent stays until its `sweep_trim` row is in the build log, and an intent whose time cannot be published is set aside as `DamagedTrimIntentSetAside(path)` (one diagnostic naming the kept `.damaged-` file) so a later take proceeds; keep both, and keep `test_unpublishable_intent_time_is_set_aside_before_a_later_take` and `test_damaged_trim_outcome_names_the_preserved_intent` as gates.
-- Phase 4 and Phase 34: one target with its own last use at the floor; one `sweep_trim` build-log row per take, with `cause` `floor take` or `budget take` and no repository identity yet. Phase 34 removed the shared build folder (`scratch.shared_build_folder`); copies seed their own build folders. Keep the per-target cargo locks; the existing busy and style-lock tests in `test_sweep.py` stay gates. Phases 33 and 34 change `sweep.py` and `test_sweep.py` first, so line numbers move: read the code by name at dispatch.
+- `hold_floor` (`scripts/lint/sweep.py`) takes idle targets least recently used first: the sort key is (target last use, then `unit_age`). The floor has no recency window and no `floor_recent_hours` key.
+- Each real scan under the floor writes one `floor_scan` build-log row through `record.floor_scan`: the free space after the scan, the floor, the shortfall, and the idle targets oldest first (folder, last use, bytes). A `--dry-run` writes no row.
+- `recent_minutes` in `[sweep]` orders only the units inside one target at its budget.
 
 **Files:**
-- `scripts/lint/sweep.py` — Spec 2 (`main`, `hold_floor`, the header).
-- `scripts/lint/test_sweep.py` — Spec 3.
-- `config/lint.conf` — Spec 2, the `[sweep]` section only (hub file, owner verify-unit; resources-unit owns its `[sweep]` section).
-- `docs/as-built/build-targets.md` — Spec 4.
-- `docs/as-built/build-memory-admission.md` — Spec 4, the floor Order bullet.
-- `scripts/buildlog/record.py` and `scripts/buildlog/test_record.py` — the `floor_scan` writer beside `sweep_trim` and its test (ruling; owner report-unit).
+- `scripts/lint/sweep.py` — the floor order and the `floor_scan` write.
+- `scripts/lint/test_sweep.py` — floor order, `floor_scan` and dry-run tests.
+- `config/lint.conf` — the `[sweep]` comment: `recent_minutes` is the budget's unit order only.
+- `scripts/buildlog/record.py`, `scripts/buildlog/test_record.py` — the `floor_scan` writer beside `sweep_trim`, and its test.
+- `docs/as-built/build-targets.md` — Build output retained by the sweep holds the floor rule; `docs/as-built/build-memory-admission.md` points there.
 
-**Workers:** `1 writer + 1 tester`
-- `impl` — the replay and its report (run folder), `sweep.py`, `config/lint.conf` (`[sweep]` only) and both as-built docs.
-- `test` — `test_sweep.py`, from Spec 3 alone with fixture values.
+**Gotchas:** a dry run during a live sweep is refused by the floor lock; run it after the live sweep ends.
 
-**Acceptance gate:**
-- `env -C <tree> python3 -m unittest discover -s scripts/lint -p test_sweep.py` passes, including the existing busy and style-lock tests and the Phase 33 damaged-intent tests; `basedpyright --pythonpath ~/.local/state/merge-gate/typecheck-venv/bin/python` over `scripts/lint/sweep.py` and `scripts/lint/test_sweep.py` reports `0 errors, 0 warnings, 0 notes`.
-- The replay report names N and the cold builds and compile minutes N stops (of 75 and 1,189 in the window, and per day). The checkpoint notice carries its table.
-- Change-Review line (ruling): the disk floor takes the least recently used target first and records each scan | on natedev, copy `~/.claude/config/lint.conf` to a scratch file, set its `sweep_free_floor_gib.natedev` 50 GiB above the free space that `df -h ~` shows, and type `LINT_CONFIG_FILE=<copy> ~/.claude/scripts/lib/py ~/.claude/scripts/lint/sweep.py --floor-only --dry-run` | the `the floor would take … last used <when>` lines go from the oldest last use to the newest; a dry run writes no `floor_scan` row (a real take under the floor writes one, with the shortfall and the idle targets oldest first)
+**Ruled out:** a floor recency window (`floor_recent_hours`) — a target used inside any window is always newer than every target outside it, so the window never changes least-recently-used order.
 
 ### Phase 30 — Waiting steps start in queue order  · status: done
 
@@ -1091,3 +1060,37 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
 **Gotchas:** a grep for `shared_target` in `scripts` also finds unrelated account-link (`test_accounts.py`) and style-sync names; only the legacy-record test in `test_scratch.py` refers to copy records.
 
 **Ruled out:** a shared per-repository build folder for verify copies — its build lock serializes the copies.
+
+### Phase 35 — The hold wait line names the hold the session waits on  · status: todo
+**Depends on:** none.
+
+**Approved:** builds showrunner 2026-10-30, current add-on (wrong result, small), from natedev's check of change C44. Natedev closes C44 when this lands.
+
+#### Work Order
+
+**Goal:** with two holds on natedev, the wait line names a hold the waiting session does not own. Today it can read `natedev is held by me for my why; waiting` while the session waits on another session's hold. The wait itself is correct and stays as it is.
+
+**Measured (2026-10-30, `builds-resources` `14248a6a`):**
+- `scripts/build_targets/build_targets.py` local wait loop (~:389-405): it returns at once when `caller_holds_only_own()` is true, else prints `{name}: natedev is held by {state.holder} for {state.reason}{waiting}` once. `state` is `target_state(target)`, a `Held` built from one holder, the oldest in force. When the caller's own hold is the oldest, the line names the caller.
+- The same `Held` text is also printed at ~:478 (`{label}: natedev is held by …`) and ~:486 (`… launch after the release.`). Check each for the same fault; a line shown to a session that holds a hold of its own must name another holder.
+- `build_hold.natedev_holds(directory).in_force` lists every hold in force, and `holds_only_own` already compares each `holder.key` with the caller's `holder_path(directory, owner.session_id).name`.
+
+**Spec:**
+1. **One choice of the named hold.** One function picks the hold a session waits on: the oldest hold in force whose key is not the caller's own. With no owning session, it is the oldest hold, as today. Every wait and launch line that names a holder for a caller uses it. `caller_holds_only_own` and this choice read one `natedev_holds` result, never two reads that can disagree.
+2. **Text.** The line keeps its words; only the holder and reason change to the chosen hold's.
+3. **Tests** (`scripts/build_targets/test_build_targets.py`), on scratch hold files as natedev reproduced it: the caller holds the older hold and another session holds a newer one; the wait line names the other session and its reason, never the caller's. One hold of another session alone: the line names it (unchanged). The caller's own hold alone: no wait, as today. Each test fails without the fix.
+4. **Docs.** `docs/as-built/build-targets.md` (or the hold doc that states the wait line): the line names the hold the session waits on.
+
+**Files:**
+- `scripts/build_targets/build_targets.py` — Spec 1-2.
+- `scripts/build_targets/test_build_targets.py` — Spec 3.
+- `docs/as-built/build-targets.md` — Spec 4.
+- If the fault also lives in `scripts/direct/verify.sh`, the change stays there (owner verify-unit; trial-merge against `origin/natedev-verify`) and the notice carries an also-touches line.
+
+**Workers:** `1 writer + 1 tester`
+- `impl` — `build_targets.py` and the doc.
+- `test` — `test_build_targets.py`.
+
+**Acceptance gate:**
+- `test_build_targets.py` passes with the new tests; `basedpyright scripts/build_targets/build_targets.py scripts/build_targets/test_build_targets.py` reports `0 errors, 0 warnings, 0 notes`; the importers of `build_targets` pass.
+- Change-Review line: the hold wait line names the hold you wait on | on natedev, while two sessions hold natedev, start a build from the session that holds the older hold | the wait line names the other session and its reason, not yours
