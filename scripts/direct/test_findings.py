@@ -16,6 +16,16 @@ from scripts.history.routed import routed_work
 
 
 class FindingsLedgerTests(FindingsLedgerFixture):
+    def test_changed_config_is_read_on_the_next_command_with_comments(self) -> None:
+        _ = self.open_finding("blocker", "needs a repair")
+        self.close_round(["F001"])
+        self.write_config("MIN_REPAIR_BUDGET=4 # current floor\n")
+        first = self.gate()
+        self.write_config("MIN_REPAIR_BUDGET=8 # revised floor\n")
+        second = self.gate()
+        self.assertEqual(first["repair_budget"], 4)
+        self.assertEqual(second["repair_budget"], 8)
+
     def test_rerun_finding_keeps_its_lens_in_ledger_and_history(self) -> None:
         self.write_progress_state("instance-rerun")
         _ = self.run_command("open", "--severity", "blocker", "--title", "Restore loses records",

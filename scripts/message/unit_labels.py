@@ -18,6 +18,7 @@ for directory in (SCRIPTS / "message", SCRIPTS / "production", SCRIPTS / "herdr"
 from scripts.production import staff, showrunners
 import production_units
 from scripts.production import session_staff
+from scripts.production.session_labels import StaffLabels
 import unit_runs
 from sessions import SessionRecord, running_sessions
 if TYPE_CHECKING:
@@ -241,11 +242,6 @@ def showrunner_ids(
     return found
 
 
-def production_rows(doc: Path, slug: str, record: staff.StaffSnapshot) -> list[dict[str, str]]:
-    lines = doc.read_text(encoding="utf-8").splitlines()
-    return production_units.live_unit_table(lines, slug, record=record)
-
-
 def every_marked_unit(record: staff.StaffSnapshot | None = None) -> session_staff.MarkedProductions | OSError:
     """Every production's observed units, joined to one staff snapshot."""
     import unit_lookup as process_units
@@ -280,7 +276,6 @@ def production_places(
     # One process scan places every record; a scan per record took most of the roster's time.
     record_places: dict[int, herdr.HerdrPlace] | None = None
     for runner in registered:
-        doc = Path(runner["doc"])
         runner_address = addresses.get(runner["slug"], "")
         showrunner: UnderShowrunner | ProductionWithoutRunningShowrunner = (
             UnderShowrunner(runner["slug"], runner["session"], runner_address)
@@ -312,19 +307,22 @@ def production_places(
                         _ = places.setdefault(session_record["sessionId"], place)
                         break
             continue
-        # Worktree ownership is a fallback only when neither host could be read.
+        # An unavailable host still permits the same staff-backed session join.
         try:
-            rows = production_rows(doc, runner["slug"], record)
+            sources = session_staff.member_sources()
+            labels = StaffLabels(record, sources.productions, sources.showrunner_members(record))
         except (OSError, UnicodeError, ValueError, production_units.Refusal) as fallback_error:
-            problem(problems, f"units in {doc}", fallback_error)
+            problem(problems, f"staff labels for {runner['slug']}", fallback_error)
             continue
-        for row in rows:
-            unit_name = production_units.cell_value(row.get("Unit", ""))
-            worktree = production_units.cell_value(row.get("Worktree", ""))
-            for session_record in records:
-                if (session_record["sessionId"] not in ledger_workers and worktree
-                        and details[session_record["sessionId"]].cwd == worktree):
-                    _ = places.setdefault(session_record["sessionId"], ProductionPlace(showrunner, DirectsUnit(unit_name)))
+        for session_record in records:
+            identity = session_record["sessionId"]
+            if identity in ledger_workers:
+                continue
+            detail = details.get(identity)
+            cwd = detail.cwd if detail is not None else session_record.get("cwd", "")
+            values = labels.environment({}, identity, session_record["name"], cwd)
+            if values.get("SHOWRUNNER_UNIT") == runner["slug"] and values.get("SHOWRUNNER_UNIT_ID"):
+                _ = places.setdefault(identity, ProductionPlace(showrunner, DirectsUnit(short_unit(values["SHOWRUNNER_UNIT_ID"]))))
     return places
 
 

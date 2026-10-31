@@ -27,6 +27,7 @@ class Outcome(str, Enum):
     FAILED = "failed"
     TIMED_OUT = "timed out"
     NOT_DUE = "not due"
+    SKIPPED = "skipped"
 
 
 @dataclass(frozen=True)
@@ -56,7 +57,7 @@ def run_part(part: Part, cadence: Schedule, deadline: float) -> PartResult:
                     pass
                 output, _ = child.communicate()
                 return PartResult(part, Outcome.TIMED_OUT, time.monotonic() - started, 124, output)
-            return PartResult(part, Outcome.SUCCESS if child.returncode == 0 else Outcome.FAILED,
+            return PartResult(part, {0: Outcome.SUCCESS, os.EX_TEMPFAIL: Outcome.SKIPPED}.get(child.returncode, Outcome.FAILED),
                               time.monotonic() - started, child.returncode, output)
     except OSError as error:
         return PartResult(part, Outcome.FAILED, time.monotonic() - started, 1, str(error))
@@ -88,7 +89,7 @@ def run_job() -> list[PartResult]:
 
         def record(result: PartResult) -> None:
             results[result.part] = result
-            if result.outcome is Outcome.SUCCESS:
+            if result.outcome in (Outcome.SUCCESS, Outcome.SKIPPED):
                 finished[result.part.value] = time.time()
                 temporary = path.with_suffix(".tmp")
                 _ = temporary.write_text(json.dumps(finished) + "\n", encoding="utf-8")
@@ -176,7 +177,7 @@ def _perform(part: Part) -> int:
         return main()
     elif part is Part.HIERARCHY:
         from scripts.maintenance.hana_hierarchy import main
-        return main([])
+        return main([], refusal_exit=os.EX_TEMPFAIL)
     else:
         from scripts.maintenance import vault_commit
         vault = Path.home() / "rust/hanadocs"
@@ -207,7 +208,7 @@ def main() -> int:
             print(f"{result.part.value}: {result.outcome.value}; {result.seconds:.3f} s; exit {result.exit_code}")
             if result.output.strip():
                 print(result.output.rstrip())
-        return int(any(result.exit_code for result in results))
+        return int(any(result.outcome in (Outcome.FAILED, Outcome.TIMED_OUT) for result in results))
     except (OSError, ValueError) as error:
         print(f"agent-notes: {error}", file=sys.stderr)
         return 1

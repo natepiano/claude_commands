@@ -18,8 +18,11 @@
 #                zone= line of USER_ZONE_CONF or config/user_zone.conf, else
 #                user_zone.py's default. jq's strflocaltime writes reset times in it.
 #   staff        the current staff rows, from STAFF_FILE or the shared staff.json.
-#                jq joins STAFF_ID, else the unique normalized session name, just
-#                as session_labels.StaffLabels does. No role comes from the env.
+#                jq joins STAFF_ID, timer target, exact local worktree, then the
+#                unique normalized name, just as session_labels.StaffLabels does.
+#   machine      the local hostname, matching shutdown.remote.local_machine.
+#   timer_*      each notifier conf, for its target and checked document path.
+#                No production document is opened for assignment.
 #   counts       "<session id> <counts line>" lines: each showrunner's `For you: …`
 #                row, from the cache counts_row.py keeps in
 #                <showrunner state>/counts/<slug>. A cache is rebuilt only when a
@@ -62,11 +65,18 @@ export TZ="${zone:-America/New_York}"
 [ -n "${TZDIR:-}" ] || [ ! -d /etc/zoneinfo ] || export TZDIR=/etc/zoneinfo
 
 counts=
+machine=${HOST:-${HOSTNAME:-}}
+{ [ ! -r /proc/sys/kernel/hostname ] || read -r machine < /proc/sys/kernel/hostname; } 2>/dev/null
+machine=${machine%%.*}
+set --
 # zsh otherwise aborts on an empty notifier glob before jq can render the line.
 [ -z "${ZSH_VERSION:-}" ] || setopt nonomatch
 # bash has EPOCHSECONDS built in; a shell with neither leaves a deferred question to the next change.
 [ -z "${ZSH_VERSION:-}" ] || zmodload -F zsh/datetime p:EPOCHSECONDS 2>/dev/null
 for conf in "${NOTIFIER_STATE_DIR:-$HOME/.local/state/notifier}"/showrunner-*/conf; do
+  [ -f "$conf" ] && [ -r "$conf" ] || continue
+  instance=${conf%/conf}
+  set -- "$@" --rawfile "timer_${instance##*/showrunner-}" "$conf"
   target=
   { read -r target < "$conf"; } 2>/dev/null
   case $target in
@@ -110,6 +120,7 @@ own=
 
 # shellcheck disable=SC2154 # statusline is set by the command that sources this.
 exec jq -r --arg pwd "$PWD" --arg account "$account" \
+  --arg machine "$machine" "$@" \
   --arg legacy_home "$legacy_home" --rawfile home_config "$home_config" \
   --rawfile staff "$staff" --arg own "$own" --arg counts "$counts" --slurpfile labels "$labels" \
   --rawfile colors "$colors" -f "$statusline/statusline.jq"

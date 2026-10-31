@@ -14,6 +14,7 @@ from typing import NamedTuple, cast
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.production import staff, staff_sources
+from scripts.lib.git_exclude import ExcludeRefused, ensure_excluded
 
 from scripts.production import showrunners
 import showrunner_tree
@@ -246,15 +247,11 @@ def open_production(production: Production, lines: list[str]) -> None:
         report("push", "ok", f"{production.merge_branch} at {tip}")
     else:
         report("push", "ok", f"already at {tip}")
-    common = Path(checked(production.checkout, "log", "rev-parse", "--git-common-dir"))
-    common = common if common.is_absolute() else production.checkout / common
-    exclude = common / "info/exclude"
-    exclude.parent.mkdir(parents=True, exist_ok=True)
     log_name = production.log.relative_to(production.checkout).as_posix()
-    existing = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
-    if log_name not in existing.splitlines():
-        with exclude.open("a", encoding="utf-8") as stream:
-            _ = stream.write(("" if not existing or existing.endswith("\n") else "\n") + log_name + "\n")
+    try:
+        ensure_excluded(production.checkout, log_name)
+    except ExcludeRefused as error:
+        raise LifecycleStop("log", "failed", str(error)) from error
     if not production.log.exists():
         production.log.parent.mkdir(parents=True, exist_ok=True)
         write_text_atomic(production.log, f"# Production log — {production_name(updated)}\n")
