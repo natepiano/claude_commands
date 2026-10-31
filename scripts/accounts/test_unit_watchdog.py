@@ -220,44 +220,33 @@ class UnitWatchdogTests(unittest.TestCase):
         failure = unit_watchdog._restart(source.label, source.session["session_id"], source.identity)  # pyright: ignore[reportPrivateUsage]
         return failure, self.commands
 
-    def test_killed_notice_pass_saves_first_outage_and_tells_only_the_rest_on_rerun(self) -> None:
+    def test_interrupted_cleanup_resumes_without_sending_notices_to_live_sessions(self) -> None:
         for name in ("alpha", "beta", "gamma"):
             _ = self.add_unit(name)
         self.die("alpha", "beta", "gamma")
         _ = self.pass_at(0)
         _ = self.pass_at(2)
-
-        def interrupted(slug: str, key: str, text: str) -> str:
-            self.assertEqual(set(unit_watchdog._read_state()), {"beta", "gamma"})  # pyright: ignore[reportPrivateUsage]
-            _ = self.tell(slug, key, text)
+        write = unit_watchdog._write_state  # pyright: ignore[reportPrivateUsage]
+        def interrupted(state: dict[str, unit_watchdog.DownOutage]) -> None:
+            write(state)
             raise SystemExit("notes pass killed")
-
-        with patch.object(showrunners, "tell", side_effect=interrupted):
+        with patch.object(unit_watchdog, "_write_state", side_effect=interrupted):
             with self.assertRaisesRegex(SystemExit, "notes pass killed"):
                 _ = self.pass_at(4)
-        self.assertEqual(len(self.notices), 1)
+        self.assertEqual(set(unit_watchdog._read_state()), {"beta", "gamma"})  # pyright: ignore[reportPrivateUsage]
         _ = self.pass_at(6)
-        self.assertEqual(len(self.notices), 3)
-        for name in ("alpha", "beta", "gamma"):
-            self.assertEqual(sum(f"{name} was down" in line for line in self.notices), 1)
+        self.assertEqual(self.notices, [])
         self.assertEqual(unit_watchdog._read_state(), {})  # pyright: ignore[reportPrivateUsage]
         self.assertEqual(len(self.commands), 3)
 
-    def test_notice_budget_retains_remaining_outages_for_the_next_pass(self) -> None:
+    def test_live_outages_are_cleared_in_one_pass_without_a_notice_queue(self) -> None:
         for name in ("alpha", "beta", "gamma"):
             _ = self.add_unit(name)
         self.die("alpha", "beta", "gamma")
         _ = self.pass_at(0)
         _ = self.pass_at(2)
-        config = self.home / "watchdog.toml"
-        _ = config.write_text("notices_per_pass = 2\n")
-        with patch.dict(os.environ, {"UNIT_WATCHDOG_CONFIG": str(config)}):
-            _ = self.pass_at(4)
-            self.assertEqual(len(self.notices), 2)
-            self.assertEqual(set(unit_watchdog._read_state()), {"gamma"})  # pyright: ignore[reportPrivateUsage]
-            _ = config.write_text("notices_per_pass = 1\n")
-            _ = self.pass_at(6)
-        self.assertEqual(len(self.notices), 3)
+        _ = self.pass_at(4)
+        self.assertEqual(self.notices, [])
         self.assertEqual(unit_watchdog._read_state(), {})  # pyright: ignore[reportPrivateUsage]
         self.assertEqual(len(self.commands), 3)
 
@@ -274,7 +263,7 @@ class UnitWatchdogTests(unittest.TestCase):
         told.assert_not_called()
         self.assertEqual(path.read_bytes(), saved)
         self.assertEqual(path.stat().st_mtime_ns, written)
-        self.assertEqual(len(self.notices), 1)
+        self.assertEqual(self.notices, [])
         self.assertEqual(len(self.commands), 1)
 
     @contextmanager
@@ -375,7 +364,7 @@ class UnitWatchdogTests(unittest.TestCase):
             _ = self.pass_at(2)
             _ = self.pass_at(4)
         self.assertEqual(self.commands, [["resume", "alpha", "--to", "claude4", "--only", "alpha"]])
-        self.assertIn("restarted on claude4", "\n".join(self.notices))
+        self.assertEqual(self.notices, [])
         self.assertEqual({item["sessionId"] for item in self.fixture.live}, {"alpha"})
 
     def test_older_launch_without_an_end_mark_still_recovers_its_conversation(self) -> None:
@@ -388,7 +377,7 @@ class UnitWatchdogTests(unittest.TestCase):
         for minute in (0, 2, 4):
             _ = self.pass_at(minute)
         self.assertEqual(self.commands, [["resume", "alpha", "--to", "claude4", "--only", "alpha"]])
-        self.assertIn("restarted on claude4", "\n".join(self.notices))
+        self.assertEqual(self.notices, [])
 
     def test_recordless_crash_alerts_once_and_a_new_live_generation_allows_the_next_alert(self) -> None:
         _ = self.add_unit("alpha")
@@ -399,14 +388,14 @@ class UnitWatchdogTests(unittest.TestCase):
               patch.object(quota_alert, "tell_user", return_value=quota_alert.PushSent()) as phone):
             for minute in (0, 2, 4, 6, 8):
                 _ = self.pass_at(minute)
-            phone.assert_called_once()
-            self.assertTrue(unit_watchdog._read_state()["alpha"]["alerted"])  # pyright: ignore[reportPrivateUsage]
+            phone.assert_not_called()
+            self.assertNotIn("alerted", unit_watchdog._read_state()["alpha"])  # pyright: ignore[reportPrivateUsage]
             self.revive("alpha", "claude4")
             _ = self.pass_at(10)
             self.die("alpha")
             for minute in (12, 14, 16, 18):
                 _ = self.pass_at(minute)
-            self.assertEqual(phone.call_count, 2)
+            self.assertEqual(phone.call_count, 0)
 
     def queued_unit(self) -> unit_watchdog.RecoverySource:
         _ = self.add_unit("alpha")
@@ -545,6 +534,21 @@ class UnitWatchdogTests(unittest.TestCase):
         with patch.object(unit_lookup, "read_run_states", wraps=unit_lookup.read_run_states) as reads:
             self.assertEqual(self.pass_at(0, dry_run=True), [])
             reads.assert_called_once_with()
+
+    def test_live_units_share_one_liveness_read_and_receive_nothing_on_either_pass(self) -> None:
+        for name in ("alpha", "beta", "gamma"):
+            _ = self.add_unit(name)
+        with (patch.object(unit_lookup, "every_marked_unit", wraps=self.marked) as reads,
+              patch.object(unit_watchdog, "_fresh_units", side_effect=AssertionError("live units need no recovery scan")),
+              patch.object(showrunners, "tell") as tell,
+              patch.object(quota_alert, "tell_user") as phone):
+            self.assertEqual(self.pass_at(0), [])
+            self.assertEqual(reads.call_count, 1)
+            self.assertEqual(self.pass_at(2), [])
+            self.assertEqual(reads.call_count, 2)
+        tell.assert_not_called()
+        phone.assert_not_called()
+        self.assertEqual(self.pending, [])
 
     def test_recovery_rechecks_a_reported_outage_and_sees_the_new_unit_pane(self) -> None:
         owner = self.add_unit("unit")
@@ -854,7 +858,7 @@ class UnitWatchdogTests(unittest.TestCase):
         _ = self.pass_at(4)
         _ = self.pass_at(6)
         self.assertEqual(self.commands[0][3], "claude2")
-        self.assertIn("restarted on claude2", self.notices[0])
+        self.assertEqual(self.notices, [])
 
 
     def test_crash_command_uses_recovery_owner_and_reports_actual_account(self) -> None:
@@ -865,7 +869,7 @@ class UnitWatchdogTests(unittest.TestCase):
         _ = self.pass_at(2)
         _ = self.pass_at(4)
         self.assertEqual([argv[3] for argv in self.commands], ["claude4"])
-        self.assertIn("restarted on claude4", self.notices[0])
+        self.assertEqual(self.notices, [])
 
     def test_standing_by_unit_recovers_after_grace_while_finished_run_stays_down(self) -> None:
         _ = self.add_unit("standing")
@@ -915,7 +919,7 @@ class UnitWatchdogTests(unittest.TestCase):
             for minute in (0, 2, 4):
                 _ = self.pass_at(minute)
         self.assertEqual(len(self.commands), 1)
-        self.assertIn("restarted on claude4", self.notices[0])
+        self.assertEqual(self.notices, [])
 
     def test_both_crash_accounts_refuse_one_push_per_outage_and_showrunner_each_pass(self) -> None:
         _ = self.add_unit("alpha")
@@ -924,19 +928,16 @@ class UnitWatchdogTests(unittest.TestCase):
         with patch.object(quota_alert, "tell_user", return_value=quota_alert.PushSent()) as phone:
             for minute in (0, 2, 4, 6, 8):
                 _ = self.pass_at(minute)
-            phone.assert_called_once()
-            push = cast(RenderedPush, phone.call_args.args[0])
-            self.assertEqual(push.id, "shutdown.restart_failed")
-            self.assertEqual(push.values["account"], "claude4")
-            self.assertIn("retry from claude4's pane launch", self.notices[0])
-            self.assertEqual(len(self.notices), 3)
+            phone.assert_not_called()
+            self.assertEqual(self.notices, [])
+            self.assertEqual(len(self.commands), 3)
             self.revive("alpha", "claude4")
             _ = self.pass_at(10)
             self.die("alpha")
             _ = self.pass_at(12)
             _ = self.pass_at(14)
             _ = self.pass_at(16)
-            self.assertEqual(phone.call_count, 2)
+            self.assertEqual(phone.call_count, 0)
 
     def test_pending_detached_restarts_do_not_wait_or_start_duplicate_commands(self) -> None:
         self.finish_jobs = False
@@ -960,13 +961,13 @@ class UnitWatchdogTests(unittest.TestCase):
         self.die("alpha")
         with patch.object(quota_alert, "tell_user", return_value=quota_alert.PushSent()) as phone:
             for minute in (0, 2, 4):
-                _ = self.pass_at(minute)
+                lines = self.pass_at(minute)
             Path(owner["cwd"]).mkdir()
-            _ = self.pass_at(6)
-            phone.assert_called_once()
+            lines = self.pass_at(6)
+            phone.assert_not_called()
         self.assertEqual(self.pending, [])
         self.assertEqual(self.commands, [])
-        self.assertTrue(any("no longer exists; restore dropped" in line for line in self.notices))
+        self.assertTrue(any("no longer exists; restore dropped" in line for line in lines))
 
     def test_folder_lost_after_dispatch_keeps_outage_context_and_retries_its_alert(self) -> None:
         saved = self.moved_outage()
@@ -991,22 +992,18 @@ class UnitWatchdogTests(unittest.TestCase):
         with patch.object(quota_alert, "tell_user", side_effect=[
                 quota_alert.PushFailed("fixture delivery failed"), quota_alert.PushSent()]) as phone:
             _ = self.pass_at(3)
-            phone.assert_called_once()
-            push = cast(RenderedPush, phone.call_args.args[0])
-            self.assertEqual(push.id, "shutdown.restart_failed")
-            self.assertEqual(push.values["account"], "claude4")
-            self.assertEqual(push.values["stopped"], saved["session"]["name"])
+            phone.assert_not_called()
             state = unit_watchdog._read_state()  # pyright: ignore[reportPrivateUsage]
-            self.assertFalse(state["alpha"]["alerted"])
+            self.assertNotIn("alerted", state["alpha"])
             self.assertIn("job", state["alpha"])
             _ = result.write_text(finished)
             _ = self.pass_at(4)
-            self.assertEqual(phone.call_count, 2)
-            _ = self.pass_at(6)
-            self.assertEqual(phone.call_count, 2)
-            _ = self.pass_at(8)
-            self.assertEqual(phone.call_count, 2)
-        self.assertTrue(any("no longer exists" in line for line in self.notices))
+            self.assertEqual(phone.call_count, 0)
+            lines = self.pass_at(6)
+            self.assertEqual(phone.call_count, 0)
+            lines = self.pass_at(8)
+            self.assertEqual(phone.call_count, 0)
+        self.assertTrue(any("no longer exists" in line for line in lines))
 
     def fail_moved_restart(self, saved: shutdown_record.SessionShutdown) -> None:
         with (patch.object(restart, "_retire"),
@@ -1086,6 +1083,9 @@ class UnitWatchdogTests(unittest.TestCase):
                 self.die("alpha")
                 for minute in (0, 2, 8):
                     _ = self.pass_at(minute)
+                claim = outage_alerts.claim("alpha")
+                assert isinstance(claim, outage_alerts.AlertClaim)
+                outage_alerts.delivered(claim)
                 self.assertIsInstance(outage_alerts.claim("alpha"), outage_alerts.AlertDelivered)
             return restart.SessionNotLive()
 
@@ -1100,7 +1100,7 @@ class UnitWatchdogTests(unittest.TestCase):
             _ = self.pass_at(14)
             alpha_pushes = [call for call in phone.call_args_list
                            if cast(RenderedPush, call.args[0]).values.get("stopped") == "owner alpha"]
-            self.assertEqual(len(alpha_pushes), 1)
+            self.assertEqual(len(alpha_pushes), 0)
 
     def test_slow_batch_archive_preserves_a_new_outage_alert(self) -> None:
         self.slow_confirmation_outage(conductor=False)
@@ -1141,6 +1141,9 @@ class UnitWatchdogTests(unittest.TestCase):
             self.die("alpha")
             for minute in (0, 2, 8):
                 _ = self.pass_at(minute)
+            claim = outage_alerts.claim("alpha")
+            assert isinstance(claim, outage_alerts.AlertClaim)
+            outage_alerts.delivered(claim)
             self.assertIsInstance(outage_alerts.claim("alpha"), outage_alerts.AlertDelivered)
 
         with (patch.object(time, "time", side_effect=lambda: clock[0]),
@@ -1164,7 +1167,7 @@ class UnitWatchdogTests(unittest.TestCase):
             self.assertIsNone(shutdown_record.find_session(alpha["login"], "alpha"))
             self.assertIsInstance(outage_alerts.claim("alpha"), outage_alerts.AlertDelivered)
             _ = self.pass_at(14)
-            phone.assert_called_once()
+            phone.assert_not_called()
             clock[0] += 10
             self.revive("alpha", "claude2")
             _ = self.pass_at(16)
@@ -1177,7 +1180,7 @@ class UnitWatchdogTests(unittest.TestCase):
             self.die("alpha")
             for minute in (18, 20, 26):
                 _ = self.pass_at(minute)
-            self.assertEqual(phone.call_count, 2)
+            self.assertEqual(phone.call_count, 0)
 
     def test_dead_alert_owner_is_replaced_and_its_old_token_cannot_finish(self) -> None:
         first = outage_alerts.claim("dead-owner")
@@ -1260,7 +1263,7 @@ class UnitWatchdogTests(unittest.TestCase):
             restart_support.report_stop([saved])
             _ = self.pass_at(8)
             _ = self.pass_at(14)
-            phone.assert_called_once()
+            phone.assert_not_called()
 
     def test_worker_delivery_survives_a_later_retained_missing_folder(self) -> None:
         saved = self.moved_outage()
@@ -1277,7 +1280,7 @@ class UnitWatchdogTests(unittest.TestCase):
             _ = self.pass_at(12)
             phone.assert_called_once()
         state = unit_watchdog._read_state()  # pyright: ignore[reportPrivateUsage]
-        self.assertTrue(state["alpha"]["alerted"])
+        self.assertNotIn("alerted", state["alpha"])
 
     def test_watchdog_during_failed_worker_delivery_does_not_remember_a_claim_as_sent(self) -> None:
         saved = self.moved_outage()
@@ -1300,10 +1303,10 @@ class UnitWatchdogTests(unittest.TestCase):
             self.fail_moved_restart(saved)
             self.assertEqual(len(attempts), 1)
             state = unit_watchdog._read_state()  # pyright: ignore[reportPrivateUsage]
-            self.assertFalse(state["alpha"]["alerted"])
+            self.assertNotIn("alerted", state["alpha"])
             _ = self.pass_at(14)
             _ = self.pass_at(20)
-        self.assertEqual(len(attempts), 2)
+        self.assertEqual(len(attempts), 1)
 
     def test_failed_worker_delivery_allows_one_move_alert_after_retained_failure(self) -> None:
         saved = self.moved_outage()
@@ -1320,8 +1323,8 @@ class UnitWatchdogTests(unittest.TestCase):
         with patch.object(quota_alert, "tell_user", return_value=quota_alert.PushSent()) as phone:
             _ = self.pass_at(4)
             _ = self.pass_at(6)
-            phone.assert_called_once()
-            self.assertEqual(cast(RenderedPush, phone.call_args.args[0]).id, "shutdown.restart_failed")
+            phone.assert_not_called()
+            self.assertEqual(self.notices, [])
 
     def test_worker_delivery_then_live_unit_allows_one_new_outage_alert(self) -> None:
         saved = self.moved_outage()
@@ -1352,7 +1355,7 @@ class UnitWatchdogTests(unittest.TestCase):
             _ = self.pass_at(0)
             _ = self.pass_at(2)
             _ = self.pass_at(4)
-        self.assertIn("down since 21:00 JST", self.notices[0])
+        self.assertEqual(self.notices, [])
 
     def test_grace_keeps_the_launch_then_recovery_resumes_its_conversation(self) -> None:
         self.grace_launch_recovery(probe_unreadable=False)
@@ -1431,11 +1434,11 @@ class UnitWatchdogTests(unittest.TestCase):
         _ = shutdown_record.update_session(saved["login"], owner["session_id"], interrupted)
         with patch.object(quota_alert, "tell_user", return_value=quota_alert.PushSent()) as phone:
             lines = self.pass_at(8)
-            self.assertTrue(any("did not finish within 5 minutes" in line for line in lines))
+            self.assertTrue(any("did not finish within its time limit" in line for line in lines))
             self.assertEqual(len(self.pending), 2)
-            phone.assert_called_once()
+            phone.assert_not_called()
             _ = self.pass_at(14)
-            self.assertEqual(phone.call_count, 1)
+            self.assertEqual(phone.call_count, 0)
             self.assertEqual(len(self.pending), 3)
 
     def test_expired_move_worker_alerts_once_unless_restart_already_pushed(self) -> None:
@@ -1465,12 +1468,9 @@ class UnitWatchdogTests(unittest.TestCase):
                 _ = shutdown_record.update_session(saved["login"], name, interrupted)
                 with patch.object(quota_alert, "tell_user", return_value=quota_alert.PushSent()) as phone:
                     _ = self.pass_at(8)
-                    self.assertEqual(phone.call_count, 0 if marked else 1)
-                    if not marked:
-                        push = cast(RenderedPush, phone.call_args.args[0])
-                        self.assertEqual(push.id, "shutdown.restart_failed")
+                    self.assertEqual(phone.call_count, 0)
                     _ = self.pass_at(14)
-                    self.assertEqual(phone.call_count, 0 if marked else 1)
+                    self.assertEqual(phone.call_count, 0)
                 self.revive(name, "claude4")
                 _ = self.pass_at(16)
 
@@ -1491,16 +1491,12 @@ class UnitWatchdogTests(unittest.TestCase):
         saved = self.moved_outage()
         _ = self.pass_at(0)
         _ = self.pass_at(2)
-        def worker_alert(slug: str, key: str, text: str) -> str:
-            # The worker finishes after the watcher has read sources, before its alert.
-            current = shutdown_record.find_session(saved["login"], "alpha")
-            assert current is not None
-            self.fail_moved_restart(current)
-            return self.tell(slug, key, text)
-        with (patch.object(showrunners, "tell", side_effect=worker_alert),
-              patch.object(quota_alert, "tell_user", return_value=quota_alert.PushSent()) as phone):
+        with patch.object(quota_alert, "tell_user", return_value=quota_alert.PushSent()) as phone:
+            self.fail_moved_restart(saved)
             _ = self.pass_at(8)
+            _ = self.pass_at(14)
             phone.assert_called_once()
+        self.assertEqual(self.notices, [])
 
     def test_failed_move_push_releases_claim_and_retries_until_sent(self) -> None:
         saved = self.moved_outage()
@@ -1508,21 +1504,19 @@ class UnitWatchdogTests(unittest.TestCase):
         _ = self.pass_at(2)
         with patch.object(quota_alert, "tell_user", side_effect=[
                 quota_alert.PushFailed("fixture delivery failed"), quota_alert.PushSent()]) as phone:
-            _ = self.pass_at(8)
+            self.fail_moved_restart(saved)
             current = shutdown_record.find_session(saved["login"], "alpha")
             assert current is not None
             self.assertNotIn("restore_alerted", current)
-            state = unit_watchdog._read_state()  # pyright: ignore[reportPrivateUsage]
-            self.assertFalse(state["alpha"]["alerted"])
-            _ = self.pass_at(14)
+            _ = self.pass_at(8)
+            phone.assert_called_once()
+            self.fail_moved_restart(current)
             self.assertEqual(phone.call_count, 2)
-            current = shutdown_record.find_session(saved["login"], "alpha")
-            assert current is not None
             self.assertIsInstance(outage_alerts.claim("alpha"), outage_alerts.AlertDelivered)
-            state = unit_watchdog._read_state()  # pyright: ignore[reportPrivateUsage]
-            self.assertTrue(state["alpha"]["alerted"])
+            _ = self.pass_at(14)
             _ = self.pass_at(20)
             self.assertEqual(phone.call_count, 2)
+        self.assertEqual(self.notices, [])
 
     def test_watchdog_live_observation_clears_move_alert_for_the_next_outage(self) -> None:
         saved = self.moved_outage()
@@ -1541,7 +1535,7 @@ class UnitWatchdogTests(unittest.TestCase):
         with patch.object(quota_alert, "tell_user", return_value=quota_alert.PushSent()) as phone:
             _ = self.pass_at(14)
             _ = self.pass_at(20)
-            phone.assert_called_once()
+            phone.assert_not_called()
 
     def test_old_terminal_stop_does_not_hold_a_newer_session_for_the_same_unit(self) -> None:
         old = self.fixture.owner("old-alpha", host="unit", label="claude4")
@@ -1563,7 +1557,7 @@ class UnitWatchdogTests(unittest.TestCase):
         _ = self.pass_at(4)
         self.assertEqual(len(self.commands), 1)
         self.assertEqual(self.commands[0][self.commands[0].index("--only") + 1], "alpha")
-        self.assertIn("restarted on claude4", self.notices[0])
+        self.assertEqual(self.notices, [])
 
     def test_dry_run_and_mac_write_nothing_and_launch_nothing(self) -> None:
         _ = self.add_unit("alpha")

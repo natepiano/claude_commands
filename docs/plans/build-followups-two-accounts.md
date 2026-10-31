@@ -1,5 +1,13 @@
 # Two accounts: showrunners on one Claude account, unit directors on another
 
+> Scheduler update (2026-10-31): the agent-notes job in
+> `scripts/maintenance/agent_notes_job.py` now owns notes, quota alerts, the
+> pacer, refusal moves, crash recovery, phase-note pruning, the hierarchy note
+> and its vault commit. Runtime schedules and limits are in
+> `config/agent_notes.toml`. Earlier snapshot-timer descriptions below record
+> the previous implementation; the watchdog no longer sends notices or pushes.
+
+
 > **Status: IMPLEMENTATION PLAN — phases 1–6 are done; the cutover (Phase 7) moved all ten build-followups unit directors to claude 3 on 2026-10-11, with the spare dir and the cross-machine message check still open; Phase 8 moves any one session, or every showrunner off an account, by hand; Phases 14–17 drop the unit role so every new session picks the account with room, and move Codex workers and Claude sessions by themselves when their account refuses them; Phase 9 reads out a week of moves; Phases 10–12 add the Codex accounts: a home per account, one account for all workers with a swap, and alerts per account; Phase 13 repairs a worker launch that finished its turn while the seats account changed.** Phases 1–5 built everything and initiated nothing: no account dir, no login, no role. Phase 6 proved `~/.claude3` live. The design: each account the user has gets its own config dir, `~/.claude1`, `~/.claude2` and `~/.claude3`. Each holds only that account's login, and everything else is a symlink into `~/.claude`. Unit directors launch with `CLAUDE_CONFIG_DIR` set to the unit account's dir. Showrunners and every other session stay on `~/.claude`'s own login, as today. When the unit account runs low, one command swaps every unit onto a spare account through `/shutdown`'s safe stop and resume. Any one session, a showrunner included, moves to any account the same way with `/showrunner:accounts move` (Phase 8). Phased, delegate-ready once approved.
 
 > **As-built disposition: create**

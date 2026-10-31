@@ -238,6 +238,12 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
         _ = self.record_session(os.getpid() + 1_000_000, "fault-id", "natedev")
         _ = self.unit("unit-one")
 
+    def watch_settings(self, **values: str) -> Path:
+        """Write only the test overrides; production supplies omitted status vocabulary."""
+        path = self.root / "stall_watch.conf"
+        _ = path.write_text("".join(f"{key}={value}\n" for key, value in values.items()))
+        return path
+
     def configure(self, runners: dict[str, list[str]], *, stall_minutes: int = 5) -> None:
         """Give each showrunner an update timer and a production doc that lists its units. The slug is its name."""
         _ = self.config.write_text(json.dumps({
@@ -1344,6 +1350,126 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
                 self.send_log.unlink()
                 path.unlink()
 
+    def test_pauses_and_external_owners_stay_quiet_even_at_the_compaction_wake(self) -> None:
+        statuses = (
+            "holding: paused until the showrunner says resume",
+            "— holding: waiting on the showrunner",
+            "● — holding: waiting for the user",
+            "⏺ — holding: held on another unit",
+            "— holding: waiting on another session",
+            "— holding: waiting on session:peer-id",
+            "— holding: waiting on typesafe",
+            "— blocked: waiting on the showrunner",
+        )
+        self.configure({"showrunner": ["unit-one", "typesafe"]})
+        # A peer may be absent from herdr; the production's live rows still name its owner.
+        window = 300_000
+        threshold = context_usage.handoff_threshold(window)
+        for tokens in (threshold - 1, threshold):
+            for status in statuses:
+                with self.subTest(status=status, tokens=tokens):
+                    self.panes["unit-one"]["pane"] = status + "\n"
+                    self.write_context_usage(tokens, window=window)
+                    for at in (START, START + 3600):
+                        result = self.tick(at)
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertEqual(self.sent(), [])
+                        path, = self.state.glob("*.json")
+                        stretch = cast(stall_watch.Stretch, json.loads(path.read_text()))
+                        self.assertEqual(stretch["since"], at)
+                        self.assertFalse(stretch["bump_sent"])
+                        self.assertFalse(stretch["tell_sent"])
+
+    def test_a_resumed_unit_gets_a_fresh_idle_stretch_before_its_bump(self) -> None:
+        self.panes["unit-one"]["pane"] = "holding: paused until the showrunner says resume\n"
+        for at in (START, START + 3600):
+            self.assertEqual(self.tick(at).returncode, 0)
+        self.assertEqual(self.sent(), [])
+        self.panes["unit-one"]["pane"] = "holding: waiting on the unit tests\n"
+        self.assertEqual(self.tick(START + 3601).returncode, 0)
+        self.assertEqual(self.sent(), [])
+        self.assertEqual(self.tick(START + 3901).returncode, 0)
+        self.assertEqual({item["key"].rsplit(":", 1)[-1] for item in self.sent()}, {"bump", "tell"})
+
+    def test_status_vocabulary_is_reread_without_restarting_the_watcher(self) -> None:
+        self.panes["unit-one"]["pane"] = "holding: budget nap\n"
+        self.assertEqual(self.tick(START).returncode, 0)
+        _ = self.watch_settings(prompt_grace_seconds="0", paused_status_pattern=r"\bbudget nap\b")
+        self.assertEqual(self.tick(START + 300).returncode, 0)
+        self.assertEqual(self.sent(), [])
+        _ = self.watch_settings(prompt_grace_seconds="0")
+        self.assertEqual(self.tick(START + 301).returncode, 0)
+        self.assertEqual(self.sent(), [])
+        self.assertEqual(self.tick(START + 601).returncode, 0)
+        self.assertEqual({item["key"].rsplit(":", 1)[-1] for item in self.sent()}, {"bump", "tell"})
+
+    def test_a_paused_turn_end_in_the_transcript_also_prevents_bumps(self) -> None:
+        self.compacted(self.said({"type": "text", "text": "holding: paused until the showrunner says resume"}))
+        self.assertEqual(self.tick(START).returncode, 0)
+        self.assertEqual(self.tick(START + 3600).returncode, 0)
+        self.assertEqual(self.sent(), [])
+
+    def test_an_invalid_status_rule_reports_the_problem_without_bumping(self) -> None:
+        self.panes["unit-one"]["pane"] = "holding: paused until the showrunner says resume\n"
+        _ = self.watch_settings(prompt_grace_seconds="0", paused_status_pattern="[")
+        for at in (START, START + 3600):
+            result = self.tick(at)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("no bump: invalid status rule", result.stderr)
+            self.assertEqual(self.sent(), [])
+
+    def test_an_own_worker_wait_recovers_after_the_worker_stops_without_a_status_change(self) -> None:
+        for status in ("holding: waiting on the Codex writer for ticket 49",
+                       "holding: waiting on the Codex worker for ticket 49",
+                       "holding: waiting on the reviewer",
+                       "holding: waiting on the tests"):
+            with self.subTest(status=status):
+                self.panes["unit-one"]["pane"] = status + "\n"
+                self.state.mkdir(exist_ok=True)
+                for path in self.state.glob("*.json"):
+                    path.unlink()
+                self.send_log.unlink(missing_ok=True)
+                # The recording ps fixture models the unit's worker launcher, then its termination.
+                director_pid = self.children[0].pid
+                self.process_rows.append(f"{director_pid + 1} {director_pid} implement.sh running")
+                for at in (START, START + 300):
+                    result = self.tick(at)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(self.sent(), [])
+                _ = self.process_rows.pop()
+                self.assertEqual(self.tick(START + 301).returncode, 0)
+                self.assertEqual(self.sent(), [])
+                self.assertEqual(self.tick(START + 601).returncode, 0)
+                self.assertEqual({item["key"].rsplit(":", 1)[-1] for item in self.sent()}, {"bump", "tell"})
+                self.assertEqual(len(self.sent()), 2)
+                tell = next(item for item in self.sent() if item["key"].endswith(":tell"))
+                self.assertIn(f"Last status: {status}", tell["text"])
+
+    def test_malformed_owner_captures_preserve_other_units_and_pending_deliveries(self) -> None:
+        self.configure({"showrunner": ["unit-one", "bad-unit", "following-unit"]})
+        _ = self.unit("bad-unit")
+        _ = self.unit("following-unit")
+        for name in ("unit-one", "following-unit"):
+            self.panes[name]["pane"] = "holding: ready for next task\n"
+        self.panes["bad-unit"]["pane"] = "holding: waiting on the showrunner\n"
+        for pattern in (r"\bwaiting\b(?P<owner>never)?", r"\bwaiting\b(?P<owner>)", r"\bwaiting\b"):
+            with self.subTest(pattern=pattern):
+                _ = self.watch_settings(prompt_grace_seconds="0", external_wait_pattern=pattern)
+                self.state.mkdir(exist_ok=True)
+                for path in self.state.glob("*.json"):
+                    path.unlink()
+                self.send_log.unlink(missing_ok=True)
+                for at in (START, START + 300):
+                    result = self.tick(at)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn("bad-unit: no bump: invalid status rule", result.stderr)
+                    self.assertIn("external_wait_pattern must capture a nonempty owner", result.stderr)
+                sent = self.sent()
+                self.assertEqual(len(sent), 4)
+                self.assertEqual({item["to"] for item in sent if item["key"].endswith(":bump")},
+                                 {f"uds:{self.root / 'sid-unit-one.sock'}", f"uds:{self.root / 'sid-following-unit.sock'}"})
+                self.assertEqual(len([item for item in sent if item["key"].endswith(":tell")]), 2)
+
     def test_a_waiting_unit_below_compaction_stays_quiet_and_resets_its_stretch(self) -> None:
         self.configure({"showrunner": ["unit-one"]}, stall_minutes=10)
         pane = "● — blocked: my context is full; it compacts on the next turn\n"
@@ -1659,7 +1785,7 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
         rows = [stall_watch.Process(10, 1, "claude"), stall_watch.Process(20, 1, "build"),
                 stall_watch.Process(21, 1, "build")]
         with (mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", self.notifier),
-              mock.patch.object(stall_watch, "unit_marks", return_value=("old-showrunner", "unit-one")),
+              mock.patch.object(stall_watch, "staff_marks", return_value=("old-showrunner", "unit-one")),
               mock.patch.object(showrunners, "_source", wraps=getattr(showrunners, "_source")) as reads):
             self.assertFalse(stall_watch.work_running(10, rows, ("unrelated", "unit-one")))
             self.assertEqual(reads.call_count, 1)

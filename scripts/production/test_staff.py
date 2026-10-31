@@ -53,6 +53,103 @@ def concurrent_ensure(
 
 
 class StaffTests(StaffTestCase):
+    def test_schema_one_rewrites_as_two_without_inventing_worktrees_or_docs(self) -> None:
+        runner, unit, worker = self.tree()
+        _ = self.write_document({"schema": 1, "rows": [row.to_json() for row in (runner, unit, worker)]})
+        record = staff.snapshot()
+        read_unit, read_runner = record.by_id(unit.id), record.by_id(runner.id)
+        assert read_unit is not None and read_runner is not None
+        self.assertIsInstance(read_unit.worktree, staff.WorktreeUnfilled)
+        self.assertIsInstance(read_runner.doc, staff.DocUnfilled)
+        _ = staff.rename(unit.id, "renamed")
+        document = cast(dict[str, object], json.loads(self.staff_file.read_text()))
+        self.assertEqual(document["schema"], 2)
+        rows = cast(list[dict[str, object]], document["rows"])
+        self.assertEqual({row["id"] for row in rows}, {runner.id, unit.id, worker.id})
+        self.assertTrue(all("worktree" not in row and "doc" not in row for row in rows))
+
+    def test_partial_fill_survives_an_ordinary_staff_write(self) -> None:
+        runner, unit, _ = self.tree()
+        other = staff.ensure("unit", name="unfilled", parent=runner.id)
+        location = staff.PresentWorktree("natedev", self.root / "filled")
+        _ = staff.set_worktree(unit.id, location)
+        worker = staff.ensure_worker("test", other.id)
+        record = staff.snapshot()
+        filled = record.by_id(unit.id)
+        assert filled is not None
+        self.assertEqual(filled.worktree, location)
+        for row_id in (runner.id, other.id, worker.id):
+            row = record.by_id(row_id)
+            assert row is not None
+            self.assertNotIn("worktree", row.to_json())
+            self.assertNotIn("doc", row.to_json())
+        self.assertEqual(json.loads(self.staff_file.read_text())["schema"], 2)
+
+    def test_worktree_and_doc_fields_are_admitted_only_on_their_row_kinds(self) -> None:
+        runner, unit, worker = self.tree()
+        for row, key, state in ((runner, "worktree", "present"), (worker, "worktree", "removed"),
+                                (unit, "doc", "live"), (worker, "doc", "wrapped")):
+            with self.subTest(kind=row.kind, key=key), self.assertRaises(staff.StaffUnreadable):
+                _ = staff.StaffRow.from_json({**row.to_json(), key: {
+                    "machine": "natedev", "path": str(self.root / "location"), "state": state,
+                }})
+        for row, key, state in ((unit, "worktree", "present"), (runner, "doc", "live")):
+            for location in ({"machine": "natedev", "path": "relative", "state": state},
+                             {"machine": "natedev", "path": str(self.root), "state": "guessed"}):
+                with self.subTest(key=key, location=location), self.assertRaises(staff.StaffUnreadable):
+                    _ = staff.StaffRow.from_json({**row.to_json(), key: location})
+
+    def test_worktree_and_doc_setters_are_idempotent_and_refuse_duplicate_live_locations(self) -> None:
+        runner, unit, worker = self.tree()
+        other = staff.ensure("unit", name="other", parent=runner.id)
+        path, doc = self.root / "worktree", self.root / "production.md"
+        _ = self.assert_rerun("set-worktree", unit.id, "--machine", "natedev", "--path", str(path), "--state", "present")
+        _ = self.assert_rerun("set-doc", runner.id, "--machine", "natedev", "--path", str(doc), "--state", "live")
+        before = self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns
+        _ = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", path))
+        _ = staff.set_doc(runner.id, staff.LiveDoc("natedev", doc))
+        self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), before)
+        self.assert_refused(lambda: staff.set_worktree(other.id, staff.PresentWorktree("natedev", path)))
+        for wrong in (runner, worker):
+            self.assert_refused(lambda: staff.set_worktree(wrong.id, staff.PresentWorktree("natedev", path)))
+        for wrong in (unit, worker):
+            self.assert_refused(lambda: staff.set_doc(wrong.id, staff.LiveDoc("natedev", doc)))
+        _ = staff.set_worktree(unit.id, staff.RemovedWorktree("natedev", path))
+        claimed = staff.set_worktree(other.id, staff.PresentWorktree("natedev", path))
+        self.assertEqual(staff.snapshot().by_worktree("natedev", path), claimed)
+        wrapped = staff.set_doc(runner.id, staff.WrappedDoc("natedev", doc))
+        self.assertEqual(staff.StaffRow.from_json(wrapped.to_json()), wrapped)
+
+    def test_snapshot_finds_present_worktrees_by_machine_and_containing_path(self) -> None:
+        runner, unit, _ = self.tree()
+        path = self.root / "checkout"
+        _ = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", path))
+        _ = staff.set_doc(runner.id, staff.LiveDoc("natedev", path / "production.md"))
+        record = staff.snapshot()
+        self.assertEqual(record.by_worktree("natedev", path), record.by_id(unit.id))
+        self.assertEqual(record.by_worktree("natedev", path / "src/file.py"), record.by_id(unit.id))
+        self.assertIsNone(record.by_worktree("mac", path))
+        self.assertIsNone(record.by_worktree("natedev", self.root / "checkout-other"))
+        self.assertEqual(record.by_doc("natedev", path / "production.md"), record.by_id(runner.id))
+        self.assertIsNone(record.by_doc("mac", path / "production.md"))
+        self.assertIsNone(record.by_doc("natedev", path / "other.md"))
+        _ = staff.set_worktree(unit.id, staff.RemovedWorktree("natedev", path))
+        self.assertIsNone(staff.snapshot().by_worktree("natedev", path))
+
+    def test_remote_setters_use_one_owner_write_and_preserve_the_other_field(self) -> None:
+        runner, unit, _ = self.tree()
+        path = self.root / "mac" / "worktree"
+        with self.machine("mac"):
+            self.assertNotIn("STAFF_FILE", os.environ)
+            changed = staff.set_worktree(unit.id, staff.PresentWorktree("mac", path))
+            self.assertEqual(changed.worktree, staff.PresentWorktree("mac", path))
+            changed_doc = staff.set_doc(runner.id, staff.LiveDoc("mac", path / "production.md"))
+        commands = self.ssh_commands()
+        self.assertEqual([command[0] for command in commands], ["set-worktree", "set-doc"])
+        self.assertEqual(staff.by_id(unit.id), changed)
+        self.assertEqual(staff.by_id(runner.id), changed_doc)
+        self.assertFalse(self.mac_file.exists())
+
     def test_launcher_names_are_accepted_without_a_fixed_role_suffix(self) -> None:
         runner = staff.ensure("showrunner", name="sdlc")
         unit = staff.ensure("unit", name="models", parent=runner.id)
@@ -399,7 +496,7 @@ class StaffTests(StaffTestCase):
     def test_file_uses_canonical_sorted_rows_and_no_cached_path(self) -> None:
         _ = self.tree()
         rows = staff.find()
-        expected = {"schema": 1, "rows": [row.to_json() for row in sorted(rows, key=lambda row: row.id)]}
+        expected = {"schema": 2, "rows": [row.to_json() for row in sorted(rows, key=lambda row: row.id)]}
         self.assertEqual(self.staff_file.read_text(), json.dumps(expected, indent=2, sort_keys=True) + "\n")
         original = self.staff_file.read_bytes()
         elsewhere = self.root / "elsewhere" / "staff.json"
@@ -422,7 +519,7 @@ class StaffTests(StaffTestCase):
         showrunner, unit, worker = self.tree()
         valid = showrunner.to_json()
         malformed: list[object] = [
-            [], {"schema": 2, "rows": []}, {"schema": 1, "rows": {}},
+            [], {"schema": 3, "rows": []}, {"schema": 1, "rows": {}},
             {"schema": 1, "rows": [{**valid, "kind": "visitor"}]},
             {"schema": 1, "rows": [{**valid, "id": 4}]},
             {"schema": 1, "rows": [{**valid, "name": False}]},

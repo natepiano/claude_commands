@@ -86,8 +86,6 @@ class BuildWhyTests(unittest.TestCase):
         entries = [self.entry(name) for name in ("widget", "demo", "organon", "frame-cost", "inspectors-fix")]
         labels = roster.unit_labels(entries)
         _ = self.enterContext(mock.patch.object(unit_labels, "unit_labels_for", return_value=labels))
-        _ = self.enterContext(mock.patch.object(roster, "roster", return_value=roster.Roster(entries, [])))
-        _ = self.enterContext(mock.patch.object(roster, "unit_labels_for", return_value=labels))
 
     def entry(self, name: str) -> roster.RosterEntry:
         return roster.RosterEntry(
@@ -150,6 +148,46 @@ class BuildWhyTests(unittest.TestCase):
         _ = (self.root / "meminfo").write_text(
             f"MemAvailable: {gib(available) // 1024} kB\nMemTotal: {60 * GIB // 1024} kB\n")
         self.change_head(need=gib(need))
+
+    def test_test_phase_charge_explains_the_mark_need_history_width_and_margin(self) -> None:
+        need = gate.TestPhaseNeed(2 * GIB, 7, 8, 12, "wider_unscaled", 1.5)
+        charge = gate.TestPhaseCharge(gib(3), gib(0.4), need, NOW - 60)
+        self.assertEqual(build_why.charge_text(charge, user_zone()),
+                         "tests since 21:50: peak so far 0.4 GiB, need 2.0 GiB "
+                         + "(wider_unscaled, p90 of 7 runs at width 12), × 1.5")
+
+    def test_expired_head_explains_refresh_even_when_all_resource_checks_pass(self) -> None:
+        self.reset_running(available=60, need=1)
+        self.change_head(estimated_at=NOW - gate.HEAD_SECONDS)
+        text = self.output()
+        self.assertIn("estimate refresh: the estimate expired at 21:41; it refreshes on the next poll", text)
+        explanation = gate.explain_queue()
+        assert isinstance(explanation.head, gate.HeadExplanation)
+        self.assertTrue(explanation.head.budget.passes)
+        self.assertTrue(explanation.head.free.passes)
+
+    def test_expired_head_release_advice_requires_refresh_instead_of_queue_order_or_a_start_time(self) -> None:
+        self.reset_running(available=40, need=1)
+        _ = self.running(800, "holder", "clippy", 1, 1, 3600)
+        expired_at = NOW - gate.HEAD_SECONDS
+        self.change_head(estimated_at=expired_at)
+        for recovering in (False, True):
+            with self.subTest(recovering=recovering):
+                if recovering:
+                    gate.write_recovery(self.directory, gate.RecoveryStarts(NOW + 120, NOW + 37))
+                explanation = gate.explain_queue()
+                assert isinstance(explanation.head, gate.HeadExplanation)
+                self.assertTrue(explanation.head.budget.passes)
+                self.assertTrue(explanation.head.free.passes)
+                for outcome in (gate.head_after_steps_end(explanation, ()),
+                                gate.head_after_steps_end(explanation, (0,)),
+                                gate.smallest_head_release(explanation)):
+                    self.assertEqual(outcome, gate.EstimateExpired(expired_at))
+                final = self.line(self.output(), "Waiting because:")
+                frees_when = final.partition("Frees when: ")[2]
+                self.assertIn("the estimate expired at 21:41; it refreshes on the next poll", frees_when)
+                self.assertNotIn("queue order", frees_when)
+                self.assertNotIn("recovery spacing starts it at", frees_when)
 
     def test_release_advice_uses_admissions_run_alone_exception(self) -> None:
         self.reset_running(available=40, need=22)
@@ -291,8 +329,8 @@ class BuildWhyTests(unittest.TestCase):
             self.fail(f"expected head admission status, got {reason}")
         running = [row.measured for row in view.running]
         head = gate.head_priority([row for _, row in ordered], view.available, 60 * GIB, running, NOW)
-        decision = gate.queue_decision(view.available, 60 * GIB, ordered[0][1], [row for _, row in ordered], running, head,
-                                      gate.NoPressureHold(), recovery=gate.NoRecoverySpacing(), now=NOW)
+        decision = gate.admission_walk(view.available, 60 * GIB, [row for _, row in ordered], running, head,
+                                      gate.NoPressureHold(), recovery=gate.NoRecoverySpacing(), now=NOW)[0].decision
         self.assertEqual(reason.decision, decision)
         self.assertEqual(decision.state, "hold")
         self.assertAlmostEqual(decision.charged / GIB, 18.1, places=5)
@@ -607,8 +645,7 @@ class BuildWhyTests(unittest.TestCase):
     def test_single_label_read_includes_bump_actor_and_bumped_step_sessions(self) -> None:
         write_bumps(NOW, [bump_line(NOW - 3, actor="actor-one", session="bumped-one"),
                           bump_line(NOW - 2, actor="actor-two", session="bumped-two")])
-        with mock.patch.object(roster, "unit_labels_for", return_value={}) as labels, \
-             mock.patch.object(roster, "roster", side_effect=AssertionError("no full roster")), \
+        with mock.patch.object(unit_labels, "unit_labels_for", return_value={}) as labels, \
              mock.patch.object(gate, "queue_read", wraps=gate.queue_read) as reading, \
              mock.patch.object(head_facts, "read_head_facts", wraps=head_facts.read_head_facts) as facts:
             output = self.output()

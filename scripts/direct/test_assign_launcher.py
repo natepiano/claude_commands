@@ -1061,6 +1061,25 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
                         max(index for index, method in enumerate(methods) if method == "turn/start"))
         self.assertEqual(self.turn_starts, 2)
 
+    def test_changed_compaction_config_takes_effect_on_the_next_assignment(self) -> None:
+        config = self.session_dir.parent / "direct.conf"
+        _ = config.write_text("UNIT_COMPACT_ABOVE_TOKENS=300000 # keep this context\n")
+        with patch.dict(os.environ, {"UNIT_CONFIG": str(config)}):
+            _ = self.successful()
+            name, record = next(iter(self.assignment_records().items()))
+            thread = record["thread_id"]
+            record["context_tokens"] = 200_000
+            self.write_pool_roster({name: record})
+            self.context_sizes = [200_000, 200_000]
+            _ = self.successful("implement", "--to", name)
+            self.assertEqual(len(self.methods("thread/compact/start")), 0)
+            _ = config.write_text("UNIT_COMPACT_ABOVE_TOKENS=100000 # compact before the next turn\n")
+            _ = self.successful("implement", "--to", name)
+        self.assertEqual(len(self.methods("thread/compact/start")), 1)
+        self.assertEqual(self.assignment_records()[name]["thread_id"], thread)
+        self.assertEqual(len(self.methods("thread/start")), 1)
+        self.assertEqual(self.turn_starts, 3)
+
     def test_a_busy_named_worker_refuses_without_creating_another_dispatch_or_pass(self) -> None:
         _ = self.successful()
         name, record = next(iter(self.assignment_records().items()))

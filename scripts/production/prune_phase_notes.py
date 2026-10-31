@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Archive the phase notes of retired units, for every production that has an update timer.
 
-The agent-sessions snapshot timer on natedev runs this every 2 minutes, in its own process
-(`/etc/nixos/modules/linux/agent-sessions-snapshot.py`); until 2026-10-13 a dailies did it,
+The agent-notes job on natedev runs this on its configured interval, in its own process
+(`scripts/maintenance/agent_notes_job.py`); until 2026-10-13 a dailies did it,
 so a production that never built one kept its retired units' notes (user, 2026-10-13: "Yes do
 the part C"). It runs under nix's plain python3, so it uses the standard library alone.
 """

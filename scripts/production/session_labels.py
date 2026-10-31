@@ -5,7 +5,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 
 from scripts.production import staff, showrunners, unit_names
-from scripts.production.unit_table import Refusal, cell_value, unit_table
+from scripts.shutdown import remote
 
 
 def showrunner_owner(record: staff.StaffSnapshot, slug: str, document: str) -> staff.StaffRow | None:
@@ -33,15 +33,31 @@ class StaffLabels:
                    if (row := showrunner_owner(record, slug, source.document)) is not None}
         return cls(record, productions, parents)
 
-    def environment(self, environment: Mapping[str, str], session_id: str, name: str = "") -> dict[str, str]:
+    def environment(self, environment: Mapping[str, str], session_id: str, name: str = "", cwd: str = "") -> dict[str, str]:
+        """Join identity, timer target, exact local worktree, then normalized name."""
         result = dict(environment)
         identity = result.get("STAFF_ID", "")
         row = self.record.by_id(staff.StaffId(identity)) if identity else None
         if identity and row is None:
             return result
         if row is None:
-            owners = [self.showrunners[slug] for slug, source in self.productions.items()
-                      if source.timer.target == f"session:{session_id}" and slug in self.showrunners]
+            owners: list[staff.StaffRow] = []
+            for slug, source in self.productions.items():
+                if not session_id or source.timer.target != f"session:{session_id}":
+                    continue
+                candidates = [owner for owner in self.record.rows
+                              if owner.kind == "showrunner" and isinstance(owner.doc, staff.LiveDoc)
+                              and owner.doc.machine == remote.local_machine() and owner.doc.path == source.timer.doc]
+                if not candidates:
+                    candidates = [owner for owner in self.record.rows if owner.kind == "showrunner" and owner.name == slug]
+                if len(candidates) == 1:
+                    owners.extend(candidates)
+            if len(owners) == 1:
+                row = owners[0]
+        if row is None and cwd:
+            owners = [owner for owner in self.record.rows
+                      if owner.kind == "unit" and isinstance(owner.worktree, staff.PresentWorktree)
+                      and owner.worktree.machine == remote.local_machine() and str(owner.worktree.path) == cwd]
             if len(owners) == 1:
                 row = owners[0]
         if row is None:
@@ -67,23 +83,12 @@ class StaffLabels:
             slugs = [slug for slug, owner in self.showrunners.items() if owner.id == parent.id]
             slug = slugs[0] if len(slugs) == 1 else parent.name
             result["SHOWRUNNER_UNIT"] = slug
-            identifiers: set[str] = set()
-            source = self.productions.get(slug)
-            if source is not None:
-                try:
-                    identifiers = {cell_value(cells["Unit"]) for cells in unit_table(source.document.splitlines())
-                                   if "Unit" in cells and unit_names.name(cell_value(cells["Unit"])) == row.name}
-                except (Refusal, unit_names.BadName):
-                    pass
             retained_id = result.get("SHOWRUNNER_UNIT_ID", "")
             try:
                 retained_owner = unit_names.name(retained_id) if retained_id else ""
             except unit_names.BadName:
                 retained_owner = ""
-            # A missing production table cannot rename an existing unit id.
-            if len(identifiers) == 1:
-                result["SHOWRUNNER_UNIT_ID"] = next(iter(identifiers))
-            elif retained_owner == row.name:
+            if retained_owner == row.name:
                 result["SHOWRUNNER_UNIT_ID"] = retained_id
             else:
                 result["SHOWRUNNER_UNIT_ID"] = unit_names.unit_id(row.name)
