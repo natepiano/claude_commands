@@ -8,9 +8,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
 from zoneinfo import ZoneInfo
 
+for directory in (Path(__file__).resolve().parent, Path(__file__).resolve().parents[2]):
+    if str(directory) not in sys.path:
+        sys.path.insert(0, str(directory))
 if TYPE_CHECKING:
     import unit_lookup
-from scripts.production import showrunners
+from scripts.production import showrunners  # noqa: E402
 from collections.abc import Iterable
 from scripts.production import staff
 import unit_names
