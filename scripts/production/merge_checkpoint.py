@@ -1237,7 +1237,7 @@ def send_result(path: Path, record: BumpGateRecord) -> None:
                         capture_output=True, text=True, check=False,
                     )
                     if result.returncode:
-                        raise ValueError(result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}")
+                        raise ValueError(failure_detail(result))
                     delivered.append(recipient)
                     save_record(path, current)
                     break

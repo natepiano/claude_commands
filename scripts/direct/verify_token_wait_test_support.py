@@ -84,6 +84,9 @@ if [ "$1" = metadata ]; then
 fi
 printf "%s\n" "$*" >> "$CARGO_CALLS"
 if [ "$1" = check ]; then
+    if [ -n "${TEST_TOKEN_OBSERVER:-}" ]; then
+        python3 "$TEST_TOKEN_OBSERVER" run || exit 96
+    fi
     if [ "${TEST_REQUIRE_OWNED:-0}" = 1 ]; then
         python3 - "$TEST_OWNED_RECORD" "$$" "$TEST_CALLER_GROUP" <<'PY'
 import json

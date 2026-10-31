@@ -630,7 +630,7 @@ class CopyWatchProcessTests(unittest.TestCase):
                 os.killpg(parent.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
-            _ = parent.communicate(timeout=HANG_GUARD_S)
+            _ = parent.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
 
     def test_parent_killed_ends_the_watcher_at_once(self) -> None:
         self.assert_parent_loss_stops_watcher(running_copy=False)

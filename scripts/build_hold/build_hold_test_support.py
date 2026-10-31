@@ -24,6 +24,9 @@ if TYPE_CHECKING:
     from ..lib import test_hang_guard
 else:
     from scripts.lib import test_hang_guard
+from override_guard import require_checkout
+
+require_checkout(Path(__file__))
 
 if TYPE_CHECKING:
     from ..lib.socket_test_support import short_socket_directory

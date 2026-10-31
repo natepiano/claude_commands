@@ -190,6 +190,31 @@ class RecordTests(unittest.TestCase):
         self.assertEqual(row["idle_targets"], targets)
         self.assertIsInstance(row["id"], str)
 
+    def test_queue_priority_events_keep_action_and_user_scope_in_the_build_log(self) -> None:
+        at = float(START)
+        for offset, action in enumerate(("set", "set", "clear")):
+            recorder.queue_priority(action, "resources", "finish the queue", "showrunner-id", at + offset)
+        rows = self.records()
+        self.assertEqual(len(rows), 3)
+        self.assertEqual([row["action"] for row in rows], ["set", "set", "clear"])
+        for offset, row in enumerate(rows):
+            self.assertEqual((row["kind"], row["v"], row["host"], row["at"]),
+                ("queue_priority", recorder.RECORD_VERSION, store.host_name(), store.utc_iso(at + offset)))
+            self.assertEqual((row["unit"], row["why"], row["set_by"]),
+                ("resources", "finish the queue", "showrunner-id"))
+            self.assertNotIn("until", row)
+            self.assertIsInstance(row["id"], str)
+        self.assertEqual(len({row["id"] for row in rows}), 3)
+
+    def test_retried_priority_event_keeps_its_transition_id_and_one_row(self) -> None:
+        for action in ("set", "clear"):
+            for attempt in range(2):
+                recorder.queue_priority(action, "resources", "retry", "showrunner-id",
+                    START + attempt, transition_id=f"priority-{action}")
+        rows = self.records()
+        self.assertEqual([row["action"] for row in rows], ["set", "clear"])
+        self.assertEqual([row["id"] for row in rows], ["priority-set", "priority-clear"])
+        self.assertTrue(all(row["at"] == store.utc_iso(START) for row in rows))
 
     def handoff(self) -> Path:
         path = self.base / "handoff.log"

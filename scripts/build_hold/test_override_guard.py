@@ -96,6 +96,68 @@ def run_shell(program: str, arguments: Sequence[str], environment: Mapping[str, 
 
 
 class OverrideGuardPythonTests(unittest.TestCase):
+    def test_wired_modules_keep_their_checkout_import_forms(self) -> None:
+        checkout = SCRIPT_DIRECTORY.parent.parent
+        environment = child_environment({})
+        modules = (
+            ("lint/memory_test_support.py", True, True),
+            ("build_hold/build_hold_test_support.py", False, False),
+            ("build_hold/test_hold_applies.py", True, True),
+            ("build_hold/test_cargo_wrapper.py", True, True),
+            ("build_hold/test_hold_enforcer.py", False, True),
+            ("build_targets/test_targets.py", False, True),
+            ("lint/test_nextest_budget.py", False, True),
+            ("lint/test_nextest_width.py", True, True),
+        )
+        for relative, package_import, direct_run in modules:
+            path = Path("scripts") / relative
+            discover = (
+                "import unittest; loader = unittest.TestLoader(); "
+                + f"loader.discover({str(path.parent)!r}, pattern={path.name!r}); "
+                + "assert not loader.errors, '\\n'.join(loader.errors)"
+            )
+            commands = [[sys.executable, "-B", "-c", discover]]
+            if package_import:
+                module = str(path.with_suffix("")).replace("/", ".")
+                commands.append([sys.executable, "-B", "-c", f"import {module}"])
+            if direct_run:
+                commands.append([sys.executable, "-B", str(path), "--help"])
+            for command in commands:
+                with self.subTest(module=relative, command=command):
+                    result = subprocess.run(
+                        command, cwd=checkout, env=environment, capture_output=True, text=True,
+                        check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_installed_suite_stops_with_one_checkout_instruction(self) -> None:
+        root = temporary_root(self)
+        installed = installed_script(root, "lint/test_example.py")
+        symbolic = root / "suite_link.py"
+        symbolic.symlink_to(installed.script)
+        for suite in (installed.script, symbolic):
+            with self.subTest(suite=suite):
+                with mock.patch.object(override_guard, "user_home", return_value=installed.home), \
+                     mock.patch.dict(os.environ, {"HOME": str(root / "other_home")}), \
+                     self.assertRaises(RuntimeError) as raised:
+                    override_guard.require_checkout(suite)
+                self.assertEqual(str(raised.exception), (
+                    f"{suite.name}: this suite runs from a checkout, not from the installed scripts under "
+                    + f"{installed.home / '.claude' / 'scripts'}; run it from a worktree."
+                ))
+
+    def test_checkout_suite_passes_without_reading_file_contents(self) -> None:
+        root = temporary_root(self)
+        installed = installed_script(root, "lint/test_example.py")
+        checkout = root / "checkout" / "scripts" / "lint" / "test_example.py"
+        checkout.parent.mkdir(parents=True)
+        _ = checkout.write_bytes(installed.script.read_bytes())
+        with mock.patch.object(override_guard, "user_home", return_value=installed.home), \
+             mock.patch.object(Path, "read_bytes", side_effect=AssertionError("Only compare paths")), \
+             mock.patch.object(Path, "read_text", side_effect=AssertionError("Only compare paths")), \
+             mock.patch.object(Path, "open", side_effect=AssertionError("Only compare paths")):
+            override_guard.require_checkout(checkout)
+
     def test_build_hold_imports_as_a_scripts_package_module(self) -> None:
         _ = temporary_root(self)
         environment = child_environment({})

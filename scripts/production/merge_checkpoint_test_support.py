@@ -31,7 +31,7 @@ from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.production import fake_unit_host
 from scripts.message import sessions
-from scripts.production.staff_test_support import isolated_staff_file
+from scripts.production.staff_test_support import isolated_staff_file, production_membership
 
 
 def invoke_checkpoint(arguments: list[str], environment: dict[str, str], cwd: Path,
@@ -445,6 +445,8 @@ class MergeCheckpointFixture(unittest.TestCase):
         self.env["MERGE_CHECKPOINT_SEND"] = str(self.bin / "send.py")
         self.env["BUMP_TEST_ORIGIN"] = str(self.origin)
         self.env.update(fake_unit_host.environment(self.state))
+        with isolated_staff_file(Path(self.env["STAFF_FILE"]), self.env):
+            production_membership("example", "alpha-unit")
         fake_unit_host.write(self.env, [fake_unit_host.HostedUnit(
             "fixture-unit", "w1:p1", {"SHOWRUNNER_UNIT": "example", "SHOWRUNNER_UNIT_ID": "alpha-unit"},
         )])

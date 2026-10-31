@@ -255,9 +255,9 @@ async function queueRun($: EngineInterface, args: string[], isOpen = () => true)
   const home = await $.env.get('HOME');
   if (!home || !isOpen()) throw new Error('Build queue could not be read.');
   const result = await $.process.run([`${home}/.claude/scripts/lib/py`,
-    `${home}/.claude/scripts/build_queue/build_queue.py`, ...args]);
+    `${home}/.claude/scripts/${args[0] === "priority" ? "lint/memory_admit.py" : "build_queue/build_queue.py"}`, ...args]);
   if (!isOpen()) throw new Error('Build queue could not be read.');
-  if (args[0] === 'bump' && result.exitCode === 3 && !result.isStdoutTruncated) {
+  if (args[0] === 'priority' && result.exitCode === 3 && !result.isStdoutTruncated) {
     const refusal = result.stdout.trim();
     if (/^build queue: [^\r\n]+$/.test(refusal)) return refusal;
   }
@@ -413,11 +413,11 @@ export const register: Register = on => {
       return { text: 'Build queue closed.' };
     }
     if (/^bump(?:\s|$)/.test(wanted)) {
-      const selector = wanted.slice(4).trim();
+      const words = wanted.split(/\s+/);
+      if (words.length !== 2) return { text: 'build queue: use /build:queue bump <unit>' };
       let line: string;
       try {
-        if (!selector) throw new Error('Missing selector.');
-        const output = await queueRun($, ['bump', selector]);
+        const output = await queueRun($, ['priority', 'set', '--unit', words[1], '--why', "the user's bump"]);
         line = output.trim();
         if (!line || /[\r\n]/.test(line)) throw new Error('Invalid bump result.');
       } catch { return { text: 'Build queue could not be read.' }; }

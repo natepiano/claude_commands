@@ -10794,7 +10794,10 @@ class FollowEventRegressionTests(MeshCommandFixture):
                 else:
                     record = self.worker_record()
                     record["status"] = "ended"
-                    self.write_pool_roster({"worker": record})
+                    self.assertTrue(codex_mesh._update_roster_if_expected(  # pyright: ignore[reportPrivateUsage]
+                        str(self.session_dir), "worker", cast(codex_mesh.ThreadRecord, cast(object, record)),
+                        codex_mesh.RosterOnThread(THREAD_ID),
+                    ))
                 code, errors = LauncherHangGuard('assert_follow_exits_after_terminal_marker').result(future)
             finally:
                 self.live_turn = ""
@@ -11254,6 +11257,10 @@ class WorkerPauseTests(MeshCommandFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
+        from scripts.production import fake_unit_host
+        host = fake_unit_host.environment(self.session_dir)
+        fake_unit_host.write(host, [])
+        self.patches.enter_context(patch.dict(os.environ, host))
         from scripts.production.staff_test_support import isolated_staff_file, production_membership
         _ = self.enterContext(isolated_staff_file(self.session_dir / "staff.json", {}))
         production_membership("demo", "builders")

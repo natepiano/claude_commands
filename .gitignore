@@ -23,6 +23,7 @@
 /config/agents.conf.*
 !docs/
 !docs/**
+docs/plans/*-log.md
 !scripts/
 !scripts/**
 !shared/

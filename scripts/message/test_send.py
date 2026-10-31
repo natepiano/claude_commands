@@ -106,11 +106,11 @@ class RelayAccountTests(unittest.TestCase):
             with mock.patch.object(sys, "argv", argv), mock.patch.object(os, "getpid", return_value=4242), \
                     mock.patch.object(os, "execvpe", side_effect=KeyboardInterrupt) as launch:
                 with mock.patch.object(os, "replace", side_effect=KeyboardInterrupt), self.assertRaises(KeyboardInterrupt):
-                    exec(send.RELAY_EXEC, {})
+                    exec(compile(send.RELAY_EXEC, "<relay>", "exec"), {})
                 launch.assert_not_called()
                 self.assertFalse((root / "4242").exists())
                 with self.assertRaises(KeyboardInterrupt):
-                    exec(send.RELAY_EXEC, {})
+                    exec(compile(send.RELAY_EXEC, "<relay>", "exec"), {})
                 self.assertEqual((root / "4242").read_text(), "verify")
                 launch.assert_called_once_with("/fixture/claude", ["/fixture/claude", "-p"], os.environ)
                 self.assertFalse((root / ".4242.tmp").exists())

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from scripts.lib.test_agents_registry import write_registry
-from scripts.lib.test_hang_guard import LauncherHangGuard
 
 import contextlib
 import fcntl
