@@ -82,9 +82,9 @@ def age(since: float, now: float) -> int:
     return max(0, int((now - since) // 60))
 
 
-def free_memory_text(threshold: int, need: int, growth: int, reserve: int, head_need: int = 0) -> str:
+def free_memory_text(threshold: int, need: int, growth: int, reserve: int) -> str:
     parts = [f"this step {need / memory_admit.GIB:.1f}"]
-    for name, value in (("running steps may grow", growth), ("head", head_need), ("earlyoom", reserve)):
+    for name, value in (("running steps may grow", growth), ("earlyoom", reserve)):
         amount = f"{value / memory_admit.GIB:.1f}"
         if amount != "0.0":
             parts.append(f"{name} {amount}")
@@ -105,7 +105,7 @@ def head_reason_text(head: memory_admit.HeadExplanation, zone: ZoneInfo, facts: 
                          + f"(starts when build use falls to {memory_text(head.budget.starts_at)})")
         if not head.free.passes:
             parts.append(free_memory_text(head.free.threshold, head.free.need, head.free.growth,
-                                          head.free.reserve, head.free.head_need))
+                                          head.free.reserve))
     parts.append(head_facts.order_text(facts, zone))
     return "head: " + "; ".join(parts)
 
@@ -123,7 +123,7 @@ def reason_text(step: memory_admit.WaitingStep, reading: memory_admit.QueueRead,
             return (f"builds use {reason.charged / memory_admit.GIB:.1f} of the "
                     + f"{reason.budget / memory_admit.GIB:.1f} GiB budget")
         case memory_admit.NeedsMemory():
-            return free_memory_text(reason.threshold, reason.need, reason.growth, reason.reserve, reason.head_need)
+            return free_memory_text(reason.threshold, reason.need, reason.growth, reason.reserve)
         case memory_admit.BehindHead():
             identity = labels.get(reason.head_session_id, roster.UnitLabels(field(reason.head_name)))
             return (f"behind {identity.session} "

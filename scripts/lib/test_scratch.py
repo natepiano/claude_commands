@@ -61,103 +61,36 @@ class ScratchTests(unittest.TestCase):
                               source_commit="a" * 40, copy_commit="b" * 40, target_mode="none",
                               seed_source="", borrows_from="", **details)
 
-    def shared_source(self, name: str = "source", origin: str = "https://example.invalid/team/sample.git") -> Path:
-        source = self.base / name
+    def test_style_build_folder_helper_creates_a_stamped_cache_the_sweep_accepts(self) -> None:
+        source = self.base / "source"
         source.mkdir()
         self.git(source, "init", "-q")
-        self.git(source, "commit", "-qm", "base", "--allow-empty")
-        self.git(source, "remote", "add", "origin", origin)
-        self.enterContext(mock.patch.dict(os.environ, {
-            "SCRATCH_SHARED_BUILD_ROOT": str(self.base / "shared-builds"),
-            "SCRATCH_COPIES_ROOT": str(self.base / "copies"),
-        }))
-        return source
-
-    def test_two_clones_reuse_one_build_folder_after_their_task_ends(self) -> None:
-        source = self.shared_source()
-        copies = self.base / "copies" / "maker"
-        copies.mkdir(parents=True)
-        folders: list[Path] = []
-        for name in ("a", "b"):
-            copy = copies / name
-            self.git(source, "clone", "-q", str(source), str(copy))
-            result = scratch.shared_build_folder(copy)
-            self.assertIsInstance(result, scratch.SharedBuildFolder)
-            assert isinstance(result, scratch.SharedBuildFolder)
-            scratch.register_copy(copy, task="gate:shared-build", owner_unit="test", source_path=str(source),
-                                  source_commit="a" * 40, copy_commit="b" * 40, target_mode="shared",
-                                  seed_source="", borrows_from="", shared_target=str(result.path))
-            record = scratch.task_of(copy)
-            assert isinstance(record, scratch.Registered)
-            self.assertEqual(record.fields["shared_target"], str(result.path))
-            folders.append(result.path)
-        self.assertEqual(folders[0], folders[1])
-        artifact = folders[0] / "artifact"
-        _ = artifact.write_text("reused")
-        self.assertCountEqual(scratch.end("gate:shared-build"), [copies / "a", copies / "b"])
-        self.assertEqual(artifact.read_text(), "reused")
-        third = copies / "c"
-        self.git(source, "clone", "-q", str(source), str(third))
-        result = scratch.shared_build_folder(third)
-        assert isinstance(result, scratch.SharedBuildFolder)
-        self.assertEqual(result.path, folders[0])
-
-    def test_shared_build_folder_depends_on_repository_key_not_checkout_name_or_commit(self) -> None:
-        source = self.shared_source()
-        other = self.shared_source("other", "https://example.invalid/other/sample.git")
-        first = scratch.shared_build_folder(source)
-        different = scratch.shared_build_folder(other)
-        assert isinstance(first, scratch.SharedBuildFolder)
-        assert isinstance(different, scratch.SharedBuildFolder)
-        self.assertNotEqual(first.repo_identity, different.repo_identity)
-        self.assertNotEqual(first.path, different.path)
-        self.git(source, "commit", "-qm", "next", "--allow-empty")
-        renamed = self.base / "renamed-checkout"
-        _ = source.rename(renamed)
-        again = scratch.shared_build_folder(renamed)
-        self.assertEqual(again, first)
-        self.assertTrue(first.path.is_relative_to(self.base / "shared-builds"))
-
-    def test_repository_without_identity_has_no_shared_build_folder(self) -> None:
-        source = self.base / "unborn"
-        source.mkdir()
-        self.git(source, "init", "-q")
-        with mock.patch.dict(os.environ, {"SCRATCH_SHARED_BUILD_ROOT": str(self.base / "shared-builds")}):
-            result = scratch.shared_build_folder(source)
-        self.assertIsInstance(result, scratch.NoSharedBuildFolder)
-        assert isinstance(result, scratch.NoSharedBuildFolder)
-        self.assertTrue(result.reason)
-        self.assertFalse((self.base / "shared-builds").exists())
-
-    def test_shared_folder_has_one_use_stamp_refreshed_by_each_clone(self) -> None:
-        source = self.shared_source()
-        first = scratch.shared_build_folder(source)
-        assert isinstance(first, scratch.SharedBuildFolder)
-        stamp = first.path / scratch.USE_STAMP
-        os.utime(stamp, (1, 1))
-        clone = self.base / "second-clone"
-        self.git(source, "clone", "-q", str(source), str(clone))
-        self.git(clone, "remote", "set-url", "origin", "https://example.invalid/team/sample.git")
-        second = scratch.shared_build_folder(clone)
-        self.assertEqual(second, first)
-        self.assertGreater(stamp.stat().st_mtime, 1)
-        self.assertEqual(list((self.base / "shared-builds").rglob(scratch.USE_STAMP)), [stamp])
-
-    def test_both_build_folder_helpers_create_stamped_caches_the_sweep_accepts(self) -> None:
-        source = self.shared_source()
         started = time.time()
-        shared = scratch.shared_build_folder(source)
-        assert isinstance(shared, scratch.SharedBuildFolder)
-        targets = (shared.path, style_sync.lint_target(source / ".git"))
-        for target in targets:
-            with self.subTest(target=target):
-                # Supply build output, but let the helper supply every cache marker.
-                fingerprint = target / "debug" / ".fingerprint" / "sample-0123456789abcdef"
-                fingerprint.mkdir(parents=True)
-                _ = (fingerprint / "bin-sample.json").write_text("{}")
-                self.assertFalse((target / sweep.RUSTC_INFO).exists())
-                self.assertTrue(sweep.is_cargo_target(str(target)), "The sweep must accept the helper's cache")
-                self.assertGreaterEqual((target / sweep.USE_STAMP).stat().st_mtime, started)
+        target = style_sync.lint_target(source / ".git")
+        # Supply build output, but let the helper supply every cache marker.
+        fingerprint = target / "debug" / ".fingerprint" / "sample-0123456789abcdef"
+        fingerprint.mkdir(parents=True)
+        _ = (fingerprint / "bin-sample.json").write_text("{}")
+        self.assertFalse((target / sweep.RUSTC_INFO).exists())
+        self.assertTrue(sweep.is_cargo_target(str(target)), "The sweep must accept the helper's cache")
+        self.assertGreaterEqual((target / sweep.USE_STAMP).stat().st_mtime, started)
+
+    def test_copy_record_with_a_legacy_shared_target_still_loads(self) -> None:
+        path = self.copy()
+        record_path = path / scratch.RECORD
+        fields = cast(dict[str, object], json.loads(record_path.read_text()))
+        fields["target_mode"] = "shared"
+        fields["shared_target"] = str(self.base / "old-build-folder")
+        _ = record_path.write_text(json.dumps(fields))
+
+        record = scratch.task_of(path)
+
+        self.assertIsInstance(record, scratch.Registered)
+        assert isinstance(record, scratch.Registered)
+        self.assertEqual(record.task, "gate:copy")
+        self.assertEqual(record.fields, fields)
+        self.assertIsInstance(scratch.lifetime(path), scratch.Live)
+        self.assertFalse((self.base / "old-build-folder").exists())
 
     def test_record_and_lifetime_results_distinguish_missing_bad_and_external_end(self) -> None:
         self.assertIsInstance(scratch.task_of(self.base), scratch.NotRegistered)
