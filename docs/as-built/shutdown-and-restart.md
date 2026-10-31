@@ -20,6 +20,11 @@ Record-driven restart, status, recovery snapshots, forget, account holds and lau
 
 ## Session hosting and manual recovery
 
+Pane launch writes store the supplied labels unchanged: an unmarked launch does not
+inherit a previous launch's staff identity. Restart, resume and the SessionStart
+hook recover a conversation's saved labels explicitly through `record_membership`
+before writing its launch.
+
 Herdr is the session host. Unit records retain `session_host: "herdr"`;
 standalone records carry the server and pane. A process inside a user-managed
 terminal multiplexer is an unknown host even if it inherits herdr variables.
