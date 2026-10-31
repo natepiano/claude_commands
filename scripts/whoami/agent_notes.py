@@ -337,12 +337,12 @@ def apply(
 
 
 @role_map_command
-def update() -> list[str]:
+def update(*, include_warnings: bool = True) -> list[str]:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from scripts.accounts import accounts
 
     workers_home = resolve_workers_home()
-    return update_for_selection(accounts.claude_account_selection(), workers_home)
+    return list(update_alert_pass(accounts.claude_account_selection(), workers_home, include_warnings=include_warnings).messages)
 
 
 def update_for_selection(selection: ClaudeAccountsInUse, workers_home: Path | NoWorkersHome) -> list[str]:
@@ -432,7 +432,7 @@ def claude_note_logins(notes: Iterable[AgentNote]) -> dict[str, str]:
 
 @role_map_command
 def update_alert_pass(selection: ClaudeAccountsInUse, workers_home: Path | NoWorkersHome, *,
-                      force_usage: bool = False) -> UpdatedAgentNotes:
+                      force_usage: bool = False, include_warnings: bool = True) -> UpdatedAgentNotes:
     """Build the alert readings before writing any note."""
     from scripts.accounts import accounts
 
@@ -528,15 +528,21 @@ def update_alert_pass(selection: ClaudeAccountsInUse, workers_home: Path | NoWor
             append_readings(readings, checked_at)
         except (OSError, UnicodeError) as error:
             messages.append(f"readings log: {error}")
+    if include_warnings:
+        messages += watch_usage(reports, selection, workers_home, codex_readings)
+    return UpdatedAgentNotes(tuple(messages), codex_readings, usage_reused=not fresh)
+
+
+def watch_usage(reports: list[Report], selection: ClaudeAccountsInUse, workers_home: Path | NoWorkersHome,
+                codex_readings: CodexAlertPassReadings) -> list[str]:
+    """Warn only for accounts in use, sharing the pass's existing usage readings."""
     try:
         watch_reports = [report for report in reports
                          if (report.tool.lower() != "codex" or codex_report_in_use(report, workers_home))
                          and (report.tool.lower() != "claude" or selection.is_in_use(report.email or ""))]
-        messages += five_hour.watch(watch_reports, codex_readings=codex_readings)
+        return five_hour.watch(watch_reports, codex_readings=codex_readings)
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
-        # The 5-hour watch must never cost the notes or the weekly alerts.
-        messages.append(f"5-hour watch did not run: {error!r}")
-    return UpdatedAgentNotes(tuple(messages), codex_readings, usage_reused=not fresh)
+        return [f"5-hour watch did not run: {error!r}"]
 
 
 def mark_tier(plan: codex_pacer.Plan) -> None:
