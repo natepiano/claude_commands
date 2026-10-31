@@ -15,7 +15,7 @@ def config_values(path: str) -> dict[str, str]:
     try:
         with open(path, encoding="utf-8") as handle:
             lines = handle.readlines()
-    except (OSError, UnicodeError):
+    except OSError:
         return {}
     values: dict[str, str] = {}
     for raw in lines:
@@ -30,7 +30,11 @@ def config_values(path: str) -> dict[str, str]:
 def build_oom_score_adj() -> int:
     """Build scope's kernel kill adjustment; keep its kill order on bad config."""
     path = os.environ.get("LINT_CONFIG_FILE") or str(Path.home() / ".claude/config/lint.conf")
-    values = config_values(path)
+    try:
+        values = config_values(path)
+    except UnicodeError as error:
+        print(f"warning: {path}: {error} — using {DEFAULT_BUILD_OOM_SCORE_ADJ}", file=sys.stderr)
+        return DEFAULT_BUILD_OOM_SCORE_ADJ
     if "build_oom_score_adj" not in values:
         return DEFAULT_BUILD_OOM_SCORE_ADJ
     value = values["build_oom_score_adj"]

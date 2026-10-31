@@ -56,7 +56,7 @@ The one admission sampler `buildlog_sample_anon` in `scripts/lint/invoke.sh` ope
 
 ### Old field names
 
-The index reads the former step and call field names in `index.FORMER_FIELDS` (`seat`→`worker`, `delegate_session`→`unit_session`) at index time, keeps a present new field's value, and never writes a source `.jsonl` file. The live logs still hold old-name fields, so a reader that opens the `.jsonl` files directly maps `FORMER_FIELDS` too.
+The index maps each former step and call field name in `index.FORMER_FIELDS` to its current name (`worker`, `unit_session`) at index time, keeps a present new field's value, and never writes a source `.jsonl` file. The live logs still hold old-name fields, so a reader that opens the `.jsonl` files directly maps `FORMER_FIELDS` too.
 
 ### Per-step stall: scope file → step record → `steps`
 

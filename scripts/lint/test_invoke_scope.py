@@ -90,22 +90,29 @@ def require_score_below_500(test: unittest.TestCase) -> None:
 
 
 class BuildOomScoreAdjReaderTests(unittest.TestCase):
+    python_reader: list[str] = [
+        sys.executable, "-c", "from scripts.lint.config_values import build_oom_score_adj; "
+        + "print(build_oom_score_adj())",
+    ]
+
+    def read_config(self, config: Path, command: list[str]) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            command, capture_output=True, text=True, check=False,
+            env={**os.environ, "HOME": str(config.parent), "LINT_CONFIG_FILE": str(config),
+                 "PYTHONPATH": str(INVOKE.resolve().parents[2])},
+            timeout=TEST_HANG_GUARD_SECS,
+        )
+
     def assert_readers(self, config: Path, expected: int, *, warns: bool) -> None:
         readers = (
             ("shell", ["bash", "-c", 'set -euo pipefail; source "$1"; '
                        + 'lint_config_build_oom_score_adj adjustment; printf "%s\\n" "$adjustment"',
                        "config-reader-test", str(LINT_CONFIG_READER)]),
-            ("python", [sys.executable, "-c", "from scripts.lint.config_values import build_oom_score_adj; "
-                        + "print(build_oom_score_adj())"]),
+            ("python", self.python_reader),
         )
         for reader, command in readers:
             with self.subTest(reader=reader):
-                result = subprocess.run(
-                    command, capture_output=True, text=True, check=False,
-                    env={**os.environ, "HOME": str(config.parent), "LINT_CONFIG_FILE": str(config),
-                         "PYTHONPATH": str(INVOKE.resolve().parents[2])},
-                    timeout=TEST_HANG_GUARD_SECS,
-                )
+                result = self.read_config(config, command)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual(result.stdout, f"{expected}\n")
                 if warns:
@@ -125,6 +132,19 @@ class BuildOomScoreAdjReaderTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             config = write_lint_config(Path(directory), 650, include_adjustment=False)
             self.assert_readers(config, 500, warns=False)
+
+    def test_python_reader_warns_once_for_undecodable_config_and_uses_default(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = write_lint_config(Path(directory), 650)
+            _ = config.write_bytes(b"\xff")
+            result = self.read_config(config, self.python_reader)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(result.stdout, "500\n")
+            self.assertEqual(
+                result.stderr,
+                f"warning: {config}: 'utf-8' codec can't decode byte 0xff in position 0: "
+                + "invalid start byte — using 500\n",
+            )
 
     def test_present_invalid_value_warns_once_and_uses_default(self) -> None:
         for value in ("", " # comment", "abc", "2000", "-1001"):
