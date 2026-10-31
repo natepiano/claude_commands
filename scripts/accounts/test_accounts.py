@@ -28,7 +28,7 @@ from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import FrozenInstanceError, replace
 from datetime import datetime, timedelta, timezone, tzinfo
 from collections.abc import Callable, Generator, Iterator
-from typing import Literal, Self, TextIO, cast, final, override
+from typing import Literal, Self, TextIO, TypedDict, cast, final, override
 from unittest.mock import AsyncMock, MagicMock, call, patch
 from zoneinfo import ZoneInfo
 
@@ -142,6 +142,20 @@ class RoleWriteTime(datetime):
 def provider_fixture_login(_login: str) -> bool:
     """Keep provider-account fixtures distinct from test-contamination cases."""
     return False
+
+
+class McpProjectFixture(TypedDict):
+    disabledMcpServers: list[str]
+
+
+class McpFixtureIdentity(TypedDict):
+    emailAddress: str
+
+
+class McpConfigurationFixture(TypedDict):
+    oauthAccount: McpFixtureIdentity
+    mcpServers: dict[str, object]
+    projects: dict[str, McpProjectFixture]
 
 
 @final
@@ -2520,6 +2534,7 @@ class AccountsTests(unittest.TestCase):
         self.assertNotIn("unit directors", stdout)
         self.assertNotIn("unclassified entries", stdout)
         self.assertNotIn("mcpServers differ", stdout)
+        self.assertNotIn(" where ~/.claude does not: ", stdout)
         self.assertEqual(set(self.home.iterdir()), before)
         self.assertFalse(any(self.home.glob(".claude[0-9]*")))
 
@@ -2546,6 +2561,7 @@ class AccountsTests(unittest.TestCase):
         )
         self.assertRegex(stdout, r"\| ~/\.claude2 +\| claude2 +\|")
         self.assertNotIn("mcpServers differ", stdout)
+        self.assertNotIn(" where ~/.claude does not: ", stdout)
         self.assertEqual(
             login_read.call_args_list,
             [call(self.main_dir)] * login_read.call_count,
@@ -2570,8 +2586,12 @@ class AccountsTests(unittest.TestCase):
                 print(note, file=sys.stderr)
             return result
 
-        expected = ("claude2: mcpServers differ from ~/.claude; - brp, + account-only; "
-                    + "check mcpServers in ~/.claude2/.claude.json against ~/.claude.json")
+        expected = (
+            "claude2 turns brp off in 1 project where ~/.claude does not: "
+            + "~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py mcp-projects claude2 brp off",
+            "claude2 turns account-only on in 1 project where ~/.claude does not: "
+            + "~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py mcp-projects claude2 account-only on",
+        )
         for arguments in ((), ("status", "--json"), ("status", "--stored"), ("status", "--stored", "--json")):
             with self.subTest(arguments=arguments, tty=tty, helper_note=helper_note):
                 stdout, stderr = io.StringIO(), io.StringIO()
@@ -2585,9 +2605,11 @@ class AccountsTests(unittest.TestCase):
                 self.assertEqual(stderr.getvalue(), note + "\n" if tty and helper_note else "")
                 if "--json" in arguments:
                     document = cast(dict[str, object], json.loads(stdout.getvalue()))
-                    self.assertIn(expected, cast(list[str], document["problems"]))
+                    for line in expected:
+                        self.assertIn(line, cast(list[str], document["problems"]))
                 else:
-                    self.assertIn(expected, stdout.getvalue().splitlines())
+                    for line in expected:
+                        self.assertIn(line, stdout.getvalue().splitlines())
 
     def test_piped_status_keeps_mcp_problem_in_table_and_json(self) -> None:
         self.assert_mcp_status_streams(tty=False, helper_note=False)
@@ -2898,6 +2920,127 @@ class AccountsTests(unittest.TestCase):
             self.assertEqual((code, output), (1, ""))
             self.assertEqual(error.splitlines(), expected)
 
+    def write_mcp_configuration(self, directory: Path, servers: tuple[str, ...],
+                                projects: dict[str, list[str]]) -> Path:
+        """Write the effective-server cases beside this test's scratch identity."""
+        configuration = McpConfigurationFixture(
+            oauthAccount=McpFixtureIdentity(emailAddress="fixture@notexample.com"),
+            mcpServers={name: {} for name in servers},
+            projects={path: McpProjectFixture(disabledMcpServers=disabled)
+                      for path, disabled in projects.items()},
+        )
+        path = agent_accounts.claude_config_file(directory)
+        _ = path.write_text(json.dumps(configuration), encoding="utf-8")
+        return path
+
+    def assert_mcp_readout(self, expected: list[str]) -> None:
+        """Both readout forms preserve every independent server and direction."""
+        for flags in ((), ("--json",)):
+            with self.subTest(flags=flags):
+                code, output, error = self.run_cli("status", "--stored", *flags)
+                self.assertEqual((code, error), (0, ""))
+                lines = (cast(accounts.StatusDocument, json.loads(output))["problems"]
+                         if flags else output.splitlines())
+                self.assertFalse(any("mcpServers differ" in line for line in lines))
+                self.assertCountEqual([line for line in lines if line.startswith("claude2 turns ")], expected)
+
+    def test_mcp_readout_counts_three_disabled_projects_and_lists_them_without_writing(self) -> None:
+        self.login_directory("claude2", "fixture@notexample.com")
+        projects = [str(self.root / name) for name in ("project one", "project-two", "project-three")]
+        baseline = self.write_mcp_configuration(self.main_dir, ("brp",), {path: [] for path in projects})
+        config = self.write_mcp_configuration(self.home / ".claude2", ("brp",),
+                                              {path: ["brp"] for path in projects})
+        before = (baseline.read_bytes(), config.read_bytes())
+        command = "~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py mcp-projects claude2 brp off"
+        self.assert_mcp_readout([f"claude2 turns brp off in 3 projects where ~/.claude does not: {command}"])
+        # Execute the printed command's account CLI arguments in the scratch HOME.
+        code, output, error = self.run_cli(*shlex.split(command)[2:])
+        self.assertEqual((code, error), (0, ""))
+        self.assertCountEqual(output.splitlines(), projects)
+        self.assertEqual((baseline.read_bytes(), config.read_bytes()), before)
+
+    def test_mcp_printed_command_accepts_a_server_name_starting_with_a_dash(self) -> None:
+        self.login_directory("claude2", "fixture@notexample.com")
+        project = str(self.root / "project with spaces")
+        _ = self.write_mcp_configuration(self.main_dir, ("-brp",), {project: []})
+        _ = self.write_mcp_configuration(self.home / ".claude2", ("-brp",), {project: ["-brp"]})
+        code, output, error = self.run_cli("status", "--stored")
+        self.assertEqual((code, error), (0, ""))
+        prefix = "claude2 turns -brp off in 1 project where ~/.claude does not: "
+        lines = [line for line in output.splitlines() if line.startswith(prefix)]
+        self.assertEqual(len(lines), 1)
+        command = lines[0].removeprefix(prefix)
+        self.assertEqual(self.run_cli(*shlex.split(command)[2:]), (0, project + "\n", ""))
+        self.assertEqual(shlex.split(command)[2:], ["mcp-projects", "--", "claude2", "-brp", "off"])
+
+    def test_matching_mcp_configuration_has_no_difference_line_or_project_output(self) -> None:
+        self.login_directory("claude2", "fixture@notexample.com")
+        projects = {str(self.root / "on"): [], str(self.root / "off"): ["brp"]}
+        for directory in (self.main_dir, self.home / ".claude2"):
+            _ = self.write_mcp_configuration(directory, ("brp",), projects)
+        self.assert_mcp_readout([])
+        for direction in ("off", "on"):
+            self.assertEqual(self.run_cli("mcp-projects", "claude2", "brp", direction), (0, "", ""))
+
+    def test_mcp_project_in_one_file_compares_against_the_other_global_servers(self) -> None:
+        self.login_directory("claude2", "fixture@notexample.com")
+        project = str(self.root / "one-file-only")
+        for account_only, direction in ((True, "off"), (False, "on")):
+            with self.subTest(account_only=account_only):
+                _ = self.write_mcp_configuration(self.main_dir, ("brp",),
+                                                  {} if account_only else {project: ["brp"]})
+                _ = self.write_mcp_configuration(self.home / ".claude2", ("brp",),
+                                                  {project: ["brp"]} if account_only else {})
+                self.assert_mcp_readout([
+                    f"claude2 turns brp {direction} in 1 project where ~/.claude does not: "
+                    + f"~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py mcp-projects claude2 brp {direction}"])
+                self.assertEqual(self.run_cli("mcp-projects", "claude2", "brp", direction),
+                                 (0, project + "\n", ""))
+
+    def test_mcp_project_command_includes_baseline_only_paths_and_the_home_scope(self) -> None:
+        self.login_directory("claude2", "fixture@notexample.com")
+        project = str(self.root / "baseline-only")
+        _ = self.write_mcp_configuration(self.main_dir, ("brp",), {project: []})
+        _ = self.write_mcp_configuration(self.home / ".claude2", (), {})
+        self.assert_mcp_readout([
+            "claude2 turns brp off in 2 projects where ~/.claude does not: "
+            + "~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py mcp-projects claude2 brp off"])
+        code, output, error = self.run_cli("mcp-projects", "claude2", "brp", "off")
+        self.assertEqual((code, error), (0, ""))
+        self.assertCountEqual(output.splitlines(), ["~", project])
+
+    def test_mcp_project_disabled_in_both_files_is_not_reported(self) -> None:
+        self.login_directory("claude2", "fixture@notexample.com")
+        project = str(self.root / "both-off")
+        for directory in (self.main_dir, self.home / ".claude2"):
+            _ = self.write_mcp_configuration(directory, ("brp",), {project: ["brp"]})
+        self.assert_mcp_readout([])
+        self.assertEqual(self.run_cli("mcp-projects", "claude2", "brp", "off"), (0, "", ""))
+
+    def test_mcp_readout_keeps_a_separate_line_for_each_server(self) -> None:
+        self.login_directory("claude2", "fixture@notexample.com")
+        project = str(self.root / "two-servers")
+        _ = self.write_mcp_configuration(self.main_dir, ("brp", "docs"), {project: []})
+        _ = self.write_mcp_configuration(self.home / ".claude2", ("brp", "docs"), {project: ["brp", "docs"]})
+        self.assert_mcp_readout([
+            f"claude2 turns {server} off in 1 project where ~/.claude does not: "
+            + f"~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py mcp-projects claude2 {server} off"
+            for server in ("brp", "docs")])
+        for server in ("brp", "docs"):
+            self.assertEqual(self.run_cli("mcp-projects", "claude2", server, "off"), (0, project + "\n", ""))
+
+    def test_mcp_readout_keeps_opposite_directions_for_the_same_server(self) -> None:
+        self.login_directory("claude2", "fixture@notexample.com")
+        turned_on, turned_off = (str(self.root / name) for name in ("turned-on", "turned-off"))
+        _ = self.write_mcp_configuration(self.main_dir, ("brp",), {turned_on: ["brp"], turned_off: []})
+        _ = self.write_mcp_configuration(self.home / ".claude2", ("brp",), {turned_on: [], turned_off: ["brp"]})
+        self.assert_mcp_readout([
+            f"claude2 turns brp {direction} in 1 project where ~/.claude does not: "
+            + f"~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py mcp-projects claude2 brp {direction}"
+            for direction in ("off", "on")])
+        for direction, project in (("off", turned_off), ("on", turned_on)):
+            self.assertEqual(self.run_cli("mcp-projects", "claude2", "brp", direction), (0, project + "\n", ""))
+
     def test_default_mcp_configuration_and_unreadable_baseline_are_reported(self) -> None:
         self.login_directory("claude2", "fixture@notexample.com")
         config = self.home / ".claude2/.claude.json"
@@ -2913,11 +3056,15 @@ class AccountsTests(unittest.TestCase):
                     self.assertEqual((code, error), (0, ""))
                     lines = (cast(accounts.StatusDocument, json.loads(output))["problems"] if flags else output.splitlines())
                     if readable:
-                        self.assertIn("claude2: mcpServers differ from ~/.claude; - brp, + account-only; check mcpServers in ~/.claude2/.claude.json against ~/.claude.json", lines)
+                        self.assertIn("claude2 turns brp off in 1 project where ~/.claude does not: ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py mcp-projects claude2 brp off", lines)
+                        self.assertIn("claude2 turns account-only on in 1 project where ~/.claude does not: ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py mcp-projects claude2 account-only on", lines)
                     else:
                         self.assertTrue(any("MCP configuration" in line and "~/.claude.json" in line
                                             and "Expecting property name" in line for line in lines))
                         self.assertNotIn("mcpServers differ", output)
+                        self.assertNotIn("claude2 turns ", output)
+                        status = next(item for item in accounts.account_statuses() if item.label == "claude2")
+                        self.assertEqual(tuple(problem.path for problem in status.mcp_baseline_problems), (baseline,))
 
     def test_mcp_comparison_uses_each_home_project_scope(self) -> None:
         self.login_directory("claude2", "fixture@notexample.com")
@@ -2934,9 +3081,11 @@ class AccountsTests(unittest.TestCase):
                     self.assertEqual((code, error), (0, ""))
                     lines = (cast(accounts.StatusDocument, json.loads(output))["problems"] if flags else output.splitlines())
                     if enabled:
-                        self.assertIn("claude2: mcpServers differ from ~/.claude; + brp; check mcpServers in ~/.claude2/.claude.json against ~/.claude.json", lines)
+                        self.assertIn("claude2 turns brp on in 1 project where ~/.claude does not: ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py mcp-projects claude2 brp on", lines)
+                        self.assertEqual(self.run_cli("mcp-projects", "claude2", "brp", "on"), (0, "~\n", ""))
                     else:
                         self.assertFalse(any("mcpServers differ" in line for line in lines))
+                        self.assertFalse(any(line.startswith("claude2 turns ") for line in lines))
 
     def test_mcp_comparison_includes_a_session_project_outside_the_home(self) -> None:
         self.login_directory("claude2", "fixture@notexample.com")
@@ -2955,8 +3104,9 @@ class AccountsTests(unittest.TestCase):
                     lines = (cast(accounts.StatusDocument, json.loads(output))["problems"] if flags else output.splitlines())
                     if matching:
                         self.assertFalse(any("mcpServers differ" in line for line in lines))
+                        self.assertFalse(any(line.startswith("claude2 turns ") for line in lines))
                     else:
-                        self.assertIn("claude2: mcpServers differ from ~/.claude; - brp; check mcpServers in ~/.claude2/.claude.json against ~/.claude.json", lines)
+                        self.assertIn("claude2 turns brp off in 1 project where ~/.claude does not: ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py mcp-projects claude2 brp off", lines)
 
     def test_selected_roles_name_the_missing_account_cause_once(self) -> None:
         for label in ("claude2", "claude3"):
@@ -3060,12 +3210,14 @@ class AccountsTests(unittest.TestCase):
             code, output, error = self.run_cli("status", "--stored", *flags)
             self.assertEqual((code, error), (0, ""))
             self.assertNotIn("mcpServers differ", output)
+            self.assertNotIn("claude2 turns ", output)
         _ = identity.write_text("{")
         for flags in ((), ("--json",)):
             code, output, error = self.run_cli("status", "--stored", *flags)
             self.assertEqual((code, error), (0, ""))
             self.assertIn("cannot read", output)
             self.assertNotIn("mcpServers differ", output)
+            self.assertNotIn("claude2 turns ", output)
 
     def test_piped_status_keeps_command_errors_on_stderr(self) -> None:
         with patch.object(accounts, "_read_status", side_effect=accounts.AccountsError("accounts: fixture read failed")):
@@ -3113,7 +3265,8 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual(stderr, "")
         self.assertRegex(stdout, r"\| ~/\.claude2 +\| claude2 +\|")
         self.assertIn("claude2: unclassified entries; mystery-cache; check these entries in ~/.claude2; keep private files in this home", stdout.splitlines())
-        self.assertIn("claude2: mcpServers differ from ~/.claude; - brp, + account-only; check mcpServers in ~/.claude2/.claude.json against ~/.claude.json", stdout.splitlines())
+        self.assertIn("claude2 turns brp off in 1 project where ~/.claude does not: ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py mcp-projects claude2 brp off", stdout.splitlines())
+        self.assertIn("claude2 turns account-only on in 1 project where ~/.claude does not: ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py mcp-projects claude2 account-only on", stdout.splitlines())
 
     def test_claude_feedback_telemetry_and_atomic_write_temps_stay_private_after_setup(self) -> None:
         self.write_main_config()
@@ -7223,11 +7376,15 @@ class StatusProblemCauseTests(unittest.TestCase):
 
     def test_independent_configuration_problems_each_keep_their_repair(self) -> None:
         status = accounts.AccountStatus("~/.claude2", self.home / ".claude2", True, True, True,
-            "claude2", "owner@provider.io", "", (), ("mystery-cache",), ("brp",), ("account-only",))
+            "claude2", "owner@provider.io", "", (), ("mystery-cache",), accounts.McpServerDifferences((
+                accounts.McpServerDifference("brp", "off", ("~",)),
+                accounts.McpServerDifference("account-only", "on", ("~",)),
+            )))
         reading = self.status_with([status], [], usage_store.StoredUsage(), detail=True)
         expected = (
             "claude2: unclassified entries; mystery-cache; check these entries in ~/.claude2; keep private files in this home",
-            "claude2: mcpServers differ from ~/.claude; - brp, + account-only; check mcpServers in ~/.claude2/.claude.json against ~/.claude.json",
+            "claude2 turns brp off in 1 project where ~/.claude does not: ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py mcp-projects claude2 brp off",
+            "claude2 turns account-only on in 1 project where ~/.claude does not: ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py mcp-projects claude2 account-only on",
         )
         problems = cast(list[str], json.loads(accounts.render_status_json(reading))["problems"])
         for line in expected:
@@ -7252,7 +7409,7 @@ class StatusProblemCauseTests(unittest.TestCase):
         directory = self.home / ".claude2"
         note = self.home / "notes/claude2.md"
         status = accounts.AccountStatus("~/.claude2", directory, True, True, True,
-            "claude2", "owner@provider.io", "", (f"accounts: could not read {note}: denied",), (), (), ())
+            "claude2", "owner@provider.io", "", (f"accounts: could not read {note}: denied",), (), accounts.McpServerDifferences())
         usage = usage_store.StoredUsage(read_outcome=agent_accounts.UsageReadOutcome.RATE_LIMITED_429,
             attempt_outcome=agent_accounts.UsageReadOutcome.RATE_LIMITED_429,
             weekly=usage_store.StoredWindow(left=50, resets="2026-11-01T01:14:00+00:00", at="2026-10-29T01:14:00+00:00"), attempted_at="2026-10-29T01:20:00+00:00")
@@ -7397,7 +7554,7 @@ class StatusProblemCauseTests(unittest.TestCase):
         identity = directory / ".claude.json"
         _ = identity.write_text('{"oauthAccount": {}}')
         status = accounts.AccountStatus("~/.claude2", directory, True, True, True,
-            "claude2", "", "", (f"accounts: {identity} has an invalid oauthAccount identity",), (), (), (),
+            "claude2", "", "", (f"accounts: {identity} has an invalid oauthAccount identity",), (), accounts.McpServerDifferences(),
             state_source=accounts.account_directory_readiness("claude2").state_source)
         lines = [line for line in self.status_with([status], [], usage_store.StoredUsage()).notes if "claude2:" in line]
         self.assertEqual(len(lines), 1)
@@ -7483,7 +7640,7 @@ class StatusProblemCauseTests(unittest.TestCase):
             at = datetime(2026, 10, 29, 1, 14, tzinfo=timezone.utc).timestamp()
             os.utime(path, (at, at))
         status = accounts.AccountStatus("~/.claude2", numbered, True, True, True,
-            "claude2", "fixture@example.invalid", "", (), (), (), ())
+            "claude2", "fixture@example.invalid", "", (), (), accounts.McpServerDifferences())
         with (patch.object(accounts, "account_statuses", return_value=[status]),
               patch.object(accounts, "codex_statuses", return_value=[]),
               patch.object(accounts, "role_account", return_value=accounts.CodexWorkersAccount("codex1", self.home / ".codex1")),

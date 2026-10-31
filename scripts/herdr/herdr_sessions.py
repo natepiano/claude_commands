@@ -240,13 +240,14 @@ def claude_names() -> dict[str, str]:
     directory = sessions_dir()
     if not directory.exists():
         return {}
+    places = herdr.herdr_places()
     for path in sorted(directory.iterdir()):
         if path.suffix != ".json":
             continue
         record = read_session(path)
         if isinstance(record, UnreadableSessionRecord) or not live_session(record):
             continue
-        place = herdr.herdr_place_of(record["pid"])
+        place = places.get(record["pid"])
         if not isinstance(place, herdr.HerdrPlace) or place.session != shared:
             continue
         if place.pane not in newest or record["updatedAt"] > newest[place.pane]["updatedAt"]:
@@ -312,8 +313,8 @@ def _main(argv: list[str]) -> int:
             for label in herdr.Herdr(shared).sort_tabs().labels:
                 print(f"herdr_sessions: {label}: tab with several panes; order kept")
             return 0
-        panes = herdr.Herdr(shared).panes()
         if argv[1] in ("attach", "focus"):
+            panes = herdr.Herdr(shared).panes()
             name = argv[2]
             pane = _tab_pane(name)
             if not pane:
@@ -326,15 +327,17 @@ def _main(argv: list[str]) -> int:
                 print(shared)
                 return 0
             _attach(pane)
-        names = claude_names()
-        roles = unit_roles(herdr.Herdr(shared), panes)
-        showrunner_names = {runner["session"] for runner in registered_showrunners() if runner["session"]}
-        for row in panes:
-            pane = row["pane_id"]
-            claude = names.get(pane, "")
-            role = roles.get(pane, "showrunner" if claude and claude in showrunner_names else "standalone")
-            print(f"{row.get("label") or pane}\t{role}\t{claude}")
-        return 0
+        with herdr.pane_snapshot() as read_panes:
+            panes = read_panes(shared)
+            names = claude_names()
+            roles = unit_roles(herdr.Herdr(shared), panes)
+            showrunner_names = {runner["session"] for runner in registered_showrunners() if runner["session"]}
+            for row in panes:
+                pane = row["pane_id"]
+                claude = names.get(pane, "")
+                role = roles.get(pane, "showrunner" if claude and claude in showrunner_names else "standalone")
+                print(f"{row.get("label") or pane}\t{role}\t{claude}")
+            return 0
     except (herdr.HerdrFailure, OSError) as error:
         print(f"herdr_sessions: {error}", file=sys.stderr)
         return 3
