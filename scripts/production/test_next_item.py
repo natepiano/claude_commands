@@ -14,14 +14,20 @@ from zoneinfo import ZoneInfo
 from typing import TYPE_CHECKING, cast, final, override
 from unittest import mock
 
+
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 import change_review
 import footer_counts
 import next_item
 from production_units import Production
 import proposals_folder
-import showrunners
+from scripts.production import showrunners
 import showrunner_tree
 from scripts.production import staff
+from scripts.production.staff_test_support import isolated_staff_file, unit_membership
 from change_review import Visible
 from next_item import NextError, Queue
 
@@ -148,6 +154,8 @@ class NextItemTests(unittest.TestCase):
             self.assertEqual(run("show", "--kind", "question", "--order", "oldest")[1], "question\ndemo: Newest question\n")
 
     def test_the_efficiency_and_change_lists_read_their_real_files(self) -> None:
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        _ = unit_membership("demo", "fixture-unit")
         _ = (self.root / "ledger.md").write_text(LEDGER, encoding="utf-8")
         doc = self.root / "docs" / "plans" / "demo-production.md"
         doc.parent.mkdir(parents=True)

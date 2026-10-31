@@ -19,7 +19,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from types import ModuleType
-from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, cast, override
+from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, cast
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS.parent))
@@ -30,13 +30,14 @@ for _directory in (SCRIPTS / "production", SCRIPTS / "direct", SCRIPTS / "herdr"
 import production_units  # noqa: E402
 import remove_workers  # noqa: E402
 from worker_state import worker_ledger  # noqa: E402
-import showrunners  # noqa: E402
+from scripts.production import showrunners  # noqa: E402
 import unit_lookup  # noqa: E402
 import unit_runs  # noqa: E402
 import herdr  # noqa: E402
 import codex_daemon  # noqa: E402
 import process_table  # noqa: E402
 from scripts.astra import design_roles  # noqa: E402
+from scripts.production import staff
 from scripts.lib import names  # noqa: E402
 from scripts.lib.names import JobKey  # noqa: E402
 if TYPE_CHECKING:
@@ -946,33 +947,15 @@ def _showrunner_ids(
     return found
 
 
-class _ProductionUnitMarks(production_units.SessionMarks):
-    """Use the roster's known marks, retaining rows when those marks are unreadable."""
-
-    def __init__(self, slug: str, every: unit_lookup.MarkedProductions | OSError) -> None:
-        super().__init__(slug)
-        self._known: set[str] | OSError = (
-            every if isinstance(every, OSError)
-            else set(every.units.get(slug, {})) | set(every.faults.get(slug, {}))
-        )
-
-    @override
-    def has(self, unit: str) -> bool:
-        return isinstance(self._known, OSError) or unit in self._known
-
-
-def _production_rows(
-    doc: Path, slug: str, every: unit_lookup.MarkedProductions | OSError,
-) -> list[dict[str, str]]:
+def _production_rows(doc: Path, slug: str, record: staff.StaffSnapshot) -> list[dict[str, str]]:
     lines = doc.read_text(encoding="utf-8").splitlines()
-    marks = _ProductionUnitMarks(slug, every)
-    return [row for row in production_units.unit_table(lines) if not production_units.unit_is_retired(row, marks)]
+    return production_units.live_unit_table(lines, slug, record=record)
 
 
-def _every_marked_unit() -> unit_lookup.MarkedProductions | OSError:
-    """Every production's marked units, or why the included hosts could not answer."""
+def _every_marked_unit(record: staff.StaffSnapshot | None = None) -> unit_lookup.MarkedProductions | OSError:
+    """Every production's observed units, joined to one staff snapshot."""
     try:
-        return unit_lookup.every_marked_unit()
+        return unit_lookup.every_marked_unit(record=record)
     except OSError as error:
         return error
 
@@ -990,13 +973,14 @@ def _production_places(
     registered: list[showrunners.Showrunner],
     runner_ids: Mapping[str, showrunners.Showrunner], ledger_workers: set[str],
     problems: list[str],
-    *, marks: unit_lookup.MarkedProductions | _DiscoverProductionMarks = _DISCOVER_PRODUCTION_MARKS,
+    *, record: staff.StaffSnapshot,
+    marks: unit_lookup.MarkedProductions | _DiscoverProductionMarks = _DISCOVER_PRODUCTION_MARKS,
 ) -> dict[str, _ProductionPlace]:
     addresses = {runner["slug"]: f"session:{session_id}" for session_id, runner in runner_ids.items()}
     places: dict[str, _ProductionPlace] = {}
     # One read of every production's marks serves every showrunner below.
     every = (marks if isinstance(marks, unit_lookup.MarkedProductions)
-             else _every_marked_unit() if registered else unit_lookup.MarkedProductions({}, {}))
+             else _every_marked_unit(record) if registered else unit_lookup.MarkedProductions({}, {}))
     # One process scan places every record; a scan per record took most of the roster's time.
     record_places: dict[int, herdr.HerdrPlace] | None = None
     for runner in registered:
@@ -1012,16 +996,11 @@ def _production_places(
                 raise every
             if fault := every.production_fault(runner["slug"]):
                 _problem(problems, f"unit hosts left out under {runner['slug']}", OSError(fault))
-            rows = _production_rows(doc, runner["slug"], every)
             units = every.units.get(runner["slug"], {})
         except (OSError, UnicodeError, ValueError, production_units.Refusal) as error:
             _problem(problems, f"unit hosts for {runner['slug']} were not read", error)
         else:
-            for row in rows:
-                unit_name = production_units.cell_value(row.get("Unit", ""))
-                marked = units.get(unit_name)
-                if marked is None:
-                    continue
+            for unit_name, marked in units.items():
                 place = _ProductionPlace(showrunner, DirectsUnit(unit_name))
                 if isinstance(marked.claude, unit_lookup.LiveClaude):
                     _ = places.setdefault(marked.claude.session_id, place)
@@ -1029,25 +1008,25 @@ def _production_places(
                 # A socketless director is still identified by its marked pane.
                 if record_places is None:
                     record_places = herdr.herdr_places()
-                for record in records:
-                    same_place = record_places.get(record["pid"]) == marked.place
-                    if record["sessionId"] not in ledger_workers and same_place:
-                        _ = places.setdefault(record["sessionId"], place)
+                for session_record in records:
+                    same_place = record_places.get(session_record["pid"]) == marked.place
+                    if session_record["sessionId"] not in ledger_workers and same_place:
+                        _ = places.setdefault(session_record["sessionId"], place)
                         break
             continue
         # Worktree ownership is a fallback only when neither host could be read.
         try:
-            rows = _production_rows(doc, runner["slug"], every)
+            rows = _production_rows(doc, runner["slug"], record)
         except (OSError, UnicodeError, ValueError, production_units.Refusal) as fallback_error:
             _problem(problems, f"units in {doc}", fallback_error)
             continue
         for row in rows:
             unit_name = production_units.cell_value(row.get("Unit", ""))
             worktree = production_units.cell_value(row.get("Worktree", ""))
-            for record in records:
-                if (record["sessionId"] not in ledger_workers and worktree
-                        and details[record["sessionId"]].cwd == worktree):
-                    _ = places.setdefault(record["sessionId"], _ProductionPlace(showrunner, DirectsUnit(unit_name)))
+            for session_record in records:
+                if (session_record["sessionId"] not in ledger_workers and worktree
+                        and details[session_record["sessionId"]].cwd == worktree):
+                    _ = places.setdefault(session_record["sessionId"], _ProductionPlace(showrunner, DirectsUnit(unit_name)))
     return places
 
 
@@ -1057,13 +1036,14 @@ def unit_labels_for(session_ids: Iterable[str], environment: Mapping[str, str]) 
     if not wanted:
         return {}
     try:
+        record = staff.snapshot()
         records = _newest_sessions()
         problems: list[str] = []
         registered = _registered_showrunners(environment, problems,
                                             known_sessions={record["sessionId"]: record for record in records})
         runners = _showrunner_ids(records, registered)
-        marks, directors = unit_lookup.session_unit_marks(records, environment)
-        places = _production_places(records, {}, registered, runners, set(directors), problems, marks=marks)
+        marks, directors = unit_lookup.session_unit_marks(records, environment, record=record)
+        places = _production_places(records, {}, registered, runners, set(directors), problems, record=record, marks=marks)
         names = {record["sessionId"]: record["name"] for record in records}
         labels: dict[str, UnitLabels] = {}
         for session_id in wanted & names.keys():
@@ -1266,8 +1246,9 @@ def mesh_shown_name(session_dir: str, name: str, record: Mapping[str, object]) -
         records = _newest_sessions()
         details = _raw_session_details(records, problems)
         registered = _registered_showrunners(os.environ, problems)
-        places = _production_places(records, details, registered,
-                                    _showrunner_ids(records, registered), set(), problems)
+        places = (_production_places(records, details, registered,
+                                     _showrunner_ids(records, registered), set(), problems, record=staff.snapshot())
+                  if registered else {})
         place = places.get(unit_runs.director(run))
         if place is not None:
             showrunner, director = place.showrunner, UnderDirector(place.director.unit, "", "")
@@ -1910,9 +1891,15 @@ def _local_roster(environment: Mapping[str, str]) -> Roster:
     roots = unit_runs.run_roots(environment.get("ROSTER_RUN_ROOT"))
     runs = _live_runs(roots, {record["sessionId"] for record in records}, problems)
     workers = _ledger_workers(runs, records, problems)
-    production_places = _production_places(
-        records, details, registered, runner_ids, set(workers), problems
-    )
+    production_places: dict[str, _ProductionPlace] = {}
+    if registered:
+        try:
+            record = staff.snapshot()
+            production_places = _production_places(
+                records, details, registered, runner_ids, set(workers), problems, record=record
+            )
+        except staff.StaffUnreadable as error:
+            _problem(problems, "staff membership", error)
     claude = _claude_entries(
         machine, records, details, runner_ids, production_places, runs, workers,
         home_state=home_state, problems=problems,

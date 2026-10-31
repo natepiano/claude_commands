@@ -3,19 +3,23 @@
 from __future__ import annotations
 
 import fcntl
-import ci_points
-from cli_fixture import invoke_cli
 import json
 import os
 import re
 import select
+import shutil
 import subprocess
 import sys
 import tempfile
 import textwrap
 import unittest
 from pathlib import Path
-from typing import cast, final, override
+from typing import TypedDict, cast, final, override
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import ci_points
+from cli_fixture import invoke_cli
+from merge_checkpoint import merge_lock
 
 
 # Script completion deadlines only bound hangs; startup can be slow under load.
@@ -57,6 +61,23 @@ reply=$(jq -cn --slurpfile result "$state/ci-result.json" --args '
      else {code:99} end)' -- "$@")
 printf '%s\n' "${reply%%$'\n'*}" >> "$state/calls.jsonl"
 answer=${reply#*$'\n'}
+if [[ ${1:-} == repo && ${2:-} == view ]]; then
+    if [[ " $* " == *' defaultBranchRef '* ]]; then
+        printf 'main\n'
+    else
+        printf 'example/example\n'
+    fi
+    exit 0
+fi
+if [[ ${1:-} == run && ${2:-} == list && " $* " == *' databaseId,createdAt '* ]]; then
+    if [[ -f "$state/fail-handoff" ]]; then
+        rm "$state/fail-handoff"
+        printf 'none 2026-10-30 00:00:00 UTC\n'
+        exit 0
+    fi
+    printf '123 2026-10-30 00:00:00 UTC\n'
+    exit 0
+fi
 if [[ ${1:-} == run && ${2:-} == watch && -n ${CI_POINTS_TEST_WATCH_HOOK:-} ]]; then
     "${TEST_PYTHON:?}" "$CI_POINTS_TEST_WATCH_HOOK"
 fi
@@ -69,12 +90,29 @@ esac
 '''
 VALIDATE_STUB = '''#!/bin/sh
 printf '%s\\n' "$*" >> "$CI_POINTS_TEST_STATE/validate-calls"
+exit 0
+'''
+PUSH_STUB = '''#!/bin/sh
+printf '%s|%s\\n' "$CANCEL_PRIOR" "$*" >> "$CI_POINTS_TEST_STATE/publish-calls"
+if [ "$1" = --publish-only ]; then
+    printf '%s contained\\n' "$2"
+    exit 0
+fi
 printf '=== CI HANDOFF TO AGENT ===\\n'
 printf 'repo: example/example\\n'
-printf 'sha: %s\\n' "$(git rev-parse production)"
+printf 'sha: %s\\n' "$2"
 printf 'run_id: 123\\n'
 exit 0
 '''
+
+
+class ValidationObservation(TypedDict):
+    directory: str
+    initial: str
+    validated: str
+    origin: str
+    remote_tip: str
+    cargo_target: str
 
 
 @final
@@ -115,6 +153,7 @@ class CiPointsTests(unittest.TestCase):
             path.parent.mkdir(parents=True, exist_ok=True)
             self.write(path, VALIDATE_STUB)
             path.chmod(0o755)
+            self.write(path.with_name("push_direct.sh"), PUSH_STUB)
         for relative in (".claude/scripts/message/send.py", ".claude/scripts/message/notifier.sh",
                          ".claude/scripts/production/showrunners.py", ".claude/scripts/lib/py"):
             self.stub(self.home / relative)
@@ -190,6 +229,311 @@ class CiPointsTests(unittest.TestCase):
                       {"name": "Test Suite", "conclusion": test_suite, "status": status},
                       {"name": "macOS: Compile and Test", "conclusion": "skipped", "status": "completed"}]}
         self.write(self.stub_state / "ci-result.json", json.dumps(record))
+
+    def fixed_commit_validation(self, *, move_branch: bool = False,
+                                fix_commit: bool = False, fail: bool = False) -> None:
+        self.env.update({"CI_POINTS_TEST_CHECKOUT": str(self.checkout),
+                         "CI_POINTS_TEST_MOVE": str(int(move_branch)),
+                         "CI_POINTS_TEST_FIX": str(int(fix_commit)),
+                         "CI_POINTS_TEST_FAIL": str(int(fail))})
+        validate = self.bin / "validate_and_push.sh"
+        self.env["CI_POINTS_VALIDATE_SCRIPT"] = str(validate)
+        scripts = SCRIPT.parents[1] / "validate_and_push"
+        for name in ("validate_and_push.sh", "push_direct.sh", "post_push_hook.sh"):
+            _ = shutil.copy2(scripts / name, self.bin / name)
+        self.write(self.bin / "run_validation.sh", '''#!/bin/sh
+set -eu
+"$TEST_PYTHON" - <<'PY'
+import json
+import os
+from pathlib import Path
+import subprocess
+
+state = Path(os.environ["CI_POINTS_TEST_STATE"])
+checkout = Path(os.environ["CI_POINTS_TEST_CHECKOUT"])
+directory = Path.cwd()
+
+def git(*args, cwd=directory):
+    return subprocess.run(["git", *args], cwd=cwd, check=True,
+                          capture_output=True, text=True).stdout.strip()
+
+initial = git("rev-parse", "HEAD")
+origin = git("remote", "get-url", "origin")
+if os.environ["CI_POINTS_TEST_FIX"] == "1" and (directory / "README.md").read_text() != "validation fix\\n":
+    (directory / "README.md").write_text("validation fix\\n")
+    git("add", "README.md")
+    git("-c", "user.name=CI Points Test", "-c", "user.email=ci-points@example.invalid",
+        "commit", "-m", "validation fix")
+validated = git("rev-parse", "HEAD")
+if os.environ["CI_POINTS_TEST_MOVE"] == "1":
+    git("commit", "--allow-empty", "-m", "concurrent merge", cwd=checkout)
+    git("push", "origin", "production", cwd=checkout)
+remote_tip = git("ls-remote", "origin", "refs/heads/production").split()[0]
+observation = {
+    "directory": str(directory), "initial": initial, "validated": validated,
+    "origin": origin, "remote_tip": remote_tip,
+    "cargo_target": os.environ.get("CARGO_TARGET_DIR", ""),
+}
+(state / "validation-observation.json").write_text(json.dumps(observation))
+with (state / "validation-attempts.jsonl").open("a") as attempts:
+    attempts.write(json.dumps(observation) + "\\n")
+result = json.loads((state / "ci-result.json").read_text())
+result["headSha"] = validated if os.environ["CI_POINTS_TEST_FIX"] == "1" else remote_tip
+(state / "ci-result.json").write_text(json.dumps(result))
+if os.environ["CI_POINTS_TEST_FAIL"] == "1":
+    print("FAILED: fixed-commit validation")
+    raise SystemExit(7)
+PY
+''')
+        update = self.origin / "hooks/update"
+        self.write(update, '#!/bin/sh\nprintf "%s\\n" "$*" >> "$CI_POINTS_TEST_STATE/pushes"\n')
+        update.chmod(0o755)
+
+    def validation_observation(self) -> ValidationObservation:
+        return cast(ValidationObservation, json.loads(
+            (self.stub_state / "validation-observation.json").read_text(encoding="utf-8")))
+
+    def test_a_contained_validated_commit_passes_after_the_branch_moves_without_pushing(self) -> None:
+        initial = self.git("rev-parse", "HEAD")
+        self.fixed_commit_validation(move_branch=True)
+
+        result = self.start_point()
+
+        observed = self.validation_observation()
+        self.assertEqual(observed["initial"], initial)
+        self.assertEqual(observed["validated"], initial)
+        self.assertNotEqual(observed["remote_tip"], initial)
+        self.assertIn(f"validation: ok — validated {initial}; no push; following {observed['remote_tip']}",
+                      result.stdout)
+        self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), observed["remote_tip"])
+        pushes = (self.stub_state / "pushes").read_text().splitlines()
+        self.assertEqual(pushes, [f"refs/heads/production {initial} {observed['remote_tip']}"])
+        self.assertEqual(ci_points.read_run(self.state).tip, observed["remote_tip"])
+        self.assertTrue(any("--commit" in call and observed["remote_tip"] in call
+                            for call in self.calls("gh")), self.calls("gh"))
+        self.assertFalse(Path(observed["directory"]).exists())
+
+    def test_a_validation_fix_fast_forwards_an_unchanged_remote_branch(self) -> None:
+        initial = self.git("rev-parse", "HEAD")
+        self.fixed_commit_validation(fix_commit=True)
+
+        result = self.start_point()
+
+        observed = self.validation_observation()
+        fixed = observed["validated"]
+        self.assertNotEqual(fixed, initial)
+        self.assertIn(f"validation: ok — validated {fixed}; fast-forward push to origin/production",
+                      result.stdout)
+        self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), fixed)
+        self.assertEqual(self.git("rev-parse", f"{fixed}^", cwd=self.origin), initial)
+        self.assertEqual((self.stub_state / "pushes").read_text().splitlines(),
+                         [f"refs/heads/production {initial} {fixed}"])
+        self.assertEqual(ci_points.read_run(self.state).tip, fixed)
+        self.assertEqual(self.git("rev-parse", "HEAD"), fixed)
+        self.assertEqual(self.git("show", "production:README.md", cwd=self.origin), "validation fix")
+        self.assertEqual((self.checkout / "README.md").read_text(), "validation fix\n")
+        self.assertFalse(Path(observed["directory"]).exists())
+
+    def test_collect_accepts_green_ci_on_the_published_validation_fix(self) -> None:
+        self.fixed_commit_validation(fix_commit=True)
+        _ = self.start_point()
+        fixed = self.validation_observation()["validated"]
+
+        result = self.collect_point()
+
+        self.assert_step(result, "ci collect", True)
+        self.assertEqual(result.stdout.splitlines()[-1], f"--ci-green {fixed}")
+        self.assertEqual(json.loads((self.state / "ci_points.json").read_text()),
+                         {"count": 0, "tip": fixed})
+        self.assertEqual(self.git("rev-parse", "production"), fixed)
+        self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), fixed)
+
+    def test_rerun_after_a_pushed_fix_with_no_handoff_reuses_the_fix_commit(self) -> None:
+        initial = self.git("rev-parse", "HEAD")
+        self.fixed_commit_validation(fix_commit=True)
+        _ = (self.stub_state / "fail-handoff").touch()
+
+        first = self.run_ci("ci", "start", "--state-dir", str(self.state))
+
+        self.assert_step(first, "ci start", False)
+        self.assertIn("validation did not provide a CI run", first.stdout)
+        fixed = self.validation_observation()["validated"]
+        self.assertNotEqual(fixed, initial)
+        self.assertEqual(self.git("rev-parse", "production"), fixed)
+        self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), fixed)
+        self.assertFalse((self.state / "ci_run.json").exists())
+        self.assertFalse(Path(self.validation_observation()["directory"]).exists())
+
+        result = self.start_point()
+
+        attempts = [cast(ValidationObservation, json.loads(line)) for line in
+                    (self.stub_state / "validation-attempts.jsonl").read_text().splitlines()]
+        self.assertEqual([(attempt["initial"], attempt["validated"]) for attempt in attempts],
+                         [(initial, fixed), (fixed, fixed)])
+        self.assertEqual(self.git("rev-list", f"{initial}..production").splitlines(), [fixed])
+        self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), fixed)
+        self.assertEqual((self.stub_state / "pushes").read_text().splitlines(),
+                         [f"refs/heads/production {initial} {fixed}"])
+        self.assertIn(f"validation: ok — validated {fixed}; no push; following {fixed}", result.stdout)
+        self.assertEqual(ci_points.read_run(self.state).tip, fixed)
+        self.assertTrue(any("--commit" in call and fixed in call for call in self.calls("gh")))
+        self.assertTrue(all(not Path(attempt["directory"]).exists() for attempt in attempts))
+
+    def test_retry_after_a_failed_push_publishes_the_existing_fix_without_a_sibling_commit(self) -> None:
+        initial = self.git("rev-parse", "HEAD")
+        self.fixed_commit_validation(fix_commit=True)
+        reject = self.origin / "hooks/pre-receive"
+        self.write(reject, '#!/bin/sh\nprintf "simulated push failure\\n" >&2\nexit 1\n')
+        reject.chmod(0o755)
+
+        first = self.run_ci("ci", "start", "--state-dir", str(self.state))
+
+        self.assert_step(first, "validation", False)
+        self.assertIn("simulated push failure", first.stdout)
+        fixed = self.validation_observation()["validated"]
+        self.assertNotEqual(fixed, initial)
+        self.assertEqual(self.git("rev-parse", "production"), fixed)
+        self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), initial)
+        self.assertFalse((self.stub_state / "pushes").exists())
+        self.assertFalse((self.state / "ci_run.json").exists())
+        self.assertFalse(self.calls("gh"))
+        self.assertFalse(Path(self.validation_observation()["directory"]).exists())
+        reject.unlink()
+
+        result = self.start_point()
+
+        attempts = [cast(ValidationObservation, json.loads(line)) for line in
+                    (self.stub_state / "validation-attempts.jsonl").read_text().splitlines()]
+        self.assertEqual([(attempt["initial"], attempt["validated"]) for attempt in attempts],
+                         [(initial, fixed), (fixed, fixed)])
+        self.assertEqual(self.git("rev-list", f"{initial}..production").splitlines(), [fixed])
+        self.assertEqual(self.git("rev-parse", "production"), fixed)
+        self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), fixed)
+        self.assertEqual((self.stub_state / "pushes").read_text().splitlines(),
+                         [f"refs/heads/production {initial} {fixed}"])
+        self.assertIn(f"validation: ok — validated {fixed}; fast-forward push to origin/production",
+                      result.stdout)
+        self.assertEqual(ci_points.read_run(self.state).tip, fixed)
+        self.assertTrue(any("--commit" in call and fixed in call for call in self.calls("gh")))
+        self.assertTrue(all(not Path(attempt["directory"]).exists() for attempt in attempts))
+
+    def test_a_later_merge_push_fast_forwards_from_the_published_ci_fix(self) -> None:
+        initial = self.git("rev-parse", "HEAD")
+        self.fixed_commit_validation(fix_commit=True)
+        _ = self.start_point()
+        fixed = self.validation_observation()["validated"]
+        self.assertEqual(self.git("rev-parse", "production"), fixed)
+
+        merged = self.merge(1)
+
+        self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), merged)
+        self.assertEqual(self.git("merge-base", fixed, merged), fixed)
+        self.assertEqual((self.checkout / "README.md").read_text(), "validation fix\n")
+        self.assertEqual((self.stub_state / "pushes").read_text().splitlines(),
+                         [f"refs/heads/production {initial} {fixed}",
+                          f"refs/heads/production {fixed} {merged}"])
+
+    def test_a_merge_landing_while_ci_publish_waits_for_the_lock_is_preserved(self) -> None:
+        initial = self.git("rev-parse", "HEAD")
+        self.fixed_commit_validation(fix_commit=True)
+        with merge_lock(self.checkout, "example"):
+            process = subprocess.Popen(
+                [sys.executable, str(SCRIPT), "ci", "start", "--production", str(self.doc),
+                 "--state-dir", str(self.state)],
+                cwd=self.checkout, env=self.env, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True,
+            )
+            self.assertIsNotNone(process.stdout)
+            assert process.stdout is not None
+            output = process.stdout
+            try:
+                descriptor = output.fileno()
+                readable, _, _ = select.select([descriptor], [], [], 300)
+                self.assertEqual(readable, [descriptor], "CI publish never reached the merge lock")
+                waiting = cast(str, output.readline())
+                self.assertTrue(waiting.startswith("merge lock: waiting —"), waiting)
+                self.assertIsNone(process.poll(), "CI publish did not wait for the held merge lock")
+                observed = self.validation_observation()
+                self.assertNotEqual(observed["validated"], initial)
+                self.assertEqual(self.git("rev-parse", "production"), initial)
+                self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), initial)
+                self.assertFalse((self.stub_state / "pushes").exists())
+                merged = self.merge(1)
+            except BaseException:
+                if process.poll() is None:
+                    process.kill()
+                _ = process.communicate(timeout=300)
+                raise
+        try:
+            stdout, stderr = process.communicate(timeout=300)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                _ = process.communicate(timeout=300)
+
+        self.assertEqual(process.returncode, 2, waiting + stdout + stderr)
+        self.assertIn("merge branch moved during validation", stdout)
+        self.assertEqual(self.git("rev-parse", "production"), merged)
+        self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), merged)
+        self.assertEqual(self.git("merge-base", initial, merged), initial)
+        self.assertEqual((self.checkout / "README.md").read_text(), "base\n")
+        self.assertEqual((self.stub_state / "pushes").read_text().splitlines(),
+                         [f"refs/heads/production {initial} {merged}"])
+        self.assertFalse((self.state / "ci_run.json").exists())
+        self.assertFalse(Path(observed["directory"]).exists())
+
+    def test_a_validation_fix_cannot_overwrite_a_branch_that_moves_during_validation(self) -> None:
+        initial = self.git("rev-parse", "HEAD")
+        self.fixed_commit_validation(move_branch=True, fix_commit=True)
+
+        result = self.run_ci("ci", "start", "--state-dir", str(self.state))
+
+        self.assert_step(result, "validation", False)
+        self.assertIn("merge branch moved during validation", result.stdout)
+        observed = self.validation_observation()
+        self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), observed["remote_tip"])
+        self.assertNotEqual(observed["remote_tip"], observed["validated"])
+        self.assertEqual((self.stub_state / "pushes").read_text().splitlines(),
+                         [f"refs/heads/production {initial} {observed['remote_tip']}"])
+        self.assertFalse((self.state / "ci_run.json").exists())
+        self.assertFalse(Path(observed["directory"]).exists())
+
+    def test_validation_uses_a_private_copy_and_leaves_the_production_checkout_unchanged(self) -> None:
+        initial = self.git("rev-parse", "HEAD")
+        before_status = self.git("status", "--porcelain")
+        before_readme = (self.checkout / "README.md").read_bytes()
+        self.fixed_commit_validation()
+
+        _ = self.start_point()
+
+        observed = self.validation_observation()
+        self.assertNotEqual(Path(observed["directory"]), self.checkout)
+        self.assertEqual(observed["initial"], initial)
+        self.assertEqual(observed["origin"], str(self.origin))
+        self.assertEqual(Path(observed["cargo_target"]), Path(observed["directory"]) / "target")
+        self.assertEqual(self.git("rev-parse", "HEAD"), initial)
+        self.assertEqual(self.git("status", "--porcelain"), before_status)
+        self.assertEqual((self.checkout / "README.md").read_bytes(), before_readme)
+        self.assertFalse((self.stub_state / "pushes").exists())
+        self.assertFalse(Path(observed["directory"]).exists())
+
+    def test_a_failed_validation_removes_its_private_copy_without_pushing(self) -> None:
+        initial = self.git("rev-parse", "HEAD")
+        self.fixed_commit_validation(fail=True)
+
+        result = self.run_ci("ci", "start", "--state-dir", str(self.state))
+
+        self.assert_step(result, "validation", False)
+        self.assertEqual(
+            result.stdout,
+            "validation: failed — stdout: === STEP: validation ===; FAILED: fixed-commit validation\n",
+        )
+        observed = self.validation_observation()
+        self.assertFalse(Path(observed["directory"]).exists())
+        self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), initial)
+        self.assertEqual(self.git("rev-parse", "HEAD"), initial)
+        self.assertFalse((self.stub_state / "pushes").exists())
+        self.assertFalse((self.state / "ci_run.json").exists())
 
     def merge(self, number: int, *, shrink: bool = False, unit: str = "alpha-unit") -> str:
         branch = f"unit-{number}{'-shrink' if shrink else ''}"
@@ -267,21 +611,47 @@ class CiPointsTests(unittest.TestCase):
         self.assertRegex(dailies, r"dailies_input\.py[\s\S]*?--state-dir\s+<STATE_DIR>/dailies_input_state\b")
 
     def test_ci_start_passes_cancel_prior_only_when_requested(self) -> None:
+        tip = self.git("rev-parse", "HEAD")
         flagged = self.run_ci("ci", "start", "--state-dir", str(self.state), "--cancel-prior")
         self.assert_step(flagged, "ci start", True)
         calls = (self.stub_state / "validate-calls").read_text(encoding="utf-8").splitlines()
         self.assertEqual(len(calls), 1)
-        self.assertIn("--cancel-prior", calls[0].split())
-        self.assertTrue(calls[0].endswith(" --cancel-prior"), calls[0])
+        publication = (self.stub_state / "publish-calls").read_text().splitlines()
+        self.assertEqual(publication, [f"true|--publish-only {tip}",
+                                       f"true|--follow-published {tip} contained"])
         plain = self.start_point()
         self.assert_step(plain, "ci start", True)
         calls = (self.stub_state / "validate-calls").read_text(encoding="utf-8").splitlines()
         self.assertEqual(len(calls), 2)
-        self.assertNotIn("--cancel-prior", calls[1].split())
+        publication += [f"false|--publish-only {tip}",
+                        f"false|--follow-published {tip} contained"]
+        self.assertEqual((self.stub_state / "publish-calls").read_text().splitlines(), publication)
         skipped = self.run_ci("ci", "start", "--state-dir", str(self.state), "--no-ci", "--cancel-prior")
         self.assertEqual(skipped.returncode, 0, skipped.stdout + skipped.stderr)
         self.assertEqual(skipped.stdout.strip(), "ci start: ok — skipped: no CI")
         self.assertEqual(len((self.stub_state / "validate-calls").read_text().splitlines()), 2)
+        self.assertEqual((self.stub_state / "publish-calls").read_text().splitlines(), publication)
+
+    def test_validation_failure_names_the_failed_check_when_stderr_only_reports_memory_waits(self) -> None:
+        validate = self.bin / "validate_and_push.sh"
+        self.write(validate, "\n".join((
+            "#!/bin/sh",
+            "printf 'waiting for memory: 2 GiB available\\nwaiting for memory: 3 GiB available\\n' >&2",
+            "printf 'FAILED: quota formatter check\\n'",
+            "exit 7",
+            "",
+        )))
+        self.env["CI_POINTS_VALIDATE_SCRIPT"] = str(validate)
+
+        result = self.run_ci("ci", "start", "--state-dir", str(self.state))
+
+        self.assert_step(result, "validation", False)
+        self.assertEqual(result.stdout.strip(), (
+            "validation: failed — stderr: waiting for memory: 2 GiB available; "
+            + "waiting for memory: 3 GiB available; stdout: FAILED: quota formatter check"
+        ))
+        self.assertEqual(result.stderr, "")
+        self.assertFalse((self.state / "ci_run.json").exists())
 
     def test_collect_records_green_tip_and_resets_five_merge_interval(self) -> None:
         for number in range(1, 5):

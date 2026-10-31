@@ -32,21 +32,24 @@ class StylePlanTests(StylePlanFixture):
         _ = self.held_proposal(read, self.sources[0])
         with self.ledger() as ledger:
             cell = style_ledger.Cell(read, self.sources[0], "crates/alpha", "C", "names", "stale")
+            definitions = {rule.rule_id: rule for rule in rules.load_rules(self.repo)}
             # Exercise the fallback before any later ticket-selection Git reads can fail.
             for code in (errno.EMFILE, errno.ENOENT):
                 with self.subTest(errno=code):
                     failure = OSError(code, "PRIVATE launch failure")
-                    with mock.patch.object(subprocess, "run", side_effect=failure):
+                    with (mock.patch.object(style_plan, "_refill_cells", wraps=style_plan._refill_cells) as refill,  # pyright: ignore[reportPrivateUsage]
+                          mock.patch.object(subprocess, "run", side_effect=failure)):
                         with self.assertRaises(style_ledger.GitReadFailed) as refused:
                             _ = style_plan._refill_cells(ledger, (cell,), style_plan.NoUnitBranch(),  # pyright: ignore[reportPrivateUsage]
-                                                         "names", AllCrates(), {})
+                                                         "names", AllCrates(), {}, definitions)
+                    refill.assert_called_once()
                     self.assertIs(refused.exception.__cause__, failure)
             # An actually removed file cannot prove that this held cell is unchanged.
             _ = self.git("rm", self.sources[0])
             removed_tip = self.commit()
             ledger.set_tip(removed_tip, "style/main")
             result = style_plan._refill_cells(ledger, (cell,), style_plan.NoUnitBranch(),  # pyright: ignore[reportPrivateUsage]
-                                              "names", AllCrates(), {})
+                                              "names", AllCrates(), {}, definitions)
             self.assertEqual(result.cells, (cell,))
             self.assertEqual(result.judged_at_base, frozenset())
 

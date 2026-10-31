@@ -37,7 +37,7 @@ Times are in the user's zone setting (`config/user_zone.conf`). The numbers are 
 
 The JSON has no login or folder fields. `--json` cannot be combined with `--detail`.
 
-Each problem below the table uses one form: `<home or account>: <what is wrong>; <cause>; <step to fix it>`. The table and JSON `problems` use the same lines; JSON omits the `* ` footnote prefix. A direct folder or sign-in check replaces the empty-row summary for that cause.
+Each problem below the table uses one form: `<home or account>: <what is wrong>; <cause>; <step to fix it>`. An MCP server difference is the one exception. It has one line per account, server and direction, and it counts only the projects where the account differs from the same project in `~/.claude`: `claude2 turns brp off in 3 projects where ~/.claude does not: ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py mcp-projects claude2 brp off`. The home scope counts as the project `~`. The command at the end changes nothing. It prints the project paths, one per line, with `~` for the home scope. The table and JSON `problems` use the same lines; JSON omits the `* ` footnote prefix. A direct folder or sign-in check replaces the empty-row summary for that cause.
 
 A login in the legacy home with no account note has one line, rather than separate usage-read, cutover and note hints. The line names the missing note, gives its `login:` value, then gives the cutover command. Other checks keep their facts and commands.
 

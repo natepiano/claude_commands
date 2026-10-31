@@ -853,6 +853,29 @@ class StyleProposalsTests(unittest.TestCase):
         ledger.ticket_drop(ticket)
         return finding
 
+    def test_always_approved_rule_refiles_after_body_change_without_new_answer(self) -> None:
+        self.standing_units("names")
+        rule = "global:rust/always.md"
+        with self.ledger() as ledger:
+            old_blob = next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == rule)
+            old = ledger.hold(rule, "alpha/src/lib.rs", 1, "old finding", "rename", "Kind::Count", "Kind::Total", old_blob, "outside")
+            old_issue, = self.file(ledger)
+            self.assertEqual(frontmatter(old_issue)["approved_by"], [f"rule {rule}"])
+            rule_file = self.catalog / "always.md"
+            _ = rule_file.write_text(rule_file.read_text() + "Changed requirement.\n")
+            # The planner can withdraw first; filing must recover the decision close from persisted reasons.
+            definitions = {item.rule_id: item for item in rules.load_rules(self.repo)}
+            _ = ledger.withdraw_superseded(definitions)
+            new = ledger.hold(rule, "alpha/src/lib.rs", 1, "new finding", "rename", "Kind::Count", "Kind::Total",
+                              definitions[rule].blob, "outside")
+            new_issue, = self.file(ledger)
+            self.assertNotEqual(old_issue, new_issue)
+            self.assertEqual(frontmatter(old_issue)["status"], ["closed"])
+            self.assertEqual(frontmatter(new_issue)["approved_by"], [f"rule {rule}"])
+            self.assertEqual(frontmatter(new_issue)["style_rule_blob"], [definitions[rule].blob])
+            self.assertIsInstance(ledger.named_held((old.finding_id,))[0].state, style_ledger.Withdrawn)
+            self.assertEqual(ledger.named_held((new.finding_id,))[0].state, style_ledger.Filed(new_issue))
+
     def test_metadata_only_rule_edit_keeps_ticket_filing_current_but_body_edit_waits(self) -> None:
         with self.ledger() as ledger:
             finding = self.hold(ledger)
@@ -2440,7 +2463,7 @@ class StyleProposalsTests(unittest.TestCase):
             self.assertEqual([item.finding_id for item in ledger.held_findings(style_ledger.HeldFindingsInState("filed"))], [finding.finding_id])
             self.assertEqual(sum(call[0] == "create" for call in self.calls), 1)
 
-    def test_changed_rule_is_skipped_while_other_batches_file(self) -> None:
+    def test_changed_rule_is_withdrawn_while_other_batches_file(self) -> None:
         with self.ledger() as ledger:
             old = self.hold(ledger)
             _ = self.hold(ledger, rule=self.propose)
@@ -2449,9 +2472,9 @@ class StyleProposalsTests(unittest.TestCase):
             output = io.StringIO()
             with redirect_stdout(output):
                 paths = style_proposals.file_proposals(ledger, self.proposals, "parent").filed
-            self.assertIn(f"skipped {old.finding_id}: rule changed since judged", output.getvalue())
+            self.assertIn(f"withdraw {old.finding_id}", output.getvalue())
             self.assertEqual(len(paths), 1)
-            self.assertEqual([finding.finding_id for finding in ledger.held_findings(style_ledger.HeldFindingsInState("unfiled"))], [old.finding_id])
+            self.assertEqual([finding.finding_id for finding in ledger.held_findings(style_ledger.HeldFindingsInState("withdrawn"))], [old.finding_id])
             self.assertEqual(next(cell.state for cell in ledger.cells(self.rename)), "stale")
 
     def test_decline_waits_for_both_findings_then_waives_the_same_cell_with_words(self) -> None:
@@ -2617,15 +2640,15 @@ class StyleProposalsTests(unittest.TestCase):
         with self.ledger() as ledger:
             finding = self.hold(ledger)
             blob = self.newer_rule_text()
-            row = self.newer_verdict(ledger, blob, "held")
+            _ = self.newer_verdict(ledger, blob, "held")
             with redirect_stdout(io.StringIO()) as output:
                 _ = style_proposals.file_proposals(ledger, self.proposals, "parent")
             self.assertIn(f"withdraw {finding.finding_id} {self.rename} alpha/src/lib.rs:1: "
-                          + f"judgment {row} held under {blob[:8]}", output.getvalue())
+                          + f"rule body changed to {blob[:8]}", output.getvalue())
             self.assertIn("totals: withdraw 1, kept 0, close 0", output.getvalue())
             self.assertNotIn(f"skipped {finding.finding_id}: rule changed since judged", output.getvalue())
             withdrawn, = ledger.held_findings(style_ledger.AllHeldFindings())
-            self.assertEqual(withdrawn.state, style_ledger.Withdrawn(style_ledger.NoDecision(), style_ledger.JudgedAgain(row)))
+            self.assertEqual(withdrawn.state, style_ledger.Withdrawn(style_ledger.NoDecision(), style_ledger.RuleBodyChanged(blob)))
             self.assertEqual(self.calls, [])
             with redirect_stdout(io.StringIO()) as repeated:
                 _ = style_proposals.file_proposals(ledger, self.proposals, "parent")
@@ -2638,36 +2661,36 @@ class StyleProposalsTests(unittest.TestCase):
             _ = self.commit_tip(ledger, {f"alpha/src/{verdict}.rs": APPLIED for verdict in verdicts})
             findings = [self.hold(ledger, file=f"{verdict}.rs") for verdict in verdicts]
             blob = self.newer_rule_text()
-            rows = [self.newer_verdict(ledger, blob, verdict, finding.path)
-                    for verdict, finding in zip(verdicts, findings)]
+            for verdict, finding in zip(verdicts, findings):
+                _ = self.newer_verdict(ledger, blob, verdict, finding.path)
             output = self.withdraw(ledger)
-            for verdict, finding, row in zip(verdicts, findings, rows):
+            for finding in findings:
                 self.assertIn(f"withdraw {finding.finding_id} {self.rename} {finding.path}:1: "
-                              + f"judgment {row} {verdict} under {blob[:8]}", output)
+                              + f"rule body changed to {blob[:8]}", output)
             self.assertIn("totals: withdraw 4, kept 0, close 0", output)
             self.assertEqual({finding.finding_id: finding.state for finding in ledger.held_findings(style_ledger.AllHeldFindings())},
-                             {finding.finding_id: style_ledger.Withdrawn(style_ledger.NoDecision(), style_ledger.JudgedAgain(row))
-                              for finding, row in zip(findings, rows)})
+                             {finding.finding_id: style_ledger.Withdrawn(style_ledger.NoDecision(), style_ledger.RuleBodyChanged(blob))
+                              for finding in findings})
 
     def test_withdraw_dry_run_lists_an_unfiled_finding_judged_again_and_writes_nothing(self) -> None:
         with self.ledger() as ledger:
             finding = self.hold(ledger)
             blob = self.newer_rule_text()
-            row = self.newer_verdict(ledger, blob, "held")
+            _ = self.newer_verdict(ledger, blob, "held")
             before = ledger.held_findings(style_ledger.AllHeldFindings())
             with redirect_stdout(io.StringIO()) as output:
                 skipped = style_proposals.run_withdrawal(
                     style_proposals.decision_writer(ledger, self.proposals, "parent"), dry_run=True)
             self.assertEqual(skipped, ())
             self.assertIn(f"withdraw {finding.finding_id} {self.rename} alpha/src/lib.rs:1: "
-                          + f"judgment {row} held under {blob[:8]}", output.getvalue())
+                          + f"rule body changed to {blob[:8]}", output.getvalue())
             self.assertIn("totals: withdraw 1, kept 0, close 0", output.getvalue())
             self.assertEqual(ledger.held_findings(style_ledger.AllHeldFindings()), before)
             unchanged, = ledger.held_findings(style_ledger.AllHeldFindings())
             self.assertEqual(unchanged.state, style_ledger.Unfiled())
             self.assertEqual(self.calls, [])
 
-    def test_an_unfiled_finding_with_no_newer_judgment_at_its_site_keeps_the_skip_line(self) -> None:
+    def test_an_unfiled_finding_with_no_newer_judgment_at_its_site_withdraws_without_a_newer_judgment(self) -> None:
         with self.ledger() as ledger:
             _ = self.commit_tip(ledger, {"alpha/src/other.rs": APPLIED})
             finding = self.hold(ledger)
@@ -2676,13 +2699,13 @@ class StyleProposalsTests(unittest.TestCase):
             _ = self.newer_verdict(ledger, newer, "held", "alpha/src/other.rs")
             with redirect_stdout(io.StringIO()) as output:
                 _ = style_proposals.file_proposals(ledger, self.proposals, "parent")
-            self.assertIn(f"skipped {finding.finding_id}: rule changed since judged", output.getvalue())
-            self.assertIn("totals: withdraw 0, kept 0, close 0", output.getvalue())
+            self.assertIn(f"withdraw {finding.finding_id}", output.getvalue())
+            self.assertIn("totals: withdraw 1, kept 0, close 0", output.getvalue())
             unchanged, = ledger.named_held((finding.finding_id,))
-            self.assertEqual(unchanged.state, style_ledger.Unfiled())
+            self.assertEqual(unchanged.state, style_ledger.Withdrawn(style_ledger.NoDecision(), style_ledger.RuleBodyChanged(newer)))
             self.assertIsInstance(ledger.named_held((support.finding_id,))[0].state, style_ledger.Filed)
 
-    def test_an_unfiled_finding_judged_after_a_judgment_under_a_restored_rule_text_is_not_withdrawn(self) -> None:
+    def test_an_unfiled_finding_judged_after_a_judgment_under_a_restored_rule_text_withdraws_on_another_body_change(self) -> None:
         with self.ledger() as ledger:
             names = self.catalog / "names.md"
             original = names.read_text()
@@ -2694,23 +2717,24 @@ class StyleProposalsTests(unittest.TestCase):
             self.assertEqual(self.newer_rule_text(), newer)
             with redirect_stdout(io.StringIO()) as output:
                 _ = style_proposals.file_proposals(ledger, self.proposals, "parent")
-            self.assertIn(f"skipped {finding.finding_id}: rule changed since judged", output.getvalue())
-            self.assertIn("totals: withdraw 0, kept 0, close 0", output.getvalue())
+            self.assertIn(f"withdraw {finding.finding_id}", output.getvalue())
+            self.assertIn("totals: withdraw 1, kept 0, close 0", output.getvalue())
             unchanged, = ledger.named_held((finding.finding_id,))
-            self.assertEqual(unchanged.state, style_ledger.Unfiled())
+            self.assertEqual(unchanged.state, style_ledger.Withdrawn(style_ledger.NoDecision(), style_ledger.RuleBodyChanged(newer)))
             self.assertIsInstance(ledger.named_held((support.finding_id,))[0].state, style_ledger.Filed)
 
-    def test_an_unfiled_finding_of_an_open_ticket_is_not_withdrawn(self) -> None:
+    def test_an_unfiled_finding_of_an_open_ticket_withdraws_and_cancels_the_ticket(self) -> None:
         with self.ledger() as ledger:
             ticket = self.assign_ticket(ledger, "names-unit")
             _ = self.hold(ledger, ticket=ticket)
             _ = self.newer_verdict(ledger, self.newer_rule_text(), "held")
             with redirect_stdout(io.StringIO()) as output:
                 _ = style_proposals.file_proposals(ledger, self.proposals, "parent")
-            self.assertIn(f"held for open ticket {ticket}: 1 findings", output.getvalue())
-            self.assertIn("totals: withdraw 0, kept 0, close 0", output.getvalue())
+            self.assertNotIn(f"held for open ticket {ticket}", output.getvalue())
+            self.assertEqual(ledger.ticket_open("names-unit"), ())
+            self.assertIn("totals: withdraw 1, kept 0, close 0", output.getvalue())
             unchanged, = ledger.held_findings(style_ledger.AllHeldFindings())
-            self.assertEqual(unchanged.state, style_ledger.Unfiled())
+            self.assertIsInstance(unchanged.state, style_ledger.Withdrawn)
 
     def test_an_original_text_judgment_of_another_cell_does_not_block_withdrawal(self) -> None:
         with self.ledger() as ledger:
@@ -2723,7 +2747,7 @@ class StyleProposalsTests(unittest.TestCase):
                     finding = self.hold(ledger, file="lib.rs" if verdict == "clean" else "filed.rs")
                     proposal = self.file(ledger)[0] if verdict == "exception" else style_ledger.NoDecision()
                     newer = self.newer_rule_text()
-                    row = self.newer_verdict(ledger, newer, verdict, finding.path)
+                    _ = self.newer_verdict(ledger, newer, verdict, finding.path)
                     _ = names.write_text(original)
                     ledger.record(self.rename, "alpha/src/other.rs", self.tip, finding.rule_blob, "clean",
                                   ticket=finding.ticket, worker="test", input_scope=style_ledger.DeclaredInputScope.RULE)
@@ -2732,56 +2756,41 @@ class StyleProposalsTests(unittest.TestCase):
                     self.assertIn(f"withdraw {finding.finding_id}", output)
                     withdrawn = next(item for item in ledger.held_findings(style_ledger.AllHeldFindings())
                                      if item.finding_id == finding.finding_id)
-                    reason = style_ledger.ExceptionVerdict(row) if verdict == "exception" else style_ledger.JudgedAgain(row)
+                    reason = style_ledger.RuleBodyChanged(newer)
                     self.assertEqual(withdrawn.state, style_ledger.Withdrawn(proposal, reason))
 
-    def test_an_unfiled_finding_keeps_its_newer_own_judgment_when_its_declaration_moves(self) -> None:
+    def test_an_unfiled_finding_withdraws_without_a_newer_judgment_when_its_declaration_moves(self) -> None:
         with self.ledger() as ledger:
             _ = self.commit_tip(ledger, {"alpha/src/a.rs": PARENT, "alpha/src/b.rs": "fn other() {}\n"})
-            names = self.catalog / "names.md"
-            original = names.read_text()
-            newer = self.newer_rule_text()
-            _ = self.newer_verdict(ledger, newer, "clean", "alpha/src/b.rs")
-            _ = names.write_text(original)
             finding, = self.judge(ledger, (("alpha/src/a.rs", 2, "old: u32,"),))
-            ledger.record(self.rename, finding.path, self.tip, finding.rule_blob, "held",
-                          ticket=finding.ticket, worker="test", input_scope=style_ledger.DeclaredInputScope.RULE)
-            self.assertEqual(self.newer_rule_text(), newer)
+            issue = style_ledger.NoDecision()
+            newer = self.newer_rule_text()
             _ = self.commit_tip(ledger, {"alpha/src/a.rs": "fn other() {}\n", "alpha/src/b.rs": PARENT})
             with redirect_stdout(io.StringIO()) as output:
                 _ = style_proposals.file_proposals(ledger, self.proposals, "parent")
-            moved, = ledger.held_findings(style_ledger.AllHeldFindings())
-            self.assertEqual((moved.path, moved.state), ("alpha/src/b.rs", style_ledger.Unfiled()))
-            self.assertIn(f"skipped {finding.finding_id}: rule changed since judged", output.getvalue())
-            row = self.newer_verdict(ledger, newer, "clean", moved.path)
-            self.assertIn(f"judgment {row} clean", self.withdraw(ledger))
-            withdrawn, = ledger.held_findings(style_ledger.AllHeldFindings())
-            self.assertEqual(withdrawn.state, style_ledger.Withdrawn(style_ledger.NoDecision(), style_ledger.JudgedAgain(row)))
+            moved, = ledger.named_held((finding.finding_id,))
+            self.assertEqual(moved.path, "alpha/src/b.rs")
+            self.assertEqual(moved.state, style_ledger.Withdrawn(issue, style_ledger.RuleBodyChanged(newer)))
+            self.assertIn(f"withdraw {finding.finding_id}", output.getvalue())
 
-    def test_a_filed_finding_keeps_its_newer_own_judgment_when_its_declaration_moves(self) -> None:
+
+    def test_a_filed_finding_withdraws_without_a_newer_judgment_when_its_declaration_moves(self) -> None:
         with self.ledger() as ledger:
             _ = self.commit_tip(ledger, {"alpha/src/a.rs": PARENT, "alpha/src/b.rs": "fn other() {}\n"})
-            names = self.catalog / "names.md"
-            original = names.read_text()
-            newer = self.newer_rule_text()
-            _ = self.newer_verdict(ledger, newer, "exception", "alpha/src/b.rs")
-            _ = names.write_text(original)
             finding, = self.judge(ledger, (("alpha/src/a.rs", 2, "old: u32,"),))
-            ledger.record(self.rename, finding.path, self.tip, finding.rule_blob, "held",
-                          ticket=finding.ticket, worker="test", input_scope=style_ledger.DeclaredInputScope.RULE)
-            issue, = self.file(ledger)
-            self.assertEqual(self.newer_rule_text(), newer)
+            issue = self.file(ledger)[0]
+            newer = self.newer_rule_text()
             _ = self.commit_tip(ledger, {"alpha/src/a.rs": "fn other() {}\n", "alpha/src/b.rs": PARENT})
-            _ = self.file(ledger)
-            moved, = ledger.proposal_findings(issue)
-            self.assertEqual((moved.path, moved.state), ("alpha/src/b.rs", style_ledger.Filed(issue)))
-            self.assertEqual(frontmatter(issue)["status"], ["open"])
-            row = self.newer_verdict(ledger, newer, "exception", moved.path)
-            self.assertIn(f"judgment {row} exception", self.withdraw(ledger))
-            withdrawn, = ledger.proposal_findings(issue)
-            self.assertEqual(withdrawn.state, style_ledger.Withdrawn(issue, style_ledger.ExceptionVerdict(row)))
+            with redirect_stdout(io.StringIO()) as output:
+                _ = style_proposals.file_proposals(ledger, self.proposals, "parent")
+            moved, = ledger.named_held((finding.finding_id,))
+            self.assertEqual(moved.path, "alpha/src/b.rs")
+            self.assertEqual(moved.state, style_ledger.Withdrawn(issue, style_ledger.RuleBodyChanged(newer)))
+            self.assertIn(f"withdraw {finding.finding_id}", output.getvalue())
+            self.assertEqual(frontmatter(issue)["status"], ["closed"])
 
-    def test_a_moved_finding_keeps_its_later_own_judgment_against_an_older_destination_judgment(self) -> None:
+
+    def test_a_moved_finding_withdraws_despite_an_older_destination_judgment(self) -> None:
         for verdict in ("clean", "exception"):
             with self.subTest(verdict=verdict), self.ledger() as ledger:
                 names = self.catalog / "names.md"
@@ -2793,28 +2802,24 @@ class StyleProposalsTests(unittest.TestCase):
                 _ = self.commit_tip(ledger, {source: declaration, destination: "fn other() {}\n"})
                 finding, = self.judge(ledger, ((source, 2, "old: u32,"),),
                                       before=f"{parent}::old", after=f"{parent}::new")
-                ledger.record(self.rename, source, self.tip, finding.rule_blob, "held",
-                              ticket=finding.ticket, worker="test", input_scope=style_ledger.DeclaredInputScope.RULE)
                 issue = self.file(ledger)[0] if verdict == "exception" else style_ledger.NoDecision()
                 newer = self.newer_rule_text()
                 _ = self.newer_verdict(ledger, newer, verdict, destination)
                 _ = names.write_text(original)
-                ledger.record(self.rename, source, self.tip, finding.rule_blob, "held",
-                              ticket=finding.ticket, worker="test", input_scope=style_ledger.DeclaredInputScope.RULE)
                 self.assertEqual(self.newer_rule_text(), newer)
                 _ = self.commit_tip(ledger, {source: "fn other() {}\n", destination: declaration})
                 with redirect_stdout(io.StringIO()) as output:
                     _ = style_proposals.file_proposals(ledger, self.proposals, "parent")
                 moved = next(item for item in ledger.held_findings(style_ledger.AllHeldFindings())
                              if item.finding_id == finding.finding_id)
-                expected = style_ledger.Filed(issue) if isinstance(issue, Path) else style_ledger.Unfiled()
+                expected = style_ledger.Withdrawn(issue, style_ledger.RuleBodyChanged(newer))
                 self.assertEqual((moved.path, moved.state), (destination, expected))
-                self.assertIn("totals: withdraw 0, kept 0, close 0", output.getvalue())
+                self.assertIn(f"withdraw {finding.finding_id}", output.getvalue())
                 if isinstance(issue, Path):
-                    self.assertEqual(frontmatter(issue)["status"], ["open"])
+                    self.assertEqual(frontmatter(issue)["status"], ["closed"])
                 _ = names.write_text(original)
 
-    def test_a_moved_finding_withdraws_by_a_judgment_at_its_new_cell_after_the_move(self) -> None:
+    def test_a_moved_finding_withdraws_before_a_judgment_at_its_new_cell(self) -> None:
         for verdict in ("clean", "exception"):
             with self.subTest(verdict=verdict), self.ledger() as ledger:
                 source = f"alpha/src/{verdict}_later_a.rs"
@@ -2832,11 +2837,11 @@ class StyleProposalsTests(unittest.TestCase):
                              if item.finding_id == finding.finding_id)
                 self.assertEqual(moved.path, destination)
                 self.assertIsInstance(moved.follow, style_ledger.FollowedDeclaration)
-                row = self.newer_verdict(ledger, newer, verdict, destination)
-                self.assertIn(f"withdraw {finding.finding_id}", self.withdraw(ledger))
+                _ = self.newer_verdict(ledger, newer, verdict, destination)
+                self.assertIn("totals: withdraw 0, kept 0, close 0", self.withdraw(ledger))
                 withdrawn = next(item for item in ledger.held_findings(style_ledger.AllHeldFindings())
                                  if item.finding_id == finding.finding_id)
-                reason = style_ledger.ExceptionVerdict(row) if verdict == "exception" else style_ledger.JudgedAgain(row)
+                reason = style_ledger.RuleBodyChanged(newer)
                 self.assertEqual(withdrawn.state, style_ledger.Withdrawn(issue, reason))
                 if isinstance(issue, Path):
                     self.assertEqual(frontmatter(issue)["status"], ["closed"])
@@ -2846,17 +2851,17 @@ class StyleProposalsTests(unittest.TestCase):
             first, second = self.hold(ledger), self.hold(ledger, line=2)
             issue = self.file(ledger)[0]
             blob = self.newer_rule_text()
-            row = self.newer_verdict(ledger, blob, "exception")
+            _ = self.newer_verdict(ledger, blob, "exception")
             output = self.withdraw(ledger)
             for finding in (first, second):
                 self.assertIn(f"withdraw {finding.finding_id} {self.rename} alpha/src/lib.rs:{finding.line}: "
-                              + f"judgment {row} exception under {blob[:8]}", output)
-            self.assertEqual({finding.state for finding in ledger.proposal_findings(issue)}, {style_ledger.Withdrawn(issue, style_ledger.ExceptionVerdict(row))})
+                              + f"rule body changed to {blob[:8]}", output)
+            self.assertEqual({finding.state for finding in ledger.proposal_findings(issue)}, {style_ledger.Withdrawn(issue, style_ledger.RuleBodyChanged(blob))})
             self.assertEqual(frontmatter(issue)["status"], ["closed"])
             reason = frontmatter(issue)["reason"][0]
             self.assertTrue(reason.startswith(style_proposals.NOTHING_LEFT_REASON))
             for finding in (first, second):
-                self.assertIn(f"{finding.finding_id} (judgment {row} exception)", reason)
+                self.assertIn(f"{finding.finding_id} (rule body changed to {blob[:8]})", reason)
             self.assertIn(f"close {issue}: {reason}", output)
             self.assertIn("totals: withdraw 2, kept 0, close 1", output)
             closed = issue.read_bytes()
@@ -2868,7 +2873,7 @@ class StyleProposalsTests(unittest.TestCase):
             finding = self.hold(ledger)
             issue = self.file(ledger)[0]
             before = issue.read_bytes()
-            blob = self.newer_rule_text()
+            blob = finding.rule_blob
             verdicts: tuple[tuple[style_ledger.Verdict, str], ...] = (
                 ("clean", finding.path), ("held", finding.path), ("exception", "beta/src/lib.rs"))
             for verdict, path in verdicts:
@@ -2877,7 +2882,7 @@ class StyleProposalsTests(unittest.TestCase):
                 self.assertEqual(ledger.proposal_findings(issue)[0].state, style_ledger.Filed(issue))
             self.assertEqual(issue.read_bytes(), before)
 
-    def test_a_finding_that_an_open_ticket_builds_is_kept_and_listed(self) -> None:
+    def test_rule_body_change_cancels_an_open_build_before_withdrawing(self) -> None:
         with self.ledger() as ledger:
             finding = self.hold(ledger)
             issue = self.file(ledger)[0]
@@ -2885,31 +2890,28 @@ class StyleProposalsTests(unittest.TestCase):
             ledger.ticket_add("names-unit-1", "names-unit", "proposal", "names", "alpha", [finding.path], [self.rename],
                               proposal=str(issue), finding_ids=(finding.finding_id,))
             blob = self.newer_rule_text()
-            row = self.newer_verdict(ledger, blob, "exception")
+            _ = self.newer_verdict(ledger, blob, "exception")
             output = self.withdraw(ledger)
-            self.assertIn(f"kept {finding.finding_id} {self.rename} {finding.path}:1: judgment {row} exception under "
-                          + f"{blob[:8]}; open ticket names-unit-1 builds it", output)
-            self.assertIn("totals: withdraw 0, kept 1, close 0", output)
-            self.assertEqual(ledger.proposal_findings(issue)[0].state, style_ledger.Filed(issue))
-            self.assertEqual(frontmatter(issue)["status"], ["open"])
+            self.assertIn(f"withdraw {finding.finding_id}", output)
+            self.assertIn("totals: withdraw 1, kept 0, close 1", output)
+            self.assertEqual(ledger.proposal_findings(issue)[0].state, style_ledger.Withdrawn(issue, style_ledger.RuleBodyChanged(blob)))
+            with self.assertRaises(style_ledger.LedgerError):
+                ledger.ticket_assign("names-unit-1", "main")
+            self.assertEqual(frontmatter(issue)["status"], ["closed"])
 
-    def test_a_decision_with_a_withdrawn_and_a_filed_finding_stays_open_and_shows_only_the_filed_one(self) -> None:
+    def test_rule_body_change_withdraws_every_cell_of_a_decision(self) -> None:
         with self.ledger() as ledger:
-            withdrawn = self.hold(ledger)
-            filed = ledger.hold(self.rename, "alpha/src/other.rs", 3, "other site", "rename", "Kind::Other", "Kind::Size",
-                                withdrawn.rule_blob, "outside")
+            first = self.hold(ledger)
+            second = ledger.hold(self.rename, "alpha/src/other.rs", 3, "other site", "rename", "Kind::Other", "Kind::Size",
+                                 first.rule_blob, "outside")
             issue = self.file(ledger)[0]
-            self.assertEqual(frontmatter(issue)["style_count"], ["2"])
             blob = self.newer_rule_text()
-            row = self.newer_verdict(ledger, blob, "exception")
-            self.assertIn("totals: withdraw 1, kept 0, close 0", self.withdraw(ledger))
+            self.assertIn("totals: withdraw 2, kept 0, close 1", self.withdraw(ledger))
             self.assertEqual({finding.finding_id: finding.state for finding in ledger.proposal_findings(issue)},
-                             {withdrawn.finding_id: style_ledger.Withdrawn(issue, style_ledger.ExceptionVerdict(row)), filed.finding_id: style_ledger.Filed(issue)})
-            self.assertEqual(frontmatter(issue)["status"], ["open"])
-            self.assertEqual(frontmatter(issue)["style_count"], ["1"])
-            body = issue.read_text()
-            self.assertIn("Parent: parent", body)
-            self.assertEqual(re.findall(r"^Site: (.*)$", body, re.MULTILINE), ["alpha/src/other.rs:3"])
+                             {finding.finding_id: style_ledger.Withdrawn(issue, style_ledger.RuleBodyChanged(blob))
+                              for finding in (first, second)})
+            self.assertEqual(frontmatter(issue)["status"], ["closed"])
+
 
     def test_withdraw_dry_run_prints_the_same_lines_and_writes_nothing(self) -> None:
         with self.ledger() as ledger:
@@ -2998,17 +3000,17 @@ class StyleProposalsTests(unittest.TestCase):
         self.assertIn("Parent: parent", body)
         self.assertEqual(re.findall(r"^Site: (.*)$", body, re.MULTILINE), ["alpha/src/lib.rs:1"])
 
-    def test_a_decision_emptied_by_an_exception_after_a_dropped_duplicate_names_each_reason_in_its_close(self) -> None:
+    def test_a_decision_emptied_by_a_rule_body_change_after_a_dropped_duplicate_names_each_reason_in_its_close(self) -> None:
         with self.ledger() as ledger:
             issue, qualified, bare = self.bare_duplicate_decision(ledger)
             with redirect_stdout(io.StringIO()):
                 _ = style_proposals.drop_duplicates(ledger, dry_run=False)
-            row = self.newer_verdict(ledger, self.newer_rule_text(), "exception")
+            blob = self.newer_rule_text()
             _ = self.withdraw(ledger)
         self.assertEqual(frontmatter(issue)["status"], ["closed"])
         self.assertEqual(frontmatter(issue)["reason"][0],
                          f"{style_proposals.NOTHING_LEFT_REASON}withdrawn: "
-                         + ", ".join(sorted((f"{qualified.finding_id} (judgment {row} exception)",
+                         + ", ".join(sorted((f"{qualified.finding_id} (rule body changed to {blob[:8]})",
                                              f"{bare.finding_id} (duplicate of {qualified.finding_id})"))))
 
     def test_drop_duplicates_skips_a_decision_whose_duplicate_an_open_ticket_holds_and_exits_1(self) -> None:
@@ -3066,7 +3068,7 @@ class StyleProposalsTests(unittest.TestCase):
             self.assertLess(text.index(f"withdraw {old.finding_id}"), text.index(f"filed {filed[0]}"))
             self.assertEqual(frontmatter(old_issue)["status"], ["closed"])
 
-    def test_an_older_exception_under_a_restored_rule_text_withdraws_no_finding_judged_after_it(self) -> None:
+    def test_restoring_an_older_body_withdraws_findings_judged_under_the_intermediate_body(self) -> None:
         with self.ledger() as ledger:
             names = self.catalog / "names.md"
             original = names.read_text()
@@ -3076,9 +3078,9 @@ class StyleProposalsTests(unittest.TestCase):
             finding = self.hold(ledger)
             issue = self.file(ledger)[0]
             _ = names.write_text(original)
-            self.assertIn("totals: withdraw 0, kept 0, close 0", self.withdraw(ledger))
+            self.assertIn("totals: withdraw 1, kept 0, close 1", self.withdraw(ledger))
             self.assertEqual([(item.finding_id, item.state) for item in ledger.proposal_findings(issue)],
-                             [(finding.finding_id, style_ledger.Filed(issue))])
+                             [(finding.finding_id, style_ledger.Withdrawn(issue, style_ledger.RuleBodyChanged(old_blob)))])
 
     def test_withdrawal_leaves_a_decision_with_a_built_finding_to_complete(self) -> None:
         self.write("alpha/src/other.rs", APPLIED)
@@ -3095,16 +3097,16 @@ class StyleProposalsTests(unittest.TestCase):
                           input_scope=style_ledger.DeclaredInputScope.RULE)
             issue = self.approved_decision(ledger, withdrawn, built)
             self.assertEqual(self.merge_ticket(ledger, "names-unit-1", issue, built), ())
-            row = self.newer_verdict(ledger, self.newer_rule_text(), "exception", withdrawn.path)
+            blob = self.newer_rule_text()
             self.assertIn("totals: withdraw 1, kept 0, close 0", self.withdraw(ledger))
             self.assertEqual({finding.finding_id: finding.state for finding in ledger.proposal_findings(issue)},
-                             {withdrawn.finding_id: style_ledger.Withdrawn(issue, style_ledger.ExceptionVerdict(row)), built.finding_id: style_ledger.Built(issue)})
+                             {withdrawn.finding_id: style_ledger.Withdrawn(issue, style_ledger.RuleBodyChanged(blob)), built.finding_id: style_ledger.Built(issue)})
             self.assertEqual(frontmatter(issue)["status"], ["open"])
             with redirect_stdout(io.StringIO()):
                 style_proposals.complete(ledger)
             self.assertEqual((frontmatter(issue)["status"], frontmatter(issue)["reason"]), (["closed"], ["built in names-unit-1"]))
 
-    def test_a_decision_that_withdrawal_cannot_close_or_refresh_is_skipped_and_the_others_still_file(self) -> None:
+    def test_a_decision_that_withdrawal_cannot_close_is_skipped_and_the_others_still_file(self) -> None:
         with self.ledger() as ledger:
             _ = self.hold(ledger)
             _ = self.hold(ledger, crate="beta")
@@ -3128,12 +3130,12 @@ class StyleProposalsTests(unittest.TestCase):
                   redirect_stdout(io.StringIO()) as output):
                 result = style_proposals.file_proposals(ledger, self.proposals, "parent")
             self.assertIn(f"skipped {closed}: close refused", output.getvalue().splitlines())
-            self.assertIn(f"skipped {refreshed}: no Parent line", output.getvalue().splitlines())
-            self.assertEqual(set(result.skipped), {refreshed, closed})
+            self.assertEqual(set(result.skipped), {closed})
             filed, = result.filed
             self.assertEqual(ledger.proposal_findings(filed)[0].finding_id, later.finding_id)
             self.assertEqual(frontmatter(closed)["status"], ["open"])
-            self.assertEqual(refreshed.read_bytes(), refreshed_bytes)
+            self.assertNotEqual(refreshed.read_bytes(), refreshed_bytes)
+            self.assertEqual(frontmatter(refreshed)["status"], ["closed"])
 
     def test_withdrawal_renumbers_once_when_it_closes_decisions_and_never_on_a_dry_run(self) -> None:
         with self.ledger() as ledger:

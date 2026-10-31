@@ -61,11 +61,11 @@ The lock file stays on disk. Closing it releases the lock, also on an error. If 
 ### Markdown page
 
 - The page uses the source file name, for example `notes.md`, as its `<title>`.
-- A viewport meta tag, a 48rem column and `overflow-wrap: anywhere` make it fit a phone.
+- A viewport meta tag and a centered 48rem text column make it fit a phone. Long words and URLs outside tables wrap with `overflow-wrap: anywhere`.
 - It follows the system light or dark mode with `color-scheme: light dark` and `light-dark()` colors.
 - It loads `marked` 12.0.2 from `https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js`.
 - It holds the HTML-escaped source in `<pre id="markdown-source">`. The `<pre>` shows until `marked` renders the page. It stays if the script does not load or throws an error.
-- Code blocks, the `<pre>` fallback and wide tables scroll sideways without wrapping. Images fit the width.
+- Code blocks and the `<pre>` fallback scroll sideways without wrapping. Tables are centered and use as much of the window width as their content needs; wider tables scroll inside the page. Cells wrap at spaces, never inside a word or number. Images fit the width.
 - A custom `marked` renderer escapes raw HTML. A `<details>` or `<script>` block shows as text and does not run.
 
 ### Server

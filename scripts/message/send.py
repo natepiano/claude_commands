@@ -1313,7 +1313,7 @@ def _recipient_matches(to: str, entries: list[roster.RosterEntry]) -> list[roste
     if to.startswith(("session:", "worker:", "codex:")):
         return [entry for entry in entries
                 if isinstance(entry.reach, roster.Messageable) and entry.reach.address == to]
-    return [entry for entry in entries if entry.name == to]
+    return [entry for entry in entries if entry.name.casefold() == to.casefold()]
 
 
 def _matched_recipient(

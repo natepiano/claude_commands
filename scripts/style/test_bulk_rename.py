@@ -24,6 +24,7 @@ import bulk_rename as bulk
 import berth_board
 import rules
 import style_ledger
+from ledger_test_support import remove_generation_schema
 import style_rules
 from scripts.direct.test_verify_untested_examples import rust_tool_path, workspace_metadata
 from approved_renames import AppliedInCode, BindingRename, NoBindingScope, binding_rename_check, binding_scope
@@ -1023,6 +1024,7 @@ class LedgerTests(CargoProjectTests):
             _ = connection.execute("DROP TABLE bulk_refusals")
             _ = connection.execute("DROP TABLE refill_results")
             _ = connection.execute("ALTER TABLE held_findings DROP COLUMN built_at")
+            remove_generation_schema(connection)
             _ = connection.execute("UPDATE schema_version SET version=23")
             connection.commit()
         with style_ledger.Ledger(self.repo, ledger.database) as upgraded:
@@ -1031,6 +1033,7 @@ class LedgerTests(CargoProjectTests):
         with closing(sqlite3.connect(ledger.database)) as connection:
             _ = connection.execute("DROP TABLE refill_results")
             _ = connection.execute("ALTER TABLE held_findings DROP COLUMN built_at")
+            remove_generation_schema(connection)
             _ = connection.execute("UPDATE schema_version SET version=23")
             connection.commit()
         with style_ledger.Ledger(self.repo, ledger.database) as replayed:

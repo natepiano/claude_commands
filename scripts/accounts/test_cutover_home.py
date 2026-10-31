@@ -21,6 +21,7 @@ from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from scripts.accounts.home_test_support import scratch_account_home
 from scripts.accounts import accounts, role_map
 from scripts.accounts.nix_env_fake import fake_nix_loader, imports_with_nix_loader
 from scripts.message import sessions
@@ -43,7 +44,7 @@ class HomeCutoverTests(unittest.TestCase):
         self.home = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         _ = cast(object, self.enterContext(patch.object(accounts, "import_module", side_effect=imports_with_nix_loader(fake_nix_loader()))))
         _ = self.enterContext(patch.object(sys, "platform", "linux"))
-        self.enterContext(patch.dict(os.environ, {"HOME": str(self.home),
+        self.enterContext(scratch_account_home(self.home, {
             "AGENT_NOTES_DIR": str(self.home / "notes")}, clear=True))
         (self.home / ".claude").mkdir()
         (self.home / "notes").mkdir()
@@ -280,8 +281,8 @@ class CodexHomeCutoverTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.home = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
-        _ = cast(object, self.enterContext(patch.dict(os.environ, {
-            "HOME": str(self.home), "AGENT_NOTES_DIR": str(self.home / "notes")}, clear=True)))
+        _ = cast(object, self.enterContext(scratch_account_home(self.home, {
+            "AGENT_NOTES_DIR": str(self.home / "notes")}, clear=True)))
         _ = self.enterContext(patch.object(role_map, "is_role_map_host", return_value=True))
         self.process_lister = accounts.list_codex_home_processes
         _ = self.enterContext(patch.object(accounts, "list_codex_home_processes", return_value=[]))
@@ -812,7 +813,7 @@ class MacHomeCutoverTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.home = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
-        self.enterContext(patch.dict(os.environ, {"HOME": str(self.home),
+        self.enterContext(scratch_account_home(self.home, {
             "AGENT_NOTES_DIR": str(self.home / "notes")}, clear=True))
         self.keychain = CutoverKeychain()
         _ = self.enterContext(patch.object(subprocess, "run", side_effect=self.keychain.run))
@@ -1060,7 +1061,7 @@ class MacHomeCutoverTests(unittest.TestCase):
         for stop_after in range(1, len(mutations) + 1):
             with self.subTest(step=stop_after), tempfile.TemporaryDirectory() as directory:
                 self.home = Path(directory).resolve()
-                with patch.dict(os.environ, {"HOME": str(self.home), "AGENT_NOTES_DIR": str(self.home / "notes")}):
+                with scratch_account_home(self.home, {"AGENT_NOTES_DIR": str(self.home / "notes")}, clear=False):
                     self.keychain.entries.clear()
                     self.keychain.calls.clear()
                     self.initialize_home()

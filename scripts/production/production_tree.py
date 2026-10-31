@@ -39,12 +39,13 @@ import sys
 from pathlib import Path
 from typing import Literal, TypedDict, cast
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "message"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.astra import astra_roles  # noqa: E402
 from scripts.production import staff, staff_sources
-import showrunners  # noqa: E402
+from scripts.production import showrunners  # noqa: E402
 import showrunner_tree
 import unit_lookup  # noqa: E402
 import unit_runs  # noqa: E402
@@ -119,9 +120,9 @@ def showrunner_edges(sessions: dict[str, str], running: set[str], record: staff.
     ]
 
 
-def marked_units() -> unit_lookup.MarkedProductions | None:
+def marked_units(*, record: staff.StaffSnapshot | None = None) -> unit_lookup.MarkedProductions | None:
     try:
-        return unit_lookup.every_marked_unit()
+        return unit_lookup.every_marked_unit(record=record)
     except OSError as error:
         _warn(f"unit marks unreadable: {error}")
         return None
@@ -139,7 +140,7 @@ def unit_edges(sessions: dict[str, str], running: set[str], marked: unit_lookup.
             claude = units[unit].claude
             if not isinstance(claude, unit_lookup.LiveClaude) or claude.session_id not in running:
                 continue
-            found = staff_sources.member(staff_sources.UnitMember(slug, unit), record)
+            found = staff_sources.member(staff_sources.ObservedUnit(unit, units[unit].staff_id), record)
             if isinstance(found, staff_sources.NoSuchMember) or found.row.parent is None:
                 continue
             manager = managers.get(found.row.parent, "")
@@ -300,12 +301,13 @@ def worker_edges(running: set[str], astra_threads: set[str] | None = None) -> li
 def tree() -> list[Edge]:
     running = {record["sessionId"] for record in running_sessions()}
     sessions = showrunner_sessions()
-    marked = marked_units()
+    marked = None
     astra = astra_edges()
     showrunner: list[Edge] = []
     directors: list[Edge] = []
     try:
         record = staff.snapshot()
+        marked = marked_units(record=record)
         showrunner = showrunner_edges(sessions, running, record)
         if marked is not None:
             directors = unit_edges(sessions, running, marked, record)

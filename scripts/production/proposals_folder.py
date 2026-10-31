@@ -10,7 +10,12 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-import showrunners
+
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from scripts.production import showrunners
 import showrunner_tree
 from issues import Issue, open_issues
 # Callers such as rename_unit read the tag here.

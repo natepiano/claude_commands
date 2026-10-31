@@ -43,7 +43,7 @@ else:
 import detection_rules
 import herdr
 import sessions
-import showrunners
+from scripts.production import showrunners
 import unit_lookup
 from scripts.whoami.account import Account, label_for
 
@@ -1096,28 +1096,24 @@ ProcessIdentity = ProcessLive | ProcessGone | ProcessUnknown
 
 
 def shutdown_identity(pid: int, timeout: float = 5) -> ProcessIdentity:
+    if timeout <= 0:
+        return ProcessUnknown(f"pid {pid}: identity read deadline expired")
+    root = Path(os.environ.get("HERDR_PROC", "/proc"))
     try:
         if sys.platform == "darwin":
-            shown = subprocess.run(["ps", "-p", str(pid), "-o", "stat=,lstart="],
-                capture_output=True, text=True, check=False, timeout=timeout,
-                env={**os.environ, "LC_ALL": "C", "TZ": "UTC"})
-            if shown.returncode == 1 and not shown.stdout.strip():
-                return ProcessGone()
-            if shown.returncode:
-                return ProcessUnknown(f"pid {pid}: ps exit {shown.returncode}: {shown.stderr.strip()}")
-            status, separator, started = shown.stdout.strip().partition(" ")
-            if not separator or not started.strip():
-                return ProcessUnknown(f"pid {pid}: malformed ps identity")
-            return ProcessGone() if status.startswith("Z") else ProcessLive(started.lstrip())
-        fields = Path(os.environ.get("HERDR_PROC", "/proc"), str(pid), "stat").read_bytes().rpartition(b")")[2].split()
-        return ProcessGone() if fields[0] == b"Z" else ProcessLive(fields[19].decode("ascii"))
-    except FileNotFoundError:
-        try:
-            present = Path(os.environ.get("HERDR_PROC", "/proc"), str(pid)).exists()
-        except OSError as error:
-            return ProcessUnknown(f"pid {pid}: identity unread: {error}")
-        return ProcessUnknown(f"pid {pid}: stat missing from existing process") if present else ProcessGone()
-    except (OSError, subprocess.SubprocessError, IndexError, UnicodeError) as error:
+            started = process_identity.process_start(pid, root, timeout=timeout)
+        else:
+            started = process_identity.process_start(pid, root)
+        if isinstance(started, process_identity.ProcessGone):
+            if sys.platform != "darwin" and (root / str(pid)).exists():
+                # A missing stat in a retained process directory is not proof
+                # that its owner is gone. Zombies still count as gone.
+                stat = process_identity.read_stat(pid, root)
+                if isinstance(stat, process_identity.ProcessGone):
+                    return ProcessUnknown(f"pid {pid}: stat missing from existing process")
+            return ProcessGone()
+        return ProcessLive(started.text)
+    except OSError as error:
         return ProcessUnknown(f"pid {pid}: identity unread: {error}")
 
 
@@ -1271,8 +1267,8 @@ def shutdown_processes(timeout: float = 5) -> ProcessObservation:
         try:
             if process.stat().st_uid != os.getuid():
                 continue
-            fields = process.joinpath("stat").read_text().rsplit(")", 1)[1].split()
-            if fields[0] == "Z":
+            stat = process_identity.read_stat(int(process.name), root)
+            if isinstance(stat, process_identity.ProcessGone) or stat.state in ("Z", "X", "x"):
                 continue
             arguments = tuple(os.fsdecode(word) for word in process.joinpath("cmdline").read_bytes().split(b"\0") if word)
             environment: dict[str, str] = {}
@@ -1290,9 +1286,9 @@ def shutdown_processes(timeout: float = 5) -> ProcessObservation:
             scope = next((group.name for _hierarchy, group in cgroups
                           if "builds.slice" in group.parts and group.suffix in {".scope", ".service"}), "")
             pid = int(process.name)
-            result[pid] = ShutdownProcess(pid, int(fields[1]), fields[19], arguments,
+            result[pid] = ShutdownProcess(pid, stat.ppid, stat.start.text, arguments,
                 environment.get("CLAUDE_CODE_SESSION_ID", ""),
-                environment.get("UNIT_RUN_DIR") or environment.get("UNIT_SESSION_DIR", ""), scope, int(fields[3]),
+                environment.get("UNIT_RUN_DIR") or environment.get("UNIT_SESSION_DIR", ""), scope, stat.session,
                 ownership_unreadable=ownership_unreadable,
                 cgroups=frozenset(str(group) for _hierarchy, group in cgroups))
         except FileNotFoundError:

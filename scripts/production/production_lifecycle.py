@@ -12,9 +12,10 @@ from pathlib import Path
 from typing import NamedTuple, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 from scripts.production import staff, staff_sources
 
-import showrunners
+from scripts.production import showrunners
 import showrunner_tree
 import showrunner_parent
 import tidy_wrapped
@@ -30,6 +31,7 @@ from scripts.production import production_doc
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 from atomic_file import write_text_atomic
+from process_failure import failure_detail
 import berth_board
 
 PHASE_TABLE = Path(__file__).resolve().parent.parent / "direct" / "phase_table.py"
@@ -89,8 +91,7 @@ def checked(checkout: Path, step: str, *args: str) -> str:
 def command(step: str, cwd: Path, *args: str) -> str:
     result = subprocess.run(args, cwd=cwd, capture_output=True, text=True, check=False)
     if result.returncode:
-        raise LifecycleStop(step, "failed", result.stderr.strip() or result.stdout.strip()
-                            or f"{' '.join(args)} exited {result.returncode}")
+        raise LifecycleStop(step, "failed", f"{' '.join(args)}: {failure_detail(result)}")
     return result.stdout.strip()
 
 

@@ -16,11 +16,13 @@ from pathlib import Path
 from typing import cast, final, override
 from unittest import mock
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import add_showrunner
 import promote_showrunner
-import showrunners
+from scripts.production import showrunners
 import showrunner_tree
 import unit_effort
 import unit_lookup
@@ -300,9 +302,12 @@ class PromoteShowrunnerTests(unittest.TestCase):
 
         def start_child(_child: Production, _model: str, _effort: str, resume: str | None,
                         cwd: Path, _selected: accounts.ClaudeLaunchAccount,
-                        *, identity: add_showrunner.ShowrunnerLaunch) -> herdr.PromptSubmitted:
+                        *, identity: add_showrunner.ShowrunnerLaunch, staff_id: str) -> herdr.PromptSubmitted:
             self.assertEqual((resume, cwd), (SESSION, self.worktree))
             self.assertEqual(identity.session_id, SESSION)
+            row = staff.by_id(staff.StaffId(staff_id))
+            assert row is not None
+            self.assertEqual((row.kind, row.name), ("showrunner", "child"))
             self.marked.clear()
             return submitted
 

@@ -12,14 +12,207 @@ from contextlib import closing
 from typing import cast, final
 from unittest import mock
 import style_ledger
+import rules
 from approved_renames import AppliedInCode, Folder, NoAppliedCheck, RenameNotApplied
 import declarations
 
-from ledger_test_support import (LedgerTestCase, PARENT_FILE, MOVED_FILE, TWIN_FILE, PARENT)
+from ledger_test_support import (remove_generation_schema, LedgerTestCase, PARENT_FILE, MOVED_FILE, TWIN_FILE, PARENT)
 
 
 @final
 class StyleLedgerFindingsTests(LedgerTestCase):
+    def test_restored_body_cannot_fall_back_to_an_older_clean_judgment(self) -> None:
+        rule = self.rule("restored-clean")
+        path = self.sources[0]
+        rule_file = self.rule_dir / "restored-clean.md"
+        original = rule_file.read_text()
+        with self.ledger() as ledger:
+            ledger.set_tip(self.initial_tip, "main")
+            blob = self.blob(rule)
+            ledger.record(rule, path, self.initial_tip, blob, "clean", ticket="outside", worker="clean")
+            finding = ledger.hold(rule, path, 1, "violation", "rename", "old", "new", blob, "outside")
+            ledger.record(rule, path, self.initial_tip, blob, "held", ticket="outside", worker="held")
+            _ = rule_file.write_text(original + "New body.\n")
+            _ = ledger.withdraw_superseded({item.rule_id: item for item in rules.load_rules(self.repo)})
+            _ = rule_file.write_text(original)
+            _ = ledger.withdraw_superseded({item.rule_id: item for item in rules.load_rules(self.repo)})
+            self.assertNotEqual(next(ledger.cells(rule)).state, "current")
+            self.assertIsInstance(ledger.named_held((finding.finding_id,))[0].state, style_ledger.Withdrawn)
+        with self.ledger() as ledger:
+            self.assertNotEqual(next(ledger.cells(rule)).state, "current")
+            # An upsert of the original clean row is fresh evidence in this generation.
+            before = len(self.judgment_rows(ledger.database))
+            ledger.record(rule, path, self.initial_tip, blob, "clean", ticket="outside", worker="clean")
+            self.assertEqual(len(self.judgment_rows(ledger.database)), before)
+            self.assertEqual(next(ledger.cells(rule)).state, "current")
+            self.assertIsInstance(ledger.named_held((finding.finding_id,))[0].state, style_ledger.Withdrawn)
+
+    def test_current_body_judgment_written_before_reconciliation_keeps_its_coverage(self) -> None:
+        rule = self.rule("fresh-before-reconcile")
+        path = self.sources[0]
+        rule_file = self.rule_dir / "fresh-before-reconcile.md"
+        original = rule_file.read_text()
+        with self.ledger() as ledger:
+            ledger.set_tip(self.initial_tip, "main")
+            ledger.record(rule, path, self.initial_tip, self.blob(rule), "clean", ticket="outside")
+            _ = rule_file.write_text(original + "Body B.\n")
+            ledger.record(rule, path, self.initial_tip, self.blob(rule), "clean", ticket="outside")
+            _ = ledger.withdraw_superseded({item.rule_id: item for item in rules.load_rules(self.repo)})
+            self.assertEqual(next(ledger.cells(rule)).state, "current")
+            _ = rule_file.write_text(original)
+            _ = ledger.withdraw_superseded({item.rule_id: item for item in rules.load_rules(self.repo)})
+            self.assertNotEqual(next(ledger.cells(rule)).state, "current")
+
+    def test_clean_only_rule_history_observes_restoration_without_findings(self) -> None:
+        rule = self.rule("clean-only")
+        path = self.sources[0]
+        rule_file = self.rule_dir / "clean-only.md"
+        original = rule_file.read_text()
+        with self.ledger() as ledger:
+            ledger.set_tip(self.initial_tip, "main")
+            ledger.record(rule, path, self.initial_tip, self.blob(rule), "clean", ticket="outside")
+            _ = rule_file.write_text(original + "Body B.\n")
+            definitions = {item.rule_id: item for item in rules.load_rules(self.repo)}
+            self.assertEqual(ledger.withdraw_superseded(definitions).withdrawn, ())
+            ledger.record(rule, path, self.initial_tip, self.blob(rule), "clean", ticket="outside")
+            self.assertEqual(next(ledger.cells(rule)).state, "current")
+            _ = rule_file.write_text(original)
+            _ = ledger.withdraw_superseded({item.rule_id: item for item in rules.load_rules(self.repo)})
+            self.assertNotEqual(next(ledger.cells(rule)).state, "current")
+        with self.ledger() as ledger:
+            self.assertNotEqual(next(ledger.cells(rule)).state, "current")
+            ledger.record(rule, path, self.initial_tip, self.blob(rule), "clean", ticket="outside")
+            self.assertEqual(next(ledger.cells(rule)).state, "current")
+
+    def test_rule_generations_ignore_administrative_edits_and_unchanged_reconciliation(self) -> None:
+        rule = self.rule("admin-generation")
+        # Historical administrative comparisons require validated blobs in the rule repository.
+        _ = self.git("init", "-q", str(self.rule_dir.parent))
+        _ = self.git("-C", str(self.rule_dir.parent), "hash-object", "-w", str(self.rule_dir / "admin-generation.md"))
+        with self.ledger() as ledger:
+            ledger.set_tip(self.initial_tip, "main")
+            ledger.record(rule, self.sources[0], self.initial_tip, self.blob(rule), "clean", ticket="outside")
+            definitions = {item.rule_id: item for item in rules.load_rules(self.repo)}
+            _ = ledger.withdraw_superseded(definitions)
+            before = self.judgment_rows(ledger.database)
+            rule_file = self.rule_dir / "admin-generation.md"
+            _ = rule_file.write_text(rule_file.read_text().replace("---\n", "---\napproval: always\n", 1))
+            definitions = {item.rule_id: item for item in rules.load_rules(self.repo)}
+            _ = ledger.withdraw_superseded(definitions)
+            _ = ledger.withdraw_superseded(definitions)
+            self.assertEqual(next(ledger.cells(rule)).state, "current")
+            self.assertEqual(self.judgment_rows(ledger.database), before)
+            with closing(sqlite3.connect(ledger.database)) as connection:
+                self.assertEqual(connection.execute("SELECT generation FROM rule_generations WHERE rule=?", (rule,)).fetchone(), (0,))
+
+    def test_restored_rule_body_requires_a_fresh_hold_and_judgment(self) -> None:
+        rule = self.rule("restored")
+        path = self.sources[0]
+        rule_file = self.rule_dir / "restored.md"
+        original = rule_file.read_text()
+        with self.ledger() as ledger:
+            ledger.set_tip(self.initial_tip, "main")
+            blob = self.blob(rule)
+            old = ledger.hold(rule, path, 1, "same violation", "rename", "old", "new", blob, "outside")
+            ledger.record(rule, path, self.initial_tip, blob, "held", ticket="outside")
+            resolved = ledger.hold(rule, path, 2, "resolved", "rename", "old", "new", blob, "outside")
+            ledger.file_held(resolved.finding_id, self.root / "resolved.md")
+            ledger.waive_held(resolved.finding_id, style_ledger.WaiveByPerson("user"))
+            _ = rule_file.write_text(original + "Changed body.\n")
+            _ = ledger.withdraw_superseded({item.rule_id: item for item in rules.load_rules(self.repo)})
+        _ = rule_file.write_text(original)
+        with self.ledger() as ledger:
+            self.assertNotEqual(next(cell for cell in ledger.cells(rule) if cell.path == path).state, "current")
+            fresh = ledger.hold(rule, path, 1, "same violation", "rename", "old", "new", blob, "outside")
+            self.assertIsInstance(fresh.state, style_ledger.Unfiled)
+            self.assertNotEqual(fresh.finding_id, old.finding_id)
+            self.assertEqual(ledger.hold(rule, path, 1, "same violation", "rename", "old", "new", blob, "outside"), fresh)
+            ledger.record(rule, path, self.initial_tip, blob, "held", ticket="outside")
+            self.assertEqual(next(cell for cell in ledger.cells(rule) if cell.path == path).state, "current")
+            self.assertIsInstance(ledger.named_held((old.finding_id,))[0].state, style_ledger.Withdrawn)
+            self.assertIsInstance(ledger.named_held((resolved.finding_id,))[0].state, style_ledger.Waived)
+
+    def test_unchanged_rule_reconciliation_reads_distinct_pins_without_hydrating_findings(self) -> None:
+        rule = self.rule("unchanged")
+        with self.ledger() as ledger:
+            blob = self.blob(rule)
+            for line in range(1, 41):
+                finding = ledger.hold(rule, self.sources[0], line, "violation", "rename", "old", "new", blob, "outside")
+                ledger.file_held(finding.finding_id, self.root / "decision.md")
+            statements: list[str] = []
+            connection = ledger._connection  # pyright: ignore[reportPrivateUsage]
+            definitions = {item.rule_id: item for item in rules.load_rules(self.repo)}
+            connection.set_trace_callback(statements.append)
+            try:
+                self.assertEqual(ledger.withdraw_superseded(definitions).withdrawn, ())
+            finally:
+                connection.set_trace_callback(None)
+            finding_reads = [sql for sql in statements if "held_findings" in sql.lower()]
+            self.assertEqual(len(finding_reads), 1, finding_reads)
+            self.assertIn("group by", finding_reads[0].lower())
+            self.assertLessEqual(len(statements), 4, statements)
+
+    def test_rule_body_change_withdraws_every_open_finding_atomically(self) -> None:
+        changed = self.rule("changed")
+        other = self.rule("other")
+        with self.ledger() as ledger:
+            ledger.set_tip(self.initial_tip, "main")
+            ledger.ticket_add("reader-1", "reader", "read", "names", "crates/alpha", list(self.sources[:2]), [changed])
+            ledger.ticket_assign("reader-1", "main")
+            open_rows = [ledger.hold(changed, path, 1, "change", "rename", "old", "new", self.blob(changed), "reader-1")
+                         for path in self.sources[:2]]
+            ledger.file_held(open_rows[0].finding_id, self.root / "decision.md")
+            untouched = ledger.hold(other, self.sources[0], 2, "other", "rename", "old", "new", self.blob(other), "outside")
+            resolved = ledger.hold(changed, self.sources[0], 3, "resolved", "rename", "old", "new", self.blob(changed), "outside")
+            ledger.file_held(resolved.finding_id, self.root / "resolved.md")
+            ledger.waive_held(resolved.finding_id, style_ledger.WaiveByPerson("user"))
+            rule_file = self.rule_dir / "changed.md"
+            _ = rule_file.write_text(rule_file.read_text() + "A new requirement.\n")
+            definitions = {rule.rule_id: rule for rule in rules.load_rules(self.repo)}
+            expected = {row.finding_id for row in open_rows}
+            preview = ledger.superseded_findings(definitions)
+            self.assertEqual({row.finding.finding_id for row in preview.withdrawn}, expected)
+            self.assertIsInstance(ledger.named_held((open_rows[0].finding_id,))[0].state, style_ledger.Filed)
+            result = ledger.withdraw_superseded(definitions)
+            self.assertEqual(result, preview)
+            reason = style_ledger.RuleBodyChanged(definitions[changed].blob)
+            for row in ledger.named_held(tuple(expected)):
+                self.assertIsInstance(row.state, style_ledger.Withdrawn)
+                if isinstance(row.state, style_ledger.Withdrawn):
+                    self.assertEqual(row.state.by, reason)
+            self.assertEqual(ledger.named_held((untouched.finding_id,))[0], untouched)
+            self.assertIsInstance(ledger.named_held((resolved.finding_id,))[0].state, style_ledger.Waived)
+            self.assertEqual(ledger.ticket_open("reader"), ())
+            self.assertEqual(ledger.withdraw_superseded(definitions).withdrawn, ())
+        with self.ledger() as reopened:
+            self.assertEqual(reopened.named_held((open_rows[0].finding_id,))[0].state,
+                             style_ledger.Withdrawn(self.root / "decision.md", reason))
+
+    def test_rule_body_withdrawal_needs_no_synced_source_and_rolls_back_cancellation_on_failure(self) -> None:
+        rule = self.rule("changed")
+        with self.ledger() as ledger:
+            ledger.ticket_add("reader-1", "reader", "read", "names", "crates/alpha", [self.sources[0]], [rule])
+            ledger.ticket_assign("reader-1", "main")
+            finding = ledger.hold(rule, self.sources[0], 1, "change", "rename", "old", "new", self.blob(rule), "reader-1")
+            rule_file = self.rule_dir / "changed.md"
+            _ = rule_file.write_text(rule_file.read_text() + "New body.\n")
+            definitions = {item.rule_id: item for item in rules.load_rules(self.repo)}
+            with closing(sqlite3.connect(ledger.database)) as connection:
+                _ = connection.execute("CREATE TRIGGER stop_withdrawal BEFORE UPDATE OF state ON held_findings "
+                                       + "WHEN NEW.state='withdrawn' BEGIN SELECT RAISE(ABORT,'stop withdrawal'); END")
+                connection.commit()
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "stop withdrawal"):
+                _ = ledger.withdraw_superseded(definitions)
+            self.assertEqual(ledger.ticket_open("reader")[0]["id"], "reader-1")
+            self.assertEqual(ledger.named_held((finding.finding_id,))[0], finding)
+            with closing(sqlite3.connect(ledger.database)) as connection:
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM rule_body_withdrawals").fetchone(), (0,))
+                _ = connection.execute("DROP TRIGGER stop_withdrawal")
+                connection.commit()
+            with mock.patch.object(ledger, "_synced_tip", side_effect=AssertionError("source proof requested")):
+                self.assertEqual(len(ledger.withdraw_superseded(definitions).withdrawn), 1)
+            self.assertEqual(ledger.ticket_open("reader"), ())
+
     def test_held_add_refuses_the_whole_before_block_with_added_lines_without_writing(self) -> None:
         rule = self.rule("comments-name-code-constructs")
         before = "/// Enters at the bottom edge.\n/// Keeps the last position so animation can resume.\n"
@@ -754,6 +947,7 @@ class StyleLedgerFindingsTests(LedgerTestCase):
             _ = connection.execute("ALTER TABLE processed_tips DROP COLUMN reason")
             _ = connection.execute("DROP TABLE refill_results")
             _ = connection.execute("ALTER TABLE held_findings DROP COLUMN built_at")
+            remove_generation_schema(connection)
             _ = connection.execute("UPDATE schema_version SET version=18")
         migrated = self.ledger()
         finding, = migrated.named_held((finding_id,))

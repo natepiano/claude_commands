@@ -52,10 +52,11 @@ class RefillSpeedTests(LedgerTestCase):
 
     def sites(self) -> tuple[style_ledger.Ledger, tuple[style_ledger.HeldFinding, ...]]:
         source = "fn work() {\n    let old = 791;\n    let second = 792;\n    let third = 793;\n}\n"
-        ledger, rule, first = self.site_fixture(source=source)
+        ledger, rule, first = self.site_fixture(source=source, keep_ticket_open=True)
         others = tuple(ledger.hold(rule, PARENT_FILE, line, source.splitlines()[line - 1], "rename", name,
                                    "fresh", first.rule_blob, first.ticket)
                        for line, name in ((3, "second"), (4, "third")))
+        ledger.ticket_drop(first.ticket)
         return ledger, (first, *others)
 
     def test_single_site_reads_load_built_findings_once(self) -> None:

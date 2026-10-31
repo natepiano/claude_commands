@@ -103,7 +103,7 @@ class ProcessStartTests(unittest.TestCase):
     def test_ps_start_dates_use_a_fixed_locale_zone_and_timeout(self) -> None:
         self.use_ps()
         result = subprocess.CompletedProcess(["ps"], 0, "Thu Oct  29   12:34:56 2026\n", "")
-        with patch("scripts.lib.process_start.subprocess.run", side_effect=[
+        with patch("time.monotonic", return_value=100.0), patch("scripts.lib.process_start.subprocess.run", side_effect=[
             result, subprocess.CompletedProcess(["ps"], 0, "S", ""),
         ]) as run:
             self.assertEqual(process_start.process_start(41),
@@ -113,6 +113,24 @@ class ProcessStartTests(unittest.TestCase):
                  timeout=5, env={**os.environ, "LC_ALL": "C", "TZ": "UTC"}),
             call(["ps", "-o", "stat=", "-p", "41"], capture_output=True, text=True, check=False,
                  timeout=5, env={**os.environ, "LC_ALL": "C", "TZ": "UTC"}),
+        ])
+
+    def test_ps_identity_probes_share_the_callers_remaining_budget(self) -> None:
+        self.use_ps()
+        with (
+            patch("time.monotonic", side_effect=[100.0, 100.25]),
+            patch("scripts.lib.process_start.subprocess.run", side_effect=[
+                subprocess.CompletedProcess(["ps"], 0, "Thu Oct 29 12:34:56 2026", ""),
+                subprocess.CompletedProcess(["ps"], 0, "S", ""),
+            ]) as run,
+        ):
+            self.assertEqual(process_start.process_start(41, timeout=0.75),
+                             process_start.ProcessStartDate("Thu Oct 29 12:34:56 2026"))
+        self.assertEqual(run.call_args_list, [
+            call(["ps", "-o", "lstart=", "-p", "41"], capture_output=True, text=True, check=False,
+                 timeout=0.75, env={**os.environ, "LC_ALL": "C", "TZ": "UTC"}),
+            call(["ps", "-o", "stat=", "-p", "41"], capture_output=True, text=True, check=False,
+                 timeout=0.5, env={**os.environ, "LC_ALL": "C", "TZ": "UTC"}),
         ])
 
     def test_ps_zombies_and_dead_processes_cannot_own_a_start_identity(self) -> None:
@@ -360,6 +378,7 @@ class ProcessStartTests(unittest.TestCase):
 
     def test_a_different_date_keeps_the_owner_without_a_legacy_zone_retry(self) -> None:
         self.use_ps()
+        _ = self.enterContext(patch("time.monotonic", return_value=100.0))
         for live in ("Thu Oct 29 12:00:00 2026", "Thu Oct 29 16:00:00 2026"):
             with self.subTest(live=live), patch("scripts.lib.process_start.subprocess.run", side_effect=[
                 subprocess.CompletedProcess(["ps"], 0, live, ""),

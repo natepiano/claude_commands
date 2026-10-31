@@ -28,15 +28,16 @@ from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import NamedTuple, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from production_units import Production, read_production  # noqa: E402
 import merge_checkpoint  # noqa: E402
 import production_units  # noqa: E402
 import rename_state  # noqa: E402
 import rename_unit  # noqa: E402
 import retire_unit  # noqa: E402
-import showrunners  # noqa: E402
+from scripts.production import showrunners  # noqa: E402
 import stall_watch  # noqa: E402
 import tidy_wrapped  # noqa: E402
 import unit_lookup  # noqa: E402

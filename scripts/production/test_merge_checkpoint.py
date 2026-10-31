@@ -10,9 +10,11 @@ from unittest import mock
 from pathlib import Path
 from typing import cast, final
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import merge_checkpoint
-import showrunners
+from scripts.production import showrunners
 from scripts.production import production_doc
 from merge_checkpoint import check_parallel
 

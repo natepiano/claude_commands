@@ -31,9 +31,10 @@ from typing import TYPE_CHECKING, cast
 from uuid import uuid4
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 from scripts.production import completion_receipt, staff, staff_sources
 
-import showrunners
+from scripts.production import showrunners
 import showrunner_tree
 from production_units import Production, read_production
 from production_units import Refusal
@@ -181,7 +182,7 @@ def account_for_launch(child: Production, resume: str | None, target: str = "", 
 
 
 def launch(child: Production, model: str, effort: str, resume: str | None, cwd: Path, selected: ClaudeLaunchAccount,
-           *, identity: ShowrunnerLaunch | NewShowrunnerLaunch = NEW_SHOWRUNNER_LAUNCH) -> herdr.PromptSubmitOutcome:
+           *, identity: ShowrunnerLaunch | NewShowrunnerLaunch = NEW_SHOWRUNNER_LAUNCH, staff_id: str = "") -> herdr.PromptSubmitOutcome:
     """Start once and prove the opening prompt reached this showrunner's transcript."""
     from scripts.message import sessions
     from scripts.whoami.account import named_account_environment
@@ -194,7 +195,8 @@ def launch(child: Production, model: str, effort: str, resume: str | None, cwd: 
     arguments = ["--model", model, "--effort", effort]
     arguments.extend(["--resume" if resuming else "--session-id", session_id])
     arguments.extend(["--remote-control", child.slug, "-n", child.slug, "--settings", '{"disableAgentView": true}'])
-    environment = {"ENABLE_TOOL_SEARCH": "true"}
+    row_id = staff_id or ensure_staff_showrunner(child, "").id
+    environment = {"ENABLE_TOOL_SEARCH": "true", "STAFF_ID": row_id}
     environment.update(named_account_environment(selected.dir))
     host = herdr.shared_session()
     _ = herdr.start_server(host, 90_000)
@@ -311,7 +313,7 @@ def _main(argv: list[str]) -> int:
                     place.pane, herdr.OpeningPrompt(prompt, transcript), identity.started_at, 90_000)
         else:
             outcome = launch(child, cast(str, args.model), cast(str, args.effort), resume, where, selected,
-                             identity=identity)
+                             identity=identity, staff_id=row.id)
     except herdr.AgentNotReady as error:
         print(f"add_showrunner: the session is not ready:\n{error.screen}", file=sys.stderr)
         return SESSION_NOT_READY

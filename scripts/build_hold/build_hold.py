@@ -33,6 +33,7 @@ else:
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "message"))
 from sessions import addressed, live_sessions  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+from process_failure import failure_detail
 from user_zone import user_zone
 import unit_runs
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -1417,7 +1418,7 @@ def send_release(entry: ReleaseEntry, socket: str) -> ReleaseDelivered | Release
         return ReleaseDelivered()
     if result.returncode == 1:
         return ReleaseQueued()
-    return ReleaseSendFailed(result.stderr.strip() or result.stdout.strip() or f"send.py exited {result.returncode}")
+    return ReleaseSendFailed(f"send.py: {failure_detail(result)}")
 
 
 def send_release_broadcast() -> None:
@@ -1425,7 +1426,7 @@ def send_release_broadcast() -> None:
     result = subprocess.run([sys.executable, str(script), "--from", "build-hold", "--all", RELEASE_NOTICE],
                             capture_output=True, text=True)
     if result.returncode:
-        raise OSError(result.stderr.strip() or result.stdout.strip() or "release broadcast failed")
+        raise OSError(f"release broadcast: {failure_detail(result)}")
 
 
 def entry_text(entry: ReleaseEntry) -> str:

@@ -68,7 +68,7 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
     def test_user_delivery_names_success_process_failure_and_launch_failure(self) -> None:
         push = render("quota.claude_next_move", account="claude2", remaining="0%")
         for code, line, expected in ((0, "SENT: to the user", quota_alert.PushSent()),
-                                     (3, "FAILED: channel unavailable", quota_alert.PushFailed("FAILED: channel unavailable"))):
+                                     (3, "FAILED: channel unavailable", quota_alert.PushFailed("stdout: FAILED: channel unavailable"))):
             with self.subTest(code=code), mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], code, line, "")):
                 self.assertEqual(REAL_TELL_USER(push), expected)
         with mock.patch.object(subprocess, "run", side_effect=OSError("sender unavailable")):

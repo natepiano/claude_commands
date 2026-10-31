@@ -13,6 +13,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import process_start as process_identity
 from typing import IO, NamedTuple, cast, override
 from unittest import mock
@@ -25,7 +26,7 @@ import push_texts  # noqa: E402
 import rca  # noqa: E402
 import review  # noqa: E402
 import send  # noqa: E402
-import showrunners  # noqa: E402
+from scripts.production import showrunners  # noqa: E402
 import silence  # noqa: E402
 from user_action import NoActionRequired  # noqa: E402
 

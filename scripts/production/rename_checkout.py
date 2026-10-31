@@ -26,10 +26,12 @@ import sys
 from pathlib import Path
 from typing import cast
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from production_units import Production, read_production  # noqa: E402
 import production_units  # noqa: E402
-import showrunners  # noqa: E402
+from scripts.production import showrunners  # noqa: E402
 import unit_move  # noqa: E402
 from rename_state import RenameRefused, write_text  # noqa: E402
 

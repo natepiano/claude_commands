@@ -126,10 +126,10 @@ Routes (`resolve_recipient(to: str, scope: RecipientResolutionScope, observed: r
 | `session:<id>` | Claude delivery; resolved to the live session's `uds:` socket first; postmaster first when available, else relay; no live session → `QUEUED` |
 | `worker:<run>/<worker>` | that row's `codex_mesh.py send --session-dir <run dir> --to <worker>` |
 | `codex:<thread>` | the loaded roster row carries its account daemon; `codex_daemon.queue(daemon, thread_id, text, timeout)` calls `thread/queue/add` on that socket. An unloaded thread fails (exit 3), naming the homes checked; multiple owners are ambiguous (exit 2), listing their accounts |
-| bare name | roster rows with that `name`; one `Messageable` sends by its address |
+| bare name | roster rows whose names are equal after `str.casefold()`; one `Messageable` sends by its address |
 | `--codex --session-dir DIR` | `MeshWorker`: `codex_mesh.py send` directly, no roster read |
 
-Resolution for `session:`, `worker:`, `codex:` and bare names reads this machine's roster once (problems print as `send.py: roster: <problem>`). Address forms match `Messageable` addresses; names match any row. `send.py` imports `roster` only on that path, so acknowledgements (`ack`, `reopen`, `pending`, `retire`), `uds:` sockets and `--machine` sends start without it.
+Resolution for `session:`, `worker:`, `codex:` and bare names reads this machine's roster once (problems print as `send.py: roster: <problem>`). Address forms match `Messageable` addresses exactly; names match any row without regard to letter case, with no preference for an exact-case match. `send.py` imports `roster` only on that path, so acknowledgements (`ack`, `reopen`, `pending`, `retire`), `uds:` sockets and `--machine` sends start without it.
 
 - A match here sends here; the other machine is not asked.
 - Several matching rows: exit 2, `<name> matches <N> sessions:` with each address (or its `cannot take messages` reason) and role; Codex daemon rows also name their account and home.

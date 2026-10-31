@@ -28,7 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from test_support import ShutdownTestCase, linux_process_fixture, empty_session_registry
 from test_stop import NOW_UTC, entry, machine_inventory, top_level, unit, showrunner, worker_session
 from scripts.lib import process_start as process_identity
-from scripts.lib.process_start_test_support import stored_start_probe
+from scripts.lib.process_start_test_support import stored_start_probe, write_stat
 from scripts.whoami.account import Account
 import inventory
 import herdr
@@ -189,9 +189,9 @@ class BoundedShutdownTests(ShutdownTestCase):
         proc.mkdir(exist_ok=True)
         for pid, process in self.processes.items():
             directory = proc / str(pid)
-            directory.mkdir(exist_ok=True)
-            fields = ["S", str(process.parent), "0", str(process.process_session), *(["0"] * 15), process.started]
-            _ = (directory / "stat").write_text(f"{pid} (process) " + " ".join(fields))
+            _ = write_stat(proc, pid, command="process", start_ticks=int(process.started),
+                           ppid=process.parent, pgrp=0, session=process.process_session,
+                           tpgid=0)
             _ = (directory / "cmdline").write_bytes(b"\0".join(
                 word.encode() for word in process.arguments or ("bash", "script.sh")) + b"\0")
             _ = (directory / "cgroup").write_text("0::" + groups[pid] + "\n")
@@ -508,7 +508,9 @@ class BoundedShutdownTests(ShutdownTestCase):
                     self.assertIn("301", str(result[0]["progress"]))
 
     def test_readable_shared_service_occupant_is_unknown_without_signal_authority(self) -> None:
-        saved = self.save(top_level("owner", 101))
+        director = top_level("owner", 101)
+        director["proc_start"] = "100"
+        saved = self.save(director)
         self.process(301, 900, started="110")
         shown = self.linux_table({101: "/user/app.slice/app-agents.slice/run-owner.scope",
             301: "/user/app.slice/herdr-agents.service"}, set())

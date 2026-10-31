@@ -6,9 +6,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from scripts.production import staff, staff_sources
-import showrunners
+from scripts.production import showrunners
 
 
 def parent_edges(*, record: staff.StaffSnapshot | None = None) -> dict[str, str]:

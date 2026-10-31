@@ -181,10 +181,11 @@ def cancel_outgoing_notices(key: str, names: list[str]) -> None:
 
 
 def watch(reports: list[Report], *,
+          now: datetime | None = None,
           codex_readings: CodexAlertPassReadings | ReadCurrentCodexReadings = READ_CURRENT_CODEX_READINGS) -> list[str]:
     """One line per Codex warning, Claude session told and alert closed."""
     lines: list[str] = []
-    now = datetime.now(timezone.utc)
+    now = now or datetime.now(timezone.utc)
     readings = (codex_alert_pass(observe_workers_home(), reports, now)
                 if isinstance(codex_readings, ReadCurrentCodexReadings) else codex_readings)
     selected = readings.selected_account

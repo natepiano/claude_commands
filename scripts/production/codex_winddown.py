@@ -25,9 +25,12 @@ from pathlib import Path
 from typing import Final, Literal, cast
 from zoneinfo import ZoneInfo
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 import broadcast
 import process_table
-import showrunners
+from scripts.production import showrunners
+from scripts.lib.process_failure import failure_detail
 from live_units import live_unit_names
 from sessions import SessionRecord, live_sessions
 
@@ -398,7 +401,7 @@ def announce_quiet(running: int | QuietCountObservation) -> None:
                                   timeout=review.user_send_seconds() + 15)
             _finish_quiet_notice(observation, sent=not done.returncode)
             if done.returncode:
-                print(f"codex wind-down: reset alert failed: {done.stdout.strip() or done.stderr.strip()}", file=sys.stderr)
+                print(f"codex wind-down: reset alert failed: {failure_detail(done)}", file=sys.stderr)
         except (OSError, subprocess.TimeoutExpired) as error:
             _finish_quiet_notice(observation, sent=False)
             print(f"codex wind-down: reset alert failed: {error}", file=sys.stderr)

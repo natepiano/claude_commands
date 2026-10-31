@@ -3,6 +3,7 @@
 import json
 import os
 import re
+import shlex
 import shutil
 from collections.abc import Iterable
 from contextlib import contextmanager
@@ -36,17 +37,6 @@ HOOK_CONFIG = Path.home() / ".claude" / "config" / "banned_words.conf"
 # do NOT silently disable the line. This is the only escape hatch; tightening
 # it is intentional.
 ALLOW_MARKER_RE = re.compile(r"(?:#|//|<!--)\s*allow-banned:", re.IGNORECASE)
-INTROSPECTION_TOKENS = (
-    "banned_words_lib",
-    "forbidden-words.md",
-    "forbidden-word-counts.json",
-    "analyze_changes.sh",
-    "load-rust-style.sh",
-    "git diff",
-    "git status",
-    "git log",
-    "git show",
-)
 
 
 def hooks_enabled() -> bool:
@@ -72,54 +62,34 @@ def hooks_enabled() -> bool:
     return True
 
 
-def is_introspection_command(command: str) -> bool:
-    """True if a Bash command's output is unsafe to scan for banned words.
-
-    Two cases:
-    1. Commands that print the banned-words machinery itself (importing the
-       lib, catting the style guide) — output naturally contains every stem.
-    2. Commands that print diff/status/log content — the output mirrors the
-       repo's own files, which were already gated when authored. Re-scanning
-       the diff would flag the same content twice and double-bump counters.
-    """
-    return any(tok in command for tok in INTROSPECTION_TOKENS)
-
-
-# Read-only shell programs: the command string is a search pattern or path and
-# the output mirrors existing files — neither is content the agent authored this
-# turn. Matched as whole words so `cat` does not fire inside `duplicate`/`truncate`.
+# Simple inspection programs take paths rather than authored text. Search
+# programs use tool_call_text's pattern masking instead. Programs with execution
+# options (such as find) are scanned rather than exempted as a whole.
 READ_ONLY_PROGRAMS = (
-    "grep", "rg", "ag", "cat", "bat", "head", "tail", "less", "more",
-    "ls", "find", "fd", "wc", "tree", "diff", "stat", "file",
+    "cat", "head", "tail", "ls", "wc",
 )
-_READ_ONLY_PROG_RE = re.compile(r"\b(" + "|".join(READ_ONLY_PROGRAMS) + r")\b")
-# A redirection to a real file (not /dev/null, not an fd dup like `2>&1` /
-# `2>/dev/null`) means the command writes — disqualifies the read-only fast path.
-_WRITE_REDIRECT_RE = re.compile(r"(?<![0-9&])>>?\s*(?!/dev/null\b)(?!&)\S")
-# Programs that mutate even without a `>` redirection.
-_WRITE_PROGRAM_RE = re.compile(r"\b(tee|dd)\b|\bsed\s+-i|\bgit\s+(commit|add|tag)\b")
 
 
 def is_read_only_command(command: str) -> bool:
-    """True when a Bash command only reads/searches and writes nothing.
+    """Exclude inspection paths from command-text matches, never written text.
 
-    Used to skip the banned-word scan for inspection commands run through Bash
-    (a `grep`/`rg`/`cat` over the repo). A command qualifies only if it invokes a
-    read-only program AND carries no file-writing redirection or mutating program,
-    so `echo ... > f`, `git commit -m`, and `sed -i` are still scanned.
+    Only a single inspection command qualifies. Shell composition, redirection,
+    expansion and substitution are scanned, so a reader beside a writer cannot
+    exempt that writer's text. Other tool-input fields are still scanned.
     """
-    if not command:
+    if not command or any(char in command for char in ";&|()<>\n$`"):
         return False
-    if _WRITE_REDIRECT_RE.search(command) or _WRITE_PROGRAM_RE.search(command):
+    try:
+        words = shlex.split(command)
+    except ValueError:
         return False
-    return bool(_READ_ONLY_PROG_RE.search(command))
+    return bool(words and Path(words[0]).name in READ_ONLY_PROGRAMS)
 
 
 # ── Exception manager: guide-reproduction detection ─────────────────────────
-# `is_introspection_command` only covers Bash command strings. It cannot see
-# the assistant's own prose (scanned by the Stop hook) or arbitrary content
-# written to non-Bash tools. Those paths legitimately reproduce the whole
-# banned-word list whenever a message is *about* the machinery — an analysis
+# The assistant's own prose (scanned by the Stop hook) and written tool text
+# can legitimately reproduce the whole banned-word list in a message about
+# the machinery — an analysis
 # report, a mechanism explanation, or an echo of the loaded style guide. When
 # that happens the naive scan bumps every counter at once (the "all 12 at the
 # same timestamp" pattern). Two signals mark such reproduction so the hooks
@@ -571,10 +541,8 @@ def _main() -> int:
     mode `path:lineno` is the real source location of the added line.
     Exit 1 if any violations found, 0 if clean. Errors go to stderr (exit 2).
 
-    Safe to call from inside Claude Code: the script path contains
-    `banned_words_lib`, so `is_introspection_command()` exempts the command
-    from the PostToolUse hook — output is not re-scanned and counters are
-    not bumped.
+    Safe to call from inside Claude Code: the PostToolUse hook scans written
+    command text, never this command's output.
     """
     import sys
 

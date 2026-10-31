@@ -299,20 +299,29 @@ class StylePlanTests(StylePlanFixture):
                 self.assertEqual(self.count_tickets(), 2)
 
 
-    def test_rebuild_after_rule_edit_restores_old_pinned_text_and_instructions(self) -> None:
+    def test_rebuild_after_rule_edit_replaces_stale_ticket_with_current_instructions(self) -> None:
         _ = self.rule("read")
         self.sync()
         self.assertEqual(self.run_next()[0], 0)
-        expected = self.plan.read_bytes()
-        pinned = self.ledger().pinned_rule_texts("names-unit-1")[0]
+        ledger = self.ledger()
+        pinned = ledger.pinned_rule_texts("names-unit-1")[0]
         path = self.plan.parent.parent / "rules" / (pinned.blob + ".md")
         path.unlink()
         _ = self.plan.write_text(self.plan_header())
         _ = (self.rule_dir / "read.md").write_text("---\ntier: C\nfamily: names\ninput_scope: file\n---\nChanged instructions.\n")
-        self.assertEqual(self.run_next(), (0, "resume names-unit-1\n", ""))
-        self.assertEqual(self.plan.read_bytes(), expected)
-        self.assertEqual(path.read_bytes(), pinned.text)
-        self.assertEqual(self.git("hash-object", str(path)), pinned.blob)
+        self.assertEqual(self.run_next(), (0, "phase written: names-unit-2\n", ""))
+        self.assertEqual([ticket["id"] for ticket in ledger.ticket_open("names-unit")], ["names-unit-2"])
+        with closing(sqlite3.connect(ledger.database)) as connection:
+            self.assertEqual(connection.execute("SELECT state FROM tickets WHERE id='names-unit-1'").fetchone(),
+                             ("dropped",))
+        current = ledger.pinned_rule_texts("names-unit-2")[0]
+        self.assertNotEqual(current.blob, pinned.blob)
+        self.assertIn(b"Changed instructions.", current.text)
+        path = path.with_name(current.blob + ".md")
+        self.assertEqual(path.read_bytes(), current.text)
+        self.assertEqual(self.git("hash-object", str(path)), current.blob)
+        self.assertIn("names-unit-2", self.plan.read_text())
+        self.assertNotIn("names-unit-1", self.plan.read_text())
 
     def test_busy_queued_ticket_is_dropped_and_replaced_with_fresh_available_work(self) -> None:
         rule = self.rule("read")

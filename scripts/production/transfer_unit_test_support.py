@@ -26,7 +26,7 @@ from scripts.direct import review_pool
 from scripts.production import staff, showrunners as pool_showrunners
 from scripts.production.cli_fixture import invoke_cli
 from scripts.production.rename_test_support import bind_staff_fixture
-from scripts.production.staff_test_support import StaffTestCase
+from scripts.production.staff_test_support import StaffTestCase, unit_membership
 from scripts.lib.atomic_file import write_text_atomic
 import transfer_unit
 import retire_unit
@@ -78,6 +78,10 @@ class UnitTransferFixture(StaffTestCase):
         self.addCleanup(shutil.rmtree, self.fixture_root)
         self.bind_fixture(self.fixture_root)
         bind_staff_fixture(self, self.env, {"demo": ("alpha-unit", "beta-unit"), "other": ("gamma-unit",)})
+        row = unit_membership("demo", "alpha-unit")
+        self.pane("w1:p1", session_id="sid-alpha", environment={
+            "SHOWRUNNER_UNIT": "demo", "SHOWRUNNER_UNIT_ID": "alpha-unit", "STAFF_ID": row.id,
+        })
         self.write(self.root / "state/notifier/showrunner-other/conf",
                    "TARGET=session:other-showrunner\nCHECK=" + shlex.join(["zsh", "/scripts/production_check.sh",
                    str(self.receiving / "docs/plans/other-production.md")]) + "\n")

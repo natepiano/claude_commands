@@ -74,6 +74,8 @@ from enum import Enum
 from pathlib import Path
 from typing import TypeVar, cast
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 from atomic_file import write_text_atomic  # noqa: E402
 import scratch  # noqa: E402
@@ -106,8 +108,7 @@ _LINE = re.compile(rf"^{TRAILER}:\s*(?P<value>.*)$", re.MULTILINE)
 _COVERS = re.compile(rf"^{TRAILER}-Covers:\s*(?P<sha>[0-9a-f]{{7,40}})\s*$", re.MULTILINE)
 _NUMBER = re.compile(r"^\| C(\d+) \|", re.MULTILINE)
 _ROW = re.compile(r"^[A-Z]\d+$")
-_LANDS = re.compile(r"\b(works|fine)\b", re.IGNORECASE)
-_FAILS = re.compile(r"\b(not|no|never|still|fails?|failed|broken|wrong|doesn't|don't|isn't)\b", re.IGNORECASE)
+_LANDS = re.compile(r"^\s*(?:(?:okay|ok)\s+)?(?:c\d+\s+)?(?:works|fine)\b", re.IGNORECASE)
 # A cell boundary is a `|` that _cell did not escape.
 _BOUNDARY = re.compile(r"(?<!\\)\|")
 _CHECKPOINT = re.compile(r"^checkpoint\((?P<branch>[^)]+)\):")
@@ -215,7 +216,7 @@ def _git(repo: Path, *arguments: str) -> str:
 
 def registered_productions() -> Iterable[Path]:
     """Production docs named by the registered update timers."""
-    import showrunners
+    from scripts.production import showrunners
 
     return showrunners.timer_docs().values()
 
@@ -625,7 +626,7 @@ def pending(path: Path) -> list[dict[str, str]]:
 
 def scope_list(doc: Path) -> Path:
     """The list that takes the production's rows: the one its Change review line names, else its root's."""
-    import showrunners
+    from scripts.production import showrunners
     import showrunner_tree
 
     slug = slug_of(doc)
@@ -959,9 +960,9 @@ def describe(row: dict[str, str]) -> str:
 
 
 def lands(verdict: str) -> bool:
-    """A verdict that says `works` or `fine` and no word of failure (`not`, `still`, `broken` ...) lands
-    the row ("okay c17 works"); any other returns it to its unit."""
-    return _LANDS.search(verdict) is not None and _FAILS.search(verdict) is None
+    """Land on an opening `works` or `fine`, after optional `okay`/`ok` and row id.
+    Case and later words do not affect the result; any other start returns the row."""
+    return _LANDS.match(verdict) is not None
 
 
 def _to_review(path: Path, lines: list[str], row: str) -> tuple[list[str], int]:
@@ -1092,7 +1093,7 @@ def production_doc(production: str) -> Path:
     """The production doc given; without one, the calling showrunner's."""
     if production:
         return Path(production).expanduser()
-    import showrunners  # only the actions that name a production read the update timers
+    from scripts.production import showrunners  # only the actions that name a production read the update timers
 
     found = showrunners.production_of(os.environ.get("CLAUDE_CODE_SESSION_ID", ""))
     if found is None:
@@ -1106,7 +1107,7 @@ def showrunner_of(doc: Path) -> str:
     A child production's rows go to its root's list. The name is the root showrunner's session
     name as it is now, never the production slug, so it is read only while that showrunner runs.
     """
-    import showrunners
+    from scripts.production import showrunners
     import showrunner_tree
 
     try:
@@ -1166,7 +1167,7 @@ def foreign_units(production: Path) -> set[str]:
 
     Empty when the productions cannot be read: drift then counts every checkpoint.
     """
-    import showrunners
+    from scripts.production import showrunners
     import showrunner_tree
 
     try:
@@ -1317,7 +1318,7 @@ def _run(options: CommandLine) -> int:
         case "showrunner":
             print(showrunner_of(production_doc(options.production)))
         case "backfill-production":
-            import showrunners
+            from scripts.production import showrunners
 
             docs = list(showrunners.timer_docs().values())
             lists = [Path(options.list).expanduser()] if options.list else sorted(LISTS.glob(f"{PREFIX}*.md"))

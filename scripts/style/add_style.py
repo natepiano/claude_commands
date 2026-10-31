@@ -10,12 +10,14 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from typing import cast
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS / "production"))
 
-import showrunners
+from scripts.production import showrunners
 import showrunner_tree
 from add_showrunner import NoEndingTab, herdr_tab_open
 import herdr

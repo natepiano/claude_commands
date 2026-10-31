@@ -1,6 +1,7 @@
 """Staff-backed reporting trees, legacy edge writes and their command-line behavior."""
 from __future__ import annotations
 
+from pathlib import Path
 import io
 import os
 import subprocess
@@ -9,9 +10,11 @@ import unittest
 from contextlib import redirect_stdout
 from unittest import mock
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 import showrunner_parent
 import showrunner_tree
-import showrunners
+from scripts.production import showrunners
 import test_showrunners
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import staff

@@ -25,6 +25,20 @@ CODEX_CONFIG_FILE="${CODEX_CONFIG_FILE:-$HOME/.codex/config.toml}"
 CODEX_MODELS_CACHE_FILE="${CODEX_MODELS_CACHE_FILE:-$HOME/.codex/models_cache.json}"
 CODEX_CATALOG_SYNC_STATE_FILE="${CODEX_CATALOG_SYNC_STATE_FILE:-$HOME/.local/state/codex-agent-catalog-sync/last_success}"
 CODEX_PACER_TIER_FILE="${CODEX_PACER_TIER_FILE:-$HOME/.local/state/codex-pacer/tier}"
+
+# Resolve the signed-in workers account rather than an inherited CODEX_HOME.
+agents_workers_home() {
+    "$AGENTS_CONFIG_DIR/../lib/py" - "$AGENTS_CONFIG_DIR/../.." <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
+from scripts.whoami.agent_accounts import workers_home
+try:
+    print(workers_home())
+except (OSError, ValueError) as error:
+    sys.exit(str(error))
+PY
+}
+
 # One shared registry for every reader and writer.
 agents_registry_text() {
     if [[ "${AGENTS_REGISTRY_BASE+x}" == x ]]; then

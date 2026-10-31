@@ -25,10 +25,11 @@ export PATH="$TEST_DIR/bin:$PATH"
 export AGENT_NOTES_DIR="$TEST_DIR/notes"
 mkdir -p "$AGENT_NOTES_DIR"
 python3 - "$SCRIPT_DIR/../.." <<'PYTHON'
-import base64, json, sys
+import json, sys
 from pathlib import Path
 sys.path.insert(0, str(Path(sys.argv[1]).resolve()))
 from scripts.accounts import accounts
+from scripts.whoami.account_test_support import write_codex_auth
 notes = Path.home().parent / "notes"
 _ = (Path.home() / ".claude.json").write_text("{}")
 _ = (notes / "claude2.md").write_text("---\nlogin: launcher@example.invalid\n---\n")
@@ -37,8 +38,7 @@ _ = (accounts.account_dir("claude2") / ".claude.json").write_text(json.dumps({"o
 login = "workers@example.invalid"
 home = Path.home() / ".codex1"
 home.mkdir()
-claims = base64.urlsafe_b64encode(json.dumps({"email": login}).encode()).decode().rstrip("=")
-_ = (home / "auth.json").write_text(json.dumps({"tokens": {"id_token": f"header.{claims}.signature"}}))
+write_codex_auth(home, login)
 _ = (notes / "codex 1.md").write_text(f"---\nlogin: {login}\n---\n")
 accounts.set_role("workers", "codex1")
 PYTHON

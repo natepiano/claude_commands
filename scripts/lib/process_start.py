@@ -44,6 +44,7 @@ from pathlib import Path
 from stat import S_ISDIR
 import subprocess
 import sys
+import time
 
 if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -168,12 +169,14 @@ def read_stat(pid: int, proc_root: Path = PROC_ROOT) -> ProcessStat | ProcessGon
         raise ProcessReadError(f"malformed process stat at {path}: {error}") from error
 
 
-def _ps_field(pid: int, field: str) -> str:
+def _ps_field(pid: int, field: str, *, timeout: float = 5) -> str:
     """An empty ps selection means the process is gone; a failed probe is an error."""
+    if timeout <= 0:
+        raise ProcessReadError(f"process {pid}: ps read deadline expired")
     try:
         result = subprocess.run(
             ["ps", "-o", f"{field}=", "-p", str(pid)],
-            capture_output=True, text=True, check=False, timeout=5,
+            capture_output=True, text=True, check=False, timeout=timeout,
             env={**os.environ, "LC_ALL": "C", "TZ": "UTC"},
         )
     except (OSError, UnicodeError, subprocess.SubprocessError) as error:
@@ -184,8 +187,11 @@ def _ps_field(pid: int, field: str) -> str:
     return value if value.strip() else ""
 
 
-def process_start(pid: int, proc_root: Path = PROC_ROOT) -> ProcessStart | ProcessGone:
-    """Read a live start. Only a missing default PROC_ROOT uses ps."""
+def process_start(pid: int, proc_root: Path = PROC_ROOT, *, timeout: float = 5) -> ProcessStart | ProcessGone:
+    """Read a live start. Only a missing default PROC_ROOT uses ps.
+
+    Both ps probes share timeout seconds. Linux stat reads do not use it.
+    """
     if pid <= 0:
         return ProcessGone(pid)
     if _has_proc(proc_root):
@@ -193,13 +199,15 @@ def process_start(pid: int, proc_root: Path = PROC_ROOT) -> ProcessStart | Proce
         if isinstance(stat, ProcessGone) or stat.state in ("Z", "X", "x"):
             return ProcessGone(pid)
         return stat.start
-    date = _ps_field(pid, "lstart")
+    expires = time.monotonic() + timeout
+    date = _ps_field(pid, "lstart", timeout=timeout)
     if not date:
         return ProcessGone(pid)
     start = ProcessStartDate(date)
     # Reject malformed ps output before it can become a stored identity.
     _ = started_at(start, proc_root)
-    if process_state(pid, proc_root) is ProcessRunState.GONE:
+    state = _ps_field(pid, "stat", timeout=expires - time.monotonic()).strip()
+    if _run_state(pid, state) is ProcessRunState.GONE:
         return ProcessGone(pid)
     return start
 

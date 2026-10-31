@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import TextIO, cast, override
 from unittest.mock import patch
 
+from scripts.accounts.home_test_support import scratch_account_home
 from scripts.accounts import moves, worker_names
 
 
@@ -25,7 +26,7 @@ class MoveJournalTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.home = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        _ = cast(object, self.enterContext(patch.dict(os.environ, {"HOME": str(self.home)}, clear=True)))
+        _ = cast(object, self.enterContext(scratch_account_home(self.home, {}, clear=True)))
 
     def common(self, *, tool: str = "codex", subject: str = "workers") -> moves.MoveCommon:
         self.assertIn(tool, ("claude", "codex"))

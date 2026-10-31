@@ -13,10 +13,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypedDict, cast
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from production_units import read_production  # noqa: E402
 import production_units  # noqa: E402
-import showrunners  # noqa: E402
+from scripts.production import showrunners  # noqa: E402
 import showrunner_tree
 import stall_watch  # noqa: E402
 import tidy_wrapped  # noqa: E402
@@ -29,7 +31,6 @@ import rename_state  # noqa: E402
 import rename_unit  # noqa: E402
 from rename_state import RenameRefused, read_json, write_json, write_text  # noqa: E402
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.astra import design_roles  # noqa: E402
 from scripts.production import staff, staff_sources
 

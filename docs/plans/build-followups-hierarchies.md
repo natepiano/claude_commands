@@ -198,8 +198,65 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 
 **Ruled out:** dropping `--cleanup-only` from `worker_owners.py` (a reopened worker can be ended again).
 
+### Phase 6b — The full baseline measure prints each repeated wait row once, and a table names its window and source once  · status: done
+
+#### As-built
+
+- `log_records.blocks` heads each table with the most common window and the most common source (`Counter.most_common`; a tie takes the first seen). A heading field prints only when 2 or more rows share it. A row prints `window:` or `source:` only when its value differs from the heading. `compare` prints through `blocks`, so it takes the same rule.
+- `measure.collapse_wait_rows(rows, source, identity_kind)` groups UncertainCoverage, attribution-miss, unresolved-origin and source-problem rows by (measure, value) into one row. Its n and its Diagnostic amount are the count of phases or waits. Its source is `<source>; phases: <ids>` or `<source>; waits: <ids>`, with every id, in text and `--json`.
+- `candidate_summary` lists each candidate once, in first-seen order. A candidate with no working directory prints `cwd=not recorded`.
+- Live: `baseline --full` falls from 11826 to 4319 lines; the 2026-10-22..29 window falls from 7521 to 3782.
+
+**Files:**
+- `scripts/hierarchies/log_records.py` — the table heading rule in `blocks`.
+- `scripts/hierarchies/measure.py` — `collapse_wait_rows`, `candidate_summary`, `WaitCandidate.label`.
+- `scripts/hierarchies/test_log_records.py`, `scripts/hierarchies/test_measure.py` — heading, tie, no shared value, collapsed rows and their amounts.
+
+**Binds later work:** In `--full` text a table heading names its common window and source once, and a collapsed wait row's n counts phases or waits, with every id in its source.
+
+**Gotchas:** A reason's "(N times)" is the producer's recorded text (progress_history.py `_read_waits`), not text from measure.py, and prints as recorded. Collapsed rows and the heading rule change display only, not what is measured.
+
+**Ruled out:** an id-list cap in text output; renaming the recorded "(N times)" text in measure.py.
+
+### Phase 6c — A later push never changes a closed window's Hana merge count  · status: done
+
+#### As-built
+
+- `walk_hana_trunk` counts the merges on the Hana trunk (`origin/init/catalyst`) along the trunk's own path. A later fast-forward onto a unit checkpoint does not change a closed window's count.
+- The walk reads the recorded tips from the trunk reflog, newest first, and drops repeats. It runs one `git log --topo-order` and one `git rev-list --ancestry-path` per tip pair. Between two tips it takes the first parent when that parent is in the ancestry set, else the other parent. It skips a tip that is not an ancestor of the newer tip (a force push). Before the oldest recorded tip it follows the first parent.
+- `HanaTrunkMerges` is a frozen value: a `merges` tuple of `HanaMerge` and a `source` text. `read_hana_merges` calls `walk_hana_trunk`. `merge_flow` and `receipt_rows` read its source.
+- The source text is `...; no fetch; trunk path from <N> recorded tips back to <oldest tip time>; first parent before that; git expires reflog entries after 90 days`. With no reflog it is `no recorded tips; first parent only`.
+- Live on natedev, `compare --before 2026-10-13T17:24..2026-10-20T17:24 --after 2026-10-23T17:37Z..2026-10-30T17:37Z` prints before 15.0/week, after 20.0/week. The read takes 0.27 s.
+
+**Files:**
+- `scripts/hierarchies/measure.py` — `walk_hana_trunk`, `HanaTrunkMerges`, `HanaMerge`, the merge row source text
+- `scripts/hierarchies/test_measure.py` — a Git fixture helper; tests for a fast-forward onto a unit checkpoint, a force push, repeated tips and no reflog
+
+**Binds later work:** The review compare reads Hana merges through the trunk walk. Results quote the merge row's source as printed: the recorded tip count, the oldest tip time and the 90-day reflog limit. The source is made per run and is not stored.
+
+**Gotchas:**
+- The Hana repo is read only: no fetch, gc or ref writes.
+- Reflog entries expire after 90 days. The local reflog starts 2026-10-30 08:30 EDT, so older windows follow the first parent.
+- `merge_receipts.jsonl` holds no Hana trunk receipts and starts 2026-10-29. It cannot replace the walk.
+
+### Phase 6d — A change-review verdict lands by its first word  · status: done
+
+#### As-built
+
+- `lands()` in `scripts/production/change_review.py` decides by the verdict's start, with one anchored regex (`_LANDS`): an optional `okay` or `ok`, an optional row id (`c17`), then `works` or `fine` as a whole word. Case and later words do not change the result. Any other start returns the row to its unit. The whole-verdict failure-word scan (`_FAILS`) is gone.
+- "okay c17 works" and "works: checked, no empty cwd" land; "not works" and "yes works" return. Only the printed land-or-return line changed; the row edits are the same.
+- The docstring, `commands/change_review.md` (## verdict), `commands/showrunner/produce.md` (<CloseChangeReview>) and `docs/as-built/feature-log.md` state the one rule.
+
+**Files:**
+- `scripts/production/change_review.py` — `_LANDS` and `lands()`
+- `scripts/production/test_change_review.py` — a command-level test of the three forms with stored row fields kept, plus case and word-boundary controls
+- `commands/change_review.md`, `commands/showrunner/produce.md`, `docs/as-built/feature-log.md` — the rule text
+
+**Gotchas:**
+- Only `okay`/`ok` and a row id may come before `works` or `fine`, so "yes works" now returns its row (Assertion-Change in checkpoint 1afb985d).
+
 ### Phase 6 — The four-week review: which waits slow Hana, which links helped, and which trial steps stay  · status: todo
-**Depends on:** Phase 6a's checkpoint (`compare`), and the checkpoints of Phases 3, 4 and 5, and the three review records: the Phase 3 and Phase 5 re-runs, which the unit director runs on 2026-11-12 (two weeks after both merged into sdlc as 3c5dea67 on 2026-10-29) and records in the design doc under Steps 1 and 4 (the push-audit re-run also confirms that `measure.py` and `push_audit.py` agree; each re-run record holds the report's source-problem lines, because both reports exit 0 with source problems), Phase 12's checkpoint (merged before the 2026-11-12 re-run), Phase 15's checkpoint (`compare` prints through its `blocks`), and four weeks from the experiment start in design doc Step 2: the first day on which each holder producer (builds' `verify.sh`, models-unit's `codex_mesh.py`) has recorded a `NamedHolder`, read live from `progress_history.py waits`. At Phase 10's checkpoint (bece20e1) neither had, and Step 2 says `start not set`; the unit director sets the start and the review date when both have. Also models-unit's checkpoint that adds `codex_mesh.py end --cleanup-only` (routed from Phase 6a), merged into sdlc, and one `worker_owners.py end` run after that merge: until then every cleanup retry exits 2, so `end_cleanup_pending` counts the missing flag, not a held worker. The phase starts on the latest of these dates, never before.
+**Depends on:** Phase 6a's checkpoint (`compare`), Phase 6c's checkpoint (the Hana trunk walk), and the checkpoints of Phases 3, 4 and 5, and the three review records: the Phase 3 and Phase 5 re-runs, which the unit director runs on 2026-11-12 (two weeks after both merged into sdlc as 3c5dea67 on 2026-10-29) and records in the design doc under Steps 1 and 4 (the push-audit re-run also confirms that `measure.py` and `push_audit.py` agree; each re-run record holds the report's source-problem lines, because both reports exit 0 with source problems), Phase 12's checkpoint (merged before the 2026-11-12 re-run), Phase 15's checkpoint (`compare` prints through its `blocks`), and four weeks from the experiment start in design doc Step 2: the first day on which each holder producer (builds' `verify.sh`, models-unit's `codex_mesh.py`) has recorded a `NamedHolder`, read live from `progress_history.py waits`. At Phase 10's checkpoint (bece20e1) neither had, and Step 2 says `start not set`; the unit director sets the start and the review date when both have. Also models-unit's checkpoint that adds `codex_mesh.py end --cleanup-only` (routed from Phase 6a), merged into sdlc, and one `worker_owners.py end` run after that merge: until then every cleanup retry exits 2, so `end_cleanup_pending` counts the missing flag, not a held worker. The phase starts on the latest of these dates, never before.
 
 #### Work Order
 
@@ -228,7 +285,7 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 
 **State:** none.
 
-**Constraints from prior phases:** as Phase 6a, plus Phase 6a's As-built. Results quotes `compare`'s markers as printed: an unknown saved snapshot stays `not recorded`; a `RowsSkipped` problem keeps the good counts and adds `; incomplete: N rows skipped`; a `SourceUnreadable` problem keeps its unavailable-source reason. `codex_mesh.py` is models-unit's file; this phase never edits it.
+**Constraints from prior phases:** as Phase 6a, plus the As-builts of Phases 6a, 6b and 6c. Results quotes the Hana merges row's source as printed: the recorded tip count, the oldest tip time and the 90-day reflog limit (before that tip the count follows the first parent). In `--full` text a table heading names its common window and source once, and a collapsed wait row's n counts phases or waits, with every id in its source. Results quotes `compare`'s markers as printed: an unknown saved snapshot stays `not recorded`; a `RowsSkipped` problem keeps the good counts and adds `; incomplete: N rows skipped`; a `SourceUnreadable` problem keeps its unavailable-source reason. `codex_mesh.py` is models-unit's file; this phase never edits it.
 
 **Acceptance gate:** Results holds real numbers for each step, judged on the measure and review point each of Phases 3–5 names; the F007 and unknown saved value tests pass on rendered `compare` output; unit tests, per-slot `basedpyright` (`0 errors, 0 warnings, 0 notes`) and merge gate green when code changed. **Measure and review point:** this phase is the review point for Steps 1, 2 and 4. Step 4's keep-or-drop reads `worker_owners.py report` `end_cleanup_pending` and the cleanup outcomes in `ends.jsonl` beside the ownerless-worker count: a worker ended with its cleanup still pending is not released capacity. At phase end the unit director sends the showrunner the Results and the keep-or-drop list as one question for the user.
 

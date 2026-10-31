@@ -16,14 +16,15 @@ from datetime import datetime
 from collections.abc import Iterator, Sequence
 from pathlib import Path
 
-from scripts.lib import process_start as process_identity
-from scripts.lib.process_start_test_support import write_stat
 from typing import ClassVar, cast, final, override
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from scripts.lib import process_start as process_identity
+from scripts.lib.process_start_test_support import write_stat
 from scripts.lib.socket_test_support import short_socket_directory
+from scripts.production.staff_test_support import StaffTestCase, showrunner_relationship, unit_membership
 from test_support import ShutdownTestCase, linux_process_fixture
 from test_restart import entry, top_level
 import shutdown_record
@@ -33,7 +34,7 @@ import unit_runs
 from scripts.whoami import account
 import herdr
 import sessions
-import showrunners
+from scripts.production import showrunners
 import unit_lookup
 import restart
 import shutdown
@@ -475,6 +476,7 @@ class InventoryTests(ShutdownTestCase):
         self.bin = Path()
         self.proc = Path()
         self.herdr_log = Path()
+        self.pane_processes: dict[int, tuple[int, list[str], dict[str, str]]] = {}
         self.target_config = Path()
         self.other_config = Path()
         self.director_pid = 0
@@ -617,6 +619,7 @@ class InventoryTests(ShutdownTestCase):
         )
         (process / "cwd").unlink(missing_ok=True)
         (process / "cwd").symlink_to(self.checkout)
+        self.pane_processes[pid] = (parent, arguments, environment)
         if arguments and Path(arguments[0]).name == "herdr" and arguments[-1] == "server":
             name = arguments[arguments.index("--session") + 1] if "--session" in arguments else "default"
             config = self.home / ".config/herdr"
@@ -627,12 +630,48 @@ class InventoryTests(ShutdownTestCase):
             _ = sockets.write_text(previous + f"000: 00000002 00000000 00010000 0001 01 {pid} {directory}/herdr.sock\n")
             (process / "fd").mkdir()
             (process / "fd/3").symlink_to(f"socket:[{pid}]")
+        self.configure_process_panes()
+
+    def configure_process_panes(self) -> None:
+        """Publish each fake server's live panes and the shell that owns each pane."""
+        path = self.root / "herdr-responses.json"
+        responses = cast(dict[str, CommandResponse], json.loads(path.read_text()))
+        panes: dict[str, dict[str, int]] = {}
+        for pid, (_, arguments, environment) in self.pane_processes.items():
+            if arguments and Path(arguments[0]).name == "herdr" and arguments[-1] == "server":
+                session = arguments[arguments.index("--session") + 1] if "--session" in arguments else "default"
+                _ = panes.setdefault(session, {})
+            pane = environment.get("HERDR_PANE_ID")
+            if not pane or environment.get("TMUX_PANE"):
+                continue
+            ancestor, shell = pid, pid
+            seen: set[int] = set()
+            while ancestor in self.pane_processes and ancestor not in seen:
+                seen.add(ancestor)
+                parent, arguments, marks = self.pane_processes[ancestor]
+                if arguments and Path(arguments[0]).name == "herdr" and arguments[-1] == "server":
+                    session = arguments[arguments.index("--session") + 1] if "--session" in arguments else "default"
+                    panes.setdefault(session, {})[pane] = shell
+                    break
+                if marks.get("HERDR_PANE_ID") == pane:
+                    shell = ancestor
+                ancestor = parent
+        for session, shells in panes.items():
+            responses[f"--session {session} pane list"] = {"code": 0, "stdout": json.dumps({"result": {
+                "panes": [{"pane_id": pane, "workspace_id": pane.split(":", 1)[0]} for pane in shells]}})}
+            for pane, shell in shells.items():
+                responses[f"--session {session} pane process-info --pane {pane}"] = {
+                    "code": 0, "stdout": json.dumps({"result": {"process_info": {"shell_pid": shell}}})}
+        _ = path.write_text(json.dumps(responses))
 
     def herdr_sessions(self, names: list[str]) -> None:
         entries = [herdr.SessionEntry(name=name, running=True, default=False,
                                     session_dir=str(self.root / name), socket_path="fake-socket") for name in names]
-        response = {"stdout": json.dumps(herdr.SessionListResult(sessions=entries)), "code": 0}
-        _ = (self.root / "herdr-responses.json").write_text(json.dumps({"default": response}))
+        response = CommandResponse(stdout=json.dumps(herdr.SessionListResult(sessions=entries)), code=0)
+        path = self.root / "herdr-responses.json"
+        responses = cast(dict[str, CommandResponse], json.loads(path.read_text())) if path.exists() else {}
+        responses["default"] = response
+        _ = path.write_text(json.dumps(responses))
 
     def git(self, *arguments: str, cwd: Path | None = None) -> str:
         result = subprocess.run(
@@ -796,6 +835,7 @@ elif "comm=" in joined:
         self.write_session(UNKNOWN_PID, UNKNOWN_ID, "hidden-account", plain, updated_at=10)
 
     def make_production_state(self) -> None:
+        _ = unit_membership("build-followups", "shutdown-unit")
         production_doc = self.root / "build-followups-production.md"
         _ = production_doc.write_text("- **User zone:** America/Los_Angeles\n", encoding="utf-8")
         showrunner = self.notifier / "showrunner-build-followups"
@@ -1561,7 +1601,7 @@ class ProcessEnvironmentTests(unittest.TestCase):
         probe.assert_not_called()
 
 
-class RecoveryInventoryTests(unittest.TestCase):
+class RecoveryInventoryTests(StaffTestCase):
     root: Path = Path()
     proc: Path = Path()
     registry: Path = Path()
@@ -1570,6 +1610,8 @@ class RecoveryInventoryTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        super().setUp()
+        _ = showrunner_relationship("fixture")
         linux_process_fixture(self)
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.proc = self.root / "proc"
@@ -1587,6 +1629,7 @@ class RecoveryInventoryTests(unittest.TestCase):
         _ = fake_responses.write_text(json.dumps({"default": {"code": 0, "stdout": '{"sessions":[]}'}}))
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "HOME": str(self.root), "HERDR_PROC": str(self.proc), "NOTIFIER_SESSIONS_DIR": str(self.registry),
+            "XDG_CONFIG_HOME": str(self.root / ".config"),
             "NOTIFIER_STATE_DIR": str(self.notifier), "AGENT_NOTES_DIR": str(self.root / "notes"),
             "SHUTDOWN_STATE_DIR": str(self.root / "shutdown"), "SHUTDOWN_RUN_ROOT": str(self.root / "runs"),
             "UNIT_HISTORY_DIR": str(self.root / "history"),
@@ -1620,6 +1663,8 @@ class RecoveryInventoryTests(unittest.TestCase):
 
     def darwin_snapshot(self) -> dict[str, CommandResponse]:
         """A Mac process tree whose external readers all use the shared fake."""
+        # These fixture probes take no simulated time from their five-second budget.
+        _ = self.enterContext(patch.object(time, "monotonic", return_value=100.0))
         self.claude()
         registered = self.registry / "1001.json"
         data = cast(dict[str, object], json.loads(registered.read_text()))
@@ -1640,7 +1685,10 @@ class RecoveryInventoryTests(unittest.TestCase):
             "--session default session list --json": {"code": 0, "stdout": json.dumps({"sessions": [{
                 "name": "writing", "running": True, "default": False,
                 "session_dir": "", "socket_path": "", } ]})},
-            "--session writing pane list": {"code": 0, "stdout": '{"result":{"panes":[]}}'},
+            "--session writing pane list": {"code": 0, "stdout": json.dumps({"result": {"panes": [
+                {"pane_id": "w1:p1", "workspace_id": "w1"}]}})},
+            "--session writing pane process-info --pane w1:p1": {
+                "code": 0, "stdout": json.dumps({"result": {"process_info": {"shell_pid": 501}}})},
             "-n -P -a -U -u " + str(os.getuid()) + " -F pfn": {"code": 0,
                 "stdout": f"p500\nf3\nn{self.root}/.config/herdr/sessions/writing/herdr.sock\n"},
         }

@@ -101,7 +101,7 @@ def builds(words: list[str], *, merge_gate_only: bool = False) -> bool:
 def building_command(command: str, *, merge_gate_only: bool = False) -> bool:
     if not CANDIDATE.search(command):
         return False
-    command = scan_text("Bash", {"command": command}, {}).replace("\\\n", "")
+    command = scan_text("Bash", {"command": command}).replace("\\\n", "")
     lexer = shlex.shlex(without_literal_heredocs(command), posix=True, punctuation_chars=";&|()\n")
     lexer.whitespace = " \t\r"
     lexer.whitespace_split = True
