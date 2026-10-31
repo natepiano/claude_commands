@@ -60,6 +60,17 @@ Case E (resources-unit's compile-cache trial): clone builds with `CARGO_INCREMEN
 
 - Rule 1 fails: with two builds at once, one waited 68.7 s of 69.0 s on the lock (99%, limit 10%). Clone 2 (0 crates) and clone 1 again (0 crates) pass.
 - Rule 2 passes: seed C with `cp -a` takes 18.9 + 1.7 = 20.6 s, 9% of A's 224.8 s, and adds 10.30 GiB against A's 11.70 GiB (-1.4 GiB net). `incremental/` cuts no build time (C+1 77.2 s against 75.5 s), so it is dropped.
+
+**Seed from another commit (rerun, 2026-10-31).** Target commit `origin/init/catalyst` a5e771a7a8; both sources had the same `Cargo.lock` and rustc 1.99.0. Cold build A: 626.7 s, 568 crates, 14.72 GiB. Table and logs: `/tmp/claude/unit/bf5b8d4c-77ff-4f7b-9318-afb6114ad8f2/copies/seed2/results.md`.
+
+| Source | Copy | GiB added | Build C | (copy + build) / A | GiB added − A |
+| --- | --- | --- | --- | --- | --- |
+| tool-based-ui-demo (26 behind, 12 files) | 44.4 s | 13.43 | 451.5 s, 154 crates | 0.79 | −1.29 |
+| inspectors (22 behind, 26 ahead, 93 files) | 185.5 s | 21.71 | 498.0 s, 154 crates | 1.09 | +6.99 |
+
+- Rule 2 passes for the near source and fails for the far one. Both seeds compiled the same 154 crates (27% of A): the cause is the kind of step that last built the source, not commit distance. A target built only by nextest and clippy does not hold the dependencies `cargo build` needs.
+- Ordered seed rule: (1) a source whose last step kind matches the copy's step kind (build, test or lint); (2) of those, the source with the fewest changed files against the copy's commit; (3) no seed, a cold build, when no source passes (1) or the copy would take free space under 280 GiB.
+
 - **Target mode: seed, without `incremental/`, sources copied with `cp -a`** (builds showrunner, 2026-10-30). `copies.py` has this one mode and no option; it has no shared target mode.
 
 Risks:
