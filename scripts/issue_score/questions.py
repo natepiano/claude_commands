@@ -12,6 +12,11 @@ class Supported:
 
 
 @dataclass(frozen=True)
+class MinimumGap:
+    gap: float
+
+
+@dataclass(frozen=True)
 class Unsupported:
     reason: str = "no threshold meets the error target with nonzero coverage"
 
@@ -21,7 +26,7 @@ class ReportOnly:
     pass
 
 
-ThresholdOutcome = Supported | Unsupported | ReportOnly
+ThresholdOutcome = Supported | MinimumGap | Unsupported | ReportOnly
 
 QUESTION_SET_VERSION = "5"
 MODEL = "jev-1.14.0"
@@ -35,17 +40,20 @@ THRESHOLDS: dict[str, ThresholdOutcome] = {
     "backlog_urgency": ReportOnly(),
     "backlog_effort": ReportOnly(),
     "category": Supported(0.90),
-    # Defined-area options: tune error .083 with .38 taken (2026-10-29).
-    "area": Supported(0.90),
+    # 62 areas, run 20261029T155801.891126Z-3015dbcf:
+    # plain averaged gap: tune 21% to user, 24.6% taken-wrong;
+    # held-out 19% to user, 25.3% taken-wrong. User confirms every value.
+    "area": MinimumGap(0.3),
 }
-# The user's per-field verdict after the blind preference test (2026-10-29):
+# The user's per-field verdict, including the area decision (2026-10-30):
 # Jev proposes these fields; the agent proposes every other field.
-JEV_FIELDS: frozenset[str] = frozenset({"backlog_goal", "backlog_impact", "backlog_alignment"})
+JEV_FIELDS: frozenset[str] = frozenset({"backlog_goal", "backlog_impact", "backlog_alignment", "area"})
 
 ERROR_TARGETS = {field: 0.1 for field in (
     "backlog_goal", "category", "area", "backlog_impact", "backlog_alignment",
 )}
 RISK_THRESHOLDS = tuple(percent / 100 for percent in range(40, 100, 5))
+RISK_GAPS = tuple(percent / 100 for percent in range(0, 100, 5))
 EVIDENCE_PRESENT = 0.7
 EVIDENCE_ABSENT = 0.3
 SPLIT_PROBABILITY = 0.25

@@ -1,8 +1,6 @@
 """The timer profiler measures reads without changing the input state."""
 from __future__ import annotations
 
-from scripts.lib.test_agents_registry import write_registry
-
 import io
 import json
 import os
@@ -18,6 +16,9 @@ from pathlib import Path
 from types import ModuleType
 from typing import cast, override
 from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib.test_agents_registry import write_registry
 
 from scripts.whoami import profile_notes_pass as profile
 
@@ -125,6 +126,10 @@ class ProfileNotesPassTests(unittest.TestCase):
 
         signature = agent_notes.timer_usage_signature(accounts.claude_account_selection(), observe_workers_home())
         usage_store.save_timer_usage(signature, [], datetime.now(timezone.utc))
+        timer_save = next(entry for entry in profile.patch_list(self.pass_)
+                          if entry.owner is usage_store and entry.attribute == "save_timer_usage")
+        timer_save_name = f"{usage_store.__name__}.{timer_save.attribute}"
+        self.assertIn(timer_save_name, {entry.name for entry in profile.patch_list(self.pass_)})
         state = profile.state_path(self.pass_.pacer, "STATE_FILE")
         state.parent.mkdir(parents=True, exist_ok=True)
         _ = state.write_text('{"files":{},"buckets":{},"history":[],"windows":{}}')
@@ -142,7 +147,7 @@ class ProfileNotesPassTests(unittest.TestCase):
                                 for file, _, name in functions))
             self.assertEqual(measured.calls["agent_notes.write_note"], 1)
             self.assertEqual(measured.calls["codex_pacer.write_atomic"], 3)
-            self.assertEqual(measured.calls["usage_store.save_timer_usage"], 0)
+            self.assertEqual(measured.calls[timer_save_name], 0)
             self.assertGreater(measured.calls["scripts.accounts.refusal_watch._watch_lock"], 0)
             self.assertTrue(measured.children)
             self.assertTrue(all(isinstance(child.completion, profile.ChildCompleted) and child.wall_time(0.0) >= 0.0

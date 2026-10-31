@@ -17,6 +17,7 @@ from scripts.lib.atomic_file import write_text_atomic
 from zoneinfo import ZoneInfo
 
 import showrunners
+import showrunner_tree
 import unit_lookup
 from production_units import Production, read_production
 from production_units import Refusal, cell_value, live_unit_table, production_field, unit_table
@@ -776,7 +777,7 @@ def child_fields(child: str, now: datetime, zone: ZoneInfo, *, expand: bool) -> 
         fields["report"] = saved
     waiting = 0
     unreadable: list[str] = []
-    for slug in (child, *showrunners.descendants_of(child)):
+    for slug in (child, *showrunner_tree.descendants_of(child)):
         try:
             waiting += len(due(read_outstanding(outstanding_file(slug)), now))
         except (InputError, OSError, ValueError):
@@ -1026,10 +1027,10 @@ def run(args: argparse.Namespace) -> int:
     report("merge branch", "ok", "pushed" if pushed else "not pushed")
     result: JsonMap = {"length": length, "zone": str(production.zone), "units": units_out, "topics": topics_out,
                        "doc": str(production.doc)}
-    root = showrunners.root_of(production.slug)
+    root = showrunner_tree.root_of(production.slug)
     if root != production.slug:
         result["reports_to"] = root
-    children = showrunners.children_of(production.slug)
+    children = showrunner_tree.children_of(production.slug)
     strangers = [name for name in expand if name != EXPAND_ALL and name not in children]
     if strangers:
         raise DailiesFailure("expand", f"{', '.join(strangers)}: not directly below {production.slug}; "

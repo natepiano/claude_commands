@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import unittest
 import io
+import fcntl
 import os
+import stat
 from pathlib import Path
 import time
 from typing import final
@@ -13,10 +15,112 @@ from unittest import mock
 from scripts.production import merge_gate
 from scripts.production.merge_gate_test_support import TEST_HANG_GUARD_SECS, gate_suites, wait_for_file
 from scripts.production.merge_gate_suites_test_support import GateSuitesFixture
+from scripts.lint import memory_admit
+from scripts.lib import scratch
 
 
 @final
 class MergeGateResourcesTests(GateSuitesFixture):
+    def test_shared_pool_accepts_fifo_and_character_device_modes(self) -> None:
+        self.supply_jobserver(b"Q")
+        metadata = Path(self.environment["BUILDLOG_JOBSERVER_FIFO"]).stat()
+        for kind in (stat.S_IFIFO, stat.S_IFCHR):
+            mode = os.stat_result((kind | 0o600, *metadata[1:]))
+            with self.subTest(kind=kind), mock.patch.dict(os.environ, self.environment), \
+                    mock.patch.object(os, "fstat", return_value=mode), merge_gate.shared_cpu_pool() as pool:
+                self.assertIsInstance(pool, merge_gate.SharedCPUPool)
+                if not isinstance(pool, merge_gate.SharedCPUPool):
+                    self.fail("the private pool was not opened")
+                slot = pool.try_acquire()
+                self.assertIsInstance(slot, merge_gate.SharedCPUSlot)
+                self.assertEqual(self.jobserver_tokens(), b"")
+            self.assertEqual(self.jobserver_tokens(), b"Q")
+
+    def test_shared_pool_refuses_regular_files_without_consuming_them(self) -> None:
+        path = Path(self.environment["BUILDLOG_JOBSERVER_FIFO"])
+        path.unlink()
+        self.write(path, "Q")
+        with mock.patch.dict(os.environ, self.environment), self.assertRaises(merge_gate.GateRefused):
+            with merge_gate.shared_cpu_pool():
+                self.fail("a regular file must not provide CPU slots")
+        self.assertEqual(path.read_text(), "Q")
+
+    def test_empty_shared_pool_does_not_read_an_unready_descriptor(self) -> None:
+        self.supply_jobserver(b"")
+        metadata = Path(self.environment["BUILDLOG_JOBSERVER_FIFO"]).stat()
+        mode = os.stat_result((stat.S_IFCHR | 0o600, *metadata[1:]))
+        with mock.patch.dict(os.environ, self.environment), \
+                mock.patch.object(os, "fstat", return_value=mode), merge_gate.shared_cpu_pool() as pool, \
+                mock.patch.object(os, "read", side_effect=AssertionError("read before the pool was ready")):
+            if not isinstance(pool, merge_gate.SharedCPUPool):
+                self.fail("the private pool was not opened")
+            self.assertIsInstance(pool.try_acquire(), merge_gate.WaitingForCPU)
+
+    @gate_suites("lib")
+    def test_one_shared_slot_serializes_modules_and_is_returned_after_each(self) -> None:
+        self.supply_jobserver(b"Q")
+        start = merge_gate.start_gate_job
+        available_at_start: list[bytes] = []
+
+        def observed(suite: str, path: Path, argv: list[str], repo: Path,
+                     environment: dict[str, str], log: Path, *,
+                kind: merge_gate.GateJobKind = merge_gate.GateJobKind.TEST_MODULE) -> merge_gate.RunningGateJob:
+            available_at_start.append(self.jobserver_tokens())
+            return start(suite, path, argv, repo, environment, log, kind=kind)
+
+        with mock.patch.object(merge_gate, "start_gate_job", side_effect=observed):
+            result = self.run_gate("--tests-only")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(available_at_start, [b""] * (self.module_count + 1))
+        self.assertEqual(self.jobserver_tokens(), b"Q")
+        events = self.module_events()
+        self.assertEqual([row["event"] for row in events], ["start", "finish"] * self.module_count)
+
+    @gate_suites("hooks")
+    def test_missing_shared_pool_runs_all_modules(self) -> None:
+        Path(self.environment["BUILDLOG_JOBSERVER_FIFO"]).unlink()
+        result = self.run_gate("--tests-only")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assert_all_modules_started()
+        self.assert_gate_released()
+
+    @gate_suites("hooks")
+    def test_checkout_stays_busy_during_memory_and_slot_waits(self) -> None:
+        busy = self.occupy_memory_queue()
+        self.supply_jobserver(b"")
+        sleep = time.sleep
+        waited: set[str] = set()
+        admitted = False
+
+        def assert_busy() -> None:
+            with (self.checkout / ".claude-busy").open("r") as lock:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+        def observed(result: memory_admit.CheckResult) -> None:
+            nonlocal admitted
+            admitted = result.decision.state == "admit"
+            if result.decision.state == "hold":
+                assert_busy()
+                waited.add("memory")
+                busy.unlink()
+
+        def free_slot(seconds: float) -> None:
+            if admitted and "slot" not in waited:
+                assert_busy()
+                self.assertEqual(self.module_events(), [])
+                waited.add("slot")
+                self.supply_jobserver(b"Q")
+            sleep(min(seconds, 0.01))
+
+        with self.observing_admission(observed), \
+                mock.patch.object(time, "sleep", side_effect=free_slot), \
+                mock.patch.object(scratch, "copy_folder", return_value=self.checkout):
+            result = self.run_gate("--tests-only")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(waited, {"memory", "slot"})
+        self.assertEqual(self.jobserver_tokens(), b"Q")
+
     @gate_suites("lib")
     def test_memory_cap_admits_two_overlapping_module_processes(self) -> None:
         self.record_module_peaks({"lib/test_first.py": 48.0, "lib/test_second.py": 48.0})
@@ -49,8 +153,9 @@ class MergeGateResourcesTests(GateSuitesFixture):
         sample = merge_gate.process_memory_mib
 
         def start_blocked(suite: str, path: Path, argv: list[str], repo: Path,
-                          environment: dict[str, str], log: Path) -> merge_gate.RunningGateJob:
-            job = start(suite, path, argv, repo, environment, log)
+                          environment: dict[str, str], log: Path, *,
+                kind: merge_gate.GateJobKind = merge_gate.GateJobKind.TEST_MODULE) -> merge_gate.RunningGateJob:
+            job = start(suite, path, argv, repo, environment, log, kind=kind)
             started.append(job)
             wait_for_file(self.state / f"{job.process.pid}.started")
             return job
