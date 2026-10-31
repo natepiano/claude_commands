@@ -29,7 +29,8 @@ sys.path.insert(0, str(PRODUCTION_SCRIPTS))
 from scripts.direct import plan_history
 from scripts.lib.user_zone import user_zone
 from scripts.production import showrunners, unit_lookup
-from production_units import Production, Refusal, cell_value, live_unit_table, read_production
+from production_units import Production, Refusal, cell_value, read_production
+from unit_lookup import live_unit_table
 from scripts.production.production_doc import PromoteTo, promotion_from_doc
 
 # The finding_opened event schema uses these severities. Importing findings to

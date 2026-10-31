@@ -129,11 +129,9 @@ def save(session: str, entries: dict[str, PaneLaunch]) -> None:
 
 
 def write(session: str, launch: PaneLaunch) -> None:
-    """Replace the pane's entry and keep every other pane's."""
+    """Write the supplied launch unchanged; label recovery belongs to record_membership."""
     with locked(session):
         entries = read(session)
-        launch = launch.copy()
-        launch["environment"] = retained_environment(launch, tuple(entries.values()))
         if entries.get(launch["pane_id"]) == launch:
             return
         entries[launch["pane_id"]] = launch

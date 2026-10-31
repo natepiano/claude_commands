@@ -325,6 +325,43 @@ class StaffTestCase(unittest.TestCase):
         write_text_atomic(folder / ".git", "gitdir: /fixture/linked-worktree\n")
         return folder
 
+    def fixture_git(self, folder: Path, *arguments: str) -> str:
+        """Run Git only inside one of this fixture's private repositories."""
+        self.assertTrue(folder.is_relative_to(self.root))
+        result = subprocess.run(
+            ["git", "-C", str(folder), *arguments], capture_output=True, text=True,
+            check=True, timeout=PROCESS_TIMEOUT,
+        )
+        return result.stdout.strip()
+
+    def fill_production(self, slug: str, *units: str) -> Path:
+        """Build a timer doc and real linked worktrees for the live fill."""
+        repository = self.source_root / "repositories" / slug
+        repository.mkdir(parents=True)
+        _ = self.fixture_git(repository, "init", "-b", "main")
+        _ = self.fixture_git(repository, "config", "user.email", "fixture@example.invalid")
+        _ = self.fixture_git(repository, "config", "user.name", "Fixture")
+        _ = self.fixture_git(repository, "commit", "--allow-empty", "-m", "fixture")
+        for unit in units:
+            folder = self.source_root / "worktrees" / unit
+            folder.parent.mkdir(parents=True, exist_ok=True)
+            _ = self.fixture_git(repository, "worktree", "add", "-b", unit, str(folder))
+        doc = repository / "docs" / f"{slug}-production.md"
+        doc.parent.mkdir()
+        rows = [f"| `{unit}` | `{self.source_root / 'worktrees' / unit}` | `{unit}` | `standby` | — |"
+                for unit in units]
+        write_text_atomic(doc, "\n".join([
+            "# Fixture production", f"- **Showrunner session:** `{slug}`", "", "## Units", "",
+            "| Unit | Worktree | Branch | Plan | Port |", "| --- | --- | --- | --- | --- |", *rows, "",
+        ]))
+        self.register_production(slug, doc)
+        production_membership(slug, *units)
+        # Do not import the checkout's real showrunner registry into the fill.
+        registry = self.source_root / "showrunners.json"
+        self.write_json(registry, {"always": []})
+        _ = self.enterContext(cast(AbstractContextManager[object], mock.patch.dict(os.environ, {"SHOWRUNNERS_CONFIG": str(registry)})))
+        return doc
+
     def pane(self, pane_id: str, *, session_id: str, environment: dict[str, str], written_at: str = "2026-10-30T09:00:00+00:00") -> None:
         path = Path(os.environ["HERDR_PANE_RECORD_DIR"]) / "agents.json"
         entries = cast(dict[str, object], json.loads(path.read_text())) if path.exists() else {}

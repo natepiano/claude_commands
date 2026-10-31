@@ -22,7 +22,8 @@ import unit_lookup
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "whoami"))
 from production_units import Production, read_production
-from production_units import Refusal, cell_value, live_unit_table, retired_units
+from production_units import Refusal, cell_value
+from unit_lookup import live_unit_table, retired_units
 from merge_checkpoint import MergeEntry, NoMerge, Stop, git, merge_branch_history, report as merge_report
 
 JsonMap = dict[str, object]
