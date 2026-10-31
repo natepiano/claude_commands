@@ -2936,24 +2936,16 @@ A rerun of a stopped `accounts.py setup`, group move or five-hour wait finishes 
 
 **Depends on:** none (order only).
 
-#### Work Order
+#### As-built
 
-**Goal:** When a CI point fails, its report names the real cause. Today `scripts/production/ci_points.py:81`, `:158` and `:226` report `result.stderr.strip() or result.stdout.strip()`. `validate_and_push.sh` now writes memory-wait lines to stderr, so that text wins and the failure on stdout is lost: hana's CI point on `cac4a24bc4` failed at 20:19 after 7 h with no cause. `merge_checkpoint.push_validate` (`scripts/production/merge_checkpoint.py:879`) calls the same script with the same pattern. Natedev showrunner order, 2026-10-30.
-
-**Spec:**
-- One helper, `scripts/lib/process_failure.py`, builds the failure text from a `subprocess.CompletedProcess[str]`: the last lines of stderr and of stdout, each labelled, empty streams left out, and `exit <code>` when both are empty. It takes the line count as a keyword with one default (20).
-- `ci_points.py` uses it at all three sites (`required`, the validation step, the review watch). `merge_checkpoint.push_validate` uses it for its validate_and_push failure. No other copy of the pattern changes in this phase.
-- `report()` already joins lines with `; `; the output stays one line per step.
+- `scripts/lib/process_failure.failure_detail(result, *, lines=20)` returns the last `lines` lines of stderr and of stdout, each labelled (`stderr: …`, `stdout: …`), stderr first, an empty stream left out, and `exit <code>` when both are empty.
+- `ci_points.py` uses it in `required`, the validation step and the review watch; `merge_checkpoint.push_validate` uses it for its validate_and_push failure. `report()` joins the lines with `; `, so each step is still one line. A validation failure with no output now reads `exit <code>`, not `validation failed`.
+- 37 other copies of the old pattern remain; Phase 101e moves them.
 
 **Files:**
-- `scripts/lib/process_failure.py` — new helper.
+- `scripts/lib/process_failure.py`, `scripts/lib/test_process_failure.py` — helper and its tests.
 - `scripts/production/ci_points.py`, `scripts/production/merge_checkpoint.py` — callers.
-- `scripts/lib/test_process_failure.py` — helper tests.
-- `scripts/production/test_ci_points.py` — a validation failure whose stderr holds only memory-wait lines and whose stdout holds the failing check; the report names the failing check.
-
-**Workers:** 1 writer (`impl`: helper and callers) + 1 tester (`test`: the two test files).
-
-**Acceptance gate:** `scripts/lib` and `scripts/production` suites pass for `test_process_failure`, `test_ci_points` and `test_merge_checkpoint*`; basedpyright on each changed file and each caller module reads `0 errors, 0 warnings, 0 notes`.
+- `scripts/production/test_ci_points.py` — memory-wait stderr with the failing check on stdout.
 
 ### Phase 101d — A CI point validates one fixed commit  · status: todo
 
@@ -2969,6 +2961,13 @@ A rerun of a stopped `accounts.py setup`, group move or five-hour wait finishes 
 - With a fix commit: push it only when it fast-forwards `origin/<merge branch>`. Otherwise fail with `merge branch moved during validation`. Never force.
 - The copy is removed when the run ends, pass or fail.
 - Report the copy's added disk use and peak memory, and whether a fresh cargo target folder makes the run longer, measured on one real CI point.
+
+**Facts for the writer:**
+- A `clone --shared` copy's `origin` is the production checkout, not GitHub. Set the copy's `origin` URL to the checkout's `origin` URL before any push or `gh` call.
+- `push_direct.sh` pushes `HEAD:refs/heads/<branch>`. Pushing a sha that the branch already contains, but that is not its tip, is refused as non-fast-forward. So the no-push pass must be decided before any push.
+- `validate_ci.sh` builds in `${CARGO_TARGET_DIR:-<repo root>/target}`, so a fresh copy starts with an empty target folder. Do not point the copy at the checkout's target folder: a merge gate builds there at the same time.
+- The CI-run lookup (`gh run list --branch … --commit …` with its wait) lives in `push_direct.sh`, and `validate_and_push.sh` holds `cancel_prior_runs`. Reuse them, or move each one into one place that both callers use. Do not add a second copy.
+- Failures keep `failure_detail` (Phase 101c).
 
 **Files:**
 - `scripts/production/ci_points.py` — fixed sha, copy, push rule.
