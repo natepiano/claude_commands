@@ -15,7 +15,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from typing import cast, final
+from typing import cast, final, override
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -24,6 +24,7 @@ import approved_renames
 import declarations
 import style_plan
 from scripts.production import showrunners
+from scripts.production.staff_test_support import isolated_staff_file, production_membership
 from scripts.build_hold import build_hold
 import live_units
 import unit_lookup
@@ -41,6 +42,12 @@ from style_plan_test_support import StylePlanFixture
 
 @final
 class StylePlanTests(StylePlanFixture):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        production_membership("sample-style", "names-unit")
+
     def test_split_partitions_the_table_left_total_including_ticketed_and_unselected_findings(self) -> None:
         rule = self.rule("split-population")
         names = ("free", "ticketed", "judged", "unsynced", "structure", "exempt", "busy", "gone",
@@ -403,7 +410,14 @@ class UnsyncedChangeTests(unittest.TestCase):
 
 
 class AllStyleProductionsTests(unittest.TestCase):
+    @override
+    def setUp(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = self.enterContext(isolated_staff_file(root / "staff.json", {}))
+        production_membership("fixture")
+
     def runner(self, root: Path, slug: str, kind: str = "style", *, running: bool = True) -> showrunners.Showrunner:
+        production_membership(slug)
         doc = root / f"{slug}-production.md"
         _ = doc.write_text(f"# Production — {slug}\n\n- **Kind:** {kind}\n")
         return {"slug": slug, "session": slug if running else "", "socket": "test" if running else "",
@@ -486,7 +500,14 @@ class AllStyleProductionsTests(unittest.TestCase):
 
 
 class RefillRecordingTests(unittest.TestCase):
+    @override
+    def setUp(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = self.enterContext(isolated_staff_file(root / "staff.json", {}))
+        production_membership("production")
+
     def test_split_all_without_live_style_units_prints_no_style_units_and_succeeds(self) -> None:
+        production_membership("production", "feature-unit")
         with tempfile.TemporaryDirectory(dir="/tmp/claude") as folder:
             production = Path(folder) / "production.md"
             _ = production.write_text("# Production\n\n## Units\n\n"
@@ -530,6 +551,7 @@ class RefillRecordingTests(unittest.TestCase):
                                       + "| Unit | Plan | Worktree | Branch |\n| --- | --- | --- | --- |\n"
                                       + "\n".join(rows) + "\n")
             completed: list[str] = []
+            production_membership("production", "names-unit", "types-unit", "values-unit")
 
             def child(command: list[str], *, capture_output: bool, text: bool, check: bool) -> subprocess.CompletedProcess[str]:
                 self.assertEqual(command[:8], ["systemd-run", "--user", "--scope", "--slice=builds.slice", "nice", "-n", "19", sys.executable])
