@@ -433,7 +433,7 @@ class RosterTests(unittest.TestCase):
         self.assertEqual(full["sid-director"], roster.UnitLabels("director", "builds", "unit-one"))
         self.assertEqual(fast, {"sid-director": full["sid-director"]})
 
-    def test_duplicate_unit_marks_leave_both_sessions_unnamed_on_both_paths(self) -> None:
+    def test_duplicate_staff_marks_leave_both_sessions_unnamed_on_both_paths(self) -> None:
         self._write_session("duplicate", "other-director", "sid-duplicate", self.home / "other", pid=991101)
         self._herdr_process(991101, 991099, ["claude"], HERDR_PANE_ID="w1:p2",
                             SHOWRUNNER_UNIT="alpha", SHOWRUNNER_UNIT_ID="unit-one")
@@ -2419,7 +2419,7 @@ class UnitLabelsTests(unittest.TestCase):
                            director=roster.UnderDirector(" report-unit\n", "director", ""), codex=True)
         self.assertEqual(roster.unit_labels([entry]), {"id": roster.UnitLabels("report test2", "builds", "report")})
 
-    def test_fast_lookup_uses_only_fixture_sessions_registry_and_unit_marks(self) -> None:
+    def test_fast_lookup_uses_only_fixture_sessions_registry_and_staff_marks(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         _ = self.enterContext(isolated_staff_file(root / "staff.json", {}))
         _ = unit_membership("cargo-liner-style", "cargo-liner-style-types-unit")

@@ -27,12 +27,12 @@ import sys
 from unittest import mock
 from scripts.message import unit_labels
 from scripts.production import staff
-import unit_marks
+import session_staff
 
 record = json.loads(sys.stdin.read())
 with (mock.patch.object(unit_labels, "newest_sessions", return_value=[record]),
       mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot(())),
-      mock.patch.object(unit_marks, "member_sources", return_value=unit_marks.MemberSources({}, ()))):
+      mock.patch.object(session_staff, "member_sources", return_value=session_staff.MemberSources({}, ()))):
     labels = unit_labels.unit_labels_for([record["sessionId"]], {
         "HERDR_PROC": sys.argv[1], "NOTIFIER_STATE_DIR": sys.argv[1],
         "NOTIFIER_SESSIONS_DIR": sys.argv[1],

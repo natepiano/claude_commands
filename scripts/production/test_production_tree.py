@@ -125,7 +125,7 @@ class ProductionTreeTests(StaffTestCase):
             "STAFF_ID": row.id, "SHOWRUNNER_UNIT": "natedev", "SHOWRUNNER_UNIT_ID": "one",
         })
         with (mock.patch.object(production_tree, "running_sessions", return_value=[record(DIRECTOR)]),
-              mock.patch.object(unit_lookup, "observed_unit_marks", return_value=(
+              mock.patch.object(unit_lookup, "observed_staff_marks", return_value=(
                   ("natedev", replace(unit(DIRECTOR, "one"), staff_id=row.id)),
               ))):
             edges = production_tree.tree()
@@ -133,7 +133,7 @@ class ProductionTreeTests(StaffTestCase):
 
     def test_complete_tree_with_child_productions_reads_one_staff_snapshot(self) -> None:
         with (mock.patch.object(staff, "snapshot", wraps=staff.snapshot) as reads,
-              mock.patch.object(unit_lookup, "observed_unit_marks", return_value=()),
+              mock.patch.object(unit_lookup, "observed_staff_marks", return_value=()),
               mock.patch.object(production_tree, "running_sessions", return_value=[record(RUNNER), record(CHILD_RUNNER)])):
             edges = production_tree.tree()
         self.assertIn({"manager": RUNNER, "member": CHILD_RUNNER, "role": "showrunner"}, edges)
@@ -345,7 +345,7 @@ class ProductionTreeTests(StaffTestCase):
         edges = self.session_tree({RUNNER}, {"main": {"one": unit(DIRECTOR, "one")}})
         self.assertEqual(edges, [])
 
-    def test_unreadable_unit_marks_keep_the_other_edges(self) -> None:
+    def test_unreadable_staff_marks_keep_the_other_edges(self) -> None:
         with mock.patch.object(production_tree, "running_sessions", return_value=[record(RUNNER), record(CHILD_RUNNER)]), \
                 mock.patch.object(unit_lookup, "every_marked_unit", side_effect=OSError("herdr: gone")), \
                 contextlib.redirect_stderr(io.StringIO()) as errors:

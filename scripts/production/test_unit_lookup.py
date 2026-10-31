@@ -90,7 +90,7 @@ class UnitLookupTests(unittest.TestCase):
         self.assertEqual(found["panes-unit"].place, herdr.HerdrPlace("director", "w4:p1"))
         self.assertEqual(unit_lookup.marked_units("show"), {})
         observed = [(slug, pane.unit, pane.staff_id, pane.claude.session_id)
-                    for slug, pane in unit_lookup.observed_unit_marks()
+                    for slug, pane in unit_lookup.observed_staff_marks()
                     if isinstance(pane.claude, LiveClaude)]
         self.assertEqual(observed, [("show", "alpha-unit", row.id, "id-director")])
 
@@ -168,11 +168,11 @@ print(observed.row.id)
         assert not isinstance(session, sessions.UnreadableSessionRecord)
         with (mock.patch.object(staff, "snapshot", side_effect=AssertionError("second owner read")),
               mock.patch.object(herdr, "herdr_processes", side_effect=AssertionError("process scan"))):
-            found, directors = unit_lookup.session_unit_marks([session], self.environment, record=record)
+            found, directors = unit_lookup.session_staff_and_directors([session], self.environment, record=record)
         self.assertEqual(list(found.units["receiving"]), ["alpha-unit"])
         self.assertEqual(directors, {})
 
-    def test_staff_identity_alone_joins_a_pane_without_legacy_unit_marks(self) -> None:
+    def test_staff_identity_alone_joins_a_pane_without_legacy_staff_marks(self) -> None:
         row = unit_membership("receiving", "alpha-unit")
         fake_unit_host.write(self.environment, [HostedUnit("director", "w4:p1", {"STAFF_ID": row.id})])
         self.claude("director", "w4:p1")

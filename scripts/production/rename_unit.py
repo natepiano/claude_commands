@@ -782,7 +782,7 @@ def stop_unit(rename: StopTarget, save: Callable[[], None]) -> None:
         found = unit_lookup.marked_unit(rename.slug, rename.old)
         if rename.session_id and (found is None or isinstance(found.claude, unit_lookup.LiveClaude)
                                   and found.claude.session_id != rename.session_id):
-            found = next((marked for _, marked in unit_lookup.observed_unit_marks()
+            found = next((marked for _, marked in unit_lookup.observed_staff_marks()
                           if isinstance(marked.claude, unit_lookup.LiveClaude)
                           and marked.claude.session_id == rename.session_id), None)
     except OSError as error:
@@ -1137,7 +1137,7 @@ def _session_failures(rename: UnitRename) -> list[str]:
         failures.append(f"{rename.new} is not running; relaunch it with shutdown.py restart --here --only {rename.session_id}")
     # When the id already matched, the mark is the new id too; only the session name changed.
     if not rename.id_matches:
-        for slug, old in unit_lookup.observed_unit_marks():
+        for slug, old in unit_lookup.observed_staff_marks():
             if (slug == rename.slug and old.unit == rename.old
                     and isinstance(old.claude, (unit_lookup.LiveClaude, unit_lookup.ClaudeUnknown))):
                 failures.append(f"a session still carries the mark {rename.old}: "

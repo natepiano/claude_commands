@@ -191,7 +191,7 @@ def descendants(root: int, rows: list[Process]) -> list[Process]:
     return found
 
 
-def unit_marks(pid: int) -> tuple[str, str] | None:
+def staff_marks(pid: int) -> tuple[str, str] | None:
     """The production and unit a process's environment marks it with, inherited from its unit's session."""
     if sys.platform == "darwin":
         # The Mac has no /proc; herdr reads the environment from ps.
@@ -235,7 +235,7 @@ def work_running(pid: int, rows: list[Process], marks: tuple[str, str] | None = 
     for row in rows:
         if row.pid in ancestors or row.pid in helpers or row.command.endswith(" <defunct>"):
             continue
-        inherited = unit_marks(row.pid)
+        inherited = staff_marks(row.pid)
         if inherited is None or inherited[1] != marks[1]:
             continue
         slug = inherited[0]
