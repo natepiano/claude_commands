@@ -5,10 +5,11 @@ from __future__ import annotations
 import re
 import sys
 from pathlib import Path
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 from zoneinfo import ZoneInfo
 
-import unit_lookup
+if TYPE_CHECKING:
+    import unit_lookup
 from scripts.production import showrunners
 from collections.abc import Iterable
 from scripts.production import staff
@@ -100,6 +101,8 @@ class ProductionMembers:
         """Whether the unit is a current staff child, including an offline child."""
         if self._units is None:
             record = self._record if self._record is not None else staff.snapshot()
+            import unit_lookup
+
             sources = unit_lookup.member_sources()
             members = unit_lookup.production_members(record, sources)
             self._units = {row.name for row in members.get(showrunners.canonical_slug(self._slug), ())}
@@ -133,6 +136,8 @@ def order_unit_names(lines: list[str], names: Iterable[str], *, offline: Iterabl
 def unit_metadata(record: staff.StaffSnapshot, sources: unit_lookup.MemberSources, *,
                   documents: dict[str, list[str]] | None = None) -> dict[staff.StaffId, dict[str, str]]:
     """Bind document cells to staff identities, preferring the current parent's row."""
+    import unit_lookup
+
     members = unit_lookup.production_members(record, sources)
     documents = ({slug: source.document.splitlines() for slug, source in sources.productions.items()}
                  | (documents or {}))
@@ -170,6 +175,8 @@ def unit_metadata(record: staff.StaffSnapshot, sources: unit_lookup.MemberSource
 
 def live_unit_table(lines: list[str], slug: str, *, record: staff.StaffSnapshot | None = None) -> list[dict[str, str]]:
     """Staff members with metadata bound by identity; a table cannot change a parent."""
+    import unit_lookup
+
     record = record if record is not None else staff.snapshot()
     sources = unit_lookup.member_sources()
     slug = showrunners.canonical_slug(slug)

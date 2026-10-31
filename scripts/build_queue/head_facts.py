@@ -2,20 +2,22 @@
 
 from __future__ import annotations
 
-from collections.abc import Generator, Iterator, Mapping
+from collections.abc import Generator, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from functools import cached_property
 import json
 import math
 import os
 from pathlib import Path
 import re
-from typing import cast
+from typing import NamedTuple, cast
 from zoneinfo import ZoneInfo
 
 from scripts.buildlog import store
+from scripts.build_queue.queue_lines import age
 from scripts.lint import memory_admit as gate
-from scripts.message import roster
+from scripts.message import unit_labels
 
 BLOCK_BYTES = 1024 * 1024
 MAX_SCAN_BYTES = 32 * BLOCK_BYTES
@@ -40,6 +42,30 @@ class BumpsUnavailable:
 
 
 @dataclass(frozen=True)
+class BumpRecord:
+    at: float
+    actor: str
+    session: str
+    step: str
+    folder: str
+    old_position: int
+
+
+class MoveIdentity(NamedTuple):
+    session: str
+    step: str
+    folder: str
+
+
+@dataclass(frozen=True)
+class QueueMoves:
+    """Matched move histories in the queue reading's waiting and running order."""
+
+    waiting: tuple[tuple[BumpRecord, ...], ...]
+    running: tuple[tuple[BumpRecord, ...], ...]
+
+
+@dataclass(frozen=True)
 class BumpGroup:
     session: str
     step: str
@@ -53,6 +79,7 @@ class BumpGroup:
 class BumpHistory:
     groups: tuple[BumpGroup, ...]
     total: int
+    records: tuple[BumpRecord, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -88,12 +115,21 @@ class HeadFacts:
     joined_at: float
     head_time: HeadTimeNotRecorded | RecordedHeadTime
     bumps: BumpsUnavailable | BumpHistory
-    order: gate.StrictUntil | gate.BackfillUntil
+    order: gate.StrictUntil | gate.BackfillUntil | gate.WindowNotStarted
     has_priority: bool
     token_waits: TokenWaitsNotRecorded | RecordedTokenWaits
     bump: gate.QueueBump | gate.NoBump = gate.NoBump()
+    bump_records: tuple[BumpRecord, ...] = ()
     budget: int = gate.BUILD_BUDGET_BYTES
     head_need: int = 0
+
+    @cached_property
+    def moves_by_step(self) -> Mapping[MoveIdentity, tuple[BumpRecord, ...]]:
+        groups: dict[MoveIdentity, list[BumpRecord]] = {}
+        for record in self.bump_records:
+            identity = MoveIdentity(record.session, record.step, record.folder)
+            groups.setdefault(identity, []).append(record)
+        return {identity: tuple(records) for identity, records in groups.items()}
 
 
 @dataclass
@@ -187,7 +223,7 @@ def _bump_row(line: bytes) -> tuple[Mapping[str, object], float]:
 
 
 def _read_bumps(since: float, now: float) -> BumpHistory | BumpsUnavailable:
-    groups: dict[tuple[str, str, str], BumpGroup] = {}
+    records: list[BumpRecord] = []
     budget = LogScanBudget()
     try:
         host = store.host_name()
@@ -195,27 +231,33 @@ def _read_bumps(since: float, now: float) -> BumpHistory | BumpsUnavailable:
             lines = _backward_lines(store.host_file(host, month), budget)
             try:
                 for line in lines:
-                    if isinstance(line, _PartialLine):
-                        continue
-                    if not _BUMP_KIND.search(line):
+                    if isinstance(line, _PartialLine) or not _BUMP_KIND.search(line):
                         continue
                     row, at = _bump_row(line)
                     if at < since:
-                        return _bump_history(groups)
-                    if at > now:
-                        continue
-                    key = (cast(str, row["session"]), cast(str, row["step"]), cast(str, row["folder"]))
-                    actor = cast(str, row["actor"])
-                    previous = groups.get(key)
-                    groups[key] = BumpGroup(*key, 1 if previous is None else previous.count + 1,
-                        tuple(sorted({actor} if previous is None else {*previous.actors, actor})),
-                        at if previous is None else max(at, previous.last_at))
+                        return group_bumps(tuple(reversed(records)))
+                    if at <= now:
+                        records.append(BumpRecord(at, cast(str, row["actor"]), cast(str, row["session"]),
+                            cast(str, row["step"]), cast(str, row["folder"]), cast(int, row["old_position"])))
             finally:
                 lines.close()
     except (OSError, ValueError, OverflowError, RecursionError) as error:
         reason = str(error) if isinstance(error, _BumpReadError) else "build log could not be read or has a malformed bump line"
         return BumpsUnavailable(reason)
-    return _bump_history(groups)
+    return group_bumps(tuple(reversed(records)))
+
+
+def group_bumps(records: tuple[BumpRecord, ...]) -> BumpHistory:
+    records = tuple(sorted(records, key=lambda record: record.at))
+    groups: dict[tuple[str, str, str], BumpGroup] = {}
+    for record in records:
+        key = (record.session, record.step, record.folder)
+        previous = groups.get(key)
+        groups[key] = BumpGroup(*key, 1 if previous is None else previous.count + 1,
+            tuple(sorted({record.actor} if previous is None else {*previous.actors, record.actor})),
+            record.at if previous is None else max(record.at, previous.last_at))
+    history = _bump_history(groups)
+    return BumpHistory(history.groups, history.total, records)
 
 
 def _bump_history(groups: Mapping[tuple[str, str, str], BumpGroup]) -> BumpHistory:
@@ -336,12 +378,16 @@ def read_head_facts(reading: gate.QueueRead) -> HeadFacts | gate.NoWaiter:
         since = _recorded_time(cast(Mapping[str, object], reading.ordered[0][1]), "head_since")
         if isinstance(since, float) and since <= now:
             head_time = RecordedHeadTime(since)
-    return HeadFacts(now, head.waiter.since, head_time, _read_bumps(head.waiter.since, now),
-                     head.order, head.has_priority, _read_token_waits(reading), head.bump,
-                     head.decision.budget, head.waiter.need)
+    history = _read_bumps(min(step.since for step in reading.view.waiting), now)
+    records = history.records if isinstance(history, BumpHistory) else ()
+    bumps = (group_bumps(tuple(record for record in records if record.at >= head.waiter.since))
+             if isinstance(history, BumpHistory) else history)
+    return HeadFacts(now, head.waiter.since, head_time, bumps,
+                     head.order, head.has_priority, _read_token_waits(reading), head.bump, records,
+                     budget=head.decision.budget, head_need=head.waiter.need)
 
 
-def _clock(instant: float, zone: ZoneInfo, *, seconds: bool = True) -> str:
+def clock(instant: float, zone: ZoneInfo, *, seconds: bool = True) -> str:
     return datetime.fromtimestamp(instant, zone).strftime("%H:%M:%S" if seconds else "%H:%M")
 
 
@@ -349,8 +395,8 @@ def head_time_text(facts: HeadFacts, zone: ZoneInfo, *, short: bool = False) -> 
     prefix = "head for" if short else "Head for:"
     if isinstance(facts.head_time, HeadTimeNotRecorded):
         return "head for: unknown" if short else "Head for: unknown"
-    minutes = max(0, int((facts.now - facts.head_time.since) // 60))
-    return f"{prefix} {minutes} min" + ("" if short else f" (since {_clock(facts.head_time.since, zone)})")
+    minutes = age(facts.head_time.since, facts.now)
+    return f"{prefix} {minutes} min" + ("" if short else f" (since {clock(facts.head_time.since, zone)})")
 
 
 def bump_text(facts: HeadFacts, zone: ZoneInfo, *, short: bool = False) -> str:
@@ -364,18 +410,18 @@ def bump_text(facts: HeadFacts, zone: ZoneInfo, *, short: bool = False) -> str:
         folder = Path(most.folder).name or "unknown"
         return f"{bumps.total} bumps since it joined, most: {folder} {most.step} ({most.count})"
     count = str(bumps.total) if bumps.groups else "none"
-    return f"Bumps since it joined at {_clock(facts.joined_at, zone)}: {count}"
+    return f"Bumps since it joined at {clock(facts.joined_at, zone)}: {count}"
 
 
-def _session_label(session: str, labels: Mapping[str, roster.UnitLabels]) -> str:
+def _session_label(session: str, labels: Mapping[str, unit_labels.UnitLabels]) -> str:
     return labels[session].session if session in labels else session or "unknown"
 
 
-def bump_rows(facts: HeadFacts, zone: ZoneInfo, labels: Mapping[str, roster.UnitLabels]) -> list[list[str]]:
+def bump_rows(facts: HeadFacts, zone: ZoneInfo, labels: Mapping[str, unit_labels.UnitLabels]) -> list[list[str]]:
     if isinstance(facts.bumps, BumpsUnavailable):
         return []
     return [[group.step, _session_label(group.session, labels), group.folder, str(group.count),
-             ", ".join(_session_label(actor, labels) for actor in group.actors), _clock(group.last_at, zone)]
+             ", ".join(_session_label(actor, labels) for actor in group.actors), clock(group.last_at, zone)]
             for group in facts.bumps.groups[:BUMP_TABLE_ROWS]]
 
 
@@ -388,20 +434,22 @@ def bump_remainder(facts: HeadFacts) -> str:
     return f"and {len(remaining)} more steps with {sum(group.count for group in remaining)} bumps"
 
 
-def order_text(facts: HeadFacts, zone: ZoneInfo) -> str:
+def order_text(facts: HeadFacts, zone: ZoneInfo, *, include_record: bool = True) -> str:
     if not facts.has_priority:
         return "no head priority: younger steps that fit may start"
+    if isinstance(facts.order, gate.WindowNotStarted):
+        return "head priority: window start not recorded; younger steps wait"
     remaining = max(0, int(facts.order.deadline - facts.now))
     minutes, seconds = divmod(remaining, 60)
     text = gate.window_clause(facts.order, facts.budget, facts.head_need, zone)
     text += f" ({minutes} min {seconds} s left)"
-    if isinstance(facts.bump, gate.QueueBump):
+    if include_record and isinstance(facts.bump, gate.QueueBump):
         kind = "bumped by position" if facts.bump.by_position else "head priority recorded"
-        text += f"; {kind} at {_clock(facts.bump.priority_since, zone, seconds=False)}"
+        text += f"; {kind} at {clock(facts.bump.priority_since, zone, seconds=False)}"
     return text
 
 
-def cargo_token_lines(facts: HeadFacts, zone: ZoneInfo, labels: Mapping[str, roster.UnitLabels]) -> list[str]:
+def cargo_token_lines(facts: HeadFacts, zone: ZoneInfo, labels: Mapping[str, unit_labels.UnitLabels]) -> list[str]:
     if isinstance(facts.token_waits, TokenWaitsNotRecorded):
         return ["Cargo token waits: unknown"]
     if not facts.token_waits.waits:
@@ -410,21 +458,19 @@ def cargo_token_lines(facts: HeadFacts, zone: ZoneInfo, labels: Mapping[str, ros
     for wait in facts.token_waits.waits:
         session = _session_label(wait.session_id, labels)
         prefix = f"Cargo token: {session} {wait.step}: "
-        seconds = int(wait.returned.at - wait.left_at)
-        span = f"{_clock(wait.left_at, zone, seconds=False)}-{_clock(wait.returned.at, zone, seconds=False)}"
-        lines.append(prefix + f"waited {seconds} s ({span})")
+        lines.append(prefix + token_wait_text((wait,), zone))
     if facts.token_waits.has_unknown:
         lines.append("Cargo token waits: unknown")
     return lines
 
 
 def cargo_token_text(facts: HeadFacts) -> str:
-    waits = facts.token_waits
-    if isinstance(waits, TokenWaitsNotRecorded) or waits.has_unknown:
+    waits = known_head_waits(facts)
+    if isinstance(waits, TokenWaitsNotRecorded):
         return "cargo token: unknown"
-    if not waits.head_waits:
+    if not waits:
         return "no cargo token wait"
-    seconds = int(sum(wait.returned.at - wait.left_at for wait in waits.head_waits))
+    seconds = token_wait_seconds(waits)
     return f"cargo token waited {seconds} s"
 
 
@@ -433,9 +479,115 @@ def session_ids(facts: HeadFacts | gate.NoWaiter) -> list[str]:
         return []
     sessions: set[str] = set()
     if isinstance(facts.bumps, BumpHistory):
+        sessions.update(record.session for record in facts.bump_records)
+        sessions.update(record.actor for record in facts.bump_records)
         for group in facts.bumps.groups:
             sessions.add(group.session)
             sessions.update(group.actors)
     if isinstance(facts.token_waits, RecordedTokenWaits):
         sessions.update(wait.session_id for wait in facts.token_waits.waits)
     return sorted(sessions - {""})
+
+
+@dataclass(frozen=True)
+class RecordedPace:
+    steps: int
+
+
+@dataclass(frozen=True)
+class PaceUnavailable:
+    pass
+
+
+def read_pace(now: float) -> RecordedPace | PaceUnavailable:
+    """Read this host's completed admission releases in the preceding hour."""
+    host = store.host_name()
+    count = 0
+    lines = _backward_lines(store.root() / "admission/anon_peaks.jsonl", LogScanBudget())
+    try:
+        for line in lines:
+            if isinstance(line, _PartialLine):
+                continue
+            row = _json_record(line)
+            value = row.get("ended_at")
+            if isinstance(value, str):
+                instant = datetime.fromisoformat(value)
+                if instant.utcoffset() is None:
+                    return PaceUnavailable()
+                ended = instant.timestamp()
+            else:
+                ended = _recorded_time(row, "ended_at")
+            if not isinstance(ended, float):
+                return PaceUnavailable()
+            if ended < now - 3600:
+                break
+            if ended <= now and row.get("host") == host:
+                count += 1
+    except (OSError, ValueError, OverflowError, RecursionError):
+        return PaceUnavailable()
+    finally:
+        lines.close()
+    return RecordedPace(count)
+
+
+def move_identity(step: gate.WaitingStep | gate.RunningStep) -> MoveIdentity:
+    return MoveIdentity(step.session_id or step.session_name, step.step, step.folder)
+
+
+def waiting_moves(facts: HeadFacts | gate.NoWaiter, step: gate.WaitingStep,
+                  row: gate.Waiter) -> tuple[BumpRecord, ...]:
+    if (isinstance(facts, gate.NoWaiter) or isinstance(facts.bumps, BumpsUnavailable)
+            or row.get("bump_order", 0) >= 0):
+        return ()
+    return tuple(record for record in facts.moves_by_step.get(move_identity(step), ())
+                 if record.at >= step.since)
+
+
+def running_moves(facts: HeadFacts | gate.NoWaiter, step: gate.ExplainedRunningStep) -> tuple[BumpRecord, ...]:
+    if (isinstance(facts, gate.NoWaiter) or isinstance(facts.bumps, BumpsUnavailable)
+            or isinstance(step.admitted_at, gate.AdmissionTimeNotRecorded)):
+        return ()
+    return tuple(record for record in facts.moves_by_step.get(move_identity(step.step), ())
+                 if record.at <= step.admitted_at)
+
+
+def queue_moves(reading: gate.QueueRead, facts: HeadFacts | gate.NoWaiter) -> QueueMoves:
+    return QueueMoves(
+        tuple(waiting_moves(facts, step, reading.ordered[index][1])
+              for index, step in enumerate(reading.view.waiting)),
+        tuple(running_moves(facts, step) for step in reading.explanation.running),
+    )
+
+
+def actor_text(actor: str, labels: Mapping[str, unit_labels.UnitLabels]) -> str:
+    return "the user" if actor.startswith("user:") else _session_label(actor, labels)
+
+
+def move_text(records: tuple[BumpRecord, ...], zone: ZoneInfo,
+              labels: Mapping[str, unit_labels.UnitLabels]) -> str:
+    return "; ".join(f"from #{record.old_position} by {actor_text(record.actor, labels)} at "
+                     + clock(record.at, zone, seconds=False) for record in records)
+
+
+def known_head_waits(facts: HeadFacts) -> tuple[CargoTokenWait, ...] | TokenWaitsNotRecorded:
+    waits = facts.token_waits
+    if isinstance(waits, TokenWaitsNotRecorded) or waits.has_unknown:
+        return TokenWaitsNotRecorded()
+    return waits.head_waits
+
+
+def head_token_text(facts: HeadFacts, zone: ZoneInfo) -> str:
+    waits = known_head_waits(facts)
+    if isinstance(waits, TokenWaitsNotRecorded) or not waits:
+        return ""
+    return "cargo token: " + token_wait_text(waits, zone)
+
+
+def token_wait_seconds(waits: Sequence[CargoTokenWait]) -> int:
+    return int(sum(wait.returned.at - wait.left_at for wait in waits))
+
+
+def token_wait_text(waits: Sequence[CargoTokenWait], zone: ZoneInfo) -> str:
+    spans = ", ".join(clock(wait.left_at, zone, seconds=False) + "-"
+                      + clock(wait.returned.at, zone, seconds=False) for wait in waits)
+    return f"waited {token_wait_seconds(waits)} s ({spans})"
