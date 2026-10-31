@@ -232,7 +232,8 @@ def _file() -> Path:
 
 
 def _is_owner() -> bool:
-    return remote.other_machine() != OWNER_MACHINE
+    """An explicit STAFF_FILE is local state owned by this process."""
+    return bool(os.environ.get("STAFF_FILE")) or remote.other_machine() != OWNER_MACHINE
 
 
 def operation_fds() -> tuple[int, ...]:

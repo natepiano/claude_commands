@@ -73,6 +73,13 @@ def unit_membership(showrunner: str, unit: str) -> staff.StaffRow:
     return staff.ensure("unit", name=unit_names.name(unit), parent=parent.id)
 
 
+def production_membership(showrunner: str, *units: str) -> None:
+    """Seed the current members of a fixture production, including an empty one."""
+    _ = showrunner_relationship(showrunner)
+    for unit in units:
+        _ = unit_membership(showrunner, unit)
+
+
 def fixture_showrunner_name(slug: str, doc: Path) -> str:
     """Keep the real doc's workspace name; extra fixture productions use their slugs."""
     from scripts.production import showrunners, production_units
@@ -202,7 +209,7 @@ class StaffTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.staff_file = self.root / "owner" / "staff.json"
-        self.mac_file = self.root / "mac" / "staff.json"
+        self.mac_file = self.root / "mac" / ".local/state/staff/staff.json"
         self.ssh_log = self.root / "ssh.jsonl"
         binaries = self.root / "bin"
         binaries.mkdir()
@@ -251,6 +258,9 @@ class StaffTestCase(unittest.TestCase):
                 "scripts.shutdown.remote.other_machine", return_value="mac" if machine == "natedev" else "natedev",
             ))
             _ = contexts.enter_context(isolated_source_readers())
+            if machine == "mac":
+                _ = os.environ.pop("STAFF_FILE", None)
+                os.environ["HOME"] = str(self.root / "mac")
             yield
 
     def tree(self) -> tuple[staff.StaffRow, staff.StaffRow, staff.StaffRow]:

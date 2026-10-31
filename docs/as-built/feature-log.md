@@ -280,7 +280,7 @@ A call is off host when the verb is not `project-of`, the short host name is not
 
 | Project | Step | Runs when | Outcome |
 | --- | --- | --- | --- |
-| hana | `<ChangeReviewFeatureLog/>`, then `<CloseChangeReview/>` | `merge_checkpoint.py` accepts a merge in `~/rust/hana` or `~/rust/hana_catalyst`; later, the user's change-review verdict | `propose` at merge; `add`/`supersede --review` on `works` or `fine`; `drop` on any other verdict |
+| hana | `<ChangeReviewFeatureLog/>`, then `<CloseChangeReview/>` | `merge_checkpoint.py` accepts a merge in `~/rust/hana` or `~/rust/hana_catalyst`; later, the user's change-review verdict | `propose` at merge; `add`/`supersede --review` when the verdict begins `works` or `fine` after optional `okay`/`ok` and a row id (`c17`), ignoring case and later words; `drop` on any other start |
 | claude | the same two steps | `merge_checkpoint.py` accepts a merge in a `~/.claude` worktree (build-followups); later, the user's change-review verdict | the same, with rows qualified by the production's list: `propose --review build-followups/C<n> --project claude`, then `add --review build-followups/C<n>` or `drop --review build-followups/C<n> --verdict …` |
 | cargo-liner, bevy_brp, obsidian_knife, nateroids | `<FeatureLogCloseOut/>` in `/validate_and_push` | the commit is on the default branch and all watched CI is green; also after `push_pr_branch_and_merge.sh` | `add`, `supersede`, or `none — <reason>` in the summary's `Feature log:` line |
 | natedev | `/etc/nixos/README.md` step 6 | `rebuild` succeeded and the activated revision (last line of `~/.local/state/rebuild/generations.log`, without `-dirty`) is on `origin/main` | `add --project natedev`, `supersede`, or `feature log: none — <reason>` |

@@ -22,7 +22,7 @@ from scripts.direct import board_json
 from scripts.lib import unit_runs
 from scripts.production import fake_showrunner, showrunner_parent, showrunner_tree, staff
 from scripts.production.cli_fixture import invoke_cli
-from scripts.production.staff_test_support import StaffTestCase
+from scripts.production.staff_test_support import isolated_staff_file, production_membership
 import unit_table_cells
 
 
@@ -66,10 +66,6 @@ class BoardJsonTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        staff_fixture = StaffTestCase()
-        staff_fixture.setUp()
-        self.addCleanup(staff_fixture.doCleanups)
-        _ = staff_fixture.write_document({"schema": 1, "rows": []})
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.history = self.root / "history"
         (self.history / "runs").mkdir(parents=True)
@@ -113,6 +109,8 @@ class BoardJsonTests(unittest.TestCase):
             "XDG_STATE_HOME": str(self.root / "state"),
             "STYLE_LEDGER_STATE_DIR": str(self.root / "style-ledgers"),
         }
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", self.environment))
+        production_membership("fixture")
 
     def production(self, slug: str = "show", *, running: bool = True,
                    unit_name: str = "alpha-unit") -> ProductionFixture:
@@ -144,7 +142,7 @@ class BoardJsonTests(unittest.TestCase):
             )
             self.addCleanup(held.close)
         self.production_count += 1
-        _ = staff.ensure("showrunner", name=slug)
+        production_membership(slug, unit_name)
         return fixture
 
     def plan(self, fixture: ProductionFixture, *, gate: str = "", all_done: bool = False) -> None:

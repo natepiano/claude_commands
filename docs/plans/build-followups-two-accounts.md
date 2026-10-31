@@ -3004,3 +3004,15 @@ A rerun of a stopped `accounts.py setup`, group move or five-hour wait finishes 
 - `scripts/production/test_add_showrunner.py` — the herdr refusal text
 
 **Gotchas:** `refusal_watch` decides "queued" from the text `not delivered: QUEUED:` in the delivery outcome line. A change to `relay`'s text breaks that check.
+
+### Phase 101g — The Mac account board shows no false problems, and Codex launches on the Mac  · status: done · e31212f7
+
+Showrunner ruling 2026-10-31 06:29 EDT; user asked for the Mac fix at 06:30.
+
+**As-built:** home row compares the `~/.claude` project in both files; `mcp-repair <label> <server>` matches an account to `~/.claude` for one server (dated backup, atomic write, a missing file created 0600); `cutover-home` archives a same-login `~/.codex/auth.json` through its journal, undo restores it; status shows one row per login; credit readings older than ten minutes show as stale with their time, and status reads Codex credits live when they are stale; a credentials entry with no access token reads as `NO_LOGIN_TOKEN`: "no login token; start a session on it", never a retry; the expired-token step no longer promises a notes pass, which the Mac lacks. Review: two lenses, then one fix round (F001 missing-file repair, F002 no-token outcome), closure approved.
+
+### Phase 101h — The Mac refreshes its account readings  · status: done · 20af9b84
+
+User 2026-10-31 07:5x EDT: claude3 showed a red dot on the Mac board while signed in.
+
+**As-built:** launchd job `account-usage` (`/etc/nixos/modules/darwin/account-usage.nix`, every 120 s, at login, Aqua session) runs `agent_notes.py usage-only`, which reads usage and sends no alerts and changes no routing; a read that cannot reach credentials (signed-out CLI answer, exit 1 over ssh) records CREDENTIALS_UNAVAILABLE and keeps the last good outcome. Review: two lenses found F001 (signed-out exit 1 still stored ERROR); one fix round; closure approved.

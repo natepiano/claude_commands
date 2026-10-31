@@ -822,8 +822,8 @@ def _identity_link_problems(
     ]
 
 
-def _read_json_object(path: Path) -> dict[str, object]:
-    decoded = cast(object, json.loads(path.read_text(encoding="utf-8")))
+def _read_json_object(path: Path | io.StringIO) -> dict[str, object]:
+    decoded = cast(object, json.loads(path.read_text(encoding="utf-8") if isinstance(path, Path) else path.read()))
     if not isinstance(decoded, dict):
         raise ValueError("expected a JSON object")
     return cast(dict[str, object], decoded)
@@ -1449,9 +1449,12 @@ def renew_login(label: str) -> LoginRenewed | LoginRenewalFailed:
         usage_store.save([report], datetime.now(timezone.utc))
     except (OSError, ValueError, RuntimeError):
         return LoginRenewalFailed("usage could not be read")
-    if (report.usage_read_outcome == agent_accounts.UsageReadOutcome.STALE_TOKEN
+    if (report.usage_read_outcome in (agent_accounts.UsageReadOutcome.STALE_TOKEN,
+                                    agent_accounts.UsageReadOutcome.NO_LOGIN_TOKEN)
             or isinstance(report.weekly_read_skip, agent_accounts.StaleTokenSkip)):
-        return LoginRenewalFailed("usage still shows an expired login")
+        return LoginRenewalFailed("usage still shows no login token"
+            if report.usage_read_outcome == agent_accounts.UsageReadOutcome.NO_LOGIN_TOKEN
+            else "usage still shows an expired login")
     return LoginRenewed()
 
 
@@ -1659,11 +1662,11 @@ def multiple_accounts_configured() -> bool:
     return bool(_existing_named_accounts())
 
 
-def checked_named_accounts() -> list[NamedAccount]:
+def checked_named_accounts(*, allow_shared_repair: bool = True) -> list[NamedAccount]:
     """Every existing named account fit for a live reading or launch."""
     return [named for named in _existing_named_accounts()
             if isinstance(_inspect_account_directory(
-                named, _account_note(named.label), allow_shared_repair=True,
+                named, _account_note(named.label), allow_shared_repair=allow_shared_repair,
             ), AccountDirectoryReady)]
 
 
@@ -1741,8 +1744,8 @@ def claude_workers_account(label: str) -> NamedAccount:
     return NamedAccount(label, directory)
 
 
-def claude_account_selection() -> agent_accounts.ClaudeAccountsInUse:
-    """Freeze the default, readable directories and local live logins once per run."""
+def claude_account_selection(*, usage_only: bool = False) -> agent_accounts.ClaudeAccountsInUse:
+    """Freeze readable accounts; usage-only selection repairs no links and reads no sessions."""
     from scripts.message import sessions
 
     default = account_identity(main_config_dir())
@@ -1751,13 +1754,13 @@ def claude_account_selection() -> agent_accounts.ClaudeAccountsInUse:
                   if isinstance(default, (agent_accounts.NumberedAccount, agent_accounts.UnnotedLogin))
                   else account.ConfigOnlyHome())
     named_accounts: list[agent_accounts.CheckedNamedClaudeAccount] = []
-    for named in checked_named_accounts():
+    for named in checked_named_accounts(allow_shared_repair=not usage_only):
         identity = account_identity(named.dir)
         if isinstance(identity, agent_accounts.NumberedAccount):
             named_accounts.append(agent_accounts.CheckedNamedClaudeAccount(note_file.canonical_label(named.label), named.dir, identity))
     live_logins: set[str] = set()
     live_directories: dict[Path, None] = {}
-    for session in sessions.live_sessions():
+    for session in (() if usage_only else sessions.live_sessions()):
         identity = account.account_of(session["pid"], home_state=home_state)
         setting = account.process_account_directory(account.process_config_dir(session["pid"]), home_state=home_state)
         directory = setting.path if isinstance(setting, account.ConfiguredClaudeFolder) else None
@@ -2511,6 +2514,10 @@ class HomeCutover(HomeCutoverEvidence):
     state: Literal["moving", "complete", "undoing", "undone"]
 
 
+class CodexHomeCutover(HomeCutover):
+    identity_action: Literal["move", "archive"]
+
+
 class MacHomeCutover(HomeCutover):
     platform: Literal["darwin"]
     oauthAccount: dict[str, object]
@@ -2789,7 +2796,7 @@ def _codex_cutover_process_check(folder: Path) -> None:
 
 
 def cutover_codex_home(label: str, *, undo: bool = False) -> None:
-    """Rename only auth.json; durable intent lets either direction resume safely."""
+    """Move the legacy identity or archive its duplicate, with reversible intent."""
     label = numbered_account_label(label, "codex").label
     source = accounts_home() / ".codex"
     destination = codex_setup_home(label)
@@ -2824,8 +2831,8 @@ def cutover_codex_home(label: str, *, undo: bool = False) -> None:
             raise AccountsError("accounts: cutover identity files must not be links")
         if any(path.exists() and not path.is_file() for path in (home_auth, numbered_auth)):
             raise AccountsError("accounts: cutover identity files must be regular files")
-        if home_auth.exists() and numbered_auth.exists():
-            raise AccountsError(f"accounts: {source if undo else destination} already holds auth.json")
+        if undo and home_auth.exists() and numbered_auth.exists() and raw.get("state") != "undoing":
+            raise AccountsError(f"accounts: {source} already holds auth.json")
         if not raw:
             if undo:
                 raise AccountsError("accounts: no Codex cutover to undo")
@@ -2835,17 +2842,34 @@ def cutover_codex_home(label: str, *, undo: bool = False) -> None:
                 raise AccountsError("accounts: cutover-home requires a readable account note and home login")
             if expected.login.casefold() != login.casefold():
                 raise AccountsError(f"accounts: ~/.codex does not hold {label}'s login")
-            if numbered_auth.exists():
+            if numbered_auth.exists() and _codex_home_login(destination).casefold() != login.casefold():
                 raise AccountsError(f"accounts: {destination} already holds auth.json")
-            journal = HomeCutover(label=label, login=login,
-                                  at=datetime.now(timezone.utc).isoformat(), state="moving")
+            journal = CodexHomeCutover(label=label, login=login,
+                at=datetime.now(timezone.utc).isoformat(), state="moving",
+                identity_action="archive" if numbered_auth.exists() else "move")
         else:
-            journal = cast(HomeCutover, cast(object, raw))
+            if raw.get("identity_action", "move") not in ("move", "archive"):
+                raise AccountsError("accounts: Codex cutover journal has an invalid identity action")
+            journal = cast(CodexHomeCutover, cast(object, {**raw, "identity_action": raw.get("identity_action", "move")}))
+        if journal["identity_action"] == "archive":
+            recorded_at = _stored_time(journal["at"])
+            if recorded_at is None:
+                raise AccountsError("accounts: Codex cutover journal has an invalid archive time")
+            moved_auth = path.with_name("cutover-codex-home."
+                + recorded_at.strftime("%Y%m%dT%H%M%S%fZ") + ".auth.json")
+            if not undo and _codex_home_login(destination).casefold() != journal["login"].casefold():
+                raise AccountsError("accounts: numbered home no longer holds the recorded login; no identity moved")
+        else:
+            moved_auth = numbered_auth
+        if moved_auth.is_symlink():
+            raise AccountsError("accounts: archived Codex identity must not be a link")
         if undo:
             journal["state"] = "undoing"
             _atomic_write(path, json.dumps(journal) + "\n")
-            if numbered_auth.exists():
-                os.replace(numbered_auth, home_auth)
+            if moved_auth.exists():
+                if home_auth.exists():
+                    raise AccountsError("accounts: legacy home already holds auth.json; no login restored")
+                os.replace(moved_auth, home_auth)
             elif not home_auth.exists():
                 raise AccountsError("accounts: neither Codex home holds auth.json; no login moved")
             journal["state"] = "undone"
@@ -2857,7 +2881,7 @@ def cutover_codex_home(label: str, *, undo: bool = False) -> None:
             login = agent_accounts.codex_email_on_disk(source)
             if not login or login.casefold() != journal["login"].casefold():
                 raise AccountsError("accounts: ~/.codex now holds another login than the recorded cutover; undo it first")
-        if not home_auth.exists() and not numbered_auth.exists():
+        if not home_auth.exists() and not moved_auth.exists():
             raise AccountsError("accounts: neither Codex home holds auth.json; no login moved")
         if not raw:
             _atomic_write(path, json.dumps(journal) + "\n")
@@ -2865,7 +2889,9 @@ def cutover_codex_home(label: str, *, undo: bool = False) -> None:
         if problems:
             raise AccountsError("; ".join(problems))
         if home_auth.exists():
-            os.replace(home_auth, numbered_auth)
+            if moved_auth.exists():
+                raise AccountsError("accounts: cutover identity destination already exists; no login moved")
+            os.replace(home_auth, moved_auth)
         _record_home_cutover(journal)
         journal["state"] = "complete"
         _atomic_write(path, json.dumps(journal) + "\n")
@@ -3473,6 +3499,8 @@ def _is_known_private(name: str) -> bool:
         or name.startswith("daemon-auth-")
         or name.startswith(".oauth_refresh.lock")
         or name.startswith(".claude.json.tmp.")
+        or name.startswith(".claude.json.mcp-backup-")
+        or name == ".mcp-repair.lock"
     )
 
 
@@ -3531,10 +3559,26 @@ class UnreadableMcpConfiguration:
 
 
 @dataclass(frozen=True)
+class MissingMcpFile:
+    """Claude has not created a configuration file yet."""
+
+
+@dataclass(frozen=True)
+class ExistingMcpFile:
+    """The original text and permissions to preserve during a repair."""
+
+    text: str
+    mode: int
+
+
+@dataclass(frozen=True)
 class ReadMcpConfiguration:
     names: frozenset[str]
+    file: ExistingMcpFile | MissingMcpFile
     global_names: frozenset[str] = frozenset()
     projects: tuple[ProjectMcpServers, ...] = ()
+    global_definitions: dict[str, object] = field(default_factory=dict)
+    configuration: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -3543,6 +3587,7 @@ class ProjectMcpServers:
 
     path: str
     names: frozenset[str]
+    definitions: dict[str, object] = field(default_factory=dict)
 
 
 McpDirection = Literal["off", "on"]
@@ -3570,19 +3615,31 @@ class McpConfigurationInspection:
     account_is_safe_to_inspect: bool
     baseline_problems: tuple[UnreadableMcpConfiguration, ...]
     account_problems: tuple[UnreadableMcpConfiguration, ...]
+    baseline: ReadMcpConfiguration | UnreadableMcpConfiguration
+    account: ReadMcpConfiguration | UnreadableMcpConfiguration
 
 
 def _mcp_server_names(config_file: Path, project: Path) -> ReadMcpConfiguration | UnreadableMcpConfiguration:
     try:
-        configuration = _read_json_object(config_file)
+        with config_file.open(encoding="utf-8") as stream:
+            source = ExistingMcpFile(stream.read(), stat.S_IMODE(os.fstat(stream.fileno()).st_mode))
+        configuration = _read_json_object(io.StringIO(source.text))
     except FileNotFoundError:
         # Claude can start without a configuration file.
-        return ReadMcpConfiguration(frozenset())
+        return ReadMcpConfiguration(frozenset(), MissingMcpFile())
     except (OSError, ValueError, TypeError) as error:
         return UnreadableMcpConfiguration(config_file, str(error))
-    def names(servers: object) -> set[str]:
-        return {name for name in cast(dict[object, object], servers) if isinstance(name, str)} if isinstance(servers, dict) else set()
-    global_names = frozenset(names(configuration.get("mcpServers", {})))
+    return _mcp_configuration(configuration, project, source)
+
+
+def _mcp_configuration(configuration: dict[str, object], project: Path,
+                       source: ExistingMcpFile | MissingMcpFile) -> ReadMcpConfiguration:
+    """Resolve effective server definitions once for readers and repairs."""
+    def definitions(servers: object) -> dict[str, object]:
+        return {name: value for name, value in cast(dict[object, object], servers).items()
+                if isinstance(name, str)} if isinstance(servers, dict) else {}
+    global_definitions = definitions(configuration.get("mcpServers", {}))
+    global_names = frozenset(global_definitions)
     raw_projects = configuration.get("projects", {})
     projects: list[ProjectMcpServers] = []
     if isinstance(raw_projects, dict):
@@ -3590,13 +3647,14 @@ def _mcp_server_names(config_file: Path, project: Path) -> ReadMcpConfiguration 
             if not isinstance(path, str) or not isinstance(local, dict):
                 continue
             values = cast(dict[str, object], local)
-            active = set(global_names) | names(values.get("mcpServers", {}))
+            local_definitions = definitions(values.get("mcpServers", {}))
+            active = set(global_names) | local_definitions.keys()
             disabled = values.get("disabledMcpServers", [])
             if isinstance(disabled, list):
                 active.difference_update(name for name in cast(list[object], disabled) if isinstance(name, str))
-            projects.append(ProjectMcpServers(path, frozenset(active)))
+            projects.append(ProjectMcpServers(path, frozenset(active), local_definitions))
     home_names = next((scope.names for scope in projects if scope.path == str(project.resolve())), global_names)
-    return ReadMcpConfiguration(home_names, global_names, tuple(projects))
+    return ReadMcpConfiguration(home_names, source, global_names, tuple(projects), global_definitions, configuration)
 
 
 def _mcp_differences(baseline: ReadMcpConfiguration | UnreadableMcpConfiguration,
@@ -3623,11 +3681,12 @@ def _inspect_mcp_configuration(directory: Path) -> McpConfigurationInspection:
     baseline = _mcp_server_names(agent_accounts.claude_config_file(main_config_dir()), main_config_dir())
     config_file = directory / ".claude.json"
     account_is_safe_to_inspect = not directory.is_symlink() and not config_file.is_symlink()
-    current = _mcp_server_names(config_file, directory) if account_is_safe_to_inspect else baseline
+    current = _mcp_server_names(config_file, main_config_dir()) if account_is_safe_to_inspect else baseline
     return McpConfigurationInspection(
         _mcp_differences(baseline, current, directory), account_is_safe_to_inspect,
         (baseline,) if isinstance(baseline, UnreadableMcpConfiguration) else (),
         (current,) if account_is_safe_to_inspect and isinstance(current, UnreadableMcpConfiguration) else (),
+        baseline, current,
     )
 
 
@@ -3643,6 +3702,82 @@ def mcp_projects(label: str, server: str, direction: McpDirection) -> tuple[str,
         raise AccountsError(f"accounts: cannot read MCP configuration {configuration.path}: {configuration.reason}")
     return next((entry.projects for entry in inspection.differences.entries
                  if entry.server == server and entry.direction == direction), ())
+
+
+def mcp_repair(label: str, server: str) -> None:
+    """Match one server's effective project settings to the shared baseline."""
+    directory = account_dir(label)
+    config_file = directory / ".claude.json"
+    if directory.is_symlink() or config_file.is_symlink() or not directory.is_dir():
+        raise AccountsError(f"accounts: cannot repair linked or missing MCP configuration for {label}")
+    with (directory / ".mcp-repair.lock").open("a") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        inspection = _inspect_mcp_configuration(directory)
+        if not inspection.account_is_safe_to_inspect:
+            raise AccountsError(f"accounts: cannot repair linked MCP configuration for {label}")
+        for fault in (*inspection.baseline_problems, *inspection.account_problems):
+            raise AccountsError(f"accounts: cannot read MCP configuration {fault.path}: {fault.reason}")
+        baseline, current = inspection.baseline, inspection.account
+        if not isinstance(baseline, ReadMcpConfiguration) or not isinstance(current, ReadMcpConfiguration):
+            raise AccountsError("accounts: MCP comparison is unavailable")
+        source = current.file
+        differences = [entry for entry in inspection.differences.entries if entry.server == server]
+        if not differences:
+            return
+        configuration = current.configuration
+        raw_globals = configuration.get("mcpServers", {})
+        if not isinstance(raw_globals, dict):
+            raise AccountsError("accounts: MCP servers must be an object; no configuration changed")
+        global_servers = dict(cast(dict[str, object], raw_globals))
+        if server in baseline.global_definitions:
+            global_servers[server] = baseline.global_definitions[server]
+        else:
+            _ = global_servers.pop(server, None)
+        configuration["mcpServers"] = global_servers
+        current = _mcp_configuration(configuration, main_config_dir(), source)
+        differences = [entry for entry in _mcp_differences(baseline, current, directory).entries
+                       if entry.server == server]
+        raw_projects = configuration.setdefault("projects", {})
+        if not isinstance(raw_projects, dict):
+            raise AccountsError("accounts: MCP projects must be an object; no configuration changed")
+        projects = cast(dict[str, object], raw_projects)
+        for entry in differences:
+            for scope in entry.projects:
+                project = str(main_config_dir().resolve()) if scope == "~" else scope
+                raw_local = projects.setdefault(project, {})
+                if not isinstance(raw_local, dict):
+                    raise AccountsError("accounts: MCP project must be an object; no configuration changed")
+                local = cast(dict[str, object], raw_local)
+                raw_disabled = local.get("disabledMcpServers", [])
+                raw_servers = local.get("mcpServers", {})
+                if not isinstance(raw_disabled, list) or not isinstance(raw_servers, dict):
+                    raise AccountsError("accounts: invalid MCP project settings; no configuration changed")
+                disabled = [name for name in cast(list[object], raw_disabled) if name != server]
+                servers = dict(cast(dict[str, object], raw_servers))
+                if entry.direction == "off":
+                    definitions = dict(baseline.global_definitions)
+                    for baseline_project in baseline.projects:
+                        if baseline_project.path == project:
+                            definitions.update(baseline_project.definitions)
+                    servers[server] = definitions[server]
+                else:
+                    disabled.append(server)
+                    _ = servers.pop(server, None)
+                local["disabledMcpServers"] = disabled
+                local["mcpServers"] = servers
+        repaired = json.dumps(configuration, indent=2) + "\n"
+        if isinstance(source, MissingMcpFile):
+            if not atomic_file.create_text_atomic(config_file, repaired):
+                raise AccountsError("accounts: MCP configuration changed during repair; rerun the command")
+            return
+        if config_file.is_symlink() or config_file.read_text(encoding="utf-8") != source.text:
+            raise AccountsError("accounts: MCP configuration changed during repair; rerun the command")
+        backup = config_file.with_name(config_file.name + ".mcp-backup-"
+            + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ"))
+        if not atomic_file.create_text_atomic(backup, source.text):
+            raise AccountsError("accounts: MCP backup already exists; no configuration changed")
+        backup.chmod(source.mode)
+        atomic_file.write_text_atomic(config_file, repaired)
 
 
 def _existing_named_accounts() -> list[NamedAccount]:
@@ -3737,6 +3872,7 @@ def codex_statuses(workers_home: Path) -> list[CodexStatus]:
     """Every listed home, then unheld noted accounts whose home is not listed."""
     statuses: list[CodexStatus] = []
     homes = agent_accounts.codex_homes(workers_home)
+    workers_login = _codex_home_login(workers_home).casefold()
     for home in homes:
         folder = _codex_folder(home)
         safe = not home.is_symlink() and not (home / "auth.json").is_symlink()
@@ -3773,9 +3909,26 @@ def codex_statuses(workers_home: Path) -> list[CodexStatus]:
         note_source = _note_source(label, expected) if isinstance(expected, (MissingAccountNote, UnreadableAccountNote)) else NO_OBSERVED_STATE_CAUSE
         statuses.append(CodexStatus(
             folder, home, True, safe, NO_VALUE if label == login else label, login,
-            CODEX_ROLE if home == workers_home else "spare", tuple(problems), unclassified, note_source=note_source, state_source=state_source,
+            CODEX_ROLE if home == workers_home or login and login.casefold() == workers_login else "spare", tuple(problems), unclassified, note_source=note_source, state_source=state_source,
         ))
-    held_logins = {status.login.casefold() for status in statuses if status.login}
+    by_login: dict[str, int] = {}
+    unique: list[CodexStatus] = []
+    for status in statuses:
+        key = status.login.casefold()
+        if key and key in by_login:
+            index = by_login[key]
+            previous = unique[index]
+            preferred = min((previous, status), key=lambda row: (
+                row.home.name != f".{row.label}", row.home.name == ".codex", str(row.home)))
+            unique[index] = replace(preferred,
+                problems=tuple(dict.fromkeys((*previous.problems, *status.problems))),
+                unclassified=tuple(sorted(set(previous.unclassified) | set(status.unclassified))))
+        else:
+            if key:
+                by_login[key] = len(unique)
+            unique.append(status)
+    statuses = unique
+    held_logins = set(by_login)
     noted = sorted(
         (note.label for note in note_file.read_notes() if note.tool == "codex"),
         key=lambda stem: _label_number(stem),
@@ -3849,7 +4002,9 @@ def _stored_usage(
         if status.login and _is_stale(stored.get(usage_store.key("Claude", status.login)), now)
     ]
     stale_codex = [status.home for status in codex
-                   if status.login and _is_stale(stored.get(usage_store.key("Codex", status.login)), now)]
+                   if status.login and (_is_stale(stored.get(usage_store.key("Codex", status.login)), now)
+                       or _credit_reading(stored.get(usage_store.key("Codex", status.login),
+                           usage_store.StoredUsage()), now)[0] == "stale")]
     if stale or stale_codex:
         with ThreadPoolExecutor() as pool:
             reads: list[tuple[Future[agent_accounts.Report],
@@ -4004,6 +4159,11 @@ def _credit_reading(
     credits = usage.get("credits")
     if credits is None:
         return ("unavailable", StatusUnavailable("unavailable"))
+    read_at = _stored_time(credits["at"])
+    if read_at is None:
+        return ("unavailable", StatusUnavailable("unavailable"))
+    if not timedelta(0) <= now - read_at <= STALE_AFTER:
+        return ("stale", StatusUnavailable(f"stale since {read_at:%Y-%m-%d %H:%M %Z}"))
     balance = credits["balance"]
     try:
         amount = math.inf if balance == "unlimited" else float(balance)
@@ -4073,7 +4233,7 @@ def _status_row_cells(row: StatusRow, zone: tzinfo, checked_at: datetime) -> tup
         read_cell = read.cell
     else:
         local = read.astimezone(zone)
-        date_format = "%m-%d %H:%M %Z" if failed and local.date() != checked_at.astimezone(zone).date() else "%H:%M %Z"
+        date_format = "%m-%d %H:%M %Z" if (failed or checked_at - read > STALE_AFTER) and local.date() != checked_at.astimezone(zone).date() else "%H:%M %Z"
         read_cell = local.strftime(date_format)
     if failed:
         read_cell += "*"
@@ -4233,12 +4393,14 @@ def _read_failure_problem(row: StatusRow, zone: tzinfo,
     previous = (f"this shows the reading from {row.read_at.astimezone(zone):%H:%M}"
                 if isinstance(row.read_at, datetime) else "no reading is stored yet")
     match row.read_outcome:
-        case agent_accounts.UsageReadOutcome.STALE_TOKEN:
+        case agent_accounts.UsageReadOutcome.STALE_TOKEN | agent_accounts.UsageReadOutcome.NO_LOGIN_TOKEN:
             attempt = login_renewal_attempts().get(row.label)
             failed = attempt is not None and isinstance(attempt.result, LoginRenewalFailed)
-            cause = (f"login token expired; a probe session at {attempt.at.astimezone(zone):%H:%M} failed"
-                     if failed and attempt is not None else "login token expired")
-            step = "log in on it by hand" if failed else "the next notes pass renews it"
+            cause = ("no login token" if row.read_outcome == agent_accounts.UsageReadOutcome.NO_LOGIN_TOKEN
+                     else "login token expired")
+            if failed and attempt is not None:
+                cause += f"; a probe session at {attempt.at.astimezone(zone):%H:%M} failed"
+            step = "log in on it by hand" if failed else "start a session on it"
         case agent_accounts.UsageReadOutcome.REFUSED_401:
             cause = "the usage service did not accept this login"
             step = "start a session on it to check it"
@@ -4246,6 +4408,8 @@ def _read_failure_problem(row: StatusRow, zone: tzinfo,
             retry = (f"after {(row.attempted_at + timedelta(minutes=10)).astimezone(zone):%H:%M}"
                      if isinstance(row.attempted_at, datetime) else "in 2 min")
             cause, step = f"the usage service is busy; {previous}", f"next try {retry}"
+        case agent_accounts.UsageReadOutcome.CREDENTIALS_UNAVAILABLE:
+            cause, step = "login credentials unavailable in this session", "refresh from a logged-in desktop session"
         case agent_accounts.UsageReadOutcome.ERROR:
             cause, step = f"the usage read failed; {previous}", "next try in 2 min"
         case agent_accounts.UsageReadOutcome.OK | agent_accounts.UsageReadOutcome.HELD:
@@ -4423,8 +4587,8 @@ def _status_problems(status: AccountStatus | CodexStatus, *, detail: bool, zone:
         for difference in status.mcp_differences.entries:
             count = len(difference.projects)
             scopes = "project" if count == 1 else "projects"
-            arguments = (status.label, difference.server, difference.direction)
-            command = ("~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py mcp-projects "
+            arguments = (status.label, difference.server)
+            command = ("~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py mcp-repair "
                        + shlex.join(("--", *arguments) if any(value.startswith("-") for value in arguments) else arguments))
             problems.append(StatusProblem(subject,
                 f"turns {difference.server} {difference.direction} in {count} {scopes} where ~/.claude does not",
@@ -4667,7 +4831,8 @@ def _read_status(source: UsageSource, *, detail: bool) -> StatusReading:
     codex_login = _codex_home_login(codex_home)
     if codex_login:
         home_status = next((status for status in codex if status.home == codex_home), None)
-        subject = _status_subject(home_status) if home_status is not None else "~/.codex"
+        subject = next((_status_subject(status) for status in codex
+                        if status.login.casefold() == codex_login.casefold()), "~/.codex")
         label = home_account_label("codex")
         label = label if _label_is(label, "codex") else "<codexN>"
         if not is_test_login(codex_login) and not (home_status is not None
@@ -5031,6 +5196,9 @@ def _parser() -> argparse.ArgumentParser:
     _ = mcp_command.add_argument("label")
     _ = mcp_command.add_argument("server")
     _ = mcp_command.add_argument("direction", choices=("off", "on"))
+    mcp_fix = commands.add_parser("mcp-repair", help="match one account MCP server to ~/.claude")
+    _ = mcp_fix.add_argument("label")
+    _ = mcp_fix.add_argument("server")
     cutover = commands.add_parser("cutover-home")
     _ = cutover.add_argument("label", nargs="?", default="")
     _ = cutover.add_argument("--undo", action="store_true")
@@ -5155,6 +5323,12 @@ def main(argv: list[str]) -> int:
             return 0
         if options.detail and options.action != "status":
             raise AccountsError("--detail goes only with no action")
+        if options.action == "mcp-repair":
+            try:
+                mcp_repair(options.label, options.server)
+            except (OSError, ValueError) as error:
+                raise AccountsError(f"accounts: MCP repair failed: {error}") from error
+            return 0
         if options.action == "mcp-projects":
             for path in mcp_projects(options.label, options.server, options.direction):
                 print(path)
