@@ -31,6 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "shutdown"))
 import add_unit
 import production_units
+from scripts.production import staff
 from cli_fixture import ImmutableGitSeed, invoke_cli
 import conversation_pause
 import unit_lookup
@@ -96,7 +97,29 @@ def configure_test_zone() -> None:
     unittest.enterModuleContext(patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
 
 
-from scripts.production.staff_test_support import StaffTestCase
+from scripts.production.staff_test_support import (
+    StaffTestCase, fixture_showrunner_name, showrunner_relationship, unit_membership,
+)
+
+
+class ObservedUnitLaunch:
+    """Validate launch identity before a test observes the spawn boundary."""
+
+    def __init__(self, case: unittest.TestCase,
+                 observe: Callable[[add_unit.UnitLaunch, str], herdr.PromptSubmitOutcome]) -> None:
+        self.case: unittest.TestCase = case
+        self.observe: Callable[[add_unit.UnitLaunch, str], herdr.PromptSubmitOutcome] = observe
+
+    def __call__(self, request: add_unit.UnitLaunch, _director: add_unit.DirectorAgent,
+                 prompt: str, _selected: accounts.ClaudeLaunchAccount, *, target: str = "",
+                 model: str = "", autocompact_window: str = "", staff_id: str = "") -> herdr.PromptSubmitOutcome:
+        self.case.assertEqual(target, "claude2" if isinstance(request.session, add_unit.ResumedSession) else "")
+        self.case.assertEqual((model, autocompact_window), ("", ""))
+        row = staff.by_id(staff.StaffId(staff_id))
+        self.case.assertIsNotNone(row)
+        if row is not None:
+            self.case.assertEqual((row.kind, row.name), ("unit", request.identity.session))
+        return self.observe(request, prompt)
 
 class AddUnitTestCase(ShutdownTestCase):
     staff: StaffTestCase = StaffTestCase()
@@ -136,10 +159,10 @@ class AddUnitTestCase(ShutdownTestCase):
 
     @override
     def setUp(self) -> None:
+        super().setUp()
         self.staff = StaffTestCase()
         self.staff.setUp()
         self.addCleanup(self.staff.doCleanups)
-        super().setUp()
         _ = self.enterContext(patch.object(names, "load_names", return_value=fixture_names()))
         # These CLI fixtures prove launcher plumbing; transcript proof is exercised
         # through the real submit method in PromptSubmissionTests.
@@ -211,6 +234,8 @@ class AddUnitTestCase(ShutdownTestCase):
                     "CODEX_CATALOG_SYNC_STATE_FILE": str(sync_state)}
         self.env["STAFF_FILE"] = str(self.staff.staff_file)
         self.env["HERDR_PANE_RECORD_DIR"] = str(self.staff.source_root / "panes")
+        self.staff.register_production("build-followups", self.doc)
+        _ = showrunner_relationship(fixture_showrunner_name("build-followups", self.doc))
         self.herdr_overrides = {}
         fake_path = self.bin / "fake-herdr"
         source = (SCRIPT.parents[1] / "herdr/fake_herdr.py").read_text()
@@ -598,6 +623,9 @@ class AddUnitTestCase(ShutdownTestCase):
         _ = self.git("add", "docs/plans/build-followups-production.md")
         _ = self.git("commit", "-m", "prepare unit rows")
         _ = self.git("push", "origin", "build-followups")
+        cells = production_units.unit_table(self.doc.read_text().splitlines())[0]
+        if not production_units.plan_cell_is_retired(cells["Plan"]):
+            _ = unit_membership(fixture_showrunner_name("build-followups", self.doc), cell_value(cells["Unit"]))
 
     def assert_no_launch_change(self, document: str, head: str) -> None:
         self.assertEqual(self.doc.read_text(), document)
@@ -687,15 +715,7 @@ class AddUnitTestCase(ShutdownTestCase):
             commands.append(command)
             return subprocess.CompletedProcess(command, 0, "", "")
 
-        def launch(
-            _request: add_unit.UnitLaunch,
-            _director: add_unit.DirectorAgent,
-            prompt: str,
-            _selected: accounts.ClaudeLaunchAccount,
-            *, target: str = "", model: str = "", autocompact_window: str = "",
-        ) -> herdr.PromptSubmitOutcome:
-            self.assertEqual(target, "claude2" if isinstance(_request.session, add_unit.ResumedSession) else "")
-            self.assertEqual((model, autocompact_window), ("", ""))
+        def launch(_request: add_unit.UnitLaunch, prompt: str) -> herdr.PromptSubmitOutcome:
             if isinstance(launch_kind, add_unit.UnitRestoreLaunch):
                 recorded = self.recorded_prompts(launch_kind.session_id)
                 self.assertEqual(recorded[-1], prompt)
@@ -722,7 +742,7 @@ class AddUnitTestCase(ShutdownTestCase):
             patch.object(add_unit, "append_row"),
             patch.object(add_unit, "commit_unit"),
             patch.object(add_unit, "ensure_worktree"),
-            patch.object(add_unit, "launch_session", side_effect=launch),
+            patch.object(add_unit, "launch_session", side_effect=ObservedUnitLaunch(self, launch)),
             patch.object(add_unit, "wait_for_remote_control", return_value=launched) as wait,
             patch.object(add_unit, "record"),
             patch.object(subprocess, "run", side_effect=run),
@@ -765,12 +785,12 @@ class AddUnitTestCase(ShutdownTestCase):
 
         def launch(request: add_unit.UnitLaunch, director: add_unit.DirectorAgent, prompt: str,
                    selected: accounts.ClaudeLaunchAccount, *, target: str = "", model: str = "",
-                   autocompact_window: str = "") -> herdr.PromptSubmitOutcome:
+                   autocompact_window: str = "", staff_id: str = "") -> herdr.PromptSubmitOutcome:
             nonlocal launched
             trace.append("launch")
             launched = True
             return launch_session(request, director, prompt, selected, target=target, model=model,
-                                  autocompact_window=autocompact_window)
+                                  autocompact_window=autocompact_window, staff_id=staff_id)
 
         def shutdown(arguments: list[str], within: float) -> subprocess.CompletedProcess[str]:
             nonlocal stopped
@@ -812,6 +832,7 @@ class AddUnitTestCase(ShutdownTestCase):
         return prior, trace
 
     def persist_herdr_unit(self, name: str, cwd: Path) -> None:
+        _ = unit_membership(fixture_showrunner_name("build-followups", self.doc), "alpha-unit")
         for pid, parent, arguments in ((201, 1, ["herdr", "--session", name, "server"]), (202, 201, ["zsh"])):
             process = self.root / "proc" / str(pid)
             process.mkdir(parents=True)
@@ -823,6 +844,8 @@ class AddUnitTestCase(ShutdownTestCase):
         (Path(self.env["HOME"]) / ".claude/sessions").mkdir(exist_ok=True)
         self.herdr_overrides["--session default session list --json"] = CommandResponse(code=0, stdout=json.dumps(herdr.SessionListResult(sessions=[
                 herdr.SessionEntry(name=name, running=True, default=False, session_dir="/fixture", socket_path="/fixture/socket")])))
+        self.herdr_overrides[f"--session {name} pane list"] = CommandResponse(code=0, stdout=json.dumps({
+            "result": {"panes": [{"pane_id": "w2:p1", "workspace_id": "w2", "label": "alpha"}]}}))
         self.herdr_overrides[f"--session {name} server stop"] = CommandResponse(code=0, stdout="", remove_paths=[str(self.root / "proc/202")])
 
     def set_unit_autocompact(self, value: str, *flags: str) -> subprocess.CompletedProcess[str]:
@@ -840,6 +863,7 @@ class AddUnitTestCase(ShutdownTestCase):
         _ = self.git("add", str(self.doc.relative_to(self.checkout)))
         _ = self.git("commit", "-m", "Add sample fixture production")
         _ = self.git("push", "origin", "build-followups")
+        self.staff.register_production("sample", self.doc)
 
         result = self.successful(unit, "--plan", "docs/plans/given.md")
         self.assertIn(f"{unit} started", result.stdout)

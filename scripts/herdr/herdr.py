@@ -745,6 +745,7 @@ class SessionListResult(TypedDict):
 
 class PaneIdentity(TypedDict):
     pane_id: str
+    terminal_id: NotRequired[str]
     label: NotRequired[str | None]
     workspace_id: str
     session_id: str | None
@@ -1093,6 +1094,7 @@ class Herdr:
             if session_id is not None and not isinstance(session_id, str):
                 raise HerdrFailure("herdr pane agent session value: expected text or null")
             panes.append({"pane_id": json_text(pane.get("pane_id"), "herdr pane id"), "label": label,
+                          "terminal_id": json_text(pane.get("terminal_id", ""), "herdr terminal id"),
                           "workspace_id": json_text(pane.get("workspace_id"), "herdr pane workspace id"),
                           "session_id": session_id})
         return panes
