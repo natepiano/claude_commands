@@ -4,13 +4,14 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import socket
 import subprocess
 import unittest
 from io import StringIO
 from unittest import mock
 from collections import Counter
 from collections.abc import Iterable, Sequence
-from contextlib import closing, redirect_stdout
+from contextlib import closing, nullcontext, redirect_stdout
 from dataclasses import replace
 from pathlib import Path
 from typing import cast, override
@@ -206,6 +207,80 @@ class WorkspaceRunTests(CargoProjectTests):
         self.tree = self.git("rev-parse", "HEAD^{tree}")
         self.runner = FakeRunner()
         self.server = ScriptedServer(lambda text, offset, new: word_edits(text, "old", new))
+
+    def crate_cli(self, ledger: ledger_api.Ledger, arguments: list[str]) -> int:
+        owned_run = run.run_crates
+        def crates(repo: Path, packages: Sequence[str], run_id: str, rule: str,
+                   base_tree: str, destination: str, authority: ledger_api.Ledger) -> int:
+            return owned_run(repo, packages, run_id, rule, base_tree, destination, authority,
+                             self.server, self.runner, self.available)
+        with mock.patch.object(socket, "gethostname", return_value="natedev"), mock.patch.object(
+                ledger_api, "open_ledger", return_value=nullcontext(ledger)), mock.patch.object(
+                run, "run_crates", side_effect=crates), redirect_stdout(StringIO()):
+            return run.main(["--repo", str(self.repo), *arguments])
+
+    def test_crate_cli_runs_lifecycle_and_resume_advances_second_crate_without_selection(self) -> None:
+        import crate_run
+
+        ledger, definition, _ = self.setup_findings()
+        self.addCleanup(ledger.close)
+        destination = "refs/heads/cli-destination"
+        _ = self.git("update-ref", destination, self.base)
+        with mock.patch.object(run, "execute_plan", wraps=run.execute_plan) as execute:
+            self.assertEqual(self.crate_cli(ledger, ["--crate", "bulk_sample", "--run", "cli",
+                             "--rule", definition.rule_id, "--base-tree", self.tree,
+                             "--destination", destination]), 0)
+            batch = crate_run.CrateRun(ledger, "cli")
+            first = batch.read()["crates"]["bulk_sample"]
+            self.assertEqual(first["stage"], crate_run.CrateStage.INTEGRATED)
+            self.assertEqual(batch.read()["crates"]["beta"]["stage"], crate_run.CrateStage.SELECTED)
+            with mock.patch.object(run, "select", side_effect=AssertionError("no reselection")):
+                self.assertEqual(self.crate_cli(ledger, ["--crate", "beta", "--run", "cli"]), 0)
+            self.assertEqual(execute.call_count, 2)
+        result = batch.read()
+        for record in result["crates"].values():
+            self.assertEqual(record["stage"], crate_run.CrateStage.INTEGRATED)
+            checkpoint = batch.result(record)["commit"]
+            self.assertEqual(self.git("merge-base", checkpoint, destination), checkpoint)
+            self.assertEqual(self.git("rev-parse", record["branch"]), checkpoint)
+        for path in ("src/lib.rs", "beta/src/lib.rs"):
+            self.assertIn("let number", self.git("show", destination + ":" + path))
+        self.assertEqual(self.git("rev-parse", "HEAD"), self.base)
+        self.assertEqual(self.git("status", "--porcelain"), "")
+
+    def test_repeated_crate_cli_arguments_advance_serially_in_one_frozen_run(self) -> None:
+        import crate_run
+
+        ledger, definition, _ = self.setup_findings()
+        self.addCleanup(ledger.close)
+        destination = "refs/heads/cli-destination"
+        _ = self.git("update-ref", destination, self.base)
+        with mock.patch.object(run, "select", wraps=run.select) as select:
+            self.assertEqual(self.crate_cli(ledger, ["--crate", "bulk_sample", "--crate", "beta",
+                             "--run", "sequence", "--rule", definition.rule_id,
+                             "--base-tree", self.tree, "--destination", destination]), 0)
+            self.assertEqual(select.call_count, 1)
+        result = crate_run.CrateRun(ledger, "sequence").read()
+        self.assertTrue(all(record["stage"] == crate_run.CrateStage.INTEGRATED
+                            for record in result["crates"].values()))
+
+    def test_cli_without_crate_uses_unchanged_workspace_run(self) -> None:
+        ledger, definition, _ = self.setup_findings()
+        self.addCleanup(ledger.close)
+        owned_run = run.run_rule
+        def workspace(repo: Path, rule: str, base_tree: str, authority: ledger_api.Ledger) -> Path:
+            return owned_run(repo, rule, base_tree, authority, self.server, self.runner, self.available)
+        with mock.patch.object(socket, "gethostname", return_value="natedev"), mock.patch.object(
+                ledger_api, "open_ledger", return_value=nullcontext(ledger)), mock.patch.object(
+                run, "run_rule", side_effect=workspace) as invoked, mock.patch.object(
+                run, "run_crates", side_effect=AssertionError("workspace does not enter crate lifecycle")), redirect_stdout(StringIO()):
+            self.assertEqual(run.main(["--repo", str(self.repo), "--rule", definition.rule_id,
+                                       "--base-tree", self.tree]), 0)
+            invoked.assert_called_once_with(self.repo, definition.rule_id, self.tree, ledger)
+        self.assertEqual(self.git("rev-list", "--count", self.base + "..HEAD"), "1")
+        self.assertFalse((ledger.database.parent / "crate_runs").exists())
+        self.assertEqual([args[2] for _, args in self.runner.calls if args[0] == "bash"],
+                         ["final", "lint", "final-pass"])
 
     def test_doc_parameter_and_derive_field_share_one_tested_rename_commit(self) -> None:
         source = '/// Add `old`.\nfn run(old: usize) -> usize { old + 1 }\n'
@@ -596,9 +671,21 @@ class WorkspaceRunTests(CargoProjectTests):
 
     def test_values_apply_in_one_tested_commit_and_keep_refusals_filed(self) -> None:
         ledger, definition, findings = self.setup_values()
-        with mock.patch.object(bulk, 'RustAnalyzer', side_effect=AssertionError('values started rust-analyzer')):
+        with (
+            mock.patch.object(bulk, 'RustAnalyzer',
+                              side_effect=AssertionError('values started rust-analyzer')),
+            mock.patch.object(run, 'plan_rule', wraps=run.plan_rule) as plan,
+        ):
             path = run.run_rule(self.repo, definition.rule_id, self.tree, ledger, runner=self.runner,
                                 available=lambda repo, path: None)
+        self.assertEqual(plan.call_count, 1)
+        selected = cast(run.Selection, plan.call_args.args[3])
+        # named_held returns finding-id order, not the fixture's declaration order.
+        self.assertEqual({finding.finding_id for finding in selected.findings},
+                         {finding.finding_id for finding in findings if finding.line != 4})
+        self.assertEqual(selected.skipped, tuple(
+            bulk.Refusal(finding.finding_id, 'decision not approved')
+            for finding in findings if finding.line == 4))
         report = bulk.object_fields(cast(object, json.loads(path.read_text())))
         self.assertEqual((report['applied'], report['refused'], report['reverted']), (2, 1, 0))
         self.assertIn('no exact constant', str(report['refusals']))
@@ -981,6 +1068,36 @@ class WorkspaceRunTests(CargoProjectTests):
         self.assertFalse(tuple(ticket for ticket in ledger.proposal_tickets() if ticket["state"] not in ledger_api.FINAL_TICKET_STATES))
         self.assertTrue(all(isinstance(f.build_ticket, ledger_api.NoBuildTicket) for f in ledger.named_held(f.finding_id for f in findings)))
         self.assertFalse(any(args[0] == "bash" for _, args in self.runner.calls))
+
+    def test_formatter_refusal_survives_later_validation_abort(self) -> None:
+        ledger, definition, findings = self.setup_findings()
+        self.addCleanup(ledger.close)
+        self.runner.break_proof = True
+        self.runner.no_progress = True
+        report = self.execute(ledger, definition)
+        formatter_reason = 'post-format rename edit changed: src/lib.rs'
+        abort_reason = ('batch refused: validation errors remain but no new edited file '
+                        'can be reverted')
+        self.assertEqual((report['applied'], report['refused'], report['reverted']), (0, 1, 1))
+        self.assertEqual(report['refusals'], {findings[0].finding_id: formatter_reason})
+        self.assertEqual(report['reversions'], {findings[1].finding_id: abort_reason})
+        self.assertEqual(report['status'], abort_reason)
+        self.assertEqual(report['counts'], [
+            {'disposition': 'refused', 'reason': formatter_reason,
+             'family': 'names', 'crate': '.', 'count': 1},
+            {'disposition': 'reverted', 'reason': abort_reason,
+             'family': 'names', 'crate': 'beta', 'count': 1},
+        ])
+        self.assertEqual({row.finding_id: row.reason
+                          for ticket in cast(list[str], report['tickets'])
+                          for row in ledger.bulk_refusals(ticket)},
+                         {findings[0].finding_id: formatter_reason,
+                          findings[1].finding_id: abort_reason})
+        self.assertTrue(all(isinstance(finding.build_ticket, ledger_api.NoBuildTicket)
+                            for finding in ledger.named_held(f.finding_id for f in findings)))
+        self.assertEqual(self.git('rev-parse', 'HEAD'), self.base)
+        self.assertEqual(self.git('status', '--porcelain'), '')
+        self.assertFalse(any(args[0] == 'bash' for _, args in self.runner.calls))
 
     def test_red_workspace_tests_drop_commit_and_release_all_kept_findings_with_failure(self) -> None:
         ledger, definition, findings = self.setup_findings()
