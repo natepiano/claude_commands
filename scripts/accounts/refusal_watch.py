@@ -36,7 +36,6 @@ from quota_alert import (RefusedAt, _refusal_window, blocked_next_move_line, blo
                          BlockedHeadReason as BlockedHeadReason, NoTargetReading as NoTargetReading,
                          TargetReadingUnavailable as TargetReadingUnavailable,
                          TargetLoginRenewalFailed as TargetLoginRenewalFailed,
-                         TargetHeldByShutdown as TargetHeldByShutdown,
                          TargetAccountUnavailable as TargetAccountUnavailable,
                          TargetAtOrBelowThreshold as TargetAtOrBelowThreshold,
                          TargetUnresolvedRefusal as TargetUnresolvedRefusal,
@@ -654,65 +653,6 @@ def _notify_no_room(text: str, now: datetime) -> bool:
 
 
 
-class PendingClearedHoldNotice(TypedDict):
-    text: str
-    recipients: NotRequired[list[str]]
-
-
-def _pending_cleared_holds() -> dict[str, PendingClearedHoldNotice]:
-    pending: dict[str, PendingClearedHoldNotice] = {}
-    for key, raw in _object(state_root() / "pending_cleared_holds.json").items():
-        if not isinstance(raw, dict):
-            continue
-        value = cast(dict[str, object], raw)
-        text = value.get("text")
-        if not isinstance(text, str):
-            continue
-        notice = PendingClearedHoldNotice(text=text)
-        recipients = value.get("recipients")
-        if isinstance(recipients, list) and all(isinstance(item, str) for item in cast(list[object], recipients)):
-            notice["recipients"] = cast(list[str], recipients)
-        pending[key] = notice
-    return pending
-
-
-def _retry_cleared_hold_notices(now: datetime) -> None:
-    import quota_alert
-    path = state_root() / "pending_cleared_holds.json"
-    pending = _pending_cleared_holds()
-    for key, notice in list(pending.items()):
-        if "recipients" not in notice:
-            recipients = quota_alert.recipients(quota_alert.load_config())
-            if not recipients:
-                continue
-            notice["recipients"] = list(dict.fromkeys(recipients))
-            _atomic_json(path, pending)
-        for recipient in list(notice["recipients"]):
-            job = quota_alert.Job(key, recipient, notice["text"], "account move")
-            outcomes = quota_alert.deliver_and_record([job], now.isoformat())
-            prefix = f"quota {job.kind} {job.name} -> {job.recipient}: "
-            # A queued message belongs to send.py now; its stable key prevents another copy.
-            if outcomes and all(line == prefix + "sent" or line.startswith(prefix + "not delivered: QUEUED:")
-                                for line in outcomes):
-                notice["recipients"].remove(recipient)
-                if not notice["recipients"]:
-                    del pending[key]
-                _atomic_json(path, pending)
-
-
-def _notify_cleared_hold(group: str, target: str, notices: tuple[str, ...], now: datetime) -> None:
-    if not notices:
-        return
-    pending = _pending_cleared_holds()
-    for notice in notices:
-        text = f"{group} move to {target}: {notice}"
-        key = hashlib.sha256(text.encode()).hexdigest()
-        _ = pending.setdefault(key, PendingClearedHoldNotice(text=text))
-    # Save before delivery, so consuming the move cannot lose a failed relay.
-    _atomic_json(state_root() / "pending_cleared_holds.json", pending)
-    _retry_cleared_hold_notices(now)
-
-
 def _blocked_head_line(rule: AutoMoveRule, reason: BlockedHeadReason) -> str:
     return blocked_next_move_line(rule.group, rule.to, rule.entry_id, reason)
 
@@ -749,7 +689,7 @@ def _set_transition(state: WatchState, session_id: str, entry_id: str, transitio
 
 def _continue_session(session_id: str, entry_id: str) -> ContinuationDelivered | ContinuationNotDelivered:
     # Shutdown imports this watcher for its hold and cancellation; resolve its delivery boundary at use.
-    messenger = cast(LiveSessionMessenger, cast(object, import_module("settle")))
+    messenger = cast(LiveSessionMessenger, cast(object, import_module("restart_support")))
     try:
         delivery = messenger.send_message(f"session:{session_id}", "Quota wait ended", "Continue where you stopped.",
             key=f"quota-continue-{session_id}-{entry_id}")
@@ -1018,17 +958,6 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
                     if _notify_no_room(text, now):
                         state["notices"][notice_key] = fingerprint
             continue
-        shutdown_hold = accounts.check_move_target_hold(chosen.label, dry_run=dry_run)
-        if isinstance(shutdown_hold, accounts.MoveRefused):
-            lines.append(shutdown_hold.reason)
-            if group_name != "ungrouped":
-                no_room_groups.add(group_name)
-            if not dry_run:
-                _ = _notify_no_room(shutdown_hold.reason, now)
-            continue
-        lines.extend(shutdown_hold.notices)
-        if not dry_run:
-            _notify_cleared_hold(group_name, chosen.label, shutdown_hold.notices, now)
         if group_name != "ungrouped":
             lines.extend(f"{session.name}: refused group {group_name}; move to {chosen.label}" for session in all_members[group_name]
                          if session.session_id not in {item[0]["session_id"] for item in group})
@@ -1129,15 +1058,6 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
                     if held is not None and not refusals.resolved(held, refusals.stored_reading("claude", identity.login, now), now):
                         lines.append(f"{group_name}: move refused: {target} holds an unresolved refusal")
                         continue
-                    shutdown_hold = accounts.check_move_target_hold(target, dry_run=dry_run)
-                    if isinstance(shutdown_hold, accounts.MoveRefused):
-                        lines.append(f"{group_name}: {shutdown_hold.reason}")
-                        if not dry_run:
-                            _ = _notify_no_room(shutdown_hold.reason, now)
-                        continue
-                    lines.extend(shutdown_hold.notices)
-                    if not dry_run:
-                        _notify_cleared_hold(group_name, target, shutdown_hold.notices, now)
                     prepared = (accounts.prepared_account_preview(target, resume=True) if dry_run
                                 else accounts.prepared_account(target, resume=True))
                     if isinstance(prepared, accounts.AccountRefused):
@@ -1281,13 +1201,6 @@ def _run_auto_moves_locked(now: datetime, *, dry_run: bool = False,
         if held is not None and not refusals.resolved(held, target, now):
             lines.append(_record_blocked_head(state, rule, TargetUnresolvedRefusal(), now, dry_run))
             continue
-        shutdown_hold = accounts.check_move_target_hold(rule.to, dry_run=dry_run)
-        if isinstance(shutdown_hold, accounts.MoveRefused):
-            lines.append(_record_blocked_head(state, rule, TargetHeldByShutdown(shutdown_hold.reason), now, dry_run))
-            continue
-        lines.extend(shutdown_hold.notices)
-        if not dry_run:
-            _notify_cleared_hold(rule.group, rule.to, shutdown_hold.notices, now)
         prepared = (accounts.prepared_account_preview(rule.to, resume=True) if dry_run
                     else accounts.prepared_account(rule.to, resume=True))
         if isinstance(prepared, accounts.AccountRefused):
@@ -1369,7 +1282,6 @@ def run(now: datetime | None = None, *, dry_run: bool = False, proof_group: froz
         return [*renew_expired_logins(at, True), *_run(at, True, proof_group),
                 *(unit_watchdog.run(at, dry_run=True) if not proof_group else [])]
     with _watch_lock():
-        _retry_cleared_hold_notices(at)
         renewed = renew_expired_logins(at, False)
         # A probe can save a reading after the pass started.
         after_renewal = max(at, datetime.now(timezone.utc)) if renewed else at

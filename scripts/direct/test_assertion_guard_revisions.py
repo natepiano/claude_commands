@@ -13,10 +13,355 @@ from unittest.mock import patch
 
 from scripts.direct.assertion_guard import commit_bases, default_base
 from scripts.production import showrunners
-from scripts.direct.assertion_guard_test_support import GUARD, AssertionFindingFixture, SeededGitRepositoryFixture, SeededMergeInProgressFixture, CLEAN, TILE_OLD, TILE_NEW
+from scripts.direct.assertion_guard_test_support import GUARD, AssertionFindingFixture, ComparisonBases, SeededGitRepositoryFixture, SeededMergeInProgressFixture, CLEAN, TILE_OLD, TILE_NEW
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
+class BindingRenameTests(AssertionFindingFixture):
+    def test_two_layout_bindings_renamed_in_one_assertion_pair(self) -> None:
+        before = self.rust("let tall = resolve_layout(40, 100);\n"
+                           + "    let short = resolve_layout(40, 4);\n"
+                           + "    assert!(short.area(PaneId::Targets).height > tall.area(PaneId::Targets).height);")
+        after = before.replace("tall", "tall_resolved_pane_layout").replace("short", "short_resolved_pane_layout")
+        self.change("layout.rs", before, after)
+        self.assert_clean(self.guard())
+
+    def test_multiline_render_binding_rename_and_rewrap_pair(self) -> None:
+        before = self.rust("let expected = ci_columns(&runs);\n"
+                           + "    let width = table_width(&runs, &expected, true);\n"
+                           + "    assert_eq!(display_columns(&runs, width), expected,);\n"
+                           + "    assert!(shows_durations(\n"
+                           + "        &runs, &expected, width,\n    ));")
+        after = before.replace("expected", "expected_ci_display_columns").replace(
+            "&runs, &expected_ci_display_columns, width,", "&runs,\n        &expected_ci_display_columns,\n        width,").replace(
+            "assert_eq!(display_columns(&runs, width), expected_ci_display_columns,);",
+            "assert_eq!(\n        display_columns(&runs, width),\n        expected_ci_display_columns,\n    );")
+        self.change("render.rs", before, after)
+        self.assert_clean(self.guard())
+
+    def test_binding_rename_refuses_other_assertion_changes(self) -> None:
+        before = self.rust("let short = layout(4);\n    let tall = layout(40);\n"
+                           + "    assert!(short.height > tall.height);")
+        renamed = before.replace("short", "short_layout").replace("tall", "tall_layout")
+        for after in (renamed.replace(" > ", " < "),
+                      renamed.replace("short_layout.height", "short_layout.width"),
+                      renamed.replace("layout(4)", "layout(5)")):
+            with self.subTest(after=after):
+                self.change("value.rs", before, after)
+                _ = self.assert_finding(self.guard(), "value.rs", "removed")
+        before = self.rust('let value = read();\n    assert!(value.contains("strict"));')
+        for expression in ('renamed.contains("")', 'other(renamed)', 'check(expected, renamed)'):
+            with self.subTest(expression=expression):
+                self.change("value.rs", before, self.rust("let renamed = read();\n    assert!(" + expression + ");"))
+                _ = self.assert_finding(self.guard(), "value.rs", "removed")
+
+    def test_binding_rename_refuses_shadowing_splits_merges_and_changed_values(self) -> None:
+        cases = (
+            ("let value = read();\n    let value = other();\n    assert!(value.ok());",
+             "let renamed = read();\n    let renamed = other();\n    assert!(renamed.ok());"),
+            ("let value = read();\n    assert!(value.left() > value.right());",
+             "let left = read();\n    let right = read();\n    assert!(left.left() > right.right());"),
+            ("let left = read();\n    let right = read();\n    assert!(left.left() > right.right());",
+             "let value = read();\n    assert!(value.left() > value.right());"),
+            ("let value = read();\n    assert!(value.ok());",
+             "let renamed = other();\n    assert!(renamed.ok());"),
+            ("let value = read();\n    use_value(renamed);\n    assert!(value.ok());",
+             "let renamed = read();\n    use_value(renamed);\n    assert!(renamed.ok());"),
+            ("let value = read();\n    assert!(value.ok());\n    consume(value);",
+             "let renamed = read();\n    assert!(renamed.ok());\n    consume(value);"),
+        )
+        for before, after in cases:
+            with self.subTest(after=after):
+                self.change("value.rs", self.rust(before), self.rust(after))
+                _ = self.assert_finding(self.guard(), "value.rs", "removed")
+
+    def test_binding_rename_refuses_patterns_closures_and_observing_macros(self) -> None:
+        cases = (
+            "let (value, other) = read();\n    assert!(value.ok());",
+            "let Data { value } = read();\n    assert!(value.ok());",
+            "let ref value = read();\n    assert!(value.ok());",
+            "let &mut value = read();\n    assert!(value.ok());",
+            "let callback = |value: Data| { assert!(value.ok()); };",
+            "let value = read();\n    assert!(observe!(value));",
+            "let value = read();\n    observe!(value);\n    assert!(value.ok());",
+            "let value = read();\n    assert!(value.ok());\n    consume(Data { value });",
+            "let value = read();\n    assert!(value.ok());\n    consume(object.value);",
+        )
+        for before in cases:
+            with self.subTest(before=before):
+                self.change("value.rs", self.rust(before), self.rust(before.replace("value", "renamed")))
+                _ = self.assert_finding(self.guard(), "value.rs", "removed")
+
+    def test_plain_mut_binding_and_dependent_rhs_renames_pair(self) -> None:
+        before = self.rust("let mut value = read();\n    let other = adjust(&value);\n"
+                           + "    value.update();\n    assert!(value.left() > other.right());", "test_layout")
+        self.change("value.rs", before, before.replace("value", "data").replace("other", "adjusted"))
+        self.assert_clean(self.guard())
+
+    def test_unrelated_function_expression_macros_do_not_refuse_local_rename(self) -> None:
+        before = ('mod common {}\nuse common::*;\nfn unrelated() -> Vec<i32> { vec![1, 2] }\n'
+                  + self.rust("let value = read();\n    assert!(value.ok());", "test_layout"))
+        after = before.replace("let value =", "let renamed =").replace("value.ok()", "renamed.ok()")
+        self.change("value.rs", before, after)
+        self.assert_clean(self.guard())
+
+    def test_binding_rename_refuses_macro_rebinding_and_producing_environments(self) -> None:
+        for environment in ('use std::stringify as assert;\n',
+                            'macro_rules! assert { ($($t:tt)*) => {} }\n',
+                            'include!("shadow.rs");\n', '#[macro_use] mod support;\n'):
+            with self.subTest(environment=environment):
+                before = environment + self.rust("let value = read();\n    assert!(value.ok());", "test_layout")
+                after = before.replace("let value =", "let renamed =").replace("value.ok()", "renamed.ok()")
+                self.change("value.rs", before, after)
+                _ = self.assert_finding(self.guard(), "value.rs", "removed", "test_layout")
+
+    def test_binding_rename_refuses_macro_callees_and_type_names(self) -> None:
+        for expression in ("value!(argument)", "observe(check::<&[value]>())", "check(0 as value)"):
+            with self.subTest(expression=expression):
+                before = ('type value = Small;\ntype renamed = Large;\n'
+                          + self.rust("let value = read();\n    assert!(" + expression + ");", "test_layout"))
+                after = before.replace("let value =", "let renamed =").replace(expression, expression.replace("value", "renamed"))
+                self.change("value.rs", before, after)
+                _ = self.assert_finding(self.guard(), "value.rs", "removed", "test_layout")
+
+    def test_binding_rename_refuses_references_before_the_binding_takes_effect(self) -> None:
+        for body in ("consume(value);\n    let value = read();\n    assert!(value.ok());",
+                     "let value = value();\n    assert!(value.ok());"):
+            with self.subTest(body=body):
+                before = self.rust(body, "test_layout")
+                self.change("value.rs", before, before.replace("value", "renamed"))
+                _ = self.assert_finding(self.guard(), "value.rs", "removed", "test_layout")
+
+    def test_binding_rename_keeps_constant_pairing_in_its_original_namespace(self) -> None:
+        before = ('const value: &str = "strict";\nconst LIMIT: i32 = 2;\n'
+                  + self.rust("let value = read();\n    assert!(value.contains(\"strict\"));\n"
+                              + "    assert!(value.len() > LIMIT);", "test_layout"))
+        after = before.replace("let value =", "let renamed =").replace("value.contains", "renamed.contains").replace("value.len", "renamed.len")
+        self.change("value.rs", before, after)
+        self.assert_clean(self.guard())
+
+    def test_test_parameter_renames_refuse_even_with_fixture_attributes(self) -> None:
+        fixtures = ("#[rstest::fixture]\nfn value() -> i32 { 1 }\n"
+                    + "#[rstest::fixture]\nfn renamed() -> i32 { -1 }\n")
+        for attribute in ("#[rstest::rstest]", "#[test]", "#[tokio::test]"):
+            with self.subTest(attribute=attribute):
+                before = (fixtures + attribute + "\nfn test_fixture(value: i32) {\n"
+                          + "    assert!(value.is_positive());\n}\n")
+                after = before.replace("value: i32", "renamed: i32").replace("value.is_positive()", "renamed.is_positive()")
+                self.change("value.rs", before, after)
+                _ = self.assert_finding(self.guard(), "value.rs", "removed", "test_fixture")
+
+    def test_binding_rename_refuses_inline_format_captures(self) -> None:
+        for capture in ("value", "renamed"):
+            for literal in ('"{' + capture + '}"', 'r#"{' + capture + ':>8?}"#'):
+                with self.subTest(literal=literal):
+                    before = self.rust("let value = read();\n    println!(" + literal
+                                       + ");\n    assert!(value.ok());", "test_layout")
+                    after = before.replace("let value =", "let renamed =").replace("value.ok()", "renamed.ok()")
+                    self.change("value.rs", before, after)
+                    _ = self.assert_finding(self.guard(), "value.rs", "removed", "test_layout")
+
+    def test_python_binding_renames_stay_removed_as_a_class(self) -> None:
+        before = self.python("value = read()\n    assert value.ok()")
+        self.change("test_value.py", before, before.replace("value =", "renamed =").replace("value.ok()", "renamed.ok()"))
+        _ = self.assert_finding(self.guard(), "test_value.py", "removed")
+
+
 class AssertionRevisionTests(AssertionFindingFixture):
+    def test_deleted_python_test_with_different_parent_signatures_still_blocks(self) -> None:
+        before = ("def test_outer():\n    def final_diff():\n        return 1\n"
+                  + "    assert final_diff() == 1\n")
+        bases = self.change_against_bases("test_x.py", before,
+                                         before.replace("test_outer():", "test_outer(tmp_path):"),
+                                         "# removed test\n")
+        for first, second in (bases, ComparisonBases(bases.second, bases.first)):
+            with self.subTest(first=first):
+                line = self.assert_finding(self.guard("--base", first, "--base", second),
+                                           "test_x.py", "removed", "test_outer")
+                self.assertIn("assert final_diff() == 1 -> (none)", line)
+                _ = self.assert_finding(self.guard("--base", first, "--base", second,
+                    "--rulings", "-", stdin="Assertion-Change: test_x.py::test_outer — Approved removal.\n"),
+                    "test_x.py", "removed", "test_outer", status=0)
+
+
+    def test_deleted_rust_test_with_different_parent_return_types_still_blocks(self) -> None:
+        for gap in ("", "\n\n"):
+            before = ("#[test]\nfn outer() -> Result<(), [u8; 1]> {\n" + gap
+                      + "    fn helper() {}\n    assert_eq!(1, 1);\n    Ok(())\n}\n")
+            bases = self.change_against_bases("value.rs", before, before.replace("[u8; 1]", "u8"),
+                                             "// removed test\n")
+            for first, second in (bases, ComparisonBases(bases.second, bases.first)):
+                with self.subTest(first=first, gap=gap):
+                    line = self.assert_finding(self.guard("--base", first, "--base", second),
+                                               "value.rs", "removed", "outer")
+                    self.assertIn("assert_eq!(1, 1); -> (none)", line)
+                    _ = self.assert_finding(self.guard("--base", first, "--base", second,
+                        "--rulings", "-", stdin="Assertion-Change: value.rs::outer — Approved removal.\n"),
+                        "value.rs", "removed", "outer", status=0)
+
+
+    def test_deleted_test_counts_only_assertions_shared_by_every_base(self) -> None:
+        bases = self.change_against_bases("test_x.py",
+            self.python("assert shared == expected\n    assert first == expected", "test_outer"),
+            self.python("assert shared == expected\n    assert second == expected", "test_outer"),
+            "# removed test\n")
+        for first, second in (bases, ComparisonBases(bases.second, bases.first)):
+            with self.subTest(first=first):
+                result = self.guard("--base", first, "--base", second)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertEqual(result.stderr, "")
+                findings = [line for line in result.stdout.splitlines() if not line.startswith("assertion guard:")]
+                self.assertEqual(len(findings), 1, result.stdout)
+                self.assertRegex(findings[0], r"^test_x\.py:\d+ test_outer test removed \(1 assertions\): ")
+                self.assertIn("assertion guard: 1 blocking;", result.stdout)
+
+
+    def test_parse_failure_keeps_shared_removal_and_first_base_owner(self) -> None:
+        before = self.python("def final_diff():\n        return 1\n    assert final_diff() == 1", "test_outer")
+        other = before + '\nlabel = t"hello"\n'
+        bases = self.change_against_bases("test_x.py", before, other,
+                                         other.replace("    assert final_diff() == 1\n", "    pass\n"))
+        for first, second, owner in ((bases.first, bases.second, "test_outer"),
+                                     (bases.second, bases.first, "final_diff")):
+            with self.subTest(first=first):
+                _ = self.assert_finding(self.guard("--base", first, "--base", second),
+                                        "test_x.py", "removed", owner)
+
+
+    def test_fixture_attributes_do_not_own_outside_helper_assertions(self) -> None:
+        for attribute in ("#[rstest::fixture]", "#[fixture]"):
+            with self.subTest(attribute=attribute):
+                before = (attribute + "\nfn client() -> usize {\n"
+                          + "    fn helper() -> usize { 1 }\n    assert_eq!(helper(), 1);\n    helper()\n}\n")
+                self.change("value.rs", before, before.replace("    assert_eq!(helper(), 1);\n", ""))
+                _ = self.assert_finding(self.guard("--rulings", "-", stdin=(
+                    "Assertion-Change: value.rs::client — Approved test removal.\n")),
+                    "value.rs", "removed", "helper")
+
+
+    def test_owner_changes_do_not_hide_shared_weaker_assertions(self) -> None:
+        before = self.python("def final_diff():\n        return 1\n    assert final_diff() == 1", "test_outer")
+        other = before + '\nlabel = t"hello"\n'
+        bases = self.change_against_bases("test_x.py", before, other,
+                                         other.replace("assert final_diff() == 1", "assert final_diff() >= 1"))
+        for first, second, owner in ((bases.first, bases.second, "test_outer"),
+                                     (bases.second, bases.first, "final_diff")):
+            with self.subTest(first=first):
+                _ = self.assert_finding(self.guard("--base", first, "--base", second),
+                                        "test_x.py", "weaker", owner)
+
+
+    def test_signature_semicolons_preserve_test_owner_and_shared_removal(self) -> None:
+        before = ("#[test]\nfn outer() -> Result<(), [u8; 1]> {\n"
+                  + "    fn helper() {}\n    assert_eq!(1, 1);\n    Ok(())\n}\n")
+        other = before.replace("[u8; 1]", "u8")
+        bases = self.change_against_bases("value.rs", before, other,
+                                         other.replace("    assert_eq!(1, 1);\n", ""))
+        _ = self.assert_finding(self.guard("--base", bases.first), "value.rs", "removed", "outer")
+        _ = self.assert_finding(self.guard("--base", bases.first, "--rulings", "-", stdin=(
+            "Assertion-Change: value.rs::outer — Approved test removal.\n")),
+            "value.rs", "removed", "outer", status=0)
+        for first, second in (bases, ComparisonBases(bases.second, bases.first)):
+            with self.subTest(first=first):
+                _ = self.assert_finding(self.guard("--base", first, "--base", second),
+                                        "value.rs", "removed", "outer")
+
+
+    def test_spaced_and_closed_test_attributes_own_nested_helpers(self) -> None:
+        for attribute in ("#[tokio :: test]", "# [test]", "# [ async_std :: test ]",
+                          "#[rstest :: rstest]", "#[test_case(1)]", "#[test_case :: test_case(1)]"):
+            with self.subTest(attribute=attribute):
+                before = (attribute + "\nasync fn outer() {\n"
+                          + "    fn helper() {}\n    assert_eq!(1, 1);\n}\n")
+                self.change("value.rs", before, before.replace("    assert_eq!(1, 1);\n", ""))
+                _ = self.assert_finding(self.guard(), "value.rs", "removed", "outer")
+                _ = self.assert_finding(self.guard("--rulings", "-", stdin=(
+                    "Assertion-Change: value.rs::outer — Approved test removal.\n")),
+                    "value.rs", "removed", "outer", status=0)
+
+
+    def test_unbalanced_braces_keep_baseline_helper_owner(self) -> None:
+        for braces in ("", "}\n}\n"):
+            with self.subTest(braces=braces):
+                before = ("#[test]\nfn outer() {\n    fn helper() {}\n"
+                          + "    assert_eq!(1, 1);\n" + braces)
+                self.change("value.rs", before, before.replace("    assert_eq!(1, 1);\n", ""))
+                _ = self.assert_finding(self.guard("--rulings", "-", stdin=(
+                    "Assertion-Change: value.rs::outer — Approved test removal.\n")),
+                    "value.rs", "removed", "helper")
+
+
+    def test_python_assertion_after_nested_helper_uses_enclosing_test_and_ruling(self) -> None:
+        for declaration in ("def", "async def"):
+            with self.subTest(declaration=declaration):
+                before = ("import unittest\nclass T(unittest.TestCase):\n"
+                          + f"    {declaration} test_outer(self):\n"
+                          + "        def final_diff():\n            return 1\n"
+                          + "        self.assertEqual(final_diff(), 1)\n        self.assertTrue(True)\n")
+                self.change("test_x.py", before, before.replace("        self.assertTrue(True)\n", ""))
+                _ = self.assert_finding(self.guard(), "test_x.py", "removed", "test_outer")
+                result = self.guard("--rulings", "-", stdin=(
+                    "Assertion-Change: test_x.py::test_outer — Approved removal.\n"))
+                line = self.assert_finding(result, "test_x.py", "removed", "test_outer", status=0)
+                self.assertIn("ruled: Approved removal.", line)
+
+
+    def test_rust_assertion_after_nested_helper_uses_enclosing_test_and_ruling(self) -> None:
+        for attribute in ("#[test]", "#[tokio::test]", "#[async_std::test]", "#[rstest]"):
+            with self.subTest(attribute=attribute):
+                before = (attribute + "\nfn outer() {\n"
+                          + "    fn final_diff() -> usize { 1 }\n"
+                          + "    assert_eq!(final_diff(), 1);\n    assert!(true);\n}\n")
+                self.change("value.rs", before, before.replace("    assert!(true);\n", ""))
+                _ = self.assert_finding(self.guard(), "value.rs", "removed", "outer")
+                result = self.guard("--rulings", "-", stdin=(
+                    "Assertion-Change: value.rs::outer — Approved removal.\n"))
+                line = self.assert_finding(result, "value.rs", "removed", "outer", status=0)
+                self.assertIn("ruled: Approved removal.", line)
+
+
+    def test_assertion_inside_nested_helper_uses_enclosing_test(self) -> None:
+        for path, before, assertion in (
+            ("test_x.py", self.python("def final_diff():\n        assert actual == expected\n"
+                                      + "        return 1\n    final_diff()", "test_outer"),
+             "        assert actual == expected\n"),
+            ("value.rs", self.rust("fn final_diff() {\n        assert_eq!(actual, expected);\n"
+                                   + "    }\n    final_diff();", "test_outer"),
+             "        assert_eq!(actual, expected);\n"),
+        ):
+            with self.subTest(path=path):
+                self.change(path, before, before.replace(assertion, ""))
+                _ = self.assert_finding(self.guard(), path, "removed", "test_outer")
+
+
+    def test_test_scope_ends_before_an_outside_helper(self) -> None:
+        for path, before, assertion in (
+            ("test_x.py", self.python("def nested():\n        return 1\n    assert True", "test_outer")
+             + "\n" + self.python("assert actual == expected", "outside_helper"),
+             "    assert actual == expected\n"),
+            ("value.rs", self.rust("fn nested() {}\n    assert!(true);", "outer")
+             + "\nfn outside_helper() {\n    assert_eq!(actual, expected);\n}\n",
+             "    assert_eq!(actual, expected);\n"),
+        ):
+            with self.subTest(path=path):
+                self.change(path, before, before.replace(assertion, "    pass\n" if path.endswith(".py") else ""))
+                _ = self.assert_finding(self.guard(), path, "removed", "outside_helper")
+
+
+    def test_innermost_test_owns_only_its_body(self) -> None:
+        for path, before, inner, outer in (
+            ("test_x.py", self.python("def test_inner():\n        assert inner_ok\n"
+                                      + "        return 1\n    assert outer_ok", "test_outer"),
+             "        assert inner_ok\n", "    assert outer_ok\n"),
+            ("value.rs", self.rust("#[test]\n    fn test_inner() {\n        assert!(inner_ok);\n"
+                                   + "    }\n    assert!(outer_ok);", "test_outer"),
+             "        assert!(inner_ok);\n", "    assert!(outer_ok);\n"),
+        ):
+            for assertion, owner in ((inner, "test_inner"), (outer, "test_outer")):
+                with self.subTest(path=path, owner=owner):
+                    self.change(path, before, before.replace(assertion, ""))
+                    _ = self.assert_finding(self.guard(), path, "removed", owner)
+
+
     def test_module_path_import_allows_pairing_but_statement_macro_refuses(self) -> None:
         prefix = ('mod module_path {}\nmod tests {\nuse super::module_path;\n'
                   + 'const FIELD: &str = "strict";\n')
@@ -653,10 +998,10 @@ class MergeAssertionTests(SeededMergeInProgressFixture):
                          (self.git("rev-parse", "HEAD"), self.git("rev-parse", "MERGE_HEAD")))
 
     def test_repeated_bases_exclude_the_other_parents_assertion_removal(self) -> None:
-        # A HEAD-only comparison really does see the imported removal.
+        # An explicit HEAD base still includes the pending merge parent.
         single = self.guard("--base", "HEAD", "--staged")
-        self.assertEqual(single.returncode, 1, single.stdout + single.stderr)
-        self.assertIn("test_incoming removed:", single.stdout)
+        self.assertEqual(single.returncode, 0, single.stdout + single.stderr)
+        self.assertNotIn("test_incoming removed:", single.stdout)
         for first, second in (("HEAD", "MERGE_HEAD"), ("MERGE_HEAD", "HEAD")):
             with self.subTest(first=first):
                 result = self.guard("--base", first, "--base", second, "--staged")
@@ -679,8 +1024,8 @@ class MergeAssertionTests(SeededMergeInProgressFixture):
     def test_completed_merge_default_base_excludes_the_other_parents_removals(self) -> None:
         _ = self.git("commit", "-q", "-m", "merge incoming")
         explicit = self.guard("--base", "HEAD^1")
-        self.assertEqual(explicit.returncode, 1, explicit.stdout + explicit.stderr)
-        self.assertIn("test_incoming removed:", explicit.stdout)
+        self.assertEqual(explicit.returncode, 0, explicit.stdout + explicit.stderr)
+        self.assertNotIn("test_incoming removed:", explicit.stdout)
         result = self.guard()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(result.stdout.strip(), CLEAN)

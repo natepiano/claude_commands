@@ -27,7 +27,7 @@ AUDIT_SCRIPT = Path(__file__).with_name("push_audit.py")
 SINCE = "2026-10-13T17:24:00-04:00"
 UNTIL = "2026-10-20T17:24:00-04:00"
 AT = "2026-10-15T12:00:00Z"
-REGISTERED_TEXT = "shutdown.stop_failed"
+REGISTERED_TEXT = "shutdown.restart_failed"
 AUDIT_SUMMARY_PREFIXES = ("Window:", "Pushes:", "ApprovedPriorityTwo:", "Source problems:")
 
 
