@@ -378,7 +378,7 @@ class SessionLookupTests(ShutdownTestCase):
         path = self.sessions / "rewriting.json"
         valid = path.read_text()
         for direct in (True, False):
-            with self.subTest(direct=direct), mock.patch.object(Path, "read_text", side_effect=["", "{", valid]) as read:
+            with self.subTest(direct=direct), mock.patch.object(Path, "read_text", side_effect=["{", valid]) as read:
                 with mock.patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(self.sessions)}):
                     if direct:
                         result = sessions.read_session(path)
@@ -387,14 +387,32 @@ class SessionLookupTests(ShutdownTestCase):
                         self.assertEqual(len(registry.entries), 1)
                         result = registry.entries[0].record
                 self.assertNotIsInstance(result, sessions.UnreadableSessionRecord)
-                self.assertEqual(read.call_count, 3)
+                self.assertEqual(read.call_count, 2)
 
-    def test_persistently_unreadable_registry_read_has_only_three_tries(self) -> None:
+    def test_persistently_unreadable_registry_read_has_one_reread(self) -> None:
         with mock.patch.object(Path, "read_text", side_effect=PermissionError("denied")) as read, \
              mock.patch.object(time, "sleep") as sleep:
             self.assertEqual(sessions.read_session(self.sessions / "bad.json"), sessions.UnreadableSessionRecord.FOUND)
-        self.assertEqual(read.call_count, 3)
-        self.assertEqual(sleep.call_args_list, [mock.call(0.05), mock.call(0.05)])
+        self.assertEqual(read.call_count, 2)
+        self.assertEqual(sleep.call_args_list, [mock.call(0.05)])
+
+    def test_unreadable_dead_pid_is_dropped_but_live_pid_stays_unknown(self) -> None:
+        path = self.sessions / "4242.json"
+        _ = path.write_text("{")
+        with mock.patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(self.sessions)}):
+            for error, expected in ((ProcessLookupError(), ()), (PermissionError(), (path,)), (None, (path,))):
+                with self.subTest(error=error), mock.patch.object(os, "kill", side_effect=error):
+                    self.assertEqual(sessions.read_registry().unreadable, expected)
+                    self.assertEqual(sessions.session_liveness("stopped"),
+                        sessions.SessionNotLive() if not expected else
+                        sessions.SessionLivenessUnknown("unreadable session registry record: 4242.json"))
+
+    def test_record_removed_between_unreadable_read_and_reread_is_dropped(self) -> None:
+        path = self.sessions / "4242.json"
+        _ = path.write_text("{")
+        with (mock.patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(self.sessions)}),
+              mock.patch.object(Path, "read_text", side_effect=["{", FileNotFoundError(path)])):
+            self.assertEqual(sessions.read_registry(), sessions.RegistryRead((), ()))
 
     def test_registry_read_keeps_good_records_and_names_each_bad_record(self) -> None:
         self.record("good.json", name="kept")
