@@ -2727,6 +2727,9 @@ def read_rebuild_steps(root: Path) -> list[RebuildStep]:
 def clone_kind(folder: str) -> str:
     path = Path(folder)
     parts = path.parts
+    # A scratch HOME sits under /tmp, so its ~/rust worktrees are named before the /tmp groups.
+    if path.is_relative_to(Path.home() / "rust"):
+        return "~/rust worktrees"
     if path.is_relative_to("/tmp") or path.is_relative_to("/private/tmp"):
         # Older copies include gate57e, mergeclone and p34-merge-<sha>.
         if any(re.search(r"(?:^|[-_])(gate|merge)", part) for part in parts):
@@ -2741,8 +2744,6 @@ def clone_kind(folder: str) -> str:
                for part in parts):
             return "mktemp folders"
         return "other /tmp"
-    if path.is_relative_to(Path.home() / "rust"):
-        return "~/rust worktrees"
     return "other"
 
 

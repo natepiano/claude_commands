@@ -504,6 +504,12 @@ class RebuildTests(SweepCase):
         self.assertEqual(sweep.clone_kind("/tmp/claude/scratch/phase-lfo-unit-3r-abc123"), "scratch.py folders")
         self.assertEqual(sweep.clone_kind("/tmp/claude/scratch/gate-check.hana"), "gate and merge copies")
 
+    def test_rust_worktree_under_a_scratch_home_stays_a_rust_worktree(self) -> None:
+        home = "/tmp/claude/scratch/gate-home-abc123"
+        self.enterContext(mock.patch.dict(os.environ, {"HOME": home}))
+        self.assertEqual(sweep.clone_kind(f"{home}/rust/hana"), "~/rust worktrees")
+        self.assertEqual(sweep.clone_kind("/tmp/claude/scratch/phase-demo-18-abc123"), "scratch.py folders")
+
     def test_manifest_path_builds_use_workspace_for_previous_step_and_tmp_removal(self) -> None:
         workspace = "/tmp/gate-check.hana"
         self.step(workspace, 2 * DAY)
