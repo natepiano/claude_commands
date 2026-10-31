@@ -11,6 +11,7 @@ import socket
 import sqlite3
 import subprocess
 import shlex
+import shutil
 import sys
 import tempfile
 import time
@@ -28,6 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "shutdown"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.socket_test_support import ShortUnixSocket, short_socket_directory
 import send
+import repeat_guard
 from scripts.lib import names
 from scripts.lib.test_names import fixture_names
 import rca
@@ -335,6 +337,57 @@ class SendTests(ShutdownTestCase):
     def send(self, *args: str) -> send.Result:
         return send.send(local_options(["--to", "bogus", "--from", "test", *args]))
 
+    def test_repeat_guard_holds_the_third_delivery_and_logs_each_held_copy(self) -> None:
+        outcomes = [self.send("--text", "Morty stopped at 02:00 EDT, pid 100").outcome
+                    for _ in range(5)]
+        self.assertEqual(outcomes, ["sent", "sent", "held", "held", "held"])
+        self.assertEqual(len(self.relayed), 2)
+        self.assertEqual([row["outcome"] for row in self.log()], outcomes)
+        self.assertEqual(self.send("--text", "Morty recovered").outcome, "sent")
+
+    def test_named_processes_are_distinct_and_a_busy_guard_admits_delivery(self) -> None:
+        for name in ("Ada", "Abe", "Bea"):
+            self.assertEqual(self.send("--text", f"process {name} stopped").outcome, "sent")
+        with repeat_guard.sender_record(send.STATE / "repeats", "test"):
+            self.assertEqual(self.send("--text", "same notice").outcome, "sent")
+        self.assertEqual(len(self.relayed), 4)
+
+    def test_failed_forwarding_is_reported_once_by_the_originating_invocation(self) -> None:
+        options = send.parse(["--machine", "mac", "--to", "codex:missing", "--from", "test", "--text", "failure notice"])
+        with mock.patch.object(send, "run", return_value=(255, "", "unreachable")) as forward:
+            result = send.send(options)
+        self.assertEqual(result.outcome, "failed")
+        rows = self.log()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual((rows[0]["outcome"], rows[0]["to"]), ("failed", "codex:missing"))
+        command = cast(list[str], forward.call_args.args[0])
+        self.assertIn("--no-accounting", command[-1])
+        self.assertIn("--report-recipient", command[-1])
+
+    def test_person_authored_and_relayed_messages_never_get_repeat_held(self) -> None:
+        for flags in (("--from", "user"), ("--human",)):
+            for attempt in range(5):
+                with self.subTest(flags=flags, attempt=attempt):
+                    self.assertEqual(self.send(*flags, "--text", "Please inspect this again").outcome, "sent")
+        self.assertTrue(all(row["human"] for row in self.log()[5:]))
+
+    def test_repeat_guard_never_holds_a_question_or_blocking_user_push(self) -> None:
+        with mock.patch.object(send, "user", return_value=send.Result("sent", "fake push sink")) as push:
+            for need in ("decision", "blocked"):
+                options = local_options(["--to", "user", "--from", "watchdog", "--summary", "Answer needed",
+                    "--need", need, "--action", "Answer the prompt", "--self-clearing", "--key", "prompt",
+                    "--repeat-minutes", "0", "--text", "The prompt still waits"] if need == "blocked" else
+                    ["--to", "user", "--from", "watchdog", "--summary", "Answer needed", "--need", need,
+                     "--action", "Answer the prompt", "--text", "The prompt still waits"])
+                for attempt in range(5):
+                    with self.subTest(need=need, attempt=attempt):
+                        self.assertEqual(send.send(options).outcome, "sent")
+            self.assertEqual(push.call_count, 10)
+
+    def fresh_repeat_history(self) -> None:
+        """Independent transport fault subcases do not share a flood window."""
+        shutil.rmtree(self.root / "repeats", ignore_errors=True)
+
     def log(self) -> list[dict[str, object]]:
         return [send.as_dict(send.loads(line)) for line in (self.root / "log.jsonl").read_text().splitlines()]
 
@@ -347,9 +400,9 @@ class SendTests(ShutdownTestCase):
 
     def postmaster_clock(self) -> FakeClock:
         clock = FakeClock()
-        _ = self.enterContext(mock.patch.object(time, "time", clock.time))
-        _ = self.enterContext(mock.patch.object(time, "monotonic", clock.monotonic))
-        _ = self.enterContext(mock.patch.object(time, "sleep", clock.sleep))
+        # Subprocess polling must use real time, without ageing the fake heartbeat.
+        for module in (postmaster, send):
+            _ = self.enterContext(mock.patch.object(module, "time", clock))
         return clock
 
     def postmaster_heartbeat(self, clock: FakeClock, identity: str = "worker") -> None:
@@ -546,6 +599,7 @@ class SendTests(ShutdownTestCase):
             ([self.sender_entry(), self.sender_entry("ambiguous")], "sender-address"),
         ):
             with self.subTest(display=display, matches=len(sender_rows)):
+                self.fresh_repeat_history()
                 with (
                     mock.patch.object(roster, "roster", return_value=roster.Roster(sender_rows, [])) as source_read,
                     mock.patch.object(send, "run", return_value=(0, "SENT: forwarded\n", "")) as ssh,
@@ -602,6 +656,7 @@ class SendTests(ShutdownTestCase):
         reasons: list[postmaster.PostmasterMiss] = ["absent", "stale", "self", "unclaimed", "outbox-error", "failed", "expired", "claimed-no-result", "relay-only-sender"]
         for reason in reasons:
             with self.subTest(reason=reason):
+                self.fresh_repeat_history()
                 self.relayed.clear()
                 with mock.patch.object(postmaster, "attempt", return_value=postmaster.RelayRequired(reason, 0.0)) as attempt:
                     result = send.send(local_options(["--to", "session:recipient", "--from", "Sender", "--summary", "Question", "--text", "body"]))
@@ -617,6 +672,7 @@ class SendTests(ShutdownTestCase):
         self.postmaster_heartbeat(clock)
         for to, sender, reason in (("session:worker", "Sender", "self"), ("session:recipient", "shutdown", "relay-only-sender")):
             with self.subTest(reason=reason):
+                self.fresh_repeat_history()
                 self.relayed.clear()
                 result = send.send(local_options(["--to", to, "--from", sender, "--text", "body"]))
                 self.assertEqual(result, self.outcome)
