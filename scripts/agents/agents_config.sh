@@ -126,9 +126,7 @@ _agents_section_keys_inline() {
 # substitution. Returning early from `while read ... < <(producer)` leaves the
 # producer writing into a pipe with no reader, and every remaining printf in
 # _agents_config_section_values reports "write error: Broken pipe" on stderr.
-# On the Mac that went to /tmp/style-fix-stderr.log and nobody looked; on NixOS
-# the systemd journal carries it, which is where the 39 lines per fix run came
-# from. The functions below that read their input to the end are fine as-is.
+# Reading the complete section avoids these errors in callers and job logs.
 _agents_registry_get() {
     local section="$1" key="$2" values line row_key value
     values="$(_agents_config_section_values "$section")"

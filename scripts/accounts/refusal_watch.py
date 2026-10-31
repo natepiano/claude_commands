@@ -28,10 +28,10 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts" / "shutdown"))
 sys.path.insert(0, str(ROOT / "scripts" / "whoami"))
 from scripts.accounts import accounts, moves, next_moves, refusals, role_map
-import account
-import agent_accounts
-from note_file import canonical_label
-import usage_store
+from scripts.whoami import account
+from scripts.whoami import agent_accounts
+from scripts.whoami.note_file import canonical_label
+from scripts.whoami import usage_store
 from quota_alert import (RefusedAt, _refusal_window, blocked_next_move_line, blocked_next_move_reason_key, notify_blocked_next_move,  # pyright: ignore[reportPrivateUsage]
                          BlockedHeadReason as BlockedHeadReason, NoTargetReading as NoTargetReading,
                          TargetReadingUnavailable as TargetReadingUnavailable,

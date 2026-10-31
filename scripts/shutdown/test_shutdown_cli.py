@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 from scripts.whoami.note_file import note_name
 
 from unit_staff_test_support import unit_host
@@ -13,12 +18,10 @@ import os
 import shlex
 import shutil
 import subprocess
-import sys
 import tempfile
 import unittest
 from collections.abc import Iterable
 from contextlib import redirect_stderr, redirect_stdout
-from pathlib import Path
 from typing import Literal, cast, final, override
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
@@ -37,7 +40,7 @@ import shutdown
 import restart_support
 from push_texts import RenderedPush
 import restart as restart_work
-from account import Account, UnreadableAccount
+from scripts.whoami.account import Account, UnreadableAccount
 
 
 # Hang guard: natedev reached load 136 on 2026-10-29; scheduling delays are not failures.

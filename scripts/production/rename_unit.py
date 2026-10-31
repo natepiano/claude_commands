@@ -34,8 +34,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, Protocol, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "direct"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "shutdown"))
@@ -53,7 +54,7 @@ import retire_unit  # noqa: E402
 import pane_record  # noqa: E402
 import rename_state  # noqa: E402
 import review_pool  # noqa: E402
-import showrunners  # noqa: E402
+from scripts.production import showrunners  # noqa: E402
 import stall_watch  # noqa: E402
 import unit_lookup  # noqa: E402
 import unit_move  # noqa: E402

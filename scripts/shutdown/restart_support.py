@@ -16,6 +16,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypedDict
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 SCRIPTS = Path(__file__).resolve().parents[1]
 for dependency in ("whoami", "message", "notify", "production", "hooks", "lib", "herdr"):
     sys.path.insert(0, str(SCRIPTS / dependency))
@@ -26,7 +28,7 @@ import shutdown_record as store
 from shutdown_record import SessionShutdown, SessionStopIssue
 from remote import other_machine, run_remote
 from scripts.production import staff_sources
-import showrunners
+from scripts.production import showrunners
 import sessions
 import inventory as stop_work
 from user_zone import user_zone

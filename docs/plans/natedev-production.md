@@ -48,7 +48,7 @@
 | herdr-unit | docs/as-built/herdr-adoption.md | `/home/natepiano/worktrees/claude-natedev-herdr` | `natedev-herdr` | — | — |
 | nightly-review-unit | (retired 2026-10-19, worktree removed) permanent | /home/natepiano/worktrees/claude-build-followups-nightly-review | build-followups-nightly-review | — | — |
 | style-unit | `docs/as-built/style-showrunner.md` (run done; as-built) | `/home/natepiano/worktrees/claude-natedev-style` | `natedev-style` | — | — |
-| unit-board-unit | docs/as-built/unit-board.md | `/home/natepiano/worktrees/claude-natedev-unit-board` | `natedev-unit-board` | — | — |
+| unit-board-unit | (retired 2026-10-30, worktree removed, session f6fa7e26-7581-4fb0-b3d8-d6a901236235) docs/as-built/unit-board.md | `/home/natepiano/worktrees/claude-natedev-unit-board` | `natedev-unit-board` | — | — |
 | hanadocs-unit | (retired 2026-10-28, worktree removed, session 6eaf058b-3fef-41bc-98d3-3c54e63a242a) standby | /home/natepiano/worktrees/claude-build-followups-hanadocs | build-followups-hanadocs | — | the hanadocs vault (~/rust/hanadocs); commits to its main |
 | review-unit | (retired 2026-10-18, worktree removed) docs/plans/build-followups-review.md | /home/natepiano/worktrees/claude-build-followups-review | build-followups-review | — | — |
 | efficiency-unit | docs/as-built/token-efficiency-study.md | `/home/natepiano/worktrees/claude-natedev-efficiency` | `natedev-efficiency` | — | the efficiency proposals ledger (~/.local/state/nightly-review/ledger.md and its night reports); the token-efficiency investigation |

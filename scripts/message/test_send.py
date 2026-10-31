@@ -18,6 +18,7 @@ import unittest
 from collections.abc import Generator
 from contextlib import AbstractContextManager, closing, contextmanager, redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, TextIO, cast, override
 from unittest import mock
@@ -292,6 +293,14 @@ class SendTests(ShutdownTestCase):
 
     def daemon_row(self, thread: str, name: str = "") -> roster.RosterEntry:
         return daemon_session_row(self.daemon_owner(), thread, name or thread)
+
+    def claude_row(self, session_id: str, name: str) -> roster.RosterEntry:
+        self.session(session_id, name)
+        return roster.RosterEntry(
+            "machine", "claude", "freestanding", name, "running",
+            roster.Messageable(f"session:{session_id}"), "/work", roster.NoShowrunner(),
+            roster.NoDirector(), roster.NotAWorker(),
+        )
 
     def session(self, session_id: str, name: str, *former: str) -> None:
         """Record a live Claude session, or its rename: this test process stands in for it."""
@@ -1686,12 +1695,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             self.assertIn("Restarted; continue.", restart_pending)
 
     def test_unique_claude_roster_name_delivers_to_its_session_address(self) -> None:
-        self.session("id-1", "recipient")
-        recipient = roster.RosterEntry(
-            "machine", "claude", "freestanding", "recipient", "running",
-            roster.Messageable("session:id-1"), "/work", roster.NoShowrunner(),
-            roster.NoDirector(), roster.NotAWorker(),
-        )
+        recipient = self.claude_row("id-1", "recipient")
 
         with mock.patch.object(
             roster, "roster", return_value=roster.Roster([recipient], []),
@@ -1704,6 +1708,18 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         self.assertEqual(len(self.relayed), 1)
         self.assertEqual(self.relayed[0].to, f"uds:{self.root / 'id-1.sock'}")
         self.assertEqual(self.log()[0]["to"], "session:id-1")
+
+    def test_a_claude_name_with_different_case_routes_to_its_session_address(self) -> None:
+        recipient = self.claude_row("id-1", "morty")
+        with mock.patch.object(roster, "roster", return_value=roster.Roster([recipient], [])):
+            output = io.StringIO()
+            with redirect_stdout(output):
+                code = send.main(["--here", "--to", "Morty", "--from", "test", "--text", "hello by name"])
+        self.assertEqual(code, 0)
+        self.assertTrue(output.getvalue().startswith("SENT:"), output.getvalue())
+        self.assertEqual([message.to for message in self.relayed], [f"uds:{self.root / 'id-1.sock'}"])
+        self.assertEqual(self.log()[0]["to"], "session:id-1")
+        self.assertFalse(send.queue_path("Morty").exists())
 
     def test_same_worker_name_in_two_runs_resolves_by_address_and_is_ambiguous_by_name(
         self,
@@ -3360,7 +3376,7 @@ class AccountDaemonRoutingTests(unittest.TestCase):
             "UNIT_HISTORY_DIR": str(self.root / "history"),
         }, clear=True)))
 
-    def serve_loaded_thread(self, connection: socket.socket) -> None:
+    def serve_loaded_thread(self, connection: socket.socket, *, name: str = "Account window") -> None:
         initialize = receive_frame(connection)
         self.assertEqual(initialize["method"], "initialize")
         reply(connection, initialize, {})
@@ -3376,7 +3392,7 @@ class AccountDaemonRoutingTests(unittest.TestCase):
                 reply(connection, request, {"data": ["account-thread"]})
             elif method == "thread/read":
                 reply(connection, request, {"thread": {
-                    "id": "account-thread", "name": "Account window", "cwd": str(self.root),
+                    "id": "account-thread", "name": name, "cwd": str(self.root),
                     "status": {"type": "idle"},
                 }})
             elif method == "thread/queue/add":
@@ -3385,8 +3401,9 @@ class AccountDaemonRoutingTests(unittest.TestCase):
             else:
                 self.fail(f"unexpected daemon method: {method}")
 
-    def daemon(self, home: Path) -> FakeDaemon:
-        return FakeDaemon(home / "app-server-control/app-server-control.sock", self.serve_loaded_thread, repeat=True)
+    def daemon(self, home: Path, *, name: str = "Account window") -> FakeDaemon:
+        return FakeDaemon(home / "app-server-control/app-server-control.sock",
+                          partial(self.serve_loaded_thread, name=name), repeat=True)
 
     def command(self, script: str, *arguments: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run([sys.executable, str(Path(send.__file__).with_name(script)), *arguments],
@@ -3395,6 +3412,29 @@ class AccountDaemonRoutingTests(unittest.TestCase):
     def assert_queues_unchanged(self) -> None:
         for queue, before in self.queue_contents.items():
             self.assertEqual(queue.read_bytes(), before, str(queue))
+
+    def test_a_codex_name_with_different_case_reaches_its_loaded_account_daemon(self) -> None:
+        with self.daemon(self.homes[1], name="morty"):
+            delivered = self.command("send.py", "--here", "--to", "Morty", "--from", "sdlc", "--text", "hello by name")
+        self.assertEqual(delivered.returncode, 0, delivered.stdout + delivered.stderr)
+        self.assertEqual(delivered.stdout, "SENT: queued on Codex session morty\n")
+        self.assertEqual([(row["threadId"], row["input"]) for row in self.queued],
+                         [("account-thread", [{"type": "text", "text": "hello by name"}])])
+        self.assertFalse((self.root / "state/message/queue/Morty.jsonl").exists())
+        self.assert_queues_unchanged()
+
+    def test_names_that_differ_only_in_case_are_ambiguous_even_with_an_exact_match(self) -> None:
+        with self.daemon(self.homes[0], name="Morty"), self.daemon(self.homes[1], name="morty"):
+            for target in ("MORTY", "Morty", "morty"):
+                with self.subTest(target=target):
+                    delivered = self.command("send.py", "--here", "--to", target, "--from", "sdlc", "--text", "hello")
+                    self.assertEqual(delivered.returncode, 2, delivered.stdout + delivered.stderr)
+                    self.assertIn(f"{target} matches 2 sessions:", delivered.stderr)
+                    for label, home in zip(("codex1", "codex2"), self.homes):
+                        self.assertIn(f"codex:account-thread (freestanding, {label}, {home})", delivered.stderr)
+        self.assertEqual(self.queued, [])
+        self.assertFalse((self.root / "state/message/queue").exists())
+        self.assert_queues_unchanged()
 
     def test_shared_history_routes_a_named_session_through_its_owning_account_daemon(self) -> None:
         with self.daemon(self.homes[1]):

@@ -11,9 +11,14 @@ from unittest import mock
 
 from typing import cast, override
 
+
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 import rename_checkout
 from scripts.shutdown import stop_resume
-import showrunners
+from scripts.production import showrunners
 import unit_move
 from rename_state import RenameRefused
 

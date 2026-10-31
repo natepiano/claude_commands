@@ -13,13 +13,11 @@ import re
 import shlex
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING, TypedDict, cast
 
-if TYPE_CHECKING:
-    from ..production.showrunners import production_of
-else:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
-    from showrunners import production_of
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from typing import TypedDict, cast
+
+from scripts.production.showrunners import production_of
 
 SKILL = ("Move or stop a session with /showrunner:move: it pauses the session first, proves the account it "
          "comes back on and tells its showrunner. ")

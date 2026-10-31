@@ -25,6 +25,8 @@ from datetime import UTC, datetime
 from enum import Enum
 from itertools import accumulate
 from pathlib import Path, PurePosixPath
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from types import FrameType, MappingProxyType
 from typing import Literal, assert_never, cast, override
 
@@ -42,7 +44,7 @@ from approved_renames import (AppliedCheck, ApprovedRename, BindingRename, Decla
                               file_rename, inline_modules)
 from add_style import StandingStyleProduction, standing_style_production
 import rules
-import showrunners
+from scripts.production import showrunners
 import style_ledger
 import style_footprint
 import style_proposals

@@ -2,17 +2,20 @@
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 import unit_staff_test_support
 from scripts.production import staff_sources
 import io
 import os
 import subprocess
 import tempfile
-import sys
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict, cast, final, override
 from unittest.mock import Mock, patch
 
@@ -30,8 +33,6 @@ if TYPE_CHECKING:
     from ..notify import review
 else:
     import review
-# The module settle imports by its own path entry: a separate object from the package import below.
-import showrunners as settle_showrunners
 from scripts.production import showrunners
 
 
@@ -48,7 +49,6 @@ def setUpModule() -> None:
     _ = unittest.enterModuleContext(patch.object(herdr, "security_session", return_value=herdr.NotMacSession()))
     root = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
     _ = unittest.enterModuleContext(patch.object(showrunners, "NOTIFIER_STATE_DIR", root))
-    _ = unittest.enterModuleContext(patch.object(settle_showrunners, "NOTIFIER_STATE_DIR", root))
 
 
 class SentCall(TypedDict):
@@ -144,7 +144,7 @@ class RestartSupportTests(ShutdownTestCase):
         self.save(stop)
         self.assertIsInstance(shutdown_record.forget_session(LOGIN, "unit", "natedev"), shutdown_record.SessionForgotten)
         with (
-            patch.object(settle_showrunners, "current_name", return_value="runner"),
+            patch.object(showrunners, "current_name", return_value="runner"),
             patch.object(settle, "send_message", return_value={"kind": "sent"}) as send,
         ):
             settle.tell_showrunners_outcome([back])
@@ -163,7 +163,7 @@ class RestartSupportTests(ShutdownTestCase):
                     current["showrunner_told"] = settle.SHOWRUNNER_TOLD_STOPPING
                 saved = shutdown_record.update_session(LOGIN, "unit", failed)
                 with (patch.object(restart_work, "restart_failed_liveness", return_value=observed) as liveness,
-                      patch.object(settle_showrunners, "current_name", return_value="runner"),
+                      patch.object(showrunners, "current_name", return_value="runner"),
                       patch.object(settle, "send_message", return_value=settle.MessageSent(kind="sent")) as send):
                     settle.tell_showrunners_outcome([saved])
                     liveness.assert_called_once_with(saved)
@@ -201,7 +201,7 @@ class RestartSupportTests(ShutdownTestCase):
         with (patch.object(restart_work, "clear_running_on_target",
                            return_value=restart_work.TargetCheck([saved], [])),
               patch.object(restart_work, "restart_failed_liveness", return_value=restart_work.SessionLive()) as liveness,
-              patch.object(settle_showrunners, "current_name", return_value="runner"),
+              patch.object(showrunners, "current_name", return_value="runner"),
               patch.object(settle, "run_remote", return_value=(0, "[]")),
               patch.object(settle, "send_message", return_value=settle.MessageSent(kind="sent")) as send,
               patch.object(settle, "alert_user", return_value=True) as alert):
@@ -523,7 +523,7 @@ class RestartSupportTests(ShutdownTestCase):
 
         saved = self.unit_for_showrunner()
         with (
-            patch.object(settle_showrunners, "current_name", return_value="fixture-runner"),
+            patch.object(showrunners, "current_name", return_value="fixture-runner"),
         ):
             with patch.object(settle, "send_message", side_effect=Killed):
                 with self.assertRaises(Killed):
@@ -558,7 +558,7 @@ class RestartSupportTests(ShutdownTestCase):
 
         saved = self.unit_for_showrunner()
         with (
-            patch.object(settle_showrunners, "current_name", return_value="fixture-runner"),
+            patch.object(showrunners, "current_name", return_value="fixture-runner"),
         ):
             with patch.object(settle, "send_message", side_effect=Killed):
                 with self.assertRaises(Killed):
@@ -591,7 +591,7 @@ class RestartSupportTests(ShutdownTestCase):
             return subprocess.CompletedProcess(command, 0, outcome, "")
 
         with (
-            patch.object(settle_showrunners, "current_name", return_value="fixture-runner"),
+            patch.object(showrunners, "current_name", return_value="fixture-runner"),
             patch.object(settle, "send_message", side_effect=send_message),
             patch.object(subprocess, "run", side_effect=deliver),
         ):
@@ -632,7 +632,7 @@ class RestartSupportTests(ShutdownTestCase):
             return subprocess.CompletedProcess(command, code, output, "")
 
         with (
-            patch.object(settle_showrunners, "current_name", return_value="fixture-runner"),
+            patch.object(showrunners, "current_name", return_value="fixture-runner"),
             patch.object(subprocess, "run", side_effect=deliver) as sender,
         ):
             self.allow_leaf(ShutdownSendLeaf.DELIVER_MESSAGE)
@@ -676,7 +676,7 @@ class RestartSupportTests(ShutdownTestCase):
 
         with (
             patch.object(settle, "send_message", return_value=settle.MessageSent(kind="sent")),
-            patch.object(settle_showrunners, "current_name", return_value="fixture-runner"),
+            patch.object(showrunners, "current_name", return_value="fixture-runner"),
             patch.object(restart_work, "restart_failed_liveness", return_value=restart_work.SessionNotLive()),
         ):
             for saved in (first, second):

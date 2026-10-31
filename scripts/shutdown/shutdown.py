@@ -18,7 +18,9 @@ SCRIPTS = Path(__file__).resolve().parents[1]
 for dependency in ("whoami", "message", "production", "lib"):
     sys.path.insert(0, str(SCRIPTS / dependency))
 
-from account import (
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from scripts.whoami.account import (
     Account,
     UnknownAccountName,
     UnreadableAccount,
@@ -46,7 +48,7 @@ import inventory as stop_work
 import restart as restart_work
 from scripts.shutdown import stop_resume
 import remote_control
-import note_file
+from scripts.whoami import note_file
 from user_zone import user_zone
 
 

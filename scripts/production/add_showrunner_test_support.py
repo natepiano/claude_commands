@@ -10,7 +10,6 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from scripts.production.cli_fixture import invoke_cli
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -18,10 +17,10 @@ from typing import ClassVar, cast, override
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
+from scripts.production.cli_fixture import invoke_cli
 from scripts.accounts import accounts
 from scripts.production import add_showrunner
-import showrunners
+from scripts.production import showrunners
 from scripts.herdr import herdr
 from scripts.herdr.fake_herdr import CommandResponse
 

@@ -16,6 +16,10 @@ from typing import TYPE_CHECKING, Literal, cast, final, override
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 from scripts.accounts import accounts, next_moves, outage_alerts, refusal_watch, role_map, unit_watchdog
 from scripts.accounts import test_refusal_watch as fixtures
 from scripts.production import showrunners
@@ -37,7 +41,7 @@ else:
     launch_permission = import_module("launch_permission")
     unit_lookup = import_module("unit_lookup")
 import quota_alert
-import agent_accounts
+from scripts.whoami import agent_accounts
 NOW = fixtures.NOW
 
 
