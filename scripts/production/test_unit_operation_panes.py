@@ -106,13 +106,13 @@ class UnitOperationPaneTests(unittest.TestCase):
         claim = unit_move.unit_pane(self.pane.found, 'demo')
         with launch_permission.admitted_launch('other@example.com', 'other-conversation', 'beta-unit', lambda: None):
             launch_permission.claim_launch_pane('other', self.pane.place.pane)
-            unit_move.close_unit_pane(claim, self.saved)
+            unit_move.close_unit_pane(claim)
         self.assertEqual(self.pane.close_calls(), [['--session', 'agents', 'pane', 'close', 'w1:p1']])
         self.assertFalse((self.root / 'proc' / str(self.pane.shell)).exists())
 
     def test_no_unit_pane_needs_no_close(self) -> None:
         self.assertIsNone(unit_move.unit_pane(None, 'demo'))
-        unit_move.close_unit_pane(None, self.saved)
+        unit_move.close_unit_pane(None)
         self.assertEqual(self.pane.close_calls(), [])
 
     def test_unknown_director_and_foreign_occupant_do_not_require_pane_proof(self) -> None:
@@ -120,7 +120,7 @@ class UnitOperationPaneTests(unittest.TestCase):
         self.pane.add_occupant(991551, unit='beta-unit')
         with mock.patch.object(herdr, 'herdr_processes', side_effect=AssertionError('no occupant scan')):
             pane = unit_move.unit_pane(self.pane.found, 'demo')
-            unit_move.close_unit_pane(pane, self.saved)
+            unit_move.close_unit_pane(pane)
         self.assertEqual(self.pane.close_calls(), [['--session', 'agents', 'pane', 'close', 'w1:p1']])
 
     def test_close_uses_saved_place_without_record_launch_or_generation_rechecks(self) -> None:
@@ -132,14 +132,14 @@ class UnitOperationPaneTests(unittest.TestCase):
               mock.patch.object(shutdown_record, 'update_session', side_effect=AssertionError('no record proof')),
               mock.patch.object(herdr, 'process_action', side_effect=AssertionError('no process proof'))):
             launch_permission.claim_launch_pane(self.pane.place.session, self.pane.place.pane)
-            unit_move.close_unit_pane(pane, self.saved)
+            unit_move.close_unit_pane(pane)
         self.assertEqual(self.pane.close_calls(), [['--session', 'agents', 'pane', 'close', 'w1:p1']])
 
     def test_a_pane_already_gone_counts_as_closed(self) -> None:
         pane = unit_move.unit_pane(self.pane.found, 'demo')
         gone = herdr.HerdrFailure('herdr pane close: pane_not_found: pane w1:p1 not found', 'pane_not_found')
         with mock.patch.object(herdr.Herdr, 'run', side_effect=gone) as close:
-            unit_move.close_unit_pane(pane, self.saved)
+            unit_move.close_unit_pane(pane)
         close.assert_called_once_with('pane', 'close', 'w1:p1')
 
     def test_herdr_close_error_is_reported_for_the_units_exact_place(self) -> None:
@@ -147,5 +147,5 @@ class UnitOperationPaneTests(unittest.TestCase):
         failure = herdr.HerdrFailure('fixture close failed')
         with mock.patch.object(herdr.Herdr, 'run', side_effect=failure) as close:
             with self.assertRaisesRegex(RenameRefused, 'alpha-unit: pane close failed: fixture close failed'):
-                unit_move.close_unit_pane(pane, self.saved)
+                unit_move.close_unit_pane(pane)
         close.assert_called_once_with('pane', 'close', 'w1:p1')

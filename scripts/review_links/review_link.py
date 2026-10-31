@@ -50,12 +50,13 @@ def render_markdown(source: str, title: str) -> str:
 <title>$title</title>
 <style>
 :root { color-scheme: light dark; font-family: system-ui, sans-serif; line-height: 1.6; }
-body { max-width: 48rem; margin: auto; padding: 1rem; overflow-wrap: anywhere; }
+body { margin: auto; padding: 1rem; overflow-wrap: anywhere; }
+main > :not(table):not(:has(table)), #markdown-source { max-width: 48rem; margin-left: auto; margin-right: auto; }
 pre { white-space: pre; overflow-x: auto; overflow-wrap: normal; padding: 1rem; background: light-dark(#f0f2f5, #202329); border-radius: .5rem; }
 code { font-family: ui-monospace, monospace; }
 img { max-width: 100%; height: auto; }
-table { display: block; overflow-x: auto; border-collapse: collapse; }
-td, th { border: 1px solid #888; padding: .4rem .6rem; }
+table { display: block; width: max-content; max-width: 100%; margin-left: auto; margin-right: auto; overflow-x: auto; border-collapse: collapse; }
+td, th { border: 1px solid #888; padding: .4rem .6rem; overflow-wrap: normal; word-break: normal; }
 a { color: light-dark(#145ac2, #91bdff); }
 </style></head><body>
 <main id="rendered" hidden></main>

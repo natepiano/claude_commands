@@ -73,6 +73,13 @@ def unit_membership(showrunner: str, unit: str) -> staff.StaffRow:
     return staff.ensure("unit", name=unit_names.name(unit), parent=parent.id)
 
 
+def production_membership(showrunner: str, *units: str) -> None:
+    """Seed the current members of a fixture production, including an empty one."""
+    _ = showrunner_relationship(showrunner)
+    for unit in units:
+        _ = unit_membership(showrunner, unit)
+
+
 def fixture_showrunner_name(slug: str, doc: Path) -> str:
     """Keep the real doc's workspace name; extra fixture productions use their slugs."""
     from scripts.production import showrunners, production_units
@@ -111,15 +118,18 @@ def observe_operation_lock() -> None:
         return
     watched = Path(os.environ["STAFF_TEST_LOCK_TARGET"])
     original = fcntl.flock
+    reported = False
 
     def report_then_lock(lock_file: int | IOBase, operation: int) -> None:
-        if operation == fcntl.LOCK_EX and watched.exists():
+        nonlocal reported
+        if not reported and operation & fcntl.LOCK_EX and watched.exists():
             descriptor = lock_file if isinstance(lock_file, int) else lock_file.fileno()
             opened, target = os.fstat(descriptor), watched.stat()
             if (opened.st_dev, opened.st_ino) == (target.st_dev, target.st_ino):
                 with socket.socket(socket.AF_UNIX) as signal:
                     signal.connect(notice)
                     signal.sendall(b"operation")
+                reported = True
         original(lock_file, operation)
 
     _ = mock.patch("fcntl.flock", side_effect=report_then_lock).start()
@@ -199,7 +209,7 @@ class StaffTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.staff_file = self.root / "owner" / "staff.json"
-        self.mac_file = self.root / "mac" / "staff.json"
+        self.mac_file = self.root / "mac" / ".local/state/staff/staff.json"
         self.ssh_log = self.root / "ssh.jsonl"
         binaries = self.root / "bin"
         binaries.mkdir()
@@ -248,6 +258,9 @@ class StaffTestCase(unittest.TestCase):
                 "scripts.shutdown.remote.other_machine", return_value="mac" if machine == "natedev" else "natedev",
             ))
             _ = contexts.enter_context(isolated_source_readers())
+            if machine == "mac":
+                _ = os.environ.pop("STAFF_FILE", None)
+                os.environ["HOME"] = str(self.root / "mac")
             yield
 
     def tree(self) -> tuple[staff.StaffRow, staff.StaffRow, staff.StaffRow]:

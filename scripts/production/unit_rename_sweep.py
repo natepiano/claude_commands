@@ -115,6 +115,32 @@ def shown(path: Path, state: Path) -> str:
     return "(masked)" if _under(path, state, ("shutdown/",)) else str(path)
 
 
+def _showrunner_live_text(text: str) -> str:
+    """Keep name fields and unknown fields; only the reader's known note text is history."""
+    fields = cast(dict[str, object], json.loads(text))
+    # judgment_state reads units[].unit as names. Keep merges_held live too; its
+    # entries name held merges. The remaining known text describes past decisions.
+    for name, note_fields in {
+        "units": ("phase", "wait"),
+        "next": (),
+        "open_for_user": ("text", "question"),
+        "report_to_user": ("text",),
+    }.items():
+        entries = fields.get(name)
+        if not isinstance(entries, list):
+            continue
+        live: list[object] = []
+        for entry in cast(list[object], entries):
+            if isinstance(entry, str) and name in ("next", "open_for_user"):
+                continue
+            if isinstance(entry, dict):
+                entry = {key: value for key, value in cast(dict[str, object], entry).items()
+                         if key not in note_fields or not isinstance(value, str)}
+            live.append(entry)
+        fields[name] = live
+    return json.dumps(fields)
+
+
 def sweep(values: tuple[str, ...], roots: Roots) -> list[str]:
     """The unclassified files that still hold one of the old names, each as a failure line."""
     pattern = token_pattern(values)
@@ -130,6 +156,12 @@ def sweep(values: tuple[str, ...], roots: Roots) -> list[str]:
             text = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
+        if path.name == "showrunner_state.json" and (path in roots.live_files or (
+                path.parent.name == "session" and path.parent.parent.parent == roots.state / "showrunner")):
+            try:
+                text = _showrunner_live_text(text)
+            except (ValueError, TypeError, AttributeError):
+                pass
         try:
             relative = path.relative_to(roots.state / "astra/design-roles")
             if path.name == "design.json":
