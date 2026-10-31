@@ -2917,3 +2917,24 @@ A rerun of a stopped `accounts.py setup`, group move or five-hour wait finishes 
 - `docs/accounts.md` — the MCP line and `mcp-projects`.
 
 **Gotchas:** The accounts suite fails two `test_cutover_home` tests when run from a real home (they reach the showrunner registry); run it with a scratch `HOME`. An add-on to fix those tests is pending.
+
+### Phase 101b — The accounts tests pass when run from a real home  · status: done
+
+**Depends on:** Phase 101 (order only; both edit `scripts/accounts/test_accounts.py`).
+
+#### Work Order
+
+**Goal:** The accounts suite passes when a worker runs it from the real home, not only from a scratch `HOME`. Today `test_cutover_home.CodexHomeCutoverTests` patches `HOME` in `setUp` (`test_cutover_home.py:281`), but `scripts/production/showrunners.py:24-27` computed its state folders from `Path.home()` at import, so `agent_accounts.user_zone` (`scripts/whoami/agent_accounts.py:228`) reads the live showrunner registry and the subprocess guard fails two tests. Showrunner ruling, 2026-10-30: a fix checkpoint with one shared HOME fixture.
+
+**Spec:**
+- One shared test fixture in `scripts/accounts` sets a scratch `HOME` and points the showrunner registry at it (patch the import-time folders in `showrunners`, or `showrunners.registered_showrunners`), so no accounts test reads the live registry, sessions or notifier state.
+- Every accounts test class that sets its own `HOME` uses that fixture. Per-file copies of the same setup (for example `test_accounts.py:209`) move to it.
+- No product change. No assertion changes.
+
+**Files:**
+- `scripts/accounts/move_test_support.py` or one new shared support module — the fixture.
+- `scripts/accounts/test_*.py` — callers.
+
+**Workers:** 1 tester owns all of these files.
+
+**Acceptance gate:** the plain worker command `env -u STAFF_OPERATION_FD -u PYTHONUNBUFFERED -u REFUSAL_WATCH_INVENTORY -u CLAUDE_CONFIG_DIR python3 -m unittest discover -s scripts/accounts -p 'test_*.py'` passes from the real home, and the same suite passes in a scratch `HOME`; basedpyright on each changed file reads `0 errors, 0 warnings, 0 notes`.
