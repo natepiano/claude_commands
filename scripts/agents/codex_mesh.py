@@ -85,7 +85,7 @@ from typing import TYPE_CHECKING, Literal, NoReturn, NotRequired, NamedTuple, Pr
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.accounts.role_map import is_role_map_host, role_map_command, RoleMapUnavailable, RoleAccountUnavailable  # noqa: E402
 from scripts.direct import plan_history
-from scripts.lib import durable_state, nix_env, unit_runs
+from scripts.lib import atomic_file, nix_env, unit_runs
 from scripts.lib.probe_session import PROBE_ENV
 from scripts.astra.design_roles import PhaseBoundDesigner, ReadOnlyReviewer, ThreadAccessPolicy
 from scripts.message import sessions, process_table
@@ -1439,13 +1439,13 @@ def _write_roster_record(handle: TextIO, roster: dict[str, object], name: str,
         stored["context_tokens"] = "not_measured_since_compaction"
     stored["revision"] = _roster_revision(previous).value + 1
     roster[name] = stored
-    durable_state.rewrite_text(handle, json.dumps(roster, indent=2, sort_keys=True))
+    atomic_file.rewrite_text(handle, json.dumps(roster, indent=2, sort_keys=True))
 
 
 def _update_roster(session_dir: str, name: str, record: ThreadRecord) -> None:
     path = _session_path(session_dir, ROSTER_FILE)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with durable_state.locked_text(path) as handle:
+    with atomic_file.locked_text(path) as handle:
         _ = handle.seek(0)
         roster = _load_roster_for_write(handle)
         _write_roster_record(handle, roster, name, record)
@@ -1456,7 +1456,7 @@ def _update_roster_if_expected(session_dir: str, name: str, record: ThreadRecord
     """Compare the name's owner and write while holding the same roster lock."""
     path = _session_path(session_dir, ROSTER_FILE)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with durable_state.locked_text(path) as handle:
+    with atomic_file.locked_text(path) as handle:
         _ = handle.seek(0)
         roster = _load_roster_for_write(handle)
         previous = _as_dict(roster.get(name))
@@ -1479,7 +1479,7 @@ def _update_roster_if_expected(session_dir: str, name: str, record: ThreadRecord
 def _set_roster_assignment(session_dir: str, name: str, role: WorkerRole, task: str) -> None:
     """Record the work assigned to an existing worker without changing its state."""
     path = _session_path(session_dir, ROSTER_FILE)
-    with durable_state.locked_text(path) as handle:
+    with atomic_file.locked_text(path) as handle:
         _ = handle.seek(0)
         roster = _load_roster_for_write(handle)
         entry = _as_dict(roster.get(name))
@@ -1491,13 +1491,13 @@ def _set_roster_assignment(session_dir: str, name: str, role: WorkerRole, task: 
                 entry["task"] = task
             _advance_roster_revision(entry)
             roster[name] = entry
-            durable_state.rewrite_text(handle, json.dumps(roster, indent=2, sort_keys=True))
+            atomic_file.rewrite_text(handle, json.dumps(roster, indent=2, sort_keys=True))
 
 
 def _mark_all_roster_ended(session_dir: str) -> None:
     """Make every worker in this run terminal while retaining its metadata."""
     path = _session_path(session_dir, ROSTER_FILE)
-    with durable_state.locked_text(path) as handle:
+    with atomic_file.locked_text(path) as handle:
         _ = handle.seek(0)
         roster = _load_roster_for_write(handle)
         for name, value in roster.items():
@@ -1506,7 +1506,7 @@ def _mark_all_roster_ended(session_dir: str) -> None:
                 entry["status"] = "ended"
                 _advance_roster_revision(entry)
                 roster[name] = entry
-        durable_state.rewrite_text(handle, json.dumps(roster, indent=2, sort_keys=True))
+        atomic_file.rewrite_text(handle, json.dumps(roster, indent=2, sort_keys=True))
 
 
 def _lookup(session_dir: str, name: str) -> ThreadRecord:
@@ -1551,7 +1551,7 @@ def _design_claim_lock(session_dir: str, name: str) -> Generator[None]:
         return
     from scripts.astra import design_roles
     directory = design_roles.design_directory(design_id)
-    with durable_state.file_lock(directory / "lock"):
+    with atomic_file.file_lock(directory / "lock"):
         with _pending_file(session_dir, name):
             yield
 
@@ -1617,7 +1617,7 @@ def _claim_follow(
 ) -> bool:
     """Take a finished roster entry before another follow can take it."""
     path = _session_path(session_dir, ROSTER_FILE)
-    with _design_claim_lock(session_dir, name), durable_state.locked_text(path) as handle:
+    with _design_claim_lock(session_dir, name), atomic_file.locked_text(path) as handle:
         _ = handle.seek(0)
         roster = _load_roster_for_write(handle)
         entry = _as_dict(roster.get(name))
@@ -1651,7 +1651,7 @@ def _claim_follow(
         _ = claimed.pop("authorized_prompt", None)
         _advance_roster_revision(claimed)
         roster[name] = claimed
-        durable_state.rewrite_text(handle, json.dumps(roster, indent=2, sort_keys=True))
+        atomic_file.rewrite_text(handle, json.dumps(roster, indent=2, sort_keys=True))
         _record_assignment(thread_id, role, lens)
         return True
 
@@ -1661,7 +1661,7 @@ def _restore_follow_claim(session_dir: str, name: str, launcher_pid: int,
                           expected_thread_id: str = "") -> None:
     """Release only this launcher's unstarted claim; retain a peer's live turn."""
     path = _session_path(session_dir, ROSTER_FILE)
-    with durable_state.locked_text(path) as handle:
+    with atomic_file.locked_text(path) as handle:
         _ = handle.seek(0)
         roster = _load_roster_for_write(handle)
         entry = _as_dict(roster.get(name))
@@ -1702,7 +1702,7 @@ def _restore_follow_claim(session_dir: str, name: str, launcher_pid: int,
                 "status": previous_status if previous_status in FOLLOWABLE_STATES else "failed",
             })
             roster[name] = restored
-        durable_state.rewrite_text(handle, json.dumps(roster, indent=2, sort_keys=True))
+        atomic_file.rewrite_text(handle, json.dumps(roster, indent=2, sort_keys=True))
         if isinstance(previous_role, AssignedWorkerRole) and entry.get("role") != previous_role.role:
             _record_assignment(thread_id, previous_role.role, None)
 
@@ -1842,7 +1842,7 @@ def _server_holds(port: int, thread_id: str) -> bool:
 def _note_worker_port(session_dir: str, name: str, launcher_pid: int, port: int) -> None:
     """Record the server a follow-up launcher attached to, while its claim is still its own."""
     path = _session_path(session_dir, ROSTER_FILE)
-    with durable_state.locked_text(path) as handle:
+    with atomic_file.locked_text(path) as handle:
         _ = handle.seek(0)
         roster = _load_roster_for_write(handle)
         entry = _as_dict(roster.get(name))
@@ -1851,7 +1851,7 @@ def _note_worker_port(session_dir: str, name: str, launcher_pid: int, port: int)
         entry["port"] = port
         _advance_roster_revision(entry)
         roster[name] = entry
-        durable_state.rewrite_text(handle, json.dumps(roster, indent=2, sort_keys=True))
+        atomic_file.rewrite_text(handle, json.dumps(roster, indent=2, sort_keys=True))
 
 
 def _record_port(session_dir: str) -> int | None:
@@ -1934,7 +1934,7 @@ def _fail_account_move(session_dir: str, name: str, marker: AccountMoveMarker, r
 @contextlib.contextmanager
 def _pending_file(session_dir: str, name: str, *, blocking: bool = True) -> Generator[TextIO]:
     path = _session_path(session_dir, f"{name}.pending.json")
-    with durable_state.locked_text(path, blocking=blocking) as handle:
+    with atomic_file.locked_text(path, blocking=blocking) as handle:
         yield handle
 
 
@@ -1978,7 +1978,7 @@ def _write_pending(handle: TextIO, thread_id: str, messages: list[str], *, accep
         stored['delivery_ids'] = delivery_ids
     if previous == stored:
         return
-    durable_state.rewrite_text(handle, json.dumps(stored))
+    atomic_file.rewrite_text(handle, json.dumps(stored))
 
 
 def pending_delivery_ids(stored: dict[str, object], thread_id: str) -> list[str]:
@@ -3842,7 +3842,7 @@ def _attach_and_run(
         previous_thread = _as_str(previous.get("thread_id"))
         if previous_thread and previous_thread != thread_id:
             dropped = len(_pending_for_thread(pending_file, previous_thread))
-            durable_state.rewrite_text(pending_file, "")
+            atomic_file.rewrite_text(pending_file, "")
             with log_path.open("a", encoding="utf-8") as log:
                 stamp = datetime.now().astimezone().isoformat(timespec="seconds")
                 _ = log.write(
@@ -5451,14 +5451,14 @@ def _start_turn(
     if turn_id:
         session_dir = _as_str(_attr(args, "session_dir"))
         name = _as_str(_attr(args, "name")) or _as_str(_attr(args, "to"))
-        with durable_state.locked_text(_session_path(session_dir, ROSTER_FILE)) as handle:
+        with atomic_file.locked_text(_session_path(session_dir, ROSTER_FILE)) as handle:
             roster = _load_roster_for_write(handle)
             entry = _as_dict(roster.get(name))
             if entry.get("thread_id") == thread_id and not entry.get("adopted_to"):
                 entry.update({"model": model, "effort": effort})
                 _advance_roster_revision(entry)
                 roster[name] = entry
-                durable_state.rewrite_text(handle, json.dumps(roster, indent=2, sort_keys=True))
+                atomic_file.rewrite_text(handle, json.dumps(roster, indent=2, sort_keys=True))
         log_file = _as_str(_attr(args, "log_file"))
         if log_file:
             with Path(log_file).open("a", encoding="utf-8") as log:
@@ -5676,7 +5676,7 @@ def command_end(args: argparse.Namespace) -> int:
     session_dir = _as_str(_attr(args, "session_dir"))
     target = _as_str(_attr(args, "to"))
     with _pending_file(session_dir, target) as pending_file:
-        with durable_state.locked_text(_session_path(session_dir, ROSTER_FILE)) as handle:
+        with atomic_file.locked_text(_session_path(session_dir, ROSTER_FILE)) as handle:
             roster = _load_roster_for_write(handle)
             record = _as_dict(roster.get(target))
             if not record:
@@ -5709,11 +5709,11 @@ def command_end(args: argparse.Namespace) -> int:
                 return 0
             _end_marker_path(session_dir, target).touch()
             if not record.get("held_design_id"):
-                durable_state.rewrite_text(pending_file, "")
+                atomic_file.rewrite_text(pending_file, "")
             record["status"] = "ended"
             _advance_roster_revision(record)
             roster[target] = record
-            durable_state.rewrite_text(handle, json.dumps(roster, indent=2, sort_keys=True))
+            atomic_file.rewrite_text(handle, json.dumps(roster, indent=2, sort_keys=True))
             availability = _server_availability(session_dir)
             dropped = 0
             if isinstance(availability, LiveServer):
@@ -5866,7 +5866,7 @@ def command_reopen(args: argparse.Namespace) -> int:
         return 2
     path = _session_path(session_dir, ROSTER_FILE)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with durable_state.locked_text(path) as handle:
+    with atomic_file.locked_text(path) as handle:
         _ = handle.seek(0)
         roster = _load_roster_for_write(handle)
         entry = _as_dict(roster.get(name))
@@ -5894,7 +5894,7 @@ def command_reopen(args: argparse.Namespace) -> int:
         entry.update({"status": "paused", "paused_from": status, "paused_turn": status != "ended"})
         _advance_roster_revision(entry)
         roster[name] = entry
-        durable_state.rewrite_text(handle, json.dumps(roster, indent=2, sort_keys=True))
+        atomic_file.rewrite_text(handle, json.dumps(roster, indent=2, sort_keys=True))
     if _attr(args, "quiet") is not True:
         print(f"reopened {name}; send its next turn with --to {name}")
     return 0
@@ -6117,7 +6117,7 @@ def _pause_roster(session_dir: str) -> None:
             raise SystemExit("codex_mesh: raw stop --pause refuses held roles; use design_roles.py")
     path = _session_path(session_dir, ROSTER_FILE)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with durable_state.locked_text(path) as handle:
+    with atomic_file.locked_text(path) as handle:
         _ = handle.seek(0)
         roster = _load_roster_for_write(handle)
         for name, raw in roster.items():
@@ -6130,7 +6130,7 @@ def _pause_roster(session_dir: str) -> None:
                                "paused_turn": status in ("running", "starting")})
             _advance_roster_revision(record)
             roster[name] = record
-        durable_state.rewrite_text(handle, json.dumps(roster, indent=2, sort_keys=True))
+        atomic_file.rewrite_text(handle, json.dumps(roster, indent=2, sort_keys=True))
     interrupt_by = time.time() + PAUSE_INTERRUPT_SECS
     failures: list[str] = []
     for name, raw in roster.items():
@@ -6161,13 +6161,13 @@ def _pause_roster(session_dir: str) -> None:
         # A thread may still have work on a retired server even when its
         # recorded port names the current server. Preserve all before reaping.
         if observed:
-            with durable_state.locked_text(path) as handle:
+            with atomic_file.locked_text(path) as handle:
                 current = _load_roster_for_write(handle)
                 entry = _as_dict(current.get(name))
                 if entry.get("status") == "paused" and entry.get("thread_id") == thread_id:
                     entry["paused_turn"] = interrupted
                     current[name] = entry
-                    durable_state.rewrite_text(handle, json.dumps(current, indent=2, sort_keys=True))
+                    atomic_file.rewrite_text(handle, json.dumps(current, indent=2, sort_keys=True))
     if failures:
         raise SystemExit("codex_mesh: servers kept alive: " + "; ".join(failures))
 
@@ -8149,14 +8149,14 @@ def command_prime(args: argparse.Namespace) -> int:
                     or reach.session_id != os.environ.get("CLAUDE_CODE_SESSION_ID")):
                 raise SystemExit("held thread creation lacks its holder's reserved claim")
             claim = design_roles.design_directory(held_design) / f"{held_role}.creation-claimed"
-            creation_lock.enter_context(durable_state.file_lock(claim.with_name(claim.name + ".lock"), blocking=False))
+            creation_lock.enter_context(atomic_file.file_lock(claim.with_name(claim.name + ".lock"), blocking=False))
             if claim.exists():
                 creation = _as_dict(_loads(claim.read_text(encoding="utf-8")))
                 if creation.get("claim") != instance.lifecycle.claim or creation.get("state") == "outcome_unknown":
                     raise SystemExit("RoleNeedsRecovery: thread creation outcome unknown; use design_roles.py recover")
             else:
                 creation = {"claim": instance.lifecycle.claim, "state": "not_started"}
-                durable_state.atomic_write_text(claim, json.dumps(creation))
+                atomic_file.write_text_atomic(claim, json.dumps(creation))
         instructions_path = Path(_as_str(_attr(args, "instructions_file"))).resolve()
         instructions = instructions_path.read_text(encoding="utf-8")
         params: dict[str, object] = {
@@ -8180,14 +8180,14 @@ def command_prime(args: argparse.Namespace) -> int:
         if not thread_id:
             if held_design:
                 creation["state"] = "outcome_unknown"
-                durable_state.atomic_write_text(claim, json.dumps(creation))
+                atomic_file.write_text_atomic(claim, json.dumps(creation))
             result = _serving_request(client, "thread/start", params)
             thread_id = _as_str(_as_dict(result.get("thread")).get("id"))
             if not thread_id:
                 raise SystemExit("thread/start returned no thread id")
             if held_design:
                 creation.update(state="created", thread_id=thread_id)
-                durable_state.atomic_write_text(claim, json.dumps(creation))
+                atomic_file.write_text_atomic(claim, json.dumps(creation))
         # The held design's holder names the thread before its mesh record exists.
         title = unit_workers.shown_name(Path(session_dir), name, role="review",
                                         held_design_id=held_design, held_role=held_role)
@@ -8311,7 +8311,7 @@ def command_set_instructions(args: argparse.Namespace) -> int:
         print(f"codex_mesh: {name}: {reason}; instructions unchanged", file=sys.stderr)
         return 2
     path = _session_path(session_dir, ROSTER_FILE)
-    with durable_state.locked_text(path) as handle:
+    with atomic_file.locked_text(path) as handle:
         _ = handle.seek(0)
         roster = _load_roster_for_write(handle)
         entry = _as_dict(roster.get(name))
@@ -8322,14 +8322,14 @@ def command_set_instructions(args: argparse.Namespace) -> int:
         entry["instructions_file"] = str(instructions)
         _advance_roster_revision(entry)
         roster[name] = entry
-        durable_state.rewrite_text(handle, json.dumps(roster, indent=2, sort_keys=True))
+        atomic_file.rewrite_text(handle, json.dumps(roster, indent=2, sort_keys=True))
     return 0
 
 
 def _clear_reset_context(session_dir: str, name: str, thread_id: str, launcher_pid: int) -> bool:
     """Clear context only while reset still owns this thread's worker claim."""
     path = _session_path(session_dir, ROSTER_FILE)
-    with durable_state.locked_text(path) as handle:
+    with atomic_file.locked_text(path) as handle:
         _ = handle.seek(0)
         roster = _load_roster_for_write(handle)
         entry = _as_dict(roster.get(name))
@@ -8339,7 +8339,7 @@ def _clear_reset_context(session_dir: str, name: str, thread_id: str, launcher_p
         entry["context_tokens"] = 0
         _advance_roster_revision(entry)
         roster[name] = entry
-        durable_state.rewrite_text(handle, json.dumps(roster, indent=2, sort_keys=True))
+        atomic_file.rewrite_text(handle, json.dumps(roster, indent=2, sort_keys=True))
         return True
 
 

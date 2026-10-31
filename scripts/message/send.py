@@ -122,7 +122,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NamedTuple, NoReturn, NotRequired, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.lib import durable_state
+from scripts.lib import atomic_file, durable_state
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "notify"))
@@ -603,13 +603,13 @@ def as_str(value: object) -> str:
 
 
 def write_atomic(path: Path, text: str) -> None:
-    durable_state.atomic_write_text(path, text)
+    atomic_file.write_text_atomic(path, text)
 
 
 @contextmanager
 def locked() -> Generator[None]:
     STATE.mkdir(parents=True, exist_ok=True)
-    with durable_state.file_lock(STATE / ".lock"):
+    with atomic_file.file_lock(STATE / ".lock"):
         yield
 
 
@@ -1679,7 +1679,7 @@ def template_fix_notice(record: dict[str, object]) -> None:
         text_key = hashlib.sha256(text_id.encode()).hexdigest()
         key = now().astimezone(user_zone()).date().isoformat() + "-" + text_key
         stamp = directory / key
-        with durable_state.file_lock(directory / (text_key + ".lock"), blocking=False):
+        with atomic_file.file_lock(directory / (text_key + ".lock"), blocking=False):
             if stamp.exists():
                 return
             recipient = "natedev"

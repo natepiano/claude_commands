@@ -52,7 +52,7 @@ from unittest.mock import MagicMock, patch
 from scripts.agents import codex_mesh
 from scripts.direct import plan_history, workers as unit_workers
 from scripts.direct.recorder_fixture import LauncherHangGuard, invoke_recorder
-from scripts.lib import durable_state, nix_env, unit_runs
+from scripts.lib import atomic_file, nix_env, unit_runs
 from scripts.lib.stop_injection_test_support import InjectedStop, stop_once
 from scripts.message import process_table, sessions, roster as message_roster
 from scripts.usage import agents_log
@@ -1154,7 +1154,7 @@ class MeshCommandFixture(unittest.TestCase):
         )
 
     def roster(self) -> dict[str, object]:
-        with durable_state.locked_text(self.session_dir / codex_mesh.ROSTER_FILE) as handle:
+        with atomic_file.locked_text(self.session_dir / codex_mesh.ROSTER_FILE) as handle:
             return cast("dict[str, object]", json.load(handle))
 
     def worker_record(self) -> dict[str, object]:
@@ -1215,8 +1215,8 @@ class MeshCommandFixture(unittest.TestCase):
         return code, output.getvalue(), errors.getvalue()
 
     def write_pool_roster(self, entries: dict[str, object]) -> None:
-        with durable_state.locked_text(self.session_dir / codex_mesh.ROSTER_FILE) as handle:
-            durable_state.rewrite_text(handle, json.dumps(entries))
+        with atomic_file.locked_text(self.session_dir / codex_mesh.ROSTER_FILE) as handle:
+            atomic_file.rewrite_text(handle, json.dumps(entries))
 
     def prime_cli(self, *options: str) -> list[str]:
         instructions_file = self.session_dir / "review-instructions.txt"
@@ -2113,10 +2113,10 @@ class MeshCommandTests(MeshCommandFixture):
             locks_roster = lock_path.exists() and os.path.samestat(os.fstat(descriptor), lock_path.stat())
             if armed[0] and operation == fcntl.LOCK_EX and locks_roster:
                 armed[0] = False
-                with durable_state.locked_text(path) as other:
+                with atomic_file.locked_text(path) as other:
                     entries = cast(dict[str, object], json.loads(other.read()))
                     entries["worker"] = replacement
-                    durable_state.rewrite_text(other, json.dumps(entries))
+                    atomic_file.rewrite_text(other, json.dumps(entries))
                 writes[0] += 1
             flock(descriptor, operation)
         self.server.respond = reply

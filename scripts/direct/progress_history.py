@@ -28,7 +28,7 @@ if not __package__:
 from scripts.direct import phase_reservation, plan_history, recorder_state  # noqa: E402
 from scripts.direct.recorder_state import OPEN_PHASES_KEY as OPEN_PHASES_KEY  # noqa: E402
 from scripts.direct.tag_inventory import contract_table_paths  # noqa: E402
-from scripts.lib import agents_registry, durable_state, unit_runs  # noqa: E402
+from scripts.lib import agents_registry, atomic_file, unit_runs  # noqa: E402
 from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
 from scripts.production import production_doc  # noqa: E402
@@ -454,7 +454,7 @@ def _read_state(session_dir: Path) -> dict[str, object]:
 
 
 def _write_state(session_dir: Path, state: dict[str, object]) -> None:
-    durable_state.atomic_write_text(_state_path(session_dir), json.dumps(state, indent=2, sort_keys=True) + "\n")
+    atomic_file.write_text_atomic(_state_path(session_dir), json.dumps(state, indent=2, sort_keys=True) + "\n")
 
 
 SESSION_ROOTS = tuple(
@@ -5682,14 +5682,14 @@ def record_turn_wait(session_dir: Path, owner_session: str, final_message: str) 
                            if same_scope and declaration.get('declaration_id')
                            and wait.get('turn_wait_declaration') == declaration), None)
         if correlated is not None and correlated.get('event_type') == 'wait_started':
-            durable_state.atomic_write_text(marker_path, json.dumps({
+            atomic_file.write_text_atomic(marker_path, json.dumps({
                 "wait_id": correlated["wait_id"], "owner_session": owner_session}) + "\n")
             return True
         # A declaration is durable before its wait event. A closed declaration
         # starts a new identity; a stopped declaration with no event resumes it.
         if not same_scope or not declaration.get('declaration_id') or correlated is not None:
             declaration = {**scope, 'declaration_id': str(uuid.uuid4())}
-            durable_state.atomic_write_text(declaration_path, json.dumps(declaration) + '\n')
+            atomic_file.write_text_atomic(declaration_path, json.dumps(declaration) + '\n')
         if previous is not None and previous.get('event_type') == 'wait_started':
             # Retain a legacy marker's open wait only within its recorded phase.
             if (not previous.get('turn_wait_declaration')
@@ -5700,7 +5700,7 @@ def record_turn_wait(session_dir: Path, owner_session: str, final_message: str) 
             _end_wait(state, previous, plan_history.now_epoch(), unclosed=True)
         args.turn_wait_declaration = declaration
         wait_id = _record_wait(state, args)
-        durable_state.atomic_write_text(marker_path, json.dumps({"wait_id": wait_id, "owner_session": owner_session}) + "\n")
+        atomic_file.write_text_atomic(marker_path, json.dumps({"wait_id": wait_id, "owner_session": owner_session}) + "\n")
     return True
 
 

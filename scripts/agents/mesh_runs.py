@@ -59,7 +59,7 @@ from uuid import NAMESPACE_URL, uuid5
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.agents import codex_mesh
 from scripts.buildlog import treekey
-from scripts.lib import durable_state, unit_runs
+from scripts.lib import atomic_file, unit_runs
 
 # Exit status of `start` when the caller is not a mesh worker: run the command attached.
 NOT_A_MESH_WORKER = 3
@@ -173,7 +173,7 @@ def _runs_dir(session_dir: str) -> Path:
 
 
 def _write_record(path: Path, record: RunRecord) -> None:
-    durable_state.atomic_write_text(path, json.dumps(record, indent=2, sort_keys=True))
+    atomic_file.write_text_atomic(path, json.dumps(record, indent=2, sort_keys=True))
 
 
 def _read_record(path: Path) -> RunRecord:
@@ -249,7 +249,7 @@ def reap_orphans(session_dir: str, worker: str = "") -> list[str]:
             continue
         claim = path.with_suffix(".reap")
         try:
-            with durable_state.file_lock(claim.with_name(claim.name + ".lock"), blocking=False):
+            with atomic_file.file_lock(claim.with_name(claim.name + ".lock"), blocking=False):
                 # The advisory lock is the owner. It expires automatically when
                 # that process exits, including a stop before this record is saved.
                 claim.unlink(missing_ok=True)

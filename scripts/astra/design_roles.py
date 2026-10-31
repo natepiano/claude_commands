@@ -26,7 +26,7 @@ from uuid import UUID, uuid4
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.astra import astra_work
-from scripts.lib import durable_state
+from scripts.lib import atomic_file
 
 ROOT = Path(__file__).resolve().parents[2]
 Role = Literal['designer', 'reviewer']
@@ -256,12 +256,12 @@ def _integer(fields: dict[str, object], key: str) -> int:
 
 
 def _atomic(path: Path, value: object) -> None:
-    durable_state.atomic_write_text(path, json.dumps(value, indent=2, sort_keys=True) + '\n')
+    atomic_file.write_text_atomic(path, json.dumps(value, indent=2, sort_keys=True) + '\n')
 
 
 @contextmanager
 def _lock(directory: Path) -> Generator[None]:
-    with durable_state.file_lock(directory / 'lock'):
+    with atomic_file.file_lock(directory / 'lock'):
         yield
 
 
@@ -579,12 +579,12 @@ def durable_meshes() -> tuple[Path, ...]:
 def _edit_roster(design_id: str) -> Generator[dict[str, object]]:
     path = mesh_directory(design_id) / 'mesh_roster.json'
     path.parent.mkdir(parents=True, exist_ok=True)
-    with durable_state.locked_text(path) as handle:
+    with atomic_file.locked_text(path) as handle:
         _ = handle.seek(0)
         text = handle.read()
         roster = _object(cast(object, json.loads(text))) if text else {}
         yield roster
-        durable_state.rewrite_text(handle, json.dumps(roster, indent=2, sort_keys=True))
+        atomic_file.rewrite_text(handle, json.dumps(roster, indent=2, sort_keys=True))
 
 
 def _roster(design: HeldDesign) -> dict[str, object]:
@@ -1241,7 +1241,7 @@ def adopt(repository: str, document: str, role: Role, holder: Holder, area: str,
     prompt, _ = _prompt(candidate, role, 'Continue the adopted design in the same thread when the holder assigns work.')
     _ = authority_request('adopt-reserve', {'repository_id': repository, 'document': document, 'host': host,
                                             'adoption_id': adoption_id})
-    with _lock(design_directory(design_id)), durable_state.locked_text(source_path) as source_lock:
+    with _lock(design_directory(design_id)), atomic_file.locked_text(source_path) as source_lock:
         roster = _object(cast(object, json.load(source_lock)))
         entry = _object(roster.get(name))
         _check_adoption_source(entry, thread_id)
@@ -1258,7 +1258,7 @@ def adopt(repository: str, document: str, role: Role, holder: Holder, area: str,
                 {**transfer, 'design_id': design_id, 'thread_id': thread_id, 'name': name, 'source_mesh': str(source)})
         entry['transferring_role'] = transfer
         roster[name] = entry
-        durable_state.rewrite_text(source_lock, json.dumps(roster))
+        atomic_file.rewrite_text(source_lock, json.dumps(roster))
     server = _read(source / 'mesh_server.json')
     port = _integer(server, 'port')
     client = codex_mesh.Client(port, 'design-role-adopt')
@@ -1305,17 +1305,17 @@ def adopt(repository: str, document: str, role: Role, holder: Holder, area: str,
             destination_roster[name] = adopted
         _atomic(mesh / 'serving_home.json', {'codex_home': _text(server, 'codex_home')})
         if pending_text:
-            with durable_state.locked_text(mesh / f'{name}.pending.json') as pending:
-                durable_state.rewrite_text(pending, pending_text)
+            with atomic_file.locked_text(mesh / f'{name}.pending.json') as pending:
+                atomic_file.rewrite_text(pending, pending_text)
         _save(design)
         _mesh_context(design, reach)
     confirm_adoption(design, role, thread_id)
-    with durable_state.locked_text(source_path) as source_lock:
+    with atomic_file.locked_text(source_path) as source_lock:
         roster = _object(cast(object, json.load(source_lock)))
         current = _object(roster.get(name))
         current['role_redirect'] = {'design_id': design_id, 'destination': str(mesh), 'adoption_id': adoption_id}
         roster[name] = current
-        durable_state.rewrite_text(source_lock, json.dumps(roster))
+        atomic_file.rewrite_text(source_lock, json.dumps(roster))
     _atomic(directory / 'adoption.json', {'adoption_id': adoption_id, 'source_mesh': str(source), 'name': name,
                                          'thread_id': thread_id, 'completed': True})
     _ = authority_request('adopt-commit', {'repository_id': repository, 'document': document, 'host': host,

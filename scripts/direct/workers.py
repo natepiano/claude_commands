@@ -28,7 +28,7 @@ from typing import TYPE_CHECKING, Literal, Protocol, TextIO, cast
 if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from scripts.lib import durable_state
+from scripts.lib import atomic_file
 
 if TYPE_CHECKING:
     from scripts.lib.names import JobKey
@@ -222,7 +222,7 @@ def _read_roster(run: Path) -> dict[str, object]:
 
 
 def _atomic(path: Path, data: Mapping[str, object]) -> None:
-    durable_state.atomic_write_text(path, json.dumps(dict(data), indent=2, sort_keys=True) + "\n")
+    atomic_file.write_text_atomic(path, json.dumps(dict(data), indent=2, sort_keys=True) + "\n")
 
 
 def _encode_worker(worker: UnitWorker) -> dict[str, object]:
@@ -465,7 +465,7 @@ def ledger_for_run(run: Path) -> UnitWorkerLedger:
 @contextmanager
 def _roster_locked(run: Path) -> Generator[tuple[TextIO, dict[str, object]], None, None]:
     run.mkdir(parents=True, exist_ok=True)
-    with durable_state.locked_text(run / ROSTER) as handle:
+    with atomic_file.locked_text(run / ROSTER) as handle:
         _ = handle.seek(0)
         content = handle.read()
         roster = _object(cast(object, json.loads(content))) if content.strip() else {}
@@ -473,7 +473,7 @@ def _roster_locked(run: Path) -> Generator[tuple[TextIO, dict[str, object]], Non
 
 
 def _write_roster(handle: TextIO, roster: dict[str, object]) -> None:
-    durable_state.rewrite_text(handle, json.dumps(roster, indent=2, sort_keys=True))
+    atomic_file.rewrite_text(handle, json.dumps(roster, indent=2, sort_keys=True))
 
 
 def allocation_is_live(record: Mapping[str, object]) -> bool:
@@ -576,7 +576,7 @@ def _read_inbox(handle: TextIO) -> dict[str, object]:
 
 def _giving_inbox(locks: ExitStack, source: Path, name: str) -> tuple[TextIO, dict[str, object]]:
     try:
-        inbox = locks.enter_context(durable_state.locked_text(source / f"{name}.pending.json", blocking=False))
+        inbox = locks.enter_context(atomic_file.locked_text(source / f"{name}.pending.json", blocking=False))
     except BlockingIOError as error:
         raise WorkerUnavailable(f"{name}: pending inbox is in use; retry adoption recovery") from error
     return inbox, _read_inbox(inbox)
@@ -585,7 +585,7 @@ def _giving_inbox(locks: ExitStack, source: Path, name: str) -> tuple[TextIO, di
 def _transfer_pending(locks: ExitStack, inbox: TextIO, destination: Path, name: str,
                       after: dict[str, object], identity: str, messages: dict[str, object]) -> None:
     try:
-        target_inbox = locks.enter_context(durable_state.locked_text(destination / f"{name}.pending.json", blocking=False))
+        target_inbox = locks.enter_context(atomic_file.locked_text(destination / f"{name}.pending.json", blocking=False))
     except BlockingIOError as error:
         raise WorkerUnavailable(f"{name}: destination inbox in use; retry recovery") from error
     saved = _read_inbox(target_inbox)
@@ -843,7 +843,7 @@ def _reserve(run: Path, name: str, store: UnitWorkerLedger, owner_pid: int, *, p
             raise WorkerUnavailable(f"{name}: work already reserved or owed")
         with ExitStack() as locks:
             try:
-                inbox = locks.enter_context(durable_state.locked_text(run / f"{name}.pending.json", blocking=False))
+                inbox = locks.enter_context(atomic_file.locked_text(run / f"{name}.pending.json", blocking=False))
             except BlockingIOError as error:
                 raise WorkerUnavailable(f"{name}: message delivery in progress") from error
             _ = inbox.seek(0)
@@ -1056,7 +1056,7 @@ def director_pid(run: Path) -> int:
 
 
 def _write_inbox(handle: TextIO, record: Mapping[str, object]) -> None:
-    durable_state.rewrite_text(handle, json.dumps(dict(record)))
+    atomic_file.rewrite_text(handle, json.dumps(dict(record)))
 
 
 def ledger_path(production: str, unit: str) -> Path:
@@ -1165,7 +1165,7 @@ def end_unit(production: str, unit: str) -> None:
             for run in histories:
                 if not run.is_dir():
                     continue
-                with durable_state.locked_text(run / f"{name}.pending.json") as inbox:
+                with atomic_file.locked_text(run / f"{name}.pending.json") as inbox:
                     _ = inbox.seek(0)
                     content = inbox.read()
                     pending = _object(cast(object, json.loads(content))) if content.strip() else {}

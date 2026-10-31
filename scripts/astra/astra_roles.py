@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Literal, NotRequired, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.lib import durable_state
+from scripts.lib import atomic_file, durable_state
 
 AstraRole = Literal["designer", "reviewer"]
 RoleState = Literal["busy", "idle"]
@@ -153,10 +153,10 @@ def hold(role: AstraRole, thread_id: str = "", codex_home: str = "", *,
     if pid is not None:
         lifetime = ExecProcess(pid)
         # Keep the role's existing JSON shape readable by an older installation.
-        durable_state.atomic_write_text(path.with_suffix(".process"), json.dumps({
+        atomic_file.write_text_atomic(path.with_suffix(".process"), json.dumps({
             "pid": lifetime.pid, "started": lifetime.started}))
     held = _parse_record(record, path)
-    durable_state.atomic_write_text(path, json.dumps(record))
+    atomic_file.write_text_atomic(path, json.dumps(record))
     return held
 
 

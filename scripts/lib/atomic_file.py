@@ -1,10 +1,14 @@
 """Publish a complete text file and persist its directory entry."""
 from __future__ import annotations
 
+import fcntl
 import os
 import re
 import tempfile
+from collections.abc import Generator
+from contextlib import contextmanager
 from pathlib import Path
+from typing import TextIO
 
 
 def sync_folder(folder: Path) -> None:
@@ -51,3 +55,32 @@ def write_text_atomic(path: Path, text: str) -> None:
         sync_folder(path.parent)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+@contextmanager
+def file_lock(path: Path, *, blocking: bool = True) -> Generator[None]:
+    """Lock an inode that is never replaced or unlinked; the OS releases it on exit."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+        yield
+
+
+@contextmanager
+def locked_text(path: Path, *, blocking: bool = True) -> Generator[TextIO]:
+    """Open state only after acquiring its permanent sidecar lock."""
+    with file_lock(path.with_name(path.name + ".lock"), blocking=blocking):
+        with path.open("a+", encoding="utf-8") as handle:
+            _ = handle.seek(0)
+            yield handle
+
+
+def rewrite_text(handle: TextIO, text: str) -> None:
+    """Publish under the caller's sidecar lock and refresh its transaction's reader."""
+    path = Path(handle.name)
+    write_text_atomic(path, text)
+    # Some inbox transactions read again after writing. Keep that reader on the
+    # newly published inode, without changing the permanent lock's descriptor.
+    with path.open("r+", encoding="utf-8") as current:
+        _ = os.dup2(current.fileno(), handle.fileno())
+    _ = handle.seek(0)
