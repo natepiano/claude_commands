@@ -2223,7 +2223,7 @@ def send(options: Options) -> Result:
             raise AssertionError("a user message must state its action")
         result = user(message, options.need, options.action, options.timeout, answerable=options.answerable, text_id=options.text_id, values=options.values)
         if options.text_id == AUTO_MODE_TEXT and result.outcome in ("sent", "kept"):
-            _ = rca.open_case(refusal_report(options))
+            _ = rca.open_case(refusal_report(options), defer_owner=True)
     elif isinstance(route, CodexWorkerRecipient):
         transport = Message(
             route.name,
