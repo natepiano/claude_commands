@@ -20,6 +20,8 @@ from contextlib import redirect_stderr
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from typing import BinaryIO, Literal, NoReturn, NotRequired, Protocol, TypedDict, cast
 from urllib.parse import urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
@@ -320,7 +322,7 @@ class ShowrunnerRegistry(Protocol):
 def showrunner_is_registered(session_id: str) -> bool:
     # This path runs only for a privileged command, never on a check poll.
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
-    showrunners = cast(ShowrunnerRegistry, cast(object, importlib.import_module("showrunners")))
+    showrunners = cast(ShowrunnerRegistry, cast(object, importlib.import_module("scripts.production.showrunners")))
     return showrunners.production_of(session_id) is not None
 
 

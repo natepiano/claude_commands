@@ -12,9 +12,10 @@ from pathlib import Path
 from typing import NamedTuple, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 from scripts.production import staff, staff_sources
 
-import showrunners
+from scripts.production import showrunners
 import showrunner_tree
 import showrunner_parent
 import tidy_wrapped

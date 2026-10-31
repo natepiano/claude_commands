@@ -18,12 +18,15 @@ from typing import cast, override
 from unittest import mock
 
 # Hang guards allow for load 136 on natedev (2026-10-29).
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 TEST_HANG_GUARD_SECS = 300
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import fake_unit_host
-import showrunners
+from scripts.production import showrunners
 from sessions import SessionRecord
 from fake_unit_host import HostedUnit
 from scripts.lib.socket_test_support import short_socket_directory
