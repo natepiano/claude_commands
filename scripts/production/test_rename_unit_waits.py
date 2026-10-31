@@ -76,6 +76,7 @@ class UnitRenameWaitsTests(UnitRenameFixture):
         log = self.seed_record()
         (self.home / ".local/state/shutdown/owner@example.com/sessions/sid-alpha.json").unlink()
         _ = self.mark_live("alpha-unit", "sid-alpha")
+        self.record_live_launch()
         planned = self.rename("plan")
         self.assert_ok(planned)
         self.assertIn("1. pause alpha-unit and its Codex workers through the shutdown path", planned.stdout)

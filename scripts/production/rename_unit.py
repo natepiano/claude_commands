@@ -102,7 +102,7 @@ class StopTarget(Protocol):
     def new(self) -> str: ...
     @property
     def id_matches(self) -> bool: ...
-    # The stop step fills these with the record the unit relaunches from.
+    # Bound before stopping, so relaunch keeps the conversation and account.
     account: str
     session_id: str
 
@@ -595,8 +595,6 @@ def _move_state(rename: UnitRename, _save: Callable[[], None]) -> None:
     for path in reworded:
         _ = rename_state.reword_showrunner_lists(path, ((rename.old, rename.new), *paths))
         _ = rename_state.rename_outstanding(path.parent.parent.name, ((rename.old, rename.new), *paths))
-    # The relaunched unit records its new pane at SessionStart; its old pane's entry would resume the old name.
-    _ = pane_record.forget_unit(rename.old)
     unit_move.move(PathMove(stall_watch.stretch_path(rename.slug, rename.old),
                             stall_watch.stretch_path(rename.slug, rename.new)))
     try:
@@ -681,12 +679,16 @@ def bind_stop_target(rename: StopTarget) -> None:
     records = _unit_records(rename)
     if len(records) > 1:
         raise RenameRefused(f"{rename.old} has {len(records)} shutdown records; settle them first")
-    if records:
-        rename.account, rename.session_id = records[0]["login"], records[0]["session"]["session_id"]
-    else:
-        marked = unit_lookup.marked_unit(rename.slug, rename.old)
-        if marked is not None and isinstance(marked.claude, unit_lookup.LiveClaude):
-            rename.session_id = marked.claude.session_id
+    marked = unit_lookup.marked_unit(rename.slug, rename.old)
+    conversation = unit_move.unit_conversation(marked, session_id=rename.session_id)
+    if isinstance(conversation, unit_move.UnitConversation):
+        rename.account, rename.session_id = conversation.account, conversation.session_id
+    elif records:
+        rename.account, rename.session_id = records[0]["label"], records[0]["session"]["session_id"]
+    elif marked is not None and isinstance(marked.claude, unit_lookup.LiveClaude):
+        raise RenameRefused(f"{rename.old}: session {marked.claude.session_id} has no pane launch account")
+    elif rename.session_id and not rename.account:
+        raise RenameRefused(f"{rename.old}: session {rename.session_id} has no pane launch account or shutdown record")
 
 
 def stop_unit(rename: StopTarget, _save: Callable[[], None]) -> None:
@@ -719,7 +721,6 @@ def stop_unit(rename: StopTarget, _save: Callable[[], None]) -> None:
             raise RenameRefused(f"{rename.old}: stop refused: {reason}")
         rename.session_id = identity
         if records:
-            rename.account = records[0]["login"]
             for saved in records:
                 _ = shutdown_record.update_session(saved["login"], identity,
                     lambda current: current.update(progress=shutdown_record.SessionStopped(
@@ -857,7 +858,8 @@ def _restart_record(rename: UnitRename, save: Callable[[], None]) -> None:
     """
     if not rename.session_id:
         return
-    if shutdown_record.find_session(rename.account, rename.session_id) is None:
+    records = _unit_records(rename)
+    if not records:
         return
     new_stem = unit_names.stem(rename.new)
 
@@ -877,7 +879,7 @@ def _restart_record(rename: UnitRename, save: Callable[[], None]) -> None:
         saved["renamed"] = renamed_note(rename)
 
     try:
-        _ = shutdown_record.update_session(rename.account, rename.session_id, change)
+        _ = shutdown_record.update_session(records[0]["login"], rename.session_id, change)
     except (shutdown_record.NoLiveRecord, shutdown_record.InvalidRecord, OSError) as error:
         raise RenameRefused(f"{rename.old}'s shutdown record: {error}") from error
     save()
@@ -886,7 +888,7 @@ def _restart_record(rename: UnitRename, save: Callable[[], None]) -> None:
 def _relaunch(rename: UnitRename, _save: Callable[[], None]) -> None:
     if rename.session_id:
         # Restart also resumes its own partial worker/timer restores on a retry.
-        if shutdown_record.find_session(rename.account, rename.session_id) is not None:
+        if _unit_records(rename):
             run_shutdown("restart", "--only", rename.session_id)
         else:
             rows = production_units.unit_table(Path(rename.doc).read_text(encoding="utf-8").splitlines())
@@ -895,10 +897,16 @@ def _relaunch(rename: UnitRename, _save: Callable[[], None]) -> None:
                 raise RenameRefused(f"{rename.new}: no Plan in {rename.doc}")
             result = subprocess.run([sys.executable, str(Path(add_unit.__file__)),
                 "--production", rename.doc, rename.new, *production_units.plan_arguments(plan),
-                "--resume", rename.session_id, "--cwd", rename.new_worktree],
+                "--resume", rename.session_id, "--cwd", rename.new_worktree,
+                *(["--account", rename.account] if rename.account else [])],
                 capture_output=True, text=True, check=False)
             if result.returncode:
                 raise RenameRefused((result.stderr or result.stdout).strip())
+    # Keep the source launch until a relaunch succeeds, then remove its old names.
+    # A stopped unit with no conversation also leaves no restorable old pane.
+    if rename.old != rename.new:
+        _ = pane_record.forget_unit(rename.old)
+    if rename.session_id:
         _await_live(rename)
 
 
@@ -1002,7 +1010,8 @@ def _session_failures(rename: UnitRename) -> list[str]:
     if not rename.session_id:
         return []
     failures: list[str] = []
-    saved = shutdown_record.find_session(rename.account, rename.session_id)
+    records = _unit_records(rename)
+    saved = records[0] if records else None
     if saved is not None and saved["session"]["host"]["kind"] == "unit" and saved["session"]["host"]["unit"] != rename.new:
         failures.append(f"shutdown record {rename.session_id} does not name {rename.new}")
     marked = unit_lookup.marked_units(rename.slug)
@@ -1266,6 +1275,9 @@ def _apply(slug: str, old: str, new: str, scratch: Path) -> UnitRename:
             rename.staff_id = _staff_id(rename.slug, rename.old)
             bind_stop_target(rename)
             # The request is saved before anything changes, so every later refusal resumes.
+            _save(path, rename)
+        if rename.session_id and not rename.account:
+            bind_stop_target(rename)
             _save(path, rename)
         try:
             _rename_staff(rename)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 import os
 import subprocess
 import sys
@@ -12,7 +13,10 @@ from typing import TYPE_CHECKING, cast, final
 from unittest.mock import patch
 import rename_unit
 import add_unit
+from scripts.shutdown import stop_resume
+from scripts.accounts import accounts
 from scripts.production.cli_fixture import parse_arguments
+from rename_state import RenameRefused
 if TYPE_CHECKING:
     from scripts.shutdown import shutdown_record
 else:
@@ -52,6 +56,65 @@ class UnitRenameSessionsTests(UnitRenameFixture):
                     rename_unit._relaunch(rename, lambda: None)  # pyright: ignore[reportPrivateUsage]
                 observed.assert_called_once_with(rename)
                 self.write(self.doc, text.replace("gamma-unit | " + mode, "alpha-unit | docs/plans/alpha.md"))
+
+    def finish_recordless_apply(self) -> None:
+        run = cast(Callable[..., subprocess.CompletedProcess[str]], subprocess.run)
+        launches: list[list[str]] = []
+        def launch(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+            if len(command) > 1 and command[1] == str(Path(add_unit.__file__)):
+                parsed = parse_arguments(add_unit.main, command[2:])
+                self.assertIsNotNone(parsed)
+                assert parsed is not None
+                self.assertEqual((cast(str, parsed.account), cast(str, parsed.resume), cast(str, parsed.name)), ("claude4", "sid-alpha", "gamma-unit"))
+                request = add_unit.launch_request(parsed)
+                with (patch.object(accounts, "prepared_account", return_value=accounts.PreparedAccount({}, frozenset())),
+                      patch.object(accounts, "claude_account_dir", return_value=self.home / ".claude4"),
+                      patch.object(accounts, "account_for_group_launch", side_effect=AssertionError("must keep launch account"))):
+                    self.assertEqual(add_unit.account_for_launch(request, cast(str, parsed.account)).label, "claude4")
+                # The journal must already contain the launch identity when a child starts.
+                self.assertEqual((self.journal()["account"], self.journal()["session_id"]), ("claude4", "sid-alpha"))
+                launches.append(command)
+                _ = self.mark_live("gamma-unit", "sid-alpha")
+                return subprocess.CompletedProcess(command, 0, "", "")
+            return run(command, **options)
+        with patch.object(subprocess, "run", side_effect=launch):
+            result = self.rename("apply")
+        self.assert_ok(result)
+        self.assertEqual(len(launches), 1)
+        self.assertIs(self.journal()["done"], True)
+
+    def test_live_recordless_rename_journals_its_account_and_resumes_the_same_conversation(self) -> None:
+        end = self.mark_live("alpha-unit", "sid-alpha")
+        self.record_live_launch()
+        def stop(identity: str) -> stop_resume.Stopped:
+            self.assertEqual(identity, "sid-alpha")
+            self.assertEqual(self.journal()["account"], "claude4")
+            end()
+            return stop_resume.Stopped(identity, 1)
+        with patch.object(self, "stop_session", side_effect=stop):
+            self.finish_recordless_apply()
+
+    def test_step_eight_journal_recovers_its_missing_account_from_the_session_launch(self) -> None:
+        # Reach the same persisted state as the interrupted live proof, using real move steps.
+        end = self.mark_live("alpha-unit", "sid-alpha")
+        self.record_live_launch()
+        def stop(identity: str) -> stop_resume.Stopped:
+            end()
+            return stop_resume.Stopped(identity, 1)
+        original = rename_unit.STEPS
+        def interrupt(_rename: rename_unit.UnitRename, _save: Callable[[], None]) -> None:
+            raise RenameRefused("checkpoint")
+        checkpoint = original[8]._replace(run=interrupt)
+        with (patch.object(self, "stop_session", side_effect=stop),
+              patch.object(rename_unit, "_restart_record", interrupt),
+              patch.object(rename_unit, "STEPS", (*original[:8], checkpoint, *original[9:]))):
+            self.assert_refused(self.rename("apply"), "checkpoint")
+        journal = self.state / "demo/rename_unit.json"
+        fields = cast(dict[str, object], json.loads(journal.read_text()))
+        self.assertEqual(fields["step"], 8)
+        fields["account"] = ""
+        self.write(journal, json.dumps(fields))
+        self.finish_recordless_apply()
 
     def moved_unit_with_leftover_marks(self) -> None:
         _ = self.seed_record()

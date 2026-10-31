@@ -1135,9 +1135,18 @@ def record(request: UnitLaunch) -> None:
 
 def account_for_launch(request: RequestedUnitLaunch, target: str = "", config_dir: str = "",
                        *, source_fallback: bool = False) -> ClaudeLaunchAccount:
-    """Use the units account, or the recorded source for a failed move."""
+    """Resume a saved conversation on its launch account; otherwise use the units account."""
     from scripts.accounts import accounts
     try:
+        if target and not config_dir and not source_fallback and isinstance(request.session, ResumedSession):
+            import unit_move
+
+            conversation = unit_move.unit_conversation(None, session_id=request.session.session_id)
+            if isinstance(conversation, unit_move.UnitConversation) and conversation.account == target:
+                prepared = accounts.prepared_account(target, resume=True)
+                if isinstance(prepared, accounts.AccountRefused):
+                    raise Refusal(prepared.reason)
+                return accounts.NamedAccount(target, accounts.claude_account_dir(target))
         if source_fallback:
             from shutdown_record import all_session_records
 

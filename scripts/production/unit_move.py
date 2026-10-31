@@ -290,6 +290,35 @@ def processes_inside(worktree: Path) -> list[int]:
     return sorted(found)
 
 
+class UnitConversation(NamedTuple):
+    """The conversation and account saved at the unit's Claude launch."""
+    session_id: str
+    account: str
+
+
+class NoUnitConversation(NamedTuple):
+    """No launch entry identifies this unit's conversation."""
+
+
+def unit_conversation(found: unit_lookup.MarkedUnit | None, *, session_id: str = "") -> UnitConversation | NoUnitConversation:
+    """Use the live director's id, then its pane launch; retained launches survive a stop."""
+    if found is not None and isinstance(found.claude, unit_lookup.LiveClaude):
+        session_id = found.claude.session_id
+    if not session_id:
+        return NoUnitConversation()
+    if found is not None:
+        entry = pane_record.read(found.place.session).get(found.place.pane)
+        if entry is not None and entry["session_id"] == session_id and entry["config_dir"]:
+            return UnitConversation(session_id, Path(entry["config_dir"]).name.removeprefix("."))
+    accounts = {Path(entry["config_dir"]).name.removeprefix(".")
+                for path in pane_record.RECORD_DIR.glob("*.json")
+                for entry in pane_record.read(path.stem).values()
+                if entry["session_id"] == session_id and entry["config_dir"]}
+    if len(accounts) > 1:
+        raise RenameRefused(f"session {session_id}: pane launches name several accounts")
+    return UnitConversation(session_id, accounts.pop()) if accounts else NoUnitConversation()
+
+
 class UnitPane(NamedTuple):
     unit: str
     place: herdr.HerdrPlace

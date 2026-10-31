@@ -418,6 +418,13 @@ class UnitRenameFixture(StaffTestCase):
         directory = self.home / ".local/state/shutdown/owner@example.com/sessions"
         return cast(dict[str, object], json.loads((directory / "sid-alpha.json").read_text()))
 
+    def record_live_launch(self) -> None:
+        pane_record.write("demo-alpha-unit", pane_record.PaneLaunch(
+            pane_id="w1:p1", session_id="sid-alpha", config_dir=str(self.home / ".claude4"),
+            cwd=str(self.rust / "claude-demo-alpha"), name="alpha", model="sonnet",
+            remote_control=True, environment={"SHOWRUNNER_UNIT": "demo", "SHOWRUNNER_UNIT_ID": "alpha-unit"},
+            flags_read=True, ended=False, written_at="2026-10-30T22:00:00+00:00"))
+
     def mark_live(self, unit: str, session_id: str, name: str = "") -> Callable[[], None]:
         """A live Claude in a herdr session marked as `unit` of this production; the result ends it.
 
