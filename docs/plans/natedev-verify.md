@@ -410,36 +410,22 @@ Checkpoint 49a471ca on `natedev-verify-base`.
 
 ### Phase 12 — Pair an assertion whose local binding was renamed  · status: done
 
-**Origin:** builds showrunner, 2026-10-31 03:15Z, wrong result, current; it lands before the bulk prefer-type rename run. Branch `natedev-verify-base` (carries Phases 6c and 11), worktree `/home/natepiano/worktrees/claude-build-followups-verify-base`.
+#### As-built
 
-**Depends on:** Phase 6b (constant pairing path), Phase 6c (test naming), Phase 11 (bases) — same file.
+Checkpoint 48859c93 on `natedev-verify-base`.
 
-#### Work Order
-
-**Source:** builds, 2026-10-31. cargo-liner-style-names-unit commit `8dd754b1` in `~/rust/cargo-liner-style-names` renames local bindings in cargo-port tests: `crates/cargo-port/src/tui/panes/layout.rs` (`short`/`tall` → `short_resolved_pane_layout`/`tall_resolved_pane_layout`) and `crates/cargo-port/src/tui/panes/ci/render.rs` (`expected` → `expected_ci_display_columns`, and nightly rustfmt rewrapped the grown lines). The guard reads `layout.rs:410` and `render.rs:833` as `removed -> (none)`. That commit passes only through two `Assertion-Change:` rulings.
-
-**Goal:** an assertion whose only change is a renamed local binding pairs with its new form and never reads as removed; any other change to the assertion still shows, and a rename the guard cannot prove blocks.
-
-**Spec:**
-
-1. Reproduce first: build a fixture repo from the two real shapes (two bindings renamed in one assert; one binding renamed in a multi-line assert that rustfmt rewraps). Record in the summary that the guard reports both as `removed` before the first edit.
-2. Extend the one Phase 6b pairing path (the place that pairs a removed literal assertion with its replacement when a literal became a `const` name). Add a binding-rename pairing there: an old and a new assertion pair when their token streams are equal after a consistent one-to-one rename of local `let` bindings and parameters of the enclosing test function. Compare tokens, not text, so a rustfmt rewrap pairs. No second matcher, no second tokenizer, no copy of the census.
-3. A rename is proven only when, in the same test function on each side: the old name has exactly one binding and no use after the rename point, the new name has exactly one binding and did not exist on the old side, and the binding's right-hand side is token-equal across the two sides (after the same rename map). Every other form refuses the pair and blocks: shadowed names, pattern bindings (tuple, struct, `ref`, `mut` patterns beyond plain `let mut x`), closure parameters, names used inside macros other than the trusted assert family, a name that maps to two names, and two names that map to one. Refuse whole classes, not single edge cases.
-4. A rename plus any other change (an operator, a literal, a call, an argument order) still reports, as it does today.
-5. Fix the guard row in `docs/as-built/phase-checks.md` so it lists binding renames among the forms that pair, and the refusal classes.
+- `assertion_guard.py` pairs a Rust assertion whose only change is a renamed local `let` binding, also across a rustfmt rewrap. `touched_assertions` calls `binding_renames(sources, code, constants)` once. For each test that `enclosing_tests` finds once on each side, `prove_binding_rename(old_rows, new_rows, scope) -> BindingRename | NoBindingRename` compares the whole test token by token (`rust_tokens`, on the shared `lexical_spans` lexer). The proof holds only when every token difference is one bijection of plain `let` names, each bound once on its side and absent from the other side, so binding values must also be token-equal. `BindingRename.rewrite` maps the new names back to the old ones in each new-side assertion of that test before matching.
+- The proof reuses the Phase 6b census. `ConstantTable` adds `local_declarations` (plain `let [mut] name [: T] =`), `function_bodies` and `local_renames_refused`; `refuse_environment()` sets `refuse_all` and `local_renames_refused`. An untrusted macro inside another function does not refuse a local rename (`pairing_code_is_certain(code, function_bodies)`); constant pairing keeps its file-wide refusal.
+- These forms refuse the proof, and normal matching runs: shadowing; patterns; function and closure parameters; a generic signature, a nested function or any attribute inside the test; a literal on either side that holds `{name` for a mapped name; a mapped name inside a macro other than the assert family; member, path, field, label, type and `as` positions; a use before the binding's statement ends or inside a nested block; split or merged maps; the Phase 6b file refusals (`macro_rules`, a trusted-macro import, an unresolved glob, uncertain code); every Python file.
+- Real case: the staged `8dd754b1` diff from `~/rust/cargo-liner-style-names` at its parent, with no `Assertion-Change:` lines, prints `assertion guard: no removed or weaker assertions`.
 
 **Files:**
-- `scripts/direct/assertion_guard.py` — the pairing path
-- `scripts/direct/test_assertion_guard_revisions.py` (or the shared test module the 6b pairing tests live in) — rename cases
-- `docs/as-built/phase-checks.md` — guard row
+- `scripts/direct/assertion_guard.py` — `RustToken`, `rust_tokens`, `BindingRename`, `NoBindingRename`, `prove_binding_rename`, `rename_references_are_plain`, `binding_renames`; `ConstantTable.local_declarations`, `function_bodies`, `local_renames_refused`, `refuse_environment`
+- `scripts/direct/test_assertion_guard_revisions.py` — `BindingRenameTests`: the two real shapes, a rename plus another change, each refusal form, Python renames stay `removed`
+- `docs/as-built/phase-checks.md` — guard row: plain local `let` renames pair, and the forms that refuse
 
-**Workers:** 1 writer (one owner for all three files).
+**Binds later work:** a rename proof change goes in `prove_binding_rename` and reuses `rust_tokens` and the census; no second tokenizer or matcher.
 
-**State:** none.
+**Gotchas:** a refused proof does not block by itself: normal matching runs, so an in-place edit of one assertion stays a non-blocking `changed` note.
 
-**Constraints from prior phases:** Phase 6b's fail-closed rules, its binding census and its git-revision reads stay as they are and are reused. Phase 6c's test naming and Phase 11's one bases function stay as they are. Never change origin/HEAD in tests.
-
-**Acceptance gate:**
-- New tests, each failing on e7c2f25c: (a) two bindings renamed in one `assert!` pair, no `removed`; (b) one binding renamed in a multi-line `assert_eq!` that rustfmt rewraps pairs, no `removed`; (c) a rename plus a changed operator or literal still reports as it does today: a removal blocks, and an in-place edit of one assertion stays a `changed` note, as on the e7c2f25c guard; (d) a rename the guard cannot prove (a shadowed name, a name mapped two ways, a binding whose value changed) blocks; (e) a Python test with a renamed local passes the same way, or refuses as a class if Python is out of scope — the summary says which.
-- The real case: with the commit's own `Assertion-Change:` lines left out (re-apply `8dd754b1`'s diff to a scratch clone at `8dd754b1^` with a plain message, or run the guard on that diff staged), `assertion_guard.py` prints no `removed` line for `layout.rs` or `render.rs`.
-- basedpyright `0 errors, 0 warnings, 0 notes` on each changed Python file; every `scripts/direct/test_assertion_guard*` and `scripts/hooks/test_change_review_gate.py` module passes; the merge gate passes.
+**Ruled out:** pairing a renamed function parameter (a test attribute such as `#[rstest]` picks a fixture by parameter name); Python renames; a block for every refused proof.
