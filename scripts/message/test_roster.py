@@ -29,6 +29,7 @@ from scripts.production.staff_test_support import (
     isolated_staff_file, production_membership, unit_membership, showrunner_relationship, showrunner_launch,
 )
 from scripts.astra import design_roles
+from scripts.astra.design_role_test_support import write_empty_binding_record
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.message import unit_labels
 
@@ -41,6 +42,7 @@ import codex_daemon
 from codex_test_support import FakeDaemon, receive_frame, reply, write_codex_account
 import process_table
 import roster
+import send
 import unit_lookup
 import unit_runs
 import herdr
@@ -906,6 +908,38 @@ class RosterTests(unittest.TestCase):
                 self.assertEqual(decoded.thread, roster.CodexThread("fixed-thread"))
                 self.assertEqual(decoded.reach, roster.Messageable("worker:run/fixed-address"))
 
+
+    def test_bad_durable_binding_warns_once_and_a_named_peer_still_receives_the_send(self) -> None:
+        bad = write_empty_binding_record(self.root, design_roles.UnitHolder('other', 'other-unit'))
+        peer = self._entry('natedev', 'freestanding', 'session:peer-session')
+        os.environ['SSH_SNAPSHOT'] = roster.RosterSnapshot(roster.Roster([peer], [])).encode()
+        output, errors = io.StringIO(), io.StringIO()
+        with mock.patch.object(send, 'STATE', self.root / 'send-state'), \
+                mock.patch.object(send, 'remote', return_value=send.Result('sent', 'fixture peer')) as deliver, \
+                mock.patch.object(send, 'user', side_effect=AssertionError('no real notification')), \
+                redirect_stdout(output), redirect_stderr(errors):
+            code = send.main(['--to', 'natedev', '--from', 'fixture-reviewer', '--text', 'owner update'])
+        self.assertEqual(code, 0, output.getvalue() + errors.getvalue())
+        self.assertEqual(output.getvalue(), 'SENT: fixture peer\n')
+        self.assertEqual(errors.getvalue().splitlines(), [
+            f'send.py: roster: warning: durable role {bad}: missing or invalid repository'])
+        self.assertEqual(deliver.call_count, 1)
+        forwarded = cast(send.Message, deliver.call_args.args[0])
+        self.assertEqual(forwarded.to, 'session:peer-session')
+        self.assertEqual(forwarded.text, 'owner update')
+
+    def test_durable_warnings_survive_snapshots_and_do_not_change_roster_exit_status(self) -> None:
+        bad = write_empty_binding_record(self.root, design_roles.UnitHolder('other', 'other-unit'))
+        code, output, errors = self._run_main('--json')
+        self.assertEqual(code, 0, errors)
+        report = cast(dict[str, object], json.loads('\n'.join(output)))
+        self.assertEqual(report['problems'], [])
+        self.assertEqual(report['warnings'], [f'durable role {bad}: missing or invalid repository'])
+        self.assertEqual(errors, [f'could not read: warning: durable role {bad}: missing or invalid repository'])
+        result = roster.roster(os.environ, roster.ThisMachine())
+        decoded = roster.RosterSnapshot.decode(roster.RosterSnapshot(result).encode()).result
+        self.assertEqual(decoded.warnings, result.warnings)
+        self.assertEqual(decoded.problems, [])
 
     def test_mesh_titles_use_held_design_holder_and_fall_back_when_it_is_unreadable(self) -> None:
         design_id = "00000000-0000-4000-8000-000000000099"

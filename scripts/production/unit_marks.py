@@ -15,6 +15,8 @@ from scripts.production import staff, showrunners
 from scripts.production.showrunners import canonical_slug
 from sessions import SessionRecord
 from place import HerdrPlace
+from pane_launch import RecordedLabels
+from production_units import Refusal as ProductionDocRefusal, cell_value, unit_table
 import unit_names
 if TYPE_CHECKING:
     from scripts.shutdown import pane_record
@@ -277,6 +279,7 @@ def session_unit_marks(
     directors: dict[str, str] = {}
     known = {session["sessionId"] for session in records}
     proc = Path(environment.get("HERDR_PROC", "/proc"))
+    labels = RecordedLabels()
     for session in records:
         try:
             # Herdr's Linux environment reader is private; keep this PID-only IO here.
@@ -289,6 +292,9 @@ def session_unit_marks(
         if owner in known and owner != session["sessionId"]:
             directors[session["sessionId"]] = owner
             continue
+        import herdr
+
+        values = labels.resolve(session["pid"], values, lambda: herdr.herdr_place_of(session["pid"]))
         slug = values.get(PRODUCTION_MARK, "")
         unit = values.get(UNIT_MARK, "")
         staff_id = values.get("STAFF_ID", "")
@@ -301,3 +307,138 @@ def session_unit_marks(
             )
             marked.append((slug, unit_mark))
     return group_marked_units(marked, record=record), directors
+
+
+@dataclass(frozen=True)
+class LaunchMembership:
+    """The staff owner's identities and the production documents that name their parents."""
+
+    record: staff.StaffSnapshot
+    sources: MemberSources
+
+    @classmethod
+    def read(cls) -> LaunchMembership:
+        return cls(staff.snapshot(), member_sources())
+
+    def environment(self, launch: pane_record.PaneLaunch, *, live_name: str = "") -> dict[str, str]:
+        environment = dict(launch["environment"])
+        identity = environment.get("STAFF_ID", "")
+        row = self.record.by_id(staff.StaffId(identity)) if identity else None
+        if identity and row is None:
+            return environment  # A missing owner id is never permission to reuse its name.
+        unit = environment.get("SHOWRUNNER_UNIT_ID", "")
+        production = environment.get("SHOWRUNNER_UNIT", "")
+        for slug, source in self.sources.productions.items():
+            if row is None and source.timer.target == f"session:{launch['session_id']}":
+                found = self.sources.member(ShowrunnerMember(slug), self.record)
+                if isinstance(found, MemberFound):
+                    row = found.row
+                    break
+        if row is None and unit and production:
+            found = self.sources.member(UnitMember(production, unit), self.record)
+            if isinstance(found, MemberFound):
+                row = found.row
+        if row is None and (unit or live_name):
+            found = unit_match(ObservedUnit(unit or live_name), self.record)
+            if isinstance(found, MemberFound):
+                row = found.row
+        if row is not None:
+            environment["STAFF_ID"] = row.id
+            if row.kind == "showrunner":
+                _ = environment.pop("SHOWRUNNER_UNIT", None)
+                _ = environment.pop("SHOWRUNNER_UNIT_ID", None)
+            elif row.kind == "unit":
+                parents = self.sources.showrunner_members(self.record)
+                slugs = [slug for slug, parent in parents.items() if parent.id == row.parent]
+                if len(slugs) == 1:
+                    environment["SHOWRUNNER_UNIT"] = slugs[0]
+                    source = self.sources.productions[slugs[0]]
+                    try:
+                        rows = unit_table(source.document.splitlines())
+                    except ProductionDocRefusal:
+                        return environment  # No declared id: retain the conversation's existing one.
+                    identifiers = [cell_value(cells["Unit"]) for cells in rows
+                                   if "Unit" in cells and unit_names.name(cell_value(cells["Unit"])) == row.name]
+                    if len(identifiers) == 1:
+                        environment["SHOWRUNNER_UNIT_ID"] = identifiers[0]
+        return environment
+
+
+def record_membership(launch: pane_record.PaneLaunch) -> pane_record.PaneLaunch:
+    """Supply launch session labels from its conversation history and staff owner."""
+    from scripts.shutdown import pane_record
+
+    result = launch.copy()
+    result["environment"] = pane_record.retained_environment(result, pane_record.launches())
+    try:
+        result["environment"] = LaunchMembership.read().environment(result)
+    except (staff.StaffUnreadable, OSError, ValueError):
+        pass  # An unavailable owner cannot erase already recorded identity.
+    return result
+
+
+@dataclass(frozen=True)
+class RepairedSessionLabels:
+    identity: str
+    assigned: tuple[tuple[str, str], ...]
+    removed: tuple[str, ...]
+
+
+def repair_marks() -> list[RepairedSessionLabels]:
+    """Repair retained identities in place; never launch or change a conversation."""
+    import sessions
+    from scripts.shutdown import pane_record
+
+    membership = LaunchMembership.read()
+    history = pane_record.launches()
+    newest = {entry["session_id"]: entry["written_at"]
+              for entry in sorted(history, key=lambda item: item["written_at"])}
+    running = {entry["sessionId"]: entry["name"] for entry in sessions.running_sessions()}
+    repaired: list[RepairedSessionLabels] = []
+    for path in sorted(pane_record.record_directory().glob("*.json")):
+        with pane_record.locked(path.stem):
+            entries = pane_record.read_strict(path.stem)
+            changed = False
+            for pane, entry in entries.items():
+                if entry["written_at"] != newest.get(entry["session_id"]):
+                    continue
+                restored = entry.copy()
+                restored["environment"] = pane_record.retained_environment(entry, history)
+                restored["environment"] = membership.environment(
+                    restored, live_name=running.get(entry["session_id"], ""))
+                if restored != entry:
+                    entries[pane] = restored
+                    before, after = entry["environment"], restored["environment"]
+                    repaired.append(RepairedSessionLabels(
+                        f"{path.stem}:{pane}:{entry['session_id']}",
+                        tuple((key, value) for key, value in sorted(after.items()) if before.get(key) != value),
+                        tuple(sorted(key for key in before if key not in after))))
+                    changed = True
+            if changed:
+                pane_record.save(path.stem, entries)
+    return repaired
+
+
+def main(arguments: list[str] | None = None) -> int:
+    """Repair saved session labels without starting or stopping a process."""
+    import argparse
+
+    parser = argparse.ArgumentParser(description=main.__doc__)
+    _ = parser.add_argument("command", choices=["repair"])
+    _ = parser.parse_args(arguments)
+    try:
+        repaired = repair_marks()
+    except (staff.StaffUnreadable, OSError, ValueError) as error:
+        print(f"session labels: {error}", file=sys.stderr)
+        return 1
+    for repair in repaired:
+        changes = [f"set {key}={value}" for key, value in repair.assigned]
+        changes.extend(f"removed {key}" for key in repair.removed)
+        print(f"{repair.identity}: " + "; ".join(changes))
+    if not repaired:
+        print("nothing to repair")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -183,7 +183,46 @@ class CrateRunTests(CargoProjectTests):
         self.assertTrue(all(not record["selected"] for record in self.batch.read()["crates"].values()))
         result = self.advance("beta")
         self.assertEqual(result["crates"]["beta"]["stage"], crates.CrateStage.ABANDONED)
+        self.assertEqual(result["crates"]["beta"].get("error"), "no selected findings")
         self.assertEqual(self.commands.calls, [])
+
+    def test_empty_selection_names_holding_tickets_and_finding_count_per_crate(self) -> None:
+        self.freeze()
+        findings = self.authority.held_findings(ledger_api.AllHeldFindings())
+        primary = next(finding for finding in findings if finding.path == "src/lib.rs")
+        assert isinstance(primary.state, ledger_api.Filed)
+        self.authority.ticket_add("read-2", "read", "read", "names", ".", [primary.path],
+                                  [self.definition.rule_id])
+        self.authority.ticket_assign("read-2", "main")
+        _ = self.authority.ticket_base("read-2")
+        source = (self.repo / primary.path).read_text().splitlines()
+        second = self.authority.hold(self.definition.rule_id, primary.path, 3, source[2],
+                                     "rename", "old", "value", self.definition.blob, "read-2")
+        file_blocked = self.authority.hold(self.definition.rule_id, primary.path, 1, source[0],
+                                           "rename", "run", "execute", self.definition.blob, "read-2")
+        for finding in (second, file_blocked):
+            self.authority.file_held(finding.finding_id, primary.state.proposal)
+        self.authority.ticket_drop("read-2")
+        other = next(finding for finding in findings if finding.path == "beta/src/lib.rs")
+        for ticket, finding in (("holder-a-1", primary), ("holder-b-1", second), ("other-crate-1", other)):
+            filed = self.authority.named_held((finding.finding_id,))[0]
+            assert isinstance(filed.state, ledger_api.Filed)
+            self.authority.ticket_add(ticket, ticket.rsplit("-", 1)[0], "proposal", "names", ".",
+                                      [filed.path], [filed.rule], proposal=str(filed.state.proposal),
+                                      finding_ids=(filed.finding_id,))
+        batch = crates.CrateRun(self.authority, "held")
+        batch.create(self.definition, self.tree, self.destination)
+        # Abandonment consumes the frozen selection evidence, not another ledger query.
+        with mock.patch.object(self.authority, "proposal_tickets", side_effect=AssertionError("must reuse skip data")):
+            result = batch.advance("bulk_sample")
+            other_result = batch.advance("beta")
+        record = result["crates"]["bulk_sample"]
+        self.assertEqual(record["selected"], [])
+        self.assertEqual(record["stage"], crates.CrateStage.ABANDONED)
+        self.assertEqual(record.get("error"),
+                         "no selected findings: 3 findings held by open tickets: holder-a-1, holder-b-1")
+        self.assertEqual(other_result["crates"]["beta"].get("error"),
+                         "no selected findings: 1 finding held by open tickets: other-crate-1")
 
     def test_one_crate_failure_releases_only_its_claims_and_the_other_proceeds(self) -> None:
         self.freeze()

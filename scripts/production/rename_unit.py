@@ -66,6 +66,7 @@ from rename_state import RenameRefused, read_json, write_json, write_text  # noq
 from unit_move import PathMove, git  # noqa: E402
 from user_zone import user_zone  # noqa: E402
 from scripts.production import staff, staff_sources
+from scripts.astra import design_roles
 
 if TYPE_CHECKING:
     from scripts.style import style_ledger
@@ -590,7 +591,6 @@ def _merge_rename(rename: UnitRename, save: Callable[[], None]) -> None:
 
 
 def _move_state(rename: UnitRename, _save: Callable[[], None]) -> None:
-    from scripts.astra import design_roles
     from scripts.direct import workers
     workers.rename_unit(rename.slug, rename.old, rename.new,
                         runs=tuple(set((*retire_unit.runs_of(Path(rename.old_worktree)),
@@ -1113,7 +1113,6 @@ def _state_failures(rename: UnitRename) -> list[str]:
     identity = phase_table.production_identity(read_production(Path(rename.doc)))
     failures.extend(f"{note}: phase note still names {rename.old}"
                     for note in phase_table.owned_notes(identity, rename.old))
-    from scripts.astra import design_roles
     failures.extend(design_roles.rename_failures(rename.slug, rename.old, rename.old_worktree))
     return failures
 
@@ -1403,7 +1402,7 @@ def apply(slug: str, old: str, new: str, scratch: Path) -> UnitRename:
     slug = showrunners.canonical_slug(slug)
     path = rename_state.unit_journal(slug)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with unit_move.production_lock():
+    with unit_move.production_lock(), design_roles.record_operation():
         if rename_state.unfinished(rename_state.production_journal(slug)):
             raise RenameRefused(f"{slug}: finish the production rename first")
         rename = _resumed(path, old, new)

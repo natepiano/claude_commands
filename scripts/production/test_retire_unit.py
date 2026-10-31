@@ -12,13 +12,14 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import TYPE_CHECKING, final, override
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from scripts.astra import design_roles
+from scripts.astra.design_role_test_support import write_empty_binding_record
 from scripts.direct import workers  # noqa: E402
 
 import add_unit
@@ -496,6 +497,30 @@ class RetireUnitTests(unittest.TestCase):
         self.assertEqual(self.doc.read_bytes(), before)
         self.assertTrue(self.worktree.is_dir())
         self.assertEqual(git(self.checkout, "branch", "--list", "--format=%(refname:short)", "alpha-branch"), "alpha-branch")
+
+    def test_bad_unrelated_role_record_warns_once_and_does_not_stop_retirement(self) -> None:
+        bad = write_empty_binding_record(self.checkout, design_roles.UnitHolder('other', 'other-unit'),
+                                         lifecycle=design_roles.RoleOpen('unrelated-thread'))
+        errors = io.StringIO()
+        with redirect_stderr(errors):
+            code, output = self.retire()
+        self.assertEqual(code, 0, output)
+        self.assertEqual(errors.getvalue().splitlines(), [f'warning: {bad}: missing or invalid repository'])
+        self.assertFalse(self.worktree.exists())
+        self.assertTrue(bad.is_file())
+
+    def test_bad_live_role_for_this_unit_preserves_the_unit_for_recovery(self) -> None:
+        bad = write_empty_binding_record(self.checkout, design_roles.UnitHolder('alpha', 'alpha-unit'),
+                                         lifecycle=design_roles.RoleOpen('held-thread'))
+        before = self.doc.read_bytes()
+        record = bad.read_bytes()
+        code, output = self.retire()
+        self.assertEqual(code, 1, output)
+        self.assertIn(f'held role cleanup: {bad}: missing or invalid repository', output)
+        self.assertIn('live held role needs recovery', output)
+        self.assertEqual(self.doc.read_bytes(), before)
+        self.assertEqual(bad.read_bytes(), record)
+        self.assertTrue(self.worktree.is_dir())
 
     def test_a_stopped_director_is_found_by_its_newest_interactive_transcript(self) -> None:
         self.marked = None

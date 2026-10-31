@@ -299,6 +299,8 @@ across rounds, phases, runs, restarts and account moves.
 
 `scripts/astra/design_roles.py` keeps one designer and one reviewer slot per design.
 
+Phase-bound `open` and `adopt` use the resolved design checkout when `--checkout` is omitted. A saved phase binding always names its repository. Document lookup, run unbinding, holder moves, holder retirement and holder verification share one per-record reader: an unreadable record emits one stderr warning naming its path and reason, and the sweep continues. Rename and transfer operations share a `record_operation()` scope across their sweeps: each bad record warns once per operation, and a later retry can warn again. If its raw JSON identifies the target holder, run or document and a role is open, paused for a move or needs recovery, the operation refuses so that the live thread remains recoverable. Holder verification returns that refusal in its failure list.
+
 **Store.** Root `DESIGN_ROLES_STATE`, else `~/.local/state/astra/design-roles/`, on the holder's host. One directory per UUID `design_id`:
 
 | Path | Holds |

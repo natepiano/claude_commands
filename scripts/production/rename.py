@@ -595,7 +595,7 @@ COUNTED_APPLY_STEP_NAMES = ("_rename_doc", "_rewrite_plans", "_rename_timer", "_
 
 
 def apply(old: str, new: str) -> RenamePlan:
-    with staff.operation():
+    with staff.operation(), design_roles.record_operation():
         return _apply(old, new)
 
 
@@ -888,7 +888,7 @@ def repair_workers(new: str, *, dry_run: bool = False) -> None:
 
 def unit(new: str, name: str) -> None:
     """Move one stopped unit, resuming recorded branch, worktree and configuration steps."""
-    with _rename_journal(new) as (result, journal):
+    with _rename_journal(new) as (result, journal), design_roles.record_operation():
         row = _unit_row(result, name)
         records = _object(journal.get("unit_moves", {}))
         if name in records:
