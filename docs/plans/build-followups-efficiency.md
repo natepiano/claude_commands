@@ -161,29 +161,15 @@ The one style block in `render_markdown` keeps top-level text in a centered 48re
 
 **Source:** the next item "nix_env trusts copies.py copies", approved by the showrunner of natedev 2026-10-29 and started on its go 2026-10-31 (the record format is `scratch.register_copy` on origin/natedev).
 
-#### Work Order
+#### As-built
 
-**Goal:** `nix_env.py` approves the `.envrc` of a copy that `copies.py` registered, and refuses every other copy, so `verify.sh` in a `/tmp/claude/copies/<pair>/<copy>` no longer stops with "direnv: .envrc is blocked".
-
-**Spec:** in `scripts/lib/nix_env.py`, `trusted_envrc` also returns true when all of these hold; any failure, read error included, returns false and direnv keeps its explicit approval.
-1. The `.envrc` is a regular file (not a symlink) at the top of a copy: `scratch.copy_folder(<its folder>)` equals that folder.
-2. The copy has a readable `Registered` record from `scripts/lib/scratch.py`. Use scratch.py's own record reader; do not copy its parsing. Import `scratch` inside the function so `nix_env.py` keeps its cheap start (phase 11).
-3. The record's `source_path` resolves to a folder for which `trusted_root` is true.
-4. The `.envrc` blob at the record's `source_commit` in that source repository (`git -C <source_path> rev-parse <source_commit>:.envrc`) equals the hash of the copy's `.envrc` file (`git hash-object --no-filters -- <file>`, run with the source repository as its working directory so no code from the copy runs).
-This is the user's strict rule. Files that `.envrc` loads (for example `flake.nix`) are not checked; say so in the as-built doc. No blanket `direnv allow`.
-
-**Tests** (`scripts/lib/test_nix_env.py`, real `git`, the fake `~/rust` the module's tests already use, `COPIES_ENV` pointing at a temp copies root): a `git clone --shared` copy registered with `register_copy` and an unchanged `.envrc` is approved and loads; the same copy with an edited `.envrc` is refused; a copy with no record is refused; a record whose `source_path` is outside the trusted roots is refused; a record whose `source_commit` has no `.envrc` is refused; a folder outside the copies root with a copied record file is refused.
+`scripts/lib/nix_env.py` approves the `.envrc` of a copy that `copies.py` registered, through `registered_copy(envrc)`, which `trusted_envrc` calls after `trusted_root` and `registered_worktree`. A copy qualifies when: `.envrc` is a regular file (not a symlink) at the top of a folder for which `scratch.copy_folder` returns that folder; `scratch.read_record` returns a `scratch.Registered` record; the record's `source_path` is a directory for which `trusted_root` is true; and `git hash-object --no-filters` of the copy's file equals `git rev-parse --verify --end-of-options <source_commit>:.envrc`. Both git commands run with the source repository as working directory, a `TIMEOUT_SECONDS` limit, and an environment from `_git_environment()`, which drops every `GIT_*` variable. Any failure, read error included, returns false and direnv keeps its explicit approval. `scratch` and `subprocess` are imported inside `registered_copy`, and the repository root joins `sys.path` once, only if absent, so the no-envrc path stays cheap.
 
 **Files:**
-- `scripts/lib/nix_env.py` — `registered_copy` and its use in `trusted_envrc`.
-- `scripts/lib/test_nix_env.py` — the six tests.
-- `docs/as-built/nix-shell-launch.md` — states the rule and the flake.nix limit.
+- `scripts/lib/nix_env.py` — `registered_copy`, `_git_environment`, `trusted_envrc`.
+- `scripts/lib/test_nix_env.py` — `GitNixFixture` (shared git helpers), `RegisteredWorktreeTests`, and `RegisteredCopyTests` (nine real-git tests on `git clone --shared` copies under a temp `COPIES_ENV` root).
+- `docs/as-built/nix-shell-launch.md` — the copy rule and the `flake.nix` limit.
 
-**Workers:** 1 writer; the change is one function and its tests.
-- `impl` — all three files.
+**Gotchas:** files that `.envrc` loads, for example `flake.nix`, are not checked and may differ from the source commit. A `GIT_DIR` in the caller's environment would redirect both git calls to another repository, so `_git_environment()` is the only environment either call gets.
 
-**State:** none
-
-**Constraints from prior phases:** Phase 9's `registered_worktree` proves registration by reading git's pointer files only, never by running git in the untrusted tree; this phase runs git only in the trusted source repository. Phase 11 made `nix_env.py` start cheaply: lazy imports, `NamedTuple` results.
-
-**Acceptance gate:** `python3 -m unittest scripts.lib.test_nix_env scripts.lib.test_nix_env_launches scripts.lib.test_nix_env_integration` passes from the repo root; `basedpyright scripts/lib/nix_env.py scripts/lib/test_nix_env.py` reads `0 errors, 0 warnings, 0 notes`; `docs/as-built/nix-shell-launch.md` states the rule.
+**Ruled out:** a blanket `direnv allow` for every copy; checking the files that `.envrc` loads.
