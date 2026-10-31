@@ -2021,7 +2021,8 @@ class QueuePriorityAndTokenWaitTests(MemoryQueueFixture):
     def setUp(self) -> None:
         super().setUp()
         self.clock = NOW.timestamp()
-        self.labels = {}
+        self.labels = {f"roster-{unit}": UnitLabels(f"director-{unit}", "builds", unit)
+                       for unit in ("chosen", "replacement")}
         self.enterContext(patch.dict(os.environ, {
             **fake_memory_readings(self.root), "BUILDLOG_MEMINFO": str(self.meminfo),
             "BUILDLOG_BUILD_BUDGET_GIB": "21", "USER_ZONE": "America/New_York",
@@ -2029,7 +2030,9 @@ class QueuePriorityAndTokenWaitTests(MemoryQueueFixture):
         }))
         _ = self.enterContext(patch.object(time, "time", side_effect=lambda: self.clock))
         _ = self.enterContext(patch.object(gate, "showrunner_is_registered", return_value=True))
-        _ = self.enterContext(patch.object(gate, "priority_labels", return_value=self.labels))
+        _ = self.enterContext(patch("scripts.message.roster.roster", return_value=mock.Mock(entries=[])))
+        _ = self.enterContext(patch("scripts.message.roster.unit_labels", return_value=self.labels))
+        _ = self.enterContext(patch("scripts.message.roster.unit_labels_for", return_value=self.labels))
         _ = self.meminfo.write_text(f"MemAvailable: {60 * GIB // 1024} kB\nMemTotal: {60 * GIB // 1024} kB\n")
         self.readings.update({300: gate.MeasuredMemory(0), 400: gate.MeasuredMemory(0)})
 
@@ -2048,6 +2051,100 @@ class QueuePriorityAndTokenWaitTests(MemoryQueueFixture):
         status, output, errors = self.command("priority", "set", "--unit", unit,
                                               "--why", "user's work")
         self.assertEqual(status, 0, output + errors)
+
+    def test_one_bad_token_wait_intent_does_not_stop_other_intents_or_admission(self) -> None:
+        directory = gate.admission_dir(self.root)
+        waiter_path = self.waiter(300, self.clock - 60, str(self.root / "waiting"), "waiting", 1)
+        waiter = cast(gate.Waiter, json.loads(waiter_path.read_text()))
+        waiter["token_left_at"] = self.clock - 10
+        waiter_path.unlink()
+        good = directory / "300-300.token-wait"
+        bad = directory / "000-bad.token-wait"
+        _ = bad.write_text("{broken")
+        _ = good.write_text(json.dumps({"reservation": str(directory / "gone.reservation"), "waiter": waiter}))
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors):
+            result = self.poll(400, need=1)
+        self.assertEqual(result.decision.state, "admit")
+        self.assertIsInstance(result.reservation, gate.Reserved)
+        self.assertFalse(good.exists())
+        self.assertEqual(cast(gate.Waiter, json.loads(waiter_path.read_text())), waiter)
+        self.assertEqual(bad.read_text(), "{broken")
+        self.assertEqual(len(errors.getvalue().splitlines()), 1, errors.getvalue())
+        self.assertIn(str(bad), errors.getvalue())
+
+    def test_unknown_priority_unit_is_refused_without_changing_the_old_priority(self) -> None:
+        self.label(300, "chosen")
+        self.set_priority()
+        path = gate.admission_dir(self.root) / "queue_priority.json"
+        before = path.read_bytes(), buildlog_rows(self.root)
+        status, output, errors = self.command("priority", "set", "--unit=not-a-roster-unit", "--why", "typo")
+        self.assertEqual((status, output, errors),
+                         (3, "build queue: unknown unit not-a-roster-unit; the queue priority did not change\n", ""))
+        self.assertEqual((path.read_bytes(), buildlog_rows(self.root)), before)
+
+    def test_failed_dead_owner_finalization_does_not_stop_two_admission_polls(self) -> None:
+        path = self.admit_for_token_wait(300)
+        with patch.object(gate, "finalize_reservation", side_effect=OSError("unreadable peak")):
+            with self.assertRaises(OSError):
+                gate.token_wait(path, root=self.root)
+        del self.processes[300]
+        intent, = gate.admission_dir(self.root).glob("*.token-wait")
+        before = path.read_bytes(), intent.read_bytes()
+        with patch.object(gate, "finalize_reservation", side_effect=OSError("unreadable peak")) as finalize:
+            for pid in (100, 400):
+                with self.subTest(pid=pid):
+                    errors = io.StringIO()
+                    with contextlib.redirect_stderr(errors):
+                        result = self.poll(pid, need=1)
+                    self.assertEqual(result.decision.state, "admit")
+                    self.assertIsInstance(result.reservation, gate.Reserved)
+                    self.assertEqual((path.read_bytes(), intent.read_bytes()), before)
+                    self.assertIn(str(path), errors.getvalue())
+                    self.assertIn("unreadable peak", errors.getvalue())
+            self.assertGreaterEqual(finalize.call_count, 2)
+
+    def test_no_unit_placeholder_is_refused_without_replacing_priority(self) -> None:
+        self.label(300, "—")
+        self.set_priority()
+        path = gate.admission_dir(self.root) / "queue_priority.json"
+        before = path.read_bytes(), buildlog_rows(self.root)
+        status, output, errors = self.command("priority", "set", "--unit=—", "--why", "not a unit")
+        self.assertEqual(status, 3, output + errors)
+        self.assertEqual(errors, "")
+        self.assertEqual(len(output.splitlines()), 1)
+        self.assertIn("—", output)
+        self.assertEqual((path.read_bytes(), buildlog_rows(self.root)), before)
+
+    def test_a_session_without_a_unit_cannot_resolve_to_unit_priority(self) -> None:
+        self.label(300, "—")
+        path = self.waiter(300, self.clock - 60, str(self.root / "freestanding"), "freestanding", 1)
+        waiter = cast(gate.Waiter, json.loads(path.read_text()))
+        directory = gate.admission_dir(self.root)
+        _ = (directory / "queue_priority.json").write_text(json.dumps({
+            "unit": "—", "why": "old placeholder priority", "set_at": self.clock,
+            "set_by": "showrunner-id"}))
+        ordered, _ = gate.resolve_queue_order(directory, [(path, waiter)])
+        self.assertEqual([(entry, row["pid"]) for entry, row in ordered], [(path, 300)])
+        self.assertEqual(gate.waiter_priority(ordered[0][1]), gate.NormalOrder())
+        self.assertEqual(cast(gate.Waiter, json.loads(path.read_text())), waiter)
+
+    def test_priority_unit_starting_with_a_dash_is_a_unit_argument(self) -> None:
+        self.label(300, "-x")
+        status, output, errors = self.command("priority", "set", "--unit=-x", "--why", "dash unit")
+        self.assertEqual((status, errors), (0, ""), output + errors)
+        path = gate.admission_dir(self.root) / "queue_priority.json"
+        saved = cast(dict[str, object], json.loads(path.read_text()))
+        self.assertEqual((saved["unit"], saved["why"]), ("-x", "dash unit"))
+
+    def test_clearing_a_corrupt_priority_removes_it_and_reports_the_removal(self) -> None:
+        path = gate.admission_dir(self.root) / "queue_priority.json"
+        _ = path.write_text("{broken")
+        status, output, errors = self.command("priority", "clear")
+        self.assertEqual(status, 0, output + errors)
+        self.assertFalse(path.exists())
+        self.assertIn("removed", output + errors)
+        self.assertIn("queue_priority.json", output + errors)
 
     def test_priority_cleanup_uses_the_saved_log_end_and_records_a_stopped_set_once(self) -> None:
         month = store.host_file(store.host_name(), self.clock)
@@ -2165,12 +2262,14 @@ class QueuePriorityAndTokenWaitTests(MemoryQueueFixture):
         directory = gate.admission_dir(self.root)
         waiting = next(directory.glob("300-*.waiting"))
         self.assertNotIn("priority_rank", cast(dict[str, object], json.loads(waiting.read_text())))
-        self.assertEqual(gate.explain_queue().ordered[0].get("priority_rank"), 0)
+        self.assertNotIn("order", cast(dict[str, object], json.loads(waiting.read_text())))
+        self.assertEqual(gate.waiter_priority(gate.explain_queue().ordered[0]), gate.PriorityUnit("chosen"))
         reservation = self.admit_for_token_wait(300)
         row = cast(gate.Reservation, json.loads(reservation.read_text()))
         if "queue_waiter" not in row:
             self.fail("admitted reservation must keep its queue place")
         self.assertNotIn("priority_rank", row["queue_waiter"])
+        self.assertNotIn("order", row["queue_waiter"])
         publish = write_text_atomic
         def stop_waiter(target: Path, content: str) -> None:
             if target.suffix == ".waiting":
@@ -2180,9 +2279,11 @@ class QueuePriorityAndTokenWaitTests(MemoryQueueFixture):
             gate.token_wait(reservation, root=self.root)
         intent = cast(dict[str, object], json.loads(reservation.with_suffix(".token-wait").read_text()))
         self.assertNotIn("priority_rank", cast(dict[str, object], intent["waiter"]))
+        self.assertNotIn("order", cast(dict[str, object], intent["waiter"]))
         gate.token_wait(reservation, root=self.root)
         self.assertNotIn("priority_rank", cast(dict[str, object], json.loads(waiting.read_text())))
-        self.assertEqual(gate.explain_queue().ordered[0].get("priority_rank"), 0)
+        self.assertNotIn("order", cast(dict[str, object], json.loads(waiting.read_text())))
+        self.assertEqual(gate.waiter_priority(gate.explain_queue().ordered[0]), gate.PriorityUnit("chosen"))
 
     def test_token_gap_retry_reads_only_the_recent_queue_time_tail(self) -> None:
         directory = gate.admission_dir(self.root)
@@ -2873,11 +2974,16 @@ class BuildFinalizerTests(BuildPromiseFixture):
                     _ = path.with_suffix(".max").write_text(str(10 * GIB))
                     if cleanup == "owner gone":
                         _ = self.processes.pop(100, None)
-                    with stop_history_append(store, tail), self.assertRaises(OSError):
+                    with stop_history_append(store, tail):
                         if cleanup == "release":
-                            gate.release(path, 137, self.root)
+                            with self.assertRaises(OSError):
+                                gate.release(path, 137, self.root)
                         else:
-                            _ = self.build_check(argv=["cargo", "check"])
+                            errors = io.StringIO()
+                            with contextlib.redirect_stderr(errors):
+                                _ = self.build_check(argv=["cargo", "check"])
+                            self.assertIn(str(path), errors.getvalue())
+                            self.assertIn("injected stop inside history append", errors.getvalue())
                     self.assertTrue(path.exists(), "a cut-short row must retain its reservation")
                     # Retry through the other entry point; the saved outcome must win.
                     if cleanup == "release":
@@ -5261,7 +5367,7 @@ class QueueApiTests(MemoryQueueFixture):
                 _ = self.waiter(400, NOW.timestamp() - 300, "/tmp/warmup-tree", "warmup")
                 view = gate.queue_view()
                 self.assertEqual(view.waiting[1].reason, gate.BehindHead(
-                    head_name=expected_name, head_since=NOW.timestamp() - 2400, head_session_id="session-300"))
+                    head_name=expected_name, joined_at=NOW.timestamp() - 2400, head_session_id="session-300"))
 
     def test_view_counts_measured_use_after_ramp_and_keeps_the_head(self) -> None:
         _ = self.running(100, 12)
@@ -6438,7 +6544,7 @@ class QueueExplanationTests(MemoryQueueFixture):
         scenarios = {
             "strict": inputs,
             "backfill": replace(inputs, now=NOW_EPOCH + 500),
-            "no priority": replace(inputs, ordered=[(path, cast(gate.Waiter, cast(object,
+            "no priority": replace(inputs, ordered=[(path, cast(gate.RankedWaiter, cast(object,
                 {key: value for key, value in row.items() if key != "priority_since"})))
                 for path, row in inputs.ordered],
                 host=gate.HostMemory(0, 60 * GIB)),
@@ -6449,10 +6555,10 @@ class QueueExplanationTests(MemoryQueueFixture):
                                       "priority_since": NOW_EPOCH - 660}),
                          (inputs.ordered[1][0], {**inputs.ordered[1][1], "need": 10 * GIB,
                                                 "since": NOW_EPOCH - 30})]),
-            "recorded priority": replace(inputs, ordered=[(head_path, {**head, "priority_rank": 0}),
+            "recorded priority": replace(inputs, ordered=[(head_path, {**head, "order": gate.PriorityUnit("head")}),
                                                              inputs.ordered[1]],
                 priority={"unit": "head", "why": "the user's bump", "set_at": NOW_EPOCH,
-                          "set_by": "showrunner"}),
+                          "set_by": "showrunner", "transition": gate.SettledPriority()}),
             "override": replace(inputs, override=override, host=gate.HostMemory(60 * GIB, 60 * GIB)),
             "unavailable": replace(inputs, host=gate.ReadingUnavailable()),
             "expired": replace(inputs, ordered=[(head_path, {**head, "estimated_at": NOW_EPOCH - 600}),
@@ -6629,11 +6735,12 @@ class QueueExplanationTests(MemoryQueueFixture):
         _ = self.waiting(400, GIB, 0)
         priorities: tuple[gate.QueuePriority | gate.NoQueuePriority, ...] = (
             gate.NO_QUEUE_PRIORITY,
-            {"unit": "head", "why": "the user's bump", "set_at": NOW_EPOCH, "set_by": "showrunner"},
             {"unit": "head", "why": "the user's bump", "set_at": NOW_EPOCH, "set_by": "showrunner",
-             "transition": {"id": "transition", "action": "set", "at": NOW_EPOCH}},
+             "transition": gate.SettledPriority()},
             {"unit": "head", "why": "the user's bump", "set_at": NOW_EPOCH, "set_by": "showrunner",
-             "transition": {"id": "transition", "action": "clear", "at": NOW_EPOCH}},
+             "transition": gate.PendingPriorityTransition("transition", "set", NOW_EPOCH)},
+            {"unit": "head", "why": "the user's bump", "set_at": NOW_EPOCH, "set_by": "showrunner",
+             "transition": gate.PendingPriorityTransition("transition", "clear", NOW_EPOCH)},
         )
         for priority in priorities:
             for owners in (frozenset[str](), frozenset(("400-warmup", "300-head"))):

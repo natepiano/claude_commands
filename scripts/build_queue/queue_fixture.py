@@ -148,10 +148,10 @@ def queue_read_fixture(view: gate.QueueView) -> gate.QueueRead:
                           limits=gate.AdmissionLimits(budget, view.reserve))
         followers.append(gate.LineWaiter(step, own.state == "admit", own,
                                          *gate.decision_checks(own, step.need, view.available)))
-    ordered: list[tuple[Path, gate.Waiter]] = [(Path(f"{step.pid}-{step.pid}.waiting"),
+    ordered: list[tuple[Path, gate.RankedWaiter]] = [(Path(f"{step.pid}-{step.pid}.waiting"),
         {"pid": step.pid, "start_time": str(step.pid), "need": step.need, "since": step.since,
          "session_id": step.session_id, "session_name": step.session_name,
-         "step": step.step, "folder": step.folder}) for step in view.waiting]
+         "step": step.step, "folder": step.folder, "order": gate.NormalOrder()}) for step in view.waiting]
     inputs = gate.QueueInputs(ordered, view.running, (),
         gate.HostMemory(view.available, gate.UnknownHostTotal()), gate.NoPressureHold(),
         gate.NoRecoverySpacing(),
@@ -170,17 +170,18 @@ def head_reading(*, since: float = HEAD_NOW - 600, now: float = HEAD_NOW,
     step = gate.WaitingStep(123, "head-session", "head", step_name, "/tmp/head", since,
                             gate.GIB, gate.ReadyForAdmission())
     reading = queue_read_fixture(gate.QueueView((step,), (), 30 * gate.GIB, 0, 3 * gate.GIB, now))
-    row = cast(gate.Waiter, cast(object, {"pid": step.pid, "start_time": "123", "need": step.need,
+    row = cast(gate.RankedWaiter, cast(object, {"pid": step.pid, "start_time": "123", "need": step.need,
                             "since": since, "session_id": step.session_id,
                             "session_name": step.session_name, "step": step.step,
-                            "folder": step.folder, **(fields or {})}))
+                            "folder": step.folder, "order": gate.NormalOrder(), **(fields or {})}))
     return replace(reading, ordered=[(Path("123-123.waiting"), row)])
 
 
 def with_waiting_process(reading: gate.QueueRead, step: gate.WaitingStep, start: str) -> gate.QueueRead:
     """Add a waiting row and its recorded process identity to the same snapshot."""
-    row: gate.Waiter = {"pid": step.pid, "start_time": start, "need": step.need,
-                        "since": step.since, "session_id": step.session_id, "step": step.step}
+    row: gate.RankedWaiter = {"pid": step.pid, "start_time": start, "need": step.need,
+                        "since": step.since, "session_id": step.session_id, "step": step.step,
+                        "order": gate.NormalOrder()}
     return replace(reading, ordered=[*reading.ordered, (Path(f"{step.pid}-{start}.waiting"), row)],
                    view=replace(reading.view, waiting=(*reading.view.waiting, step)))
 
@@ -302,7 +303,7 @@ class QueueFixture(ExitStack):
                 budget=replace(head.budget, need=step.need, charged=int(16.6 * gate.GIB))))
         reading = replace(model.reading, explanation=explanation,
             view=replace(model.reading.view, waiting=(step, *model.reading.view.waiting[1:])),
-            ordered=cast(list[tuple[Path, gate.Waiter]], ordered))
+            ordered=cast(list[tuple[Path, gate.RankedWaiter]], ordered))
         return replace(model, reading=reading)
 
 

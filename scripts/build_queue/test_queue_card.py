@@ -11,6 +11,20 @@ from scripts.lint import memory_admit as gate
 
 
 class QueueCardTests(QueueFixtureTests):
+    def test_unit_priority_cards_use_the_unit_and_saved_why_without_legacy_move_reasons(self) -> None:
+        model = self.fixture.model()
+        for position in (1, 2, 4):
+            with self.subTest(position=position):
+                text = plain(queue_card.render_card(model, [position], 400))
+                self.assertEqual(text.count("queue priority: cables (captured priority)"), 1)
+                self.assertNotIn("moved up", text)
+                self.assertNotIn("from #27", text)
+                self.assertNotIn("from #1 by", text)
+                self.assertNotIn("the user's bump", text)
+                if position > 1:
+                    self.assertIn(f"{min(position - 1, 3)} of cables (queue priority)", text)
+                self.assertIn("build budget: 11.1 of 21.0 GiB held; needs", text)
+
     def test_follower_names_the_eligible_heads_place_after_a_token_waiter(self) -> None:
         inputs = self.fixture.inputs()
         (token_path, token), (head_path, head), (follower_path, follower) = inputs.ordered[:3]
@@ -105,7 +119,7 @@ class QueueCardTests(QueueFixtureTests):
 
     def test_fourth_card_counts_moves_and_join_order_with_recorded_checks(self) -> None:
         text = plain(queue_card.render_card(self.fixture.model(), [4], 400))
-        self.assertIn("Next? No. 3 steps are ahead of it: 3 moved up, 0 joined earlier.", text)
+        self.assertIn("Next? No. 3 steps are ahead of it: 3 of cables (queue priority), 0 joined earlier.", text)
         self.assertIn("joined 10:10, 3 min after it", text)
         self.assertIn("It joined 1st of the steps waiting now.", text)
         self.assertIn("✓ queue order", text)
@@ -215,7 +229,7 @@ class QueueCardTests(QueueFixtureTests):
 
     def test_rows_ahead_cap_at_five_and_report_the_remainder(self) -> None:
         text = plain(queue_card.render_card(self.fixture.model(), [9], 400))
-        self.assertIn("8 steps are ahead of it: 3 moved up, 5 joined earlier.", text)
+        self.assertIn("8 steps are ahead of it: 3 of cables (queue priority), 5 joined earlier.", text)
         for place in range(1, 6):
             self.assertIn(f"\n  #{place} ", text)
         self.assertNotIn("\n  #6 ", text)
@@ -227,7 +241,7 @@ class QueueCardTests(QueueFixtureTests):
                 lines = queue_card.render_card(self.fixture.model(), [5], columns)
                 text = " ".join(plain(lines).split())
                 self.assertTrue(all(terminal_width(plain([line])) <= columns for line in lines))
-                self.assertIn("Next? No. 4 steps are ahead of it: 3 moved up, 1 joined earlier.", text)
+                self.assertIn("Next? No. 4 steps are ahead of it: 3 of cables (queue priority), 1 joined earlier.", text)
                 self.assertIn("Folder/home/natepiano/rust/cargo-liner/repo.", text.replace(" ", ""))
 
     def test_missing_pace_never_invents_a_likely_start(self) -> None:
