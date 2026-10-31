@@ -2972,21 +2972,50 @@ A rerun of a stopped `accounts.py setup`, group move or five-hour wait finishes 
 
 **Ruled out:** `--ci-base` (removed); validation in the production checkout; a shared cargo target folder with the checkout (a merge gate builds there at the same time); a second copy of the CI-run lookup or `cancel_prior_runs`.
 
-### Phase 101e — One helper reports a failed command's output  · status: todo
+### Phase 101e — One helper reports a failed command's output  · status: done
 
 **Depends on:** Phase 101c (the helper).
 
 #### Work Order
 
-**Goal:** No caller loses a failure's cause behind stderr noise. `result.stderr.strip() or result.stdout.strip()` appears 41 times in 22 non-test modules. Each copy drops stdout whenever stderr holds any text. Natedev showrunner ruling, 2026-10-30: current, after 101d.
+**Goal:** No caller loses a failure's cause behind stderr noise. `stderr.strip() or stdout.strip()` (either order) appears in 24 non-test modules after the 101e phase-start merge. Each copy drops stdout whenever stderr holds any text. Natedev showrunner ruling, 2026-10-30: current, after 101d.
 
 **Spec:**
 - Every non-test copy calls `scripts/lib/process_failure.py`'s helper. Local wrappers such as `waiting.detail` go away or become one call to it.
 - A check keeps new copies out: a test or lint scan of `scripts/` fails on the pattern outside the helper.
 - No caller's other behavior changes.
 
-**Files:** the 22 modules (list them from `grep -rln 'stderr.strip() or' scripts --include=*.py`), the scan test, and any test that asserts the old text.
+**Files:**
+- `scripts/bevy_upgrade/upgrade_schedule.py`
+- `scripts/build_hold/build_hold.py`
+- `scripts/direct/assign.py`
+- `scripts/direct/review_pool.py`
+- `scripts/herdr/herdr.py`
+- `scripts/lib/agents_registry.py`
+- `scripts/lib/main_sync.py`
+- `scripts/lint/sweep.py`
+- `scripts/message/escalate.py`
+- `scripts/nightly_review/nightly_review.py`
+- `scripts/production/add_unit.py`
+- `scripts/production/codex_winddown.py`
+- `scripts/production/dailies_input.py`
+- `scripts/production/merge_checkpoint.py`
+- `scripts/production/merge_gate.py`
+- `scripts/production/production_lifecycle.py`
+- `scripts/production/unit_move.py`
+- `scripts/production/update_registration.py`
+- `scripts/production/waiting.py`
+- `scripts/shutdown/stop.py`
+- `scripts/style/style_plan.py`
+- `scripts/style/style_proposals.py`
+- `scripts/style/style_sync.py`
+- `scripts/whoami/quota_alert.py`
+- `scripts/lib/process_failure.py` — the one helper
+- `scripts/lib/test_process_failure.py` — the scan test that fails on a planted copy
+- `scripts/` — tests that assert the old text
 
-**Workers:** 2 writers split by folder + 1 tester.
+**Workers:** 2 writers
+- impl — the 9 `scripts/production/` modules
+- test — the other 15 modules, the scan test and the tests that assert the old text
 
 **Acceptance gate:** each touched module's suite passes; basedpyright 0/0/0 on each changed file and its callers; the scan test fails on a planted copy.

@@ -7,6 +7,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 from unit_staff_test_support import unit_host
 import copy
 import io

@@ -34,6 +34,7 @@ SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS / "lib"))
 sys.path.insert(0, str(SCRIPTS / "production"))
 
+from process_failure import failure_detail
 import berth_board
 import coverage_report
 import mechanical_classes
@@ -2946,7 +2947,7 @@ def split_all(production: Path) -> int:
                                     "split", "--unit", unit, "--repo", str(worktree)],
                                    capture_output=True, text=True, check=False)
             if child.returncode:
-                cause = (child.stderr.strip() or child.stdout.strip() or f"exit {child.returncode}")
+                cause = failure_detail(child)
                 raise style_ledger.LedgerError(cause.removeprefix(f"split {unit}: "))
             print(child.stdout.strip())
         except Exception as error:

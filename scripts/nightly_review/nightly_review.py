@@ -33,6 +33,7 @@ sys.path.insert(0, str(SCRIPTS.parent))
 sys.path.insert(0, str(SCRIPTS / "whoami"))
 sys.path.insert(0, str(SCRIPTS / "shutdown"))
 sys.path.insert(0, str(SCRIPTS / "production"))
+from scripts.lib.process_failure import failure_detail
 from scripts.whoami import account  # noqa: E402
 
 if TYPE_CHECKING:
@@ -287,7 +288,7 @@ def tonight(day: date) -> list[str]:
             started = subprocess.run([sys.executable, str(SCRIPTS / "production" / "add_unit.py"), "--production",
                                       str(production.doc), SESSION, "--permanent"], capture_output=True, text=True, check=False)
             if started.returncode != 0:
-                return [f"{SESSION}: not started: {started.stderr.strip() or started.stdout.strip()}"]
+                return [f"{SESSION}: not started: {failure_detail(started)}"]
             lines.append(f"{SESSION}: started")
             claude = live_unit(production.slug)
     except OSError as error:

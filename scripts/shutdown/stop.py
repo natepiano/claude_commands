@@ -35,6 +35,7 @@ from scripts.production import staff_sources
 import unit_lookup
 from inventory import (Inventory, Session, ShutdownProcess, ProcessObservation, ProcessIdentity,
     ProcessLive, ProcessGone, ProcessUnknown, shutdown_identity, shutdown_processes, terminal_kind, live_supervisor, codex_seats)
+from process_failure import failure_detail
 from user_zone import user_zone
 from shutdown_record import (
     CLAIM_STALE_SECONDS,
@@ -1463,7 +1464,7 @@ def _release_build_claims(owner: BoundedOwner, identity: Callable[[int], str | N
                 result = subprocess.run([sys.executable, str(SCRIPTS / "mac_test/mac_test.py"),
                     "unblock", "--holder", holder], capture_output=True, text=True, check=False, timeout=max(0.001, timeout))
                 if result.returncode:
-                    print(f"shutdown: {session['name']}: Mac hold retained: {result.stderr.strip() or result.stdout.strip()}",
+                    print(f"shutdown: {session['name']}: Mac hold retained: {failure_detail(result)}",
                           file=sys.stderr, flush=True)
             except (OSError, subprocess.TimeoutExpired) as error:
                 print(f"shutdown: {session['name']}: Mac hold retained: {error}", file=sys.stderr, flush=True)
