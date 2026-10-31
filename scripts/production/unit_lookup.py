@@ -26,13 +26,15 @@ import herdr  # noqa: E402
 import sessions  # noqa: E402
 from herdr import HerdrPlace  # noqa: E402
 from sessions import SessionRecord, live_session, sessions_dir as sessions_dir  # noqa: E402
-from scripts.production import staff  # noqa: E402
+from scripts.production import staff, showrunners  # noqa: E402
+import unit_names  # noqa: E402
+from production_units import Refusal, cell_value, unit_table, order_unit_names  # noqa: E402
 from scripts.lib import unit_runs  # noqa: E402
 
 USAGE = "usage: unit_lookup.py list <production slug> | pane <production slug> <unit>"
 
 
-from scripts.production.unit_marks import (
+from scripts.production.session_staff import (
     PRODUCTION_MARK as PRODUCTION_MARK,
     UNIT_MARK as UNIT_MARK,
     ShowrunnerMember as ShowrunnerMember,
@@ -56,8 +58,89 @@ from scripts.production.unit_marks import (
     lookup_slug as _lookup_slug,
     production_members as production_members,
     group_marked_units as group_marked_units,
-    session_unit_marks as session_unit_marks,
+    session_staff_and_directors as session_staff_and_directors,
 )
+
+
+class ProductionMembers:
+    """Recorded membership of a production, read once without probing live panes."""
+
+    def __init__(self, slug: str, *, record: staff.StaffSnapshot | None = None) -> None:
+        self._slug: str = slug
+        self._record: staff.StaffSnapshot | None = record
+        self._units: set[str] | None = None
+
+    def has(self, unit: str) -> bool:
+        """Whether the unit is a current staff child, including an offline child."""
+        if self._units is None:
+            record = self._record if self._record is not None else staff.snapshot()
+            sources = member_sources()
+            members = production_members(record, sources)
+            self._units = {row.name for row in members.get(showrunners.canonical_slug(self._slug), ())}
+        return unit_names.name(unit) in self._units
+
+
+def unit_is_retired(cells: dict[str, str], marks: ProductionMembers) -> bool:
+    """A unit is retired when it has no current row under this showrunner."""
+    unit = cell_value(cells.get("Unit", ""))
+    return not unit or not marks.has(unit)
+
+
+def unit_metadata(record: staff.StaffSnapshot, sources: MemberSources, *,
+                  documents: dict[str, list[str]] | None = None) -> dict[staff.StaffId, dict[str, str]]:
+    """Bind document cells to staff identities, preferring the current parent's row."""
+    members = production_members(record, sources)
+    documents = ({slug: source.document.splitlines() for slug, source in sources.productions.items()}
+                 | (documents or {}))
+    direct: dict[staff.StaffId, dict[str, str]] = {}
+    orphans: dict[str, list[tuple[str, dict[str, str]]]] = {}
+    for slug, lines in documents.items():
+        local = {row.name: row for row in members.get(slug, ())}
+        try:
+            rows = unit_table(lines)
+        except Refusal:
+            continue
+        for cells in rows:
+            try:
+                name = unit_names.name(cell_value(cells.get("Unit", "")))
+            except unit_names.BadName:
+                continue
+            if name in local:
+                direct[local[name].id] = cells
+            else:
+                orphans.setdefault(name, []).append((slug, cells))
+    units = record.find(kind="unit")
+    for row in units:
+        if row.id in direct:
+            continue
+        candidates = orphans.get(row.name, [])
+        if len(candidates) == 1 and sum(other.name == row.name for other in units) == 1:
+            direct[row.id] = candidates[0][1]
+            continue
+        parents = [slug for slug, rows in members.items() if row in rows]
+        production = ", ".join(parents) or str(row.parent)
+        reason = "ambiguous orphan rows" if len(candidates) > 1 else "no unique document binding"
+        print(f"production_units: {production}/{row.name}: metadata unavailable: {reason}", file=sys.stderr)
+    return direct
+
+
+def live_unit_table(lines: list[str], slug: str, *, record: staff.StaffSnapshot | None = None) -> list[dict[str, str]]:
+    """Staff members with metadata bound by identity; a table cannot change a parent."""
+    record = record if record is not None else staff.snapshot()
+    sources = member_sources()
+    slug = showrunners.canonical_slug(slug)
+    members = production_members(record, sources).get(slug, ())
+    metadata = unit_metadata(record, sources, documents={slug: lines})
+    rows = {unit_names.unit_id(row.name): {**metadata.get(row.id, {"Worktree": "—", "Plan": "—"}),
+                                          "Unit": metadata.get(row.id, {}).get("Unit", f"`{unit_names.unit_id(row.name)}`")}
+            for row in members}
+    return [rows[name] for name in order_unit_names(lines, rows)]
+
+
+def retired_units(lines: list[str], slug: str, *, record: staff.StaffSnapshot | None = None) -> set[str]:
+    """Document unit names that are no longer recorded under this showrunner."""
+    marks = ProductionMembers(slug, record=record)
+    return {cell_value(cells.get("Unit", "")) for cells in unit_table(lines) if unit_is_retired(cells, marks)} - {""}
 
 
 @dataclass(frozen=True)
@@ -327,7 +410,7 @@ def _herdr_marked(claudes: dict[int, LiveClaude], unread: UnreadAt,
         yield slug, MarkedUnit(unit, claude, place, process.pid, process.command, staff_id)
 
 
-def observed_unit_marks(*, running: Sequence[SessionRecord] | None = None) -> tuple[tuple[str, MarkedUnit], ...]:
+def observed_staff_marks(*, running: Sequence[SessionRecord] | None = None) -> tuple[tuple[str, MarkedUnit], ...]:
     """Read pane marks for stop and cleanup checks, including former staff names."""
     try:
         processes = herdr.herdr_processes()
@@ -339,7 +422,7 @@ def observed_unit_marks(*, running: Sequence[SessionRecord] | None = None) -> tu
 
 def every_marked_unit(*, record: staff.StaffSnapshot | None = None) -> MarkedProductions:
     """Read all herdr units once. An unreadable host raises OSError."""
-    return group_marked_units(observed_unit_marks(), record=record)
+    return group_marked_units(observed_staff_marks(), record=record)
 
 
 def marked_units(slug: str, *, record: staff.StaffSnapshot | None = None) -> dict[str, MarkedUnit]:
@@ -356,7 +439,7 @@ def marked_unit(slug: str, name: str, *, record: staff.StaffSnapshot | None = No
                 running: Sequence[SessionRecord] | None = None) -> MarkedUnit | None:
     """One unit of the production. Unreadable herdr, or this unit's mark on two sessions, raises OSError."""
     slug = _lookup_slug(slug)
-    found = group_marked_units(observed_unit_marks(running=running), record=record, sources=sources)
+    found = group_marked_units(observed_staff_marks(running=running), record=record, sources=sources)
     if fault := found.faults.get(slug, {}).get(name):
         raise OSError(fault)
     return found.units.get(slug, {}).get(name)

@@ -337,15 +337,15 @@ class RestartTests(ShutdownTestCase):
     conversation_lookup = staticmethod(restart._conversation_launch)  # pyright: ignore[reportPrivateUsage]
 
     def test_snapshot_restart_restores_recorded_marks_and_the_staff_owners_id(self) -> None:
-        from scripts.production import staff, unit_marks
+        from scripts.production import staff, session_staff
         from scripts.production.staff_test_support import unit_membership
 
         row = unit_membership("demo", "alpha-unit")
         entry = pane_record.launch("old", "sid-alpha", str(self.root), {
             "SHOWRUNNER_UNIT": "demo", "SHOWRUNNER_UNIT_ID": "alpha-unit"}, ["claude"])
         pane_record.write("writing", entry)
-        membership = unit_marks.LaunchMembership(staff.snapshot(), unit_marks.MemberSources({}, (entry,)))
-        with patch.object(unit_marks.LaunchMembership, "read", return_value=membership):
+        membership = session_staff.LaunchMembership(staff.snapshot(), session_staff.MemberSources({}, (entry,)))
+        with patch.object(session_staff.LaunchMembership, "read", return_value=membership):
             parts = restart._resume_parts(top_level("sid-alpha"), "existing restart prompt")  # pyright: ignore[reportPrivateUsage]
         self.assertEqual(parts.environment["STAFF_ID"], row.id)
         self.assertEqual(parts.environment["SHOWRUNNER_UNIT_ID"], "alpha-unit")
