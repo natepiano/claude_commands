@@ -69,8 +69,8 @@ Case E (resources-unit's compile-cache trial): clone builds with `CARGO_INCREMEN
 | inspectors (22 behind, 26 ahead, 93 files) | 185.5 s | 21.71 | 498.0 s, 154 crates | 1.09 | +6.99 |
 
 - Rule 2 (copy + build at most 50% of A) fails for both sources: 0.79 near, 1.09 far. Both seeds compiled the same 154 crates (27% of A). Neither source's last step was a plain build, so the step-kind cause is not proved.
-- Candidate ordered rule, not adopted: (1) a source whose last step kind matches the copy's step kind; (2) of those, the fewest changed files against the copy's commit; (3) otherwise a cold build. No seed may take free space under the host sweep floor, `sweep_free_floor_gib` in `config/lint.conf`.
-- Next case: a source whose last step kind matches the copy's kind (test, for gate and review copies), at a different commit. At most 50% of A and at most 5 GiB net adopts the candidate rule. Otherwise a seed comes only from the same commit (measured 9% of A), and every other commit builds cold. `copies.py` builds no other-commit seed path before that case reports.
+- Candidate ordered rule, not adopted: (1) a source whose last step kind matches the copy's step kind; (2) of those, the fewest changed files against the copy's commit; (3) otherwise a cold build. The sweep floor (`sweep_free_floor_gib` in `config/lint.conf`) stays the only disk limit; rule 2 caps a seed at 5 GiB net over a cold build.
+- Next case (runs once resources-unit Phase 37 is on main): a source whose last step kind matches the copy's kind (test, for gate and review copies), at a different commit. At most 50% of A and at most 5 GiB net adopts the candidate rule. Otherwise a seed comes only from the same commit (measured 9% of A), and every other commit builds cold. `copies.py` builds no other-commit seed path before that case reports.
 
 - **Target mode: seed, without `incremental/`, sources copied with `cp -a`** (builds showrunner, 2026-10-30). `copies.py` has this one mode and no option; it has no shared target mode.
 
