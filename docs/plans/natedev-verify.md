@@ -408,7 +408,7 @@ Checkpoint 49a471ca on `natedev-verify-base`.
 
 **Ruled out:** a new setting, flag or skip for merges; parent discovery wider than the non-first parents of merges in the judged range.
 
-### Phase 12 — Pair an assertion whose local binding was renamed  · status: todo
+### Phase 12 — Pair an assertion whose local binding was renamed  · status: done
 
 **Origin:** builds showrunner, 2026-10-31 03:15Z, wrong result, current; it lands before the bulk prefer-type rename run. Branch `natedev-verify-base` (carries Phases 6c and 11), worktree `/home/natepiano/worktrees/claude-build-followups-verify-base`.
 
@@ -440,6 +440,6 @@ Checkpoint 49a471ca on `natedev-verify-base`.
 **Constraints from prior phases:** Phase 6b's fail-closed rules, its binding census and its git-revision reads stay as they are and are reused. Phase 6c's test naming and Phase 11's one bases function stay as they are. Never change origin/HEAD in tests.
 
 **Acceptance gate:**
-- New tests, each failing on e7c2f25c: (a) two bindings renamed in one `assert!` pair, no `removed`; (b) one binding renamed in a multi-line `assert_eq!` that rustfmt rewraps pairs, no `removed`; (c) a rename plus a changed operator or literal still reports and blocks; (d) a rename the guard cannot prove (a shadowed name, a name mapped two ways, a binding whose value changed) blocks; (e) a Python test with a renamed local passes the same way, or refuses as a class if Python is out of scope — the summary says which.
+- New tests, each failing on e7c2f25c: (a) two bindings renamed in one `assert!` pair, no `removed`; (b) one binding renamed in a multi-line `assert_eq!` that rustfmt rewraps pairs, no `removed`; (c) a rename plus a changed operator or literal still reports as it does today: a removal blocks, and an in-place edit of one assertion stays a `changed` note, as on the e7c2f25c guard; (d) a rename the guard cannot prove (a shadowed name, a name mapped two ways, a binding whose value changed) blocks; (e) a Python test with a renamed local passes the same way, or refuses as a class if Python is out of scope — the summary says which.
 - The real case: with the commit's own `Assertion-Change:` lines left out (re-apply `8dd754b1`'s diff to a scratch clone at `8dd754b1^` with a plain message, or run the guard on that diff staged), `assertion_guard.py` prints no `removed` line for `layout.rs` or `render.rs`.
 - basedpyright `0 errors, 0 warnings, 0 notes` on each changed Python file; every `scripts/direct/test_assertion_guard*` and `scripts/hooks/test_change_review_gate.py` module passes; the merge gate passes.

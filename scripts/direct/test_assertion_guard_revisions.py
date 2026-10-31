@@ -15,6 +15,156 @@ from scripts.direct.assertion_guard import commit_bases, default_base
 from scripts.production import showrunners
 from scripts.direct.assertion_guard_test_support import GUARD, AssertionFindingFixture, ComparisonBases, SeededGitRepositoryFixture, SeededMergeInProgressFixture, CLEAN, TILE_OLD, TILE_NEW
 
+class BindingRenameTests(AssertionFindingFixture):
+    def test_two_layout_bindings_renamed_in_one_assertion_pair(self) -> None:
+        before = self.rust("let tall = resolve_layout(40, 100);\n"
+                           + "    let short = resolve_layout(40, 4);\n"
+                           + "    assert!(short.area(PaneId::Targets).height > tall.area(PaneId::Targets).height);")
+        after = before.replace("tall", "tall_resolved_pane_layout").replace("short", "short_resolved_pane_layout")
+        self.change("layout.rs", before, after)
+        self.assert_clean(self.guard())
+
+    def test_multiline_render_binding_rename_and_rewrap_pair(self) -> None:
+        before = self.rust("let expected = ci_columns(&runs);\n"
+                           + "    let width = table_width(&runs, &expected, true);\n"
+                           + "    assert_eq!(display_columns(&runs, width), expected,);\n"
+                           + "    assert!(shows_durations(\n"
+                           + "        &runs, &expected, width,\n    ));")
+        after = before.replace("expected", "expected_ci_display_columns").replace(
+            "&runs, &expected_ci_display_columns, width,", "&runs,\n        &expected_ci_display_columns,\n        width,").replace(
+            "assert_eq!(display_columns(&runs, width), expected_ci_display_columns,);",
+            "assert_eq!(\n        display_columns(&runs, width),\n        expected_ci_display_columns,\n    );")
+        self.change("render.rs", before, after)
+        self.assert_clean(self.guard())
+
+    def test_binding_rename_refuses_other_assertion_changes(self) -> None:
+        before = self.rust("let short = layout(4);\n    let tall = layout(40);\n"
+                           + "    assert!(short.height > tall.height);")
+        renamed = before.replace("short", "short_layout").replace("tall", "tall_layout")
+        for after in (renamed.replace(" > ", " < "),
+                      renamed.replace("short_layout.height", "short_layout.width"),
+                      renamed.replace("layout(4)", "layout(5)")):
+            with self.subTest(after=after):
+                self.change("value.rs", before, after)
+                _ = self.assert_finding(self.guard(), "value.rs", "removed")
+        before = self.rust('let value = read();\n    assert!(value.contains("strict"));')
+        for expression in ('renamed.contains("")', 'other(renamed)', 'check(expected, renamed)'):
+            with self.subTest(expression=expression):
+                self.change("value.rs", before, self.rust("let renamed = read();\n    assert!(" + expression + ");"))
+                _ = self.assert_finding(self.guard(), "value.rs", "removed")
+
+    def test_binding_rename_refuses_shadowing_splits_merges_and_changed_values(self) -> None:
+        cases = (
+            ("let value = read();\n    let value = other();\n    assert!(value.ok());",
+             "let renamed = read();\n    let renamed = other();\n    assert!(renamed.ok());"),
+            ("let value = read();\n    assert!(value.left() > value.right());",
+             "let left = read();\n    let right = read();\n    assert!(left.left() > right.right());"),
+            ("let left = read();\n    let right = read();\n    assert!(left.left() > right.right());",
+             "let value = read();\n    assert!(value.left() > value.right());"),
+            ("let value = read();\n    assert!(value.ok());",
+             "let renamed = other();\n    assert!(renamed.ok());"),
+            ("let value = read();\n    use_value(renamed);\n    assert!(value.ok());",
+             "let renamed = read();\n    use_value(renamed);\n    assert!(renamed.ok());"),
+            ("let value = read();\n    assert!(value.ok());\n    consume(value);",
+             "let renamed = read();\n    assert!(renamed.ok());\n    consume(value);"),
+        )
+        for before, after in cases:
+            with self.subTest(after=after):
+                self.change("value.rs", self.rust(before), self.rust(after))
+                _ = self.assert_finding(self.guard(), "value.rs", "removed")
+
+    def test_binding_rename_refuses_patterns_closures_and_observing_macros(self) -> None:
+        cases = (
+            "let (value, other) = read();\n    assert!(value.ok());",
+            "let Data { value } = read();\n    assert!(value.ok());",
+            "let ref value = read();\n    assert!(value.ok());",
+            "let &mut value = read();\n    assert!(value.ok());",
+            "let callback = |value: Data| { assert!(value.ok()); };",
+            "let value = read();\n    assert!(observe!(value));",
+            "let value = read();\n    observe!(value);\n    assert!(value.ok());",
+            "let value = read();\n    assert!(value.ok());\n    consume(Data { value });",
+            "let value = read();\n    assert!(value.ok());\n    consume(object.value);",
+        )
+        for before in cases:
+            with self.subTest(before=before):
+                self.change("value.rs", self.rust(before), self.rust(before.replace("value", "renamed")))
+                _ = self.assert_finding(self.guard(), "value.rs", "removed")
+
+    def test_plain_mut_binding_and_dependent_rhs_renames_pair(self) -> None:
+        before = self.rust("let mut value = read();\n    let other = adjust(&value);\n"
+                           + "    value.update();\n    assert!(value.left() > other.right());", "test_layout")
+        self.change("value.rs", before, before.replace("value", "data").replace("other", "adjusted"))
+        self.assert_clean(self.guard())
+
+    def test_unrelated_function_expression_macros_do_not_refuse_local_rename(self) -> None:
+        before = ('mod common {}\nuse common::*;\nfn unrelated() -> Vec<i32> { vec![1, 2] }\n'
+                  + self.rust("let value = read();\n    assert!(value.ok());", "test_layout"))
+        after = before.replace("let value =", "let renamed =").replace("value.ok()", "renamed.ok()")
+        self.change("value.rs", before, after)
+        self.assert_clean(self.guard())
+
+    def test_binding_rename_refuses_macro_rebinding_and_producing_environments(self) -> None:
+        for environment in ('use std::stringify as assert;\n',
+                            'macro_rules! assert { ($($t:tt)*) => {} }\n',
+                            'include!("shadow.rs");\n', '#[macro_use] mod support;\n'):
+            with self.subTest(environment=environment):
+                before = environment + self.rust("let value = read();\n    assert!(value.ok());", "test_layout")
+                after = before.replace("let value =", "let renamed =").replace("value.ok()", "renamed.ok()")
+                self.change("value.rs", before, after)
+                _ = self.assert_finding(self.guard(), "value.rs", "removed", "test_layout")
+
+    def test_binding_rename_refuses_macro_callees_and_type_names(self) -> None:
+        for expression in ("value!(argument)", "observe(check::<&[value]>())", "check(0 as value)"):
+            with self.subTest(expression=expression):
+                before = ('type value = Small;\ntype renamed = Large;\n'
+                          + self.rust("let value = read();\n    assert!(" + expression + ");", "test_layout"))
+                after = before.replace("let value =", "let renamed =").replace(expression, expression.replace("value", "renamed"))
+                self.change("value.rs", before, after)
+                _ = self.assert_finding(self.guard(), "value.rs", "removed", "test_layout")
+
+    def test_binding_rename_refuses_references_before_the_binding_takes_effect(self) -> None:
+        for body in ("consume(value);\n    let value = read();\n    assert!(value.ok());",
+                     "let value = value();\n    assert!(value.ok());"):
+            with self.subTest(body=body):
+                before = self.rust(body, "test_layout")
+                self.change("value.rs", before, before.replace("value", "renamed"))
+                _ = self.assert_finding(self.guard(), "value.rs", "removed", "test_layout")
+
+    def test_binding_rename_keeps_constant_pairing_in_its_original_namespace(self) -> None:
+        before = ('const value: &str = "strict";\nconst LIMIT: i32 = 2;\n'
+                  + self.rust("let value = read();\n    assert!(value.contains(\"strict\"));\n"
+                              + "    assert!(value.len() > LIMIT);", "test_layout"))
+        after = before.replace("let value =", "let renamed =").replace("value.contains", "renamed.contains").replace("value.len", "renamed.len")
+        self.change("value.rs", before, after)
+        self.assert_clean(self.guard())
+
+    def test_test_parameter_renames_refuse_even_with_fixture_attributes(self) -> None:
+        fixtures = ("#[rstest::fixture]\nfn value() -> i32 { 1 }\n"
+                    + "#[rstest::fixture]\nfn renamed() -> i32 { -1 }\n")
+        for attribute in ("#[rstest::rstest]", "#[test]", "#[tokio::test]"):
+            with self.subTest(attribute=attribute):
+                before = (fixtures + attribute + "\nfn test_fixture(value: i32) {\n"
+                          + "    assert!(value.is_positive());\n}\n")
+                after = before.replace("value: i32", "renamed: i32").replace("value.is_positive()", "renamed.is_positive()")
+                self.change("value.rs", before, after)
+                _ = self.assert_finding(self.guard(), "value.rs", "removed", "test_fixture")
+
+    def test_binding_rename_refuses_inline_format_captures(self) -> None:
+        for capture in ("value", "renamed"):
+            for literal in ('"{' + capture + '}"', 'r#"{' + capture + ':>8?}"#'):
+                with self.subTest(literal=literal):
+                    before = self.rust("let value = read();\n    println!(" + literal
+                                       + ");\n    assert!(value.ok());", "test_layout")
+                    after = before.replace("let value =", "let renamed =").replace("value.ok()", "renamed.ok()")
+                    self.change("value.rs", before, after)
+                    _ = self.assert_finding(self.guard(), "value.rs", "removed", "test_layout")
+
+    def test_python_binding_renames_stay_removed_as_a_class(self) -> None:
+        before = self.python("value = read()\n    assert value.ok()")
+        self.change("test_value.py", before, before.replace("value =", "renamed =").replace("value.ok()", "renamed.ok()"))
+        _ = self.assert_finding(self.guard(), "test_value.py", "removed")
+
+
 class AssertionRevisionTests(AssertionFindingFixture):
     def test_deleted_python_test_with_different_parent_signatures_still_blocks(self) -> None:
         before = ("def test_outer():\n    def final_diff():\n        return 1\n"

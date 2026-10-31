@@ -270,10 +270,17 @@ class ConstantTable:
     inline_modules: set[tuple[str, ...]] = field(default_factory=set)
     refused_names: set[str] = field(default_factory=set)
     refuse_all: bool = False
+    local_declarations: dict[str, int] = field(default_factory=dict)
+    function_bodies: list[ScopeBlock] = field(default_factory=list)
+    local_renames_refused: bool = False
 
     def bind(self, name: str, block: ScopeBlock,
              value: LiteralExpression | NumericConstant | UnresolvedConstant = UNRESOLVED_CONSTANT) -> None:
         self.bindings.setdefault(name, []).append(NameBinding(block.module, value))
+
+    def refuse_environment(self) -> None:
+        self.refuse_all = True
+        self.local_renames_refused = True
 
     def assertion_scope(self, code: list[str], line: int) -> ScopeBlock:
         match = ASSERTION.search(code[line - 1])
@@ -376,7 +383,7 @@ def declaration_end(text: str, start: int, stops: str, *, angles: bool = False) 
     return len(text)
 
 
-def pairing_code_is_certain(code: str) -> bool:
+def pairing_code_is_certain(code: str, function_bodies: tuple[ScopeBlock, ...] = ()) -> bool:
     """Require fully read code and known statement/item macro environments."""
     if not code.isascii() or re.search(r"\br#|\bextern\s+crate\s+\w+\s+as\b", code):
         return False
@@ -392,7 +399,8 @@ def pairing_code_is_certain(code: str) -> bool:
                 boundary = cursor
         elif token["name"]:
             prefix = code[boundary:token.start()].rstrip()
-            if prefix.endswith(":") or (token["name"] not in TRUSTED_MACROS and not prefix):
+            unrelated_function = any(body.first < token.start() < body.last for body in function_bodies)
+            if not unrelated_function and (prefix.endswith(":") or (token["name"] not in TRUSTED_MACROS and not prefix)):
                 return False
         else:
             boundary = cursor
@@ -489,9 +497,7 @@ def constant_table(lines: list[str], code: list[str]) -> ConstantTable:
     text, masked = "\n".join(lines), "\n".join(code)
     root = ScopeBlock(0, len(text), (), module_items=True)
     table = ConstantTable(root, [0] + [match.end() for match in re.finditer("\n", text)])
-    if not pairing_code_is_certain(masked):
-        table.refuse_all = True
-        return table
+    table.refuse_all = not pairing_code_is_certain(masked)
     blocks = [root]
     tokens = re.compile(r"\b(?:const|static|use|mod|let|for|fn|type|struct|enum|union|trait|impl|extern|macro_rules)\b|[{};|]")
     # Unknown keywords may introduce bindings: refuse their following name.
@@ -520,6 +526,8 @@ def constant_table(lines: list[str], code: list[str]) -> ConstantTable:
                                 or bool(re.search(r"!\s*(?:\w+\s*)?$|=>|\||\b(?:for|mod|impl|trait|enum|struct)\b", header)))
             block.children.append(nested)
             blocks.append(nested)
+            if function:
+                table.function_bodies.append(nested)
             boundary = cursor
         elif value == "}":
             if len(blocks) > 1:
@@ -537,6 +545,10 @@ def constant_table(lines: list[str], code: list[str]) -> ConstantTable:
                     end = cursor + in_keyword.start()
             for name in pattern_names(masked[cursor:end]):
                 table.bind(name, block)
+            plain = re.fullmatch(r"\s*(?:mut\s+)?([A-Za-z_]\w*)\s*(?::[^=;]+)?", masked[cursor:end])
+            if (value == "let" and plain and end < len(masked) and masked[end] == "="
+                    and not masked[boundary:token.start()].strip()):
+                table.local_declarations[plain[1]] = cursor + plain.start(1)
         elif value == "|":
             end = masked.find("|", cursor)
             if end >= 0 and not re.search(r"[;{}]", masked[cursor:end]):
@@ -546,6 +558,7 @@ def constant_table(lines: list[str], code: list[str]) -> ConstantTable:
                 cursor = end + 1
         elif value == "macro_rules":
             table.refuse_all = True
+            table.local_renames_refused = True
         elif value == "extern":
             imported_crate = re.match(r"\s+crate\s+(\w+)(?:\s+as\s+(\w+))?", masked[cursor:])
             if imported_crate:
@@ -598,6 +611,7 @@ def constant_table(lines: list[str], code: list[str]) -> ConstantTable:
                 for imported in use_bindings(masked[cursor:end].strip()):
                     if imported.name in TRUSTED_MACROS:
                         table.refuse_all = True
+                        table.local_renames_refused = True
                     if imported.name == "*":
                         table.globs.append(GlobImport(block.module, imported.parts[:-1]))
                     else:
@@ -619,6 +633,8 @@ def constant_table(lines: list[str], code: list[str]) -> ConstantTable:
                     table.bind(binding[1], block)
     if len(blocks) != 1:
         root.uncertain = True
+    # Local proofs check their own function; unrelated function-local macros cannot bind there.
+    table.local_renames_refused |= root.uncertain or not pairing_code_is_certain(masked, tuple(table.function_bodies))
     for typed_name in re.finditer(r"\b([A-Za-z_]\w*)\s*:(?!:)", masked):
         if typed_name.start(1) not in literal_definitions:
             table.refused_names.add(typed_name[1])
@@ -674,7 +690,7 @@ def inspect_globs(repo: Path, base: str, head: str, staged: bool, path: str, sid
         owner, parts = glob.module, glob.parts
         if parts and parts[0] == "crate":
             if source.name not in ("lib.rs", "main.rs"):
-                table.refuse_all = True
+                table.refuse_environment()
                 continue
             owner, parts = (), parts[1:]
         elif parts and parts[0] == "self":
@@ -683,25 +699,25 @@ def inspect_globs(repo: Path, base: str, head: str, staged: bool, path: str, sid
             owner, parts = owner[:-1], parts[1:]
         target = owner + parts
         if not parts or any(len(table.bindings.get(name, [])) != 1 for name in target):
-            table.refuse_all = True
+            table.refuse_environment()
             continue
         if target in table.inline_modules:
             table.refused_names.update(name for name, bindings in table.bindings.items()
                                        if any(binding.module == target for binding in bindings))
             continue
         if target not in table.external_modules:
-            table.refuse_all = True
+            table.refuse_environment()
             continue
         module = directory.joinpath(*target)
         candidates = [candidate.as_posix() for candidate in (module.with_suffix(".rs"), module / "mod.rs")
                       if candidate.as_posix() in cache.files[revision]]
         if len(candidates) != 1:
-            table.refuse_all = True
+            table.refuse_environment()
             continue
         key = revision, candidates[0]
         try:
             if key in cache.unreadable:
-                table.refuse_all = True
+                table.refuse_environment()
                 continue
             if key not in cache.tables:
                 rows = read_sources(repo, base, head, staged, [], cache,
@@ -710,11 +726,13 @@ def inspect_globs(repo: Path, base: str, head: str, staged: bool, path: str, sid
             imported = cache.tables[key]
             if imported.refuse_all or imported.globs or imported.block.uncertain:
                 table.refuse_all = True
+            if imported.local_renames_refused or imported.globs or imported.block.uncertain:
+                table.local_renames_refused = True
             table.refused_names.update(imported.bindings)
             table.refused_names.update(imported.refused_names)
         except (GuardError, OSError, UnicodeError):
             cache.unreadable.add(key)
-            table.refuse_all = True
+            table.refuse_environment()
 
 
 def diff_path(text: str) -> str:
@@ -898,6 +916,7 @@ def touched_assertions(lines: list[DiffLine], sources: dict[tuple[str, Side], li
     for line in lines:
         groups[line.path, line.side].append(line)
     assertions: list[TouchedAssertion] = []
+    renames = binding_renames(sources, code, constants)
     for (path, side), changes in groups.items():
         cursor = 0
         for span in assertion_spans(sources[path, side], code[path, side], path.endswith(".rs"), changes):
@@ -913,6 +932,11 @@ def touched_assertions(lines: list[DiffLine], sources: dict[tuple[str, Side], li
                 if path.endswith(".rs"):
                     table = constants[path, side]
                     expansion = table.expand(expansion.text, table.assertion_scope(code[path, side], span.first))
+                if side == "new":
+                    for proof in renames.get(path, ()):
+                        if proof.scope.first <= span.first <= span.last <= proof.scope.last:
+                            expansion = proof.rewrite(expansion)
+                            break
                 assertions.append(TouchedAssertion(source, tuple(hunks), expansion.text, expansion.numeric_constants))
             if cursor == len(changes):
                 break
@@ -1437,6 +1461,175 @@ def enclosing_tests(rows: list[str], rust: bool) -> Iterable[TestScope]:
     if depth == 0:
         yield from scopes
 
+
+
+class RustToken(NamedTuple):
+    text: str
+    first: int
+    last: int
+
+
+RUST_CODE_TOKEN = re.compile(
+    r"[A-Za-z_]\w*|::|->|=>|\.\.=|\.\.\.|\.\.|<<=|>>=|==|!=|<=|>=|&&|\|\||"
+    + r"<<|>>|[+*/%&|^!-]=|[^\s]")
+
+
+def rust_tokens(text: str) -> Iterable[RustToken]:
+    """Use the shared lexer for exact literals/comments; retain code token boundaries."""
+    cursor = 0
+    for span in lexical_spans(text, True):
+        for token in RUST_CODE_TOKEN.finditer(text, cursor, span.first):
+            yield RustToken(token[0], token.start(), token.end())
+        if span.kind == "literal":
+            yield RustToken(text[span.first:span.last], span.first, span.last)
+        cursor = span.last
+    for token in RUST_CODE_TOKEN.finditer(text, cursor):
+        yield RustToken(token[0], token.start(), token.end())
+
+
+@dataclass(frozen=True)
+class NoBindingRename:
+    """The test's token changes do not prove a local binding rename."""
+
+
+@dataclass(frozen=True)
+class BindingRename:
+    scope: TestScope
+    names: dict[str, str]  # Head names back to their base names.
+
+    def rewrite(self, expansion: AssertionExpansion) -> AssertionExpansion:
+        text = expansion.text
+        tokens = [token for token in rust_tokens(text) if token.text in self.names]
+        parts: list[str] = []
+        cursor = 0
+        for token in tokens:
+            parts.extend((text[cursor:token.first], self.names[token.text]))
+            cursor = token.last
+        parts.append(text[cursor:])
+
+        def renamed_offset(offset: int) -> int:
+            return offset + sum(len(self.names[token.text]) - len(token.text)
+                                for token in tokens if token.last <= offset)
+
+        numbers = tuple(replace(number, first=renamed_offset(number.first), last=renamed_offset(number.last))
+                        for number in expansion.numeric_constants)
+        return AssertionExpansion("".join(parts), numbers)
+
+
+def rename_references_are_plain(text: str, tokens: list[RustToken],
+                                census: ConstantTable, names: set[str]) -> bool:
+    """Refuse member/path/field names, nested scopes and token-observing macros."""
+    masked = "\n".join(code_lines(text.split("\n"), True))
+    for macro in MACRO_INVOCATION.finditer(masked):
+        if macro["name"] not in ASSERTION_MACROS:
+            end = declaration_end(masked, macro.end(), ")]}")
+            if any(identifier[0] in names for identifier in IDENTIFIER.finditer(masked, macro.end(), end)):
+                return False
+    # A local value cannot prove a type-namespace change, even with the same spelling.
+    for type_site in re.finditer(r"::\s*<|\bas\b|(?<!:):(?!:)", masked):
+        stops = ">" if type_site[0].endswith("<") else "=;,)}"
+        end = declaration_end(masked, type_site.end(), stops, angles=True)
+        if any(identifier[0] in names for identifier in IDENTIFIER.finditer(masked, type_site.end(), end)):
+            return False
+    binding_ready: dict[str, int] = {}
+    for index, token in enumerate(tokens):
+        if token.text not in names or token.first != census.local_declarations[token.text]:
+            continue
+        binding_ready[token.text] = declaration_end(masked, token.last, ";")
+    depth = 0
+    for index, token in enumerate(tokens):
+        if token.text == "{":
+            depth += 1
+        elif token.text == "}":
+            depth -= 1
+        if token.text not in names:
+            continue
+        declaration = token.first == census.local_declarations[token.text]
+        if not declaration and token.first < binding_ready[token.text]:
+            return False
+        before = tokens[index - 1].text if index else ""
+        after = tokens[index + 1].text if index + 1 < len(tokens) else ""
+        if (depth != 1
+                or before in (".", "::", "'") or after in ("::", "!") or (after == ":" and not declaration)):
+            return False
+    return depth == 0
+
+
+def prove_binding_rename(old_rows: list[str], new_rows: list[str], scope: TestScope) -> BindingRename | NoBindingRename:
+    """Require the complete test, including every RHS, to be equal under one bijection."""
+    old_text, new_text = "\n".join(old_rows), "\n".join(new_rows)
+    old_code, new_code = code_lines(old_rows, True), code_lines(new_rows, True)
+    # Nested functions, attributed/generic signatures and unfamiliar test headers are a refusal class.
+    for rows in (old_code, new_code):
+        masked = "\n".join(rows)
+        if (not re.match(r"\s*(?:async\s+)?fn\s+\w+\s*\(", masked)
+                or len(list(FUNCTION.finditer(masked))) != 1 or "#" in masked):
+            return NoBindingRename()
+    old_tokens, new_tokens = list(rust_tokens(old_text)), list(rust_tokens(new_text))
+    if len(old_tokens) != len(new_tokens):
+        return NoBindingRename()
+    old_census, new_census = constant_table(old_rows, old_code), constant_table(new_rows, new_code)
+    if (old_census.refuse_all or new_census.refuse_all
+            or old_census.block.uncertain or new_census.block.uncertain):
+        return NoBindingRename()
+    names: dict[str, str] = {}
+    old_names: set[str] = set()
+    old_present = {token.text for token in old_tokens}
+    new_present = {token.text for token in new_tokens}
+    for old, new in zip(old_tokens, new_tokens):
+        if old.text == new.text:
+            continue
+        if (old.text not in old_census.local_declarations or new.text not in new_census.local_declarations
+                or len(old_census.bindings.get(old.text, ())) != 1
+                or len(new_census.bindings.get(new.text, ())) != 1
+                or new.text in old_present or old.text in new_present):
+            return NoBindingRename()
+        if new.text in names:
+            if names[new.text] != old.text:
+                return NoBindingRename()
+        elif old.text in old_names:
+            return NoBindingRename()
+        names[new.text] = old.text
+        old_names.add(old.text)
+    if not names:
+        return NoBindingRename()
+    capture = re.compile(r"\{(?:" + "|".join(re.escape(name) for name in old_names | set(names)) + r")\b")
+    for text in (old_text, new_text):
+        if any(span.kind == "literal" and capture.search(text[span.first:span.last])
+               for span in lexical_spans(text, True)):
+            return NoBindingRename()
+    if (not rename_references_are_plain(old_text, old_tokens, old_census, old_names)
+            or not rename_references_are_plain(new_text, new_tokens, new_census, set(names))):
+        return NoBindingRename()
+    return BindingRename(scope, names)
+
+
+def binding_renames(sources: dict[tuple[str, Side], list[str]],
+                    code: dict[tuple[str, Side], list[str]],
+                    constants: dict[tuple[str, Side], ConstantTable]) -> dict[str, list[BindingRename]]:
+    """Prove renames once per enclosing test, using the existing revision reads and census."""
+    result: dict[str, list[BindingRename]] = {}
+    for path, side in sources:
+        if side != "old" or not path.endswith(".rs") or (path, "new") not in sources:
+            continue
+        if any(constants[path, side].local_renames_refused for side in ("old", "new")):
+            continue
+        old_tests: dict[str, list[TestScope]] = defaultdict(list)
+        new_tests: dict[str, list[TestScope]] = defaultdict(list)
+        for scope in enclosing_tests(code[path, "old"], True):
+            old_tests[scope.name].append(scope)
+        for scope in enclosing_tests(code[path, "new"], True):
+            new_tests[scope.name].append(scope)
+        for name, old in old_tests.items():
+            new = new_tests.get(name, [])
+            if len(old) != 1 or len(new) != 1:
+                continue
+            before, after = old[0], new[0]
+            proof = prove_binding_rename(sources[path, "old"][before.first - 1:before.last],
+                                         sources[path, "new"][after.first - 1:after.last], after)
+            if isinstance(proof, BindingRename):
+                result.setdefault(path, []).append(proof)
+    return result
 
 def name_tests(findings: list[Finding], sources: dict[tuple[str, Side], list[str]],
                code: dict[tuple[str, Side], list[str]]) -> list[Finding]:
