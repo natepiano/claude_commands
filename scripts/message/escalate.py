@@ -34,6 +34,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "notify"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "whoami"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "production"))
+from scripts.lib.process_failure import failure_detail
 from scripts.production.showrunners import load_settings, registered_showrunners
 if TYPE_CHECKING:
     from ..whoami.agent_accounts import (KnownCodexAccount, UnknownCodexAccount, StoredCodexAccount,
@@ -410,7 +411,7 @@ def close(key: str) -> bool:
                 done = subprocess.run([sys.executable, str(SEND), "retire", "--to", "user", "--from", JOB,
                                        "--key", user_key(key)], capture_output=True, text=True, check=False, timeout=60)
                 problem = "" if done.returncode == 0 else (
-                    done.stdout.strip() or done.stderr.strip() or f"exit {done.returncode}").split("\n")[-1]
+                    failure_detail(done, lines=1)).replace("\n", "; ")
             except (OSError, subprocess.TimeoutExpired) as error:
                 problem = str(error)
             if problem:
@@ -479,7 +480,7 @@ def forward_review_hold(held: HeldMessage, reason: str, entry_key: str) -> list[
                                    "--text", f"Your relayed push {held.summary!r} was not sent. {reason} Revise and resend it."],
                                   capture_output=True, text=True, check=False, timeout=40)
             if done.returncode not in (0, 1):
-                errors.append(f"{relay['recipient']}: {done.stdout.strip() or done.stderr.strip() or f'exit {done.returncode}'}")
+                errors.append(f"{relay['recipient']}: {failure_detail(done)}")
         except (OSError, subprocess.TimeoutExpired) as error:
             errors.append(f"{relay['recipient']}: {error}")
     return errors

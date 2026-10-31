@@ -2947,52 +2947,47 @@ A rerun of a stopped `accounts.py setup`, group move or five-hour wait finishes 
 - `scripts/production/ci_points.py`, `scripts/production/merge_checkpoint.py` — callers.
 - `scripts/production/test_ci_points.py` — memory-wait stderr with the failing check on stdout.
 
-### Phase 101d — A CI point validates one fixed commit  · status: todo
+### Phase 101d — A CI point validates one fixed commit  · status: done
 
-**Depends on:** Phase 101c (order only; both edit `scripts/production/ci_points.py`).
+#### As-built
 
-#### Work Order
-
-**Goal:** A CI point never pushes a tree it did not validate. Today `ci_points.py ci start` runs `validate_and_push.sh --to <merge branch>` in `production.checkout` with no lock, while `merge_checkpoint.py` merges and pushes in the same checkout (`merge_checkpoint.py:847-849`). `push_direct.sh` pushes `HEAD` as it is at push time, and `ci_start`'s guard (`ci_points.py:163`) compares two readings of that same new `HEAD`. Natedev showrunner ruling, 2026-10-30.
-
-**Spec:**
-- `ci start` records the merge branch's sha, makes a `git clone --shared` copy of `production.checkout` at that sha in a scratch folder, and runs validation there. The production checkout is never touched.
-- After validation passes, with no fix commit: if `origin/<merge branch>` contains the sha, that is a pass. Report the sha, push nothing, and follow the CI run of the branch tip that contains it.
-- With a fix commit: push it only when it fast-forwards `origin/<merge branch>`. Otherwise fail with `merge branch moved during validation`. Never force.
-- The copy is removed when the run ends, pass or fail.
-- Report the copy's added disk use and peak memory, and whether a fresh cargo target folder makes the run longer, measured on one real CI point.
-
-**Facts for the writer:**
-- A `clone --shared` copy's `origin` is the production checkout, not GitHub. Set the copy's `origin` URL to the checkout's `origin` URL before any push or `gh` call.
-- `push_direct.sh` pushes `HEAD:refs/heads/<branch>`. Pushing a sha that the branch already contains, but that is not its tip, is refused as non-fast-forward. So the no-push pass must be decided before any push.
-- `validate_ci.sh` builds in `${CARGO_TARGET_DIR:-<repo root>/target}`, so a fresh copy starts with an empty target folder. Do not point the copy at the checkout's target folder: a merge gate builds there at the same time.
-- The CI-run lookup (`gh run list --branch … --commit …` with its wait) lives in `push_direct.sh`, and `validate_and_push.sh` holds `cancel_prior_runs`. Reuse them, or move each one into one place that both callers use. Do not add a second copy.
-- Failures keep `failure_detail` (Phase 101c).
+- `ci_points.py ci start` records the merge branch tip and validates it in a private `git clone --shared --no-checkout` copy under the state dir, with `CARGO_TARGET_DIR=<copy>/target`. The production checkout is never the validation tree. The copy is removed when the run ends, pass or fail.
+- `validate_and_push.sh --validate-only` runs validation in the copy and makes at most one fix commit there. It does not push.
+- Publish runs under `merge_checkpoint.merge_lock`: it fetches the copy's `HEAD` into the production checkout, does a guarded `git merge --ff-only`, then runs `push_direct.sh --publish-only <sha>`, which prints `<sha> pushed` or `<sha> contained`.
+- The publish rule: if `origin/<merge branch>` contains the sha, the run passes and nothing is pushed. A fix commit is pushed only when it fast-forwards `origin/<merge branch>`. Otherwise the run fails with `merge branch moved during validation`. Nothing is ever force-pushed.
+- After the lock is released, `push_direct.sh --follow-published <sha> <state>` runs the hook, the CI-run lookup and the cancellation of older runs (`CANCEL_PRIOR` env). The validation report line follows the publish receipt. Failures keep `failure_detail`.
 
 **Files:**
-- `scripts/production/ci_points.py` — fixed sha, copy, push rule.
-- `scripts/validate_and_push/*` — only if the push rule cannot be done in `ci_points.py`.
-- `scripts/production/test_ci_points.py` — moved-branch, contained-sha and fix-commit cases.
+- `scripts/production/ci_points.py` — the fixed sha, the copy, publish under `merge_lock`, the report line.
+- `scripts/validate_and_push/push_direct.sh` — the one publish rule (`--publish-only`), the follow step (`--follow-published`), `cancel_prior_runs`.
+- `scripts/validate_and_push/validate_and_push.sh` — `--validate-only`.
+- `scripts/production/test_ci_points.py` — copy, contained, fast-forward, moved-branch, retry and lock-wait cases.
 
-**Workers:** 1 writer + 1 tester.
+**Binds later work:** The publish rule and the cancellation of older runs live only in `push_direct.sh`; other callers use them there. A fix commit reaches the local merge branch through the fetch and `--ff-only` merge under `merge_lock`, so the local branch and `origin` stay equal. The outcomes `pushed`, `contained` and `merge branch moved during validation` show in the CI point's validation line.
 
-**Acceptance gate:** `test_ci_points` passes; basedpyright 0/0/0 on each changed file; one real CI point, with the measures above.
+**Gotchas:**
+- A push of a fix commit from the copy alone leaves the local merge branch stale: collect rejects it, a rerun makes a second fix, and a later merge-gate push is refused. The fix must go through the checkout under the lock.
+- A retry after a failed publish starts with the local branch at fix F; the publish rule fast-forwards `origin` to F.
+- Copy disk use, peak memory and the fresh-target build time are not yet measured. They are measured at the first real CI point and reported to the showrunner.
 
-### Phase 101e — One helper reports a failed command's output  · status: todo
+**Ruled out:** `--ci-base` (removed); validation in the production checkout; a shared cargo target folder with the checkout (a merge gate builds there at the same time); a second copy of the CI-run lookup or `cancel_prior_runs`.
 
-**Depends on:** Phase 101c (the helper).
+### Phase 101e — One helper reports a failed command's output  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** No caller loses a failure's cause behind stderr noise. `result.stderr.strip() or result.stdout.strip()` appears 41 times in 22 non-test modules. Each copy drops stdout whenever stderr holds any text. Natedev showrunner ruling, 2026-10-30: current, after 101d.
+- `failure_detail(result: subprocess.CompletedProcess[str], *, lines: int = 20) -> str` in `scripts/lib/process_failure.py` is the one way to describe a failed command. It returns labelled tails of both streams, `stderr: …` first and then `stdout: …`, each cut to the last `lines` lines. It omits an empty stream. When both streams are empty, it returns `exit <code>`. A `lines` value below 1 raises `ValueError`.
+- All 24 non-test modules that had a local `stderr.strip() or stdout.strip()` fallback (either order) now call `failure_detail`. `waiting.detail` stays as a one-call wrapper.
+- Callers keep their command-name prefix (`send.py: …`, `mesh: …`) in front of `failure_detail(result)`, so each message still names its source.
+- A scan test walks every non-test `.py` file under `scripts/` with `ast` and fails on a stream fallback outside `process_failure.py`. Conditions that test both streams (`if result.stdout.strip() or result.stderr.strip()`) do not match.
 
-**Spec:**
-- Every non-test copy calls `scripts/lib/process_failure.py`'s helper. Local wrappers such as `waiting.detail` go away or become one call to it.
-- A check keeps new copies out: a test or lint scan of `scripts/` fails on the pattern outside the helper.
-- No caller's other behavior changes.
+**Files:**
+- `scripts/lib/process_failure.py` — `failure_detail`
+- `scripts/lib/test_process_failure.py` — the scan test and the helper's output tests
+- `scripts/production/unit_status_test_support.py` — the fixed list of lib files the unit-status fixture copies; includes `process_failure.py`
+- `scripts/production/` — 9 callers: `add_unit`, `codex_winddown`, `dailies_input`, `merge_checkpoint`, `merge_gate`, `production_lifecycle`, `unit_move`, `update_registration`, `waiting`
+- `scripts/{bevy_upgrade,build_hold,direct,herdr,lib,lint,message,nightly_review,shutdown,style,whoami}/` — the other 15 callers; their tests expect the `stderr:`/`stdout:` labels
 
-**Files:** the 22 modules (list them from `grep -rln 'stderr.strip() or' scripts --include=*.py`), the scan test, and any test that asserts the old text.
+**Gotchas:** `unit_status_test_support.py` copies lib files into its fixture by a fixed list. A new lib helper that a copied module imports must join that list, or the unit-status suites fail on import.
 
-**Workers:** 2 writers split by folder + 1 tester.
-
-**Acceptance gate:** each touched module's suite passes; basedpyright 0/0/0 on each changed file and its callers; the scan test fails on a planted copy.
+**Ruled out:** a local `stderr or stdout` fallback at a call site, because it drops one stream; the scan test fails on it.

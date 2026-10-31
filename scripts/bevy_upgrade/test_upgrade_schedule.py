@@ -6,12 +6,15 @@ import io
 import json
 import os
 import shlex
+import sys
 import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, cast, final
 from unittest import mock
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import upgrade_record
 import upgrade_schedule
@@ -109,7 +112,7 @@ class ScheduleTests(unittest.TestCase):
                 stderr = io.StringIO()
                 with contextlib.redirect_stderr(stderr):
                     self.assertFalse(upgrade_schedule.tell_showrunner("demo", "changes", "body"))
-                self.assertEqual(stderr.getvalue(), f"bevy_upgrade: the showrunner was not told: {outcome}\n")
+                self.assertEqual(stderr.getvalue(), f"bevy_upgrade: the showrunner was not told: stdout: {outcome}\n")
 
     def test_retirement_names_recipient_sender_and_key_and_suppresses_success_output(self) -> None:
         stdout, stderr = io.StringIO(), io.StringIO()
@@ -139,7 +142,7 @@ class ScheduleTests(unittest.TestCase):
             upgrade_schedule.retire_message("demo")
         self.assertEqual(stdout.getvalue(), "")
         self.assertEqual(stderr.getvalue(),
-                         "bevy_upgrade: could not retire the queued message: FAILED: queue inaccessible\n")
+                         "bevy_upgrade: could not retire the queued message: stdout: FAILED: queue inaccessible\n")
 
     def test_retirement_os_error_reports_failure_without_raising(self) -> None:
         stderr = io.StringIO()

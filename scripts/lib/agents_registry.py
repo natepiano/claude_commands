@@ -14,6 +14,7 @@ from typing import NamedTuple, final
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib.process_failure import failure_detail
 from scripts.lib.atomic_file import write_text_atomic
 
 DEFAULT_PATH = Path("~/.claude/config/agents.conf").expanduser()
@@ -159,7 +160,7 @@ def _git(repo: Path, *arguments: str, input_text: str | None = None,
     except subprocess.TimeoutExpired as error:
         raise OSError(f"git {' '.join(arguments)} timed out") from error
     if done.returncode:
-        raise OSError(f"git {' '.join(arguments)}: {done.stderr.strip() or done.stdout.strip()}")
+        raise OSError(f"git {' '.join(arguments)}: {failure_detail(done)}")
     return done.stdout.strip()
 
 
