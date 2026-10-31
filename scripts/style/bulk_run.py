@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib
 import json
 import re
 import socket
@@ -758,6 +759,81 @@ class RenameService(Enum):
     ON_DEMAND = "start only for a names rule"
 
 
+def plan_rule(repo: Path, ledger: ledger_api.Ledger, base: str, selected: Selection,
+              definition: rules.Rule, server: bulk.RenameServer | RenameService,
+              available: Callable[[Path, str], None]) -> PlannedEdits:
+    """Plan against one execution checkout while retaining canonical ledger authority."""
+    if definition.family != "names":
+        return available_constant_plan(plan_constants(repo, ledger, base, selected),
+                                       PlanningFileAvailability(repo, available))
+    with ExitStack() as stack:
+        rename_server = stack.enter_context(bulk.RustAnalyzer(repo)) if isinstance(server, RenameService) else server
+        # Injected analyzers have the same lifetime across retries; clear
+        # their overlays after restoring the tree, before any new proof.
+        if not isinstance(server, RenameService):
+            for path in tuple(rename_server.documents):
+                if path.is_relative_to(repo):
+                    rename_server.open(path, (repo / path).read_text())
+        return plan_renames(repo, ledger, base, selected, rename_server,
+                            PlanningFileAvailability(repo, available))
+
+
+def execute_plan(workspace: WorkspaceEdits, plan: PlannedEdits, definition: rules.Rule,
+                 ledger: ledger_api.Ledger, intent: WorkspaceIntent, runner: Runner,
+                 available: Callable[[Path, str], None],
+                 replan: Callable[[frozenset[str]], PlannedEdits], times: dict[str, float],
+                 loops: list[dict[str, object]], refused: dict[str, str]) -> set[str]:
+    """Install the complete plan, journal writes, format/reprove and validate its survivors.
+
+    Both workspace and identified crate runs use this execution owner. Replanning must
+    preserve the caller's selection and source boundaries before any rebuilt overlay.
+    Refusals update the caller's accumulator so rollback retains evidence even on failure.
+    """
+    repo, base = workspace.repo, workspace.base
+    refused.update((item.finding_id, item.reason) for item in plan.refusals)
+    candidates = plan.files
+    workspace.set_plan(plan)
+    _ = require_base(repo, git(repo, "rev-parse", base + "^{tree}"))
+    for file in candidates:
+        available(repo, file.path)
+    require_edit_paths(repo, candidates)
+    intent.record_plan(plan)
+    for file in candidates:
+        _ = (repo / file.path).write_bytes(file.edited.encode())
+    kept = set(workspace.files)
+    if kept:
+        started = time.monotonic()
+        members = coverage_report.workspace(ledger, base)
+        directories = tuple(member.directory for member in members)
+        touched = {style_proposals.crate_for(directories, path) for path in kept}
+        packages = sorted({member.package_name for member in members if member.directory in touched})
+        if not packages:
+            raise bulk.BulkRenameError("changed files have no workspace package")
+        format_arguments = ("cargo", "+nightly", "fmt", *(arg for name in packages for arg in ("--package", name)))
+        if definition.family == "names":
+            refused.update(format_rename_plan(workspace, runner, format_arguments, replan, intent.record_plan, times))
+            kept = set(workspace.files)
+        else:
+            formatted = runner(repo, format_arguments)
+            times["fmt"] = time.monotonic() - started
+            if formatted.code:
+                raise bulk.BulkRenameError("workspace format failed: " + formatted.stderr.strip())
+            workspace.guard(kept)
+        def reprove_remaining(paths: set[str]) -> set[str]:
+            if definition.family != "names":
+                return paths
+            restored = frozenset(workspace.files.keys() - paths)
+            refused.update(reprove_rename_plan(workspace, paths, replan, intent.record_plan, times))
+            refused.update(format_rename_plan(workspace, runner, format_arguments, replan,
+                                              intent.record_plan, times, restored))
+            return set(workspace.files)
+
+        if kept:
+            kept, diagnostics_refused = validate(workspace, runner, times, loops, reprove_remaining)
+            refused.update(diagnostics_refused)
+    return kept
+
+
 def run_rule(repo: Path, rule: str, base_tree: str, ledger: ledger_api.Ledger,
              server: bulk.RenameServer | RenameService = RenameService.ON_DEMAND,
              runner: Runner = run_command, available: Callable[[Path, str], None] = bulk.check_available) -> Path:
@@ -812,67 +888,15 @@ def run_rule(repo: Path, rule: str, base_tree: str, ledger: ledger_api.Ledger,
 
     try:
         started = time.monotonic()
-        availability = PlanningFileAvailability(repo, available)
         def replan(identities: frozenset[str]) -> PlannedEdits:
             survivors = Selection(tuple(finding for finding in selected.findings
                                          if finding.finding_id in identities), ())
-            with ExitStack() as stack:
-                rename_server = stack.enter_context(bulk.RustAnalyzer(repo)) if isinstance(server, RenameService) else server
-                # Injected analyzers have the same lifetime across retries; clear
-                # their overlays after restoring the tree, before any new proof.
-                if not isinstance(server, RenameService):
-                    for path in tuple(rename_server.documents):
-                        if path.is_relative_to(repo):
-                            rename_server.open(path, (repo / path).read_text())
-                return plan_renames(repo, ledger, base, survivors, rename_server,
-                                    PlanningFileAvailability(repo, available))
+            return plan_rule(repo, ledger, base, survivors, definition, server, available)
 
-        if definition.family == "names":
-            plan = replan(frozenset(finding.finding_id for finding in selected.findings))
-        else:
-            plan = available_constant_plan(plan_constants(repo, ledger, base, selected), availability)
-        refused.update((item.finding_id, item.reason) for item in plan.refusals)
+        plan = plan_rule(repo, ledger, base, selected, definition, server, available)
         times["rename"] = time.monotonic() - started
-        candidates = plan.files
-        workspace.set_plan(plan)
-        _ = require_base(repo, base_tree)
-        for file in candidates:
-            available(repo, file.path)
-        require_edit_paths(repo, candidates)
-        intent.record_plan(plan)
-        for file in candidates:
-            _ = (repo / file.path).write_bytes(file.edited.encode())
-        kept = set(workspace.files)
-        if kept:
-            started = time.monotonic()
-            members = coverage_report.workspace(ledger, base)
-            directories = tuple(member.directory for member in members)
-            touched = {style_proposals.crate_for(directories, path) for path in kept}
-            packages = sorted({member.package_name for member in members if member.directory in touched})
-            if not packages:
-                raise bulk.BulkRenameError("changed files have no workspace package")
-            format_arguments = ("cargo", "+nightly", "fmt", *(arg for name in packages for arg in ("--package", name)))
-            if definition.family == "names":
-                refused.update(format_rename_plan(workspace, runner, format_arguments, replan, intent.record_plan, times))
-                kept = set(workspace.files)
-            else:
-                formatted = runner(repo, format_arguments)
-                times["fmt"] = time.monotonic() - started
-                if formatted.code:
-                    raise bulk.BulkRenameError("workspace format failed: " + formatted.stderr.strip())
-                workspace.guard(kept)
-            def reprove_remaining(paths: set[str]) -> set[str]:
-                if definition.family != "names":
-                    return paths
-                restored = frozenset(workspace.files.keys() - paths)
-                refused.update(reprove_rename_plan(workspace, paths, replan, intent.record_plan, times))
-                refused.update(format_rename_plan(workspace, runner, format_arguments, replan,
-                                                  intent.record_plan, times, restored))
-                return set(workspace.files)
-
-            if kept:
-                kept, diagnostics_refused = validate(workspace, runner, times, loops, reprove_remaining)
-                refused.update(diagnostics_refused)
+        kept = execute_plan(workspace, plan, definition, ledger, intent,
+                            runner, available, replan, times, loops, refused)
         for ticket in tickets:
             _ = ledger.bulk_release(ticket, {identity: reason for identity, reason in {**refused, **reverted}.items() if owned[identity] == ticket})
         kept_findings = tuple(item for path in sorted(kept) for item in workspace.files[path].kept)
@@ -959,22 +983,55 @@ def run_rule(repo: Path, rule: str, base_tree: str, ledger: ledger_api.Ledger,
     return path
 
 
+class CrateCommand(Protocol):
+    def __call__(self, repo: Path, packages: Sequence[str], run_id: str, rule: str, base_tree: str,
+                 destination: str, ledger: ledger_api.Ledger,
+                 server: bulk.RenameServer | RenameService, runner: Runner,
+                 available: Callable[[Path, str], None], /) -> int: ...
+
+
+def run_crates(repo: Path, packages: Sequence[str], run_id: str, rule: str, base_tree: str,
+               destination: str, ledger: ledger_api.Ledger,
+               server: bulk.RenameServer | RenameService = RenameService.ON_DEMAND,
+               runner: Runner = run_command,
+               available: Callable[[Path, str], None] = bulk.check_available) -> int:
+    """Enter the lifecycle through a deferred typed command; crate_run depends on this API."""
+    handler = cast(CrateCommand, getattr(importlib.import_module("crate_run"), "run_crates"))
+    return handler(repo, packages, run_id, rule, base_tree, destination, ledger, server, runner, available)
+
+
 class Arguments(argparse.Namespace):
     repo: Path = Path()
     rule: str = ""
     base_tree: str = ""
+    crate: list[str] = []
+    run: str = ""
+    destination: str = ""
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     _ = parser.add_argument("--repo", type=Path, default=Path.cwd())
-    _ = parser.add_argument("--rule", required=True)
-    _ = parser.add_argument("--base-tree", required=True)
+    _ = parser.add_argument("--rule", default="")
+    _ = parser.add_argument("--base-tree", default="")
+    _ = parser.add_argument("--crate", action="append", default=[])
+    _ = parser.add_argument("--run", default="")
+    _ = parser.add_argument("--destination", default="")
     args = parser.parse_args(argv, namespace=Arguments())
+    if args.crate:
+        if not args.run:
+            parser.error("--crate requires --run")
+    elif args.run or args.destination:
+        parser.error("--run and --destination require --crate")
+    elif not args.rule or not args.base_tree:
+        parser.error("--rule and --base-tree are required without --crate")
     try:
         if socket.gethostname().split(".")[0] != "natedev":
             raise bulk.BulkRenameError("workspace bulk tests must run on natedev")
         with ledger_api.open_ledger(args.repo) as ledger:
+            if args.crate:
+                return run_crates(args.repo, args.crate, args.run, args.rule, args.base_tree,
+                                  args.destination, ledger)
             report = run_rule(args.repo, args.rule, args.base_tree, ledger)
             status = bulk.object_fields(cast(object, json.loads(report.read_text()))).get("status", "")
             return 1 if (str(status).startswith(("tests failed:", "batch refused:", "tool defect:"))
@@ -985,4 +1042,6 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    # crate_run imports this module: keep one class identity when entered as a script.
+    import bulk_run
+    raise SystemExit(bulk_run.main())
