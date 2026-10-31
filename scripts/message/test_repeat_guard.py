@@ -81,7 +81,7 @@ class RepeatGuardTests(unittest.TestCase):
         if isinstance(limits, guard.GuardUnavailable):
             raise AssertionError(limits.reason)
         self.limits = limits
-        self.state = guard.SenderState("watchdog", "fixture-host", 0, 0)
+        self.state = guard.SenderState("watchdog", "fixture-host", 0)
         self.root = self.home / "state/message/repeats"
 
     def attempt(self, text: str = "Morty: worker stopped", *, at: float = 1,
@@ -114,9 +114,160 @@ class RepeatGuardTests(unittest.TestCase):
             self.assertTrue(self.apply(texts[0]).held)
 
     def test_distinct_names_and_meaningful_numbers_are_never_held(self) -> None:
-        for index in range(self.limits.sender_rate_count + 1):
+        for index in range(self.limits.receiver_rate_count + 1):
             self.assertFalse(self.apply(f"worker-{index}: inspect issue #{index}", at=index).held)
         self.assertEqual([notice.kind for notice in self.state.notices], ["owner"])
+
+    def test_restart_results_spread_over_seven_receivers_do_not_notify_or_hold(self) -> None:
+        self.state = guard.SenderState("mesh-runs", "fixture-host", 0)
+        index = 0
+        for receiver, count in enumerate((50, 22, 15, 8, 3, 3, 1)):
+            for _ in range(count):
+                attempt = guard.Attempt("mesh-runs", f"session:{receiver}", f"run-{index} finished",
+                                        "fixture-host", index * 22 * 60 / 101)
+                self.assertFalse(guard.transition(self.state, attempt, self.limits).held)
+                index += 1
+        self.assertEqual(index, 102)
+        self.assertEqual(self.state.notices, [])
+        self.assertEqual(self.state.holds, [])
+
+    def test_rate_threshold_is_not_combined_across_receivers(self) -> None:
+        for index in range(self.limits.receiver_rate_count):
+            self.assertFalse(guard.transition(self.state, self.attempt(
+                f"result {index}", receiver=f"session:{index % 2}", at=index), self.limits).held)
+        self.assertEqual(self.state.notices, [])
+        self.assertEqual(self.state.holds, [])
+
+    def test_one_receivers_distinct_flood_notifies_its_owner_once_without_phone_or_hold(self) -> None:
+        target = "session:results"
+        for index in range(self.limits.receiver_rate_count):
+            self.assertFalse(self.persist(self.attempt(f"result {index}", receiver=target, at=index)).held)
+        sink: list[send.Options] = []
+        def run(command: list[str], _stdin: str, _timeout: float) -> tuple[int, str, str]:
+            sink.append(send.parse(command[2:]))
+            return 0, "SENT: fixture owner", ""
+        with patch.object(send, "run", run), patch.object(send, "repeat_notice_owner", return_value="owner"):
+            guard.drain(self.root, send.deliver_repeat_notice, self.limits.receiver_rate_count)
+            self.assertFalse(self.persist(self.attempt("next distinct result", receiver=target,
+                                                     at=self.limits.receiver_rate_count + 1)).held)
+            guard.drain(self.root, send.deliver_repeat_notice, self.limits.receiver_rate_count + 2)
+        self.assertEqual(len(sink), 1)
+        self.assertEqual(sink[0].to, "owner")
+        self.assertIn(target, sink[0].text or "")
+        self.assertIn("1 sessions", sink[0].text or "")
+        self.assertIn(f"{self.limits.receiver_rate_count} copies", sink[0].text or "")
+        state = guard.decode(next(self.root.glob("*.json")).read_text())
+        self.assertEqual([notice.kind for notice in state.notices], ["owner"])
+        self.assertEqual(state.holds, [])
+
+    def test_receiver_rate_windows_and_episodes_are_independent_and_bounded(self) -> None:
+        limits = replace(self.limits, receiver_rate_count=2)
+        for target in ("session:a", "session:b"):
+            for at in (0, 1):
+                self.assertFalse(guard.transition(self.state, self.attempt(
+                    f"{target} result {at}", receiver=target, at=at), limits).held)
+        self.assertEqual([notice.receivers for notice in self.state.notices], [1, 1])
+        self.assertEqual(len({notice.id for notice in self.state.notices}), 2)
+        for at in (limits.window_seconds - 1, limits.window_seconds, limits.window_seconds + 1):
+            self.assertFalse(guard.transition(self.state, self.attempt(
+                f"ongoing {at}", receiver="session:a", at=at), limits).held)
+        self.assertEqual(len(self.state.notices), 2)
+        for at in (3 * limits.window_seconds, 3 * limits.window_seconds + 1):
+            self.assertFalse(guard.transition(self.state, self.attempt(
+                f"new episode {at}", receiver="session:a", at=at), limits).held)
+        self.assertEqual(len(self.state.notices), 3)
+        state = guard.SenderState("watchdog", "fixture-host", 0)
+        for target in ("session:a", "session:b", "session:c"):
+            _ = guard.transition(state, self.attempt(target, receiver=target), replace(limits, max_keys=2))
+        self.assertEqual(set(state.rates), {"session:a", "session:b"})
+
+    def test_receiver_counts_do_not_add_up_across_fixed_windows(self) -> None:
+        limits = replace(self.limits, receiver_rate_count=3)
+        for at in (0, 1, limits.window_seconds):
+            self.assertFalse(guard.transition(self.state, self.attempt(f"result {at}", at=at), limits).held)
+        self.assertEqual(self.state.notices, [])
+        for at in (limits.window_seconds + 1, limits.window_seconds + 2):
+            self.assertFalse(guard.transition(self.state, self.attempt(f"result {at}", at=at), limits).held)
+        self.assertEqual([notice.kind for notice in self.state.notices], ["owner"])
+
+    def test_receiver_rate_policy_is_read_at_use_and_the_old_key_is_rejected(self) -> None:
+        config = self.limits_file(replace(self.limits, receiver_rate_count=2))
+        with patch.dict(os.environ, {"SEND_REPEAT_CONFIG": str(config)}):
+            self.assertFalse(self.persist(self.attempt("first result", at=0)).held)
+            _ = self.limits_file(replace(self.limits, receiver_rate_count=3))
+            self.assertFalse(self.persist(self.attempt("second result", at=1)).held)
+            state = guard.decode(next(self.root.glob("*.json")).read_text())
+            self.assertEqual(state.notices, [])
+            self.assertFalse(self.persist(self.attempt("third result", at=2)).held)
+            state = guard.decode(next(self.root.glob("*.json")).read_text())
+            self.assertEqual([notice.kind for notice in state.notices], ["owner"])
+            _ = config.write_text(config.read_text().replace("receiver_rate_count", "sender_rate_count"))
+            with redirect_stderr(io.StringIO()):
+                self.assertIsInstance(guard.configuration(), guard.GuardUnavailable)
+
+    def test_legacy_sender_rate_state_migrates_silently_without_an_owner_notice(self) -> None:
+        raw = asdict(self.state)
+        del raw["rates"]
+        raw.update(rate_first=0, rate_count=self.limits.receiver_rate_count)
+        errors = io.StringIO()
+        self.root.mkdir(parents=True)
+        path = self.root / (guard.digest("watchdog") + ".json")
+        _ = path.write_text(json.dumps(raw))
+        def unexpected_notice(_state: guard.SenderState, _notice: guard.Notice,
+                              _limits: guard.Limits) -> guard.NoticeOutcome:
+            self.fail("legacy rate generated a notice")
+        with redirect_stderr(errors):
+            decoded = guard.decode(path.read_text())
+            self.assertEqual(decoded.rates, {})
+            self.assertFalse(self.persist(self.attempt("one new result", at=1)).held)
+            guard.drain(self.root, unexpected_notice, 2)
+        self.assertEqual(errors.getvalue(), "")
+        migrated = guard.decode(path.read_text())
+        self.assertEqual(migrated.notices, [])
+        self.assertEqual(migrated.rates["session:morty"].count, 1)
+        saved = cast(dict[str, object], json.loads(path.read_text()))
+        self.assertNotIn("rate_first", saved)
+        self.assertNotIn("rate_count", saved)
+
+    def test_legacy_rate_outbox_is_retired_without_losing_exact_text_notices(self) -> None:
+        self.prime_outbox()
+        path = next(self.root.glob("*.json"))
+        state = guard.decode(path.read_text())
+        exact = state.notices.copy()
+        legacy = guard.Flood("Many distinct messages; latest: result", 0, 2, 102,
+                             ["session:a", "session:b"])
+        state.floods["rate"] = legacy
+        episode = guard.digest(state.sender + "\0rate\0" + str(legacy.first))
+        state.notices.append(guard.Notice("owner", legacy.text, 0, 2, 102, 2, episode))
+        raw = asdict(state)
+        del raw["rates"]
+        raw.update(rate_first=0, rate_count=102)
+        decoded = guard.decode(json.dumps(raw))
+        self.assertEqual(decoded.notices, exact)
+        self.assertNotIn("rate", decoded.floods)
+        self.assertEqual(decoded.receivers, state.receivers)
+        self.assertEqual(decoded.holds, state.holds)
+        raw["holds"] = ["corrupt"]
+        with self.assertRaises(ValueError):
+            _ = guard.decode(json.dumps(raw))
+
+    def test_an_expired_legacy_rate_flood_cannot_leave_a_pending_false_notice(self) -> None:
+        raw = asdict(self.state)
+        del raw["rates"]
+        raw.update(rate_first=0, rate_count=102)
+        episode = guard.digest(self.state.sender + "\0rate\0" + str(0))
+        raw["notices"] = [asdict(guard.Notice("owner", "Many distinct messages", 0, 2, 102, 7, episode))]
+        self.assertEqual(guard.decode(json.dumps(raw)).notices, [])
+
+    def test_rate_counts_continue_when_literal_keys_are_full(self) -> None:
+        limits = replace(self.limits, max_keys=2, receiver_rate_count=3)
+        for index in range(4):
+            self.assertFalse(guard.transition(self.state, self.attempt(f"result {index}", at=index), limits).held)
+        self.assertEqual([notice.kind for notice in self.state.notices], ["owner"])
+        self.assertEqual(self.state.notices[0].receivers, 1)
+        self.assertEqual(self.state.rates["session:morty"].count, 4)
+        self.assertEqual(len(self.state.receivers), 2)
+        self.assertEqual(len(self.state.floods), 2)
 
     def test_person_messages_and_phone_questions_never_enter_guard_state(self) -> None:
         self.assertEqual([self.apply(at=index).held for index in range(3)], [False, False, True])
@@ -210,7 +361,7 @@ class RepeatGuardTests(unittest.TestCase):
         # Once contention ends, durable counting still enforces the threshold.
         self.assertEqual([attempt(index) for index in range(8, 11)], [False, False, True])
         state = guard.decode(next(self.root.glob("*.json")).read_text())
-        self.assertEqual(state.rate_count, 3)
+        self.assertEqual(state.rates["morty"].count, 3)
         self.assertEqual(state.holds, [10])
 
     def test_missing_or_invalid_config_fails_open_and_prints_one_error(self) -> None:
@@ -303,7 +454,8 @@ print(json.dumps(asdict(g._stored_check(Path(sys.argv[1]), g.Attempt('watchdog',
             self.assertFalse(guard.isolated([sys.executable, "-c", program, str(self.root), str(marker)], "", 1).held)
         self.assertLess(time.monotonic() - start, 1.3)
         self.assertIn(str(path), marker.read_text())
-        self.assertIn('"rate_count": 4', marker.read_text())
+        published = cast(dict[str, dict[str, dict[str, object]]], json.loads(marker.read_text().split("\n", 1)[1]))
+        self.assertEqual(published["rates"]["session:morty"]["count"], 4)
 
     def assert_notice(self, state: guard.SenderState, notice: guard.Notice, limits: guard.Limits) -> None:
         self.assertTrue(any(item.id == notice.id for item in state.notices))
@@ -368,6 +520,7 @@ print(json.dumps(asdict(g._stored_check(Path(sys.argv[1]), g.Attempt('watchdog',
         self.prime_outbox()
         path = next(self.root.glob("*.json"))
         raw = cast(dict[str, object], json.loads(path.read_text()))
+        raw["rate_first"] = 0
         raw["rate_count"] = float("inf")
         _ = path.write_text(json.dumps(raw).replace("Infinity", "1e309"))
         self.assertFalse(guard.check(self.root, self.attempt(at=4)).held)
