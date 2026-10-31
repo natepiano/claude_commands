@@ -72,6 +72,29 @@ class WorkspaceRunTests(CargoProjectTests):
     runner: FakeRunner = FakeRunner()
     server: ScriptedServer = ScriptedServer(lambda text, offset, new: word_edits(text, "old", new))
 
+    def test_unnormalizable_shorthand_refusal_keeps_independent_plan_before_any_write(self) -> None:
+        source = 'pub fn run() {\n    let old = 1;\n    consume(Outcome::Honored { old });\n}\n'
+        _ = (self.repo / 'src/lib.rs').write_text(source)
+        _ = self.git('add', '.')
+        _ = self.git('commit', '-qm', 'candidate shorthand fixture')
+        self.base, self.tree = self.git('rev-parse', 'HEAD'), self.git('rev-parse', 'HEAD^{tree}')
+        ledger, _definition, findings = self.setup_findings()
+        self.addCleanup(ledger.close)
+        original_beta = (self.repo / 'beta/src/lib.rs').read_text()
+        def edits(text: str, _offset: int, new: str) -> tuple[bulk.SourceEdit, ...]:
+            return tuple(replace(edit, text=new + ' /* analyzer fragment */')
+                         if text[edit.end:].startswith(' });') else edit
+                         for edit in word_edits(text, 'old', new))
+        server = ScriptedServer(edits)
+        plan = run.plan_renames(self.repo, ledger, self.base, run.Selection(findings, ()), server,
+                               run.PlanningFileAvailability(self.repo, self.available))
+        self.assertEqual([item.finding_id for item in plan.refusals], [findings[0].finding_id])
+        self.assertIn('record shorthand', plan.refusals[0].reason)
+        self.assertEqual([file.path for file in plan.files], ['beta/src/lib.rs'])
+        self.assertIn('let number', plan.files[0].edited)
+        self.assertEqual((self.repo / 'src/lib.rs').read_text(), source)
+        self.assertEqual((self.repo / 'beta/src/lib.rs').read_text(), original_beta)
+
     def test_recovery_preserves_another_users_ticket_after_plan_record(self) -> None:
         ledger, definition, findings = self.setup_findings()
         self.addCleanup(ledger.close)
