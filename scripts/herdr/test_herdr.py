@@ -1385,6 +1385,8 @@ class HerdrTests(unittest.TestCase):
         message = isolated.parent / "message"
         message.mkdir()
         _ = shutil.copy2(Path(herdr.__file__).resolve().parents[1] / "message/sessions.py", message / "sessions.py")
+        _ = shutil.copy2(Path(herdr.__file__).resolve().parents[1] / "message/relay_identity.py", message / "relay_identity.py")
+        _ = shutil.copy2(Path(herdr.__file__).resolve().parents[1] / "message/process_identity.py", message / "process_identity.py")
         library = isolated.parent / "lib"
         library.mkdir()
         _ = shutil.copy2(Path(herdr.__file__).resolve().parents[1] / "lib/nix_env.py", library / "nix_env.py")

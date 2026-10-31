@@ -6,7 +6,6 @@ from __future__ import annotations
 import json
 import os
 import stat
-import subprocess
 import sys
 import time
 import tomllib
@@ -15,6 +14,13 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Literal, NotRequired, TypedDict, cast
+
+if __package__:
+    from .process_identity import process_start as process_start
+    from .relay_identity import RelayIdentity, live_relay_identity, relay_senders_directory
+else:
+    from process_identity import process_start as process_start
+    from relay_identity import RelayIdentity, live_relay_identity, relay_senders_directory
 
 
 # Claude's entrypoint for a print-mode run starts with this; an interactive session's is "cli".
@@ -223,40 +229,13 @@ def remote_control(record: SessionRecord) -> Literal["active", "absent"]:
     return "absent"
 
 
-def process_start(pid: int) -> str | None:
-    """The process identity stored in session records, in this platform's native units."""
-    if sys.platform == "darwin":
-        # Claude writes procStart under this locale and zone; other text never matches.
-        try:
-            result = subprocess.run(
-                ("ps", "-o", "lstart=", "-p", str(pid)),
-                capture_output=True,
-                text=True,
-                timeout=5,
-                check=False,
-                env={**os.environ, "LC_ALL": "C", "TZ": "UTC"},
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            return None
-        started = result.stdout.strip()
-        return started if result.returncode == 0 and started else None
-    try:
-        # The kernel can truncate the process name inside a UTF-8 character.
-        _, separator, fields = Path(f"/proc/{pid}/stat").read_bytes().rpartition(b")")
-        if not separator:
-            return None
-        started = fields.split()[19].decode("ascii")
-        return started if started.isdigit() else None
-    except (OSError, IndexError, UnicodeDecodeError):
-        return None
-
-
 def headless(record: SessionRecord) -> bool:
-    """A `claude -p` run, such as send.py's relay, which takes its sender's name for one message.
+    """A `claude -p` run, or a process identified by the relay launcher's PID record.
 
     It is no session: no roster lists it, and no name lookup finds it.
     """
-    return record.get("entrypoint", "").startswith(HEADLESS_ENTRYPOINT_PREFIX)
+    return (record.get("entrypoint", "").startswith(HEADLESS_ENTRYPOINT_PREFIX)
+            or isinstance(live_relay_identity(record["pid"], relay_senders_directory()), RelayIdentity))
 
 
 def running_session(record: SessionRecord) -> bool:
