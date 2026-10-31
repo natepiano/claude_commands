@@ -644,6 +644,44 @@ if [[ -n "${EARLY_READY_FILE}" && -n "${REVIEW_WORKER}" ]]; then
   fi
 fi
 
+# A broad pass reviews the exact pending snapshot it receives. New pushes made
+# during this pass stay pending for the next pass.
+FAST_TRACK_UNIT=""
+FAST_TRACK_COMMITS=()
+FAST_TRACK_SCRIPT="${SCRIPT_DIR}/../production/fast_track.py"
+if [[ "${PASS_INDEX}" == 1 && "${LENS}" != ux && -f "${PROGRESS_STATE}" ]]; then
+  FAST_TRACK_UNIT="$("$PY" - "${PROGRESS_STATE}" <<'PY'
+import json
+import sys
+from pathlib import Path
+print(json.loads(Path(sys.argv[1]).read_text()).get("unit", ""))
+PY
+)"
+  if [[ -n "${FAST_TRACK_UNIT}" ]]; then
+    FAST_TRACK_DIFF="${ARTIFACT_DIR}/review_fast_track_${PASS_INDEX}.diff"
+    # One atomic snapshot for every lens and retry of this phase's broad pass.
+    (
+      flock -x 9
+      if [[ ! -f "${FAST_TRACK_DIFF}" ]]; then
+        SNAPSHOT_TEMP="${FAST_TRACK_DIFF}.$$.tmp"
+        trap 'rm -f "${SNAPSHOT_TEMP}"' EXIT
+        (cd "${WORKING_DIR}" && "$PY" "${FAST_TRACK_SCRIPT}" --pending --unit "${FAST_TRACK_UNIT}") > "${SNAPSHOT_TEMP}"
+        mv "${SNAPSHOT_TEMP}" "${FAST_TRACK_DIFF}"
+      fi
+    ) 9>"${FAST_TRACK_DIFF}.lock"
+    while IFS= read -r commit; do
+      [[ -z "${commit}" ]] || FAST_TRACK_COMMITS+=(--commit "${commit}")
+    done < <(sed -n 's/^## Fast-track \([0-9a-f]*\) .*/\1/p' "${FAST_TRACK_DIFF}")
+    if [[ ${#FAST_TRACK_COMMITS[@]} -gt 0 ]]; then
+      REVIEW_PROMPT="${ARTIFACT_DIR}/review_with_fast_track_${PASS_INDEX}${SUFFIX}.$$.md"
+      cat "${PROMPT_FILE}" > "${REVIEW_PROMPT}"
+      printf '\nReview these pending fast-track fixes against the same rules:\n' >> "${REVIEW_PROMPT}"
+      cat "${FAST_TRACK_DIFF}" >> "${REVIEW_PROMPT}"
+      PROMPT_FILE="${REVIEW_PROMPT}"
+    fi
+  fi
+fi
+
 TURN_WORKTREE_ARGS=(--cwd "${WORKING_DIR}" --read-only)
 if [[ -n "${FOLLOW_TO}" ]]; then
   "$PY" "${SCRIPT_DIR}/../agents/codex_mesh.py" follow \
@@ -754,6 +792,14 @@ if [[ "${AGENT_CODE}" -eq 0 && "${TREE_CHANGED}" -eq 0 ]]; then
     bash "${HEARTBEAT_HELPER}" "${HEARTBEAT_FILE}" wrapper \
       "${BEAT_TAG} agent finished before delivery — no pass recorded, verdict void" || true
   else
+    if [[ ${#FAST_TRACK_COMMITS[@]} -gt 0 ]]; then
+      if ! (cd "${WORKING_DIR}" && "$PY" "${FAST_TRACK_SCRIPT}" --mark-reviewed \
+        --unit "${FAST_TRACK_UNIT}" --pass "${PHASE_ID}/${PASS_INDEX}/${LENS}" "${FAST_TRACK_COMMITS[@]}"); then
+        echo error > "${STATUS_FILE}"
+        echo "ERROR: unable to record the fast-track review completion." >&2
+        exit 1
+      fi
+    fi
     TURN_RECORD_STATUS="reviewed"
     bash "${HEARTBEAT_HELPER}" "${HEARTBEAT_FILE}" wrapper "${BEAT_TAG} agent finished" || true
   fi

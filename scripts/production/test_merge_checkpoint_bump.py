@@ -5,13 +5,11 @@ from __future__ import annotations
 import json
 import os
 import re
-import subprocess
 import sys
 import unittest
 from pathlib import Path
 from typing import cast, final
 from unittest import mock
-from collections.abc import Sequence
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import merge_checkpoint
@@ -246,14 +244,7 @@ class CheckpointBumpTests(MergeCheckpointFixture):
         self.promotions = str(self.promote)
         self.production_doc()
         checkpoint = self.checkpoint()
-        real_process = mock.Mock(wraps=subprocess.Popen)
-
-        def launch(command: Sequence[str], *args: object, **kwargs: object) -> subprocess.Popen[str] | subprocess.Popen[bytes]:
-            if any(Path(word).name == "bump_gate.py" for word in command):
-                raise OSError("fixture gate launch refused")
-            return cast(subprocess.Popen[str] | subprocess.Popen[bytes], real_process(command, *args, **kwargs))
-
-        with mock.patch.object(subprocess, "Popen", side_effect=launch):
+        with self.refuse_bump_gate_launch():
             result = self.run_checkpoint(checkpoint, "--bump")
         self.assertEqual(result.process.returncode, 0, result.process.stdout + result.process.stderr)
         tip = self.assert_pushed(checkpoint)
@@ -272,13 +263,14 @@ class CheckpointBumpTests(MergeCheckpointFixture):
     def test_first_step_that_cannot_start_is_red_after_push(self) -> None:
         self.prepare_bump_gate()
         checkpoint = self.checkpoint()
-        notify_style = merge_checkpoint.notify_style
+        original_start = merge_checkpoint.start_gate
 
-        def remove_gate_command(checkout: Path, branch: str, tip: str) -> None:
-            notify_style(checkout, branch, tip)
+        def remove_gate_command(request: merge_checkpoint.MergeRequest, paths: tuple[str, ...],
+                                merge_head: str, tip: str) -> None:
             (self.bin / "checkpoint-test").unlink()
+            original_start(request, paths, merge_head, tip)
 
-        with mock.patch.object(merge_checkpoint, "notify_style", side_effect=remove_gate_command):
+        with mock.patch.object(merge_checkpoint, "start_gate", side_effect=remove_gate_command):
             result = self.run_checkpoint(checkpoint, "--bump")
         self.assertEqual(result.process.returncode, 0, result.process.stdout + result.process.stderr)
         tip = self.assert_pushed(checkpoint)

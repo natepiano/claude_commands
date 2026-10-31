@@ -597,6 +597,78 @@ class RetireUnitTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn(f"refused: uncommitted work in {self.worktree}: work.txt", output)
 
+    def test_dry_run_names_the_unmerged_tip_before_removal_without_saving_it(self) -> None:
+        ref, tip = self.unmerged_work()
+        before = (self.doc.read_bytes(), self.doc.stat().st_mtime_ns,
+                  git(self.checkout, "for-each-ref"), self.staff.staff_file.read_bytes())
+        fetch_head = self.checkout / ".git/FETCH_HEAD"
+        before_fetch = fetch_head.read_bytes() if fetch_head.exists() else b""
+
+        code, output = self.retire("--dry-run")
+
+        self.assertEqual(code, 0, output)
+        lines = output.splitlines()
+        save = f"would save: {tip} to origin {ref}"
+        self.assertIn(save, lines)
+        self.assertLess(lines.index(save), lines.index(f"would remove: worktree {self.worktree}"))
+        self.assertLess(lines.index(save), lines.index("would delete: branch alpha-branch here and on origin"))
+        self.assertEqual(git(self.checkout, "ls-remote", "origin", ref), "")
+        self.assertEqual(git(self.worktree, "rev-parse", "HEAD"), tip)
+        self.assertEqual((self.doc.read_bytes(), self.doc.stat().st_mtime_ns,
+                          git(self.checkout, "for-each-ref"), self.staff.staff_file.read_bytes()), before)
+        self.assertEqual(fetch_head.read_bytes() if fetch_head.exists() else b"", before_fetch)
+        self.assertEqual(self.stops(), [])
+
+    def test_dry_run_retired_note_includes_the_ref_and_full_tip(self) -> None:
+        ref, tip = self.unmerged_work()
+
+        code, output = self.retire("--dry-run")
+
+        self.assertEqual(code, 0, output)
+        mark = [line for line in output.splitlines() if line.startswith("would mark:")]
+        self.assertEqual(len(mark), 1, output)
+        self.assertIn(f", ref {ref}, tip {tip}", mark[0])
+        self.assertIn(f"session {DIRECTOR}", mark[0])
+
+    def test_dry_run_refuses_a_divergent_retired_ref_like_a_real_retirement(self) -> None:
+        ref, tip = self.unmerged_work()
+        _ = git(self.worktree, "checkout", "-q", "-B", "alpha-branch", f"{tip}^")
+        divergent_tip = self.commit_later_work(self.worktree)
+        _ = git(self.worktree, "push", "-q", "origin", f"{divergent_tip}:{ref}")
+        _ = git(self.worktree, "checkout", "-q", "-B", "alpha-branch", tip)
+        before = self.doc.read_bytes()
+
+        dry_code, dry_output = self.retire("--dry-run")
+        real_code, real_output = self.retire()
+
+        self.assertEqual(dry_code, 1, dry_output)
+        self.assertEqual(real_code, 1, real_output)
+        refusal = "refused: alpha-branch: branch and retired ref diverge; keep both before retiring"
+        self.assertIn(refusal, dry_output.splitlines())
+        self.assertIn(refusal, real_output.splitlines())
+        self.assertEqual(self.doc.read_bytes(), before)
+        self.assertEqual(git(self.worktree, "rev-parse", "HEAD"), tip)
+        self.assertEqual(git(self.checkout, "ls-remote", "origin", ref), f"{divergent_tip}\t{ref}")
+        self.assertEqual(self.stops(), [])
+
+    def test_dry_run_of_merged_work_has_no_save_or_saved_ref_note(self) -> None:
+        before = self.doc.read_bytes()
+        tip = git(self.worktree, "rev-parse", "HEAD")
+
+        code, output = self.retire("--dry-run")
+
+        self.assertEqual(code, 0, output)
+        self.assertFalse(any(line.startswith("would save:") for line in output.splitlines()), output)
+        mark = [line for line in output.splitlines() if line.startswith("would mark:")]
+        self.assertEqual(len(mark), 1, output)
+        self.assertNotIn(", ref ", mark[0])
+        self.assertNotIn(", tip ", mark[0])
+        self.assertIn(f"would remove: worktree {self.worktree}", output.splitlines())
+        self.assertIn("would delete: branch alpha-branch here and on origin", output.splitlines())
+        self.assertEqual(self.doc.read_bytes(), before)
+        self.assertEqual(git(self.worktree, "rev-parse", "HEAD"), tip)
+        self.assertEqual(self.stops(), [])
+
     def test_dry_run_lists_the_seat_the_worker_and_the_reviewer_and_changes_nothing(self) -> None:
         before = self.doc.read_text(encoding="utf-8")
 

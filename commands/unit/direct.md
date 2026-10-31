@@ -122,6 +122,7 @@ it:
 | <PhaseEnd/> | `docs/direct/phase_end.md` | — |
 | <FinalGateCommit/>, <RunAsBuilt/>, <AsBuiltCommit/> | `docs/direct/final_gate_commit.md` | — |
 | <ProductionUnit/> | `docs/production_format.md` | — |
+| <FastTrack/> | `commands/unit/fast_track.md` | `/unit:fast_track` |
 
 Paths are under `~/.claude/`.
 
@@ -151,16 +152,16 @@ it. A failed compaction leaves the thread available for its own compaction.
   create is the remote branch <PushCheckpoint/> pushes; never switch to an
   existing branch.
 - The unit director does not write implementation code unless the user explicitly
-  asks. Exceptions: agreed doc-only/trivial post-review fixes.
+  asks, except <FastTrack/>. Exceptions: agreed doc-only/trivial post-review fixes.
 - `single` never commits. Loop and verbose modes create one
   <CheckpointCommit/> and one <ShrinkCommit/> per completed phase, plus the one
   <FinalGateCommit/> that closes verification and the one <AsBuiltCommit/> that
   carries the run's documentation. <PeriodicCI/> may add `ci(<plan-slug>): …`
-  commits for validation fixes and CI repairs. No other commit is allowed.
+  commits for validation fixes and CI repairs. No other commit is allowed except <FastTrack/>.
   Only <ShrinkCommit/> runs while workers edit, and it commits only the plan doc
   and an approved `${NEXT_ITEMS_PATH}` change.
 - Every commit the run makes is pushed by <PushCheckpoint/>, fast-forward only,
-  to the working branch's own name on origin, never to the default branch.
+  to the working branch's own name on origin, never to the default branch except <FastTrack/>.
   <PeriodicCI/> runs CI on it every fifth checkpoint of a plan with five or more
   phases.
 - A phase reservation is released only by the successful-checkpoint path in

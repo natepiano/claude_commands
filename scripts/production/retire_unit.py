@@ -202,18 +202,21 @@ def _git(unit: Unit, *arguments: str) -> subprocess.CompletedProcess[str]:
     return run(["git", "-C", str(unit.production.checkout), *arguments])
 
 
-def branch_refs(unit: Unit) -> list[str]:
-    """The unit's branch here and on origin, each that exists; origin's is fetched to read it."""
+def branch_refs(unit: Unit, *, read_only: bool = False) -> list[str]:
+    """The unit's branch here and on origin; a preview reads origin's tip without fetching."""
     refs: list[str] = []
     if _git(unit, "show-ref", "--verify", "--quiet", f"refs/heads/{unit.branch}").returncode == 0:
         refs.append(f"refs/heads/{unit.branch}")
     remote = _git(unit, "ls-remote", "--exit-code", "--heads", "origin", unit.branch)
     if remote.returncode == 0:
-        tracking = f"refs/remotes/origin/{unit.branch}"
-        fetched = _git(unit, "fetch", "-q", "origin", f"+refs/heads/{unit.branch}:{tracking}")
-        if fetched.returncode:
-            raise Refused(f"cannot read origin {unit.branch}: {failure(fetched)}")
-        refs.append(tracking)
+        if read_only:
+            refs.append(remote.stdout.split()[0])
+        else:
+            tracking = f"refs/remotes/origin/{unit.branch}"
+            fetched = _git(unit, "fetch", "-q", "origin", f"+refs/heads/{unit.branch}:{tracking}")
+            if fetched.returncode:
+                raise Refused(f"cannot read origin {unit.branch}: {failure(fetched)}")
+            refs.append(tracking)
     elif remote.returncode != 2:
         raise Refused(f"cannot read origin {unit.branch}: {failure(remote)}")
     return refs
@@ -232,13 +235,14 @@ def confirm_saved_branch(unit: Unit, saved: SavedBranch) -> None:
         raise Refused(f"cannot confirm {saved.ref} at {saved.tip}: {failure(remote)}")
 
 
-def preserve_branch(unit: Unit, saved: SavedBranch | NoSavedBranch = NO_SAVED_BRANCH) -> SavedBranch | NoSavedBranch:
-    """Refresh and confirm the saved tip before the note or any removal."""
+def plan_saved_branch(unit: Unit, saved: SavedBranch | NoSavedBranch = NO_SAVED_BRANCH,
+                      *, read_only: bool = False) -> SavedBranch | NoSavedBranch:
+    """Choose one tip that retains the local, origin and previously saved work."""
     if isinstance(saved, NoSavedBranch):
         saved = saved_branch_in_note(unit_plan(unit))
     recorded_tip = saved.tip if isinstance(saved, SavedBranch) else ""
     tip = recorded_tip
-    for ref in branch_refs(unit):
+    for ref in branch_refs(unit, read_only=read_only):
         result = _git(unit, "rev-parse", f"{ref}^{{commit}}")
         if result.returncode:
             raise Refused(f"cannot read {ref}: {failure(result)}")
@@ -261,10 +265,14 @@ def preserve_branch(unit: Unit, saved: SavedBranch | NoSavedBranch = NO_SAVED_BR
         if remote.stdout.splitlines() == [f"{saved.tip}\t{saved.ref}"]:
             remote_tip = saved.tip
         else:
-            fetched = _git(unit, "fetch", "-q", "origin", saved.ref)
-            if fetched.returncode:
-                raise Refused(f"cannot read {saved.ref}: {failure(fetched)}")
-            result = _git(unit, "rev-parse", "--verify", "FETCH_HEAD^{commit}")
+            if read_only:
+                remote_ref = remote.stdout.split()[0]
+            else:
+                fetched = _git(unit, "fetch", "-q", "origin", saved.ref)
+                if fetched.returncode:
+                    raise Refused(f"cannot read {saved.ref}: {failure(fetched)}")
+                remote_ref = "FETCH_HEAD"
+            result = _git(unit, "rev-parse", "--verify", f"{remote_ref}^{{commit}}")
             if result.returncode:
                 raise Refused(f"cannot read {saved.ref}: {failure(result)}")
             remote_tip = result.stdout.strip()
@@ -276,11 +284,21 @@ def preserve_branch(unit: Unit, saved: SavedBranch | NoSavedBranch = NO_SAVED_BR
             raise Refused(f"{unit.branch}: branch and retired ref diverge; keep both before retiring")
     elif remote.returncode != 2:
         raise Refused(f"cannot read {saved.ref}: {failure(remote)}")
-    updated = SavedBranch(saved.ref, tip)
-    if remote.returncode == 2 or remote.stdout.splitlines() != [f"{tip}\t{saved.ref}"]:
-        pushed = _git(unit, "push", "origin", f"{tip}:{saved.ref}")
+    return SavedBranch(saved.ref, tip)
+
+
+def preserve_branch(unit: Unit, saved: SavedBranch | NoSavedBranch = NO_SAVED_BRANCH) -> SavedBranch | NoSavedBranch:
+    """Refresh and confirm the saved tip before the note or any removal."""
+    updated = plan_saved_branch(unit, saved)
+    if isinstance(updated, NoSavedBranch):
+        return updated
+    remote = _git(unit, "ls-remote", "--exit-code", "origin", updated.ref)
+    if remote.returncode not in (0, 2):
+        raise Refused(f"cannot read {updated.ref}: {failure(remote)}")
+    if remote.returncode == 2 or remote.stdout.splitlines() != [f"{updated.tip}\t{updated.ref}"]:
+        pushed = _git(unit, "push", "origin", f"{updated.tip}:{updated.ref}")
         if pushed.returncode:
-            raise Refused(f"cannot preserve {saved.ref}: {failure(pushed)}")
+            raise Refused(f"cannot preserve {updated.ref}: {failure(pushed)}")
     confirm_saved_branch(unit, updated)
     print(f"kept: {updated.ref} at {updated.tip}")
     return updated
@@ -608,8 +626,11 @@ def dry_run(unit: Unit) -> int:
              + [f"would stop: Mac claim {item.what} (pid {item.pid})" for item in found.claims]
              + [f"blocks retirement: unowned process {pid}" for pid in found.processes])
     print("\n".join(lines or ["nothing to stop"]))
+    saved = plan_saved_branch(unit, read_only=True)
+    if isinstance(saved, SavedBranch):
+        print(f"would save: {saved.tip} to origin {saved.ref}")
     if not unit.retired:
-        print(f"would mark: the Units row {retired_note(unit, director_session(unit))}, committed on {unit.production.merge_branch}")
+        print(f"would mark: the Units row {retired_note(unit, director_session(unit), saved)}, committed on {unit.production.merge_branch}")
     if unit_move.exists(unit.worktree):
         print(f"would remove: worktree {unit.worktree}")
     print(f"would delete: branch {unit.branch} here and on origin")

@@ -454,3 +454,25 @@ Design (showrunner ruling): retire keeps the work, with no new flag and no secon
 **State:** origin refs `refs/retired/<staff id>`, the Units row retired note, the unit worktree and branch (tests use temporary repositories and a temporary origin only).
 
 **Acceptance gate:** tests in temporary repositories show items 1-7, each rerun exiting 0 with no write. Live proof on tool-based-ui unit `assembly` (one tree, wip commit 5f9b7b2283 not on origin): note its tip and session; retire; rerun; resume; rerun; the branch tip is 5f9b7b2283, the session id is the same, and the worktree is back.
+
+### Phase 7j — The retire dry run names the saved ref  · status: todo
+
+Source: Phase 7i live-proof dry run on tool-based-ui `assembly` (tip 5f9b7b22837a, not on init/catalyst): the dry run printed `would delete: branch` with no save line, and its `would mark:` note had no ref and tip.
+
+#### Work Order
+
+**Goal:** `retire_unit.py --dry-run` shows the save that a real run makes, so a showrunner sees the work is kept before it retires.
+
+**Spec:**
+1. When the branch has commits the merge branch lacks, the dry run prints `would save: <full tip> to origin <ref>` before the remove lines, where `<ref>` is `refs/retired/<staff id>` (or the ref already in the note). It reads only: no push, fetch into refs, or note write.
+2. Its `would mark:` line shows the note a real run writes, ref and tip included.
+3. A tip that diverges from a saved ref prints the same refusal a real run gives.
+4. With no unmerged commits, output is unchanged.
+
+**Files:**
+- `scripts/production/retire_unit.py`
+- `scripts/production/test_retire_unit.py`
+
+**Workers:** 1 writer + 1 tester (impl: retire_unit.py; test: test_retire_unit.py)
+
+**Acceptance gate:** test_retire_unit.py tests for items 1-4 (each fails without the change); retire 47+ OK; basedpyright 0/0/0; live: dry run on `assembly` prints the save line.
