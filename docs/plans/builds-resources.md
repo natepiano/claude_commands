@@ -125,7 +125,7 @@ Own what a build may use and when it starts: memory admission and the memory que
 
 #### As-built
 
-- `scratch.shared_build_folder(source: Path) -> SharedBuildFolder(path, repo_identity) | NoSharedBuildFolder(reason)` is the one mapping from repository to its shared Cargo build folder. `copies.py` sets the path as `CARGO_BUILD_BUILD_DIR`. The key is `memory_admit.git_identity(...)`'s repository key, so the path names its repository with no copy record: `$SCRATCH_SHARED_BUILD_ROOT` (default `~/.cache/claude-builds`) plus the URL-quoted key. An `UnknownRepository` gets `NoSharedBuildFolder`, and that clone keeps its own target. The folder lives past any one task.
+- `scratch.shared_build_folder(source: Path) -> SharedBuildFolder(path, repo_identity) | NoSharedBuildFolder(reason)` is the one mapping from repository to its shared Cargo build folder. No caller sets the path as `CARGO_BUILD_BUILD_DIR`: the builds showrunner reversed its 02:42 word on 2026-10-30, because the verify-copies measurement (case D) spent 68.7 of 69.0 s on the shared folder's build lock, so `copies.py` seeds each copy's own build folder. Phase 34 removes the shared folder. The key is `memory_admit.git_identity(...)`'s repository key, so the path names its repository with no copy record: `$SCRATCH_SHARED_BUILD_ROOT` (default `~/.cache/claude-builds`) plus the URL-quoted key. An `UnknownRepository` gets `NoSharedBuildFolder`, and that clone keeps its own target. The folder lives past any one task.
 - `scratch.mark_cargo_cache(target)` writes `CACHEDIR.TAG` and refreshes the one use stamp. `scratch.USE_STAMP`, `CACHE_TAG`, `STYLE_TARGET_NAME` and `STYLE_LOCK_NAME` are the only spellings of these names.
 - `style_sync.py` keeps its one `style-sync-target` per repository past task end and keeps its `sync.lock`.
 - The sweeps treat a shared folder as one target with its own last use. `sweep.lock_trees(trees) -> TargetLocksAcquired(held) | TargetLockBusy(path)` takes Cargo's locks and, for a style target, `sync.lock`, without a wait. The busy check expands Cargo `build.build-dir` templates (`{workspace-root}`, `{cargo-cache-home}`, `{workspace-path-hash}`); an unknown template keeps the whole Cargo cache busy.
@@ -1011,7 +1011,7 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
 - Bump refusal on stderr with exit 2 — it breaks the unit-board pane protocol.
 - A second `BehindHead` text in the shell summary.
 
-### Phase 31 — The strict window lets younger steps use the budget minus the head's need  · status: todo
+### Phase 31 — The strict window lets younger steps use the budget minus the head's need  · status: done
 **Depends on:** Phase 30 (same files). Build on the branch tip `f6abb584` (`31c3ee3e` with `origin/builds` `b56c91b0` merged), which includes checkpointed Phases 30 (`7106f93d`), 28, 4, 24 (`31c3ee3e`) and 32 (`f8601d3c`); Phase 24 Part B is no longer uncommitted. Global order: Phases 21, 16, 25, 30, 28, 4, 24 and 32 are checkpointed; serial memory chain **31** → 33 → 26 → 15 → 27 → 20 → 11 → 17 → 18 → 19 → 8; 29 runs beside the chain, checkpoints after 33 (same file, `sweep.py`) and joins before 11.
 
 **Approved:** builds showrunner 2026-10-30 10:5x EDT, rule A (user priority, ahead of 26, 15 and 27)
@@ -1146,3 +1146,30 @@ Follow-up of Phase 24 (finding F010, landed out under the landing rule) and Phas
 **Acceptance gate:**
 - `python3 -m unittest discover -s scripts/lint -p test_memory_admit.py` and `-p test_sweep.py` pass; basedpyright on the changed Python files reads `0 errors, 0 warnings, 0 notes`.
 - Change-Review line: none — a cut-short history row no longer loses or breaks a build's record; nothing on screen changes
+
+### Phase 34 — The unused shared build folder goes  · status: todo
+
+Follow-up of the Phase 4 reversal. On 2026-10-30 the builds showrunner reversed its 02:42 word: the verify-copies measurement (case D) spent 68.7 of 69.0 s waiting on the shared folder's build lock, so the copies rule picks seed and `copies.py` has no shared mode. `scratch.shared_build_folder` has no consumer, so it goes.
+
+**Depends on:** Phases 31 and 33 checkpoints (both edit `test_sweep.py` or `sweep.py`).
+
+#### Work Order
+
+**Goal:** no code, test or as-built text names a shared Cargo build folder per repository; `style_sync.py`'s own `style-sync-target` and the sweep's general Cargo `build.build-dir` template reading stay unchanged.
+
+**Spec:**
+
+1. Remove `scratch.shared_build_folder`, `SharedBuildFolder`, `NoSharedBuildFolder` and the `SCRATCH_SHARED_BUILD_ROOT` setting from `scripts/lib/scratch.py`. Keep `mark_cargo_cache`, `USE_STAMP`, `CACHE_TAG`, `STYLE_TARGET_NAME` and `STYLE_LOCK_NAME` when another caller uses them; remove any that only the shared folder used.
+2. Remove their tests in `scripts/lib/test_scratch.py` and `test_sweep.py` (`test_helper_created_shared_folder_is_discovered_without_rustc_info_or_copy_record`). Keep a sweep test that a target with no rustc info and no copy record is still found, if no other test pins that.
+3. Correct `docs/as-built/build-targets.md` ("Copy records and lifetime") and plan Phase 4's as-built to say the shared folder was removed.
+
+**Files:**
+- `scripts/lib/scratch.py`, `scripts/lib/test_scratch.py` — Specs 1 and 2.
+- `scripts/lint/test_sweep.py` — Spec 2.
+- `docs/as-built/build-targets.md` — Spec 3.
+
+**Workers:** `1 writer`
+
+**Acceptance gate:**
+- `python3 -m unittest discover -s scripts/lib -p test_scratch.py` and `-s scripts/lint -p test_sweep.py` pass; basedpyright on the changed Python files reads `0 errors, 0 warnings, 0 notes`; `grep -rn shared_build_folder scripts docs/as-built` finds nothing.
+- Change-Review line: none — an unused helper goes; nothing on screen changes.

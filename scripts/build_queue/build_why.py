@@ -130,10 +130,8 @@ def need_text(source: gate.RecordedNeed | gate.NeedSourceNotRecorded) -> str:
 
 
 def budget_text(check: gate.BudgetCheck) -> str:
-    total = check.charged + check.need + check.head_need
+    total = check.charged + check.need
     terms = f"charged {check.charged / gate.GIB:.1f} + need {check.need / gate.GIB:.1f}"
-    if check.head_need:
-        terms += f" + head need {check.head_need / gate.GIB:.1f}"
     relation = "<=" if total <= check.budget else ">"
     result = "pass" if check.passes else "blocked"
     exception = "; run-alone exception" if check.passes and total > check.budget else ""
@@ -144,8 +142,6 @@ def budget_text(check: gate.BudgetCheck) -> str:
 def free_text(check: gate.FreeCheck) -> str:
     terms = f"need {check.need / gate.GIB:.1f} + earlyoom {check.reserve / gate.GIB:.1f}"
     terms += f" + promise not yet used {check.growth / gate.GIB:.1f}"
-    if check.head_need:
-        terms += f" + head need {check.head_need / gate.GIB:.1f}"
     relation = ">=" if check.passes else "<"
     result = "pass" if check.passes else "blocked"
     return f"Free memory: free {gib(check.available)} {relation} {terms} = {gib(check.threshold)}: {result}"

@@ -92,6 +92,8 @@ class HeadFacts:
     has_priority: bool
     token_waits: TokenWaitsNotRecorded | RecordedTokenWaits
     bump: gate.QueueBump | gate.NoBump = gate.NoBump()
+    budget: int = gate.BUILD_BUDGET_BYTES
+    head_need: int = 0
 
 
 @dataclass
@@ -335,7 +337,8 @@ def read_head_facts(reading: gate.QueueRead) -> HeadFacts | gate.NoWaiter:
         if isinstance(since, float) and since <= now:
             head_time = RecordedHeadTime(since)
     return HeadFacts(now, head.waiter.since, head_time, _read_bumps(head.waiter.since, now),
-                     head.order, head.has_priority, _read_token_waits(reading), head.bump)
+                     head.order, head.has_priority, _read_token_waits(reading), head.bump,
+                     head.decision.budget, head.waiter.need)
 
 
 def _clock(instant: float, zone: ZoneInfo, *, seconds: bool = True) -> str:
@@ -390,11 +393,8 @@ def order_text(facts: HeadFacts, zone: ZoneInfo) -> str:
         return "no head priority: younger steps that fit may start"
     remaining = max(0, int(facts.order.deadline - facts.now))
     minutes, seconds = divmod(remaining, 60)
-    until = f"until {_clock(facts.order.deadline, zone)} ({minutes} min {seconds} s left)"
-    if isinstance(facts.order, gate.StrictUntil):
-        text = f"strict {until}: younger steps wait"
-    else:
-        text = f"backfill {until}: younger steps that fit may start"
+    text = gate.window_clause(facts.order, facts.budget, facts.head_need, zone)
+    text += f" ({minutes} min {seconds} s left)"
     if isinstance(facts.bump, gate.QueueBump):
         kind = "bumped by position" if facts.bump.by_position else "head priority recorded"
         text += f"; {kind} at {_clock(facts.bump.priority_since, zone, seconds=False)}"

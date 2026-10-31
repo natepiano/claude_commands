@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 import io
 import json
 import os
+import re
 from pathlib import Path
 import tempfile
 import time
@@ -160,6 +161,23 @@ class BuildWhyTests(unittest.TestCase):
         result = gate.head_after_steps_end(gate.explain_queue(), (0,))
         self.assertIsInstance(result, gate.HeadAdmitsAfterEnd)
 
+    def test_override_free_memory_terms_add_up_to_its_printed_threshold(self) -> None:
+        self.reset_running(available=23, need=12)
+        _ = self.running(800, "growing", "clippy", 20, 1, 30)
+        starts = {pid: identity.start for pid, identity in gate.process_table(self.proc).items()}
+        with mock.patch.object(gate, "showrunner_is_registered", return_value=True), \
+                mock.patch.object(gate, "process_start_time", side_effect=starts.get), \
+                mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "showrunner-id", "CODEX_THREAD_ID": ""}):
+            _ = gate.admit_head("arithmetic regression")
+        output = self.output()
+        free = self.line(output, "Free memory:")
+        match = re.search(r"need ([0-9.]+) \+ earlyoom ([0-9.]+) \+ promise not yet used ([0-9.]+) = ([0-9.]+) GiB: pass", free)
+        self.assertIsNotNone(match, free)
+        if match is not None:
+            need, reserve, growth, threshold = (float(value) for value in match.groups())
+            self.assertEqual((need, reserve, threshold), (12.0, 3.0, 15.0))
+            self.assertEqual(need + reserve + growth, threshold, free)
+
     def test_release_advice_names_only_the_smaller_step_that_frees_enough_memory(self) -> None:
         self.reset_running(available=3, need=8)
         _ = self.running(800, "large-peak", "clippy", 10, 0.1, 3600, peak=10)
@@ -284,7 +302,7 @@ class BuildWhyTests(unittest.TestCase):
         self.assertIn("64.25", output)
         self.assertIn("32", output)
         self.assertRegex(output, r"Total:.*charged\s+18\.1 GiB.*using\s+12\.4 GiB")
-        self.assertRegex(output, r"(?i)strict until 21:59.*younger steps wait")
+        self.assertRegex(output, r"younger steps may use 9\.2 GiB of the budget until 21:59.*8 min 0 s left")
         self.assertRegex(output, r"16 waiting behind it;\s*2 would fit now")
         self.assertRegex(output, r"needs from 1\.0 to 16\.0 GiB.*oldest wait 20 min")
         final = self.line(output, "Waiting because:").lower()
@@ -560,10 +578,18 @@ class BuildWhyTests(unittest.TestCase):
         self.assertNotIn("the admission state could not be read", output)
         self.assertIn("First in line:", output)
 
+    def test_order_rule_names_no_room_when_head_uses_all_the_budget(self) -> None:
+        for need in (21, 22):
+            with self.subTest(need=need):
+                self.change_head(need=need * GIB)
+                line = self.line(self.output(), "Order rule:")
+                self.assertIn("younger steps wait until 21:59", line)
+                self.assertNotIn("may use", line)
+
     def test_backfill_and_position_bump_report_the_admission_deadlines(self) -> None:
         self.change_head(priority_since=NOW - 630, bump_order=-1)
         output = self.output()
-        self.assertRegex(output, r"(?i)backfill until 21:52.*younger steps that fit may start")
+        self.assertRegex(output, r"younger steps may start until 21:52.*1 min 30 s left")
         self.assertIn("bumped by position at 21:40", output)
 
     def test_pressure_hold_and_recovery_spacing_are_explicit(self) -> None:
