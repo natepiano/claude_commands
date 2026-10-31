@@ -5,22 +5,31 @@ from __future__ import annotations
 
 import errno
 import os
-import re
 import select
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
 from pathlib import Path
 from dataclasses import dataclass
-from typing import cast
+from typing import TYPE_CHECKING, cast
+
+if TYPE_CHECKING:
+    from ..buildlog.cgroup_test_support import write_cgroup
+    from ..buildlog.test_memory_window import write_lint_config
+else:
+    from scripts.buildlog.cgroup_test_support import write_cgroup
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "buildlog"))
+    from test_memory_window import write_lint_config
 
 
 # Hang guards allow for load 136 on natedev (2026-10-29).
 TEST_HANG_GUARD_SECS = 300
 
 INVOKE = Path(__file__).with_name("invoke.sh")
+LINT_CONFIG_READER = INVOKE.with_name("lint_config.sh")
 OOM_SCORE_ADJ = "/proc/self/oom_score_adj"
 
 
@@ -45,12 +54,32 @@ def sampler_command() -> str:
     return "buildlog_sample_anon() {" + body + "\n}\n"
 
 
+def configured_scope_command(root: Path, config: Path, *,
+                             reader: Path = LINT_CONFIG_READER) -> str:
+    result = BuildAdmissionTests(methodName="runTest").run_invoke(
+        root, 'printf "%s" "$BUILDLOG_SCOPE_SH"', [], environment={
+            "LINT_CONFIG_READER": str(reader),
+            "LINT_CONFIG_FILE": str(config),
+        },
+    )
+    if result.returncode != 0:
+        raise AssertionError(result.stdout + result.stderr)
+    return result.stdout
+
+
 def scope_command() -> str:
-    source = INVOKE.read_text(encoding="utf-8")
-    match = re.search(r"^BUILDLOG_SCOPE_SH='([^'\n]*)'$", source, re.MULTILINE)
-    if match is None:
-        raise AssertionError("BUILDLOG_SCOPE_SH is missing or no longer a single-quoted string")
-    return match.group(1)
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        return configured_scope_command(root, write_lint_config(root, 500))
+
+
+def python_spy(root: Path) -> None:
+    tool = root / ".claude/scripts/lib/py"
+    tool.parent.mkdir(parents=True)
+    _ = tool.write_text("\n".join([
+        "#!/bin/sh", 'echo python >> "$HOME/python-called"', "exit 93", "",
+    ]))
+    tool.chmod(0o755)
 
 
 def require_score_below_500(test: unittest.TestCase) -> None:
@@ -58,6 +87,76 @@ def require_score_below_500(test: unittest.TestCase) -> None:
         test.skipTest(f"{OOM_SCORE_ADJ} is unavailable")
     if int(Path(OOM_SCORE_ADJ).read_text(encoding="utf-8")) >= 500:
         test.skipTest("this process already runs at oom_score_adj 500 or more, so a 500 in the step proves nothing")
+
+
+class BuildOomScoreAdjReaderTests(unittest.TestCase):
+    python_reader: list[str] = [
+        sys.executable, "-c", "from scripts.lint.config_values import build_oom_score_adj; "
+        + "print(build_oom_score_adj())",
+    ]
+
+    def read_config(self, config: Path, command: list[str]) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            command, capture_output=True, text=True, check=False,
+            env={**os.environ, "HOME": str(config.parent), "LINT_CONFIG_FILE": str(config),
+                 "PYTHONPATH": str(INVOKE.resolve().parents[2])},
+            timeout=TEST_HANG_GUARD_SECS,
+        )
+
+    def assert_readers(self, config: Path, expected: int, *, warns: bool) -> None:
+        readers = (
+            ("shell", ["bash", "-c", 'set -euo pipefail; source "$1"; '
+                       + 'lint_config_build_oom_score_adj adjustment; printf "%s\\n" "$adjustment"',
+                       "config-reader-test", str(LINT_CONFIG_READER)]),
+            ("python", self.python_reader),
+        )
+        for reader, command in readers:
+            with self.subTest(reader=reader):
+                result = self.read_config(config, command)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(result.stdout, f"{expected}\n")
+                if warns:
+                    self.assertEqual(len(result.stderr.splitlines()), 1, result.stderr)
+                    self.assertTrue(result.stderr.startswith(f"warning: {config}: build_oom_score_adj="))
+                    self.assertIn("is invalid", result.stderr)
+                    self.assertIn("expected integer -1000..1000", result.stderr)
+                    self.assertTrue(result.stderr.endswith("using 500\n"))
+                else:
+                    self.assertEqual(result.stderr, "")
+
+    def test_absent_file_uses_default_silently(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            self.assert_readers(Path(directory) / "lint.conf", 500, warns=False)
+
+    def test_absent_key_uses_default_silently(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = write_lint_config(Path(directory), 650, include_adjustment=False)
+            self.assert_readers(config, 500, warns=False)
+
+    def test_python_reader_warns_once_for_undecodable_config_and_uses_default(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = write_lint_config(Path(directory), 650)
+            _ = config.write_bytes(b"\xff")
+            result = self.read_config(config, self.python_reader)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(result.stdout, "500\n")
+            self.assertEqual(
+                result.stderr,
+                f"warning: {config}: 'utf-8' codec can't decode byte 0xff in position 0: "
+                + "invalid start byte — using 500\n",
+            )
+
+    def test_present_invalid_value_warns_once_and_uses_default(self) -> None:
+        for value in ("", " # comment", "abc", "2000", "-1001"):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as directory:
+                config = write_lint_config(Path(directory), value)
+                self.assert_readers(config, 500, warns=True)
+
+    def test_valid_override_is_silent(self) -> None:
+        for value in (650, -1000, 0, 1000):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as directory:
+                config = write_lint_config(Path(directory), value)
+                self.assert_readers(config, value, warns=False)
 
 
 class BuildScopeTests(unittest.TestCase):
@@ -94,9 +193,50 @@ class BuildScopeTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertEqual(result.stdout, "500\n")
 
+    def test_configured_kill_level_reaches_the_scope_write(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            score = root / "oom-score-adj"
+            command = configured_scope_command(root, write_lint_config(root, 650))
+            result = self.run_scope(
+                ["sh", "-c", 'cat "$1"', "step", str(score)],
+                command.replace(OOM_SCORE_ADJ, str(score)),
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(result.stdout, "650\n")
+            self.assertEqual(score.read_text(), "650\n")
+
+    def test_legacy_reader_keeps_scope_kill_level_and_step_status(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            reader = root / "legacy-reader.sh"
+            _ = reader.write_text("lint_config_enabled() { return 0; }\n"
+                                  + "lint_config_skip_notice() { :; }\n", encoding="utf-8")
+            score = root / "oom-score-adj"
+            command = configured_scope_command(root, write_lint_config(root, 650), reader=reader)
+            result = self.run_scope(["sh", "-c", "exit 7"],
+                                    command.replace(OOM_SCORE_ADJ, str(score)))
+            self.assertEqual(result.returncode, 7, result.stdout + result.stderr)
+            self.assertEqual(score.read_text(), "500\n")
+            self.assertEqual(result.stderr, "")
+
     def test_step_exit_status_passes_through(self) -> None:
         result = self.run_scope(["sh", "-c", "exit 7"])
         self.assertEqual(result.returncode, 7)
+
+    def test_scope_copies_counters_without_python_and_keeps_status_when_io_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            scope = root / "scope"
+            write_cgroup(scope, with_io=False)
+            python_spy(root)
+            command = scope_command().replace(
+                '"/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup)"', f'"{scope}"')
+            result = self.run_scope(["/bin/sh", "-c", "exit 7"], command,
+                                    {**os.environ, "HOME": str(root)})
+            self.assertEqual(result.returncode, 7, result.stdout + result.stderr)
+            self.assertFalse((root / "python-called").exists())
+            self.assertFalse((scope / "io.stat").exists())
 
     def test_scope_writes_cgroup_sidecar_before_step(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -386,6 +526,47 @@ class BuildAdmissionTests(unittest.TestCase):
                                                b"".join(chunks).decode(), result.stderr)
         finally:
             os.close(reader)
+
+    def test_terminal_and_tee_runs_capture_scope_after_command_before_release(self) -> None:
+        shell = r'''
+events="$TMPDIR/events"
+buildlog_step_compiles() { return 1; }
+buildlog_begin() {
+    BUILDLOG_START="" BUILDLOG_PEAK="$TMPDIR/peak" BUILDLOG_MEM_RESERVATION=""
+    printf '%s\n' "$TMPDIR/scope" > "$BUILDLOG_PEAK.cgroup"
+}
+buildlog_exec() {
+    /bin/sh -c "$SCOPE_TEST_COMMAND" "$BUILDLOG_PEAK" sh -c \
+        'echo command >> "$TMPDIR/events"; printf "usage_usec 99\n" > "$TMPDIR/scope/cpu.stat"; exit 7' 3>&2
+}
+buildlog_release_memory() {
+    test "$(cat "$BUILDLOG_PEAK.cpu.stat")" = "usage_usec 99" || return 91
+    test ! -s "$BUILDLOG_PEAK.io.stat" || return 92
+    echo capture >> "$events"
+    echo release >> "$events"
+    rm -rf "$TMPDIR/scope"
+}
+nextest_share_end() { :; }
+buildlog_end() { echo "record $1" >> "$events"; }
+sweep_after_step() { :; }
+run_once fixture-step
+'''
+        for terminal in (False, True):
+            with self.subTest(terminal=terminal), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / "scope").mkdir()
+                python_spy(root)
+                translated = scope_command().replace(
+                    '\"/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup)\"', f'"{root / "scope"}"')
+                result = self.run_invoke(root, shell, [], terminal=terminal,
+                                         environment={"SCOPE_TEST_COMMAND": translated})
+                self.assertEqual(result.returncode, 7, result.stdout + result.stderr)
+                self.assertEqual((root / "events").read_text().splitlines(),
+                                 ["command", "capture", "release", "record 7"])
+                self.assertFalse((root / "peak.cgroup").exists())
+                self.assertFalse((root / "python-called").exists())
+                self.assertEqual((root / "peak.cpu.stat").read_text(), "usage_usec 99\n")
+                self.assertEqual((root / "peak.io.stat").read_text(), "")
 
     def test_taplo_does_not_compile_and_existing_command_classification_is_preserved(self) -> None:
         cases = [
