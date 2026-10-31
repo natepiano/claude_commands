@@ -11,7 +11,7 @@ import dailies_input
 import fake_unit_host
 import fake_herdr
 import dailies_render
-from cli_fixture import ImmutableGitSeed, invoke_cli
+from cli_fixture import ImmutableGitSeed, invoke_cli, production_paths
 import os
 import subprocess
 import sys
@@ -24,8 +24,10 @@ from unittest import mock
 from dailies_input import (Activity, Block, ClaudeNotRunning, Decision, FormWaiting, Running, SessionGone,
                            StillWaiting, TicksFailing, UnitRow, status_blocks)
 from unit_lookup import UnitState
+from scripts.production import staff, unit_names
 from scripts.production.staff_test_support import (
     fixture_showrunner_name, isolated_staff_file, showrunner_launch, showrunner_relationship,
+    unit_membership,
 )
 
 
@@ -197,6 +199,7 @@ class DailiesInputFixture(unittest.TestCase):
             setattr(self, name, value)
         self.env = self.fixture_env.copy()
         _ = self.enterContext(isolated_staff_file(self.root / "staff/staff.json", self.env))
+        _ = self.enterContext(production_paths(self.env))
         self.patch_commands()
 
     def build_fixture(self) -> None:
@@ -332,6 +335,9 @@ class DailiesInputFixture(unittest.TestCase):
             rows.append(f"| `{BETA}` | `docs/beta.md` | `{self.root / 'beta'}` | `beta` | — | — |")
         rows.extend(["", "## Gates", ""])
         _ = self.doc.write_text("\n".join(rows), encoding="utf-8")
+        self.timer("example")
+        for unit in (ALPHA, BETA) if beta else (ALPHA,):
+            _ = unit_membership(fixture_showrunner_name("example", self.doc), unit)
 
     def status_lines(self, *lines: str) -> None:
         _ = self.status.write_text("\n".join((STAMP, *lines)) + "\n", encoding="utf-8")
@@ -484,6 +490,8 @@ class DailiesInputFixture(unittest.TestCase):
                               capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
 
     def rename_unit(self, name: str) -> None:
+        row = unit_membership(fixture_showrunner_name("example", self.doc), ALPHA)
+        _ = staff.rename(row.id, unit_names.name(name))
         for path in (self.doc, self.status, self.judgment):
             _ = path.write_text(path.read_text(encoding="utf-8").replace(ALPHA, name), encoding="utf-8")
 
@@ -525,7 +533,7 @@ class DailiesInputFixture(unittest.TestCase):
     def timer(self, slug: str) -> None:
         """A production with a complete update timer, so the tree counts it."""
         instance = self.root / "notifier-state" / f"showrunner-{slug}"
-        instance.mkdir(parents=True)
+        instance.mkdir(parents=True, exist_ok=True)
         _ = (instance / "conf").write_text(
             f"TARGET=session:{slug}-session\nCHECK=zsh /x/production_check.sh {self.doc}\n", encoding="utf-8")
         row = showrunner_relationship(fixture_showrunner_name(slug, self.doc))

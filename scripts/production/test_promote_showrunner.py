@@ -300,9 +300,12 @@ class PromoteShowrunnerTests(unittest.TestCase):
 
         def start_child(_child: Production, _model: str, _effort: str, resume: str | None,
                         cwd: Path, _selected: accounts.ClaudeLaunchAccount,
-                        *, identity: add_showrunner.ShowrunnerLaunch) -> herdr.PromptSubmitted:
+                        *, identity: add_showrunner.ShowrunnerLaunch, staff_id: str) -> herdr.PromptSubmitted:
             self.assertEqual((resume, cwd), (SESSION, self.worktree))
             self.assertEqual(identity.session_id, SESSION)
+            row = staff.by_id(staff.StaffId(staff_id))
+            assert row is not None
+            self.assertEqual((row.kind, row.name), ("showrunner", "child"))
             self.marked.clear()
             return submitted
 

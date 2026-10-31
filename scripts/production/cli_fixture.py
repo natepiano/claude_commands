@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
-from contextlib import AbstractContextManager, ExitStack, redirect_stderr, redirect_stdout
+from collections.abc import Callable, Generator, Mapping
+from contextlib import AbstractContextManager, ExitStack, contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import dataclass
+from importlib import import_module
 import io
 import os
 from pathlib import Path
@@ -15,6 +16,39 @@ import sys
 from types import ModuleType
 from typing import TYPE_CHECKING, cast
 from unittest.mock import patch
+
+
+@contextmanager
+def production_paths(environment: Mapping[str, str]) -> Generator[None]:
+    """Bind source readers to the same fixture paths for direct and CLI calls."""
+    import dailies_render
+    import showrunners
+    if TYPE_CHECKING:
+        from ..whoami import note_file
+    else:
+        import note_file
+
+    home = Path(environment.get("HOME", str(Path.home())))
+    with ExitStack() as scope:
+        for name, value in {
+            "CHART_CONF": home / ".local/state/showrunner/dailies.conf",
+            "READINGS_LOG": home / ".local/state/agent-notes/readings.jsonl",
+        }.items():
+            _ = scope.enter_context(patch.object(dailies_render, name, value))
+        _ = scope.enter_context(patch.object(note_file, "AGENTS_DIR", home / "rust/hanadocs/agents"))
+        for name, value in {
+            "CONFIG": Path(environment.get("SHOWRUNNERS_CONFIG") or
+                           str(Path(showrunners.__file__).parents[2] / "config/showrunners.json")),
+            "NOTIFIER_STATE_DIR": Path(environment.get("NOTIFIER_STATE_DIR") or str(home / ".local/state/notifier")),
+            "SESSIONS_DIR": Path(environment.get("NOTIFIER_SESSIONS_DIR") or str(home / ".claude/sessions")),
+            "SHOWRUNNER_STATE_DIR": Path(environment.get("SHOWRUNNER_STATE_DIR") or str(home / ".local/state/showrunner")),
+            "SESSIONS": Path(environment.get("SHOWRUNNERS_SESSIONS") or
+                             str(Path(showrunners.__file__).parents[1] / "message/sessions.py")),
+            "SEND": Path(environment.get("SHOWRUNNERS_SEND") or
+                         str(Path(showrunners.__file__).parents[1] / "message/send.py")),
+        }.items():
+            _ = scope.enter_context(patch.object(showrunners, name, value))
+        yield
 
 
 def invoke_cli(module: ModuleType, main: Callable[[], int], arguments: list[str],
@@ -30,8 +64,8 @@ def invoke_cli(module: ModuleType, main: Callable[[], int], arguments: list[str]
     # patch.object will then restore caller paths rather than fixture paths.
     if production_state:
         with patch.object(sys, "path", sys.path.copy()):
-            import dailies_render
-            import showrunners
+            _ = import_module("dailies_render")
+            _ = import_module("showrunners")
 
     before = vars(module).copy()
     directory = Path.cwd()
@@ -48,36 +82,7 @@ def invoke_cli(module: ModuleType, main: Callable[[], int], arguments: list[str]
             _ = scope.enter_context(redirect_stderr(stderr))
             os.chdir(cwd)
             if production_state:
-                # These imports only retrieve the caller-initialized modules.
-                import dailies_render
-                import showrunners
-                if TYPE_CHECKING:
-                    from ..whoami import note_file
-                else:
-                    import note_file
-
-                home = Path.home()
-                for name, value in {
-                    "CHART_CONF": home / ".local/state/showrunner/dailies.conf",
-                    "READINGS_LOG": home / ".local/state/agent-notes/readings.jsonl",
-                }.items():
-                    _ = scope.enter_context(patch.object(dailies_render, name, value))
-                _ = scope.enter_context(patch.object(note_file, "AGENTS_DIR",
-                                                    home / "rust/hanadocs/agents"))
-                for name, value in {
-                    "CONFIG": Path(environment.get("SHOWRUNNERS_CONFIG") or
-                                   str(Path(showrunners.__file__).parents[2] / "config/showrunners.json")),
-                    "NOTIFIER_STATE_DIR": Path(environment.get("NOTIFIER_STATE_DIR") or
-                                               str(home / ".local/state/notifier")),
-                    "SESSIONS_DIR": Path(environment.get("NOTIFIER_SESSIONS_DIR") or str(home / ".claude/sessions")),
-                    "SHOWRUNNER_STATE_DIR": Path(environment.get("SHOWRUNNER_STATE_DIR") or
-                                                 str(home / ".local/state/showrunner")),
-                    "SESSIONS": Path(environment.get("SHOWRUNNERS_SESSIONS") or
-                                     str(Path(showrunners.__file__).parents[1] / "message/sessions.py")),
-                    "SEND": Path(environment.get("SHOWRUNNERS_SEND") or
-                                 str(Path(showrunners.__file__).parents[1] / "message/send.py")),
-                }.items():
-                    _ = scope.enter_context(patch.object(showrunners, name, value))
+                _ = scope.enter_context(production_paths(environment))
             try:
                 status = main()
             except SystemExit as exit_status:

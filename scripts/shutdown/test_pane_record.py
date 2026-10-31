@@ -92,6 +92,15 @@ class PaneRecordTests(unittest.TestCase):
                             "SHOWRUNNER_UNIT_ID": "alpha-unit"},
             "flags_read": True, "ended": False})
 
+    def test_hook_preserves_staff_identity_for_restore_and_membership(self) -> None:
+        self.env["STAFF_ID"] = "s123456789ab"
+        result = self.start("w1:p2", "sid-alpha", "-n", "alpha")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        entry = self.entries()["w1:p2"]
+        environment = cast(dict[str, str], entry["environment"])
+        self.assertEqual(environment.get("STAFF_ID"), "s123456789ab")
+        self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", environment)
+
     def test_a_new_start_replaces_its_own_pane_and_keeps_the_others(self) -> None:
         for pane, session_id in (("w1:p2", "sid-alpha"), ("w2:p1", "sid-ups"), ("w1:p2", "sid-alpha-2")):
             self.assertEqual(self.start(pane, session_id).returncode, 0)

@@ -558,6 +558,10 @@ class MessageTests(unittest.TestCase):
             "UNIT_HISTORY_DIR": str(self.root / "history"),
         }
         self.environment.update(fake_unit_host.environment(self.root))
+        from scripts.production.staff_test_support import isolated_staff_file, unit_membership
+
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", self.environment))
+        _ = unit_membership("show", "trunk-unit")
         fake_unit_host.write({**os.environ, **self.environment}, [
             fake_unit_host.HostedUnit("trunk", "w1:p1", {"SHOWRUNNER_UNIT": "show", "SHOWRUNNER_UNIT_ID": "trunk-unit"})])
         fake_unit_host.place_process(self.environment, os.getppid(), "w1:p1")

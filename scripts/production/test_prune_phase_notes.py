@@ -9,6 +9,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import override
+from scripts.production.staff_test_support import isolated_staff_file, unit_membership
 
 SCRIPT = Path(__file__).with_name("prune_phase_notes.py")
 
@@ -33,6 +34,7 @@ class PrunePhaseNotesTests(unittest.TestCase):
                     "PHASE_TABLE_VAULT": str(self.vault), "USER_ZONE": "America/New_York",
                     "SHOWRUNNER_STATE_DIR": str(self.root / "showrunner"),
                     "HERDR_BIN": "/nonexistent/herdr"}
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", self.env))
 
     def production(self, slug: str) -> Path:
         """A production with one live unit, alpha-unit, and its update timer."""
@@ -52,6 +54,7 @@ class PrunePhaseNotesTests(unittest.TestCase):
             f"| `alpha-unit` | `docs/alpha.md` | `{alpha}` | `alpha` | — | — |", "",
         )), encoding="utf-8")
         self.timer(slug, doc)
+        _ = unit_membership(slug, "alpha-unit")
         return doc
 
     def timer(self, slug: str, doc: Path) -> None:

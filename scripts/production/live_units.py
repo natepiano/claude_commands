@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""List a showrunner's units: the live rows of its production doc, each with its session now."""
+"""List a showrunner's recorded units, each with its session now."""
 from __future__ import annotations
 
 import sys
@@ -8,7 +8,7 @@ from typing import NamedTuple
 
 import showrunners
 import unit_lookup
-from production_units import Refusal, cell_value, live_unit_table
+from production_units import order_unit_names
 
 
 class LiveUnit(NamedTuple):
@@ -24,32 +24,17 @@ class LiveUnit(NamedTuple):
 
 
 def production_units(doc: Path) -> list[LiveUnit]:
-    """Every unit the doc's Units table lists and has not retired, found by its mark.
-
-    Raises OSError when the doc cannot be read or herdr cannot say which sessions exist.
-    """
-    slug, units = _listed(doc)
-    return _joined(slug, units, unit_lookup.every_marked_unit())
+    """Every recorded unit child, joined with the current pane when one exists."""
+    return units_in(doc, unit_lookup.every_marked_unit())
 
 
 def units_in(doc: Path, every: unit_lookup.MarkedProductions) -> list[LiveUnit]:
-    """The doc's units, as `production_units` finds them, from one read of every production's marks.
-
-    Raises OSError when the doc cannot be read or its production's marks are at fault.
-    """
-    slug, units = _listed(doc)
-    return _joined(slug, units, every)
-
-
-def _listed(doc: Path) -> tuple[str, list[str]]:
-    """The doc's production slug and the units its Units table lists and has not retired."""
+    """Join one production to a caller's membership and pane snapshot."""
     slug = showrunners.production_slug(str(doc))
-    try:
-        rows = live_unit_table(doc.read_text(encoding="utf-8").splitlines(), slug)
-    except (UnicodeError, Refusal) as error:
-        raise OSError(f"{doc}: {error}") from error
-    units = [cell_value(cells.get("Unit", "")) for cells in rows]
-    return slug, [unit for unit in units if unit]
+    members = every.members.get(slug, ())
+    offline = set(members) - every.units.get(slug, {}).keys()
+    names = order_unit_names(doc.read_text(encoding="utf-8").splitlines(), members, offline=offline)
+    return _joined(slug, names, every)
 
 
 def _joined(slug: str, units: list[str], every: unit_lookup.MarkedProductions) -> list[LiveUnit]:

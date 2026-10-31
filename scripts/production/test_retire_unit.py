@@ -256,8 +256,11 @@ class RetireUnitTests(unittest.TestCase):
         self.pane_shell_completes(live=True)
 
     def staff_unit(self) -> tuple[staff.StaffRow, staff.StaffRow]:
-        runner = staff.ensure("showrunner", name="tools")
-        unit = staff.ensure("unit", name="panes", parent=runner.id)
+        parent = next(row for row in staff.find(kind="showrunner") if row.name == "alpha")
+        original = next(row for row in staff.find(kind="unit", parent=parent.id) if row.name == "alpha")
+        runner = staff.rename(parent.id, "tools")
+        unit = staff.rename(original.id, "panes")
+        self.staff.pane("w1:runner", session_id="session-alpha", environment={"STAFF_ID": runner.id})
         self.staff.pane("w1:p1", session_id=DIRECTOR, environment={
             "STAFF_ID": unit.id, "SHOWRUNNER_UNIT": "alpha", "SHOWRUNNER_UNIT_ID": "alpha-unit"})
         return runner, unit
@@ -273,6 +276,24 @@ class RetireUnitTests(unittest.TestCase):
         self.assertEqual(staff.by_id(worker.id), worker)
         self.assertEqual(staff.by_id(runner.id), runner)
         self.assertFalse(self.worktree.exists())
+
+    def test_replaying_an_old_retirement_keeps_a_reused_name_in_another_production(self) -> None:
+        old = next(row for row in staff.find(kind="unit") if row.name == "alpha")
+        code, output = self.retire()
+        self.assertEqual(code, 0, output)
+        self.assertIsNone(staff.by_id(old.id))
+        new_doc = self.staff.production("receiving")
+        _ = new_doc.write_text("- **Merge branch:** main\n"
+                               + f"- **Showrunner checkout:** {self.checkout}\n- **Log:** log.md\n"
+                               + new_doc.read_text())
+        receiving = staff.ensure("showrunner", name="receiving")
+        replacement = add_unit.ensure_staff_unit(read_production(self.staff.source_root / "receiving-production.md"),
+                                                "alpha-unit")
+        self.assertEqual(replacement.parent, receiving.id)
+        self.assertFalse(self.marked and self.marked.staff_id)
+        code, output = self.retire()
+        self.assertEqual(code, 0, output)
+        self.assertEqual(staff.by_id(replacement.id), replacement)
 
     def test_retire_unit_rerun(self) -> None:
         runner, unit = self.staff_unit()
