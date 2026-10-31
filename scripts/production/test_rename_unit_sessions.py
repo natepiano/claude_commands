@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Callable
 import os
+import signal
 import subprocess
 import sys
 import unittest
@@ -16,10 +17,10 @@ import add_unit
 from scripts.shutdown import stop_resume
 from scripts.accounts import accounts
 from scripts.production.cli_fixture import parse_arguments
-from rename_state import RenameRefused
 if TYPE_CHECKING:
-    from scripts.shutdown import shutdown_record
+    from scripts.shutdown import pane_record, shutdown_record
 else:
+    import pane_record
     import shutdown_record
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -83,7 +84,7 @@ class UnitRenameSessionsTests(UnitRenameFixture):
         self.assertEqual(len(launches), 1)
         self.assertIs(self.journal()["done"], True)
 
-    def test_live_recordless_rename_journals_its_account_and_resumes_the_same_conversation(self) -> None:
+    def recordless_stop(self) -> Callable[[str], stop_resume.Stopped]:
         end = self.mark_live("alpha-unit", "sid-alpha")
         self.record_live_launch()
         def stop(identity: str) -> stop_resume.Stopped:
@@ -91,30 +92,63 @@ class UnitRenameSessionsTests(UnitRenameFixture):
             self.assertEqual(self.journal()["account"], "claude4")
             end()
             return stop_resume.Stopped(identity, 1)
-        with patch.object(self, "stop_session", side_effect=stop):
+        return stop
+
+    def test_live_recordless_rename_journals_its_account_and_resumes_the_same_conversation(self) -> None:
+        with patch.object(self, "stop_session", side_effect=self.recordless_stop()):
             self.finish_recordless_apply()
 
-    def test_step_eight_journal_recovers_its_missing_account_from_the_session_launch(self) -> None:
-        # Reach the same persisted state as the interrupted live proof, using real move steps.
-        end = self.mark_live("alpha-unit", "sid-alpha")
-        self.record_live_launch()
-        def stop(identity: str) -> stop_resume.Stopped:
-            end()
-            return stop_resume.Stopped(identity, 1)
-        original = rename_unit.STEPS
-        def interrupt(_rename: rename_unit.UnitRename, _save: Callable[[], None]) -> None:
-            raise RenameRefused("checkpoint")
-        checkpoint = original[8]._replace(run=interrupt)
-        with (patch.object(self, "stop_session", side_effect=stop),
-              patch.object(rename_unit, "_restart_record", interrupt),
-              patch.object(rename_unit, "STEPS", (*original[:8], checkpoint, *original[9:]))):
-            self.assert_refused(self.rename("apply"), "checkpoint")
+    def kill_apply_after_save(self, step: int) -> None:
+        """Kill only the fixture child, immediately after its real atomic journal write."""
+        save = rename_unit._save  # pyright: ignore[reportPrivateUsage]
+        def save_then_kill(path: Path, rename: rename_unit.UnitRename) -> None:
+            save(path, rename)
+            if rename.step == step:
+                os.kill(os.getpid(), signal.SIGKILL)
+        child = os.fork()
+        if child == 0:
+            try:
+                with patch.object(rename_unit, "_save", side_effect=save_then_kill):
+                    result = self.rename("apply")
+                print(result.stdout + result.stderr, file=sys.__stderr__, flush=True)
+            finally:
+                os._exit(1)
+        status = os.waitpid(child, 0)[1]
+        self.assertTrue(os.WIFSIGNALED(status), f"apply exited instead of reaching journal step {step}: {status}")
+        self.assertEqual(os.WTERMSIG(status), signal.SIGKILL)
+        self.assertEqual(self.journal()["step"], step)
+
+    def finish_after_killed_save(self, step: int) -> None:
+        with patch.object(self, "stop_session", side_effect=self.recordless_stop()):
+            self.kill_apply_after_save(step)
+            self.assertEqual((self.journal()["account"], self.journal()["session_id"]), ("claude4", "sid-alpha"))
+            self.finish_recordless_apply()
+
+    def test_apply_killed_after_its_first_journal_save_resumes_the_same_account_and_conversation(self) -> None:
+        # The initial request is step 0; step 1 stops the director.
+        self.finish_after_killed_save(0)
+
+    def test_apply_killed_after_its_stop_step_resumes_the_same_account_and_conversation(self) -> None:
+        self.finish_after_killed_save(1)
+
+    def test_old_step_eight_journal_without_account_or_launch_refuses_without_changes(self) -> None:
+        with patch.object(self, "stop_session", side_effect=self.recordless_stop()):
+            self.kill_apply_after_save(8)
+        # The old tree removed this entry at step 7 and saved no account before stopping.
+        self.assertTrue(pane_record.forget_unit("alpha-unit"))
         journal = self.state / "demo/rename_unit.json"
         fields = cast(dict[str, object], json.loads(journal.read_text()))
-        self.assertEqual(fields["step"], 8)
         fields["account"] = ""
         self.write(journal, json.dumps(fields))
-        self.finish_recordless_apply()
+        before = self.snapshot()
+        with (patch.object(self, "stop_session") as stop,
+              patch.object(os, "kill") as kill):
+            self.assert_refused(self.rename("apply"),
+                                "alpha-unit: session sid-alpha has no pane launch account or shutdown record")
+        stop.assert_not_called()
+        self.assertTrue(all(call.args[1] == 0 for call in kill.call_args_list),
+                        "refused apply must send no process-changing signal")
+        self.assertEqual(self.snapshot(), before)
 
     def moved_unit_with_leftover_marks(self) -> None:
         _ = self.seed_record()

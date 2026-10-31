@@ -1277,6 +1277,8 @@ def _apply(slug: str, old: str, new: str, scratch: Path) -> UnitRename:
             # The request is saved before anything changes, so every later refusal resumes.
             _save(path, rename)
         if rename.session_id and not rename.account:
+            # Old journals may have lost both the account and its launch entry. Refuse before
+            # changing staff or files when no surviving source can identify the account.
             bind_stop_target(rename)
             _save(path, rename)
         try:
