@@ -62,8 +62,8 @@ only when the first build ends, or never. Cargo's registry carries the same
 tag with no build tree. A folder made before a build with
 CARGO_CACHE_RUSTC_INFO=0 has neither and stays unseen. Orphaned files go first
 from every idle target. Then the least recently used idle target loses
-output, then by build-unit use within each target. Targets used within
-recent_minutes (60 by default) go last, whatever their location.
+output, then by build-unit use within each target. Recent targets are not
+held back. Each scan under the floor records its shortfall and idle targets.
 On 2026-10-08 the tag rule found 76 targets where
 .rustc_info.json alone found 41: 31 finished scratch targets carried only the
 tag, and one in its first build had reached 22 GiB unseen. A target's last use
@@ -327,6 +327,7 @@ class Scan:
     links: dict[InodeKey, int] = field(default_factory=dict)
     groups: list[Group] = field(default_factory=list)
     orphans: list[Group] = field(default_factory=list)
+    target_bytes: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -1640,12 +1641,15 @@ def scan_roots(roots: list[str], trees: list[str]) -> Scan:
 
 def scan_floor_roots(roots: list[str], trees: dict[str, list[str]]) -> Scan:
     """Scan independent targets with bounded IO concurrency and no cargo locks."""
-    if len(roots) <= 1:
-        return scan_roots(roots, [tree for root in roots for tree in trees[root]])
-
     def scan_target(root: str) -> Scan:
-        return scan_roots([root], trees[root])
+        scan = scan_roots([root], trees[root])
+        scan.target_bytes[root] = sum(scan.blocks.values())
+        return scan
 
+    if not roots:
+        return Scan()
+    if len(roots) == 1:
+        return scan_target(roots[0])
     combined = Scan()
     with ThreadPoolExecutor(max_workers=4) as workers:
         for scan in workers.map(scan_target, roots):
@@ -1654,6 +1658,7 @@ def scan_floor_roots(roots: list[str], trees: dict[str, list[str]]) -> Scan:
             combined.links.update(scan.links)
             combined.groups.extend(scan.groups)
             combined.orphans.extend(scan.orphans)
+            combined.target_bytes.update(scan.target_bytes)
     return combined
 
 
@@ -2325,7 +2330,6 @@ def hold_floor(
     dry_run: bool,
     roots: Sequence[str] = FLOOR_ROOTS,
     lock: str = FLOOR_LOCK,
-    recent_minutes: float = DEFAULT_RECENT_MINUTES,
 ) -> int:
     """Below the floor, take the shortfall from the least used idle targets."""
     if not dry_run:
@@ -2404,10 +2408,14 @@ def hold_floor(
         left, failures = total, 0
         chosen: list[tuple[Group, int]] = []
         if scanned_free < floor:
+            if not dry_run:
+                record.floor_scan(scanned_free, floor, [
+                    {"folder": root, "last_use": target_uses[root], "bytes": scan.target_bytes[root]}
+                    for root in sorted(idle, key=lambda root: (target_uses[root], root))
+                ], time.time())
             left, failures, chosen = shrink_floor(
                 scan, total, budget, dry_run, tree_targets, known_trees, busy,
                 lambda group: (
-                    float(target_uses[tree_targets[group.build_tree]] > planned_at - recent_minutes * 60),
                     target_uses[tree_targets[group.build_tree]],
                     *unit_age(group, planned_at),
                 ),
@@ -2906,7 +2914,7 @@ def main(argv: list[str]) -> int:
     if floor_only:
         status = tmp_sweep.run_if_due(dry_run) or status
     if floor is not None:
-        status = hold_floor(floor, dry_run, recent_minutes=recent_minutes) or status
+        status = hold_floor(floor, dry_run) or status
     return status
 
 

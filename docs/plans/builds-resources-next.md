@@ -24,14 +24,20 @@
   - Completion condition: the call uses fewer imports or a lighter entry path; the change reports before and after CPU figures for the same call, and the build_targets and verify tests pass.
   - Revealed by: verify-unit measurement (builds showrunner 2026-10-30: next)
 
-- [ ] **After a build folder that clones share is trimmed, the build log says which repository's builds it slowed down and why**
-  - Target: `scripts/lib/scratch.py`, `scripts/lint/sweep.py`, report-unit's step attribution, and their tests
-  - Why needed: clones share one lasting build folder per repository since Phase 4, and no saved row says which repository's build a trim slowed down; `target_dir` reads `CARGO_TARGET_DIR`, not the shared folder
-  - Completion condition: a trim row carries the repository identity, and the rebuild report names the repository and the trim for a rebuild that followed it
-  - Revealed by: Phase 4 (builds showrunner 2026-10-30: next; waits on report-unit 4f)
+- [ ] **Record the Cargo cache folder each build used so trims can be matched to affected builds**
+  - Target: report-unit's step recorder and attribution, `scripts/lint/sweep.py`, and their tests
+  - Why needed: copies seed their own build folders (builds reversed the shared build folder on 2026-10-30; Phase 34 removed it, `efccbe4e`), and intermediate Cargo build folders still lack lasting repository and build attribution
+  - Completion condition: step records keep the repository identity and the actual target and build folder, independent of copy lifetime; the rebuild report links a later build to a trim through that recorded folder; missing attribution stays an explicit unknown; Phase 17's cache-history predictor reads this record and adds no second mapping
+  - Revealed by: Phase 4 (builds showrunner 2026-10-30: next; waits on report-unit 4f); amended after the shared-folder reversal (Phase 31 review)
 
 - [ ] **The working-set summary tells a Node script apart from a Node task or one-line program**
   - Target: `scripts/build_targets/working_set.py`, `scripts/build_targets/test_working_set.py`
   - Why needed: `NO_NODE_ENTRY` is an empty string, so a missing entry script and a real value read the same
   - Completion condition: the classification carries a named no-entry state, and a test pins a `node --run` task and a `node -e` program as no-entry
   - Revealed by: Phase 28 (builds showrunner 2026-10-30: next)
+
+- [ ] **A stopped sweep plan ends with one line, and a plan run prints a short summary**
+  - Target: `scripts/lint/tmp_sweep.py` (`--plan`), its tests
+  - Why needed: Ctrl-C during `tmp_sweep.py --plan` prints a Python traceback, and a plan run prints 79,530 lines, so the plan cannot be read on screen
+  - Completion condition: Ctrl-C ends with one line and exit 130; a plan run prints a short summary (counts and bytes per group) and the path of the full plan file; a test pins both
+  - Revealed by: builds C617 (builds showrunner 2026-10-30: next)

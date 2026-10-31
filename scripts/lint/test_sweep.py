@@ -26,7 +26,6 @@ from zoneinfo import ZoneInfo
 import sweep
 from test_memory_admit import HISTORY_APPEND_STOPS, stop_history_append
 if TYPE_CHECKING:
-    from . import memory_admit
     from ..build_hold import build_hold
     from ..buildlog import record, store
     from ..lib import scratch
@@ -36,7 +35,6 @@ if TYPE_CHECKING:
     from ..notify.push_texts import RenderedPush, catalog, render, render_entry
     from ..notify.user_action import ActionRequired
 else:
-    from scripts.lint import memory_admit
     import build_hold
     import record
     import scratch
@@ -173,15 +171,17 @@ class SweepCase(unittest.TestCase):
     def target(self) -> Target:
         return Target(Path(self.enterContext(tempfile.TemporaryDirectory())).resolve())
 
-    def trim_rows(self) -> list[dict[str, object]]:
+    def build_log_rows(self) -> list[dict[str, object]]:
         root = Path(os.environ[sweep.BUILDLOG_DIR_ENV])
         rows: list[dict[str, object]] = []
         for path in root.glob("*/????-??.jsonl"):
             for line in path.read_text().splitlines():
                 row = cast(dict[str, object], json.loads(line))
-                if row.get("kind") == "sweep_trim":
-                    rows.append(row)
+                rows.append(row)
         return rows
+
+    def trim_rows(self) -> list[dict[str, object]]:
+        return [row for row in self.build_log_rows() if row.get("kind") == "sweep_trim"]
 
     def trim_events(self) -> list[sweep.SweepRemoval]:
         return [sweep.SweepRemoval(datetime.fromisoformat(cast(str, row["at"])).timestamp(),
@@ -1312,24 +1312,6 @@ with open(sys.argv[1], 'a') as lock:
         self.assertFalse(output.exists())
         row, = self.trim_rows()
         self.assertEqual((row["folder"], row["extent"], row["cause"]), (str(target), "whole", "floor take"))
-
-    def test_helper_created_shared_folder_is_discovered_without_rustc_info_or_copy_record(self) -> None:
-        base = self.base()
-        source = base / "source"
-        source.mkdir()
-        with (mock.patch.dict(os.environ, {"SCRATCH_SHARED_BUILD_ROOT": str(base / "shared-builds")}),
-              mock.patch.object(memory_admit, "git_identity", return_value=(
-                  memory_admit.RepositoryIdentity("example.invalid/team/sample", "sample"), str(source)))):
-            result = scratch.shared_build_folder(source)
-        assert isinstance(result, scratch.SharedBuildFolder)
-        output = unit(result.path / "debug", "deps", "app", APP, time.time() - DAY)
-        shutil.rmtree(source)
-        self.assertFalse((result.path / sweep.RUSTC_INFO).exists())
-        self.assertEqual(sweep.target_dirs([str(base)]), [str(result.path)])
-        with mock.patch.object(sweep, "held_cargo_lock_files", return_value=set()):
-            status, _ = self.hold(base, 10 * GIB, [10 * GIB - 1, 10 * GIB])
-        self.assertEqual(status, 0)
-        self.assertFalse(output.exists())
 
     def test_partial_unlink_failure_still_records_successfully_freed_bytes(self) -> None:
         for caller in ("budget", "floor"):
@@ -2651,6 +2633,52 @@ if sys.argv[sys.argv.index("--to") + 1] == "user":
         self.assertNotIn(f"from {base / 'scratch' / 'recent' / 'target'}", output)
         self.assertIn(f"from {base / 'home' / 'rust' / 'managed' / 'target'}", output)
 
+    def test_floor_takes_the_oldest_target_when_it_covers_the_shortfall(self) -> None:
+        base = self.base()
+        now = time.time()
+        _, older = cargo_target(base, "older", APP, now - 9 * 3600)
+        recent_tree, recent = cargo_target(base, "recent", DEMO, now - 60)
+        status, output = self.hold(base, 10 * GIB, [10 * GIB - 1, 10 * GIB])
+        self.assertEqual(status, 0)
+        self.assertFalse(older.exists())
+        self.assertTrue(recent.exists())
+        self.assertNotIn(f"from {recent_tree.parent}", output)
+
+    def test_floor_scan_records_the_post_scan_shortfall_and_idle_targets_oldest_first(self) -> None:
+        base = self.base()
+        now = time.time()
+        recent_tree, _ = cargo_target(base, "a-recent", APP, now - 60)
+        older_tree, _ = cargo_target(base, "z-older", DEMO, now - 9 * 3600)
+        targets = [older_tree.parent, recent_tree.parent]
+        expected = [{"folder": str(target), "last_use": used,
+                     "bytes": sweep.directory_blocks(str(target))}
+                    for target, used in zip(targets, (now - 9 * 3600, now - 60))]
+        with mock.patch.object(time, "time", return_value=now):
+            status, _ = self.hold(base, 10 * GIB, [8 * GIB, 10 * GIB], scanned=10 * GIB - 1)
+        self.assertEqual(status, 0)
+        scans = [row for row in self.build_log_rows() if row.get("kind") == "floor_scan"]
+        self.assertEqual(len(scans), 1)
+        row = scans[0]
+        self.assertEqual((row["at"], row["free_after_scan"], row["floor"], row["shortfall"]),
+                         (store.utc_iso(now), 10 * GIB - 1, 10 * GIB, 1))
+        self.assertEqual(row["idle_targets"], expected)
+
+    def test_floor_dry_run_under_the_floor_writes_no_scan_row(self) -> None:
+        base = self.base()
+        _, output = cargo_target(base, "kept", APP, time.time() - DAY)
+        status, _ = self.hold(base, 10 * GIB, [8 * GIB, 10 * GIB], True, scanned=10 * GIB - 1)
+        self.assertEqual(status, 0)
+        self.assertTrue(output.exists())
+        self.assertEqual(self.build_log_rows(), [])
+
+    def test_floor_scan_above_the_floor_writes_no_scan_row(self) -> None:
+        base = self.base()
+        _, output = cargo_target(base, "kept", APP, time.time() - DAY)
+        status, _ = self.hold(base, 10 * GIB, [8 * GIB, 11 * GIB], scanned=11 * GIB)
+        self.assertEqual(status, 0)
+        self.assertTrue(output.exists())
+        self.assertEqual(self.build_log_rows(), [])
+
     def test_floor_orders_old_tmp_and_rust_targets_by_last_use(self) -> None:
         base = self.base()
         now = time.time()
@@ -3090,7 +3118,7 @@ if sys.argv[sys.argv.index("--to") + 1] == "user":
                     self.assertEqual(sweep.main([sweep.FLOOR_ONLY_FLAG]), 0)
                 workspace.assert_not_called()
                 scratch.assert_called_once_with(False)
-                floor.assert_called_once_with(7 * GIB, False, recent_minutes=minutes)
+                floor.assert_called_once_with(7 * GIB, False)
 
     def test_malformed_floor_is_an_error(self) -> None:
         config = self.base() / "lint.conf"

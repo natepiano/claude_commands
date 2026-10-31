@@ -76,6 +76,7 @@ Every command checks holds through `target_state`. The sole holder may run its o
 - `build_hold_nothing_held` returns 0 only when the holder directory (`BUILD_HOLD_DIR`, default `~/.local/state/build-hold`) is a readable, searchable directory with no entry at all (dot files and dangling links count), and the shell expands patterns unfiltered (no `noglob`, `GLOBIGNORE` or `failglob`). `BUILD_HOLD_DIR` set but empty, a missing directory, or any doubt returns 1, and the Python runs.
 - `build_hold_wait_local`, `build_hold_check_local`, `check_routing_hold` and the per-call `wait-local` in `verify.sh` all return through it before starting Python. With nothing held a local call starts no hold-check process anywhere, and an unreadable `config/build_targets.conf` stops only a `test` call (at `eligible`).
 - Every caller waits for natedev's hold, not only `verify.sh` (fixed 2026-10-19: cargo-port's `port-lint clippy` ran 5 hana clippy runs through a demo hold, load 134). `build_hold_applies` skips the wait only for `verify-mac`, for macOS (`OSTYPE` `darwin*`), and when the holder directory does not exist. A caller with no `verify` call id gets `BUILDLOG_HOLD_CALL_ID`, made once per shell in verify's form (`v<UTC stamp>-<pid>-<random>`) after `build_hold_nothing_held` says 1. It is not exported, so build log rows keep `call_id` null. `wait-local` and `check-local` get `--caller <BUILDLOG_CALLER or lint>`, and their lines start `lint (<caller>):` (or `lint:`) in place of `verify.sh:`; the waiting line ends `; waiting for the release.` The holder's own session still passes its hold (`caller_holds_only_own`).
+- Wait, check and launch lines name the oldest hold in force that the calling session does not own, with that hold's reason. A caller with no owning session sees the oldest hold. The own-hold check and the named hold use the same hold list.
 
 ### The launch gate: `scripts/hooks/pre-tool-use-brp-launch-gate.sh`
 
@@ -146,12 +147,19 @@ Removing a hard link in another target does not change this check.
 The pass stops when successful deletions cover
 the shortfall.
 
-`recent_minutes=60` in `[sweep]` of `config/lint.conf` puts targets used in the
-last hour after all older targets. Recent output can go when the older output
-cannot meet the floor. The per-target budget sweep uses the same rule for build
-units: older units first, then recent units. Within each group, whole days
-since last use come first, then oldest compile time. Orphaned
-copies and the separate rustdoc index limit keep their existing rules.
+The floor takes the least recently used idle target first, then orders build
+units within that target by use. Recent targets are not held back. After each
+scan that finds free space under the floor, it writes one `floor_scan`
+build-log row; a dry run writes none. The row records `at`, `free_after_scan` (bytes),
+`floor` (bytes), `shortfall` (bytes), and `idle_targets` in oldest-first order.
+Each idle target has `folder`, `last_use` (epoch seconds), and `bytes` (allocated
+file bytes measured in the scan). These rows keep the scan's capacity and use
+evidence for later replay.
+
+`recent_minutes=60` orders only build units inside one target under its budget:
+older units first, then recent units. Within each group, whole days since last
+use come first, then oldest compile time. Orphaned copies and the separate
+rustdoc index limit keep their existing rules.
 
 The timed tmp sweep keeps top-level `/tmp/claude` entries and direct
 `unit`/`delegate` run folders without recorded end evidence until they are
@@ -221,20 +229,13 @@ the log does not record that connection. Journal retention also limits the evide
 
 ### Copy records and lifetime
 
-`scratch.shared_build_folder(source)` returns `SharedBuildFolder(path,
-repo_identity)`, a folder a caller can set as `CARGO_BUILD_BUILD_DIR`. No caller
-uses it: `copies.py` seeds each copy's own build folder, because the
-verify-copies measurement (2026-10-30, case D) spent 68.7 of 69.0 s waiting on
-the shared folder's build lock. A later resources phase removes it. It calls
-`memory_admit.git_identity` only when used. The repository key alone names the
-folder under `~/.cache/claude-builds` (`SCRATCH_SHARED_BUILD_ROOT` overrides the
-root); each use updates the folder's one `.lint-sweep-used` stamp. An unknown
-repository returns `NoSharedBuildFolder(reason)` and keeps its own build folder.
-The shared folder outlives individual copy tasks, uses Cargo's build locks and
-is swept as one target by its own last use. A copy record can name its shared
-target; ending the copy never removes that target. The existing
-`style-sync-target` also outlives its production task and keeps `sync.lock`
-across checkout creation, lint and cleanup.
+Copies seed their own build folders. The unused per-repository Cargo folder
+helper was removed: the verify-copies measurement (2026-10-30, case D) spent
+68.7 of 69.0 s waiting on that folder's build lock. New copy records do not
+write its path; old records still load and the old field has no effect.
+The `style-sync-target` still outlives its production task and keeps
+`sync.lock` across checkout creation, lint and cleanup. The sweep still reads
+Cargo's general `build.build-dir` templates.
 
 `/tmp/claude/copies` is a kept root, with copies at `<pair>/<copy>`. The tmp sweep judges each copy separately and removes an empty pair; the folder audit and scratch guard keep the root. `scratch.register_copy` writes `.scratch.json` atomically with source path and commit, copy commit, target mode, seed source, borrowed git directory, owner unit, task, land target and copy identity. A phase record also names its run directory and phase id. Registration, renew, hand-over, task end and removal use one read/change/publish path under the copy's record lock. Only `.scratch.json` and `.claude-busy` are excluded in the copy's own Git exclude file; ordinary untracked files keep the copy.
 
