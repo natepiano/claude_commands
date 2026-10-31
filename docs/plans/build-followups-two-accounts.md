@@ -2947,7 +2947,7 @@ A rerun of a stopped `accounts.py setup`, group move or five-hour wait finishes 
 - `scripts/production/ci_points.py`, `scripts/production/merge_checkpoint.py` — callers.
 - `scripts/production/test_ci_points.py` — memory-wait stderr with the failing check on stdout.
 
-### Phase 101d — A CI point validates one fixed commit  · status: todo
+### Phase 101d — A CI point validates one fixed commit  · status: done
 
 **Depends on:** Phase 101c (order only; both edit `scripts/production/ci_points.py`).
 
