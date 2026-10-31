@@ -24,7 +24,7 @@ from scripts.herdr import fake_herdr
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.production.cli_fixture import invoke_cli
 from scripts.production.rename_test_support import bind_staff_fixture
-from scripts.production.staff_test_support import StaffTestCase
+from scripts.production.staff_test_support import StaffTestCase, unit_membership
 from scripts.shutdown import stop_resume
 from scripts.production import staff
 from scripts.lib.atomic_file import write_text_atomic
@@ -431,10 +431,12 @@ class UnitRenameFixture(StaffTestCase):
         The session and its pane label are called `name`, the unit's stem when it is empty.
         """
         name = name or unit.removesuffix("-unit")
+        row = unit_membership(SLUG, unit)
         held = fake_showrunner.write_session(self.root / "state/sessions", name, session_id)
         self.addCleanup(held.close)
         fake_unit_host.write(self.env, [fake_unit_host.HostedUnit(
-            f"demo-{unit}", "w1:p1", {"SHOWRUNNER_UNIT": SLUG, "SHOWRUNNER_UNIT_ID": unit}, label=name)])
+            f"demo-{unit}", "w1:p1", {"SHOWRUNNER_UNIT": SLUG, "SHOWRUNNER_UNIT_ID": unit,
+                                    "STAFF_ID": row.id}, label=name)])
         fake_unit_host.place_process(self.env, os.getpid(), "w1:p1", exec_shell=True)
 
         def end() -> None:

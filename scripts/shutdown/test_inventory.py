@@ -22,6 +22,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.lib.socket_test_support import short_socket_directory
+from scripts.production.staff_test_support import StaffTestCase, showrunner_relationship, unit_membership
 from test_support import ShutdownTestCase, linux_process_fixture
 from test_restart import entry, top_level, worker_session
 import shutdown_record
@@ -832,6 +833,7 @@ elif "comm=" in joined:
         self.write_session(UNKNOWN_PID, UNKNOWN_ID, "hidden-account", plain, updated_at=10)
 
     def make_production_state(self) -> None:
+        _ = unit_membership("build-followups", "shutdown-unit")
         production_doc = self.root / "build-followups-production.md"
         _ = production_doc.write_text("- **User zone:** America/Los_Angeles\n", encoding="utf-8")
         showrunner = self.notifier / "showrunner-build-followups"
@@ -1583,7 +1585,7 @@ class ProcessEnvironmentTests(unittest.TestCase):
         probe.assert_not_called()
 
 
-class RecoveryInventoryTests(unittest.TestCase):
+class RecoveryInventoryTests(StaffTestCase):
     root: Path = Path()
     proc: Path = Path()
     registry: Path = Path()
@@ -1592,6 +1594,8 @@ class RecoveryInventoryTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        super().setUp()
+        _ = showrunner_relationship("fixture")
         linux_process_fixture(self)
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.proc = self.root / "proc"
@@ -1609,6 +1613,7 @@ class RecoveryInventoryTests(unittest.TestCase):
         _ = fake_responses.write_text(json.dumps({"default": {"code": 0, "stdout": '{"sessions":[]}'}}))
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "HOME": str(self.root), "HERDR_PROC": str(self.proc), "NOTIFIER_SESSIONS_DIR": str(self.registry),
+            "XDG_CONFIG_HOME": str(self.root / ".config"),
             "NOTIFIER_STATE_DIR": str(self.notifier), "AGENT_NOTES_DIR": str(self.root / "notes"),
             "SHUTDOWN_STATE_DIR": str(self.root / "shutdown"), "SHUTDOWN_RUN_ROOT": str(self.root / "runs"),
             "UNIT_HISTORY_DIR": str(self.root / "history"),

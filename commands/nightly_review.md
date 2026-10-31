@@ -1,5 +1,5 @@
 ---
-description: Nightly read-only review with one proposal per mode. The timer runs config, rust, then messages at 01:00 on natedev.
+description: Read-only review with one proposal per mode, run on demand on natedev in the order config, rust, messages.
 argument-hint: config | rust | messages | config rust messages
 ---
 

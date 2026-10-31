@@ -23,6 +23,7 @@ import restart_support
 import shutdown
 import sessions
 from unit_staff_test_support import isolated_parents
+from scripts.production.staff_test_support import isolated_staff_file, showrunner_relationship
 from shutdown_record import SessionShutdown
 
 
@@ -97,6 +98,10 @@ class ShutdownTestCase(unittest.TestCase):
         faulthandler.dump_traceback_later(TEST_TIME_LIMIT_SECONDS, exit=True)
         self.addCleanup(faulthandler.cancel_dump_traceback_later)
         registry = Path(self.enterContext(tempfile.TemporaryDirectory())) / "sessions"
+        _ = self.enterContext(isolated_staff_file(registry.parent / "staff.json", {}))
+        # Seed the local owner record before subclasses select their modeled platform.
+        with patch.object(sys, "platform", "linux"):
+            _ = showrunner_relationship("fixture")
         empty_session_registry(self, registry)
         # Records and reports in these fixtures belong to natedev.
         _ = self.enterContext(patch.object(socket, "gethostname", return_value="natedev"))

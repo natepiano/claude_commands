@@ -24,7 +24,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.accounts import accounts, next_moves, outage_alerts, refusal_watch, role_map, unit_watchdog
 from scripts.accounts import test_refusal_watch as fixtures
-from scripts.production import showrunners
+from scripts.production import showrunners, staff
+from scripts.production.staff_test_support import isolated_staff_file, showrunner_relationship, unit_membership
 from scripts.shutdown import folder_trust, stop_resume
 from scripts.notify.push_texts import RenderedPush
 
@@ -71,6 +72,8 @@ class UnitWatchdogTests(unittest.TestCase):
         self.fixture.setUp()
         self.addCleanup(self.fixture.doCleanups)
         self.home = self.fixture.home
+        _ = self.enterContext(isolated_staff_file(self.home / "staff.json", {}))
+        _ = showrunner_relationship("fixture")
         self.doc = self.home / "fixture-production.md"
         self.units = {}
         self.runs = self.home / "runs"
@@ -111,6 +114,9 @@ class UnitWatchdogTests(unittest.TestCase):
     def write_doc(self) -> None:
         rows = ["# Fixture", "- **Production slug:** fixture", "## Units", "| Unit | Plan | Worktree |", "| --- | --- | --- |"]
         for name in self.units:
+            member = unit_membership("fixture", name)
+            if name in self.retired:
+                _ = staff.retire(member.id)
             tree = self.home / name
             tree.mkdir(exist_ok=True)
             _ = (tree / ".git").write_text("gitdir: scratch\n")
@@ -147,7 +153,7 @@ class UnitWatchdogTests(unittest.TestCase):
                       if owner["session_id"] in known else unit_lookup.ClaudeNotRunning())
             found[name] = unit_lookup.MarkedUnit(name, claude,
                 unit_lookup.Place("shared", name))
-        return unit_lookup.MarkedProductions({"fixture": found}, {})
+        return unit_lookup.group_marked_units(("fixture", unit) for unit in found.values())
 
     def die(self, *names: str) -> None:
         self.fixture.live[:] = [entry for entry in self.fixture.live if entry["sessionId"] not in names]
@@ -406,7 +412,7 @@ class UnitWatchdogTests(unittest.TestCase):
             if herdr.herdr_processes():
                 return self.marked()
             return unit_lookup.MarkedProductions({"fixture": {"unit": unit_lookup.MarkedUnit(
-                "unit", unit_lookup.ClaudeNotRunning(), unit_lookup.Place("shared", "unit"))}}, {})
+                "unit", unit_lookup.ClaudeNotRunning(), unit_lookup.Place("shared", "unit"))}}, {}, self.marked().members)
         with (patch.object(herdr, "_scan_herdr_processes", side_effect=[[], [fresh]]) as scans,
               patch.object(unit_lookup, "every_marked_unit", side_effect=observed),
               herdr.process_snapshot()):

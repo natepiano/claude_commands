@@ -59,6 +59,7 @@ import review_pool  # noqa: E402
 from scripts.production import showrunners  # noqa: E402
 import stall_watch  # noqa: E402
 import unit_lookup  # noqa: E402
+import herdr  # noqa: E402
 import unit_move  # noqa: E402
 import unit_names  # noqa: E402
 import unit_rename_sweep  # noqa: E402
@@ -93,6 +94,13 @@ class RenameWaiting(RenameRefused):
     """The unit is still stopping after STOP_WAIT_SECONDS: a rerun of apply resumes once it has stopped."""
 
 
+class StopIdentityEvidence(Enum):
+    """Whether the journal established a pane target, including explicitly having none."""
+
+    RECORDED = "recorded"
+    LEGACY_UNKNOWN = "legacy-unknown"
+
+
 class StopTarget(Protocol):
     """What the stop steps read: the unit's production and ids, and where its worktree is now.
     A rename and a transfer both stop a unit this way."""
@@ -107,6 +115,10 @@ class StopTarget(Protocol):
     # Bound before stopping, so relaunch keeps the conversation and account.
     account: str
     session_id: str
+    pane_session: str
+    pane_id: str
+    terminal_id: str
+    stop_identity: StopIdentityEvidence
 
     def worktree(self) -> Path: ...
 
@@ -139,6 +151,11 @@ class UnitRename:
     unit_tip: str = ""
     account: str = ""
     session_id: str = ""
+    # Exact place and terminal saved before stopping; conversation metadata can clear on exit.
+    pane_session: str = ""
+    pane_id: str = ""
+    terminal_id: str = ""
+    stop_identity: StopIdentityEvidence = StopIdentityEvidence.RECORDED
     # Why the unit branch took no merge: its work was in progress (an open phase or uncommitted work).
     kept: str = ""
     # The Claude session's name before the rename, which verify finds nowhere live afterwards.
@@ -156,7 +173,8 @@ class UnitRename:
         return Path(self.new_worktree if self.step >= step_number(_move_git) else self.old_worktree)
 
 
-REQUIRED = tuple(field.name for field in dataclasses.fields(UnitRename) if field.name not in ("step", "id_matches", "staff_id", *PROGRESS))
+PANE_IDENTITY_FIELDS = ("pane_session", "pane_id", "terminal_id")
+REQUIRED = tuple(field.name for field in dataclasses.fields(UnitRename) if field.name not in ("step", "id_matches", "staff_id", "stop_identity", *PANE_IDENTITY_FIELDS, *PROGRESS))
 LOCATION_FIELDS = ("doc", "checkout")
 
 
@@ -677,12 +695,33 @@ def shutdown_records(slug: str, units: tuple[str, ...], *, session_id: str = "")
     return found
 
 
+def _bind_live_pane(rename: StopTarget, marked: unit_lookup.MarkedUnit) -> None:
+    """Pin the terminal at the director's exact place before stopping its agent."""
+    try:
+        panes = herdr.Herdr(marked.place.session).panes()
+    except (herdr.HerdrFailure, OSError, ValueError) as error:
+        raise RenameRefused(f"{rename.old}: cannot read its director pane: {error}") from error
+    matches = [pane for pane in panes if pane["pane_id"] == marked.place.pane]
+    if len(matches) != 1 or not (terminal_id := matches[0].get("terminal_id", "")):
+        raise RenameRefused(f"{rename.old}: director pane has no unique terminal identity")
+    if sum(pane.get("terminal_id") == terminal_id for pane in panes) != 1:
+        raise RenameRefused(f"{rename.old}: director terminal identity is ambiguous")
+    if matches[0]["session_id"] not in (None, rename.session_id):
+        raise RenameRefused(f"{rename.old}: director pane conversation does not match")
+    rename.pane_session, rename.pane_id = marked.place.session, marked.place.pane
+    rename.terminal_id = terminal_id
+    rename.stop_identity = StopIdentityEvidence.RECORDED
+
+
 def bind_stop_target(rename: StopTarget) -> None:
     """Journal the director before changing the staff name or parent used to find it."""
     records = _unit_records(rename)
     if len(records) > 1:
         raise RenameRefused(f"{rename.old} has {len(records)} shutdown records; settle them first")
     marked = unit_lookup.marked_unit(rename.slug, rename.old)
+    if (records and marked is not None and isinstance(marked.claude, unit_lookup.LiveClaude)
+            and records[0]["session"]["session_id"] != marked.claude.session_id):
+        raise RenameRefused(f"{rename.old}: director does not match its shutdown record")
     conversation = unit_move.unit_conversation(marked, session_id=rename.session_id)
     if isinstance(conversation, unit_move.UnitConversation):
         rename.account, rename.session_id = conversation.account, conversation.session_id
@@ -692,9 +731,45 @@ def bind_stop_target(rename: StopTarget) -> None:
         raise RenameRefused(f"{rename.old}: session {marked.claude.session_id} has no pane launch account")
     elif rename.session_id and not rename.account:
         raise RenameRefused(f"{rename.old}: session {rename.session_id} has no pane launch account or shutdown record")
+    if marked is not None and isinstance(marked.claude, unit_lookup.LiveClaude):
+        _bind_live_pane(rename, marked)
 
 
-def stop_unit(rename: StopTarget, _save: Callable[[], None]) -> None:
+def _stopped_pane(rename: StopTarget) -> unit_move.UnitPane | None:
+    """Recover the exact journaled terminal, even after its agent metadata clears."""
+    if not rename.pane_session or not rename.pane_id or not rename.session_id or not rename.terminal_id:
+        raise RenameRefused(f"{rename.old}: no journaled terminal identity for pane recovery")
+    client = herdr.Herdr(rename.pane_session)
+    try:
+        panes = client.panes()
+    except (herdr.HerdrFailure, OSError, ValueError) as error:
+        raise RenameRefused(f"{rename.old}: cannot read its journaled pane: {error}") from error
+    if any(not pane.get("terminal_id") for pane in panes):
+        raise RenameRefused(f"{rename.old}: pane list has incomplete terminal identity")
+    matches = [pane for pane in panes if pane.get("terminal_id") == rename.terminal_id]
+    if any(pane["session_id"] == rename.session_id and pane.get("terminal_id") != rename.terminal_id
+           for pane in panes):
+        raise RenameRefused(f"{rename.old}: journaled conversation is on another terminal")
+    if not matches:
+        return None  # A completed close is safe to replay.
+    if len(matches) != 1:
+        raise RenameRefused(f"{rename.old}: journaled terminal identity is ambiguous")
+    if matches[0]["pane_id"] != rename.pane_id:
+        raise RenameRefused(f"{rename.old}: journaled terminal moved to pane {matches[0]['pane_id']}")
+    if matches[0]["session_id"] not in (None, rename.session_id):
+        raise RenameRefused(f"{rename.old}: journaled terminal holds another conversation")
+    try:
+        activity = client.pane_activity(rename.pane_id)
+    except (herdr.HerdrFailure, OSError, ValueError) as error:
+        raise RenameRefused(f"{rename.old}: cannot read journaled pane activity: {error}") from error
+    if not isinstance(activity, herdr.PaneAtShell):
+        raise RenameRefused(f"{rename.old}: journaled pane has foreground work")
+    found = unit_lookup.MarkedUnit(rename.old, unit_lookup.ClaudeNotRunning(),
+                                  herdr.HerdrPlace(rename.pane_session, rename.pane_id))
+    return unit_move.unit_pane(found, rename.slug)
+
+
+def stop_unit(rename: StopTarget, save: Callable[[], None]) -> None:
     """Stop the unit Claude through the shared API before moving its files.
 
     A live process cannot change its env mark and the director's context holds the old paths, so a
@@ -705,9 +780,24 @@ def stop_unit(rename: StopTarget, _save: Callable[[], None]) -> None:
     _refuse_detached_worktree(rename)
     try:
         found = unit_lookup.marked_unit(rename.slug, rename.old)
+        if rename.session_id and (found is None or isinstance(found.claude, unit_lookup.LiveClaude)
+                                  and found.claude.session_id != rename.session_id):
+            found = next((marked for _, marked in unit_lookup.observed_unit_marks()
+                          if isinstance(marked.claude, unit_lookup.LiveClaude)
+                          and marked.claude.session_id == rename.session_id), None)
     except OSError as error:
         raise RenameRefused(f"{rename.old}: cannot tell whether Claude is running: {error}") from error
-    pane = unit_move.unit_pane(found, rename.slug)
+    live = found is not None and isinstance(found.claude, unit_lookup.LiveClaude)
+    if rename.stop_identity is StopIdentityEvidence.LEGACY_UNKNOWN and not live:
+        raise RenameRefused(f"{rename.old}: journal has no terminal identity; settle the pane by hand")
+    if (not rename.pane_id or rename.stop_identity is StopIdentityEvidence.LEGACY_UNKNOWN) and found is not None and isinstance(found.claude, unit_lookup.LiveClaude):
+        rename.session_id = found.claude.session_id
+        _bind_live_pane(rename, found)
+        save()
+    if rename.pane_id and not rename.terminal_id:
+        raise RenameRefused(f"{rename.old}: no journaled terminal identity for pane recovery")
+    recovering_pane = bool(rename.pane_id) and (found is None or not isinstance(found.claude, unit_lookup.LiveClaude))
+    pane = None if recovering_pane else unit_move.unit_pane(found, rename.slug)
     from scripts.shutdown import stop_resume
     records = _unit_records(rename)
     if len(records) > 1:
@@ -736,6 +826,8 @@ def stop_unit(rename: StopTarget, _save: Callable[[], None]) -> None:
             raise RenameRefused(f"{rename.old}: an old stop record has unresolved cleanup issues; settle it: "
                                 + f"cd ~/.claude && {settle}")
     _stop_runs(rename)
+    if rename.pane_id and (recovering_pane or pane is not None):
+        pane = _stopped_pane(rename)
     unit_move.close_unit_pane(pane)
 
 
@@ -1044,10 +1136,12 @@ def _session_failures(rename: UnitRename) -> list[str]:
     if found is None or not isinstance(found.claude, unit_lookup.LiveClaude):
         failures.append(f"{rename.new} is not running; relaunch it with shutdown.py restart --here --only {rename.session_id}")
     # When the id already matched, the mark is the new id too; only the session name changed.
-    old = marked.get(rename.old)
-    if old is not None and not rename.id_matches and isinstance(old.claude, (unit_lookup.LiveClaude, unit_lookup.ClaudeUnknown)):
-        failures.append(f"a session still carries the mark {rename.old}: "
-                        + unit_lookup.holder_text(old))
+    if not rename.id_matches:
+        for slug, old in unit_lookup.observed_unit_marks():
+            if (slug == rename.slug and old.unit == rename.old
+                    and isinstance(old.claude, (unit_lookup.LiveClaude, unit_lookup.ClaudeUnknown))):
+                failures.append(f"a session still carries the mark {rename.old}: "
+                                + unit_lookup.holder_text(old))
     new_stem = unit_names.stem(rename.new)
     if found is not None and isinstance(found.claude, unit_lookup.LiveClaude):
         if found.claude.name != new_stem:
@@ -1221,6 +1315,8 @@ def step_number(run: Callable[[UnitRename, Callable[[], None]], None]) -> int:
 
 def _load(path: Path) -> UnitRename:
     fields = unit_move.json_object(read_json(path))
+    stop_identity = (StopIdentityEvidence.RECORDED if all(name in fields for name in PANE_IDENTITY_FIELDS)
+                     else StopIdentityEvidence.LEGACY_UNKNOWN)
     step = fields.get("step")
     id_matches = fields.get("id_matches", False)
     if type(id_matches) is not bool:
@@ -1239,7 +1335,13 @@ def _load(path: Path) -> UnitRename:
     fields.update(doc=str(production.doc), checkout=str(production.checkout))
     merged, doc_commit, unit_tip, account, session_id, kept, old_session = (cast(str, fields.get(name, ""))
                                                                             for name in PROGRESS)
+    pane_session, pane_id, terminal_id = (fields.get(name, "") for name in PANE_IDENTITY_FIELDS)
+    if (not isinstance(pane_session, str) or not isinstance(pane_id, str) or not isinstance(terminal_id, str)
+            or bool(pane_session) != bool(pane_id) or terminal_id and not pane_id):
+        raise RenameRefused(f"{path}: invalid journaled pane identity")
     return UnitRename(*(cast(str, fields[name]) for name in REQUIRED), step=step, merged=merged,
+                      pane_session=pane_session, pane_id=pane_id, terminal_id=terminal_id,
+                      stop_identity=stop_identity,
                       doc_commit=doc_commit, unit_tip=unit_tip, account=account, session_id=session_id, kept=kept,
                       old_session=old_session, id_matches=id_matches, staff_id=staff.StaffId(cast(str, fields["staff_id"])))
 
@@ -1248,6 +1350,10 @@ def _save(path: Path, rename: UnitRename) -> None:
     # The claim holds until the record names the new unit: from then on the relaunch, and any
     # later launch, finds every name moved.
     saved = cast(dict[str, object], asdict(rename))
+    del saved["stop_identity"]
+    if rename.stop_identity is StopIdentityEvidence.LEGACY_UNKNOWN:
+        for name in PANE_IDENTITY_FIELDS:
+            del saved[name]
     for name in LOCATION_FIELDS:
         del saved[name]
     write_json(path, {**saved, "done": rename.step == len(STEPS),

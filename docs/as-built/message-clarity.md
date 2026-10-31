@@ -309,7 +309,7 @@ The user asked for this on 2026-10-23: each permission alert starts a root cause
 
 ### Nightly `messages` mode
 
-- `scripts/nightly_review/nightly_review.py`: the modes are `MODES = ("config", "rust", "messages")`. The timer runs them in that order at 01:00 on natedev. The command scope is `<Scope mode="messages">` in `commands/nightly_review.md`; its one write outside DIR is the `review.jsonl` sample lines.
+- `scripts/nightly_review/nightly_review.py`: the modes are `MODES = ("config", "rust", "messages")`. A run on demand does them in that order on natedev; no timer runs them since /etc/nixos cc9a0e9 (2026-10-19). The command scope is `<Scope mode="messages">` in `commands/nightly_review.md`; its one write outside DIR is the `review.jsonl` sample lines.
 - `live_message_counts(review.jsonl, since)` counts the live verdicts: messages, failures (`rewrite|ask|failed|withhold`), failures by rule, and `Unreviewed` (`unreviewed:` or `review: off`). It also counts registry templates sent despite a failed review. It skips `replay`, `dry` and `sample` lines and `kind: "question"` lines.
 - `showrunner_transcripts(since)` finds transcripts. It maps each `~/.claude/sessions/*.json` record that belongs to a registered showrunner, a production session, or `natedev` to its transcript in that session's own account home. A recorded transcript path is used first. A transcript counts only if it has an assistant reply since the cutoff.
 - `messages(since)` runs `review.py sample <transcripts> --limit 20 --since <iso>` with timeout `20 * review.user_send_seconds() + 15`.

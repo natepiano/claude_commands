@@ -12,6 +12,7 @@ import unittest
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Literal, cast, final
 from unittest import mock
 
@@ -93,7 +94,9 @@ def write(env: Mapping[str, str], units: Sequence[HostedUnit]) -> None:
             shell = shells[(name, unit.pane)]
             process(env, shell, server, ["zsh"], {**unit.marks, "HERDR_PANE_ID": unit.pane, "HERDR_SESSION": name})
             responses[f"--session {name} pane process-info --pane {unit.pane}"] = {
-                "code": 0, "stdout": json.dumps({"result": {"process_info": {"shell_pid": shell}}})}
+                "code": 0, "stdout": json.dumps({"result": {"process_info": {
+                    "shell_pid": shell, "foreground_process_group_id": shell,
+                    "foreground_processes": [{"name": "zsh"}]}}})}
             responses[f"--session {name} pane close {unit.pane}"] = {
                 "code": 0, "stdout": "", "remove_paths": [str(Path(env["HERDR_PROC"]) / str(shell))]}
             for source in ("recent", "recent-unwrapped"):
@@ -236,6 +239,10 @@ class PaneShellFixture:
             server = pid + 1
             process(self.environment, server, 0, ["herdr", "--session", session, "server"], {})
             herdr_listener(Path(self.environment["HERDR_PROC"]), server, session, self.environment)
+            responses_file = Path(self.environment["FAKE_HERDR_RESPONSES"])
+            responses = cast(dict[str, CommandResponse], json.loads(responses_file.read_text()))
+            responses[f"--session {session} pane list"] = responses[f"--session {self.place.session} pane list"]
+            _ = responses_file.write_text(json.dumps(responses))
             parent, os_session = server, pid
         process(self.environment, pid, parent, ["visitor"], marks,
                 session=os_session, cwd=self.worktree)
@@ -331,4 +338,5 @@ def record_shutdown(case: unittest.TestCase, pane: PaneShellFixture, path: Path,
     _ = case.enterContext(mock.patch.object(rename_unit, 'run_shutdown', side_effect=shutdown))
     def wait_for_stop(_seconds: float) -> None:
         case.assertTrue(stopped_event.wait(TEST_HANG_GUARD_SECS), 'fake shutdown did not publish its stop')
-    _ = case.enterContext(mock.patch.object(time, 'sleep', side_effect=wait_for_stop))
+    _ = case.enterContext(mock.patch.object(rename_unit, 'time',
+        SimpleNamespace(monotonic=time.monotonic, sleep=wait_for_stop)))
