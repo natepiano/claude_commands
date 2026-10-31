@@ -2974,48 +2974,20 @@ A rerun of a stopped `accounts.py setup`, group move or five-hour wait finishes 
 
 ### Phase 101e — One helper reports a failed command's output  · status: done
 
-**Depends on:** Phase 101c (the helper).
+#### As-built
 
-#### Work Order
-
-**Goal:** No caller loses a failure's cause behind stderr noise. `stderr.strip() or stdout.strip()` (either order) appears in 24 non-test modules after the 101e phase-start merge. Each copy drops stdout whenever stderr holds any text. Natedev showrunner ruling, 2026-10-30: current, after 101d.
-
-**Spec:**
-- Every non-test copy calls `scripts/lib/process_failure.py`'s helper. Local wrappers such as `waiting.detail` go away or become one call to it.
-- A check keeps new copies out: a test or lint scan of `scripts/` fails on the pattern outside the helper.
-- No caller's other behavior changes.
+- `failure_detail(result: subprocess.CompletedProcess[str], *, lines: int = 20) -> str` in `scripts/lib/process_failure.py` is the one way to describe a failed command. It returns labelled tails of both streams, `stderr: …` first and then `stdout: …`, each cut to the last `lines` lines. It omits an empty stream. When both streams are empty, it returns `exit <code>`. A `lines` value below 1 raises `ValueError`.
+- All 24 non-test modules that had a local `stderr.strip() or stdout.strip()` fallback (either order) now call `failure_detail`. `waiting.detail` stays as a one-call wrapper.
+- Callers keep their command-name prefix (`send.py: …`, `mesh: …`) in front of `failure_detail(result)`, so each message still names its source.
+- A scan test walks every non-test `.py` file under `scripts/` with `ast` and fails on a stream fallback outside `process_failure.py`. Conditions that test both streams (`if result.stdout.strip() or result.stderr.strip()`) do not match.
 
 **Files:**
-- `scripts/bevy_upgrade/upgrade_schedule.py`
-- `scripts/build_hold/build_hold.py`
-- `scripts/direct/assign.py`
-- `scripts/direct/review_pool.py`
-- `scripts/herdr/herdr.py`
-- `scripts/lib/agents_registry.py`
-- `scripts/lib/main_sync.py`
-- `scripts/lint/sweep.py`
-- `scripts/message/escalate.py`
-- `scripts/nightly_review/nightly_review.py`
-- `scripts/production/add_unit.py`
-- `scripts/production/codex_winddown.py`
-- `scripts/production/dailies_input.py`
-- `scripts/production/merge_checkpoint.py`
-- `scripts/production/merge_gate.py`
-- `scripts/production/production_lifecycle.py`
-- `scripts/production/unit_move.py`
-- `scripts/production/update_registration.py`
-- `scripts/production/waiting.py`
-- `scripts/shutdown/stop.py`
-- `scripts/style/style_plan.py`
-- `scripts/style/style_proposals.py`
-- `scripts/style/style_sync.py`
-- `scripts/whoami/quota_alert.py`
-- `scripts/lib/process_failure.py` — the one helper
-- `scripts/lib/test_process_failure.py` — the scan test that fails on a planted copy
-- `scripts/` — tests that assert the old text
+- `scripts/lib/process_failure.py` — `failure_detail`
+- `scripts/lib/test_process_failure.py` — the scan test and the helper's output tests
+- `scripts/production/unit_status_test_support.py` — the fixed list of lib files the unit-status fixture copies; includes `process_failure.py`
+- `scripts/production/` — 9 callers: `add_unit`, `codex_winddown`, `dailies_input`, `merge_checkpoint`, `merge_gate`, `production_lifecycle`, `unit_move`, `update_registration`, `waiting`
+- `scripts/{bevy_upgrade,build_hold,direct,herdr,lib,lint,message,nightly_review,shutdown,style,whoami}/` — the other 15 callers; their tests expect the `stderr:`/`stdout:` labels
 
-**Workers:** 2 writers
-- impl — the 9 `scripts/production/` modules
-- test — the other 15 modules, the scan test and the tests that assert the old text
+**Gotchas:** `unit_status_test_support.py` copies lib files into its fixture by a fixed list. A new lib helper that a copied module imports must join that list, or the unit-status suites fail on import.
 
-**Acceptance gate:** each touched module's suite passes; basedpyright 0/0/0 on each changed file and its callers; the scan test fails on a planted copy.
+**Ruled out:** a local `stderr or stdout` fallback at a call site, because it drops one stream; the scan test fails on it.
