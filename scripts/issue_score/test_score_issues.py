@@ -21,6 +21,7 @@ from urllib.request import Request
 
 from scripts.issue_score import client, questions, score_issues, vault
 from scripts.issue_score import records as run_records
+from scripts.issue_score.test_decide import choice_answer
 
 # proposals_table.py imports its production neighbors by bare name.
 PRODUCTION_DIR = str(Path(__file__).resolve().parents[1] / "production")
@@ -182,6 +183,20 @@ class ScoreIssuesTests(unittest.TestCase):
         self.assertIn("goal 1 - Ship Hana (alignment ⭐⭐⭐⭐ / ⭐⭐⭐ (unsure)) / "
                       + "2 - Find Collaborators (alignment ⭐⭐ / ⭐⭐⭐ (unsure)) (unsure)", alternatives)
 
+    def test_propose_unsure_area_shows_the_top_two_averaged_choices_as_alternatives(self) -> None:
+        _ = self.issue("Vocabulary rendering")
+        _ = self.issue("Vocabulary tooling", area="tooling")
+        main = cast(client.Response, json.loads((FIXTURES / "main_response.json").read_text()))
+        area = cast(client.Response, json.loads((FIXTURES / "area_response.json").read_text()))
+        area["answers"]["area"] = choice_answer({"rendering": .62, "tooling": .38})
+        area["answers"]["area_reverse"] = choice_answer({"tooling": .42, "rendering": .58})
+        with mock.patch.object(client, "urlopen", side_effect=self.proposal_replay(main, area)) as http:
+            ranking, alternatives = self.proposal().splitlines()
+        self.assertEqual(http.call_count, 2)
+        self.assertEqual(ranking.split(" · ")[-1], "area rendering (unsure)")
+        self.assertTrue(alternatives.startswith("Alternatives: "))
+        self.assertEqual(alternatives.split(" · ")[-1], "area rendering / tooling (unsure)")
+
     def test_propose_ranking_scores_only_top_values_even_when_goal_is_unsure(self) -> None:
         _ = self.issue("Vocabulary rendering")
         _ = self.issue("Vocabulary tooling", area="tooling")
@@ -276,7 +291,7 @@ class ScoreIssuesTests(unittest.TestCase):
                     }}
                 with mock.patch.object(client, "urlopen", side_effect=self.proposal_replay(main, area)):
                     area_text = self.proposal().splitlines()[0].split(" · ")[-1]
-                expected = "area unfiled (hint: rendering) (agent proposes)" if fallback else "area unfiled (agent proposes)"
+                expected = "area unfiled (hint: rendering)" if fallback else "area unfiled"
                 self.assertEqual(area_text, expected)
 
     def test_propose_missing_or_empty_definitions_exits_two_with_path_before_http(self) -> None:
@@ -466,8 +481,11 @@ class ScoreIssuesTests(unittest.TestCase):
         cached = self.records(cached_path)[0]
         current_decisions = cached["decided_fields"]
         stale_decisions = dict(current_decisions)
-        for field in ("area", "backlog_urgency", "backlog_effort"):
-            stale_decisions[field] = dict(cast(dict[str, object], current_decisions[field]), certainty="sure")
+        expected_certainty = {"area": "sure", "backlog_urgency": "unsure", "backlog_effort": "unsure"}
+        for field, certainty in expected_certainty.items():
+            self.assertEqual(cast(dict[str, object], current_decisions[field])["certainty"], certainty)
+            stale_decisions[field] = dict(cast(dict[str, object], current_decisions[field]),
+                                          certainty="unsure" if certainty == "sure" else "sure")
         cached["decided_fields"] = stale_decisions
         _ = cached_path.write_text(json.dumps(cached) + "\n", encoding="utf-8")
         cached_bytes = cached_path.read_bytes()
@@ -481,9 +499,9 @@ class ScoreIssuesTests(unittest.TestCase):
         self.assertEqual(refreshed["answers"], cached["answers"])
         self.assertEqual(refreshed["payloads"], cached["payloads"])
         self.assertEqual(refreshed["decided_fields"], current_decisions)
-        for field in ("area", "backlog_urgency", "backlog_effort"):
+        for field, certainty in expected_certainty.items():
             with self.subTest(field=field):
-                self.assertEqual(cast(dict[str, object], refreshed["decided_fields"][field])["certainty"], "unsure")
+                self.assertEqual(cast(dict[str, object], refreshed["decided_fields"][field])["certainty"], certainty)
         self.assertEqual(cached_path.read_bytes(), cached_bytes)
         self.assertEqual((self.state / "spend.jsonl").read_bytes(), ledger_before)
 

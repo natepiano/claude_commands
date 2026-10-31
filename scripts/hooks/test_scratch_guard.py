@@ -93,6 +93,19 @@ class ScratchGuardTests(unittest.TestCase):
             self.assertEqual(self.write_hook("Write", "file_path", path), "", path)
         self.assert_refused(f"mkdir {rust}/scratch/{self.name}", f"{rust}/scratch/{self.name}")
 
+    def test_copies_root_allows_a_new_pair_and_copy(self) -> None:
+        guard = importlib.import_module(HOOK.stem)
+        private = self.temp / "claude"
+        loose_folder = cast(Callable[[Path], Path | None], guard.loose_folder)
+
+        def private_root(text: str) -> Path:
+            return private if text == "/tmp/claude" else Path(text)
+
+        with (mock.patch.object(guard, "roots", return_value=[private]),
+              mock.patch.object(guard, "real", side_effect=private_root)):
+            self.assertIsNone(loose_folder(private / "copies" / "show-maker" / "21-gate"))
+            self.assertEqual(loose_folder(private / "loose" / "21-gate"), private / "loose")
+
     def test_deleted_session_temp_folder_is_restored_for_each_tool(self) -> None:
         own = self.session_root / "scratch-session"
         own.mkdir(parents=True, mode=0o700)
