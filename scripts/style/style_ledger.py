@@ -1750,10 +1750,9 @@ def _is_ignored(path: str, patterns: tuple[str, ...]) -> bool:
     )
 
 
-def _tip(repo: Path, commit: str) -> RepositoryTip:
-    commit = _git(repo, "rev-parse", "--verify", f"{commit}^{{commit}}")
-    tree = _git(repo, "rev-parse", f"{commit}^{{tree}}")
-    listing = _git(repo, "ls-tree", "-rz", "--full-tree", commit)
+def tree_entries(repo: Path, revision: str) -> dict[str, TreeEntry]:
+    """Read the complete inventory of a commit or bare tree, retaining modes and object kinds."""
+    listing = _git(repo, "ls-tree", "-rz", "--full-tree", revision)
     entries: dict[str, TreeEntry] = {}
     for entry in listing.split("\0"):
         if not entry:
@@ -1761,6 +1760,13 @@ def _tip(repo: Path, commit: str) -> RepositoryTip:
         metadata, path = entry.split("\t", 1)
         mode, kind, name = metadata.split()
         entries[path] = TreeEntry(mode, kind, name)
+    return entries
+
+
+def _tip(repo: Path, commit: str) -> RepositoryTip:
+    commit = _git(repo, "rev-parse", "--verify", f"{commit}^{{commit}}")
+    tree = _git(repo, "rev-parse", f"{commit}^{{tree}}")
+    entries = tree_entries(repo, commit)
     blobs = {path: entry.object for path, entry in entries.items() if entry.kind == "blob"}
     configs = (".claude/config/berth.toml", "rustfmt.toml", ".rustfmt.toml")
     inputs = {path: blob for path, blob in blobs.items() if PurePosixPath(path).name == "Cargo.toml" or path in configs}
