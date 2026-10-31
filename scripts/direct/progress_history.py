@@ -3672,9 +3672,9 @@ def _current_worker_cells(
 def _worker_turn_windows(session_dir: Path, windows: list[StageWindow]) -> list[StageWindow]:
     """Current worker notes show accepted-turn telemetry; historical windows stay intact."""
     try:
-        roster = _json_object((session_dir / "mesh_roster.json").read_text(encoding="utf-8")) or {}
-    except OSError:
-        return windows
+        roster = worker_lifecycle.read_worker_state(session_dir / "mesh_roster.json")
+    except worker_lifecycle.WorkerStateUnreadable:
+        return [{**window, "worker": "unavailable"} for window in windows]
     from scripts.agents.codex_mesh import recorded_turn_settings
 
     slots: dict[str, str] = {}

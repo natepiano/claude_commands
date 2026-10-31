@@ -20,6 +20,7 @@ from types import FrameType
 from typing import NoReturn, cast, final
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.agents import worker_lifecycle
 from scripts.lib.process_failure import failure_detail
 from scripts.agents import codex_mesh
 from scripts.direct import workers
@@ -70,16 +71,12 @@ def text(value: object) -> str:
 
 
 def read_object(path: Path) -> dict[str, object]:
-    try:
-        return object_map(cast(object, json.loads(path.read_text())))
-    except (OSError, ValueError):
-        return {}
+    return worker_lifecycle.read_worker_state(path)
 
 
 def read_roster(run: Path, name: str) -> dict[str, object]:
-    with (run / "mesh_roster.json").open() as handle:
-        fcntl.flock(handle, fcntl.LOCK_SH)
-        return object_map(object_map(cast(object, json.load(handle))).get(name))
+    with worker_lifecycle.locked_state(run / "mesh_roster.json", mode=fcntl.LOCK_SH) as state:
+        return object_map(state.read_object().get(name))
 
 
 def refuse(message: str) -> NoReturn:
@@ -328,7 +325,7 @@ class Dispatch:
                 if not record.get("adopted_to") and record.get("thread_id"):
                     identity = read_object(self.claim.identity_path)
                     identity["worker_id"] = record["thread_id"]
-                    _ = self.claim.identity_path.write_text(json.dumps(identity))
+                    worker_lifecycle.WorkerStateFile(self.claim.identity_path).publish(json.dumps(identity))
         workers.release_allocation(self.run, self.worker, self.reservation)
 
 
@@ -348,7 +345,7 @@ def claim_worker(dispatch: Dispatch) -> WorkerClaim:
         if (identity and identity != expected) or not record.get("thread_id"):
             refuse(f"{dispatch.worker} has no matching durable worker identity for slot {slot}")
         if not identity:
-            _ = identity_path.write_text(json.dumps(expected))
+            worker_lifecycle.WorkerStateFile(identity_path).publish(json.dumps(expected))
         claim_path = dispatch.run / f"impl_claim_{slot}.json"
         previous_claim = read_object(claim_path)
         pid = previous_claim.get("pid")
@@ -401,7 +398,7 @@ def claim_worker(dispatch: Dispatch) -> WorkerClaim:
         if record.get("status") == "ended":
             _ = dispatch.mesh_call("reopen", capture=True)
         dispatch.claim_follow()
-        _ = claim_path.write_text(json.dumps({"pid": os.getpid(), "worker": dispatch.worker, "turn_id": ""}))
+        worker_lifecycle.WorkerStateFile(claim_path).publish(json.dumps({"pid": os.getpid(), "worker": dispatch.worker, "turn_id": ""}))
         # Each turn runs at the caller's model:effort (agents.conf default or explicit override).
         return WorkerClaim(identity_path, slot, dispatch.model, dispatch.effort)
 
@@ -512,7 +509,7 @@ def execute(dispatch: Dispatch, paths: list[str]) -> int:
     dispatch.model, dispatch.effort = dispatch.claim.model, dispatch.claim.effort
     shown = workers.shown_name(dispatch.run, dispatch.worker)
     with (phase_dir / "dispatch.lock").open("a+") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        worker_lifecycle.acquire_flock(lock, mode=fcntl.LOCK_EX)
         numbers = [int(path.stem.split("_")[1]) for path in phase_dir.glob("dispatch_*_paths.json")]
         number = max(numbers, default=0) + 1
         _ = (phase_dir / f"dispatch_{number}_paths.json").write_text(json.dumps(
@@ -565,9 +562,8 @@ def execute(dispatch: Dispatch, paths: list[str]) -> int:
                     code = 1
                 else:
                     pending_path = dispatch.run / f"{dispatch.worker}.pending.json"
-                    with pending_path.open() as inbox:
-                        fcntl.flock(inbox, fcntl.LOCK_SH)
-                        pending = object_map(cast(object, json.load(inbox)))
+                    with worker_lifecycle.locked_state(pending_path, mode=fcntl.LOCK_SH) as inbox:
+                        pending = inbox.read_object()
                     needs_follow = dispatch.stage_message in cast(list[object], pending.get("messages", []))
                     if needs_follow:
                         dispatch.claim_follow()

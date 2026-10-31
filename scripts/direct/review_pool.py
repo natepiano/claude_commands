@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Literal, NotRequired, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.agents import worker_lifecycle
 from scripts.lib.process_failure import failure_detail
 from scripts.production.showrunners import canonical_slug, timer_docs  # noqa: E402
 
@@ -199,7 +200,7 @@ class ProductionPool:
     def locked(self, *, write: bool = True) -> Generator[Pool, None, None]:
         self.directory.mkdir(parents=True, exist_ok=True)
         with (self.directory / "pool.lock").open("a+") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
+            worker_lifecycle.acquire_flock(lock, mode=fcntl.LOCK_EX)
             try:
                 path = self.directory / "pool.json"
                 if path.exists():
@@ -211,7 +212,7 @@ class ProductionPool:
                 if write:
                     self.save(pool)
             finally:
-                fcntl.flock(lock, fcntl.LOCK_UN)
+                worker_lifecycle.acquire_flock(lock, mode=fcntl.LOCK_UN)
 
     def save(self, pool: Pool) -> None:
         """Write while the caller holds locked(write=False) or locked()."""
@@ -250,7 +251,7 @@ class ProductionPool:
             try:
                 with path.open("rb") as prompt:
                     try:
-                        fcntl.flock(prompt, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        worker_lifecycle.acquire_flock(prompt, mode=fcntl.LOCK_EX | fcntl.LOCK_NB)
                     except BlockingIOError:
                         continue
                     path.unlink(missing_ok=True)
@@ -361,7 +362,7 @@ def _prime(production: ProductionPool, reviewer_type: ReviewerType, content: byt
                 _ = copied.write(content)
         # A shared file lock protects an unpublished prime from prompt collection.
         prompt = prompt_path.open("rb")
-        fcntl.flock(prompt, fcntl.LOCK_SH)
+        worker_lifecycle.acquire_flock(prompt, mode=fcntl.LOCK_SH)
         current = pool.templates.get(reviewer_type)
         unchanged = current is not None and current.prime_hash == prime_hash
     try:
@@ -454,7 +455,7 @@ def _repoint(production: ProductionPool, name: str, thread_id: str, prime_hash: 
         return
     with prompt:
         # A shared lock keeps prompt collection off the file until the pool names it.
-        fcntl.flock(prompt, fcntl.LOCK_SH)
+        worker_lifecycle.acquire_flock(prompt, mode=fcntl.LOCK_SH)
         result = production.mesh("set-instructions", "--to", name, "--instructions-file", str(path),
                                  generation=generation, mesh_generation=generation)
         if result.returncode:

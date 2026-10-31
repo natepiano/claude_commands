@@ -13,6 +13,7 @@ file replaced by its last chat reply.
 from __future__ import annotations
 
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
+from scripts.lib.signal_test_support import SignalPidGuard, install_signal_pid_guard
 
 from scripts.lib.test_agents_registry import write_registry
 
@@ -54,13 +55,13 @@ from types import SimpleNamespace
 from collections import deque
 from collections.abc import Generator, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import Callable, Literal, TextIO, TypedDict, cast, final, override
-from unittest.mock import MagicMock, patch
+from typing import BinaryIO, Callable, Literal, TextIO, TypedDict, cast, final, override
+from unittest.mock import MagicMock, call, patch
 
 from scripts.agents import codex_mesh, worker_lifecycle
-from scripts.direct import plan_history, progress_history, workers as unit_workers
+from scripts.direct import assign, plan_history, progress_history, review_pool, worker_state, workers as unit_workers
 from scripts.direct.recorder_fixture import invoke_recorder
-from scripts.lib import nix_env
+from scripts.lib import atomic_file, nix_env
 from scripts.message import process_table, sessions, roster as message_roster
 from scripts.usage import agents_log
 from scripts.accounts import accounts, moves, refusals, role_map
@@ -71,6 +72,11 @@ from scripts.whoami import account, agent_accounts
 REAL_HOME = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
 # Intentional contention probes bypass fixture observers and bookkeeping.
 KERNEL_FLOCK = fcntl.flock
+
+
+def worker_state_lock_path(path: Path) -> Path:
+    """Locate the persistent lock inode used by real state contention fixtures."""
+    return path.with_name(path.name + ".lock")
 
 
 def assert_shutdown_deadline(deadline: float) -> None:
@@ -124,8 +130,8 @@ class RosterRelockGuard:
             kind, rank = ("membership", 0) if filename == "membership.lock" else (
                 ("lifecycle", 1) if filename.endswith(".lifecycle.lock") else (
                 ("server", 2) if filename == codex_mesh.LOCK_FILE else (
-                ("inbox", 3) if filename.endswith(".pending.json") else (
-                ("roster", 4) if filename == codex_mesh.ROSTER_FILE else ("", -1)))))
+                ("inbox", 3) if filename.endswith((".pending.json", ".pending.json.lock")) else (
+                ("roster", 4) if filename in (codex_mesh.ROSTER_FILE, codex_mesh.ROSTER_FILE + ".lock") else ("", -1)))))
             is_roster = bool(kind) or held is not None
             if kind and not operation & fcntl.LOCK_UN:
                 for inode, owner in self.held.items():
@@ -444,6 +450,7 @@ def select_fixture_workers(home: Path, *, notes: Path) -> None:
 
 
 def setUpModule() -> None:
+    install_signal_pid_guard()
     # Registered first, checked last; unittest reports cleanup assertions as module errors.
     unittest.addModuleCleanup(assert_real_codex_unchanged)
     # codex_mesh and its callers share this imported module; fixture-side locks
@@ -1446,9 +1453,8 @@ class MeshCommandFixture(unittest.TestCase):
             _ = self.patches.enter_context(patch.object(codex_mesh.Client, "wait_for_activity", activity))
 
     def roster(self) -> dict[str, object]:
-        with (self.session_dir / codex_mesh.ROSTER_FILE).open(encoding="utf-8") as handle:
-            fcntl.flock(handle, fcntl.LOCK_SH)
-            return cast("dict[str, object]", json.load(handle))
+        with worker_lifecycle.locked_state(self.session_dir / codex_mesh.ROSTER_FILE, mode=fcntl.LOCK_SH) as state:
+            return state.read_object()
 
     def worker_record(self) -> dict[str, object]:
         return cast("dict[str, object]", self.roster()["worker"])
@@ -1803,6 +1809,303 @@ class WorkerShownNameTests(MeshCommandFixture):
 
 
 @final
+class AtomicWorkerStateTests(MeshCommandFixture):
+    def assert_unreadable_state(self, path: Path, action: Callable[[], object]) -> None:
+        with self.assertRaises(Exception) as caught:
+            _ = action()
+        self.assertEqual(type(caught.exception).__name__, "WorkerStateUnreadable")
+        self.assertIn(str(path), str(caught.exception))
+
+    def test_review_pool_contention_obeys_the_active_operation_deadline(self) -> None:
+        self.lifecycle_clock.freeze()
+        pool = review_pool.ProductionPool(self.session_dir / "review-pool")
+        pool.directory.mkdir()
+        path = pool.directory / "pool.lock"
+        with path.open("a") as holder:
+            KERNEL_FLOCK(holder, fcntl.LOCK_EX)
+            with (self.expire_contended_lock(path, 1),
+                  patch.object(worker_lifecycle, "time", self.lifecycle_clock),
+                  worker_lifecycle.operation_deadline(timeout=0.1)):
+                with self.assertRaises(worker_lifecycle.OperationDeadlineExpired):
+                    with pool.locked():
+                        self.fail("contended pool lock was acquired")
+            KERNEL_FLOCK(holder, fcntl.LOCK_UN)
+        with pool.locked() as state:
+            state.generation = 7
+        with pool.locked(write=False) as state:
+            self.assertEqual(state.generation, 7)
+
+    def test_claim_lock_deadline_precedes_identity_migration(self) -> None:
+        path = self.session_dir / "impl_worker_claim.lock"
+        previous = self.session_dir / "impl_seat_impl.json"
+        original = b'{"name":"retained","seat_id":"thread-retained"}'
+        _ = previous.write_bytes(original)
+        self.lifecycle_clock.freeze()
+        with path.open("a+") as holder:
+            KERNEL_FLOCK(holder, fcntl.LOCK_EX)
+            with (self.expire_contended_lock(path, 1),
+                  patch.object(worker_lifecycle, "time", self.lifecycle_clock),
+                  worker_lifecycle.operation_deadline(timeout=0.1)):
+                with self.assertRaises(worker_lifecycle.OperationDeadlineExpired):
+                    with worker_state.worker_claim_lock(self.session_dir):
+                        self.fail("contended claim lock acquired")
+            KERNEL_FLOCK(holder, fcntl.LOCK_UN)
+        self.assertEqual(previous.read_bytes(), original)
+        current = self.session_dir / "impl_worker_impl.json"
+        self.assertFalse(current.exists())
+        with worker_state.worker_claim_lock(self.session_dir):
+            self.assertFalse(previous.exists())
+            self.assertEqual(_as_test_dict(cast(object, json.loads(current.read_text())))["worker_id"], "thread-retained")
+
+    def test_strict_roster_readers_refuse_damaged_state_without_rewriting_it(self) -> None:
+        path = self.session_dir / codex_mesh.ROSTER_FILE
+        readers: dict[str, Callable[[], object]] = {
+            "mesh": lambda: codex_mesh._read_json_object(path),  # pyright: ignore[reportPrivateUsage]
+            "worker state": lambda: unit_workers._read(path),  # pyright: ignore[reportPrivateUsage]
+            "worker roster": lambda: unit_workers._read_roster(self.session_dir),  # pyright: ignore[reportPrivateUsage]
+            "design ownership": lambda: design_roles._read(path),  # pyright: ignore[reportPrivateUsage]
+            "assign": lambda: assign.read_roster(self.session_dir, "worker"),
+            "live launchers": lambda: codex_mesh._live_launchers(self.session_dir),  # pyright: ignore[reportPrivateUsage]
+            "running workers": lambda: codex_mesh._running_roster_workers(self.session_dir),  # pyright: ignore[reportPrivateUsage]
+            "cleanup threads": lambda: codex_mesh._roster_threads(self.session_dir),  # pyright: ignore[reportPrivateUsage]
+        }
+        for damaged in ("", '{"worker":', "not JSON", "[]", '{"worker": []}',
+                        '{"worker": {"thread_id": 42, "status": "done"}}'):
+            _ = path.write_text(damaged)
+            for name, read in readers.items():
+                with self.subTest(damaged=damaged, reader=name):
+                    self.assert_unreadable_state(path, read)
+                    self.assertEqual(path.read_text(), damaged)
+            with self.subTest(damaged=damaged, writer="mesh"):
+                self.assert_unreadable_state(path, lambda: codex_mesh._update_roster(  # pyright: ignore[reportPrivateUsage]
+                    str(self.session_dir), "new-worker", {"thread_id": "new-thread", "status": "done"}))
+                self.assertEqual(path.read_text(), damaged)
+            with self.subTest(damaged=damaged, writer="adoption"):
+                def edit() -> None:
+                    with unit_workers._roster_locked(self.session_dir) as (handle, roster):  # pyright: ignore[reportPrivateUsage]
+                        roster["new"] = {"thread_id": "new-thread", "status": "done"}
+                        unit_workers._write_roster(handle, roster)  # pyright: ignore[reportPrivateUsage]
+                self.assert_unreadable_state(path, edit)
+                self.assertEqual(path.read_text(), damaged)
+
+    def test_cleanup_keeps_the_server_and_reports_an_unreadable_roster(self) -> None:
+        path = self.session_dir / codex_mesh.ROSTER_FILE
+        _ = path.write_text('{"worker":')
+        server = self.session_dir / codex_mesh.SERVER_FILE
+        before = path.read_bytes(), server.read_bytes()
+        with (patch.object(codex_mesh, "_running_servers", return_value=[(os.getpid(), self.server.port, 7200)]),
+              patch.object(codex_mesh, "_client_counts", return_value={}),
+              patch.object(codex_mesh, "_process_executable", return_value=Path("/fixture/codex")),
+              patch.object(codex_mesh, "_server_folder", return_value=codex_mesh.MeshServerLog(self.session_dir)),
+              patch.object(codex_mesh, "_reap") as reaped,
+              contextlib.redirect_stdout(io.StringIO()) as output,
+              contextlib.redirect_stderr(io.StringIO()) as errors):
+            result = codex_mesh.command_idle_stop(argparse.Namespace(
+                session_dir=str(self.session_dir), pid=os.getpid(), port=self.server.port))
+        self.assertEqual(result, 1)
+        self.assertIn(str(path), output.getvalue() + errors.getvalue())
+        self.assertIn("unreadable", (output.getvalue() + errors.getvalue()).lower())
+        reaped.assert_not_called()
+        self.assertEqual((path.read_bytes(), server.read_bytes()), before)
+
+    def worker_presentation_window(self) -> progress_history.StageWindow:
+        return {
+            "instance_id": "phase-instance", "slot": "worker", "kind": "implement", "fix_round": 0,
+            "label": "implementation", "text": "", "started_at": 1.0, "elapsed": 1,
+            "status": "running", "result": "", "worker": "previously measured worker", "main": "",
+        }
+
+    def test_presentation_reads_or_marks_unavailable_without_waiting_for_the_roster_lock(self) -> None:
+        path = self.session_dir / codex_mesh.ROSTER_FILE
+        lock = worker_state_lock_path(path)
+        self.lifecycle_clock.freeze()
+        for content in (json.dumps({"worker": {"thread_id": THREAD_ID, "status": "running",
+                                               "turn_model": "gpt-kept-sol", "turn_effort": "high"}}),
+                        '{"worker":'):
+            with self.subTest(content=content):
+                _ = path.write_text(content)
+                with lock.open("a+") as holder:
+                    KERNEL_FLOCK(holder, fcntl.LOCK_EX)
+                    identity = lock.stat().st_ino
+                    with self.expire_contended_lock(lock, 1):
+                        shown = progress_history._worker_turn_windows(  # pyright: ignore[reportPrivateUsage]
+                            self.session_dir, [self.worker_presentation_window()])
+                    self.assertEqual(lock.stat().st_ino, identity)
+                    # The real holder still excludes a second independent lock owner.
+                    with lock.open("a+") as contender:
+                        with self.assertRaises(BlockingIOError):
+                            KERNEL_FLOCK(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    KERNEL_FLOCK(holder, fcntl.LOCK_UN)
+                self.assertEqual(path.read_text(), content)
+                self.assertEqual(shown[0]["started_at"], 1.0)
+                label = shown[0]["worker"].lower()
+                self.assertTrue("unavailable" in label or "gpt-kept-sol" in label, label)
+                if content == '{"worker":':
+                    self.assertIn("unavailable", label)
+
+    def test_presentation_marks_unreadable_worker_identity_unavailable(self) -> None:
+        path = self.session_dir / codex_mesh.ROSTER_FILE
+        _ = path.write_text('{"worker":')
+        window = self.worker_presentation_window()
+        displayed = progress_history._worker_turn_windows(self.session_dir, [window])  # pyright: ignore[reportPrivateUsage]
+        self.assertIn("unavailable", displayed[0]["worker"].lower())
+        self.assertEqual(displayed[0]["started_at"], 1.0)
+        with (patch.object(subprocess, "run") as posted,
+              contextlib.redirect_stderr(io.StringIO()) as errors):
+            codex_mesh._post_board_status(str(self.session_dir), "worker", "finished")  # pyright: ignore[reportPrivateUsage]
+        narration = errors.getvalue() + str(posted.call_args_list)
+        self.assertIn("unavailable", narration.lower())
+        self.assertEqual(path.read_text(), '{"worker":')
+
+    def test_repeated_inbox_publications_read_the_current_path_and_keep_adoption_metadata(self) -> None:
+        path = self.session_dir / "worker.pending.json"
+        _ = path.write_text(json.dumps({"thread_id": THREAD_ID, "messages": ["first"],
+                                        "accepting_messages": True, "adoption_id": "keep-adoption"}))
+        with codex_mesh._pending_file(str(self.session_dir), "worker") as inbox:  # pyright: ignore[reportPrivateUsage]
+            for index in range(3):
+                previous_inode = path.stat().st_ino
+                messages = codex_mesh._pending_for_thread(inbox, THREAD_ID)  # pyright: ignore[reportPrivateUsage]
+                self.assertEqual(messages, ["first", *[f"message {n}" for n in range(index)]])
+                codex_mesh._write_pending(inbox, THREAD_ID, [*messages, f"message {index}"])  # pyright: ignore[reportPrivateUsage]
+                self.assertEqual(codex_mesh._pending_for_thread(inbox, THREAD_ID), [*messages, f"message {index}"])  # pyright: ignore[reportPrivateUsage]
+                self.assertEqual(_as_test_dict(cast(object, json.loads(path.read_text())))["adoption_id"], "keep-adoption")
+                self.assertNotEqual(path.stat().st_ino, previous_inode, "inbox publication still truncates its live data inode")
+
+    def test_inbox_readers_and_writers_refuse_damaged_messages_without_clearing_them(self) -> None:
+        path = self.session_dir / "worker.pending.json"
+        for damaged in ('{"thread_id":', "not JSON", "[]", '{"thread_id": "kept", "messages": [42]}',
+                        '{"thread_id": "kept", "messages": [], "accepting_messages": "yes"}'):
+            for operation in ("read", "closed", "write", "adoption"):
+                with self.subTest(damaged=damaged, operation=operation):
+                    _ = path.write_text(damaged)
+                    def access() -> object:
+                        with codex_mesh._pending_file(str(self.session_dir), "worker") as inbox:  # pyright: ignore[reportPrivateUsage]
+                            if operation == "read":
+                                return codex_mesh._pending_for_thread(inbox, THREAD_ID)  # pyright: ignore[reportPrivateUsage]
+                            if operation == "closed":
+                                return codex_mesh._messages_closed(inbox, THREAD_ID)  # pyright: ignore[reportPrivateUsage]
+                            if operation == "adoption":
+                                return unit_workers._read_inbox(inbox)  # pyright: ignore[reportPrivateUsage]
+                            return codex_mesh._write_pending(inbox, THREAD_ID, ["replacement"])  # pyright: ignore[reportPrivateUsage]
+                    self.assert_unreadable_state(path, access)
+                    self.assertEqual(path.read_text(), damaged)
+
+    def test_legacy_zero_byte_inbox_requires_recovery_instead_of_assuming_no_work(self) -> None:
+        path = self.session_dir / "worker.pending.json"
+        _ = path.write_bytes(b"")
+        for operation in ("read", "write"):
+            with self.subTest(operation=operation):
+                def access() -> object:
+                    with codex_mesh._pending_file(str(self.session_dir), "worker") as inbox:  # pyright: ignore[reportPrivateUsage]
+                        if operation == "read":
+                            return codex_mesh._pending_for_thread(inbox, THREAD_ID)  # pyright: ignore[reportPrivateUsage]
+                        return codex_mesh._write_pending(inbox, THREAD_ID, ["new work"])  # pyright: ignore[reportPrivateUsage]
+                self.assert_unreadable_state(path, access)
+                self.assertEqual(path.read_bytes(), b"")
+
+    def test_missing_inbox_stays_absent_until_its_first_complete_publication(self) -> None:
+        path = self.session_dir / "worker.pending.json"
+        with codex_mesh._pending_file(str(self.session_dir), "worker") as inbox:  # pyright: ignore[reportPrivateUsage]
+            self.assertEqual(codex_mesh._pending_for_thread(inbox, THREAD_ID), [])  # pyright: ignore[reportPrivateUsage]
+            self.assertFalse(path.exists(), "taking a lock created ambiguous empty worker state")
+            codex_mesh._write_pending(inbox, THREAD_ID, [])  # pyright: ignore[reportPrivateUsage]
+            self.assertEqual(json.loads(path.read_text()), {"thread_id": THREAD_ID, "messages": [],
+                                                           "accepting_messages": True})
+
+    def test_roster_failure_keeps_existing_workers_and_pending_work_whole(self) -> None:
+        self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "running",
+                                           "turn_id": "keep-turn", "launcher_pid": os.getpid()}})
+        path = self.session_dir / codex_mesh.ROSTER_FILE
+        inbox = self.session_dir / "worker.pending.json"
+        _ = inbox.write_text(json.dumps({"thread_id": THREAD_ID, "messages": ["keep work"]}))
+        before, messages = path.read_bytes(), inbox.read_bytes()
+        with patch("scripts.lib.atomic_file.os.replace", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                _ = codex_mesh._update_roster(str(self.session_dir), "other", {"thread_id": "other-thread", "status": "done"})  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(inbox.read_bytes(), messages)
+
+    def test_concurrent_inbox_appends_keep_every_message_across_replacements(self) -> None:
+        path = self.session_dir / "worker.pending.json"
+        _ = path.write_text(json.dumps({"thread_id": THREAD_ID, "messages": ["original"],
+                                        "accepting_messages": True, "adoption_id": "retained-adoption"}))
+        barrier = threading.Barrier(2)
+        lock_inodes: list[int] = []
+        acquire = worker_lifecycle.acquire_flock
+
+        def observe(handle: TextIO | BinaryIO, mode: int = fcntl.LOCK_EX, *,
+                    deadline: float = worker_lifecycle.NO_LOCK_DEADLINE) -> None:
+            descriptor = handle.fileno()
+            if mode & fcntl.LOCK_EX:
+                lock_inodes.append(os.fstat(descriptor).st_ino)
+            acquire(handle, mode=mode, deadline=deadline)
+
+        def append(prefix: str) -> None:
+            for number in range(3):
+                _ = barrier.wait(TEST_HANG_GUARD_SECS)
+                with codex_mesh._pending_file(str(self.session_dir), "worker") as inbox:  # pyright: ignore[reportPrivateUsage]
+                    messages = codex_mesh._pending_for_thread(inbox, THREAD_ID)  # pyright: ignore[reportPrivateUsage]
+                    codex_mesh._write_pending(inbox, THREAD_ID, [*messages, f"{prefix}-{number}"])  # pyright: ignore[reportPrivateUsage]
+
+        original_inode = path.stat().st_ino
+        with patch.object(worker_lifecycle, "acquire_flock", observe), ThreadPoolExecutor(max_workers=2) as pool:
+            first, second = pool.submit(append, "first"), pool.submit(append, "second")
+            first.result(TEST_HANG_GUARD_SECS)
+            second.result(TEST_HANG_GUARD_SECS)
+        record = _as_test_dict(cast(object, json.loads(path.read_text())))
+        self.assertCountEqual(cast(list[str], record["messages"]),
+                              ["original", *[f"{owner}-{n}" for owner in ("first", "second") for n in range(3)]])
+        self.assertEqual(record["adoption_id"], "retained-adoption")
+        self.assertIs(record["accepting_messages"], True)
+        self.assertEqual(len(set(lock_inodes)), 1)
+        self.assertNotEqual(lock_inodes[0], original_inode, "senders still lock the replaceable queue data")
+
+    def test_two_roster_writers_open_current_data_only_after_the_stable_lock(self) -> None:
+        path = self.session_dir / codex_mesh.ROSTER_FILE
+        self.write_pool_roster({"original": {"thread_id": "original-thread", "status": "done"}})
+        original_inode = path.stat().st_ino
+        first_locked, second_attempted, release_first = threading.Event(), threading.Event(), threading.Event()
+        acquire = worker_lifecycle.acquire_flock
+        lock_inodes: list[int] = []
+
+        def coordinated(handle: TextIO | BinaryIO, mode: int = fcntl.LOCK_EX, *,
+                        deadline: float = worker_lifecycle.NO_LOCK_DEADLINE) -> None:
+            descriptor = handle.fileno()
+            target = Path(os.readlink(f"/proc/self/fd/{descriptor}"))
+            roster_lock = target == path or target.name == "mesh_roster.json.lock"
+            if roster_lock and mode & fcntl.LOCK_EX:
+                lock_inodes.append(os.fstat(descriptor).st_ino)
+                if threading.current_thread().name == "second-roster-writer":
+                    second_attempted.set()
+            acquire(handle, mode=mode, deadline=deadline)
+            if roster_lock and mode & fcntl.LOCK_EX and threading.current_thread().name == "first-roster-writer":
+                first_locked.set()
+                self.assertTrue(release_first.wait(TEST_HANG_GUARD_SECS))
+
+        def write(name: str) -> None:
+            threading.current_thread().name = name + "-roster-writer"
+            if name == "second":
+                self.assertTrue(first_locked.wait(TEST_HANG_GUARD_SECS))
+            self.assertTrue(codex_mesh._update_roster(str(self.session_dir), name,  # pyright: ignore[reportPrivateUsage]
+                                                    {"thread_id": name + "-thread", "status": "done"}))
+
+        with patch.object(worker_lifecycle, "acquire_flock", coordinated), ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(write, "first")
+            second = pool.submit(write, "second")
+            try:
+                self.assertTrue(first_locked.wait(TEST_HANG_GUARD_SECS))
+                self.assertTrue(second_attempted.wait(TEST_HANG_GUARD_SECS))
+                self.assertFalse(second.done())
+            finally:
+                release_first.set()
+            first.result(TEST_HANG_GUARD_SECS)
+            second.result(TEST_HANG_GUARD_SECS)
+        self.assertEqual(set(_as_test_dict(cast(object, json.loads(path.read_text())))), {"original", "first", "second"})
+        self.assertEqual(lock_inodes, [lock_inodes[0], lock_inodes[0]])
+        self.assertNotEqual(lock_inodes[0], original_inode, "writers still lock the replaceable data inode")
+        self.assertNotEqual(path.stat().st_ino, lock_inodes[0])
+
+
 class ShutdownDeadlineTests(MeshCommandFixture):
     @contextlib.contextmanager
     def rpc_socket(
@@ -2054,8 +2357,8 @@ class ShutdownDeadlineTests(MeshCommandFixture):
         self.server.respond = loaded_thread
         for method in ("thread/loaded/list", "thread/queue/list"):
             with self.subTest(method=method):
-                self.live_turn = "unconfirmed-pause-turn"
-                self.queued = [{"id": "unconfirmed-pause-work"}]
+                self.live_turn: str = "unconfirmed-pause-turn"
+                self.queued: list[dict[str, object]] = [{"id": "unconfirmed-pause-work"}]
                 self.write_pool_roster({"worker": {
                     "thread_id": THREAD_ID, "status": "running", "turn_id": self.live_turn,
                     "port": self.server.port, "launcher_pid": os.getpid(), "role": "impl"}})
@@ -2155,8 +2458,10 @@ class ShutdownDeadlineTests(MeshCommandFixture):
 
     def test_lock_acquisitions_use_the_shared_deadline_primitive(self) -> None:
         sources = (Path(codex_mesh.__file__), Path(worker_lifecycle.__file__),
-                   Path(unit_workers.__file__), Path(design_roles.__file__), Path(progress_history.__file__))
+                   Path(unit_workers.__file__), Path(design_roles.__file__), Path(progress_history.__file__),
+                   Path(assign.__file__), Path(review_pool.__file__), Path(worker_state.__file__))
         bypasses: list[str] = []
+        unsafe_writes: list[str] = []
         for path in sources:
             tree = ast.parse(path.read_text())
             fcntl_names = {alias.asname or alias.name for node in ast.walk(tree)
@@ -2174,6 +2479,22 @@ class ShutdownDeadlineTests(MeshCommandFixture):
                 if (direct or imported) and not (path == Path(worker_lifecycle.__file__)
                                                  and function == "acquire_flock"):
                     bypasses.append(f"{path.name}:{cast(ast.expr, node).lineno} ({function})")
+                if path in (Path(codex_mesh.__file__), Path(unit_workers.__file__), Path(design_roles.__file__)):
+                    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                        method = node.func.attr
+                        # Append-only transcripts and prompts are not ownership state.
+                        unsafe = method == "truncate"
+                        if method == "write_text":
+                            unsafe = function not in {
+                                "_deliver_reply", "_finish_summary", "_mesh_phase_wait", "command_resume_account_move"}
+                        if method == "open":
+                            unsafe = any(isinstance(arg, ast.Constant) and arg.value in ("w", "w+", "wb", "wb+", "w+b", "r+", "rb+", "r+b")
+                                         for arg in (*node.args, *(item.value for item in node.keywords if item.arg == "mode")))
+                        if unsafe:
+                            unsafe_writes.append(f"{path.name}:{node.lineno} ({function}: {method})")
+                    if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "replace"
+                            and isinstance(node.func.value, ast.Name) and node.func.value.id == "os"):
+                        unsafe_writes.append(f"{path.name}:{node.lineno} ({function}: private atomic writer)")
                 for child in ast.iter_child_nodes(node):
                     inspect_calls(child, function)
 
@@ -2184,6 +2505,7 @@ class ShutdownDeadlineTests(MeshCommandFixture):
             else:
                 inspect_calls(tree)
         self.assertEqual(bypasses, [], "flock bypasses the scoped shutdown deadline")
+        self.assertEqual(unsafe_writes, [], "worker state bypasses shared atomic publication")
 
     def test_nonblocking_inbox_refusal_does_not_wait_or_consume_the_shutdown_budget(self) -> None:
         pending = self.session_dir / "worker.pending.json"
@@ -2191,7 +2513,7 @@ class ShutdownDeadlineTests(MeshCommandFixture):
         before = pending.read_bytes()
         self.lifecycle_clock.freeze()
         started = self.lifecycle_clock.monotonic()
-        with pending.open("r+") as owner:
+        with worker_state_lock_path(pending).open("a") as owner:
             KERNEL_FLOCK(owner, fcntl.LOCK_EX)
             with (patch.object(worker_lifecycle, "time", self.lifecycle_clock),
                   patch.object(select, "select", side_effect=AssertionError("try-lock waited")),
@@ -3131,17 +3453,15 @@ class MeshCommandTests(MeshCommandFixture):
         def acquire(descriptor: int | io.IOBase, operation: int) -> None:
             # Matched by inode, not /proc/self/fd, which macOS lacks.
             number = descriptor.fileno() if isinstance(descriptor, io.IOBase) else descriptor
-            locks_roster = path.exists() and os.path.samestat(os.fstat(number), path.stat())
+            lock_path = worker_state_lock_path(path)
+            locks_roster = lock_path.exists() and os.path.samestat(os.fstat(number), lock_path.stat())
             if armed[0] and operation == fcntl.LOCK_EX and locks_roster:
                 armed[0] = False
-                with path.open("r+") as other:
+                with lock_path.open("a") as other:
                     flock(other.fileno(), fcntl.LOCK_EX)
-                    entries = cast(dict[str, object], json.loads(other.read()))
+                    entries = cast(dict[str, object], json.loads(path.read_text()))
                     entries["worker"] = replacement
-                    _ = other.seek(0)
-                    _ = other.truncate()
-                    _ = other.write(json.dumps(entries))
-                    other.flush()
+                    _ = path.write_text(json.dumps(entries))
                     flock(other.fileno(), fcntl.LOCK_UN)
                 writes[0] += 1
             flock(descriptor, operation)
@@ -8870,9 +9190,9 @@ class MeshCommandTests(MeshCommandFixture):
         self.assertEqual(self.worker_record()["thread_id"], THREAD_ID)
         self.assertEqual(self.worker_record()["status"], "ended")
         pending = cast("dict[str, object]", json.loads(
-            (self.session_dir / "worker.pending.json").read_text(encoding="utf-8") or "{}"
+            (self.session_dir / "worker.pending.json").read_text(encoding="utf-8")
         ))
-        self.assertEqual(pending, {})
+        self.assertEqual(pending, worker_lifecycle.empty_inbox())
 
     def test_send_after_end_refuses_waiting_worker_and_keeps_pending_empty(self) -> None:
         """An end marker closes the waiting worker to new messages."""
@@ -8892,14 +9212,14 @@ class MeshCommandTests(MeshCommandFixture):
         self.assertEqual(sent, 2)
         self.assertEqual(len(errors.getvalue().splitlines()), 1)
         self.assertIn("being ended", errors.getvalue())
-        self.assertEqual((self.session_dir / "worker.pending.json").read_text(encoding="utf-8"), "")
+        self.assertEqual(json.loads((self.session_dir / "worker.pending.json").read_text()), worker_lifecycle.empty_inbox())
 
     def test_send_to_ended_status_without_end_marker_refuses_and_keeps_pending_empty(self) -> None:
         self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "ended"}})
         code, output, errors = self.run_mesh(["send", "--to", "worker", "--message", "Too late"])
         self.assertEqual((code, output), (2, ""))
         self.assertEqual(errors, "codex_mesh: worker is ended; message not delivered\n")
-        self.assertEqual((self.session_dir / "worker.pending.json").read_text(), "")
+        self.assertFalse((self.session_dir / "worker.pending.json").exists())
         self.assertEqual(self.server.requests, [])
 
     def test_send_to_worker_missing_from_roster_names_the_known_workers_and_holds_nothing(self) -> None:
@@ -9496,7 +9816,7 @@ class MeshCommandTests(MeshCommandFixture):
                 events.append("accepted")
             return turn
 
-        def pending(handle: TextIO, thread: str, messages: list[str], *, accepting_messages: bool = True) -> None:
+        def pending(handle: worker_lifecycle.WorkerStateFile, thread: str, messages: list[str], *, accepting_messages: bool = True) -> None:
             if write_site == "pending" and events == ["accepted"]:
                 self.assertEqual(messages, [])
                 events.append("write failed")
@@ -9584,7 +9904,7 @@ class MeshCommandTests(MeshCommandFixture):
                 _ = (self.session_dir / "worker.end").write_text("end")
             return notice
 
-        def pending(handle: TextIO, thread: str, messages: list[str], *, accepting_messages: bool = True) -> None:
+        def pending(handle: worker_lifecycle.WorkerStateFile, thread: str, messages: list[str], *, accepting_messages: bool = True) -> None:
             if (self.session_dir / "worker.end").exists():
                 writes_after_end.append(thread)
             write_pending(handle, thread, messages, accepting_messages=accepting_messages)
@@ -9822,9 +10142,12 @@ class FollowEventRegressionTests(MeshCommandFixture):
         self.write_pool_roster({"worker": {"status": "done", "thread_id": THREAD_ID}})
         # Fixture-owned locks must be recognized too; an inode alias ensures the
         # detector does not merely compare the two path spellings.
-        alias = self.session_dir / "roster-alias.json"
+        alias = self.session_dir / "roster-alias" / codex_mesh.ROSTER_FILE
+        alias.parent.mkdir()
         os.link(roster, alias)
-        with roster.open("r+") as owner:
+        worker_state_lock_path(roster).touch(exist_ok=True)
+        os.link(worker_state_lock_path(roster), worker_state_lock_path(alias))
+        with worker_state_lock_path(roster).open("a") as owner:
             fcntl.flock(owner, fcntl.LOCK_EX)
             def lock_deadline(signum: int, frame: object) -> None:
                 raise AssertionError(f"roster guard failed to intercept flock ({signum}, {frame})")
@@ -9842,7 +10165,7 @@ class FollowEventRegressionTests(MeshCommandFixture):
             self.assertIn("_read_json_object", str(failure.exception))
         # No explicit LOCK_UN: production writers also release by closing.
         self.assertEqual(self.worker_record()["status"], "done")
-        with roster.open() as reader, ThreadPoolExecutor(max_workers=1) as executor:
+        with worker_state_lock_path(roster).open() as reader, ThreadPoolExecutor(max_workers=1) as executor:
             fcntl.flock(reader, fcntl.LOCK_SH)
             other_reader = executor.submit(self.worker_record)
             self.assertEqual(other_reader.result(timeout=5)["status"], "done")
@@ -10471,9 +10794,9 @@ class FollowEventRegressionTests(MeshCommandFixture):
         paths = (roster, pending, self.session_dir / codex_mesh.SERVER_FILE)
         before = {path: path.read_bytes() for path in paths}
         self.lifecycle_clock.freeze()
-        with roster.open("r+") as owner:
+        with worker_state_lock_path(roster).open("a") as owner:
             KERNEL_FLOCK(owner, fcntl.LOCK_EX)
-            with (self.expire_contended_lock(roster, codex_mesh.PAUSE_INTERRUPT_SECS + 1),
+            with (self.expire_contended_lock(worker_state_lock_path(roster), codex_mesh.PAUSE_INTERRUPT_SECS + 1),
                   patch.object(worker_lifecycle, "time", self.lifecycle_clock),
                   patch.object(codex_mesh, "_reap") as reap,
                   ThreadPoolExecutor(max_workers=1) as executor):
@@ -10494,13 +10817,27 @@ class FollowEventRegressionTests(MeshCommandFixture):
             if not path.exists():
                 _ = path.write_text('{"worker": {"status": "done", "thread_id": "kept"}}')
             before = path.read_bytes()
-            with self.subTest(file=filename), path.open("r+") as owner:
+            with self.subTest(file=filename), worker_state_lock_path(path).open("a") as owner:
                 KERNEL_FLOCK(owner, fcntl.LOCK_EX)
-                with (self.expire_contended_lock(path, 2),
+                with (self.expire_contended_lock(worker_state_lock_path(path), 2),
                       patch.object(worker_lifecycle, "time", self.lifecycle_clock),
                       worker_lifecycle.operation_deadline(timeout=1)):
-                    with self.assertRaisesRegex(TimeoutError, "lock"):
-                        _ = codex_mesh._read_json_object(path)  # pyright: ignore[reportPrivateUsage]
+                    # Server records are atomic snapshots under the server owner,
+                    # not readers of the roster/inbox sidecar protocol. Retain the
+                    # read-fallback timeout check at the underlying I/O boundary.
+                    read_text = Path.read_text
+
+                    def read_snapshot(snapshot: Path, encoding: str | None = None, errors: str | None = None) -> str:
+                        if filename == codex_mesh.SERVER_FILE and snapshot == path:
+                            raise worker_lifecycle.OperationDeadlineExpired("lock operation expired during read")
+                        return read_text(snapshot, encoding=encoding, errors=errors)
+
+                    if filename == codex_mesh.SERVER_FILE:
+                        self.assertEqual(codex_mesh._read_json_object(path),  # pyright: ignore[reportPrivateUsage]
+                                         _as_test_dict(cast(object, json.loads(before))))
+                    with patch.object(Path, "read_text", read_snapshot):
+                        with self.assertRaisesRegex(TimeoutError, "lock"):
+                            _ = codex_mesh._read_json_object(path)  # pyright: ignore[reportPrivateUsage]
             self.assertEqual(path.read_bytes(), before)
 
     def test_shutdown_inbox_contention_keeps_work_and_releases_its_other_locks(self) -> None:
@@ -10523,9 +10860,9 @@ class FollowEventRegressionTests(MeshCommandFixture):
 
         self.server.respond = loaded
         self.lifecycle_clock.freeze()
-        with pending.open("r+") as owner:
+        with worker_state_lock_path(pending).open("a") as owner:
             KERNEL_FLOCK(owner, fcntl.LOCK_EX)
-            with (self.expire_contended_lock(pending, codex_mesh.PAUSE_INTERRUPT_SECS + 1),
+            with (self.expire_contended_lock(worker_state_lock_path(pending), codex_mesh.PAUSE_INTERRUPT_SECS + 1),
                   patch.object(worker_lifecycle, "time", self.lifecycle_clock),
                   patch.object(codex_mesh, "_reap") as reap,
                   ThreadPoolExecutor(max_workers=1) as executor):
@@ -11024,11 +11361,19 @@ class FollowEventRegressionTests(MeshCommandFixture):
                                 "launcher_pid": 99999999, "role": "impl"}})
                             self.server.requests.clear()
                             before = self.worker_record(), pending.read_bytes(), self.queued.copy(), self.live_turn
-                            self.assertIsInstance(codex_mesh._server_availability(str(self.session_dir)),  # pyright: ignore[reportPrivateUsage]
-                                                  codex_mesh.ServerRestartRequired)
+                            availability = codex_mesh._server_availability(str(self.session_dir))  # pyright: ignore[reportPrivateUsage]
+                            self.assertIsInstance(availability, codex_mesh.ServerRestartRequired)
+                            assert isinstance(availability, codex_mesh.ServerRestartRequired)
+                            unreadable = type(value) is not int or (field == "pid" and value <= 1)
+                            if unreadable:
+                                self.assertIn(str(server_path), availability.doubt)
+                            else:
+                                self.assertEqual(availability.doubt, "")
                             self.assertEqual(codex_mesh._run_servers(str(self.session_dir)), [])  # pyright: ignore[reportPrivateUsage]
-                            # A restart uses the same real protocol fixture, whose turn is live.
-                            # Invalid metadata must not reuse that endpoint as idle evidence.
+                            server_evidence = {path: path.read_bytes() for path in (
+                                server_path, self.session_dir / codex_mesh.RETIRED_FILE)}
+                            # Typed unavailable endpoints may restart against this same live fixture.
+                            # F042 unreadable evidence must be preserved for repair before restart.
                             with patch.object(codex_mesh, "_start_server", return_value=self.server.port) as restart:
                                 if verb == "follow":
                                     code, errors = self.run_follow()
@@ -11036,9 +11381,16 @@ class FollowEventRegressionTests(MeshCommandFixture):
                                 else:
                                     code, output, errors = self.run_mesh(["reopen", "--to", "worker"])
                                     errors = output + errors
-                                    restart.assert_called_once()
+                                    if unreadable:
+                                        restart.assert_not_called()
+                                    else:
+                                        restart.assert_called_once()
                             self.assertEqual(code, 2, errors)
                             self.assertIn("live", errors)
+                            if unreadable:
+                                self.assertIn("unreadable", errors)
+                                self.assertIn(str(server_path), errors)
+                                self.assertEqual({path: path.read_bytes() for path in server_evidence}, server_evidence)
                             self.assertEqual((self.worker_record(), pending.read_bytes(), self.queued, self.live_turn), before)
                             self.assertEqual(self.methods("turn/start"), [])
                             self.assertEqual(self.methods("turn/interrupt"), [])
@@ -11698,7 +12050,7 @@ class FollowEventRegressionTests(MeshCommandFixture):
                 # The server is idle, but its turn/completed notice is lost.
                 self.live_turn = ""
                 if finished_run:
-                    _ = (self.session_dir / plan_history.STATE_FILENAME).write_text(json.dumps({
+                    atomic_file.write_text_atomic(self.session_dir / plan_history.STATE_FILENAME, json.dumps({
                         "status": "done", "finished_at": "2026-10-28T12:00:00Z",
                     }))
                 else:
@@ -11940,7 +12292,7 @@ class GuardedWorkerEndTests(MeshCommandFixture):
         self.assertEqual(code, 0, output + errors)
         self.assertEqual(self.worker_record()["status"], "ended")
         self.assertTrue((self.session_dir / "worker.end").is_file())
-        self.assertEqual((self.session_dir / "worker.pending.json").read_text(), "")
+        self.assertEqual(json.loads((self.session_dir / "worker.pending.json").read_text()), worker_lifecycle.empty_inbox())
         self.assertEqual(self.queued, [])
         self.assertEqual(self.methods("turn/interrupt"), [])
 
@@ -16349,6 +16701,7 @@ class DevShellServerTests(unittest.TestCase):
         self.stop = MagicMock()
         self.shell_load = MagicMock()
         self.process = MagicMock(spec=subprocess.Popen)
+        self.process.pid = 87654
         self.launch = MagicMock()
 
     @override
@@ -16518,10 +16871,17 @@ class DevShellServerTests(unittest.TestCase):
         def advance(seconds: float) -> None:
             elapsed[0] += seconds
 
+        def confirmed_exit(*, timeout: float) -> int:
+            self.assertEqual(timeout, 5)
+            cast(MagicMock, self.process.poll).return_value = 0
+            return 0
+
+        cast(MagicMock, self.process.wait).side_effect = confirmed_exit
         clock = SimpleNamespace(time=bounded_fixture(lambda: elapsed[0]), sleep=advance)
         with (patch.object(codex_mesh, "time", clock),
               patch.object(codex_mesh, "WebSocket", side_effect=ConnectionRefusedError),
-              patch.object(os, "killpg")):
+              patch.object(os, "killpg"),
+              patch.object(os, "kill")):
             with self.assertRaisesRegex(SystemExit, "did not accept connections"):
                 _ = codex_mesh.ensure_server(str(self.session_dir), self.workers_home)
         self.assertGreaterEqual(elapsed[0], 30)
@@ -16847,6 +17207,48 @@ class ServerRecordTests(unittest.TestCase):
         self.spawned.append(process)
         return process.pid
 
+    def test_failed_start_signals_only_real_process_ids_above_one(self) -> None:
+        invalid: tuple[object, ...] = (MagicMock(), 1, 0, -1, True, "5", None)
+        # Check the safety net against spies, never against a kernel signal send.
+        for pid in invalid:
+            with self.subTest(guard_target=pid):
+                send = MagicMock()
+                with self.assertRaisesRegex(AssertionError, "unsafe signal target"):
+                    SignalPidGuard(send)(pid, signal.SIGTERM)
+                send.assert_not_called()
+        send = MagicMock()
+        SignalPidGuard(send)(4242, signal.SIGTERM)
+        send.assert_called_once_with(4242, signal.SIGTERM)
+
+        for pid in (*invalid, 4242):
+            with self.subTest(startup_pid=pid):
+                process = MagicMock(spec=subprocess.Popen)
+                process.pid = pid
+                poll = cast(MagicMock, process.poll)
+                poll.return_value = None
+
+                def handle_killed() -> None:
+                    poll.return_value = 0
+
+                cast(MagicMock, process.kill).side_effect = handle_killed
+                cast(MagicMock, process.wait).side_effect = [
+                    subprocess.TimeoutExpired("fixture server", 5), 0]
+                served: codex_mesh.ServerRecord = {"pid": 4242, "port": 4321}
+                with (patch.object(os, "killpg") as group_signal,
+                      patch.object(os, "kill") as process_signal):
+                    codex_mesh._discard_failed_server_start(  # pyright: ignore[reportPrivateUsage]
+                        str(self.session_dir), served, process)
+                process_signal.assert_not_called()
+                if type(pid) is int and pid == 4242:
+                    self.assertEqual(group_signal.call_args_list, [
+                        call(4242, signal.SIGTERM),
+                        call(4242, signal.SIGKILL)])
+                    cast(MagicMock, process.terminate).assert_not_called()
+                else:
+                    group_signal.assert_not_called()
+                    cast(MagicMock, process.terminate).assert_called_once_with()
+                cast(MagicMock, process.kill).assert_called_once_with()
+
     def test_reap_uses_configured_probes_and_escalates_only_for_a_live_server(self) -> None:
         elapsed = [0.0]
         waits: list[float] = []
@@ -16937,6 +17339,99 @@ class ServerRecordTests(unittest.TestCase):
         self.assertEqual(current, replacement)
         self.assertEqual(self.retired_ports(), [4321])
         self.assertTrue(codex_mesh._pid_alive(old_pid))  # pyright: ignore[reportPrivateUsage]
+
+    def test_start_record_survives_a_folder_fsync_failure_before_current_server_publication(self) -> None:
+        pid = self.sleeper()
+        process = self.spawned[-1]
+        pending = self.session_dir / codex_mesh.SERVER_START_FILE
+        current = self.session_dir / codex_mesh.SERVER_FILE
+        worktree = self.session_dir / "worktree"
+        worktree.mkdir()
+        visible: list[bytes] = []
+
+        def folder_full(folder: Path) -> None:
+            self.assertEqual(folder, self.session_dir)
+            self.assertFalse(current.exists())
+            visible.append(pending.read_bytes())
+            raise OSError("folder fsync disk full")
+
+        with (patch.object(codex_mesh, "_free_port", return_value=4321),
+              patch.object(subprocess, "Popen", return_value=process),
+              patch.object(nix_env, "ensure", return_value=nix_env.Loaded(dict(os.environ), worktree / ".envrc")),
+              patch.object(codex_mesh, "_server_dev_shell", return_value=codex_mesh.WorktreeDevShell(worktree, "fixture-revision")),
+              patch.object(atomic_file, "sync_folder", side_effect=folder_full),
+              patch.object(codex_mesh, "_start_watcher") as watcher):
+            with self.assertRaisesRegex(atomic_file.AtomicDurabilityUnconfirmed, "folder fsync disk full"):
+                _ = codex_mesh.ensure_server(
+                    str(self.session_dir), agent_accounts.workers_home(), str(worktree))
+        self.assertEqual(len(visible), 1)
+        self.assertIsNone(process.poll(), "test must cover an unconfirmed live start")
+        self.assertTrue(pending.exists(), "the only evidence of a live startup was removed")
+        self.assertEqual(pending.read_bytes(), visible[0])
+        record = _as_test_dict(cast(object, json.loads(pending.read_text())))
+        self.assertEqual((record["pid"], record["port"]), (pid, 4321))
+        self.assertEqual(record["dev_shell_worktree"], str(worktree))
+        self.assertFalse(current.exists())
+        watcher.assert_not_called()
+
+        # A retry must reconcile this live, unconfirmed startup before spawning.
+        # The stand-in is not an owned, answering Codex server, so it must refuse.
+        with (patch.object(subprocess, "Popen", side_effect=AssertionError("started a second live child")) as launch,
+              patch.object(codex_mesh, "_server_owned_by_user", return_value=False),
+              patch.object(codex_mesh, "SERVER_START_TIMEOUT_SECS", 0),
+              patch.object(codex_mesh, "WebSocket", side_effect=ConnectionError("startup endpoint unavailable")),
+              patch.object(codex_mesh, "_start_watcher") as retry_watcher):
+            with self.assertRaises(SystemExit) as refused:
+                _ = codex_mesh.ensure_server(str(self.session_dir), agent_accounts.workers_home())
+        launch.assert_not_called()
+        retry_watcher.assert_not_called()
+        self.assertIn(str(pending), str(refused.exception))
+        self.assertEqual(pending.read_bytes(), visible[0])
+        self.assertFalse(current.exists())
+        self.assertIsNone(process.poll())
+
+        # Only positive exit evidence permits discarding the old start record.
+        process.kill()
+        _ = process.wait(timeout=LauncherHangGuard("startup exit").remaining())
+        replacement_pid = self.sleeper()
+        replacement = self.spawned[-1]
+        with (patch.object(codex_mesh, "_free_port", return_value=9876),
+              patch.object(subprocess, "Popen", return_value=replacement) as launch,
+              patch.object(codex_mesh, "WebSocket", return_value=SimpleNamespace(close=lambda: None)),
+              patch.object(codex_mesh, "_start_watcher") as retry_watcher):
+            result = codex_mesh.ensure_server(str(self.session_dir), agent_accounts.workers_home())
+        self.assertEqual(result, (9876, True))
+        launch.assert_called_once()
+        retry_watcher.assert_called_once_with(str(self.session_dir), replacement_pid, 9876)
+        self.assertFalse(pending.exists())
+        record = _as_test_dict(cast(object, json.loads(current.read_text())))
+        self.assertEqual((record["pid"], record["port"]), (replacement_pid, 9876))
+        self.assertIsNone(replacement.poll())
+
+    def test_confirmed_retained_start_is_adopted_without_starting_another_child(self) -> None:
+        pid = self.sleeper()
+        self.write_server(4321, pid)
+        current = self.session_dir / codex_mesh.SERVER_FILE
+        pending = self.session_dir / codex_mesh.SERVER_START_FILE
+        _ = current.rename(pending)
+        retained = _as_test_dict(cast(object, json.loads(pending.read_text())))
+        probe = SimpleNamespace(close=MagicMock())
+        with (patch.object(subprocess, "Popen", side_effect=AssertionError("started a second live child")) as launch,
+              patch.object(codex_mesh, "_server_owned_by_user", return_value=True) as owned,
+              patch.object(codex_mesh, "_running_servers", return_value=[codex_mesh.WebSocketServer(pid, 4321, 1.0)]),
+              patch.object(codex_mesh, "_holds_old_sign_in", return_value=False),
+              patch.object(codex_mesh, "WebSocket", return_value=probe) as handshake,
+              patch.object(codex_mesh, "_start_watcher") as watcher):
+            result = codex_mesh.ensure_server(str(self.session_dir), agent_accounts.workers_home())
+        self.assertEqual(result, (4321, False))
+        launch.assert_not_called()
+        owned.assert_called_once_with(pid)
+        handshake.assert_called_once_with(4321)
+        cast(MagicMock, probe.close).assert_called_once_with()
+        watcher.assert_called_once_with(str(self.session_dir), pid, 4321)
+        self.assertFalse(pending.exists())
+        self.assertEqual(_as_test_dict(cast(object, json.loads(current.read_text()))), retained)
+        self.assertIsNone(self.spawned[-1].poll())
 
     def test_a_server_that_never_accepts_is_stopped_before_start_fails(self) -> None:
         process = subprocess.Popen(["sleep", str(TEST_HANG_GUARD_SECS)])

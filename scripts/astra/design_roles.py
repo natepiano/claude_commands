@@ -22,12 +22,13 @@ from contextlib import AbstractContextManager, contextmanager
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal, Protocol, TextIO, cast
+from typing import Literal, Protocol, cast
 from uuid import UUID, uuid4
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.astra import astra_work
 from scripts.agents import worker_lifecycle
+from scripts.lib.atomic_file import write_text_atomic
 
 ROOT = Path(__file__).resolve().parents[2]
 Role = Literal['designer', 'reviewer']
@@ -61,9 +62,9 @@ class MeshLifecycleTransport(Protocol):
     def _read_live_turn(self, client: MeshLifecycleClient, thread: str) -> object: ...
     def _release_held_server(self, session_dir: str) -> None: ...
     def held_thread_end_confirmed(self, session_dir: str, thread_id: str) -> bool: ...
-    def _pending_file(self, session_dir: str, name: str) -> AbstractContextManager[TextIO]: ...
-    def _pending_for_thread(self, handle: TextIO, thread: str) -> list[str]: ...
-    def _write_pending(self, handle: TextIO, thread: str, messages: list[str]) -> None: ...
+    def _pending_file(self, session_dir: str, name: str) -> AbstractContextManager[worker_lifecycle.WorkerStateFile]: ...
+    def _pending_for_thread(self, handle: worker_lifecycle.WorkerStateFile, thread: str) -> list[str]: ...
+    def _write_pending(self, handle: worker_lifecycle.WorkerStateFile, thread: str, messages: list[str]) -> None: ...
     def _move_queue_to_pending(self, client: MeshLifecycleClient, thread: str, park: Callable[[str], None]) -> None: ...
     def _release_worker_thread(self, client: MeshLifecycleClient, thread: str, session_dir: str) -> object: ...
     def recorded_turn_settings(self, record: Mapping[str, object]) -> RecordedTurnEvidence: ...
@@ -232,7 +233,7 @@ def _object(value: object) -> dict[str, object]:
 
 
 def _read(path: Path) -> dict[str, object]:
-    return _object(cast(object, json.loads(path.read_text(encoding='utf-8'))))
+    return worker_lifecycle.read_worker_state(path)
 
 
 def _text(fields: dict[str, object], key: str) -> str:
@@ -250,13 +251,9 @@ def _integer(fields: dict[str, object], key: str) -> int:
 
 
 def _atomic(path: Path, value: object) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f'.{path.name}.{uuid4()}.tmp')
-    try:
-        _ = temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + '\n', encoding='utf-8')
-        _ = temporary.replace(path)
-    finally:
-        temporary.unlink(missing_ok=True)
+    _ = worker_lifecycle.read_worker_value(path)
+    _ = worker_lifecycle.validate_worker_state_value(path, value)
+    write_text_atomic(path, json.dumps(value, indent=2, sort_keys=True) + '\n')
 
 
 @contextmanager
@@ -317,34 +314,38 @@ def _lifecycle(fields: dict[str, object]) -> Lifecycle:
 
 
 def read_design(design_id: str) -> HeldDesign:
-    fields = _read(design_directory(design_id) / 'design.json')
-    if fields.get('schema') != 1:
-        raise RoleRefused('unknown design schema')
-    placement = _object(fields.get('placement'))
-    if placement.get('design_id') != design_id:
-        raise RoleRefused('design identity differs from directory')
-    entries = fields.get('roles')
-    if not isinstance(entries, list):
-        raise RoleRefused('missing roles')
-    instances: list[RoleInstance] = []
-    for value in cast(list[object], entries):
-        entry = _object(value)
-        role = entry.get('role')
-        if role not in ('designer', 'reviewer') or any(instance.role == role for instance in instances):
-            raise RoleRefused('invalid or duplicate role')
-        claim = entry.get('assignment_claim', '')
-        if not isinstance(claim, str):
-            raise RoleRefused('invalid assignment claim')
-        instances.append(RoleInstance(role, _text(entry, 'name'), _lifecycle(_object(entry.get('lifecycle'))), claim))
-    if {instance.role for instance in instances} != {'designer', 'reviewer'}:
-        raise RoleRefused('design must record both role slots')
-    for key in ('repository', 'document'):
-        if not Path(_text(fields, key)).is_absolute():
-            raise RoleRefused(key + ' must be absolute')
-    return HeldDesign(DesignPlacement(design_id, _text(placement, 'host'), _integer(placement, 'generation')),
-                      _text(fields, 'repository_id'), _text(fields, 'repository'), _text(fields, 'document'),
-                      _text(fields, 'area'), _text(fields, 'created_at_utc'),
-                      _holder(_object(fields.get('holder'))), _binding(_object(fields.get('binding'))), tuple(instances))
+    path = design_directory(design_id) / 'design.json'
+    try:
+        fields = _read(design_directory(design_id) / 'design.json')
+        if fields.get('schema') != 1:
+            raise RoleRefused('unknown design schema')
+        placement = _object(fields.get('placement'))
+        if placement.get('design_id') != design_id:
+            raise RoleRefused('design identity differs from directory')
+        entries = fields.get('roles')
+        if not isinstance(entries, list):
+            raise RoleRefused('missing roles')
+        instances: list[RoleInstance] = []
+        for value in cast(list[object], entries):
+            entry = _object(value)
+            role = entry.get('role')
+            if role not in ('designer', 'reviewer') or any(instance.role == role for instance in instances):
+                raise RoleRefused('invalid or duplicate role')
+            claim = entry.get('assignment_claim', '')
+            if not isinstance(claim, str):
+                raise RoleRefused('invalid assignment claim')
+            instances.append(RoleInstance(role, _text(entry, 'name'), _lifecycle(_object(entry.get('lifecycle'))), claim))
+        if {instance.role for instance in instances} != {'designer', 'reviewer'}:
+            raise RoleRefused('design must record both role slots')
+        for key in ('repository', 'document'):
+            if not Path(_text(fields, key)).is_absolute():
+                raise RoleRefused(key + ' must be absolute')
+        return HeldDesign(DesignPlacement(design_id, _text(placement, 'host'), _integer(placement, 'generation')),
+                          _text(fields, 'repository_id'), _text(fields, 'repository'), _text(fields, 'document'),
+                          _text(fields, 'area'), _text(fields, 'created_at_utc'),
+                          _holder(_object(fields.get('holder'))), _binding(_object(fields.get('binding'))), tuple(instances))
+    except RoleRefused as error:
+        raise worker_lifecycle.WorkerStateUnreadable(path, str(error)) from error
 
 
 def _save(design: HeldDesign) -> None:
@@ -585,17 +586,10 @@ def durable_meshes() -> tuple[Path, ...]:
 @contextmanager
 def _edit_roster(design_id: str) -> Generator[dict[str, object]]:
     path = mesh_directory(design_id) / 'mesh_roster.json'
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open('a+', encoding='utf-8') as handle:
-        worker_lifecycle.acquire_flock(handle, mode=fcntl.LOCK_EX)
-        _ = handle.seek(0)
-        text = handle.read()
-        roster = _object(cast(object, json.loads(text))) if text else {}
+    with worker_lifecycle.locked_state(path) as state:
+        roster = state.read_object()
         yield roster
-        _ = handle.seek(0)
-        _ = handle.truncate()
-        json.dump(roster, handle, indent=2, sort_keys=True)
-        handle.flush()
+        state.publish(json.dumps(roster, indent=2, sort_keys=True))
 
 
 def _roster(design: HeldDesign) -> dict[str, object]:
@@ -887,7 +881,7 @@ def resume(instance_id: str, prompt_file: str | Path) -> Path:
         current = read_design(design_id)
         _save(_set_lifecycle(replace(current, roles=tuple(replace(value, assignment_claim='') if value.role == role else value
                                                       for value in current.roles)), role, RoleOpen(instance.lifecycle.thread_id)))
-        identifiers = cast(list[str], json.loads(prompt.with_suffix('.messages.json').read_text(encoding='utf-8')))
+        identifiers = cast(list[str], worker_lifecycle.read_worker_value(prompt.with_suffix('.messages.json')))
         for identifier in identifiers:
             (directory / 'pending' / role / f'{identifier}.json').unlink(missing_ok=True)
     _project_hold(design, role, reach)
@@ -1171,9 +1165,8 @@ def adopt(repository: str, document: str, role: Role, holder: Holder, area: str,
             prompt, _ = _prompt(candidate, role, 'Continue the adopted design in the same thread when the holder assigns work.')
             _ = authority_request('adopt-reserve', {'repository_id': repository, 'document': document, 'host': host,
                                                     'adoption_id': adoption_id})
-            with source_path.open('r+', encoding='utf-8') as source_lock:
-                worker_lifecycle.acquire_flock(source_lock, mode=fcntl.LOCK_EX)
-                roster = _object(cast(object, json.load(source_lock)))
+            with worker_lifecycle.locked_state(source_path) as source_lock:
+                roster = source_lock.read_object()
                 entry = _object(roster.get(name))
                 _check_adoption_source(entry, thread_id)
                 recorded = codex_mesh.recorded_turn_settings(entry)
@@ -1190,10 +1183,7 @@ def adopt(repository: str, document: str, role: Role, holder: Holder, area: str,
                         {**transfer, 'design_id': design_id, 'thread_id': thread_id, 'name': name, 'source_mesh': str(source)})
                 entry['transferring_role'] = transfer
                 roster[name] = entry
-                _ = source_lock.seek(0)
-                _ = source_lock.truncate()
-                json.dump(roster, source_lock)
-                source_lock.flush()
+                source_lock.publish(json.dumps(roster))
             server = _read(source / 'mesh_server.json')
             port = _integer(server, 'port')
             client = codex_mesh.Client(port, 'design-role-adopt')
@@ -1209,7 +1199,6 @@ def adopt(repository: str, document: str, role: Role, holder: Holder, area: str,
                     released = codex_mesh._release_worker_thread(client, thread_id, str(source))  # pyright: ignore[reportPrivateUsage]
                     if isinstance(released, codex_mesh.WorkerThreadStateUnknown):
                         raise RoleRefused('AdoptionNeedsRecovery: ' + released.reason)
-                    _ = pending.seek(0)
                     pending_text = pending.read()
             finally:
                 client.close()
@@ -1239,20 +1228,17 @@ def adopt(repository: str, document: str, role: Role, holder: Holder, area: str,
                 destination_roster[name] = adopted
             _atomic(mesh / 'serving_home.json', {'codex_home': _text(server, 'codex_home')})
             if pending_text:
-                _ = (mesh / f'{name}.pending.json').write_text(pending_text, encoding='utf-8')
+                with worker_lifecycle.locked_state(mesh / f'{name}.pending.json') as inbox:
+                    inbox.publish(pending_text)
             _save(design)
             _mesh_context(design, reach)
             confirm_adoption(design, role, thread_id)
-            with source_path.open('r+', encoding='utf-8') as source_lock:
-                worker_lifecycle.acquire_flock(source_lock, mode=fcntl.LOCK_EX)
-                roster = _object(cast(object, json.load(source_lock)))
+            with worker_lifecycle.locked_state(source_path) as source_lock:
+                roster = source_lock.read_object()
                 current = _object(roster.get(name))
                 current['role_redirect'] = {'design_id': design_id, 'destination': str(mesh), 'adoption_id': adoption_id}
                 roster[name] = current
-                _ = source_lock.seek(0)
-                _ = source_lock.truncate()
-                json.dump(roster, source_lock)
-                source_lock.flush()
+                source_lock.publish(json.dumps(roster))
             _atomic(directory / 'adoption.json', {'adoption_id': adoption_id, 'source_mesh': str(source), 'name': name,
                                                  'thread_id': thread_id, 'completed': True})
             _ = authority_request('adopt-commit', {'repository_id': repository, 'document': document, 'host': host,
