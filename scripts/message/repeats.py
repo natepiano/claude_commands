@@ -15,14 +15,16 @@ import subprocess
 import sys
 from collections.abc import Iterable, Iterator
 from dataclasses import asdict, dataclass, field
-from datetime import date, datetime
+from datetime import datetime
 from pathlib import Path
 from typing import cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 import repeat_guard
 from scripts.shutdown import remote
+from user_zone import user_zone  # noqa: E402
 
 
 @dataclass
@@ -48,7 +50,7 @@ def _records_file(path: Path, day: str) -> Iterator[dict[str, object]]:
                 if isinstance(record, dict):
                     values = cast(dict[str, object], record)
                     at = datetime.fromisoformat(str(values.get("time", "")))
-                    if at.astimezone().date().isoformat() == day:
+                    if at.astimezone(user_zone()).date().isoformat() == day:
                         yield values
             except (ValueError, TypeError):
                 continue
@@ -94,7 +96,7 @@ def replay(rows: Iterable[dict[str, object]], limits: repeat_guard.Limits, *, si
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     _ = parser.add_argument("--here", action="store_true")
-    _ = parser.add_argument("--day", default=date.today().isoformat())
+    _ = parser.add_argument("--day", default=datetime.now(user_zone()).date().isoformat())
     _ = parser.add_argument("--log", type=Path, default=Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state"))) / "message/log.jsonl")
     _ = parser.add_argument("--replay", action="store_true")
     _ = parser.add_argument("--snapshot", action="store_true", help=argparse.SUPPRESS)
