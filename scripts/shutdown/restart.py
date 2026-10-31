@@ -43,7 +43,7 @@ from scripts.whoami.account import (  # noqa: E402
     own_claude_account,
     NAMED_ACCOUNT_VARIABLES,
 )
-from scripts.shutdown import stop_resume  # noqa: E402
+from scripts.shutdown import folder_trust, stop_resume  # noqa: E402
 import pane_record  # noqa: E402
 import production_units  # noqa: E402
 from scripts.production import staff, staff_sources  # noqa: E402
@@ -1101,19 +1101,15 @@ class FolderNotTrusted(OSError):
 
 
 def _heal_folder_trust(session: Session, folder: Path, config_dir: Path, *, dry_run: bool) -> None:
-    """Copy the folder's trust from another account on this machine, or raise `FolderNotTrusted`."""
-    from scripts.accounts import accounts
-
+    """Adapt the shared trust result to recorded restart's reporting and failure storage."""
     recorded = session.get("config_dir")
-    sources = accounts.trust_sources(config_dir, Path(recorded) if recorded else None)
-    trust = herdr.heal_claude_trust(folder, config_dir / ".claude.json", sources, dry_run=dry_run)
+    trust = folder_trust.heal(folder, config_dir, Path(recorded) if recorded else config_dir, dry_run=dry_run)
     target = config_dir.name.removeprefix(".")
     if isinstance(trust, herdr.TrustCopied):
         copied = "would copy" if dry_run else "copied"
         print(f"{session['name']}: {copied} folder trust for {folder} from {trust.source} to {target}")
-    elif isinstance(trust, (herdr.Untrusted, herdr.UnreadableTrustFile)):
-        reason = str(trust) if isinstance(trust, herdr.UnreadableTrustFile) else f"{folder}: Claude has not trusted this folder"
-        raise FolderNotTrusted(reason, accounts.trust_command(folder, accounts.NamedAccount(target, config_dir)))
+    elif isinstance(trust, (folder_trust.FolderNotTrusted, folder_trust.FolderTrustUnreadable)):
+        raise FolderNotTrusted(trust.reason, trust.command)
 
 
 def _prepare_resume_environment(session_id: str, cwd: str, environment: dict[str, str],

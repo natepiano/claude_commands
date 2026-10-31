@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 import os
 import shlex
 import signal
@@ -16,6 +17,7 @@ from threading import Barrier, Lock, local
 from typing import cast, final, override
 from unittest.mock import Mock, call, patch
 
+from scripts.accounts import accounts
 from scripts.shutdown import stop_resume
 import herdr
 import pane_record
@@ -38,6 +40,12 @@ class StopResumeTests(unittest.TestCase):
             ["claude", "-n", "alpha", "--remote-control", "alpha", "--model", "sonnet"])
         self.client = FakeClient([{"pane_id": "w1:p2", "tab_id": "w1:t9", "label": "alpha", "workspace_id": "w1",
                                    "agent_session": {"kind": "id", "value": "sid-alpha"}}])
+        for label in ("claude3", "claude4"):
+            config = self.root / f".{label}"
+            config.mkdir()
+            _ = (config / ".claude.json").write_text(json.dumps({
+                "projects": {str(self.root): {"hasTrustDialogAccepted": True}},
+            }))
         self.live = Mock(return_value=sessions.SessionNotLive())
         self.process = Mock(return_value=sessions.LiveSessionProcess(123))
         self.kill = Mock()
@@ -51,6 +59,9 @@ class StopResumeTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        _ = self.enterContext(patch.object(accounts, "accounts_home", return_value=self.root))
+        _ = self.enterContext(patch.object(herdr, "repository_root", return_value=self.root))
+        _ = self.enterContext(patch.object(herdr, "repository_trust_key", return_value=self.root))
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "", "SHUTDOWN_STATE_DIR": str(self.root / "shutdown")})))
         _ = self.enterContext(patch.object(herdr, "shared_session", return_value="agents"))
         _ = self.enterContext(patch.object(herdr, "Herdr", return_value=self.client))
@@ -113,6 +124,48 @@ class StopResumeTests(unittest.TestCase):
         self.seed.assert_called_once()
         select = cast(Callable[[herdr.PaneIdentity], bool], self.seed.call_args.kwargs["select"])
         self.assertEqual([pane["pane_id"] for pane in self.client.panes() if select(pane)], ["w1:p2"])
+
+    def test_move_copies_source_folder_trust_to_the_target_before_start(self) -> None:
+        target = self.root / ".claude4/.claude.json"
+        _ = target.write_text(json.dumps({"projects": {}, "unrelated": "keep"}))
+        def start_after_trust(*arguments: str) -> str:
+            self.assertIsInstance(herdr.claude_trust(self.root, target), herdr.Trusted)
+            command = self._typed(arguments)
+            self.assertEqual(command[command.index("exec") + 1], "claude4")
+            return ""
+        self.start.side_effect = start_after_trust
+        results = stop_resume.move_sessions(["alpha"], "claude4", why="usage limit")
+        self.start.assert_called_once()
+        result = results[0]
+        self.assertIsInstance(result, stop_resume.ClaudeUp)
+        assert isinstance(result, stop_resume.ClaudeUp)
+        self.assertEqual(result.trust_copied_from, "claude3")
+        line = accounts.move_result_line(result)
+        self.assertEqual(line.count("copied folder trust from claude3"), 1)
+        self.assertEqual(json.loads(target.read_text())["unrelated"], "keep")
+
+    def test_move_without_trust_refuses_with_target_trust_command_before_start(self) -> None:
+        for label in ("claude3", "claude4"):
+            _ = (self.root / f".{label}/.claude.json").write_text('{"projects": {}}')
+        results = stop_resume.move_sessions(["alpha"], "claude4", why="usage limit")
+        result = results[0]
+        self.assertIsInstance(result, stop_resume.ResumeFailed)
+        assert isinstance(result, stop_resume.ResumeFailed)
+        command = accounts.trust_command(self.root, accounts.NamedAccount("claude4", self.root / ".claude4"))
+        self.assertIn("Claude has not trusted this folder", result.reason)
+        self.assertIn(f"Run: {command}", result.reason)
+        self.start.assert_not_called()
+        self.detach.assert_not_called()
+
+    def test_resume_with_unreadable_target_trust_refuses_before_start(self) -> None:
+        _ = (self.root / ".claude4/.claude.json").write_text('{"private": "never disclose"')
+        result = stop_resume.resume("alpha", to="claude4", why="usage limit")
+        self.assertIsInstance(result, stop_resume.ResumeFailed)
+        assert isinstance(result, stop_resume.ResumeFailed)
+        self.assertIn("cannot read", result.reason)
+        self.assertIn("Run: " + accounts.trust_command(self.root, accounts.NamedAccount("claude4", self.root / ".claude4")), result.reason)
+        self.assertNotIn("never disclose", result.reason)
+        self.start.assert_not_called()
 
     def test_a_stopped_tab_resumes_by_id_or_label_from_its_launch_entry(self) -> None:
         self.client.rows[0]["agent_session"] = None

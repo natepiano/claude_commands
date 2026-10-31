@@ -28,6 +28,7 @@ for dependency in ("shutdown", "herdr", "message", "whoami", "lib"):
 
 import herdr
 import pane_record
+from scripts.shutdown import folder_trust
 import sessions
 from shutdown_record import PausedSeat
 from launch_permission import shutdown_state_root
@@ -62,6 +63,7 @@ class ClaudeUp:
     pane_id: str
     account: str
     elapsed_seconds: float = field(default=0.0, compare=False)
+    trust_copied_from: str = field(default="", compare=False)
 
 
 @dataclass(frozen=True)
@@ -261,8 +263,15 @@ def resume(session: str, *, why: str, to: str | None = None, requester: str = ""
         from inventory import codex_seats
         import unit_runs
 
+        from scripts.accounts import accounts
+
         source = Path(entry["config_dir"])
         label = to if to is not None else source.name.removeprefix(".")
+        target_dir = accounts.account_dir(label) if to is not None else source
+        trust = folder_trust.heal(Path(entry["cwd"]), target_dir, source)
+        if isinstance(trust, (folder_trust.FolderNotTrusted, folder_trust.FolderTrustUnreadable)):
+            return ResumeFailed(identity, f"{trust.reason}. Run: {trust.command}")
+        copied_from = trust.source if isinstance(trust, herdr.TrustCopied) else ""
         workers = ResumeWorkers(codex_seats([Path(run) for run in unit_runs.held(identity)]), entry["cwd"])
         message = resume_message(why, moved_from=source.name.removeprefix(".") if to else None,
                                  moved_to=to, workers=workers)
@@ -291,7 +300,7 @@ def resume(session: str, *, why: str, to: str | None = None, requester: str = ""
             _detach(["stay", "--session", identity, "--pane", tab.pane_id,
                      "--account", label, "--pid", str(live.pid), "--generation", generation, "--why", why,
                      *(["--requester", requester] if requester else [])], "stay")
-            return ClaudeUp(identity, tab.pane_id, label, monotonic() - began)
+            return ClaudeUp(identity, tab.pane_id, label, monotonic() - began, copied_from)
         return ResumeFailed(identity, reason)
     except (OSError, ValueError, herdr.HerdrFailure, subprocess.SubprocessError) as error:
         return ResumeFailed(identity, str(error))
@@ -392,7 +401,8 @@ def _early_exit(identity: str, pane: str, account: str, elapsed: float, *, reque
 
 def claude_up_line(result: ClaudeUp) -> str:
     return (f"{result.session_id}: Claude is up on {result.account} in {result.pane_id} "
-            f"({result.elapsed_seconds:.1f} s)")
+            + f"({result.elapsed_seconds:.1f} s)"
+            + (f"; copied folder trust from {result.trust_copied_from}" if result.trust_copied_from else ""))
 
 
 def _warn_session(session: str, target: str, why: str, seconds: int) -> None:
