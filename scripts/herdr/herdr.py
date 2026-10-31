@@ -39,6 +39,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from process_failure import failure_detail
 import nix_env as nix_env
 
 if TYPE_CHECKING:
@@ -887,7 +888,7 @@ def require_success(result: subprocess.CompletedProcess[str], context: str) -> N
     if result.returncode == 0:
         return
     code = ""
-    detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
+    detail = failure_detail(result)
     for text in (result.stderr, result.stdout):
         try:
             error = json_object(decode_object(text, context).get("error"), context)

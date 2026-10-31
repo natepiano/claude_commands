@@ -23,6 +23,8 @@ from typing import TYPE_CHECKING, Literal, cast, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 import sweep
 if TYPE_CHECKING:
     from . import memory_admit
@@ -2136,7 +2138,7 @@ if sys.argv[sys.argv.index("--to") + 1] == "user":
               redirect_stdout(io.StringIO()), redirect_stderr(errors)):
             self.assertTrue(sweep.send_floor_alert("disk notice", sweep.FloorAlertChannels.NATEDEV_AND_PHONE,
                                                    phone=sweep.disk_floor_push(2 * GIB, 9 * GIB, 10 * GIB, PAGE_PATHS)))
-        self.assertIn("phone alert failed (3): FAILED: Pushover keys are missing", errors.getvalue())
+        self.assertIn("phone alert failed (3): stdout: FAILED: Pushover keys are missing", errors.getvalue())
 
     def test_natedev_only_channel_never_calls_phone(self) -> None:
         result = subprocess.CompletedProcess([], 1, "", "")

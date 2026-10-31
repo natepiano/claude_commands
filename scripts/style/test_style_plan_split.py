@@ -93,6 +93,7 @@ class StylePlanTests(StylePlanFixture):
         def exempt(finding: style_ledger.HeldFinding, _family: rules.Family) -> bool:
             return finding.path == paths["exempt"]
 
+        self.finish_judging()
         definitions = {definition.rule_id: definition for definition in rules.load_rules(self.repo)}
         measured_at = "2026-10-28T12:00:00+00:00"
         with (mock.patch.object(style_ledger.Ledger, "declaration_reading", return_value=style_ledger.DeclarationReading(self.tip, outcomes)),
@@ -180,11 +181,12 @@ class StylePlanTests(StylePlanFixture):
         ledger.ticket_add("types-unit-1", "types-unit", "read", "types", "crates/alpha", [self.sources[1]], [type_rule])
         ledger.ticket_assign("types-unit-1", "style/main")
         _ = ledger.ticket_base("types-unit-1")
-        ledger.ticket_drop("types-unit-1")
         for index, path in enumerate(self.sources[:2]):
             _ = ledger.hold(type_rule, path, 1, "type work", "type", "before", "after", definition.blob,
                             "outside" if index == 0 else "types-unit-1")
+        ledger.ticket_drop("types-unit-1")
         self.commit_files({self.sources[1]: "pub fn value() { changed(); }\n"})
+        self.finish_judging()
         scopes: dict[rules.Family, unit_plans.PilotScope] = {"names": unit_plans.AllCrates(), "types": unit_plans.AllCrates()}
         cache = style_ledger.GitReadCache(self.repo)
         expected = {self.sources[0]: style_proposals.RankWait("names", self.sources[0], "types")}
@@ -550,7 +552,7 @@ class RefillRecordingTests(unittest.TestCase):
             self.assertEqual(code, 1)
             self.assertEqual(completed, ["names-unit", "types-unit", "values-unit"])
             self.assertEqual(output.getvalue(), "names-unit: 1/2/3/4 in 0.25 min\n"
-                             + "types-unit: failed: cannot read tree\nvalues-unit: 1/2/3/4 in 0.25 min\n")
+                             + "types-unit: failed: stderr: split types-unit: cannot read tree\nvalues-unit: 1/2/3/4 in 0.25 min\n")
 
     def test_main_records_every_outcome_after_next_phase_returns(self) -> None:
         cases: tuple[tuple[object, str, int, str], ...] = (

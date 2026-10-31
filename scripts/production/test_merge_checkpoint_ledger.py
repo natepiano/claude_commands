@@ -49,7 +49,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), merge)
         self.assertEqual(len(self.events("send.py")), 1)
         self.assertEqual([line for line in result.stdout.splitlines() if line.startswith("hand-off ledger:")],
-                         [f"hand-off ledger: style_ledger: unknown hand-off {checkpoint}"])
+                         [f"hand-off ledger: stderr: style_ledger: unknown hand-off {checkpoint}"])
     def test_duplicate_child_notice_records_a_ledger_write_missed_at_the_merge(self) -> None:
         _ = self.child_production()
         checkpoint = self.checkpoint()
