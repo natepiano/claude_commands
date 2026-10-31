@@ -328,6 +328,17 @@ class UsageStoreTests(unittest.TestCase):
         self.assertEqual(stored["main@example.invalid"].get("attempted_at"), READ.isoformat())
         self.assertEqual(stored["main@example.invalid"].get("attempt_outcome"), UsageReadOutcome.RATE_LIMITED_429)
 
+    def test_unavailable_credentials_create_no_failure_or_directory_mapping(self) -> None:
+        report = Report("Claude", email="desktop@example.invalid",
+            source=agent_accounts.ClaudeDirectorySource(self.home / ".claude2"),
+            usage_read_outcome=UsageReadOutcome.CREDENTIALS_UNAVAILABLE)
+        stored = usage_store.UsageReadings()
+        self.assertFalse(usage_store.merge(stored, [report], READ))
+        self.assertEqual(stored, {})
+        self.assertEqual(stored.directory_logins, {})
+        usage_store.save([report], READ)
+        self.assertFalse(usage_store.store_file().exists())
+
     def test_a_late_save_of_a_good_read_keeps_a_newer_failed_attempt(self) -> None:
         login = "main@example.invalid"
         first = usage_store.claim_read(login, READ)

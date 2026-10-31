@@ -7,7 +7,6 @@ import json
 import os
 import re
 import shlex
-import socket
 import subprocess
 import sys
 from collections.abc import Mapping
@@ -26,7 +25,7 @@ import herdr
 from inventory import Session, inventory
 import shutdown_record as store
 from shutdown_record import SessionShutdown, SessionStopIssue
-from remote import other_machine, run_remote
+from remote import local_machine, other_machine, run_remote
 from scripts.production import staff_sources
 from scripts.production import showrunners
 import sessions
@@ -123,16 +122,6 @@ def elapsed_text(seconds: int) -> str:
     if seconds < 86400:
         return f"{seconds // 3600}h"
     return f"{seconds // 86400}d"
-
-
-def _machine() -> str:
-    name = socket.gethostname().split(".", 1)[0]
-    return name or ("mac" if sys.platform == "darwin" else "natedev")
-
-
-def local_machine() -> str:
-    """Return this machine's shutdown-record name."""
-    return _machine()
 
 
 def _notifier_command() -> list[str]:
