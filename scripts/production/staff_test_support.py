@@ -121,15 +121,18 @@ def observe_operation_lock() -> None:
         return
     watched = Path(os.environ["STAFF_TEST_LOCK_TARGET"])
     original = fcntl.flock
+    reported = False
 
     def report_then_lock(lock_file: int | IOBase, operation: int) -> None:
-        if operation == fcntl.LOCK_EX and watched.exists():
+        nonlocal reported
+        if not reported and operation & fcntl.LOCK_EX and watched.exists():
             descriptor = lock_file if isinstance(lock_file, int) else lock_file.fileno()
             opened, target = os.fstat(descriptor), watched.stat()
             if (opened.st_dev, opened.st_ino) == (target.st_dev, target.st_ino):
                 with socket.socket(socket.AF_UNIX) as signal:
                     signal.connect(notice)
                     signal.sendall(b"operation")
+                reported = True
         original(lock_file, operation)
 
     _ = mock.patch("fcntl.flock", side_effect=report_then_lock).start()

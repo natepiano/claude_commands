@@ -43,7 +43,6 @@ The settings.json entry, one more SessionStart item:
   an entry, it resumes the conversation unless a reason below holds, and prints the reason:
   - herdr's `agent_session` names another conversation;
   - the entry is `ended` (closed by hand);
-  - a shutdown record holds the session (`shutdown.py up` brings it back);
   - the conversation already runs (`sessions.live_sessions` or `running_sessions`);
   - `flags_read` is false (entries written before the field are read as true off the Mac);
   - the account has no transcript of the conversation;
@@ -59,9 +58,8 @@ The settings.json entry, one more SessionStart item:
   on the server's account, so `_clear_restored_workspaces` clears the layout, as for every other
   session.
 - `restart._herdr_launch` runs `pane_restore.restore` once, when its launch started the shared
-  server (`ServerCreated` or `WindowServerCreated`) and the layout is kept. The restore leaves
-  the sessions that a shutdown record holds, and restart then resumes each of them in its
-  recorded pane: the restored pane at a shell closes first. A restore that leaves a pane not
+  server (`ServerCreated` or `WindowServerCreated`) and the layout is kept. The restore resumes each eligible stopped conversation from its pane launch entry.
+  Stale shutdown records do not prevent pane restore. A restore that leaves a pane not
   resumed prints a restart issue that names the command to run it again.
 - `herdr._submit_server`, for the shared session only, starts `herdr-<name>.service` with
   `systemctl --user start` when a unit file defines it (`systemctl show -p FragmentPath`, not

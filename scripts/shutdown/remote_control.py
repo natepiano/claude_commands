@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, cast
@@ -22,7 +23,6 @@ from launch_permission import shutdown_state_root
 import session_pane
 import sessions
 from herdr import AgentBlocked
-from shutdown_record import SessionShutdown
 
 FLAG_WAIT = 60.0
 ATTEMPT_WAIT = 30.0
@@ -82,14 +82,23 @@ class RegistryUnavailable:
     """The process still matches, but its registry cannot authorize pane input."""
 
 
-def remote_control_who(saved: SessionShutdown) -> str:
-    session = saved["session"]
-    host = session["host"]
-    if host["kind"] == "unit":
-        return host["unit"].removesuffix("-unit") + " unit"
-    if session["kind"] == "showrunner":
-        return session["production"] + " showrunner"
-    return session["name"]
+def remote_control_who(session: Mapping[str, object]) -> str:
+    """Name live registry/pane data; accept the retiring restart wrapper at its boundary."""
+    nested = session.get("session")
+    if isinstance(nested, dict):
+        session = cast(Mapping[str, object], nested)
+    environment = session.get("environment", {})
+    marks: Mapping[str, object] = cast(Mapping[str, object], environment) if isinstance(environment, dict) else {}
+    host = session.get("host", {})
+    place: Mapping[str, object] = cast(Mapping[str, object], host) if isinstance(host, dict) else {}
+    unit = marks.get("SHOWRUNNER_UNIT_ID") or place.get("unit")
+    if isinstance(unit, str) and unit:
+        return unit.removesuffix("-unit") + " unit"
+    production = session.get("production") if session.get("kind") == "showrunner" else marks.get("SHOWRUNNER_UNIT")
+    if isinstance(production, str) and production:
+        return production + " showrunner"
+    name = session.get("name") or session.get("sessionId") or session.get("session_id")
+    return name if isinstance(name, str) else ""
 
 
 def launch_fixer(session_id: str, pid: int, proc_start: str, who: str, session: str) -> None:

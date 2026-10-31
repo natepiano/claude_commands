@@ -27,6 +27,15 @@ from scripts.production.cli_fixture import invoke_cli
 
 
 STUB_ATOMIC_JSON_WRITER = '''
+import pathlib
+import sys
+if len(sys.argv) > 1 and sys.argv[1] == 'compact':
+    session = pathlib.Path(sys.argv[sys.argv.index('--session-dir') + 1])
+    if (session / 'compact_roster_changed').exists():
+        with (session / 'mesh_events.txt').open('a') as events:
+            events.write('compact\\n')
+        print('codex_mesh: roster changed during compaction; reopen before following', file=sys.stderr)
+        sys.exit(4)
 def write_json(path, value):
     import json
     import os

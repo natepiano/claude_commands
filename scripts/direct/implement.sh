@@ -352,6 +352,10 @@ with worker_claim_lock(root):
                              "follow-up not sent")
                         fail(f"{name} still has a live turn after compaction; end the worker "
                              f"(codex_mesh.py end --to {name}) and start a fresh one")
+                    if compact.returncode == 4:
+                        post(f"launcher: {detail}; follow-up not sent")
+                        fail(f"{name}: roster changed during compaction; follow-up not sent; "
+                             f"inspect the worker and use codex_mesh.py reopen --to {name} if idle")
                     post(f"launcher: compaction failed for {name}: {detail}; continuing follow-up")
             check = subprocess.run(
                 [sys.executable, mesh_script, "can-follow", "--session-dir", root_text,
