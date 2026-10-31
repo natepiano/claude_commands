@@ -26,7 +26,7 @@ import retire_unit
 import unit_lookup
 import unit_move
 from production_units import Production, read_production
-from shutdown_record import SessionShutdown
+import pane_record
 
 from scripts.production.staff_test_support import CHECKOUT, PROCESS_TIMEOUT, StaffTestCase
 from scripts.lib.atomic_file import write_text_atomic
@@ -76,6 +76,7 @@ class ResumeUnitTests(unittest.TestCase):
         _ = git(self.checkout, "add", "-A")
         _ = git(self.checkout, "commit", "-q", "-m", "production(alpha): retire alpha-unit")
         _ = git(self.checkout, "push", "-q", "origin", "main")
+        _ = self.enterContext(mock.patch.object(pane_record, "RECORD_DIR", self.root / "pane-launches"))
         self.configs = [self.root / "claude1", self.root / "claude2"]
         self.transcript(self.configs[0])
 
@@ -354,15 +355,15 @@ class ResumeUnitTests(unittest.TestCase):
         self.assertEqual(self.calls, [])
         self.assert_resumed(*self.resume())
 
-    def test_missing_session_prefers_the_newest_retained_shutdown_record(self) -> None:
+    def test_missing_session_prefers_the_newest_retained_pane_launch(self) -> None:
         self.write_row("(retired 2026-10-28, worktree removed) docs/plans/alpha.md")
-        # Only the fields consumed by last_session at this shutdown-record boundary.
-        records = cast(list[SessionShutdown], cast(object, [
-            {"requested_at": "2026-10-27T23:00:00+00:00", "session": {"session_id": "older"}},
-            {"requested_at": "2026-10-28T23:00:00+00:00", "session": {"session_id": DIRECTOR}},
-        ]))
-        with mock.patch.object(retire_unit, "unit_shutdowns", return_value=records):
-            self.assert_resumed(*self.resume())
+        for pane, identity, at in (("w1:p1", "older", "2026-10-27T23:00:00+00:00"),
+                                    ("w1:p2", DIRECTOR, "2026-10-28T23:00:00+00:00")):
+            launch = pane_record.launch(pane, identity, str(self.worktree),
+                {"SHOWRUNNER_UNIT_ID": "alpha-unit", "CLAUDE_CONFIG_DIR": str(self.configs[0])}, ["--resume", identity])
+            launch["written_at"] = at
+            pane_record.write("agents", launch)
+        self.assert_resumed(*self.resume())
 
     def external_transcript(self) -> Path:
         for transcript in (self.configs[0] / "projects").glob(f"*/{DIRECTOR}.jsonl"):

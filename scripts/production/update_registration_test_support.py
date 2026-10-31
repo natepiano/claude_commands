@@ -223,7 +223,7 @@ class RegistrationFixture(unittest.TestCase):
 
     def build_command_copy(self, tree: Path) -> None:
         _ = shutil.copytree(SCRIPT.parent, tree / "scripts/production")
-        for name in ("build_hold", "build_targets", "buildlog", "direct", "herdr", "lib", "lint", "mac_test", "message", "shutdown", "usage", "whoami"):
+        for name in ("agents", "astra", "build_hold", "build_targets", "buildlog", "direct", "herdr", "lib", "lint", "mac_test", "message", "shutdown", "usage", "whoami"):
             _ = shutil.copytree(SCRIPT.parent.parent / name, tree / "scripts" / name)
         hooks = tree / "scripts/hooks"
         hooks.mkdir(parents=True)

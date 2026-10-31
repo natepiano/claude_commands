@@ -20,6 +20,8 @@ from dailies_render import LENGTHS
 from dailies_input import (BevyUpgradeUnavailable, Block, ClaudeNotRunning, Decision, FormWaiting,
                            Running, SessionGone, StillWaiting, TicksFailing, bevy_upgrade_watch)
 import unit_lookup
+from scripts.production import staff
+from scripts.production.staff_test_support import fixture_showrunner_name, unit_membership
 from unit_lookup import UnitState
 from dailies_input_test_support import (DailiesInputFixture, SCRIPT, RENDERER, WAITING, STAMP, AT,
                                         ALPHA, BETA, RACE_WATCH_STUB)
@@ -44,7 +46,7 @@ class DailiesInputTests(DailiesInputFixture):
         with (mock.patch.dict(os.environ, self.env),
               mock.patch.object(unit_lookup, "marked_units", return_value={}),
               mock.patch.object(unit_lookup, "read_run_states", wraps=unit_lookup.read_run_states) as reads):
-            units = dailies_input.units_from_doc(self.doc.read_text(encoding="utf-8").splitlines(), "fixture")
+            units = dailies_input.units_from_doc(self.doc.read_text(encoding="utf-8").splitlines(), "example")
             reads.assert_called_once_with()
         self.assertEqual([(unit.name, unit.run) for unit in units],
                          [(ALPHA, UnitState.STANDING_BY), (BETA, UnitState.RUN_FINISHED)])
@@ -579,6 +581,7 @@ class DailiesInputTests(DailiesInputFixture):
         self.assertEqual(cast(dict[str, object], self.unit()["eta"])["time"], "23:40")
 
     def test_a_dailies_leaves_a_retired_units_note_for_the_timer_to_prune(self) -> None:
+        _ = staff.retire(unit_membership(fixture_showrunner_name("example", self.doc), ALPHA).id)
         note = self.root / "vault/old-showrunner/alpha-unit.md"
         note.parent.mkdir(parents=True)
         _ = note.write_text(
@@ -662,6 +665,7 @@ class DailiesInputTests(DailiesInputFixture):
         self.assertEqual([unit["unit"] for unit in units], [ALPHA])
 
     def test_all_retired_units_report_no_live_units(self) -> None:
+        _ = staff.retire(unit_membership(fixture_showrunner_name("example", self.doc), ALPHA).id)
         content = self.doc.read_text(encoding="utf-8")
         _ = self.doc.write_text(content.replace("`docs/alpha.md`", "retired after completion", 1),
                                 encoding="utf-8")
@@ -1673,6 +1677,17 @@ class DailiesInputTests(DailiesInputFixture):
                     self.assertEqual(unavailable, {"unavailable": f"summary: stderr: {error}"})
                 parsed = dailies_render.parse_child_report(saved, "saved", ZoneInfo("America/Los_Angeles"))
                 self.assertIsInstance(parsed.style, dailies_render.StyleSummaryUnavailable)
+
+    def test_complete_dailies_with_child_productions_reads_one_staff_snapshot(self) -> None:
+        self.attach("kid", "example")
+        self.attach("leaf", "kid")
+        self.write_saved_report("kid")
+        self.write_open_for("leaf", json.dumps([{"since": "2026-10-06T10:00", "text": "name the release"}]))
+        with mock.patch.object(staff, "snapshot", wraps=staff.snapshot) as reads:
+            result = self.run_builder()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual([(child["name"], child["open"]) for child in self.children()], [("kid", 1)])
+        self.assertEqual(reads.call_count, 1)
 
     def test_a_production_below_is_read_into_the_input_with_what_waits_on_the_user(self) -> None:
         self.attach("kid", "example")

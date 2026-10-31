@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""PostToolUse hook: block a tool call whose written text or output has a banned word.
+"""PostToolUse hook: block a tool call whose written text has a banned word.
 
 What is scanned per tool is defined once, in tool_call_text.scan_text: text a
 call removes or searches for (an Edit's old_string, the old side of a scripted
-replacement or the pattern of a grep in a Bash command) is never scanned, and a
-banned word in that text is not reported in the tool's output either; the rest
-of the output is.
+replacement or the pattern of a grep in a Bash command) is never scanned.
+Tool output is never scanned: it is text the agent reads.
 
 One JSON object carries the whole verdict: `decision: block` with a short
 reason, so the agent must address the violation before moving on; a one-line
@@ -55,25 +54,16 @@ def main() -> None:
         get_stem_guidance,
         hooks_enabled,
         is_guide_reproduction,
-        is_introspection_command,
-        is_read_only_command,
     )
-    from tool_call_text import ToolInput, ToolResponse, scan_text
+    from tool_call_text import ToolInput, scan_text
 
     if not hooks_enabled():
         sys.exit(0)
 
-    # Some MCP tools deliver `tool_input`/`tool_response` as a string instead
-    # of a dict — defend against that before calling .get() on them.
+    # Some MCP tools deliver `tool_input` as a string instead of a dict.
     raw_tool_input: object = data.get("tool_input", {})
     tool_input: ToolInput = (
         cast(ToolInput, raw_tool_input) if isinstance(raw_tool_input, dict) else ToolInput()
-    )
-    raw_tool_response: object = data.get("tool_response", {})
-    tool_response: ToolResponse = (
-        cast(ToolResponse, raw_tool_response)
-        if isinstance(raw_tool_response, dict)
-        else ToolResponse()
     )
     file_path: str = tool_input.get("file_path", "") or tool_input.get("notebook_path", "") or ""
 
@@ -88,17 +78,7 @@ def main() -> None:
     if any(s in file_path for s in skip_substrings):
         sys.exit(0)
 
-    command = tool_input.get("command", "") or tool_input.get("cmd", "") or ""
-    if is_introspection_command(command) or is_read_only_command(command):
-        sys.exit(0)
-
-    if (
-        "Counter state:" in (tool_response.get("output", "") or "")
-        and "forbidden-word-counts.json" in (tool_response.get("output", "") or "")
-    ):
-        sys.exit(0)
-
-    text: str = scan_text(tool_name, tool_input, tool_response)
+    text: str = scan_text(tool_name, tool_input)
     if not text:
         sys.exit(0)
 

@@ -19,32 +19,32 @@ import remote
 import remote_control
 import restart
 import herdr
-import settle
+import restart_support
 import shutdown
 import sessions
 from unit_staff_test_support import isolated_parents
+from scripts.production.staff_test_support import isolated_staff_file, showrunner_relationship
 from shutdown_record import SessionShutdown
 
 
 class ShutdownSendLeaf(StrEnum):
-    DELIVER_MESSAGE = "settle._deliver_message"
-    RETIRE_SHUTDOWN_MESSAGES = "settle._retire_shutdown_messages"
+    DELIVER_MESSAGE = "restart_support._deliver_message"
+    RETIRE_SHUTDOWN_MESSAGES = "restart_support.retire_shutdown_messages"
     RESTART_RETIRE = "restart._retire"
     RESUME_CODEX_WORKERS = "restart._send_worker_resume"
     RUN_REMOTE = "remote.run_remote"
-    LAUNCH_CONDUCTOR = "settle._launch_conductor"
     LAUNCH_REMOTE_CONTROL_FIXER = "remote_control.launch_fixer"
-    RUN_NOTIFIER = "settle.run_notifier"
+    RUN_NOTIFIER = "restart_support.run_notifier"
 
 
 # Keep real functions before any test installs guards, including nested proof cases.
 _REAL_RESTART_RETIRE = restart._retire  # pyright: ignore[reportPrivateUsage]
 _REAL_LEAF_BINDINGS: dict[ShutdownSendLeaf, tuple[tuple[ModuleType, str, object], ...]] = {
     ShutdownSendLeaf.DELIVER_MESSAGE: (
-        (settle, "_deliver_message", settle._deliver_message),  # pyright: ignore[reportPrivateUsage]
+        (restart_support, "_deliver_message", restart_support._deliver_message),  # pyright: ignore[reportPrivateUsage]
     ),
     ShutdownSendLeaf.RETIRE_SHUTDOWN_MESSAGES: (
-        (settle, "_retire_shutdown_messages", settle._retire_shutdown_messages),  # pyright: ignore[reportPrivateUsage]
+        (restart_support, "retire_shutdown_messages", restart_support.retire_shutdown_messages),
     ),
     ShutdownSendLeaf.RESTART_RETIRE: ((restart, "_retire", _REAL_RESTART_RETIRE),),
     ShutdownSendLeaf.RESUME_CODEX_WORKERS: (
@@ -52,17 +52,14 @@ _REAL_LEAF_BINDINGS: dict[ShutdownSendLeaf, tuple[tuple[ModuleType, str, object]
     ),
     ShutdownSendLeaf.RUN_REMOTE: (
         (remote, "run_remote", remote.run_remote),
-        (settle, "run_remote", remote.run_remote),
+        (restart_support, "run_remote", remote.run_remote),
         (restart, "run_remote", remote.run_remote),
         (shutdown, "run_remote", remote.run_remote),
-    ),
-    ShutdownSendLeaf.LAUNCH_CONDUCTOR: (
-        (settle, "_launch_conductor", settle._launch_conductor),  # pyright: ignore[reportPrivateUsage]
     ),
     ShutdownSendLeaf.LAUNCH_REMOTE_CONTROL_FIXER: (
         (remote_control, "launch_fixer", remote_control.launch_fixer),
     ),
-    ShutdownSendLeaf.RUN_NOTIFIER: ((settle, "run_notifier", settle.run_notifier),),
+    ShutdownSendLeaf.RUN_NOTIFIER: ((restart_support, "run_notifier", restart_support.run_notifier),),
 }
 
 
@@ -101,6 +98,10 @@ class ShutdownTestCase(unittest.TestCase):
         faulthandler.dump_traceback_later(TEST_TIME_LIMIT_SECONDS, exit=True)
         self.addCleanup(faulthandler.cancel_dump_traceback_later)
         registry = Path(self.enterContext(tempfile.TemporaryDirectory())) / "sessions"
+        _ = self.enterContext(isolated_staff_file(registry.parent / "staff.json", {}))
+        # Seed the local owner record before subclasses select their modeled platform.
+        with patch.object(sys, "platform", "linux"):
+            _ = showrunner_relationship("fixture")
         empty_session_registry(self, registry)
         # Records and reports in these fixtures belong to natedev.
         _ = self.enterContext(patch.object(socket, "gethostname", return_value="natedev"))
@@ -115,7 +116,6 @@ class ShutdownTestCase(unittest.TestCase):
             ShutdownSendLeaf.RESTART_RETIRE: self._block_restart_retire,
             ShutdownSendLeaf.RESUME_CODEX_WORKERS: self._block_worker_resume,
             ShutdownSendLeaf.RUN_REMOTE: self._block_run_remote,
-            ShutdownSendLeaf.LAUNCH_CONDUCTOR: self._block_launch_conductor,
             ShutdownSendLeaf.RUN_NOTIFIER: self._block_run_notifier,
             ShutdownSendLeaf.LAUNCH_REMOTE_CONTROL_FIXER: self._block_launch_remote_control,
         }
@@ -185,11 +185,6 @@ class ShutdownTestCase(unittest.TestCase):
                 f"session:{record['session']['session_id']}",
             )
 
-    def _block_launch_conductor(self, login: str, label: str, here: bool = True) -> Never:
-        del label, here
-        self._reached_send_leaf(
-            ShutdownSendLeaf.LAUNCH_CONDUCTOR, f"conductor for {login}"
-        )
 
     def _block_launch_remote_control(
         self, session_id: str, pid: int, proc_start: str, who: str,

@@ -122,7 +122,7 @@ def checked(child: Production, caller: str, ending: EndingTab = NO_ENDING_TAB, s
     `ending` identifies the unit's tab that closes before launch, or says no tab ends.
     `start_in` is the folder the session starts in, the child's checkout unless given.
     """
-    from scripts.accounts.accounts import NamedAccount, account_dir, trust_command
+    from scripts.accounts.accounts import NamedAccount, account_dir, claude_config_label, trust_command
     from scripts.herdr.herdr import Untrusted, UnreadableTrustFile, claude_trust
 
     if not caller:
@@ -138,10 +138,9 @@ def checked(child: Production, caller: str, ending: EndingTab = NO_ENDING_TAB, s
     if taken:
         raise Refusal(f"{child.slug} already has a running showrunner")
     folder = start_in or child.checkout
-    label = str(config_dir)
-    numbered = re.fullmatch(r"\.claude([0-9]+)", config_dir.name)
-    if numbered and config_dir == account_dir(f"claude{numbered.group(1)}"):
-        label = f"claude{numbered.group(1)}"
+    folder_label = claude_config_label(config_dir)
+    label = (folder_label if re.fullmatch(r"claude[0-9]+", folder_label)
+             and config_dir == account_dir(folder_label) else str(config_dir))
     selected = NamedAccount(label, config_dir)
     trust = claude_trust(folder, claude_json(config_dir))
     if isinstance(trust, UnreadableTrustFile):
@@ -182,7 +181,7 @@ def account_for_launch(child: Production, resume: str | None, target: str = "", 
 
 
 def launch(child: Production, model: str, effort: str, resume: str | None, cwd: Path, selected: ClaudeLaunchAccount,
-           *, identity: ShowrunnerLaunch | NewShowrunnerLaunch = NEW_SHOWRUNNER_LAUNCH) -> herdr.PromptSubmitOutcome:
+           *, identity: ShowrunnerLaunch | NewShowrunnerLaunch = NEW_SHOWRUNNER_LAUNCH, staff_id: str = "") -> herdr.PromptSubmitOutcome:
     """Start once and prove the opening prompt reached this showrunner's transcript."""
     from scripts.message import sessions
     from scripts.whoami.account import named_account_environment
@@ -195,7 +194,8 @@ def launch(child: Production, model: str, effort: str, resume: str | None, cwd: 
     arguments = ["--model", model, "--effort", effort]
     arguments.extend(["--resume" if resuming else "--session-id", session_id])
     arguments.extend(["--remote-control", child.slug, "-n", child.slug, "--settings", '{"disableAgentView": true}'])
-    environment = {"ENABLE_TOOL_SEARCH": "true"}
+    row_id = staff_id or ensure_staff_showrunner(child, "").id
+    environment = {"ENABLE_TOOL_SEARCH": "true", "STAFF_ID": row_id}
     environment.update(named_account_environment(selected.dir))
     host = herdr.shared_session()
     _ = herdr.start_server(host, 90_000)
@@ -312,7 +312,7 @@ def _main(argv: list[str]) -> int:
                     place.pane, herdr.OpeningPrompt(prompt, transcript), identity.started_at, 90_000)
         else:
             outcome = launch(child, cast(str, args.model), cast(str, args.effort), resume, where, selected,
-                             identity=identity)
+                             identity=identity, staff_id=row.id)
     except herdr.AgentNotReady as error:
         print(f"add_showrunner: the session is not ready:\n{error.screen}", file=sys.stderr)
         return SESSION_NOT_READY

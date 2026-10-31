@@ -2,37 +2,25 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
 import json
-import os
-from pathlib import Path
-import tempfile
 import unittest
-from typing import cast, override
+from typing import cast
 from unittest import mock
 from zoneinfo import ZoneInfo
 
 from scripts.build_queue import head_facts
+from scripts.build_queue.queue_fixture import (
+    AdmissionLogTests, bump_line as bump_line, head_reading, queue_read_fixture as queue_read_fixture,
+    queue_time_line as queue_time_line, token_gap_line as token_gap_line,
+    write_bumps as write_bumps, write_lines, write_token_gaps as write_token_gaps, with_waiting_process,
+)
 from scripts.buildlog import store
 from scripts.lint import memory_admit as gate
 
 NOW = datetime(2026, 10, 30, 11, 0, tzinfo=UTC).timestamp()
 ZONE = ZoneInfo("America/New_York")
-
-
-def bump_line(at: float, *, session: str = "bumped-session", step: str = "check",
-              folder: str = "/tmp/bumped", actor: str = "actor-session") -> bytes:
-    return (json.dumps({"kind": "queue_bump", "at": store.utc_iso(at), "session": session,
-                        "step": step, "folder": folder, "actor": actor, "old_position": 3},
-                       separators=(",", ":"), ensure_ascii=False) + "\n").encode()
-
-
-def write_bumps(epoch: float, lines: Sequence[bytes], *, tail: bytes = b"") -> None:
-    """One log writer shared by reader and command tests, always under BUILDLOG_DIR."""
-    path = store.host_file(store.host_name(), epoch)
-    write_lines(path, lines, tail=tail)
 
 
 def write_bumps_with_block_edge(line: bytes, split_at: int) -> None:
@@ -45,86 +33,7 @@ def write_bumps_with_block_edge(line: bytes, split_at: int) -> None:
     write_bumps(NOW, [line, prefix + b"x" * padding + suffix, newer])
 
 
-def token_gap_line(left_at: float, back_at: float, *, session: str = "head-session",
-                   step: str = "nextest", pid: int = 123, start_time: str = "123") -> bytes:
-    return queue_time_line(back_at, kind="token_gap", session_id=session, step=step, pid=pid,
-                           start_time=start_time, token_left_at=left_at, token_back_at=back_at)
-
-
-def queue_time_line(at: float, *, kind: str = "admitted", **fields: object) -> bytes:
-    return (json.dumps({"kind": kind, "at": at, **fields}, separators=(",", ":")) + "\n").encode()
-
-
-def write_token_gaps(lines: Sequence[bytes], *, tail: bytes = b"") -> None:
-    write_lines(store.root() / head_facts.QUEUE_TIMES_PATH, lines, tail=tail)
-
-
-def write_lines(path: Path, lines: Sequence[bytes], *, tail: bytes = b"") -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    content = b"".join(lines) + tail
-    if path.write_bytes(content) != len(content):
-        raise OSError("fixture log write was incomplete")
-
-
-def queue_read_fixture(view: gate.QueueView) -> gate.QueueRead:
-    """Pair legacy rendering fixtures with explicit, already-decided explanation fields."""
-    running = tuple(gate.ExplainedRunningStep(step, gate.AdmissionTimeNotRecorded(),
-        step.promise, step.measured.bytes if isinstance(step.measured, gate.MeasuredMemory) else 0,
-        gate.build_charge(step.measured), gate.charge_basis(step.measured)) for step in view.running)
-    first: gate.HeadExplanation | gate.NoWaiter = gate.NoWaiter()
-    host: gate.HostAvailable | gate.ReadingUnavailable = gate.HostAvailable(
-        view.available, gate.UnknownHostTotal(), view.reserve, 21 * gate.GIB, gate.NoPressureHold())
-    if view.waiting:
-        step = view.waiting[0]
-        reason = step.reason
-        row: gate.Waiter = {"pid": step.pid, "start_time": "", "need": step.need, "since": step.since}
-        order = gate.head_window(row, view.now)
-        decision = gate.AdmissionDecision("admit", step.need + view.reserve, view.promised, view.reserve, 0)
-        if isinstance(reason, gate.HeadAdmissionStatus):
-            decision, order = reason.decision, reason.backfill
-        elif isinstance(reason, gate.NeedsBuildBudget):
-            decision = gate.AdmissionDecision("hold", step.need + view.reserve, view.promised, view.reserve,
-                0, charged=reason.charged, budget=reason.budget, budget_passes=False)
-        elif isinstance(reason, gate.NeedsMemory):
-            decision = gate.AdmissionDecision("hold", reason.threshold, reason.growth, reason.reserve,
-                0, free_passes=False, head_need=reason.head_need)
-        elif isinstance(reason, gate.MemoryPressure):
-            decision = gate.AdmissionDecision("hold", step.need + view.reserve, view.promised,
-                                                      view.reserve, 0, pressure=reason)
-        elif isinstance(reason, gate.ReadingUnavailable):
-            host = reason
-        first = gate.HeadExplanation(step, gate.NeedSourceNotRecorded(), decision,
-            gate.BudgetCheck(decision.charged, step.need, decision.head_need, decision.budget,
-                decision.budget - step.need - decision.head_need, decision.budget_passes),
-            gate.FreeCheck(view.available, step.need, decision.reserve, decision.promised,
-                decision.head_need, decision.threshold, decision.free_passes),
-            order, False, gate.NoBump())
-    explanation = gate.QueueExplanation(view.now, host, running,
-        gate.QueueMemoryTotals(sum(step.charged for step in running), sum(step.measured for step in running), view.promised),
-        first, gate.WaitingLine((), 0, 0, 0, 0, view.now))
-    return gate.QueueRead(view, explanation, [])
-
-
-def head_reading(*, since: float = NOW - 600, now: float = NOW,
-                 fields: dict[str, object] | None = None, step_name: str = "nextest") -> gate.QueueRead:
-    step = gate.WaitingStep(123, "head-session", "head", step_name, "/tmp/head", since,
-                            gate.GIB, gate.ReadyForAdmission())
-    reading = queue_read_fixture(gate.QueueView((step,), (), 30 * gate.GIB, 0, 3 * gate.GIB, now))
-    row = cast(gate.Waiter, cast(object, {"pid": step.pid, "start_time": "123", "need": step.need,
-                            "since": since, "session_id": step.session_id,
-                            "session_name": step.session_name, "step": step.step,
-                            "folder": step.folder, **(fields or {})}))
-    return replace(reading, ordered=[(Path("123-123.waiting"), row)])
-
-
-class HeadFactsTests(unittest.TestCase):
-    root: Path = Path()
-
-    @override
-    def setUp(self) -> None:
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        self.enterContext(mock.patch.dict(os.environ, {"BUILDLOG_DIR": str(self.root)}))
-
+class HeadFactsTests(AdmissionLogTests):
     def facts(self, reading: gate.QueueRead) -> head_facts.HeadFacts:
         result = head_facts.read_head_facts(reading)
         self.assertIsInstance(result, head_facts.HeadFacts)
@@ -277,28 +186,44 @@ class HeadFactsTests(unittest.TestCase):
             facts = self.facts(reading)
         self.assertEqual(facts.joined_at, NOW - 600)
         self.assertEqual(facts.bumps, head_facts.BumpHistory((head_facts.BumpGroup(
-            "bumped-session", "check", "/tmp/bumped", 1, ("actor-session",), NOW - 5),), 1))
+            "bumped-session", "check", "/tmp/bumped", 1, ("actor-session",), NOW - 5),), 1,
+            (head_facts.BumpRecord(NOW - 5, "actor-session", "bumped-session", "check", "/tmp/bumped", 3),)))
 
-    def test_head_time_does_not_come_from_a_younger_rows_record(self) -> None:
+    def test_total_wait_ignores_every_legacy_head_clock(self) -> None:
+        for fields in cast(tuple[dict[str, object], ...], ({}, {"head_state": "head", "head_since": NOW - 125},
+                       {"head_state": "not_head"}, {"head_since": float("inf")})):
+            with self.subTest(fields=fields):
+                reading = head_reading(since=NOW - 158 * 60, fields=fields)
+                facts = self.facts(reading)
+                self.assertEqual(facts.joined_at, NOW - 158 * 60)
+                self.assertNotIn("head_since", repr(facts))
+                self.assertNotIn("Head for", head_facts.order_text(facts, ZONE))
+
+    def test_follower_token_gap_never_becomes_the_same_sessions_head_gap(self) -> None:
         reading = head_reading()
-        younger = head_reading(fields={"head_since": NOW - 1}).ordered[0]
-        facts = self.facts(replace(reading, ordered=[*reading.ordered, younger]))
-        self.assertIsInstance(facts.head_time, head_facts.HeadTimeNotRecorded)
+        follower = replace(reading.view.waiting[0], pid=456)
+        reading = with_waiting_process(reading, follower, "456")
+        write_token_gaps([token_gap_line(NOW - 200, NOW - 46, pid=456, start_time="456")])
+        facts = self.facts(reading)
+        self.assertEqual(head_facts.cargo_token_lines(facts, ZONE, {}),
+                         ["Cargo token: head-session nextest: waited 154 s (06:56-06:59)"])
+        self.assertEqual(head_facts.cargo_token_text(facts), "no cargo token wait")
 
-    def test_head_time_is_unknown_without_record_even_with_priority_and_join_times(self) -> None:
-        facts = self.facts(head_reading(since=NOW - 158 * 60,
-                                       fields={"priority_since": NOW - 60}))
-        self.assertIsInstance(facts.head_time, head_facts.HeadTimeNotRecorded)
-        self.assertEqual(head_facts.head_time_text(facts, ZONE), "Head for: unknown")
-        self.assertEqual(head_facts.head_time_text(facts, ZONE, short=True), "head for: unknown")
+    def test_token_gap_without_process_identity_matches_no_waiter(self) -> None:
+        write_token_gaps([token_gap_line(NOW - 200, NOW - 46, start_time="")])
+        facts = self.facts(head_reading())
+        self.assertEqual(head_facts.cargo_token_text(facts), "no cargo token wait")
 
-    def test_head_time_uses_only_the_new_recorded_field(self) -> None:
-        facts = self.facts(head_reading(since=NOW - 158 * 60,
-            fields={"head_since": NOW - 125, "priority_since": NOW - 1200}))
-        self.assertEqual(facts.head_time, head_facts.RecordedHeadTime(NOW - 125))
-        self.assertRegex(head_facts.head_time_text(facts, ZONE),
-                         r"(?i)^head for:? 2 min \(since 06:57:55\)$")
-        self.assertEqual(head_facts.head_time_text(facts, ZONE, short=True), "head for 2 min")
+    def test_live_queue_priority_is_shown_with_legacy_bump_history(self) -> None:
+        reading = head_reading()
+        priority: gate.QueuePriority = {"unit": "resources", "why": "user work", "set_at": NOW,
+            "set_by": "showrunner"}
+        reading = replace(reading, explanation=replace(reading.explanation, priority=priority))
+        write_bumps(NOW, [bump_line(NOW - 5)])
+        facts = self.facts(reading)
+        self.assertIn("queue priority: resources (the user's bump)", head_facts.order_text(facts, ZONE))
+        self.assertEqual(self.history(reading).total, 1)
+        self.assertEqual(head_facts.bump_text(facts, ZONE), "Bumps since it joined at 06:50:00: 1")
 
     def test_three_order_texts_use_recorded_priority_and_deadline(self) -> None:
         reading = head_reading()
@@ -307,9 +232,9 @@ class HeadFactsTests(unittest.TestCase):
             self.fail("fixture needs a head")
         for order, priority, expected in (
             (gate.StrictUntil(NOW + 125), True,
-             "strict until 07:02:05 (2 min 5 s left): younger steps wait"),
+             "younger steps may use 20.0 GiB of the budget until 07:02 (2 min 5 s left)"),
             (gate.BackfillUntil(NOW + 65), True,
-             "backfill until 07:01:05 (1 min 5 s left): younger steps that fit may start"),
+             "younger steps may start until 07:01 (1 min 5 s left)"),
             (gate.StrictUntil(NOW + 125), False,
              "no head priority: younger steps that fit may start"),
             (gate.BackfillUntil(NOW + 65), False,
@@ -319,6 +244,20 @@ class HeadFactsTests(unittest.TestCase):
                 explanation = replace(reading.explanation, head=replace(head, order=order, has_priority=priority))
                 facts = self.facts(replace(reading, explanation=explanation))
                 self.assertEqual(head_facts.order_text(facts, ZONE), expected)
+
+    def test_strict_order_has_no_room_when_head_needs_the_whole_budget(self) -> None:
+        reading = head_reading()
+        head = reading.explanation.head
+        if not isinstance(head, gate.HeadExplanation):
+            self.fail("fixture needs a head")
+        for need in (21, 22):
+            with self.subTest(need=need):
+                waiting = replace(head.waiter, need=need * gate.GIB)
+                explanation = replace(reading.explanation, head=replace(
+                    head, waiter=waiting, order=gate.StrictUntil(NOW + 125), has_priority=True))
+                facts = self.facts(replace(reading, explanation=explanation))
+                self.assertEqual(head_facts.order_text(facts, ZONE),
+                    "younger steps wait until 07:02 (2 min 5 s left)")
 
     def test_token_wait_is_unknown_without_a_record(self) -> None:
         facts = self.facts(head_reading(fields={"priority_since": NOW - 154}))
@@ -335,10 +274,10 @@ class HeadFactsTests(unittest.TestCase):
         self.assertIn("head-session", lines[0])
         self.assertIn("waited 154 s (06:56-06:59)", lines[0])
 
-    def test_token_gaps_match_session_and_step_without_requiring_the_same_process(self) -> None:
+    def test_another_process_gap_on_the_same_step_is_not_the_heads(self) -> None:
         write_token_gaps([token_gap_line(NOW - 200, NOW - 46, pid=456, start_time="different")])
         lines = head_facts.cargo_token_lines(self.facts(head_reading()), ZONE, {})
-        self.assertEqual(lines, ["Cargo token: head-session nextest: waited 154 s (06:56-06:59)"])
+        self.assertEqual(lines, ["Cargo token waits: none"])
 
     def test_token_gaps_fall_back_to_both_pid_and_start_time_for_legacy_identity(self) -> None:
         write_token_gaps([token_gap_line(NOW - 200, NOW - 46, session="", step="legacy-check")])
@@ -433,7 +372,7 @@ class HeadFactsTests(unittest.TestCase):
     def test_token_scan_uses_the_oldest_waiter_join_instead_of_the_head_join(self) -> None:
         reading = head_reading(since=NOW - 60)
         follower = replace(reading.view.waiting[0], pid=456, session_id="follower", since=NOW - 400)
-        reading = replace(reading, view=replace(reading.view, waiting=(*reading.view.waiting, follower)))
+        reading = with_waiting_process(reading, follower, "123")
         write_token_gaps([token_gap_line(NOW - 300, NOW - 146, session="follower", pid=456)])
         facts = self.facts(reading)
         self.assertEqual(head_facts.cargo_token_lines(facts, ZONE, {}),
@@ -467,8 +406,8 @@ class HeadFactsTests(unittest.TestCase):
                           since=NOW - 300)
         running = gate.RunningStep("running-session", "runner", "check", "/tmp/run", gate.GIB,
                                    gate.MeasuredMemory(gate.GIB))
-        reading = replace(reading, view=replace(reading.view,
-            waiting=(*reading.view.waiting, younger), running=(running,)))
+        reading = with_waiting_process(reading, younger, "123")
+        reading = replace(reading, view=replace(reading.view, running=(running,)))
         write_token_gaps([
             token_gap_line(NOW - 400, NOW - 300, session="running-session", step="check", pid=789),
             token_gap_line(NOW - 200, NOW - 46, session="younger-session", step="clippy", pid=456),
@@ -546,3 +485,78 @@ class HeadFactsTests(unittest.TestCase):
         reading = queue_read_fixture(gate.QueueView((), (), 30 * gate.GIB, 0, 3 * gate.GIB, NOW))
         with mock.patch.object(store, "host_file", side_effect=AssertionError("nothing waits")):
             self.assertEqual(head_facts.read_head_facts(reading), gate.NoWaiter())
+
+    def test_bump_scan_keeps_oldest_waiters_moves_separate_from_head_history(self) -> None:
+        reading = head_reading(since=NOW - 60)
+        older = replace(reading.view.waiting[0], pid=456, session_id="older", since=NOW - 900)
+        reading = replace(reading, view=replace(reading.view, waiting=(*reading.view.waiting, older)))
+        write_bumps(NOW, [bump_line(NOW - 500, session="older"), bump_line(NOW - 5)])
+        facts = self.facts(reading)
+        self.assertEqual([record.at for record in facts.bump_records], [NOW - 500, NOW - 5])
+        assert isinstance(facts.bumps, head_facts.BumpHistory)
+        self.assertEqual(facts.bumps.total, 1)
+        self.assertEqual(facts.bumps.groups[0].session, "bumped-session")
+
+    def test_waiting_move_history_matches_identity_join_boundary_and_resolved_priority(self) -> None:
+        reading = head_reading(since=NOW - 60)
+        step = reading.view.waiting[0]
+        row: gate.Waiter = {**reading.ordered[0][1], "priority_rank": 0}
+        write_bumps(NOW, [
+            bump_line(NOW - 61, session="head-session", step="nextest", folder="/tmp/head"),
+            bump_line(NOW - 60, session="head-session", step="nextest", folder="/tmp/head", old_position=9),
+            bump_line(NOW - 10, session="head-session", step="clippy", folder="/tmp/head"),
+            bump_line(NOW - 9, session="head-session", step="nextest", folder="/tmp/other"),
+            bump_line(NOW - 8, session="other", step="nextest", folder="/tmp/head"),
+            bump_line(NOW - 1, session="head-session", step="nextest", folder="/tmp/head", old_position=2),
+        ])
+        facts = self.facts(reading)
+        moves = head_facts.waiting_moves(facts, step, row)
+        self.assertEqual([(record.at, record.old_position) for record in moves], [(NOW - 60, 9), (NOW - 1, 2)])
+        self.assertEqual(head_facts.waiting_moves(facts, step, reading.ordered[0][1]), ())
+        legacy = replace(step, session_id="", session_name="head-session")
+        self.assertEqual(head_facts.waiting_moves(facts, legacy, row), moves)
+
+    def test_running_moves_stop_at_admission_and_require_every_identity_field(self) -> None:
+        reading = head_reading(since=NOW - 600)
+        write_bumps(NOW, [
+            bump_line(NOW - 60, session="runner", step="nextest", folder="/tmp/run", old_position=29),
+            bump_line(NOW - 50, session="runner", step="nextest", folder="/tmp/other"),
+            bump_line(NOW - 25, session="runner", step="nextest", folder="/tmp/run", old_position=4),
+            bump_line(NOW - 24, session="runner", step="nextest", folder="/tmp/run", old_position=2),
+        ])
+        step = gate.RunningStep("runner", "runner", "nextest", "/tmp/run", gate.GIB, gate.MeasuredMemory(gate.GIB))
+        running = gate.ExplainedRunningStep(step, NOW - 25, gate.GIB, gate.GIB, gate.GIB, gate.UsingNow(gate.GIB))
+        facts = self.facts(reading)
+        self.assertEqual([record.old_position for record in head_facts.running_moves(facts, running)], [29, 4])
+        self.assertEqual(head_facts.running_moves(facts, replace(running, admitted_at=gate.AdmissionTimeNotRecorded())), ())
+
+
+class PaceTests(AdmissionLogTests):
+    def test_window_edges_this_host_future_and_torn_last_line(self) -> None:
+        from scripts.build_queue.queue_fixture import QueueFixture
+        with QueueFixture() as fixture:
+            fixture.write_pace([NOW - 3600.001, NOW - 3600, NOW - 1, NOW, NOW + 1],
+                tail=(json.dumps({"host": store.host_name(), "ended_at": store.utc_iso(NOW)}) + "no-newline").encode())
+            self.assertEqual(head_facts.read_pace(NOW), head_facts.RecordedPace(3))
+            fixture.write_pace([NOW - 1], host="another-host")
+            self.assertEqual(head_facts.read_pace(NOW), head_facts.RecordedPace(0))
+
+    def test_old_line_stops_before_malformed_or_large_older_history(self) -> None:
+        path = self.root / "admission/anon_peaks.jsonl"
+        write_lines(path, [b'{broken old line}\n',
+            (json.dumps({"host": store.host_name(), "ended_at": store.utc_iso(NOW - 3601)}) + "\n").encode(),
+            (json.dumps({"host": store.host_name(), "ended_at": store.utc_iso(NOW)}) + "\n").encode()])
+        self.assertEqual(head_facts.read_pace(NOW), head_facts.RecordedPace(1))
+
+    def test_missing_and_empty_files_have_zero_pace_but_a_read_error_is_unknown(self) -> None:
+        path = self.root / "admission/anon_peaks.jsonl"
+        self.assertEqual(head_facts.read_pace(NOW), head_facts.RecordedPace(0))
+        write_lines(path, [])
+        self.assertEqual(head_facts.read_pace(NOW), head_facts.RecordedPace(0))
+        path.unlink()
+        path.mkdir()
+        self.assertIsInstance(head_facts.read_pace(NOW), head_facts.PaceUnavailable)
+
+
+if __name__ == "__main__":
+    _ = unittest.main()

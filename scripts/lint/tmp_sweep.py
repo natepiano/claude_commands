@@ -654,11 +654,10 @@ def marked_runs(roots: Roots) -> dict[str, str]:
 @dataclass(frozen=True)
 class SessionRunUse:
     worktrees: frozenset[str]
-    runs: frozenset[str]
 
 
 def session_run_use(live: frozenset[str]) -> SessionRunUse:
-    """Read registry cwd and the mover's shutdown session/legacy pause records without writing."""
+    """Read live registry working directories without consulting stale shutdown state."""
     registry = sessions.read_registry()
     if registry.unreadable:
         raise ValueError("session registry unreadable")
@@ -669,58 +668,7 @@ def session_run_use(live: frozenset[str]) -> SessionRunUse:
             raise ValueError("session cwd unreadable")
         if item.record["sessionId"] in live and cwd:
             worktrees.add(os.path.realpath(cwd))
-    runs: set[str] = set()
-
-    def add_session(value: object) -> None:
-        if not isinstance(value, dict):
-            raise ValueError("shutdown session unreadable")
-        session = cast(dict[str, object], value)
-        cwd, run_dirs = session.get("cwd"), session.get("run_dirs")
-        if not isinstance(cwd, str) or not isinstance(run_dirs, list):
-            raise ValueError("shutdown session has no cwd or run_dirs")
-        if cwd:
-            if not os.path.isabs(cwd):
-                raise ValueError("shutdown session cwd unreadable")
-            worktrees.add(os.path.realpath(cwd))
-        for run in cast(list[object], run_dirs):
-            if not isinstance(run, str) or not os.path.isabs(run):
-                raise ValueError("shutdown session has an invalid run path")
-            runs.add(os.path.realpath(run))
-
-    def add_pause(record: dict[str, object]) -> None:
-        progress = record.get("progress")
-        if not isinstance(progress, dict) or not isinstance(cast(dict[str, object], progress).get("kind"), str):
-            raise ValueError("shutdown progress unreadable")
-        if cast(dict[str, object], progress)["kind"] not in ("restarted", "timers pending"):
-            add_session(record.get("session"))
-
-    state = Path(os.environ.get("SHUTDOWN_STATE_DIR", str(Path.home() / ".local/state/shutdown")))
-    for account in record_entries(state):
-        if not account.is_dir():
-            continue
-        for path in record_entries(account / "sessions"):
-            if path.suffix == ".json":
-                record = record_object(path)
-                if isinstance(record, MissingRecord):
-                    raise ValueError(f"{path}: record disappeared")
-                add_pause(record)
-        # The mover still reads pre-session account records and partial shutdowns.
-        legacy = [account / "record.json"] + [path for path in record_entries(account / "partial")
-                                             if path.suffix == ".json"]
-        for path in legacy:
-            record = record_object(path)
-            if isinstance(record, MissingRecord):
-                continue
-            if record.get("state") in ("up", "cancelled"):
-                continue
-            entries = record.get("entries")
-            if not isinstance(entries, list):
-                raise ValueError(f"{path}: shutdown entries unreadable")
-            for entry in cast(list[object], entries):
-                if not isinstance(entry, dict):
-                    raise ValueError(f"{path}: shutdown entry unreadable")
-                add_pause(cast(dict[str, object], entry))
-    return SessionRunUse(frozenset(worktrees), frozenset(runs))
+    return SessionRunUse(frozenset(worktrees))
 
 
 def run_folder_guards(roots: Roots, live: frozenset[str] | None,
@@ -751,8 +699,6 @@ def run_folder_guards(roots: Roots, live: frozenset[str] | None,
                     raise ValueError("run worktree unreadable")
                 if working and os.path.realpath(working) in use.worktrees:
                     kept[folder] = RunKeepReason.SESSION_WORKTREE
-            if os.path.realpath(folder) in use.runs:
-                kept[folder] = RunKeepReason.SESSION_WORKTREE
             if os.path.realpath(folder) in marked:
                 kept[folder] = RunKeepReason.ACTIVE_MARKER
             # director() handles the history fallback; check its inputs before that permissive reader.

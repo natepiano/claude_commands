@@ -3,8 +3,45 @@ from __future__ import annotations
 
 import re
 import unittest
+from typing import override
 
 from scripts.direct.assertion_guard_test_support import GitRepositoryFixture as GitRepositoryFixture, MergeInProgressFixture as MergeInProgressFixture, AssertionFindingFixture, TILE_OLD as TILE_OLD, TILE_NEW as TILE_NEW
+from scripts.direct.assertion_guard_test_support import SeededMergeInProgressFixture
+
+
+class MergeBaseSelectionTests(SeededMergeInProgressFixture, AssertionFindingFixture):
+    @override
+    def build_fixture(self) -> None:
+        super().build_fixture()
+        _ = self.git("commit", "-q", "-m", "merge incoming")
+
+    def test_explicit_fork_base_ignores_merged_trunk_removals(self) -> None:
+        self.assert_clean(self.guard("--base", self.base))
+
+    def test_explicit_fork_base_still_blocks_our_removal_after_merge(self) -> None:
+        _ = self.save("test_merge.py", self.merge_source(incoming=False, ours=False))
+        _ = self.git("commit", "-q", "-am", "our assertion removal")
+        _ = self.assert_finding(self.guard("--base", self.base), "test_merge.py", "removed", "test_ours")
+
+    def test_explicit_base_after_two_trunk_merges_and_a_commit(self) -> None:
+        _ = self.git("checkout", "-q", "incoming")
+        _ = self.save("test_merge.py", self.merge_source(incoming=False, ours=False))
+        _ = self.git("commit", "-q", "-am", "second incoming removal")
+        _ = self.git("checkout", "-q", "unit")
+        _ = self.git("merge", "-q", "--no-ff", "incoming", "-m", "second merge")
+        _ = self.save("local.txt", "a later unrelated commit\n")
+        _ = self.git("commit", "-q", "-am", "later branch change")
+        self.assert_clean(self.guard("--base", self.base))
+
+    def test_head_revision_uses_its_merge_parents_instead_of_head_parents(self) -> None:
+        merge = self.git("rev-parse", "HEAD")
+        _ = self.git("checkout", "-q", "-b", "unrelated", self.base)
+        _ = self.save("unrelated.txt", "different HEAD with no merge parents\n")
+        _ = self.git("add", "unrelated.txt")
+        _ = self.git("commit", "-q", "-m", "unrelated HEAD")
+        for arguments in (("--base", self.base), ()):
+            with self.subTest(arguments=arguments):
+                self.assert_clean(self.guard(*arguments, "--head", merge))
 
 class AssertionGuardTests(AssertionFindingFixture):
     def test_tile_weaker_assertion_is_found_among_six_thousand_other_changes(self) -> None:

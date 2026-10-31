@@ -178,12 +178,12 @@ def _reword_items(items: object, fields: tuple[str, ...], words: Words) -> bool:
 
 
 def _reword_lists(value: object, words: Words) -> bool:
-    """The live lists `next` and `open_for_user` take the new names in their text: they are what the
-    showrunner still has to do, not history."""
+    """Keep held merge names current, and reword the showrunner's pending notes for readability."""
     if not isinstance(value, dict):
         return False
     state = cast(JsonObject, value)
-    changed = _reword_items(state.get("next"), (), words)
+    changed = _reword_items(state.get("merges_held"), (), words)
+    changed = _reword_items(state.get("next"), (), words) | changed
     return _reword_items(state.get("open_for_user"), ("text", "question"), words) | changed
 
 

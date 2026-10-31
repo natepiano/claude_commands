@@ -406,26 +406,6 @@ the turn and resumes from a task message; Codex applies
 <CodexDispatchWait/>.
 </BackgroundVerificationContract>
 
-<PauseForMove>
-A message whose first line starts `Pause for move:` or `Pause for stop:` is the
-shutdown mover asking this session to stop so it can move or stop it. Act on it
-at once, in the turn it arrives; it never waits for a better moment:
-
-1. Stop mid-step. Do not finish the step, dispatch, review or gate in progress,
-   and start nothing new. Leave uncommitted work in place.
-2. Stop any build you started outside `verify.sh`, or name it in the line below.
-   For a move, leave Codex workers running; the mover pauses them after you exit.
-   For a stop, if ready names a running Codex worker, retry when its turn finishes;
-   start no new turns.
-3. Run the `shutdown.py ready --where "<phase N: the step you stopped in and what
-   comes next>"` command the message gives.
-4. End the turn with `— blocked: shutdown requested by the user`.
-
-The session is resumed with that line, on the account the message names; continue
-from it. Before any dispatch, run the resume commands in the shutdown message;
-never open a new worker for a role a paused worker holds. A forced stop without this
-message is a separate command the user gives.
-</PauseForMove>
 
 <CompactionContract>
 - Apply <LongLivedWorkers/> to Codex worker compaction and overflow continuation;

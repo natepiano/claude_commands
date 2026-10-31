@@ -486,8 +486,8 @@ class ShowrunnerRegistryTests(ShowrunnerFixture):
             delivery = showrunners.tell_others({"self": "skip", "top": "hello", "mid": "hello"}, "notice")
         self.assertEqual(list(delivery.lines), ["told top", "could not tell mid: offline"])
         self.assertEqual(delivery.failed, ("mid",))
-        self.assertEqual(sender.call_args_list, [mock.call("session:top", "notice", "hello", recipient="top"),
-                                                 mock.call("session:mid", "notice", "hello", recipient="mid")])
+        self.assertEqual(sender.call_args_list, [mock.call("session:top", "notice", "hello", recipient="top", sender="showrunners"),
+                                                 mock.call("session:mid", "notice", "hello", recipient="mid", sender="showrunners")])
         with self.assertRaises(FrozenInstanceError):
             setattr(delivery, "lines", ())
         with self.assertRaises(FrozenInstanceError):

@@ -76,6 +76,7 @@ Every command checks holds through `target_state`. The sole holder may run its o
 - `build_hold_nothing_held` returns 0 only when the holder directory (`BUILD_HOLD_DIR`, default `~/.local/state/build-hold`) is a readable, searchable directory with no entry at all (dot files and dangling links count), and the shell expands patterns unfiltered (no `noglob`, `GLOBIGNORE` or `failglob`). `BUILD_HOLD_DIR` set but empty, a missing directory, or any doubt returns 1, and the Python runs.
 - `build_hold_wait_local`, `build_hold_check_local`, `check_routing_hold` and the per-call `wait-local` in `verify.sh` all return through it before starting Python. With nothing held a local call starts no hold-check process anywhere, and an unreadable `config/build_targets.conf` stops only a `test` call (at `eligible`).
 - Every caller waits for natedev's hold, not only `verify.sh` (fixed 2026-10-19: cargo-port's `port-lint clippy` ran 5 hana clippy runs through a demo hold, load 134). `build_hold_applies` skips the wait only for `verify-mac`, for macOS (`OSTYPE` `darwin*`), and when the holder directory does not exist. A caller with no `verify` call id gets `BUILDLOG_HOLD_CALL_ID`, made once per shell in verify's form (`v<UTC stamp>-<pid>-<random>`) after `build_hold_nothing_held` says 1. It is not exported, so build log rows keep `call_id` null. `wait-local` and `check-local` get `--caller <BUILDLOG_CALLER or lint>`, and their lines start `lint (<caller>):` (or `lint:`) in place of `verify.sh:`; the waiting line ends `; waiting for the release.` The holder's own session still passes its hold (`caller_holds_only_own`).
+- Wait, check and launch lines name the oldest hold in force that the calling session does not own, with that hold's reason. A caller with no owning session sees the oldest hold. The own-hold check and the named hold use the same hold list.
 
 ### The launch gate: `scripts/hooks/pre-tool-use-brp-launch-gate.sh`
 
@@ -109,7 +110,7 @@ The runner, the claim and the block are covered in [mac-test-offload.md](mac-tes
 | `/build:hold` | `build_hold.py` | Hold or release natedev (default) or the Mac (`target mac`), check quiet, show holds. The protocol every holder follows. |
 | `/build:mac` | `mac_test.py` | Block, unblock, settle and show the Mac; audit which packages belong on it; claim it for a job of one's own (released after 15 idle minutes). |
 | `/build:status` | `build_targets.py status [--probe]` | Each target's state, read only, with the holder's showrunner and unit when its session is known. |
-| `/build:queue [bump <position\|session\|folder>]` | `build_queue.py` | Running steps with promises and measured use, then waiting steps in order; each row names its showrunner, unit and session by short name, the bare step and the folder, and a waiting row adds its wait time, need, free memory and one reason ([build-memory-admission.md](build-memory-admission.md), "Queue API"). `bump` moves one waiting step to the head for the next memory admission and records the caller and step in the build log. Memory limits still apply. |
+| `/build:queue [<position\|session\|folder>]` | `build_queue.py` | A free/taken budget bar and one waiting row per step, with showrunner, unit, minutes waited and a size bar on the budget scale. `▸` marks the asking session. Row 1 shows `↑` for backfill, `↑ ≤N.N` for strict-window room or `⊘` when no room remains, its recorded window countdown and host holds. A selector opens step cards with each step’s admission checks. `queue_read()` uses the lock-free snapshot or a 0.5 s bounded lock; stale readings keep their time and an amber header, and unavailable readings show `queue busy; try again`. Bump is off and nothing can move a waiting step. |
 | `/build:report` | `buildlog report` | The build report: natedev's steps in its tables, the Mac's in its `### Mac` section, natedev's power-profile changes in `### Power profile`; see [build-report-session.md](build-report-session.md) and [build-followups.md](build-followups.md). |
 | `/build:mac_report` | `buildlog mac-report` | How often tests finish on the Mac when it is usable. |
 
@@ -132,10 +133,40 @@ Each command shows its script's output unchanged; each script answers in about a
 ### Build output retained by the sweep
 
 `scripts/lint/sweep.py` keeps the configured free-space floor (300 GiB on natedev).
-When free space is below the floor, it takes only the shortfall. After orphaned
-copies, it takes output from idle targets in last-use order, oldest first,
-across all locations. `/tmp` targets have no special priority. A target's last
+When free space is below the floor, it takes only the shortfall. Orphaned
+copies go first from any idle target. Then whole takes and build-unit batches
+share target last-use order, oldest first, across all locations. A whole take
+has no special priority over a target with build units. `/tmp` targets have no
+special priority. A target's last
 use is the newer of its `.lint-sweep-used` stamp and its build units' last uses.
+A target folder is disposable; keep nothing you need in it. An idle target with
+no build-unit groups is a whole take: its contents go through the same
+write-ahead trim intent, confirmed deletion account and `sweep_trim` publication
+as build units. Orphaned copies keep their first place even when their target
+has no build units; a whole take covers the remaining contents. The target
+folder and its lock files stay. A held `doc/.lock`, Cargo lock or style sync lock
+keeps the target. Before the first unlink, the target root is saved durably in
+`target-deletes.json`, so memory admission refuses a warm promise even if the
+take stops. Cargo markers go last, after every payload delete succeeds. If a
+payload delete fails, the markers keep the target discoverable for the retry. Without a use stamp or build units, the newest mtime of
+the target's top-level entries supplies its last use.
+
+Nested Cargo targets outside Cargo's build trees are separate targets, with
+their own last use, locks and busy checks. The outer scan and whole take leave
+them alone. One owner index per floor pass resolves each target once. Paths from
+`/proc` are already resolved by the kernel and need no further resolution. The
+index rejects paths outside every target root before checking parent folders,
+and remembers each distinct path's deepest owner for the pass. Build-tree paths
+from other sources are resolved once. Process checks read each pid's mappings
+once per check and reuse the index for every batch recheck, tree mapping and
+trim intent. Each batch still checks live processes, so a use that starts during
+the scan keeps its target. Paths and
+processes belong to the deepest target, and the byte
+totals count nested output once. A Cargo target inside a build tree belongs to
+the build unit that holds it, including its bytes and change checks. Linker temporary files named
+`.<name>-<hash>.<pid>` in `deps/` go with the unit whose hash they carry;
+copied-up output still goes with its unit.
+
 Build locks, live processes and build holds still keep their targets out of the sweep.
 Candidate and size scans hold no cargo locks. Up to four target scans run
 together; combined inode accounting counts shared blocks once. The floor takes one target's locks
@@ -145,13 +176,22 @@ File identity, size and mtime are checked before deletion; changed output stays.
 Removing a hard link in another target does not change this check.
 The pass stops when successful deletions cover
 the shortfall.
+A dry run takes no `floor.lock`, so it can plan while a real floor pass holds
+that lock and cannot block a real pass. Real passes still take it without waiting.
 
-`recent_minutes=60` in `[sweep]` of `config/lint.conf` puts targets used in the
-last hour after all older targets. Recent output can go when the older output
-cannot meet the floor. The per-target budget sweep uses the same rule for build
-units: older units first, then recent units. Within each group, whole days
-since last use come first, then oldest compile time. Orphaned
-copies and the separate rustdoc index limit keep their existing rules.
+The floor takes the least recently used idle target first, then orders build
+units within that target by use. Recent targets are not held back. After each
+scan that finds free space under the floor, it writes one `floor_scan`
+build-log row; a dry run writes none. The row records `at`, `free_after_scan` (bytes),
+`floor` (bytes), `shortfall` (bytes), and `idle_targets` in oldest-first order.
+Each idle target has `folder`, `last_use` (epoch seconds), and `bytes` (allocated
+file bytes measured in the scan). These rows keep the scan's capacity and use
+evidence for later replay.
+
+`recent_minutes=60` orders only build units inside one target under its budget:
+older units first, then recent units. Within each group, whole days since last
+use come first, then oldest compile time. Orphaned copies and the separate
+rustdoc index limit keep their existing rules.
 
 The timed tmp sweep keeps top-level `/tmp/claude` entries and direct
 `unit`/`delegate` run folders without recorded end evidence until they are
@@ -221,17 +261,13 @@ the log does not record that connection. Journal retention also limits the evide
 
 ### Copy records and lifetime
 
-`scratch.shared_build_folder(source)` returns `SharedBuildFolder(path,
-repo_identity)` for `copies.py` to set as `CARGO_BUILD_BUILD_DIR`. It calls
-`memory_admit.git_identity` only when used. The repository key alone names the
-folder under `~/.cache/claude-builds` (`SCRATCH_SHARED_BUILD_ROOT` overrides the
-root); each use updates the folder's one `.lint-sweep-used` stamp. An unknown
-repository returns `NoSharedBuildFolder(reason)` and keeps its own build folder.
-The shared folder outlives individual copy tasks, uses Cargo's build locks and
-is swept as one target by its own last use. A copy record can name its shared
-target; ending the copy never removes that target. The existing
-`style-sync-target` also outlives its production task and keeps `sync.lock`
-across checkout creation, lint and cleanup.
+Copies seed their own build folders. The unused per-repository Cargo folder
+helper was removed: the verify-copies measurement (2026-10-30, case D) spent
+68.7 of 69.0 s waiting on that folder's build lock. New copy records do not
+write its path; old records still load and the old field has no effect.
+The `style-sync-target` still outlives its production task and keeps
+`sync.lock` across checkout creation, lint and cleanup. The sweep still reads
+Cargo's general `build.build-dir` templates.
 
 `/tmp/claude/copies` is a kept root, with copies at `<pair>/<copy>`. The tmp sweep judges each copy separately and removes an empty pair; the folder audit and scratch guard keep the root. `scratch.register_copy` writes `.scratch.json` atomically with source path and commit, copy commit, target mode, seed source, borrowed git directory, owner unit, task, land target and copy identity. A phase record also names its run directory and phase id. Registration, renew, hand-over, task end and removal use one read/change/publish path under the copy's record lock. Only `.scratch.json` and `.claude-busy` are excluded in the copy's own Git exclude file; ordinary untracked files keep the copy.
 
@@ -259,7 +295,7 @@ Scratch end rechecks the task under the removal lock. A hold on a copy's ancesto
 - The leftover check ends every process under the Mac's mirror root, for every repository, a person's shell or editor there included. ssh's exit status proves nothing (Tailscale SSH returns 0 whatever ran); only printed lines are read.
 - `MACOSX_DEPLOYMENT_TARGET` was unset because the remote command runs in a non-login ssh shell and the mirror is outside `~/rust`, so direnv never runs there; rustc then links for macOS 11.0. Below 12.0 the SDK records `@rpath/libswift_Concurrency.dylib` and a binary with no rpath aborts at load (exit 104). A changed value costs one rebuild on the Mac (a cold hana build measured 12 min 35 s); nothing in the mirror is deleted by hand.
 - Guard limits: a checkout or any other copy of the scripts accepts the variables, so a worker that runs a copy still passes a hold. Report-only programs and variables outside the list (`VERIFY_MAC_RUNNER`, `LINT_CONFIG_READER`, `MAC_TEST_SESSIONS`, `MAC_TEST_SEND`, the `BUILDLOG_HOLD_*` files) are not guarded. A shell caller started through a link outside `scripts/` looks for `override_guard.sh` beside the link and stops with status 2.
-- Tests: every fixture that can reach the hold wait needs temporary `BUILD_HOLD_DIR`, `BUILD_HOLD_RELEASE_DIR` and `UNIT_ACTIVE_DIR` and cleared `BUILDLOG_CALL_ID` and `BUILDLOG_CALLER`; one that reaches the installed scripts through the real `HOME` rewrites the live release record. Run the suites from a worktree, not inside `~/.claude`, where every case that sets a listed variable meets the refusal. A test that changes `cycle.json` mid-wait writes it whole under `release_lock()` (`change_cycle`), never with `Path.write_text`. A case that reaches a hold-event write sets a temporary `BUILDLOG_DIR` and waits for the detached recorder before checking that no further event was written. The full `scripts/direct` suite takes about 12.5 minutes and is the only check that a sibling import loads where tests import a module as `scripts.<dir>.<file>`.
+- Tests: every fixture that can reach the hold wait needs temporary `BUILD_HOLD_DIR`, `BUILD_HOLD_RELEASE_DIR` and `UNIT_ACTIVE_DIR` and cleared `BUILDLOG_CALL_ID` and `BUILDLOG_CALLER`; one that reaches the installed scripts through the real `HOME` rewrites the live release record. Shared test support and guarded suites call `override_guard.require_checkout(Path(__file__))` at import. From the installed scripts it raises one error: `<suite file>: this suite runs from a checkout, not from the installed scripts under <home>/.claude/scripts; run it from a worktree.` The home comes from the account database and links are followed. Run the suites from a worktree; the check does not skip tests. A test that changes `cycle.json` mid-wait writes it whole under `release_lock()` (`change_cycle`), never with `Path.write_text`. A case that reaches a hold-event write sets a temporary `BUILDLOG_DIR` and waits for the detached recorder before checking that no further event was written. The full `scripts/direct` suite takes about 12.5 minutes and is the only check that a sibling import loads where tests import a module as `scripts.<dir>.<file>`.
 - The test stand-in for `mac_run.sh` answers "not an ancestor" when the sha equals the clone head, where git answers "is an ancestor"; the bundle-path cases depend on that.
 
 ## Why

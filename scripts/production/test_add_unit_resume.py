@@ -18,11 +18,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "shutdown"))
 import add_unit
 import production_units
+from scripts.production import staff
 import launch_permission
 import unit_lookup
 import sessions
-import shutdown_record as shutdown_store
-import restart
+from scripts.shutdown import stop_resume
 import herdr
 from herdr import HerdrPlace
 from production_units import cell_value, live_unit_table, plan_cell_is_retired, retired_units
@@ -30,6 +30,9 @@ from test_support import ShutdownTestCase
 
 
 from add_unit_test_support import AddUnitTestCase, configure_test_zone, SCRIPT, OLD_HEADER
+from scripts.production.staff_test_support import (
+    StaffTestCase, fixture_showrunner_name, showrunner_relationship, unit_membership,
+)
 
 
 def setUpModule() -> None:
@@ -127,6 +130,8 @@ class AddUnitResumeTests(AddUnitTestCase):
             "| enh-showrunner-unit | `docs/plans/build-followups-enh-showrunner-dailies.md` (follow-up: retired units drop out of the status and a simple dailies groups idle units; the user, 2026-10-07; the earlier run's as-built is `docs/as-built/showrunner-automation.md`) (Phases 7 and 8 of stalls-unit's plan, moved by the user 2026-10-06 14:2x PDT) | `/home/natepiano/worktrees/claude-build-followups-enh-showrunner` | `build-followups-enh-showrunner` | `enh-showrunner` | — | `docs/as-built/showrunner-automation.md`; `scripts/production/add_unit.py`, `test_add_unit.py`, `merge_checkpoint.py`, `test_merge_checkpoint.py`; `commands/showrunner/add_unit.md`; after stalls-unit Phase 6 merges: `commands/showrunner/produce.md`, `commands/showrunner/promote_unit.md`, `scripts/production/showrunners.py`, `scripts/production/stall_watch.py` and their tests (hub rows); from its Phase 5 (the user, 2026-10-06 15:25 PDT, the phase-end split): `commands/unit/direct.md`, `commands/unit/checkpoint.md`, `docs/direct/run_phase_review.md`, `docs/production_format.md`, `commands/unit/add_ons.md`, `commands/plan/shrink.md`, `commands/plan/phase_review.md`, `docs/direct/phase_end.md`, `docs/direct_plan_format.md`, `commands/unit/eta_breakdown.md`, `docs/direct/final_gate_commit.md` |",
             "| model-study-unit | `docs/as-built/director-model-study.md` (run done; as-built 16e5ac6) | `/home/natepiano/worktrees/claude-build-followups-model-study` | `build-followups-model-study` | `model-study` | — | `docs/plans/build-followups-model-study.md`; `scripts/model_study/`; `docs/as-built/director-model-study-results.md` |",
         ]
+        for unit in ("enh-showrunner-unit", "model-study-unit"):
+            _ = unit_membership(fixture_showrunner_name("build-followups", self.doc), unit)
         self.assertEqual(retired_units(lines, "build-followups"), {"stalls-unit"})
         self.assertEqual([cell_value(cells["Unit"]) for cells in live_unit_table(lines, "build-followups")],
                          ["enh-showrunner-unit", "model-study-unit"])
@@ -139,6 +144,7 @@ class AddUnitResumeTests(AddUnitTestCase):
             "| `old-unit` | retired after completion | /tmp/old | old | old | — | — |",
             "| `live-unit` | docs/live.md | /tmp/live | live | live | — | — |",
         ]
+        _ = unit_membership("show", "live-unit")
         self.assertEqual(retired_units(lines, "show"), {"old-unit"})
 
     def test_running_resume_refuses_before_any_launch_write(self) -> None:
@@ -208,7 +214,7 @@ class AddUnitResumeTests(AddUnitTestCase):
     def test_attach_stops_then_launches_once_with_unit_marks_and_finishes(self) -> None:
         prior, trace = self.prepare_attach()
         result = self.successful("alpha", "--permanent", "--attach", "session-123", "--cwd", str(prior))
-        self.assertEqual(trace, ["down", "follow", "launch", "finish"])
+        self.assertEqual(trace, ["stop", "launch"])
         starts = [row for row in self.herdr_calls() if row[2:4] == ["agent", "start"]]
         self.assertEqual(len(starts), 1)
         arguments = self.agent_arguments()
@@ -242,44 +248,28 @@ class AddUnitResumeTests(AddUnitTestCase):
         for liveness, reason in ((sessions.SessionNotLive(), "session session-123 does not run; use --resume"),
                                  (sessions.SessionLivenessUnknown("registry permission denied"), "registry permission denied")):
             with (self.subTest(reason=reason), patch.object(sessions, "session_liveness", return_value=liveness),
-                  patch.object(add_unit, "run_attach_shutdown") as shutdown):
+                  patch.object(stop_resume, "stop") as shutdown):
                 result = self.cli("alpha", "--standby", "--attach", "session-123", "--cwd", str(prior))
                 self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
                 self.assertIn(reason, result.stderr)
                 shutdown.assert_not_called()
                 self.assert_no_launch_change(document, head)
 
-    def test_attach_checks_launch_hold_before_requesting_shutdown(self) -> None:
+    def test_attach_uses_live_source_without_consulting_stale_holds(self) -> None:
         prior, trace = self.prepare_attach()
-        with patch.object(launch_permission, "launch_permission", return_value=launch_permission.BlockedByShutdown("units account is held")):
+        self.write_shutdown_record(self.shutdown_record("down"))
+        with patch.object(launch_permission, "launch_permission", side_effect=AssertionError("stale hold queried")):
             result = self.cli("alpha", "--permanent", "--attach", "session-123", "--cwd", str(prior))
-        self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
-        self.assertIn("units account is held", result.stderr)
-        self.assertEqual(trace, [])
-
-    def test_attach_timeout_leaves_shutdown_state_and_prints_cancel(self) -> None:
-        prior, trace = self.prepare_attach(stop_progress="waiting", timeout=True)
-        result = self.cli("alpha", "--permanent", "--attach", "session-123", "--cwd", str(prior))
-        self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
-        self.assertEqual(trace, ["down", "follow"])
-        self.assertIn("cancel owner@example.com --here --only session-123", result.stderr)
-        with patch.dict(os.environ, self.env):
-            self.assertEqual(shutdown_store.session_records("owner@example.com")[0]["progress"]["kind"], "waiting")
-
-    def test_attach_requires_stopped_record_even_when_follower_returns_success(self) -> None:
-        prior, trace = self.prepare_attach(stop_progress="waiting")
-        result = self.cli("alpha", "--permanent", "--attach", "session-123", "--cwd", str(prior))
-        self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
-        self.assertIn("record does not confirm a completed stop", result.stderr)
-        self.assertIn("cancel owner@example.com --here --only session-123", result.stderr)
-        self.assertEqual(trace, ["down", "follow"])
+        self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
+        self.assertEqual(trace, ["stop", "launch"])
+        self.assertIn("--resume session-123", self.launch_command())
 
     def test_attach_refuses_process_still_registered_after_stop(self) -> None:
         prior, trace = self.prepare_attach(after_stop=(303,))
         result = self.cli("alpha", "--permanent", "--attach", "session-123", "--cwd", str(prior))
         self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
         self.assertIn("processes still run after shutdown; pids found: [303]", result.stderr)
-        self.assertEqual(trace, ["down", "follow"])
+        self.assertEqual(trace, ["stop"])
 
     def test_attach_checks_old_pid_even_after_registry_record_disappears(self) -> None:
         prior, trace = self.prepare_attach()
@@ -287,25 +277,14 @@ class AddUnitResumeTests(AddUnitTestCase):
             result = self.cli("alpha", "--permanent", "--attach", "session-123", "--cwd", str(prior))
         self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
         self.assertIn(f"pids found: [{os.getpid()}]", result.stderr)
-        self.assertEqual(trace, ["down", "follow"])
+        self.assertEqual(trace, ["stop"])
 
-    def test_attach_refuses_unfinished_shutdown_record_after_launch(self) -> None:
-        prior, trace = self.prepare_attach()
-        def unfinished(records: list[shutdown_store.SessionShutdown]) -> restart.TargetCheck:
-            return restart.TargetCheck(records, [])
-
-        with patch.object(restart, "clear_running_on_target", side_effect=unfinished):
-            result = self.cli("alpha", "--permanent", "--attach", "session-123", "--cwd", str(prior))
-        self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
-        self.assertEqual(trace, ["down", "follow", "launch"])
-        self.assertIn("shutdown record did not finish", result.stderr)
-        self.assertNotIn("attached session-123 as", result.stdout)
 
     def test_attach_reports_duplicate_processes_after_launch_without_touching_them(self) -> None:
         prior, trace = self.prepare_attach(after_launch=(202, 303))
         result = self.cli("alpha", "--plan", "docs/plans/given.md", "--attach", "session-123", "--cwd", str(prior))
         self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
-        self.assertEqual(trace, ["down", "follow", "launch", "finish"])
+        self.assertEqual(trace, ["stop", "launch"])
         self.assertIn("ATTACH UNPROVEN", result.stderr)
         self.assertIn("pids found: [202, 303]", result.stderr)
         self.assertNotIn("attached session-123 as", result.stdout)
@@ -610,7 +589,7 @@ class UnitLaunchProtocolTests(ShutdownTestCase):
 
 
 class RetiredRowTests(ShutdownTestCase):
-    """A unit is retired by its Plan cell, or when its worktree and its herdr session are both gone."""
+    """Staff membership outlives stale Plan, worktree and pane observations."""
 
     root: Path = Path()
     linked: Path = Path()
@@ -619,7 +598,11 @@ class RetiredRowTests(ShutdownTestCase):
 
     @override
     def setUp(self) -> None:
+        fixture = StaffTestCase()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
         super().setUp()
+        _ = showrunner_relationship("show")
         self.root = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.root)
         home_context = cast(object, self.enterContext(
@@ -644,28 +627,30 @@ class RetiredRowTests(ShutdownTestCase):
         found = {} if gone else {"some-unit": self.session("some-unit")}
         cells = production_units.unit_table([*OLD_HEADER, self.row("some", worktree, plan)])[0]
         with patch.object(unit_lookup, "marked_units", return_value=found) as asked:
-            return production_units.unit_is_retired(cells, production_units.SessionMarks("show")), asked.call_count
+            return production_units.unit_is_retired(cells, production_units.ProductionMembers("show")), asked.call_count
 
-    def test_a_unit_is_gone_only_without_both_its_worktree_and_its_session(self) -> None:
-        self.assertEqual(self.retired(self.missing, gone=True), (True, 1))
-        self.assertEqual(self.retired(self.missing, gone=False), (False, 1))
-        # A session that is only restarting keeps its row: its worktree is there, and herdr is not asked.
-        self.assertEqual(self.retired(self.linked, gone=True), (False, 0))
-        # A main checkout is shared, so it holds no unit once the session is gone.
-        self.assertEqual(self.retired(self.main, gone=True), (True, 1))
-        self.assertEqual(self.retired(self.main, gone=False), (False, 1))
-        self.assertEqual(self.retired(self.linked, gone=False, plan="retired after completion"), (True, 0))
+    def test_membership_lasts_until_the_staff_row_is_retired(self) -> None:
+        self.assertEqual(self.retired(self.linked, gone=False), (True, 0))
+        row = unit_membership("show", "some-unit")
+        for worktree in (self.missing, self.linked, self.main):
+            for gone in (True, False):
+                with self.subTest(worktree=worktree, gone=gone):
+                    self.assertEqual(self.retired(worktree, gone=gone), (False, 0))
+        self.assertEqual(self.retired(self.linked, gone=False, plan="retired after completion"), (False, 0))
+        _ = staff.retire(row.id)
+        self.assertEqual(self.retired(self.linked, gone=False), (True, 0))
 
-    def test_herdr_must_say_the_session_is_gone_and_is_asked_once_for_a_whole_table(self) -> None:
+    def test_a_whole_table_reads_one_snapshot_and_no_herdr_membership(self) -> None:
         lines = [*OLD_HEADER, self.row("first", self.missing), self.row("second", self.missing)]
-        with patch.object(unit_lookup, "marked_units", side_effect=OSError("herdr could not list sessions")) as asked:
-            self.assertEqual(retired_units(lines, "show"), set())
-        self.assertEqual(asked.call_count, 1)
-        with patch.object(unit_lookup, "marked_units", return_value={"second-unit": self.session("second-unit")}) as asked:
+        _ = unit_membership("show", "second-unit")
+        with (patch.object(unit_lookup, "marked_units", side_effect=OSError("herdr could not list sessions")) as asked,
+              patch.object(staff, "snapshot", wraps=staff.snapshot) as reads):
             self.assertEqual(retired_units(lines, "show"), {"first-unit"})
-        self.assertEqual(asked.call_count, 1)
+        asked.assert_not_called()
+        reads.assert_called_once_with()
 
     def test_every_list_drops_a_unit_that_is_gone(self) -> None:
+        _ = unit_membership("show", "parked-unit")
         lines = [
             *OLD_HEADER,
             self.row("marked", self.linked, "retired after completion"),

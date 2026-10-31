@@ -725,10 +725,12 @@ class WaitLocalTests(IsolatedBuildTargetTest):
 
     def test_waiting_line_collapses_holder_and_reason_whitespace(self) -> None:
         self.begin_hold()
-        holder = targets.Held(" hana\nteam ", " render\nchecks ", SINCE, targets.UntilReleased())
-        with mock.patch.object(build_targets, "target_state", side_effect=[holder, targets.Free()]):
-            with mock.patch.object(build_targets, "wait_sleep", side_effect=self.release_hold):
-                code, output, errors = self.wait()
+        _ = (self.holders / "hana").write_text(json.dumps({
+            "holder": " hana\nteam ", "for": " render\nchecks ",
+            "since": SINCE.isoformat(), "release_eta": "unknown",
+        }))
+        with mock.patch.object(build_targets, "wait_sleep", side_effect=self.release_hold):
+            code, output, errors = self.wait()
         self.assertEqual(code, 0)
         self.assertIn("held by hana team for render checks; waiting", output + errors)
 
@@ -852,9 +854,52 @@ class WaitLocalTests(IsolatedBuildTargetTest):
         _ = build_hold.start_hold(self.holders, build_hold.HolderIdentity("other-session", "research"),
                                   "timing", build_hold.NoReleaseEta(), NOW + timedelta(seconds=1))
         self.assertEqual(self.check_launch("holder-session"), (
-            10, "natedev is held by hana for render checks; launch after the release.\n", "",
+            10, "natedev is held by research for timing; launch after the release.\n", "",
         ))
 
+    def test_wait_and_launch_lines_name_the_oldest_hold_the_caller_does_not_own(self) -> None:
+        cases = ((("caller", "peer", "later"), "caller"), (("peer",), "caller"),
+                 (("caller",), "caller"), (("peer", "later"), ""))
+        for sessions, owner in cases:
+            with self.subTest(sessions=sessions, owner=owner):
+                for offset, session in enumerate(sessions):
+                    _ = build_hold.start_hold(
+                        self.holders, build_hold.HolderIdentity(session, session),
+                        f"{session} checks", build_hold.NoReleaseEta(), NOW + timedelta(seconds=offset))
+                others = tuple(session for session in sessions if session != owner)
+                try:
+                    with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": owner}):
+                        for caller in ("", "verify", "lint"):
+                            with self.subTest(command="check-local", caller=caller):
+                                output, errors = io.StringIO(), io.StringIO()
+                                with redirect_stdout(output), redirect_stderr(errors):
+                                    status = build_targets.command_check_local(caller)
+                                if others:
+                                    line = "natedev is held by peer for peer checks"
+                                    expected = (f"{line}; launch after the release.\n" if not caller else
+                                                f"{'verify.sh' if caller == 'verify' else 'lint'}: {line}.\n")
+                                    self.assertEqual((status, output.getvalue(), errors.getvalue()),
+                                                     (10, expected, "") if not caller else (10, "", expected))
+                                else:
+                                    self.assertEqual((status, output.getvalue(), errors.getvalue()), (0, "", ""))
+
+                        def other_releases(_seconds: float) -> None:
+                            self.sleeps += 1
+                            for session in others:
+                                build_hold.holder_path(self.holders, session).unlink()
+
+                        with self.subTest(command="wait-local"), \
+                             mock.patch.object(build_targets, "wait_sleep", side_effect=other_releases):
+                            result = self.wait()
+                            self.assertEqual(result, (
+                                0, "", "verify.sh: natedev is held by peer for peer checks; waiting "
+                                + "(tests that can run on the Mac keep running there).\n",
+                            ) if others else (0, "", ""))
+                            self.assertEqual(self.sleeps, int(bool(others)))
+                finally:
+                    for session in sessions:
+                        build_hold.holder_path(self.holders, session).unlink(missing_ok=True)
+                    self.sleeps = 0
 
     def test_hold_under_a_name_refuses_every_launching_session(self) -> None:
         self.begin_hold()

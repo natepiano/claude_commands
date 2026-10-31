@@ -910,7 +910,7 @@ class RunFolderTests(TmpSweepCase):
         self.assertTrue(payload.is_file())
         self.assertTrue(roster.is_file())
 
-    def test_a_paused_unit_keeps_a_run_that_records_its_worktree(self) -> None:
+    def test_stale_pause_does_not_keep_a_dead_units_worktree(self) -> None:
         self.now: float = time.time() + 8 * DAY
         worktree = self.tmp.parent / "worktree"
         payload = write(self.unit / "paused-unit" / "board.log")
@@ -921,11 +921,12 @@ class RunFolderTests(TmpSweepCase):
         }))
         other = write(self.delegate / "ended" / "board.log")
         result = self.sweep()
-        self.assertTrue(payload.is_file())
+        self.assertFalse(payload.exists())
         self.assertFalse(other.exists())
-        self.assertIn(str(payload.parent), result.kept[tmp_sweep.RunKeepReason.SESSION_WORKTREE.value])
+        self.assertNotIn(str(payload.parent), result.kept.get(tmp_sweep.RunKeepReason.SESSION_WORKTREE.value, []))
 
-    def test_a_legacy_paused_unit_keeps_the_worktree_run(self) -> None:
+    def test_stale_legacy_pause_does_not_keep_a_dead_units_run(self) -> None:
+        self.now = time.time() + 8 * DAY
         worktree = self.tmp.parent / "legacy-worktree"
         payload = write(self.delegate / "legacy-unit" / "board.log")
         _ = write(payload.parent / "progress_history_state.json", json.dumps({"working_dir": str(worktree)}))
@@ -934,7 +935,7 @@ class RunFolderTests(TmpSweepCase):
                                             "progress": {"kind": "stopped"}}],
         }))
         _ = self.sweep()
-        self.assertTrue(payload.is_file())
+        self.assertFalse(payload.exists())
 
     def test_a_live_units_worktree_keeps_a_run_without_a_director_record(self) -> None:
         worktree = self.tmp.parent / "worktree"
@@ -948,7 +949,7 @@ class RunFolderTests(TmpSweepCase):
         self.assertTrue(payload.is_file())
 
     def test_unreadable_ownership_records_keep_the_run(self) -> None:
-        for name in ("mesh_roster.json", "progress_history_state.json", "director", "marker", "pause", "session"):
+        for name in ("mesh_roster.json", "progress_history_state.json", "director", "marker", "session"):
             with self.subTest(record=name):
                 payload = write(self.unit / name / "tmp" / "old" / "file")
                 run = payload.parents[2]
@@ -958,8 +959,6 @@ class RunFolderTests(TmpSweepCase):
                 elif name == "director":
                     broken = run / name
                     broken.mkdir()
-                elif name == "pause":
-                    broken = write(Path(os.environ["SHUTDOWN_STATE_DIR"]) / "account" / "sessions" / "bad.json", "{")
                 elif name == "session":
                     broken = write(Path(os.environ["NOTIFIER_SESSIONS_DIR"]) / "bad.json", "{")
                 else:

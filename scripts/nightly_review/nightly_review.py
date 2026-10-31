@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """The nightly review: one read-only unit, one improvement proposal per mode, queued for the user.
 
-`launch` runs from the nightly-review timer on natedev (/etc/nixos/modules/linux/nightly-review.nix).
-The review is the permanent nightly-review-unit of one production: wrap never retires it, so it
-keeps one conversation across nights. Each night the timer sends that unit the night's job,
-`/nightly_review config rust messages` for NIGHT=<date>. When the unit is gone, the timer first
-starts it through add_unit.py --permanent, which uses the configured units account, checks shutdown holds and trust,
+`launch` runs on demand on natedev; the 01:00 nightly-review timer that ran it was retired by
+/etc/nixos cc9a0e9 (2026-10-19). The review is the permanent nightly-review-unit of one production:
+wrap never retires it, so it keeps one conversation across nights. Each launch sends that unit the
+night's job, `/nightly_review config rust messages` for NIGHT=<date>. When the unit is gone, launch
+first starts it through add_unit.py --permanent, which uses the configured units account, checks shutdown holds and trust,
 and keeps the unit's launch flags (its own settings, ~/rust, /etc/nixos and ~/.claude).
 The unit does the modes in order; for each it writes NIGHT/<mode>.md and messages natedev, which
 distills the proposals into NIGHT/digest.md and the ledger (/watcher). The night is skipped when no

@@ -23,7 +23,7 @@ import json
 import os
 import sys
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, cast
 
@@ -148,17 +148,19 @@ def _claude_worker(run: Path, session_id: str) -> bool:
     return any(short and session_id.startswith(short) for short in (line.partition("\t")[0].strip() for line in ledger))
 
 
-def director(run: Path) -> str:
+def director(run: Path, *, dependencies: Callable[[Path], None] | None = None) -> str:
     """The run's director: its recorded one, else the session that started it, from the
     `run_started` event that opens its history, for a run nothing has dispatched in since
     dispatches began recording it. The state's own `main_agent` is not used: in runs started before
     2026-10-17 a pass opened inside a worker rewrote it with that worker's thread, and
     progress_history reads the director from here to repair it."""
+    if dependencies is not None:
+        dependencies(run / DIRECTOR_FILE)
     try:
         recorded = (run / DIRECTOR_FILE).read_text(encoding="utf-8").strip()
     except (OSError, UnicodeError):
         recorded = ""
-    return recorded or _started_by(run)
+    return recorded or _started_by(run, dependencies=dependencies)
 
 
 def held(session_id: str, root_override: str | Path | None = None,
@@ -194,11 +196,15 @@ def _json_object(text: str) -> dict[str, object]:
     return cast(dict[str, object], raw) if isinstance(raw, dict) else {}
 
 
-def _started_by(run: Path) -> str:
+def _started_by(run: Path, *, dependencies: Callable[[Path], None] | None = None) -> str:
+    if dependencies is not None:
+        dependencies(run / STATE_FILE)
     try:
         history = _json_object((run / STATE_FILE).read_text(encoding="utf-8")).get("history_file")
         if not isinstance(history, str) or not history:
             return ""
+        if dependencies is not None:
+            dependencies(Path(history))
         with Path(history).open(encoding="utf-8") as handle:
             event = _json_object(handle.readline())
     except (OSError, UnicodeError):

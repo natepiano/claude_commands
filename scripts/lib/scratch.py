@@ -68,7 +68,6 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TypedDict, cast
-from urllib.parse import quote
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.user_zone import user_zone  # noqa: E402
@@ -142,17 +141,6 @@ class Unknown:
     reason: str
 
 
-@dataclass(frozen=True)
-class SharedBuildFolder:
-    path: Path
-    repo_identity: str
-
-
-@dataclass(frozen=True)
-class NoSharedBuildFolder:
-    reason: str
-
-
 def mark_cargo_cache(target: Path) -> None:
     """Tag a lasting Cargo cache and refresh its one use stamp."""
     from scripts.lib.atomic_file import write_text_atomic
@@ -162,20 +150,6 @@ def mark_cargo_cache(target: Path) -> None:
     if not tag.exists():
         write_text_atomic(tag, CACHE_TAG_SIGNATURE + "\n" + CARGO_TAG_LINE + "\n")
     (target / USE_STAMP).touch()
-
-
-def shared_build_folder(source: Path) -> SharedBuildFolder | NoSharedBuildFolder:
-    """One lasting Cargo build folder per repository, independent of its copies' tasks."""
-    # Most scratch callers need no admission code. Load its one identity rule only here.
-    from scripts.lint import memory_admit
-
-    repository, _ = memory_admit.git_identity(["cargo"], str(source))
-    if isinstance(repository, memory_admit.UnknownRepository):
-        return NoSharedBuildFolder(f"{source}: repository identity is unknown; use the copy's own target")
-    base = Path(os.environ.get("SCRATCH_SHARED_BUILD_ROOT") or "~/.cache/claude-builds").expanduser().resolve()
-    target = base / quote(repository.key, safe="")
-    mark_cargo_cache(target)
-    return SharedBuildFolder(target, repository.key)
 
 
 def copies_root() -> Path:
@@ -235,13 +209,13 @@ def exclude_copy_metadata(path: Path) -> None:
 
 def register_copy(path: Path, *, task: str, owner_unit: str, source_path: str, source_commit: str,
                   copy_commit: str, target_mode: str, seed_source: str, borrows_from: str,
-                  land_target: str = "", run_dir: str = "", phase_id: str = "", shared_target: str = "") -> None:
+                  land_target: str = "", run_dir: str = "", phase_id: str = "") -> None:
     if copy_folder(path) != path.resolve() or path.is_symlink() or not path.is_dir():
         raise ScratchError(f"{path}: a copy must be a folder at {copies_root()}/<pair>/<copy>")
     def registered(record: Registered | NotRegistered | UnreadableRecord) -> dict[str, object]:
         fields: dict[str, object] = dict(owner_unit=owner_unit, source_path=source_path,
             source_commit=source_commit, copy_commit=copy_commit, target_mode=target_mode, seed_source=seed_source,
-            borrows_from=borrows_from, shared_target=shared_target,
+            borrows_from=borrows_from,
             maker=maker(), created=time.time(), renewed=time.time())
         if isinstance(record, Registered):
             fields["created"] = record.fields.get("created", fields["created"])

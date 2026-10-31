@@ -38,9 +38,11 @@ from typing import TYPE_CHECKING, NamedTuple, NotRequired, TypedDict, TypeVar, c
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from process_failure import failure_detail
 import nix_env as nix_env
+from place import HerdrPlace as HerdrPlace
 
 if TYPE_CHECKING:
     from scripts.production import staff
@@ -572,12 +574,6 @@ class WaitTimedOut:
 
 
 @dataclass(frozen=True)
-class HerdrPlace:
-    session: str
-    pane: str
-
-
-@dataclass(frozen=True)
 class TabWithPane:
     """The identities returned when a live pane moves into a new tab."""
 
@@ -745,6 +741,7 @@ class SessionListResult(TypedDict):
 
 class PaneIdentity(TypedDict):
     pane_id: str
+    terminal_id: NotRequired[str]
     label: NotRequired[str | None]
     workspace_id: str
     session_id: str | None
@@ -1001,6 +998,15 @@ def merged_order(saved: list[SavedName], live: list[str], now: float) -> list[Sa
     return result
 
 
+def _write_layout(session: str, layout: SavedLayout) -> None:
+    """The one writer of a session's saved layout: a staged file renamed over the old one."""
+    path = layout_path(session)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    staged = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    _ = staged.write_text(json.dumps(layout, indent=1) + "\n", encoding="utf-8")
+    _ = staged.replace(path)
+
+
 def merged_layout(saved: SavedLayout, live: list[_LiveSpace], now: float) -> SavedLayout:
     """The saved layout with the live one laid over it: live order wins, gone entries keep their places."""
     tabs = {space["name"]: space["tabs"] for space in saved["workspaces"]}
@@ -1093,6 +1099,7 @@ class Herdr:
             if session_id is not None and not isinstance(session_id, str):
                 raise HerdrFailure("herdr pane agent session value: expected text or null")
             panes.append({"pane_id": json_text(pane.get("pane_id"), "herdr pane id"), "label": label,
+                          "terminal_id": json_text(pane.get("terminal_id", ""), "herdr terminal id"),
                           "workspace_id": json_text(pane.get("workspace_id"), "herdr pane workspace id"),
                           "session_id": session_id})
         return panes
@@ -1267,12 +1274,7 @@ class Herdr:
         live = [space for space in live if space.tabs]
         if not live:
             return
-        path = layout_path(self.session)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        staged = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-        _ = staged.write_text(json.dumps(merged_layout(saved_layout(self.session), live, time.time()), indent=1) + "\n",
-                              encoding="utf-8")
-        _ = staged.replace(path)
+        _write_layout(self.session, merged_layout(saved_layout(self.session), live, time.time()))
 
     def retitle(self, pane: str, title: str) -> bool:
         """Give the tab and pane the session's current name.
@@ -2331,7 +2333,7 @@ def restore_server(name: str, timeout_ms: int, *,
     raise MacDesktopUnavailable()
 
 
-def shared_session() -> str:
+def shared_session(*, dependencies: Callable[[Path], None] | None = None) -> str:
     """The one herdr session every Claude session lives in, one workspace per production and one tab
     per Claude session: `agents`, or the name in `herdr/shared-session` under the config directory.
 
@@ -2339,6 +2341,8 @@ def shared_session() -> str:
     (user, 2026-10-26); `_require_shared` refuses any other name.
     """
     path = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "herdr" / "shared-session"
+    if dependencies is not None:
+        dependencies(path)
     try:
         name = path.read_text(encoding="utf-8").strip()
     except FileNotFoundError:
@@ -2361,6 +2365,33 @@ def _require_shared(name: str) -> None:
 
 def open_tab(name: str, space: str, title: str, cwd: str, environment: dict[str, str]) -> str:
     return Herdr(name).open_tab(space, title, cwd, environment)
+
+
+def rename_saved_tab(session: str, workspace: str, old_titles: Set[str], title: str) -> None:
+    """Give a renamed tab its old saved place, dropping any duplicate destination entry.
+
+    Other workspaces and timestamps survive. Launchers can then order the new tab
+    against this entry before recording their live layout.
+    """
+    old_titles = old_titles - {title}
+    with _LayoutLock(session):
+        saved = saved_layout(session)
+        for space in saved["workspaces"]:
+            if space["name"] != workspace or not any(tab["name"] in old_titles for tab in space["tabs"]):
+                continue
+            seen = max(tab["seen"] for tab in space["tabs"] if tab["name"] in old_titles or tab["name"] == title)
+            tabs: list[SavedName] = []
+            renamed = False
+            for tab in space["tabs"]:
+                if tab["name"] in old_titles:
+                    if not renamed:
+                        tabs.append(SavedName(name=title, seen=seen))
+                        renamed = True
+                elif tab["name"] != title:
+                    tabs.append(tab)
+            space["tabs"] = tabs
+            _write_layout(session, saved)
+            return
 
 
 def save_shared_layout(running: set[str]) -> None:

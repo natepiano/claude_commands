@@ -73,6 +73,21 @@ class StoreTests(unittest.TestCase):
         self.assertEqual([cast(dict[str, object], json.loads(line)) for line in contents.splitlines()],
                          [*old_rows, {"id": "next"}])
 
+    def test_whole_rows_skip_damaged_nonobject_and_partial_rows_from_the_offset(self) -> None:
+        path = self.root / "history.jsonl"
+        path.parent.mkdir(parents=True)
+        first = b'{"id":"first"}\n'
+        fragment = b'broken {"id":"fragment"}\n'
+        _ = path.write_bytes(first + fragment + b'{"id":"\xff"}\n'
+                             + b'[{"id":"list"}]\n' + b'{"id":"last"}\n' + b'{"id":"cut"}')
+        cases = ((0, [{"id": "first"}, {"id": "last"}]),
+                 (len(first) + len(b"broken "), [{"id": "last"}]),
+                 (len(first) + len(fragment), [{"id": "last"}]))
+        for start, expected in cases:
+            with self.subTest(start=start), path.open("rb") as handle:
+                fcntl.flock(handle, fcntl.LOCK_SH)
+                self.assertEqual(list(store.whole_rows(handle, start)), expected)
+
     def test_append_keeps_whole_rows_before_a_long_unfinished_tail(self) -> None:
         path = self.root / "natedev" / "2026-10.jsonl"
         store.append_line(path, {"id": "old"})

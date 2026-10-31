@@ -25,10 +25,10 @@ class FakeSessionMoves:
         self.batches.append(list(sessions))
         return [self.move(session, target, why=why) for session in sessions]
 
-    def move(self, session: str, target: str, *, why: str) -> stop_resume.Resumed | stop_resume.ResumeFailed:
+    def move(self, session: str, target: str, *, why: str) -> stop_resume.ClaudeUp | stop_resume.ResumeFailed:
         call = MoveCall(session, target, why)
         self.calls.append(call)
         if session in self.failures:
             return stop_resume.ResumeFailed(session, self.failures[session])
         self.moved(call)
-        return stop_resume.Resumed(session, "w1:p1", target)
+        return stop_resume.ClaudeUp(session, "w1:p1", target)

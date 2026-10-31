@@ -242,9 +242,7 @@ class RemoveWorkersTest(unittest.TestCase):
         (former / "old-ended").mkdir()
         _ = (former / "old-ended" / "workers").write_text("old2\tproject-old2\n", encoding="utf-8")
         roots = (self.root, former)
-        held: remove_workers.HeldSessions = {"kind": "held sessions", "session_ids": set()}
-        with patch.object(remove_workers, "shutdown_held_sessions", return_value=held):
-            live = remove_workers.live_runs(roots, {ORCHESTRATOR, GONE_ORCHESTRATOR})
+        live = remove_workers.live_runs(roots, {ORCHESTRATOR, GONE_ORCHESTRATOR})
         self.assertEqual(live, {new_live.resolve(), old_live.resolve()})
         self.assertEqual(set(remove_workers.removal_targets(roots, set(), [], live)), {"new2", "old2"})
 
@@ -293,67 +291,34 @@ class RemoveWorkersTest(unittest.TestCase):
     def test_successful_run_cleanup_does_not_launch_an_implicit_server_sweep(self) -> None:
         own = self.run_dir("own", [], orchestrator=ORCHESTRATOR)
         arguments = [str(SCRIPT), "--session-dir", str(own)]
-        held: remove_workers.HeldSessions = {"kind": "held sessions", "session_ids": set()}
         with (patch.object(sys, "argv", arguments),
               patch.object(remove_workers, "DEFAULT_ROOTS", (self.root,)),
               patch.object(remove_workers, "list_sessions", return_value=[]),
-              patch.object(remove_workers, "shutdown_held_sessions", return_value=held),
               patch.object(subprocess, "run", side_effect=AssertionError("run cleanup launched a server sweep")) as commands):
             self.assertEqual(remove_workers.main(), 0)
         commands.assert_not_called()
 
-    def test_shutdown_query_returns_named_held_sessions(self) -> None:
-        completed = subprocess.CompletedProcess[str](
-            ["shutdown", "held-sessions"], 0, "first\n\nsecond\n", ""
-        )
-        with patch.object(subprocess, "run", return_value=completed):
-            result = remove_workers.shutdown_held_sessions()
 
-        self.assertEqual(
-            result,
-            {"kind": "held sessions", "session_ids": {"first", "second"}},
-        )
 
-    def test_shutdown_query_failure_names_unreadable_state(self) -> None:
-        completed = subprocess.CompletedProcess[str](
-            ["shutdown", "held-sessions"], 2, "", "bad state\n"
-        )
-        with patch.object(subprocess, "run", return_value=completed):
-            result = remove_workers.shutdown_held_sessions()
 
-        self.assertEqual(
-            result,
-            {
-                "kind": "shutdown state unreadable",
-                "reason": "held-sessions exited 2: bad state",
-            },
-        )
 
-    def test_environment_cannot_replace_shutdown_command(self) -> None:
-        with patch.dict(
-            os.environ, {"REMOVE_WORKERS_SHUTDOWN_COMMAND": "/tmp/not-shutdown"}
-        ):
-            command = remove_workers.shutdown_command()
 
-        self.assertEqual(
-            command, [sys.executable, str(remove_workers.SHUTDOWN)]
-        )
 
-    def test_down_shutdown_record_keeps_its_directors_run(self) -> None:
+    def test_stale_down_record_does_not_keep_a_dead_directors_run(self) -> None:
         _ = self.run_dir("held", ["held1"], orchestrator=GONE_ORCHESTRATOR)
         self.write_shutdown_record(GONE_ORCHESTRATOR, "down")
         self.list_rows([row("held1", "held-test")])
 
-        self.assertEqual(self.remove_workers(), (0, []))
+        self.assertEqual(self.remove_workers(), (0, ["held1"]))
 
-    def test_restarting_shutdown_record_keeps_its_directors_run(self) -> None:
+    def test_stale_restarting_record_does_not_keep_a_dead_directors_run(self) -> None:
         _ = self.run_dir("held", ["held1"], orchestrator=GONE_ORCHESTRATOR)
         self.write_shutdown_record(GONE_ORCHESTRATOR, "restarting")
         self.list_rows([row("held1", "held-test")])
 
-        self.assertEqual(self.remove_workers(), (0, []))
+        self.assertEqual(self.remove_workers(), (0, ["held1"]))
 
-    def test_unreadable_shutdown_state_keeps_every_active_run(self) -> None:
+    def test_unreadable_stale_shutdown_state_does_not_keep_dead_runs(self) -> None:
         _ = self.run_dir("first", ["first1"], orchestrator=GONE_ORCHESTRATOR)
         _ = self.run_dir("second", ["second1"], orchestrator=LEGACY_DEAD)
         account = self.state_root / "owner@example.com"
@@ -366,8 +331,8 @@ class RemoveWorkersTest(unittest.TestCase):
         result, removed = self.run_remove_workers()
 
         self.assertEqual(result.returncode, 0)
-        self.assertEqual(removed, [])
-        self.assertIn("shutdown state could not be read", result.stderr)
+        self.assertEqual(set(removed), {"first1", "second1"})
+        self.assertNotIn("shutdown state could not be read", result.stderr)
 
 
 if __name__ == "__main__":

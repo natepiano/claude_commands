@@ -39,7 +39,7 @@ import style_ledger
 from approved_renames import (BindingComments, BindingRename, BindingScope, NoBindingScope,
                               RenameDeclaration, rename_declaration, refactor_rename, refactor_comments, binding_comments,
                               PatternBindingCollision, pattern_binding_check,
-                              backtick_mentions, identifier_mentions)
+                              backtick_mentions, identifier_mentions, field_sites)
 
 
 class BulkRenameError(Exception):
@@ -87,6 +87,7 @@ class FileRenames:
     refusals: tuple[Refusal, ...]
     related: tuple[RenamedDocument, ...] = ()
     dependencies: frozenset[str] = frozenset()
+    proof_dependencies: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -460,8 +461,15 @@ class RustAnalyzer:
         if self.request("textDocument/prepareRename", params) is None:
             raise BulkRenameError("rust-analyzer refused prepareRename")
         value = self.request("textDocument/rename", {**params, "newName": new})
-        return workspace_edits(value, path, text, self.versions[path], self.documents, self.versions,
-                               lambda target: self.sources.read(target).source)
+        workspace = workspace_edits(value, path, text, self.versions[path], self.documents, self.versions,
+                                    lambda target: self.sources.read(target).source)
+        token = next(span for span in self.sources.tokens(text).spans if span.start == offset)
+        line = text.count("\n", 0, offset) + 1
+        rename = BindingRename(line, text.splitlines()[line - 1], token.token.value, new)
+        declaration = rename_declaration(text, rename)
+        if isinstance(declaration, RenameDeclaration) and declaration.scope.kind not in {"field", "variant", "item"}:
+            return preserve_shorthand_field_labels(self.sources, workspace, rename)
+        return workspace
 
     def definitions(self, path: Path, text: str, offsets: tuple[int, ...]) -> tuple[DefinitionResolution, ...]:
         """Pipeline one file's definition requests; one deadline bounds the entire round."""
@@ -786,6 +794,82 @@ def module_exports(server: RenameServer, path: Path, source: str, module: int, n
     return False
 
 
+def cfg_field_reference_guard(server: RenameServer, path: Path, parsed: BindingText,
+                              declaration: RenameDeclaration, rename: BindingRename,
+                              workspace: WorkspaceRename) -> WorkspaceRename:
+    """Complete proven cfg field uses in the analyzer edit set; refuse missing proof."""
+    if declaration.scope.kind != "field":
+        return workspace
+    span = parsed.spans[declaration.scope.declaration]
+    begin, end = lsp_position(parsed.source, span.start), lsp_position(parsed.source, span.end)
+    target = DefinitionTarget(path.as_uri(), (begin["line"], begin["character"]),
+                              (end["line"], end["character"]))
+    documents = {document.path: document for document in workspace.documents}
+    for source in crate_source_documents(server, path):
+        tokens = server.sources.tokens(source.source)
+        if rename.old not in tokens.words:
+            continue
+        owners = style_footprint.attribute_owners(tokens.words)
+        gated: set[int] = set()
+        for start, finish in style_footprint.attribute_spans(tokens.words):
+            if not set(tokens.words[start:finish]) & {"cfg", "cfg_attr"}:
+                continue
+            item = owners.get(start, finish)
+            finish = item
+            while finish < len(tokens.words) and tokens.words[finish] not in {"{", ";", ","}:
+                finish = tokens.ends.get(finish, finish) + 1
+            finish = tokens.ends.get(finish, finish) + 1
+            gated.update(range(item, finish))
+        document = documents.get(source.path, DocumentEdits(source.path, source.source, ()))
+        missing: list[int] = []
+        for i in sorted(gated):
+            if i >= len(tokens.spans) or tokens.words[i] != rename.old:
+                continue
+            token = tokens.spans[i]
+            owner = tokens.parents.get(i, -1)
+            field_use = (tokens.words[max(0, i - 1):i] == (".",)
+                         and tokens.words[i + 1:i + 2] != ("(",)
+                         or isinstance(rename_edit_site(tokens, SourceEdit(token.start, token.end, rename.new)),
+                                       ShorthandFieldLabel)
+                         or owner >= 0 and tokens.words[owner] == "{"
+                         and i in field_sites(tokens.words, owner, tokens.ends[owner]))
+            if not field_use or source.path == path and token.start == span.start:
+                continue
+            if any(edit.start <= token.start and token.end <= edit.end and edit.text != rename.old
+                   for edit in document.edits):
+                continue
+            missing.append(token.start)
+        if not missing:
+            continue
+        server.open(source.path, source.source)
+        answers = server.definitions(source.path, source.source, tuple(missing))
+        if len(answers) != len(missing):
+            raise BulkRenameError("cfg field reference coverage unavailable: incomplete definition response")
+        edits = list(document.edits)
+        for point, answer in zip(missing, answers, strict=True):
+            if isinstance(answer, DefinitionUnavailable):
+                line = source.source.count("\n", 0, point) + 1
+                raise BulkRenameError(f"field rename has cfg-dependent references: {source.path}:{line}; "
+                                      + "field definition is unproved: " + answer.reason)
+            if answer == target or isinstance(answer, FieldShorthandTargets) and answer.field == target:
+                edit = SourceEdit(point, point + len(rename.old), rename.new)
+                site = rename_edit_site(tokens, edit)
+                edits.extend(site.field_edits(rename.new) if isinstance(site, ShorthandFieldLabel) else (edit,))
+        if tuple(edits) != document.edits:
+            documents[source.path] = replace(document, edits=tuple(edits))
+    return WorkspaceRename(tuple(documents.values()))
+
+
+def shorthand_edit_guard(document: DocumentEdits, rename: BindingRename) -> None:
+    """A local binding edit must keep the record field label intact."""
+    before = BindingText(document.source)
+    for edit in document.edits:
+        site = rename_edit_site(before, edit)
+        if (isinstance(site, ShorthandFieldLabel) and site.span.token.value == rename.old
+                and site.binding_edits(rename.new)[0] not in document.edits):
+            raise BulkRenameError("record shorthand edit was not normalized to preserve its field label")
+
+
 def rename_guard(server: RenameServer, path: Path, source: str, declaration: RenameDeclaration,
                  rename: BindingRename) -> PreservedFieldNames:
     parsed = server.sources.tokens(source)
@@ -875,6 +959,59 @@ def text_name_guard(server: RenameServer, document: DocumentEdits, rename: Bindi
             raise BulkRenameError("rename changes serialized or externally visible literal text")
 
 
+@dataclass(frozen=True)
+class ShorthandFieldLabel:
+    """One token that names both a record field and its local value or pattern binding."""
+
+    span: style_footprint.TokenSpan
+
+    def field_edits(self, new: str) -> tuple[SourceEdit, ...]:
+        return (SourceEdit(self.span.start, self.span.end, new + ": " + self.span.token.value),)
+
+    def binding_edits(self, new: str) -> tuple[SourceEdit, SourceEdit]:
+        # Keeping the insertion separate maps the old binding boundary to the value,
+        # including when this shorthand is the renamed pattern's declaration.
+        return (SourceEdit(self.span.start, self.span.start, self.span.token.value + ": "),
+                SourceEdit(self.span.start, self.span.end, new))
+
+
+def rename_edit_site(parsed: BindingText, edit: SourceEdit) -> ShorthandFieldLabel | SourceEdit:
+    """Classify only an entire existing shorthand token, using the shared token spans."""
+    for i, span in enumerate(parsed.spans):
+        if (span.start == edit.start and span.end == edit.end
+                and parsed.words[parsed.parents.get(i, i)] == "{"
+                and style_footprint.shorthand_field(parsed.words, i)):
+            return ShorthandFieldLabel(span)
+    return edit
+
+
+def preserve_shorthand_field_labels(sources: RunSourceIndex, workspace: WorkspaceRename,
+                                    rename: BindingRename) -> WorkspaceRename:
+    """A local rename changes the value side, never the record's field label.
+
+    Some analyzer edits (notably inside macro arguments) replace the bare token.
+    Split both bare replacements and already expanded fields into the same edit
+    pair so the existing offset and reference proof also handles pattern bindings.
+    """
+    documents: list[DocumentEdits] = []
+    for document in workspace.documents:
+        parsed = sources.tokens(document.source)
+        edits: list[SourceEdit] = []
+        for edit in document.edits:
+            site = rename_edit_site(parsed, edit)
+            if (isinstance(site, ShorthandFieldLabel) and site.span.token.value == rename.old
+                    and site.binding_edits(rename.new)[0] not in document.edits):
+                words = tuple(span.token.value for span in sources.tokens(edit.text).spans)
+                if (words == (rename.new,) and edit.text == rename.new
+                        or words == (rename.old, ":", rename.new)
+                        and re.fullmatch(re.escape(rename.old) + r"\s*:\s*" + re.escape(rename.new), edit.text)):
+                    edits.extend(site.binding_edits(rename.new))
+                    continue
+            edits.append(edit)
+        documents.append(replace(document, edits=tuple(edits)))
+    return WorkspaceRename(tuple(documents))
+
+
 def public_edit_guard(document: DocumentEdits, rename: BindingRename) -> None:
     if not published_crate(crate_directory(document.path)):
         return
@@ -882,6 +1019,9 @@ def public_edit_guard(document: DocumentEdits, rename: BindingRename) -> None:
     for i, span in enumerate(parsed.spans):
         if span.token.kind != "identifier" or not any(edit.start <= span.start < edit.end for edit in document.edits):
             continue
+        site = rename_edit_site(parsed, SourceEdit(span.start, span.end, rename.new))
+        if isinstance(site, ShorthandFieldLabel) and site.binding_edits(rename.new)[0] in document.edits:
+            continue  # The label is preserved; the edited value is still resolution-checked.
         line = document.source.count("\n", 0, span.start) + 1
         scope = BindingScope("item", i, ((i, i + 1),))
         if not public_declaration(parsed, scope):
@@ -1057,6 +1197,13 @@ class RunSourceIndex:
         if source not in self.names:
             self.names[source] = source_name_index(self.tokens(source))
         return self.names[source].get(name.removeprefix("r#"), ())
+
+    def originally_named(self, path: Path, name: str) -> frozenset[Path]:
+        """Restoring an earlier overlay can reintroduce a destination-name reference."""
+        _ = self.coverage(path)
+        original = self.packages[crate_directory(path)]
+        assert isinstance(original, CrateSourceCoverage)
+        return frozenset(document.path for document in original.documents if self.named(document.source, name))
 
     def module_layout(self, path: Path, parsed: BindingText) -> tuple[ModuleLoadingSite, ...]:
         key = (path, parsed.source)
@@ -1328,7 +1475,7 @@ def collapsed_field_shorthands(sources: RunSourceIndex, document: DocumentEdits,
 
 
 def verify_rename_references(server: RenameServer, path: Path, offset: int, rename: BindingRename,
-                             replacements: Sequence[tuple[DocumentEdits, str]]) -> None:
+                             replacements: Sequence[tuple[DocumentEdits, str]]) -> frozenset[Path]:
     """Accept only preserved definitions; restore all server overlays on every failed proof."""
     declaration_document, declaration_text = next((document, edited) for document, edited in replacements
                                                   if document.path == path)
@@ -1343,6 +1490,8 @@ def verify_rename_references(server: RenameServer, path: Path, offset: int, rena
     inspected = [*replacements, *((document, document.source)
                                  for document in crate_name_documents(server, path, rename.new, tuple(changed_paths))
                                  if document.path not in changed_paths)]
+    proof_dependencies = set(server.sources.originally_named(path, rename.new))
+    proof_dependencies.update(document.path for document, _ in inspected)
     for document, edited in inspected:
         checks: list[ReferenceMustResolve] = []
         collapsed = collapsed_field_shorthands(server.sources, document, edited, rename) if document.edits else ()
@@ -1360,6 +1509,8 @@ def verify_rename_references(server: RenameServer, path: Path, offset: int, rena
             line = document.source.count("\n", 0, point) + 1
             if isinstance(answer, DefinitionUnavailable):
                 raise BulkRenameError(f"rename resolution unavailable for {rename.new!r} at line {line} in {document.path.name}: {answer.reason}")
+            targets = (answer.field, answer.binding) if isinstance(answer, FieldShorthandTargets) else (answer,)
+            proof_dependencies.update(Path(unquote(urlparse(target.uri).path)) for target in targets)
         for point, answer in zip(untouched, answers[:len(untouched)], strict=True):
             if isinstance(answer, DefinitionUnavailable):
                 raise AssertionError("unavailable definitions were refused above")
@@ -1398,17 +1549,57 @@ def verify_rename_references(server: RenameServer, path: Path, offset: int, rena
         for document, _ in replacements:
             server.open(document.path, document.source)
         raise
+    return frozenset(proof_dependencies)
 
 
 def file_edits_preserved(file: FileRenames, after: str) -> bool:
-    """Formatting may change whitespace only, never RA's tokens or the approved comments."""
+    """Keep significant tokens and attached comment paragraphs across rustfmt.
+
+    Only commas/braces and line wrapping of a plain comment paragraph may
+    differ. Markdown structure, hard breaks and block comments remain exact.
+    """
+    def formatted_evidence(source: str) -> tuple[tuple[style_footprint.Token, ...], tuple[tuple[int, str], ...]]:
+        spans = style_footprint.token_spans(source)
+        tokens: list[style_footprint.Token] = []
+        comments: list[tuple[int, str]] = []
+        previous_end = 0
+        paragraph = ""
+        marker = ""
+        for index, end in enumerate((*(span.start for span in spans), len(source))):
+            lines = [(raw, re.fullmatch(r"(///(?!/)|//!|//(?![/!])) ?(.*)", raw.lstrip()))
+                     for raw in source[previous_end:end].splitlines() if raw.strip()]
+            structured = any(not match or raw.endswith(("  ", "\\")) or (match and re.match(
+                r"(?:[ \t]|[#>*|]|`{3}|~{3}|[-+] |[0-9]+[.)] |\[.*\]:|<)", match[2]))
+                             for raw, match in lines)
+            for raw, match in lines:
+                line = raw.strip()
+                body = match[2] if match else ""
+                plain = bool(not structured and match and body)
+                if plain and match:
+                    if paragraph and marker != match[1]:
+                        comments.append((len(tokens), marker + " " + paragraph))
+                        paragraph = ""
+                    marker = match[1]
+                    paragraph = (paragraph + " " + body) if paragraph else body
+                else:
+                    if paragraph:
+                        comments.append((len(tokens), marker + " " + paragraph))
+                        paragraph = ""
+                    comments.append((len(tokens), line))
+            if paragraph:
+                comments.append((len(tokens), marker + " " + paragraph))
+                paragraph = ""
+            if index < len(spans):
+                span = spans[index]
+                if span.token.value not in {",", "{", "}"}:
+                    tokens.append(span.token)
+                previous_end = span.end
+        return tuple(tokens), tuple(comments)
+
     try:
-        before_spans, after_spans = style_footprint.token_spans(file.edited), style_footprint.token_spans(after)
+        return formatted_evidence(file.edited) == formatted_evidence(after)
     except style_footprint.UnreadableTokenSpans:
         return False
-    return (tuple(span.token for span in before_spans) == tuple(span.token for span in after_spans)
-            and style_footprint.comment_gaps(file.edited, before_spans, lambda text: text)
-            == style_footprint.comment_gaps(after, after_spans, lambda text: text))
 
 
 def parameter_comments(source: str, declaration: RenameDeclaration, rename: BindingRename) -> BindingComments | NoBindingScope:
@@ -1458,6 +1649,7 @@ def rename_file(server: RenameServer, path: Path, relative: str, source: str,
     kept: list[KeptRename] = []
     offsets = {finding.finding_id: declaration.offset for finding, declaration in located}
     changed: dict[Path, RenamedDocument] = {}
+    proof_dependencies: set[str] = set()
     occupied: dict[Path, list[tuple[int, int]]] = defaultdict(list)
     root = path
     for _ in Path(relative).parts:
@@ -1480,6 +1672,7 @@ def rename_file(server: RenameServer, path: Path, relative: str, source: str,
             if not own_doc and docs_name_binding(docs, comments, rename.old):
                 raise BulkRenameError("repository Markdown names the parameter; requires a coordinated documentation edit")
             workspace = server.rename(path, current, offset, rename.new)
+            workspace = cfg_field_reference_guard(server, path, server.sources.tokens(current), declaration, rename, workspace)
             documents: list[DocumentEdits] = []
             for document in workspace.documents:
                 if not document.path.is_relative_to(root) or crate_directory(document.path) != crate_directory(path):
@@ -1489,6 +1682,8 @@ def rename_file(server: RenameServer, path: Path, relative: str, source: str,
                     if any(not any(span.start <= edit.start and edit.end <= span.end for span in spans)
                            and (document.path != path or edit not in companion) for edit in document.edits):
                         raise BulkRenameError("parameter refactor changes text outside its proved comment mentions")
+                if declaration.scope.kind not in {"field", "variant", "item"}:
+                    shorthand_edit_guard(document, rename)
                 text_name_guard(server, document, rename)
                 public_edit_guard(document, rename)
                 edits = list(document.edits)
@@ -1510,7 +1705,7 @@ def rename_file(server: RenameServer, path: Path, relative: str, source: str,
             check_files(tuple(document.path.relative_to(root).as_posix() for document in documents))
             # Validate every document before changing any server document.
             replacements = [(document, apply_edits(document.source, document.edits)) for document in documents]
-            verify_rename_references(server, path, offset, rename, replacements)
+            reads = verify_rename_references(server, path, offset, rename, replacements)
         except (BulkRenameError, OSError, UnicodeError, ValueError) as error:
             refused.append(Refusal(finding.finding_id, str(error)))
             continue
@@ -1532,9 +1727,10 @@ def rename_file(server: RenameServer, path: Path, relative: str, source: str,
                     except BulkRenameError:
                         offsets[identity] = -1
         kept.append(KeptRename(finding, declaration.scope.kind, 0))
+        proof_dependencies.update(target.relative_to(root).as_posix() for target in reads if target.is_relative_to(root))
     return FileRenames(relative, source, current, tuple(kept), tuple(refused),
                        tuple(document for target, document in changed.items() if target != path),
-                       frozenset(document.path for document in changed.values()))
+                       frozenset(document.path for document in changed.values()), frozenset(proof_dependencies))
 
 
 def combine_file_renames(files: Sequence[FileRenames]) -> tuple[FileRenames, ...]:
@@ -1548,7 +1744,9 @@ def combine_file_renames(files: Sequence[FileRenames]) -> tuple[FileRenames, ...
                                                 document.edited,
                                                 (*(previous.kept if previous else ()), *(file.kept if own else ())),
                                                 (*(previous.refusals if previous else ()), *(file.refusals if own else ())),
-                                                dependencies=(previous.dependencies if previous else frozenset[str]()) | file.dependencies)
+                                                dependencies=(previous.dependencies if previous else frozenset[str]()) | file.dependencies,
+                                                proof_dependencies=(previous.proof_dependencies if previous else frozenset[str]())
+                                                                   | file.proof_dependencies)
     return tuple(merged.values())
 
 
@@ -1672,6 +1870,9 @@ class BatchIntent:
                 raise ValueError("invalid batch owner")
             self.batch_id = batch_id
             files = object_fields(value["files"])
+            formatted = object_list(value.get("formatter_restored_paths", []))
+            if not all(isinstance(name, str) and name in files for name in formatted):
+                raise ValueError("invalid formatter restoration paths")
             tickets = object_list(value["tickets"])
             if not all(isinstance(ticket, str) for ticket in tickets):
                 raise ValueError("invalid tickets")
@@ -1695,7 +1896,12 @@ class BatchIntent:
                 if not isinstance(before, str) or not isinstance(after, str):
                     raise ValueError("invalid source bytes")
                 data = bytes.fromhex(before)
-                if hashlib.sha256(data).hexdigest() != digest or target.read_bytes() not in (data, bytes.fromhex(after)):
+                current = target.read_bytes()
+                preserved = current in (data, bytes.fromhex(after))
+                if not preserved and name in formatted:
+                    original = data.decode("utf-8")
+                    preserved = file_edits_preserved(FileRenames(name, original, original, (), ()), current.decode("utf-8"))
+                if hashlib.sha256(data).hexdigest() != digest or not preserved:
                     raise self.refuse(f"{name}: bytes do not match the recorded edit")
                 originals[target] = data
             # Check the whole set before restoring any file. Repeated recovery accepts before bytes too.
