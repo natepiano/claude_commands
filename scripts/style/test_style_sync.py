@@ -485,11 +485,8 @@ class StyleSyncTests(unittest.TestCase):
         result = fixture.verify("lint", "--workspace", "--no-cache")
         self.assertEqual(fixture.calls("+nightly"), [
             ["fmt", "--version"], ["fmt", "--all"],
-            ["fmt", "--version"], ["fmt", "--all"],
         ])
         self.assertEqual(fixture.calls("clippy"), [
-            ["--fix", "--allow-dirty", "--allow-staged", "--allow-no-vcs",
-             "--workspace", "--all-targets", "--all-features", "--keep-going", "--", "-D", "warnings"],
             ["--workspace", "--all-targets", "--all-features", "--keep-going", "--", "-D", "warnings"],
         ])
         self.assertEqual(fixture.calls("mend"), [["--all-targets", "--workspace", "--fix"]])
