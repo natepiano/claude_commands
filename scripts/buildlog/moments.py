@@ -111,6 +111,7 @@ MOMENTS: tuple[Moment, ...] = (
                 ), ("sdlc: clone rebuilds 805 runs, 231 of 327 hana nextest hours; 134 phases.",
                     "Fail then fail differs (ours about 80 h, sdlc 50–55 h); load ratios differ because sdlc's 134 phases include the Mac."), "week")),
     MemoryMoment(datetime(2026, 10, 31, 13, 33, tzinfo=UTC), "Build budget 21 → 24 GiB (e791376e)"),
+    BuildMoment(datetime(2026, 10, 31, 20, 36, tzinfo=UTC), "Queue test-phase charge (2a819dfd)", "all"),
 )
 
 HANA_PATTERNS = ("hana", "tool-based-ui", "catalyst", "fairy_dust")

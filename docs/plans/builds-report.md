@@ -132,3 +132,12 @@ Do not wait for sdlc's exact keys. Print our definition, our number and sdlc's n
 - `scripts/buildlog/test_moments.py`, `scripts/buildlog/test_report.py`, `scripts/buildlog/test_memory_window.py`, `scripts/lint/test_invoke_scope.py` — tests
 
 **Gotchas:** earlyoom joins argv with spaces and no shell quotes, so only the text before the first space is the program. A journal that cannot be read is `unavailable`, never zero.
+
+### Phase 3 — The build report splits build rates at the queue test-phase charge  · status: done
+**Depends on:** Phase 1
+
+2026-10-31 16:36 EDT (the showrunner): set a moment at about 16:36 EDT; queue's test-phase charge and one decision pass are on main (2a819dfd).
+
+- Add one `BuildMoment` to `MOMENTS` in `scripts/buildlog/moments.py`: `datetime(2026, 10, 31, 20, 36, tzinfo=UTC)`, name `"Queue test-phase charge (2a819dfd)"`, scope `"all"`, no sdlc baseline.
+- This is not Moment 2. Moment 2 stays phases-unit's prompt and lint change, added when its hash arrives.
+- `buildlog moments` shows the new moment with a thin after window until a day of data exists.

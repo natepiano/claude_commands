@@ -383,6 +383,7 @@ class MomentTests(unittest.TestCase):
         lines = self.section(day="2026-10-31")
         comparisons = [line for line in lines if line.startswith("Before ")]
         expected = (
+            ("Queue test-phase charge (2a819dfd)", "2026-10-31 20:36:00 UTC"),
             ("Build rules 1 (Moment 1)", "2026-10-31 10:50:00 UTC"),
             ("Floor sweep (e3b8e391)", "2026-10-29 18:26:00 UTC"),
             ("hana Bevy dylib", "2026-10-29 09:33:00 UTC"),
