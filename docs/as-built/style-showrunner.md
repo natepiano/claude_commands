@@ -546,3 +546,28 @@ its findings; it cannot leave a partial ticket. Identified crate runs alone keep
 reservation-blocked findings pending for automatic manifest resume.
 A terminal error in any member of an atomic group takes precedence over a
 reservation wait: each finding is refused once and never also persisted as pending.
+
+
+### Read-only crate admission report
+
+`bulk_run.py --repo R --crate PACKAGE [--crate PACKAGE...] --rule RULE --base-tree TREE --dry-run`
+reports through `crate_run.admission_plan`, the same boundary used before real
+crate execution. It requires the exact clean current base and reads an existing,
+current-schema ledger through SQLite `mode=ro`; it creates no run, ticket, manifest,
+checkout, result or publication. Reservations use the canonical cargo-berth board.
+Selection and cross-crate proposal exclusions, source ownership, site anchors,
+fresh-judgment eligibility, supported rename syntax and dependent edit group
+availability use the production owners. Values planning uses the shared frozen Cargo
+manifest/source inventory directly, without exporting sources or creating temporary
+directories; the constant proof remains in memory. Each finding reports `admitted`, `pending`
+(with path and berth holders), `refused` (with reason), or `not checked` (with why).
+
+The default report does not start rust-analyzer: that service enables build scripts
+and procedural macros and can write build artifacts. Findings requiring its semantic
+or fresh-machine-judgment proof are explicitly selection-only for that proof, never
+reported admitted. An injected read-only analyzer can complete the shared planner's
+semantic proof without applying its overlay edits. An admitted result proves planning
+admission only. Formatting, compiler validation, tests and final-tree publication
+require writes and remain explicitly not checked; the report forecasts no test pass
+or final applied count. The report is a point-in-time observation, not a frozen run
+or a reservation guarantee. A later real run rechecks every boundary.
