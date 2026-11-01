@@ -1316,12 +1316,14 @@ def tick(now: float, *, deadline: float = math.inf) -> int:
         if not stretch["reported_status"]:
             stretch["reported_status"] = last
             save_stretch(path, stretch)
-        if not stretch["bump_sent"]:
+        holding = turn is not None and turn.group("kind") == HOLDING_KIND
+        if not holding and not stretch["bump_sent"]:
             text = (f"stall-watch: you have been idle since {since_text} with nothing running. "
                     "Continue your run; if you are waiting on someone, say on whom in one line.")
             pending.append(delivery(path, "bump", socket, f"{key}:bump", text))
         if not stretch["tell_sent"] and showrunner_socket:
-            text = f"{name} idle since {since_text}, nothing running; bumped. Last status: {last}"
+            text = (f"{name} holding since {since_text}, nothing running; not bumped. Last status: {last}"
+                    if holding else f"{name} idle since {since_text}, nothing running; bumped. Last status: {last}")
             pending.append(delivery(path, "tell", showrunner_socket, f"{key}:tell", text))
     send_all(pending, now, deadline=deadline, limits=sender.limits)
     finish_cancellations(cancellations.requests)

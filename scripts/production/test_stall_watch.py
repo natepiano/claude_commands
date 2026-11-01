@@ -51,7 +51,7 @@ import unit_lookup
 
 SCRIPT = Path(__file__).with_name("stall_watch.py")
 START = int(datetime(2026, 10, 6, 12, 0, tzinfo=ZoneInfo("America/Los_Angeles")).timestamp())
-PANE = "— holding: waiting on a decision\n"
+PANE = "Ready for the next step.\n"
 EDIT_PROMPT = ("— holding: waiting on the seats\n\n Edit file\n scripts/herdr/panes.py\n"
                + " Do you want to make this edit to panes.py?\n ❯ 1. Yes\n   2. No\n")
 BASH_PROMPT = (" Bash command\n\n   sed -n '5,$p' /tmp/saved.txt\n   Read lines 5 to the end of a saved output\n\n"
@@ -707,7 +707,7 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
         self.assertEqual(self.tick(START + 301).returncode, 0)
         self.assertEqual(len(self.sent()), 2)
 
-    def test_stalled_unit_waits_at_gate_then_bumps_after_holding_returns(self) -> None:
+    def test_stalled_unit_waits_at_gate_then_tells_after_holding_returns(self) -> None:
         self.assertEqual(self.tick(START).returncode, 0)
         self.assertEqual(self.sent(), [])
         self.assertEqual(self.tick(START + 300).returncode, 0)
@@ -720,10 +720,10 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
         self.assertEqual(tell["to"], f"uds:{self.root / 'show-id.sock'}")
         self.assertIn("idle since 12:00 PDT", bump["text"])
         self.assertIn("Continue your run", bump["text"])
-        self.assertIn("Last status: — holding: waiting on a decision", tell["text"])
+        self.assertIn("Last status: none on screen", tell["text"])
         self.assertEqual(self.tick(START + 360).returncode, 0)
         self.assertEqual(len(self.sent()), 2)
-        self.panes["unit-one"]["pane"] = "reply text\n— holding: waiting on a decision\n"
+        self.panes["unit-one"]["pane"] = "reply text\n" + PANE
         self.assertEqual(self.tick(START + 361).returncode, 0)
         self.assertEqual(self.tick(START + 661).returncode, 0)
         self.assertEqual(len(self.sent()), 2)
@@ -736,10 +736,12 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
         self.assertEqual(len(self.sent()), 2)
         self.assertEqual(self.tick(START + 1263).returncode, 0)
         second = self.sent()[2:]
-        self.assertEqual(len(second), 2)
+        self.assertEqual(len(second), 1)
+        self.assertTrue(second[0]["key"].endswith(":tell"))
+        self.assertIn("not bumped", second[0]["text"])
         self.assertNotEqual({item["key"] for item in first}, {item["key"] for item in second})
 
-    def test_stalled_unit_is_bumped_and_told_once_until_latest_turn_end_changes(self) -> None:
+    def test_stalled_unit_is_bumped_then_only_told_when_its_status_holds(self) -> None:
         self.assertEqual(self.tick(START).returncode, 0)
         self.assertEqual(self.sent(), [])
         self.assertEqual(self.tick(START + 300).returncode, 0)
@@ -747,7 +749,7 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
         self.assertEqual(len(first), 2)
         self.assertEqual(self.tick(START + 360).returncode, 0)
         self.assertEqual(len(self.sent()), 2)
-        self.panes["unit-one"]["pane"] = "reply text\n— holding: waiting on a decision\n"
+        self.panes["unit-one"]["pane"] = "reply text\n" + PANE
         self.assertEqual(self.tick(START + 361).returncode, 0)
         self.assertEqual(self.tick(START + 661).returncode, 0)
         self.assertEqual(len(self.sent()), 2)
@@ -755,7 +757,9 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
         self.assertEqual(self.tick(START + 662).returncode, 0)
         self.assertEqual(self.tick(START + 962).returncode, 0)
         second = self.sent()[2:]
-        self.assertEqual(len(second), 2)
+        self.assertEqual(len(second), 1)
+        self.assertTrue(second[0]["key"].endswith(":tell"))
+        self.assertIn("not bumped", second[0]["text"])
         self.assertNotEqual({item["key"] for item in first}, {item["key"] for item in second})
 
     def test_a_unit_at_a_permission_prompt_alerts_the_user_once_and_is_not_bumped(self) -> None:
@@ -1495,7 +1499,7 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
                 self.assertEqual(self.sent(), [])
                 self.assertEqual(self.tick(START + 1201).returncode, 0)
                 self.assertEqual({item["key"].rsplit(":", 1)[-1] for item in self.sent()},
-                                 {"bump", "tell"})
+                                 {"tell"})
                 self.send_log.unlink()
                 for path in self.state.glob("*.json"):
                     path.unlink()
@@ -1514,7 +1518,7 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
         _ = transcript.write_text("".join(json.dumps(entry) + "\n" for entry in entries))
         os.utime(transcript, (START - 3600, START - 3600))
 
-    def test_an_idle_waiting_unit_near_compaction_is_bumped_and_told_once(self) -> None:
+    def test_near_compaction_waits_bump_once_except_holding_only_tells(self) -> None:
         self.configure({"showrunner": ["unit-one"]}, stall_minutes=10)
         blocked = "— blocked: my context is full; it compacts on the next turn"
         window = 283_800
@@ -1535,21 +1539,26 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
                     bump_sent=False, tell_sent=False, reported_status="")
                 _ = path.write_text(json.dumps(stretch))
                 self.assertEqual(self.tick(START).returncode, 0)
-                self.assertEqual(len(self.sent()), 2)
+                holding = "holding:" in status
+                self.assertEqual(len(self.sent()), 1 if holding else 2)
                 self.assertEqual(self.tick(START + 600).returncode, 0)
                 sent = self.sent()
-                self.assertEqual(len(sent), 2)
-                bump, = [item for item in sent if item["key"].endswith(":bump")]
+                self.assertEqual(len(sent), 1 if holding else 2)
                 tell, = [item for item in sent if item["key"].endswith(":tell")]
-                self.assertEqual(bump["key"].rsplit(":", 1)[-1], "bump")
-                self.assertIn("sid-unit-one.sock", bump["to"])
+                if holding:
+                    self.assertFalse(any(item["key"].endswith(":bump") for item in sent))
+                    self.assertIn("not bumped", tell["text"])
+                else:
+                    bump, = [item for item in sent if item["key"].endswith(":bump")]
+                    self.assertEqual(bump["key"].rsplit(":", 1)[-1], "bump")
+                    self.assertIn("sid-unit-one.sock", bump["to"])
                 self.assertEqual(tell["key"].rsplit(":", 1)[-1], "tell")
                 self.assertIn("show-id.sock", tell["to"])
                 self.assertIn(f"Last status: {status}", tell["text"])
                 saved = cast(stall_watch.Stretch, json.loads(path.read_text()))
                 self.assertEqual(saved["since"], START - 601)
                 self.assertEqual(saved["reported_status"], status)
-                self.assertTrue(saved["bump_sent"])
+                self.assertEqual(saved["bump_sent"], not holding)
                 self.assertTrue(saved["tell_sent"])
                 self.send_log.unlink()
                 path.unlink()
@@ -1595,15 +1604,16 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(self.sent(), [])
         # An actual new assignment still recovers if its own work stops.
-        _ = transcript.write_text(json.dumps(self.said({"type": "text", "text": PANE})) + "\n")
+        _ = transcript.write_text(json.dumps(self.said({"type": "tool_use", "name": "Bash"})) + "\n")
         os.utime(transcript, (START - 3600, START - 3600))
+        self.panes["unit-one"]["pane"] = PANE
         self.assertEqual(self.tick(START + 601).returncode, 0)
         self.assertEqual(self.tick(START + 901).returncode, 0)
         tell, = [item for item in self.sent() if item["key"].endswith(":tell")]
-        self.assertIn(f"Last status: {PANE.strip()}", tell["text"])
+        self.assertIn("Last status: none on screen", tell["text"])
         self.assertEqual(len(self.sent()), 2)
 
-    def test_a_resumed_unit_gets_a_fresh_idle_stretch_before_its_bump(self) -> None:
+    def test_a_resumed_holding_unit_gets_a_fresh_idle_stretch_before_its_tell(self) -> None:
         self.panes["unit-one"]["pane"] = "holding: paused until the showrunner says resume\n"
         for at in (START, START + 3600):
             self.assertEqual(self.tick(at).returncode, 0)
@@ -1612,7 +1622,7 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
         self.assertEqual(self.tick(START + 3601).returncode, 0)
         self.assertEqual(self.sent(), [])
         self.assertEqual(self.tick(START + 3901).returncode, 0)
-        self.assertEqual({item["key"].rsplit(":", 1)[-1] for item in self.sent()}, {"bump", "tell"})
+        self.assertEqual({item["key"].rsplit(":", 1)[-1] for item in self.sent()}, {"tell"})
 
     def test_status_vocabulary_is_reread_without_restarting_the_watcher(self) -> None:
         self.panes["unit-one"]["pane"] = "holding: budget nap\n"
@@ -1624,7 +1634,7 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
         self.assertEqual(self.tick(START + 301).returncode, 0)
         self.assertEqual(self.sent(), [])
         self.assertEqual(self.tick(START + 601).returncode, 0)
-        self.assertEqual({item["key"].rsplit(":", 1)[-1] for item in self.sent()}, {"bump", "tell"})
+        self.assertEqual({item["key"].rsplit(":", 1)[-1] for item in self.sent()}, {"tell"})
 
     def test_a_paused_turn_end_in_the_transcript_also_prevents_bumps(self) -> None:
         self.compacted(self.said({"type": "text", "text": "holding: paused until the showrunner says resume"}))
@@ -1663,8 +1673,8 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
                 self.assertEqual(self.tick(START + 301).returncode, 0)
                 self.assertEqual(self.sent(), [])
                 self.assertEqual(self.tick(START + 601).returncode, 0)
-                self.assertEqual({item["key"].rsplit(":", 1)[-1] for item in self.sent()}, {"bump", "tell"})
-                self.assertEqual(len(self.sent()), 2)
+                self.assertEqual({item["key"].rsplit(":", 1)[-1] for item in self.sent()}, {"tell"})
+                self.assertEqual(len(self.sent()), 1)
                 tell = next(item for item in self.sent() if item["key"].endswith(":tell"))
                 self.assertIn(f"Last status: {status}", tell["text"])
 
@@ -1673,7 +1683,7 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
         _ = self.unit("bad-unit")
         _ = self.unit("following-unit")
         for name in ("unit-one", "following-unit"):
-            self.panes[name]["pane"] = "holding: ready for next task\n"
+            self.panes[name]["pane"] = PANE
         self.panes["bad-unit"]["pane"] = "holding: waiting on the showrunner\n"
         for pattern in (r"\bwaiting\b(?P<owner>never)?", r"\bwaiting\b(?P<owner>)", r"\bwaiting\b"):
             with self.subTest(pattern=pattern):
@@ -1749,7 +1759,7 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
         self.panes["unit-one"]["pane"] = f"  {old}\n"
         self.assertEqual(self.tick(START).returncode, 0)
         self.assertEqual(self.tick(START + 300).returncode, 0)
-        self.assertEqual(len(self.sent()), 2)
+        self.assertEqual(len(self.sent()), 1)
         path, = self.state.glob("*.json")
         stretch = cast(stall_watch.Stretch, json.loads(path.read_text()))
         self.assertEqual(stretch["reported_status"], old)
@@ -1762,10 +1772,10 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
         self.assertFalse(stretch["tell_sent"])
         self.assertEqual(stretch["reported_status"], "")
         self.assertEqual(self.tick(START + 600).returncode, 0)
-        self.assertEqual(len(self.sent()), 2)
+        self.assertEqual(len(self.sent()), 1)
         self.assertEqual(self.tick(START + 601).returncode, 0)
-        self.assertEqual(len(self.sent()), 4)
-        tell = next(item for item in self.sent()[2:] if item["key"].endswith(":tell"))
+        self.assertEqual(len(self.sent()), 2)
+        tell = next(item for item in self.sent()[1:] if item["key"].endswith(":tell"))
         self.assertTrue(tell["text"].endswith(f"Last status: {status}"))
         self.assertNotIn("●", tell["text"])
         stretch = cast(stall_watch.Stretch, json.loads(path.read_text()))
@@ -1793,7 +1803,7 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
                 self.assertEqual(self.sent(), [])
                 self.assertEqual(self.tick(START + 1201).returncode, 0)
                 self.assertEqual({item["key"].rsplit(":", 1)[-1] for item in self.sent()},
-                                 {"bump", "tell"})
+                                 {"tell"})
                 self.send_log.unlink(missing_ok=True)
                 for path in self.state.glob("*.json"):
                     path.unlink()
@@ -1815,7 +1825,7 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
                 self.assertEqual(self.sent(), [])
                 self.assertEqual(self.tick(START + 1201).returncode, 0)
                 self.assertEqual({item["key"].rsplit(":", 1)[-1] for item in self.sent()},
-                                 {"bump", "tell"})
+                                 {"tell"})
                 self.send_log.unlink(missing_ok=True)
                 for path in self.state.glob("*.json"):
                     path.unlink()
@@ -1842,7 +1852,7 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
         self.assertEqual(self.tick(START + 3600).returncode, 0)
         self.assertEqual(self.sent(), [])
 
-    def test_a_compacted_pane_bumps_when_the_transcript_turn_holds_or_went_on(self) -> None:
+    def test_a_compacted_pane_only_bumps_when_the_transcript_went_on(self) -> None:
         for last, status in (([self.said({"type": "text", "text": "— holding: waiting on the tests"})],
                               "— holding: waiting on the tests"),
                              ([self.said({"type": "text", "text": "— blocked: the user's Ghostty check"}),
@@ -1853,20 +1863,40 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
                 self.assertEqual(self.tick(START + 300).returncode, 0)
                 tell = next(item for item in self.sent() if item["key"].endswith(":tell"))
                 self.assertIn(f"Last status: {status}", tell["text"])
+                self.assertEqual({item["key"].rsplit(":", 1)[-1] for item in self.sent()},
+                                 {"bump", "tell"} if status == "none on screen" else {"tell"})
                 self.send_log.unlink()
                 for path in self.state.glob("*.json"):
                     path.unlink()
 
-    def test_holding_turn_end_still_bumps_idle_unit(self) -> None:
+    def test_reported_holding_statuses_tell_once_and_never_bump(self) -> None:
+        for status in ("— holding: no work until the showrunner restarts it on your word",
+                       "holding: waiting on your confirmed values"):
+            with self.subTest(status=status):
+                self.send_log.unlink(missing_ok=True)
+                self.state.mkdir(exist_ok=True)
+                for path in self.state.glob("*.json"):
+                    path.unlink()
+                self.panes["unit-one"]["pane"] = status + "\n"
+                for at in (START, START + 300, START + 600):
+                    result = self.tick(at)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                tell, = self.sent()
+                self.assertEqual(tell["to"], f"uds:{self.root / 'show-id.sock'}")
+                self.assertTrue(tell["key"].endswith(":tell"))
+                self.assertEqual(tell["text"],
+                                 f"unit-one holding since 12:00 PDT, nothing running; not bumped. Last status: {status}")
+
+    def test_holding_turn_end_tells_without_bumping_idle_unit(self) -> None:
         self.configure({"showrunner": ["unit-one"]}, stall_minutes=10)
         self.panes["unit-one"]["pane"] = "— holding: waiting on a decision\n"
         self.assertEqual(self.tick(START).returncode, 0)
         self.assertEqual(self.tick(START + 600).returncode, 0)
         self.assertEqual({item["key"].rsplit(":", 1)[-1] for item in self.sent()},
-                         {"bump", "tell"})
+                         {"tell"})
 
-    def test_a_hold_that_states_its_end_is_not_bumped_before_then(self) -> None:
-        """START is 12:00 PDT: a hold ending at 14:00, dated or not, bumps only once 14:00 is past."""
+    def test_a_hold_that_states_its_end_is_not_reported_before_then(self) -> None:
+        """START is 12:00 PDT: a hold ending at 14:00, dated or not, is reported only once 14:00 is past."""
         for status in ("— holding: waiting on the re-measure window, which ends 2026-10-06 14:00 PDT",
                        "— holding: waiting on the re-measure window until 14:00 PDT",
                        "— holding: waiting on the window until 21:00 UTC",
@@ -1881,9 +1911,9 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
                     self.assertEqual(self.tick(at).returncode, 0)
                 self.assertEqual(self.sent(), [])
                 self.assertEqual(self.tick(START + 7199 + 300).returncode, 0)
-                self.assertEqual({item["key"].rsplit(":", 1)[-1] for item in self.sent()}, {"bump", "tell"})
+                self.assertEqual({item["key"].rsplit(":", 1)[-1] for item in self.sent()}, {"tell"})
 
-    def test_a_hold_naming_a_past_time_still_bumps(self) -> None:
+    def test_a_hold_naming_a_past_time_tells_without_bumping(self) -> None:
         """A time without a date is the nearest one: 11:50 read at 12:00 is this morning, not tonight."""
         for status in ("— holding: waiting on the tests since 11:50 PDT",
                        "— holding: waiting on the window, which ended 2026-10-06 11:00 PDT",
@@ -1896,7 +1926,9 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
                 self.panes["unit-one"]["pane"] = status + "\n"
                 self.assertEqual(self.tick(START).returncode, 0)
                 self.assertEqual(self.tick(START + 300).returncode, 0)
-                self.assertEqual(len(self.sent()), 2)
+                self.assertEqual(len(self.sent()), 1)
+                self.assertTrue(self.sent()[0]["key"].endswith(":tell"))
+                self.assertIn("not bumped", self.sent()[0]["text"])
 
     def test_shell_seen_then_gone_starts_a_new_idle_stretch(self) -> None:
         _ = self.tick(START)
@@ -1919,16 +1951,18 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
         self.assertEqual(self.sent(), [])
 
     def test_done_turn_ends_reported_stretch_before_same_holding_status_returns(self) -> None:
+        self.panes["unit-one"]["pane"] = "— holding: waiting on the tests\n"
         _ = self.tick(START)
         _ = self.tick(START + 300)
         first_keys = {item["key"] for item in self.sent()}
         self.panes["unit-one"]["pane"] = "— done: phase finished\n"
         _ = self.tick(START + 360)
-        self.panes["unit-one"]["pane"] = PANE
+        self.panes["unit-one"]["pane"] = "— holding: waiting on the tests\n"
         _ = self.tick(START + 361)
         _ = self.tick(START + 661)
-        second = self.sent()[2:]
-        self.assertEqual(len(second), 2)
+        second = self.sent()[1:]
+        self.assertEqual(len(second), 1)
+        self.assertTrue(second[0]["key"].endswith(":tell"))
         self.assertTrue(first_keys.isdisjoint({item["key"] for item in second}))
 
     def test_failed_showrunner_delivery_retries_without_rebumping_unit(self) -> None:
