@@ -4167,6 +4167,11 @@ class WeeklyNotReadSince:
 
 
 @dataclass(frozen=True)
+class NoRoleCount:
+    """A spare account has no role membership to count."""
+
+
+@dataclass(frozen=True)
 class StatusRow:
     """One account's values, shared by the table and JSON renderers."""
     label: str
@@ -4182,6 +4187,7 @@ class StatusRow:
     read_at: datetime | StatusUnavailable
     read_outcome: agent_accounts.UsageReadOutcome
     attempted_at: datetime | StatusUnavailable
+    role_counts: tuple[int | NoRoleCount, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -4192,12 +4198,14 @@ class StatusReading:
     zone: tzinfo
     checked_at: datetime
     represented_stderr: tuple[str, ...] = ()
+    session_inputs: tuple[str, ...] = ()
 
 
 class StatusAccountDocument(TypedDict):
     label: str
     tool: Literal["claude", "codex"]
     roles: list[str]
+    role_counts: list[int | None]
     weekly_left_percent: float | None
     resets_at: str | None
     credits: float | Literal["unlimited"] | None
@@ -4208,6 +4216,7 @@ class StatusAccountDocument(TypedDict):
 
 
 class StatusDocument(TypedDict):
+    session_inputs: list[str]
     accounts: list[StatusAccountDocument]
     problems: list[str]
 
@@ -4308,6 +4317,8 @@ def render_status_json(reading: StatusReading) -> str:
     accounts: list[StatusAccountDocument] = []
     for row in reading.rows:
         item = StatusAccountDocument(label=row.label, tool=row.tool, roles=list(row.roles),
+            role_counts=[count if isinstance(count, int) else None for count in
+                (row.role_counts or tuple(NoRoleCount() for _role in row.roles))],
             weekly_left_percent=None if isinstance(row.weekly_left_percent, (StatusUnavailable, WeeklyNotReadSince)) else row.weekly_left_percent,
             resets_at=None if isinstance(row.resets_at, StatusUnavailable) else row.resets_at.astimezone(timezone.utc).isoformat(),
             credits=None if isinstance(row.credits, StatusUnavailable) else row.credits,
@@ -4317,7 +4328,7 @@ def render_status_json(reading: StatusReading) -> str:
                 agent_accounts.UsageReadOutcome.OK, agent_accounts.UsageReadOutcome.HELD),
             credits_in_use=row.on_credits == "yes")
         accounts.append(item)
-    return json.dumps(StatusDocument(accounts=accounts, problems=[note.removeprefix("* ") for note in reading.notes]))
+    return json.dumps(StatusDocument(session_inputs=list(reading.session_inputs), accounts=accounts, problems=[note.removeprefix("* ") for note in reading.notes]))
 
 
 ProblemKind = Literal["warning", "usage claim", "usage save", "startup", "usage", "legacy", "unnoted", "test login", "access", "identity", "signed out", "wrong login", "unreadable note", "note", "state", "check", "role", "unclassified", "mcp servers"]
@@ -4892,6 +4903,7 @@ def _read_status(source: UsageSource, *, detail: bool) -> StatusReading:
         *(_status_row(status, usage.get(usage_store.key("Codex", status.login)), now,
             (status.role,) if status.role in (CODEX_ROLE, "spare") else ()) for status in codex),
     )
+    rows, session_inputs = _count_role_sessions(rows)
     home_step = "run accounts.py cutover-home"
     all_statuses: list[AccountStatus | CodexStatus] = [*statuses, *codex]
     diagnostics_by_status = [_status_problems(status, detail=detail, zone=zone) for status in all_statuses]
@@ -4946,7 +4958,7 @@ def _read_status(source: UsageSource, *, detail: bool) -> StatusReading:
                       if isinstance(source, RefreshStaleUsage) else ())
         detail_lines = (*live_lines,
             *_move_status_lines(moves.account_moves(journal), zone), *_routing_status_lines(journal, zone))
-    return StatusReading(rows, tuple(notes), detail_lines, zone, now, tuple(represented_stderr))
+    return StatusReading(rows, tuple(notes), detail_lines, zone, now, tuple(represented_stderr), session_inputs)
 
 
 @dataclass
@@ -5101,6 +5113,116 @@ def status_report(*, detail: bool = False, source: UsageSource = REFRESH_STALE_U
 WORKERS_RUN_ROOTS = unit_runs.run_roots()
 
 
+def _count_role_sessions(rows: tuple[StatusRow, ...]) -> tuple[tuple[StatusRow, ...], tuple[str, ...]]:
+    """Count local owners from the detail view's registries, without host discovery."""
+    from scripts.message import sessions
+    from scripts.shutdown import inventory
+    from scripts.herdr import pane_launch
+    from scripts.production import showrunners, session_staff, staff
+
+    inputs = {sessions.sessions_dir(), pane_launch.record_directory(), showrunners.NOTIFIER_STATE_DIR}
+    counts: dict[tuple[Path, str], set[str]] = {}
+    launches: dict[str, pane_launch.PaneLaunch] = {}
+    for path in pane_launch.record_directory().glob("*.json"):
+        inputs.add(path)
+        try:
+            entries = pane_launch.read_valid_entries(path)
+        except (OSError, ValueError):
+            continue
+        for launch in entries.values():
+            previous = launches.get(launch["session_id"])
+            if previous is None or previous["written_at"] < launch["written_at"]:
+                launches[launch["session_id"]] = launch
+    try:
+        membership = staff.local_snapshot()
+    except staff.StaffUnreadable:
+        membership = staff.StaffSnapshot(())
+    inputs.update(Path(path) for path in membership.inputs)
+    runners = inventory.showrunner_registrations()
+    runner_ids = {runner.session_id for runner in runners.entries}
+    for path in showrunners.NOTIFIER_STATE_DIR.glob("showrunner-*/conf"):
+        inputs.add(path)
+    for path in sessions.sessions_dir().glob("*.json"):
+        inputs.add(path)
+    for session in sessions.live_sessions():
+        identity = session["sessionId"]
+        launch = launches.get(identity)
+        role = "showrunners" if identity in runner_ids else ""
+        if not role and launch is not None:
+            marks = launch["environment"]
+            unit, staff_id = marks.get("SHOWRUNNER_UNIT_ID", ""), marks.get("STAFF_ID", "")
+            if unit or staff_id:
+                try:
+                    member = session_staff.unit_match(session_staff.ObservedUnit(unit), membership, staff_id)
+                except (staff.StaffUnreadable, ValueError):
+                    continue
+                if isinstance(member, session_staff.MemberFound):
+                    role = "units"
+        if not role:
+            continue
+        if launch is not None and launch.get("ended", False):
+            continue
+        if launch is not None:
+            directory_name = launch.get("config_dir", "")
+            if not directory_name:
+                continue
+            directory = Path(directory_name)
+        else:
+            setting = account.process_config_dir(session["pid"])
+            if not isinstance(setting, account.ConfiguredClaudeFolder):
+                continue
+            directory = setting.path
+        counts.setdefault((directory, role), set()).add(identity)
+    from scripts.message.unit_labels import MeshWorker, listed_mesh_worker
+
+    for run, name, entry, home in _worker_status_records(inputs):
+        if home and listed_mesh_worker(cast(MeshWorker, cast(object, entry))):
+            counts.setdefault((Path(home), "workers"), set()).add(str(run / name))
+    counted = tuple(replace(row, role_counts=tuple(
+        NoRoleCount() if role == "spare" else len(counts.get((Path(row.folder).expanduser(), role), set()))
+        for role in row.roles)) for row in rows)
+    return counted, tuple(str(path) for path in sorted(inputs))
+
+
+def _worker_status_records(inputs: set[Path]) -> list[tuple[Path, str, dict[str, object], str]]:
+    """Read each live mesh once for counts and the detail view's continuation lines."""
+    from scripts.message.unit_labels import read_object
+
+    found: list[tuple[Path, str, dict[str, object], str]] = []
+    for root in WORKERS_RUN_ROOTS:
+        inputs.add(root)
+        for path in sorted(root.glob("*/mesh_roster.json")):
+            inputs.update((path.parent, path, path.parent / "mesh_server.json"))
+            if not _mesh_server_running(path.parent):
+                continue
+            try:
+                raw = read_object(path)
+                server = read_object(path.parent / "mesh_server.json")
+            except (OSError, ValueError):
+                continue
+            homes: dict[int, str] = {}
+            try:
+                retired = read_object(path.parent / "mesh_retired.json").get("servers", [])
+            except (OSError, ValueError):
+                retired = []
+            inputs.add(path.parent / "mesh_retired.json")
+            servers = [*(cast(list[object], retired) if isinstance(retired, list) else []), server]
+            for value in servers:
+                if isinstance(value, dict):
+                    record = cast(dict[str, object], value)
+                    port, home = record.get("port"), record.get("codex_home")
+                    if isinstance(port, int) and isinstance(home, str):
+                        homes[port] = home
+            for name, value in raw.items():
+                if not isinstance(value, dict):
+                    continue
+                entry = cast(dict[str, object], value)
+                port = entry.get("port", server.get("port"))
+                home = homes.get(port, "") if isinstance(port, int) else ""
+                found.append((path.parent, name, entry, home))
+    return found
+
+
 def _live_status_lines(groups: GroupAccounts) -> list[str]:
     from scripts.message import sessions
     members = live_group_members()
@@ -5151,26 +5273,14 @@ def _workers_status_lines(now: datetime, selected: CodexWorkersAccount) -> list[
     chosen = pick("codex", now, exclude=exclude, keep=NoKeep())
     destination = chosen.label if isinstance(chosen, PickedAccount) else no_room_line("codex", chosen)
     lines = [f"Codex workers: {selected.label}; on refusal: {destination}"] if selected.label else []
-    for path in sorted(path for root in WORKERS_RUN_ROOTS for path in root.glob("*/mesh_roster.json")):
-        if not _mesh_server_running(path.parent):
-            continue
-        try:
-            raw = cast(object, json.loads(path.read_text()))
-        except (OSError, ValueError):
-            continue
-        if not isinstance(raw, dict):
-            continue
-        for name, value in cast(dict[str, object], raw).items():
-            if not isinstance(value, dict):
-                continue
-            entry = cast(dict[str, object], value)
-            if entry.get("continuation_owed") is True:
-                reason = entry.get("continuation_reason")
-                if not isinstance(reason, str):
-                    reason = "quota refusal; waiting for account recovery or a confirmed move"
-                    if entry.get("status") == "waiting_capacity":
-                        reason = "waiting for capacity on the selected account"
-                lines.append(f"worker {path.parent.name}/{name}: continuation owed — {reason}")
+    for run, name, entry, _home in _worker_status_records(set()):
+        if entry.get("continuation_owed") is True:
+            reason = entry.get("continuation_reason")
+            if not isinstance(reason, str):
+                reason = "quota refusal; waiting for account recovery or a confirmed move"
+                if entry.get("status") == "waiting_capacity":
+                    reason = "waiting for capacity on the selected account"
+            lines.append(f"worker {run.name}/{name}: continuation owed — {reason}")
     return lines
 
 

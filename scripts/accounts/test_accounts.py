@@ -385,6 +385,109 @@ class AccountsTests(unittest.TestCase):
             self.assertEqual(len(row), len(accounts.TABLE_HEADINGS))
         return rows
 
+    def test_stored_json_counts_local_members_per_account_and_role_without_discovery(self) -> None:
+        self.assert_stored_role_counts("unit marks")
+
+    def test_stored_role_counts_resolve_a_unit_with_only_its_staff_identity(self) -> None:
+        self.assert_stored_role_counts("staff identity")
+
+    def test_stored_role_counts_skip_damaged_launch_history_and_keep_loading(self) -> None:
+        self.assert_stored_role_counts("damaged history")
+
+    def test_stored_role_counts_keep_valid_siblings_of_an_empty_launch_entry(self) -> None:
+        self.assert_stored_role_counts("damaged sibling")
+
+    def test_stored_role_counts_skip_a_newer_launch_with_a_non_string_config_dir(self) -> None:
+        self.assert_stored_role_counts("damaged folder")
+
+    def assert_stored_role_counts(self, evidence: Literal[
+        "unit marks", "staff identity", "damaged history", "damaged sibling", "damaged folder",
+    ]) -> None:
+        from scripts.message import sessions
+        from scripts.shutdown import inventory
+        from scripts.herdr import pane_launch
+        from scripts.production import staff
+        from scripts.production.staff_test_support import unit_membership
+
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"STAFF_FILE": str(self.root / "staff.json")})))
+        members = {name: unit_membership("fixture", name) for name in ("a", "b", "c")}
+
+        self.login_directory("claude1", "units@notexample.com")
+        self.login_directory("claude2", "runners@notexample.com")
+        self.write_note("codex1", "workers@notexample.com")
+        self.codex_login("workers@notexample.com", self.home / ".codex1")
+        self.write_note("codex2", "spare@notexample.com")
+        self.codex_login("spare@notexample.com", self.home / ".codex2")
+        configuration = accounts.accounts_config_file()
+        configuration.parent.mkdir(parents=True, exist_ok=True)
+        _ = configuration.write_text('{"workers": "codex1"}')
+        records = self.root / "pane-records"
+        records.mkdir()
+        owners: list[sessions.SessionRecord] = []
+        launches: dict[str, pane_launch.PaneLaunch] = {}
+        for identity, label, unit in (("unit-a", "claude1", "a"), ("unit-b", "claude1", "b"),
+                                      ("runner-a", "claude2", ""), ("runner-b", "claude1", ""),
+                                      ("stopped", "claude1", "c"), ("plain", "claude1", "")):
+            launches[identity] = pane_launch.PaneLaunch(pane_id=identity, session_id=identity,
+                config_dir=str(self.home / ("." + label)), cwd=str(self.root), name=identity,
+                model="", remote_control=False, flags_read=True, written_at="2026-10-01T00:00:00Z",
+                environment={"SHOWRUNNER_UNIT_ID": unit} if unit else {})
+            if evidence == "staff identity" and unit:
+                launches[identity]["environment"] = {"STAFF_ID": members[unit].id}
+            if identity != "stopped":
+                owners.append(sessions.SessionRecord(pid=12345, sessionId=identity, name=identity,
+                    messagingSocketPath="/fake.sock", updatedAt=1, tmux="", formerNames=[]))
+        # A repeated registry identity is still one session.
+        owners.append(owners[0])
+        history: dict[str, object] = dict(launches)
+        if evidence == "damaged sibling":
+            history["broken-pane"] = {}
+        elif evidence == "damaged folder":
+            damaged: dict[str, object] = dict(launches["unit-a"])
+            damaged.update(config_dir=[], written_at="2026-10-02T00:00:00Z")
+            history["broken-pane"] = damaged
+        _ = (records / "fixture.json").write_text(json.dumps(history))
+        if evidence == "damaged history":
+            _ = (records / "damaged.json").write_text('{"broken-pane": {}}')
+        run = self.root / "worker-runs" / "run-one"
+        run.mkdir(parents=True)
+        _ = (run / "mesh_server.json").write_text(json.dumps({
+            "pid": 12345, "port": 123, "codex_home": str(self.home / ".codex1"),
+        }))
+        _ = (run / "mesh_roster.json").write_text(json.dumps({
+            "first": {"status": "running", "thread_id": "one", "port": 123},
+            "second": {"status": "done", "thread_id": "two", "port": 123},
+            "ended": {"status": "ended", "thread_id": "ended", "port": 123},
+        }))
+        runners = inventory.ShowrunnerRegistrations((
+            inventory.ShowrunnerRegistration("runner-a", "runner-a", ""),
+            inventory.ShowrunnerRegistration("runner-b", "runner-b", ""),
+        ))
+        cases: tuple[tuple[str, dict[str, tuple[list[str], list[int]]]], ...] = (
+            ("claude2", {"claude1": (["units"], [2]), "claude2": (["showrunners"], [1])}),
+            ("claude1", {"claude1": (["units", "showrunners"], [2, 1]), "claude2": ([], [])}),
+        )
+        for runner_label, expected in cases:
+            _ = accounts.set_group_account("units", "claude1", why="fixture")
+            _ = accounts.set_group_account("showrunners", runner_label, why="fixture")
+            with (self.subTest(runner_label=runner_label),
+                  patch.object(sessions, "live_sessions", return_value=owners),
+                  patch.object(pane_launch, "record_directory", return_value=records),
+                  # Even on a client machine, counts use only the retained local record.
+                  patch.object(staff, "snapshot", side_effect=AssertionError("no owner fetch")),
+                  patch.object(inventory, "showrunner_registrations", return_value=runners),
+                  patch.object(accounts, "_mesh_server_running", return_value=True),
+                  patch.object(accounts, "live_group_members", side_effect=AssertionError("rich inventory")),
+                  patch.object(subprocess, "run", side_effect=AssertionError("no process or network discovery")),
+                  patch.object(subprocess, "Popen", side_effect=AssertionError("no process or network discovery"))):
+                code, text, error = self.run_cli("status", "--stored", "--json")
+            self.assertEqual((code, error), (0, ""))
+            document = cast(accounts.StatusDocument, json.loads(text))
+            values = {row["label"]: (row["roles"], row["role_counts"]) for row in document["accounts"]}
+            self.assertEqual(values, {**expected, "codex1": (["workers"], [2]), "codex2": (["spare"], [None])})
+            self.assertIn(str(run / "mesh_roster.json"), document["session_inputs"])
+            self.assertIn(str(records / "fixture.json"), document["session_inputs"])
+
     def run_cli(self, *arguments: str) -> tuple[int, str, str]:
         stdout = io.StringIO()
         stderr = io.StringIO()
@@ -4477,9 +4580,9 @@ class AccountsTests(unittest.TestCase):
         code, output, error = self.run_cli("status", "--json")
         self.assertEqual((code, error), (0, ""))
         document = cast(dict[str, object], json.loads(output))
-        self.assertEqual(set(document), {"accounts", "problems"})
+        self.assertEqual(set(document), {"accounts", "problems", "session_inputs"})
         rows = cast(list[dict[str, object]], document["accounts"])
-        keys = {"label", "tool", "roles", "weekly_left_percent", "resets_at", "credits", "use_credits", "read_at",
+        keys = {"label", "tool", "roles", "role_counts", "weekly_left_percent", "resets_at", "credits", "use_credits", "read_at",
                 "read_ok", "credits_in_use"}
         self.assertTrue(all(set(row) == keys for row in rows))
         expected: list[tuple[str, str, list[str], float | None, str | None, float | str | None, bool, str | None]] = [
@@ -7270,7 +7373,7 @@ class SharedStatusDocumentTests(unittest.TestCase):
     def row(self) -> accounts.StatusRow:
         return accounts.StatusRow(
             label="fixture", tool="codex", folder="~/.codex1", login="fixture@example.invalid",
-            roles=("workers",), weekly_left_percent=60, resets_at=self.at + timedelta(days=1),
+            roles=("workers",), role_counts=(0,), weekly_left_percent=60, resets_at=self.at + timedelta(days=1),
             credits=13446, on_credits="no", use_credits=True, read_at=self.at,
             read_outcome=agent_accounts.UsageReadOutcome.OK, attempted_at=self.at)
 
@@ -7348,7 +7451,7 @@ class SharedStatusDocumentTests(unittest.TestCase):
             '* Fixture problem.'
         ))
         self.assertEqual(self.document(self.row()), {
-            "label": "fixture", "tool": "codex", "roles": ["workers"],
+            "label": "fixture", "tool": "codex", "roles": ["workers"], "role_counts": [0],
             "weekly_left_percent": 60, "resets_at": "2026-10-17T18:00:00+00:00",
             "credits": 13446, "use_credits": True, "read_at": "2026-10-16T18:00:00+00:00",
             "read_ok": True, "credits_in_use": False,

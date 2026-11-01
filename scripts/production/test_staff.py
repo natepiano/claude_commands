@@ -992,6 +992,20 @@ class StaffTests(StaffTestCase):
         with self.assertRaises(FrozenInstanceError):
             setattr(record, "rows", ())
 
+    def test_local_snapshot_reads_retained_membership_without_contacting_the_owner(self) -> None:
+        _, unit, _ = self.tree()
+        retained = self.staff_file.read_bytes()
+        _ = staff.rename(unit.id, "renamed-on-owner")
+        with self.machine("mac"):
+            self.mac_file.parent.mkdir(parents=True, exist_ok=True)
+            _ = self.mac_file.write_bytes(retained)
+            _ = self.ssh_log.write_text("")
+            with mock.patch.object(subprocess, "run", side_effect=AssertionError("no remote owner read")):
+                record = staff.local_snapshot()
+            self.assertEqual(record.by_id(unit.id), unit)
+            self.assertEqual(record.inputs, (str(self.mac_file),))
+            self.assertEqual(self.ssh_commands(), [])
+
     def test_mac_snapshot_refuses_an_unreachable_owner(self) -> None:
         _ = self.tree()
         before = self.staff_file.read_bytes()
