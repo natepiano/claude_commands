@@ -24,7 +24,28 @@ under `~/rust`, `~/worktrees`, and `~/.claude*` are approved with
 when their `.git`, `commondir`, and `gitdir` back pointer prove registration by
 a repository under a trusted root, using file reads alone. This covers
 style-sync lint snapshots made with `git worktree add` under `/tmp/claude/session`;
-clones and forged links still require explicit approval. Files elsewhere require existing explicit approval;
+forged links still require explicit approval.
+
+Copies registered by `copies.py` under the configured scratch copies root
+(normally `/tmp/claude/copies/<pair>/<copy>`) also qualify when `.envrc` is a
+regular file, not a symlink, at the copy's top level. `registered_copy` uses
+`copy_record.copy_folder` to prove that location and `copy_record.read_record` to
+require a readable `copy_record.Registered` record. Its `source_path` must resolve
+to a directory under a trusted root. Git resolves `.envrc` at the record's
+`source_commit` and hashes the copy's file with `hash-object --no-filters`;
+approval requires equal blob hashes. Both git commands run in the trusted
+source repository with no `GIT_*` variables in their environment, so the copy supplies no git configuration or filters.
+Missing, malformed, unreadable or mismatching evidence requires explicit
+approval; an unregistered clone or a copied record outside the copies root
+does not qualify. `scripts/lib/copy_record.py` owns the copy locations and record
+reader using only the standard library, so importing it does not reach scratch
+or herdr. It is imported only when checking a copy, preserving the helper's
+cheap startup.
+
+This rule checks only `.envrc`. Files it loads, including `flake.nix`, are not
+checked and may differ from the source commit.
+
+Files elsewhere require existing explicit approval;
 a blocked-file refusal names the `direnv allow <path>` command. Each direnv
 command has a 600-second timeout. `direnv export json` runs in the requested
 directory with the supplied base environment. Strings replace variables;

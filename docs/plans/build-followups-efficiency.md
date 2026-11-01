@@ -148,3 +148,49 @@ Outside a nix shell, `scripts/direct/verify.sh` makes one `nix_env.py exec` of i
 #### As-built
 
 The one style block in `render_markdown` keeps top-level text in a centered 48rem column; a table is `display: block; width: max-content; max-width: 100%` with sideways scroll, and `td, th` wrap only at spaces. Stored snapshots hold rendered HTML, so the five Markdown pages were re-rendered once from their stored `.md`; the service needed no restart. `copy_watch.py`'s `Wakeup` records its parent pid and requests a stop when the parent is gone, checked at least once a second in both loops. Open minors: F002 (a paragraph beside a table in one blockquote or list has no 48rem limit) and F003 (a verify.sh killed before the watcher records its parent is missed). Checkpoint 3a47b79d on branch natedev-efficiency-links.
+
+### Phase 14 — The STE rule loads into every Claude and Codex session context  · status: done
+
+**Source:** the user, 2026-10-18: "everyone needs to use simplified technical english henceforth".
+
+#### As-built
+
+`scripts/hooks/session-start-ste.py` reads `config/simplified-technical-english.md` from its own checkout and returns it as `additionalContext` for `SessionStart` and `SubagentStart`; a bad payload, a missing file or a read error exits 0 with no output. `scripts/hooks/codex_hooks.py` has two rows, `ste` (SessionStart) and `ste-subagent` (SubagentStart), both with matcher `*`; `_select_hooks` picks a hook by command, event and matcher so two events share one script with separate trust. Checkpoint 69374ebc on branch natedev-efficiency. The `settings.json` hook lines for Claude Code and the live Codex install and trust wait for the user.
+
+### Phase 15 — nix_env trusts copies.py copies  · status: done
+
+**Source:** the next item "nix_env trusts copies.py copies", approved by the showrunner of natedev 2026-10-29 and started on its go 2026-10-31 (the record format is `scratch.register_copy` on origin/natedev).
+
+#### As-built
+
+`scripts/lib/nix_env.py` approves the `.envrc` of a copy that `copies.py` registered, through `registered_copy(envrc)`, which `trusted_envrc` calls after `trusted_root` and `registered_worktree`. A copy qualifies when: `.envrc` is a regular file (not a symlink) at the top of a folder for which `copy_record.copy_folder` returns that folder; `copy_record.read_record` returns a `copy_record.Registered` record; the record's `source_path` is a directory for which `trusted_root` is true; and `git hash-object --no-filters` of the copy's file equals `git rev-parse --verify --end-of-options <source_commit>:.envrc`. Both git commands run with the source repository as working directory, a `TIMEOUT_SECONDS` limit, and an environment from `_git_environment()`, which drops every `GIT_*` variable. Any failure, read error included, returns false and direnv keeps its explicit approval. `copy_record` and `subprocess` are imported inside `registered_copy`, and the repository root joins `sys.path` once, only if absent, so the no-envrc path stays cheap.
+
+**Files:**
+- `scripts/lib/nix_env.py` — `registered_copy`, `_git_environment`, `trusted_envrc`.
+- `scripts/lib/test_nix_env.py` — `GitNixFixture` (shared git helpers), `RegisteredWorktreeTests`, and `RegisteredCopyTests` (nine real-git tests on `git clone --shared` copies under a temp `COPIES_ENV` root).
+- `docs/as-built/nix-shell-launch.md` — the copy rule and the `flake.nix` limit.
+
+**Gotchas:** files that `.envrc` loads, for example `flake.nix`, are not checked and may differ from the source commit. A `GIT_DIR` in the caller's environment would redirect both git calls to another repository, so `_git_environment()` is the only environment either call gets.
+
+**Ruled out:** a blanket `direnv allow` for every copy; checking the files that `.envrc` loads.
+
+### Phase 16 — nix_env reads the copy record without importing scratch  · status: done
+
+#### As-built
+
+`scripts/lib/copy_record.py` is a standard-library-only leaf module that owns the copy-record reader: `ROOT_ENV`, `DEFAULT_ROOT`, `COPIES_ENV`, `RECORD`, `TASK`, `root()`, `copies_root()`, `copy_folder(path)`, the results `Registered`, `NotRegistered` and `UnreadableRecord`, and `read_record(path)`. `scratch.py` holds none of these names. It and every other caller (`nix_env.registered_copy`, `scripts/lint/tmp_sweep.py` and the scratch, nix_env, tmp_sweep, folder_audit, change_review and merge-gate tests) call through `from scripts.lib import copy_record`, so one `mock.patch.object(copy_record, ...)` reaches all of them. `nix_env.registered_copy` imports `copy_record` where it imported `scratch`; the copy rule, its git calls and its `sys.path` handling are unchanged. A full-tree `basedpyright` reports no `Cycle detected` (main had 17, every chain through `nix_env.py → scratch.py`).
+
+**Files:**
+- `scripts/lib/copy_record.py` — the reader.
+- `scripts/lib/scratch.py` — copy lifecycle; reads records through `copy_record`.
+- `scripts/lib/nix_env.py` — `registered_copy`.
+- `scripts/lint/tmp_sweep.py` — reads records through `copy_record`.
+- `scripts/lib/test_scratch.py`, `scripts/lib/test_nix_env.py`, `scripts/lint/test_tmp_sweep.py`, `scripts/lint/test_folder_audit.py`, `scripts/production/test_change_review.py`, `scripts/production/test_merge_gate_suites_resources.py` — references switched; the merge-gate test patches `copy_record.copy_folder`.
+- `pyrightconfig.json` — the `scripts/lint` environment lists `"."` in `extraPaths`, so `scripts.lib` resolves there.
+- `docs/as-built/nix-shell-launch.md`, `docs/plans/builds-resources.md` — names say `copy_record`.
+
+**Binds later work:** a module that `scripts/lib/nix_env.py` imports must not reach `scripts/herdr/herdr.py`, directly or through another import.
+
+**Gotchas:** `basedpyright` counts function-local imports in `reportImportCycles`, so a local import hides no cycle. `tmp_sweep.py` imports `scratch` by bare name and `scratch.py` inserts the repository root into `sys.path` first, so `scripts.lib.copy_record` there is the same module object and `isinstance` checks hold. The assertion guard reads `assert isinstance(record, scratch.Registered)` renamed to `copy_record` as a removed assertion; the checkpoint commit carries an `Assertion-Change:` ruling per test.
+
+**Ruled out:** an alias or re-export of a moved name in `scratch.py`; `from scripts.lib.copy_record import name` in callers; a function-local import as the way out of the cycle.

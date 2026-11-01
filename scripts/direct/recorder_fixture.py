@@ -168,7 +168,7 @@ def prepare_launcher_runtime(root: Path) -> tuple[Path, Path, Path]:
     for name in ("py", "atomic_file.py", "user_zone.py", "unit_runs.py", "agents_registry.py", "codex_models_cache.py"):
         _ = shutil.copy2(source / "lib" / name, lib / name)
     _ = shutil.copy2(source / "production/production_doc.py", root / "scripts/production/production_doc.py")
-    for name in ("agents_config.sh", "heartbeat.sh", "heartbeat_watch.sh"):
+    for name in ("agents_config.sh", "heartbeat.sh", "heartbeat_watch.sh", "worker_lifecycle.py"):
         _ = shutil.copy2(source / "agents" / name, agents / name)
     for name in ("implement.sh", "worker_name.sh", "worker_state.py", "progress_history.py", "plan_history.py",
                  "phase_reservation.py", "recorder_state.py", "findings.py", "board.sh"):

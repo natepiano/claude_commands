@@ -38,7 +38,6 @@ from inventory import (
     listing,
     parse_inventory,
 )
-import inventory as inventory_work
 import shutdown_record as recovery_store
 from launch_permission import RELEASED_HOLD_PREFIX, LaunchPurpose, NewWorkLaunchPurpose, RecordedSessionRestoreLaunchPurpose
 from shutdown_record import InvalidRecord, SessionShutdown, ShutdownContinuation, AccountOpen, HoldReleased, RequestOrigin, ShutdownFound, lookup_session, release_finished_account_hold, all_account_holds, all_session_records, parse_account_holds, parse_session_records, session_records
@@ -91,36 +90,6 @@ class UnavailableMachine(TypedDict):
     status: Literal["unavailable"]
     rc: int
     reason: str
-
-
-class UnresolvedRecoverySession(TypedDict):
-    session_id: str
-    name: str
-    agent: Literal["claude", "codex"]
-    last_seen: str
-
-
-class SnapshotOutcomeRecorded(TypedDict):
-    kind: Literal["recorded"]
-    last_success: recovery_store.LastSuccessfulSnapshot | recovery_store.NoSuccessfulSnapshotRecorded
-    latest: recovery_store.SnapshotTaken | recovery_store.SnapshotFailed
-
-
-class NoSnapshotOutcomeRecorded(TypedDict):
-    kind: Literal["no outcome recorded"]
-
-
-class SnapshotOutcomeUnreadable(TypedDict):
-    kind: Literal["unreadable"]
-    error: str
-
-
-SnapshotStatus = SnapshotOutcomeRecorded | NoSnapshotOutcomeRecorded | SnapshotOutcomeUnreadable
-
-
-class RecoveryStatusInventory(Inventory):
-    recovery: list[UnresolvedRecoverySession]
-    snapshot: SnapshotStatus
 
 
 MachineStatusReport = Inventory | UnreachableMachine | UnavailableMachine
@@ -200,13 +169,8 @@ def _session_lines(session: Session, report: Inventory) -> list[str]:
     summary += f" · {session['status']} · {_checkout_text(session['checkout'])}"
     lines = [summary]
     if session["host"]["kind"] in {"legacy tmux", "legacy tmux unit"}:
-        at = restart_support.record_time()
-        snapshot = recovery_store.RecoverySnapshot(machine=report["machine"], login=report["login"],
-            label=report["label"], taken_at=at, sessions=[])
-        entry = recovery_store.SnapshotClaudeSession(agent="claude", session=session, workers=[],
-            timers=[], last_seen=at, state="unresolved")
-        saved = recovery_store.snapshot_restore_record(snapshot, entry)
-        lines.append(f"    manual restart: {restart_work.legacy_resume_command(saved)}")
+        command = restart_work.legacy_session_resume_command(session, report["login"], restart_support.record_time())
+        lines.append(f"    manual restart: {command}")
     for server in session["codex_servers"]:
         activity = (
             "busy: " + ", ".join(server["busy_workers"])
@@ -242,8 +206,6 @@ def _unavailable(machine: str, rc: int, reason: str) -> UnavailableMachine:
 
 def _status(selected: Account, here: bool, only: tuple[str, ...] = ()) -> list[MachineStatusReport]:
     local = inventory(selected.login, only=frozenset(only)) if only else inventory(selected.login)
-    unresolved = _unresolved_snapshot_status(selected.login, only)
-    local = RecoveryStatusInventory(**local, recovery=unresolved, snapshot=_snapshot_status())
     reports: list[MachineStatusReport] = [local]
     if here:
         return reports
@@ -292,8 +254,6 @@ def _requester(origin: RequestOrigin) -> str:
             return f"requested by session {origin['session_id'][:8]}"
         case "terminal":
             return "requested in a terminal"
-        case "snapshot":
-            return "requested by a recovery snapshot"
 
 
 def launch_blocked(selected: Account, purpose: LaunchPurpose) -> int:
@@ -414,7 +374,6 @@ def _observed_owner(record: SessionShutdown, observations: tuple[Inventory, ...]
     return stop_work.SessionAbsent(kind="session absent")
 
 
-
 @dataclass(frozen=True)
 class _SelectableSession:
     session_id: str
@@ -447,15 +406,6 @@ def resolve_sessions(login: str, items: Iterable[str], *, here: bool = False, re
     for saved in session_records(login):
         owner = saved["session"]
         local[owner["session_id"]] = _SelectableSession(owner["session_id"], owner["name"], saved["machine"])
-    if recovery:
-        snapshot = recovery_store.read_snapshot(login)
-        if not isinstance(snapshot, recovery_store.NoRecoverySnapshot):
-            for item in snapshot["sessions"]:
-                owner = item["session"]
-                host = owner["host"]
-                aliases = (host["herdr_session"],) if host["kind"] == "herdr" else ()
-                _ = local.setdefault(owner["session_id"], _SelectableSession(
-                    owner["session_id"], owner["name"], snapshot["machine"], aliases))
     recorded = dict(local)
     for owner in listing(login):
         if owner.kind != "worker":
@@ -516,56 +466,6 @@ def resolve_sessions(login: str, items: Iterable[str], *, here: bool = False, re
     return ResolvedSessions(tuple(result), report)
 
 
-def _snapshot() -> int:
-    observed = inventory_work.snapshot_inventory()
-    at = restart_support.record_time()
-    if isinstance(observed, inventory_work.PartialInventory):
-        _record_snapshot_outcome(recovery_store.SnapshotFailed(kind="failed", at=at, reasons=list(observed.failures)))
-        print("snapshot incomplete: " + "; ".join(observed.failures), file=sys.stderr)
-        return 1
-    try:
-        saved = recovery_store.merge_snapshots(observed, at)
-    except (InvalidRecord, OSError) as error:
-        _record_snapshot_outcome(recovery_store.SnapshotFailed(kind="failed", at=at, reasons=[str(error)]))
-        raise
-    _record_snapshot_outcome(recovery_store.SnapshotTaken(kind="taken", at=at, accounts=len(saved)))
-    print(f"recovery snapshot saved for {len(saved)} accounts")
-    return 0
-
-
-def _record_snapshot_outcome(outcome: recovery_store.SnapshotTaken | recovery_store.SnapshotFailed) -> None:
-    try:
-        recovery_store.record_snapshot_attempt(outcome, remote.local_machine())
-    except (InvalidRecord, OSError) as error:
-        print(f"snapshot outcome not recorded: {error}", file=sys.stderr)
-
-
-def _snapshot_status() -> SnapshotStatus:
-    try:
-        attempts = recovery_store.read_snapshot_attempts()
-    except (InvalidRecord, OSError) as error:
-        return SnapshotOutcomeUnreadable(kind="unreadable", error=str(error))
-    if isinstance(attempts, recovery_store.NoSnapshotAttempt):
-        return NoSnapshotOutcomeRecorded(kind="no outcome recorded")
-    return SnapshotOutcomeRecorded(kind="recorded", last_success=attempts["last_success"], latest=attempts["latest"])
-
-
-def _snapshot_outcome_lines(status: SnapshotStatus) -> list[str]:
-    if status["kind"] == "unreadable":
-        return [f"  recovery snapshot: outcome unreadable: {status['error']}"]
-    lines = ["  recovery snapshot: no successful snapshot recorded"]
-    if status["kind"] == "recorded":
-        success = status["last_success"]
-        if success["kind"] == "taken":
-            elapsed = datetime.fromisoformat(restart_support.record_time()) - datetime.fromisoformat(success["at"])
-            age = restart_support.elapsed_text(int(elapsed.total_seconds()))
-            lines = [f"  recovery snapshot: last taken {_local_time(success['at'])} ({age} ago)"]
-        latest = status["latest"]
-        if latest["kind"] == "failed":
-            lines.append(f"  recovery snapshot failed {_local_time(latest['at'])}: {'; '.join(latest['reasons'])}")
-    return lines
-
-
 @dataclass
 class ForgetCandidate:
     login: str
@@ -598,11 +498,6 @@ def _forget(text: str, account: str = "") -> int:
         else:
             candidates[key] = ForgetCandidate(login, label, owner["session_id"], owner["name"], names)
 
-    for snapshot in recovery_store.all_snapshots():
-        if snapshot["machine"].casefold() != machine.casefold():
-            continue
-        for item in snapshot["sessions"]:
-            add(snapshot["login"], snapshot["label"], item["session"])
     for saved in all_session_records():
         if saved["machine"].casefold() == machine.casefold():
             add(saved["login"], saved["label"], saved["session"])
@@ -621,34 +516,8 @@ def _forget(text: str, account: str = "") -> int:
             print(f"forget: {item.name}: cannot forget shutdown in progress ({outcome.record['progress']['kind']})", file=sys.stderr)
             code = 1
             continue
-        _ = recovery_store.acknowledge_snapshot(item.login, item.session_id)
         print(f"{item.name}: forgotten" + (f" on {item.label}" if len(matches) > 1 else ""))
     return code
-
-
-def _unresolved_snapshot_lines(login: str, only: tuple[str, ...] = ()) -> list[str]:
-    snapshot = recovery_store.read_snapshot(login)
-    if isinstance(snapshot, recovery_store.NoRecoverySnapshot):
-        return []
-    lines: list[str] = []
-    for item in snapshot["sessions"]:
-        owner = item["session"]
-        if item["state"] != "unresolved" or (only and owner["session_id"] not in only):
-            continue
-        lines.append(f"  {owner['name']}: unresolved; last seen {_local_time(item['last_seen'])}")
-    return lines
-
-
-def _unresolved_snapshot_status(login: str, only: tuple[str, ...] = ()) -> list[UnresolvedRecoverySession]:
-    snapshot = recovery_store.read_snapshot(login)
-    if isinstance(snapshot, recovery_store.NoRecoverySnapshot):
-        return []
-    return [UnresolvedRecoverySession(session_id=item["session"]["session_id"], name=item["session"]["name"],
-            agent=item["agent"], last_seen=item["last_seen"])
-            for item in snapshot["sessions"] if item["state"] == "unresolved"
-            and (not only or item["session"]["session_id"] in only)]
-
-
 
 
 def _restart_failed_liveness(saved: SessionShutdown, observations: tuple[Inventory, ...] = ()) -> restart_work.SessionLive | restart_work.SessionNotLive | restart_work.SessionLivenessUnknown:
@@ -682,7 +551,6 @@ def _status_actions(records: list[SessionShutdown],
         names = ", ".join(saved["session"]["name"] for saved in selected)
         lines.append(f"  bring back: in a terminal on {selected[0]['machine']}: {command} · {names}")
     return lines
-
 
 
 def _only_ids(value: str | None) -> tuple[str, ...]:
@@ -741,7 +609,7 @@ def main(arguments: list[str] | None = None) -> int:
     commands = parser.add_subparsers(
         dest="command",
         required=True,
-        metavar="{stop,resume,status,restart,snapshot,forget,remote-control,launch-blocked}",
+        metavar="{stop,resume,status,restart,forget,remote-control,launch-blocked}",
     )
     stop_command = commands.add_parser("stop", help="end one local tab's Claude; leave its workers alone")
     _ = stop_command.add_argument("session")
@@ -749,8 +617,7 @@ def main(arguments: list[str] | None = None) -> int:
     _ = resume_command.add_argument("session")
     _ = resume_command.add_argument("--why", required=True)
     _ = resume_command.add_argument("--to", dest="resume_to")
-    _ = commands.add_parser("snapshot", help="save a read-only local recovery observation")
-    forget = commands.add_parser("forget", help="forget one local recovery entry or stopped session's restore")
+    forget = commands.add_parser("forget", help="forget one stopped session's restore")
     _ = forget.add_argument("forget_name", metavar="NAME_OR_ID")
     _ = forget.add_argument("--account", help="account login or label containing this session")
     status = commands.add_parser("status", help="show what runs for one Claude account")
@@ -826,10 +693,6 @@ def _terminal_accounts(options: CommandLine) -> TerminalAccountSelection:
                       for saved in all_session_records()}
         candidates.update({held["login"].casefold(): Account("claude", held["login"], held["label"])
                            for held in all_account_holds()})
-        for snapshot in recovery_store.all_snapshots():
-            if snapshot["sessions"]:
-                tool = "codex" if all(item["agent"] == "codex" for item in snapshot["sessions"]) else "claude"
-                _ = candidates.setdefault(snapshot["login"].casefold(), Account(tool, snapshot["login"], snapshot["label"]))
         if not options.here:
             for command in ("records", "holds"):
                 status, output = run_remote([command, "--json", "--here"])
@@ -851,11 +714,6 @@ def _terminal_accounts(options: CommandLine) -> TerminalAccountSelection:
             login = note.get("login")
             if note.tool == "claude" and login:
                 selected[login.casefold()] = Account("claude", login, note.label)
-        if options.command == "status":
-            for snapshot in recovery_store.all_snapshots():
-                if snapshot["sessions"]:
-                    tool = "codex" if all(item["agent"] == "codex" for item in snapshot["sessions"]) else "claude"
-                    _ = selected.setdefault(snapshot["login"].casefold(), Account(tool, snapshot["login"], snapshot["label"]))
     return TerminalAccountSelection(tuple(sorted(selected.values(), key=lambda account: account.label)),
                                     tuple(unavailable))
 
@@ -938,12 +796,9 @@ def _all_accounts(options: CommandLine) -> int:
                 status = max(status, restart_work.up(account.login, options.dry_run, ids))
             elif options.command == "status" and not options.as_json:
                 print(f"{account.label} · {account.login}")
-                print("\n".join(_snapshot_outcome_lines(_snapshot_status())))
-                print("\n".join(_unresolved_snapshot_lines(account.login, ids)))
             elif options.command == "status":
-                reports.append(RecoveryStatusInventory(machine=remote.local_machine(), login=account.login,
-                    label=account.label, sessions=[], unattributed=[],
-                    recovery=_unresolved_snapshot_status(account.login, ids), snapshot=_snapshot_status()))
+                reports.append(Inventory(machine=remote.local_machine(), login=account.login,
+                    label=account.label, sessions=[], unattributed=[]))
             continue
         if options.command == "status" and options.as_json:
             try:
@@ -965,8 +820,6 @@ def _all_accounts(options: CommandLine) -> int:
     return status
 
 
-
-
 def _dispatch(options: CommandLine) -> int:
     if options.command in {"stop", "resume"}:
         result = (stop_resume.stop(options.session) if options.command == "stop"
@@ -984,9 +837,9 @@ def _dispatch(options: CommandLine) -> int:
         else:
             print(f"{result.session_id}: not running")
         return 0
-    if options.command in {"snapshot", "forget"}:
+    if options.command == "forget":
         try:
-            return _snapshot() if options.command == "snapshot" else _forget(options.forget_name, options.account or "")
+            return _forget(options.forget_name, options.account or "")
         except (InvalidRecord, InvalidInventory, OSError, ValueError) as error:
             print(f"shutdown: {error}", file=sys.stderr)
             return 1
@@ -1130,11 +983,6 @@ def _dispatch(options: CommandLine) -> int:
                     record_lines.extend(_status_actions(outcome["records"], observations))
                 if record_lines:
                     print("\n".join(record_lines))
-                if index == 0:
-                    for line in _snapshot_outcome_lines(_snapshot_status()):
-                        print(line)
-                    for line in _unresolved_snapshot_lines(selected.login, status_ids):
-                        print(line)
         return 0
     except SessionSelectionError as error:
         print(f"shutdown: {error}", file=sys.stderr)

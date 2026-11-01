@@ -7,14 +7,14 @@ from pathlib import Path
 import shlex
 import subprocess
 import sys
-from typing import cast
+from typing import cast, override
 from unittest.mock import patch
 
 # Hang guards allow for load 136 on natedev (2026-10-29).
 TEST_HANG_GUARD_SECS = 300
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.lib import nix_env
+from scripts.lib import copy_record, nix_env, scratch
 from scripts.lib.nix_env_test_support import HELPER, NixFixture
 
 
@@ -184,7 +184,7 @@ class EnsureTests(NixFixture):
         self.assertEqual(self.direnv_calls(), [])
 
 
-class RegisteredWorktreeTests(NixFixture):
+class GitNixFixture(NixFixture):
     def git(self, directory: Path, *arguments: str) -> str:
         result = subprocess.run(
             ["git", "-c", "user.name=t", "-c", "user.email=t@t", *arguments],
@@ -199,11 +199,6 @@ class RegisteredWorktreeTests(NixFixture):
         _ = self.git(directory, "commit", "-m", "fixture")
         return directory
 
-    def worktree(self, repository: Path, directory: Path) -> Path:
-        directory.parent.mkdir(parents=True, exist_ok=True)
-        _ = self.git(repository, "worktree", "add", "--detach", str(directory), "HEAD")
-        return directory
-
     def assert_explicit_approval_required(self, directory: Path) -> None:
         before = len(self.direnv_calls())
         outcome = nix_env.ensure(directory, {**self.env, "DIRENV_DENY": "1"})
@@ -214,6 +209,13 @@ class RegisteredWorktreeTests(NixFixture):
         self.assertEqual(self.direnv_calls()[before:], [
             {"args": ["export", "json"], "cwd": str(directory)}])
         self.assertFalse(Path(self.env["DIRENV_APPROVAL"]).exists())
+
+
+class RegisteredWorktreeTests(GitNixFixture):
+    def worktree(self, repository: Path, directory: Path) -> Path:
+        directory.parent.mkdir(parents=True, exist_ok=True)
+        _ = self.git(repository, "worktree", "add", "--detach", str(directory), "HEAD")
+        return directory
 
     def test_trusted_repository_registered_snapshot_is_automatically_allowed(self) -> None:
         repository = self.repository(self.home / "rust/repo")
@@ -288,3 +290,124 @@ class RegisteredWorktreeTests(NixFixture):
         (checkout / ".envrc").unlink()
         (checkout / ".envrc").symlink_to(outside)
         self.assert_explicit_approval_required(checkout)
+
+
+class RegisteredCopyTests(GitNixFixture):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        self.env[copy_record.COPIES_ENV] = str(self.root / "copies")
+        os.environ[copy_record.COPIES_ENV] = self.env[copy_record.COPIES_ENV]
+
+    def clone(self, repository: Path) -> Path:
+        checkout = copy_record.copies_root() / "pair/copy"
+        checkout.parent.mkdir(parents=True)
+        _ = self.git(self.root, "clone", "--shared", str(repository), str(checkout))
+        return checkout
+
+    def register(self, repository: Path, checkout: Path) -> None:
+        commit = self.git(repository, "rev-parse", "HEAD")
+        scratch.register_copy(
+            checkout, task="gate:nix-env", owner_unit="efficiency", source_path=str(repository),
+            source_commit=commit, copy_commit=commit, target_mode="shared", seed_source=str(repository),
+            borrows_from=str(repository / ".git"))
+
+    def test_registered_shared_copy_with_unchanged_envrc_is_approved_and_loads(self) -> None:
+        repository = self.repository(self.home / "rust/repo")
+        checkout = self.clone(repository)
+        self.register(repository, checkout)
+        search_path = list(sys.path)
+        self.assertTrue(nix_env.trusted_envrc(checkout / ".envrc"))
+        self.assertTrue(nix_env.registered_copy(checkout / ".envrc"))
+        self.assertEqual(sys.path, search_path)
+        # Approval is tied to the recorded commit, not the source's current file.
+        _ = (repository / ".envrc").write_text("changed source\n", encoding="utf-8")
+        outcome = nix_env.ensure(checkout, {**self.env, "DIRENV_DENY": "1"})
+        self.assertIsInstance(outcome, nix_env.Loaded)
+        if not isinstance(outcome, nix_env.Loaded):
+            self.fail(str(outcome))
+        self.assertEqual(outcome.env["IN_NIX_SHELL"], "impure")
+        self.assertEqual(self.direnv_calls(), [
+            {"args": ["allow", str(checkout / ".envrc")], "cwd": str(checkout)},
+            {"args": ["export", "json"], "cwd": str(checkout)}])
+
+        # The standalone helper must find scratch even when started in the copy.
+        Path(self.env["DIRENV_APPROVAL"]).unlink()
+        result = subprocess.run(
+            [sys.executable, "-S", str(HELPER), "ensure", str(checkout)], cwd=checkout,
+            env={**self.env, "DIRENV_DENY": "1"}, capture_output=True, text=True,
+            timeout=TEST_HANG_GUARD_SECS, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        environment = cast(dict[str, str], json.loads(result.stdout))
+        self.assertEqual(environment["IN_NIX_SHELL"], "impure")
+
+    def test_registered_copy_with_edited_envrc_requires_explicit_approval(self) -> None:
+        repository = self.repository(self.home / "rust/repo")
+        checkout = self.clone(repository)
+        self.register(repository, checkout)
+        _ = (checkout / ".envrc").write_text("use another flake\n", encoding="utf-8")
+        self.assert_explicit_approval_required(checkout)
+
+    def test_copy_without_record_requires_explicit_approval(self) -> None:
+        repository = self.repository(self.home / "rust/repo")
+        checkout = self.clone(repository)
+        self.assert_explicit_approval_required(checkout)
+
+    def test_git_repository_override_cannot_approve_a_foreign_commit(self) -> None:
+        repository = self.repository(self.home / "rust/repo")
+        checkout = self.clone(repository)
+        self.register(repository, checkout)
+        other = self.repository(self.root / "other-repository")
+        changed_envrc = "use another flake\n"
+        _ = (other / ".envrc").write_text(changed_envrc, encoding="utf-8")
+        _ = self.git(other, "add", ".envrc")
+        _ = self.git(other, "commit", "-m", "foreign envrc")
+        foreign_commit = self.git(other, "rev-parse", "HEAD")
+        _ = (checkout / ".envrc").write_text(changed_envrc, encoding="utf-8")
+        _ = scratch.update_record(checkout, lambda record: {
+            **(record.fields if isinstance(record, copy_record.Registered) else {}),
+            "source_commit": foreign_commit})
+
+        with patch.dict(os.environ, {"GIT_DIR": str(other / ".git")}):
+            self.assertFalse(nix_env.registered_copy(checkout / ".envrc"))
+            self.assertFalse(nix_env.trusted_envrc(checkout / ".envrc"))
+            self.assert_explicit_approval_required(checkout)
+
+    def test_registered_copy_requires_regular_envrc_even_when_symlink_bytes_match(self) -> None:
+        repository = self.repository(self.home / "rust/repo")
+        checkout = self.clone(repository)
+        self.register(repository, checkout)
+        envrc = checkout / ".envrc"
+        self.assertTrue(nix_env.trusted_envrc(envrc))
+        target = self.envrc(self.root / "outside")
+        envrc.unlink()
+        envrc.symlink_to(target)
+        self.assertFalse(nix_env.registered_copy(envrc))
+        self.assert_explicit_approval_required(checkout)
+        envrc.unlink()
+        _ = envrc.write_bytes(target.read_bytes())
+        self.assertTrue(nix_env.trusted_envrc(envrc))
+
+    def test_copy_from_untrusted_source_requires_explicit_approval(self) -> None:
+        repository = self.repository(self.root / "outside/repo")
+        checkout = self.clone(repository)
+        self.register(repository, checkout)
+        self.assert_explicit_approval_required(checkout)
+
+    def test_source_commit_without_envrc_requires_explicit_approval(self) -> None:
+        repository = self.repository(self.home / "rust/repo")
+        _ = self.git(repository, "rm", ".envrc")
+        _ = self.git(repository, "commit", "-m", "without envrc")
+        checkout = self.clone(repository)
+        self.register(repository, checkout)
+        _ = self.envrc(checkout)
+        self.assert_explicit_approval_required(checkout)
+
+    def test_copied_record_outside_copies_root_requires_explicit_approval(self) -> None:
+        repository = self.repository(self.home / "rust/repo")
+        checkout = self.clone(repository)
+        self.register(repository, checkout)
+        outside = self.root / "outside-copy"
+        _ = self.envrc(outside)
+        _ = (outside / copy_record.RECORD).write_bytes((checkout / copy_record.RECORD).read_bytes())
+        self.assert_explicit_approval_required(outside)

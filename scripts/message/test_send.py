@@ -21,15 +21,19 @@ from contextlib import AbstractContextManager, closing, contextmanager, redirect
 from datetime import datetime, timedelta, timezone
 from functools import partial
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, TextIO, cast, override
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "shutdown"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib.signal_test_support import install_signal_pid_guard
 from scripts.lib.socket_test_support import ShortUnixSocket, short_socket_directory
 import send
 import repeat_guard
+from relay_identity import relay_session_name
+from relay_test_support import write_relay_record
 from scripts.lib import names
 from scripts.lib.test_names import fixture_names
 import rca
@@ -44,6 +48,7 @@ from codex_test_support import FakeDaemon, daemon_session_row, receive_frame, re
 import shutdown_record
 import restart
 import roster
+import sessions
 import restart_support
 if TYPE_CHECKING:
     from ..accounts import accounts
@@ -52,6 +57,10 @@ else:
 from test_support import ShutdownTestCase, ShutdownSendLeaf
 from user_zone import user_zone
 from user_action import REFUSED_BEFORE_SENDING, ActionRequired, NoActionRequired, first_line
+
+
+def setUpModule() -> None:
+    install_signal_pid_guard()
 
 
 def stream(*events: dict[str, object]) -> str:
@@ -93,6 +102,9 @@ class RelayAccountTests(unittest.TestCase):
                 + "import os, pathlib, socket, sys\n"
                 + "root = pathlib.Path(sys.argv[1])\n"
                 + "assert (root / 'relay_senders' / str(os.getpid())).read_text() == 'verify'\n"
+                + f"sys.path.insert(0, {str(Path(send.__file__).resolve().parent)!r})\n"
+                + "from relay_identity import RelayIdentity, live_relay_identity\n"
+                + "assert isinstance(live_relay_identity(os.getpid(), root / 'relay_senders'), RelayIdentity)\n"
                 + "with socket.socket(socket.AF_UNIX) as listener:\n"
                 + "    listener.bind(str(root / (str(os.getpid()) + '.sock')))\n"
                 + "    print(os.getpid())\n")
@@ -140,8 +152,13 @@ class RelayAccountTests(unittest.TestCase):
                 self.assertEqual(result.outcome, "sent")
                 self.assertIn(f"; {status};", result.detail)
                 command = cast(list[str], launch.call_args.args[0])
-                self.assertEqual(command[command.index("-n") + 1], "sender-address")
+                self.assertEqual(command[command.index("-n") + 1], "relay/sender-address")
+                self.assertEqual(command[4], "sender-address")
                 self.assertIn(displayed, cast(str, launch.call_args.args[1]))
+
+    def test_relay_names_a_plain_sender_in_the_payload(self) -> None:
+        message = send.Message("uds:/recipient", "shutdown", "Stop", "Stop now.\nKeep the record.", None)
+        self.assertIn("Stop now.\nShown sender: shutdown\nKeep the record.", send.relay_prompt(message))
 
     def test_relay_before_cutover_keeps_home_login_without_requiring_numbered_folders(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -280,7 +297,8 @@ class SendTests(ShutdownTestCase):
         )
         fake_ssh.chmod(0o755)
         _ = self.enterContext(cast(AbstractContextManager[object], mock.patch.dict(os.environ, {
-            "HOME": str(self.root), "PATH": f"{binaries}{os.pathsep}{os.environ.get('PATH', '')}",
+            "HOME": str(self.root), "XDG_STATE_HOME": str(self.root / "state"),
+            "PATH": f"{binaries}{os.pathsep}{os.environ.get('PATH', '')}",
             "SSH_RECORD": str(self.root / "ssh.jsonl"),
             "SSH_SNAPSHOT": roster.RosterSnapshot(roster.Roster([], [])).encode(),
         })))
@@ -1179,9 +1197,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         self.assertIn("anyone there", send.pending("bogus"))
 
     def relay_record(self, pid: int, name: str, *, stale: bool = False) -> str:
-        directory = self.root / "relay_senders"
-        directory.mkdir(exist_ok=True)
-        _ = (directory / str(pid)).write_text(name)
+        write_relay_record(send.STATE, pid, name)
         path = self.root / "cc-socks" / f"{pid}.sock"
         if stale:
             path.parent.mkdir(exist_ok=True)
@@ -1205,6 +1221,23 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         self.assertEqual(result.outcome, "sent")
         self.assertEqual([(message.to, message.text) for message in self.relayed],
                          [(f"uds:{self.root / 'verify-session.sock'}", "reply")])
+        self.assertFalse((self.root / "queue").exists())
+
+    def test_a_reply_to_a_relay_socket_finds_the_real_sender_while_another_relay_is_live(self) -> None:
+        self.session("sender-session", "natedev-renamed", "natedev")
+        self.session("relay-session", relay_session_name("natedev"), "natedev")
+        record_path = self.root / "sessions/relay-session.json"
+        record = sessions.read_session(record_path)
+        assert not isinstance(record, sessions.UnreadableSessionRecord)
+        record["pid"] = os.getppid()
+        _ = record_path.write_text(json.dumps(record))
+        with mock.patch.object(send, "STATE", self.root / "state/message"):
+            _ = self.relay_record(record["pid"], "natedev")
+            address = self.relay_record(42, "natedev")
+            result = send.send(local_options(["--to", address, "--from", "builds", "--text", "reply"]))
+        self.assertEqual(result.outcome, "sent")
+        self.assertEqual([(message.to, message.text) for message in self.relayed],
+                         [(f"uds:{self.root / 'sender-session.sock'}", "reply")])
         self.assertFalse((self.root / "queue").exists())
 
     def test_a_dead_socket_without_a_live_named_recipient_fails_loudly_and_never_queues(self) -> None:
@@ -2235,7 +2268,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
 
     def test_template_fix_notice_runs_once_per_id_per_day_without_delaying_the_push(self) -> None:
         record: dict[str, object] = {"text_id": "quota", "title": "Choose an account", "action": "Choose retry.", "body": "The work stopped.", "failed_rules": ["reader-starts-cold"], "findings": [{"rule": "reader-starts-cold", "quote": "an account"}], "sent_despite_failed_review": True}
-        with mock.patch.object(subprocess, "Popen") as launch:
+        with mock.patch.object(subprocess, "Popen", return_value=SimpleNamespace(pid=4321)) as launch:
             send.template_fix_notice(record)
             send.template_fix_notice(record)
             send.template_fix_notice(dict(record, text_id="disk"))
@@ -2245,14 +2278,14 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             self.assertIn("reader-starts-cold", command[-1])
             self.assertIn("The work stopped.", command[-1])
         tomorrow = send.now() + timedelta(days=1)
-        with mock.patch.object(send, "now", return_value=tomorrow), mock.patch.object(subprocess, "Popen") as launch:
+        with mock.patch.object(send, "now", return_value=tomorrow), mock.patch.object(subprocess, "Popen", return_value=SimpleNamespace(pid=4321)) as launch:
             send.template_fix_notice(record)
             launch.assert_called_once()
 
     def test_a_user_specified_template_gets_no_fix_notice(self) -> None:
         record: dict[str, object] = {"text_id": "nate.adhoc", "title": "natedev it is ready", "body": "It is ready.\n\nadhoc",
                                      "failed_rules": ["reader-starts-cold"], "sent_despite_failed_review": True}
-        with mock.patch.object(subprocess, "Popen") as launch:
+        with mock.patch.object(subprocess, "Popen", return_value=SimpleNamespace(pid=4321)) as launch:
             send.template_fix_notice(record)
             launch.assert_not_called()
 
@@ -2291,7 +2324,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
                 real_flock(fd, operation)
             with (mock.patch.object(fcntl, "flock", side_effect=require_nonblocking),
                   mock.patch.object(send, "run", return_value=(0, "pushover: reviewed JSON: " + json.dumps(record), "")),
-                  mock.patch.object(subprocess, "Popen") as launch):
+                  mock.patch.object(subprocess, "Popen", return_value=SimpleNamespace(pid=4321)) as launch):
                 result = send.user(message, "decision", ActionRequired("Choose retry."), 145, text_id="quota")
             launch.assert_not_called()
         self.assertEqual(result.outcome, "sent")
@@ -2310,7 +2343,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
                 send.template_fix_notice({"text_id": "disk"})
                 send.template_fix_notice({"text_id": "quota"})
         with (mock.patch.object(fcntl, "flock", side_effect=compete_during_claim),
-              mock.patch.object(subprocess, "Popen") as launch):
+              mock.patch.object(subprocess, "Popen", return_value=SimpleNamespace(pid=4321)) as launch):
             send.template_fix_notice({"text_id": "quota"})
             send.template_fix_notice({"text_id": "disk"})
             send.template_fix_notice({"text_id": "quota"})
