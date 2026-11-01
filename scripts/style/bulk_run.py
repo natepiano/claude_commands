@@ -191,24 +191,20 @@ def current_finding(ledger: ledger_api.Ledger, finding: ledger_api.HeldFinding, 
     The ledger owns lineage; the planner's checkout owns current physical bytes.
     """
     evidence = ledger.finding_site(finding, head)
-    judged = ledger.judged_commit(finding)
-    if not isinstance(evidence, ledger_api.UnchangedSite) or not isinstance(judged, ledger_api.JudgedCommit):
-        return bulk.Refusal(finding.finding_id, "changed since judged: site lineage is not unchanged or the judged commit is missing")
+    if not isinstance(evidence, ledger_api.UnchangedSite):
+        return bulk.Refusal(finding.finding_id, "changed since judged: " + evidence.reason)
     path = checkout / evidence.path
     if path.resolve() != path or not path.is_file() or path.suffix != ".rs":
         return bulk.Refusal(finding.finding_id, "finding path is not a regular Rust file")
     if evidence.path not in sources.current:
         sources.current[evidence.path] = path.read_bytes().decode("utf-8")
     source = sources.current[evidence.path]
-    old = sources.judged_file(ledger.repo, judged.commit, finding.path)
+    old = sources.judged_file(ledger.repo, evidence.anchor.commit, evidence.anchor.path)
     if old.code:
         return bulk.Refusal(finding.finding_id, "changed since judged: the file cannot be read at the judged commit")
     old_lines = old.stdout.encode().splitlines(keepends=True)
     new_lines = source.encode().splitlines(keepends=True)
-    old_line = finding.line
-    if isinstance(finding.follow, ledger_api.FollowedDeclaration):
-        matches = [i + 1 for i, line in enumerate(old_lines) if line.decode("utf-8").rstrip("\r\n") == finding.text]
-        old_line = matches[0] if len(matches) == 1 else 0
+    old_line = evidence.anchor.line
     if (not 0 < old_line <= len(old_lines) or not 0 < evidence.line <= len(new_lines)
             or old_lines[old_line - 1] != new_lines[evidence.line - 1]):
         return bulk.Refusal(finding.finding_id, "changed since judged: the judged line bytes differ from the current line")

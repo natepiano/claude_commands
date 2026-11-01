@@ -16,9 +16,20 @@ import style_footprint
 
 @final
 @dataclass(frozen=True)
+class FindingAnchor:
+    """The commit and coordinate whose bytes a finding actually names."""
+
+    commit: str
+    path: str
+    line: int
+
+
+@final
+@dataclass(frozen=True)
 class UnchangedSite:
     path: str
     line: int
+    anchor: FindingAnchor
 
 
 @final
@@ -27,7 +38,20 @@ class NeedsJudgment:
     reason: str
 
 
-SiteEvidence = UnchangedSite | NeedsJudgment
+@final
+@dataclass(frozen=True)
+class FilingEligibleWithoutHistory:
+    """An existing finding may be filed, but no judgment proves its source bytes."""
+
+    path: str
+    line: int
+
+    @property
+    def reason(self) -> str:
+        return "no judging ticket for source anchor"
+
+
+SiteEvidence = UnchangedSite | NeedsJudgment | FilingEligibleWithoutHistory
 
 
 @dataclass(frozen=True)

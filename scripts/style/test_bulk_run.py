@@ -592,16 +592,15 @@ class WorkspaceRunTests(CargoProjectTests):
         self.assertFalse(self.runner.calls)
         self.assertFalse((self.repo / 'src/constants.rs').exists())
 
-    def test_stale_lineage_or_missing_judged_commit_names_its_cause(self) -> None:
+    def test_stale_lineage_names_the_ledger_reason(self) -> None:
         ledger, _, findings = self.setup_findings()
         finding = findings[0]
-        for evidence, judged in ((ledger_api.NeedsJudgment('item changed'), ledger_api.JudgedCommit(self.base)),
-                                 (ledger_api.UnchangedSite(finding.path, finding.line), ledger_api.NoJudgedCommit())):
-            with self.subTest(evidence=evidence, judged=judged), mock.patch.object(
-                    ledger, 'finding_site', return_value=evidence), mock.patch.object(ledger, 'judged_commit', return_value=judged):
+        for reason in ('item changed', 'recorded anchor commit is missing'):
+            with self.subTest(reason=reason), mock.patch.object(
+                    ledger, 'finding_site', return_value=ledger_api.NeedsJudgment(reason)):
                 result = run.current_rename(ledger, finding, self.base, run.RenameSources(), self.repo)
                 self.assertEqual(result, bulk.Refusal(finding.finding_id,
-                    'changed since judged: site lineage is not unchanged or the judged commit is missing'))
+                    'changed since judged: ' + reason))
 
     def test_stale_unreadable_judged_file_names_its_cause(self) -> None:
         ledger, _, findings = self.setup_findings()
@@ -936,7 +935,7 @@ class WorkspaceRunTests(CargoProjectTests):
         ledger.set_tip(self.git("rev-parse", "HEAD"))
         report = self.execute(ledger, definition)
         self.assertEqual(report["refusals"], {findings[0].finding_id:
-            "changed since judged: site lineage is not unchanged or the judged commit is missing"})
+            "changed since judged: unchanged source site not proved"})
         self.assertEqual(report["applied_ids"], [findings[1].finding_id])
         self.assertIn("let old = 2", path.read_text())
         self.assertIn("let number", (self.repo / "beta/src/lib.rs").read_text())
