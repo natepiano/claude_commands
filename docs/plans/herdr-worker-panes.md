@@ -681,78 +681,40 @@ Split from 3l on 2026-10-31; the same user ask and the same sdlc acceptance as 3
 
 ### Phase 3j — Today's staff passes the staff check  · status: done
 
-**Depends on:** 3r and 3i (on main at `1d8bc1b62`). Runs beside 3h (user, via sdlc showrunner, 2026-11-01: "you should fix the current staffing in parallel").
+#### As-built
 
-#### Work Order
-
-**Goal:** `staff_check.py` from main on today's `staff.json` exits 0, with a real fix for each of the 98 lines it printed at 08:05 EST, and the showrunner's rerun confirms it.
-
-**Spec:** sdlc showrunner, 2026-11-01. Back up `staff.json` before each write, write under the staff lock, and prove a rerun of each step changes nothing.
-1. The five live sessions on removed ids are not restarted. A one-time data repair sets the three right rows' own ids to the ids the live sessions carry (herdr-unit `s9a4ebb73262` → `s9c5de6a34d9`, shutdown-unit `s1255ec654c7` → `s6d4efbdc187`, style-unit `s0a2a001f59e` → `s4869eee4762`), keeps them under sdlc, and moves their workers' parent to match. The handler then shows all three under sdlc.
-2. The 82 hana workers with no row: if they are live, place them; if not, the check's liveness rule is wrong and is fixed.
-3. The 8 double-session lines: the check sees a Codex worker as a worker, not as the unit's second session.
-4. The five rows with no worktree, organon's missing doc worktree and the delegate roster worker with an empty role: each is fixed from evidence; what has no evidence is listed for sdlc.
-5. The retired fill reads no scratch copy under `/tmp` and then adds the retired rows, with ids that fit Phase 3h's session-id design.
+- `staff_check.py` treats a Codex app-server process as a host of worker threads, never a second session of a row; Codex top-level value options (`--local-provider`, `--remote`, `--remote-auth-token-env`) come before the subcommand and are skipped with their values.
+- The retired fill in `staff_sources.py` takes each owner from its showrunner row and that row's bound document; a document bound under a scratch root gives one line and adds nothing (`source_allowed()` is the one scratch-root check, `showrunners.SCRATCH_ROOT`). Its dry run lists the retired rows it would add.
+- Live data, under the staff lock with a backup before each write: the three moved unit rows carry the ids their live sessions carry, under sdlc; 82 paused-worker rows and 4 empty worktrees are filled; the organon duplicate row is merged into geometry-material.
 
 **Files:**
-- `scripts/production/staff_check.py`
-- `scripts/production/test_staff_check.py`
-- `scripts/production/staff_sources.py`
-- `scripts/production/test_staff_sources.py`
+- `scripts/production/staff_check.py` — the one staff check.
+- `scripts/production/staff_sources.py` — row-outward fill and the retired preview.
 
-**Workers:** `1 writer, 1 tester` — item 1 is a data repair by the `fix` slot with no repository file; items 2–5 go to `impl` and `test` once the evidence names their causes.
+**Binds later work:** the retired fill's one source rule: the document a showrunner row names is the only source, checked by `source_allowed()`. Retired rows the dry run lists, and historical facts with no evidence, stay listed with no row until the native session-id work writes them.
 
-**Acceptance gate:** basedpyright 0/0 on changed files and their callers; the changed modules' tests pass; the full merge gate passes. Live, from main: a backup before each write; the item 1 repair and each fill print `unchanged` on rerun and change no byte; `staff.py show` and the handler show herdr-unit, shutdown-unit and style-unit under sdlc with their workers; `staff_check.py` exits 0 on two runs with the same bytes, and the showrunner's rerun exits 0.
+**Gotchas:**
+- A wrapped showrunner's name can differ from its document slug (`fps` → `performance-production.md`).
+- A resume that does not reuse the saved `STAFF_ID` makes a duplicate unit row.
+
+**Ruled out:** a store registry or identity journal for `/clear`; keeping the old launcher names as thin entry points.
 
 ### Phase 3o — The staff check skips a delegate run with no server  · status: done
 
 **Depends on:** 3j
 
-#### Work Order
+#### As-built
 
-**Goal:** `staff_check.py` on today's `staff.json` exits 0. A delegate run
-folder that has no `mesh_server.json` is not a live source of workers: the
-source reader skips it and counts it in the one existing skip line. Ruling of
-the sdlc showrunner, 2026-11-01 10:14 EST: it goes with the 3j repair, not
-3h, and the run's owner clears nothing.
-
-**Spec:**
-1. In `scripts/production/staff_sources.py`, `_WorkerSources.run_live` (the
-   activity proof before the roster read) returns `False` for a delegate run
-   (`/tmp/claude/delegate/<id>/`) that has no `mesh_server.json`, before it
-   reads the roster, and adds the run to `skipped_runs`. The roster entries
-   of that run are not read, so an empty or missing `role` in them gives no
-   line.
-2. A unit run, and a delegate run that has `mesh_server.json`, keep today's
-   behavior: uncertain evidence is never an inactive skip.
-3. The skip count stays one line: `worker_fill.py` prints
-   `len(skipped_runs) + len(skipped_ledgers)` as now; no new line kind.
-4. Do not weaken, delete or turn off an existing assertion or test.
+`_WorkerSources.skip_serverless_delegate(run)` in `scripts/production/staff_sources.py` marks a run under `unit_runs.FORMER_RUN_ROOT` that has no `mesh_server.json` as inactive and adds it to `skipped_runs`, before any roster of that run is read. `ledger()` calls it before the HeldBy roster read, and `run_live` calls it first. Only `FileNotFoundError` proves absence; any other stat error stays uncertain, never a skip. The skip shows in the one existing `worker_fill.py` line (`len(skipped_runs) + len(skipped_ledgers)`); `staff_check.py` prints nothing for it. A unit run, and a delegate run with `mesh_server.json`, keep their behavior.
 
 **Files:**
-- `scripts/production/staff_sources.py`
-- `scripts/production/test_staff_sources.py`
-- `scripts/production/test_staff_check.py`
+- `scripts/production/staff_sources.py` — the shared skip helper.
+- `scripts/production/test_staff_sources.py` — serverless delegate run and HeldBy ledger tests; a unit run with no server stays uncertain.
+- `scripts/production/test_staff_check.py` — no line without a server; the role problem still shows with a live server.
 
-**Workers:** 1 writer + 1 tester
-- impl (slot fix): `scripts/production/staff_sources.py`
-- test (slot test): `scripts/production/test_staff_sources.py`, `scripts/production/test_staff_check.py`
+**Gotchas:** `collect()` reads worker ledgers before run folders, so a run check placed only in `run_live` misses a HeldBy worker.
 
-**Constraints from prior phases:**
-- 3j: an app-server process is a host of worker threads, never a row's
-  session (`test_codex_app_server_with_top_level_value_options_is_not_a_second_session`).
-- 3j: `source_allowed()` is the one scratch-root check; keep it.
-- 3j: a paused open worker of a live unit is a member (sdlc ruling A).
-
-**Acceptance gate:**
-- A test: a delegate run with a roster whose paused entry has an empty role
-  and no `mesh_server.json` adds no row, prints no line, and raises the skip
-  count by one.
-- A test: the same run with a live `mesh_server.json` still lists the entry.
-- Live: `python3 scripts/production/staff_check.py` from the main checkout
-  after merge exits 0, twice, with the same bytes.
-- `basedpyright` on each slot's files: `0 errors, 0 warnings, 0 notes`;
-  the staff suite (`test_staff*.py`) passes.
+**Ruled out:** a new skip line kind.
 
 ### Phase 3h — Staff row ids are the Claude session and Codex thread ids  · status: todo
 
