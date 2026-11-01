@@ -19,6 +19,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "shutdown"))
 import add_unit
+from scripts.production import unit_config
 import production_units
 import autocompact
 import conversation_pause
@@ -157,6 +158,7 @@ class AddUnitRestoreTests(AddUnitTestCase):
                 launch_kind=add_unit.UnitRestoreLaunch("session-123", note, "recorded-name", "build-followups-alpha"),
                 timeout=90,
             )
+            _ = self.prepare_restored_worktree("alpha", request.worktree)
             self.configure_herdr(request)
             with self.assertRaises(herdr.AgentExited):
                 _ = add_unit.launch_session(request, add_unit.DirectorAgent("opus", add_unit.DefaultEffort()),
@@ -187,6 +189,7 @@ class AddUnitRestoreTests(AddUnitTestCase):
         self.write_shutdown_record(self.shutdown_record("restarting"))
         prior = self.root / "prior-session"
         prior.mkdir()
+        _ = self.prepare_restored_worktree("alpha", self.root / "project-alpha", plan="docs/plans/given.md")
         note = self.root / "restart-note.txt"
         _ = note.write_text("Resume this unit.", encoding="utf-8")
 
@@ -214,6 +217,7 @@ class AddUnitRestoreTests(AddUnitTestCase):
         self.commit_prepared_row(self.unit_row("review"))
         prior = self.root / "prior-session"
         prior.mkdir()
+        _ = self.prepare_restored_worktree("review", self.root / "project-alpha", plan="docs/plans/given.md")
         note = self.root / "restart-note.txt"
         _ = note.write_text("Resume this unit.", encoding="utf-8")
         # hana's review-unit holds the bare name this record was written under.
@@ -234,14 +238,15 @@ class AddUnitRestoreTests(AddUnitTestCase):
     def test_restart_restore_marks_only_the_probe_pane_despite_inherited_marker(self) -> None:
         self.env["CLAUDE_PROBE_SESSION"] = "1"
         prior = self.root / "prior-session"
-        prior.mkdir()
         note = self.root / "restart-note.txt"
         _ = note.write_text("Resume this unit.", encoding="utf-8")
         cases = ((False, ""), (True, ""), (False, "claude2"), (True, "claude2"))
         for probe, target in cases:
             with self.subTest(probe=probe, target=target):
                 name = ("probe" if probe else "ordinary") + ("-move" if target else "-restore")
-                self.commit_prepared_row(self.unit_row(name))
+                prior = self.root / f"prior-{name}"
+                self.commit_prepared_row(self.unit_row(name, branch=f"build-followups-{name}", worktree=prior))
+                _ = self.prepare_restored_worktree(name, prior, branch=f"build-followups-{name}")
                 result = self.successful(
                     name, "--plan", "docs/plans/given.md", "--resume", f"session-{name}",
                     "--cwd", str(prior), "--restart-note", str(note),
@@ -275,6 +280,7 @@ class AddUnitRestoreTests(AddUnitTestCase):
         self.write_shutdown_record(self.shutdown_record("restarting"))
         prior = self.root / "prior-session"
         prior.mkdir()
+        _ = self.prepare_restored_worktree("alpha", self.root / "project-alpha", plan="docs/as-built/alpha.md")
         note = self.root / "restart-note.txt"
         _ = note.write_text("Resume this unit.", encoding="utf-8")
 
@@ -334,7 +340,8 @@ class AddUnitRestoreTests(AddUnitTestCase):
         self.commit_prepared_row(self.unit_row())
         worktree = self.root / "project-alpha"
         recorded = self.root / "prior-session"
-        _ = self.git("worktree", "add", str(recorded), "-b", "build-followups-alpha")
+        _ = self.git("worktree", "add", str(recorded), "-b", "recorded-alpha")
+        _ = self.prepare_restored_worktree("alpha", worktree)
         before = self.repository_state()
 
         result = self.restore("alpha", recorded)
@@ -343,18 +350,38 @@ class AddUnitRestoreTests(AddUnitTestCase):
         self.assertEqual(result.stderr, "")
         self.assertEqual(self.opened()[self.opened().index("--cwd") + 1], str(recorded))
         self.assertEqual(self.repository_state(), before)
-        self.assertFalse(worktree.exists())
+        self.assertTrue(worktree.exists())
 
-    def test_restore_in_the_row_worktree_on_another_branch_launches(self) -> None:
+    def test_restore_refuses_a_units_row_worktree_other_than_the_retained_worktree(self) -> None:
+        self.commit_prepared_row(self.unit_row())
+        worktree = self.root / "project-alpha"
+        recorded = self.root / "prior-session"
+        _ = self.git("worktree", "add", str(worktree), "-b", "build-followups-alpha")
+        _ = self.prepare_restored_worktree("alpha", recorded, branch="recorded-alpha")
+        unit_config.write(worktree, unit_config.UnitConfig(
+            unit_config.PlanFile(Path("docs/plans/given.md")), unit_config.NoAppPort(), ()))
+        before = self.repository_state()
+
+        result = self.restore("alpha", recorded)
+
+        self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
+        self.assertIn("scheduled restore worktree conflicts with staff row", result.stderr)
+        self.assertEqual(self.servers_started(), [])
+        self.assertEqual(self.repository_state(), before)
+        self.assertTrue(worktree.exists())
+
+    def test_restore_refuses_the_retained_worktree_on_another_branch(self) -> None:
         self.commit_prepared_row(self.unit_row())
         worktree = self.root / "project-alpha"
         _ = self.git("worktree", "add", str(worktree), "-b", "other-branch")
+        _ = self.prepare_restored_worktree("alpha", worktree)
         before = self.repository_state()
 
         result = self.restore("alpha", worktree)
 
-        self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
-        self.assertEqual(result.stderr, "")
+        self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
+        self.assertIn(f"worktree {worktree} is not on build-followups-alpha", result.stderr)
+        self.assertEqual(self.servers_started(), [])
         self.assertEqual(self.repository_state(), before)
 
     def test_restart_restore_ignores_a_stale_down_record(self) -> None:
@@ -362,6 +389,7 @@ class AddUnitRestoreTests(AddUnitTestCase):
         self.write_shutdown_record(self.shutdown_record("down"))
         prior = self.root / "prior-session"
         prior.mkdir()
+        _ = self.prepare_restored_worktree("alpha", self.root / "project-alpha", plan="docs/plans/given.md")
         note = self.root / "restart-note.txt"
         _ = note.write_text("Resume this unit.", encoding="utf-8")
 
@@ -392,6 +420,7 @@ class AddUnitRestoreTests(AddUnitTestCase):
         )
         prior = self.root / "prior-session"
         prior.mkdir()
+        _ = self.prepare_restored_worktree("alpha", self.root / "project-alpha", plan="docs/plans/given.md")
         note = self.root / "restart-note.txt"
         _ = note.write_text("Resume this unit.", encoding="utf-8")
 
@@ -422,6 +451,7 @@ class AddUnitRestoreTests(AddUnitTestCase):
         _ = (account / "record.json").write_text("{", encoding="utf-8")
         prior = self.root / "prior-session"
         prior.mkdir()
+        _ = self.prepare_restored_worktree("alpha", self.root / "project-alpha", plan="docs/plans/given.md")
         note = self.root / "restart-note.txt"
         _ = note.write_text("Resume this unit.", encoding="utf-8")
 
@@ -473,6 +503,7 @@ class AddUnitRestoreTests(AddUnitTestCase):
             ),
             timeout=1.0,
         )
+        _ = self.prepare_restored_worktree("alpha", request.worktree)
         ready = add_unit.ReadyToLaunch(
             request,
             add_unit.NoUnitRow(),
@@ -626,6 +657,7 @@ class AddUnitRestoreTests(AddUnitTestCase):
         self.write_shutdown_record(self.shutdown_record("restarting"))
         prior = self.root / "prior-session"
         prior.mkdir()
+        _ = self.prepare_restored_worktree("alpha", self.root / "project-alpha", plan="standby")
         note = self.root / "restart-note.txt"
         _ = note.write_text("Resume this unit.", encoding="utf-8")
 
@@ -644,14 +676,15 @@ class AddUnitRestoreTests(AddUnitTestCase):
     def test_restart_restore_carries_the_recorded_autocompact_window(self) -> None:
         """A /shutdown restart, account move or rename relaunches through a restore with no flag of its own."""
         prior = self.root / "prior-session"
-        prior.mkdir()
         note = self.root / "restart-note.txt"
         _ = note.write_text("Resume this unit.", encoding="utf-8")
         with patch.dict(os.environ, self.env):
             autocompact.record("session-compact", "200k")
         for name, flags, expected in (("compact", (), "200k"), ("reverted", ("--autocompact", "auto"), None)):
             with self.subTest(name=name):
-                self.commit_prepared_row(self.unit_row(name))
+                prior = self.root / f"prior-{name}"
+                self.commit_prepared_row(self.unit_row(name, branch=f"build-followups-{name}", worktree=prior))
+                _ = self.prepare_restored_worktree(name, prior, branch=f"build-followups-{name}")
                 _ = self.successful(name, "--plan", "docs/plans/given.md", "--resume", "session-compact",
                                     "--cwd", str(prior), "--restart-note", str(note), "--session-name", name,
                                     "--host-session", f"build-followups-{name}", *flags)
@@ -682,6 +715,7 @@ class AddUnitRestoreTests(AddUnitTestCase):
         _ = self.prepare_unit_account("claude2")
         prior = self.root / "prior-session"
         prior.mkdir()
+        _ = self.prepare_restored_worktree("alpha", self.root / "project-alpha", plan="docs/plans/given.md")
         note = self.root / "restart-note.txt"
         _ = note.write_text("Resume on the source after the target refused.", encoding="utf-8")
         self.persist_unit_account(directory, session="alpha")
@@ -800,6 +834,7 @@ class AddUnitRestoreTests(AddUnitTestCase):
         self.commit_prepared_row(self.unit_row())
         prior = self.root / "prior session"
         prior.mkdir()
+        _ = self.prepare_restored_worktree("alpha", self.root / "project-alpha", plan="docs/plans/given.md")
         note = self.root / "restart note.txt"
         restart_note = "Restarted with spaces, 'quotes', and $() unchanged."
         _ = note.write_text(restart_note, encoding="utf-8")
@@ -845,6 +880,7 @@ class AddUnitRestoreTests(AddUnitTestCase):
         self.commit_prepared_row(self.unit_row())
         prior = self.root / "prior-session"
         prior.mkdir()
+        _ = self.prepare_restored_worktree("alpha", self.root / "project-alpha", plan="docs/plans/given.md")
         note = self.root / "restart-note.txt"
         _ = note.write_text("Resume this unit.", encoding="utf-8")
         _ = self.pause_state.write_text("not a directory", encoding="utf-8")

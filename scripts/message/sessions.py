@@ -229,13 +229,18 @@ def remote_control(record: SessionRecord) -> Literal["active", "absent"]:
     return "absent"
 
 
+def headless_process(pid: int, entrypoint: str = "") -> bool:
+    """Exclude SDK and relay processes even before a session record exists."""
+    return (entrypoint.startswith(HEADLESS_ENTRYPOINT_PREFIX)
+            or isinstance(live_relay_identity(pid, relay_senders_directory()), RelayIdentity))
+
+
 def headless(record: SessionRecord) -> bool:
     """A `claude -p` run, or a process identified by the relay launcher's PID record.
 
     It is no session: no roster lists it, and no name lookup finds it.
     """
-    return (record.get("entrypoint", "").startswith(HEADLESS_ENTRYPOINT_PREFIX)
-            or isinstance(live_relay_identity(record["pid"], relay_senders_directory()), RelayIdentity))
+    return headless_process(record["pid"], record.get("entrypoint", ""))
 
 
 def running_session(record: SessionRecord) -> bool:

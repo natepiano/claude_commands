@@ -212,13 +212,13 @@ def run_rename(arguments: list[str], environment: dict[str, str], cwd: Path,
 
     def run(argv: Sequence[str], *, capture_output: bool = False, text: bool = False, check: bool = False,
             timeout: float | None = None, env: dict[str, str] | None = None,
-            cwd: str | Path | None = None) -> subprocess.CompletedProcess[str]:
+            cwd: str | Path | None = None, input: str | None = None) -> subprocess.CompletedProcess[str]:
         if argv[0] == str(Path(fake_herdr.__file__)):
             return invoke_cli(fake_herdr, lambda: fake_herdr.main(list(argv[1:])), list(argv[1:]),
                               dict(os.environ) if env is None else env,
                               Path.cwd() if cwd is None else Path(cwd))
         return real_run(argv, capture_output=capture_output, text=text, check=check,
-                        timeout=timeout, env=env, cwd=cwd)
+                        timeout=timeout, env=env, cwd=cwd, input=input)
 
     def trust_readback(seconds: float) -> None:
         # The fixtures have no concurrent Claude writer. The overwrite wrapper

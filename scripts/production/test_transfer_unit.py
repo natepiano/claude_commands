@@ -13,13 +13,14 @@ from typing import cast, final
 from unittest import mock
 from collections.abc import Callable
 from contextlib import ExitStack
+from dataclasses import replace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.astra import design_roles
 from scripts.astra.design_role_test_support import write_empty_binding_record
 from scripts.direct import workers
-from scripts.production import staff, staff_sources, staff_move
+from scripts.production import staff, staff_sources, staff_move, unit_config
 from scripts.production.rename_test_support import legacy_staff_journal, stop_at_staff_write
 from scripts.production.rename_rerun_test_support import final_files, saved_fixture
 from scripts.production.staff_test_support import SOURCES_SCRIPT
@@ -37,6 +38,30 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 @final
 class UnitTransferTests(UnitTransferFixture):
+    def test_transfer_changes_only_parent_and_preserves_locations_and_config_bytes(self) -> None:
+        row = next(row for row in staff.find(kind="unit") if row.name == "alpha")
+        row = staff.set_worktree(row.id, staff.PresentWorktree("natedev", self.unit))
+        receiving = next(row for row in staff.find(kind="showrunner") if row.name == "other")
+        assert row.parent is not None
+        giving = staff.by_id(row.parent)
+        assert giving is not None
+        parents = tuple(staff.set_doc(parent.id, staff.LiveDoc(
+            "natedev", checkout / "docs/plans" / f"{parent.name}-production.md"))
+            for parent, checkout in ((giving, self.giving), (receiving, self.receiving)))
+        unit_config.write(self.unit, unit_config.UnitConfig(
+            unit_config.PlanFile(Path("docs/plans/alpha.md")), unit_config.AppPort(8123), ("review",)))
+        path = self.unit / ".unit.toml"
+        before = path.read_bytes(), path.stat().st_mtime_ns
+        self.assert_ok(self.transfer("apply"))
+        self.assertEqual(staff.by_id(row.id), replace(row, parent=receiving.id))
+        self.assertEqual(tuple(staff.by_id(parent.id) for parent in parents), parents)
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+        self.assertTrue(self.unit.is_dir())
+        self.assertEqual(self.git("check-ignore", ".unit.toml", cwd=self.unit), ".unit.toml")
+        self.assert_ok(self.transfer("apply"))
+        self.assertEqual(staff.by_id(row.id), replace(row, parent=receiving.id))
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+
     def test_bad_unrelated_record_warns_once_across_move_and_verification(self) -> None:
         self.env['DESIGN_ROLES_STATE'] = str(self.root / 'state/astra/design-roles')
         with mock.patch.dict(os.environ, self.env):
@@ -256,7 +281,7 @@ class UnitTransferTests(UnitTransferFixture):
 
     def test_missing_staff_member_refuses_before_sources_change(self) -> None:
         row = next(row for row in staff.snapshot().find(kind="unit") if row.name == "alpha")
-        _ = staff.retire(row.id)
+        self.forget_rows(row.id)
         before = final_files(self.root)
         failed = self.transfer("apply")
         self.assertEqual(failed.returncode, 2, failed.stderr)

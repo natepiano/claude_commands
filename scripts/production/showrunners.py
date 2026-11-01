@@ -255,6 +255,7 @@ class UnreadableTimerPolicy(Enum):
 
     RAISE = "raise"
     SKIP = "skip"
+    STRICT = "strict"  # Audit every source, including incomplete timer declarations.
 
 
 def read_sources(state_dir: Path | None = None, *,
@@ -268,6 +269,8 @@ def read_sources(state_dir: Path | None = None, *,
         try:
             found.append(_source(instance, dependencies=dependencies))
         except (OSError, KeyError, ValueError, UnicodeError) as error:
+            if unreadable is UnreadableTimerPolicy.STRICT:
+                raise ValueError(f"{instance / 'conf'}: {error}") from error
             if isinstance(error, OSError) and unreadable is UnreadableTimerPolicy.RAISE:
                 raise
             print(f"showrunners: skipping {instance.name}: {error}", file=sys.stderr)

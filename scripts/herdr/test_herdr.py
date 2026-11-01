@@ -4075,6 +4075,20 @@ class SavedLayoutTests(unittest.TestCase):
                 _ = client.open_tab(space, title, "/repo", {})
         return client
 
+    def test_retained_removed_units_and_wrapped_parents_do_not_classify_tabs_as_current_staff(self) -> None:
+        retired = unit_membership("current", "retired-unit")
+        old_child = unit_membership("wrapped", "child-unit")
+        _ = staff.set_worktree(retired.id, staff.RemovedWorktree("natedev", self.root / "retired"))
+        assert old_child.parent is not None
+        _ = staff.set_doc(old_child.parent, staff.WrappedDoc("natedev", self.root / "archive.md"))
+        processes = [herdr.HerdrProcess(1, herdr.HerdrPlace("fixture", "w1:p1"),
+                                       {"STAFF_ID": retired.id}, "claude", "/missing")]
+        classifier = herdr.UnitTabClassifier("fixture", processes, staff.snapshot())
+        self.assertIsInstance(classifier.classify("current", "retired", ["w1:p1"]), herdr.OtherTab)
+        self.assertIsInstance(classifier.classify("wrapped", "child", []), herdr.OtherTab)
+        self.assertFalse(classifier.has_unit_title("retired"))
+        self.assertFalse(classifier.has_unit_title("child"))
+
     def test_session_names_restore_saved_tab_order_and_resolve_each_pane(self) -> None:
         old = TitledLayoutHerdr()
         for key in ("sdlc", "zulu", "alpha"):

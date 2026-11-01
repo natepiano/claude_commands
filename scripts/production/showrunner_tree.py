@@ -16,9 +16,9 @@ def parent_edges(*, record: staff.StaffSnapshot | None = None) -> dict[str, str]
     """Join showrunner parent ids from one snapshot to their production slugs."""
     record = staff.snapshot() if record is None else record
     members = staff_sources.showrunner_members(record)
-    names = {row.id: row.name for row in record.find(kind="showrunner")}
-    names.update({row.id: slug for slug, row in members.items()})
-    return {names[row.id]: names[row.parent] for row in record.find(kind="showrunner")
+    names = {row.id: row.name for row in staff.active(record, "showrunner")}
+    names.update({row.id: slug for slug, row in members.items() if row.id in names})
+    return {names[row.id]: names[row.parent] for row in staff.active(record, "showrunner")
             if row.parent is not None and row.parent in names}
 
 

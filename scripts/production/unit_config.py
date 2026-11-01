@@ -202,6 +202,11 @@ def read(worktree: Path, *, cleanup: bool = True) -> UnitConfig | ConfigMissing:
     return _read_file(worktree / ".unit.toml", cleanup=cleanup)
 
 
+def read_parked(unit: StaffId, *, cleanup: bool = True) -> UnitConfig | ConfigMissing:
+    """Read retained facts on this machine; previews perform no recovery cleanup."""
+    return _read_file(parked_path(unit), cleanup=cleanup)
+
+
 def _fields(config: UnitConfig) -> dict[str, object]:
     if isinstance(config.plan, PlanFile):
         plan = config.plan.path.as_posix()
@@ -247,7 +252,7 @@ def write(worktree: Path, config: UnitConfig) -> None:
     _publish(worktree / ".unit.toml", config)
 
 
-def _first_difference(left: UnitConfig, right: UnitConfig) -> str:
+def first_difference(left: UnitConfig, right: UnitConfig) -> str:
     for key in ("plan", "port", "responsibilities"):
         if getattr(left, key) != getattr(right, key):
             return key
@@ -257,17 +262,17 @@ def _first_difference(left: UnitConfig, right: UnitConfig) -> str:
 
 
 def _check_pair(worktree_path: Path, parked: Path, source: UnitConfig, saved: UnitConfig) -> None:
-    key = _first_difference(replace(source, retired=NoRetiredSession()),
+    key = first_difference(replace(source, retired=NoRetiredSession()),
                             replace(saved, retired=NoRetiredSession()))
     if key:
         raise ConfigRefused(f"{worktree_path} and {parked}: {key} differs; no file was changed")
 
 
-def place(unit: StaffId, worktree: Path) -> InWorktree | Parked | Both | Nowhere:
+def place(unit: StaffId, worktree: Path, *, cleanup: bool = True) -> InWorktree | Parked | Both | Nowhere:
     live_path, saved_path = worktree / ".unit.toml", parked_path(unit)
-    live, saved = _read_file(live_path), _read_file(saved_path)
+    live, saved = _read_file(live_path, cleanup=cleanup), read_parked(unit, cleanup=cleanup)
     if isinstance(live, UnitConfig) and isinstance(saved, UnitConfig):
-        same = not _first_difference(replace(live, retired=NoRetiredSession()),
+        same = not first_difference(replace(live, retired=NoRetiredSession()),
                                      replace(saved, retired=NoRetiredSession()))
         return Both(live_path, saved_path, same)
     if isinstance(live, UnitConfig):
@@ -275,6 +280,19 @@ def place(unit: StaffId, worktree: Path) -> InWorktree | Parked | Both | Nowhere
     if isinstance(saved, UnitConfig):
         return Parked(saved_path)
     return Nowhere()
+
+
+def write_parked(unit: StaffId, config: UnitConfig) -> None:
+    """Publish complete retired facts once; never overwrite different retained facts."""
+    if not isinstance(config.retired, RetiredSession):
+        raise ConfigRefused(f"{parked_path(unit)}: parked configuration requires retirement facts")
+    path = parked_path(unit)
+    saved = read_parked(unit)
+    if isinstance(saved, UnitConfig):
+        key = first_difference(saved, config)
+        if key:
+            raise ConfigRefused(f"{path}: {key} differs; no file was changed")
+    _publish(path, config)
 
 
 def park(unit: StaffId, worktree: Path, retired: RetiredSession) -> None:
@@ -290,7 +308,7 @@ def park(unit: StaffId, worktree: Path, retired: RetiredSession) -> None:
         _check_pair(source_path, saved_path, source, saved)
         if saved.retired != retired:
             raise ConfigRefused(f"{source_path} and {saved_path}: retired differs; no file was changed")
-    _publish(saved_path, desired)
+    write_parked(unit, desired)
 
 
 def restore(unit: StaffId, worktree: Path) -> None:

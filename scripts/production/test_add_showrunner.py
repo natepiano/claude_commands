@@ -41,6 +41,17 @@ from scripts.message import sessions
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 class AddShowrunnerTests(AddShowrunnerFixture):
+    def test_new_showrunner_and_missing_parent_are_admitted_with_their_live_docs(self) -> None:
+        self.starts("kid-session", registers="kid")
+        result = self.run_command("kid")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        child = staff.by_path("kid")
+        parent = staff.by_path("top")
+        assert child is not None and parent is not None
+        self.assertEqual(child.doc, staff.LiveDoc("natedev", self.doc("kid")))
+        self.assertEqual(parent.doc, staff.LiveDoc("natedev", self.doc("top")))
+        self.assertEqual(child.parent, parent.id)
+
     @override
     def setUp(self) -> None:
         super().setUp()
@@ -57,10 +68,33 @@ class AddShowrunnerTests(AddShowrunnerFixture):
                            for index, value in enumerate(opened) if value == "--env")
         self.assertEqual(environment.get("STAFF_ID"), rows[0].id)
 
+    def test_showrunner_and_unit_add_paths_share_the_live_doc_admission_writer(self) -> None:
+        import add_unit
+
+        self.starts("kid-session", registers="kid")
+        original = add_showrunner.ensure_staff_showrunner
+        self.assertIs(add_unit.ensure_staff_showrunner, original)
+        with (patch.object(add_showrunner, "ensure_staff_showrunner", wraps=original) as showrunner_admit,
+              patch.object(add_unit, "ensure_staff_showrunner", wraps=original) as unit_admit):
+            result = self.run_command("kid")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            child = next(row for row in staff.find(kind="showrunner") if row.name == "kid")
+            self.assertGreater(showrunner_admit.call_count, 0)
+            with (patch.dict(os.environ, self.env),
+                  patch.object(showrunners, "NOTIFIER_STATE_DIR", self.root / "notifier")):
+                unit = add_unit.ensure_staff_unit(production_units.read_production(self.doc("kid")), "probe-unit",
+                    worktree=staff.PresentWorktree("natedev", self.root / "probe"))
+            unit_admit.assert_called_once()
+        self.assertEqual(unit.parent, child.id)
+        self.assertEqual(staff.by_id(child.id), child)
+        self.assertEqual(child.doc, staff.LiveDoc("natedev", self.doc("kid")))
+        self.assertEqual(len([row for row in staff.find(kind="showrunner") if row.id == child.id]), 1)
+
     def test_existing_staff_parent_survives_a_stale_saved_parent_during_ensure(self) -> None:
         self.timer("kid", "kid-session")
         parent = staff.ensure("showrunner", name="other")
-        child = staff.ensure("showrunner", name="kid", parent=parent.id)
+        child = staff.ensure("showrunner", name="kid", parent=parent.id,
+                             doc=staff.LiveDoc("natedev", self.doc("kid")))
         path = self.root / "showrunner/kid/parent"
         path.parent.mkdir(parents=True, exist_ok=True)
         write_text_atomic(path, "top\n")
@@ -147,11 +181,11 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
         child = staff.by_path("kid")
         assert child is not None
-        _ = staff.retire(child.id)
+        wrapped = staff.set_doc(child.id, staff.WrappedDoc("natedev", self.doc("kid")))
         second = self.run_command("kid")
         self.assertEqual(second.returncode, 2, second.stdout + second.stderr)
         self.assertNotIn("already started", second.stdout)
-        self.assertIsNone(staff.by_id(child.id))
+        self.assertEqual(staff.by_id(child.id), wrapped)
 
     def test_add_showrunner_rerun(self) -> None:
         self.starts("kid-session", registers="kid")

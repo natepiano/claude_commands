@@ -9,6 +9,7 @@ import io
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import unittest
@@ -41,7 +42,7 @@ def setUpModule() -> None:
     configure_test_zone()
 
 
-from scripts.production import staff
+from scripts.production import staff, unit_config
 
 @final
 class AddUnitLaunchTests(AddUnitTestCase):
@@ -62,18 +63,120 @@ class AddUnitLaunchTests(AddUnitTestCase):
             + "    raise SystemExit(add_unit.main(sys.argv[1:]))\n", encoding="utf-8")
         _ = self.enterContext(patch("add_unit_test_support.SCRIPT", script))
 
-    def test_unit_under_another_production_refuses_with_move_command_without_changing_its_row(self) -> None:
+    def test_real_brief_admission_can_switch_to_its_approved_plan(self) -> None:
+        _ = self.successful("alpha", "--brief", "Write a full plan.", subprocess_cli=True)
+        worktree = self.root / "project-alpha"
+        before = unit_config.read(worktree)
+        assert isinstance(before, unit_config.UnitConfig)
+        assert isinstance(before.plan, unit_config.PlanFile)
+        stub = self.checkout / before.plan.path
+        source = stub.read_bytes()
+        # End the brief's fixture session before opening the approved plan.
+        (self.state / f"herdr-live-{SHARED}").unlink()
+        for pid in (101, 102):
+            shutil.rmtree(self.root / "proc" / str(pid))
+        before_calls = len(self.herdr_calls())
+        _ = self.successful("alpha", "--plan", "docs/plans/given.md", subprocess_cli=True)
+        self.assertEqual(unit_config.read(worktree), unit_config.UnitConfig(
+            unit_config.PlanFile(Path("docs/plans/given.md")), before.port, before.responsibilities))
+        prompts = [row[-1] for row in self.herdr_calls()[before_calls:] if row[2:4] == ["agent", "prompt"]]
+        self.assertEqual(prompts, ["/unit:direct docs/plans/given.md"])
+        self.assertIn(self.unit_row(), self.doc.read_text())
+        self.assertEqual(stub.read_bytes(), source)
+
+    def test_adopting_a_prepared_row_without_a_port_flag_keeps_its_recorded_port(self) -> None:
+        self.commit_prepared_row(self.unit_row(port="8123"))
+        worktree = self.root / "project-alpha"
+        _ = self.successful("alpha", "--plan", "docs/plans/given.md")
+        expected = unit_config.UnitConfig(unit_config.PlanFile(Path("docs/plans/given.md")),
+                                         unit_config.AppPort(8123), ())
+        self.assertEqual(unit_config.read(worktree), expected)
+        path = worktree / ".unit.toml"
+        before = path.read_bytes(), path.stat().st_mtime_ns
+        _ = self.successful("alpha", "--plan", "docs/plans/given.md")
+        self.assertEqual(unit_config.read(worktree), expected)
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+        self.assertIn(self.unit_row(port="8123"), self.doc.read_text())
+
+    def test_an_existing_config_port_conflict_refuses_before_admission_or_launch(self) -> None:
+        worktree = self.root / "project-alpha"
+        _ = self.git("worktree", "add", "-b", "build-followups-alpha", str(worktree), "build-followups")
+        unit_config.write(worktree, unit_config.UnitConfig(
+            unit_config.PlanFile(Path("docs/plans/given.md")), unit_config.AppPort(8123), ()))
+        path = worktree / ".unit.toml"
+        before = path.read_bytes(), path.stat().st_mtime_ns, self.staff.staff_file.read_bytes(), self.doc.read_bytes()
+        result = self.cli("alpha", "--plan", "docs/plans/given.md", "--port", "8124")
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(str(path), result.stdout + result.stderr)
+        self.assertIn("port", result.stdout + result.stderr)
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns,
+                          self.staff.staff_file.read_bytes(), self.doc.read_bytes()), before)
+        self.assertFalse(any(command[2:4] == ["agent", "start"] for command in self.herdr_calls()))
+
+    def test_exclude_refusal_stops_config_publication_and_worker_launch(self) -> None:
+        from scripts.lib import git_exclude
+
+        worktree = self.root / "project-alpha"
+        with patch.object(git_exclude, "ensure_excluded",
+                          side_effect=git_exclude.ExcludeRefused(f"{worktree}: fixture exclude refusal")) as exclude:
+            result = self.cli("alpha", "--plan", "docs/plans/given.md")
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("fixture exclude refusal", result.stdout + result.stderr)
+        exclude.assert_called_once_with(worktree, "/.unit.toml")
+        self.assertFalse((worktree / ".unit.toml").exists())
+        self.assertFalse(any(command[2:4] == ["agent", "start"] for command in self.herdr_calls()))
+
+    def test_plan_launch_admits_its_real_worktree_and_writes_port_and_repeatable_responsibilities(self) -> None:
+        _ = self.successful("alpha", "--plan", "docs/plans/given.md", "--port", "8123",
+                            "--responsibility", "nightly", "--responsibility", "build-check")
+        row = next(row for row in staff.find(kind="unit") if row.name == "alpha")
+        worktree = self.root / "project-alpha"
+        self.assertEqual(row.worktree, staff.PresentWorktree("natedev", worktree))
+        self.assertEqual(unit_config.read(worktree), unit_config.UnitConfig(
+            unit_config.PlanFile(Path("docs/plans/given.md")), unit_config.AppPort(8123), ("nightly", "build-check")))
+        ignored = subprocess.run(["git", "-C", str(worktree), "check-ignore", "-q", ".unit.toml"], check=False)
+        self.assertEqual(ignored.returncode, 0)
+        tracked = subprocess.run(["git", "-C", str(worktree), "ls-files", "--error-unmatch", ".unit.toml"],
+                                 capture_output=True, check=False)
+        self.assertNotEqual(tracked.returncode, 0)
+        self.assertEqual(self.pane_environment()["STAFF_ID"], row.id)
+
+    def test_standby_launch_writes_the_standby_plan_in_its_unit_config(self) -> None:
+        _ = self.successful("alpha", "--standby")
+        self.assertEqual(unit_config.read(self.root / "project-alpha"), unit_config.UnitConfig(
+            unit_config.StandbyPlan(), unit_config.NoAppPort(), ()))
+
+    def test_permanent_launch_writes_the_permanent_plan_in_its_unit_config(self) -> None:
+        _ = self.successful("alpha", "--permanent")
+        self.assertEqual(unit_config.read(self.root / "project-alpha"), unit_config.UnitConfig(
+            unit_config.PermanentPlan(), unit_config.NoAppPort(), ()))
+
+    def test_brief_launch_writes_its_existing_relative_stub_plan_in_the_unit_config(self) -> None:
+        _ = self.successful("alpha", "--brief", "Build the missing reader.")
+        config = unit_config.read(self.root / "project-alpha")
+        assert isinstance(config, unit_config.UnitConfig)
+        self.assertIsInstance(config.plan, unit_config.PlanFile)
+        assert isinstance(config.plan, unit_config.PlanFile)
+        self.assertFalse(config.plan.path.is_absolute())
+        self.assertTrue((self.checkout / config.plan.path).is_file())
+
+    def test_existing_unit_name_under_another_production_requires_an_explicit_move(self) -> None:
         old_doc = self.staff.production("old", "alpha-unit", workspace="original")
         original = staff.ensure("showrunner", name="original")
         old = staff.ensure("unit", name="alpha", parent=original.id)
         before = self.staff.staff_file.read_bytes()
-        result = self.cli("alpha", "--plan", "docs/plans/given.md")
-        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-        self.assertEqual(result.stderr,
-                         "add_unit: alpha is under original; to move it, run: staff.py move original/alpha build-followups\n")
-        self.assertEqual(staff.by_id(old.id), old)
-        self.assertIn("alpha-unit", old_doc.read_text())
-        self.assertEqual(self.staff.staff_file.read_bytes(), before)
+        document = old_doc.read_bytes()
+        for attempt in range(2):
+            with self.subTest(attempt=attempt):
+                result = self.cli("alpha", "--plan", "docs/plans/given.md", subprocess_cli=True)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertEqual(result.stderr,
+                    "add_unit: alpha is under original; to move it, run: staff.py move original/alpha build-followups\n")
+                self.assertEqual(staff.by_id(old.id), old)
+                self.assertIn("alpha-unit", old_doc.read_text())
+                self.assertEqual(self.staff.staff_file.read_bytes(), before)
+                self.assertEqual(old_doc.read_bytes(), document)
+        self.assertEqual(self.herdr_calls(), [])
 
     def test_new_launch_carries_the_ensured_staff_identity(self) -> None:
         _ = self.successful("alpha", "--standby")
@@ -90,9 +193,10 @@ class AddUnitLaunchTests(AddUnitTestCase):
     def test_add_unit_rerun(self) -> None:
         original = add_unit.ensure_staff_unit
         for after in (False, True):
-            def interrupted(production: production_units.Production, unit: str) -> staff.StaffRow:
+            def interrupted(production: production_units.Production, unit: str, *,
+                            worktree: staff.PresentWorktree | staff.WorktreeUnfilled) -> staff.StaffRow:
                 if after:
-                    _ = original(production, unit)
+                    _ = original(production, unit, worktree=worktree)
                 raise RuntimeError("stopped at staff step")
             with patch.object(add_unit, "ensure_staff_unit", side_effect=interrupted):
                 stopped = self.cli("alpha", "--plan", "docs/plans/given.md")
