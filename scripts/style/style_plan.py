@@ -37,6 +37,7 @@ sys.path.insert(0, str(SCRIPTS / "production"))
 from process_failure import failure_detail
 import berth_board
 import coverage_report
+import finding_sites
 import mechanical_classes
 import merge_gate
 from approved_renames import (AppliedCheck, ApprovedRename, BindingRename, Declarations, FileRename, Folder, InlineModule,
@@ -1064,6 +1065,13 @@ class ApprovedTicket:
     allowed: frozenset[str]
 
 
+def decision_approves(decision: Issue, selected_rules: frozenset[str], crate: str) -> bool:
+    """The gate's one approval check, shared by proposal builds and approved sites in coverage tickets."""
+    return (decision.value("status") == "open" and style_proposals.is_decision(decision)
+            and isinstance(decision_answer(decision), ApprovedDecision)
+            and selected_rules == frozenset({decision.value("style_rule")}) and decision.value("style_crate") == crate)
+
+
 def approved_ticket(
     ledger: style_ledger.Ledger, ticket_id: str, origin: style_ledger.ApprovedProposal,
 ) -> ApprovedTicket:
@@ -1083,13 +1091,9 @@ def approved_ticket(
     crate = ledger.ticket_crate(ticket_id)
     for issue in origin.issues:
         decision = Issue(issue, frontmatter(issue))
-        answer = decision_answer(decision)
-        selected_rules = {style_ledger.base_rule(finding.rule) for finding in findings
-                          if isinstance(finding.state, style_ledger.Filed) and finding.state.proposal == issue}
-        if (decision.value("status") != "open" or not style_proposals.is_decision(decision)
-                or not isinstance(answer, ApprovedDecision)
-                or selected_rules != {decision.value("style_rule")}
-                or decision.value("style_crate") != crate):
+        selected_rules = frozenset(style_ledger.base_rule(finding.rule) for finding in findings
+                                   if isinstance(finding.state, style_ledger.Filed) and finding.state.proposal == issue)
+        if not decision_approves(decision, selected_rules, crate):
             raise style_ledger.LedgerError("proposal approval or filed findings changed")
     moves = approved_file_renames(findings)
     allowed = frozenset({finding.path for finding in findings} | {moved.new for moved in moves})
@@ -1143,6 +1147,52 @@ def verify_ticket(repo: Path, ticket_id: str) -> int:
         return 0
 
 
+def approved_documentation_sites(ledger: style_ledger.Ledger, ticket_id: str,
+                                 base: str) -> tuple[style_footprint.ApprovedDocumentationSite, ...]:
+    """Pass existing decision approval to check 6 only at unchanged, ticket-owned source coordinates."""
+    cells = ledger.latest_ticket_judgments(ticket_id)
+    decisions: dict[Path, Issue] = {}
+    trees: dict[str, style_footprint.RevisionTree] = {}
+    sites: list[style_footprint.ApprovedDocumentationSite] = []
+    for finding in ledger.held_findings(style_ledger.HeldFindingsInState("filed")):
+        if (not isinstance(finding.state, style_ledger.Filed)
+                or finding.build_ticket not in (style_ledger.NoBuildTicket(), style_ledger.BuildTicket(ticket_id))
+                or not any(cell.rule == finding.rule and (finding.path == cell.path
+                           or finding.path.startswith(cell.path + "/")) for cell in cells)):
+            continue
+        issue = finding.state.proposal
+        if issue not in decisions:
+            if not issue.is_file():
+                continue
+            decisions[issue] = Issue(issue, frontmatter(issue))
+        if not decision_approves(decisions[issue], frozenset({style_ledger.base_rule(finding.rule)}),
+                                 ledger.ticket_crate(ticket_id)):
+            continue
+        if base not in trees:
+            trees[base] = style_footprint.RevisionTree(ledger.repo, base)
+        original = trees[base]
+        if finding.path not in original.paths:
+            continue
+        judged = ledger.judged_commit(finding)
+        if isinstance(judged, style_ledger.NoJudgedCommit):
+            continue
+        read = finding.follow.commit if isinstance(finding.follow, style_ledger.FollowedDeclaration) else judged.commit
+        if read not in trees:
+            trees[read] = style_footprint.RevisionTree(ledger.repo, read)
+        source = trees[read]
+        if finding.path not in source.paths:
+            continue
+        old = finding_sites.SourceSites(source.text(finding.path))
+        current = finding_sites.SourceSites(original.text(finding.path))
+        patch = git(ledger.repo, "diff", "--no-ext-diff", "--no-textconv", "--unified=0", read, base, "--", finding.path)
+        line = finding_sites.unchanged_lines(patch, old, current).get(finding.line, 0)
+        doc_lines = {number for comment in style_footprint.documentation_comments(current.source)
+                     for number in range(comment.line, comment.line + len(comment.text.splitlines()))}
+        if line in doc_lines:
+            sites.append(style_footprint.ApprovedDocumentationSite(finding.path, line, current.lines[line - 1].rstrip("\r\n")))
+    return tuple(sites)
+
+
 def gate(repo: Path, ticket_id: str) -> int:
     """Exit 0 when the change may commit, 1 for a review result, 2 when the gate could not run."""
     try:
@@ -1157,8 +1207,10 @@ def gate(repo: Path, ticket_id: str) -> int:
                         print(f"unjudged: {cell.rule} {cell.path}")
                     return 1
                 base = coverage_footprint_base(repo, ledger, origin.base)
+                approval_arguments = [argument for site in approved_documentation_sites(ledger, ticket_id, base)
+                                      for argument in ("--approved-documentation-site", site.path, str(site.line), site.text)]
                 result = subprocess.run([sys.executable, str(SCRIPTS / "style/style_footprint.py"), "check",
-                                         "--repo", str(repo), "--base", base, "--worktree"], check=False)
+                                         "--repo", str(repo), "--base", base, "--worktree", *approval_arguments], check=False)
                 if result.returncode != 0:
                     return 2 if result.returncode == 2 else 1
                 return format_check(repo)

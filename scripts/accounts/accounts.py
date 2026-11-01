@@ -2595,7 +2595,8 @@ def _cutover_session_check(folder: Path) -> None:
             raise AccountsError(f"accounts: a live session uses {folder}; stop it before cutover-home")
 
 
-MAC_HOME_LOGIN_STEP = "Mac's own step: one /login in ~/.claude2, never /logout"
+MAC_HOME_LOGIN_STEP = ("in a Mac Terminal, run accounts.py exec claude2, then /login, then /exit, "
+                       + "then accounts.py cutover-home claude2; never /logout")
 
 
 def _mac_login_keychain_visible() -> bool:
@@ -4392,9 +4393,15 @@ NO_STARTUP_FAILURE = agent_accounts.NoCodexStartupFailure()
 
 
 def _read_failure_problem(row: StatusRow, zone: tzinfo,
-                          startup: agent_accounts.CodexStartupStatus = NO_STARTUP_FAILURE) -> list[StatusProblem]:
-    previous = (f"this shows the reading from {row.read_at.astimezone(zone):%H:%M}"
+                          startup: agent_accounts.CodexStartupStatus = NO_STARTUP_FAILURE, *, now: datetime) -> list[StatusProblem]:
+    def stamp(at: datetime) -> str:
+        local = at.astimezone(zone)
+        return local.strftime("%H:%M" if local.date() == now.astimezone(zone).date() else "%m-%d %H:%M")
+
+    previous = (f"this shows the reading from {stamp(row.read_at)}"
                 if isinstance(row.read_at, datetime) else "no reading is stored yet")
+    last_attempt = (f"last read attempted at {stamp(row.attempted_at)}"
+                    if isinstance(row.attempted_at, datetime) else "no usage read has been attempted")
     match row.read_outcome:
         case agent_accounts.UsageReadOutcome.STALE_TOKEN | agent_accounts.UsageReadOutcome.NO_LOGIN_TOKEN:
             attempt = login_renewal_attempts().get(row.label)
@@ -4408,13 +4415,11 @@ def _read_failure_problem(row: StatusRow, zone: tzinfo,
             cause = "the usage service did not accept this login"
             step = "start a session on it to check it"
         case agent_accounts.UsageReadOutcome.RATE_LIMITED_429:
-            retry = (f"after {(row.attempted_at + timedelta(minutes=10)).astimezone(zone):%H:%M}"
-                     if isinstance(row.attempted_at, datetime) else "in 2 min")
-            cause, step = f"the usage service is busy; {previous}", f"next try {retry}"
+            cause, step = f"the usage service is busy; {previous}", last_attempt
         case agent_accounts.UsageReadOutcome.CREDENTIALS_UNAVAILABLE:
             cause, step = "login credentials unavailable in this session", "refresh from a logged-in desktop session"
         case agent_accounts.UsageReadOutcome.ERROR:
-            cause, step = f"the usage read failed; {previous}", "next try in 2 min"
+            cause, step = f"the usage read failed; {previous}", last_attempt
         case agent_accounts.UsageReadOutcome.OK | agent_accounts.UsageReadOutcome.HELD:
             cause, step = "", ""
     subject = row.label if _label_is(row.label, "claude") or _label_is(row.label, "codex") else row.folder
@@ -4461,6 +4466,23 @@ def _status_steps(status: AccountStatus | CodexStatus) -> tuple[str, str]:
     return setup, login
 
 
+def _codex_login_command(home: Path) -> str:
+    return f"env CODEX_HOME={shlex.quote(str(home))} codex login"
+
+
+def _codex_cutover_problem(label: str, legacy_login: str) -> StatusProblem:
+    destination = codex_setup_home(label)
+    destination_login = _codex_home_login(destination)
+    if destination_login and destination_login.casefold() != legacy_login.casefold():
+        folder = _codex_folder(destination)
+        return StatusProblem(label, "wrong sign-in",
+            ProblemCause("wrong login", f"{folder} holds a different login from {label}",
+                CauseFile(str(destination)), CauseAccount(label)),
+            ProblemStep(f"stop what uses {folder}, then run {_codex_login_command(destination)} to sign in as {label}"))
+    return StatusProblem(label, f"~/.codex still holds {label}'s login", NoSeparateCause(),
+        ProblemStep(f"stop what uses ~/.codex (such as the ChatGPT app), then run accounts.py cutover-home {label}"))
+
+
 def status_check_problem(text: str, subject: str, *, setup: str, login: str,
                           access_paths: tuple[str, ...] = (), note_paths: tuple[str, ...] = ()) -> StatusProblem:
     """Convert command diagnostics at the status boundary; launches keep their words."""
@@ -4504,14 +4526,20 @@ def status_check_problem(text: str, subject: str, *, setup: str, login: str,
             account=CauseAccount(primary.split(" ", 1)[0])),
             ProblemStep("add the account note with its login, then " + setup))
     if primary.startswith("sign in as "):
+        hint, _, folder = primary.removeprefix("sign in as ").rpartition(" at ")
+        instruction = (primary if _label_is(hint, "codex") or _label_is(hint, "claude")
+                       else f"sign in at {folder}; {login}")
         return StatusProblem(subject, "not logged in", ProblemCause("signed out", "the home has no readable sign-in"),
-            ProblemStep(primary))
+            ProblemStep(instruction))
     if " is logged in as " in primary:
-        return StatusProblem(subject, "wrong sign-in", ProblemCause("wrong login", primary),
+        return StatusProblem(subject, "wrong sign-in", ProblemCause("wrong login", primary.split(" is logged in as ", 1)[0] + f" holds a different login from {subject}"),
             step if separator else ProblemStep(login))
     if " are logged in as " in primary or " hold " in primary:
-        cause = primary if tail.startswith("keep ") else text
         homes = primary.split(" are logged in as ", 1)[0].split(" hold ", 1)[0].split(" and ", 1)
+        shared_login = primary.split(" are logged in as ", 1)[-1].split(" hold ", 1)[-1]
+        if "~/.codex" in homes and _label_is(subject, "codex") and not is_test_login(shared_login):
+            return _codex_cutover_problem(subject, shared_login)
+        cause = " and ".join(homes) + f" store {subject}'s login; two homes on one login break token refresh"
         location = DuplicateLoginHomes((min(homes), max(homes))) if len(homes) == 2 else NoCauseFile()
         return StatusProblem(subject, "login is stored in two homes", ProblemCause("identity", cause, location),
             ProblemStep(tail if tail.startswith("keep ") else "keep each login in one home"))
@@ -4560,15 +4588,15 @@ def _status_problems(status: AccountStatus | CodexStatus, *, detail: bool, zone:
             problem = replace(problem, cause=replace(problem.cause, key=note_source.key))
         problems.append(problem)
     if status.login and not test_signin:
-        problems = [replace(problem, step=ProblemStep(f"repair the account note with login: {status.login}; {setup}"))
+        problems = [replace(problem, step=ProblemStep(f"repair the account note for {subject} with its login; {setup}"))
                     if isinstance(problem.cause, ProblemCause) and problem.cause.kind == "unreadable note"
                     else replace(problem, step=ProblemStep(
-                        f"add ~/rust/hanadocs/agents/{'codex' if isinstance(status, CodexStatus) else 'claude'}N.md with login: {status.login}; {setup}"))
+                        f"add ~/rust/hanadocs/agents/{'codex' if isinstance(status, CodexStatus) else 'claude'}N.md with the login for {subject}; {setup}"))
                     if isinstance(problem.cause, ProblemCause) and problem.cause.kind == "note"
                     else problem for problem in problems]
     if unnoted in status.problems and not test_signin:
         tool = "codex" if isinstance(status, CodexStatus) else "claude"
-        instruction = f"add ~/rust/hanadocs/agents/{tool}N.md with login: {status.login}"
+        instruction = f"add ~/rust/hanadocs/agents/{tool}N.md with the login for {subject}"
         if isinstance(status, CodexStatus) and status.home == accounts_home() / ".codex":
             label = home_account_label("codex")
             instruction += f"; then run accounts.py cutover-home {label if _label_is(label, 'codex') else '<codexN>'}"
@@ -4773,7 +4801,7 @@ def _read_status(source: UsageSource, *, detail: bool) -> StatusReading:
     for status in [*statuses, *codex]:
         tool = "Codex" if isinstance(status, CodexStatus) else "Claude"
         row = _status_row(status, usage.get(usage_store.key(tool, status.login)), now, ())
-        for problem in _read_failure_problem(row, zone, status.startup if isinstance(status, CodexStatus) else NO_STARTUP_FAILURE):
+        for problem in _read_failure_problem(row, zone, status.startup if isinstance(status, CodexStatus) else NO_STARTUP_FAILURE, now=now):
             _observe_status_problem(_usage_problem_identity(problem, row, status))
     try:
         groups = group_accounts()
@@ -4814,7 +4842,7 @@ def _read_status(source: UsageSource, *, detail: bool) -> StatusReading:
     problems: list[StatusProblem] = list(store_problems)
     problems.extend(_map_provenance_problem(role_map.observed_map_provenance()))
     for row, status in zip(rows, all_statuses):
-        for problem in _read_failure_problem(row, zone, status.startup if isinstance(status, CodexStatus) else NO_STARTUP_FAILURE):
+        for problem in _read_failure_problem(row, zone, status.startup if isinstance(status, CodexStatus) else NO_STARTUP_FAILURE, now=now):
             problems.append(_usage_problem_identity(problem, row, status))
     note_paths = tuple(str(note_file.note_path(status.label)) for status in all_statuses
                        if isinstance(_status_cause_account(status), CauseAccount))
@@ -4840,9 +4868,10 @@ def _read_status(source: UsageSource, *, detail: bool) -> StatusReading:
         label = label if _label_is(label, "codex") else "<codexN>"
         if not is_test_login(codex_login) and not (home_status is not None
                 and unnoted_home_line(codex_home, codex_login) in home_status.problems):
-            problems.append(StatusProblem(subject, "legacy login is stored",
-                ProblemCause("legacy", "~/.codex still holds a login", CauseFile(str(codex_home))),
-                ProblemStep(f"run accounts.py cutover-home {label}")))
+            problems.append(_codex_cutover_problem(label, codex_login) if _label_is(label, "codex") else
+                StatusProblem(subject, "legacy login is stored",
+                    ProblemCause("legacy", "~/.codex still holds a login", CauseFile(str(codex_home))),
+                    ProblemStep(f"stop what uses ~/.codex (such as the ChatGPT app), then run accounts.py cutover-home {label}")))
         if home_status is None and is_test_login(codex_login):
             problems.append(test_login_problem(subject, codex_home / "auth.json", zone))
     problems.extend(diagnostics)
@@ -4932,15 +4961,13 @@ def _observe_status_problem(problem: StatusProblem, raw: tuple[str, ...] = (), *
 
 
 def _map_provenance_problem(provenance: role_map.RoleMapProvenance) -> list[StatusProblem]:
-    if not isinstance(provenance, (role_map.CachedAfterFetchFailure, role_map.ExplicitStoredRoleMap)):
+    if not isinstance(provenance, role_map.CachedAfterFetchFailure):
         return []
     stamp = provenance.at.astimezone(agent_accounts.user_zone()).strftime("%Y-%m-%d %H:%M %Z")
-    cause = (f"natedev fetch failed: {provenance.failure}" if isinstance(provenance, role_map.CachedAfterFetchFailure)
-             else "stored mode; no fetch was attempted")
+    cause = f"natedev fetch failed: {provenance.failure}"
     return [StatusProblem("role map", "using saved assignments",
         ProblemCause("role", f"map saved at {stamp}; {cause}", CauseFile(str(role_map.role_map_cache_file()))),
-        ProblemStep("restore access to natedev; run accounts.py status again" if isinstance(provenance, role_map.CachedAfterFetchFailure)
-                    else "run accounts.py status to fetch current assignments"))]
+        ProblemStep("restore access to natedev; run accounts.py status again"))]
 
 
 def _observe_map_provenance(provenance: role_map.RoleMapProvenance) -> None:
@@ -5367,7 +5394,7 @@ def main(argv: list[str]) -> int:
             if _label_is(options.label, "codex"):
                 home = codex_setup_home(options.label)
                 if not problems and home.is_dir() and not home.is_symlink():
-                    print(f"CODEX_HOME=~/{home.name} codex login")
+                    print(_codex_login_command(home))
                     print("Keep CODEX_HOME on that command: codex login without it signs ~/.codex out and in; workers always use their mapped account.")
                 return 1 if problems else 0
             destination = account_dir(options.label)
