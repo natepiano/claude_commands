@@ -9,6 +9,7 @@ import unittest
 from typing import override
 
 from scripts.direct import test_verify_mac_offload as offload_tests
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 CHECK_STUB = '''
@@ -134,7 +135,7 @@ class VerifyChecksFailClosedTests(unittest.TestCase):
             ["bash", "-c", command, "test", str(self.invoke)],
             cwd=self.fixture.root, env=self.fixture.environment,
             capture_output=True, text=True, check=False,
-            timeout=offload_tests.HANG_GUARD_S,
+            timeout=TEST_HANG_GUARD_SECS,
         )
 
     def assert_refused(self, result: subprocess.CompletedProcess[str]) -> None:
@@ -262,7 +263,7 @@ class VerifyChecksFailClosedTests(unittest.TestCase):
             ["bash", "-c", command, "test", str(self.invoke)],
             cwd=self.fixture.root, env=self.fixture.environment,
             capture_output=True, text=True, check=False,
-            timeout=offload_tests.HANG_GUARD_S,
+            timeout=TEST_HANG_GUARD_SECS,
         )
         self.assert_refused(result)
         self.assertTrue(refused.exists())

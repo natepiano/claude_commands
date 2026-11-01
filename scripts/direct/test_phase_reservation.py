@@ -16,11 +16,10 @@ from pathlib import Path
 from typing import cast, final, override
 from unittest import mock
 
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.direct import phase_reservation, plan_history  # noqa: E402
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 ACTIVE: dict[str, object] = {"kind": "active", "active_phase_reservation": {
     "reservation_id": "r1", "coordination_run_id": "c1", "phase": "34h", "phase_start_head": "a" * 40}}

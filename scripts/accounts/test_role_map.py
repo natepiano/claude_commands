@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Self, cast, override
 from unittest.mock import Mock, patch
 
+from scripts.lib.signal_test_support import install_signal_pid_guard
 from scripts.accounts.home_test_support import scratch_account_home
 from scripts.accounts import accounts, next_moves, refusal_watch, refusals, role_map
 from scripts.accounts.nix_env_fake import fake_nix_loader, imports_with_nix_loader
@@ -23,6 +24,10 @@ from scripts.agents import codex_mesh
 from scripts.whoami import agent_accounts
 
 send_role_map_command = role_map.ssh_role_map
+
+
+def setUpModule() -> None:
+    install_signal_pid_guard()
 
 
 class RoleMapReadTime(datetime):

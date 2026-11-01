@@ -5,10 +5,10 @@ from pathlib import Path
 import shutil
 import subprocess
 from scripts.direct.test_verify_untested_examples import VERIFY
-from scripts.direct.verify_final_pass_test_support import TEST_HANG_GUARD_SECS
 import unittest
 
 from scripts.direct.verify_final_pass_test_support import FinalPassFixture
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 class FinalPassTests(FinalPassFixture):

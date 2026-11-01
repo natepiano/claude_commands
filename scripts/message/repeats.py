@@ -75,7 +75,7 @@ def replay(rows: Iterable[dict[str, object]], limits: repeat_guard.Limits, *, si
         at = datetime.fromisoformat(at_text).timestamp()
         protected = sender.casefold() == "user" or row.get("human") is True or receiver == "user"
         attempt = repeat_guard.Attempt(sender, receiver, text, str(row.get("machine", "")), at, protected)
-        state = states.setdefault(sender, repeat_guard.SenderState(sender, attempt.host, at, at))
+        state = states.setdefault(sender, repeat_guard.SenderState(sender, attempt.host, at))
         decision = (repeat_guard.transition(state, attempt, limits) if simulate else
                     repeat_guard.Decision(row.get("outcome") == "held"))
         item = totals.setdefault(sender, SenderTotals(first=at_text))

@@ -26,9 +26,7 @@ from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.test_agents_registry import write_registry
-
-# load 136 on natedev, 2026-10-29
-TEST_HANG_GUARD_SECS = 300
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "herdr"))

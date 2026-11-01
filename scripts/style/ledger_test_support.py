@@ -25,10 +25,7 @@ from approved_renames import AppliedCheck
 import style_plan
 import style_rules
 import declarations
-
-
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 # A release checkpoints the current worktree; each fake berth keeps its own board.

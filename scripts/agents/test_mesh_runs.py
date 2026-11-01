@@ -18,6 +18,7 @@ from types import SimpleNamespace
 from typing import NamedTuple, cast, override
 from unittest.mock import MagicMock, patch
 
+from scripts.lib.signal_test_support import install_signal_pid_guard
 from scripts.agents import codex_mesh, mesh_runs
 from scripts.buildlog import treekey
 from scripts.astra import design_roles
@@ -26,6 +27,10 @@ from scripts.lib.socket_test_support import short_socket_directory
 
 WORKER = "unit-impl"
 DEAD_PID = 2 ** 22 + 12345
+
+
+def setUpModule() -> None:
+    install_signal_pid_guard()
 
 
 class DirectorNotice(NamedTuple):
@@ -348,7 +353,7 @@ class MeshRunsTests(unittest.TestCase):
         self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["status"], "running")
 
     def test_start_exits_3_for_a_caller_that_is_not_a_mesh_worker(self) -> None:
-        popen = MagicMock()
+        popen = MagicMock(return_value=SimpleNamespace(pid=4321))
         for environment in ({"CODEX_THREAD_ID": "thread-unknown"}, {"CODEX_THREAD_ID": ""}):
             with patch.dict(os.environ, environment), patch.object(subprocess, "Popen", popen):
                 self.assertEqual(mesh_runs.main(["start", "--", "true"]), mesh_runs.NOT_A_MESH_WORKER)

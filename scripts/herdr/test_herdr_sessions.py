@@ -26,12 +26,10 @@ from sessions import SessionRecord, UnreadableSessionRecord, read_session
 from scripts.production import showrunners
 from scripts.shutdown import launch_permission
 from scripts.accounts import accounts
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff
 from scripts.production.staff_test_support import isolated_staff_file, showrunner_relationship, unit_membership
 
-
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
 
 class SessionListReply(TypedDict):
     ok: bool

@@ -7,6 +7,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import signal
 import shutil
 import subprocess
 import sys
@@ -19,6 +20,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from scripts.astra import design_roles
+from scripts.astra.test_design_roles import damage_binding_repository
 from scripts.astra.design_role_test_support import write_empty_binding_record
 from scripts.direct import workers  # noqa: E402
 
@@ -40,6 +42,8 @@ else:
     from sessions import SessionRecord
 
 from scripts.production.staff_test_support import StaffTestCase
+from scripts.lib import process_group
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.shutdown import stop_resume
 import pane_record
 from scripts.production import staff
@@ -297,6 +301,233 @@ class RetireUnitTests(unittest.TestCase):
     def test_exited_directors_pane_shell_closes_and_retires(self) -> None:
         self.pane_shell_completes(live=False)
 
+    def unmerged_work(self) -> tuple[str, str]:
+        row = next(row for row in staff.find(kind="unit") if row.name == "alpha")
+        _ = (self.worktree / "late.txt").write_text("unmerged work\n")
+        _ = git(self.worktree, "add", "late.txt")
+        _ = git(self.worktree, "commit", "-q", "-m", "checkpoint(alpha): unmerged work")
+        return f"refs/retired/{row.id}", git(self.worktree, "rev-parse", "HEAD")
+
+    def assert_saved_retirement(self, ref: str, tip: str) -> None:
+        self.assertEqual(git(self.checkout, "ls-remote", "origin", ref), f"{tip}\t{ref}")
+        self.assertIn(f", ref {ref}, tip {tip}", self.doc.read_text())
+        self.assertIn(f"session {DIRECTOR}", self.doc.read_text())
+        self.assertFalse(self.worktree.exists())
+        self.assertEqual(git(self.checkout, "branch", "--list", "alpha-branch"), "")
+        self.assertEqual(git(self.checkout, "ls-remote", "--heads", "origin", "alpha-branch"), "")
+
+    def test_retirement_saves_unmerged_work_on_origin_before_removal_and_rerun_is_unchanged(self) -> None:
+        ref, tip = self.unmerged_work()
+        code, output = self.retire()
+        self.assertEqual(code, 0, output)
+        self.assert_saved_retirement(ref, tip)
+        before = (self.doc.read_bytes(), self.doc.stat().st_mtime_ns,
+                  self.staff.staff_file.read_bytes(), git(self.checkout, "rev-parse", "HEAD"))
+        code, output = self.retire()
+        self.assertEqual(code, 0, output)
+        self.assertEqual((self.doc.read_bytes(), self.doc.stat().st_mtime_ns,
+                          self.staff.staff_file.read_bytes(), git(self.checkout, "rev-parse", "HEAD")), before)
+        self.assert_saved_retirement(ref, tip)
+
+    def test_failed_saved_ref_push_keeps_the_note_branch_and_worktree(self) -> None:
+        ref, tip = self.unmerged_work()
+        before = self.doc.read_bytes()
+        hook = self.root / "origin.git/hooks/pre-receive"
+        _ = hook.write_text("#!/bin/sh\nexit 1\n")
+        hook.chmod(0o755)
+        code, output = self.retire()
+        self.assertEqual(code, 1, output)
+        self.assertEqual(self.doc.read_bytes(), before)
+        self.assertEqual(git(self.worktree, "rev-parse", "HEAD"), tip)
+        self.assertEqual(git(self.checkout, "ls-remote", "origin", ref), "")
+        self.assertEqual(self.calls, [])
+
+    def commit_later_work(self, checkout: Path) -> str:
+        _ = (checkout / "later.txt").write_text("work committed after preservation\n")
+        _ = git(checkout, "add", "later.txt")
+        _ = git(checkout, "commit", "-q", "-m", "checkpoint(alpha): later work")
+        return git(checkout, "rev-parse", "HEAD")
+
+    def clone_writer(self) -> Path:
+        writer = self.root / "late-writer"
+        _ = git(self.checkout, "clone", "-q", "--branch", "alpha-branch", str(self.root / "origin.git"), str(writer))
+        _ = git(writer, "config", "user.email", "test@example.invalid")
+        _ = git(writer, "config", "user.name", "test")
+        _ = git(writer, "config", "commit.gpgsign", "false")
+        return writer
+
+    def interrupt_before_removal(self) -> None:
+        with mock.patch.object(retire_unit, "remove", side_effect=OSError("stop before removal")):
+            code, output = self.retire()
+        self.assertEqual(code, 1, output)
+        self.assertIn("stop before removal", output)
+        self.assertTrue(self.worktree.is_dir())
+        self.assertIn("retired", self.doc.read_text())
+
+    def test_retirement_preserves_work_committed_during_shutdown(self) -> None:
+        ref, first_tip = self.unmerged_work()
+        later_tip = ""
+        def stop(identity: str) -> stop_resume.Stopped | stop_resume.NotRunning:
+            nonlocal later_tip
+            if not later_tip:
+                self.assertEqual(git(self.checkout, "ls-remote", "origin", ref), f"{first_tip}\t{ref}")
+                later_tip = self.commit_later_work(self.worktree)
+            return self.stop_session(identity)
+        with mock.patch.object(stop_resume, "stop", side_effect=stop):
+            code, output = self.retire()
+        self.assertEqual(code, 0, output)
+        self.assertNotEqual(later_tip, first_tip)
+        self.assert_saved_retirement(ref, later_tip)
+        self.assertEqual(git(self.checkout, "show", f"{later_tip}:later.txt"), "work committed after preservation")
+
+    def test_retirement_refreshes_saved_work_after_the_note_before_removal(self) -> None:
+        ref, first_tip = self.unmerged_work()
+        mark = retire_unit.mark_retired
+        later_tip = ""
+        def marked(unit: retire_unit.Unit, director: retire_unit.DirectorSession | retire_unit.NoDirectorSession,
+                   saved: retire_unit.SavedBranch | retire_unit.NoSavedBranch = retire_unit.NO_SAVED_BRANCH) -> None:
+            nonlocal later_tip
+            mark(unit, director, saved)
+            if not later_tip:
+                later_tip = self.commit_later_work(self.worktree)
+        with mock.patch.object(retire_unit, "mark_retired", side_effect=marked):
+            code, output = self.retire()
+        self.assertEqual(code, 0, output)
+        self.assertNotEqual(later_tip, first_tip)
+        self.assert_saved_retirement(ref, later_tip)
+
+    def test_retirement_retry_preserves_a_new_local_descendant(self) -> None:
+        ref, first_tip = self.unmerged_work()
+        self.interrupt_before_removal()
+        later_tip = self.commit_later_work(self.worktree)
+        code, output = self.retire()
+        self.assertEqual(code, 0, output)
+        self.assertNotEqual(later_tip, first_tip)
+        self.assert_saved_retirement(ref, later_tip)
+
+    def test_retirement_retry_preserves_a_new_origin_descendant(self) -> None:
+        ref, first_tip = self.unmerged_work()
+        _ = git(self.worktree, "push", "-q", "origin", "alpha-branch")
+        self.interrupt_before_removal()
+        writer = self.clone_writer()
+        later_tip = self.commit_later_work(writer)
+        _ = git(writer, "push", "-q", "origin", "alpha-branch")
+        code, output = self.retire()
+        self.assertEqual(code, 0, output)
+        self.assertNotEqual(later_tip, first_tip)
+        self.assert_saved_retirement(ref, later_tip)
+
+    def test_retirement_retry_keeps_a_divergent_branch_and_the_saved_tip(self) -> None:
+        ref, first_tip = self.unmerged_work()
+        self.interrupt_before_removal()
+        _ = git(self.worktree, "checkout", "-q", "-B", "alpha-branch", f"{first_tip}^")
+        divergent_tip = self.commit_later_work(self.worktree)
+        before = self.doc.read_bytes()
+        code, output = self.retire()
+        self.assertEqual(code, 1, output)
+        self.assertIn("diverg", output)
+        self.assertEqual(self.doc.read_bytes(), before)
+        self.assertEqual(git(self.worktree, "rev-parse", "HEAD"), divergent_tip)
+        self.assertEqual(git(self.checkout, "ls-remote", "origin", ref), f"{first_tip}\t{ref}")
+
+    def test_unconfirmed_saved_ref_keeps_the_note_branch_and_worktree(self) -> None:
+        ref, tip = self.unmerged_work()
+        before = self.doc.read_bytes()
+        def unconfirmed(argv: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+            result = self.fake_run(argv, cwd)
+            if "ls-remote" in argv and ref in argv and result.returncode == 0:
+                return subprocess.CompletedProcess(argv, 0, "", "")
+            return result
+        with mock.patch.object(retire_unit, "run", side_effect=unconfirmed):
+            code, output = self.retire()
+        self.assertEqual(code, 1, output)
+        self.assertEqual(self.doc.read_bytes(), before)
+        self.assertEqual(git(self.worktree, "rev-parse", "HEAD"), tip)
+        self.assertEqual(git(self.checkout, "ls-remote", "origin", ref), f"{tip}\t{ref}")
+        self.assertEqual(self.calls, [])
+
+    def test_retire_recovers_a_saved_ref_when_stopped_before_the_note(self) -> None:
+        ref, tip = self.unmerged_work()
+        before = self.doc.read_bytes()
+        with mock.patch.object(retire_unit, "mark_retired", side_effect=OSError("stop before note")):
+            code, output = self.retire()
+        self.assertEqual(code, 1, output)
+        self.assertEqual(self.doc.read_bytes(), before)
+        self.assertEqual(git(self.worktree, "rev-parse", "HEAD"), tip)
+        self.assertEqual(git(self.checkout, "ls-remote", "origin", ref), f"{tip}\t{ref}")
+        code, output = self.retire()
+        self.assertEqual(code, 0, output)
+        self.assert_saved_retirement(ref, tip)
+
+    def test_a_finished_berth_reservation_is_released_on_replay(self) -> None:
+        unit = retire_unit.find_unit("alpha", "alpha")
+        found = retire_unit.Found((), (), (), ("reservation-1",), (), ())
+        for stdout, stderr in (("already has a final disposition", ""),
+                               ("", "already has a final disposition")):
+            with self.subTest(stdout=stdout, stderr=stderr):
+                with mock.patch.object(retire_unit, "run", return_value=subprocess.CompletedProcess(
+                        ["cargo-berth"], 5, stdout, stderr)):
+                    self.assertEqual(retire_unit.stop_rest(unit, found), [])
+        with mock.patch.object(retire_unit, "run", return_value=subprocess.CompletedProcess(
+                ["cargo-berth"], 5, "", "reservation could not be released")):
+            self.assertTrue(any("reservation-1" in line for line in retire_unit.stop_rest(unit, found)))
+
+    def test_final_stop_check_excludes_only_the_units_exact_pane_shell(self) -> None:
+        self.claude = []
+        pane = PaneShellFixture(self, self.worktree, self.root / "pane-proc", live=False, slug="alpha")
+        pane.stopped()
+        unit = retire_unit.find_unit("alpha", "alpha")
+        self.assertEqual(retire_unit.final_stop_check(unit, frozenset()), [])
+        pane.add_occupant(991551, unit="beta-unit")
+        left = retire_unit.final_stop_check(unit, frozenset())
+        self.assertTrue(any("991551" in line for line in left), left)
+        self.assertFalse(any(f"process {pane.shell}," in line for line in left), left)
+
+    def orphan_child(self, session_id: str) -> subprocess.Popen[bytes]:
+        child = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()"],
+                                 stdin=subprocess.PIPE, cwd=self.worktree, start_new_session=True,
+                                 env={**os.environ, "CLAUDE_CODE_SESSION_ID": session_id})
+        def cleanup() -> None:
+            if child.stdin is not None:
+                child.stdin.close()
+            _ = child.wait(timeout=TEST_HANG_GUARD_SECS)
+        self.addCleanup(cleanup)
+        return child
+
+    def test_dead_sessions_orphan_group_is_signalled_after_identity_checks(self) -> None:
+        child = self.orphan_child(DIRECTOR)
+        self.claude = []
+        unit = retire_unit.find_unit("alpha", "alpha")
+        with (mock.patch.object(process_group, "send_process_group") as send,
+              mock.patch.object(retire_unit, "_alive", return_value=False)):
+            self.assertEqual(retire_unit.stop_orphan(unit, child.pid, DIRECTOR), [])
+        send.assert_called_once_with(child.pid, signal.SIGTERM)
+        self.assertIsNone(child.poll(), "the test patches the signal; the child still runs")
+
+    def test_unowned_or_live_sessions_process_is_named_and_never_signalled(self) -> None:
+        unit = retire_unit.find_unit("alpha", "alpha")
+        for session_id, live_owner in ((SEAT, False), (DIRECTOR, True)):
+            with self.subTest(session_id=session_id, live_owner=live_owner):
+                child = self.orphan_child(session_id)
+                self.claude = [session(DIRECTOR, "alpha", 4101)] if live_owner else []
+                with mock.patch.object(process_group, "send_process_group") as send:
+                    left = retire_unit.stop_orphan(unit, child.pid, DIRECTOR)
+                send.assert_not_called()
+                self.assertEqual(len(left), 1, left)
+                for detail in (f"unowned process {child.pid}, parent ", "command ", "start ", str(self.worktree)):
+                    self.assertIn(detail, left[0])
+
+    def test_orphan_start_time_change_before_signal_refuses_without_sending(self) -> None:
+        child = self.orphan_child(DIRECTOR)
+        self.claude = []
+        unit = retire_unit.find_unit("alpha", "alpha")
+        birth = retire_unit.proc_start(child.pid)
+        with (mock.patch.object(retire_unit, "proc_start", side_effect=[birth, birth, birth, "reused"]),
+              mock.patch.object(process_group, "send_process_group") as send):
+            left = retire_unit.stop_orphan(unit, child.pid, DIRECTOR)
+        send.assert_not_called()
+        self.assertTrue(any("identity changed before signal" in line for line in left), left)
+
     def test_unowned_cwd_visitor_or_other_units_shell_blocks_without_signals(self) -> None:
         for marked_pane in (False,True):
             for visitor_unit in ("", "beta-unit"):
@@ -351,7 +582,6 @@ class RetireUnitTests(unittest.TestCase):
 
         self.assertEqual(code, 1)
         self.assertIn(f"refused: uncommitted work in {self.worktree}: draft.txt", output)
-        self.assertIn("refused: alpha-branch has a checkpoint not merged: checkpoint(alpha): the late work", output)
         self.assertEqual(self.calls, [])
         self.assertTrue(self.worktree.is_dir())
         self.assertEqual(self.doc.read_text(encoding="utf-8"), before)
@@ -370,6 +600,139 @@ class RetireUnitTests(unittest.TestCase):
         code, output = self.retire("--dry-run")
         self.assertEqual(code, 1)
         self.assertIn(f"refused: uncommitted work in {self.worktree}: work.txt", output)
+
+    def test_dry_run_names_the_unmerged_tip_before_removal_without_saving_it(self) -> None:
+        ref, tip = self.unmerged_work()
+        before = (self.doc.read_bytes(), self.doc.stat().st_mtime_ns,
+                  git(self.checkout, "for-each-ref"), self.staff.staff_file.read_bytes())
+        fetch_head = self.checkout / ".git/FETCH_HEAD"
+        before_fetch = fetch_head.read_bytes() if fetch_head.exists() else b""
+
+        code, output = self.retire("--dry-run")
+
+        self.assertEqual(code, 0, output)
+        lines = output.splitlines()
+        save = f"would save: {tip} to origin {ref}"
+        self.assertIn(save, lines)
+        self.assertLess(lines.index(save), lines.index(f"would remove: worktree {self.worktree}"))
+        self.assertLess(lines.index(save), lines.index("would delete: branch alpha-branch here and on origin"))
+        self.assertEqual(git(self.checkout, "ls-remote", "origin", ref), "")
+        self.assertEqual(git(self.worktree, "rev-parse", "HEAD"), tip)
+        self.assertEqual((self.doc.read_bytes(), self.doc.stat().st_mtime_ns,
+                          git(self.checkout, "for-each-ref"), self.staff.staff_file.read_bytes()), before)
+        self.assertEqual(fetch_head.read_bytes() if fetch_head.exists() else b"", before_fetch)
+        self.assertEqual(self.stops(), [])
+
+    def test_dry_run_retired_note_includes_the_ref_and_full_tip(self) -> None:
+        ref, tip = self.unmerged_work()
+
+        code, output = self.retire("--dry-run")
+
+        self.assertEqual(code, 0, output)
+        mark = [line for line in output.splitlines() if line.startswith("would mark:")]
+        self.assertEqual(len(mark), 1, output)
+        self.assertIn(f", ref {ref}, tip {tip}", mark[0])
+        self.assertIn(f"session {DIRECTOR}", mark[0])
+
+    def test_dry_run_saves_an_unfetched_origin_tip_without_changing_local_state(self) -> None:
+        row = next(row for row in staff.find(kind="unit") if row.name == "alpha")
+        ref = f"refs/retired/{row.id}"
+        _ = git(self.checkout, "fetch", "-q", "origin")
+        writer = self.clone_writer()
+        tip = self.commit_later_work(writer)
+        _ = git(writer, "push", "-q", "origin", "alpha-branch")
+        unseen = subprocess.run(["git", "-C", str(self.checkout), "cat-file", "-e", tip],
+                                capture_output=True)
+        self.assertNotEqual(unseen.returncode, 0)
+        fetch_head = self.checkout / ".git/FETCH_HEAD"
+        before = (git(self.checkout, "for-each-ref"), fetch_head.read_bytes(),
+                  fetch_head.stat().st_mtime_ns, self.doc.read_bytes(), self.doc.stat().st_mtime_ns,
+                  self.staff.staff_file.read_bytes(), self.staff.staff_file.stat().st_mtime_ns,
+                  git(self.worktree, "rev-parse", "HEAD"))
+
+        code, output = self.retire("--dry-run")
+
+        self.assertEqual(code, 0, output)
+        lines = output.splitlines()
+        save = f"would save: {tip} to origin {ref}"
+        self.assertIn(save, lines)
+        self.assertLess(lines.index(save), lines.index(f"would remove: worktree {self.worktree}"))
+        self.assertIn(f", ref {ref}, tip {tip}", output)
+        self.assertEqual((git(self.checkout, "for-each-ref"), fetch_head.read_bytes(),
+                          fetch_head.stat().st_mtime_ns, self.doc.read_bytes(), self.doc.stat().st_mtime_ns,
+                          self.staff.staff_file.read_bytes(), self.staff.staff_file.stat().st_mtime_ns,
+                          git(self.worktree, "rev-parse", "HEAD")), before)
+        self.assertEqual(git(self.checkout, "ls-remote", "origin", ref), "")
+        self.assertEqual(self.stops(), [])
+
+    def test_dry_run_and_retire_refuse_an_unfetched_divergent_retired_tip(self) -> None:
+        ref, tip = self.unmerged_work()
+        _ = git(self.checkout, "fetch", "-q", "origin")
+        writer = self.clone_writer()
+        divergent_tip = self.commit_later_work(writer)
+        _ = git(writer, "push", "-q", "origin", f"{divergent_tip}:{ref}")
+        unseen = subprocess.run(["git", "-C", str(self.checkout), "cat-file", "-e", divergent_tip],
+                                capture_output=True)
+        self.assertNotEqual(unseen.returncode, 0)
+        fetch_head = self.checkout / ".git/FETCH_HEAD"
+        before = (git(self.checkout, "for-each-ref"), fetch_head.read_bytes(),
+                  fetch_head.stat().st_mtime_ns, self.doc.read_bytes(), self.doc.stat().st_mtime_ns,
+                  self.staff.staff_file.read_bytes(), self.staff.staff_file.stat().st_mtime_ns)
+
+        dry_code, dry_output = self.retire("--dry-run")
+
+        self.assertEqual(dry_code, 1, dry_output)
+        refusal = "refused: alpha-branch: branch and retired ref diverge; keep both before retiring"
+        self.assertIn(refusal, dry_output.splitlines())
+        self.assertEqual((git(self.checkout, "for-each-ref"), fetch_head.read_bytes(),
+                          fetch_head.stat().st_mtime_ns, self.doc.read_bytes(), self.doc.stat().st_mtime_ns,
+                          self.staff.staff_file.read_bytes(), self.staff.staff_file.stat().st_mtime_ns), before)
+        real_code, real_output = self.retire()
+        self.assertEqual(real_code, 1, real_output)
+        self.assertIn(refusal, real_output.splitlines())
+        self.assertEqual(self.doc.read_bytes(), before[3])
+        self.assertEqual(git(self.worktree, "rev-parse", "HEAD"), tip)
+        self.assertEqual(git(self.checkout, "ls-remote", "origin", ref), f"{divergent_tip}\t{ref}")
+        self.assertEqual(self.stops(), [])
+
+    def test_dry_run_refuses_a_divergent_retired_ref_like_a_real_retirement(self) -> None:
+        ref, tip = self.unmerged_work()
+        _ = git(self.worktree, "checkout", "-q", "-B", "alpha-branch", f"{tip}^")
+        divergent_tip = self.commit_later_work(self.worktree)
+        _ = git(self.worktree, "push", "-q", "origin", f"{divergent_tip}:{ref}")
+        _ = git(self.worktree, "checkout", "-q", "-B", "alpha-branch", tip)
+        before = self.doc.read_bytes()
+
+        dry_code, dry_output = self.retire("--dry-run")
+        real_code, real_output = self.retire()
+
+        self.assertEqual(dry_code, 1, dry_output)
+        self.assertEqual(real_code, 1, real_output)
+        refusal = "refused: alpha-branch: branch and retired ref diverge; keep both before retiring"
+        self.assertIn(refusal, dry_output.splitlines())
+        self.assertIn(refusal, real_output.splitlines())
+        self.assertEqual(self.doc.read_bytes(), before)
+        self.assertEqual(git(self.worktree, "rev-parse", "HEAD"), tip)
+        self.assertEqual(git(self.checkout, "ls-remote", "origin", ref), f"{divergent_tip}\t{ref}")
+        self.assertEqual(self.stops(), [])
+
+    def test_dry_run_of_merged_work_has_no_save_or_saved_ref_note(self) -> None:
+        before = self.doc.read_bytes()
+        tip = git(self.worktree, "rev-parse", "HEAD")
+
+        code, output = self.retire("--dry-run")
+
+        self.assertEqual(code, 0, output)
+        self.assertFalse(any(line.startswith("would save:") for line in output.splitlines()), output)
+        mark = [line for line in output.splitlines() if line.startswith("would mark:")]
+        self.assertEqual(len(mark), 1, output)
+        self.assertNotIn(", ref ", mark[0])
+        self.assertNotIn(", tip ", mark[0])
+        self.assertIn(f"would remove: worktree {self.worktree}", output.splitlines())
+        self.assertIn("would delete: branch alpha-branch here and on origin", output.splitlines())
+        self.assertEqual(self.doc.read_bytes(), before)
+        self.assertEqual(git(self.worktree, "rev-parse", "HEAD"), tip)
+        self.assertEqual(self.stops(), [])
 
     def test_dry_run_lists_the_seat_the_worker_and_the_reviewer_and_changes_nothing(self) -> None:
         before = self.doc.read_text(encoding="utf-8")
@@ -498,6 +861,26 @@ class RetireUnitTests(unittest.TestCase):
         self.assertTrue(self.worktree.is_dir())
         self.assertEqual(git(self.checkout, "branch", "--list", "--format=%(refname:short)", "alpha-branch"), "alpha-branch")
 
+    def test_a_damaged_role_held_by_the_unit_refuses_retirement_by_record_and_field(self) -> None:
+        design = design_roles.HeldDesign(
+            design_roles.DesignPlacement("00000000-0000-4000-8000-000000000071", "natedev", 1),
+            "fixture-repo", str(self.worktree), str(self.worktree / "work.txt"), "design",
+            "2026-10-31T12:00:00+00:00", design_roles.UnitHolder("alpha", "alpha-unit"),
+            design_roles.DesignBoundToPhase(str(self.run_folder), "1", str(self.worktree), ("work.txt",)),
+            (design_roles.RoleInstance("designer", "alpha-designer", design_roles.RoleNotOpened()),
+             design_roles.RoleInstance("reviewer", "alpha-reviewer", design_roles.RoleNotOpened())))
+        design_roles._save(design)  # pyright: ignore[reportPrivateUsage]
+        path = damage_binding_repository(design)
+        before = self.doc.read_bytes(), path.read_bytes()
+
+        code, output = self.retire()
+
+        self.assertEqual(code, 1, output)
+        self.assertIn(f"held role cleanup: {path}: missing or invalid repository", output)
+        self.assertEqual((self.doc.read_bytes(), path.read_bytes()), before)
+        self.assertTrue(self.worktree.is_dir())
+        self.assertEqual(git(self.checkout, "branch", "--list", "--format=%(refname:short)", "alpha-branch"),
+                         "alpha-branch")
     def test_bad_unrelated_role_record_warns_once_and_does_not_stop_retirement(self) -> None:
         bad = write_empty_binding_record(self.checkout, design_roles.UnitHolder('other', 'other-unit'),
                                          lifecycle=design_roles.RoleOpen('unrelated-thread'))

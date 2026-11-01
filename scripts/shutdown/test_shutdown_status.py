@@ -40,8 +40,6 @@ def action_line(label: str, verb: str, names: str, machine: str = "natedev") -> 
         f"~/.claude/scripts/shutdown/shutdown.py {verb} {LOGIN} --here --only {identities} · {names}")
 
 
-
-
 def empty_inventory(machine: str = "natedev") -> Inventory:
     return {
         "machine": machine,
@@ -52,9 +50,8 @@ def empty_inventory(machine: str = "natedev") -> Inventory:
     }
 
 
-def empty_recovery_inventory() -> shutdown.RecoveryStatusInventory:
-    return shutdown.RecoveryStatusInventory(**empty_inventory(), recovery=[],
-        snapshot=shutdown.NoSnapshotOutcomeRecorded(kind="no outcome recorded"))
+def empty_recovery_inventory() -> inventory.Inventory:
+    return empty_inventory()
 
 
 def complete_session(*, host: object) -> dict[str, object]:
@@ -566,28 +563,6 @@ else:
                 self.assertNotIn('--session old-destination', output.getvalue())
         self.assertEqual(record_store.find_session(LOGIN, saved['session']['session_id']), saved)
 
-    def test_unresolved_legacy_claude_and_codex_snapshots_list_without_manual_commands(self) -> None:
-        owner = cast(inventory.TopLevelSession, cast(object, {
-            **session_shutdown(name="snapshot claude")["session"], "kind": "top-level",
-            "host": inventory.LegacyTmuxHost(kind="legacy tmux", session_name="old-claude")}))
-        claude = record_store.SnapshotClaudeSession(agent="claude", session=owner, workers=[], timers=[],
-            last_seen="2026-10-09T21:49:10+00:00", state="unresolved")
-        codex_owner = cast(inventory.TopLevelSession, cast(object, {
-            **owner, "name": "snapshot codex", "session_id": "codex-id",
-            "host": inventory.LegacyTmuxHost(kind="legacy tmux", session_name="old-codex")}))
-        codex = record_store.SnapshotCodexSession(agent="codex", session=codex_owner, workers=[], timers=[],
-            last_seen=claude["last_seen"], state="unresolved", codex=inventory.CodexLaunch(
-                home=str(self.root / "recorded-codex"), resume=inventory.CodexSessionId(kind="session id", session_id="recorded-id")))
-        snapshot = record_store.RecoverySnapshot(machine="natedev", login=LOGIN, label="claude2",
-            taken_at=claude["last_seen"], sessions=[claude, codex])
-        record_store.write_snapshot(snapshot)
-        with patch.object(shutdown, "inventory", return_value=empty_inventory()), redirect_stdout(io.StringIO()) as output:
-            self.assertEqual(shutdown.main(["status", LOGIN, "--here"]), 0)
-        self.assertIn("snapshot claude: unresolved", output.getvalue())
-        self.assertIn("snapshot codex: unresolved", output.getvalue())
-        self.assertNotIn("manual restart", output.getvalue())
-        self.assertEqual(record_store.read_snapshot(LOGIN), snapshot)
-        self.assertEqual(record_store.session_records(LOGIN), [])
 
     def test_legacy_live_inventory_uses_the_same_fresh_manual_resume_command(self) -> None:
         owner = cast(inventory.TopLevelSession, cast(object, {
@@ -890,8 +865,6 @@ else:
         self.assertNotIn(action_line('bring back', 'restart', 'Owner') + '\n', output.getvalue())
 
 
-
-
     def test_status_stopped_and_failed_owners_offer_only_applicable_actions(self) -> None:
         stopped, failed, stopping = [session_shutdown(name=name) for name in ('Stopped', 'Failed', 'Stopping')]
         stopped['progress'] = {'kind': 'stopped', 'at': stopped['requested_at']}
@@ -903,8 +876,6 @@ else:
         with patch.object(shutdown, 'inventory', return_value=empty_inventory()), redirect_stdout(output):
             self.assertEqual(shutdown.main(['status', LOGIN, '--here']), 0)
         self.assertEqual([line for line in output.getvalue().splitlines() if any((label in line for label in ('  take out:', '  stop now:', '  bring back:')))], [action_line('bring back', 'restart', 'Failed, Stopped')])
-
-
 
 
     def test_status_whole_machine_blocks_group_actions_and_report_conductor_once(self) -> None:
@@ -933,9 +904,8 @@ else:
             self.assertEqual(shutdown.main(['status', LOGIN]), 0)
         expected = [LOGIN + ' · ' + LOGIN]
         for machine in ('natedev', 'Mac'):
-            expected.extend([machine + ':', '  no sessions on claude2', '  bevy: stopped', *(['    14:49:10 stopped'] if machine == 'natedev' else []), '  failed: stop failed — still live', *(['    14:49:10 stop failed still live'] if machine == 'natedev' else []), '  hana: waiting', *(['    14:49:10 waiting'] if machine == 'natedev' else []), '  nixos: waiting', *(['    14:49:10 waiting'] if machine == 'natedev' else []), action_line('bring back', 'restart', 'bevy, failed', machine), *(['  recovery snapshot: no successful snapshot recorded'] if machine == 'natedev' else [])])
+            expected.extend([machine + ':', '  no sessions on claude2', '  bevy: stopped', *(['    14:49:10 stopped'] if machine == 'natedev' else []), '  failed: stop failed — still live', *(['    14:49:10 stop failed still live'] if machine == 'natedev' else []), '  hana: waiting', *(['    14:49:10 waiting'] if machine == 'natedev' else []), '  nixos: waiting', *(['    14:49:10 waiting'] if machine == 'natedev' else []), action_line('bring back', 'restart', 'bevy, failed', machine)])
         self.assertEqual(output.getvalue().splitlines(), expected)
-
 
 
 if __name__ == "__main__":

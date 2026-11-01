@@ -25,6 +25,7 @@ from typing import Literal, cast
 SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS / "production"))
 sys.path.insert(0, str(SCRIPTS / "lib"))
+import process_group
 
 from add_style import NoStyleProduction, standing_style_production
 from production_units import Refusal
@@ -223,17 +224,17 @@ def lint_run_running(directory: Path, owner_record: OwnerRecord) -> bool:
     group = int(verifier_file.read_text())
     if group <= 0:
         raise ValueError(f"{VERIFIER_FILE} names no process group")
-    return probe(os.killpg, group)
+    return probe(process_group.send_process_group, group)
 
 
 def stop_lint_child(child: subprocess.Popen[str]) -> None:
     """Stop verify.sh and every process it started, so no cargo build writes into a removed checkout."""
     with suppress(ProcessLookupError):
-        os.killpg(child.pid, signal.SIGTERM)
+        process_group.send_process_group(child.pid, signal.SIGTERM)
     with suppress(subprocess.TimeoutExpired):
         _ = child.wait(CHILD_STOP_SECONDS)
     with suppress(ProcessLookupError):
-        os.killpg(child.pid, signal.SIGKILL)
+        process_group.send_process_group(child.pid, signal.SIGKILL)
     _ = child.wait()
 
 

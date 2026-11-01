@@ -22,9 +22,6 @@ from types import SimpleNamespace
 from typing import BinaryIO, cast, final, override
 from unittest.mock import Mock, call, patch
 
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
-
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -32,7 +29,9 @@ import herdr
 import fake_herdr
 import trust_survey
 from fake_herdr import CommandResponse
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff
+from scripts.message.sessions_test_support import copy_session_modules
 from scripts.production.staff_test_support import isolated_staff_file, unit_membership
 
 GIT_BINARY = shutil.which("git") or "git"
@@ -1384,8 +1383,7 @@ class HerdrTests(unittest.TestCase):
         _ = shutil.copy2(Path(herdr.__file__).with_name("place.py"), isolated / "place.py")
         _ = shutil.copy2(Path(herdr.__file__).with_name("pane_launch.py"), isolated / "pane_launch.py")
         message = isolated.parent / "message"
-        message.mkdir()
-        _ = shutil.copy2(Path(herdr.__file__).resolve().parents[1] / "message/sessions.py", message / "sessions.py")
+        copy_session_modules(message)
         library = isolated.parent / "lib"
         library.mkdir()
         _ = shutil.copy2(Path(herdr.__file__).resolve().parents[1] / "lib/nix_env.py", library / "nix_env.py")

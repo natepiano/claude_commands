@@ -7,6 +7,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from scripts.lib.signal_test_support import install_signal_pid_guard
 from scripts.whoami.note_file import note_name
 
 import io
@@ -45,9 +46,7 @@ from scripts.whoami import agent_accounts
 from scripts.whoami import usage_store
 import quota_alert
 from scripts.whoami import run_out
-
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 send_role_map_command = role_map.ssh_role_map
 
@@ -67,6 +66,7 @@ def named_environment(config_dir: Path) -> dict[str, str]:
 
 
 def setUpModule() -> None:
+    install_signal_pid_guard()
     _ = cast(object, unittest.enterModuleContext(patch.object(accounts, "import_module", side_effect=imports_with_nix_loader(fake_nix_loader()))))
     root = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory())).resolve()
     _ = unittest.enterModuleContext(patch.object(accounts, "WORKERS_RUN_ROOTS", (root / "worker-runs",)))
