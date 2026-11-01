@@ -19,6 +19,7 @@ import json
 import math
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -35,6 +36,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "shutdown"))
 
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.process_failure import failure_detail
+from scripts.lib.process_group import send_process_group
 
 import production_units
 from scripts.production import showrunners
@@ -223,16 +226,58 @@ class PendingTool(NamedTuple):
     started: float
 
 
-def command_output(command: list[str]) -> str:
-    result = subprocess.run(command, capture_output=True, text=True, check=False)
+class ProcessRows(list[Process]):
+    """A successful process snapshot, including a proven empty snapshot."""
+
+
+class ProcessSnapshotFailure(NamedTuple):
+    reason: str
+
+
+class CommandFailure(NamedTuple):
+    reason: str
+
+
+def finish_process(process: subprocess.Popen[str], work_deadline: float,
+                   cleanup_deadline: float) -> subprocess.CompletedProcess[str] | CommandFailure:
+    """Bound both pipe reads and reaping; kill only the group this watcher started."""
+    try:
+        out, err = process.communicate(timeout=max(0, work_deadline - time.monotonic()))
+        return subprocess.CompletedProcess(process.args, process.returncode, out, err)
+    except subprocess.TimeoutExpired:
+        try:
+            send_process_group(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            _ = process.communicate(timeout=max(0, cleanup_deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            # An inherited pipe must never turn cleanup into an unbounded read.
+            for pipe in (process.stdout, process.stderr):
+                if pipe is not None:
+                    pipe.close()
+            try:
+                _ = process.wait(timeout=max(0, cleanup_deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                pass
+        return CommandFailure("timeout")
+
+
+def processes(*, deadline: float, limits: SenderLimits | None = None) -> ProcessRows | ProcessSnapshotFailure:
+    """Unknown liveness is a failure, never an empty process table."""
+    try:
+        cleanup = (sender_configuration().limits if limits is None else limits).cleanup_seconds
+        process = subprocess.Popen([PS, "-eo", "pid=,ppid=,args="], stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, text=True, start_new_session=True)
+        result = finish_process(process, deadline - cleanup, deadline)
+    except (OSError, ValueError) as error:
+        return ProcessSnapshotFailure(str(error))
+    if isinstance(result, CommandFailure):
+        return ProcessSnapshotFailure(result.reason)
     if result.returncode != 0:
-        raise OSError(f"{' '.join(command)} exited {result.returncode}: {result.stderr.strip()}")
-    return result.stdout.strip()
-
-
-def processes() -> list[Process]:
-    rows: list[Process] = []
-    for line in command_output([PS, "-eo", "pid=,ppid=,args="]).splitlines():
+        return ProcessSnapshotFailure(f"ps exited {result.returncode}: {failure_detail(result)}")
+    rows = ProcessRows()
+    for line in result.stdout.splitlines():
         match = re.match(r"\s*(\d+)\s+(\d+)\s+(.*)", line)
         if match:
             rows.append(Process(int(match.group(1)), int(match.group(2)), match.group(3)))
@@ -484,13 +529,24 @@ def prompt_key(slug: str, unit: str) -> str:
     return f"stall-watch:prompt:{slug}:{unit}"
 
 
-def watch_config(*, status_defaults: bool = False) -> dict[str, str]:
+def watch_config(*, status_defaults: bool = False, packaged_only: bool = False) -> dict[str, str]:
     """Read person-edited settings at use, without an import-time cache."""
     defaults = Path(__file__).resolve().parents[2] / "config/stall_watch.conf"
-    path = Path(os.environ.get("STALL_WATCH_CONFIG") or defaults)
+    path = defaults if packaged_only else Path(os.environ.get("STALL_WATCH_CONFIG") or defaults)
     paths = (defaults, path) if status_defaults and path != defaults else (path,)
-    return dict(line.split("=", 1) for source in paths for line in source.read_text(encoding="utf-8").splitlines()
-                if line.strip() and not line.lstrip().startswith("#") and "=" in line)
+    fields: dict[str, str] = {}
+    for source in paths:
+        try:
+            content = source.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            if status_defaults and source != defaults:
+                continue
+            raise
+        for line in content.splitlines():
+            if line.strip() and not line.lstrip().startswith("#") and "=" in line:
+                key, value = line.split("=", 1)
+                fields[key] = value
+    return fields
 
 
 def status_defers_bump(status: str, peers: Iterable[str]) -> bool:
@@ -531,6 +587,38 @@ def delivery_reserve_seconds() -> float:
     except (OSError, KeyError, ValueError) as error:
         print(f"stall-watch: invalid delivery reserve: {error}; using zero reserve", file=sys.stderr)
         return 0.0
+
+
+class SenderLimits(NamedTuple):
+    batch_seconds: float
+    cleanup_seconds: float
+
+
+class SenderConfiguration(NamedTuple):
+    limits: SenderLimits
+    exit_code: int
+
+
+def sender_limits(fields: dict[str, str]) -> SenderLimits:
+    values: list[float] = []
+    for key in ("sender_batch_seconds", "sender_cleanup_seconds"):
+        try:
+            value = float(fields[key])
+        except (KeyError, ValueError) as error:
+            raise ValueError(f"invalid {key}: expected a finite positive number") from error
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(f"invalid {key}: expected a finite positive number")
+        values.append(value)
+    return SenderLimits(*values)
+
+
+def sender_configuration() -> SenderConfiguration:
+    """A bad override must not suppress pending work; retain failure in the pass result."""
+    try:
+        return SenderConfiguration(sender_limits(watch_config(status_defaults=True)), 0)
+    except (OSError, ValueError) as error:
+        print(f"stall-watch: sender config: {error}; using packaged defaults", file=sys.stderr)
+        return SenderConfiguration(sender_limits(watch_config(packaged_only=True)), 1)
 
 
 def inspection_order(work: list[PaneInspection]) -> list[PaneInspection]:
@@ -987,30 +1075,31 @@ def delivery(path: Path, kind: str, socket: str, key: str, text: str) -> Deliver
                                  "--key", key, "--text", text])
 
 
-def send_all(pending: list[Delivery], now: float, *, deadline: float = math.inf) -> None:
-    """Start every relay and alert retire, then give the entire batch one 90-second deadline.
+def send_all(pending: list[Delivery], now: float, *, deadline: float = math.inf,
+             limits: SenderLimits | None = None) -> None:
+    """Start every relay and alert retire in its own group, with bounded batch and cleanup waits.
 
     After the batch, each prompt alert that went out opens its rca.py case. A retire that fails keeps
     its prompt state, so the next tick tries it again and sends no new alert.
     """
+    if limits is None:
+        limits = sender_configuration().limits
+    batch_deadline = min(time.monotonic() + limits.batch_seconds, deadline - limits.cleanup_seconds)
+    cleanup_deadline = min(deadline, batch_deadline + limits.cleanup_seconds)
     started: list[tuple[Delivery, subprocess.Popen[str]]] = []
     for item in pending:
         try:
             started.append((item, subprocess.Popen(item.command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                                   text=True)))
+                                                   text=True, start_new_session=True)))
         except OSError as error:
             print(f"stall-watch: {item.kind}: {error}", file=sys.stderr)
-    deadline = min(deadline, time.monotonic() + 90)
     for item, process in started:
-        try:
-            out, err = process.communicate(timeout=max(0, deadline - time.monotonic()))
-        except subprocess.TimeoutExpired:
-            process.kill()
-            out, err = process.communicate()
-            print(f"stall-watch: {item.kind}: send timeout", file=sys.stderr)
+        result = finish_process(process, batch_deadline, cleanup_deadline)
+        if isinstance(result, CommandFailure):
+            print(f"stall-watch: {item.kind}: send {result.reason}", file=sys.stderr)
             continue
-        if process.returncode != 0:
-            print(f"stall-watch: {item.kind}: {err.strip() or out.strip() or process.returncode}", file=sys.stderr)
+        if result.returncode != 0:
+            print(f"stall-watch: {item.kind}: {failure_detail(result)}", file=sys.stderr)
             continue
         if item.kind == "retire":
             prompt = saved_prompt(item.state_path)
@@ -1083,7 +1172,11 @@ def tick(now: float, *, deadline: float = math.inf) -> int:
         print(f"stall-watch: using zero prompt grace: {error}", file=sys.stderr)
         grace = 0
     inspection_deadline = deadline - delivery_reserve_seconds()
-    rows = processes()
+    sender = sender_configuration()
+    rows = processes(deadline=inspection_deadline, limits=sender.limits)
+    snapshot_failed = isinstance(rows, ProcessSnapshotFailure)
+    if isinstance(rows, ProcessSnapshotFailure):
+        print(f"stall-watch: process snapshot: {rows.reason}", file=sys.stderr)
     runners = showrunners.ShowrunnerDiscovery()
     try:
         runs = unit_lookup.read_run_states()
@@ -1116,6 +1209,8 @@ def tick(now: float, *, deadline: float = math.inf) -> int:
         work.extend(PaneInspection(slug, configured, zone, live, name, unit) for name, unit in marked.items())
     inspection_started = False
     for slug, configured, zone, live, name, unit in inspection_order(work):
+        if isinstance(rows, ProcessSnapshotFailure):
+            continue
         showrunner_socket = configured["socket"]
         if any(item.state_path == prompt_path(slug, name) for item in pending):
             continue
@@ -1226,9 +1321,9 @@ def tick(now: float, *, deadline: float = math.inf) -> int:
         if not stretch["tell_sent"] and showrunner_socket:
             text = f"{name} idle since {since_text}, nothing running; bumped. Last status: {last}"
             pending.append(delivery(path, "tell", showrunner_socket, f"{key}:tell", text))
-    send_all(pending, now, deadline=deadline)
+    send_all(pending, now, deadline=deadline, limits=sender.limits)
     finish_cancellations(cancellations.requests)
-    return runners.exit_code
+    return max(runners.exit_code, int(snapshot_failed), sender.exit_code)
 
 
 def main() -> int:
