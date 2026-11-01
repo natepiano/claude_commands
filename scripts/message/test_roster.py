@@ -925,7 +925,7 @@ class RosterTests(unittest.TestCase):
         self.assertEqual(code, 0, output.getvalue() + errors.getvalue())
         self.assertEqual(output.getvalue(), 'SENT: fixture peer\n')
         self.assertEqual(errors.getvalue().splitlines(), [
-            f'send.py: roster: warning: durable role {bad}: missing or invalid repository'])
+            f'send.py: roster: warning: durable role {bad}: {bad}: worker state unreadable: missing or invalid repository'])
         self.assertEqual(deliver.call_count, 1)
         forwarded = cast(send.Message, deliver.call_args.args[0])
         self.assertEqual(forwarded.to, 'session:peer-session')
@@ -937,8 +937,8 @@ class RosterTests(unittest.TestCase):
         self.assertEqual(code, 0, errors)
         report = cast(dict[str, object], json.loads('\n'.join(output)))
         self.assertEqual(report['problems'], [])
-        self.assertEqual(report['warnings'], [f'durable role {bad}: missing or invalid repository'])
-        self.assertEqual(errors, [f'could not read: warning: durable role {bad}: missing or invalid repository'])
+        self.assertEqual(report['warnings'], [f'durable role {bad}: {bad}: worker state unreadable: missing or invalid repository'])
+        self.assertEqual(errors, [f'could not read: warning: durable role {bad}: {bad}: worker state unreadable: missing or invalid repository'])
         result = roster.roster(os.environ, roster.ThisMachine())
         decoded = roster.RosterSnapshot.decode(roster.RosterSnapshot(result).encode()).result
         self.assertEqual(decoded.warnings, result.warnings)

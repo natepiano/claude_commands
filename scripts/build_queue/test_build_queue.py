@@ -25,6 +25,7 @@ from scripts.buildlog import store
 from scripts.lint import memory_admit
 from scripts.message import roster, unit_labels
 from scripts.message.unit_labels import UnitLabels, unit_labels_for
+from scripts.production import staff
 
 GIB = memory_admit.GIB
 
@@ -576,6 +577,7 @@ class QueueTests(unittest.TestCase):
         running = memory_admit.RunningStep("also-missing", "", "doc", "/tmp/folder", GIB, memory_admit.MeasuredMemory(GIB))
         reading = queue_read_fixture(memory_admit.QueueView((waiting, ), (running, ), 20 * GIB, 0, GIB, NOW))
         with mock.patch.object(unit_labels, "unit_labels_for", unit_labels_for), \
+             mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot(())), \
              mock.patch.object(unit_labels, "newest_sessions", side_effect=OSError("session files unavailable")) as sessions:
             status, text, errors = self.invoke(reading, "recorded")
             other_status, other, other_errors = self.invoke(reading, "folder")
