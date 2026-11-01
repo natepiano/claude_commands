@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 import unittest
 from pathlib import Path
-from typing import cast
+from typing import cast, override
 
 
 REPO = Path(__file__).resolve().parents[2]
@@ -39,6 +39,9 @@ class CommandStubTests(unittest.TestCase):
 
 
 class PhaseStyleReviewTests(unittest.TestCase):
+    review: str = ""
+
+    @override
     def setUp(self) -> None:
         self.review = (REPO / "docs/direct/dual_review.md").read_text()
 
