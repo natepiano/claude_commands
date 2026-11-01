@@ -352,6 +352,9 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
                 continue
             events = [{"event_type": "run_started", "run_started_at": 1.0,
                        "working_dir": str(Path(f"/tmp/no-worktree-of-{name}").resolve())},
+                      {"event_type": "phase_started", "phase_instance_id": "fixture-phase"},
+                      *([{"event_type": "phase_finished", "phase_instance_id": "fixture-phase"}]
+                        if state == "between-phases" else []),
                       *([{"event_type": "run_finished"}] if state == "run-finished" else [])]
             _ = (runs / f"{name}.jsonl").write_text("".join(json.dumps(event) + "\n" for event in events))
         environment = {**self.environment, "STALL_WATCH_NOW_EPOCH": str(at),
@@ -1308,6 +1311,96 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
         self.assertFalse(self.prompt_state().exists())
         self.assertEqual(len(self.prompt_notices()), 1)
 
+    def test_a_unit_between_phases_still_alerts_its_owner_before_prompt_escalation(self) -> None:
+        self.states["unit-one"] = "between-phases"
+        _ = self.watch_settings(prompt_grace_seconds="120")
+        self.panes["unit-one"].update(pane=EDIT_PROMPT, agent_status="blocked")
+        self.assertEqual(self.tick(START).returncode, 0)
+        self.assertTrue(self.prompt_state().exists())
+        self.tell_prompt_owner(START + 60)
+        self.assertEqual(self.prompt_followups(), [])
+        self.assertEqual(self.tick(START + 180).returncode, 0)
+        self.assertEqual([item["key"] for item in self.prompt_followups()], [PROMPT_KEY])
+        self.assertEqual(len(self.prompt_notices()), 1)
+        self.assertFalse((self.state / stall_watch.stretch_path("showrunner", "unit-one").name).exists())
+
+    def test_finishing_a_phase_keeps_a_live_prompt_alert_until_the_prompt_clears(self) -> None:
+        self.alerted_at_a_prompt()
+        self.states["unit-one"] = "between-phases"
+        saved = self.prompt_state().read_bytes()
+        for at in (START + 120, START + 600):
+            result = self.tick(at)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(self.prompt_state().read_bytes(), saved)
+            self.assertEqual([item["key"] for item in self.prompt_followups()], [PROMPT_KEY])
+        self.panes["unit-one"].update(pane=PANE, agent_status="idle")
+        self.assertEqual(self.tick(START + 601).returncode, 0)
+        self.assertEqual(self.prompt_followups()[1:], [RETIRE])
+        self.assertFalse(self.prompt_state().exists())
+        self.assertEqual(self.tick(START + 1200).returncode, 0)
+        self.assertEqual(self.prompt_followups()[1:], [RETIRE])
+
+    def test_unreadable_phase_history_keeps_prompt_handling_and_other_units_idle_bumps(self) -> None:
+        self.configure({"showrunner": ["unit-one", "busy-unit"]})
+        _ = self.unit("busy-unit")
+        self.panes["unit-one"].update(pane=EDIT_PROMPT, agent_status="blocked")
+        read = stall_watch.run_has_open_phase
+
+        def read_phase(record: unit_lookup.RunRecord) -> bool:
+            if record.path.name == "unit-one.jsonl":
+                raise PermissionError("fixture history unreadable")
+            return read(record)
+
+        with mock.patch.object(stall_watch, "run_has_open_phase", side_effect=read_phase):
+            for at in (START, START + 60, START + 600):
+                result = self.tick(at)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stderr.count("its open phase is unknown"), 1, result.stderr)
+        self.assertEqual(len(self.prompt_notices()), 1)
+        self.assertEqual([item["key"] for item in self.prompt_followups() if item["to"] == "user"], [PROMPT_KEY])
+        idle = [item for item in self.sent() if item["key"].endswith((":bump", ":tell"))]
+        self.assertEqual(len(idle), 2)
+        self.assertTrue(all(item["key"].startswith("stall-watch:busy-unit:") for item in idle))
+
+    def test_a_prompt_retire_error_is_not_reported_as_an_unknown_open_phase(self) -> None:
+        self.alerted_at_a_prompt()
+        self.states["unit-one"] = "between-phases"
+        self.panes["unit-one"]["agent_status"] = "idle"
+        with mock.patch.object(stall_watch, "end_prompt", side_effect=PermissionError("fixture retire failed")):
+            # The in-process fixture calls main directly, before the CLI's outer error handler.
+            # A history-read catch must let this retire failure propagate to that handler.
+            with self.assertRaisesRegex(PermissionError, "fixture retire failed"):
+                _ = self.tick(START + 120)
+
+    def test_unreadable_phase_history_preserves_idle_timer_and_sent_flags_through_recovery(self) -> None:
+        self.assertEqual(self.tick(START).returncode, 0)
+        path = self.state / stall_watch.stretch_path("showrunner", "unit-one").name
+        saved = path.read_bytes()
+        with mock.patch.object(stall_watch, "run_has_open_phase", side_effect=PermissionError("history unreadable")):
+            for at in (START + 301, START + 302):
+                result = self.tick(at)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stderr.count("its open phase is unknown"), 1, result.stderr)
+                self.assertEqual(path.read_bytes(), saved)
+                self.assertEqual(self.sent(), [])
+        # Recovery uses the original idle interval, rather than starting a new one.
+        self.assertEqual(self.tick(START + 303).returncode, 0)
+        self.assertEqual({item["key"].rsplit(":", 1)[-1] for item in self.sent()}, {"bump", "tell"})
+        stretch = cast(stall_watch.Stretch, json.loads(path.read_text()))
+        self.assertEqual(stretch["since"], START)
+        self.assertTrue(stretch["bump_sent"])
+        self.assertTrue(stretch["tell_sent"])
+        saved = path.read_bytes()
+        sent = self.sent()
+        with mock.patch.object(stall_watch, "run_has_open_phase", side_effect=PermissionError("history unreadable")):
+            result = self.tick(START + 600)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr.count("its open phase is unknown"), 1, result.stderr)
+        self.assertEqual(path.read_bytes(), saved)
+        self.assertEqual(self.sent(), sent)
+        self.assertEqual(self.tick(START + 601).returncode, 0)
+        self.assertEqual(self.sent(), sent, "sent flags survive the failure, preventing duplicate deliveries")
+
     def test_a_prompt_that_never_alerted_sends_no_retire(self) -> None:
         self.panes["unit-one"]["agent_status"] = "blocked"
         self.panes["unit-one"]["pane"] = EDIT_PROMPT
@@ -1581,6 +1674,99 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
                         self.assertEqual(stretch["since"], at)
                         self.assertFalse(stretch["bump_sent"])
                         self.assertFalse(stretch["tell_sent"])
+
+    def test_latest_transcript_wait_on_natedev_overrides_a_stale_pane(self) -> None:
+        self.panes["unit-one"]["pane"] = "— holding: waiting on the second blind code reviewer\n"
+        transcript = self.projects / "project/sid-unit-one.jsonl"
+        waiting = "— holding: no job: waiting on natedev for the next assignment"
+        _ = transcript.write_text(json.dumps(self.said({"type": "text", "text": waiting})) + "\n")
+        os.utime(transcript, (START - 3600, START - 3600))
+        for at in (START, START + 600):
+            result = self.tick(at)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(self.sent(), [])
+        # An actual new assignment still recovers if its own work stops.
+        _ = transcript.write_text(json.dumps(self.said({"type": "text", "text": PANE})) + "\n")
+        os.utime(transcript, (START - 3600, START - 3600))
+        self.assertEqual(self.tick(START + 601).returncode, 0)
+        self.assertEqual(self.tick(START + 901).returncode, 0)
+        tell, = [item for item in self.sent() if item["key"].endswith(":tell")]
+        self.assertIn(f"Last status: {PANE.strip()}", tell["text"])
+        self.assertEqual(len(self.sent()), 2)
+
+    def test_a_run_without_an_open_phase_is_quiet_while_a_live_job_is_bumped(self) -> None:
+        self.configure_registered({"showrunner": [("unit-one", "between-phases"), ("busy-unit", "running")]})
+        _ = self.unit("busy-unit")
+        # Even a stale status cannot turn a closed phase back into work.
+        self.panes["unit-one"]["pane"] = "— holding: waiting on the second blind code reviewer\n"
+        for at in (START, START + 600):
+            result = self.tick(at)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        sent = self.sent()
+        self.assertEqual(len(sent), 2)
+        self.assertEqual({item["key"].rsplit(":", 1)[-1] for item in sent}, {"bump", "tell"})
+        self.assertTrue(all(item["key"].startswith("stall-watch:busy-unit:") for item in sent))
+        self.assertFalse((self.state / stall_watch.stretch_path("showrunner", "unit-one").name).exists())
+
+    def test_finishing_one_of_two_open_phases_keeps_the_idle_job_watched(self) -> None:
+        history = self.root / "two-phases.jsonl"
+        _ = history.write_text("\n".join(json.dumps(event) for event in (
+            {"event_type": "phase_started", "phase_instance_id": "one"},
+            {"event_type": "phase_started", "phase_instance_id": "two"},
+            {"event_type": "phase_finished", "phase_instance_id": "two"})))
+        record = unit_lookup.RunRecord(history, unit_lookup.UnitState.RUNNING)
+        self.assertTrue(stall_watch.run_has_open_phase(record))
+        with history.open("a") as output:
+            _ = output.write('\n{"event_type":"phase_finished","phase_instance_id":"one"}\n')
+        self.assertFalse(stall_watch.run_has_open_phase(record))
+
+    def test_finishing_a_phase_clears_idle_time_before_the_next_assignment(self) -> None:
+        self.assertEqual(self.tick(START).returncode, 0)
+        self.states["unit-one"] = "between-phases"
+        self.assertEqual(self.tick(START + 600).returncode, 0)
+        self.assertEqual(self.sent(), [])
+        self.assertFalse((self.state / stall_watch.stretch_path("showrunner", "unit-one").name).exists())
+        self.states["unit-one"] = "running"
+        self.assertEqual(self.tick(START + 601).returncode, 0)
+        self.assertEqual(self.tick(START + 900).returncode, 0)
+        self.assertEqual(self.sent(), [])
+        self.assertEqual(self.tick(START + 901).returncode, 0)
+        self.assertEqual({item["key"].rsplit(":", 1)[-1] for item in self.sent()}, {"bump", "tell"})
+
+    def test_phase_scan_skips_non_lifecycle_progress_before_json_decoding(self) -> None:
+        history = self.root / "phase-progress.jsonl"
+        progress = json.dumps({"event_type": "worker_progress", "phase_instance_id": "one",
+                               "phase_started_at": START, "text": "working"})
+        started = json.dumps({"event_type": "phase_started", "phase_instance_id": "one"})
+        finished = json.dumps({"event_type": "phase_finished", "phase_instance_id": "one"})
+        _ = history.write_text("\n".join([progress] * 100 + [started] + [progress] * 100))
+        record = unit_lookup.RunRecord(history, unit_lookup.UnitState.RUNNING)
+        with mock.patch.object(json, "loads", wraps=json.loads) as decode:
+            self.assertTrue(stall_watch.run_has_open_phase(record))
+        self.assertEqual(decode.call_count, 1, "worker progress must not pay for JSON decoding")
+        with history.open("a") as output:
+            _ = output.write("\n" + finished + "\n" + progress)
+        with mock.patch.object(json, "loads", wraps=json.loads) as decode:
+            self.assertFalse(stall_watch.run_has_open_phase(record))
+        self.assertEqual(decode.call_count, 2)
+
+    def test_phase_scan_preserves_escaped_names_and_ignores_non_events(self) -> None:
+        history = self.root / "escaped-phases.jsonl"
+        _ = history.write_text('\n'.join((
+            'invalid phase_started JSON',
+            '["phase_started"]',
+            '{"event_type":"worker_progress","text":"phase_started"}',
+            '{"event_type":"phase_started","phase_id":"legacy"}',
+            '{"event_type":"phase_finished","phase_id":"legacy"}',
+            '{"event_type":"phase_started","phase_instance_id":""}',
+            '{"event_type":"phase_started","phase_instance_id":17}',
+            r'{"event_type":"phase_\u0073tarted","phase_instance_id":"one"}',
+        )))
+        record = unit_lookup.RunRecord(history, unit_lookup.UnitState.RUNNING)
+        self.assertTrue(stall_watch.run_has_open_phase(record))
+        with history.open("a") as output:
+            _ = output.write('\n' + r'{"event_type":"phase_\u0066inished","phase_instance_id":"one"}')
+        self.assertFalse(stall_watch.run_has_open_phase(record))
 
     def test_a_resumed_unit_gets_a_fresh_idle_stretch_before_its_bump(self) -> None:
         self.panes["unit-one"]["pane"] = "holding: paused until the showrunner says resume\n"
