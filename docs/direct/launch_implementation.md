@@ -7,11 +7,11 @@ in full.
 completes.
 
 <LaunchImplementation>
-1. Once per phase, create `${PHASE_DIR}` if it is missing (ad hoc work uses
-   `${SESSION_DIR}/phases/adhoc`), then save `git rev-parse HEAD` to
-   `${PHASE_DIR}/phase_baseline` and `git status --short` to
-   `${PHASE_DIR}/progress_baseline_status` before dispatch. Stop if either
-   fails; fixes retain both baselines.
+1. The launcher's `phase_reservation.py claim` writes `${PHASE_DIR}/phase_baseline`
+   (the repository's full `HEAD` id) and `${PHASE_DIR}/progress_baseline_status`
+   (`git status --short`) at the phase's first launch, before the worker opens.
+   A git failure stops the launch. Later launches, including fixes and reopened
+   phases, keep both first baselines. Ad hoc work uses `${SESSION_DIR}/phases/adhoc`.
 2. Close the outgoing phase before opening this one, per <PassOwnership/>: when a
    finished phase's record is still active, run `progress_history.py finish-phase
    --session-dir "${SESSION_DIR}" --status completed` first. A phase opened
