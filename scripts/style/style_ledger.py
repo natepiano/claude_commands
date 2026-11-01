@@ -2273,13 +2273,19 @@ class NoGitReadCache:
 _NO_GIT_READ_CACHE = NoGitReadCache()
 
 
+@dataclass(frozen=True)
+class UnloadedRuleCatalog:
+    """Rule metadata is read on first use from the active execution checkout."""
+
+
 class Ledger:
     def __init__(self, repo: Path, database: Path, *, git_cache: GitReadCache | NoGitReadCache = _NO_GIT_READ_CACHE) -> None:
         self.repo: Path = repo
         self._git_operation_depth: int = 0
         self.database: Path = database
         self.git_cache: GitReadCache | NoGitReadCache = git_cache
-        self._catalog: tuple[Rule, ...] = self._load_rules()
+        self._rule_checkouts: list[Path] = []
+        self._loaded_catalog: tuple[Rule, ...] | UnloadedRuleCatalog = UnloadedRuleCatalog()
         self._tips: dict[str, RepositoryTip] = {}
         self._fingerprints: dict[tuple[str, CellInputScope, str], str] = {}
         self._inputs: dict[tuple[str, CellInputScope, str], dict[str, TreeEntry]] = {}
@@ -2349,8 +2355,35 @@ class Ledger:
         finally:
             self._git_operation_depth -= 1
 
+    @property
+    def _catalog(self) -> tuple[Rule, ...]:
+        if isinstance(self._loaded_catalog, UnloadedRuleCatalog):
+            self._loaded_catalog = self._load_rules()
+        return self._loaded_catalog
+
+    @_catalog.setter
+    def _catalog(self, catalog: tuple[Rule, ...]) -> None:
+        self._loaded_catalog = catalog
+
     def _load_rules(self) -> tuple[Rule, ...]:
-        return rule_catalog.load_rules(self.repo)
+        checkout = self._rule_checkouts[-1] if self._rule_checkouts else self.repo
+        return rule_catalog.load_rules(checkout)
+
+    @contextmanager
+    def rules_from_checkout(self, checkout: Path) -> Generator[None]:
+        """Scope rule reads to an execution checkout; Git, SQL and claims stay canonical.
+
+        Restore the prior derived catalog even on interruption, without rereading a mutable
+        checkout. Nested scopes retain the caller's rule source and catalog.
+        """
+        previous = self._loaded_catalog
+        self._rule_checkouts.append(checkout)
+        self._loaded_catalog = UnloadedRuleCatalog()
+        try:
+            yield
+        finally:
+            _ = self._rule_checkouts.pop()
+            self._loaded_catalog = previous
 
     def close(self) -> None:
         self._connection.close()
@@ -3413,7 +3446,7 @@ class Ledger:
         if not renames:
             return BindingCarryForward()
         base, tip = self._tip(ticket["base"]), self._tip(checkpoint)
-        definitions = {rule.rule_id: rule for rule in rule_catalog.load_rules(self.repo) if rule.family == "types"}
+        definitions = {rule.rule_id: rule for rule in self._load_rules() if rule.family == "types"}
         if not definitions:
             return BindingCarryForward()
         open_types = tuple(f for f in self.held_findings(AllHeldFindings())

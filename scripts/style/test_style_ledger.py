@@ -45,6 +45,41 @@ class StyleLedgerRecordsTests(LedgerTestCase):
                                  style_ledger.MountedFile("src/lib.rs", ("src/direct.rs",)),
                                  style_ledger.MountedFile("src/lib.rs", ("src/raw.rs",))))
 
+    def test_private_rule_scope_nests_and_restores_after_interruption(self) -> None:
+        rule_id = self.rule("private-rules")
+        private, nested = self.root / "private", self.root / "nested"
+        private.mkdir()
+        nested.mkdir()
+        roots: list[Path] = []
+        load = rules.load_rules
+
+        def observed(repo: Path) -> tuple[rules.Rule, ...]:
+            roots.append(repo)
+            return load(repo)
+
+        with self.ledger() as initial:
+            initial.set_tip(self.initial_tip)
+        invalid = self.repo / "docs/style/invalid.md"
+        invalid.parent.mkdir(parents=True)
+        _ = invalid.write_text("---\ninvalid: [\n")
+        with self.ledger() as ledger:
+            with mock.patch.object(rules, "load_rules", side_effect=observed):
+                with self.assertRaisesRegex(RuntimeError, "interrupted"):
+                    with ledger.rules_from_checkout(private):
+                        ledger.ticket_add("scope-1", "scope", "read", "names", "crates/alpha",
+                                          [self.sources[0]], [rule_id])
+                        with ledger.rules_from_checkout(nested):
+                            ledger.ticket_add("scope-2", "scope", "read", "names", "crates/alpha",
+                                              [self.sources[0]], [rule_id])
+                        ledger.ticket_add("scope-3", "scope", "read", "names", "crates/alpha",
+                                          [self.sources[0]], [rule_id])
+                        raise RuntimeError("interrupted")
+                invalid.unlink()
+                ledger.ticket_add("scope-4", "scope", "read", "names", "crates/alpha",
+                                  [self.sources[0]], [rule_id])
+            self.assertEqual(roots, [private, nested, private, self.repo])
+            self.assertEqual(ledger.repo, self.repo)
+
     def test_tree_entries_share_commit_and_bare_tree_inventory(self) -> None:
         path = self.sources[0]
         _ = self.git("update-index", "--chmod=+x", path)
