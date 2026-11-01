@@ -480,6 +480,8 @@ class _WorkerSources:
                     relevant += 1
                 if isinstance(worker.ownership, workers.HeldBy):
                     run = Path(worker.ownership.run)
+                    if self.skip_serverless_delegate(run):
+                        continue
                     roster = self.checked(run / workers.ROSTER) if (run / workers.ROSTER).exists() else {}
                     entry = _object(roster.get(name, {}))
                     backend = worker.backend
@@ -594,10 +596,25 @@ class _WorkerSources:
             self.activity_unavailable[run] = error
             raise
 
+    def skip_serverless_delegate(self, run: Path) -> bool:
+        """Exclude a serverless delegate before any held-run roster is read."""
+        if run.parent.absolute() == unit_runs.FORMER_RUN_ROOT.absolute():
+            server = run / "mesh_server.json"
+            self.dependencies(server)
+            try:
+                _ = server.stat()
+            except FileNotFoundError:
+                self.run_activity[run] = False
+                self.skipped_runs.add(run.absolute())
+                return True
+        return False
+
     def run_live(self, run: Path) -> bool:
         """Prove activity before ownership; uncertain evidence is never an inactive skip."""
         if run in self.run_activity:
             return self.run_activity[run]
+        if self.skip_serverless_delegate(run):
+            return False
         live = run in self.live_worker_runs
         failures = ([self.activity_unavailable[run]] if run in self.activity_unavailable else [])
         try:
