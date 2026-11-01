@@ -3033,20 +3033,8 @@ Showrunner defect 2026-10-31 09:3x EDT, reported by hana: the validation line op
 
 **As-built:** `ci_start` writes validation's stdout and stderr, in order, to `<state dir>/ci_validation.log`, replaced at each start and kept after the copy is removed. A failure reads `validation: failed — step <label> failed; log <path>` from the last `!!! VALIDATION FAILED at step: <label> !!!` line (`validate_ci.sh` `run_step`), or `exit <code>, no step named; log <path>`. The scan uses `errors="replace"`, so bytes that are not UTF-8 never hide the step. An `OSError` stays a `PointFailure("validation", …)`. `merge_checkpoint.push_validate` keeps `failure_detail`. Review: two lenses found F001 (strict UTF-8 scan); one fix round; closure approved.
 
-### Phase 101j — The account board lists only true problems, each with its full step  · status: done
+### Phase 101j — The account board lists only true problems, each with its full step  · status: done · b034f13e
 
 User 2026-11-01 07:4x EST: "please look at the problems coming from the script feeding the accounts board and correct them". Seen on the Mac board (stored-mode `accounts.py status`).
 
-**Depends on:** none.
-
-#### Work Order
-
-- **Role map in stored mode.** A stored-mode read with a cached role map lists no problem (today: "role map: using saved assignments; … stored mode; no fetch was attempted; …"). With no cache it still refuses as now.
-- **Old usage readings.** "this shows the reading from 10:58" gives the date when the reading is not from today (`10-16 10:58`). "next try in 2 min" appears only when a usage read was attempted within two reader intervals; otherwise the line says when the last read was attempted, or that none was. Use the existing reader interval value; add no new constant.
-- **Mac legacy `~/.claude` step.** `MAC_HOME_LOGIN_STEP` gives the whole step: `accounts.py exec claude2`, `/login`, `/exit`, then `accounts.py cutover-home claude2` in a Mac Terminal; never `/logout` (docs/accounts.md, the Mac's separate step).
-- **One line per Codex cause.** When the legacy `~/.codex` login and the numbered home hold the same login, print one line: `codex2: ~/.codex still holds codex2's login; stop what uses ~/.codex (such as the ChatGPT app), then run accounts.py cutover-home codex2`. Not two lines.
-- **No login in problem text.** No problem line prints an email or other login; name the account label. Add a test that fails if any status problem text holds a login from its fixture.
-- Docs: `docs/accounts.md` and `commands/showrunner/accounts.md` where they quote the changed lines.
-- Tests in the accounts suites for each item. Tests never touch live homes, keychains, ssh or real usage stores.
-
-**Files:** `scripts/accounts/accounts.py`, its tests, the docs above.
+**As-built:** a stored-mode read with a cached role map lists no role-map problem; with no cache it refuses as before. A usage reading not from today shows its date (`10-29 01:14`). The retry promise is gone: the line says `last read attempted at <time>` or `no usage read has been attempted`, because the notes timer can reuse a failed report for ten minutes. `MAC_HOME_LOGIN_STEP` gives the whole Mac step: `accounts.py exec claude2`, `/login`, `/exit`, then `accounts.py cutover-home claude2`, never `/logout`. When `~/.codex` and the numbered home hold the same login, one line reads `~/.codex still holds codex2's login; stop what uses ~/.codex (such as the ChatGPT app), then run accounts.py cutover-home codex2`; when the numbered home holds another login, one label-only line gives its repair instead of a cutover that would refuse. The login command is one shared `env CODEX_HOME=<quoted home> codex login`, which the `codex` alias cannot redirect, also used by `setup codexN`. No problem line prints a login; a test fails if one holds a fixture login. Review: two lenses found F001 (cutover step for a home holding another login) and F002 (false retry promise); two fix rounds; closure approved.
