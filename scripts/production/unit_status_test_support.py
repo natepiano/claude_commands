@@ -19,6 +19,7 @@ from unittest import mock
 sys.path[:0] = [str(Path(__file__).resolve().parents[1] / name)
                 for name in ("production", "message", "herdr")]
 from scripts.lib.socket_test_support import short_socket_directory
+from scripts.message.sessions_test_support import copy_session_modules
 from scripts.production.staff_test_support import isolated_staff_file, showrunner_relationship, unit_membership
 from dailies_input import StatusBlock, UnitRow, status_blocks
 from unit_lookup import UnitState
@@ -86,8 +87,7 @@ class UnitStatusFixture(unittest.TestCase):
         _ = shutil.copy2(SCRIPT, script)
         _write_executable(root / "scripts/lib/py", f'#!/bin/sh\nexec {shlex.quote(sys.executable)} "$@"\n')
         message = root / "scripts/message"
-        message.mkdir()
-        _ = shutil.copy2(SCRIPT.parents[1] / "message/sessions.py", message / "sessions.py")
+        copy_session_modules(message)
         (root / "config").mkdir()
         _ = shutil.copy2(SCRIPT.parents[2] / "config/session_retries.toml", root / "config/session_retries.toml")
         _write_executable(message / "notifier.sh", 'print -r -- "$*" >> "$NOTIFIER_CALL_LOG"\nprint -r -- "$NOTIFIER_HEALTH_TEXT"\nexit "$NOTIFIER_HEALTH_EXIT"\n')

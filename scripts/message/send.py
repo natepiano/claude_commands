@@ -25,8 +25,8 @@ Delivery. A Claude recipient is tried through the postmaster outbox first when
 its heartbeat is fresh. Every path without confirmed delivery falls back to a
 headless `claude -p` relay whose one job is a SendMessage call. It runs sonnet in auto mode (haiku cannot run in auto mode),
 with hooks, MCP and slash commands off and the caller's CLAUDE_* variables
-removed, so it never passes for the session that ran this. It is named --from,
-which is the sender name the recipient sees. Delivery is read from the
+removed, so it never passes for the session that ran this. Its relay
+name is separate from the sender, who is named in the message. Delivery is read from the
 SendMessage tool result in the relay's stream, never from what the model says;
 the last stream per recipient stays in STATE/relay/<to>.jsonl.
 `worker:` addresses queue through codex_mesh.py; `codex:` addresses queue through
@@ -126,6 +126,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "notify"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 import sessions  # noqa: E402
+from relay_identity import SavedRelaySender, read_relay_sender, relay_session_name
 import postmaster  # noqa: E402
 import codex_daemon  # noqa: E402
 if TYPE_CHECKING:
@@ -211,14 +212,11 @@ TIMEOUT = 40
 KILL_GRACE = 10
 # Exec preserves this PID: Claude's cc-socks/<pid>.sock belongs to the recorded process.
 # Publish before Claude starts, so even an immediate reply can resolve its sender.
-RELAY_EXEC = """import os, sys
+RELAY_EXEC = f"""import os, sys
 from pathlib import Path
-directory = Path(sys.argv[1])
-directory.mkdir(parents=True, exist_ok=True)
-path = directory / str(os.getpid())
-temporary = path.with_name('.' + path.name + '.tmp')
-temporary.write_text(sys.argv[2], encoding='utf-8')
-os.replace(temporary, path)
+sys.path.insert(0, {str(Path(__file__).resolve().parent)!r})
+from relay_identity import publish_relay_identity
+publish_relay_identity(os.getpid(), sys.argv[2], Path(sys.argv[1]))
 os.execvpe(sys.argv[3], sys.argv[3:], os.environ)
 """
 # Above pushover.TIMEOUT_S, so Pushover's own timeout reports first.
@@ -1067,10 +1065,8 @@ def relay_sender(address: str) -> str:
     path = Path(address.removeprefix("uds:"))
     if path.parent.name != "cc-socks" or path.suffix != ".sock" or not path.stem.isdecimal():
         return ""
-    try:
-        return (STATE / "relay_senders" / path.stem).read_text(encoding="utf-8").strip()
-    except (OSError, UnicodeError):
-        return ""
+    identity = read_relay_sender(int(path.stem), STATE / "relay_senders")
+    return identity.sender if isinstance(identity, SavedRelaySender) else ""
 
 
 def socket_sender(address: str, metadata: dict[str, object]) -> str:
@@ -1450,7 +1446,7 @@ def relay_prompt(message: Message) -> str:
                      + f"then make the call once more with `to` set to the row whose name is exactly "
                      + f"{json.dumps(message.to)}, followed by its [ref]. If no row has that name, stop.")
     lines += ["Then stop: reply with one line, the SendMessage result. Call no other tool.",
-              "----- BEGIN MESSAGE -----", agent_text(message), "----- END MESSAGE -----"]
+              "----- BEGIN MESSAGE -----", agent_text(message, via_relay=True), "----- END MESSAGE -----"]
     return "\n".join(lines)
 
 
@@ -1521,7 +1517,7 @@ def relay(message: Message, timeout: float) -> Result:
                "--tools", tools, "--allowedTools", tools,
                "--setting-sources", "user", "--settings", json.dumps({"disableAllHooks": True}),
                "--strict-mcp-config", "--disable-slash-commands", "--no-session-persistence",
-               "-n", message.sender, "--output-format", "stream-json", "--verbose"]
+               "-n", relay_session_name(message.sender), "--output-format", "stream-json", "--verbose"]
     # An inherited CLAUDE_* variable makes the relay pass for the caller's session:
     # CLAUDE_CODE_MESSAGING_SOCKET, for one, is that session's inbox.
     env = {name: value for name, value in os.environ.items() if not name.startswith("CLAUDE")}
@@ -1552,7 +1548,7 @@ def relay(message: Message, timeout: float) -> Result:
     write_atomic(raw, out + err)
     if code is None:
         return Result("queued", f"relay timed out after {timeout:g} s")
-    result = read_relay(out, agent_text(message))
+    result = read_relay(out, agent_text(message, via_relay=True))
     if result.outcome == "queued" and code != 0:
         return Result("queued", f"relay exit {code}: {result.detail}; {one_line(err, 200)}")
     return result
@@ -2181,10 +2177,11 @@ def shown_sender_line(sender: str, display: str) -> str:
     return f"\nShown sender: {display}" if display != sender else ""
 
 
-def agent_text(message: Message) -> str:
+def agent_text(message: Message, *, via_relay: bool = False) -> str:
     """Keep the body preview intact and add the sending machine's display text."""
     first, separator, rest = message.text.partition("\n")
-    return first + shown_sender_line(message.sender, message.shown_sender) + separator + rest
+    sender = relay_session_name(message.sender) if via_relay else message.sender
+    return first + shown_sender_line(sender, message.shown_sender) + separator + rest
 
 
 def delivered_text(message: Message, entry_id: str) -> str:
