@@ -34,6 +34,7 @@ class CrateStage(StrEnum):
     SELECTED = "selected"
     CLAIMING = "claiming"
     CLAIMED = "claimed"
+    WAITING_FOR_RESERVATIONS = "waiting for reservations"
     EDITED = "edited"
     COMMITTED = "committed"
     TESTED = "tested"
@@ -104,6 +105,9 @@ class CrateRecord(TypedDict):
     selected: list[FrozenFinding]
     finding_holders: NotRequired[dict[str, list[str]]]
     machine_judgments: NotRequired[list[FrozenMachineJudgment]]
+    judgment_planned_findings: NotRequired[list[str]]
+    pending: NotRequired[list[bulk.PendingReservation]]
+    terminal_refusals: NotRequired[dict[str, str]]
     stage: str
     owner: NotRequired[str]
     tickets: NotRequired[dict[str, str]]
@@ -783,7 +787,7 @@ class CrateRun:
         built = (set(self.result(record)["findings"])
                  if CrateStage(record["stage"]) in {CrateStage.COMMITTED, CrateStage.TESTED,
                     CrateStage.IMPORTED, CrateStage.CHECKPOINT_PUBLISHED, CrateStage.INTEGRATED}
-                 else set(record["tickets"]))
+                 else set(record["tickets"]) - record.get("terminal_refusals", {}).keys())
         for frozen in record["selected"]:
             if frozen["id"] in built:
                 finding = current[frozen["id"]]
@@ -922,10 +926,22 @@ class CrateRun:
                     record["stage"] = CrateStage.CLAIMED
                     self.save(manifest)
                     stage = CrateStage.CLAIMED
-                if stage == CrateStage.CLAIMED:
-                    refused: dict[str, str] = {}
+                if stage in {CrateStage.CLAIMED, CrateStage.WAITING_FOR_RESERVATIONS}:
+                    refused: dict[str, str] = dict(record.get("terminal_refusals", {}))
+                    if stage == CrateStage.WAITING_FOR_RESERVATIONS:
+                        with ledger_api.refill_lock(self.repo):
+                            self.publish_refusals(manifest, record, refused)
                     try:
                         self.execute(manifest, record, intent, definition, planner, runner, available, executor, refused)
+                    except bulk.ReservationBlocked as blocked:
+                        # A writer may appear after planning. Undo journaled private edits,
+                        # retain all claims, and retry normal proof on the next invocation.
+                        _ = run.git(checkout, "reset", "--mixed", base)
+                        _ = intent.recover()
+                        self.wait_for_reservations(manifest, record,
+                            tuple(bulk.PendingFinding(identity, blocked.path, blocked.holders)
+                                  for identity in record["tickets"] if identity not in refused), refused)
+                        return manifest
                     except Exception as error:
                         self.abandon(manifest, record, str(error), refused)
                         return manifest
@@ -975,6 +991,15 @@ class CrateRun:
                     self.integrate(manifest, record, runner)
                 return manifest
 
+    def wait_for_reservations(self, manifest: Manifest, record: CrateRecord,
+                              pending: tuple[bulk.PendingFinding, ...], refused: dict[str, str]) -> None:
+        record["pending"] = [bulk.freeze_pending(item) for item in pending]
+        record["terminal_refusals"] = dict(refused)
+        record["stage"] = CrateStage.WAITING_FOR_RESERVATIONS
+        self.save(manifest)
+        with ledger_api.refill_lock(self.repo):
+            self.publish_refusals(manifest, record, refused)
+
     def execute(self, manifest: Manifest, record: CrateRecord, intent: run.WorkspaceIntent,
                 definition: rules.Rule, planner: Planner, runner: run.Runner,
                 available: Callable[[Path, str], None], executor: PlanExecutor | ExecutionService,
@@ -990,7 +1015,8 @@ class CrateRun:
         def boundary(_repo: Path, path: str) -> None:
             ownership.require(record["directory"], (path,))
             available(self.repo, path)
-        selected = run.Selection(self.ledger.named_held(record["tickets"]), ())
+        selected = run.Selection(self.ledger.named_held(
+            identity for identity in record["tickets"] if identity not in refused), ())
         availability = run.PlanningFileAvailability(checkout, boundary)
 
         def remember_refusals(planned: run.PlannedEdits) -> run.PlannedEdits:
@@ -999,38 +1025,63 @@ class CrateRun:
 
         def admitted(identities: frozenset[str]) -> run.PlannedEdits:
             findings: list[ledger_api.HeldFinding] = []
+            pending: list[bulk.PendingFinding] = []
             for finding in selected.findings:
                 if finding.finding_id not in identities:
                     continue
                 try:
                     availability.require((finding.path,))
+                except bulk.ReservationBlocked as blocked:
+                    pending.append(bulk.PendingFinding(finding.finding_id, blocked.path, blocked.holders))
                 except bulk.BulkRenameError as error:
                     refused[finding.finding_id] = str(error)
                 else:
                     findings.append(finding)
-            frozen = tuple(thaw_machine_judgment(item) for item in record.get("machine_judgments", []))
+            frozen = tuple(thaw_machine_judgment(item) for item in record.get("machine_judgments", [])
+                           if item["finding_id"] not in refused)
             for judgment in frozen:
                 finding = next(item for item in selected.findings if item.finding_id == judgment.finding_id)
                 reason = run.validate_machine_judgment(self.ledger, finding, base, checkout, judgment)
                 if reason:
                     raise bulk.BulkRenameError(reason)
+            previous = set(record.get("judgment_planned_findings", record["tickets"]
+                                      if "machine_judgments" in record else ()))
             selection = run.Selection(tuple(findings), (), frozen,
-                                      run.JudgmentPolicy.FROZEN_ONLY if "machine_judgments" in record
-                                      else run.JudgmentPolicy.PROVE_CURRENT)
+                                      run.JudgmentPolicy.FROZEN_ONLY,
+                                      frozenset(item.finding_id for item in findings) - previous)
             rebuilt = remember_refusals(planner(
                 checkout, self.ledger, base, selection, availability, definition))
-            if "machine_judgments" not in record:
-                # Durable before execution, including an empty set. Recovery may consume
-                # this evidence but must never silently make a different fresh judgment.
-                record["machine_judgments"] = [freeze_machine_judgment(item) for item in rebuilt.judgments]
-                self.save(manifest)
-            elif any(item not in frozen for item in rebuilt.judgments):
+            if any(item.finding_id in previous and item not in frozen for item in rebuilt.judgments):
                 raise bulk.BulkRenameError("planner replaced a frozen machine judgment")
+            judgments = {item.finding_id: item for item in (*frozen, *rebuilt.judgments)}
+            record["machine_judgments"] = [freeze_machine_judgment(item) for item in judgments.values()]
             # The shared plan owner removes whole dependent edit groups, including files
             # introduced by a planner. No overlay may precede this boundary check.
-            return remember_refusals(run.available_constant_plan(rebuilt, availability))
+            checked = remember_refusals(run.available_constant_plan(rebuilt, availability))
+            record["judgment_planned_findings"] = sorted(previous | ({item.finding_id for item in findings}
+                                                       - {item.finding_id for item in checked.pending}))
+            self.save(manifest)
+            return run.PlannedEdits(checked.files, checked.refusals, checked.constant_proofs,
+                                    checked.judgments, (*pending, *checked.pending))
 
         planned = admitted(frozenset(record["tickets"]))
+        if planned.pending:
+            # One fresh availability retry after independent planning; never sleep or loop.
+            still_pending: list[bulk.PendingFinding] = []
+            for item in planned.pending:
+                try:
+                    boundary(checkout, item.path)
+                except bulk.ReservationBlocked as blocked:
+                    still_pending.append(bulk.PendingFinding(item.finding_id, blocked.path, blocked.holders))
+            if still_pending:
+                self.wait_for_reservations(manifest, record, tuple(still_pending), refused)
+                return
+            availability = run.PlanningFileAvailability(checkout, boundary)
+            planned = admitted(frozenset(record["tickets"]) - refused.keys())
+            if planned.pending:
+                self.wait_for_reservations(manifest, record, planned.pending, refused)
+                return
+        record["pending"] = []
         unchanged_base()
         record["stage"] = CrateStage.EDITED
         self.save(manifest)

@@ -18,10 +18,11 @@ from typing import cast, override
 
 import bulk_run as run
 import bulk_rename as bulk
+import berth_board
 import rules
 from ledger_test_support import machine_rename_fixture, MACHINE_RENAME_AFTER
 import style_ledger as ledger_api
-from approved_renames import BindingRename, NoBindingScope, rename_declaration
+from approved_renames import AppliedInCode, BindingRename, NoBindingScope, rename_declaration
 from test_bulk_rename import CargoProjectTests, ScriptedServer, word_edits, stop_after_edit, stop_process
 
 
@@ -73,6 +74,142 @@ class WorkspaceRunTests(CargoProjectTests):
     tree: str = ""
     runner: FakeRunner = FakeRunner()
     server: ScriptedServer = ScriptedServer(lambda text, offset, new: word_edits(text, "old", new))
+
+    def assert_refused_writer_releases_its_finding(self, *, shared_proposal: bool) -> None:
+        ledger, definition, findings = self.setup_findings(shared_proposal=shared_proposal)
+        self.addCleanup(ledger.close)
+        holder = berth_board.Reservation("writer", "style/main", self.root / "product",
+                                         "refs/heads/product", ("src/lib.rs",), "active", "blocking")
+        with mock.patch.object(berth_board, "read_board", return_value=berth_board.Board((holder,))):
+            report_path = run.run_rule(self.repo, definition.rule_id, self.tree, ledger,
+                                       self.server, self.runner, bulk.check_available)
+        report = bulk.object_fields(cast(object, json.loads(report_path.read_text())))
+        self.assertEqual((report["applied"], report["refused"], report["reverted"]), (1, 1, 0))
+        self.assertNotIn("pending", report)
+        reason = bulk.object_fields(report["refusals"])[findings[0].finding_id]
+        for detail in ("src/lib.rs", str(holder.holder_worktree_root), holder.holder_branch, holder.reservation_id):
+            self.assertIn(detail, str(reason))
+        self.assertEqual(report["status"], "tested; checkpointed; built at normal ticket merge")
+        self.assertIn("let old", (self.repo / "src/lib.rs").read_text())
+        self.assertIn("let number", (self.repo / "beta/src/lib.rs").read_text())
+        self.assertEqual(self.git("rev-list", "--count", f"{self.base}..HEAD"), "1")
+        self.assertEqual([args[2] for _, args in self.runner.calls if args[0] == "bash"],
+                         ["final", "lint", "final-pass"])
+        released = ledger.named_held((findings[0].finding_id,))[0]
+        self.assertIsInstance(released.build_ticket, ledger_api.NoBuildTicket)
+        self.assertIsInstance(released.state, ledger_api.Filed)
+        ready = ledger.named_held((findings[1].finding_id,))[0]
+        self.assertIsInstance(ready.build_ticket, ledger_api.BuildTicket)
+        assert isinstance(ready.build_ticket, ledger_api.BuildTicket)
+        ready_ticket = next(item for item in ledger.proposal_tickets() if item["id"] == ready.build_ticket.ticket)
+        self.assertEqual(ready_ticket["state"], "checkpointed")
+        tickets = [item for item in ledger.proposal_tickets() if item["id"] in cast(list[str], report["tickets"])]
+        self.assertTrue(all(item["state"] in ("checkpointed", "dropped") for item in tickets))
+        self.assertEqual(sum(len(ledger.bulk_refusals(item["id"])) for item in tickets), 1)
+
+    def test_workspace_applies_ready_findings_and_releases_a_blocked_writers_claim(self) -> None:
+        self.assert_refused_writer_releases_its_finding(shared_proposal=False)
+
+    def test_workspace_checkpoints_a_shared_ticket_after_releasing_its_blocked_member(self) -> None:
+        self.assert_refused_writer_releases_its_finding(shared_proposal=True)
+
+    def test_workspace_releases_an_entire_blocked_batch_without_tests(self) -> None:
+        ledger, definition, findings = self.setup_findings()
+        self.addCleanup(ledger.close)
+        holder = berth_board.Reservation("writer", "style/main", self.root / "product",
+                                         "refs/heads/product", ("tree:.",), "active", "blocking")
+        with mock.patch.object(berth_board, "read_board", return_value=berth_board.Board((holder,))):
+            path = run.run_rule(self.repo, definition.rule_id, self.tree, ledger,
+                                self.server, self.runner, bulk.check_available)
+        report = bulk.object_fields(cast(object, json.loads(path.read_text())))
+        self.assertEqual((report["applied"], report["refused"], report["reverted"]), (0, 2, 0))
+        self.assertNotIn("pending", report)
+        self.assertEqual(report["status"], "no edits")
+        self.assertEqual(self.runner.calls, [])
+        self.assertEqual(self.git("rev-parse", "HEAD"), self.base)
+        self.assertTrue(all(isinstance(item.build_ticket, ledger_api.NoBuildTicket)
+                            for item in ledger.named_held(item.finding_id for item in findings)))
+        self.assertTrue(all(item["state"] == "dropped" for item in ledger.proposal_tickets()
+                            if item["id"] in cast(list[str], report["tickets"])))
+
+    def test_workspace_writer_arriving_during_execution_rolls_back_and_releases_the_batch(self) -> None:
+        ledger, definition, findings = self.setup_findings()
+        self.addCleanup(ledger.close)
+        holder = berth_board.Reservation("writer", "style/main", self.root / "product",
+                                         "refs/heads/product", ("tree:.",), "active", "blocking")
+        checked: Counter[str] = Counter()
+        def boundary(_repo: Path, path: str) -> None:
+            checked[path] += 1
+            if checked[path] > 1:
+                raise bulk.ReservationBlocked(path, (holder,))
+        path = run.run_rule(self.repo, definition.rule_id, self.tree, ledger,
+                            self.server, self.runner, boundary)
+        report = bulk.object_fields(cast(object, json.loads(path.read_text())))
+        self.assertEqual((report["applied"], report["refused"], report["reverted"]), (0, 0, 2))
+        self.assertNotIn("pending", report)
+        self.assertTrue(str(report["status"]).startswith("batch refused:"))
+        self.assertTrue(all(item["state"] == "dropped" for item in ledger.proposal_tickets()))
+        self.assertTrue(all(isinstance(item.build_ticket, ledger_api.NoBuildTicket)
+                            for item in ledger.named_held(item.finding_id for item in findings)))
+        self.assertEqual(self.git("rev-parse", "HEAD"), self.base)
+        self.assertEqual(self.git("status", "--porcelain"), "")
+        self.assertEqual(self.runner.calls, [])
+
+    def shared_file_reservation_probe(self) -> tuple[ledger_api.Ledger, rules.Rule, ledger_api.HeldFinding]:
+        path = self.repo / "beta/src/lib.rs"
+        _ = path.write_text(path.read_text() + "fn extra() {\n    let other = 2;\n    let _ = other + 1;\n}\n")
+        _ = self.git("add", ".")
+        _ = self.git("commit", "-qm", "shared file checkpoint fixture")
+        self.base, self.tree = self.git("rev-parse", "HEAD"), self.git("rev-parse", "HEAD^{tree}")
+        ledger, definition, findings = self.setup_findings(shared_proposal=True)
+        self.addCleanup(ledger.close)
+        extra = self.approve_extra_rename(ledger, definition, 6, "other", "size", "beta/src/lib.rs")
+        self.server = ScriptedServer(lambda text, offset, new:
+                                     word_edits(text, "old" if new == "number" else "other", new))
+        holder = berth_board.Reservation("writer", "style/main", self.root / "product",
+                                         "refs/heads/product", ("src/lib.rs",), "active", "blocking")
+        with mock.patch.object(berth_board, "read_board", return_value=berth_board.Board((holder,))):
+            report_path = run.run_rule(self.repo, definition.rule_id, self.tree, ledger,
+                                       self.server, self.runner, bulk.check_available)
+        report = bulk.object_fields(cast(object, json.loads(report_path.read_text())))
+        self.assertEqual((report["applied"], report["refused"], report["reverted"]), (2, 1, 0))
+        self.assertNotIn("pending", report)
+        reason = str(bulk.object_fields(report["refusals"])[findings[0].finding_id])
+        self.assertIn(str(holder.holder_worktree_root), reason)
+        self.assertIn(holder.holder_branch, reason)
+        self.assertIn(holder.reservation_id, reason)
+        built = ledger.named_held((extra.finding_id,))[0]
+        self.assertIsInstance(ledger.applied_check(built, self.git("rev-parse", "HEAD")), AppliedInCode)
+        tickets = cast(list[str], report["tickets"])
+        self.assertEqual(len(tickets), 2)
+        self.assertTrue(all(item["state"] == "checkpointed" and item["checkpoint"] == report["commit"]
+                            for item in ledger.proposal_tickets() if item["id"] in tickets))
+        released = ledger.named_held((findings[0].finding_id,))[0]
+        self.assertIsInstance(released.build_ticket, ledger_api.NoBuildTicket)
+        self.assertIsInstance(released.state, ledger_api.Filed)
+        ledger.set_tip(self.git("rev-parse", "HEAD"), "main")
+        for ticket in tickets:
+            self.assertEqual(ledger.ticket_merge(ticket), ())
+        return ledger, definition, released
+
+    def test_workspace_shared_file_proof_includes_every_contributing_tickets_checkpoint(self) -> None:
+        _ = self.shared_file_reservation_probe()
+
+    def test_later_workspace_run_selects_the_released_finding_after_the_writer_leaves(self) -> None:
+        ledger, definition, released = self.shared_file_reservation_probe()
+        tree = self.git("rev-parse", "HEAD^{tree}")
+        with mock.patch.object(berth_board, "read_board", return_value=berth_board.Board(())):
+            path = run.run_rule(self.repo, definition.rule_id, tree, ledger,
+                                self.server, self.runner, bulk.check_available)
+        report = bulk.object_fields(cast(object, json.loads(path.read_text())))
+        self.assertEqual((report["applied"], report["refused"], report["reverted"]), (1, 0, 0))
+        self.assertEqual(report["applied_ids"], [released.finding_id])
+        self.assertEqual(report["status"], "tested; checkpointed; built at normal ticket merge")
+        self.assertIn("let number", (self.repo / "src/lib.rs").read_text())
+        ledger.set_tip(self.git("rev-parse", "HEAD"), "main")
+        for ticket in cast(list[str], report["tickets"]):
+            self.assertEqual(ledger.ticket_merge(ticket), ())
+        self.assertIsInstance(ledger.named_held((released.finding_id,))[0].state, ledger_api.Built)
 
     def test_unnormalizable_shorthand_refusal_keeps_independent_plan_before_any_write(self) -> None:
         source = 'pub fn run() {\n    let old = 1;\n    consume(Outcome::Honored { old });\n}\n'
@@ -319,7 +456,7 @@ class WorkspaceRunTests(CargoProjectTests):
         self.assertFalse(selected.findings)
         self.assertEqual({item.reason for item in selected.skipped}, {"rule changed since judged"})
 
-    def setup_findings(self) -> tuple[ledger_api.Ledger, rules.Rule, tuple[ledger_api.HeldFinding, ...]]:
+    def setup_findings(self, *, shared_proposal: bool = False) -> tuple[ledger_api.Ledger, rules.Rule, tuple[ledger_api.HeldFinding, ...]]:
         ledger = self.ledger()
         ledger.set_tip(self.base)
         definition = next(rule for rule in rules.load_rules(self.repo) if rule.name == "prefer-type-named-fields-and-bindings")
@@ -329,7 +466,7 @@ class WorkspaceRunTests(CargoProjectTests):
         _ = ledger.ticket_base("read-1")
         findings: list[ledger_api.HeldFinding] = []
         for index, path in enumerate(paths):
-            issue = self.root / f"decision-{index}.md"
+            issue = self.root / ("decision.md" if shared_proposal else f"decision-{index}.md")
             _ = issue.write_text('---\nunit: names-unit\nplan: /tmp/standing-names.md\nstatus: open\n---\nApproved rename\n')
             finding = ledger.hold(definition.rule_id, path, 2, (self.repo / path).read_text().splitlines()[1],
                                   "rename", "old", "number", definition.blob, "read-1")
@@ -1603,6 +1740,45 @@ class FreshMachineJudgmentTests(CargoProjectTests):
         server = ScriptedServer(lambda text, _offset, new: word_edits(text, "item", new))
         return run.fresh_machine_judgment(ledger, finding, tip, self.repo, server,
                                          run.PlanningFileAvailability(self.repo, lambda _repo, _path: None))
+
+    def test_fresh_proof_blocked_by_a_writer_is_pending_instead_of_a_refusal(self) -> None:
+        ledger, finding, tip = self.fresh_case()
+        writer = berth_board.Reservation("writer", "main", self.root / "writer", "refs/heads/writer",
+                                         ("src/lib.rs",), "active", "blocking")
+        server = ScriptedServer(lambda text, _offset, new: word_edits(text, "item", new))
+        with mock.patch.object(berth_board, "read_board", return_value=berth_board.Board((writer,))):
+            plan = run.plan_rule(self.repo, ledger, tip, run.Selection((finding,), ()),
+                                 next(rule for rule in rules.load_rules(self.repo) if rule.rule_id == finding.rule),
+                                 server, bulk.check_available)
+        self.assertEqual(plan.refusals, ())
+        self.assertEqual(plan.files, ())
+        self.assertEqual(plan.pending, (bulk.PendingFinding(finding.finding_id, finding.path, (writer,)),))
+        self.assertEqual(server.changes, [])
+
+    def test_planning_availability_cache_keeps_the_reservation_variant(self) -> None:
+        writer = berth_board.Reservation("writer", "main", self.root / "writer", "refs/heads/writer",
+                                         ("src/lib.rs",), "active", "blocking")
+        cache = run.PlanningFileAvailability(self.repo, bulk.check_available)
+        with mock.patch.object(berth_board, "read_board", return_value=berth_board.Board((writer,))) as board:
+            for _ in range(2):
+                with self.assertRaises(bulk.ReservationBlocked) as caught:
+                    cache.require(("src/lib.rs",))
+                self.assertEqual(caught.exception.holders, (writer,))
+        self.assertEqual(board.call_count, 1)
+
+    def test_late_plan_boundary_retains_pending_instead_of_terminal_file_refusals(self) -> None:
+        ledger, finding, tip = self.fresh_case()
+        server = ScriptedServer(lambda text, _offset, new: word_edits(text, "item", new))
+        plan = run.plan_renames(self.repo, ledger, tip, run.Selection((finding,), ()), server,
+                                run.PlanningFileAvailability(self.repo, lambda _repo, _path: None))
+        self.assertTrue(plan.files)
+        writer = berth_board.Reservation("writer", "main", self.root / "writer", "refs/heads/writer",
+                                         ("src/lib.rs",), "active", "blocking")
+        with mock.patch.object(berth_board, "read_board", return_value=berth_board.Board((writer,))):
+            checked = run.available_constant_plan(plan, run.PlanningFileAvailability(self.repo, bulk.check_available))
+        self.assertEqual(checked.files, ())
+        self.assertEqual(checked.refusals, ())
+        self.assertEqual(checked.pending, (bulk.PendingFinding(finding.finding_id, finding.path, (writer,)),))
 
     def test_return_type_and_owner_change_gets_a_new_judgment_without_changing_the_old_one(self) -> None:
         ledger, finding, tip = self.fresh_case()

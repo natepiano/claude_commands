@@ -1063,6 +1063,16 @@ class ValidationTests(CargoProjectTests):
         self.assertEqual({item.kind for item in sample}, {"let", "closure"})
         self.assertEqual(len(bulk.sample_findings(findings[:3])), 3)
 
+    def test_blocking_writer_availability_retains_every_holder_as_typed_evidence(self) -> None:
+        writer = berth_board.Reservation("writer", "main", self.root / "writer", "refs/heads/writer",
+                                         ("src/lib.rs",), "active", "blocking")
+        reader = replace(writer, reservation_id="reader", edit_blocking_status="clear")
+        with mock.patch.object(berth_board, "read_board", return_value=berth_board.Board((reader, writer))):
+            with self.assertRaises(bulk.ReservationBlocked) as caught:
+                bulk.check_available(self.repo, "src/lib.rs")
+        self.assertEqual(caught.exception.path, "src/lib.rs")
+        self.assertEqual(caught.exception.holders, (writer,))
+
     def test_busy_path_or_unreadable_board_refuses_writes(self) -> None:
         reservation = berth_board.Reservation("other", "x", self.root / "other", "branch", ("src/lib.rs",), "active", "blocking")
         with mock.patch.object(berth_board, "read_board", return_value=berth_board.Board((reservation,))):

@@ -507,3 +507,42 @@ paths, covering later references and unplanned edits. A legacy overlap waits
 for repair; its successor can be dropped to recover.
 The ledger's independent guard conservatively counts every module-name mention
 and possible path-attribute owner, with refill's shared build-input protection.
+
+
+### Reservation waits in identified crate runs
+
+`bulk_rename.check_available` remains the cargo-berth authority: only another
+worktree's matching `Reservation.blocks` claim blocks editing. A clear read
+claim permits work. A blocking claim raises `ReservationBlocked(path, holders)`;
+planning retains it as `PendingFinding`, separately from terminal `Refusal`.
+Each holder carries the worktree, branch and reservation id supplied by berth.
+Private checkouts always check the canonical repository's board.
+
+An identified serial crate run records pending findings in its manifest, keeps
+its existing ticket claims and enters `waiting for reservations`. Independent
+findings finish planning, then availability is retried once with a fresh answer.
+If any remain blocked, this invocation returns nonzero without source edits,
+tests or an incomplete checkpoint. The complete crate remains one atomic proof
+and publication group; it is not split into another ticket. There is no sleep,
+polling loop or new wait limit. Resume the same `--run` and `--crate` after a
+release: ownership and frozen finding inputs are rechecked, availability is read
+again, and admitted findings pass the normal site, semantic and execution checks.
+Only findings not previously admitted may receive their first fresh machine
+judgment; existing frozen proofs are validated and never silently replaced.
+A writer appearing at the execution boundary rolls back journaled private edits
+and keeps the batch pending. A completed run executes no second edit on resume.
+
+Only terminal refusals enter the refusal publication/release path, including
+terminal failures discovered after a reservation releases. Their durable manifest
+record precedes release; pending siblings keep their claims across interruption.
+The anonymous `bulk_run --rule` workspace entry point has no resume manifest.
+It refuses and releases a blocked file's findings, naming the path and berth
+holders in the refusal. Independent ready groups still run; every ticket that
+contributes edits receives the tested checkpoint and joins the complete workspace
+proof group. Release returns a held finding to selection: a later invocation can
+pick it after the reservation clears and the earlier tickets merge. A writer
+arriving during execution fails the atomic batch, rolling back edits and releasing
+its findings; it cannot leave a partial ticket. Identified crate runs alone keep
+reservation-blocked findings pending for automatic manifest resume.
+A terminal error in any member of an atomic group takes precedence over a
+reservation wait: each finding is refused once and never also persisted as pending.
