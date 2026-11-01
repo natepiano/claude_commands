@@ -328,6 +328,24 @@ class UsageStoreTests(unittest.TestCase):
         self.assertEqual(stored["main@example.invalid"].get("attempted_at"), READ.isoformat())
         self.assertEqual(stored["main@example.invalid"].get("attempt_outcome"), UsageReadOutcome.RATE_LIMITED_429)
 
+    def test_scoped_read_cadence_preserves_rate_limit_backoff_and_restores_default(self) -> None:
+        login = "main@example.invalid"
+        with usage_store.read_cadence(45):
+            claim = usage_store.claim_read(login, READ)
+            assert isinstance(claim, agent_accounts.UsageReadClaim)
+            usage_store.finish_read(login, claim, Report("Claude", email=login,
+                usage_read_outcome=UsageReadOutcome.RATE_LIMITED_429))
+            self.assertIsInstance(usage_store.claim_read(login, READ + timedelta(seconds=60)),
+                                  agent_accounts.UsageReadHeld)
+            self.assertIsInstance(usage_store.claim_read(login, READ + timedelta(seconds=599)),
+                                  agent_accounts.UsageReadHeld)
+            self.assertIsInstance(usage_store.claim_read(login, READ + timedelta(seconds=600)),
+                                  agent_accounts.UsageReadClaim)
+        self.assertIsInstance(usage_store.claim_read(login, READ + timedelta(seconds=660)),
+                              agent_accounts.UsageReadHeld)
+        self.assertIsInstance(usage_store.claim_read(login, READ + timedelta(seconds=690)),
+                              agent_accounts.UsageReadClaim)
+
     def test_unavailable_credentials_create_no_failure_or_directory_mapping(self) -> None:
         report = Report("Claude", email="desktop@example.invalid",
             source=agent_accounts.ClaudeDirectorySource(self.home / ".claude2"),

@@ -3038,3 +3038,34 @@ Showrunner defect 2026-10-31 09:3x EDT, reported by hana: the validation line op
 User 2026-11-01 07:4x EST: "please look at the problems coming from the script feeding the accounts board and correct them". Seen on the Mac board (stored-mode `accounts.py status`).
 
 **As-built:** a stored-mode read with a cached role map lists no role-map problem; with no cache it refuses as before. A usage reading not from today shows its date (`10-29 01:14`). The retry promise is gone: the line says `last read attempted at <time>` or `no usage read has been attempted`, because the notes timer can reuse a failed report for ten minutes. `MAC_HOME_LOGIN_STEP` gives the whole Mac step: `accounts.py exec claude2`, `/login`, `/exit`, then `accounts.py cutover-home claude2`, never `/logout`. When `~/.codex` and the numbered home hold the same login, one line reads `~/.codex still holds codex2's login; stop what uses ~/.codex (such as the ChatGPT app), then run accounts.py cutover-home codex2`; when the numbered home holds another login, one label-only line gives its repair instead of a cutover that would refuse. The login command is one shared `env CODEX_HOME=<quoted home> codex login`, which the `codex` alias cannot redirect, also used by `setup codexN`. No problem line prints a login; a test fails if one holds a fixture login. Review: two lenses found F001 (cutover step for a home holding another login) and F002 (false retry promise); two fix rounds; closure approved.
+
+### Phase 101k — The Mac reads account usage at an interval set in config, now one minute  · status: done
+
+User 2026-11-01 09:2x EST, through the Mac session: "make that interval configurable - and to make the refresh interval 1 minute instead of 2 minutes". The Mac job `account-usage` (`/etc/nixos/modules/darwin/account-usage.nix`) runs `agent_notes.py usage-only` at a fixed launchd `StartInterval` of 120 s, so a change needs a rebuild. Director call: one key for the Mac read only; natedev's usage read stays inside its notes part (`[parts.notes]`, 120 s), because that pass also routes quota and moves sessions, and the user named only the Mac.
+
+**Depends on:** none.
+
+#### Work Order
+
+- **One config key.** `config/agent_notes.toml` gets the Mac usage-read interval (60 s), read at each run; no literal interval in code. A missing or invalid value refuses with one line that names the file and key.
+- **Due check.** `agent_notes.py usage-only` reads only when the last usage-only attempt is at least the configured interval old; otherwise it exits 0 at once with no read and no log line. Reuse the existing due and schedule code in `scripts/maintenance/agent_notes_job.py` (move it to one shared place if needed); no second copy. With a 30 s launchd poll and a 60 s interval, reads come every 60 s, not every 90 s: start jitter must not skip a poll.
+- **Mac job.** The director changes `account-usage.nix` to a 30 s poll (comment: the interval belongs to the runtime config), like natedev's `agent-notes.nix`. Workers do not edit `/etc/nixos`.
+- Docs: `docs/accounts.md` where it names the Mac refresh interval.
+- Tests: due and not-due runs, the jitter case, config read at use, the refusal. Tests never touch live homes, keychains, ssh, real usage stores or launchd.
+
+**Files:** `scripts/whoami/agent_notes.py`, `scripts/maintenance/agent_notes_job.py`, their tests, `config/agent_notes.toml`, `docs/accounts.md`.
+
+### Phase 101l — A legacy-login line and the brp registration each stay fixed  · status: todo
+
+Found 2026-11-01. (1) On the Mac, `~/.claude.json` held another account's `oauthAccount` with no keychain credential; `cutover-home claude2` returned early (journal complete since 10-16), and the printed step ("one /login in ~/.claude2") could not clear it. (2) On natedev, the login job `claude-brp-mcp` (`/etc/nixos/modules/common/claude-code.nix`) registers brp at user scope in `~/.claude.json` at each login, which undid the user's 10-28 rule (brp only in hana, nateroids and bevy_brp). The board then told claude1-4 to turn brp on in about 35 projects. The director removed the user-scope entry at 09:3x.
+
+**Depends on:** 101k (same worker).
+
+#### Work Order
+
+- **Leftover account data.** When `~/.claude` has no credential but `~/.claude.json` still names an account, `cutover-home` removes only that account data (dated backup, atomic write) even when the journal is complete, and status prints that step. No `/logout`.
+- **brp only in its repos.** The login job and its setup check register brp at local scope in `$HOME/rust/{hana,nateroids,bevy_brp}` for `~/.claude` and each numbered home, and never at user scope; a run that changes nothing writes nothing. Workers write the new module text to the phase folder; the director commits it to a nixos branch.
+- **Wrong sign-in recovery.** `accounts.py exec claudeN` refuses a home signed in to another account, but `docs/accounts.md` "Log out and in" sends the user to that same command for `/login`. Give the refusal a working step that reaches `/login` on that home, and make the doc match. The refusal prints the label, never the login (today it prints the email).
+- Tests for the first and third items; the second is checked by `nix-instantiate --parse` and a dry read of the script.
+
+**Files:** `scripts/accounts/accounts.py`, its tests, `docs/accounts.md`; nixos `modules/common/claude-code.nix` through the director.
