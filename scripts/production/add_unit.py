@@ -1242,10 +1242,16 @@ def set_autocompact(request: RequestedUnitLaunch, session_id: str, value: str, c
 def ensure_staff_unit(production: Production, unit: str) -> staff.StaffRow:
     """Keep member identities, ensuring missing rows on first add or resume."""
     record = staff.initial_snapshot()
-    found = staff_sources.member(staff_sources.UnitMember(production.slug, unit), record)
-    if isinstance(found, staff_sources.MemberFound):
-        return found.row
+    found = staff_sources.member(staff_sources.ObservedUnit(unit), record)
     parent = staff_sources.member(staff_sources.ShowrunnerMember(production.slug), record)
+    if isinstance(found, staff_sources.MemberFound):
+        if not isinstance(parent, staff_sources.MemberFound) or found.row.parent != parent.row.id:
+            owner = record.by_id(found.row.parent) if found.row.parent is not None else None
+            if owner is None or owner.kind != "showrunner":
+                raise staff.StaffUnreadable(f"{found.row.name}: no showrunner staff row")
+            raise Refusal(f"{found.row.name} is under {owner.name}; to move it, run: "
+                          + f"staff.py move {owner.name}/{found.row.name} {production.slug}")
+        return found.row
     runner = (parent.row if isinstance(parent, staff_sources.MemberFound)
               else staff.ensure("showrunner", name=showrunners.herdr_space(production.slug, str(production.doc))))
     return staff.ensure("unit", name=unit_names.name(unit), parent=runner.id)
