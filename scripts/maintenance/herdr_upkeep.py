@@ -14,6 +14,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
+from scripts.lib import process_group
 from scripts.maintenance.settings import schedule, table
 
 
@@ -50,7 +51,7 @@ def run_job() -> int:
                 code = child.wait(timeout=cadence.timeout_seconds)
             except subprocess.TimeoutExpired:
                 try:
-                    os.killpg(child.pid, signal.SIGKILL)
+                    process_group.send_process_group(child.pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
                 _ = child.wait()

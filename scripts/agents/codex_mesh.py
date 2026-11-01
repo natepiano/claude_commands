@@ -64,6 +64,7 @@ import errno
 import fcntl
 import importlib
 import json
+import math
 import os
 import re
 import secrets
@@ -89,7 +90,7 @@ from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed, write_text_atom
 from scripts.agents import worker_lifecycle
 
 NO_LOCK_DEADLINE = worker_lifecycle.NO_LOCK_DEADLINE
-from scripts.lib import nix_env, unit_runs
+from scripts.lib import nix_env, process_group, unit_runs
 from scripts.lib.probe_session import PROBE_ENV
 from scripts.astra.design_roles import PhaseBoundDesigner, ReadOnlyReviewer, ThreadAccessPolicy
 from scripts.message import sessions, process_table
@@ -1915,7 +1916,7 @@ def _signal_process(pid: object, signum: int, *, group: bool = False) -> None:
         raise ProcessLookupError(errno.ESRCH, "refusing unsafe process ID")
     try:
         if group:
-            os.killpg(pid, signum)
+            process_group.send_process_group(pid, signum)
         else:
             os.kill(pid, signum)
     except OverflowError as error:
@@ -3239,6 +3240,21 @@ def _ended_unseen(client: Client, thread_id: str, turn_id: str = "", *, start_se
     return False
 
 
+def queue_grace_secs() -> float:
+    """Read the queue grace for this wait, including in child processes."""
+    variable = "CODEX_MESH_QUEUE_GRACE_SECS"
+    value = os.environ.get(variable, "")
+    if not value:
+        return QUEUE_GRACE_SECS
+    try:
+        grace = float(value)
+    except ValueError:
+        raise SystemExit(f"{variable} must be a finite number of 0 or more; got {value!r}") from None
+    if not math.isfinite(grace) or grace < 0:
+        raise SystemExit(f"{variable} must be a finite number of 0 or more; got {value!r}")
+    return grace
+
+
 def _more_work_coming(client: Client, thread_id: str, deadline: float) -> bool:
     """True when a turn that just ended is not the worker's last.
 
@@ -3258,7 +3274,7 @@ def _more_work_coming(client: Client, thread_id: str, deadline: float) -> bool:
     # Frames are held locally rather than pushed back as they arrive: a frame
     # returned to the buffer is the next thing `next_frame` hands out, so
     # push-as-you-go would re-serve the same frame and never reach the socket.
-    grace = min(time.time() + QUEUE_GRACE_SECS, deadline)
+    grace = min(time.time() + queue_grace_secs(), deadline)
     expires = time.monotonic() + max(0.0, grace - time.time())
     held: list[RpcMessage] = []
     started = False

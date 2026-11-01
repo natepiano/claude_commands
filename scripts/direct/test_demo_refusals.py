@@ -9,6 +9,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 DEMO = Path(__file__).resolve().with_name("demo_refusals.sh")
@@ -78,7 +79,7 @@ printf "%s\n" "$created"
                 },
                 capture_output=True,
                 text=True,
-                timeout=60,
+                timeout=TEST_HANG_GUARD_SECS,
                 check=False,
             )
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

@@ -10,11 +10,11 @@ import unittest
 from unittest import mock
 
 from scripts.direct.verify_hold_wait_test_support import (
-    TEST_HANG_GUARD_SECS,
     VerifyHoldWaitFixture,
     grant_call,
     read_cycle_file,
 )
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 class VerifyHoldWaitTests(VerifyHoldWaitFixture):

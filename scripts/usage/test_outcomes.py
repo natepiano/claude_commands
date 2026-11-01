@@ -21,10 +21,8 @@ from scripts.whoami import worker_usage
 from scripts.usage.test_collect import (
     CollectorFixture, FIXTURES as COLLECT_FIXTURES, MacRun, MacStreamReport, SshBehavior,
 )
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
-
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
 
 class DefaultSourcesTests(unittest.TestCase):
     def test_first_read_accepts_a_concurrent_baseline_conversion(self) -> None:

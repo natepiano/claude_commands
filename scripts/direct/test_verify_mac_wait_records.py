@@ -4,7 +4,7 @@ from __future__ import annotations
 import unittest
 from typing import final
 from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture
-from scripts.direct.verify_mac_offload_test_support import HANG_GUARD_S as HANG_GUARD_S
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 @final
@@ -21,7 +21,7 @@ class VerifyMacWaitRecordsTests(VerifyMacOffloadFixture):
         _ = clock.write_text("105")
         _ = (self.runner_state / "mac-free").write_text("free\n")
         _ = (self.runner_state / "continue-sleep-2").write_text("continue\n")
-        output, errors = process.communicate(timeout=HANG_GUARD_S)
+        output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(process.returncode, 0, output + errors)
         self.assertEqual(len(self.runner_events()), 3)
         self.assertEqual(self.routing_record()["hold_wait_s"], 2 + 4.5 + 3)
@@ -34,7 +34,7 @@ class VerifyMacWaitRecordsTests(VerifyMacOffloadFixture):
         _ = clock.write_text("103")
         self.release_local_hold()
         _ = (self.runner_state / "continue-sleep").write_text("continue\n")
-        output, errors = process.communicate(timeout=HANG_GUARD_S)
+        output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(process.returncode, 0, output + errors)
         record = self.routing_record()
         self.assertEqual(record["hold_wait_s"], 3)

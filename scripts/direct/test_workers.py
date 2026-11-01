@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from scripts.lib.test_agents_registry import write_registry
 from scripts.lib.atomic_file import write_bytes_atomic
-from scripts.lib.test_hang_guard import LauncherHangGuard
 
 import contextlib
 import dataclasses
@@ -32,6 +31,7 @@ from unittest.mock import patch
 from scripts.agents import codex_mesh, worker_lifecycle, test_codex_mesh as mesh_fixture
 from scripts.direct import progress_history, workers
 from scripts.direct.recorder_fixture import invoke_recorder
+from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.message import sessions
 from scripts.production.staff_test_support import StaffTestCase, isolated_source_readers, showrunner_relationship
 
@@ -46,16 +46,8 @@ class AdoptionWriteInterrupted(BaseException):
 @contextmanager
 def bounded_worker_change() -> Generator[None, None, None]:
     """A lock-order regression fails instead of hanging the fixture forever."""
-    def expired(number: int, frame: object) -> None:
-        raise AssertionError(f"worker change exceeded its 15s deadline ({number}, {type(frame).__name__})")
-
-    previous = signal.signal(signal.SIGALRM, expired)
-    timer = signal.setitimer(signal.ITIMER_REAL, 15)
-    try:
+    with LauncherHangGuard("worker change").protect():
         yield
-    finally:
-        _ = signal.setitimer(signal.ITIMER_REAL, *timer)
-        _ = signal.signal(signal.SIGALRM, previous)
 
 
 @contextmanager
@@ -781,7 +773,7 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
             self.assertIn(str(self.session_dir), codex_mesh.worker_run_history(str(destination), "w7"))
             with bounded_worker_change(), redirect_stdout(io.StringIO()) as output:
                 workers.end_unit("before", "builders")
-            _ = child.communicate(timeout=4)
+            _ = child.communicate(timeout=TEST_HANG_GUARD_SECS)
             self.assertEqual(child.returncode, -signal.SIGTERM)
             self.assertIn("retiring-command", output.getvalue())
             self.assertIn(str(child.pid), output.getvalue())
@@ -789,7 +781,7 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
         finally:
             if child.poll() is None:
                 child.kill()
-                _ = child.communicate(timeout=4)
+                _ = child.communicate(timeout=TEST_HANG_GUARD_SECS)
 
     def test_retirement_never_trusts_or_signals_a_reused_supervisor_pid(self) -> None:
         _ = self.lifecycle_worker()
@@ -813,7 +805,7 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
                 workers.end_unit("before", "builders")
             self.assertIsNone(unrelated.poll())
             self.assertNotIn("cancelled detached run abandoned", output.getvalue())
-            _ = unrelated.communicate(timeout=4)
+            _ = unrelated.communicate(timeout=TEST_HANG_GUARD_SECS)
 
     def test_a_supervisor_started_through_a_linked_run_protects_its_resolved_checkout(self) -> None:
         _ = self.lifecycle_worker()
@@ -826,7 +818,7 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
         checkout.mkdir(parents=True)
         child = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()",
             "mesh_runs.py", "supervise", str(linked / "mesh_runs" / record.name)], stdin=subprocess.PIPE)
-        self.addCleanup(child.communicate, timeout=4)
+        self.addCleanup(child.communicate, timeout=TEST_HANG_GUARD_SECS)
         _ = record.write_text(json.dumps({"worker": "w7", "status": "running", "pid": child.pid,
                                          "cwd": str(checkout)}))
         workers.pause_unit("before", "builders")
@@ -940,20 +932,20 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
                                  stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         try:
             result = subprocess.run([sys.executable, str(SCRIPT), "resolve", "--session-dir", str(self.session_dir),
-                "--role", "impl", "--owner-pid", str(owner.pid)], capture_output=True, text=True, timeout=15, check=False)
+                "--role", "impl", "--owner-pid", str(owner.pid)], capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS, check=False)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout.strip(), "impl")
             record = cast(dict[str, object], json_object(self.session_dir / codex_mesh.ROSTER_FILE)["impl"])
             self.assertEqual(record["allocation_owner_pid"], owner.pid)
             self.assertTrue(workers.allocation_is_live(record))
-            _ = owner.communicate(timeout=4)
+            _ = owner.communicate(timeout=TEST_HANG_GUARD_SECS)
             self.assertFalse(workers.allocation_is_live(record))
             self.assertEqual(self.resolve(self.session_dir), "impl")
             self.assertEqual(self.methods("thread/start"), [])
         finally:
             if owner.poll() is None:
                 owner.kill()
-                _ = owner.communicate(timeout=4)
+                _ = owner.communicate(timeout=TEST_HANG_GUARD_SECS)
 
     def test_resolve_from_a_short_lived_shell_keeps_the_directors_reservation(self) -> None:
         _ = self.lifecycle_worker(name="impl")
@@ -977,7 +969,7 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
 
     def check_short_lived_resolve(self) -> None:
         command = shlex.join([sys.executable, str(SCRIPT), "resolve", "--session-dir", str(self.session_dir), "--role", "impl"])
-        first = subprocess.run(["bash", "-c", command + "; true"], capture_output=True, text=True, timeout=15, check=False)
+        first = subprocess.run(["bash", "-c", command + "; true"], capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS, check=False)
         self.assertEqual(first.stdout.strip(), "impl", first.stderr)
         record = cast(dict[str, object], json_object(self.session_dir / codex_mesh.ROSTER_FILE)["impl"])
         self.assertEqual(record["allocation_owner_pid"], os.getpid())
@@ -1065,7 +1057,7 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
     def test_two_simultaneous_resolves_in_one_run_reserve_distinct_workers(self) -> None:
         self.open_worker(name="impl")
         self.configure_new_worker()
-        gate = threading.Barrier(2, timeout=4)
+        gate = threading.Barrier(2, timeout=TEST_HANG_GUARD_SECS)
 
         def reserve() -> str:
             _ = gate.wait()
@@ -1073,7 +1065,7 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
 
         with ThreadPoolExecutor(max_workers=2) as executor:
             futures = [executor.submit(reserve) for _ in range(2)]
-            names = [future.result(timeout=20) for future in futures]
+            names = [future.result(timeout=TEST_HANG_GUARD_SECS) for future in futures]
         self.assertEqual(set(names), {"impl", "impl2"})
         roster = json_object(self.session_dir / codex_mesh.ROSTER_FILE)
         self.assertEqual({cast(dict[str, object], roster[name])["thread_id"] for name in names},
@@ -1097,13 +1089,13 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
                     str(self.session_dir),
                 ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=os.environ.copy())
                 try:
-                    output, errors = child.communicate(timeout=15)
+                    output, errors = child.communicate(timeout=TEST_HANG_GUARD_SECS)
                     self.assertEqual(child.returncode, 0, errors.decode())
                     self.assertEqual(output.decode().strip(), "impl")
                 finally:
                     if child.poll() is None:
                         child.kill()
-                        _ = child.communicate(timeout=4)
+                        _ = child.communicate(timeout=TEST_HANG_GUARD_SECS)
                 destination = (self.session_dir if destination_name == "same-run"
                                else self.next_run("after-resolver-exit"))
                 if destination != self.session_dir:
@@ -1209,7 +1201,7 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
         result = subprocess.run([
             sys.executable, str(SCRIPT), "resolve", "--session-dir", str(self.session_dir), "--role", "impl",
             "--owner-pid", str(os.getpid()),
-        ], env=os.environ.copy(), capture_output=True, text=True, timeout=15, check=False)
+        ], env=os.environ.copy(), capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS, check=False)
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertIn("start-phase", result.stderr)
         self.assertEqual((self.session_dir / codex_mesh.ROSTER_FILE).read_bytes(), before)
@@ -1230,7 +1222,7 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=os.environ.copy())
             try:
                 assert child.stdout is not None
-                ready, _, _ = select.select([child.stdout], [], [], 4)
+                ready, _, _ = select.select([child.stdout], [], [], TEST_HANG_GUARD_SECS)
                 self.assertTrue(ready, "reader did not finish importing within its fixture deadline")
                 self.assertEqual(child.stdout.readline(), b"reader-ready\n")
                 with self.assertRaises(subprocess.TimeoutExpired):
@@ -1239,13 +1231,13 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
                 _ = roster.write(original)
                 roster.flush()
                 fcntl.flock(owner, fcntl.LOCK_UN)
-                output, errors = child.communicate(timeout=15)
+                output, errors = child.communicate(timeout=TEST_HANG_GUARD_SECS)
                 self.assertEqual(child.returncode, 0, errors.decode())
                 self.assertEqual(output.decode().strip(), "address-with-no-role-suffix")
             finally:
                 if child.poll() is None:
                     child.kill()
-                    _ = child.communicate(timeout=4)
+                    _ = child.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(self.methods("thread/start"), [])
 
     def test_legacy_reviewer_instructions_keep_the_read_only_ledger_policy(self) -> None:
@@ -1330,7 +1322,7 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
              "--role", "impl", "--owner-pid", str(os.getpid()),
              "--model", model, "--effort", effort],
             cwd=self.session_dir.parent / "repository", capture_output=True, text=True,
-            env=os.environ.copy(), timeout=15, check=False)
+            env=os.environ.copy(), timeout=TEST_HANG_GUARD_SECS, check=False)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(len(result.stdout.strip().splitlines()), 1, result.stdout)
         return result.stdout.strip()
@@ -1364,7 +1356,7 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
         def shown() -> str:
             result = subprocess.run([sys.executable, str(SCRIPT), "shown-name", "--session-dir",
                                      str(self.session_dir), "--name", "w7"],
-                                    capture_output=True, text=True, timeout=15, check=False)
+                                    capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS, check=False)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             return result.stdout.strip()
 
@@ -1764,7 +1756,7 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
         result = subprocess.run([
             sys.executable, str(Path(codex_mesh.__file__)), "follow", "--session-dir", str(self.session_dir),
             *self.follow_cli()[1:],
-        ], capture_output=True, text=True, timeout=15, check=False)
+        ], capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS, check=False)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("quarantin", result.stderr.lower())
         self.assertNotIn("Traceback", result.stderr)
@@ -1894,7 +1886,7 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
         self.complete_assignment("impl")
         destinations = [self.next_run("racing-a"), self.next_run("racing-b")]
         self.configure_new_worker()
-        gate = threading.Barrier(2, timeout=4)
+        gate = threading.Barrier(2, timeout=TEST_HANG_GUARD_SECS)
 
         def resolve_after_gate(run: Path) -> str:
             _ = gate.wait()
@@ -1902,7 +1894,7 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
 
         with ThreadPoolExecutor(max_workers=2) as executor:
             futures = [executor.submit(resolve_after_gate, run) for run in destinations]
-            names = [future.result(timeout=20) for future in futures]
+            names = [future.result(timeout=TEST_HANG_GUARD_SECS) for future in futures]
         self.assertEqual(set(names), {"impl", "impl2"})
         threads: list[object] = []
         for run, name in zip(destinations, names):

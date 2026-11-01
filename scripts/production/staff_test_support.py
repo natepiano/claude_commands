@@ -19,12 +19,12 @@ from unittest import mock
 
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import staff
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.shutdown import pane_record
 
 CHECKOUT = Path(__file__).resolve().parents[2]
 STAFF_SCRIPT = Path(__file__).with_name("staff.py")
 SOURCES_SCRIPT = Path(__file__).with_name("staff_sources.py")
-PROCESS_TIMEOUT = 30
 FixtureMachine = Literal["natedev", "mac"]
 
 
@@ -280,7 +280,7 @@ class StaffTestCase(unittest.TestCase):
         completed = subprocess.run(
             [sys.executable, "-c", OWNER_CLI, str(script), *arguments],
             cwd=CHECKOUT, capture_output=True, text=True, check=False,
-            timeout=PROCESS_TIMEOUT,
+            timeout=TEST_HANG_GUARD_SECS,
         )
         self.assertEqual(completed.returncode, code, completed.stderr)
         return completed
@@ -330,7 +330,7 @@ class StaffTestCase(unittest.TestCase):
         self.assertTrue(folder.is_relative_to(self.root))
         result = subprocess.run(
             ["git", "-C", str(folder), *arguments], capture_output=True, text=True,
-            check=True, timeout=PROCESS_TIMEOUT,
+            check=True, timeout=TEST_HANG_GUARD_SECS,
         )
         return result.stdout.strip()
 
@@ -444,17 +444,17 @@ class StaffTestCase(unittest.TestCase):
         direct = CHECKOUT / "scripts/direct"
         named = subprocess.run(
             ["bash", str(direct / "worker_name.sh"), str(self.root), "impl", kind, prefix],
-            capture_output=True, text=True, check=True, timeout=PROCESS_TIMEOUT,
+            capture_output=True, text=True, check=True, timeout=TEST_HANG_GUARD_SECS,
         )
         name = named.stdout.strip()
         _ = subprocess.run(
             ["bash", str(direct / "board.sh"), "post", str(run), "impl", "register",
-             f"mesh={name}"], capture_output=True, text=True, check=True, timeout=PROCESS_TIMEOUT,
+             f"mesh={name}"], capture_output=True, text=True, check=True, timeout=TEST_HANG_GUARD_SECS,
         )
         if role:
             _ = subprocess.run(
                 ["bash", str(direct / "board.sh"), "role", str(run), "impl", role],
-                capture_output=True, text=True, check=True, timeout=PROCESS_TIMEOUT,
+                capture_output=True, text=True, check=True, timeout=TEST_HANG_GUARD_SECS,
             )
         write_text_atomic(run / "workers", f"{session_id[:8]}\t{name}\n")
         return name
@@ -480,7 +480,7 @@ class StaffTestCase(unittest.TestCase):
         with socket.socket(socket.AF_UNIX) as listener:
             listener.bind(str(path))
             listener.listen()
-            listener.settimeout(PROCESS_TIMEOUT)
+            listener.settimeout(TEST_HANG_GUARD_SECS)
             with mock.patch.dict(os.environ, {"STAFF_TEST_LOCK_NOTICE": str(path), "STAFF_TEST_LOCK_TARGET": str(lock)}):
                 yield listener
 
@@ -493,7 +493,7 @@ class StaffTestCase(unittest.TestCase):
         def clean_up() -> None:
             if pending.returncode is None:
                 pending.terminate()
-                _ = pending.communicate(timeout=PROCESS_TIMEOUT)
+                _ = pending.communicate(timeout=TEST_HANG_GUARD_SECS)
 
         self.addCleanup(clean_up)
         return pending

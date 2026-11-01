@@ -209,6 +209,18 @@ class RoleRefused(ValueError):
     pass
 
 
+class DamagedDesignRecord(RoleRefused):
+    path: Path
+    field: str
+    holder: Holder
+
+    def __init__(self, path: Path, field: str, holder: Holder) -> None:
+        self.path = path
+        self.field = field
+        self.holder = holder
+        super().__init__('missing or invalid ' + field.rsplit('.', 1)[-1])
+
+
 def state_root() -> Path:
     return Path(os.environ.get('DESIGN_ROLES_STATE') or '~/.local/state/astra/design-roles').expanduser()
 
@@ -315,15 +327,20 @@ def _lifecycle(fields: dict[str, object]) -> Lifecycle:
 
 
 def read_design(design_id: str) -> HeldDesign:
+    return _load_design(design_id, repair_empty_repository=False)
+
+
+def _load_design(design_id: str, *, repair_empty_repository: bool) -> HeldDesign:
     path = design_directory(design_id) / 'design.json'
     try:
-        return _decode_design(design_id, _read(path))
+        return _decode_design(design_id, _read(path), repair_empty_repository=repair_empty_repository)
     except RoleRefused as error:
         raise worker_lifecycle.WorkerStateUnreadable(path, str(error)) from error
 
 
-def _decode_design(design_id: str, fields: dict[str, object]) -> HeldDesign:
-    _ = design_directory(design_id)
+def _decode_design(design_id: str, fields: dict[str, object], *,
+                        repair_empty_repository: bool = False) -> HeldDesign:
+    path = design_directory(design_id) / 'design.json'
     if fields.get('schema') != 1:
         raise RoleRefused('unknown design schema')
     placement = _object(fields.get('placement'))
@@ -347,20 +364,37 @@ def _decode_design(design_id: str, fields: dict[str, object]) -> HeldDesign:
     for key in ('repository', 'document'):
         if not Path(_text(fields, key)).is_absolute():
             raise RoleRefused(key + ' must be absolute')
-    return HeldDesign(DesignPlacement(design_id, _text(placement, 'host'), _integer(placement, 'generation')),
+    binding_fields = _object(fields.get('binding'))
+    empty_repository = (binding_fields.get('kind') == 'DesignBoundToPhase'
+                        and binding_fields.get('repository') == '')
+    if empty_repository:
+        binding_fields = {**binding_fields, 'repository': _text(fields, 'repository')}
+    design = HeldDesign(DesignPlacement(design_id, _text(placement, 'host'), _integer(placement, 'generation')),
                       _text(fields, 'repository_id'), _text(fields, 'repository'), _text(fields, 'document'),
                       _text(fields, 'area'), _text(fields, 'created_at_utc'),
-                      _holder(_object(fields.get('holder'))), _binding(_object(fields.get('binding'))), tuple(instances))
+                      _holder(_object(fields.get('holder'))), _binding(binding_fields), tuple(instances))
+    if empty_repository and not repair_empty_repository:
+        raise DamagedDesignRecord(path, 'binding.repository', design.holder)
+    return design
 
 
-def _save(design: HeldDesign) -> None:
+def _design_fields(design: HeldDesign) -> dict[str, object]:
     if isinstance(design.binding, DesignBoundToPhase) and not design.binding.repository:
-        raise RoleRefused('missing or invalid repository')
+        raise RoleRefused('missing or invalid binding.repository')
     fields = asdict(design)
     fields['schema'] = 1
     fields['holder'] = _tag(design.holder)
-    fields['binding'] = _tag(design.binding)
+    binding_fields = _tag(design.binding)
+    if isinstance(design.binding, DesignBoundToPhase):
+        binding_fields['output_paths'] = list(design.binding.output_paths)
+    fields['binding'] = binding_fields
     fields['roles'] = [{'role': role.role, 'name': role.name, 'lifecycle': _tag(role.lifecycle), 'assignment_claim': role.assignment_claim} for role in design.roles]
+    return fields
+
+
+def _save(design: HeldDesign) -> None:
+    fields = _design_fields(design)
+    _ = _decode_design(design.placement.design_id, fields)
     _atomic(design_directory(design.placement.design_id) / 'design.json', fields)
 
 
@@ -647,9 +681,12 @@ def access_policy(design: HeldDesign, role: Role) -> ThreadAccessPolicy:
 
 
 def _mesh_context(design: HeldDesign, reach: HolderReach) -> None:
-    _atomic(mesh_directory(design.placement.design_id) / 'design_context.json',
-            {'design_id': design.placement.design_id, 'generation': design.placement.generation,
-             'holder_session': reach.session_id, 'binding': _tag(design.binding), 'cwd': design.repository})
+    _atomic(mesh_directory(design.placement.design_id) / 'design_context.json', _mesh_context_fields(design, reach))
+
+
+def _mesh_context_fields(design: HeldDesign, reach: HolderReach) -> dict[str, object]:
+    return {'design_id': design.placement.design_id, 'generation': design.placement.generation,
+            'holder_session': reach.session_id, 'binding': _design_fields(design)['binding'], 'cwd': design.repository}
 
 
 def launch_thread(design: HeldDesign, role: Role, prompt: Path, model: str, effort: str) -> str:
@@ -908,7 +945,7 @@ def rebind(design_id: str, *, expected_generation: int, reason: str,
     if not reason.strip():
         raise RoleRefused('rebind needs a reason')
     directory = design_directory(design_id)
-    design = read_design(design_id)
+    design = _load_design(design_id, repair_empty_repository=binding is not None)
     _ = _authorize(design)
     if holder is not None:
         reach = resolve_holder(holder)
@@ -916,34 +953,71 @@ def rebind(design_id: str, *, expected_generation: int, reason: str,
             raise RoleRefused(reach.reason)
         _ = authority_request('lookup', {'repository_id': design.repository_id, 'document': design.document,
                                         'host': local_host()})
+    transition = directory / 'transition.json'
     with _lock(directory):
-        design = read_design(design_id)
-        if design.placement.generation != expected_generation:
-            raise RoleRefused('stale binding generation')
-        transition = directory / 'transition.json'
-        if transition.exists() and _read(transition).get('reason') != reason:
+        fields = _read(directory / 'design.json')
+        design = _decode_design(design_id, fields, repair_empty_repository=binding is not None)
+        damaged_binding = _object(fields.get('binding')).get('repository') == ''
+        target = replace(design, holder=holder or design.holder,
+                         binding=binding if binding is not None else design.binding,
+                         repository=repository or design.repository, document=document or design.document)
+        # A target must pass the same rules as a saved record before lifecycle effects.
+        _ = _decode_design(design_id, _design_fields(target))
+        updated = replace(target, placement=replace(target.placement, generation=expected_generation + 1))
+        pending = _read(transition) if transition.exists() else {}
+        if pending and (pending.get('reason') != reason or pending.get('generation') != expected_generation):
             raise RoleRefused('another lifecycle transition is incomplete')
-        _idle(design)
-        _atomic(directory / 'transition.json', {'generation': expected_generation, 'reason': reason})
+        publication_retry = (not damaged_binding and binding is not None and target == design and expected_generation >= 1
+                             and expected_generation in
+                             (design.placement.generation, design.placement.generation - 1))
+        if publication_retry:
+            if pending and (design.placement.generation != expected_generation + 1
+                            or pending.get('target', _design_fields(design)) != _design_fields(design)):
+                raise RoleRefused('another lifecycle transition is incomplete')
+            reach = resolve_holder(design.holder)
+            if isinstance(reach, HolderUnavailable):
+                raise RoleRefused(reach.reason)
+            context = mesh_directory(design_id) / 'design_context.json'
+            if not pending and context.exists() and _read(context) == _mesh_context_fields(design, reach):
+                return design
+        else:
+            if design.placement.generation != expected_generation:
+                raise RoleRefused('stale binding generation')
+            fields = _design_fields(updated)
+            if pending and pending.get('target', fields) != fields:
+                raise RoleRefused('another lifecycle transition is incomplete')
+            _idle(design)
+            _atomic(transition, {'generation': expected_generation, 'reason': reason, 'target': fields})
+    if publication_retry:
+        return _finish_rebind(design)
     release_servers(design)
     _ = authority_request('advance', {'repository_id': design.repository_id, 'document': design.document,
                                       'host': local_host(), 'expected_generation': expected_generation})
     with _lock(directory):
-        current = read_design(design_id)
-        if current.placement.generation != expected_generation:
+        current = _load_design(design_id, repair_empty_repository=binding is not None)
+        if current != design:
             raise RoleRefused('binding changed while releasing server')
-        updated = replace(current, holder=holder or current.holder, binding=binding if binding is not None else current.binding,
-                          repository=repository or current.repository, document=document or current.document,
-                          placement=replace(current.placement, generation=expected_generation + 1))
         _save(updated)
+    return _finish_rebind(updated)
+
+
+def _finish_rebind(design: HeldDesign) -> HeldDesign:
+    """Keep the transition until the saved generation is fully published."""
+    directory = design_directory(design.placement.design_id)
+    with _lock(directory):
+        if read_design(design.placement.design_id) != design:
+            raise RoleRefused('binding changed during publication')
+        reach = resolve_holder(design.holder)
+        if isinstance(reach, HolderUnavailable):
+            raise RoleRefused(reach.reason)
+        _mesh_context(design, reach)
+    for instance in design.roles:
+        _project_hold(design, instance.role, reach)
+    with _lock(directory):
+        if read_design(design.placement.design_id) != design:
+            raise RoleRefused('binding changed during publication')
         (directory / 'transition.json').unlink(missing_ok=True)
-        reach = resolve_holder(updated.holder)
-        if isinstance(reach, HolderReach):
-            _mesh_context(updated, reach)
-    if isinstance(reach, HolderReach):
-        for instance in updated.roles:
-            _project_hold(updated, instance.role, reach)
-    return updated
+    return design
 
 
 def queue_message(design_id: str, role: Role, source: str, text: str, *, message_id: str = '') -> PendingMessage:
@@ -1371,7 +1445,8 @@ def record_operation() -> Generator[None]:
         yield
 
 
-def _read_designs(relevant: Callable[[dict[str, object]], bool]) -> Generator[HeldDesign]:
+def _read_designs(relevant: Callable[[dict[str, object]], bool], *,
+                  refuse_matching_damage: bool = False) -> Generator[HeldDesign]:
     """Skip broken records, but preserve a caller's matching live role for recovery."""
     with record_operation():
         warned = _record_warnings.get().paths
@@ -1382,8 +1457,10 @@ def _read_designs(relevant: Callable[[dict[str, object]], bool]) -> Generator[He
                 design = _decode_design(path.parent.name, fields)
             except (OSError, ValueError, KeyError, TypeError) as error:
                 reason = ' '.join(str(error).splitlines())
-                if relevant(fields) and _has_live_roles(fields):
-                    raise RoleRefused(f'{path}: {reason}; live held role needs recovery') from error
+                live_roles = _has_live_roles(fields)
+                if relevant(fields) and (refuse_matching_damage or live_roles):
+                    recovery = '; live held role needs recovery' if live_roles else ''
+                    raise RoleRefused(f'{path}: {reason}{recovery}') from error
                 if path not in warned:
                     print(f'warning: {path}: {reason}', file=sys.stderr)
                     warned.add(path)
@@ -1416,7 +1493,7 @@ def unbind_run(run_directory: str) -> None:
 
 def end_holder(production: str, unit: str) -> None:
     holder = UnitHolder(production, unit)
-    for design in _read_designs(lambda fields: _held_by(fields, holder)):
+    for design in _read_designs(lambda fields: _held_by(fields, holder), refuse_matching_damage=True):
         if design.holder == holder:
             reach = resolve_holder(ShowrunnerHolder(production))
             if not isinstance(reach, HolderReach) or reach.session_id != os.environ.get('CLAUDE_CODE_SESSION_ID'):
@@ -1482,7 +1559,7 @@ def move_holder(old_holder: Holder, new_holder: Holder, old_checkout: str = '', 
     `new_checkout` when both are given. A unit transfer or a production rename changes the holder only;
     a unit rename changes both. Role names, saved prompt/reply paths and aliases retain their history."""
     moves_checkout = bool(old_checkout) and old_checkout != new_checkout
-    for design in _read_designs(lambda fields: _held_by(fields, old_holder, new_holder)):
+    for design in _read_designs(lambda fields: _held_by(fields, old_holder, new_holder), refuse_matching_damage=True):
         path = design_directory(design.placement.design_id) / 'design.json'
         if design.holder not in (old_holder, new_holder):
             continue
@@ -1650,7 +1727,9 @@ def main(argv: list[str]) -> int:
         elif command == 'resume':
             print(resume(argument('instance_id'), argument('prompt_file')))
         elif command == 'rebind':
-            current = read_design(argument('design_id'))
+            repair = bool(args.get('unbind') or (argument('run_directory') and argument('phase')
+                                                and argument('checkout')))
+            current = _load_design(argument('design_id'), repair_empty_repository=repair)
             next_binding = current.binding
             if args.get('unbind'):
                 next_binding = DesignUnbound()
@@ -1659,13 +1738,15 @@ def main(argv: list[str]) -> int:
                     raise RoleRefused('run-directory and phase are required together')
                 next_binding = DesignBoundToPhase(str(Path(argument('run_directory')).resolve()), argument('phase'),
                                                  argument('checkout') or current.repository,
-                                                 tuple(cast(list[str], args['output_path'])))
+                                                 tuple(cast(list[str], args['output_path'])) or
+                                                 (current.binding.output_paths if isinstance(current.binding, DesignBoundToPhase) else ()))
             next_holder = current.holder
             if argument('production'):
                 next_holder = UnitHolder(argument('production'), argument('unit')) if argument('unit') else ShowrunnerHolder(argument('production'))
-            _ = rebind(argument('design_id'), expected_generation=cast(int, args['expected_generation']),
+            updated = rebind(argument('design_id'), expected_generation=cast(int, args['expected_generation']),
                        reason=argument('reason'), binding=next_binding, holder=next_holder,
                        repository=argument('checkout'), document=argument('document'))
+            print(f'{updated.placement.design_id} rebound at generation {updated.placement.generation}')
         elif command == 'end':
             _ = end(argument('instance_id'))
         elif command == 'recover':
@@ -1685,7 +1766,11 @@ def main(argv: list[str]) -> int:
             report = list_roles()
             print(json.dumps(report) if args.get('json') else render_roles(report))
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError, configparser.Error) as error:
-        print('design_roles: ' + str(error).replace('\n', ' '), file=sys.stderr)
+        damaged = (error.__cause__ if isinstance(error, worker_lifecycle.WorkerStateUnreadable)
+                   else error)
+        detail = (f'{damaged.path}: missing or invalid {damaged.field}'
+                  if isinstance(damaged, DamagedDesignRecord) else str(error))
+        print('design_roles: ' + detail.replace('\n', ' '), file=sys.stderr)
         return 2
     return 0
 

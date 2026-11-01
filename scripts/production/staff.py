@@ -706,6 +706,29 @@ def ensure_worker(name: str, parent: StaffId) -> StaffRow:
     return ensure("worker", name=name, parent=parent)
 
 
+def restore_unit(staff_id: StaffId, *, name: str, parent: StaffId) -> StaffRow:
+    """Restore a retired unit's identity without replacing another member."""
+    if not _is_owner():
+        return _remote_row(["restore-unit", staff_id, f"--name={name}", "--parent", parent])
+    if _ID.fullmatch(staff_id) is None:
+        raise StaffRefused(f"invalid staff id: {staff_id}")
+
+    def edit(rows: list[StaffRow], pending: set[StaffId]) -> StaffRow:
+        pending.discard(staff_id)
+        existing = _row_by_id(rows, staff_id)
+        if existing is not None:
+            if (existing.kind, existing.name, existing.parent) == ("unit", name, parent):
+                return existing
+            raise StaffRefused(f"staff id already belongs to another member: {staff_id}")
+        if any((row.kind, row.name, row.parent) == ("unit", name, parent) for row in rows):
+            raise StaffRefused(f"unit name already exists: {name}")
+        row = StaffRow(staff_id, "unit", name, parent)
+        rows.append(row)
+        return row
+
+    return _record_transaction(edit)
+
+
 def rename(staff_id: StaffId, new_name: str) -> StaffRow:
     if not _is_owner():
         return _remote_row(["rename", staff_id, f"--name={new_name}"])
@@ -958,6 +981,10 @@ def _parser() -> argparse.ArgumentParser:
     _ = add.add_argument("--name", required=True)
     _ = add.add_argument("--parent")
     _ = add.add_argument("--row-write", action="store_true", help=argparse.SUPPRESS)
+    restore_parser = verbs.add_parser("restore-unit", help=argparse.SUPPRESS)
+    _ = restore_parser.add_argument("target")
+    _ = restore_parser.add_argument("--name", required=True)
+    _ = restore_parser.add_argument("--parent", required=True)
     rename_parser = verbs.add_parser("rename", help=argparse.SUPPRESS)
     _ = rename_parser.add_argument("target")
     _ = rename_parser.add_argument("--name", required=True)
@@ -981,7 +1008,7 @@ def _parser() -> argparse.ArgumentParser:
         _ = location_parser.add_argument("--path", required=True)
         _ = location_parser.add_argument("--state", required=True, choices=states)
         location_parsers.append(location_parser)
-    for verb in (*location_parsers, show, get, add, rename_parser, move_parser, retire_parser, apply_parser, defer_parser, pending_parser):
+    for verb in (*location_parsers, show, get, add, restore_parser, rename_parser, move_parser, retire_parser, apply_parser, defer_parser, pending_parser):
         _ = verb.add_argument("--json", action="store_true")
     return parser
 
@@ -1010,6 +1037,9 @@ def _mutate(arguments: _Arguments) -> StaffRow | StaffSnapshot | tuple[StaffId, 
     if arguments.verb == "ensure":
         assert arguments.kind is not None
         return ensure(arguments.kind, name=arguments.name, parent=_parent(arguments.parent))
+    if arguments.verb == "restore-unit":
+        assert arguments.parent is not None
+        return restore_unit(StaffId(arguments.target), name=arguments.name, parent=StaffId(arguments.parent))
     if arguments.verb == "rename":
         return rename(StaffId(arguments.target), arguments.name)
     if arguments.verb == "move":

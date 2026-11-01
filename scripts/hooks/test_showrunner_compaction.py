@@ -12,6 +12,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import cast, final, override
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 HOOK = Path(__file__).resolve().parent / "showrunner-compaction.py"
 # Records each call; refuses a call with --state while REFUSE_STATE is set.
@@ -52,7 +53,7 @@ class ShowrunnerCompactionTests(unittest.TestCase):
 
     def run_hook(self, payload: dict[str, str], **env: str) -> str:
         result = subprocess.run([sys.executable, str(HOOK)], input=json.dumps(payload), capture_output=True,
-                                text=True, env={**self.env, **env}, timeout=60, check=False)
+                                text=True, env={**self.env, **env}, timeout=TEST_HANG_GUARD_SECS, check=False)
         self.assertEqual(result.returncode, 0, result.stderr)
         return result.stdout
 

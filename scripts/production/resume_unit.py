@@ -15,14 +15,19 @@ retire reads the same transcript.
 A note can include ", folder <path>" after the session id. Older notes find the transcript across
 all config dirs and read the first cwd matching the project folder that holds it; none, ambiguous
 project folders or no matching cwd refuse. When the
-start folder is outside the worktree, resume uses --cwd there and skips worktree and branch steps.
+start folder is outside the worktree, resume uses --cwd there. It skips worktree and branch steps
+only when no retired ref was recorded.
 When the note has no session id, the unit's mark, newest retained shutdown record or interactive
 transcript supplies it; no evidence refuses both a dry run and a real run.
 
-Then it makes the worktree again at the same path, on the branch, from the merge branch; resumes the
+When the note names a retired ref and tip, resume fetches that ref and restores the branch and
+worktree at that exact tip, even when the session starts elsewhere. It checks worktree HEAD before
+deleting the origin ref. A stop after branch creation or ref deletion resumes safely on a rerun.
+Without a saved ref, it makes the worktree from the merge branch as before. Then it resumes the
 session through `add_unit.py --resume` (the units account, the unit's name and Remote Control); and
 takes the retired note out of the Plan cell, committed on the merge branch. Each step checks whether
 it is done, so a rerun after a failure resumes: the note goes last, because it holds the session id.
+When the note records a staff id, resume restores that unit row before launch. Older notes use a new id.
 --dry-run prints each refusal and each step, and changes nothing.
 
 Exit 0 when the unit is resumed; 1 on a refusal or a failed step; 2 on usage.
@@ -51,7 +56,7 @@ from atomic_file import write_text_atomic
 
 ADD_UNIT = Path(__file__).resolve().parent / "add_unit.py"
 RETIRED = re.compile(r"^\s*\(retired [^)]*\)\s*")
-SESSION = re.compile(r"^\s*\(retired [^)]*, session ([0-9A-Za-z-]+)(?:, folder ([^)]*))?\)")
+SESSION = re.compile(r"^\s*\(retired [^)]*, session ([0-9A-Za-z-]+)(?:, folder (.*?))?(?:, (?:ref|staff) [^)]*)?\)")
 
 
 class Refused(Exception):
@@ -78,6 +83,8 @@ class RetiredUnit:
     session_id: str
     retired: bool
     start_folder: RecordedStartFolder | UnrecordedStartFolder
+    saved_branch: retire_unit.SavedBranch | retire_unit.NoSavedBranch = retire_unit.NoSavedBranch()
+    recorded_staff_id: str = ""
 
 
 def find_unit(slug: str, given: str) -> RetiredUnit:
@@ -106,7 +113,8 @@ def find_unit(slug: str, given: str) -> RetiredUnit:
             raise Refused(f"{name}: its Units row names no session to resume; no director session was found")
     return RetiredUnit(production, name, worktree, branch, production_units.cell_value(RETIRED.sub("", plan)),
                        session_id, retired,
-                       RecordedStartFolder(Path(session[2]).expanduser()) if session and session[2] else UnrecordedStartFolder())
+                       RecordedStartFolder(Path(session[2]).expanduser()) if session and session[2] else UnrecordedStartFolder(),
+                       retire_unit.saved_branch_in_note(plan), retire_unit.staff_id_in_note(plan))
 
 
 def resume_record(production: Production, name: str) -> Path:
@@ -163,13 +171,13 @@ def refusals(unit: RetiredUnit) -> list[str]:
         folder = resume_folder(unit)
         if not has_transcript(unit):
             refused.append(f"{unit.name}: no account has the transcript of session {unit.session_id} under {folder}")
-        if folder.resolve() != unit.worktree.resolve():
+        if folder.resolve() != unit.worktree.resolve() and isinstance(unit.saved_branch, retire_unit.NoSavedBranch):
             return refused
     except (retire_unit.Refused, OSError) as error:
         refused.append(f"{unit.name}: {error}")
     if unit.worktree.exists() and not has_worktree(unit):
         refused.append(f"{unit.worktree} exists and is not {unit.name}'s worktree on {unit.branch}")
-    elif not unit.worktree.exists():
+    elif not unit.worktree.exists() and isinstance(unit.saved_branch, retire_unit.NoSavedBranch):
         if _git(unit, "branch", "--list", unit.branch):
             refused.append(f"branch {unit.branch} still exists; retire did not finish")
         if _git(unit, "ls-remote", "--heads", "origin", unit.branch):
@@ -185,13 +193,56 @@ def launch_command(unit: RetiredUnit) -> list[str]:
 
 
 def make_worktree(unit: RetiredUnit) -> None:
-    if has_worktree(unit):
-        return
-    result = retire_unit.run(["git", "-C", str(unit.production.checkout), "worktree", "add", str(unit.worktree),
-                              "-b", unit.branch, unit.production.merge_branch])
-    if result.returncode:
-        raise Refused(f"worktree {unit.worktree}: {retire_unit.failure(result)}")
-    print(f"made: worktree {unit.worktree} on {unit.branch}, from {unit.production.merge_branch}")
+    saved = unit.saved_branch
+    ref_on_origin = False
+    restored_worktree = False
+    if isinstance(saved, retire_unit.SavedBranch):
+        remote = retire_unit.run(["git", "-C", str(unit.production.checkout), "ls-remote", "--exit-code",
+                                  "origin", saved.ref])
+        if remote.returncode == 0:
+            ref_on_origin = True
+            if remote.stdout.splitlines() != [f"{saved.tip}\t{saved.ref}"]:
+                raise Refused(f"{saved.ref} no longer holds {saved.tip}")
+            fetched = retire_unit.run(["git", "-C", str(unit.production.checkout), "fetch", "origin", saved.ref])
+            if fetched.returncode or _git(unit, "rev-parse", "FETCH_HEAD") != saved.tip:
+                raise Refused(f"cannot fetch {saved.ref} at {saved.tip}: {retire_unit.failure(fetched)}")
+        elif remote.returncode != 2:
+            raise Refused(f"cannot read {saved.ref}: {retire_unit.failure(remote)}")
+        # After ref deletion the relaunched director may already have committed.
+        restored_worktree = remote.returncode == 2 and has_worktree(unit)
+        branch_tip = _git(unit, "rev-parse", "--verify", f"refs/heads/{unit.branch}")
+        descendant = (restored_worktree and retire_unit.run([
+            "git", "-C", str(unit.production.checkout), "merge-base", "--is-ancestor",
+            saved.tip, branch_tip]).returncode == 0)
+        if branch_tip and branch_tip != saved.tip and not descendant:
+            raise Refused(f"branch {unit.branch} is at {branch_tip}, expected saved tip {saved.tip}")
+        if remote.returncode == 2 and not branch_tip:
+            raise Refused(f"{saved.ref} is missing and branch {unit.branch} has not been restored")
+    if not has_worktree(unit):
+        command = ["git", "-C", str(unit.production.checkout), "worktree", "add", str(unit.worktree)]
+        if isinstance(saved, retire_unit.SavedBranch):
+            command += ([unit.branch] if _git(unit, "branch", "--list", unit.branch)
+                        else ["-b", unit.branch, saved.tip])
+        else:
+            command += ["-b", unit.branch, unit.production.merge_branch]
+        result = retire_unit.run(command)
+        if result.returncode:
+            raise Refused(f"worktree {unit.worktree}: {retire_unit.failure(result)}")
+        source = saved.tip if isinstance(saved, retire_unit.SavedBranch) else unit.production.merge_branch
+        print(f"made: worktree {unit.worktree} on {unit.branch}, from {source}")
+    if isinstance(saved, retire_unit.SavedBranch):
+        head = retire_unit.run(["git", "-C", str(unit.worktree), "rev-parse", "HEAD"])
+        descendant = (restored_worktree and retire_unit.run([
+            "git", "-C", str(unit.worktree), "merge-base", "--is-ancestor",
+            saved.tip, "HEAD"]).returncode == 0)
+        if head.returncode or (head.stdout.strip() != saved.tip and not descendant):
+            raise Refused(f"worktree {unit.worktree} is not at saved tip {saved.tip}")
+        if ref_on_origin:
+            deleted = retire_unit.run(["git", "-C", str(unit.production.checkout), "push",
+                                      f"--force-with-lease={saved.ref}:{saved.tip}", "origin", f":{saved.ref}"])
+            if deleted.returncode:
+                raise Refused(f"cannot delete restored {saved.ref}: {retire_unit.failure(deleted)}")
+            print(f"restored: {saved.ref} at {saved.tip}; origin ref removed")
 
 
 def launch(unit: RetiredUnit) -> None:
@@ -223,8 +274,8 @@ def unmark(unit: RetiredUnit) -> None:
             lines[index] = "|".join(parts)
             break
     write_text_atomic(doc, "\n".join(lines))
-    add_unit.commit_paths(unit.production, [doc], f"production({unit.production.slug}): resume {unit.name}")
-    print(f"unmarked: the Units row, committed on {unit.production.merge_branch}")
+    if add_unit.commit_paths(unit.production, [doc], f"production({unit.production.slug}): resume {unit.name}"):
+        print(f"unmarked: the Units row, committed on {unit.production.merge_branch}")
 
 
 def dry_run(unit: RetiredUnit) -> int:
@@ -233,10 +284,13 @@ def dry_run(unit: RetiredUnit) -> int:
     print("\n".join(f"refused: {reason}" for reason in refused))
     if refused:
         return 1
-    if resume_folder(unit).resolve() != unit.worktree.resolve():
+    if (resume_folder(unit).resolve() != unit.worktree.resolve()
+            and isinstance(unit.saved_branch, retire_unit.NoSavedBranch)):
         print(f"would skip: worktree and branch steps; session starts in {resume_folder(unit)}")
     elif not has_worktree(unit):
-        print(f"would make: worktree {unit.worktree} on {unit.branch}, from {unit.production.merge_branch}")
+        source = (unit.saved_branch.tip if isinstance(unit.saved_branch, retire_unit.SavedBranch)
+                  else unit.production.merge_branch)
+        print(f"would make: worktree {unit.worktree} on {unit.branch}, from {source}")
     print(f"would resume: session {unit.session_id} through add_unit.py --resume --cwd {resume_folder(unit)}")
     print(f"would unmark: the Units row, committed on {unit.production.merge_branch}")
     return 1 if refused else 0
@@ -247,8 +301,12 @@ def resume(unit: RetiredUnit) -> int:
     if refused:
         print("\n".join(f"refused: {reason}" for reason in refused))
         return 1
+    if unit.recorded_staff_id:
+        parent = add_unit.ensure_staff_showrunner(unit.production)
+        _ = staff.restore_unit(staff.StaffId(unit.recorded_staff_id), name=unit_names.name(unit.name), parent=parent.id)
     row = add_unit.ensure_staff_unit(unit.production, unit.name)
-    if resume_folder(unit).resolve() == unit.worktree.resolve():
+    if (resume_folder(unit).resolve() == unit.worktree.resolve()
+            or isinstance(unit.saved_branch, retire_unit.SavedBranch)):
         make_worktree(unit)
     launch(unit)
     unmark(unit)

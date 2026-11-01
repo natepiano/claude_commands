@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from scripts.lib.process_group import send_process_group
 from scripts.lib import test_hang_guard
 
 from collections.abc import Mapping, Sequence
@@ -165,8 +166,12 @@ def prepare_launcher_runtime(root: Path) -> tuple[Path, Path, Path]:
     direct, agents, lib = (root / "scripts" / name for name in ("direct", "agents", "lib"))
     for directory in (direct, agents, lib, root / "scripts/production"):
         directory.mkdir(parents=True)
-    for name in ("py", "atomic_file.py", "user_zone.py", "unit_runs.py", "agents_registry.py", "codex_models_cache.py"):
+    for name in ("py", "process_group.py", "atomic_file.py", "user_zone.py", "unit_runs.py", "agents_registry.py", "codex_models_cache.py"):
         _ = shutil.copy2(source / "lib" / name, lib / name)
+    home_lib = root / ".claude/scripts/lib"
+    home_lib.mkdir(parents=True, exist_ok=True)
+    for name in ("py", "process_group.py"):
+        _ = shutil.copy2(source / "lib" / name, home_lib / name)
     _ = shutil.copy2(source / "production/production_doc.py", root / "scripts/production/production_doc.py")
     for name in ("agents_config.sh", "heartbeat.sh", "heartbeat_watch.sh", "worker_lifecycle.py"):
         _ = shutil.copy2(source / "agents" / name, agents / name)
@@ -209,7 +214,7 @@ def communicate_launcher(process: subprocess.Popen[str], timeout: float = test_h
         return process.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
         try:
-            os.killpg(process.pid, signal.SIGKILL)
+            send_process_group(process.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
         _ = process.communicate()

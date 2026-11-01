@@ -11,13 +11,14 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import cast, override
+from typing import TYPE_CHECKING, cast, override
 
 import launches
 from test_index import Record, point_root_at
-
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
+if TYPE_CHECKING:
+    from ..lib import test_hang_guard
+else:
+    from scripts.lib import test_hang_guard
 
 CLI = Path(__file__).with_name("cli.py")
 ENDED = "2026-10-02T16:40:18+00:00"
@@ -105,7 +106,7 @@ class LaunchTests(unittest.TestCase):
     def run_cli(self, *args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             [sys.executable, str(CLI), *args], env=self.environment, capture_output=True,
-            text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
+            text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
 
     def records(self) -> list[Record]:

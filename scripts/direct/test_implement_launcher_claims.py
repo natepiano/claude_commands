@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 import json
@@ -86,7 +87,7 @@ class ImplementLauncherWorkerTests(CompletedWorkerFixture):
 
                     wait_until(held_claim, session_dir)
                 finally:
-                    os.killpg(process.pid, signal.SIGKILL)
+                    send_process_group(process.pid, signal.SIGKILL)
                     _ = process.wait(timeout=TEST_HANG_GUARD_SECS)
 
                 result = self.mesh_launch(session_dir, to=name)
