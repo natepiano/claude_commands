@@ -48,7 +48,7 @@ per-consumer override — `clippy=off` means cargo clippy does not run in a
 Use `/lint_config` to view or change them. Consumers read it on their
 next run, so a change is immediate:
 
-- `/unit:style_review` — the phase's main review or a run by hand
+- `/unit:style_review` — the phase's reviewer worker or a run by hand
 - `scripts/lint/invoke.sh` — the lint CLI and
   `scripts/direct/verify.sh`'s `lint` and `fmt` arms
 
