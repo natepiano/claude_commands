@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import io
 import json
+import math
 import os
 import shlex
 import subprocess
@@ -233,7 +234,8 @@ class AddShowrunnerTests(AddShowrunnerFixture):
             nonlocal elapsed
             elapsed += seconds
 
-        def visible(*_args: str) -> str:
+        def visible(*_args: str, deadline: float = math.inf) -> str:
+            del deadline
             return screen
 
         def turn(*, meta: bool) -> None:
