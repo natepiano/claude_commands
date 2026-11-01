@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import fake_unit_host
 import production_lifecycle
-from scripts.production import showrunners
+from scripts.production import showrunners, staff, unit_config
 import unit_lookup
 import tidy_wrapped
 from scripts.production.cli_fixture import invoke_cli
@@ -220,10 +220,27 @@ class LifecycleFixture(unittest.TestCase):
         _ = self.git("worktree", "add", "-b", "alpha-branch", str(self.alpha), "production")
         _ = self.git("worktree", "add", "-b", "beta-branch", str(self.beta), "production")
         _ = self.git("push", "origin", "alpha-branch", "beta-branch")
+        runner = staff.ensure("showrunner", name="old-showrunner",
+                              doc=staff.LiveDoc("natedev", self.doc))
+        for name, worktree in (("alpha", self.alpha), ("beta", self.beta)):
+            row = staff.ensure("unit", name=name, parent=runner.id,
+                               worktree=staff.PresentWorktree("natedev", worktree))
+            unit_config.write(worktree, unit_config.UnitConfig(
+                unit_config.PlanFile(Path(f"docs/plans/{name}.md")), unit_config.NoAppPort(), ()))
+            self.staff.pane(f"fixture:{name}", session_id=name, environment={
+                "STAFF_ID": row.id, "SHOWRUNNER_UNIT": "example", "SHOWRUNNER_UNIT_ID": f"{name}-unit",
+            })
+            _ = self.staff.session_transcript(name, worktree, home=self.home)
         common_dir = Path(self.git("rev-parse", "--git-common-dir"))
         with (self.checkout / common_dir / "info/exclude").open("a", encoding="utf-8") as output:
             _ = output.write("production.log\n")
         self.write(self.log, "# Production log — example\n\n### STATE\nold state\n")
+
+    def park_fixture_unit(self, name: str, worktree: Path, branch: str) -> None:
+        row = next(row for row in staff.find(kind="unit") if row.name == name)
+        with mock.patch.dict(os.environ, self.env):
+            unit_config.park(row.id, worktree, unit_config.RetiredSession("2026-10-31", name,
+                unit_config.RecordedStartFolder(worktree), unit_config.Branch(branch)))
 
     def run_lifecycle(self, action: str, *extra: str) -> subprocess.CompletedProcess[str]:
         # Restore import-time state just as a fresh CLI would compute it.

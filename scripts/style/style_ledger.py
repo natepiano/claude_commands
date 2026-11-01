@@ -1541,6 +1541,53 @@ class UnreadPathAttribute:
     reason: str
 
 
+class PathAttributeMode(StrEnum):
+    DIRECT = "direct"
+    CONDITIONAL = "conditional"
+
+
+@dataclass(frozen=True)
+class PathAttributeMeta:
+    """A path attribute meta item, excluding cfg predicates and unrelated attribute arguments."""
+    begin: int
+    index: int
+    end: int
+    mode: PathAttributeMode
+
+
+def path_attribute_metas(words: tuple[str, ...]) -> tuple[PathAttributeMeta, ...]:
+    """Interpret attribute roles once: only cfg_attr payloads recursively contain attributes."""
+    words = tuple(word.removeprefix("r#") for word in words)
+    ends = style_footprint.delimiter_ends(words)
+    result: list[PathAttributeMeta] = []
+
+    def meta(begin: int, start: int, stop: int, mode: PathAttributeMode) -> None:
+        if words[start:start + 1] == ("path",) and words[start + 1:start + 2] != ("::",):
+            result.append(PathAttributeMeta(begin, start, stop, mode))
+        elif words[start:start + 2] == ("cfg_attr", "("):
+            finish = ends.get(start + 1, stop)
+            cursor = start + 2
+            # The first comma-delimited argument is a predicate, never an attribute.
+            parts: list[tuple[int, int]] = []
+            part = cursor
+            while cursor < finish:
+                if words[cursor] in {"(", "[", "{"}:
+                    cursor = ends.get(cursor, finish)
+                elif words[cursor] == ",":
+                    parts.append((part, cursor))
+                    part = cursor + 1
+                cursor += 1
+            parts.append((part, finish))
+            for part, end in parts[1:]:
+                if part < end:
+                    meta(begin, part, end, PathAttributeMode.CONDITIONAL)
+
+    for begin, end in style_footprint.attribute_spans(words):
+        opening = begin + (2 if words[begin + 1] == "!" else 1)
+        meta(begin, opening + 1, end - 1, PathAttributeMode.DIRECT)
+    return tuple(result)
+
+
 def _path_attributes(path: str, content: bytes) -> tuple[MountedFile | MountedFolder | UnreadPathAttribute, ...]:
     """The `path` attributes of a Rust file, also those inside `cfg_attr`, read from its code words.
 
@@ -1564,16 +1611,18 @@ def _path_attributes(path: str, content: bytes) -> tuple[MountedFile | MountedFo
     owners = style_footprint.attribute_owners(words)
     file = PurePosixPath(path)
     read: list[tuple[int, tuple[int, ...], str | UnreadPathAttribute]] = []
-    for begin, end in style_footprint.attribute_spans(words):
-        for index in (index for index in range(begin, end) if words[index] == "path"):
-            literal = PLAIN_STRING.fullmatch(words[index + 2]) if words[index + 1:index + 2] == ("=",) else None
-            chain = tuple(sorted(block for block in blocks if block < index < ends.get(block, len(words))))
-            if any(start < index < stop for start, stop in macros):
-                read.append((begin, chain, UnreadPathAttribute(path, "holds a path attribute in a macro")))
-            elif literal is None or literal.group(1).startswith("/"):
-                read.append((begin, chain, UnreadPathAttribute(path, "holds a path attribute that is not a relative string")))
-            else:
-                read.append((begin, chain, literal.group(1)))
+    for attribute in path_attribute_metas(words):
+        begin, index = attribute.begin, attribute.index
+        literal = (PLAIN_STRING.fullmatch(words[index + 2])
+                   if words[index + 1:attribute.end][:1] == ("=",)
+                   and attribute.end == index + 3 else None)
+        chain = tuple(sorted(block for block in blocks if block < index < ends.get(block, len(words))))
+        if any(start < index < stop for start, stop in macros):
+            read.append((begin, chain, UnreadPathAttribute(path, "holds a path attribute in a macro")))
+        elif literal is None or literal.group(1).startswith("/"):
+            read.append((begin, chain, UnreadPathAttribute(path, "holds a path attribute that is not a relative string")))
+        else:
+            read.append((begin, chain, literal.group(1)))
     # The `{` of each inline module whose outer path attribute names its folder.
     inline_owner = {begin: owners[begin] + 2 for begin, _, _ in read
                     if owners.get(begin) is not None and words[owners[begin]] == "mod" and owners[begin] + 2 in blocks}
@@ -2224,13 +2273,19 @@ class NoGitReadCache:
 _NO_GIT_READ_CACHE = NoGitReadCache()
 
 
+@dataclass(frozen=True)
+class UnloadedRuleCatalog:
+    """Rule metadata is read on first use from the active execution checkout."""
+
+
 class Ledger:
     def __init__(self, repo: Path, database: Path, *, git_cache: GitReadCache | NoGitReadCache = _NO_GIT_READ_CACHE) -> None:
         self.repo: Path = repo
         self._git_operation_depth: int = 0
         self.database: Path = database
         self.git_cache: GitReadCache | NoGitReadCache = git_cache
-        self._catalog: tuple[Rule, ...] = self._load_rules()
+        self._rule_checkouts: list[Path] = []
+        self._loaded_catalog: tuple[Rule, ...] | UnloadedRuleCatalog = UnloadedRuleCatalog()
         self._tips: dict[str, RepositoryTip] = {}
         self._fingerprints: dict[tuple[str, CellInputScope, str], str] = {}
         self._inputs: dict[tuple[str, CellInputScope, str], dict[str, TreeEntry]] = {}
@@ -2300,8 +2355,35 @@ class Ledger:
         finally:
             self._git_operation_depth -= 1
 
+    @property
+    def _catalog(self) -> tuple[Rule, ...]:
+        if isinstance(self._loaded_catalog, UnloadedRuleCatalog):
+            self._loaded_catalog = self._load_rules()
+        return self._loaded_catalog
+
+    @_catalog.setter
+    def _catalog(self, catalog: tuple[Rule, ...]) -> None:
+        self._loaded_catalog = catalog
+
     def _load_rules(self) -> tuple[Rule, ...]:
-        return rule_catalog.load_rules(self.repo)
+        checkout = self._rule_checkouts[-1] if self._rule_checkouts else self.repo
+        return rule_catalog.load_rules(checkout)
+
+    @contextmanager
+    def rules_from_checkout(self, checkout: Path) -> Generator[None]:
+        """Scope rule reads to an execution checkout; Git, SQL and claims stay canonical.
+
+        Restore the prior derived catalog even on interruption, without rereading a mutable
+        checkout. Nested scopes retain the caller's rule source and catalog.
+        """
+        previous = self._loaded_catalog
+        self._rule_checkouts.append(checkout)
+        self._loaded_catalog = UnloadedRuleCatalog()
+        try:
+            yield
+        finally:
+            _ = self._rule_checkouts.pop()
+            self._loaded_catalog = previous
 
     def close(self) -> None:
         self._connection.close()
@@ -3364,7 +3446,7 @@ class Ledger:
         if not renames:
             return BindingCarryForward()
         base, tip = self._tip(ticket["base"]), self._tip(checkpoint)
-        definitions = {rule.rule_id: rule for rule in rule_catalog.load_rules(self.repo) if rule.family == "types"}
+        definitions = {rule.rule_id: rule for rule in self._load_rules() if rule.family == "types"}
         if not definitions:
             return BindingCarryForward()
         open_types = tuple(f for f in self.held_findings(AllHeldFindings())

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import redirect_stdout
+from datetime import datetime, tzinfo
 from io import StringIO
 import os
 import re
@@ -12,6 +13,7 @@ import unittest
 from unittest import mock
 from pathlib import Path
 from typing import final
+from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from merge_checkpoint import promote, request_from
@@ -20,6 +22,9 @@ from merge_checkpoint import promote, request_from
 
 
 from scripts.production.merge_checkpoint_test_support import DELIVERS, MergeCheckpointFixture, PARALLEL, STARTED, TRIAL, configure_test_environment
+
+
+MERGED_AT = datetime(2026, 10, 6, 12, tzinfo=ZoneInfo("America/Los_Angeles"))
 
 
 def setUpModule() -> None:
@@ -147,8 +152,12 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         _ = self.git("add", "main-only.txt", cwd=main_writer)
         _ = self.git("commit", "-m", "main moved", cwd=main_writer)
         _ = self.git("push", "origin", "main", cwd=main_writer)
-        result = self.run_checkpoint(sha, "--holds", "2", "--merge-defects", "1",
-                                     "--regime", "trial", "--excluded", "no merge design check")
+        def now(zone: tzinfo | None = None) -> datetime:
+            return MERGED_AT.astimezone(zone)
+
+        with mock.patch("merge_checkpoint.datetime", wraps=datetime, now=now):
+            result = self.run_checkpoint(sha, "--holds", "2", "--merge-defects", "1",
+                                         "--regime", "trial", "--excluded", "no merge design check")
         self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
         tip = self.git("rev-parse", "HEAD")
         self.assertEqual(self.git("rev-parse", "refs/heads/production", cwd=self.origin), tip)
@@ -181,7 +190,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
             "--review-minutes", "14", "--ux-check-minutes", "4",
             "--ux-repair-minutes", "1", "--excluded", "no merge design check",
         ])
-        self.assertRegex(self.log.read_text(), r"- \d\d:\d\d PDT: alpha-unit phase 2 \([0-9a-f]+\) merged as [0-9a-f]+; .*green; pushed; promoted")
+        self.assertRegex(self.log.read_text(), rf"- {MERGED_AT:%H:%M %Z}: alpha-unit phase 2 \([0-9a-f]+\) merged as [0-9a-f]+; .*green; pushed; promoted")
         self.assertIn("send alpha-unit:", result.process.stdout)
     def test_promotion_refusal_keeps_pushed_merge_and_resume_reaches_only_missing_place(self) -> None:
         self.promotions = str(self.promote)

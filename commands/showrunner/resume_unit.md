@@ -29,13 +29,14 @@ It refuses, and changes nothing, when:
 Then it:
 1. fetches a recorded retired ref, restores the branch and worktree at its saved tip, checks
    worktree HEAD, then deletes the origin ref. With no ref, it uses the merge branch as before;
-2. resumes that session through `add_unit.py --resume`, on the units account, with the unit's
+2. restores `.unit.toml`, sets `PresentWorktree` on the retained row, and resumes that session through `add_unit.py --resume`, on the units account, with the unit's
    name and Remote Control;
 3. takes the retired note out of the Plan cell, committed on the merge branch (the next merge push
-   takes it out). The Units row is live again.
+   takes it out). The Units row is live again. Parked facts go only after the running session
+   and its pane `STAFF_ID` are proven.
 
 A rerun after a failure resumes: each step checks whether it is done, and the note goes last,
-because it holds the session id.
+while the parked file keeps the session facts until launch is proven.
 
 `--dry-run` prints each refusal and each step, and changes nothing.
 
