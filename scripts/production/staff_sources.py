@@ -32,6 +32,7 @@ from scripts.production.showrunners import (  # noqa: E402
 )
 import unit_names  # noqa: E402
 from scripts.production import staff, unit_config  # noqa: E402
+from scripts.production.session_labels import showrunner_owner  # noqa: E402
 from scripts.production.worker_admission import parent as worker_parent, showrunner_member  # noqa: E402
 from scripts.direct import workers  # noqa: E402
 from scripts.astra import astra_roles, design_roles  # noqa: E402
@@ -916,14 +917,33 @@ class _FillSources:
         self.repositories: set[Path] = set()
         self.manifest: set[str] = set()
         self.problems: list[str] = []
+        self.missing_owners: set[str] = set()
+        self.excluded_documents: set[Path] = set()
 
     def problem(self, source: str | Path, unit: str, reason: object) -> None:
         self.problems.append(f"{source} {unit}: {str(reason).replace(chr(10), ' ')}")
 
+    def source_allowed(self, path: Path) -> bool:
+        resolved = path.expanduser().resolve()
+        if not resolved.is_relative_to(showrunners.SCRATCH_ROOT.expanduser().resolve()):
+            return True
+        if resolved not in self.excluded_documents:
+            self.excluded_documents.add(resolved)
+            for row in self.record.find(kind="showrunner"):
+                location = row.doc
+                if (isinstance(location, (staff.LiveDoc, staff.WrappedDoc))
+                        and location.machine == _fill_machine() and location.path.resolve() == resolved):
+                    self.problem(row.id, row.name, f"production document is under scratch root: {path}")
+        return False
+
     def repository(self, path: Path) -> None:
+        if not self.source_allowed(path):
+            return
         folder = path if path.is_dir() else path.parent
         try:
             common = Path(_fill_git(folder, "rev-parse", "--path-format=absolute", "--git-common-dir"))
+            if not self.source_allowed(common):
+                return
             # The common directory names the repository once, even for linked worktrees.
             self.repositories.add(common)
             self.manifest.add(f"repository {common}")
@@ -932,12 +952,47 @@ class _FillSources:
 
     def document(self, path: Path) -> None:
         path = path.expanduser().absolute()
-        self.dependencies(path)
+        if not self.source_allowed(path):
+            return
+        if any(document.path == path for document in self.documents.values()):
+            return
+        slug = showrunners.production_slug(str(path))
         try:
             text = path.read_text(encoding="utf-8")
-            self.documents[(path, text)] = FillDocument(path, text, str(path))
         except (OSError, UnicodeError) as error:
             self.problem(path, "document", error)
+            return
+        # Share the document's session-name join, including owners without timers.
+        owner = showrunner_owner(self.record, slug, text)
+        if owner is None:
+            # An unowned old copy cannot make an already-bound production missing.
+            if any(document.slug == slug for document in self.documents.values()):
+                return
+            if slug not in self.missing_owners:
+                self.missing_owners.add(slug)
+                self.problem(path, slug, "no current showrunner staff row")
+            return
+        location = owner.doc
+        if not isinstance(location, (staff.LiveDoc, staff.WrappedDoc)):
+            self.problem(path, slug, "showrunner document is unfilled")
+            return
+        if location.machine != _fill_machine():
+            self.problem(path, slug, f"showrunner document is on {location.machine}")
+            return
+        bound_path = location.path.expanduser().absolute()
+        if not self.source_allowed(bound_path):
+            return
+        if bound_path != path:
+            path = bound_path
+            if any(document.path == path for document in self.documents.values()):
+                return
+            try:
+                text = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeError) as error:
+                self.problem(path, "document", error)
+                return
+        self.dependencies(path)
+        self.documents[(path, text)] = FillDocument(path, text, str(path))
 
     def _repository_documents(self, common: Path) -> None:
         # --git-dir works for both a main checkout and its linked worktrees.
@@ -953,44 +1008,23 @@ class _FillSources:
             worktrees = [Path(line.removeprefix("worktree ")) for line in listing.splitlines()
                          if line.startswith("worktree ")]
             for worktree in worktrees:
+                if not self.source_allowed(worktree):
+                    continue
                 self.manifest.add(f"worktree {worktree}")
                 for path in sorted((worktree / "docs").rglob("*-production.md")):
                     self.document(path)
-            # Take the newest committed copy of each path among all local tips.
-            newest: dict[str, tuple[int, str]] = {}
-            for branch in git("for-each-ref", "--format=%(refname)", "refs/heads").splitlines():
-                self.manifest.add(f"branch {common}:{branch}")
-                for relative in git("ls-tree", "-r", "--name-only", branch, "--", "docs").splitlines():
-                    if not relative.endswith("-production.md"):
-                        continue
-                    stamp = int(git("log", "-1", "--format=%ct", branch, "--", relative))
-                    if relative not in newest or stamp > newest[relative][0]:
-                        newest[relative] = (stamp, branch)
-            for relative, (_, branch) in newest.items():
-                source = f"{common}:{branch}:{relative}"
-                self.manifest.add(source)
-                text = git("show", f"{branch}:{relative}")
-                # A working copy already represents this committed text.
-                if any(doc.text.strip() == text for doc in self.documents.values()):
-                    continue
-                path = (worktrees[0] / relative) if worktrees else common.parent / relative
-                self.documents[(path, text)] = FillDocument(path, text, source)
         except (OSError, UnicodeError, ValueError) as error:
             self.problem(common, "repository", error)
 
     def collect(self) -> tuple[FillDocument, ...]:
+        for row in self.record.find(kind="showrunner"):
+            location = row.doc
+            if (isinstance(location, (staff.LiveDoc, staff.WrappedDoc))
+                    and location.machine == _fill_machine()):
+                self.document(location.path)
         for source in self.sources.productions.values():
             path = source.timer.doc.expanduser().absolute()
-            self.documents[(path, source.document)] = FillDocument(path, source.document, str(path))
-            self.dependencies(path)
-            self.repository(path)
-            try:
-                for cells in production_units.unit_table(source.document.splitlines()):
-                    path_text = production_units.cell_value(cells.get("Worktree", ""))
-                    if path_text and Path(path_text).expanduser().is_dir():
-                        self.repository(Path(path_text).expanduser())
-            except production_units.Refusal as error:
-                self.problem(path, source.timer.slug, error)
+            self.document(path)
         for path_text in tuple(self.dependencies.paths):
             path = Path(path_text)
             if path.name.endswith("-production.md") and not any(doc.path == path for doc in self.documents.values()):
@@ -1002,8 +1036,6 @@ class _FillSources:
                 if location.machine == _fill_machine():
                     if location.path.exists():
                         self.repository(location.path)
-                    if isinstance(location, (staff.LiveDoc, staff.WrappedDoc)):
-                        self.document(location.path)
         state = Path(os.environ.get("SHOWRUNNER_STATE_DIR") or showrunners.SHOWRUNNER_STATE_DIR)
         slugs: set[str] = set()
         for folder in sorted(state.glob("*")):
@@ -1028,8 +1060,20 @@ class _FillSources:
         for common in sorted(self.repositories):
             self._repository_documents(common)
         found_slugs = {document.slug for document in self.documents.values()}
+        found_slugs.update(showrunners.production_slug(str(path)) for path in self.excluded_documents
+                           if path.name.endswith("-production.md"))
         for slug in sorted(slugs - found_slugs):
-            self.problem(state / slug, slug, "no source holds its production doc")
+            if slug not in self.missing_owners:
+                owner = self.sources.member(ShowrunnerMember(slug), self.record)
+                reason = ("no current showrunner staff row" if isinstance(owner, NoSuchMember)
+                          else "no source holds its production doc")
+                self.problem(state / slug, slug, reason)
+        # Timer parsing may have read a stale copy. It is not retirement evidence.
+        authoritative = {str(document.path) for document in self.documents.values()}
+        self.dependencies.paths.difference_update(
+            path for path in tuple(self.dependencies.paths)
+            if Path(path).name.endswith("-production.md") and path not in authoritative
+        )
         return tuple(self.documents.values())
 
 
@@ -1168,16 +1212,13 @@ class RetiredFillUnit:
 
 @dataclass(frozen=True)
 class WrappedFillDoc:
-    name: str
-    member: MemberFound | NoSuchMember
+    member: MemberFound
     location: staff.WrappedDoc
-    parent_slug: str
-    source: str
 
 
 def _fill_retired(scan: _FillSources, documents: tuple[FillDocument, ...],
                   joined: _MemberSources, machine: str, *, dry_run: bool) -> int:
-    """Prepare all candidates before admitting one historical member."""
+    """Repair retained retirement facts; new rows wait for the session-id migration."""
     from scripts.production.tidy_wrapped import WRAPPED
 
     owners: dict[str, WrappedFillDoc] = {}
@@ -1185,7 +1226,6 @@ def _fill_retired(scan: _FillSources, documents: tuple[FillDocument, ...],
     rejected_owners: set[str] = set()
     rejected_units: set[tuple[str, str]] = set()
     texts: dict[str, FillDocument] = {}
-    state = Path(os.environ.get("SHOWRUNNER_STATE_DIR") or showrunners.SHOWRUNNER_STATE_DIR)
     for document in documents:
         slug = document.slug
         try:
@@ -1198,24 +1238,17 @@ def _fill_retired(scan: _FillSources, documents: tuple[FillDocument, ...],
             wrapped = WRAPPED in document.text or bool(re.search(
                 r"(?im)^(?:>\s*)?(?:-\s*)?\*\*Status:\*\*\s*wrapped\b", document.text))
             owner = joined.member(ShowrunnerMember(slug), scan.record)
+            if isinstance(owner, NoSuchMember):
+                raise ValueError("no current showrunner staff row")
             if wrapped:
                 if not document.path.is_file():
                     raise ValueError(f"wrapped production doc is missing: {document.path}")
                 if document.path.read_text(encoding="utf-8").strip() != document.text.strip():
                     raise ValueError(f"wrapped document evidence differs from {document.path}")
                 location = staff.WrappedDoc(machine, document.path)
-                if isinstance(owner, MemberFound) and not isinstance(owner.row.doc, staff.DocUnfilled) and owner.row.doc != location:
+                if not isinstance(owner.row.doc, staff.DocUnfilled) and owner.row.doc != location:
                     raise ValueError(f"existing doc {owner.row.doc!r} conflicts with wrapped location {location!r}")
-                parent_path = state / slug / showrunners.PARENT_FILE
-                scan.dependencies(parent_path)
-                try:
-                    parent_slug = parent_path.read_text(encoding="utf-8").strip()
-                except FileNotFoundError:
-                    parent_slug = ""
-                name = showrunners.space_from_text(slug, document.text)
-                owners[slug] = WrappedFillDoc(name, owner, location, parent_slug, document.source)
-            elif isinstance(owner, NoSuchMember):
-                raise ValueError("no current showrunner staff row")
+                owners[slug] = WrappedFillDoc(owner, location)
             lines = document.text.splitlines()
             cells_list = production_units.unit_table(lines)
             _, raw_rows = production_units.unit_rows(lines)
@@ -1260,35 +1293,7 @@ def _fill_retired(scan: _FillSources, documents: tuple[FillDocument, ...],
         except (OSError, ValueError, production_units.Refusal, staff.StaffUnreadable, staff.StaffRefused) as error:
             rejected_owners.add(slug)
             scan.problem(document.source, slug, error)
-    # Resolve every missing owner's recorded parent before any publication.
-    invalid: set[str] = set()
-    visiting: set[str] = set()
-    def check_parent(slug: str) -> None:
-        if slug in visiting:
-            raise ValueError("cyclic wrapped production parent evidence")
-        candidate = owners[slug]
-        if isinstance(candidate.member, MemberFound):
-            return  # Its durable edge is authoritative.
-        visiting.add(slug)
-        parent = candidate.parent_slug
-        if parent:
-            if parent in rejected_owners or parent in invalid:
-                raise ValueError(f"parent production {parent} has conflicting facts")
-            if parent in owners:
-                check_parent(parent)
-            elif isinstance(joined.member(ShowrunnerMember(parent), scan.record), NoSuchMember):
-                raise ValueError(f"missing recorded parent production {parent}")
-        visiting.remove(slug)
-    for slug, candidate in owners.items():
-        try:
-            check_parent(slug)
-        except (ValueError, staff.StaffUnreadable) as error:
-            visiting.clear()
-            invalid.add(slug)
-            scan.problem(candidate.source, slug, error)
-    rejected_owners.update(invalid)
-    planned_changes = any(isinstance(candidate.member, NoSuchMember)
-                          or candidate.member.row.doc != candidate.location
+    planned_changes = any(candidate.member.row.doc != candidate.location
                           for slug, candidate in owners.items() if slug not in rejected_owners)
     planned_changes |= any(candidate.needs_publication for (slug, name), candidate in units.items()
                            if slug not in rejected_owners and (slug, name) not in rejected_units)
@@ -1296,58 +1301,40 @@ def _fill_retired(scan: _FillSources, documents: tuple[FillDocument, ...],
         for source in sorted(scan.dependencies.paths | scan.manifest):
             print(f"source {source}")
     changed = False
-    record = scan.record
-    admitted: dict[str, staff.StaffRow] = {}
-    def owner_row(slug: str) -> staff.StaffRow:
-        nonlocal record, changed
-        if slug in rejected_owners:
-            raise ValueError(f"{slug}: production facts were refused")
-        if slug in admitted:
-            return admitted[slug]
-        found = joined.member(ShowrunnerMember(slug), record)
-        candidate = owners.get(slug)
-        if candidate is None:
-            if isinstance(found, NoSuchMember):
-                raise ValueError(f"{slug}: missing showrunner")
-            return found.row
-        if isinstance(candidate.member, MemberFound):
-            row = candidate.member.row
-            changed |= row.doc != candidate.location
-            if row.doc != candidate.location and not dry_run:
-                row = staff.set_doc(row.id, candidate.location)
-        else:
-            # Dry runs validate through check_parent and never need a fake id.
-            parent = owner_row(candidate.parent_slug).id if candidate.parent_slug else None
-            row = staff.ensure("showrunner", name=candidate.name, parent=parent, doc=candidate.location)
-            changed = True
-        admitted[slug] = row
-        record = replace(record, rows=tuple(item for item in record.rows if item.id != row.id) + (row,))
-        return row
+    for (slug, name), candidate in sorted(units.items()):
+        if slug in rejected_owners or (slug, name) in rejected_units:
+            continue
+        if isinstance(candidate.member, NoSuchMember):
+            if dry_run:
+                print(f"would add retired unit {slug}/{name}: {candidate.worktree.path}")
+            else:
+                print(f"deferred: retired unit {slug}/{name} waits for Phase 3h")
+        elif dry_run and candidate.needs_publication:
+            print(f"would repair retired unit {slug}/{name}: {candidate.worktree.path}")
     if dry_run:
         changed = planned_changes
     else:
-        for slug in sorted(owners):
+        for slug, owner in sorted(owners.items()):
             if slug in rejected_owners:
                 continue
             try:
-                _ = owner_row(slug)
+                if owner.member.row.doc != owner.location:
+                    _ = staff.set_doc(owner.member.row.id, owner.location)
+                    changed = True
             except (OSError, ValueError, staff.StaffUnreadable, staff.StaffRefused) as error:
                 rejected_owners.add(slug)
-                scan.problem(owners[slug].source, slug, error)
+                scan.problem(owner.location.path, slug, error)
         for (slug, name), candidate in sorted(units.items()):
             if slug in rejected_owners or (slug, name) in rejected_units:
                 continue
             try:
-                owner = owner_row(slug)
                 selected = candidate.member
                 if isinstance(selected, NoSuchMember):
-                    row = staff.ensure("unit", name=unit_names.name(name), parent=owner.id, worktree=candidate.worktree)
+                    continue
+                row = selected.row
+                if row.worktree != candidate.worktree:
+                    row = staff.set_worktree(row.id, candidate.worktree)
                     changed = True
-                else:
-                    row = selected.row
-                    if row.worktree != candidate.worktree:
-                        row = staff.set_worktree(row.id, candidate.worktree)
-                        changed = True
                 current = unit_config.read_parked(row.id, cleanup=False)
                 changed |= current != candidate.config
                 unit_config.write_parked(row.id, candidate.config)
@@ -1639,9 +1626,10 @@ def fill(*, dry_run: bool = False, retired: bool = False) -> int:
         documents = scan.collect()
         productions = dict(sources.productions)
         for document in documents:
-            if document.slug not in productions:
-                timer = showrunners.Timer(document.slug, "session:unrecorded", document.path, "")
-                productions[document.slug] = showrunners.ShowrunnerSource(timer, document.text)
+            source = productions.get(document.slug)
+            timer = (source.timer if source is not None else
+                     showrunners.Timer(document.slug, "session:unrecorded", document.path, ""))
+            productions[document.slug] = showrunners.ShowrunnerSource(timer, document.text)
         joined = _MemberSources(productions, sources.launches)
         return _fill_retired(scan, documents, joined, _fill_machine(), dry_run=dry_run)
 
