@@ -31,7 +31,7 @@
 | devtools-unit | `docs/plans/sdlc-devtools-tests.md` | /home/natepiano/worktrees/claude-build-followups-sdlc-devtools | sdlc-devtools | — | idempotency (rerun safety) of tools that change shared state in steps |
 | qprobe2-unit | (retired 2026-10-31, worktree removed, session 1161c633-2484-4417-82db-c5eb4ac1ca53) standby | /home/natepiano/worktrees/claude-build-followups-sdlc-qprobe2 | sdlc-qprobe2 | — | — |
 | namecheck-unit | standby | /home/natepiano/worktrees/namecheck | namecheck | — | — |
-| retire-check-unit | standby | /home/natepiano/worktrees/claude-build-followups-sdlc-retire-check | sdlc-retire-check | — | — |
+| retire-check-unit | (retired 2026-10-31, worktree removed, session 1a89da7a-362a-4579-bd37-711fc8c17aac, ref refs/retired/sbe6e99b47a1, tip 04b799a43e83c7c7634c84fce42b8b3d3250f5e0, staff sbe6e99b47a1) standby | /home/natepiano/worktrees/claude-build-followups-sdlc-retire-check | sdlc-retire-check | — | — |
 
 Scope of each unit:
 
