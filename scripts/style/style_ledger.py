@@ -2291,8 +2291,14 @@ class UnloadedRuleCatalog:
     """Rule metadata is read on first use from the active execution checkout."""
 
 
+class LedgerAccess(StrEnum):
+    READ_WRITE = "read and migrate"
+    READ_ONLY = "inspect without migration or writes"
+
+
 class Ledger:
-    def __init__(self, repo: Path, database: Path, *, git_cache: GitReadCache | NoGitReadCache = _NO_GIT_READ_CACHE) -> None:
+    def __init__(self, repo: Path, database: Path, *, git_cache: GitReadCache | NoGitReadCache = _NO_GIT_READ_CACHE,
+                 access: LedgerAccess = LedgerAccess.READ_WRITE) -> None:
         self.repo: Path = repo
         self._git_operation_depth: int = 0
         self.database: Path = database
@@ -2332,8 +2338,20 @@ class Ledger:
         self._crate_names: dict[tuple[str, str, str], bool] = {}
         self._outside_bodies: dict[tuple[str, str, str, DeclaredItem, str, DeclaredItem], tuple[int, int, tuple[OutsideFailure, ...]]] = {}
         self._item_bodies: dict[tuple[str, str, DeclaredItem], declarations.ReadableBody | declarations.UnreadableBody] = {}
-        database.parent.mkdir(parents=True, exist_ok=True)
-        self._connection: sqlite3.Connection = sqlite3.connect(database, timeout=BUSY_TIMEOUT_SECONDS)
+        if access == LedgerAccess.READ_WRITE:
+            database.parent.mkdir(parents=True, exist_ok=True)
+        self._connection: sqlite3.Connection = (
+            sqlite3.connect(database.resolve().as_uri() + "?mode=ro", uri=True, timeout=BUSY_TIMEOUT_SECONDS)
+            if access == LedgerAccess.READ_ONLY else sqlite3.connect(database, timeout=BUSY_TIMEOUT_SECONDS))
+        if access == LedgerAccess.READ_ONLY:
+            try:
+                versions = cast(list[tuple[int]], self._connection.execute("SELECT version FROM schema_version").fetchall())
+                if len(versions) != 1 or versions[0][0] != max(MIGRATIONS):
+                    raise LedgerError("read-only admission requires the current ledger schema; migrate separately")
+            except BaseException:
+                self.close()
+                raise
+            return
         try:
             _ = self._connection.execute("PRAGMA foreign_keys=ON")
             _ = self._connection.execute("BEGIN IMMEDIATE")

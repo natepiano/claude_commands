@@ -61,7 +61,7 @@ def git(repo: Path, *arguments: str) -> str:
 
 
 def require_base(repo: Path, tree: str) -> str:
-    if git(repo, "status", "--porcelain", "--untracked-files=no"):
+    if git(repo, "--no-optional-locks", "status", "--porcelain", "--untracked-files=no"):
         raise bulk.BulkRenameError("workspace run requires a clean tracked tree and index")
     if not re.fullmatch(r"[0-9a-f]{40}", tree) or git(repo, "rev-parse", "HEAD^{tree}") != tree:
         raise bulk.BulkRenameError("base-tree mismatch")
@@ -286,16 +286,26 @@ class ConstantTargetProof:
 
 
 @dataclass(frozen=True)
+class NotCheckedFinding:
+    """Admission requires a proof service that cannot promise read-only operation."""
+    finding_id: str
+    reason: str
+
+
+@dataclass(frozen=True)
 class PlannedEdits:
     files: tuple[bulk.FileRenames | ConstantFileEdit, ...]
     refusals: tuple[bulk.Refusal, ...]
     constant_proofs: tuple[ConstantTargetProof, ...] = ()
     judgments: tuple[FreshMachineJudgment, ...] = ()
     pending: tuple[bulk.PendingFinding, ...] = ()
+    not_checked: tuple[NotCheckedFinding, ...] = ()
 
 
 def require_ready_plan(plan: PlannedEdits) -> None:
     """Never execute or rebuild an incomplete atomic batch."""
+    if plan.not_checked:
+        raise bulk.BulkRenameError("admission not checked: " + plan.not_checked[0].reason)
     if plan.pending:
         first = plan.pending[0]
         raise bulk.ReservationBlocked(first.path, first.holders)
@@ -526,10 +536,17 @@ def validate_machine_judgment(ledger: ledger_api.Ledger, finding: ledger_api.Hel
     return ""
 
 
-def fresh_machine_judgment(ledger: ledger_api.Ledger, finding: ledger_api.HeldFinding,
-                           head: str, checkout: Path, server: bulk.RenameServer,
-                           availability: PlanningFileAvailability) -> FreshMachineJudgment | bulk.Refusal:
-    """Run the existing rename executor as a read-only proof before giving stale work authority."""
+@dataclass(frozen=True)
+class MachineRenameCandidate:
+    """Current rule and declaration are eligible; semantic reference proof is still required."""
+    anchor: ledger_api.FindingAnchor
+    source: str
+    rename: BindingRename
+
+
+def machine_rename_candidate(ledger: ledger_api.Ledger, finding: ledger_api.HeldFinding,
+                             head: str, checkout: Path) -> MachineRenameCandidate | bulk.Refusal:
+    """The read-only prerequisites of a fresh judgment, shared with admission reports."""
     site = ledger.rename_judgment_site(finding, head)
     if isinstance(site, ledger_api.NeedsJudgment):
         return bulk.Refusal(finding.finding_id, "changed since judged: " + site.reason)
@@ -560,6 +577,19 @@ def fresh_machine_judgment(ledger: ledger_api.Ledger, finding: ledger_api.HeldFi
         return bulk.Refusal(finding.finding_id, "fresh judgment: " + contract.reason)
     if source.count("\n", 0, declaration.offset) + 1 != line:
         return bulk.Refusal(finding.finding_id, "fresh judgment declaration location changed")
+    return MachineRenameCandidate(site.anchor, source, pair)
+
+
+def fresh_machine_judgment(ledger: ledger_api.Ledger, finding: ledger_api.HeldFinding,
+                           head: str, checkout: Path, server: bulk.RenameServer,
+                           availability: PlanningFileAvailability) -> FreshMachineJudgment | bulk.Refusal:
+    """Run the existing rename executor as a read-only proof before giving stale work authority."""
+    candidate = machine_rename_candidate(ledger, finding, head, checkout)
+    if isinstance(candidate, bulk.Refusal):
+        return candidate
+    path = candidate.anchor.path
+    source, pair = candidate.source, candidate.rename
+    target = checkout / path
     try:
         availability.require((path,))
         # rename_file owns syntax, references, capture, docs, visibility and module-instance
@@ -571,7 +601,7 @@ def fresh_machine_judgment(ledger: ledger_api.Ledger, finding: ledger_api.HeldFi
             return next(iter(file.refusals), bulk.Refusal(finding.finding_id, "fresh judgment has no complete rename proof"))
         inputs = tuple((name, hashlib.sha256((checkout / name).read_bytes()).hexdigest())
                        for name in sorted({path, *file.proof_dependencies, *file.dependencies}))
-        return FreshMachineJudgment(finding.finding_id, site.anchor,
+        return FreshMachineJudgment(finding.finding_id, candidate.anchor,
                                     ledger.finding_input_identity(finding), finding.rule_blob, inputs)
     finally:
         # A proof must not leave a speculative rename as input to another proof.
@@ -581,12 +611,13 @@ def fresh_machine_judgment(ledger: ledger_api.Ledger, finding: ledger_api.HeldFi
 
 
 def plan_renames(repo: Path, ledger: ledger_api.Ledger, base: str, selected: Selection,
-                 server: bulk.RenameServer, availability: PlanningFileAvailability) -> PlannedEdits:
+                 server: bulk.RenameServer | RenameService, availability: PlanningFileAvailability) -> PlannedEdits:
     sources = RenameSources()
     sources.judgments = {item.finding_id: item for item in selected.judgments}
     refused: dict[str, str] = {}
     pending: list[bulk.PendingFinding] = []
     groups: dict[str, list[bulk.RenameFinding]] = defaultdict(list)
+    not_checked: list[NotCheckedFinding] = []
     for finding in selected.findings:
         try:
             rename = current_rename(ledger, finding, base, sources, repo)
@@ -598,6 +629,13 @@ def plan_renames(repo: Path, ledger: ledger_api.Ledger, base: str, selected: Sel
                 if isinstance(candidate, ledger_api.NeedsJudgment):
                     rename = bulk.Refusal(finding.finding_id, "changed since judged: " + candidate.reason)
                 else:
+                    if isinstance(server, RenameService):
+                        prerequisites = machine_rename_candidate(ledger, finding, base, repo)
+                        if isinstance(prerequisites, bulk.Refusal):
+                            refused[finding.finding_id] = prerequisites.reason
+                        else:
+                            not_checked.append(NotCheckedFinding(finding.finding_id, server.value))
+                        continue
                     judgment = fresh_machine_judgment(ledger, finding, base, repo, server, availability)
                     if isinstance(judgment, bulk.Refusal):
                         rename = judgment
@@ -615,6 +653,9 @@ def plan_renames(repo: Path, ledger: ledger_api.Ledger, base: str, selected: Sel
     docs = bulk.repository_docs(repo)
     files: list[bulk.FileRenames] = []
     for path, findings in groups.items():
+        if isinstance(server, RenameService):
+            not_checked.extend(NotCheckedFinding(item.finding_id, server.value) for item in findings)
+            continue
         try:
             file = bulk.rename_file(server, repo / path, path, sources.current[path], tuple(findings), docs,
                                     check_files=availability.require)
@@ -627,7 +668,8 @@ def plan_renames(repo: Path, ledger: ledger_api.Ledger, base: str, selected: Sel
             sources.current[document.path] = document.edited
     return PlannedEdits(tuple(file for file in bulk.combine_file_renames(files) if file.edited != file.original),
                         tuple(bulk.Refusal(identity, reason) for identity, reason in refused.items()),
-                        judgments=tuple(sources.judgments.values()), pending=tuple(pending))
+                        judgments=tuple(sources.judgments.values()), pending=tuple(pending),
+                        not_checked=tuple(not_checked))
 
 
 def plan_constants(repo: Path, ledger: ledger_api.Ledger, base: str, selected: Selection) -> PlannedEdits:
@@ -641,8 +683,8 @@ def plan_constants(repo: Path, ledger: ledger_api.Ledger, base: str, selected: S
             refused[finding.finding_id] = current.reason
         else:
             findings.append(current)
-    # Export the base once to reuse Cargo's existing target discovery, including configured roots.
-    # Source snapshots never consult the checkout's Rust bytes or untracked files.
+    # Target discovery shares the frozen manifest/path reader with source ownership.
+    # No export is needed; snapshots never consult untracked files or write sources.
     entries = git(repo, "ls-tree", "-rz", base).split("\0")
     blobs: dict[str, str] = {}
     for entry in filter(None, entries):
@@ -656,37 +698,34 @@ def plan_constants(repo: Path, ledger: ledger_api.Ledger, base: str, selected: S
     directories = tuple(member.directory for member in members)
     proofs: list[ConstantTargetProof] = []
     seen: set[str] = set()
-    with tempfile.TemporaryDirectory(prefix="bulk-constant-sources-") as folder:
-        export = Path(folder)
-        for path, data in contents.items():
-            target = export / path
-            target.parent.mkdir(parents=True, exist_ok=True)
-            _ = target.write_bytes(data)
-        for member in members:
-            owned = tuple(finding for finding in findings if style_proposals.crate_for(directories, finding.path) == member.directory)
-            if not owned:
-                continue
+    for member in members:
+        owned = tuple(finding for finding in findings if style_proposals.crate_for(directories, finding.path) == member.directory)
+        if not owned:
+            continue
+        try:
+            targets = bulk.cargo_target_roots(
+                repo / member.directory, frozen=bulk.FrozenCargoTargetInventory(
+                    contents[(Path(member.directory) / "Cargo.toml").as_posix()].decode(),
+                    frozenset(repo / path for path in blobs)))
+        except (bulk.BulkRenameError, ValueError, OSError) as error:
+            refused.update((finding.finding_id, str(error)) for finding in owned)
+            continue
+        for target in targets:
+            entry = target.path.relative_to(repo).as_posix()
+            snapshot = constants.CrateSources(entry, {path: data.decode() for path, data in contents.items()
+                if (path.endswith(".rs") or path == entry) and Path(path).is_relative_to(Path(entry).parent)
+                and style_proposals.crate_for(directories, path) == member.directory})
             try:
-                targets = bulk.cargo_target_roots(export / member.directory)
-            except (bulk.BulkRenameError, ValueError, OSError) as error:
-                refused.update((finding.finding_id, str(error)) for finding in owned)
+                modules = constants.crate_module_paths(snapshot)
+            except (ValueError, rust.UnreadableTokenSpans) as error:
+                refused.update((finding.finding_id, f"target {entry}: {error}") for finding in owned)
                 continue
-            for target in targets:
-                entry = target.path.relative_to(export).as_posix()
-                snapshot = constants.CrateSources(entry, {path: data.decode() for path, data in contents.items()
-                    if (path.endswith(".rs") or path == entry) and Path(path).is_relative_to(Path(entry).parent)
-                    and style_proposals.crate_for(directories, path) == member.directory})
-                try:
-                    modules = constants.crate_module_paths(snapshot)
-                except (ValueError, rust.UnreadableTokenSpans) as error:
-                    refused.update((finding.finding_id, f"target {entry}: {error}") for finding in owned)
-                    continue
-                applicable = tuple(finding for finding in owned if finding.path in modules)
-                seen.update(finding.finding_id for finding in applicable)
-                result = constants.apply_crate_constants(snapshot, applicable)
-                refused.update((item.finding_id, item.reason) for item in result.refusals)
-                if result.kept:
-                    proofs.append(ConstantTargetProof(snapshot, result))
+            applicable = tuple(finding for finding in owned if finding.path in modules)
+            seen.update(finding.finding_id for finding in applicable)
+            result = constants.apply_crate_constants(snapshot, applicable)
+            refused.update((item.finding_id, item.reason) for item in result.refusals)
+            if result.kept:
+                proofs.append(ConstantTargetProof(snapshot, result))
     for finding in findings:
         if finding.finding_id not in seen:
             _ = refused.setdefault(finding.finding_id, "finding is not in an ordinary Cargo target module")
@@ -793,7 +832,7 @@ def available_constant_plan(plan: PlannedEdits, availability: PlanningFileAvaila
                         tuple(proof for proof in plan.constant_proofs
                               if not any(edit.path in removed for edit in proof.result.edits)), plan.judgments,
                         tuple({item.finding_id: item for item in pending
-                               if item.finding_id not in refused}.values()))
+                               if item.finding_id not in refused}.values()), plan.not_checked)
 
 
 def diagnostic_failures(repo: Path, result: CommandResult) -> dict[str, str]:
@@ -934,6 +973,7 @@ def review_record(item: AppliedFinding) -> dict[str, object]:
 
 class RenameService(Enum):
     ON_DEMAND = "start only for a names rule"
+    READ_ONLY = "selection-only for semantic rename proof: rust-analyzer may run build scripts and write build artifacts"
 
 
 def plan_rule(repo: Path, ledger: ledger_api.Ledger, base: str, selected: Selection,
@@ -943,6 +983,9 @@ def plan_rule(repo: Path, ledger: ledger_api.Ledger, base: str, selected: Select
     if definition.family != "names":
         return available_constant_plan(plan_constants(repo, ledger, base, selected),
                                        PlanningFileAvailability(repo, available))
+    if server == RenameService.READ_ONLY:
+        return plan_renames(repo, ledger, base, selected, server,
+                            PlanningFileAvailability(repo, available))
     with ExitStack() as stack:
         rename_server = stack.enter_context(bulk.RustAnalyzer(repo)) if isinstance(server, RenameService) else server
         # Injected analyzers have the same lifetime across retries; clear
@@ -1187,6 +1230,11 @@ def run_crates(repo: Path, packages: Sequence[str], run_id: str, rule: str, base
     return handler(repo, packages, run_id, rule, base_tree, destination, ledger, server, runner, available)
 
 
+class DryRunCommand(Protocol):
+    def __call__(self, repo: Path, packages: Sequence[str], rule: str, base_tree: str,
+                 ledger: ledger_api.Ledger, /) -> dict[str, object]: ...
+
+
 class Arguments(argparse.Namespace):
     repo: Path = Path()
     rule: str = ""
@@ -1194,6 +1242,7 @@ class Arguments(argparse.Namespace):
     crate: list[str] = []
     run: str = ""
     destination: str = ""
+    dry_run: bool = False
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -1204,15 +1253,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     _ = parser.add_argument("--crate", action="append", default=[])
     _ = parser.add_argument("--run", default="")
     _ = parser.add_argument("--destination", default="")
+    _ = parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv, namespace=Arguments())
     if args.crate:
-        if not args.run:
+        if not args.run and not args.dry_run:
             parser.error("--crate requires --run")
     elif args.run or args.destination:
         parser.error("--run and --destination require --crate")
     elif not args.rule or not args.base_tree:
         parser.error("--rule and --base-tree are required without --crate")
+    if args.dry_run and not args.crate:
+        parser.error("--dry-run requires --crate")
     try:
+        if args.dry_run:
+            location = ledger_api.ledger_location(args.repo)
+            with ledger_api.Ledger(location.repo, location.database, access=ledger_api.LedgerAccess.READ_ONLY) as ledger:
+                handler = cast(DryRunCommand, getattr(importlib.import_module("crate_run"), "dry_run_crates"))
+                print(json.dumps(handler(args.repo, args.crate, args.rule, args.base_tree, ledger), indent=2))
+                return 0
         if socket.gethostname().split(".")[0] != "natedev":
             raise bulk.BulkRenameError("workspace bulk tests must run on natedev")
         with ledger_api.open_ledger(args.repo) as ledger:

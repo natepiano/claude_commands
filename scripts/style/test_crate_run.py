@@ -2,7 +2,11 @@
 from __future__ import annotations
 
 import json
+import io
 import sqlite3
+import os
+import sys
+import tempfile
 from dataclasses import replace
 from contextlib import closing
 from collections.abc import Callable, Sequence
@@ -125,7 +129,8 @@ class CrateRunTests(CargoProjectTests):
     def batch(self) -> crates.CrateRun:
         return crates.CrateRun(self.authority, "identified")
 
-    def freeze(self, *, shared_proposal: bool = False, paths: tuple[str, ...] = ("src/lib.rs", "beta/src/lib.rs")) -> None:
+    def file_findings(self, *, shared_proposal: bool = False,
+                      paths: tuple[str, ...] = ("src/lib.rs", "beta/src/lib.rs")) -> None:
         self.authority.ticket_add("read-1", "read", "read", "names", ".", list(paths), [self.definition.rule_id])
         self.authority.ticket_assign("read-1", "main")
         _ = self.authority.ticket_base("read-1")
@@ -137,6 +142,9 @@ class CrateRunTests(CargoProjectTests):
                                           "rename", "old", "number", self.definition.blob, "read-1")
             self.authority.file_held(finding.finding_id, proposal)
         self.authority.ticket_drop("read-1")
+
+    def freeze(self, *, shared_proposal: bool = False, paths: tuple[str, ...] = ("src/lib.rs", "beta/src/lib.rs")) -> None:
+        self.file_findings(shared_proposal=shared_proposal, paths=paths)
         self.batch.create(self.definition, self.tree, self.destination)
 
     def advance(self, package: str) -> crates.Manifest:
@@ -150,6 +158,169 @@ class CrateRunTests(CargoProjectTests):
     def reservation_advance(self) -> crates.Manifest:
         return self.batch.advance("bulk_sample", renamed, self.commands,
                                   bulk.check_available, fixture_execute)
+
+    def dry_run_snapshot(self) -> dict[str, bytes]:
+        return {str(path): path.read_bytes() for root in (self.repo, self.authority.database.parent)
+                for path in root.rglob("*") if path.is_file()}
+
+    def test_dry_run_uses_execution_admission_for_reserved_stale_and_unsupported_findings_without_writes(self) -> None:
+        source = (self.repo / "src/lib.rs").read_text()
+        stale = self.repo / "src/stale.rs"
+        _ = stale.write_text(source + source.replace("run()", "second()"))
+        _ = (self.repo / "src/unsupported.rs").write_text(source)
+        _ = self.git("add", ".")
+        _ = self.git("commit", "-qm", "admission fixtures")
+        self.authority.set_tip(self.git("rev-parse", "HEAD"))
+        self.file_findings(paths=("src/lib.rs", "src/stale.rs", "src/unsupported.rs"))
+        with closing(sqlite3.connect(self.authority.database)) as connection, connection:
+            _ = connection.execute("UPDATE held_findings SET kind='restructure' WHERE path='src/unsupported.rs'")
+        _ = stale.write_text(source.replace("old", "gone") + source.replace("run()", "second()"))
+        _ = self.git("add", ".")
+        _ = self.git("commit", "-qm", "remove only the first repeated declaration")
+        self.authority.set_tip(self.git("rev-parse", "HEAD"))
+        before = self.dry_run_snapshot()
+        output = io.StringIO()
+        with (mock.patch.object(berth_board, "read_board", return_value=berth_board.Board((self.other_writer,))),
+              mock.patch.object(crates, "admission_plan", wraps=crates.admission_plan) as admission,
+              mock.patch("sys.stdout", output)):
+            code = run.main(["--repo", str(self.repo), "--crate", "bulk_sample", "--dry-run",
+                             "--rule", self.definition.rule_id, "--base-tree", self.git("rev-parse", "HEAD^{tree}")])
+        self.assertEqual(code, 0, output.getvalue())
+        admission.assert_called_once()
+        report = bulk.object_fields(cast(object, json.loads(output.getvalue())))
+        outcomes = [bulk.object_fields(item) for item in bulk.object_list(bulk.object_fields(report["crates"])["bulk_sample"])]
+        findings = {finding.finding_id: finding for finding in self.authority.held_findings(ledger_api.AllHeldFindings())}
+        by_path = {findings[str(item["finding_id"])].path: item for item in outcomes}
+        self.assertEqual(by_path["src/lib.rs"]["outcome"], "pending")
+        self.assertEqual(by_path["src/lib.rs"]["holders"], [{"worktree": str(self.other_writer.holder_worktree_root),
+            "branch": self.other_writer.holder_branch, "reservation_id": self.other_writer.reservation_id}])
+        self.assertEqual(by_path["src/stale.rs"]["outcome"], "refused")
+        self.assertTrue(str(by_path["src/stale.rs"]["reason"]))
+        self.assertEqual(by_path["src/unsupported.rs"], {"finding_id": by_path["src/unsupported.rs"]["finding_id"],
+            "outcome": "refused", "reason": "finding does not specify one identifier rename"})
+        self.assertEqual(self.dry_run_snapshot(), before)
+        self.assertFalse(self.batch.folder.exists())
+        self.assertTrue(all(isinstance(item.build_ticket, ledger_api.NoBuildTicket) for item in findings.values()))
+
+    def test_values_dry_run_never_exports_sources_even_when_every_finding_is_pending(self) -> None:
+        source = ('pub fn run() {\n    let first: usize = 42;\n' +
+                  '    let second: usize = 43;\n}\n')
+        _ = (self.repo / "src/lib.rs").write_text(source)
+        _ = self.git("add", ".")
+        _ = self.git("commit", "-qm", "values admission fixture")
+        base = self.git("rev-parse", "HEAD")
+        tree = self.git("rev-parse", "HEAD^{tree}")
+        self.authority.set_tip(base)
+        _ = (self.root / "style/rust/no-magic-values.md").write_text(
+            "---\ntier: B\nfamily: values\ninput_scope: file\npre_filter: magic-values\n" +
+            "approval: always\n---\n# Values\n")
+        definition = next(rule for rule in rules.load_rules(self.repo) if rule.name == "no-magic-values")
+        self.authority.ticket_add("values-read-1", "values-read", "read", "values", ".",
+                                  ["src/lib.rs"], [definition.rule_id])
+        self.authority.ticket_assign("values-read-1", "main")
+        _ = self.authority.ticket_base("values-read-1")
+        identities: list[str] = []
+        for line, after in ((2, "Add `const FIRST: usize = 42;` in constants.rs."),
+                            (3, "Compute a better value instead.")):
+            issue = self.root / f"values-{line}.md"
+            _ = issue.write_text("---\nstatus: open\n---\nValues decision\n")
+            finding = self.authority.hold(definition.rule_id, "src/lib.rs", line,
+                source.splitlines()[line - 1], "restructure", str(40 + line), after,
+                definition.blob, "values-read-1")
+            self.authority.file_held(finding.finding_id, issue)
+            identities.append(finding.finding_id)
+        self.authority.ticket_drop("values-read-1")
+        before = self.dry_run_snapshot()
+        denying_writes = False
+        def deny_writes(event: str, arguments: tuple[object, ...]) -> None:
+            if not denying_writes:
+                return
+            if event == "open":
+                if isinstance(arguments[0], int):
+                    return
+                # TemporaryFile first opens its existing directory through io.open,
+                # then its opener requests O_TMPFILE there. Neither names a file.
+                # A custom opener that creates a named file emits its own audited
+                # open, which is still refused below; directory mutations are too.
+                if isinstance(arguments[0], (str, bytes)) and os.path.isdir(arguments[0]):
+                    return
+                mode, flags = arguments[1:3]
+                if (isinstance(mode, str) and any(flag in mode for flag in "wax+")) or (
+                    isinstance(flags, int) and flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND)):
+                    raise AssertionError(f"dry run attempted a file write: {arguments!r}")
+            elif event in {"os.mkdir", "os.remove", "os.rmdir", "os.rename", "os.link", "os.symlink",
+                           "os.truncate", "os.chmod", "os.chown", "os.utime"}:
+                raise AssertionError(f"dry run attempted a filesystem mutation: {event} {arguments!r}")
+        # Audit hooks cannot be removed; the finally block disables this hook after each report.
+        sys.addaudithook(deny_writes)
+        try:
+            denying_writes = True
+            with tempfile.TemporaryFile() as spool:
+                _ = spool.write(b"anonymous git read output")
+                self.assertEqual(os.fstat(spool.fileno()).st_nlink, 0)
+            with self.assertRaisesRegex(AssertionError, "dry run attempted a file write"):
+                with tempfile.NamedTemporaryFile():
+                    self.fail("a named temporary file must not be created")
+            with self.assertRaisesRegex(AssertionError, "dry run attempted a filesystem mutation: os.mkdir"):
+                _ = tempfile.mkdtemp()
+            with self.assertRaisesRegex(AssertionError, "dry run attempted a file write"):
+                _ = (self.repo / "named-write-probe").write_bytes(b"must not be written")
+        finally:
+            denying_writes = False
+        for blocked in (True, False):
+            with (self.subTest(blocked=blocked),
+                  ledger_api.Ledger(self.repo, self.authority.database, access=ledger_api.LedgerAccess.READ_ONLY) as ledger,
+                  mock.patch.object(berth_board, "read_board", return_value=berth_board.Board(
+                      (self.other_writer,) if blocked else ()))):
+                try:
+                    denying_writes = True
+                    report = crates.dry_run_crates(self.repo, ["bulk_sample"], definition.rule_id, tree, ledger)
+                finally:
+                    denying_writes = False
+                outcomes = {str(item["finding_id"]): item for item in (
+                    bulk.object_fields(value) for value in bulk.object_list(
+                        bulk.object_fields(report["crates"])["bulk_sample"]))}
+                if blocked:
+                    self.assertEqual([outcomes[identity]["outcome"] for identity in identities], ["pending", "pending"])
+                    self.assertEqual(outcomes[identities[0]]["holders"], [{
+                        "worktree": str(self.other_writer.holder_worktree_root),
+                        "branch": self.other_writer.holder_branch, "reservation_id": self.other_writer.reservation_id}])
+                else:
+                    self.assertEqual(outcomes[identities[0]]["outcome"], "admitted")
+                    self.assertEqual(outcomes[identities[1]]["outcome"], "refused")
+                    self.assertTrue(outcomes[identities[1]]["reason"])
+                self.assertEqual(self.dry_run_snapshot(), before)
+                self.assertFalse(self.batch.folder.exists())
+                self.assertTrue(all(isinstance(item.build_ticket, ledger_api.NoBuildTicket)
+                                    for item in self.authority.named_held(identities)))
+
+    def test_dry_run_labels_semantic_proof_not_checked_instead_of_starting_a_writer(self) -> None:
+        self.file_findings(paths=("src/lib.rs",))
+        before = self.dry_run_snapshot()
+        with (ledger_api.Ledger(self.repo, self.authority.database, access=ledger_api.LedgerAccess.READ_ONLY) as ledger,
+              mock.patch.object(bulk, "RustAnalyzer", side_effect=AssertionError("must not start a building service"))):
+            report = crates.dry_run_crates(self.repo, ["bulk_sample"], self.definition.rule_id,
+                                           self.tree, ledger, available=available)
+        outcomes = bulk.object_list(bulk.object_fields(report["crates"])["bulk_sample"])
+        self.assertEqual(len(outcomes), 1)
+        outcome = bulk.object_fields(outcomes[0])
+        self.assertEqual(outcome["outcome"], "not checked")
+        self.assertIn("rust-analyzer", str(outcome["reason"]))
+        self.assertIn("require writes", str(report["not_checked"]))
+        self.assertEqual(self.dry_run_snapshot(), before)
+
+    def test_dry_run_with_a_read_only_analyzer_reports_the_shared_semantic_proof_without_claiming(self) -> None:
+        self.file_findings(paths=("src/lib.rs",))
+        before = self.dry_run_snapshot()
+        server = ScriptedServer(lambda text, _offset, new: word_edits(text, "old", new))
+        with ledger_api.Ledger(self.repo, self.authority.database, access=ledger_api.LedgerAccess.READ_ONLY) as ledger:
+            report = crates.dry_run_crates(self.repo, ["bulk_sample"], self.definition.rule_id,
+                                           self.tree, ledger, server, available)
+        outcomes = bulk.object_list(bulk.object_fields(report["crates"])["bulk_sample"])
+        self.assertEqual([bulk.object_fields(item)["outcome"] for item in outcomes], ["admitted"])
+        self.assertTrue(server.calls)
+        self.assertEqual(self.dry_run_snapshot(), before)
+        self.assertFalse(self.batch.folder.exists())
 
     def test_blocking_reservation_is_pending_with_holder_and_keeps_the_same_ticket(self) -> None:
         self.freeze(paths=("src/lib.rs",))
