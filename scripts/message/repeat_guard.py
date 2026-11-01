@@ -25,6 +25,7 @@ from subprocess import Popen
 from typing import Literal, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib import process_group
 from scripts.lib.atomic_file import write_text_atomic
 
 CONFIG = Path(__file__).resolve().parents[2] / "config/send_repeat_guard.conf"
@@ -424,7 +425,7 @@ def isolated(command: list[str], request: str, budget: float) -> Decision:
             raise ValueError("invalid guard worker count")
         return Decision(raw["held"] is True, copies)
     except subprocess.TimeoutExpired:
-        os.killpg(child.pid, signal.SIGKILL)
+        process_group.send_process_group(child.pid, signal.SIGKILL)
         warn("operation deadline exceeded")
         # Only subprocess creation is used: no Python state is forked by this caller.
         threading.Thread(target=child.communicate, daemon=True).start()
@@ -588,7 +589,7 @@ def notice_job(command: list[str], budget: float) -> None:
     finally:
         # Also clean descendants left behind after an apparently normal exit.
         try:
-            os.killpg(child.pid, signal.SIGKILL)
+            process_group.send_process_group(child.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
         _ = child.wait()
