@@ -19,9 +19,12 @@ from __future__ import annotations
 import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from functools import cache
 from pathlib import PurePosixPath
 
 import style_footprint
+from candidate_generators import snake_case
+from git_process import run_git
 
 # The keywords that declare an item with a name that other names can sit under.
 PARENT_KEYWORDS = frozenset({"enum", "struct", "union", "trait", "mod"})
@@ -360,6 +363,77 @@ def rename_declaration(source: str, rename: BindingRename) -> RenameDeclaration 
     if isinstance(local, BindingScope) and local.declaration == index:
         scope = local
     return RenameDeclaration(scan.spans[index].start, scope)
+
+
+TYPE_NAMED_PARAMETER_RULE = (
+    "---\ntier: C\nfamily: names\ninput_scope: file\n---\n"
+    "# Type-named parameters\n\n"
+    "Name a function parameter with an explicit direct named type after the snake_case form of that type's final path component.\n"
+    "References, optional lifetimes and mutability do not change that name.\n"
+    "Do not rename inferred or compound types, fields or other bindings under this contract.\n"
+)
+
+
+@dataclass(frozen=True)
+class TypeNamedParameterRule:
+    """The complete rule is the direct named-type parameter contract checked below."""
+
+
+@dataclass(frozen=True)
+class NoMachineRenameRule:
+    reason: str = "rule has no recognized machine-checkable contract"
+
+
+@cache
+def _type_named_parameter_rule_blob() -> str:
+    return run_git(("git", "hash-object", "--stdin"), input=TYPE_NAMED_PARAMETER_RULE.encode()).stdout.decode().strip()
+
+
+def machine_rename_rule(rule_blob: str) -> TypeNamedParameterRule | NoMachineRenameRule:
+    # Match the entire pinned rule, including metadata. A filename, a matching
+    # paragraph or an extra restriction is insufficient authority to judge code.
+    return TypeNamedParameterRule() if rule_blob == _type_named_parameter_rule_blob() else NoMachineRenameRule()
+
+
+def type_named_parameter(source: str, rename: BindingRename) -> RenameDeclaration | NoBindingScope:
+    """Machine-check the direct named-type parameter subset of the type-named rule.
+
+    Inferred types, generic/compound types, fields and semantic role names still need a person.
+    Reference identity, capture, visibility and documentation remain the rename executor's proof.
+    """
+    declaration = rename_declaration(source, rename)
+    if isinstance(declaration, NoBindingScope):
+        return declaration
+    if declaration.scope.kind != "fn parameter":
+        return NoBindingScope("rule applicability is not machine-checkable for this declaration")
+    scan = _BindingScan(source)
+    index = declaration.scope.declaration
+    words = scan.words
+    if words[index + 1:index + 2] != (":",):
+        return NoBindingScope("parameter type is not explicit")
+    cursor = index + 2
+    if words[cursor:cursor + 1] == ("&",):
+        cursor += 1
+        if words[cursor:cursor + 1] == ("'",):
+            cursor += 2
+        if words[cursor:cursor + 1] == ("mut",):
+            cursor += 1
+    if cursor >= len(words) or not style_footprint.IDENTIFIER.fullmatch(words[cursor]):
+        return NoBindingScope("parameter type is not a direct named type")
+    name = words[cursor]
+    cursor += 1
+    while words[cursor:cursor + 1] == ("::",):
+        cursor += 1
+        if cursor >= len(words) or not style_footprint.IDENTIFIER.fullmatch(words[cursor]):
+            return NoBindingScope("parameter type path is unreadable")
+        name = words[cursor]
+        cursor += 1
+    if words[cursor:cursor + 1] not in {(",",), (")",)}:
+        return NoBindingScope("compound parameter type requires judgment")
+    expected = snake_case(name)
+    if rename.new.removeprefix("r#") != expected or rename.old.removeprefix("r#") == expected:
+        return NoBindingScope("current parameter does not prove the proposed type-named rule")
+    return declaration
 
 
 @dataclass(frozen=True)

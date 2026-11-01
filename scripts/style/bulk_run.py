@@ -31,7 +31,8 @@ import rules
 import style_ledger as ledger_api
 import style_proposals
 import style_footprint as rust
-from approved_renames import BindingRename, NoBindingScope, refactor_rename, rename_declaration
+from approved_renames import (BindingRename, NoBindingScope, NoMachineRenameRule, machine_rename_rule,
+                              refactor_rename, rename_declaration, type_named_parameter)
 from issues import Issue, frontmatter
 from proposal_issue import ApprovedDecision, UnansweredDecision, decision_answer
 
@@ -77,9 +78,38 @@ class OpenTicketRefusal(bulk.Refusal):
 
 
 @dataclass(frozen=True)
+class FreshMachineJudgment:
+    """A new current-tip rename judgment after the shared semantic proof, not continuity."""
+
+    finding_id: str
+    anchor: ledger_api.FindingAnchor
+    finding_identity: str
+    rule_blob: str
+    inputs: tuple[tuple[str, str], ...]
+
+
+class JudgmentPolicy(Enum):
+    PROVE_CURRENT = "prove a new judgment while planning"
+    FROZEN_ONLY = "consume the plan's judgments without replacing them"
+
+
+@dataclass(frozen=True)
 class Selection:
     findings: tuple[ledger_api.HeldFinding, ...]
     skipped: tuple[bulk.Refusal, ...]
+    judgments: tuple[FreshMachineJudgment, ...] = ()
+    judgment_policy: JudgmentPolicy = JudgmentPolicy.PROVE_CURRENT
+
+
+def approved_finding_decision(finding: ledger_api.HeldFinding, definition: rules.Rule) -> bool:
+    """The single approval boundary shared by selection and fresh judgment."""
+    if not isinstance(finding.state, ledger_api.Filed):
+        return False
+    proposal = finding.state.proposal
+    answer = decision_answer(Issue(proposal, frontmatter(proposal))) if proposal.is_file() else UnansweredDecision()
+    return (isinstance(answer, ApprovedDecision)
+            or isinstance(definition.approval, rules.AlwaysApproved)
+            and isinstance(answer, UnansweredDecision) and proposal.is_file())
 
 
 def select(ledger: ledger_api.Ledger, definition: rules.Rule) -> Selection:
@@ -116,10 +146,7 @@ def select(ledger: ledger_api.Ledger, definition: rules.Rule) -> Selection:
         else:
             proposal = finding.state.proposal
             if proposal not in approvals:
-                answer = decision_answer(Issue(proposal, frontmatter(proposal))) if proposal.is_file() else UnansweredDecision()
-                approvals[proposal] = (isinstance(answer, ApprovedDecision)
-                                       or (isinstance(definition.approval, rules.AlwaysApproved)
-                                           and isinstance(answer, UnansweredDecision) and proposal.is_file()))
+                approvals[proposal] = approved_finding_decision(finding, definition)
             if not approvals[proposal]:
                 reason = "decision not approved"
         if reason:
@@ -171,6 +198,7 @@ class RenameSources:
     def __init__(self) -> None:
         self.current: dict[str, str] = {}
         self.judged: dict[tuple[str, str], CommandResult] = {}
+        self.judgments: dict[str, FreshMachineJudgment] = {}
 
     def judged_file(self, repo: Path, commit: str, path: str) -> CommandResult:
         key = (commit, path)
@@ -191,24 +219,32 @@ def current_finding(ledger: ledger_api.Ledger, finding: ledger_api.HeldFinding, 
     The ledger owns lineage; the planner's checkout owns current physical bytes.
     """
     evidence = ledger.finding_site(finding, head)
-    if not isinstance(evidence, ledger_api.UnchangedSite):
+    if finding.finding_id in sources.judgments:
+        judgment = sources.judgments[finding.finding_id]
+        refusal = validate_machine_judgment(ledger, finding, head, checkout, judgment)
+        if refusal:
+            return bulk.Refusal(finding.finding_id, refusal)
+        evidence = judgment
+    if not isinstance(evidence, (ledger_api.UnchangedSite, FreshMachineJudgment)):
         return bulk.Refusal(finding.finding_id, "changed since judged: " + evidence.reason)
-    path = checkout / evidence.path
+    current_path = evidence.anchor.path if isinstance(evidence, FreshMachineJudgment) else evidence.path
+    current_line = evidence.anchor.line if isinstance(evidence, FreshMachineJudgment) else evidence.line
+    path = checkout / current_path
     if path.resolve() != path or not path.is_file() or path.suffix != ".rs":
         return bulk.Refusal(finding.finding_id, "finding path is not a regular Rust file")
-    if evidence.path not in sources.current:
-        sources.current[evidence.path] = path.read_bytes().decode("utf-8")
-    source = sources.current[evidence.path]
+    if current_path not in sources.current:
+        sources.current[current_path] = path.read_bytes().decode("utf-8")
+    source = sources.current[current_path]
     old = sources.judged_file(ledger.repo, evidence.anchor.commit, evidence.anchor.path)
     if old.code:
         return bulk.Refusal(finding.finding_id, "changed since judged: the file cannot be read at the judged commit")
     old_lines = old.stdout.encode().splitlines(keepends=True)
     new_lines = source.encode().splitlines(keepends=True)
     old_line = evidence.anchor.line
-    if (not 0 < old_line <= len(old_lines) or not 0 < evidence.line <= len(new_lines)
-            or old_lines[old_line - 1] != new_lines[evidence.line - 1]):
+    if (not 0 < old_line <= len(old_lines) or not 0 < current_line <= len(new_lines)
+            or old_lines[old_line - 1] != new_lines[current_line - 1]):
         return bulk.Refusal(finding.finding_id, "changed since judged: the judged line bytes differ from the current line")
-    return replace(finding, path=evidence.path, line=evidence.line, text=source.splitlines()[evidence.line - 1])
+    return replace(finding, path=current_path, line=current_line, text=source.splitlines()[current_line - 1])
 
 
 def current_rename(ledger: ledger_api.Ledger, finding: ledger_api.HeldFinding, head: str,
@@ -253,6 +289,7 @@ class PlannedEdits:
     files: tuple[bulk.FileRenames | ConstantFileEdit, ...]
     refusals: tuple[bulk.Refusal, ...]
     constant_proofs: tuple[ConstantTargetProof, ...] = ()
+    judgments: tuple[FreshMachineJudgment, ...] = ()
 
 
 def require_edit_paths(repo: Path, files: tuple[bulk.FileRenames | ConstantFileEdit, ...]) -> None:
@@ -452,14 +489,109 @@ def format_rename_plan(workspace: WorkspaceEdits, runner: Runner, arguments: tup
     return refused
 
 
+def validate_machine_judgment(ledger: ledger_api.Ledger, finding: ledger_api.HeldFinding,
+                              head: str, checkout: Path, judgment: FreshMachineJudgment) -> str:
+    """Frozen inputs are checked, never refreshed; the ordinary byte gate still runs."""
+    if judgment.anchor.commit != head:
+        return "fresh judgment tip changed"
+    if judgment.finding_identity != ledger.finding_input_identity(finding):
+        return "fresh judgment finding row changed"
+    site = ledger.rename_judgment_site(finding, head)
+    if isinstance(site, ledger_api.NeedsJudgment):
+        return "fresh judgment refused: " + site.reason
+    if site.anchor != judgment.anchor or finding.rule_blob != judgment.rule_blob:
+        return "fresh judgment rule or coordinate changed"
+    definition = next((rule for rule in rules.load_rules(checkout) if rule.rule_id == finding.rule), None)
+    if definition is None or definition.blob != finding.rule_blob:
+        return "fresh judgment rule changed"
+    contract = machine_rename_rule(definition.blob)
+    if isinstance(contract, NoMachineRenameRule):
+        return "fresh judgment refused: " + contract.reason
+    if not approved_finding_decision(finding, definition):
+        return "fresh judgment decision not approved"
+    for path, identity in judgment.inputs:
+        target = checkout / path
+        if target.resolve() != target or not target.is_file() or hashlib.sha256(target.read_bytes()).hexdigest() != identity:
+            return "fresh judgment source inputs changed: " + path
+    return ""
+
+
+def fresh_machine_judgment(ledger: ledger_api.Ledger, finding: ledger_api.HeldFinding,
+                           head: str, checkout: Path, server: bulk.RenameServer,
+                           availability: PlanningFileAvailability) -> FreshMachineJudgment | bulk.Refusal:
+    """Run the existing rename executor as a read-only proof before giving stale work authority."""
+    site = ledger.rename_judgment_site(finding, head)
+    if isinstance(site, ledger_api.NeedsJudgment):
+        return bulk.Refusal(finding.finding_id, "changed since judged: " + site.reason)
+    definition = next((rule for rule in rules.load_rules(checkout) if rule.rule_id == finding.rule), None)
+    if definition is None or definition.blob != finding.rule_blob:
+        return bulk.Refusal(finding.finding_id, "fresh judgment rule changed")
+    if not approved_finding_decision(finding, definition):
+        return bulk.Refusal(finding.finding_id, "fresh judgment decision not approved")
+    path, line = site.anchor.path, site.anchor.line
+    target = checkout / path
+    if target.resolve() != target or not target.is_file():
+        return bulk.Refusal(finding.finding_id, "fresh judgment source is not a regular file")
+    source = target.read_bytes().decode()
+    committed = RenameSources().judged_file(ledger.repo, head, path)
+    if committed.code or committed.stdout != source:
+        return bulk.Refusal(finding.finding_id, "fresh judgment checkout differs from tip")
+    lines = source.splitlines()
+    if not 0 < line <= len(lines):
+        return bulk.Refusal(finding.finding_id, "fresh judgment declaration location is unreadable")
+    pair = refactor_rename(finding.kind, finding.before, finding.after, line, lines[line - 1])
+    if not isinstance(pair, BindingRename):
+        return bulk.Refusal(finding.finding_id, "finding does not specify one identifier rename")
+    declaration = type_named_parameter(source, pair)
+    if isinstance(declaration, NoBindingScope):
+        return bulk.Refusal(finding.finding_id, "fresh judgment: " + declaration.reason)
+    contract = machine_rename_rule(definition.blob)
+    if isinstance(contract, NoMachineRenameRule):
+        return bulk.Refusal(finding.finding_id, "fresh judgment: " + contract.reason)
+    if source.count("\n", 0, declaration.offset) + 1 != line:
+        return bulk.Refusal(finding.finding_id, "fresh judgment declaration location changed")
+    try:
+        availability.require((path,))
+        # rename_file owns syntax, references, capture, docs, visibility and module-instance
+        # proof. It updates analyzer overlays only; no checkout or ledger row is written.
+        file = bulk.rename_file(server, target, path, source,
+                                (bulk.RenameFinding(finding.finding_id, path, pair),),
+                                bulk.repository_docs(checkout), check_files=availability.require)
+        if not file.kept:
+            return next(iter(file.refusals), bulk.Refusal(finding.finding_id, "fresh judgment has no complete rename proof"))
+        inputs = tuple((name, hashlib.sha256((checkout / name).read_bytes()).hexdigest())
+                       for name in sorted({path, *file.proof_dependencies, *file.dependencies}))
+        return FreshMachineJudgment(finding.finding_id, site.anchor,
+                                    ledger.finding_input_identity(finding), finding.rule_blob, inputs)
+    finally:
+        # A proof must not leave a speculative rename as input to another proof.
+        for document in tuple(server.documents):
+            if document.is_relative_to(checkout):
+                server.open(document, document.read_bytes().decode())
+
+
 def plan_renames(repo: Path, ledger: ledger_api.Ledger, base: str, selected: Selection,
                  server: bulk.RenameServer, availability: PlanningFileAvailability) -> PlannedEdits:
     sources = RenameSources()
+    sources.judgments = {item.finding_id: item for item in selected.judgments}
     refused: dict[str, str] = {}
     groups: dict[str, list[bulk.RenameFinding]] = defaultdict(list)
     for finding in selected.findings:
         try:
             rename = current_rename(ledger, finding, base, sources, repo)
+            if (isinstance(rename, bulk.Refusal) and finding.finding_id not in sources.judgments
+                    and selected.judgment_policy == JudgmentPolicy.PROVE_CURRENT
+                    and isinstance(ledger.finding_site(finding, base), ledger_api.NeedsJudgment)):
+                candidate = ledger.rename_judgment_site(finding, base)
+                if isinstance(candidate, ledger_api.NeedsJudgment):
+                    rename = bulk.Refusal(finding.finding_id, "changed since judged: " + candidate.reason)
+                else:
+                    judgment = fresh_machine_judgment(ledger, finding, base, repo, server, availability)
+                    if isinstance(judgment, bulk.Refusal):
+                        rename = judgment
+                    else:
+                        sources.judgments[finding.finding_id] = judgment
+                        rename = current_rename(ledger, finding, base, sources, repo)
             if isinstance(rename, bulk.Refusal):
                 refused[finding.finding_id] = rename.reason
             else:
@@ -476,7 +608,8 @@ def plan_renames(repo: Path, ledger: ledger_api.Ledger, base: str, selected: Sel
         for document in file.related:
             sources.current[document.path] = document.edited
     return PlannedEdits(tuple(file for file in bulk.combine_file_renames(files) if file.edited != file.original),
-                        tuple(bulk.Refusal(identity, reason) for identity, reason in refused.items()))
+                        tuple(bulk.Refusal(identity, reason) for identity, reason in refused.items()),
+                        judgments=tuple(sources.judgments.values()))
 
 
 def plan_constants(repo: Path, ledger: ledger_api.Ledger, base: str, selected: Selection) -> PlannedEdits:
@@ -630,7 +763,7 @@ def available_constant_plan(plan: PlannedEdits, availability: PlanningFileAvaila
     return PlannedEdits(tuple(file for file in plan.files if file.path not in removed),
                         tuple(bulk.Refusal(identity, reason) for identity, reason in refused.items()),
                         tuple(proof for proof in plan.constant_proofs
-                              if not any(edit.path in removed for edit in proof.result.edits)))
+                              if not any(edit.path in removed for edit in proof.result.edits)), plan.judgments)
 
 
 def diagnostic_failures(repo: Path, result: CommandResult) -> dict[str, str]:

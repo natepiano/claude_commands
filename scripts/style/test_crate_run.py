@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import sqlite3
+from contextlib import closing
 from collections.abc import Callable, Sequence
 from functools import cached_property
 from pathlib import Path
@@ -14,7 +16,8 @@ import crate_run as crates
 import rules
 import style_ledger as ledger_api
 from approved_renames import BindingRename
-from test_bulk_rename import CargoProjectTests
+from ledger_test_support import machine_rename_fixture
+from test_bulk_rename import ScriptedServer, word_edits, CargoProjectTests
 
 
 class Commands:
@@ -136,6 +139,67 @@ class CrateRunTests(CargoProjectTests):
 
     def advance(self, package: str) -> crates.Manifest:
         return self.batch.advance(package, renamed, self.commands, available, fixture_execute)
+
+    def freeze_fresh_judgment(self) -> None:
+        _, tip = machine_rename_fixture(self.authority, self.definition, self.repo, self.root / "fresh.md")
+        self.definition = next(rule for rule in rules.load_rules(self.repo) if rule.rule_id == self.definition.rule_id)
+        self.base = tip
+        self.tree = self.git("rev-parse", "HEAD^{tree}")
+        _ = self.git("update-ref", self.destination, tip)
+        self.batch.create(self.definition, self.tree, self.destination)
+
+    def machine_plan(self, checkout: Path, ledger: ledger_api.Ledger, base: str,
+                     selected: run.Selection, availability: run.PlanningFileAvailability,
+                     definition: rules.Rule) -> run.PlannedEdits:
+        server = ScriptedServer(lambda text, _offset, new: word_edits(text, "item", new))
+        return run.plan_rule(checkout, ledger, base, selected, definition, server, availability.available)
+
+    def stop_with_frozen_judgment(self) -> crates.FrozenMachineJudgment:
+        self.freeze_fresh_judgment()
+        def stopped(checkout: Path, _base: str, planned: run.PlannedEdits,
+                    _intent: run.WorkspaceIntent, _runner: run.Runner,
+                    _boundary: Callable[[Path, str], None]) -> crates.ValidatedEdits:
+            frozen = self.batch.read()["crates"]["bulk_sample"].get("machine_judgments", [])
+            self.assertEqual(len(frozen), 1)
+            self.assertEqual(frozen[0], crates.freeze_machine_judgment(planned.judgments[0]))
+            self.assertEqual(run.git(checkout, "status", "--porcelain"), "")
+            raise SystemExit("before execution")
+        with self.assertRaisesRegex(SystemExit, "before execution"):
+            _ = self.batch.advance("bulk_sample", self.machine_plan, self.commands, available, stopped)
+        return self.batch.read()["crates"]["bulk_sample"].get("machine_judgments", [])[0]
+
+    def test_crate_resume_executes_the_frozen_machine_judgment_without_rejudging(self) -> None:
+        frozen = self.stop_with_frozen_judgment()
+        with mock.patch.object(run, "fresh_machine_judgment", side_effect=AssertionError("must use frozen judgment")):
+            result = self.batch.advance("bulk_sample", self.machine_plan, self.commands, available, fixture_execute)
+        self.assertEqual(result["crates"]["bulk_sample"]["stage"], crates.CrateStage.INTEGRATED)
+        self.assertEqual(result["crates"]["bulk_sample"].get("machine_judgments", []), [frozen])
+        self.assertIn("impl_item: &ImplItem", self.git("show", self.destination + ":src/lib.rs"))
+
+    def test_crate_resume_refuses_a_changed_finding_row_without_replacing_its_judgment(self) -> None:
+        frozen = self.stop_with_frozen_judgment()
+        with closing(sqlite3.connect(self.authority.database)) as connection, connection:
+            _ = connection.execute("UPDATE held_findings SET after='different' WHERE finding_id=?", (frozen["finding_id"],))
+        with self.assertRaisesRegex(bulk.BulkRenameError, "frozen finding"):
+            _ = self.batch.advance("bulk_sample", self.machine_plan, self.commands, available, fixture_execute)
+        self.assertEqual(self.batch.read()["crates"]["bulk_sample"].get("machine_judgments", []), [frozen])
+
+    def test_crate_resume_refuses_a_changed_rule_without_replacing_its_judgment(self) -> None:
+        frozen = self.stop_with_frozen_judgment()
+        _ = self.definition.path.write_text(self.definition.path.read_text() + "Changed rule requirement\n")
+        with self.assertRaisesRegex(bulk.BulkRenameError, "rule"):
+            _ = self.batch.advance("bulk_sample", self.machine_plan, self.commands, available, fixture_execute)
+        self.assertEqual(self.batch.read()["crates"]["bulk_sample"].get("machine_judgments", []), [frozen])
+
+    def test_crate_resume_refuses_a_judgment_for_another_tip(self) -> None:
+        frozen = self.stop_with_frozen_judgment()
+        manifest = self.batch.read()
+        manifest["crates"]["bulk_sample"].get("machine_judgments", [])[0]["commit"] = self.git("rev-parse", self.base + "^")
+        self.batch.save(manifest)
+        result = self.batch.advance("bulk_sample", self.machine_plan, self.commands, available, fixture_execute)
+        self.assertEqual(result["crates"]["bulk_sample"]["stage"], crates.CrateStage.ABANDONED)
+        self.assertIn("tip changed", result["crates"]["bulk_sample"].get("error", ""))
+        self.assertEqual(result["crates"]["bulk_sample"].get("machine_judgments", [])[0]["finding_identity"], frozen["finding_identity"])
 
     def test_one_crate_has_canonical_branch_before_assignment_and_preserves_checkpoint_ancestry(self) -> None:
         self.freeze()

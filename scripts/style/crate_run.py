@@ -71,6 +71,30 @@ class CommitEvidence(TypedDict):
     refusals: dict[str, str]
 
 
+class FrozenMachineJudgment(TypedDict):
+    finding_id: str
+    commit: str
+    path: str
+    line: int
+    finding_identity: str
+    rule_blob: str
+    inputs: dict[str, str]
+
+
+def freeze_machine_judgment(judgment: run.FreshMachineJudgment) -> FrozenMachineJudgment:
+    return {"finding_id": judgment.finding_id, "commit": judgment.anchor.commit,
+            "path": judgment.anchor.path, "line": judgment.anchor.line,
+            "finding_identity": judgment.finding_identity, "rule_blob": judgment.rule_blob,
+            "inputs": dict(judgment.inputs)}
+
+
+def thaw_machine_judgment(judgment: FrozenMachineJudgment) -> run.FreshMachineJudgment:
+    return run.FreshMachineJudgment(judgment["finding_id"],
+                                    ledger_api.FindingAnchor(judgment["commit"], judgment["path"], judgment["line"]),
+                                    judgment["finding_identity"], judgment["rule_blob"],
+                                    tuple(sorted(judgment["inputs"].items())))
+
+
 class CrateRecord(TypedDict):
     directory: str
     checkout: str
@@ -79,6 +103,7 @@ class CrateRecord(TypedDict):
     result_path: str
     selected: list[FrozenFinding]
     finding_holders: NotRequired[dict[str, list[str]]]
+    machine_judgments: NotRequired[list[FrozenMachineJudgment]]
     stage: str
     owner: NotRequired[str]
     tickets: NotRequired[dict[str, str]]
@@ -983,9 +1008,24 @@ class CrateRun:
                     refused[finding.finding_id] = str(error)
                 else:
                     findings.append(finding)
+            frozen = tuple(thaw_machine_judgment(item) for item in record.get("machine_judgments", []))
+            for judgment in frozen:
+                finding = next(item for item in selected.findings if item.finding_id == judgment.finding_id)
+                reason = run.validate_machine_judgment(self.ledger, finding, base, checkout, judgment)
+                if reason:
+                    raise bulk.BulkRenameError(reason)
+            selection = run.Selection(tuple(findings), (), frozen,
+                                      run.JudgmentPolicy.FROZEN_ONLY if "machine_judgments" in record
+                                      else run.JudgmentPolicy.PROVE_CURRENT)
             rebuilt = remember_refusals(planner(
-                checkout, self.ledger, base, run.Selection(tuple(findings), ()),
-                availability, definition))
+                checkout, self.ledger, base, selection, availability, definition))
+            if "machine_judgments" not in record:
+                # Durable before execution, including an empty set. Recovery may consume
+                # this evidence but must never silently make a different fresh judgment.
+                record["machine_judgments"] = [freeze_machine_judgment(item) for item in rebuilt.judgments]
+                self.save(manifest)
+            elif any(item not in frozen for item in rebuilt.judgments):
+                raise bulk.BulkRenameError("planner replaced a frozen machine judgment")
             # The shared plan owner removes whole dependent edit groups, including files
             # introduced by a planner. No overlay may precede this boundary check.
             return remember_refusals(run.available_constant_plan(rebuilt, availability))
