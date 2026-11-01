@@ -27,6 +27,7 @@ Without a saved ref, it makes the worktree from the merge branch as before. Then
 session through `add_unit.py --resume` (the units account, the unit's name and Remote Control); and
 takes the retired note out of the Plan cell, committed on the merge branch. Each step checks whether
 it is done, so a rerun after a failure resumes: the note goes last, because it holds the session id.
+When the note records a staff id, resume restores that unit row before launch. Older notes use a new id.
 --dry-run prints each refusal and each step, and changes nothing.
 
 Exit 0 when the unit is resumed; 1 on a refusal or a failed step; 2 on usage.
@@ -55,7 +56,7 @@ from atomic_file import write_text_atomic
 
 ADD_UNIT = Path(__file__).resolve().parent / "add_unit.py"
 RETIRED = re.compile(r"^\s*\(retired [^)]*\)\s*")
-SESSION = re.compile(r"^\s*\(retired [^)]*, session ([0-9A-Za-z-]+)(?:, folder (.*?))?(?:, ref [^)]*)?\)")
+SESSION = re.compile(r"^\s*\(retired [^)]*, session ([0-9A-Za-z-]+)(?:, folder (.*?))?(?:, (?:ref|staff) [^)]*)?\)")
 
 
 class Refused(Exception):
@@ -83,6 +84,7 @@ class RetiredUnit:
     retired: bool
     start_folder: RecordedStartFolder | UnrecordedStartFolder
     saved_branch: retire_unit.SavedBranch | retire_unit.NoSavedBranch = retire_unit.NoSavedBranch()
+    recorded_staff_id: str = ""
 
 
 def find_unit(slug: str, given: str) -> RetiredUnit:
@@ -112,7 +114,7 @@ def find_unit(slug: str, given: str) -> RetiredUnit:
     return RetiredUnit(production, name, worktree, branch, production_units.cell_value(RETIRED.sub("", plan)),
                        session_id, retired,
                        RecordedStartFolder(Path(session[2]).expanduser()) if session and session[2] else UnrecordedStartFolder(),
-                       retire_unit.saved_branch_in_note(plan))
+                       retire_unit.saved_branch_in_note(plan), retire_unit.staff_id_in_note(plan))
 
 
 def resume_record(production: Production, name: str) -> Path:
@@ -272,8 +274,8 @@ def unmark(unit: RetiredUnit) -> None:
             lines[index] = "|".join(parts)
             break
     write_text_atomic(doc, "\n".join(lines))
-    add_unit.commit_paths(unit.production, [doc], f"production({unit.production.slug}): resume {unit.name}")
-    print(f"unmarked: the Units row, committed on {unit.production.merge_branch}")
+    if add_unit.commit_paths(unit.production, [doc], f"production({unit.production.slug}): resume {unit.name}"):
+        print(f"unmarked: the Units row, committed on {unit.production.merge_branch}")
 
 
 def dry_run(unit: RetiredUnit) -> int:
@@ -299,6 +301,9 @@ def resume(unit: RetiredUnit) -> int:
     if refused:
         print("\n".join(f"refused: {reason}" for reason in refused))
         return 1
+    if unit.recorded_staff_id:
+        parent = add_unit.ensure_staff_showrunner(unit.production)
+        _ = staff.restore_unit(staff.StaffId(unit.recorded_staff_id), name=unit_names.name(unit.name), parent=parent.id)
     row = add_unit.ensure_staff_unit(unit.production, unit.name)
     if (resume_folder(unit).resolve() == unit.worktree.resolve()
             or isinstance(unit.saved_branch, retire_unit.SavedBranch)):

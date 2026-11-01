@@ -5,7 +5,7 @@ Usage: retire_unit.py <slug> <unit> [--dry-run] [--wait-minutes N]
 
 A showrunner runs it through /showrunner:retire_unit. Uncommitted work refuses. Commits the merge
 branch lacks are pushed to origin as refs/retired/<staff id> and confirmed before any removal.
-The retired note keeps that ref and its full tip, alongside the director session and resume folder.
+The retired note keeps that ref and its full tip, alongside the staff id, director session and resume folder.
 The `Project started` line the /unit:direct recorder adds to a plan, alone in its file's diff, is not
 uncommitted work: no person wrote it. Then it stops what the unit owns. It finds each thing by its own record, never by a name pattern:
 
@@ -24,6 +24,7 @@ When nothing is left running, the Units row's Plan cell gets "(retired <date>, w
 session <id>)", adding ", folder <path>" when its transcript resumes outside the worktree,
 committed on the merge branch. Unmerged work adds ", ref refs/retired/<staff id>, tip <SHA>".
 Only then do the worktree, local branch and origin branch go. The retired ref stays for resume.
+The staff row is retired; resume restores it with the id in the note.
 Shutdown completion and forgetting its restore must succeed; a final liveness and record check
 refuses marking or removal while a known session still runs or its liveness is unreadable.
 --dry-run prints each refusal and everything it would stop and remove, and changes nothing.
@@ -110,6 +111,14 @@ class NoSavedBranch:
 
 
 NO_SAVED_BRANCH = NoSavedBranch()
+
+
+def staff_id_in_note(plan: str) -> str:
+    note = re.match(r"^\s*\(retired ([^)]*)\)", plan)
+    identity = re.search(r", staff (s[a-z0-9]{11})(?=,|$)", note[1]) if note else None
+    if note and ", staff " in note[1] and identity is None:
+        raise Refused("retired note has an invalid staff id")
+    return identity[1] if identity else ""
 
 
 def saved_branch_in_note(plan: str) -> SavedBranch | NoSavedBranch:
@@ -302,8 +311,8 @@ def preserve_branch(unit: Unit, saved: SavedBranch | NoSavedBranch = NO_SAVED_BR
         pushed = _git(unit, "push", "origin", f"{updated.tip}:{updated.ref}")
         if pushed.returncode:
             raise Refused(f"cannot preserve {updated.ref}: {failure(pushed)}")
+        print(f"saved: {updated.ref} at {updated.tip}")
     confirm_saved_branch(unit, updated)
-    print(f"kept: {updated.ref} at {updated.tip}")
     return updated
 
 
@@ -587,6 +596,14 @@ def director_session(unit: Unit) -> DirectorSession | NoDirectorSession:
     return DirectorSession(session_id, director_resume_folder(session_id)) if session_id else NoDirectorSession()
 
 
+def retirement_staff_id(unit: Unit) -> str:
+    recorded = staff_id_in_note(unit_plan(unit))
+    if recorded:
+        return recorded
+    member = staff_sources.member(staff_sources.UnitMember(unit.production.slug, unit.name), staff.initial_snapshot())
+    return member.row.id if isinstance(member, staff_sources.MemberFound) else ""
+
+
 def retired_note(unit: Unit, director: DirectorSession | NoDirectorSession,
                  saved: SavedBranch | NoSavedBranch = NO_SAVED_BRANCH) -> str:
     date = datetime.now(unit.production.zone).strftime("%Y-%m-%d")
@@ -597,6 +614,10 @@ def retired_note(unit: Unit, director: DirectorSession | NoDirectorSession,
             session += f", folder {director.resume_folder}"
     if isinstance(saved, SavedBranch):
         session += f", ref {saved.ref}, tip {saved.tip}"
+    identity = retirement_staff_id(unit)
+    if not identity:
+        raise Refused(f"{unit.name}: no staff id for the retired note")
+    session += f", staff {identity}"
     return RETIRED_NOTE.format(date=date, session=session)
 
 
@@ -616,18 +637,25 @@ def _command_name(pid: int) -> str:
         return "?"
 
 
+def blocking_processes(pids: tuple[int, ...], pane: unit_move.UnitPane | None) -> tuple[int, ...]:
+    """Only the caller and the unit's proven pane shell are exempt from cwd blockers."""
+    return tuple(pid for pid in pids if pid != os.getpid() and (pane is None or pid != pane.shell))
+
+
 def dry_run(unit: Unit) -> int:
     print(f"retire {unit.name} of {unit.production.slug}: dry run, nothing changes")
     refused = refusals(unit)
     for reason in refused:
         print(f"refused: {reason}")
     found = gather(unit)
+    pane = unit_move.unit_pane(unit_lookup.marked_unit(unit.production.slug, unit.name), unit.production.slug)
     lines = ([f"would stop: {describe_session(item)}, through stop_resume.stop" for item in found.claude]
              + [f"would stop: {describe_run(item)}" for item in found.runs]
              + [f"would release: build hold of {key}" for key in found.holds]
              + [f"would release: berth reservation {key}" for key in found.reservations]
              + [f"would stop: Mac claim {item.what} (pid {item.pid})" for item in found.claims]
-             + [f"blocks retirement: unowned process {pid}" for pid in found.processes])
+             + ([f"would close: pane {pane.place.pane} (shell {pane.shell})"] if pane is not None else [])
+             + [f"blocks retirement: unowned process {pid}" for pid in blocking_processes(found.processes, pane)])
     print("\n".join(lines or ["nothing to stop"]))
     saved = plan_saved_branch(unit, read_only=True)
     if isinstance(saved, SavedBranch):
@@ -646,6 +674,8 @@ def stop_sessions(unit: Unit, found: Found, wait_minutes: float, known_ids: froz
     identities = list(dict.fromkeys([item["sessionId"] for item in found.claude] + sorted(known_ids)))
     failures: list[str] = []
     for identity in identities:
+        if isinstance(sessions.session_liveness(identity), sessions.SessionNotLive):
+            continue
         outcome = stop_resume.stop(identity)
         if isinstance(outcome, stop_resume.StopFailed):
             failures.append(f"{identity}: stop refused: {outcome.reason}")
@@ -654,7 +684,8 @@ def stop_sessions(unit: Unit, found: Found, wait_minutes: float, known_ids: froz
             if not isinstance(sessions.session_liveness(identity), sessions.SessionNotLive):
                 failures.append(f"{identity}: no local tab; stop refused")
                 continue
-        print(f"stopped: {identity}")
+        if isinstance(outcome, stop_resume.Stopped):
+            print(f"stopped: {identity}")
     if forget and not failures:
         try:
             _ = pane_record.forget_unit(unit.name)
@@ -665,9 +696,11 @@ def stop_sessions(unit: Unit, found: Found, wait_minutes: float, known_ids: froz
 
 def terminate(pids: list[int], what: dict[int, str], wait: float | None = None) -> list[str]:
     """SIGTERM each pid; one alive after `wait` seconds (TERM_WAIT_SECONDS) comes back as still running."""
+    signalled: set[int] = set()
     for pid in pids:
         try:
             os.kill(pid, signal.SIGTERM)
+            signalled.add(pid)
         except ProcessLookupError:
             continue
         except PermissionError as error:
@@ -679,7 +712,7 @@ def terminate(pids: list[int], what: dict[int, str], wait: float | None = None) 
     for pid in pids:
         if _alive(pid):
             left.append(f"{what[pid]}: still runs after SIGTERM")
-        else:
+        elif pid in signalled:
             print(f"stopped: {what[pid]}")
     return left
 
@@ -766,6 +799,10 @@ def stop_orphan(unit: Unit, pid: int, recorded_session_id: str = "") -> list[str
     return []
 
 
+def live_claims(claims: tuple[MacClaim, ...]) -> tuple[MacClaim, ...]:
+    return tuple(claim for claim in claims if _alive(claim.pid) and proc_start(claim.pid) == claim.proc_start)
+
+
 def stop_rest(unit: Unit, found: Found, recorded_session_id: str = "") -> list[str]:
     """Stop owned resources; remaining unowned cwd processes come back as blockers."""
     from scripts.direct import workers
@@ -788,9 +825,9 @@ def stop_rest(unit: Unit, found: Found, recorded_session_id: str = "") -> list[s
         if result.returncode and not (result.returncode == 5
                 and "already has a final disposition" in result.stdout + result.stderr):
             left.append(f"berth reservation {key}: {failure(result)}")
-        else:
+        elif result.returncode == 0:
             print(f"released: berth reservation {key}")
-    claims = [claim for claim in found.claims if _alive(claim.pid) and proc_start(claim.pid) == claim.proc_start]
+    claims = live_claims(found.claims)
     what = {claim.pid: f"Mac claim {claim.what} (pid {claim.pid})" for claim in claims}
     left += terminate([claim.pid for claim in claims], what)
     # Cwd alone never gives signal authority; the session and identity must agree.
@@ -802,7 +839,7 @@ def stop_rest(unit: Unit, found: Found, recorded_session_id: str = "") -> list[s
 
 
 def mark_retired(unit: Unit, director: DirectorSession | NoDirectorSession,
-                 saved: SavedBranch | NoSavedBranch = NO_SAVED_BRANCH) -> None:
+                 saved: SavedBranch | NoSavedBranch = NO_SAVED_BRANCH) -> bool:
     """Put the retired note in front of the Units row's Plan cell and commit the doc on the merge branch."""
     doc = unit.production.doc
     lines = doc.read_text(encoding="utf-8").split("\n")
@@ -814,6 +851,9 @@ def mark_retired(unit: Unit, director: DirectorSession | NoDirectorSession,
         if line in rows and production_units.cell_value(parts[headings.index("Unit") + 1].strip()) == unit.name:
             plan = parts[plan_at].strip()
             if production_units.plan_cell_is_retired(plan):
+                identity = retirement_staff_id(unit)
+                if identity and not staff_id_in_note(plan):
+                    plan = plan.replace(")", f", staff {identity})", 1)
                 if isinstance(saved, SavedBranch):
                     previous = saved_branch_in_note(plan)
                     if isinstance(previous, SavedBranch):
@@ -828,15 +868,17 @@ def mark_retired(unit: Unit, director: DirectorSession | NoDirectorSession,
                 lines[index] = "|".join(parts)
                 _ = doc.write_text("\n".join(lines), encoding="utf-8")
             break
-    add_unit.commit_paths(unit.production, [doc], f"production({unit.production.slug}): retire {unit.name}")
-    print(f"marked: the retired Units row, committed on {unit.production.merge_branch}")
+    committed = add_unit.commit_paths(unit.production, [doc], f"production({unit.production.slug}): retire {unit.name}")
+    if committed:
+        print(f"marked: the retired Units row, committed on {unit.production.merge_branch}")
+    return committed
 
 
 def remove(unit: Unit) -> list[str]:
     """Remove the worktree, the local branch and the origin branch; a failure comes back."""
     saved = preserve_branch(unit)
     if saved != saved_branch_in_note(unit_plan(unit)):
-        mark_retired(unit, NoDirectorSession(), saved)
+        _ = mark_retired(unit, NoDirectorSession(), saved)
     failed: list[str] = []
     if unit_move.exists(unit.worktree):
         result = _git(unit, "worktree", "remove", str(unit.worktree))
@@ -875,8 +917,7 @@ def final_stop_check(unit: Unit, ids: frozenset[str]) -> list[str]:
     if unit_move.exists(unit.worktree):
         pane = unit_move.unit_pane(unit_lookup.marked_unit(unit.production.slug, unit.name), unit.production.slug)
         left.extend(f"{process_description(pid)} works inside {unit.worktree}; stop it first"
-                    for pid in unit_move.processes_inside(unit.worktree)
-                    if pid != os.getpid() and (pane is None or pid != pane.shell))
+                    for pid in blocking_processes(tuple(unit_move.processes_inside(unit.worktree)), pane))
     return left
 
 
@@ -886,12 +927,23 @@ def retire(unit: Unit, wait_minutes: float) -> int:
         print("\n".join(f"refused: {reason}" for reason in refused))
         return 1
     member = staff_sources.member(staff_sources.UnitMember(unit.production.slug, unit.name), staff.initial_snapshot())
+    recorded = saved_branch_in_note(unit_plan(unit))
+    saved_on_origin = (isinstance(recorded, NoSavedBranch) or
+                       _git(unit, "ls-remote", "--exit-code", "origin", recorded.ref).stdout.splitlines()
+                       == [f"{recorded.tip}\t{recorded.ref}"])
     saved = preserve_branch(unit)
     pane = unit_move.unit_pane(unit_lookup.marked_unit(unit.production.slug, unit.name), unit.production.slug)
     # Read before the stop: once stopped, the unit's mark is gone.
     director = director_session(unit) if not unit.retired else NoDirectorSession()
     session_id = director.session_id if isinstance(director, DirectorSession) else last_session(unit)
     found = gather(unit)
+    # Do not return early: a completed retirement still checks every stop and saved ref.
+    already_retired = (unit.retired and saved_on_origin
+                      and not isinstance(member, staff_sources.MemberFound)
+                      and not unit_move.exists(unit.worktree) and pane is None
+                      and not any(found._replace(claims=live_claims(found.claims)))
+                      and _git(unit, "show-ref", "--verify", "--quiet", f"refs/heads/{unit.branch}").returncode == 1
+                      and _git(unit, "ls-remote", "--exit-code", "--heads", "origin", unit.branch).returncode == 2)
     ids = {item["sessionId"] for item in found.claude}
     if session_id:
         ids.add(session_id)
@@ -900,8 +952,7 @@ def retire(unit: Unit, wait_minutes: float) -> int:
         remaining = gather(unit)
         ids.update(item["sessionId"] for item in remaining.claude)
         # Only the guarded close can remove the proven shell; all other cwd PIDs block.
-        cleanup = remaining._replace(processes=tuple(pid for pid in remaining.processes
-            if pane is None or pid != pane.shell))
+        cleanup = remaining._replace(processes=blocking_processes(remaining.processes, pane))
         left = stop_rest(unit, cleanup, session_id)
         if not left and pane is not None:
             try:
@@ -931,9 +982,10 @@ def retire(unit: Unit, wait_minutes: float) -> int:
     # All writers are stopped; include commits made during shutdown.
     saved = preserve_branch(unit, saved)
     # The note may have reached disk before its commit; finish it before removal.
-    mark_retired(unit, director, saved)
+    committed = mark_retired(unit, director, saved)
     failed = remove(unit)
-    print("\n".join(f"not removed: {reason}" for reason in failed) if failed else f"{unit.name} retired")
+    if failed:
+        print("\n".join(f"not removed: {reason}" for reason in failed))
     if isinstance(member, staff_sources.MemberFound):
         workers = staff.find(kind="worker", parent=member.row.id)
         for worker in workers:
@@ -942,6 +994,9 @@ def retire(unit: Unit, wait_minutes: float) -> int:
             return 1
         if not failed:
             _ = staff.retire(member.row.id)
+    if not failed:
+        unchanged = already_retired and not committed
+        print(f"{unit.name} already retired" if unchanged else f"{unit.name} retired")
     return 1 if failed else 0
 
 
