@@ -86,7 +86,7 @@ class StylePlanTests(StylePlanFixture):
         self.assertEqual(ticket["finding_ids"], [])
         self.assertIsInstance(self.ledger().proposal_findings(issue)[0].build_ticket, style_ledger.NoBuildTicket)
 
-    def test_modules_reads_held_structure_files_and_manifest(self) -> None:
+    def test_modules_skips_held_structure_files_and_manifest(self) -> None:
         plan = self.modules_unit()
         structure = self.rule("structure", "tier: D\nfamily: modules\ninput_scope: file\n")
         _ = self.rule("manifest", "tier: D\nfamily: modules\ninput_scope: manifest\n")
@@ -98,7 +98,7 @@ class StylePlanTests(StylePlanFixture):
                           [self.sources[0]], [structure])
         ledger.ticket_assign("values-unit-1", "style/main")
         branch = self.git("rev-parse", "demo-style-modules")
-        # Board reservations and the other ticket's held paths both allow a source read.
+        # Board reservations and the other ticket's held paths both exclude source reads.
         board = self.board("crates/alpha/Cargo.toml", *self.sources[:2])
         busy = style_plan.busy_files(self.repo, self.doc, ledger, "modules-unit", board)
         self.assertIn(self.sources[0], busy.paths)
@@ -106,7 +106,7 @@ class StylePlanTests(StylePlanFixture):
         with mock.patch.object(berth_board, "read_board", return_value=board):
             ticket = self.select_for_family("modules", plan)
         self.assertEqual((ticket["kind"], ticket["files"]),
-                         ("structure", ["crates/alpha/Cargo.toml", *self.sources[:2]]))
+                         ("structure", ["crates/beta/Cargo.toml", *self.sources[2:]]))
         self.assertEqual(self.git("rev-parse", "demo-style-modules"), branch)
         self.assertEqual(ledger.ticket_open("values-unit")[0]["state"], "assigned")
 
@@ -120,6 +120,30 @@ class StylePlanTests(StylePlanFixture):
         with mock.patch.object(style_plan.EditedFiles, "of", side_effect=AssertionError("decision footprint read")):
             ticket = self.select_for_family("modules", plan)
         self.assertEqual((ticket["kind"], ticket["files"]), ("structure", list(self.sources[:2])))
+
+    def test_borrowed_structure_skips_product_reservations_and_refill_is_idempotent(self) -> None:
+        structure = self.rule("structure", "tier: D\nfamily: modules\ninput_scope: file\n")
+        _ = self.rule("read")
+        self.sync()
+        held, available = self.sources[:2]
+        _ = self.plan.write_text(self.plan_header().replace("## Phases", "**Pilot scope:** alpha\n\n## Phases"))
+        # Own modules and borrowed modules use the same busy set before slicing.
+        candidates = self.candidates("modules", blocked=(held,))
+        self.assertEqual({path for ticket in candidates for path in ticket.files}, set(self.sources[1:]))
+        ledger = self.ledger()
+        # An old queued structure ticket must pass the same availability check.
+        ledger.ticket_add("names-unit-1", "names-unit", "structure", "modules", "crates/alpha", [held], [structure])
+        with mock.patch.object(berth_board, "read_board", return_value=self.board(held)):
+            code, output, errors = self.run_next()
+            self.assertEqual((code, errors), (0, ""), output)
+            ticket, = ledger.ticket_open("names-unit")
+            self.assertEqual((ticket["kind"], ticket["family"], ticket["files"]),
+                             ("structure", "modules", [available]))
+            self.assertIn("dropped names-unit-1: files busy", output)
+            before = self.plan.read_bytes(), ledger.ticket_open("names-unit"), self.count_tickets()
+            code, output, errors = self.run_next()
+        self.assertEqual((code, errors), (0, ""), output)
+        self.assertEqual((self.plan.read_bytes(), ledger.ticket_open("names-unit"), self.count_tickets()), before)
 
     def test_structure_selection_omits_a_deleted_file_from_an_older_cell_snapshot(self) -> None:
         structure = self.rule("structure", "tier: D\nfamily: modules\ninput_scope: file\n")
