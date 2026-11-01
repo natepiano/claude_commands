@@ -14,9 +14,6 @@ from typing import TYPE_CHECKING, cast, override
 from unittest.mock import Mock, patch
 from zoneinfo import ZoneInfo
 
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
-
 ROOT = Path(__file__).resolve().parents[2]
 for dependency in ("lib", "herdr", "production", "message", "shutdown", "notify", "whoami", "direct"):
     sys.path.insert(0, str(ROOT / "scripts" / dependency))
@@ -43,6 +40,7 @@ from scripts.lib import nix_env
 from scripts.lib.nix_env_test_support import NixFixture
 from scripts.whoami import account
 from scripts.shutdown import launch_permission
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 class HerdrLaunchTests(NixFixture):

@@ -26,13 +26,10 @@ from unittest import mock
 from scripts.build_hold import build_hold
 from scripts.direct.local_release_wait import LocalReleaseEvents, local_release_waiter
 from scripts.production.cli_fixture import invoke_cli
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 VERIFY = Path(__file__).with_name("verify.sh")
-# load 136 on natedev, 2026-10-29
-TEST_HANG_GUARD_SECS = 300
-# Existing fixture consumers import this name.
-HANG_GUARD_S = TEST_HANG_GUARD_SECS
 
 
 def invoke_mac_claim(arguments: list[str], environment: dict[str, str], cwd: Path) -> subprocess.CompletedProcess[str]:
@@ -112,7 +109,7 @@ def reap(marker: str) -> set[int]:
     for pid in stopped:
         with contextlib.suppress(ProcessLookupError):
             os.kill(pid, signal.SIGKILL)
-    deadline = time.monotonic() + HANG_GUARD_S
+    deadline = time.monotonic() + TEST_HANG_GUARD_SECS
     for pid in stopped:
         try:
             descriptor = os.pidfd_open(pid)
@@ -862,7 +859,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
             capture_output=True,
             text=True,
             check=False,
-            timeout=HANG_GUARD_S,
+            timeout=TEST_HANG_GUARD_SECS,
         )
 
     def start_verify(
@@ -955,7 +952,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
         return clock
 
     @contextmanager
-    def hold_environment(self, timeout: float = HANG_GUARD_S) -> Generator[None, None, None]:
+    def hold_environment(self, timeout: float = TEST_HANG_GUARD_SECS) -> Generator[None, None, None]:
         children: list[subprocess.Popen[bytes]] = []
         threads: list[threading.Thread] = []
         launch = cast(Callable[..., subprocess.Popen[bytes]], subprocess.Popen)
@@ -1022,7 +1019,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
     def stop_verify(self, process: subprocess.Popen[str]) -> None:
         """Kill the call and every process under it, its steps' own groups and sessions too."""
         _ = reap(self.child_marker())
-        _ = process.communicate(timeout=HANG_GUARD_S)
+        _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
 
     def assert_nothing_outlives(self) -> None:
         # Runs after every other cleanup: a process a call left behind
@@ -1030,7 +1027,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
         # as a cargo run for as long as it lives.
         # Lint recorders intentionally detach from their caller. Wait for their
         # exit events; a two-second grace period races their work under load.
-        deadline = time.monotonic() + HANG_GUARD_S
+        deadline = time.monotonic() + TEST_HANG_GUARD_SECS
         while children := processes_carrying(self.child_marker()):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -1221,7 +1218,7 @@ trap hold_after_routing DEBUG
             self.assertEqual(len(self.runner_events()), 2)
             self.set_mac_answer("passed", "", 0)
             _ = clock.write_text("460")
-        output, errors = process.communicate(timeout=HANG_GUARD_S)
+        output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(process.returncode, 0, output + errors)
         self.assertEqual(len(self.runner_events()), 3 if repeat_decline else 2)
         self.assertEqual(self.local_runs(), [])
@@ -1241,7 +1238,7 @@ trap hold_after_routing DEBUG
         else:
             board = VERIFY.with_name("board.sh")
             acquired = subprocess.run(["bash", str(board), "acquire", str(self.board), "peer", "cargo",
-                "--pid", str(os.getpid())], env=self.environment, capture_output=True, text=True, timeout=HANG_GUARD_S)
+                "--pid", str(os.getpid())], env=self.environment, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
             self.assertEqual(acquired.returncode, 0, acquired.stderr)
         self.set_mac_answer("lost", "", 75)
         process = self.start_verify("test", "sample", "--no-cache")
@@ -1252,7 +1249,7 @@ trap hold_after_routing DEBUG
         self.assertEqual(len(paths), 1)
         self.set_mac_answer("passed", "", 0)
         _ = paths[0].with_suffix(".retry").write_text("retry_delayed\n")
-        output, errors = process.communicate(timeout=HANG_GUARD_S)
+        output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(process.returncode, 0, output + errors)
         self.assertEqual(len(self.runner_events()), 2)
         self.assertEqual(self.local_runs(), [])

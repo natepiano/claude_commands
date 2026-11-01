@@ -11,14 +11,12 @@ import sys
 import tempfile
 from typing import ClassVar, TypedDict, cast, override
 import unittest
+from scripts.direct.verify_assertion_guard_test_support import write_guard
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 VERIFY = Path(__file__).with_name("verify.sh")
 SCRIPTS = VERIFY.parent.parent
-# A hang limit, not a speed check. One `verify.sh lint` call starts about 60 processes: 10 s at
-# load 75 on natedev, and over 30 s at load 160 (two merge gates went red at 30 s, 2026-10-18).
-# A real hang still fails, after this many seconds.
-TEST_HANG_GUARD_SECS = 300  # load 136 on natedev, 2026-10-29
 
 
 class CargoInvocation(TypedDict):
@@ -204,22 +202,7 @@ class VerifyLintScopeFixture(unittest.TestCase):
         targets = self.root / "build-targets.py"
         self.write_executable(targets, 'import sys\nif sys.argv[1] == "eligible": print("natedev_only test target\\nnatedev\\teligible\\t-\\t-")\n')
         assertion_guard = self.root / "assertion-guard.py"
-        self.write_executable(assertion_guard, '''
-class GuardError(Exception):
-    pass
-
-def default_base(repo, explicit_base=""):
-    return "fixture-base"
-
-def git(repo, *arguments):
-    return "fixture-head\\n" if arguments[0] == "rev-parse" else ""
-
-def read_rulings(sources, messages):
-    return {}
-
-if __name__ == "__main__":
-    raise SystemExit(0)
-''')
+        write_guard(assertion_guard)
         for name in ("ssh", "rsync", "scp", "gh", "systemd-run"):
             self.write_shell(bin_directory / name, "exit 99\n")
         for directory in ("tmp", "state", "cache", "runtime", "target", "cargo-home", ".git", "cgroup"):

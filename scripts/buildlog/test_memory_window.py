@@ -12,7 +12,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import cast, override
+from typing import TYPE_CHECKING, cast, override
 from unittest.mock import patch
 
 import index
@@ -20,9 +20,10 @@ import memory
 from cgroup_test_support import CPU, GIB, IO_LINES, slice_reading, write_cgroup
 import store
 from test_index import Record, call, encode, point_root_at, sample, step
-
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
+if TYPE_CHECKING:
+    from ..lib import test_hang_guard
+else:
+    from scripts.lib import test_hang_guard
 
 CLI = Path(__file__).with_name("cli.py")
 START = "2026-10-04T23:30-07:00"
@@ -121,7 +122,7 @@ class MemoryWindowTests(unittest.TestCase):
             capture_output=True,
             text=True,
             check=False,
-            timeout=TEST_HANG_GUARD_SECS,
+            timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
 
     def write(self, path: Path, *records: Record) -> None:

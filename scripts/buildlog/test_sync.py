@@ -16,7 +16,7 @@ from contextlib import ExitStack, redirect_stdout
 from functools import partial
 from io import StringIO
 from pathlib import Path
-from typing import cast, override
+from typing import TYPE_CHECKING, cast, override
 from unittest import mock
 
 import ci
@@ -29,10 +29,11 @@ import store
 import sync
 import vault_pull
 from test_index import point_root_at
+if TYPE_CHECKING:
+    from ..lib import test_hang_guard
+else:
+    from scripts.lib import test_hang_guard
 
-
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
 
 def setUpModule() -> None:
     """The times these tests expect are Eastern; the user's zone setting must not change them."""
@@ -255,7 +256,7 @@ class SyncTests(unittest.TestCase):
         def run_ssh(args: list[str], **_: object) -> subprocess.CompletedProcess[str]:
             self.commands.append(args)
             worker.start()
-            self.assertTrue(waiting.wait(TEST_HANG_GUARD_SECS))
+            self.assertTrue(waiting.wait(test_hang_guard.TEST_HANG_GUARD_SECS))
             self.assertFalse(returned.is_set())
             return subprocess.CompletedProcess(args, 255, stdout="", stderr="unreachable")
 
@@ -264,7 +265,7 @@ class SyncTests(unittest.TestCase):
             mock.patch.object(sync, "print", record_line, create=True),
         ):
             self.assertEqual(sync.sync(), 0)
-            worker.join(TEST_HANG_GUARD_SECS)
+            worker.join(test_hang_guard.TEST_HANG_GUARD_SECS)
 
         self.assertFalse(worker.is_alive())
         self.assertTrue(returned.is_set())

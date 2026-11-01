@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import final
 from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture
 import signal
-from scripts.direct.verify_mac_offload_test_support import HANG_GUARD_S as HANG_GUARD_S
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 @final
@@ -23,7 +23,7 @@ class VerifyMacWithdrawalTests(VerifyMacOffloadFixture):
         self.assertIsNone(process.poll())
 
         _ = (self.runner_state / "continue-retry").write_text("continue\n")
-        output, errors = process.communicate(timeout=HANG_GUARD_S)
+        output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(process.returncode, 0, output + errors)
         self.assertEqual(self.local_runs(), [])
 
@@ -37,7 +37,7 @@ class VerifyMacWithdrawalTests(VerifyMacOffloadFixture):
         self.wait_for_path(self.runner_state / "retry-running")
         _ = clock.write_text("500")
         process.send_signal(signal.SIGTERM)
-        output, errors = process.communicate(timeout=HANG_GUARD_S)
+        output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(process.returncode, 143, output + errors)
         self.assert_no_pending_calls(cycle_path)
         record = self.routing_record()

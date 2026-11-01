@@ -20,11 +20,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import staff, staff_sources, unit_config, live_units, fake_unit_host
 from scripts.production.staff_test_support import (
-    PROCESS_TIMEOUT, SOURCES_SCRIPT, FixtureMachine, StaffTestCase, production_membership, unit_membership,
+    SOURCES_SCRIPT, FixtureMachine, StaffTestCase, production_membership, unit_membership,
 )
 from scripts.shutdown import pane_record, remote
 import herdr
 from scripts.production import showrunners
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 import showrunner_tree
 import production_units
 from unit_lookup import ProductionMembers, live_unit_table, retired_units, unit_is_retired
@@ -1104,7 +1105,7 @@ class StaffSourcesTests(StaffTestCase):
                 self.assert_operation_blocks(pending, listener)
                 self.units_doc(old_doc, (), workspace="old")
                 self.units_doc(new_doc, ("models-unit",), workspace="new")
-            _output, errors = pending.communicate(timeout=PROCESS_TIMEOUT)
+            _output, errors = pending.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(pending.returncode, 0, errors)
         self.assertEqual(staff.by_id(unit.id), moved)
         self.assertEqual(staff.by_path("new/models"), moved)

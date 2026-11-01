@@ -6,6 +6,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 BOARD = Path(__file__).resolve().with_name("board.sh")
@@ -18,14 +19,14 @@ class BoardTextTests(unittest.TestCase):
             environment = {**os.environ, "UNIT_SYNC_WRITES": "0", "UNIT_NOW_EPOCH": "1793232000"}
             message = "production · unité · 设计 reviewer 🚀\nnext\rline\ttab\x1b\x07\x7f"
             posted = subprocess.run(["bash", str(BOARD), "post", str(run), "w7", "status", message],
-                                    env=environment, capture_output=True, text=True, timeout=10)
+                                    env=environment, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
             self.assertEqual(posted.returncode, 0, posted.stdout + posted.stderr)
             lines = (run / "board.log").read_text(encoding="utf-8").splitlines()
             self.assertEqual(len(lines), 1, lines)
             self.assertEqual(lines[0].split("] status: ", 1)[1],
                              "production · unité · 设计 reviewer 🚀 next line tab")
             read = subprocess.run(["bash", str(BOARD), "read", str(run), "--from", "w7"],
-                                  env=environment, capture_output=True, text=True, timeout=10)
+                                  env=environment, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
             self.assertEqual(read.returncode, 0, read.stdout + read.stderr)
             self.assertIn(lines[0], read.stdout)
 
@@ -34,7 +35,7 @@ class BoardTextTests(unittest.TestCase):
             run = Path(directory)
             message = "界🚀é·" * 300
             posted = subprocess.run(["bash", str(BOARD), "post", str(run), "w7", "status", message],
-                                    capture_output=True, timeout=10)
+                                    capture_output=True, timeout=TEST_HANG_GUARD_SECS)
             self.assertEqual(posted.returncode, 0, posted.stdout + posted.stderr)
             line = (run / "board.log").read_bytes().decode("utf-8", errors="strict")
             body = line.rstrip("\n").split("] status: ", 1)[1]
