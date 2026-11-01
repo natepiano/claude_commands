@@ -599,7 +599,7 @@ class WorkspaceRunTests(CargoProjectTests):
                                  (ledger_api.UnchangedSite(finding.path, finding.line), ledger_api.NoJudgedCommit())):
             with self.subTest(evidence=evidence, judged=judged), mock.patch.object(
                     ledger, 'finding_site', return_value=evidence), mock.patch.object(ledger, 'judged_commit', return_value=judged):
-                result = run.current_rename(ledger, finding, self.base, run.RenameSources())
+                result = run.current_rename(ledger, finding, self.base, run.RenameSources(), self.repo)
                 self.assertEqual(result, bulk.Refusal(finding.finding_id,
                     'changed since judged: site lineage is not unchanged or the judged commit is missing'))
 
@@ -607,7 +607,7 @@ class WorkspaceRunTests(CargoProjectTests):
         ledger, _, findings = self.setup_findings()
         finding = findings[0]
         with mock.patch.object(run.RenameSources, 'judged_file', return_value=run.CommandResult(1)):
-            result = run.current_rename(ledger, finding, self.base, run.RenameSources())
+            result = run.current_rename(ledger, finding, self.base, run.RenameSources(), self.repo)
         self.assertEqual(result, bulk.Refusal(finding.finding_id,
             'changed since judged: the file cannot be read at the judged commit'))
 
@@ -617,7 +617,7 @@ class WorkspaceRunTests(CargoProjectTests):
         # Token-equivalent CRLF is still different judged physical line evidence.
         source = (self.repo / finding.path).read_bytes().decode().replace('\n', '\r\n')
         with mock.patch.object(run.RenameSources, 'judged_file', return_value=run.CommandResult(0, source)):
-            result = run.current_rename(ledger, finding, self.base, run.RenameSources())
+            result = run.current_rename(ledger, finding, self.base, run.RenameSources(), self.repo)
         self.assertEqual(result, bulk.Refusal(finding.finding_id,
             'changed since judged: the judged line bytes differ from the current line'))
 
@@ -629,7 +629,7 @@ class WorkspaceRunTests(CargoProjectTests):
         self.assertNotIsInstance(declaration, NoBindingScope)
         assert not isinstance(declaration, NoBindingScope)
         with mock.patch.object(run, 'rename_declaration', return_value=replace(declaration, offset=0)):
-            result = run.current_rename(ledger, finding, self.base, run.RenameSources())
+            result = run.current_rename(ledger, finding, self.base, run.RenameSources(), self.repo)
         self.assertEqual(result, bulk.Refusal(finding.finding_id,
             'changed since judged: the declaration is not on the current line'))
 
@@ -853,8 +853,9 @@ class WorkspaceRunTests(CargoProjectTests):
         # Site lineage is held fixed to inspect the planner's source boundary directly.
         selected = run.select(ledger, definition)
         def unchanged(ledger: ledger_api.Ledger, finding: ledger_api.HeldFinding, head: str,
-                      sources: run.RenameSources) -> ledger_api.HeldFinding:
+                      sources: run.RenameSources, checkout: Path) -> ledger_api.HeldFinding:
             del ledger, head, sources
+            self.assertEqual(checkout, self.repo)
             return finding
         with mock.patch.object(run, 'current_finding', side_effect=unchanged):
             plan = run.plan_constants(self.repo, ledger, base, selected)
@@ -875,8 +876,9 @@ class WorkspaceRunTests(CargoProjectTests):
             evidence = ledger.finding_site(finding, self.base)
             judged = ledger.judged_commit(finding)
             self.assertIsInstance(evidence, ledger_api.UnchangedSite, repr((evidence, judged)))
-            self.assertIsInstance(run.current_rename(ledger, finding, self.base, run.RenameSources()), bulk.RenameFinding,
-                                  repr((evidence, judged, finding)))
+            self.assertIsInstance(
+                run.current_rename(ledger, finding, self.base, run.RenameSources(), self.repo),
+                bulk.RenameFinding, repr((evidence, judged, finding)))
 
     def test_field_refactor_runs_through_lineage_and_post_format_guard(self) -> None:
         source = "struct Record {\n old: usize,\n}\nfn f(r: Record) -> usize { r.old }\n"
@@ -888,7 +890,9 @@ class WorkspaceRunTests(CargoProjectTests):
         self.tree = self.git("rev-parse", "HEAD^{tree}")
         ledger, definition, findings = self.setup_findings()
         for finding in findings:
-            self.assertIsInstance(run.current_rename(ledger, finding, self.base, run.RenameSources()), bulk.RenameFinding)
+            self.assertIsInstance(
+                run.current_rename(ledger, finding, self.base, run.RenameSources(), self.repo),
+                bulk.RenameFinding)
         report = self.execute(ledger, definition)
         self.assertEqual(report["applied"], 2)
         self.assertEqual(report["refused"], 0)
@@ -1566,6 +1570,23 @@ class WorkspaceRunTests(CargoProjectTests):
                                if ticket["state"] not in ledger_api.FINAL_TICKET_STATES))
         self.assertTrue(all(isinstance(f.build_ticket, ledger_api.NoBuildTicket)
                             for f in ledger.named_held(f.finding_id for f in findings)))
+
+
+    def test_private_planners_read_physical_bytes_from_execution_checkout(self) -> None:
+        ledger, definition, _ = self.setup_findings()
+        self.addCleanup(ledger.close)
+        checkout = self.root / "private"
+        _ = self.git("clone", "--shared", str(self.repo), str(checkout))
+        selected = run.select(ledger, definition)
+        for finding in selected.findings:
+            _ = (self.repo / finding.path).write_text("pub fn dirty() {}\n")
+        planned = run.plan_rule(checkout, ledger, self.base, selected, definition,
+                                self.server, self.available)
+        self.assertEqual(planned.refusals, ())
+        self.assertEqual({item.finding.finding_id for file in planned.files for item in file.kept},
+                         {finding.finding_id for finding in selected.findings})
+        self.assertTrue(all("let old" in file.original for file in planned.files))
+        self.assertTrue(all("let number" in file.edited for file in planned.files))
 
 
 if __name__ == "__main__":

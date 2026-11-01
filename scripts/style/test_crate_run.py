@@ -905,6 +905,22 @@ class CrateRunTests(CargoProjectTests):
         self.assertEqual(contents.call_count, 1)
         self.assertEqual(owners.owners["src/lib.rs"], {"."})
 
+    def test_target_folder_gitlink_refuses_package_sources_without_crashing(self) -> None:
+        members = rules.workspace_members({"Cargo.toml": (self.repo / "Cargo.toml").read_text(),
+                                           "beta/Cargo.toml": (self.repo / "beta/Cargo.toml").read_text()})
+        for folder in ("src/bin", "examples", "tests", "benches"):
+            with self.subTest(folder=folder):
+                _ = self.git("update-index", "--add", "--cacheinfo", "160000", self.base, folder)
+                tree = self.git("write-tree")
+                owners = crates.SourceOwnership(self.repo, tree, members)
+                with self.assertRaisesRegex(bulk.BulkRenameError,
+                                            "target folder " + folder + " is not a directory"):
+                    owners.require(".", ("src/lib.rs",))
+                owners.require("beta", ("beta/src/lib.rs",))
+                self.assertEqual(dict(crates.SourceOwnership(self.repo, tree, members).uncertain),
+                                 dict(owners.uncertain))
+                _ = self.git("update-index", "--force-remove", folder)
+
     def test_default_execution_uses_bulk_run_owner_and_retains_ancestry(self) -> None:
         self.freeze()
         with mock.patch.object(run, "execute_plan", wraps=run.execute_plan) as execute:
@@ -1052,10 +1068,39 @@ class CrateRunTests(CargoProjectTests):
 
     def test_checked_out_destination_refuses_publication_and_retains_pending_claims(self) -> None:
         self.freeze()
-        _ = self.git("worktree", "add", str(self.root / "publication"), self.destination.removeprefix("refs/heads/"))
+        checkout = self.root / "publication"
+        _ = self.git("worktree", "add", str(checkout),
+                     self.destination.removeprefix("refs/heads/"))
+        original = (checkout / "src/lib.rs").read_bytes()
+        index = run.git(checkout, "write-tree")
         with self.assertRaisesRegex(bulk.BulkRenameError, "destination is checked out"):
             _ = self.advance("bulk_sample")
-        self.assert_pending(self.batch.read()["crates"]["bulk_sample"])
+        record = self.batch.read()["crates"]["bulk_sample"]
+        self.assert_pending(record)
+        assert "integration" in record
+        candidate = record["integration"]["commit"]
+        self.assertEqual(record["integration"]["stage"], crates.IntegrationStage.TESTED)
+        assert "error" in record
+        self.assertIn("checkout owner must integrate validated candidate", record["error"])
+        self.assertIn(candidate, record["error"])
+        self.assertIn(self.batch.read()["integration_ref"], record["error"])
+        self.assertEqual(self.git("rev-parse", self.destination), self.base)
+        self.assertEqual(self.git("rev-parse", self.batch.read()["integration_ref"]), candidate)
+        self.assertEqual((checkout / "src/lib.rs").read_bytes(), original)
+        self.assertEqual(run.git(checkout, "write-tree"), index)
+        self.assertEqual(run.git(checkout, "status", "--porcelain"), "")
+        self.assertIn("let number", self.git("show", candidate + ":src/lib.rs"))
+        calls = len(self.commands.calls)
+        pending = self.batch.read()
+        with self.assertRaisesRegex(bulk.BulkRenameError, "checkout owner must integrate"):
+            _ = self.advance("bulk_sample")
+        self.assertEqual(self.batch.read(), pending)
+        self.assertEqual(len(self.commands.calls), calls)
+        _ = self.git("worktree", "remove", str(checkout))
+        result = self.advance("bulk_sample")
+        self.assertEqual(result["crates"]["bulk_sample"]["stage"], crates.CrateStage.INTEGRATED)
+        self.assertNotIn("error", result["crates"]["bulk_sample"])
+        self.assertEqual(len(self.commands.calls), calls)
 
     def test_combined_test_failure_retains_pending_claims_for_resume(self) -> None:
         self.freeze()
@@ -1143,3 +1188,329 @@ class CrateRunTests(CargoProjectTests):
         assert "owner" in record and "tickets" in record
         self.assertTrue(all(self.authority.ticket_batch_owner(ticket) == ledger_api.BatchOwner(record["owner"])
                             for ticket in set(record["tickets"].values())))
+
+    def test_planning_reads_only_private_base_after_main_moves_and_rules_change(self) -> None:
+        self.freeze()
+        _ = (self.repo / "src/lib.rs").write_text("pub fn moved() {}\n")
+        _ = self.git("add", ".")
+        _ = self.git("commit", "-qm", "main product work")
+        docs = self.repo / "docs/style"
+        docs.mkdir(parents=True)
+        _ = (docs / "invalid.md").write_text("invalid local rule\n")
+        _ = (self.repo / "src/lib.rs").write_text("pub fn dirty() {}\n")
+        def private(checkout: Path, ledger: ledger_api.Ledger, base: str,
+                    selected: run.Selection, availability: run.PlanningFileAvailability,
+                    definition: rules.Rule) -> run.PlannedEdits:
+            sources = run.RenameSources()
+            for finding in selected.findings:
+                self.assertIsInstance(run.current_rename(ledger, finding, base, sources, checkout),
+                                      bulk.RenameFinding)
+                self.assertIn("let old", sources.current[finding.path])
+            return renamed(checkout, ledger, base, selected, availability, definition)
+        load = rules.load_rules
+        def private_rules(repo_root: Path | None) -> tuple[rules.Rule, ...]:
+            self.assertNotEqual(repo_root, self.repo)
+            return load(repo_root)
+        with mock.patch.object(rules, "load_rules", side_effect=private_rules):
+            # Resuming opens a fresh canonical ledger, too: construction must not scan main.
+            with ledger_api.Ledger(self.repo, self.authority.database) as reopened:
+                resumed = crates.CrateRun(reopened, self.batch.run_id)
+                result = resumed.advance("bulk_sample", private, self.commands,
+                                         available, fixture_execute)
+        self.assertEqual(result["crates"]["bulk_sample"]["stage"], crates.CrateStage.INTEGRATED)
+        self.assertEqual((self.repo / "src/lib.rs").read_text(), "pub fn dirty() {}\n")
+        self.assertIn("let number", self.git("show", self.destination + ":src/lib.rs"))
+
+    def test_moved_destination_rebuilds_combined_proof_and_resume_is_idempotent(self) -> None:
+        self.freeze()
+        with mock.patch.object(self.batch, "integrate", side_effect=SystemExit("checkpoint")):
+            with self.assertRaises(SystemExit):
+                _ = self.advance("bulk_sample")
+        _ = (self.repo / "product.txt").write_text("product change\n")
+        _ = self.git("add", "product.txt")
+        tree = self.git("write-tree")
+        moved = self.git("commit-tree", tree, "-p", self.base, "-m", "product change")
+        _ = self.git("reset", "--hard", self.base)
+        _ = self.git("update-ref", self.destination, moved, self.base)
+        with mock.patch.object(run, "test_tree", wraps=run.test_tree) as proof:
+            result = self.advance("bulk_sample")
+            self.assertEqual(proof.call_count, 1)
+            calls = len(self.commands.calls)
+            self.assertEqual(self.advance("bulk_sample"), result)
+            self.assertEqual(proof.call_count, 1)
+            self.assertEqual(len(self.commands.calls), calls)
+        tip = self.git("rev-parse", self.destination)
+        self.assertEqual(self.git("rev-parse", tip + "^1"), moved)
+        self.assertEqual(result["expected_tip"], tip)
+        self.assertEqual(self.git("show", tip + ":product.txt"), "product change")
+        self.assertIn("let number", self.git("show", tip + ":src/lib.rs"))
+
+    def test_moved_destination_invalidates_prepared_combined_proof(self) -> None:
+        self.freeze()
+        proof = run.test_tree
+        def interrupted(repo: Path, commit: str, tree: str, runner: run.Runner,
+                        times: dict[str, float]) -> run.CommandResult:
+            if repo.name.startswith("integration-"):
+                raise RuntimeError("combined interrupted")
+            return proof(repo, commit, tree, runner, times)
+        with mock.patch.object(run, "test_tree", side_effect=interrupted):
+            with self.assertRaisesRegex(RuntimeError, "combined interrupted"):
+                _ = self.advance("bulk_sample")
+        before = self.batch.read()["crates"]["bulk_sample"]
+        assert "integration" in before
+        old_candidate = before["integration"]["commit"]
+        moved = self.git("commit-tree", self.tree, "-p", self.base, "-m", "destination moved")
+        _ = self.git("update-ref", self.destination, moved, self.base)
+        with mock.patch.object(run, "test_tree", wraps=run.test_tree) as proving:
+            result = self.advance("bulk_sample")
+        self.assertEqual(proving.call_count, 1)
+        record = result["crates"]["bulk_sample"]
+        assert "integration" in record
+        self.assertNotEqual(record["integration"]["commit"], old_candidate)
+        self.assertEqual(self.git("rev-parse", self.destination + "^1"), moved)
+        self.assertEqual(record["stage"], crates.CrateStage.INTEGRATED)
+
+    def test_other_crate_refresh_cannot_publish_stale_tested_candidate(self) -> None:
+        self.freeze()
+        checkout = self.root / "publication"
+        _ = self.git("worktree", "add", str(checkout),
+                     self.destination.removeprefix("refs/heads/"))
+        with self.assertRaisesRegex(bulk.BulkRenameError, "destination is checked out"):
+            _ = self.advance("bulk_sample")
+        first = self.batch.read()["crates"]["bulk_sample"]
+        assert "integration" in first
+        stale = first["integration"]["commit"]
+        self.assertEqual(first["integration"]["stage"], crates.IntegrationStage.TESTED)
+        _ = self.git("worktree", "remove", str(checkout))
+
+        _ = (self.repo / "product.txt").write_text("product change\n")
+        _ = self.git("add", "product.txt")
+        moved = self.git("commit-tree", self.git("write-tree"), "-p", self.base,
+                         "-m", "independent destination change")
+        _ = self.git("reset", "--hard", self.base)
+        _ = self.git("update-ref", self.destination, moved, self.base)
+        proof = run.test_tree
+        def failed(repo: Path, commit: str, tree: str, runner: run.Runner,
+                   times: dict[str, float]) -> run.CommandResult:
+            if repo.name.startswith("integration-"):
+                return run.CommandResult(1, "combined proof failure")
+            return proof(repo, commit, tree, runner, times)
+        with mock.patch.object(run, "test_tree", side_effect=failed):
+            with self.assertRaisesRegex(bulk.BulkRenameError, "combined-tree proof failed"):
+                _ = self.advance("beta")
+        pending = self.batch.read()
+        self.assertEqual(pending["expected_tip"], moved)
+        retained = pending["crates"]["bulk_sample"]
+        assert "integration" in retained
+        self.assertEqual(retained["integration"]["commit"], stale)
+        self.assertEqual(self.git("rev-parse", self.destination), moved)
+
+        with mock.patch.object(run, "test_tree", wraps=proof) as proving:
+            result = self.advance("bulk_sample")
+            self.assertEqual(proving.call_count, 1)
+            calls = len(self.commands.calls)
+            self.assertEqual(self.advance("bulk_sample"), result)
+            self.assertEqual(proving.call_count, 1)
+            self.assertEqual(len(self.commands.calls), calls)
+        record = result["crates"]["bulk_sample"]
+        assert "integration" in record
+        self.assertNotEqual(record["integration"]["commit"], stale)
+        self.assertEqual(record["integration"]["destination_tip"], moved)
+        self.assertEqual(self.git("rev-parse", self.destination + "^1"), moved)
+        self.assertEqual(self.git("show", self.destination + ":product.txt"), "product change")
+        self.assertIn("let number", self.git("show", self.destination + ":src/lib.rs"))
+        with mock.patch.object(run, "test_tree", wraps=proof) as proving:
+            result = self.advance("beta")
+            self.assertEqual(proving.call_count, 1)
+        self.assertEqual(result["crates"]["beta"]["stage"], crates.CrateStage.INTEGRATED)
+        self.assertEqual(self.git("show", self.destination + ":product.txt"), "product change")
+        for path in ("src/lib.rs", "beta/src/lib.rs"):
+            self.assertIn("let number", self.git("show", self.destination + ":" + path))
+
+    def test_moved_destination_clean_overlap_is_merged_and_reproved(self) -> None:
+        _ = (self.repo / "src/lib.rs").write_text(
+            (self.repo / "src/lib.rs").read_text() + "\n" * 8 + "pub fn product() {}\n")
+        _ = self.git("add", ".")
+        _ = self.git("commit", "-qm", "separate hunk fixture")
+        self.base, self.tree = self.git("rev-parse", "HEAD"), self.git("rev-parse", "HEAD^{tree}")
+        _ = self.git("update-ref", self.destination, self.base)
+        self.authority.set_tip(self.base)
+        self.freeze()
+        _ = (self.repo / "src/lib.rs").write_text(
+            (self.repo / "src/lib.rs").read_text().replace("fn product()", "fn shipped()"))
+        _ = self.git("add", ".")
+        moved = self.git("commit-tree", self.git("write-tree"), "-p", self.base,
+                         "-m", "product hunk")
+        _ = self.git("reset", "--hard", self.base)
+        _ = self.git("update-ref", self.destination, moved, self.base)
+        result = self.advance("bulk_sample")
+        self.assertEqual(result["crates"]["bulk_sample"]["stage"], crates.CrateStage.INTEGRATED)
+        source = self.git("show", self.destination + ":src/lib.rs")
+        self.assertIn("let number", source)
+        self.assertIn("fn shipped()", source)
+
+    def test_glob_and_out_of_line_loader_imports_preserve_shared_edges(self) -> None:
+        for invocation, module in (
+            ('mod loaders { pub use std::include_str as source; } use loaders::*; '
+             + 'const CODE: &str = source!("../../src/lib.rs");', ""),
+            ('use std::*; const CODE: &str = include_str!("../../src/lib.rs");', ""),
+            ('mod loaders; const CODE: &str = loaders::source!("../../src/lib.rs");',
+             'pub use std::include_str as source;'),
+            ('mod loaders; use loaders::*; const CODE: &str = source!("../../src/lib.rs");',
+             'pub use std::include_str as source;'),
+        ):
+            with self.subTest(invocation=invocation):
+                _ = (self.repo / "beta/src/lib.rs").write_text(invocation + "\n")
+                _ = (self.repo / "beta/src/loaders.rs").write_text(module + "\n")
+                _ = self.git("add", ".")
+                _ = self.git("commit", "-qm", "glob or external loader import")
+                owners = self.ownership()
+                self.assertIn("src/lib.rs", owners.edges["beta/src/lib.rs"])
+                self.assertEqual(owners.owners["src/lib.rs"], {".", "beta"})
+                with self.assertRaisesRegex(bulk.BulkRenameError, "shared or cross-crate"):
+                    owners.require(".", ("src/lib.rs",))
+                edges = dict(owners.edges)
+                owners.propagate()
+                self.assertEqual(owners.edges, edges)
+
+    def test_conditional_inline_mount_protects_escaping_loaded_descendants(self) -> None:
+        for path, source in {
+            "src/lib.rs": "mod elsewhere; mod included; mod unrelated;",
+            "src/shared/child.rs": '#[path="../elsewhere.rs"] mod leaf; '
+                                   + 'include!("../included.rs");',
+            "src/elsewhere.rs": "mod grandchild;",
+            "src/grandchild.rs": "pub fn grandchild() {}",
+            "src/included.rs": "pub fn included() {}",
+            "src/unrelated.rs": "pub fn unrelated() {}",
+            "beta/src/lib.rs": '#[cfg_attr(feature="shared", path="../../src/shared")] '
+                               + 'mod shared { mod child; }',
+        }.items():
+            target = self.repo / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            _ = target.write_text(source + "\n")
+        _ = self.git("add", ".")
+        _ = self.git("commit", "-qm", "conditional mount escaping descendants")
+        owners = self.ownership()
+        for path in ("src/shared/child.rs", "src/elsewhere.rs",
+                     "src/grandchild.rs", "src/included.rs"):
+            with self.subTest(path=path):
+                self.assertTrue(any("unproved inline mount" in reason
+                                    for reason in owners.uncertain[path]))
+                with self.assertRaisesRegex(bulk.BulkRenameError, "unproved inline mount"):
+                    owners.require(".", (path,))
+        owners.require(".", ("src/unrelated.rs",))
+        uncertain = {path: list(reasons) for path, reasons in owners.uncertain.items()}
+        owners.propagate()
+        self.assertEqual(dict(owners.uncertain), uncertain)
+
+    def test_cross_file_anchored_loader_aliases_keep_all_module_instances(self) -> None:
+        for anchor, declaration in (
+            ("crate::loaders", "mod caller; mod loaders;"),
+            ("super::loaders", "mod caller; mod loaders;"),
+            ("super::loaders",
+             'mod first { #[path="../caller.rs"] mod caller; '
+             + 'mod loaders { pub use std::include_str as source; } } '
+             + 'mod second { #[path="../caller.rs"] mod caller; '
+             + 'mod loaders { pub use core::include_bytes as source; } }'),
+        ):
+            with self.subTest(anchor=anchor, declaration=declaration):
+                for folder in ("first", "second"):
+                    (self.repo / "beta/src" / folder).mkdir(exist_ok=True)
+                _ = (self.repo / "src/lib.rs").write_text("pub fn shared() {}\n")
+                _ = (self.repo / "beta/src/lib.rs").write_text(declaration + "\n")
+                _ = (self.repo / "beta/src/loaders.rs").write_text(
+                    "pub use std::include_str as source;\n")
+                _ = (self.repo / "beta/src/caller.rs").write_text(
+                    f'use {anchor}::source; const CODE: &str = source!("../../src/lib.rs");\n')
+                _ = self.git("add", ".")
+                _ = self.git("commit", "-qm", "anchored cross-file loader aliases")
+                owners = self.ownership()
+                self.assertIn("src/lib.rs", owners.edges["beta/src/caller.rs"])
+                self.assertEqual(owners.owners["src/lib.rs"], {".", "beta"})
+                self.assertNotIn("beta/src/caller.rs", owners.uncertain)
+                with self.assertRaisesRegex(bulk.BulkRenameError, "shared or cross-crate"):
+                    owners.require(".", ("src/lib.rs",))
+                if "mod first" in declaration:
+                    self.assertEqual(owners.module_parents["beta/src/caller.rs"], {
+                        ("beta/src/lib.rs", ("first", "caller")),
+                        ("beta/src/lib.rs", ("second", "caller")),
+                    })
+                edges = dict(owners.edges)
+                owners.propagate()
+                self.assertEqual(owners.edges, edges)
+
+    def test_unproved_anchored_loader_protects_possible_target_closure(self) -> None:
+        for path, source in {
+            "src/lib.rs": "mod child;",
+            "src/child.rs": "pub fn child() {}",
+            "beta/src/orphan.rs": 'use crate::loaders::source; '
+                                  + 'const CODE: &str = source!("../../src/lib.rs");',
+        }.items():
+            _ = (self.repo / path).write_text(source + "\n")
+        _ = self.git("add", ".")
+        _ = self.git("commit", "-qm", "unproved anchored loader closure")
+        owners = self.ownership()
+        self.assertIn("src/lib.rs", owners.edges["beta/src/orphan.rs"])
+        for path in ("beta/src/orphan.rs", "src/lib.rs", "src/child.rs"):
+            with self.subTest(path=path):
+                with self.assertRaisesRegex(bulk.BulkRenameError, "unproved anchored loader module instance"):
+                    owners.require(owners.home(path), (path,))
+
+    def test_included_root_named_files_protect_anchored_loader_targets(self) -> None:
+        for name in ("mod.rs", "lib.rs", "main.rs", "part.rs"):
+            with self.subTest(name=name):
+                included = "beta/src/nested/" + name
+                for path, source in {
+                    "src/lib.rs": "pub fn shared() {}",
+                    "src/unrelated.rs": "pub fn unrelated() {}",
+                    "beta/src/lib.rs": 'mod loaders { pub use std::include_str as source; } '
+                                       + f'include!("nested/{name}");',
+                    included: 'use crate::loaders::source; '
+                              + 'const CODE: &str = source!("../../../src/lib.rs");',
+                }.items():
+                    target = self.repo / path
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    _ = target.write_text(source + "\n")
+                _ = self.git("add", ".")
+                _ = self.git("commit", "-qm", "included file is not a Cargo root")
+                owners = self.ownership()
+                self.assertNotIn(included, owners.crate_roots)
+                self.assertIn(included, owners.edges["beta/src/lib.rs"])
+                self.assertIn("src/lib.rs", owners.edges[included])
+                self.assertEqual(owners.owners["src/lib.rs"], {".", "beta"})
+                for path in (included, "src/lib.rs"):
+                    with self.assertRaisesRegex(
+                            bulk.BulkRenameError, "unproved anchored loader module instance"):
+                        owners.require(owners.home(path), (path,))
+                owners.require(".", ("src/unrelated.rs",))
+                edges = dict(owners.edges)
+                uncertain = {path: list(reasons) for path, reasons in owners.uncertain.items()}
+                owners.propagate()
+                self.assertEqual(owners.edges, edges)
+                self.assertEqual(dict(owners.uncertain), uncertain)
+
+    def test_configured_root_identity_uses_frozen_manifest_and_sources(self) -> None:
+        for path, source in {
+            "src/lib.rs": "pub fn shared() {}",
+            "beta/Cargo.toml": '[package]\nname="beta"\nversion="0.1.0"\n'
+                               + '[lib]\npath="src/entry.rs"',
+            "beta/src/entry.rs": "mod caller; mod loaders;",
+            "beta/src/caller.rs": 'use crate::loaders::source; '
+                                  + 'const CODE: &str = source!("../../src/lib.rs");',
+            "beta/src/loaders.rs": "pub use std::include_str as source;",
+        }.items():
+            _ = (self.repo / path).write_text(source + "\n")
+        _ = self.git("add", ".")
+        _ = self.git("commit", "-qm", "configured Cargo root")
+        _ = (self.repo / "beta/Cargo.toml").write_text("invalid mutable manifest")
+        (self.repo / "beta/src/entry.rs").unlink()
+        members = rules.workspace_members({
+            path: self.git("show", "HEAD:" + path)
+            for path in ("Cargo.toml", "beta/Cargo.toml")})
+        owners = crates.SourceOwnership(self.repo, self.git("rev-parse", "HEAD"), members)
+        self.assertEqual(owners.crate_roots, {"src/lib.rs", "beta/src/entry.rs"})
+        self.assertIn("src/lib.rs", owners.edges["beta/src/caller.rs"])
+        self.assertEqual(owners.owners["src/lib.rs"], {".", "beta"})
+        self.assertNotIn("beta/src/caller.rs", owners.uncertain)
+        with self.assertRaisesRegex(bulk.BulkRenameError, "shared or cross-crate"):
+            owners.require(".", ("src/lib.rs",))

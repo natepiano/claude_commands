@@ -1262,25 +1262,47 @@ class RunSourceIndex:
         return coverage
 
 
-def cargo_target_roots(crate: Path) -> tuple[CargoSourceTarget, ...]:
-    """Read configured targets and Cargo's conventional target locations, without building."""
-    manifest = object_fields(tomllib.loads((crate / "Cargo.toml").read_text()))
+@dataclass(frozen=True)
+class FrozenCargoTargetInventory:
+    """A manifest and source paths from the same immutable repository tree."""
+
+    manifest: str
+    paths: frozenset[Path]
+
+
+def cargo_target_roots(crate: Path, *, frozen: FrozenCargoTargetInventory | None = None
+                       ) -> tuple[CargoSourceTarget, ...]:
+    """Read Cargo targets from disk or an explicit frozen manifest/source inventory."""
+    manifest = object_fields(tomllib.loads(
+        (crate / "Cargo.toml").read_text() if frozen is None else frozen.manifest))
+    def exists(path: Path) -> bool:
+        return path.exists() if frozen is None else Path(os.path.normpath(path)) in frozen.paths
+
     package = object_fields(manifest.get("package"))
     roots: list[CargoSourceTarget] = []
     library = object_fields(manifest.get("lib", {}))
-    if "lib" in manifest or package.get("autolib", True) and (crate / "src/lib.rs").exists():
+    if "lib" in manifest or package.get("autolib", True) and exists(crate / "src/lib.rs"):
         roots.append(CargoSourceTarget("lib", str(package.get("name")), crate / str(library.get("path", "src/lib.rs"))))
     for kind, folder, auto in (("bin", "src/bin", "autobins"), ("example", "examples", "autoexamples"),
                                ("test", "tests", "autotests"), ("bench", "benches", "autobenches")):
         discovered: dict[str, Path] = {}
         directory = crate / folder
-        if directory.exists():
-            for entry in sorted(directory.iterdir()):
-                if entry.suffix == ".rs" and entry.is_file():
-                    discovered[entry.stem] = entry
-                elif entry.is_dir() and (entry / "main.rs").exists():
-                    discovered[entry.name] = entry / "main.rs"
-        if kind == "bin" and (crate / "src/main.rs").exists():
+        if frozen is None:
+            entries = tuple(directory.iterdir()) if directory.exists() else ()
+        else:
+            # Recursive Git inventories contain leaf entries, never directories.
+            # A leaf at the folder itself (including a gitlink) cannot be searched.
+            if directory in frozen.paths:
+                raise BulkRenameError(
+                    f"source coverage unavailable: Cargo {kind} target folder {directory} is not a directory")
+            entries = tuple({directory / path.relative_to(directory).parts[0]
+                             for path in frozen.paths if path.is_relative_to(directory)})
+        for entry in sorted(entries):
+            if entry.suffix == ".rs" and (entry.is_file() if frozen is None else exists(entry)):
+                discovered[entry.stem] = entry
+            elif exists(entry / "main.rs"):
+                discovered[entry.name] = entry / "main.rs"
+        if kind == "bin" and exists(crate / "src/main.rs"):
             discovered[str(package.get("name"))] = crate / "src/main.rs"
         configured = object_list(manifest.get(kind, []))
         for value in configured:
@@ -1296,7 +1318,7 @@ def cargo_target_roots(crate: Path) -> tuple[CargoSourceTarget, ...]:
         if package.get(auto, True):
             roots.extend(CargoSourceTarget(kind, name, path) for name, path in sorted(discovered.items()))
     build = package.get("build", "build.rs")
-    if isinstance(build, str) and ("build" in package or (crate / build).exists()):
+    if isinstance(build, str) and ("build" in package or exists(crate / build)):
         roots.append(CargoSourceTarget("build", "build", crate / build))
     if not roots:
         raise BulkRenameError("source coverage unavailable: no Cargo target roots")
