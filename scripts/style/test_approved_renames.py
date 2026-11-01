@@ -5,6 +5,7 @@ from __future__ import annotations
 import unittest
 
 import style_footprint
+import approved_renames
 from approved_renames import (AppliedCheck, AppliedInCode, ApprovedRename, BindingProof, BindingRename, BindingScope,
                               Declarations, FileReader, FileRename, Folder, MissingFile, NoAppliedCheck, NoBindingRename,
                               NoBindingScope, NoFileRename, RenameNotApplied, UncertainScan, applied_check,
@@ -657,6 +658,27 @@ class BindingRenameTests(unittest.TestCase):
                          ("alert-count", "fresh-count"), ("alert.rs", "fresh.rs"), ("alertx", "freshx")):
             with self.subTest(old=old):
                 self.assertFalse(self.prove(source, edited.replace(old, new), 3, "alert").explained)
+
+
+class MachineRuleTests(unittest.TestCase):
+    def test_machine_rule_contract_rejects_extra_conditions_in_body_or_metadata(self) -> None:
+        from git_process import run_git
+        original = approved_renames.TYPE_NAMED_PARAMETER_RULE
+        for text, allowed in ((original, True), (original + "Only in functions returning bool.\n", False),
+                              (original.replace("input_scope: file", "input_scope: file\nonly_return: bool"), False)):
+            with self.subTest(text=text):
+                blob = run_git(("git", "hash-object", "--stdin"), input=text.encode()).stdout.decode().strip()
+                self.assertEqual(isinstance(approved_renames.machine_rename_rule(blob),
+                                           approved_renames.TypeNamedParameterRule), allowed)
+
+    def test_type_named_parameter_proof_requires_a_current_direct_named_type(self) -> None:
+        for annotation, allowed in (("&ImplItem", True), ("&mut ImplItem", True),
+                                    ("&crate::ImplItem", True), ("&OtherType", False),
+                                    ("Vec<ImplItem>", False), ("impl Trait", False)):
+            with self.subTest(annotation=annotation):
+                source = "fn changed(item: " + annotation + ") { inspect(item); }\n"
+                pair = BindingRename(1, source.strip(), "item", "impl_item")
+                self.assertEqual(isinstance(approved_renames.type_named_parameter(source, pair), RenameDeclaration), allowed)
 
 
 if __name__ == "__main__":

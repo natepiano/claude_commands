@@ -21,6 +21,18 @@ class FindingSitesTests(unittest.TestCase):
         cls.addClassCleanup(test_style_ledger_sites.StyleLedgerSitesTests.doClassCleanups)
         test_style_ledger_sites.StyleLedgerSitesTests.setUpClass()
 
+    def test_changed_function_signature_cannot_carry_its_parameters_old_judgment(self) -> None:
+        source = "fn work(\n    item: &ImplItem,\n) -> bool { inspect(item) }\n"
+        original = finding_sites.SourceSites(source)
+        for changed in (source.replace("-> bool", "-> SurfaceReferenceMatch"),
+                        source.replace("&ImplItem", "&mut ImplItem")):
+            with self.subTest(source=changed):
+                self.assertFalse(original.same_owner(2, finding_sites.SourceSites(changed), 2))
+        # A body-only change keeps the same header, so the fix does not make a
+        # historical site depend on unrelated statements in the function body.
+        self.assertTrue(original.same_owner(2, finding_sites.SourceSites(
+            source.replace("inspect(item)", "consume(item)")), 2))
+
     def assert_unproved_owner(self, source: str) -> None:
         sites = finding_sites.SourceSites(source)
         if isinstance(sites.item_reading, finding_sites.UnreadableSourceItems):
