@@ -1,6 +1,7 @@
 """Exercise durable design identity with local stores and a recording mesh transport."""
 from __future__ import annotations
 
+from scripts.lib.signal_test_support import install_signal_pid_guard
 from scripts.lib.test_agents_registry import write_registry
 
 import argparse
@@ -25,10 +26,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
 from scripts.astra import astra_roles  # noqa: E402
 from scripts.accounts import role_map  # noqa: E402
-from scripts.agents import codex_mesh  # noqa: E402
+from scripts.agents import codex_mesh, worker_lifecycle  # noqa: E402
 from scripts.lib.code_kind import is_test_code  # noqa: E402
 from scripts.astra import astra_work, design_roles  # noqa: E402
-from scripts.astra.design_role_test_support import write_empty_binding_record
+from scripts.direct import workers  # noqa: E402
+from scripts.astra.design_role_test_support import write_empty_binding_record, write_mesh_server_record
 from scripts.astra.design_roles import resolve_holder as resolve_current_holder  # noqa: E402
 from scripts.astra.design_roles import release_servers as release_design_servers  # noqa: E402
 from scripts.message import sessions  # noqa: E402
@@ -46,6 +48,10 @@ def damage_binding_repository(design: design_roles.HeldDesign) -> Path:
     cast(dict[str, object], fields["binding"])["repository"] = ""
     _ = path.write_text(json.dumps(fields))
     return path
+
+
+def setUpModule() -> None:
+    install_signal_pid_guard()
 
 
 class LiveDesignRoleNamesTests(unittest.TestCase):
@@ -162,7 +168,7 @@ class DurableRolesTests(unittest.TestCase):
                                  "held_design_id": design.placement.design_id, "held_role": role,
                                  "cwd": design.repository, "launcher_pid": 0}
         _ = path.write_text(json.dumps(roster))
-        _ = (mesh / "mesh_server.json").write_text(json.dumps({"codex_home": str(self.root / "codex-home")}))
+        write_mesh_server_record(mesh, self.root / "codex-home")
         self.launches.append((role, thread))
         if self.lose_creation_ack:
             raise TimeoutError("creation acknowledgement lost")
@@ -190,6 +196,71 @@ class DurableRolesTests(unittest.TestCase):
         prompt = self.root / "assignment.md"
         _ = prompt.write_text(text)
         return design_roles.resume(design.placement.design_id + "/" + role, prompt)
+
+    def test_damaged_design_roster_refuses_publication_without_erasing_ownership(self) -> None:
+        design = self.open_designer()
+        path = design_roles.mesh_directory(design.placement.design_id) / "mesh_roster.json"
+        for damaged in ("", '{"designer":', "not JSON", "[]", '{"designer": []}'):
+            with self.subTest(damaged=damaged):
+                _ = path.write_text(damaged)
+                with self.assertRaises(Exception) as refused:
+                    with design_roles._edit_roster(design.placement.design_id) as roster:  # pyright: ignore[reportPrivateUsage]
+                        roster["replacement"] = {"thread_id": "fresh", "status": "done"}
+                self.assertEqual(type(refused.exception).__name__, "WorkerStateUnreadable")
+                self.assertIn(str(path), str(refused.exception))
+                self.assertEqual(path.read_text(), damaged)
+                self.assertEqual(design_roles.read_design(design.placement.design_id), design)
+        self.assertEqual(len(self.launches), 1)
+
+    def test_design_ownership_read_names_damaged_state_instead_of_decoding_it_as_empty(self) -> None:
+        design = self.open_designer()
+        directory = design_roles.design_directory(design.placement.design_id)
+        path = directory / "design.json"
+        for damaged in ("", '{"placement":', "not JSON", "[]", '{"roles": [42]}'):
+            with self.subTest(damaged=damaged):
+                _ = path.write_text(damaged)
+                with self.assertRaises(Exception) as refused:
+                    _ = design_roles.read_design(design.placement.design_id)
+                self.assertEqual(type(refused.exception).__name__, "WorkerStateUnreadable")
+                self.assertIn(str(path), str(refused.exception))
+                self.assertEqual(path.read_text(), damaged)
+
+    def test_roster_repair_restores_design_authority_limits_and_refuses_unfinished_transfer(self) -> None:
+        design = self.open_designer()
+        mesh = design_roles.mesh_directory(design.placement.design_id)
+        path = mesh / "mesh_roster.json"
+        role = self.instance(design, "designer")
+        self.assertIsInstance(role.lifecycle, design_roles.RoleOpen)
+        assert isinstance(role.lifecycle, design_roles.RoleOpen)
+        thread = role.lifecycle.thread_id
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"UNIT_WORKERS_STATE": str(self.root / "unit-workers")})))
+        store = workers.ledger_for_run(mesh)
+        with store.locked() as ledger:
+            ledger.workers[role.name] = workers.UnitWorker(
+                role.name, "astra-designer", "codex", "gpt-fixture", "xhigh", {"kind": "WorkerLaunchPolicy"},
+                workers.CodexThread(thread, str(self.root / "codex-home")), workers.HeldBy(str(mesh)))
+        _ = path.write_bytes(b"")
+        transition = design_roles.design_directory(design.placement.design_id) / "transition.json"
+        _ = transition.write_text('{"in_progress": true}')
+        client = MagicMock(spec=codex_mesh.Client)
+        cast(MagicMock, client.call).return_value = {"result": {"thread": {"id": thread, "status": {"type": "idle"}, "turns": []}}}
+        with (patch.object(codex_mesh, "recorded_run_ports", return_value=[12345]),
+              patch.object(codex_mesh, "Client", return_value=client)):
+            with self.assertRaisesRegex(workers.WorkerUnavailable, "transfer.*unfinished"):
+                _ = workers.repair_roster(mesh)
+            self.assertEqual(path.read_bytes(), b"")
+            transition.unlink()
+            _ = workers.repair_roster(mesh)
+        repaired = cast(dict[str, object], json.loads(path.read_text()))
+        record = cast(dict[str, object], repaired[role.name])
+        self.assertEqual(record["thread_id"], thread)
+        self.assertEqual(record["held_design_id"], design.placement.design_id)
+        self.assertEqual(record["held_role"], "designer")
+        policy = cast(dict[str, object], record["access_policy"])
+        self.assertEqual(policy["kind"], "PhaseBoundDesigner")
+        self.assertNotIn("context_tokens", record)
+        self.assertEqual((path.with_name(path.name + ".damaged")).read_bytes(), b"")
+        self.assertEqual(self.launches, [("designer", thread)])
 
     def test_open_retry_and_normalized_document_alias_keep_one_pair_and_thread(self) -> None:
         design = self.open_designer()
@@ -845,8 +916,11 @@ class DurableRolesTests(unittest.TestCase):
         operations: list[str] = []
         environments: list[dict[str, str]] = []
 
-        def release_server(folder: str) -> None:
+        def release_server(folder: str, *, membership: worker_lifecycle.MembershipLease,
+                           owned_workers: tuple[worker_lifecycle.WorkerIdentity, ...]) -> None:
             self.assertEqual(folder, str(mesh))
+            self.assertTrue(membership.covers(mesh))
+            self.assertEqual(owned_workers, ())
             operations.append("release")
             server.unlink()
 

@@ -116,7 +116,7 @@ the user as the failure message. Correct the named input before reporting.
 When it prints `phase tables: unavailable — <reason>`, continue. Only a unit
 whose records could not be read takes its ETA from the saved status capture
 and needs `started` in its judgment. A dailies archives no notes: the
-agent-sessions snapshot timer prunes retired units' notes every 2 minutes.
+agent-notes job prunes retired units' notes on the schedule in `config/agent_notes.toml`.
 When it prints `bevy upgrade: unavailable — <reason>`, continue; the report
 carries the topic with that reason.
 

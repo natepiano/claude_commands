@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
 
 import session_pane
+from scripts.message.relay_identity import relay_session_name
 from unit_lookup import Place
 from scripts.hooks import hook_dispatch
 from scripts.lib import test_hang_guard
@@ -84,6 +85,18 @@ class ConversationPauseTests(ConversationPauseFixture):
             ),
         ):
             _ = self.invoke([sys.executable, str(lookup)], env=self.environment)
+
+    def test_relay_wrappers_keep_the_scheduled_sender_and_return_question(self) -> None:
+        for sender, expected in (("stall-watch", conversation_pause.PromptSource.SCHEDULED),
+                                 ("unit-abc", conversation_pause.PromptSource.SCHEDULED),
+                                 ("natedev", conversation_pause.PromptSource.PEER)):
+            with self.subTest(sender=sender):
+                prompt = cross_session(relay_session_name(sender), "update")
+                self.assertIs(conversation_pause.prompt_source(prompt, lambda: frozenset({"unit-abc"}), tuple),
+                              expected)
+                self.assertFalse(conversation_pause.is_return_question(prompt))
+        self.assertTrue(conversation_pause.is_return_question(
+            cross_session(relay_session_name(conversation_pause.WATCHER), QUESTION)))
 
     def test_prompt_source_rows(self) -> None:
         def unexpected_sender_read() -> frozenset[str]:

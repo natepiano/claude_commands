@@ -5,6 +5,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 
 from scripts.production import staff, showrunners, unit_names
+from scripts.production.unit_table import Refusal, cell_value, unit_table
 from scripts.shutdown import remote
 
 
@@ -83,12 +84,23 @@ class StaffLabels:
             slugs = [slug for slug, owner in self.showrunners.items() if owner.id == parent.id]
             slug = slugs[0] if len(slugs) == 1 else parent.name
             result["SHOWRUNNER_UNIT"] = slug
+            identifiers: set[str] = set()
+            source = self.productions.get(slug)
+            if source is not None:
+                try:
+                    identifiers = {cell_value(cells["Unit"]) for cells in unit_table(source.document.splitlines())
+                                   if "Unit" in cells and unit_names.name(cell_value(cells["Unit"])) == row.name}
+                except (Refusal, unit_names.BadName):
+                    pass
             retained_id = result.get("SHOWRUNNER_UNIT_ID", "")
             try:
                 retained_owner = unit_names.name(retained_id) if retained_id else ""
             except unit_names.BadName:
                 retained_owner = ""
-            if retained_owner == row.name:
+            # A missing production table cannot rename an existing unit id.
+            if len(identifiers) == 1:
+                result["SHOWRUNNER_UNIT_ID"] = next(iter(identifiers))
+            elif retained_owner == row.name:
                 result["SHOWRUNNER_UNIT_ID"] = retained_id
             else:
                 result["SHOWRUNNER_UNIT_ID"] = unit_names.unit_id(row.name)

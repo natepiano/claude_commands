@@ -841,7 +841,7 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
         # The injected code changes only the ownership boundary. Real followers
         # submit input, write receipts, and settle actual loopback-server turns.
         _ = script.with_suffix(".py").write_text(
-            "import fcntl, json\nfrom pathlib import Path\nfrom scripts.direct import assign\n" +
+            "import fcntl, json\nfrom pathlib import Path\nfrom scripts.direct import assign\nfrom scripts.agents import worker_lifecycle\n" +
             f"boundary = {boundary!r}\nready = Path({str(ready)!r})\n" +
             f"trace = Path({str(trace)!r})\ndestination = Path({str(destination)!r})\n" +
             f"delivered = Path({str(delivered)!r})\n" +
@@ -854,20 +854,18 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
             "    if adopted: return\n" +
             "    adopted = True\n" +
             "    destination.mkdir()\n" +
-            "    with (dispatch.run / 'mesh_roster.json').open('r+') as handle:\n" +
-            "        fcntl.flock(handle, fcntl.LOCK_EX)\n" +
-            "        roster = json.load(handle)\n" +
+            "    with worker_lifecycle.locked_state(dispatch.run / 'mesh_roster.json') as handle:\n" +
+            "        roster = handle.read_object()\n" +
             "        record = roster[dispatch.worker]\n" +
             "        (destination / 'mesh_roster.json').write_text(json.dumps({dispatch.worker: record.copy()}))\n" +
             "        record['adopted_to'] = str(destination)\n" +
             "        assign.codex_mesh.advance_worker_roster_revision(record)\n" +
-            "        handle.seek(0); json.dump(roster, handle); handle.truncate()\n" +
+            "        handle.publish(json.dumps(roster))\n" +
             "    if boundary == 'before_inbox':\n" +
             "        pending = dispatch.run / (dispatch.worker + '.pending.json')\n" +
-            "        with pending.open('r+') as handle:\n" +
-            "            fcntl.flock(handle, fcntl.LOCK_EX)\n" +
+            "        with worker_lifecycle.locked_state(pending) as handle:\n" +
             "            (destination / pending.name).write_text(handle.read())\n" +
-            "            handle.seek(0); json.dump({'messages': []}, handle); handle.truncate()\n" +
+            "            handle.publish(json.dumps(worker_lifecycle.empty_inbox()))\n" +
             "    with trace.open('a') as handle: handle.write(json.dumps({'adopted': True}) + '\\n')\n" +
             "def follow(dispatch, command, shown, log):\n" +
             "    global follow_count, active_dispatch\n" +

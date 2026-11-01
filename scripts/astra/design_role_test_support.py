@@ -1,14 +1,22 @@
-"""Malformed durable-role records shared by lifecycle and messaging regressions."""
+"""Durable-role records shared by lifecycle, review and messaging regressions."""
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import cast
 from uuid import uuid4
 
 from scripts.astra import design_roles
+from scripts.lib.atomic_file import write_text_atomic
 
 _NOT_OPENED = design_roles.RoleNotOpened()
+
+
+def write_mesh_server_record(mesh: Path, codex_home: Path) -> None:
+    write_text_atomic(mesh / "mesh_server.json", json.dumps({
+        "codex_home": str(codex_home), "pid": os.getpid(), "port": 32100,
+    }))
 
 
 def write_empty_binding_record(repository: Path, holder: design_roles.Holder, *,

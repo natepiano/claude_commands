@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Self, cast, override
 from unittest.mock import MagicMock, call, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib.signal_test_support import install_signal_pid_guard
 from scripts.whoami.note_file import note_name
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -57,6 +58,7 @@ def apply_quota_and_write(notes: list[Note], report: Report, checked_at: datetim
 
 
 def setUpModule() -> None:
+    install_signal_pid_guard()
     _ = unittest.enterModuleContext(patch.object(role_map, "is_role_map_host", return_value=True))
     root = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
     _ = unittest.enterModuleContext(patch.object(showrunners, "NOTIFIER_STATE_DIR", root))

@@ -13,7 +13,7 @@ import time
 import unittest
 from datetime import datetime
 from pathlib import Path
-from typing import override
+from typing import cast, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
@@ -68,6 +68,28 @@ class NotifierTests(unittest.TestCase):
         self.socket_path = Path(self.enterContext(short_socket_directory())) / "live.sock"
         self.live_socket.bind(str(self.socket_path))
         self.record("sid-1")
+
+    def test_tick_drains_repeat_notices_only_from_the_configured_local_state(self) -> None:
+        pending = self.root / "repeat-outbox"
+        pending.mkdir()
+        launched = self.root / "drain.argv"
+        launcher = self.launcher_dir / "systemd-run"
+        _ = launcher.write_text("#!/usr/bin/env python3\nimport json,sys\nfrom pathlib import Path\n"
+            + f"Path({str(launched)!r}).write_text(json.dumps(sys.argv[1:]))\n")
+        config = self.root / "selected.conf"
+        with mock.patch.dict(os.environ, {"NOTIFIER_REPEAT_STATE": str(pending),
+                                         "SEND_REPEAT_CONFIG": str(config), "XDG_STATE_HOME": str(self.root / "xdg")}):
+            _ = self.successful("tick")
+            _ = self.successful("tick")
+        arguments = cast(list[str], json.loads(launched.read_text()))
+        self.assertIn("--no-block", arguments)
+        self.assertIn("SEND_REPEAT_STATE=" + str(pending), arguments)
+        self.assertIn("SEND_REPEAT_CONFIG=" + str(config), arguments)
+        self.assertIn("XDG_STATE_HOME=" + str(self.root / "xdg"), arguments)
+        self.assertEqual(arguments[-2:], [str(self.fake_send), "repeat-notices"])
+        self.assertIn("notices", arguments)
+        self.assertTrue(any(value.endswith("/repeat_guard.py") for value in arguments))
+        self.assertFalse(self.send_args.exists(), "the tick ran the drain synchronously")
 
     def record(self, session_id: str, path: Path | None = None, updated: int = 1) -> None:
         record = {

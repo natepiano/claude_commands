@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import change_review
+from scripts.lib import copy_record
 from scripts.production import showrunners
 import showrunner_tree
 from change_review import Invisible, Malformed, Visible
@@ -63,7 +64,7 @@ def setUpModule() -> None:
     folder = tempfile.TemporaryDirectory()
     unittest.addModuleCleanup(folder.cleanup)
     unittest.enterModuleContext(mock.patch.dict(os.environ, {
-        "NEXT_STATE_DIR": folder.name, scratch.ROOT_ENV: f"{folder.name}/scratch",
+        "NEXT_STATE_DIR": folder.name, copy_record.ROOT_ENV: f"{folder.name}/scratch",
         scratch.VISIBLE_ROOT_ENV: f"{folder.name}/repro"}))
     _ = unittest.enterModuleContext(mock.patch.object(showrunners, "timer_docs", return_value={}))
 
@@ -511,7 +512,7 @@ class ActionTest(unittest.TestCase):
     def test_verdict_rerun_finishes_scratch_and_replays_merged_result(self) -> None:
         for verdict in ("works", "still missing the shield"):
             with self.subTest(verdict=verdict), mock.patch.dict(os.environ, {
-                scratch.ROOT_ENV: str(self.path.parent / "scratch"),
+                copy_record.ROOT_ENV: str(self.path.parent / "scratch"),
                 scratch.HOLDS_ENV: str(self.path.parent / "holds.json"),
             }):
                 _ = self.path.write_text(LIST, encoding="utf-8")
@@ -538,7 +539,7 @@ class ActionTest(unittest.TestCase):
                 self.assertEqual(self.path.read_text().split("## Reviewed")[1].count("| C76 |"), 1)
 
     def test_conflicting_verdict_keeps_reviewed_row_and_finishes_scratch(self) -> None:
-        with mock.patch.dict(os.environ, {scratch.ROOT_ENV: str(self.path.parent / "scratch"),
+        with mock.patch.dict(os.environ, {copy_record.ROOT_ENV: str(self.path.parent / "scratch"),
                                           scratch.HOLDS_ENV: str(self.path.parent / "holds.json")}):
             folder = scratch.new(f"row:{self.path.stem}-C76", "conflict")
             _ = change_review.hold_for_row(self.path, "C76", [str(folder)])

@@ -19,9 +19,9 @@ problem on every run and freeze the note.
 When the roster reports a problem, has no hana showrunner or no unit director
 under it, git cannot run, or a showrunners.py call fails, the note is left as it
 stands and the reason goes to stderr: a stale note says when it was taken, an
-empty diagram says nothing is running. No director is the answer roster.py gives,
-problems empty, when tmux is not on PATH (it then skips every tmux-hosted unit),
-and a missing git would quietly turn the production link into a file:// URI.
+empty diagram says nothing is running. The roster reads staff and live sessions;
+it does not require tmux. A missing git would quietly turn the production link
+into a file:// URI. Source-command failures still fail the job.
 
 Run by agent-notes; its vault part commits the generated note.
 """
@@ -137,6 +137,10 @@ class Snapshot(NamedTuple):
 
 class Refused(Exception):
     """The sources cannot be trusted this run; the note stays as it is."""
+
+
+class ReadFailed(Refused):
+    """A source command failed or timed out; preserve the note but fail the job."""
 
 
 def tidy(path: str) -> str:
@@ -316,7 +320,7 @@ def git(directory: Path, *args: str) -> str:
     try:
         done = subprocess.run(["git", "-C", str(directory), *args], capture_output=True, text=True, timeout=settings().hierarchy_git_seconds)
     except (OSError, subprocess.TimeoutExpired) as error:
-        raise Refused(f"git {' '.join(args)}: {error}") from error
+        raise ReadFailed(f"git {' '.join(args)}: {error}") from error
     return done.stdout.strip() if done.returncode == 0 else ""
 
 
@@ -379,10 +383,10 @@ def call(script: str, *args: str) -> str:
     try:
         done = subprocess.run([sys.executable, "-I", script, *args], capture_output=True, text=True, timeout=settings().hierarchy_read_seconds)
     except (OSError, subprocess.TimeoutExpired) as error:
-        raise Refused(f"{os.path.basename(script)} {' '.join(args)}: {error}") from error
+        raise ReadFailed(f"{os.path.basename(script)} {' '.join(args)}: {error}") from error
     if done.returncode != 0:
         reason = (done.stderr or done.stdout).strip().splitlines()
-        raise Refused(f"{os.path.basename(script)} {' '.join(args)}: {reason[0] if reason else done.returncode}")
+        raise ReadFailed(f"{os.path.basename(script)} {' '.join(args)}: {reason[0] if reason else done.returncode}")
     return done.stdout
 
 
@@ -457,20 +461,20 @@ def gather(note: str, now: datetime) -> Snapshot:
     lower = [t for child in children[slug] if (t := subtree(roster, child, listed, children)) is not None]
     hierarchy = tree(roster, top, lower)
     if not all_directors(hierarchy):
-        raise Refused(f"roster.py lists no unit director under {SHOWRUNNER}; is tmux on PATH?")
+        raise Refused(f"roster.py lists no unit director under {SHOWRUNNER}")
     link = production_file_link(Path(listed[slug].doc), Path(os.path.dirname(note)))
     created = kept_created(note, f"{now:%Y-%m-%d}")
     name = Path(listed[slug].doc).name
     return Snapshot(hierarchy, lower_names(children[slug], listed), name, link, created, now)
 
 
-def main(argv: list[str]) -> int:
+def main(argv: list[str], *, refusal_exit: int = 1) -> int:
     note = argv[0] if argv else NOTE
     try:
         text = render(gather(note, datetime.now(user_zone())))
     except Refused as reason:
         print(f"hana hierarchy: left as it stands: {reason}", file=sys.stderr)
-        return 1
+        return 1 if isinstance(reason, ReadFailed) else refusal_exit
     tmp = note + ".tmp"
     with open(tmp, "w", encoding="utf-8") as handle:
         _ = handle.write(text)

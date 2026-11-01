@@ -48,6 +48,8 @@ import unit_runs
 import herdr
 from fake_herdr import CommandResponse, herdr_listener
 import sessions
+from relay_identity import relay_session_name
+from relay_test_support import write_relay_record
 from scripts.production import showrunners
 if TYPE_CHECKING:
     from ..whoami import account, agent_accounts
@@ -132,6 +134,7 @@ class RosterTests(unittest.TestCase):
         self.environment = {
             **os.environ,
             "HOME": str(self.home),
+            "XDG_STATE_HOME": str(self.root / "state"),
             "PATH": f"{binaries}{os.pathsep}{os.environ.get('PATH', '')}",
             "SSH_RECORD": str(self.ssh_log),
             "SSH_SNAPSHOT": roster.RosterSnapshot(roster.Roster([], [])).encode(),
@@ -922,7 +925,7 @@ class RosterTests(unittest.TestCase):
         self.assertEqual(code, 0, output.getvalue() + errors.getvalue())
         self.assertEqual(output.getvalue(), 'SENT: fixture peer\n')
         self.assertEqual(errors.getvalue().splitlines(), [
-            f'send.py: roster: warning: durable role {bad}: missing or invalid repository'])
+            f'send.py: roster: warning: durable role {bad}: {bad}: worker state unreadable: missing or invalid repository'])
         self.assertEqual(deliver.call_count, 1)
         forwarded = cast(send.Message, deliver.call_args.args[0])
         self.assertEqual(forwarded.to, 'session:peer-session')
@@ -934,8 +937,8 @@ class RosterTests(unittest.TestCase):
         self.assertEqual(code, 0, errors)
         report = cast(dict[str, object], json.loads('\n'.join(output)))
         self.assertEqual(report['problems'], [])
-        self.assertEqual(report['warnings'], [f'durable role {bad}: missing or invalid repository'])
-        self.assertEqual(errors, [f'could not read: warning: durable role {bad}: missing or invalid repository'])
+        self.assertEqual(report['warnings'], [f'durable role {bad}: {bad}: worker state unreadable: missing or invalid repository'])
+        self.assertEqual(errors, [f'could not read: warning: durable role {bad}: {bad}: worker state unreadable: missing or invalid repository'])
         result = roster.roster(os.environ, roster.ThisMachine())
         decoded = roster.RosterSnapshot.decode(roster.RosterSnapshot(result).encode()).result
         self.assertEqual(decoded.warnings, result.warnings)
@@ -1246,6 +1249,19 @@ class RosterTests(unittest.TestCase):
             found = roster.roster(os.environ, roster.ThisMachine())
         named = [entry.session for entry in found.entries if entry.name == "free-claude"]
         self.assertEqual(named, [roster.ClaudeSession("sid-free")])
+
+    def test_a_recorded_relay_is_absent_even_without_its_entrypoint(self) -> None:
+        relay_name = relay_session_name("free-claude")
+        self._write_session("relay", relay_name, "sid-relay", self.home / "projects" / "relay",
+                            status="relaying", updated=9, entrypoint="", pid=os.getppid())
+        write_relay_record(self.root / "state/message", os.getppid(), "free-claude")
+        with mock.patch.object(codex_daemon, "loaded_sessions", return_value=self._daemon_sessions()):
+            found = roster.roster(os.environ, roster.ThisMachine())
+        self.assertNotIn("sid-relay", [entry.session.session_id for entry in found.entries
+                                       if isinstance(entry.session, roster.ClaudeSession)])
+        self.assertEqual(send.resolve_recipient("free-claude", send.LocalOnly(), found),
+                         send.ClaudeRecipient("session:sid-free"))
+        self.assertEqual([entry for entry in found.entries if entry.name == relay_name], [])
 
     def test_socketless_record_with_another_process_start_is_absent_from_the_roster(self) -> None:
         self._write_session(
