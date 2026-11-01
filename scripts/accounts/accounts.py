@@ -836,15 +836,18 @@ def trust_settings_file() -> Path:
     return REPOSITORY_ROOT / "config" / "accounts.toml"
 
 
-def trusted_folders() -> tuple[str, ...]:
+def _accounts_settings_section(document: dict[str, object], name: str) -> dict[str, object]:
+    section = document.get(name)
+    if not isinstance(section, dict):
+        raise AccountsError(f"accounts: {trust_settings_file()}: expected [{name}] section")
+    return cast(dict[str, object], section)
+
+
+def _trusted_folders(document: dict[str, object]) -> tuple[str, ...]:
     """Configured absolute project paths, resolved for this machine at use."""
     path = trust_settings_file()
     try:
-        document = tomllib.loads(path.read_text(encoding="utf-8"))
-        section = cast(object, document.get("trust"))
-        if not isinstance(section, dict):
-            raise ValueError("expected [trust] folders")
-        folders = cast(dict[str, object], section).get("folders")
+        folders = _accounts_settings_section(document, "trust").get("folders")
         if not isinstance(folders, list):
             raise ValueError("trust.folders must be a list of paths")
         result: list[str] = []
@@ -853,7 +856,9 @@ def trusted_folders() -> tuple[str, ...]:
                 raise ValueError("trust.folders must contain absolute or ~/ paths")
             result.append(str(Path(folder).expanduser().absolute()))
         return tuple(dict.fromkeys(result))
-    except (OSError, ValueError) as error:
+    except AccountsError:
+        raise
+    except ValueError as error:
         raise AccountsError(f"accounts: {path}: {error}") from error
 
 
@@ -884,10 +889,55 @@ def _account_home_lock(home: Path) -> Generator[None]:
         os.close(directory)
 
 
-# Claude Code 2.1.296: xi/RTs and proper-lockfile Nt/rt in the installed
-# executable. These are interoperability values, not our own retry policy.
-CLAUDE_CONFIG_LOCK_RETRIES = (0.2, 0.4, 0.8, 1.6, 3.2, 4.0)
-CLAUDE_CONFIG_LOCK_STALE_SECONDS = 10.0
+@dataclass(frozen=True)
+class ClaudeConfigLockPolicy:
+    """Configured timing for interoperating with Claude's directory lock."""
+
+    retries: tuple[float, ...]
+    stale_seconds: float
+
+
+def _positive_lock_seconds(value: object, key: str) -> float:
+    try:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError
+        seconds = float(value)
+        if not math.isfinite(seconds) or seconds <= 0:
+            raise ValueError
+        return seconds
+    except (ValueError, OverflowError) as error:
+        raise AccountsError(
+            f"accounts: {trust_settings_file()}: claude_config_lock.{key} must contain finite positive seconds"
+        ) from error
+
+
+def _claude_config_lock_policy(document: dict[str, object]) -> ClaudeConfigLockPolicy:
+    section = _accounts_settings_section(document, "claude_config_lock")
+    retries = section.get("retries")
+    if not isinstance(retries, list) or not retries:
+        raise AccountsError(f"accounts: {trust_settings_file()}: claude_config_lock.retries must be a non-empty list")
+    return ClaudeConfigLockPolicy(
+        tuple(_positive_lock_seconds(value, "retries") for value in cast(list[object], retries)),
+        _positive_lock_seconds(section.get("stale_seconds"), "stale_seconds"),
+    )
+
+
+@dataclass(frozen=True)
+class TrustConfiguration:
+    """Validated folders and lock timing for one trust or seed operation."""
+
+    folders: tuple[str, ...]
+    lock_policy: ClaudeConfigLockPolicy
+
+
+def trust_configuration() -> TrustConfiguration:
+    """Read and validate all trust settings before any home mutation or lock."""
+    path = trust_settings_file()
+    try:
+        document = cast(dict[str, object], tomllib.loads(path.read_text(encoding="utf-8")))
+    except (OSError, ValueError) as error:
+        raise AccountsError(f"accounts: {path}: {error}") from error
+    return TrustConfiguration(_trusted_folders(document), _claude_config_lock_policy(document))
 
 
 @dataclass(frozen=True)
@@ -906,22 +956,22 @@ class ClaudeConfigLock:
 
 
 @contextmanager
-def claude_config_lock(path: Path) -> Generator[ClaudeConfigLock]:
-    """Wait like Claude, recovering only locks whose mtime is over 10s old.
+def claude_config_lock(path: Path, policy: ClaudeConfigLockPolicy) -> Generator[ClaudeConfigLock]:
+    """Wait like Claude, recovering locks older than the configured stale age.
 
     Our critical section has no waits: its publication budget is half Claude's
     shortest retry, also below its 1.5s boot retry-abort window. No heartbeat is
     needed for such a short hold (Claude normally updates its lock every 5s).
     """
     lock = path.with_name(path.name + ".lock")
-    for attempt in range(len(CLAUDE_CONFIG_LOCK_RETRIES) + 1):
-        if _try_claude_config_lock(lock):
+    for attempt in range(len(policy.retries) + 1):
+        if _try_claude_config_lock(lock, policy.stale_seconds):
             break
-        if attempt == len(CLAUDE_CONFIG_LOCK_RETRIES):
+        if attempt == len(policy.retries):
             raise TimeoutError("Claude config lock still held after retries; rerun trust")
-        time.sleep(CLAUDE_CONFIG_LOCK_RETRIES[attempt] * (1 + random.random()))
+        time.sleep(policy.retries[attempt] * (1 + random.random()))
     ownership = ClaudeConfigLock(lock, lock.stat().st_ino,
-                                time.monotonic() + min(CLAUDE_CONFIG_LOCK_RETRIES) / 2)
+                                time.monotonic() + min(policy.retries) / 2)
     try:
         yield ownership
     finally:
@@ -933,14 +983,14 @@ def claude_config_lock(path: Path) -> Generator[ClaudeConfigLock]:
             pass
 
 
-def _try_claude_config_lock(lock: Path) -> bool:
+def _try_claude_config_lock(lock: Path, stale_seconds: float) -> bool:
     try:
         lock.mkdir(mode=0o700)
         return True
     except FileExistsError:
         pass
     try:
-        if lock.stat().st_mtime >= time.time() - CLAUDE_CONFIG_LOCK_STALE_SECONDS:
+        if lock.stat().st_mtime >= time.time() - stale_seconds:
             return False
         lock.rmdir()
     except FileNotFoundError:
@@ -953,7 +1003,7 @@ def _try_claude_config_lock(lock: Path) -> bool:
         return False
 
 
-def _trust_file(home: Path, path: Path, folders: tuple[str, ...]) -> bool:
+def _trust_file(home: Path, path: Path, configuration: TrustConfiguration) -> bool:
     if home.is_symlink() or path.is_symlink():
         raise ValueError("linked account configuration refused")
     with _account_home_lock(home):
@@ -961,12 +1011,12 @@ def _trust_file(home: Path, path: Path, folders: tuple[str, ...]) -> bool:
             before_mode = stat.S_IMODE(path.stat().st_mode)
             before = path.read_bytes()
             original = read_json_object(io.StringIO(before.decode("utf-8")))
-            updated = with_trusted_folders(original, folders)
+            updated = with_trusted_folders(original, configuration.folders)
             if updated == original:
                 return False
             published = json.dumps(updated, indent=2, ensure_ascii=False) + "\n"
             with atomic_file.prepared_replacement(path, published, mode=before_mode) as temporary:
-                with claude_config_lock(path) as ownership:
+                with claude_config_lock(path, configuration.lock_policy) as ownership:
                     if path.read_bytes() != before or stat.S_IMODE(path.stat().st_mode) != before_mode:
                         continue
                     ownership.require_current()
@@ -979,13 +1029,13 @@ def _trust_file(home: Path, path: Path, folders: tuple[str, ...]) -> bool:
 
 def trust_accounts() -> int:
     """Apply configured trust to each home independently without inspecting identity."""
-    folders = trusted_folders()
+    configuration = trust_configuration()
     homes = [NamedAccount("~/.claude", main_config_dir()), *_existing_named_accounts()]
     failures = False
     for home in homes:
         path = accounts_home() / ".claude.json" if home.dir == main_config_dir() else home.dir / ".claude.json"
         try:
-            changed = _trust_file(home.dir, path, folders)
+            changed = _trust_file(home.dir, path, configuration)
             state = "updated" if changed else "unchanged"
             print(f"{home.label}: trust {state}")
         except (OSError, ValueError) as error:
@@ -995,7 +1045,7 @@ def trust_accounts() -> int:
     return int(failures)
 
 
-def _filtered_seed(source: dict[str, object]) -> ClaudeConfigSeed:
+def _filtered_seed(source: dict[str, object], folders: tuple[str, ...]) -> ClaudeConfigSeed:
     seed: dict[str, object] = {
         key: source[key] for key in TOP_LEVEL_SEED_KEYS if key in source
     }
@@ -1013,10 +1063,10 @@ def _filtered_seed(source: dict[str, object]) -> ClaudeConfigSeed:
             }
             projects[project_path] = cast(ProjectSeed, cast(object, filtered))
         seed["projects"] = projects
-    return cast(ClaudeConfigSeed, cast(object, with_trusted_folders(seed, trusted_folders())))
+    return cast(ClaudeConfigSeed, cast(object, with_trusted_folders(seed, folders)))
 
 
-def _seed_config(destination: Path) -> list[str]:
+def _seed_config(destination: Path, configuration: TrustConfiguration) -> list[str]:
     if destination.is_symlink():
         return [
             f"accounts: {destination} is a link; identity stays in each account dir"
@@ -1030,7 +1080,7 @@ def _seed_config(destination: Path) -> list[str]:
                 if not stat.S_ISREG(existing.st_mode) or existing.st_size:
                     return []
                 destination.unlink()
-            seed = _filtered_seed(read_json_object(source))
+            seed = _filtered_seed(read_json_object(source), configuration.folders)
             _ = atomic_file.create_text_atomic(destination, json.dumps(seed, indent=2, sort_keys=True) + "\n")
     except (OSError, ValueError, TypeError) as error:
         return [f"accounts: could not seed {destination} from {source}: {error}"]
@@ -1042,6 +1092,7 @@ def setup(label: str) -> list[str]:
     label = note_file.canonical_label(label)
     if _label_is(label, "codex"):
         return _setup_codex_home(label)
+    configuration = trust_configuration()
     destination = account_dir(label)
     problems: list[str] = []
     if destination.is_symlink():
@@ -1063,7 +1114,7 @@ def setup(label: str) -> list[str]:
         destination, main_config_dir().absolute(), SHARED, ALWAYS_LINKED,
     ))
 
-    problems.extend(_seed_config(destination / ".claude.json"))
+    problems.extend(_seed_config(destination / ".claude.json", configuration))
     return problems
 
 
@@ -3126,6 +3177,7 @@ def cutover_home(label: str = "", *, undo: bool = False) -> None:
     if sys.platform == "darwin":
         _cutover_home_macos(label, undo=undo)
         return
+    folders = trust_configuration().folders if not undo else ()
     path = accounts_home() / ".local/state/accounts/cutover-home.json"
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     with path.with_suffix(".lock").open("a") as lock:
@@ -3212,7 +3264,7 @@ def cutover_home(label: str = "", *, undo: bool = False) -> None:
         if "oauthAccount" in seed:
             if "oauthAccount" in numbered and numbered["oauthAccount"] != seed["oauthAccount"]:
                 raise AccountsError("accounts: destination holds another oauthAccount")
-            numbered = {**_filtered_seed(seed), **numbered, "oauthAccount": seed["oauthAccount"]}
+            numbered = {**_filtered_seed(seed, folders), **numbered, "oauthAccount": seed["oauthAccount"]}
             _atomic_write(numbered_path, json.dumps(numbered) + "\n")
             del seed["oauthAccount"]
             _atomic_write(seed_path, json.dumps(seed) + "\n")
