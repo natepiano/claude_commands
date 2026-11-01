@@ -3057,15 +3057,8 @@ User 2026-11-01: add a role count to the accounts board and order the columns ac
 
 **As-built:** `accounts.py` stored-status JSON carries `role_counts` per account: live members per role from the local session registry, launch history and the shared staff classifier, with no ssh or usage read. `mods/unit-board/hooks/accounts.tsx` shows the requested order; the count cell joins counts with `, ` in role order, blank for spare. `scripts/herdr/pane_launch.py` validates each history entry and skips only a damaged one. An unchanged board tick refreshes counts; a failed refresh keeps its retry. `in use` stays: it marks paid-credit use. Also fixed two tests the 101l gate turned red. Three repair rounds; style review PASS.
 
-### Phase 101n — Every Claude account trusts ~/worktrees  · status: done
+### Phase 101n — Every Claude account trusts ~/worktrees  · status: done · fe60721b
 
 User 2026-11-01 (via the natedev showrunner and sdlc): trust `~/worktrees` once, so a new folder under it starts with no trust prompt. Claude Code carries trust from a parent folder to every folder below it, also after a move (herdr-unit test).
 
-**Work Order:**
-- `config/accounts.toml` (new) lists the trusted folders: `[trust] folders = ["~/worktrees"]`, read at use.
-- `accounts.py trust` sets `projects[<absolute folder>].hasTrustDialogAccepted = true` in every Claude account's `.claude.json` on this machine (`~/.claude.json` for `~/.claude`, `<home>/.claude.json` for each numbered home). It touches no other key or entry and prints no login. A rerun changes nothing and exits 0 with one line per home.
-- Safe against a live Claude rewriting the file: read, change and publish atomically under the account-home lock the seed code uses, keep the file mode, re-read after the write, and retry when the file changed under us. Find from the installed Claude Code whether it merges the file from disk before it saves; if it can drop our key, the command says so and the proof below catches it.
-- The seed for a new account carries the trusted folders through `_filtered_seed` and `_seed_config`, with the same helper as `trust` — no second copy.
-- Tests use scratch homes only.
-
-**Proof (director):** after merge, run `accounts.py trust` on natedev and on the Mac; then a throwaway session in a new folder under `~/worktrees` on each account kind starts with no trust prompt; remove the folder after.
+**As-built:** `config/accounts.toml` `[trust] folders` lists `~/worktrees`. `accounts.py trust` sets `hasTrustDialogAccepted` for each folder in every Claude account file on the machine, touches no other key and prints one line per account; a rerun changes nothing. It follows Claude Code 2.1.296's `.claude.json.lock` protocol (waits for a held lock, 10 s stale rule), prepares and fsyncs outside the lock, and under the lock only compares bytes and mode and replaces (hold well under Claude's 1.5 s boot retry). A new account's seed carries the folders through the same helper. `scripts/lib/atomic_file.py` keeps late mode selection for its other callers. Residual, stated in `docs/accounts.md`: a Claude save that skips its own lock can lose any writer's change; rerun `trust`. Three repair rounds; style review PASS. Live apply and proof follow the user's confirmation.
