@@ -31,6 +31,7 @@ from typing import NamedTuple, cast
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.production import completion_receipt, staff, staff_sources
+from scripts.shutdown import remote
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "whoami"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
@@ -295,11 +296,14 @@ def _main(argv: list[str]) -> int:
             completed = promotion_record(parent, unit_name).with_suffix(".done.json")
             receipt = completion_receipt.read_receipt(completed, record)
             if isinstance(receipt, completion_receipt.OwnedReceipt):
+                if isinstance(receipt.owner.doc, staff.WrappedDoc):
+                    raise Refusal(f"{receipt.owner.name}: showrunner is wrapped; cannot complete this promotion")
+                old = staff_sources.member(staff_sources.UnitMember(parent.slug, unit_name), record)
                 child_doc = receipt.fields.get("child_doc")
                 if (receipt.owner.kind == "showrunner" and isinstance(child_doc, str)
                         and Path(child_doc).resolve() == cast(Path, args.production).expanduser().resolve()
-                        and isinstance(staff_sources.member(staff_sources.UnitMember(parent.slug, unit_name), record),
-                                       staff_sources.NoSuchMember)):
+                        and (isinstance(old, staff_sources.NoSuchMember)
+                             or isinstance(old.row.worktree, staff.RemovedWorktree))):
                     print(f"{unit_name} already promoted")
                     return 0
         promotion = checked(cast(str, args.unit), cast(Path, args.production))
@@ -316,12 +320,14 @@ def _main(argv: list[str]) -> int:
               + f"{slug} in {promotion.worktree} under {promotion.parent.slug}, and retire its row; {moved}")
         return 0
     old_member = staff_sources.member(staff_sources.UnitMember(promotion.parent.slug, promotion.unit), record)
-    new_member = staff_sources.member(staff_sources.ShowrunnerMember(slug), record)
     parent_member = staff_sources.member(staff_sources.ShowrunnerMember(promotion.parent.slug), record)
-    if isinstance(parent_member, staff_sources.NoSuchMember):
-        _ = staff.ensure("showrunner", name=showrunners.herdr_space(promotion.parent.slug, str(promotion.parent.doc)))
-    if isinstance(new_member, staff_sources.NoSuchMember):
-        new_member = staff_sources.MemberFound(staff.ensure("showrunner", name=showrunners.herdr_space(slug, str(promotion.child.doc))))
+    parent_row = parent_member.row if isinstance(parent_member, staff_sources.MemberFound) else None
+    parent_location = staff.LiveDoc(remote.local_machine(), promotion.parent.doc.resolve())
+    if parent_row is None or parent_row.doc != parent_location:
+        _ = staff.ensure("showrunner", name=parent_row.name if parent_row else showrunners.herdr_space(
+            promotion.parent.slug, str(promotion.parent.doc)), parent=parent_row.parent if parent_row else None,
+            doc=parent_location)
+    new_member = staff_sources.MemberFound(add_showrunner.ensure_staff_showrunner(promotion.child, promotion.parent.slug))
     was_pending = pending.exists()
     if not was_pending:
         save_promotion(promotion, target_directory)
@@ -375,7 +381,7 @@ def _main(argv: list[str]) -> int:
         if workers:
             return 1
         if result.unit_retired:
-            _ = staff.retire(old_member.row.id)
+            _ = staff.set_worktree(old_member.row.id, staff.RemovedWorktree(remote.local_machine(), promotion.worktree))
     if result.exit_code == 0:
         fields = cast(dict[str, object], json.loads(pending.read_text(encoding="utf-8")))
         completion_receipt.write_receipt(pending.with_suffix(".done.json"), new_member.row.id, fields)

@@ -3202,8 +3202,10 @@ class UnitTabClassifier:
     by_workspace: dict[str, dict[str, UnitTab]]
 
     def __init__(self, session: str, processes: Sequence[HerdrProcess], record: staff.StaffSnapshot) -> None:
-        parents = {row.id: row for row in record.find(kind="showrunner")}
-        units: dict[str, UnitTab] = {row.id: UnitTab(row, parents[row.parent]) for row in record.find(kind="unit")
+        from scripts.production import staff
+
+        parents = {row.id: row for row in staff.active(record, "showrunner")}
+        units: dict[str, UnitTab] = {row.id: UnitTab(row, parents[row.parent]) for row in staff.active(record, "unit")
                                      if row.parent is not None and row.parent in parents}
         self.by_pane = {process.place.pane: units[ident] for process in processes
                         if process.place.session == session and (ident := process.marks.get("STAFF_ID")) in units}

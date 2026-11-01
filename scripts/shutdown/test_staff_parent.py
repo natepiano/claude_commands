@@ -58,7 +58,7 @@ class StaffParentTests(StaffTestCase):
         saved = self.saved_unit()
         member = staff.snapshot().by_path("demo/owner")
         assert member is not None
-        _ = staff.retire(member.id)
+        self.forget_rows(member.id)
         output = io.StringIO()
         def launch(*_args: object, **_kwargs: object) -> restart.SessionLaunched:
             _ = restart._unit_argv(saved)  # pyright: ignore[reportPrivateUsage]

@@ -22,6 +22,7 @@ from dailies_input import (BevyUpgradeUnavailable, Block, ClaudeNotRunning, Deci
                            Running, SessionGone, StillWaiting, TicksFailing, bevy_upgrade_watch)
 import unit_lookup
 from scripts.production import staff
+from scripts.shutdown.remote import local_machine
 from scripts.production.staff_test_support import fixture_showrunner_name, unit_membership
 from unit_lookup import UnitState
 from dailies_input_test_support import (DailiesInputFixture, SCRIPT, RENDERER, WAITING, STAMP, AT,
@@ -582,7 +583,9 @@ class DailiesInputTests(DailiesInputFixture):
         self.assertEqual(cast(dict[str, object], self.unit()["eta"])["time"], "23:40")
 
     def test_a_dailies_leaves_a_retired_units_note_for_the_timer_to_prune(self) -> None:
-        _ = staff.retire(unit_membership(fixture_showrunner_name("example", self.doc), ALPHA).id)
+        _ = staff.set_worktree(
+            unit_membership(fixture_showrunner_name("example", self.doc), ALPHA).id,
+            staff.RemovedWorktree(local_machine(), self.root / "alpha"))
         note = self.root / "vault/old-showrunner/alpha-unit.md"
         note.parent.mkdir(parents=True)
         _ = note.write_text(
@@ -666,7 +669,9 @@ class DailiesInputTests(DailiesInputFixture):
         self.assertEqual([unit["unit"] for unit in units], [ALPHA])
 
     def test_all_retired_units_report_no_live_units(self) -> None:
-        _ = staff.retire(unit_membership(fixture_showrunner_name("example", self.doc), ALPHA).id)
+        _ = staff.set_worktree(
+            unit_membership(fixture_showrunner_name("example", self.doc), ALPHA).id,
+            staff.RemovedWorktree(local_machine(), self.root / "alpha"))
         content = self.doc.read_text(encoding="utf-8")
         _ = self.doc.write_text(content.replace("`docs/alpha.md`", "retired after completion", 1),
                                 encoding="utf-8")

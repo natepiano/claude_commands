@@ -35,6 +35,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "herdr"))
 
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.production import showrunners, staff
+from scripts.shutdown.remote import local_machine
 from scripts.production.staff_test_support import isolated_staff_file, showrunner_relationship, unit_membership
 import fake_unit_host
 from fake_unit_host import HostedUnit
@@ -259,7 +260,8 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
             intended = {unit_membership(session, unit).id for unit in live_units}
             for row in staff.snapshot().find(kind="unit", parent=parent.id):
                 if row.id not in intended:
-                    _ = staff.retire(row.id)
+                    _ = staff.set_worktree(row.id, staff.RemovedWorktree(
+                        local_machine(), Path(f"/tmp/no-worktree-of-{row.name}")))
             # A showrunner is recorded by its update timer alone, addressed to its Claude session id.
             self.production(session, tuple(units), doc=self.root / f"{session}-production.md")
             rows = [f"| {unit} | {self.plans.get(unit, '`docs/plan.md`')} | /tmp/no-worktree-of-{unit} | {unit} | — | — |"

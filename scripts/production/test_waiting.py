@@ -29,6 +29,7 @@ import production_units
 import dailies_render
 import merge_checkpoint
 from scripts.production import production_doc, staff
+from scripts.shutdown.remote import local_machine
 from scripts.production.staff_test_support import isolated_staff_file, unit_membership
 from fake_showrunner import write_timer
 import update_registration
@@ -306,7 +307,8 @@ class WaitingTests(unittest.TestCase):
 
 
     def test_named_unit_refuses_retired_row(self) -> None:
-        _ = staff.retire(unit_membership("showrunner-example", ALPHA).id)
+        _ = staff.set_worktree(unit_membership("showrunner-example", ALPHA).id,
+                               staff.RemovedWorktree(local_machine(), self.alpha))
         content = self.doc.read_text(encoding="utf-8")
         self.write(self.doc, content.replace("`docs/alpha.md`", "(retired by the user)", 1))
         production = production_units.read_production(self.doc)
@@ -742,7 +744,8 @@ runpy.run_path(sys.argv[0], run_name='__main__')
         self.assertNotIn(f"{BETA} on {ALPHA}: open", output.getvalue())
 
     def test_waits_hide_retired_waiting_unit_but_keep_live_wait_on_it(self) -> None:
-        _ = staff.retire(unit_membership("showrunner-example", ALPHA).id)
+        _ = staff.set_worktree(unit_membership("showrunner-example", ALPHA).id,
+                               staff.RemovedWorktree(local_machine(), self.alpha))
         content = self.doc.read_text(encoding="utf-8")
         self.write(self.doc, content.replace("`docs/alpha.md`", "retired after completion", 1))
         now = datetime.now(ZoneInfo("America/Los_Angeles"))

@@ -217,12 +217,14 @@ def lookup_slug(slug: str) -> str:
 
 def production_members(record: staff.StaffSnapshot, sources: MemberSources) -> dict[str, tuple[staff.StaffRow, ...]]:
     """All recorded unit children, including those with no pane or local worktree."""
-    runners = sources.showrunner_members(record)
+    active_runners = {row.id for row in staff.active(record, "showrunner")}
+    runners = {slug: row for slug, row in sources.showrunner_members(record).items() if row.id in active_runners}
     # A timer is not required for an offline production whose short name is its slug.
     mapped = {row.id for row in runners.values()}
-    runners.update({row.name: row for row in record.find(kind="showrunner")
+    runners.update({row.name: row for row in staff.active(record, "showrunner")
                     if row.id not in mapped and row.name not in runners})
-    return {slug: tuple(record.find(kind="unit", parent=row.id)) for slug, row in runners.items()}
+    return {slug: tuple(unit for unit in staff.active(record, "unit") if unit.parent == row.id)
+            for slug, row in runners.items()}
 
 
 def group_marked_units(marked: Iterable[tuple[str, MarkedUnit]], *,
@@ -231,7 +233,21 @@ def group_marked_units(marked: Iterable[tuple[str, MarkedUnit]], *,
     """Join panes to the recorded parent; refuse ambiguous legacy names and duplicate panes."""
     record = record if record is not None else staff.snapshot()
     sources = sources if sources is not None else member_sources()
+    return _group_marked_units(marked, record, sources, production_members(record, sources))
+
+
+def retained_unit_marks(marked: Iterable[tuple[str, MarkedUnit]], row: staff.StaffRow, slug: str, *,
+                        record: staff.StaffSnapshot, sources: MemberSources) -> MarkedProductions:
+    """Keep pane evidence for a retained identity during stop and cleanup checks."""
     membership = production_members(record, sources)
+    if row not in membership.get(slug, ()):
+        membership[slug] = (*membership.get(slug, ()), row)
+    return _group_marked_units(marked, record, sources, membership)
+
+
+def _group_marked_units(marked: Iterable[tuple[str, MarkedUnit]], record: staff.StaffSnapshot,
+                        sources: MemberSources,
+                        membership: dict[str, tuple[staff.StaffRow, ...]]) -> MarkedProductions:
     parents = {row.id: slug for slug, rows in membership.items() for row in rows}
     found: dict[str, dict[staff.StaffId, list[MarkedUnit]]] = {}
     faults: dict[str, dict[str, str]] = {}
@@ -243,6 +259,11 @@ def group_marked_units(marked: Iterable[tuple[str, MarkedUnit]], *,
             row = selected.row
             slug = parents.get(row.id)
             if slug is None:
+                parent = record.by_id(row.parent) if row.parent is not None else None
+                if (isinstance(row.worktree, staff.RemovedWorktree)
+                        or (parent is not None and parent.kind == "showrunner"
+                            and isinstance(parent.doc, staff.WrappedDoc))):
+                    continue
                 raise staff.StaffUnreadable(f"{row.name}: no showrunner staff parent")
         except (staff.StaffUnreadable, unit_names.BadName) as error:
             faults.setdefault(old_slug, {})[unit.unit] = str(error)

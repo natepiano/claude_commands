@@ -647,7 +647,7 @@ Split from 3l on 2026-10-31; the same user ask and the same sdlc acceptance as 3
 
 **Acceptance gate:** basedpyright 0/0 on changed files and callers; `test_unit_config*` and `test_staff_sources*` pass, with a test that runs taplo on the writer's output under an aligning config; the live rerun rewrites the files, `taplo fmt --check .unit.toml` passes in each filled worktree, and a second rerun prints `unchanged` with no byte changed.
 
-### Phase 3r — Writers keep the worktree, the doc and `.unit.toml` current; retired rows filled  · status: todo
+### Phase 3r — Writers keep the worktree, the doc and `.unit.toml` current; retired rows filled  · status: done
 
 **Depends on:** 3q.
 
@@ -692,6 +692,73 @@ Split from 3l on 2026-10-31; the same user ask and the same sdlc acceptance as 3
 **Constraints from prior phases:** Phase 3q (`set_worktree`, `set_doc`, the unfilled states, `unit_config.park`, `restore`, `discard_parked`, `place`, `git_exclude.ensure_excluded`, `tunables`, the fill and its manifest). Phase 3 (each tool writes its row and checks the staff step before any change). Delegation Context → Staff design (2026-10-31), Rerun-safe tools, Lifecycle reruns keep the pane, No hard-coded config.
 
 **Acceptance gate:** basedpyright 0/0 on changed files and every caller module; the named suites pass; the active-unit list of `live_units.py` and of the roster on natedev is the same before and after the retired backfill (the backfill adds no active unit); a real add, retire and resume of a throwaway unit: the file sits in the worktree, then in `~/.local/state/staff/units/<staff id>.toml`, then back, the row's worktree state follows, the row stays after the retire, and the resumed worktree is on the branch it had; the backfill proof: the parked file of `guild-process-unit` holds session `842c2149-c59b-4abd-934c-ba61d14944ad`, its folder (from the transcript folder) and its branch, and a real `resume_unit.py sdlc guild-process-unit --dry-run` passes from the parked file alone; a resume with neither file refuses with the line above and changes nothing; a retire stopped after the park, a resume stopped after the restore and a resume stopped after the launch and before `discard_parked` each finish on rerun, and the last keeps the session facts until then; a real `rename_unit.py` of a throwaway unit leaves the row's worktree on the moved folder, and one stopped after the folder move sets it on rerun; `fill --retired` lists every missing fact for sdlc, a stop after one unit finishes on rerun, and a rerun of a finished run prints `unchanged` and exits 0; a rerun of each finished tool changes nothing and exits 0; `staff_sources.py fill --dry-run` then reports `unchanged`; a changed `config/production.conf` value takes effect with no code change; item 11: a real `add_unit.py` launch of a throwaway unit, a real `add_showrunner.py` launch, a real `resume_unit.py` and a real account move each leave a pane launch record whose environment carries `STAFF_ID=<the row's id>` (read from `~/.local/state/herdr-panes/`), a real relaunch of herdr-unit (or a throwaway unit) then shows its right showrunner, not `unassigned`, in each session reader that printed `unassigned` (`roster.py`, `usage_report.py`; the checkpoint notice names the one the user saw), and a rerun of each changes nothing and exits 0; full gate green.
+
+### Phase 3i — Read-only staff check lists every wrong row  · status: in progress
+
+**Depends on:** 3m. Runs beside 3r (sdlc showrunner, 2026-11-01); lands after it, since both change `staff_sources.py`.
+
+#### Work Order
+
+**Goal:** one read-only command, `staff_check.py`, lists every wrong staff row and exits 0 only when every row is right, so sdlc can see what is still wrong.
+
+**Spec (sdlc showrunner, 2026-11-01):**
+1. Safe to rerun: it writes no file, row, mark or lock.
+2. One row per live session: each live Claude or Codex session that carries a `STAFF_ID` names exactly one existing row, and one row has at most one live session.
+3. Each parent is live where the row is live, and is the correct kind. A record the staff reader refuses (a missing parent, a wrong parent kind) exits 2 with the reader's reason.
+4. Each unit row's worktree, and each showrunner row's doc, exists and belongs to that row; a retired row's `RemovedWorktree` is right.
+5. Each live worker is under its unit's row. Worker liveness is the shared scanner's answer (`staff_sources.observe_workers`), the same one the fill uses.
+6. It lists wrong rows, one line each (`<row id> <name>: <what is wrong>`), then one count line; evidence it cannot settle is listed as uncertain, never filled in. Exit 1 when it lists a line, 2 when a source cannot be read.
+7. A new file that reads staff through the one existing reader (`staff.snapshot()` and the existing joins), with no copy of their logic. Any strict read it needs leaves the existing callers' behavior as it is.
+
+**Files:** new `scripts/production/staff_check.py` and `scripts/production/test_staff_check.py`; the smallest accessors in `scripts/production/staff_sources.py`, `scripts/production/session_staff.py`, `scripts/production/showrunners.py`, `scripts/herdr/herdr.py`.
+
+**Workers:** `1 writer` — `fix`, in its own clone.
+
+**Acceptance gate:** basedpyright 0/0 on changed files and their callers; `test_staff_check.py`, `test_staff.py`, `test_staff_sources.py` pass; a real run on natedev lists only real wrong rows (its output goes to sdlc); two runs print the same bytes and change nothing on disk.
+
+### Phase 3h — A session's `STAFF_ID` comes from its row; a dead id is listed, never replayed  · status: todo
+
+**Depends on:** 3r and 3i (both change `staff.py`, `staff_sources.py` and `session_staff.py`). Top priority beside 3r (sdlc showrunner, 2026-11-01).
+
+#### Work Order
+
+**Goal:** a restart or restore never brings back a `STAFF_ID` whose row is gone, a row's id never changes for the life of its unit, and every reader shows a session with no valid id one way.
+
+**Spec:** sdlc showrunner rulings, 2026-11-01; staff correctness is an invariant (user ruling).
+1. A restart or restore takes `STAFF_ID` from the staff row. It never replays a recorded id whose row is gone (`pane_record.retained_environment`, `session_labels.StaffLabels.environment`). When no single row matches, the session gets no `STAFF_ID` and is listed on one line; nothing is set by name alone.
+2. Removing a row refuses while a live session carries its id, and names the session.
+3. The handler shows a session with no valid id one way (today: top-level for two, unassigned for one).
+4. `staff_check.py` lists a live session whose `STAFF_ID` names no row; a test pins it.
+5. `worker_admission.py:84` names what it could not find: the `STAFF_ID` and the run, never an empty name.
+6. A row's id never changes for the life of its unit or showrunner: a move changes the parent and the tab only. `_ensure_row` and `_validate` hold the rule: a unit's or showrunner's identity is not tied to its parent, and an ensure under a different parent refuses and names `staff.py move`. Each ensure caller gets a test: `add_unit.py`, `staff_sources.py:73` and `:1344`, `promote_showrunner.py:327`, the seed import at `staff.py:944/952`.
+7. The retired fill lists a same-name pair (such as `notifier-unit` in two productions) and adds nothing; a resume of one of them stops at that line.
+
+**Cause (proved 2026-11-01):** at main `d61b993ec` (10-31 18:15), `add_unit.ensure_staff_unit` looked the unit up only inside production `natedev`, found none, and called `staff.ensure` under the natedev row; `_ensure_row` matches on (kind, name, parent), so three new ids were made, and the restore path replayed them after their rows were removed.
+
+**Files:**
+- `scripts/production/staff.py`
+- `scripts/production/staff_sources.py`
+- `scripts/production/promote_showrunner.py`
+- `scripts/production/add_unit.py`
+- `scripts/production/session_labels.py`
+- `scripts/production/session_staff.py`
+- `scripts/production/worker_admission.py`
+- `scripts/production/staff_check.py`
+- `scripts/shutdown/pane_record.py`
+- `scripts/message/roster.py`
+- `scripts/production/test_staff.py`
+- `scripts/production/test_staff_sources.py`
+- `scripts/production/test_promote_showrunner.py`
+- `scripts/production/test_add_unit.py`
+- `scripts/production/test_session_labels.py`
+- `scripts/production/test_worker_admission.py`
+- `scripts/production/test_staff_check.py`
+- `scripts/shutdown/test_pane_record.py`
+- `scripts/message/test_roster.py`
+
+**Workers:** `1 writer, 1 tester` — `impl` and `test`, in one clone.
+
+**Acceptance gate:** basedpyright 0/0 on changed files and their callers; the changed modules' tests pass; the full merge gate passes. Live, from main: restart shutdown (idle), then style, then herdr-unit, and worker 2864179; each new `STAFF_ID` read from `/proc` names its sdlc row; style-unit's worker admission passes without a hand-set id; a real herdr-up rerun leaves all of them under sdlc; `staff_check.py` lists no dead id.
 
 ### Phase 3s — The one join answers from the row  · status: todo
 
@@ -739,6 +806,7 @@ Split from 3l on 2026-10-31; the same user ask and the same sdlc acceptance as 3
 2. Each reads who exists and who reports to whom from one snapshot, and each fact from the resolver. A timer still gives its session, socket, zone and interval through `showrunners.timer_for` (decision 16); its doc comes from the showrunner row. The excluded files keep their `production_units` import until Phase 4c moves it. `resume_unit.py` and `retire_unit.py` stop reading the retired note: the parked file holds it. `add_unit.py` finds an existing unit by its row, not by its Units row.
 3. The Owns scope check of `merge_checkpoint.py` (:243-248, :583) is not changed here; Phase 4b deletes it.
 4. History stays history: a reader that reports who owned a past commit or run keeps what the artifact recorded (old 3i rule).
+5. **The resume recovery type states its guarantee (moved here from the Phase 3r closure review, 2026-11-01).** `resume_unit.py:89` holds `recovery: UnitConfig | NoRetiredSession`. A `UnitConfig` can lack the retirement facts, and the sentinel means only that no recovery file is outstanding, so the callers keep the guarantee by procedure. Replace it with one named recovery type whose retirement facts are mandatory, and a separate `NoRecoveryRequired` state. A test pins that a recovery value without the retirement facts cannot be made.
 
 **Files:**
 - `scripts/production/{add_showrunner,add_unit,change_review,ci_points,codex_winddown,completion_receipt,footer_counts,log_backup,merge_checkpoint,merge_gate,next_item,production_lifecycle,promote_showrunner,proposals_folder,proposals_table,prune_phase_notes,resume_unit,retire_unit,roles_audit,stall_watch,style_units,unit_run,update_registration,waiting}.py` — the readers item 1 lists (ac680222); a reader the search finds at dispatch joins them.

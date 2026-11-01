@@ -26,6 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.accounts import accounts, next_moves, outage_alerts, refusal_watch, role_map, unit_watchdog
 from scripts.accounts import test_refusal_watch as fixtures
 from scripts.production import showrunners, staff
+from scripts.shutdown.remote import local_machine
 from scripts.production.staff_test_support import isolated_staff_file, showrunner_relationship, unit_membership
 from scripts.shutdown import folder_trust, stop_resume
 from scripts.notify.push_texts import RenderedPush
@@ -132,9 +133,9 @@ class UnitWatchdogTests(unittest.TestCase):
         rows = ["# Fixture", "- **Production slug:** fixture", "## Units", "| Unit | Plan | Worktree |", "| --- | --- | --- |"]
         for name in self.units:
             member = unit_membership("fixture", name)
-            if name in self.retired:
-                _ = staff.retire(member.id)
             tree = self.home / name
+            if name in self.retired:
+                _ = staff.set_worktree(member.id, staff.RemovedWorktree(local_machine(), tree))
             tree.mkdir(exist_ok=True)
             _ = (tree / ".git").write_text("gitdir: scratch\n")
             events: list[dict[str, object]] = [{"event_type": "run_started", "working_dir": str(tree), "run_started_at": 1}]
