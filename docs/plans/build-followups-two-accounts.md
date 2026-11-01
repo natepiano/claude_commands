@@ -3051,16 +3051,8 @@ Found 2026-11-01: a leftover `oauthAccount` with no credential that `cutover-hom
 
 **As-built:** `cutover-home` removes leftover account data (dated private backup, atomic write) when no credential file or keychain entry exists, also after a complete journal; an already-clean home exits 0 with one line and no write. `accounts.py exec claudeN` refuses a wrong sign-in with the label only and prints `env -u CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR=<home> claude`, then `/login`; `docs/accounts.md` matches. The brp job and its setup check share one script that removes user-scope brp and registers brp at local scope in `~/rust/{hana,nateroids,bevy_brp}` for `~/.claude` and each numbered home, writing only on a difference: /etc/nixos branch `accounts-brp-local-scope` (881cc227), pushed by the showrunner. Also: `mac_usage.interval_seconds` went back to 120, because at 60 the provider answered 429 across the four Claude accounts in turn while Codex read fine. One repair round (credential-file check on macOS; clean-home rerun).
 
-### Phase 101m — The accounts board shows how many sessions use each role  · status: done
+### Phase 101m — The accounts board shows how many sessions use each role  · status: done · ab8092aa
 
-User 2026-11-01: "i want the accounts-board modified to add the count of the role and swap the column order account, left, role, count, resets, credits, enabled, in use, read". Also: "if two roles are on one account show the counts for each separated by comma in the same order that you output the role names". The user found the `in use` column empty; it marks an account that spends paid credits, so it is blank in normal use. Director call: keep it in the order the user gave. The user asked to tell the handler unit about the change.
+User 2026-11-01: add a role count to the accounts board and order the columns account, left, role, count, resets, credits, enabled, in use, read; two roles show two counts in role order. The handler unit was told.
 
-**Depends on:** 101l (same file, `accounts.py`).
-
-#### Work Order
-
-- **Count.** The stored-status JSON from `accounts.py` gives each account a live session count per role, in the same order as its roles. Units, showrunners and workers count their live members on that account; `spare` has no count. The count comes from the same live-session source that `--detail` uses, read without ssh.
-- **Board.** `mods/unit-board/hooks/accounts.tsx` shows the columns in this order: account, left, role, count, resets, credits, enabled, in use, read. The count cell joins the role counts with `, ` in role order (`units, showrunners` → `3, 2`). The narrow layout keeps the same order.
-- Tests: JSON counts for one role, two roles on one account and a spare account; board column order and the joined count cell. Tests never read live homes, sessions or state.
-
-**Files:** `scripts/accounts/accounts.py`, its tests, `mods/unit-board/hooks/accounts.tsx`, `mods/unit-board/types/accounts.d.ts`, `mods/unit-board/tests/accounts.test.ts`, `docs/accounts.md`.
+**As-built:** `accounts.py` stored-status JSON carries `role_counts` per account: live members per role from the local session registry, launch history and the shared staff classifier, with no ssh or usage read. `mods/unit-board/hooks/accounts.tsx` shows the requested order; the count cell joins counts with `, ` in role order, blank for spare. `scripts/herdr/pane_launch.py` validates each history entry and skips only a damaged one. An unchanged board tick refreshes counts; a failed refresh keeps its retry. `in use` stays: it marks paid-credit use. Also fixed two tests the 101l gate turned red. Three repair rounds; style review PASS.
