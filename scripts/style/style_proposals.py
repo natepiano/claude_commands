@@ -572,8 +572,9 @@ _DEFAULT_PROPOSAL_READS = DefaultProposalReads()
 
 
 def judged_at_current_file(ledger: style_ledger.Ledger, finding: style_ledger.HeldFinding, tip: str) -> bool:
-    """Whether the shared declaration evidence retains this finding's source site."""
-    return isinstance(ledger.finding_site(finding, tip), style_ledger.UnchangedSite)
+    """Whether the shared evidence permits filing, including existing untracked findings."""
+    return isinstance(ledger.finding_site(finding, tip),
+                      (style_ledger.UnchangedSite, style_ledger.FilingEligibleWithoutHistory))
 
 
 def print_finding_waits(issue: Path, waits: Mapping[tuple[str, str], int]) -> None:
@@ -616,7 +617,8 @@ def ranked_work(ledger: style_ledger.Ledger, cells: Iterable[style_ledger.Cell],
             family = families.get(finding.rule.removesuffix("#uncovered"))
             if family is not None and counts(family, crate_for(directories, finding.path)) and (
                     isinstance(finding.state, style_ledger.Filed)
-                    or isinstance(evidence[finding.finding_id], style_ledger.UnchangedSite)):
+                    or isinstance(evidence[finding.finding_id],
+                                  (style_ledger.UnchangedSite, style_ledger.FilingEligibleWithoutHistory))):
                 work[finding.path].add(family)
     return RankedWork({path: frozenset(present) for path, present in work.items()})
 
@@ -832,12 +834,12 @@ class MovedSites:
             text = finding.text.strip()
             if len(text.splitlines()) != 1 or any(text in line for line in self.lines_at(self.tip, finding.path)):
                 continue
-            judged = self.ledger.judged_commit(finding)
-            if isinstance(judged, style_ledger.NoJudgedCommit):
+            anchor = self.ledger.finding_anchor(finding)
+            if isinstance(anchor, style_ledger.NeedsJudgment):
                 continue
-            gained = [path for path in self.changed_since(judged.commit)
+            gained = [path for path in self.changed_since(anchor.commit)
                       if path != finding.path and text in self.lines_at(self.tip, path)
-                      and text not in self.lines_at(judged.commit, path)]
+                      and text not in self.lines_at(anchor.commit, path)]
             if len(gained) == 1:
                 moved[finding.finding_id] = gained[0]
         return moved
@@ -1641,6 +1643,8 @@ def follow_line(outcome: DeclarationChange, tip: str) -> str:
                 return f"follow {site} -> {path}:{line}: unchanged source site"
             case style_ledger.NeedsJudgment(reason):
                 return f"left {site}: needs judgment: {reason}"
+            case style_ledger.FilingEligibleWithoutHistory():
+                return f"left {site}: eligible for filing without source history"
     suffix = (style_ledger.outside_evidence_suffix(outcome.evidence)
               if isinstance(outcome, (style_ledger.DeclarationRemoved, style_ledger.DeclarationGoneFromFile,
                                       style_ledger.DeclaredInSeveralFiles, style_ledger.DeclaredInAnotherCrate))
@@ -1704,7 +1708,7 @@ def run_follow(writer: DecisionWriter, findings: Iterable[style_ledger.HeldFindi
     skipped: list[Path] = []
     for issue in sorted({outcome.finding.state.proposal for outcome in planned.outcomes
                          if (isinstance(outcome, (style_ledger.DeclarationMoved, style_ledger.DeclarationRemoved))
-                             or isinstance(outcome, style_ledger.FindingSite) and not isinstance(outcome.evidence, style_ledger.NeedsJudgment))
+                             or isinstance(outcome, style_ledger.FindingSite) and isinstance(outcome.evidence, style_ledger.UnchangedSite))
                          and isinstance(outcome.finding.state, style_ledger.Filed)}):
         if not open_decision(issue):
             continue

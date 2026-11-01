@@ -128,6 +128,11 @@ elif verb == 'follow':
     pathlib.Path(session / 'follow_message.txt').write_text(
         pathlib.Path(option('--message-file')).read_text()
     )
+    if os.environ.get('STUB_EXPECT_PREPARED_STYLE'):
+        prompt = pathlib.Path(option('--message-file')).read_text()
+        diff_line = next(line for line in prompt.splitlines() if line.startswith('- Diff '))
+        diff = pathlib.Path(diff_line.split(': ', 1)[1])
+        pathlib.Path(session / 'prepared_at_dispatch.diff').write_bytes(diff.read_bytes())
     finish_file = os.environ.get('STUB_REVIEW_FINISH_FILE', '')
     if finish_file:
         sys.path.insert(0, os.environ['TEST_WAIT_HELPER_DIR'])
@@ -243,6 +248,17 @@ class ReviewLauncherFixture(LauncherFixture):
         for name in ("review.sh", "review_tree.py", "tag_inventory.py"):
             _ = shutil.copy2(DIRECT_DIR / name, direct_dir / name)
         configure_launcher_fixture(direct_dir / "review.sh")
+        lint = self.root / "scripts/lint"
+        lint.mkdir()
+        for name in ("style_review.py", "lint_config.sh"):
+            _ = shutil.copy2(DIRECT_DIR.parent / "lint" / name, lint / name)
+        message = self.root / "scripts/message"
+        message.mkdir()
+        for name in ("sessions.py", "process_identity.py", "relay_identity.py"):
+            _ = shutil.copy2(DIRECT_DIR.parent / "message" / name, message / name)
+        review_config = self.root / "config/review"
+        review_config.mkdir(parents=True)
+        _ = shutil.copy2(DIRECT_DIR.parents[1] / "config/review/style.md", review_config / "style.md")
         stub = agents / "agent_exec.sh"
         _ = stub.write_text(STUB_AGENT_EXEC, encoding="utf-8")
         stub.chmod(0o755)
@@ -254,6 +270,7 @@ class ReviewLauncherFixture(LauncherFixture):
     @override
     def environment(self) -> dict[str, str]:
         environment = launcher_environment(self.root)
+        environment["LINT_CONFIG_FILE"] = str(self.root / "lint.conf")
         environment["UNIT_EARLY_POLL_SECS"] = "0.01"
         environment["TEST_WAIT_HELPER_DIR"] = str(DIRECT_DIR.resolve())
         # Early mode starts a detached Stage 2 run; the stub records its arguments instead.

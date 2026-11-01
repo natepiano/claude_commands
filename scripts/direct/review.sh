@@ -2,7 +2,7 @@
 # review.sh — Invoke the configured worker agent for a review.
 #
 # Usage: review.sh [--to <worker> | --slot <new-slot>]
-#                  [--phase <id>] <session_dir>
+#                  [--phase <id>] [--style-since <commit> [--style-until <commit>]] <session_dir>
 #                  [working_dir] [prompt_file] [task]
 #                  [role_description] [pass_activity] [pass_index] [lens]
 #                  [early_ready_file]
@@ -61,12 +61,17 @@ FOLLOW_TO=""
 NEW_SLOT=""
 # A phase running beside the current one names itself, so start-pass stamps this pass with it.
 PHASE_ID=""
+STYLE_SINCE=""
+STYLE_UNTIL=""
+STYLE_INPUT_DIR=""
 REQUESTED_LENS=""
 while [[ "${1:-}" == --* ]]; do
   case "$1" in
     --to) FOLLOW_TO="${2:?--to requires a worker}" ;;
     --slot) NEW_SLOT="${2:?--slot requires a slot}" ;;
     --lens) REQUESTED_LENS="${2:?--lens requires a lens}" ;;
+    --style-since) STYLE_SINCE="${2:?--style-since requires a baseline}" ;;
+    --style-until) STYLE_UNTIL="${2:?--style-until requires an end commit}" ;;
     --phase) PHASE_ID="${2:?--phase requires a phase id}" ;;
     *) echo "ERROR: unknown review option '$1'." >&2; exit 2 ;;
   esac
@@ -88,6 +93,14 @@ if [[ -n "${PHASE_ID}" ]]; then
     exit 2
   fi
   ARTIFACT_DIR="${SESSION_DIR}/phases/${PHASE_DIR_NAME}"
+fi
+if [[ -n "${STYLE_SINCE}" && ( -z "${PHASE_ID}" || -n "${9:-}" ) ]]; then
+  echo "ERROR: --style-since requires --phase and a final-diff dispatch (no early review)." >&2
+  exit 2
+fi
+if [[ -n "${STYLE_UNTIL}" && -z "${STYLE_SINCE}" ]]; then
+  echo "ERROR: --style-until requires --style-since." >&2
+  exit 2
 fi
 WORKING_DIR="${2:-$(pwd)}"
 PROMPT_FILE="${3:-${ARTIFACT_DIR}/review_prompt.md}"
@@ -458,6 +471,19 @@ for sequence in itertools.count():
 PY
 }
 
+finish_style_review() {
+  [[ -n "${STYLE_INPUT_DIR}" ]] || return 0
+  "$PY" "${SCRIPT_DIR}/../lint/style_review.py" finish \
+    --input-dir "${STYLE_INPUT_DIR}" --result "${FINDINGS_FILE}" --dispatch-code "$1"
+}
+
+finish_fresh_exit() {
+  local code=$?
+  trap - EXIT
+  finish_style_review "${code}" || code=1
+  exit "${code}"
+}
+
 finish_review_exit() {
   local code=$?
   trap - EXIT
@@ -465,6 +491,7 @@ finish_review_exit() {
   if [[ "${code}" -ne 0 && "${TURN_FINDINGS_READY}" -eq 1 ]]; then
     echo error > "${STATUS_FILE}"
   fi
+  finish_style_review "${code}" || code=1
   count_turn_findings
   refresh_turn_thread_id
   if ! write_turn_record; then
@@ -516,6 +543,20 @@ PY
   trap 'interrupt_review 143' TERM
   trap 'interrupt_review 130' INT
   trap 'interrupt_review 129' HUP
+else
+  trap finish_fresh_exit EXIT
+fi
+
+if [[ -n "${STYLE_SINCE}" ]]; then
+  STYLE_DIRECTORY_FILE="${ARTIFACT_DIR}/style_directory.$$.txt"
+  "$PY" "${SCRIPT_DIR}/../lint/style_review.py" prepare \
+    --working-dir "${WORKING_DIR}" --since "${STYLE_SINCE}" \
+    --until "${STYLE_UNTIL}" \
+    --phase-dir "${ARTIFACT_DIR}" --prompt "${PROMPT_FILE}" \
+    --owner-pid "$$" --pass-name "pass-${PASS_INDEX}${SUFFIX}" --directory-file "${STYLE_DIRECTORY_FILE}"
+  STYLE_INPUT_DIR="$(cat "${STYLE_DIRECTORY_FILE}")"
+  rm -f "${STYLE_DIRECTORY_FILE}"
+  PROMPT_FILE="${STYLE_INPUT_DIR}/prompt.md"
 fi
 
 # shellcheck source=/dev/null
