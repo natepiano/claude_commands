@@ -78,6 +78,37 @@ class StaffCheckTests(StaffTestCase):
               mock.patch.object(staff_sources, "observe_workers", return_value=staff_sources.WorkerEvidence((), {}, ()))):
             return staff_check.read_evidence(staff.snapshot())
 
+    def test_codex_app_server_with_a_director_staff_mark_is_not_a_second_session(self) -> None:
+        process = process_table.Process(104, 1, "codex", "codex app-server --listen stdio://")
+        evidence = self.process_evidence(process, sessions.RegistryRead((), ()),
+                                         {"STAFF_ID": self.fixture.unit.id})
+        evidence = replace(evidence, sessions=(*self.fixture.live, *evidence.sessions),
+                           workers=self.fixture.evidence.workers)
+        self.assertEqual(self.check(evidence), (0, "checked 3 rows; 0 wrong\n"))
+
+    def test_codex_director_with_a_claude_director_staff_mark_is_a_second_session(self) -> None:
+        process = process_table.Process(104, 1, "codex", "codex --resume director-thread")
+        evidence = self.process_evidence(process, sessions.RegistryRead((), ()),
+                                         {"STAFF_ID": self.fixture.unit.id, "CODEX_THREAD_ID": "director-thread"})
+        evidence = replace(evidence, sessions=(*self.fixture.live, *evidence.sessions),
+                           workers=self.fixture.evidence.workers)
+        _ = self.assert_wrong(self.fixture.unit,
+                              "multiple live sessions: claude:director, codex:director-thread", evidence)
+
+    def test_codex_app_server_with_top_level_value_options_is_not_a_second_session(self) -> None:
+        for options in ("--local-provider ollama", "--local-provider=ollama",
+                        "-c model=example", "--config=model=example",
+                        "--remote unix:///tmp/example.sock", "--remote=unix:///tmp/example.sock",
+                        "--remote-auth-token-env EXAMPLE_TOKEN", "--remote-auth-token-env=EXAMPLE_TOKEN"):
+            with self.subTest(options=options):
+                process = process_table.Process(
+                    104, 1, "codex", f"codex {options} app-server --listen stdio://")
+                evidence = self.process_evidence(process, sessions.RegistryRead((), ()),
+                                                 {"STAFF_ID": self.fixture.unit.id})
+                evidence = replace(evidence, sessions=(*self.fixture.live, *evidence.sessions),
+                                   workers=self.fixture.evidence.workers)
+                self.assertEqual(self.check(evidence), (0, "checked 3 rows; 0 wrong\n"))
+
     def test_clean_staff_exits_zero_with_only_the_count_line(self) -> None:
         self.assertEqual(self.check(), (0, "checked 3 rows; 0 wrong\n"))
 
@@ -255,6 +286,26 @@ class StaffCheckTests(StaffTestCase):
     def test_unfilled_worktree_is_listed(self) -> None:
         row = staff.ensure("unit", name="unfilled", parent=self.fixture.runner.id)
         _ = self.assert_wrong(row, "worktree is unfilled")
+
+    def test_an_unbound_row_cannot_borrow_another_units_marked_session_or_document(self) -> None:
+        stale = staff.ensure("unit", name="former-name", parent=self.fixture.runner.id)
+        folder = self.worktree("former-name-unit")
+        stale = staff.set_worktree(stale.id, staff.PresentWorktree("natedev", folder))
+        output = self.assert_wrong(stale, "uncertain: no document worktree bound to this unit")
+        self.assertNotIn(f"{self.fixture.unit.id} {self.fixture.unit.name}:", output)
+
+    def test_a_paused_worker_without_a_recorded_role_remains_an_audit_problem(self) -> None:
+        _ = self.session_record("session-models", "models-unit")
+        self.pane("w1:models", session_id="session-models", environment={"STAFF_ID": self.fixture.unit.id})
+        run = self.worker_run("sdlc", "models-unit", "session-models")
+        roster = self.roster_worker(run, "delegate", "", "thread-paused", status="paused")
+        workers = staff_sources.observe_workers(staff.snapshot(), unit_lookup.member_sources())
+        evidence = replace(self.fixture.evidence, workers=workers)
+        code, output = self.check(evidence)
+        self.assertEqual(code, 1, output)
+        self.assertIn(str(roster), output)
+        self.assertIn("missing or invalid recorded worker role", output)
+        self.assertNotIn("delegate", [row.name for row in staff.find(kind="worker")])
 
     def test_unreadable_staff_record_exits_two_and_names_the_source(self) -> None:
         _ = self.staff_file.write_text("broken record")
