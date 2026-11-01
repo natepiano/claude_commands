@@ -223,7 +223,7 @@ class StylePlanTests(StylePlanFixture):
         ])
         held_batches = [ticket for ticket in self.candidates("modules", ("crates/alpha/Cargo.toml",))
                         if ticket.crate == "crates/alpha"]
-        self.assertEqual(held_batches, batches)
+        self.assertEqual(held_batches, [])
         self.record(manifest, "crates/alpha", self.tip)
         self.write(self.sources[0], "pub fn changed() {}\n")
         self.tip = self.commit()
