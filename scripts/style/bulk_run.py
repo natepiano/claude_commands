@@ -99,6 +99,7 @@ class Selection:
     skipped: tuple[bulk.Refusal, ...]
     judgments: tuple[FreshMachineJudgment, ...] = ()
     judgment_policy: JudgmentPolicy = JudgmentPolicy.PROVE_CURRENT
+    newly_admitted: frozenset[str] = frozenset()
 
 
 def approved_finding_decision(finding: ledger_api.HeldFinding, definition: rules.Rule) -> bool:
@@ -290,6 +291,14 @@ class PlannedEdits:
     refusals: tuple[bulk.Refusal, ...]
     constant_proofs: tuple[ConstantTargetProof, ...] = ()
     judgments: tuple[FreshMachineJudgment, ...] = ()
+    pending: tuple[bulk.PendingFinding, ...] = ()
+
+
+def require_ready_plan(plan: PlannedEdits) -> None:
+    """Never execute or rebuild an incomplete atomic batch."""
+    if plan.pending:
+        first = plan.pending[0]
+        raise bulk.ReservationBlocked(first.path, first.holders)
 
 
 def require_edit_paths(repo: Path, files: tuple[bulk.FileRenames | ConstantFileEdit, ...]) -> None:
@@ -446,6 +455,7 @@ def reprove_rename_plan(workspace: WorkspaceEdits, kept: set[str],
     workspace.restore(sorted(workspace.files))
     started = time.monotonic()
     plan = replan(survivors) if survivors else PlannedEdits((), ())
+    require_ready_plan(plan)
     times["rename"] += time.monotonic() - started
     require_edit_paths(workspace.repo, plan.files)
     workspace.refused_files.clear()
@@ -575,12 +585,14 @@ def plan_renames(repo: Path, ledger: ledger_api.Ledger, base: str, selected: Sel
     sources = RenameSources()
     sources.judgments = {item.finding_id: item for item in selected.judgments}
     refused: dict[str, str] = {}
+    pending: list[bulk.PendingFinding] = []
     groups: dict[str, list[bulk.RenameFinding]] = defaultdict(list)
     for finding in selected.findings:
         try:
             rename = current_rename(ledger, finding, base, sources, repo)
             if (isinstance(rename, bulk.Refusal) and finding.finding_id not in sources.judgments
-                    and selected.judgment_policy == JudgmentPolicy.PROVE_CURRENT
+                    and (selected.judgment_policy == JudgmentPolicy.PROVE_CURRENT
+                         or finding.finding_id in selected.newly_admitted)
                     and isinstance(ledger.finding_site(finding, base), ledger_api.NeedsJudgment)):
                 candidate = ledger.rename_judgment_site(finding, base)
                 if isinstance(candidate, ledger_api.NeedsJudgment):
@@ -596,20 +608,26 @@ def plan_renames(repo: Path, ledger: ledger_api.Ledger, base: str, selected: Sel
                 refused[finding.finding_id] = rename.reason
             else:
                 groups[rename.path].append(rename)
+        except bulk.ReservationBlocked as blocked:
+            pending.append(bulk.PendingFinding(finding.finding_id, blocked.path, blocked.holders))
         except (bulk.BulkRenameError, OSError, UnicodeError) as error:
             refused[finding.finding_id] = str(error)
     docs = bulk.repository_docs(repo)
     files: list[bulk.FileRenames] = []
     for path, findings in groups.items():
-        file = bulk.rename_file(server, repo / path, path, sources.current[path], tuple(findings), docs,
-                                check_files=availability.require)
+        try:
+            file = bulk.rename_file(server, repo / path, path, sources.current[path], tuple(findings), docs,
+                                    check_files=availability.require)
+        except bulk.ReservationBlocked as blocked:
+            pending.extend(bulk.PendingFinding(item.finding_id, blocked.path, blocked.holders) for item in findings)
+            continue
         files.append(file)
         refused.update((item.finding_id, item.reason) for item in file.refusals)
         for document in file.related:
             sources.current[document.path] = document.edited
     return PlannedEdits(tuple(file for file in bulk.combine_file_renames(files) if file.edited != file.original),
                         tuple(bulk.Refusal(identity, reason) for identity, reason in refused.items()),
-                        judgments=tuple(sources.judgments.values()))
+                        judgments=tuple(sources.judgments.values()), pending=tuple(pending))
 
 
 def plan_constants(repo: Path, ledger: ledger_api.Ledger, base: str, selected: Selection) -> PlannedEdits:
@@ -730,7 +748,7 @@ class PlanningFileAvailability:
     def __init__(self, repo: Path, available: Callable[[Path, str], None]) -> None:
         self.repo: Path = repo
         self.available: Callable[[Path, str], None] = available
-        self.checked: dict[str, AvailableFile | UnavailableFile] = {}
+        self.checked: dict[str, AvailableFile | UnavailableFile | bulk.ReservationBlocked] = {}
 
     def require(self, paths: tuple[str, ...]) -> None:
         for path in paths:
@@ -738,22 +756,32 @@ class PlanningFileAvailability:
                 try:
                     self.available(self.repo, path)
                     self.checked[path] = AvailableFile.AVAILABLE
+                except bulk.ReservationBlocked as blocked:
+                    self.checked[path] = blocked
                 except (bulk.BulkRenameError, OSError) as error:
                     self.checked[path] = UnavailableFile(str(error))
             answer = self.checked[path]
+            if isinstance(answer, bulk.ReservationBlocked):
+                raise answer
             if isinstance(answer, UnavailableFile):
                 raise bulk.BulkRenameError(answer.reason)
 
 
 def available_constant_plan(plan: PlannedEdits, availability: PlanningFileAvailability) -> PlannedEdits:
-    """Constants have no analyzer overlays; refuse their atomic extraction groups."""
+    """Partition atomic groups; a terminal error wins over a transient reservation."""
     files = {file.path: file for file in plan.files}
     dependencies = {file.path: file.dependencies for file in plan.files}
     refused = {item.finding_id: item.reason for item in plan.refusals}
     removed: set[str] = set()
+    pending = list(plan.pending)
     for path in files:
         try:
             availability.require((path,))
+        except bulk.ReservationBlocked as blocked:
+            group = dependent_files(dependencies, {path})
+            removed.update(group)
+            pending.extend(bulk.PendingFinding(item.finding.finding_id, blocked.path, blocked.holders)
+                           for member in group & files.keys() for item in files[member].kept)
         except bulk.BulkRenameError as error:
             group = dependent_files(dependencies, {path})
             removed.update(group)
@@ -763,7 +791,9 @@ def available_constant_plan(plan: PlannedEdits, availability: PlanningFileAvaila
     return PlannedEdits(tuple(file for file in plan.files if file.path not in removed),
                         tuple(bulk.Refusal(identity, reason) for identity, reason in refused.items()),
                         tuple(proof for proof in plan.constant_proofs
-                              if not any(edit.path in removed for edit in proof.result.edits)), plan.judgments)
+                              if not any(edit.path in removed for edit in proof.result.edits)), plan.judgments,
+                        tuple({item.finding_id: item for item in pending
+                               if item.finding_id not in refused}.values()))
 
 
 def diagnostic_failures(repo: Path, result: CommandResult) -> dict[str, str]:
@@ -936,6 +966,7 @@ def execute_plan(workspace: WorkspaceEdits, plan: PlannedEdits, definition: rule
     preserve the caller's selection and source boundaries before any rebuilt overlay.
     Refusals update the caller's accumulator so rollback retains evidence even on failure.
     """
+    require_ready_plan(plan)
     repo, base = workspace.repo, workspace.base
     refused.update((item.finding_id, item.reason) for item in plan.refusals)
     candidates = plan.files
@@ -1035,12 +1066,21 @@ def run_rule(repo: Path, rule: str, base_tree: str, ledger: ledger_api.Ledger,
 
     try:
         started = time.monotonic()
+        def release_blocked_files(plan: PlannedEdits) -> PlannedEdits:
+            # Workspace runs have no resume manifest. Release blocked groups for
+            # later selection, so every edit committed now has its full checkpoint.
+            reservation_refusals = tuple(bulk.Refusal(item.finding_id,
+                f"{item.path}: another worktree holds the file: " + "; ".join(
+                    f"{holder.holder_worktree_root} ({holder.holder_branch}, reservation {holder.reservation_id})"
+                    for holder in item.holders)) for item in plan.pending)
+            return replace(plan, refusals=(*plan.refusals, *reservation_refusals), pending=())
+
         def replan(identities: frozenset[str]) -> PlannedEdits:
             survivors = Selection(tuple(finding for finding in selected.findings
                                          if finding.finding_id in identities), ())
-            return plan_rule(repo, ledger, base, survivors, definition, server, available)
+            return release_blocked_files(plan_rule(repo, ledger, base, survivors, definition, server, available))
 
-        plan = plan_rule(repo, ledger, base, selected, definition, server, available)
+        plan = release_blocked_files(plan_rule(repo, ledger, base, selected, definition, server, available))
         times["rename"] = time.monotonic() - started
         kept = execute_plan(workspace, plan, definition, ledger, intent,
                             runner, available, replan, times, loops, refused)

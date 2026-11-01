@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from dataclasses import replace
 from contextlib import closing
 from collections.abc import Callable, Sequence
 from functools import cached_property
@@ -11,6 +12,7 @@ from typing import cast, override
 from unittest import mock
 
 import bulk_rename as bulk
+import berth_board
 import bulk_run as run
 import crate_run as crates
 import rules
@@ -139,6 +141,234 @@ class CrateRunTests(CargoProjectTests):
 
     def advance(self, package: str) -> crates.Manifest:
         return self.batch.advance(package, renamed, self.commands, available, fixture_execute)
+
+    @property
+    def other_writer(self) -> berth_board.Reservation:
+        return berth_board.Reservation("writer-reservation", "style/main", self.root / "product",
+                                       "refs/heads/product", ("src/lib.rs",), "active", "blocking")
+
+    def reservation_advance(self) -> crates.Manifest:
+        return self.batch.advance("bulk_sample", renamed, self.commands,
+                                  bulk.check_available, fixture_execute)
+
+    def test_blocking_reservation_is_pending_with_holder_and_keeps_the_same_ticket(self) -> None:
+        self.freeze(paths=("src/lib.rs",))
+        with mock.patch.object(berth_board, "read_board", return_value=berth_board.Board((self.other_writer,))):
+            result = self.reservation_advance()
+        record = result["crates"]["bulk_sample"]
+        self.assertEqual(record["stage"], "waiting for reservations")
+        self.assertEqual(record.get("pending"), [{"finding_id": record["selected"][0]["id"], "path": "src/lib.rs",
+            "holders": [{"worktree": str(self.other_writer.holder_worktree_root),
+                         "branch": self.other_writer.holder_branch, "reservation_id": self.other_writer.reservation_id}]}])
+        self.assertEqual(result["refusals"], [])
+        assert "tickets" in record
+        ticket = record["tickets"][record["selected"][0]["id"]]
+        self.assertEqual(self.authority.named_held(record["tickets"])[0].build_ticket, ledger_api.BuildTicket(ticket))
+        self.assertEqual(self.authority.bulk_refusals(ticket), ())
+        self.assertFalse(Path(record["result_path"]).exists())
+        self.assertEqual(self.commands.calls, [])
+        self.assertIn("let old", (Path(record["checkout"]) / "src/lib.rs").read_text())
+
+    def test_released_reservation_executes_once_without_a_second_ticket(self) -> None:
+        self.freeze(paths=("src/lib.rs",))
+        with mock.patch.object(berth_board, "read_board", return_value=berth_board.Board((self.other_writer,))):
+            pending = self.reservation_advance()["crates"]["bulk_sample"]
+        claims = pending.get("tickets", {})
+        with mock.patch.object(berth_board, "read_board", return_value=berth_board.Board(())), mock.patch.object(
+                self.authority, "ticket_add", side_effect=AssertionError("must keep original claim")), mock.patch(
+                __name__ + ".fixture_execute", wraps=fixture_execute) as execute:
+            result = self.reservation_advance()
+            again = self.reservation_advance()
+        self.assertEqual(execute.call_count, 1)
+        self.assertEqual(result, again)
+        self.assertEqual(result["crates"]["bulk_sample"].get("tickets"), claims)
+        self.assertEqual(result["crates"]["bulk_sample"]["stage"], crates.CrateStage.INTEGRATED)
+        self.assertEqual(result["crates"]["bulk_sample"].get("pending"), [])
+        self.assertIn("let number", self.git("show", self.destination + ":src/lib.rs"))
+
+    def test_restart_keeps_manifest_pending_until_the_writer_releases(self) -> None:
+        self.freeze(paths=("src/lib.rs",))
+        with mock.patch.object(berth_board, "read_board", return_value=berth_board.Board((self.other_writer,))):
+            before = self.reservation_advance()["crates"]["bulk_sample"]
+        with ledger_api.Ledger(self.repo, self.authority.database) as ledger:
+            resumed = crates.CrateRun(ledger, self.batch.run_id)
+            with mock.patch.object(berth_board, "read_board", return_value=berth_board.Board((self.other_writer,))):
+                blocked = resumed.advance("bulk_sample", renamed, self.commands, bulk.check_available, fixture_execute)
+            self.assertEqual(blocked["crates"]["bulk_sample"].get("pending"), before.get("pending"))
+            self.assertEqual(blocked["crates"]["bulk_sample"]["stage"], "waiting for reservations")
+            with mock.patch.object(berth_board, "read_board", return_value=berth_board.Board(())):
+                result = resumed.advance("bulk_sample", renamed, self.commands, bulk.check_available, fixture_execute)
+        self.assertEqual(result["crates"]["bulk_sample"].get("tickets"), before.get("tickets"))
+        self.assertEqual(result["crates"]["bulk_sample"]["stage"], crates.CrateStage.INTEGRATED)
+
+    def test_pending_writer_can_become_a_clear_read_claim(self) -> None:
+        self.freeze(paths=("src/lib.rs",))
+        with mock.patch.object(berth_board, "read_board", return_value=berth_board.Board((self.other_writer,))):
+            blocked = self.reservation_advance()
+        self.assertEqual(blocked["crates"]["bulk_sample"]["stage"], "waiting for reservations")
+        reader = replace(self.other_writer, edit_blocking_status="clear")
+        with mock.patch.object(berth_board, "read_board", return_value=berth_board.Board((reader,))):
+            result = self.reservation_advance()
+        self.assertEqual(result["crates"]["bulk_sample"]["stage"], crates.CrateStage.INTEGRATED)
+
+    def test_pending_finding_released_after_planning_is_admitted_in_the_same_invocation(self) -> None:
+        self.freeze(paths=("src/lib.rs",))
+        boards = iter((berth_board.Board((self.other_writer,)),))
+        def released(_repo: Path) -> berth_board.Board:
+            return next(boards, berth_board.Board(()))
+        with mock.patch.object(berth_board, "read_board", side_effect=released):
+            result = self.reservation_advance()
+        self.assertEqual(result["crates"]["bulk_sample"]["stage"], crates.CrateStage.INTEGRATED)
+        self.assertEqual(result["refusals"], [])
+        self.assertIn("let number", self.git("show", self.destination + ":src/lib.rs"))
+
+    def test_released_pending_finding_still_requires_its_fresh_machine_proof(self) -> None:
+        self.freeze_fresh_judgment()
+        with mock.patch.object(berth_board, "read_board", return_value=berth_board.Board((self.other_writer,))):
+            before = self.batch.advance("bulk_sample", self.machine_plan, self.commands,
+                                        bulk.check_available, fixture_execute)
+        self.assertEqual(before["crates"]["bulk_sample"]["stage"], "waiting for reservations")
+        self.assertEqual(before["crates"]["bulk_sample"].get("machine_judgments"), [])
+        with mock.patch.object(berth_board, "read_board", return_value=berth_board.Board(())):
+            result = self.batch.advance("bulk_sample", self.machine_plan, self.commands,
+                                       bulk.check_available, fixture_execute)
+        self.assertEqual(result["crates"]["bulk_sample"]["stage"], crates.CrateStage.INTEGRATED)
+        self.assertEqual(len(result["crates"]["bulk_sample"].get("machine_judgments", [])), 1)
+
+    def test_released_pending_finding_can_still_receive_a_terminal_ledger_refusal(self) -> None:
+        self.freeze_fresh_judgment()
+        # A changed rule invalidates the still-applicable-looking stale parameter.
+        # It remains a terminal refusal when it reaches the production planner.
+        selected = self.batch.read()["crates"]["bulk_sample"]["selected"]
+        identity = selected[0]["id"]
+        with mock.patch.object(berth_board, "read_board", return_value=berth_board.Board((self.other_writer,))):
+            before = self.batch.advance("bulk_sample", self.machine_plan, self.commands,
+                                        bulk.check_available, fixture_execute)
+        self.assertEqual(before["crates"]["bulk_sample"]["stage"], "waiting for reservations")
+        with mock.patch.object(berth_board, "read_board", return_value=berth_board.Board(())), mock.patch.object(
+                self.authority, "rename_judgment_site", return_value=ledger_api.NeedsJudgment("rule changed since judged")):
+            result = self.batch.advance("bulk_sample", self.machine_plan, self.commands,
+                                       bulk.check_available, fixture_execute)
+        self.assertEqual(result["crates"]["bulk_sample"]["stage"], crates.CrateStage.ABANDONED)
+        self.assertEqual(result["refusals"], [{"finding_id": identity,
+                                             "reason": "changed since judged: rule changed since judged"}])
+        self.assertIsInstance(self.authority.named_held((identity,))[0].build_ticket, ledger_api.NoBuildTicket)
+
+    def test_terminal_refusal_is_published_without_releasing_a_pending_sibling(self) -> None:
+        second = "src/second.rs"
+        _ = (self.repo / second).write_bytes((self.repo / "src/lib.rs").read_bytes())
+        _ = self.git("add", ".")
+        _ = self.git("commit", "-qm", "independent finding")
+        self.base, self.tree = self.git("rev-parse", "HEAD"), self.git("rev-parse", "HEAD^{tree}")
+        _ = self.git("update-ref", self.destination, self.base)
+        self.authority.set_tip(self.base)
+        self.freeze(shared_proposal=True, paths=("src/lib.rs", second))
+        def terminal(_checkout: Path, _ledger: ledger_api.Ledger, _base: str,
+                     selected: run.Selection, _availability: run.PlanningFileAvailability,
+                     _definition: rules.Rule) -> run.PlannedEdits:
+            return run.PlannedEdits((), tuple(bulk.Refusal(item.finding_id, "changed since judged: removed site")
+                                             for item in selected.findings))
+        with mock.patch.object(berth_board, "read_board", return_value=berth_board.Board((self.other_writer,))):
+            result = self.batch.advance("bulk_sample", terminal, self.commands, bulk.check_available, fixture_execute)
+        record = result["crates"]["bulk_sample"]
+        self.assertEqual(record["stage"], "waiting for reservations")
+        self.assertEqual(len(result["refusals"]), 1)
+        assert "tickets" in record
+        by_path = {item.path: item for item in self.authority.named_held(record["tickets"])}
+        self.assertIsInstance(by_path[second].build_ticket, ledger_api.NoBuildTicket)
+        self.assertIsInstance(by_path["src/lib.rs"].build_ticket, ledger_api.BuildTicket)
+        with mock.patch.object(berth_board, "read_board", return_value=berth_board.Board(())):
+            resumed = self.reservation_advance()
+        self.assertEqual(resumed["crates"]["bulk_sample"]["stage"], crates.CrateStage.INTEGRATED)
+        self.assertEqual(resumed["refusals"], result["refusals"])
+        self.assertIn("let old", self.git("show", self.destination + ":" + second))
+
+    def test_crate_keeps_a_shared_ticket_uncommitted_until_every_pending_member_is_ready(self) -> None:
+        second = "src/ready.rs"
+        _ = (self.repo / second).write_bytes((self.repo / "src/lib.rs").read_bytes())
+        with (self.repo / "src/lib.rs").open("a") as source:
+            _ = source.write("mod ready;\n")
+        _ = self.git("add", ".")
+        _ = self.git("commit", "-qm", "two files under one proposal")
+        self.base, self.tree = self.git("rev-parse", "HEAD"), self.git("rev-parse", "HEAD^{tree}")
+        _ = self.git("update-ref", self.destination, self.base)
+        self.authority.set_tip(self.base)
+        self.freeze(shared_proposal=True, paths=("src/lib.rs", second))
+        with mock.patch.object(berth_board, "read_board", return_value=berth_board.Board((self.other_writer,))):
+            waiting = self.reservation_advance()["crates"]["bulk_sample"]
+        self.assertEqual(waiting["stage"], "waiting for reservations")
+        assert "tickets" in waiting
+        tickets = set(waiting["tickets"].values())
+        self.assertEqual(len(tickets), 1)
+        ticket = next(item for item in self.authority.proposal_tickets() if item["id"] in tickets)
+        self.assertEqual((ticket["state"], ticket["checkpoint"]), ("assigned", ""))
+        checkout = Path(waiting["checkout"])
+        self.assertEqual(run.git(checkout, "rev-parse", "HEAD"), self.base)
+        self.assertEqual(run.git(checkout, "status", "--porcelain"), "")
+        self.assertIn("let old", (checkout / second).read_text())
+        self.assertFalse(Path(waiting["result_path"]).exists())
+        self.assertEqual(self.commands.calls, [])
+        with mock.patch.object(berth_board, "read_board", return_value=berth_board.Board(())), mock.patch(
+                __name__ + ".fixture_execute", wraps=fixture_execute) as execute:
+            result = self.reservation_advance()
+            again = self.reservation_advance()
+        self.assertEqual(execute.call_count, 1)
+        self.assertEqual(result, again)
+        record = result["crates"]["bulk_sample"]
+        self.assertEqual(record["stage"], crates.CrateStage.INTEGRATED)
+        self.assertEqual(record.get("tickets"), waiting["tickets"])
+        evidence = bulk.object_fields(cast(object, json.loads(Path(record["result_path"]).read_text())))
+        self.assertEqual(set(cast(list[str], evidence["findings"])), set(waiting["tickets"]))
+        ticket = next(item for item in self.authority.proposal_tickets() if item["id"] in tickets)
+        self.assertEqual((ticket["state"], ticket["checkpoint"]), ("checkpointed", evidence["commit"]))
+        for path in ("src/lib.rs", second):
+            self.assertIn("let number", self.git("show", self.destination + ":" + path))
+
+    def test_terminal_atomic_group_refusal_removes_its_reservation_pending_outcome(self) -> None:
+        self.freeze(paths=("src/lib.rs",))
+        def atomic(checkout: Path, ledger: ledger_api.Ledger, base: str,
+                   selected: run.Selection, availability: run.PlanningFileAvailability,
+                   definition: rules.Rule) -> run.PlannedEdits:
+            planned = renamed(checkout, ledger, base, selected, availability, definition)
+            file = planned.files[0]
+            assert isinstance(file, bulk.FileRenames)
+            paths = frozenset((file.path, "src/writer.rs", "src/unavailable.rs"))
+            return run.PlannedEdits(tuple(replace(file, path=path, dependencies=paths)
+                                         for path in (file.path, "src/writer.rs", "src/unavailable.rs")), ())
+        writer = replace(self.other_writer, scopes=("src/writer.rs",))
+        def boundary(repo: Path, path: str) -> None:
+            if path == "src/unavailable.rs":
+                raise bulk.BulkRenameError("source is unavailable")
+            bulk.check_available(repo, path)
+        with mock.patch.object(berth_board, "read_board", return_value=berth_board.Board((writer,))):
+            result = self.batch.advance("bulk_sample", atomic, self.commands, boundary, fixture_execute)
+        record = result["crates"]["bulk_sample"]
+        identity = record["selected"][0]["id"]
+        self.assertEqual(result["refusals"], [{"finding_id": identity, "reason": "source is unavailable"}])
+        self.assertEqual(record.get("pending", []), [])
+        self.assertEqual(record["stage"], crates.CrateStage.ABANDONED)
+        self.assertIsInstance(self.authority.named_held((identity,))[0].build_ticket, ledger_api.NoBuildTicket)
+        assert "tickets" in record
+        self.assertEqual(len(self.authority.bulk_refusals(record["tickets"][identity])), 1)
+        self.assertEqual(self.commands.calls, [])
+
+    def test_writer_arriving_at_execution_keeps_the_claim_and_rolls_back_private_edits(self) -> None:
+        self.freeze(paths=("src/lib.rs",))
+        reads = iter((berth_board.Board(()),))
+        def writer_arrives(_repo: Path) -> berth_board.Board:
+            return next(reads, berth_board.Board((self.other_writer,)))
+        with mock.patch.object(berth_board, "read_board", side_effect=writer_arrives):
+            result = self.reservation_advance()
+        record = result["crates"]["bulk_sample"]
+        self.assertEqual(record["stage"], "waiting for reservations")
+        self.assertEqual(result["refusals"], [])
+        self.assertIn("let old", (Path(record["checkout"]) / "src/lib.rs").read_text())
+        self.assertEqual(run.git(Path(record["checkout"]), "status", "--porcelain"), "")
+        self.assertTrue(all(isinstance(item.build_ticket, ledger_api.BuildTicket)
+                            for item in self.authority.named_held(frozen["id"] for frozen in record["selected"])))
+        with mock.patch.object(berth_board, "read_board", return_value=berth_board.Board(())):
+            resumed = self.reservation_advance()
+        self.assertEqual(resumed["crates"]["bulk_sample"]["stage"], crates.CrateStage.INTEGRATED)
 
     def freeze_fresh_judgment(self) -> None:
         _, tip = machine_rename_fixture(self.authority, self.definition, self.repo, self.root / "fresh.md")
