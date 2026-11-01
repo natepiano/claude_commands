@@ -15,7 +15,8 @@ from typing import cast, get_type_hints
 
 from scripts.agents import codex_mesh
 from scripts.herdr.herdr import HerdrPlace
-from scripts.production import staff, staff_sources, unit_lookup, worker_fill, worker_admission
+from scripts.production import staff, staff_sources, worker_fill, worker_admission
+import unit_lookup
 from scripts.production.staff_test_support import StaffTestCase, production_membership, unit_membership, showrunner_relationship
 
 

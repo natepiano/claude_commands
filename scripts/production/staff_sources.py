@@ -46,7 +46,7 @@ from unit_lookup import (  # noqa: E402
     UnitProduction as UnitProduction, MemberSources as _MemberSources,
     member_sources as _member_sources,
 )
-from scripts.production import unit_lookup  # noqa: E402
+import unit_lookup  # noqa: E402
 
 
 def member(selector: MemberSelector, record: staff.StaffSnapshot) -> MemberFound | NoSuchMember:
