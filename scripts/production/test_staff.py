@@ -53,6 +53,59 @@ def concurrent_ensure(
 
 
 class StaffTests(StaffTestCase):
+    def test_restored_unit_survives_its_previous_pending_retirement(self) -> None:
+        parent = staff.ensure("showrunner", name="sdlc")
+        unit = staff.ensure("unit", name="models", parent=parent.id)
+        staff.defer_retire((unit.id,))
+        _ = staff.retire(unit.id)
+        self.assertIsNone(staff.by_id(unit.id))
+        self.assertEqual(staff.snapshot().pending_retire, (unit.id,))
+
+        restored = staff.restore_unit(unit.id, name=unit.name, parent=parent.id)
+        self.assertEqual(staff.snapshot().pending_retire, ())
+        self.assertEqual(staff.retire_pending(), ())
+        self.assertEqual(staff.by_id(unit.id), restored)
+        self.assertEqual((restored.id, restored.kind, restored.name, restored.parent),
+                         (unit.id, "unit", unit.name, parent.id))
+
+    def test_restore_unit_recovers_the_requested_id_and_rerun_writes_nothing(self) -> None:
+        parent = staff.ensure("showrunner", name="sdlc")
+        unit = staff.restore_unit(MISSING_ID, name="models", parent=parent.id)
+        self.assertEqual((unit.id, unit.kind, unit.name, unit.parent), (MISSING_ID, "unit", "models", parent.id))
+        self.assertEqual(staff.by_id(MISSING_ID), unit)
+        before = self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns
+        self.assertEqual(staff.restore_unit(MISSING_ID, name="models", parent=parent.id), unit)
+        self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), before)
+
+    def test_restore_unit_refuses_an_id_or_name_held_by_another_row(self) -> None:
+        parent, unit, worker = self.tree()
+        other = staff.ensure("showrunner", name="other")
+        for held_id in (parent.id, worker.id, unit.id):
+            with self.subTest(held_id=held_id):
+                self.assert_refused(lambda: staff.restore_unit(held_id, name="restored", parent=other.id))
+        self.assert_refused(lambda: staff.restore_unit(MISSING_ID, name=unit.name, parent=parent.id))
+        restored = staff.restore_unit(MISSING_ID, name=unit.name, parent=other.id)
+        self.assertEqual((restored.id, restored.parent), (MISSING_ID, other.id))
+        self.assertEqual(staff.by_id(unit.id), unit)
+
+    def test_restore_unit_from_mac_uses_the_owner_and_is_idempotent_through_the_cli(self) -> None:
+        parent = staff.ensure("showrunner", name="sdlc")
+        with self.machine("mac"):
+            restored = staff.restore_unit(MISSING_ID, name="models", parent=parent.id)
+            before = self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns
+            self.assertEqual(staff.restore_unit(MISSING_ID, name="models", parent=parent.id), restored)
+        self.assertEqual((restored.id, restored.kind, restored.name, restored.parent),
+                         (MISSING_ID, "unit", "models", parent.id))
+        self.assertEqual(staff.by_id(MISSING_ID), restored)
+        self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), before)
+        self.assertEqual(self.ssh_commands(), [
+            ["restore-unit", MISSING_ID, "--name=models", "--parent", parent.id, "--json"],
+            ["restore-unit", MISSING_ID, "--name=models", "--parent", parent.id, "--json"],
+        ])
+        self.assertFalse(self.mac_file.exists())
+        _ = self.assert_rerun("restore-unit", MISSING_ID, "--name=models", "--parent", parent.id)
+        self.assertEqual(staff.by_id(MISSING_ID), restored)
+
     def test_schema_one_rewrites_as_two_without_inventing_worktrees_or_docs(self) -> None:
         runner, unit, worker = self.tree()
         _ = self.write_document({"schema": 1, "rows": [row.to_json() for row in (runner, unit, worker)]})

@@ -307,64 +307,38 @@ Source: the user via the sdlc showrunner, 2026-10-31: "yes i want a fast track" 
 **Acceptance gate:** from the worktree root, `python3 -m unittest discover -s scripts/production -p test_fast_track.py`, the same for `test_merge_checkpoint_promotion.py`, and `python3 -m unittest discover -s scripts/direct -p test_review_launcher.py` green, covering: each refusal and its exit 2, each config key missing and invalid, a conflicting patch, origin/main moving between check and push (re-apply, re-check, push), the time limit, a rerun (exit 0, no change), the worktree restore, the record row, `--pending`, and a review pass marking rows reviewed. `basedpyright` on each slot's Python files `0 errors, 0 warnings, 0 notes`. Live, by the director: one real small fix through the command to main, then the same command again (exit 0, `already on main`); a fast fix landing while a real `merge_checkpoint` runs, with that merge's promotion still finishing, and the showrunner's 08:54 gate result as the second case. Put the timings in the checkpoint notice.
 
 ### Phase 7e — Every process-group kill checks its pid  · status: done
-**Depends on:** Phase 7d (checkpoint order only: two caller files are in its list)
 
-Source: the sdlc showrunner and natedev, 2026-10-31. Both natedev-wide stops today (11:53:50, 11:59:21) most likely came from `os.killpg` with a mocked pid: `MagicMock.__index__` is 1, and `killpg(1)` is `kill(-1)`, SIGTERM to every process of the user.
+#### As-built
 
-#### Work Order
-
-**Goal:** no code path in this repo can signal a process group with a pid that is not a real one, and a new raw `os.killpg` fails a guard.
-
-**Spec:**
-1. New `scripts/lib/process_group.py` holds one check and one send: it refuses a pid that is not a real `int` (a `bool` or a mock is refused), a pid of 1 or less, and the caller's own process group (`os.getpgrp()`). A refusal raises and sends nothing.
-2. Every non-test `os.killpg` caller uses it: codex_mesh, rust_release, hana_shot, detached, copy_watch, send, fast_track, merge_gate, style_sync, quota_alert, and any other the search finds. Test helpers and fixtures that send a real group signal use it too. A caller keeps its own `ProcessLookupError` handling.
-3. Shell group kills use the module's CLI, so there is one check: `verify.sh:2529` (Python in a heredoc), `verify.sh:1156` and `:2815` (`kill -- "-$RUN_STEP_PID"`), `board.sh:285`, `smoke_launch.sh:62,64`, and any other the search finds. Keep each `verify.sh` edit to the call line: it runs in every gate (natedev, 2026-10-31).
-4. One guard test fails on a new raw `os.killpg` or an unguarded shell group kill, anywhere under `scripts/`, except the one send in `process_group.py`.
-5. models-unit's guard at `codex_mesh.py:3111` uses this check: no second copy.
-6. `scripts/production/fast_track.py` and `scripts/production/merge_checkpoint_test_support.py` are in Phase 7d's list. The writer switches their calls too. Phase 7d's checkpoint carries those two edits, so this phase checkpoints after Phase 7d.
+- `check_process_group(pid: object) -> int` in `scripts/lib/process_group.py` raises `ValueError` for non-`int` values, including bools and mocks, ids <= 1, and `os.getpgrp()`; `send_process_group(pid: object, signum: int) -> None` checks before the sole raw `os.killpg`, leaving `ProcessLookupError` handling to callers.
+- Python callers and signal fixtures use the shared sender; shell callers use their own tree's `process_group.py PID SIGNAL` through `scripts/lib/py` (exit 3 means missing group; exit 2 means refusal or failure).
+- `unguarded_group_signals(scripts: Path) -> list[str]` in `scripts/lib/test_process_group.py` checks Python AST references and embedded/shell text for raw sends, allowing only the shared send.
 
 **Files:**
-- `scripts/lib/process_group.py` — the one check and the one send, with a small CLI for shell callers
-- `scripts/lib/test_process_group.py` — the check's tests and the guard over `scripts/`
-- `scripts/agents/codex_mesh.py`, `scripts/buildlog/rust_release.py`, `scripts/hana_shot/hana_shot.py`, `scripts/lib/detached.py`, `scripts/mac_test/copy_watch.py`, `scripts/message/send.py`, `scripts/production/merge_gate.py`, `scripts/style/style_sync.py`, `scripts/whoami/quota_alert.py` — Python callers
-- `scripts/direct/verify.sh`, `scripts/direct/board.sh`, `scripts/production/smoke_launch.sh` — shell callers and Python inside shell
-- `scripts/direct/recorder_fixture.py`, `scripts/direct/verify_token_wait_test_support.py`, `scripts/mac_test/offload_test_support.py` — test support that signals a real group
-- `scripts/agents/test_heartbeat.py`, `scripts/direct/test_implement_launcher.py`, `scripts/direct/test_implement_launcher_claims.py`, `scripts/direct/test_review_launcher_delivery.py`, `scripts/lib/test_detached.py`, `scripts/lib/test_relaunch.py`, `scripts/mac_test/test_copy_watch.py`, `scripts/message/test_notifier.py`, `scripts/prioritize/tests/test_run_watcher.py`, `scripts/production/test_mac_run.py`, `scripts/production/test_merge_gate_suites_signals.py`, `scripts/screen_record/test_screen_record.py`, `scripts/style/test_style_sync.py`, `scripts/whoami/test_quota_alert_cancellation.py` — tests that patch `os.killpg` or signal a group
+- `scripts/lib/process_group.py`, `scripts/lib/test_process_group.py` — validation, send, CLI, refusal tests and source guard
+- `scripts/direct/verify.sh`, `scripts/direct/board.sh`, `scripts/production/smoke_launch.sh` — CLI callers; Python callers and signal test/support files share the send boundary
 
-**Workers:** 1 writer + 1 tester
-- `impl` — `process_group.py` and every non-test caller above, the 7d pair included
-- `test` — `test_process_group.py`, the test support files and the test files, from this Spec alone
+**Binds later work:** “The group-kill guard reads commands, not text” extends `unguarded_group_signals` in `scripts/lib/test_process_group.py`; `process_group.py` remains the sole raw-send exception.
 
-**State:** none.
-
-**Acceptance gate:** tests with `os.killpg` patched show that a MagicMock pid, a `bool`, 0, 1, a negative pid and the caller's own group each raise and send nothing, and a real child's group passes to the patched send. The guard test fails on a planted raw call in a temporary tree. No test sends a real signal to prove the refusal, and nothing replays the failure.
+**Gotchas:** `MagicMock.__index__` returns 1; refusal tests patch `os.killpg`, and real test signals target only owned children started with `start_new_session=True`. Embedded text checks still miss some aliases and shell command positions.
 
 ### Phase 7f — A damaged design-role record names itself and stops no other unit  · status: done
-**Depends on:** none
 
-Source: the sdlc showrunner, 2026-10-31. Role record `b8288785` (devtools-unit, 7b assertion-guard) has `binding.repository: ""`. Every reader refuses it with `missing or invalid repository`: `retire_unit.py` for berth-unit stops, `send.py` prints the error, and `design_roles.py rebind` and `end` refuse it too, so no supported command can repair it. Cause: `open` and `adopt` with `--run-directory` and `--phase` and no `--checkout` bind the phase to `argument('checkout')`, the empty string (`design_roles.py:1558`).
+#### As-built
 
-#### Work Order
-
-**Goal:** no writer saves a design-role record its own reader refuses, `design_roles.py` can repair a record that is damaged that way, and one damaged record stops only the unit that holds it.
-
-**Spec:**
-1. `open` and `adopt` bind a phase to `--checkout` when given, else to the design's repository. The write path refuses a phase binding with an empty repository, so no command can save one again.
-2. `design_roles.py rebind <id> --unbind`, and `rebind <id> --checkout <path> --run-directory <dir> --phase <id>`, repair a record whose only defect is an empty phase-binding repository. The generation check and the lock stay. Every other verb still refuses the record, and the refusal names the record's path and the bad field.
-3. The retire check skips a damaged record that the unit being retired does not hold, with one stderr line that names the record's path and field: `end_holder` and `holder_failures`. A damaged record held by the unit being retired, renamed or moved still refuses that operation, with the same named line. The roster and staff scans are messaging-unit's (showrunner, 2026-10-31), not this phase's.
-4. A rerun changes nothing: a second `rebind --unbind` on a repaired record exits 0 with one line and writes nothing.
+- `open_role` and `adopt` resolve an omitted phase-binding repository to the authority's checkout; `_save` validates the complete record with `_decode_design` before writing and refuses an empty `binding.repository`.
+- `rebind <id> --unbind` or `rebind <id> --checkout <path> --run-directory <dir> --phase <id>` repairs an otherwise valid empty-repository binding under the lock and generation check, retains omitted output paths, and validates the target before server release or generation advance.
+- `DamagedDesignRecord(RoleRefused)` carries `path`, `field` and `holder`; strict reads wrap it in `WorkerStateUnreadable`, and CLI refusals name the path and `binding.repository`.
+- `_read_designs` skips unrelated damaged records with `warning: <path>: <reason>` once per `record_operation`; `end_holder` and `move_holder` refuse matching damage, while `holder_failures` reports matching damage with live roles.
+- `_finish_rebind` publishes launch context and role projections before removing `transition.json`; a completed identical retry writes nothing and prints `<id> rebound at generation <N>`.
 
 **Files:**
-- `scripts/astra/design_roles.py` — the phase-binding writer, the repair path in `rebind`, the named refusal, and the retire check's scans
-- `scripts/astra/test_design_roles.py`, `scripts/production/test_retire_unit.py` — regression tests
+- `scripts/astra/design_roles.py` — binding validation, repair, named errors and holder-aware scans
+- `scripts/astra/test_design_roles.py`, `scripts/production/test_retire_unit.py` — repair, interruption, scan and retirement regressions
 
-**Workers:** 1 writer + 1 tester
-- `impl` — `design_roles.py`
-- `test` — the two test files, from this Spec alone
+**Binds later work:** “Run cleanup and the role list skip another unit's damaged record” uses `_read_designs`, `unbind_run()` and `list_roles()` with the named stderr diagnostic and addresses markerless `rebind` publication retries.
 
-**State:** design-role records under `~/.local/state/astra/design-roles/` (tests use a temporary state root only).
-
-**Acceptance gate:** tests with a temporary state root show: `open` with a phase and no `--checkout` saves the design's repository; a planted record with an empty binding repository is repaired by `rebind --unbind` and by `rebind --checkout`, and a rerun writes nothing; `end_holder` and `holder_failures` for another unit each skip the planted record with one named line, and the holding unit's retire still refuses it by name. Live check, from this phase's tree once its tests pass (the block is urgent): `scripts/astra/design_roles.py rebind b8288785-7704-4041-aab5-9e1d6eccaddb --expected-generation 1 --unbind --reason ...` exits 0, a rerun exits 0 and writes nothing, and `retire_unit.py` for berth-unit and for natedev's bevy-upgrade no longer names the record.
+**Gotchas:** The markerless identical-retry shortcut checks launch context before returning; matching context alone does not prove census publication finished. Scan warnings use the decoded reason (`missing or invalid repository` for an empty binding repository), while strict CLI refusals include `binding.repository`.
 
 ### Phase 7g — Run cleanup and the role list skip another unit's damaged record  · status: todo
 **Depends on:** Phase 7f (same file; it checkpoints first)
@@ -449,3 +423,46 @@ Source: Phase 7e closure review (F002), moved here under the landing rule (model
 - `scripts/production/test_retire_unit.py` — dry-run tests
 
 **Gotchas:** the read-only fetch is `git fetch --no-write-fetch-head --refmap= -q origin <ref>` with no destination refspec, then resolves the sha `ls-remote` advertised; `--refmap=` stops configured tracking-ref updates.
+
+### Phase 7k — Retire says only what it did, and its dry run agrees with a real run  · status: done
+**Depends on:** Phase 7j (same files; it is done)
+
+Source: the live retire and resume proof on a throwaway sdlc unit, 2026-10-31 (W scripts at 6985a8d6). Resume and its rerun passed. Retire did its work, but: (a) its rerun on the retired unit exited 0 and changed nothing, yet printed six lines (`kept:` three times, `stopped: <session>` for a session already ended, `marked: the retired Units row, committed on sdlc` with no new commit); the user rule is one plain line on a rerun that changes nothing. (b) The first run printed `stopped: <session>` twice (`stop_sessions` runs again after the pane closes, `retire_unit.py:911`) and `kept:` three times (`preserve_branch` at `:893`, `:931` and through `mark_retired`). (c) The dry run printed `blocks retirement: unowned process <pid>` for the unit's own pane shell (`retire_unit.py:630`), which the real run excludes (`:879`, `:904`) and closes through `unit_move.close_unit_pane`; the dry run and the real run disagree.
+
+#### Work Order
+
+**Goal:** every retire line names one thing this run did, a rerun that changes nothing prints one line, and the dry run lists the same blockers a real run stops on.
+
+**Spec:**
+1. A real run prints an action line only when it changed something: `saved: <ref> at <tip>` when it pushed the ref (a ref already at that tip on origin prints nothing), one `stopped:` line per process it ended (a session already gone prints nothing), `marked:` only when it committed the note (`add_unit.commit_paths` reports whether it made a commit; no HEAD comparison), `removed:` and `deleted:` only for what it removed. Each action prints once per run.
+2. A run on a unit that is already fully retired (row marked, worktree and branch gone here and on origin, the note's saved ref, if any, at the note's tip on origin, nothing of the unit running, judged by the same liveness checks the stop steps use, so a Mac claim record whose process is gone counts as not running; no staff row) still runs every check, changes nothing (no commit, push, staff change, and no stop or cancellation record written for a session that is already gone), prints exactly `<unit> already retired`, and exits 0. A run that stopped partway finishes on rerun and prints only what that rerun did, then `<unit> retired`.
+3. The proven pane shell is decided by one function that the dry run and the real run both call; the real-run sites at `:879` and `:904` use it, and no copy of the rule stays. The dry run prints `would close: pane <pane id> (shell <pid>)` for it and no `blocks retirement` line; any other process inside the worktree still prints `blocks retirement: unowned process <pid>`.
+4. Refusals, `left running:`, `not removed:` and `kept worker` lines are unchanged.
+5. The unit's staff id survives retire and resume (showrunner, 2026-10-31: the proof showed s1ad0b39b490 -> sf84c5a1a6c8; the retired file and every reader go by that id). A unit with no staff row is retired to every reader (`unit_lookup.unit_is_retired`, `live_unit_table`, `retired_units`, waiting, dailies), so retire still retires the row (`staff.retire`, as before this phase). The retired note records the id (`staff <id>`), also when no ref is saved, and the saved ref stays `refs/retired/<that id>`. Resume reads the id from the note and restores the row with that id before it launches: one new staff function, with an owner path and a remote verb like the others, adds a unit row with a given id, name and parent; it returns the row when that exact row is already there (a rerun changes nothing) and refuses an id or a name that another row holds. `ensure_staff_unit` then finds that row, so the resumed unit has the same staff id. A note with no staff id (retired before this phase) resumes with a new id, as before. Removing a retired unit for good removes its Units row and its saved ref; `commands/showrunner/retire_unit.md` names both.
+
+
+Assertion-Change: scripts/production/test_retire_unit.py::test_live_director_in_pane_shell_stops_closes_and_retires — a session already gone gets no stop call (Spec 2, F003); the expected stop count drops by the calls for the gone session (helper `pane_shell_completes`).
+Assertion-Change: scripts/production/test_retire_unit.py::test_exited_directors_pane_shell_closes_and_retires — a session already gone gets no stop call (Spec 2, F003); the expected stop count drops by the calls for the gone session (helper `pane_shell_completes`).
+Assertion-Change: scripts/production/test_retire_unit.py::test_retires_a_unit_with_a_seat_a_worker_and_a_reviewer — the retired note now records `staff <id>` (item 5); the expected note gains that part.
+Assertion-Change: scripts/production/test_retire_unit.py::test_a_stopped_director_is_found_by_its_newest_interactive_transcript — the retired note now records `staff <id>` (item 5); the expected note gains that part.
+Assertion-Change: scripts/production/test_retire_unit.py::test_dry_run_finds_a_marked_director_outside_the_worktree_without_run_history — the retired note now records `staff <id>` (item 5); the expected note gains that part.
+Assertion-Change: scripts/production/test_retire_unit.py::test_retires_the_marked_director_outside_the_worktree_and_records_its_start_folder — the retired note now records `staff <id>` (item 5); the expected note gains that part.
+Assertion-Change: scripts/production/test_retire_unit.py::test_retired_note_uses_the_folder_holding_a_renamed_directors_transcript — the retired note now records `staff <id>` (item 5); the expected note gains that part.
+Assertion-Change: scripts/production/test_retire_unit.py::test_rerun_forgets_the_exited_directors_pane_launch_before_marking — the retired note now records `staff <id>` (item 5); the expected note gains that part; and a session already gone gets no stop call (Spec 2, F003); the expected stop count drops by the calls for the gone session.
+
+**Files:**
+- `scripts/production/retire_unit.py` — action lines, already-retired line, shared pane-shell rule
+- `scripts/production/test_retire_unit.py` — output tests
+- `scripts/production/resume_unit.py` — reuse the staff id
+- `scripts/production/test_resume_unit.py` — staff id tests
+- `scripts/production/staff.py` — restore a unit row with a given id
+- `scripts/production/test_staff.py` — restore tests
+- `scripts/production/add_unit.py` — `commit_paths` reports whether it committed
+- `scripts/production/promote_showrunner.py` — caller of `commit_paths`
+- `commands/showrunner/retire_unit.md` — removal for good
+
+**Workers:** 1 writer + 1 tester (impl: retire_unit.py, resume_unit.py, staff.py, add_unit.py, promote_showrunner.py, retire_unit.md; test: test_retire_unit.py, test_resume_unit.py, test_staff.py)
+
+**State:** the unit's staff row (retire retires it as before; resume restores it with its old id) and the retired note, which now records the id (item 5); items 1-4 change output only. Tests use temporary repositories; no real unit is retired, resumed or dry-run.
+
+**Acceptance gate:** test_retire_unit.py tests, each failing without the change: a rerun on a retired fixture prints exactly one line, exits 0, makes no commit or push; a first run prints each save, stop and mark line once; a session already ended prints no `stopped:` line; the dry run with a proven pane shell prints `would close:` and no `blocks retirement:` line, and an unproven process inside the worktree still blocks. A rerun on a fully retired fixture writes no record (stop, cancellation, staff, commit or push), also with a Mac claim record whose process is gone. A retire then resume of a fixture unit keeps its staff id, the retired note and ref name it, a resume rerun changes nothing, and between them no staff row exists (every reader counts the unit retired). test_staff.py tests restore: a new id, the same row again, and refusal of an id or name another row holds. The retire, resume and staff suites pass (retire had 53 tests before this phase); basedpyright of every changed Python file reads 0 errors, 0 warnings, 0 notes. Live: on a new throwaway sdlc unit, the dry run lists no blocker for its own pane shell, retire then its rerun prints one line, resume keeps its staff id, then retire it for good (Units row and retired ref removed; no staff row remains).

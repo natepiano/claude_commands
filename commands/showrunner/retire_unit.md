@@ -43,6 +43,10 @@ The retired ref stays on origin until resume restores and checks the tip. Then t
 branch and the origin branch are removed. When something still runs, nothing is marked or removed:
 the output says what, and a rerun resumes.
 
+Retire removes the unit's staff row and records `staff <id>` in the note. Resume restores that id.
+To remove a retired unit for good, remove its Units row and delete its `origin` ref
+`refs/retired/<id>` if it has one.
+
 `--dry-run` prints each refusal and everything it would stop and remove, and changes nothing.
 
 Exit 0 means the unit is retired. Exit 1 is a refusal, or something still runs.
