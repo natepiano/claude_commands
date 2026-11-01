@@ -33,11 +33,137 @@ from unit_lookup import ProductionMembers, live_unit_table, retired_units, unit_
 
 class StaffSourcesTests(StaffTestCase):
     @override
+    def setUp(self) -> None:
+        super().setUp()
+        # Keep the host's scratch policy, with a private root for this fixture.
+        _ = self.enterContext(mock.patch.object(showrunners, "SCRATCH_ROOT", self.root / "scratch-checkout"))
+
+    @override
     def fill_production(self, slug: str, *units: str) -> Path:
         doc = super().fill_production(slug, *units)
         write_text_atomic(doc, f"- **Showrunner checkout:** `{doc.parents[1]}`\n"
                           + "- **Merge branch:** `main`\n" + doc.read_text())
         return doc
+
+    @override
+    def retired_fill_production(self, slug: str, *units: str, wrapped: bool = False) -> Path:
+        doc = super().retired_fill_production(slug, *units, wrapped=wrapped)
+        owner = next(row for row in staff.find(kind="showrunner") if row.name == slug)
+        location = (staff.WrappedDoc("natedev", doc) if wrapped else staff.LiveDoc("natedev", doc))
+        _ = staff.set_doc(owner.id, location)
+        return doc
+
+    def test_retired_fill_ignores_temporary_worktree_documents_as_sources(self) -> None:
+        doc = self.retired_fill_production("sdlc", "models-unit")
+        owner = next(row for row in staff.find(kind="showrunner") if row.name == "sdlc")
+        _ = staff.set_doc(owner.id, staff.LiveDoc("natedev", doc))
+        scratch = self.root / "scratch-checkout"
+        _ = self.fixture_git(doc.parents[1], "worktree", "add", "-b", "scratch", str(scratch))
+        extra = scratch / "docs" / doc.name
+        write_text_atomic(extra, doc.read_text().replace("standby", "permanent"))
+        before = self.staff_file.read_bytes()
+        code, output, errors = self.fill_result(retired=True, dry_run=True)
+        self.assertEqual(code, 0, output + errors)
+        self.assertNotIn(str(extra), output + errors)
+        self.assertNotIn("conflicting production documents", errors)
+        self.assertIn("models-unit", output)
+        self.assertEqual(self.staff_file.read_bytes(), before)
+
+    def test_retired_fill_finds_a_timerless_wrapped_owner_with_a_different_document_slug(self) -> None:
+        doc = self.retired_fill_production("performance", "models-unit", wrapped=True)
+        owner = next(row for row in staff.find(kind="showrunner") if row.name == "performance")
+        owner = staff.rename(owner.id, "fps")
+        write_text_atomic(doc, doc.read_text().replace("**Showrunner session:** `performance`",
+                                                     "**Showrunner session:** `fps`"))
+        timer = Path(os.environ["NOTIFIER_STATE_DIR"]) / "showrunner-performance" / "conf"
+        timer.unlink()
+        timer.parent.rmdir()
+        before = self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns
+        code, output, errors = self.fill_result(retired=True, dry_run=True)
+        self.assertEqual(code, 0, output + errors)
+        self.assertIn(f"source {doc}\n", output)
+        self.assertIn("would repair retired unit performance/models-unit:", output)
+        self.assertNotIn("no current showrunner staff row", errors)
+        self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), before)
+        after = self.staff_file.read_bytes()
+        for attempt in range(2):
+            with self.subTest(attempt=attempt):
+                code, output, errors = self.fill_result(retired=True)
+                self.assertEqual(code, 0, output + errors)
+                if attempt:
+                    self.assertEqual(output, "unchanged\n")
+                    self.assertEqual(self.staff_file.read_bytes(), after)
+                after = self.staff_file.read_bytes()
+        self.assertEqual(staff.by_id(owner.id), owner)
+
+    def test_retired_fill_excludes_an_only_bound_scratch_document_from_every_source_route(self) -> None:
+        doc = self.retired_fill_production("scratch-only", "scratch-only-unit")
+        owner = next(row for row in staff.find(kind="showrunner") if row.name == "scratch-only")
+        row = unit_membership("scratch-only", "scratch-only-unit")
+        before = self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns, doc.read_bytes()
+        with mock.patch.object(showrunners, "SCRATCH_ROOT", doc.parents[1]):
+            for dry_run in (True, False, False):
+                with self.subTest(dry_run=dry_run):
+                    code, output, errors = self.fill_result(retired=True, dry_run=dry_run)
+                    self.assertEqual(code, 1, output + errors)
+                    self.assertEqual(len(errors.splitlines()), 1, errors)
+                    self.assertIn(f"{owner.id} {owner.name}:", errors)
+                    self.assertIn(str(doc), errors)
+                    self.assertIn("scratch", errors)
+                    self.assertNotIn(f"source {doc}\n", output)
+                    self.assertNotIn("would repair", output)
+                    self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns,
+                                      doc.read_bytes()), before)
+                    self.assertFalse(unit_config.parked_path(row.id).exists())
+
+    def test_retired_fill_uses_only_the_showrunner_bound_document_despite_other_copies(self) -> None:
+        doc = self.retired_fill_production("sdlc", "models-unit")
+        owner = next(row for row in staff.find(kind="showrunner") if row.name == "sdlc")
+        _ = staff.set_doc(owner.id, staff.LiveDoc("natedev", doc))
+        second = doc.parent / "old" / doc.name
+        write_text_atomic(second, doc.read_text().replace("standby", "permanent").replace(
+            "**Showrunner session:** `sdlc`", "**Showrunner session:** `former-sdlc`"))
+        # A stale timer copy must not override the durable staff document either.
+        self.register_production("sdlc", second)
+        code, output, errors = self.fill_result(retired=True, dry_run=True)
+        self.assertEqual(code, 0, output + errors)
+        self.assertNotIn("conflicting production documents", errors)
+        self.assertNotIn(str(second), output + errors)
+        self.assertIn("models-unit", output)
+        self.assertIn(str(doc), output)
+
+    def test_retired_fill_lists_a_production_without_a_showrunner_once_and_adds_nothing(self) -> None:
+        doc = self.retired_fill_production("sdlc", "models-unit")
+        self.forget_rows(*(row.id for row in staff.snapshot().rows))
+        before = self.staff_file.read_bytes()
+        code, output, errors = self.fill_result(retired=True)
+        self.assertEqual(code, 1, output + errors)
+        lines = [line for line in errors.splitlines() if "no current showrunner staff row" in line]
+        self.assertEqual(len(lines), 1, errors)
+        self.assertIn(str(doc), lines[0])
+        self.assertEqual(self.staff_file.read_bytes(), before)
+        self.assertEqual(staff.snapshot().rows, ())
+
+    def test_retired_fill_previews_missing_rows_but_defers_admission_and_reruns_without_writes(self) -> None:
+        doc = self.retired_fill_production("sdlc", "models-unit")
+        owner = next(row for row in staff.find(kind="showrunner") if row.name == "sdlc")
+        _ = staff.set_doc(owner.id, staff.LiveDoc("natedev", doc))
+        row = unit_membership("sdlc", "models-unit")
+        self.forget_rows(row.id)
+        before = self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns, doc.read_bytes()
+        code, output, errors = self.fill_result(retired=True, dry_run=True)
+        self.assertEqual(code, 0, output + errors)
+        self.assertIn("models-unit", output)
+        self.assertIn(f"would add retired unit sdlc/models-unit: {self.source_root / 'worktrees/models-unit'}", output)
+        for attempt in range(2):
+            with self.subTest(attempt=attempt):
+                code, output, errors = self.fill_result(retired=True)
+                self.assertEqual(code, 0, output + errors)
+                self.assertIn("deferred: retired unit sdlc/models-unit waits for Phase 3h", output)
+                self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns,
+                                  doc.read_bytes()), before)
+                self.assertIsNone(staff.by_id(row.id))
+                self.assertFalse(unit_config.parked_path(row.id).exists())
 
     def test_fill_uses_session_fallback_without_a_units_table_and_continues_after_a_missing_session(self) -> None:
         doc = self.fill_production("sdlc", "fallback-unit", "unavailable-unit")
@@ -273,27 +399,31 @@ class StaffSourcesTests(StaffTestCase):
         self.assertEqual([(path.read_bytes(), path.stat().st_mtime_ns) for path in paths], before)
         self.assertFalse(unit_config.parked_path(row.id).exists())
 
-    def test_retired_fill_admits_a_missing_wrapped_parent_and_unit_without_a_timer_or_active_members(self) -> None:
+    def test_retired_fill_lists_a_missing_wrapped_owner_without_admitting_rows(self) -> None:
         doc = self.retired_fill_production("sdlc", "models-unit", wrapped=True)
         record = staff.snapshot()
         self.forget_rows(*(row.id for row in record.rows))
         timer = Path(os.environ["NOTIFIER_STATE_DIR"]) / "showrunner-sdlc/conf"
         timer.unlink()
-        # The existing repository manifest can discover an ignored archived doc from a raw location.
+        # A different owner's archived location cannot admit this production.
         anchor_parent = staff.ensure("showrunner", name="archive", doc=staff.WrappedDoc("natedev", doc))
         anchor = staff.ensure("unit", name="anchor", parent=anchor_parent.id,
                               worktree=staff.RemovedWorktree("natedev", doc.parents[1]))
+        before = self.staff_file.read_bytes()
         code, output, errors = self.fill_result(retired=True)
-        self.assertEqual(code, 0, output + errors)
-        runner = next(row for row in staff.find(kind="showrunner") if row.name == "sdlc")
-        unit = next(row for row in staff.find(kind="unit") if row.name == "models")
-        self.assertEqual(runner.doc, staff.WrappedDoc("natedev", doc))
-        self.assertEqual(unit.parent, runner.id)
-        self.assertIsInstance(unit.worktree, staff.RemovedWorktree)
-        self.assertIsInstance(unit_config.read_parked(unit.id), unit_config.UnitConfig)
+        self.assertEqual(code, 1, output + errors)
+        lines = [line for line in errors.splitlines() if "no current showrunner staff row" in line]
+        self.assertEqual(len(lines), 1, errors)
+        self.assertIn(str(doc), lines[0])
+        self.assertEqual(self.staff_file.read_bytes(), before)
+        self.assertFalse(any(row.name == "sdlc" for row in staff.find(kind="showrunner")))
+        self.assertFalse(any(row.name == "models" for row in staff.find(kind="unit")))
+        for row in record.rows:
+            self.assertFalse(unit_config.parked_path(row.id).exists())
         self.assertEqual(staff.active(staff.snapshot(), "unit"), ())
         self.assertEqual(staff.active(staff.snapshot(), "showrunner"), ())
         self.assertFalse(timer.exists())
+        self.assertEqual(staff.by_id(anchor_parent.id), anchor_parent)
         self.assertEqual(staff.by_id(anchor.id), anchor)
 
     def test_retired_fill_preserves_an_active_location_and_reports_both_conflicting_paths(self) -> None:

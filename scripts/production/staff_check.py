@@ -39,6 +39,23 @@ class CheckEvidence:
     uncertainties: tuple[str, ...] = ()
 
 
+def _codex_thread_host(arguments: list[str]) -> bool:
+    """An app-server hosts threads; its inherited staff mark is not a session."""
+    index = 2 if arguments and Path(arguments[0]).name in ("node", "nodejs") else 1
+    while index < len(arguments):
+        option = arguments[index]
+        if option in ("-c", "--config", "--enable", "--disable", "--remote",
+                      "--remote-auth-token-env", "--local-provider", "-m", "--model",
+                      "-p", "--profile", "-s", "--sandbox", "-a", "--ask-for-approval",
+                      "-C", "--cd", "--add-dir", "-i", "--image"):
+            index += 2
+        elif option.startswith("-") and option != "--":
+            index += 1
+        else:
+            return option == "app-server"
+    return False
+
+
 def read_evidence(record: staff.StaffSnapshot) -> CheckEvidence:
     """Use strict public readers; unreadable evidence never becomes absence."""
     try:
@@ -65,6 +82,8 @@ def read_evidence(record: staff.StaffSnapshot) -> CheckEvidence:
         claude = process.pid in running or herdr.is_claude_process(arguments)
         codex = herdr.is_codex_process(arguments)
         if not claude and not codex:
+            continue
+        if codex and _codex_thread_host(arguments):
             continue
         registered = records.get(process.pid)
         if claude and sessions.headless_process(

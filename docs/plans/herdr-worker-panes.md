@@ -716,49 +716,68 @@ Split from 3l on 2026-10-31; the same user ask and the same sdlc acceptance as 3
 
 **Acceptance gate:** basedpyright 0/0 on changed files and their callers; `test_staff_check.py`, `test_staff.py`, `test_staff_sources.py` pass; a real run on natedev lists only real wrong rows (its output goes to sdlc); two runs print the same bytes and change nothing on disk.
 
-### Phase 3h — A session's `STAFF_ID` comes from its row; a dead id is listed, never replayed  · status: todo
+### Phase 3j — Today's staff passes the staff check  · status: done
 
-**Depends on:** 3r and 3i (both change `staff.py`, `staff_sources.py` and `session_staff.py`). Top priority beside 3r (sdlc showrunner, 2026-11-01).
+**Depends on:** 3r and 3i (on main at `1d8bc1b62`). Runs beside 3h (user, via sdlc showrunner, 2026-11-01: "you should fix the current staffing in parallel").
 
 #### Work Order
 
-**Goal:** a restart or restore never brings back a `STAFF_ID` whose row is gone, a row's id never changes for the life of its unit, and every reader shows a session with no valid id one way.
+**Goal:** `staff_check.py` from main on today's `staff.json` exits 0, with a real fix for each of the 98 lines it printed at 08:05 EST, and the showrunner's rerun confirms it.
 
-**Spec:** sdlc showrunner rulings, 2026-11-01; staff correctness is an invariant (user ruling).
-1. A restart or restore takes `STAFF_ID` from the staff row. It never replays a recorded id whose row is gone (`pane_record.retained_environment`, `session_labels.StaffLabels.environment`). When no single row matches, the session gets no `STAFF_ID` and is listed on one line; nothing is set by name alone.
-2. Removing a row refuses while a live session carries its id, and names the session.
-3. The handler shows a session with no valid id one way (today: top-level for two, unassigned for one).
-4. `staff_check.py` lists a live session whose `STAFF_ID` names no row; a test pins it.
-5. `worker_admission.py:84` names what it could not find: the `STAFF_ID` and the run, never an empty name.
-6. A row's id never changes for the life of its unit or showrunner: a move changes the parent and the tab only. `_ensure_row` and `_validate` hold the rule: a unit's or showrunner's identity is not tied to its parent, and an ensure under a different parent refuses and names `staff.py move`. Each ensure caller gets a test: `add_unit.py`, `staff_sources.py:73` and `:1344`, `promote_showrunner.py:327`, the seed import at `staff.py:944/952`.
-7. The retired fill lists a same-name pair (such as `notifier-unit` in two productions) and adds nothing; a resume of one of them stops at that line.
+**Spec:** sdlc showrunner, 2026-11-01. Back up `staff.json` before each write, write under the staff lock, and prove a rerun of each step changes nothing.
+1. The five live sessions on removed ids are not restarted. A one-time data repair sets the three right rows' own ids to the ids the live sessions carry (herdr-unit `s9a4ebb73262` → `s9c5de6a34d9`, shutdown-unit `s1255ec654c7` → `s6d4efbdc187`, style-unit `s0a2a001f59e` → `s4869eee4762`), keeps them under sdlc, and moves their workers' parent to match. The handler then shows all three under sdlc.
+2. The 82 hana workers with no row: if they are live, place them; if not, the check's liveness rule is wrong and is fixed.
+3. The 8 double-session lines: the check sees a Codex worker as a worker, not as the unit's second session.
+4. The five rows with no worktree, organon's missing doc worktree and the delegate roster worker with an empty role: each is fixed from evidence; what has no evidence is listed for sdlc.
+5. The retired fill reads no scratch copy under `/tmp` and then adds the retired rows, with ids that fit Phase 3h's session-id design.
 
-**Cause (proved 2026-11-01):** at main `d61b993ec` (10-31 18:15), `add_unit.ensure_staff_unit` looked the unit up only inside production `natedev`, found none, and called `staff.ensure` under the natedev row; `_ensure_row` matches on (kind, name, parent), so three new ids were made, and the restore path replayed them after their rows were removed.
+**Files:**
+- `scripts/production/staff_check.py`
+- `scripts/production/test_staff_check.py`
+- `scripts/production/staff_sources.py`
+- `scripts/production/test_staff_sources.py`
+
+**Workers:** `1 writer, 1 tester` — item 1 is a data repair by the `fix` slot with no repository file; items 2–5 go to `impl` and `test` once the evidence names their causes.
+
+**Acceptance gate:** basedpyright 0/0 on changed files and their callers; the changed modules' tests pass; the full merge gate passes. Live, from main: a backup before each write; the item 1 repair and each fill print `unchanged` on rerun and change no byte; `staff.py show` and the handler show herdr-unit, shutdown-unit and style-unit under sdlc with their workers; `staff_check.py` exits 0 on two runs with the same bytes, and the showrunner's rerun exits 0.
+
+### Phase 3h — Staff row ids are the Claude session and Codex thread ids  · status: todo
+
+**Depends on:** 3j (lands after it; both change `staff_sources.py` and `staff_check.py`). User ruling, 2026-11-01, via the sdlc showrunner: "the session id's should be the session id's that come from claude and codex - they are unique and durable and will not drift and we have no assignment responsibvility".
+
+#### Work Order
+
+**Goal:** each staff row's id is its member's own session id, staff makes no id, and `STAFF_ID` and its copies go.
+
+**Spec:** sdlc showrunner rulings, 2026-11-01. Evidence: run folder `phases/3h/review_findings_1.txt`, `review_findings_2.txt`, `clear_mac/results.md`.
+1. A row's id is the Claude `sessionId` (registry `~/.claude/sessions/<pid>.json`, transcript name) or the Codex thread id (`CODEX_THREAD_ID`, roster `thread_id`, rollout `session_meta.payload.id`). A parent is the parent's id. The generator (`staff.py:712`) and the `s…` pattern (`staff.py:32`) go; no id mapping or alias table.
+2. `STAFF_ID` and its copies go: a session reads its own id from its runtime (Claude: its registry `sessionId`, or in a hook the input `session_id` and the environment `CLAUDE_CODE_SESSION_ID`; the Claude process environment itself has no `CLAUDE_CODE_SESSION_ID`, proved live 2026-11-01. Codex: `CODEX_THREAD_ID`), and a restart record keeps no identity. One owner switches every caller: the 30 files in `phases/3h/id_callers.txt`, `statusline.jq:119` and `promote_showrunner.py:327`.
+3. Admission writes a worker's row after `thread/start` returns its thread id (`worker_admission.py:91` writes it before today). A thread with no row (a stop between the two) is listed by `staff_check.py`; a test pins it.
+4. An id that changes takes effect at once, in one write under the staff lock, with the children's parents: a replaced Codex thread (`codex_mesh.py:5603-5607`) when it is replaced; a Claude session that `/clear` gives a new id (proved live 2026-11-01: SessionEnd with reason `clear` and the old id, then 0.19 s later SessionStart with source `clear` and the new id, before the next prompt) from a SessionStart hook with source `clear`, registered in `settings.json`, which finds the one row by the session's worktree or doc and writes the new id from its input. No gap and no restart (sdlc ruling, 2026-11-01). When the hook does not fire or finds no single row, it changes no row, and `staff_check.py` lists the session; a test pins each case. Compaction and moves keep the id.
+5. Migration, one script: backup, staff lock, rekey each row to its one proved id (179 rows) and every reference (204 parents, parked unit files, `refs/retired/<id>`, rename and transfer journals, receipt owners). The 24 workers whose owner records disagree get no row; each writes one at its next admission. The `metrics-visualization` unit row has no session field: list it for sdlc. The retired rows land here with their session ids (sdlc ruling: no `s…` ids made only to be replaced); a retired unit with no recorded session, and the four guilds units with no showrunner row, are listed. A rerun prints `unchanged`; a run stopped part way finishes on rerun.
+6. Mac (read 2026-11-01): one live session, with no row and no `STAFF_ID`; no Mac staff record. A Mac session joins at admission with its own id, read through `roster.py:1422`.
+7. Kept from the earlier 3h: removing a row refuses while a live session carries its id, and names it; the handler shows a session with no row one way; `worker_admission.py` names what it could not find.
 
 **Files:**
 - `scripts/production/staff.py`
 - `scripts/production/staff_sources.py`
+- `scripts/production/staff_check.py`
+- `scripts/production/session_staff.py`
+- `scripts/production/session_labels.py`
+- `scripts/production/worker_admission.py`
 - `scripts/production/promote_showrunner.py`
 - `scripts/production/add_unit.py`
-- `scripts/production/session_labels.py`
-- `scripts/production/session_staff.py`
-- `scripts/production/worker_admission.py`
-- `scripts/production/staff_check.py`
+- `scripts/production/retire_unit.py`
+- `scripts/production/unit_config.py`
+- `scripts/agents/codex_mesh.py`
 - `scripts/shutdown/pane_record.py`
 - `scripts/message/roster.py`
-- `scripts/production/test_staff.py`
-- `scripts/production/test_staff_sources.py`
-- `scripts/production/test_promote_showrunner.py`
-- `scripts/production/test_add_unit.py`
-- `scripts/production/test_session_labels.py`
-- `scripts/production/test_worker_admission.py`
-- `scripts/production/test_staff_check.py`
-- `scripts/shutdown/test_pane_record.py`
-- `scripts/message/test_roster.py`
+- `settings.json`
+- `scripts/`
 
 **Workers:** `1 writer, 1 tester` — `impl` and `test`, in one clone.
 
-**Acceptance gate:** basedpyright 0/0 on changed files and their callers; the changed modules' tests pass; the full merge gate passes. Live, from main: restart shutdown (idle), then style, then herdr-unit, and worker 2864179; each new `STAFF_ID` read from `/proc` names its sdlc row; style-unit's worker admission passes without a hand-set id; a real herdr-up rerun leaves all of them under sdlc; `staff_check.py` lists no dead id.
+**Acceptance gate:** basedpyright 0/0 on changed files and their callers; the changed modules' tests pass; the full merge gate passes. Live, from main: a backup; the migration's dry run, real run and rerun (`unchanged`, same sha256); `staff_check.py` exits 0 on two runs with the same bytes; each live session's row id equals the id its runtime reports; shutdown-unit restarted (idle) keeps its id; no new process carries `STAFF_ID`.
 
 ### Phase 3s — The one join answers from the row  · status: todo
 
