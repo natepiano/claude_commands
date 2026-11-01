@@ -25,6 +25,7 @@ import add_unit
 import retire_unit
 import unit_lookup
 import unit_move
+import test_retire_unit
 from production_units import Production, read_production
 import pane_record
 
@@ -159,6 +160,51 @@ class ResumeUnitTests(unittest.TestCase):
         self.assertIn("already resumed", output)
         self.assertEqual((self.staff.staff_file.read_bytes(), self.doc.read_bytes()), (data, document))
         self.assertEqual(len(self.calls), 1)
+
+    def test_retire_then_resume_reuses_the_staff_identity_at_the_add_unit_boundary(self) -> None:
+        retirement = test_retire_unit.RetireUnitTests()
+        self.addCleanup(retirement.doCleanups)
+        retirement.setUp()
+        unit = next(row for row in staff.find(kind="unit") if row.name == "alpha")
+        ref, tip = retirement.unmerged_work()
+        self.assertEqual(ref, f"refs/retired/{unit.id}")
+        code, output = retirement.retire()
+        self.assertEqual(code, 0, output)
+        retirement.assert_saved_retirement(ref, tip)
+        self.assertIsNone(staff.by_id(unit.id))
+        self.assertIn(f", staff {unit.id}", retirement.doc.read_text())
+        self.assertIn("alpha-unit", unit_lookup.retired_units(retirement.doc.read_text().splitlines(), "alpha"))
+        launched_ids: list[staff.StaffId] = []
+        commands: list[list[str]] = []
+
+        def launch(argv: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+            if len(argv) > 1 and Path(argv[1]).name == "add_unit.py":
+                commands.append(argv)
+                production = read_production(Path(argv[argv.index("--production") + 1]))
+                row = add_unit.ensure_staff_unit(production, argv[4])
+                launched_ids.append(row.id)
+                return subprocess.CompletedProcess(argv, 0, "", "")
+            return retirement.fake_run(argv, cwd)
+
+        resumed = io.StringIO()
+        with mock.patch.object(retire_unit, "run", side_effect=launch), redirect_stdout(resumed):
+            code = resume_unit.main(["alpha", "alpha"])
+        self.assertEqual(code, 0, resumed.getvalue())
+        self.assertEqual(launched_ids, [unit.id])
+        self.assertEqual(len(commands), 1)
+        self.assertEqual(commands[0][commands[0].index("--resume") + 1], DIRECTOR)
+        self.assertEqual(staff.by_id(unit.id), unit)
+        self.assertEqual(staff.find(kind="unit", parent=unit.parent), [unit])
+        self.assertEqual(git(retirement.worktree, "rev-parse", "HEAD"), tip)
+        self.assertEqual(git(retirement.checkout, "ls-remote", "origin", ref), "")
+        before = (retirement.staff.staff_file.read_bytes(), retirement.doc.read_bytes(),
+                  git(retirement.checkout, "for-each-ref"))
+        with mock.patch.object(retire_unit, "run", side_effect=launch), redirect_stdout(io.StringIO()):
+            code = resume_unit.main(["alpha", "alpha"])
+        self.assertEqual(code, 0)
+        self.assertEqual(len(commands), 1)
+        self.assertEqual((retirement.staff.staff_file.read_bytes(), retirement.doc.read_bytes(),
+                          git(retirement.checkout, "for-each-ref")), before)
 
     def saved_branch(self) -> tuple[str, str]:
         ref = "refs/retired/fixture-unit"

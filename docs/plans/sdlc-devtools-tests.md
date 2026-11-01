@@ -424,7 +424,7 @@ Source: Phase 7e closure review (F002), moved here under the landing rule (model
 
 **Gotchas:** the read-only fetch is `git fetch --no-write-fetch-head --refmap= -q origin <ref>` with no destination refspec, then resolves the sha `ls-remote` advertised; `--refmap=` stops configured tracking-ref updates.
 
-### Phase 7k — Retire says only what it did, and its dry run agrees with a real run  · status: todo
+### Phase 7k — Retire says only what it did, and its dry run agrees with a real run  · status: done
 **Depends on:** Phase 7j (same files; it is done)
 
 Source: the live retire and resume proof on a throwaway sdlc unit, 2026-10-31 (W scripts at 6985a8d6). Resume and its rerun passed. Retire did its work, but: (a) its rerun on the retired unit exited 0 and changed nothing, yet printed six lines (`kept:` three times, `stopped: <session>` for a session already ended, `marked: the retired Units row, committed on sdlc` with no new commit); the user rule is one plain line on a rerun that changes nothing. (b) The first run printed `stopped: <session>` twice (`stop_sessions` runs again after the pane closes, `retire_unit.py:911`) and `kept:` three times (`preserve_branch` at `:893`, `:931` and through `mark_retired`). (c) The dry run printed `blocks retirement: unowned process <pid>` for the unit's own pane shell (`retire_unit.py:630`), which the real run excludes (`:879`, `:904`) and closes through `unit_move.close_unit_pane`; the dry run and the real run disagree.

@@ -266,7 +266,7 @@ def retire(promotion: Promotion) -> None:
         lines[index] = "|".join(parts)
         break
     write_text_atomic(doc, "\n".join(lines))
-    commit_paths(promotion.parent, [doc], f"production({promotion.parent.slug}): retire {promotion.unit}, "
+    _ = commit_paths(promotion.parent, [doc], f"production({promotion.parent.slug}): retire {promotion.unit}, "
                  + f"promoted to showrunner of {promotion.child.slug}")
 
 
