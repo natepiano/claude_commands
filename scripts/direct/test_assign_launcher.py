@@ -148,6 +148,22 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
         return [cast(dict[str, object], json.loads(line)) for line in
                 (self.history / "runs" / f"{self.session_dir.name}.jsonl").read_text().splitlines()]
 
+    def test_dispatch_has_a_durable_worker_row_before_submitting_work(self) -> None:
+        from scripts.production import staff
+        _ = self.successful()
+        name = next(iter(self.assignment_records()))
+        rows = staff.snapshot().find(kind="worker", parent=staff.StaffId(os.environ["STAFF_ID"]))
+        self.assertEqual([row.name for row in rows], [name])
+
+    def test_unreadable_staff_starts_no_worker(self) -> None:
+        record = Path(os.environ["STAFF_FILE"])
+        _ = record.write_text("{broken")
+        result = self.launch()
+        self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
+        self.assertIn("staff: impl: not opened:", result.stderr)
+        self.assertEqual(self.methods("thread/start"), [])
+        self.assertEqual(record.read_text(), "{broken")
+
     def test_rerun_review_dispatch_keeps_its_lens_and_read_only_thread(self) -> None:
         _ = self.successful("review", "--lens", "rerun", "--pass", "1")
         starts = self.methods("thread/start")
@@ -841,7 +857,7 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
         # The injected code changes only the ownership boundary. Real followers
         # submit input, write receipts, and settle actual loopback-server turns.
         _ = script.with_suffix(".py").write_text(
-            "import fcntl, json\nfrom pathlib import Path\nfrom scripts.direct import assign\n" +
+            "import fcntl, json\nfrom pathlib import Path\nfrom scripts.direct import assign\nfrom scripts.agents import worker_lifecycle\n" +
             f"boundary = {boundary!r}\nready = Path({str(ready)!r})\n" +
             f"trace = Path({str(trace)!r})\ndestination = Path({str(destination)!r})\n" +
             f"delivered = Path({str(delivered)!r})\n" +
@@ -854,20 +870,18 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
             "    if adopted: return\n" +
             "    adopted = True\n" +
             "    destination.mkdir()\n" +
-            "    with (dispatch.run / 'mesh_roster.json').open('r+') as handle:\n" +
-            "        fcntl.flock(handle, fcntl.LOCK_EX)\n" +
-            "        roster = json.load(handle)\n" +
+            "    with worker_lifecycle.locked_state(dispatch.run / 'mesh_roster.json') as handle:\n" +
+            "        roster = handle.read_object()\n" +
             "        record = roster[dispatch.worker]\n" +
             "        (destination / 'mesh_roster.json').write_text(json.dumps({dispatch.worker: record.copy()}))\n" +
             "        record['adopted_to'] = str(destination)\n" +
             "        assign.codex_mesh.advance_worker_roster_revision(record)\n" +
-            "        handle.seek(0); json.dump(roster, handle); handle.truncate()\n" +
+            "        handle.publish(json.dumps(roster))\n" +
             "    if boundary == 'before_inbox':\n" +
             "        pending = dispatch.run / (dispatch.worker + '.pending.json')\n" +
-            "        with pending.open('r+') as handle:\n" +
-            "            fcntl.flock(handle, fcntl.LOCK_EX)\n" +
+            "        with worker_lifecycle.locked_state(pending) as handle:\n" +
             "            (destination / pending.name).write_text(handle.read())\n" +
-            "            handle.seek(0); json.dump({'messages': []}, handle); handle.truncate()\n" +
+            "            handle.publish(json.dumps(worker_lifecycle.empty_inbox()))\n" +
             "    with trace.open('a') as handle: handle.write(json.dumps({'adopted': True}) + '\\n')\n" +
             "def follow(dispatch, command, shown, log):\n" +
             "    global follow_count, active_dispatch\n" +

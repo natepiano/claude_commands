@@ -636,6 +636,34 @@ require_taplo() {
     fi
 }
 
+workspace_taplo() (
+    # Explicit paths retain Taplo's include/exclude rules and omit untracked files.
+    cd "$WORKSPACE_ROOT" || return
+    local listing file pattern character index
+    local -a files=()
+    listing="$(mktemp)" || return
+    if ! git ls-files -z -- '*.toml' > "$listing"; then
+        rm -f "$listing"
+        return 1
+    fi
+    while IFS= read -r -d '' file; do
+        # Taplo expands arguments as globs, even after --. Select each literal path.
+        pattern=""
+        for ((index=0; index<${#file}; index++)); do
+            character=${file:index:1}
+            case "$character" in
+                '['|']'|'*'|'?') pattern+="[$character]" ;;
+                *) pattern+="$character" ;;
+            esac
+        done
+        files+=("$pattern")
+    done < "$listing"
+    rm -f "$listing"
+    # No paths means a repository scan to Taplo, so skip the empty set.
+    (( ${#files[@]} )) || return 0
+    run taplo fmt "$@" -- "${files[@]}"
+)
+
 example_features() {
     cargo metadata --no-deps --format-version 1 \
         | "$PY" -c "$EXAMPLE_FEATURES_PY" "$1" "$2"
@@ -1153,7 +1181,7 @@ cancel_tree_run() {
     # Board release also stops a step's separately owned process group.
     if declare -F release_token >/dev/null; then release_token || true; fi
     if [[ -n "${RUN_STEP_PID:-}" ]]; then
-        kill -KILL -- "-$RUN_STEP_PID" 2>/dev/null || true
+        "${STEP_RECORD_SCRIPT%/*}/../lib/py" "${STEP_RECORD_SCRIPT%/*}/../lib/process_group.py" "$RUN_STEP_PID" KILL 2>/dev/null || { [[ $? == 3 ]] || printf 'verify.sh: process group helper failed for pid %s\n' "$RUN_STEP_PID" >&2; }
         wait "$RUN_STEP_PID" 2>/dev/null || true
         RUN_STEP_PID=""
     fi
@@ -2526,7 +2554,7 @@ child = os.fork()
 if child:
     def forward(signum, _frame):
         try:
-            os.killpg(child, signum)
+            if (sent := subprocess.run([str(Path(os.environ["VERIFY_PROCESS_GROUP_LIB"]) / "py"), str(Path(os.environ["VERIFY_PROCESS_GROUP_LIB"]) / "process_group.py"), str(child), str(signum)], capture_output=True, text=True)).returncode: raise ProcessLookupError if sent.returncode == 3 else SystemExit("verify.sh: process group helper failed: " + " ".join(sent.stderr.splitlines()))
         except ProcessLookupError:
             # The child has not created its new group yet, or has exited.
             try:
@@ -2565,7 +2593,7 @@ sys.exit(shell_status(subprocess.call(command)))
 eval "$(declare -f buildlog_exec | sed '1s/buildlog_exec/buildlog_exec_unowned/')"
 buildlog_exec() {
     if [[ "${TOKEN_HELD}" -eq 1 ]]; then
-        buildlog_exec_unowned python3 -c "$STEP_OWNER_PY" \
+        buildlog_exec_unowned env VERIFY_PROCESS_GROUP_LIB="$(dirname -- "${STEP_RECORD_SCRIPT:-$BOARD_HELPER}")/../lib" python3 -c "$STEP_OWNER_PY" \
             "${BOARD_DIR}/locks/cargo.d" "$$" "$@"
     else
         buildlog_exec_unowned "$@"
@@ -2812,7 +2840,7 @@ verify_interrupted() {
     EXIT_STATUS=$((128 + $1))
     interrupt_hold_wait
     if [[ -n "$RUN_STEP_PID" ]]; then
-        kill -s "$1" -- "-$RUN_STEP_PID" 2>/dev/null || true
+        "${STEP_RECORD_SCRIPT%/*}/../lib/py" "${STEP_RECORD_SCRIPT%/*}/../lib/process_group.py" "$RUN_STEP_PID" "$1" 2>/dev/null || { [[ $? == 3 ]] || printf 'verify.sh: process group helper failed for pid %s\n' "$RUN_STEP_PID" >&2; }
         release_token || true
         wait "$RUN_STEP_PID" 2>/dev/null || true
         RUN_STEP_PID=""
@@ -2887,7 +2915,7 @@ case "$CMD" in
             fmt_cargo --all
             GATE_METADATA="$(cargo metadata --no-deps --format-version 1)"
             WORKSPACE_ROOT="$("$PY" -c 'import json, sys; print(json.load(sys.stdin)["workspace_root"])' <<< "$GATE_METADATA")"
-            (cd "$WORKSPACE_ROOT" && run taplo fmt)
+            workspace_taplo
             lint_status=0
             if lint_config_enabled mend; then
                 invoke_mend --workspace --fail-on-warn "${FEATURE_FLAGS[@]}" || lint_status=1
@@ -2925,7 +2953,7 @@ case "$CMD" in
             fi
             GATE_METADATA="$(cargo metadata --no-deps --format-version 1)"
             WORKSPACE_ROOT="$("$PY" -c 'import json, sys; print(json.load(sys.stdin)["workspace_root"])' <<< "$GATE_METADATA")"
-            if ! (cd "$WORKSPACE_ROOT" && run taplo fmt --check); then
+            if ! workspace_taplo --check; then
                 lint_status=1
             fi
             if lint_config_enabled clippy; then
@@ -3006,9 +3034,9 @@ case "$CMD" in
         # Run there so Taplo uses the same config and scope as the push gate.
         GATE_METADATA="$(cargo metadata --no-deps --format-version 1)"
         WORKSPACE_ROOT="$("$PY" -c 'import json, sys; print(json.load(sys.stdin)["workspace_root"])' <<< "$GATE_METADATA")"
-        TAPLO_ARGS=(fmt --check)
-        if [[ "$HOLD_LINT" == 1 ]]; then TAPLO_ARGS=(fmt); fi
-        if (cd "$WORKSPACE_ROOT" && run taplo "${TAPLO_ARGS[@]}"); then
+        TAPLO_ARGS=(--check)
+        if [[ "$HOLD_LINT" == 1 ]]; then TAPLO_ARGS=(); fi
+        if workspace_taplo ${TAPLO_ARGS[@]+"${TAPLO_ARGS[@]}"}; then
             :
         else
             taplo_status=$?

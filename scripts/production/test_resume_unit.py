@@ -25,12 +25,14 @@ import add_unit
 import retire_unit
 import unit_lookup
 import unit_move
+import test_retire_unit
 from production_units import Production, read_production
 import pane_record
 
-from scripts.production.staff_test_support import CHECKOUT, PROCESS_TIMEOUT, StaffTestCase
+from scripts.production.staff_test_support import CHECKOUT, StaffTestCase
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import staff
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 RUN_COMMAND = retire_unit.run
 
@@ -159,6 +161,151 @@ class ResumeUnitTests(unittest.TestCase):
         self.assertEqual((self.staff.staff_file.read_bytes(), self.doc.read_bytes()), (data, document))
         self.assertEqual(len(self.calls), 1)
 
+    def test_retire_then_resume_reuses_the_staff_identity_at_the_add_unit_boundary(self) -> None:
+        retirement = test_retire_unit.RetireUnitTests()
+        self.addCleanup(retirement.doCleanups)
+        retirement.setUp()
+        unit = next(row for row in staff.find(kind="unit") if row.name == "alpha")
+        ref, tip = retirement.unmerged_work()
+        self.assertEqual(ref, f"refs/retired/{unit.id}")
+        code, output = retirement.retire()
+        self.assertEqual(code, 0, output)
+        retirement.assert_saved_retirement(ref, tip)
+        self.assertIsNone(staff.by_id(unit.id))
+        self.assertIn(f", staff {unit.id}", retirement.doc.read_text())
+        self.assertIn("alpha-unit", unit_lookup.retired_units(retirement.doc.read_text().splitlines(), "alpha"))
+        launched_ids: list[staff.StaffId] = []
+        commands: list[list[str]] = []
+
+        def launch(argv: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+            if len(argv) > 1 and Path(argv[1]).name == "add_unit.py":
+                commands.append(argv)
+                production = read_production(Path(argv[argv.index("--production") + 1]))
+                row = add_unit.ensure_staff_unit(production, argv[4])
+                launched_ids.append(row.id)
+                return subprocess.CompletedProcess(argv, 0, "", "")
+            return retirement.fake_run(argv, cwd)
+
+        resumed = io.StringIO()
+        with mock.patch.object(retire_unit, "run", side_effect=launch), redirect_stdout(resumed):
+            code = resume_unit.main(["alpha", "alpha"])
+        self.assertEqual(code, 0, resumed.getvalue())
+        self.assertEqual(launched_ids, [unit.id])
+        self.assertEqual(len(commands), 1)
+        self.assertEqual(commands[0][commands[0].index("--resume") + 1], DIRECTOR)
+        self.assertEqual(staff.by_id(unit.id), unit)
+        self.assertEqual(staff.find(kind="unit", parent=unit.parent), [unit])
+        self.assertEqual(git(retirement.worktree, "rev-parse", "HEAD"), tip)
+        self.assertEqual(git(retirement.checkout, "ls-remote", "origin", ref), "")
+        before = (retirement.staff.staff_file.read_bytes(), retirement.doc.read_bytes(),
+                  git(retirement.checkout, "for-each-ref"))
+        with mock.patch.object(retire_unit, "run", side_effect=launch), redirect_stdout(io.StringIO()):
+            code = resume_unit.main(["alpha", "alpha"])
+        self.assertEqual(code, 0)
+        self.assertEqual(len(commands), 1)
+        self.assertEqual((retirement.staff.staff_file.read_bytes(), retirement.doc.read_bytes(),
+                          git(retirement.checkout, "for-each-ref")), before)
+
+    def saved_branch(self) -> tuple[str, str]:
+        ref = "refs/retired/fixture-unit"
+        _ = git(self.checkout, "checkout", "-q", "-b", "saved-work")
+        _ = (self.checkout / "unmerged.txt").write_text("keep this work\n")
+        _ = git(self.checkout, "add", "unmerged.txt")
+        _ = git(self.checkout, "commit", "-q", "-m", "unmerged unit work")
+        tip = git(self.checkout, "rev-parse", "HEAD")
+        _ = git(self.checkout, "push", "-q", "origin", f"HEAD:{ref}")
+        _ = git(self.checkout, "checkout", "-q", "main")
+        _ = git(self.checkout, "branch", "-D", "saved-work")
+        self.write_row(f"(retired 2026-10-20, worktree removed, session {DIRECTOR}, ref {ref}, tip {tip}) docs/plans/alpha.md")
+        _ = git(self.checkout, "add", self.doc.name)
+        _ = git(self.checkout, "commit", "-q", "-m", "record saved branch")
+        return ref, tip
+
+    def assert_saved_branch_resumed(self, ref: str, tip: str) -> None:
+        self.assertEqual(git(self.worktree, "rev-parse", "HEAD"), tip)
+        self.assertEqual(git(self.worktree, "branch", "--show-current"), "alpha-branch")
+        self.assertEqual((self.worktree / "unmerged.txt").read_text(), "keep this work\n")
+        self.assertEqual(git(self.checkout, "ls-remote", "origin", ref), "")
+        self.assertNotIn("retired", self.row())
+        self.assertIn(DIRECTOR, self.calls[-1])
+
+    def test_resume_restores_the_saved_tip_and_session_and_rerun_writes_nothing(self) -> None:
+        ref, tip = self.saved_branch()
+        code, output = self.resume()
+        self.assertEqual(code, 0, output)
+        self.assert_saved_branch_resumed(ref, tip)
+        before = (self.doc.read_bytes(), self.doc.stat().st_mtime_ns,
+                  self.staff.staff_file.read_bytes(), git(self.checkout, "rev-parse", "HEAD"))
+        calls = self.calls.copy()
+        code, output = self.resume()
+        self.assertEqual(code, 0, output)
+        self.assertEqual((self.doc.read_bytes(), self.doc.stat().st_mtime_ns,
+                          self.staff.staff_file.read_bytes(), git(self.checkout, "rev-parse", "HEAD")), before)
+        self.assertEqual(self.calls, calls)
+
+    def test_resume_finishes_after_worktree_creation_before_saved_ref_deletion(self) -> None:
+        ref, tip = self.saved_branch()
+        def interrupted(argv: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+            if "push" in argv and (ref in argv or f":{ref}" in argv) and ("--delete" in argv or f":{ref}" in argv):
+                return subprocess.CompletedProcess(argv, 1, "", "stop before saved ref deletion")
+            return self.fake_run(argv, cwd)
+        with mock.patch.object(retire_unit, "run", side_effect=interrupted):
+            code, output = self.resume()
+        self.assertEqual(code, 1, output)
+        self.assertEqual(git(self.worktree, "rev-parse", "HEAD"), tip)
+        self.assertEqual(git(self.checkout, "ls-remote", "origin", ref), f"{tip}\t{ref}")
+        code, output = self.resume()
+        self.assertEqual(code, 0, output)
+        self.assert_saved_branch_resumed(ref, tip)
+
+    def launch_with_commit(self, argv: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+        result = self.fake_run(argv, cwd)
+        if argv[0] != "git":
+            _ = (self.worktree / "director-work.txt").write_text("new director work\n")
+            _ = git(self.worktree, "add", "director-work.txt")
+            _ = git(self.worktree, "commit", "-q", "-m", "checkpoint(alpha): resumed work")
+        return result
+
+    def test_resume_retry_keeps_the_directors_new_commit_after_ref_deletion(self) -> None:
+        ref, tip = self.saved_branch()
+        with mock.patch.object(retire_unit, "run", side_effect=self.launch_with_commit), mock.patch.object(
+                resume_unit, "unmark", side_effect=OSError("stop before unmark")):
+            code, output = self.resume()
+        self.assertEqual(code, 1, output)
+        self.assertIn("stop before unmark", output)
+        later_tip = git(self.worktree, "rev-parse", "HEAD")
+        self.assertNotEqual(later_tip, tip)
+        self.assertEqual(git(self.worktree, "rev-parse", "HEAD^"), tip)
+        self.assertEqual(git(self.checkout, "ls-remote", "origin", ref), "")
+        self.assertIn("retired", self.row())
+        code, output = self.resume()
+        self.assertEqual(code, 0, output)
+        self.assert_saved_branch_resumed(ref, later_tip)
+        self.assertEqual((self.worktree / "director-work.txt").read_text(), "new director work\n")
+        before = (self.doc.read_bytes(), self.doc.stat().st_mtime_ns,
+                  self.staff.staff_file.read_bytes(), git(self.checkout, "rev-parse", "HEAD"), self.calls.copy())
+        code, output = self.resume()
+        self.assertEqual(code, 0, output)
+        self.assertEqual((self.doc.read_bytes(), self.doc.stat().st_mtime_ns,
+                          self.staff.staff_file.read_bytes(), git(self.checkout, "rev-parse", "HEAD"), self.calls), before)
+
+    def test_resume_retry_refuses_a_divergent_branch_after_ref_deletion(self) -> None:
+        ref, tip = self.saved_branch()
+        with mock.patch.object(resume_unit, "unmark", side_effect=OSError("stop before unmark")):
+            code, output = self.resume()
+        self.assertEqual(code, 1, output)
+        self.assertEqual(git(self.checkout, "ls-remote", "origin", ref), "")
+        _ = git(self.worktree, "checkout", "-q", "-B", "alpha-branch", f"{tip}^")
+        _ = self.launch_with_commit([sys.executable, "add_unit.py"])
+        divergent_tip = git(self.worktree, "rev-parse", "HEAD")
+        before, calls = self.doc.read_bytes(), self.calls.copy()
+        code, output = self.resume()
+        self.assertEqual(code, 1, output)
+        self.assertIn("expected saved tip", output)
+        self.assertEqual(self.doc.read_bytes(), before)
+        self.assertEqual(git(self.worktree, "rev-parse", "HEAD"), divergent_tip)
+        self.assertEqual(self.calls, calls)
+
     def test_retired_unit_receipt_cannot_complete_a_new_incarnation(self) -> None:
         code, output = self.resume()
         self.assertEqual(code, 0, output)
@@ -214,18 +361,18 @@ class ResumeUnitTests(unittest.TestCase):
             with self.staff.lock_notice(self.staff.staff_file.parent / "operation.lock") as listener:
                 process.start()
                 child.close()
-                self.assertTrue(parent.poll(PROCESS_TIMEOUT), "nested add_unit did not join resume's lock")
+                self.assertTrue(parent.poll(TEST_HANG_GUARD_SECS), "nested add_unit did not join resume's lock")
                 staff_id = staff.StaffId(cast(str, parent.recv()))
                 self.assertIn("retired", self.row())
                 seed = self.staff.start_script(CHECKOUT / "scripts/production/staff_sources.py", "seed")
                 self.staff.assert_operation_blocks(seed, listener)
                 parent.send("finish")
-                self.assertTrue(parent.poll(PROCESS_TIMEOUT), "resume did not clear the retired note")
+                self.assertTrue(parent.poll(TEST_HANG_GUARD_SECS), "resume did not clear the retired note")
                 code, output = cast(tuple[int, str], parent.recv())
                 self.assertEqual(code, 0, output)
-                process.join(timeout=PROCESS_TIMEOUT)
+                process.join(timeout=TEST_HANG_GUARD_SECS)
                 self.assertEqual(process.exitcode, 0)
-                output, errors = seed.communicate(timeout=PROCESS_TIMEOUT)
+                output, errors = seed.communicate(timeout=TEST_HANG_GUARD_SECS)
             self.assertEqual(seed.returncode, 0, output + errors)
             self.assertNotIn("retired", self.row())
             row = staff.by_id(staff_id)
@@ -238,11 +385,11 @@ class ResumeUnitTests(unittest.TestCase):
             child.close()
             if process.is_alive():
                 process.terminate()
-                process.join(timeout=PROCESS_TIMEOUT)
+                process.join(timeout=TEST_HANG_GUARD_SECS)
             process.close()
             if seed is not None and seed.returncode is None:
                 seed.kill()
-                _ = seed.communicate(timeout=PROCESS_TIMEOUT)
+                _ = seed.communicate(timeout=TEST_HANG_GUARD_SECS)
 
     def test_resumes_the_recorded_session_in_a_worktree_made_from_the_merge_branch(self) -> None:
         self.assert_resumed(*self.resume())

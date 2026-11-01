@@ -3187,7 +3187,8 @@ def split_all_running() -> int:
         print("split-all: natedev build hold in force; skipped")
         return 0
     found = False
-    for runner in showrunners.registered_showrunners():
+    runners = showrunners.registered_showrunners()
+    for runner in runners:
         if not runner["session"]:
             continue
         try:
@@ -3202,6 +3203,7 @@ def split_all_running() -> int:
             found = True
             if build_hold.natedev_holds(build_hold.holder_directory()).in_force:
                 print("split-all: natedev build hold in force; skipped")
+                _ = showrunners.require_complete(runners)
                 return 0
             code = split_all(production)
             if code:
@@ -3210,6 +3212,7 @@ def split_all_running() -> int:
             print(f"split-all: {runner['slug']}: failed: {' '.join(str(error).split())}")
     if not found:
         print("no running style productions")
+    _ = showrunners.require_complete(runners)
     return 0
 
 

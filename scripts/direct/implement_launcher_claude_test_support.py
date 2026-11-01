@@ -89,6 +89,7 @@ class ClaudeLauncherFixture(support.ImplementLauncherFixture):
         self.config_file: Path = self.root / "direct.conf"
         self.prompt_file: Path = self.root / "implementation_prompt.md"
         self.implement_script: Path = self.root / "scripts/direct/implement.sh"
+        _ = self.staff_parent
 
     @override
     def tearDown(self) -> None:

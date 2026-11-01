@@ -44,8 +44,21 @@ def main() -> None:
         sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
         import roster
         import send
+        import sessions
+        from relay_identity import RelayIdentity, live_relay_identity, message_sender_name, relay_senders_directory
 
-        found = send.matching_recipients(name, send.LocalThenPeer(), roster.roster(os.environ, roster.ThisMachine()))
+        observed = roster.roster(os.environ, roster.ThisMachine())
+        found = send.matching_recipients(name, send.LocalThenPeer(), observed)
+        if (isinstance(found, send.RecipientMatches) and not found.entries
+                and message_sender_name(name) != name):
+            registry = sessions.read_registry()
+            if not registry.unreadable and any(
+                item.record["name"] == name
+                and isinstance(live_relay_identity(item.record["pid"], relay_senders_directory()), RelayIdentity)
+                for item in registry.entries
+            ):
+                name = message_sender_name(name)
+                found = send.matching_recipients(name, send.LocalThenPeer(), observed)
         if isinstance(found, (send.LocalRosterIncomplete, send.RecipientSearchFailed)):
             context("send.py roster error: " + "; ".join(found.problems))
             return

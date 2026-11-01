@@ -183,15 +183,28 @@ class StaffMoveTests(StaffTestCase):
         with self.assertRaises(FrozenInstanceError):
             setattr(result, "row", self.unit)
 
-    def test_staff_move_rerun_reports_done_without_a_second_move_or_file_change(self) -> None:
+    def test_staff_move_rerun_reports_one_unchanged_line_without_a_second_move_or_file_change(self) -> None:
         _ = staff_move.move_unit("sdlc", "models-unit", "target")
         before = self.staff_file.read_bytes()
+        modified = self.staff_file.stat().st_mtime_ns
+        with (redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors,
+              mock.patch.object(staff, "move", wraps=staff.move) as move):
+            code = staff.main(["move", "sdlc/models-unit", "target"])
+        self.assertEqual(code, 0, errors.getvalue())
+        self.assertEqual(output.getvalue(), "unchanged: panes under new-tools\n")
+        self.assertEqual(errors.getvalue(), "")
+        move.assert_not_called()
+        self.assertEqual(self.staff_file.read_bytes(), before)
+        self.assertEqual(self.staff_file.stat().st_mtime_ns, modified)
+        self.assertEqual(sum(command[2:4] == ["pane", "move"] for command in self.commands()), 1)
+
+    def test_first_staff_move_keeps_its_done_line_and_changes_parent_and_tab(self) -> None:
         with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
             code = staff.main(["move", "sdlc/models-unit", "target"])
         self.assertEqual(code, 0, errors.getvalue())
-        self.assertIn("done", output.getvalue())
-        self.assertIn("unchanged", errors.getvalue())
-        self.assertEqual(self.staff_file.read_bytes(), before)
+        self.assertEqual(output.getvalue(), "done: panes under new-tools\n")
+        self.assertEqual(errors.getvalue(), "")
+        self.assertEqual(staff.by_id(self.unit.id), replace(self.unit, parent=self.destination.id))
         self.assertEqual(sum(command[2:4] == ["pane", "move"] for command in self.commands()), 1)
 
     def test_no_live_pane_keeps_parent_change_and_reports_the_unmoved_tab_once(self) -> None:
