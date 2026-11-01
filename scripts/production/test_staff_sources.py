@@ -18,7 +18,8 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.production import staff, staff_sources, unit_config, live_units, fake_unit_host
+from scripts.lib import unit_runs
+from scripts.production import staff, staff_sources, unit_config, live_units, fake_unit_host, worker_fill
 from scripts.production.staff_test_support import (
     SOURCES_SCRIPT, FixtureMachine, StaffTestCase, production_membership, unit_membership,
 )
@@ -842,6 +843,68 @@ class StaffSourcesTests(StaffTestCase):
             self.assertIsInstance(unit_membership("sdlc", name).worktree, staff.WorktreeUnfilled)
         self.assertEqual((tracked / ".unit.toml").read_bytes(), before)
         self.assertFalse((negated / ".unit.toml").exists())
+
+    def test_serverless_delegate_skips_its_roster_and_counts_once_in_worker_fill(self) -> None:
+        _ = self.production("sdlc", "models-unit")
+        production_membership("sdlc", "models-unit")
+        unit = unit_membership("sdlc", "models-unit")
+        _ = self.session_record("session-models", "models-unit")
+        self.pane("w1:models", session_id="session-models", environment={"STAFF_ID": unit.id})
+        delegate_root = self.source_root / "delegate"
+        with (mock.patch.object(unit_runs, "FORMER_RUN_ROOT", delegate_root),
+              mock.patch.dict(os.environ, {"ROSTER_RUN_ROOT": str(delegate_root)})):
+            run = self.worker_run("sdlc", "models-unit", "session-models")
+            (run / "mesh_server.json").unlink()
+            roster = self.roster_worker(run, "delegate", "", "thread-paused", status="paused")
+            entry = cast(dict[str, dict[str, object]], json.loads(roster.read_text()))
+            missing_role = {"delegate": {key: value for key, value in entry["delegate"].items() if key != "role"}}
+            before = self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns
+            for contents in (roster.read_text(), json.dumps(missing_role), "{broken roster"):
+                with self.subTest(roster=contents):
+                    write_text_atomic(roster, contents)
+                    with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
+                        code = worker_fill.fill()
+                    self.assertEqual((code, output.getvalue(), errors.getvalue()),
+                                     (0, "skipped 1 not current\nunchanged\n", ""))
+                    self.assertEqual(staff.find(kind="worker"), [])
+                    self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), before)
+
+    def test_serverless_delegate_held_by_ledger_adds_no_worker_and_counts_once(self) -> None:
+        _ = self.production("sdlc", "models-unit")
+        production_membership("sdlc", "models-unit")
+        unit = unit_membership("sdlc", "models-unit")
+        _ = self.session_record("session-models", "models-unit")
+        self.pane("w1:models", session_id="session-models", environment={"STAFF_ID": unit.id})
+        delegate_root = self.source_root / "delegate"
+        with (mock.patch.object(unit_runs, "FORMER_RUN_ROOT", delegate_root),
+              mock.patch.dict(os.environ, {"ROSTER_RUN_ROOT": str(delegate_root)})):
+            run = self.worker_run("sdlc", "models-unit", "session-models")
+            _ = self.ledger_worker(run, "sdlc", "models-unit", "test", "test", "thread-held")
+            _ = self.roster_worker(run, "test", "test", "thread-held", status="paused")
+            (run / "mesh_server.json").unlink()
+            before = self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns
+            with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
+                code = worker_fill.fill()
+            self.assertEqual((code, output.getvalue(), errors.getvalue()),
+                             (0, "skipped 1 not current\nunchanged\n", ""))
+            self.assertEqual(staff.find(kind="worker"), [])
+            self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), before)
+
+    def test_serverless_unit_keeps_uncertain_worker_evidence_out_of_the_skip_count(self) -> None:
+        _ = self.production("sdlc", "models-unit")
+        production_membership("sdlc", "models-unit")
+        run = self.worker_run("sdlc", "models-unit", "gone-director")
+        (run / "mesh_server.json").unlink()
+        self.write_json(run / "mesh_roster.json", {
+            "test": {"role": "test", "status": "paused", "family": "codex", "launcher_pid": 0},
+        })
+        with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
+            code = worker_fill.fill()
+        self.assertEqual(code, 1, output.getvalue() + errors.getvalue())
+        self.assertIn(str(run), errors.getvalue())
+        self.assertIn("source unavailable", errors.getvalue())
+        self.assertNotIn("skipped", output.getvalue())
+        self.assertEqual(staff.find(kind="worker"), [])
 
     def test_paused_roster_workers_survive_a_director_restart_or_a_missing_messaging_socket(self) -> None:
         _ = self.production("sdlc", "models-unit")
