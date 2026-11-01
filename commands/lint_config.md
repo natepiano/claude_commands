@@ -50,7 +50,7 @@ effect on the next run of each consumer; nothing needs restarting.
 | Check | Runs | Where it applies |
 |---|---|---|
 | `mend` | `cargo mend` check pass and `--fix` | `invoke.sh mend` (lint CLI, validate_ci mend steps, `verify.sh lint`) |
-| `style_review` | style-guide walk and banned-words scan over the caller's diff | `/unit:style_review` · `/unit:direct` main phase review |
+| `style_review` | style-guide walk and banned-words scan over the caller's diff | `/unit:style_review` · `/unit:direct` reviewer worker |
 | `clippy` | `cargo clippy` | `invoke.sh clippy` (lint CLI, `verify.sh lint`) |
 | `doc` | `cargo doc -D warnings` | standalone `lint doc` only; `verify.sh doc` ignores this switch |
 | `fmt` | `cargo +nightly fmt` | `invoke.sh fmt` (`lint fmt`, `verify.sh lint`) |

@@ -16,7 +16,8 @@ Everything below is the contract.
 ---
 
 <StyleReview>
-Perform the diff scan and checklist walk inline; do not worker this review.
+In a phase, the assigned reviewer worker applies this contract. For a run by
+hand, the invoking session applies it.
 
 1. Read the operation switches with:
 
@@ -29,7 +30,7 @@ Perform the diff scan and checklist walk inline; do not worker this review.
    review runs even when mend and clippy found no issues.
 2. Set `STYLE_SINCE` to the caller's baseline or `since <ref>` argument,
    defaulting to `HEAD`. Set `STYLE_DIR` anew for this invocation: use the
-   caller's named directory (a run supplies its session directory), or run
+   caller's named directory, or run
    `mkdir -p /tmp/claude` followed by
    `STYLE_DIR=$(mktemp -d /tmp/claude/style-review.XXXXXX)` when none is named.
    Create the caller's directory if needed. On directory creation failure,
@@ -65,8 +66,8 @@ Perform the diff scan and checklist walk inline; do not worker this review.
    including untracked files and deletions: `.rs`, `Cargo.toml`, or `Cargo.lock`.
    With no Rust change, do not load the guide or walk its rules; record
    `Skip (no Rust change)` for the Rust checklist and continue to step 4.
-   Otherwise, unless `=== STYLE_CHECKLIST ===` is already in context, load
-   the guide:
+   Otherwise load the guide once for this phase (or this manual invocation),
+   even if a previous phase loaded it:
 
    ```bash
    zsh ~/.claude/scripts/rust_style/load-rust-style.sh
@@ -92,7 +93,9 @@ Perform the diff scan and checklist walk inline; do not worker this review.
    real `path:line`, including untracked files. Pre-existing lines are not
    scanned. Record the scanner result in the table, including when the Rust
    checklist is skipped. Any other exit is an error; report it and stop.
-5. Open every violation in the caller's findings ledger when one is supplied,
-   for repair through <FixDispatch/>; otherwise report it in the table.
+5. In a phase, include every violation in the review summary with severity,
+   title and file:line, alongside the code findings. <Synthesize/> records
+   them in the normal findings ledger for <FixDispatch/>; the reviewer does
+   not write the ledger. For a run by hand, report violations in the table.
    Report the reviewed range and violation count, or that the review passed.
 </StyleReview>
