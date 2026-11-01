@@ -2452,6 +2452,13 @@ def _process_environment(process: Path) -> dict[str, str]:
     return dict(entry.split("=", 1) for entry in process.joinpath("environ").read_bytes().decode(errors="replace").split("\0") if "=" in entry)
 
 
+def process_environment(pid: int) -> dict[str, str]:
+    """Read a process even outside herdr; a failed observation remains an error."""
+    if _platform() == "darwin":
+        return darwin_process_environment(pid)
+    return _process_environment(_proc_root() / str(pid))
+
+
 def _process_arguments(process: Path) -> list[str]:
     return [value for value in process.joinpath("cmdline").read_bytes().decode(errors="replace").split("\0") if value]
 
@@ -2473,6 +2480,11 @@ def _is_agent_process(arguments: list[str], kind: str) -> bool:
 def is_claude_process(arguments: list[str]) -> bool:
     """The argv is a Claude Code process, native or through node."""
     return _is_agent_process(arguments, "claude")
+
+
+def is_codex_process(arguments: list[str]) -> bool:
+    """The argv is a Codex process, native or through node."""
+    return _is_agent_process(arguments, "codex")
 
 
 def _startup_processes(shell: PaneShell, kind: str, tracked: set[AgentProcessIdentity]) -> AgentProcessPresent | PaneAtShell | PaneRunning | PaneProcessesUnreadable:

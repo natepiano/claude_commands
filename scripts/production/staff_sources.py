@@ -4,7 +4,8 @@
 from __future__ import annotations
 
 import argparse
-from contextlib import nullcontext
+from contextlib import nullcontext, redirect_stderr
+import io
 import json
 import os
 import re
@@ -813,6 +814,29 @@ def _worker_seed(record: staff.StaffSnapshot, sources: _MemberSources, base: sta
                                         existing.id if existing is not None else staff.NewSeedMember(),
                                         staff.SeedParent(parent_key)))
     return staff.SeedInput(tuple(members), base.retire)
+
+
+@dataclass(frozen=True)
+class WorkerEvidence:
+    """Raw ownership observations, including workers not yet represented in staff."""
+
+    workers: tuple[WorkerObservation, ...]
+    identities: dict[staff.StaffId, dict[str, str]]
+    diagnostics: tuple[str, ...]
+
+
+def observe_workers(record: staff.StaffSnapshot, sources: _MemberSources) -> WorkerEvidence:
+    """Expose the shared scanner without dropping missing rows or acquiring a lock."""
+    errors = io.StringIO()
+    with redirect_stderr(errors):
+        scan = _WorkerSources(record, sources)
+        observed = scan.collect()
+    if scan.unreadable:
+        raise staff.StaffUnreadable("worker sources: " + ", ".join(map(str, sorted(scan.unreadable))))
+    if scan.registry_incomplete:
+        raise staff.StaffUnreadable("Claude session registry is incomplete")
+    diagnostics = tuple(errors.getvalue().splitlines())
+    return WorkerEvidence(observed, scan.identities, diagnostics)
 
 
 def live() -> dict[str, object]:

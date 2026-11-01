@@ -135,7 +135,8 @@ class MemberSources:
         return found
 
 
-def member_sources(*, dependencies: Callable[[Path], None] | None = None) -> MemberSources:
+def member_sources(*, dependencies: Callable[[Path], None] | None = None,
+                   unreadable: showrunners.UnreadableTimerPolicy = showrunners.UnreadableTimerPolicy.SKIP) -> MemberSources:
     import herdr
     from scripts.shutdown import pane_record
 
@@ -146,7 +147,7 @@ def member_sources(*, dependencies: Callable[[Path], None] | None = None) -> Mem
         raise staff.StaffUnreadable(f"{pane_record.record_path(session)}: {error}") from error
     except ValueError as error:
         raise staff.StaffUnreadable(str(error)) from error
-    sources = showrunners.read_sources(unreadable=showrunners.UnreadableTimerPolicy.SKIP,
+    sources = showrunners.read_sources(unreadable=unreadable,
                                        dependencies=dependencies)
     return MemberSources({source.timer.slug: source for source in sources}, tuple(launches.values()))
 
