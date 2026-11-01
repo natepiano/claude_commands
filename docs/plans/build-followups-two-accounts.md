@@ -3039,21 +3039,11 @@ User 2026-11-01 07:4x EST: "please look at the problems coming from the script f
 
 **As-built:** a stored-mode read with a cached role map lists no role-map problem; with no cache it refuses as before. A usage reading not from today shows its date (`10-29 01:14`). The retry promise is gone: the line says `last read attempted at <time>` or `no usage read has been attempted`, because the notes timer can reuse a failed report for ten minutes. `MAC_HOME_LOGIN_STEP` gives the whole Mac step: `accounts.py exec claude2`, `/login`, `/exit`, then `accounts.py cutover-home claude2`, never `/logout`. When `~/.codex` and the numbered home hold the same login, one line reads `~/.codex still holds codex2's login; stop what uses ~/.codex (such as the ChatGPT app), then run accounts.py cutover-home codex2`; when the numbered home holds another login, one label-only line gives its repair instead of a cutover that would refuse. The login command is one shared `env CODEX_HOME=<quoted home> codex login`, which the `codex` alias cannot redirect, also used by `setup codexN`. No problem line prints a login; a test fails if one holds a fixture login. Review: two lenses found F001 (cutover step for a home holding another login) and F002 (false retry promise); two fix rounds; closure approved.
 
-### Phase 101k — The Mac reads account usage at an interval set in config, now one minute  · status: done
+### Phase 101k — The Mac reads account usage at an interval set in config, now one minute  · status: done · d7b8562d
 
-User 2026-11-01 09:2x EST, through the Mac session: "make that interval configurable - and to make the refresh interval 1 minute instead of 2 minutes". The Mac job `account-usage` (`/etc/nixos/modules/darwin/account-usage.nix`) runs `agent_notes.py usage-only` at a fixed launchd `StartInterval` of 120 s, so a change needs a rebuild. Director call: one key for the Mac read only; natedev's usage read stays inside its notes part (`[parts.notes]`, 120 s), because that pass also routes quota and moves sessions, and the user named only the Mac.
+User 2026-11-01 09:2x EST, through the Mac session: "make that interval configurable - and to make the refresh interval 1 minute instead of 2 minutes". Director call: the key is for the Mac read only; natedev's usage read stays in `[parts.notes]` (120 s), because that pass also routes quota and moves sessions.
 
-**Depends on:** none.
-
-#### Work Order
-
-- **One config key.** `config/agent_notes.toml` gets the Mac usage-read interval (60 s), read at each run; no literal interval in code. A missing or invalid value refuses with one line that names the file and key.
-- **Due check.** `agent_notes.py usage-only` reads only when the last usage-only attempt is at least the configured interval old; otherwise it exits 0 at once with no read and no log line. Reuse the existing due and schedule code in `scripts/maintenance/agent_notes_job.py` (move it to one shared place if needed); no second copy. With a 30 s launchd poll and a 60 s interval, reads come every 60 s, not every 90 s: start jitter must not skip a poll.
-- **Mac job.** The director changes `account-usage.nix` to a 30 s poll (comment: the interval belongs to the runtime config), like natedev's `agent-notes.nix`. Workers do not edit `/etc/nixos`.
-- Docs: `docs/accounts.md` where it names the Mac refresh interval.
-- Tests: due and not-due runs, the jitter case, config read at use, the refusal. Tests never touch live homes, keychains, ssh, real usage stores or launchd.
-
-**Files:** `scripts/whoami/agent_notes.py`, `scripts/maintenance/agent_notes_job.py`, their tests, `config/agent_notes.toml`, `docs/accounts.md`.
+**As-built:** `mac_usage.interval_seconds = 60` in `config/agent_notes.toml`, read at use; a bad or huge value refuses with the file and key. `agent_notes.py usage-only --poll-seconds 30` reads an account when its own last granted claim is at least interval minus half a poll (45 s) old, so start jitter never skips a poll and one slow account never delays another; a held claim leaves that account's time unchanged. The shared claim guard and the 600 s rate-limit backoff stay; natedev's 90 s guard is unchanged. Due checks share `scripts/maintenance/schedule.py` with `agent_notes_job.py`. Tests script two accounts with 0 s, 15 s and changing credential latency and assert per-account gaps of 45–90 s. The Mac job change (30 s launchd poll, `--poll-seconds 30`) is on /etc/nixos branch `accounts-mac-usage-interval` (afb41714), pushed by the showrunner; it takes effect after a Mac `rebuild`. Three repair rounds; the third used an Astra design.
 
 ### Phase 101l — A legacy-login line and the brp registration each stay fixed  · status: todo
 
