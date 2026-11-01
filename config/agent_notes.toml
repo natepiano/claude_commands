@@ -3,6 +3,9 @@
 interval_seconds = 120
 timeout_seconds = 120
 
+[mac_usage]
+interval_seconds = 60
+
 [parts.notes]
 interval_seconds = 120
 timeout_seconds = 60

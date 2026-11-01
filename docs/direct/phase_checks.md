@@ -13,13 +13,13 @@ Each phase runs these checks once at the points named below:
 | taplo fmt `--check` | the same `lint` | the workspace TOML |
 | clippy `--all-targets --all-features` | the same `lint` | the workspace |
 | rustdoc `-D warnings` | `verify.sh doc`, run by the unit director as the last command before the checkpoint commit | the workspace |
-| style review | the unit director's main review in <DualReview/>, reading `commands/unit/style_review.md` | the phase's diff from its baseline, untracked files included |
+| style review | the reviewer worker assigned by <ReviewPromptContract/>, using <StyleReview/> | the phase's diff from its baseline, untracked files included |
 
 The five lint checks run wherever the phase's workers run `verify.sh lint`. The checkpoint commit hook runs the assertion guard again on the staged tree, in Rust and Python repositories; an `Assertion-Change: <path>::<test> — <why>` line in a work order or the commit message rules one finding.
 Test starts as soon as the code is ready, independently of lint.
 <VerificationContract/> defines when each result counts.
-A phase with no Rust change has no lint run; its style review runs only the
-banned-words scan and marks the checklist `Skip (no Rust change)`.
+A phase with no Rust change has no lint run; <StyleReview/> defines the
+remaining review scope.
 
 `config/lint.conf` can switch off lint and style checks; it cannot switch off
 the checkpoint rustdoc check, even in a phase with no Rust change in a Cargo

@@ -38,8 +38,9 @@ An answer that shows unsafe rerun behavior is a defect, fixed in the phase
 as a blocker or minor finding. The prompt closes by asking for the rerun case
 the reviewer built, or a plain statement that it could not build one.
 
-The `craft` lens is off since 2026-10-04 (user: review trial ended); the unit
-director's main review audits style each phase.
+The `craft` lens remains off since 2026-10-04 (user: review trial ended).
+The `contract` reviewer also owns the phase style review under
+<ReviewPromptContract/>.
 
 Each lens uses the unit's own read-only reviewer. Dispatch with
 `assign.sh --role review`; it resumes `review`, or `review2` when `review` is
@@ -82,19 +83,48 @@ narrates each change of activity as a short output line so the wrapper
 heartbeat remains live, and never polls, sleeps or narrates a wait. It receives no
 heartbeat path and never receives `${IMPL_SUMMARY}`. The reviewer runs read-only.
 
-Do not repeat the implementer's listed verification or audit style. A reviewer
-may run one specific omitted check only when a plausible regression lies
-outside the listed gate, and must name that command; a Codex reviewer runs it
+Do not repeat the implementer's listed verification. Apart from the assigned
+<StyleReview/>, a reviewer may run one specific omitted check only when a
+plausible regression lies outside the listed gate, and must name that command;
+a Codex reviewer runs it
 with `verify.sh` per the `## Builds and tests` section of
 <WritePromptContract/> item 3, which every Codex review prompt carries verbatim. Broad reviews apply
-<TypeDesignContract/>; closure reviews apply only <ClosureReview/>.
+<TypeDesignContract/>; closure reviews apply <ClosureReview/>, including any
+style assignment still owed under this contract.
 
 Every review prompt carries the Three Gods sentence and the Type Design
 Contract under <WritePromptContract/>. Its standing-instructions line names
 `config/review/code.md`.
 
 A broad review's prompt names its lens per <TeamReview/> and asks that lens's
-questions and no others; a closure review names no lens.
+questions, plus its style assignment below; a closure review names no lens.
+
+The phase style review starts **owed**. Append this assignment to the
+`contract` reviewer's broad prompt, or to the next closure reviewer's prompt
+while it remains owed, with concrete paths and the baseline commit filled in:
+
+```
+## Phase style review
+
+Read ~/.claude/commands/unit/style_review.md in full and apply <StyleReview/>
+with since <phase_baseline commit> and <SESSION_DIR>/style/<phase id> as the
+diff directory. Save its table and result, including Off or an error, to
+<SESSION_DIR>/phase_style_review_<phase id>.md. Include every style finding
+and the report path in your normal review summary for <Synthesize/>.
+```
+
+The assignment becomes **complete** only when a reviewer returns the report
+for this phase and baseline, with a finished result (findings, Pass, Off, or
+No changes to review) and includes its findings in the normal summary for
+<Synthesize/>. A canceled or failed dispatch, missing report, invalid baseline,
+or errored report leaves it owed, even if an artifact was written. Resume the
+assigned reviewer thread where possible; retain its completed guide load.
+Never assign style to two reviewers at once. Once complete, later reviewers
+check style repairs through existing finding ids without repeating the pass.
+The phase cannot converge while style is owed; if no repair needs closure,
+dispatch a reviewer for the owed assignment alone. The director reads the
+ledger and result for <RunSummary/> and never substitutes a guide load or rule
+walk.
 
 Every code review prompt, under any lens and in a closure review, also asks
 this, verbatim:
@@ -125,16 +155,16 @@ Read surrounding code as needed. Report a numbered list; each item has a title, 
 1-3 sentence explanation, and severity:
 - blocker: wrong behavior, spec violation, or missing required work
 - minor: real edge, error-handling, or quality defect
-- nit: non-behavioral quality; style-guide conformance is out of scope
+- nit: non-behavioral quality
 End with APPROVE, APPROVE WITH FIXES, or REQUEST CHANGES. Do not invent findings.
 
 ## Your lens
 [the lens name and what it reads for, from <TeamReview/>]
 
 Other reviewers read this same diff under their own lenses. Report only
-what yours covers: a finding another lens owns is that lens's to
-make, and duplicating it costs the synthesis a second opinion and buys a
-count instead.
+what yours covers, including your assigned phase style review: a finding
+another lens owns is that lens's to make, and duplicating it costs the
+synthesis a second opinion and buys a count instead.
 
 ## Three Gods
 [the section of that name in <WritePromptContract/>, verbatim]
@@ -253,22 +283,14 @@ final diff only.
 4. While they run, perform the main review. Pass 1 reads changed code in risk
    order: Work Order paths, public API/traits/registration/plugin wiring, then
    remaining hunks. Verify spec, extras, codebase fit, <TypeDesignContract/>, and
-   `${IMPL_SUMMARY}` claims. On pass 1 only, run the style review named by
-   <PhaseChecks/>: read `~/.claude/commands/unit/style_review.md` in full and
-   apply <StyleReview/> with `since <commit from ${PHASE_DIR}/phase_baseline>`
-   and `${SESSION_DIR}` as its directory; supply the phase's findings ledger.
-   A missing or invalid baseline stops the review. Save its table and result to
-   `${SESSION_DIR}/phase_style_review_<phase-id>.md`, including `Off` or an
-   error. For its ledger writes use `findings.py open --caught-by main` with
-   each violation's severity, title, file and line; retain the returned ids
-   for <Synthesize/> without opening them again. A phase with no Rust change runs only the
-   banned-words scan under <StyleReview/>. Blind reviewers never audit style.
+   `${IMPL_SUMMARY}` claims. Style belongs to the assigned reviewer under
+   <ReviewPromptContract/>; the director does not load or walk the guide.
    The summaries' self-reports per <WritePromptContract/> — what a slot was unsure
    about, what it could not verify, what it touched outside its file set — are
    this read's alone: no lens receives a summary, so a stated doubt is a place
    only the main review can go looking. Say where this read did not reach. Later
    passes read only repair paths and affected callers, consumers, transitions,
-   or invariants; do not repeat the checklist walk.
+   or invariants.
 5. If this main pass confirms a substantial, unambiguous spec-defined defect
    while blind reviewers remain active, read each log once, cancel them all, and
    close each one's own pass with
@@ -279,7 +301,8 @@ final diff only.
    finding and apply <FixDispatch/> with useful
    partial-review evidence. Preempt at most once per phase; never edit while an
    old-diff review remains active. A canceled review supplies no verdict or
-   direct-fix agreement.
+   direct-fix agreement. Any owed style assignment follows
+   <ReviewPromptContract/> on the next reviewer dispatch.
 6. Otherwise finish the main pass and let <DispatchContract/> await every blind
    reviewer by its host-specific path. Each completed dispatch loads the summary
    named by its handle into `${AGENT_REVIEW}`. A lens that reports `error` is named in one
@@ -293,6 +316,8 @@ Run `findings.py status` and write a prompt under <ReviewPromptContract/> that
 contains only:
 
 - The role-switch opening from <ReviewPromptContract/>.
+- The style assignment from <ReviewPromptContract/> when still owed, with the
+  complete phase diff and baseline; its scope is separate from the repair diff.
 - Each open id, severity, file:line, and title verbatim.
 - Paths named by the fix plus new post-fix paths.
 - Diff limited to those paths, including new files.
@@ -308,8 +333,9 @@ contains only:
 - The `## Type Design Contract` section using <WritePromptContract/> item 7's
   follow-up pointer.
 
-Forbid whole-phase and already-reviewed design findings, and style or polish
-findings on code the repair did not write. An outside-path problem is valid
+Outside an owed style assignment, forbid whole-phase and already-reviewed
+design findings, and style or polish findings on code the repair did not write.
+An outside-path problem is valid
 only when a quoted repair hunk causes it. Omit the broad questions and Type
 Design questions.
 

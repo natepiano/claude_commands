@@ -69,7 +69,7 @@ to rediscover after a context compaction lives in the doc.
   otherwise the project's exact test command>
 - **Lint:** <for Rust always `bash ~/.claude/scripts/direct/verify.sh lint <pkg>`;
   never raw cargo commands. <PhaseChecks/> defines scope and the phase's
-  style review in the unit director's main review; workers never load the guide>
+  style review under <ReviewPromptContract/>>
 - **Invariants:** <project-wide rules every phase must preserve; omit if none>
 
 ## Phases

@@ -48,6 +48,97 @@ class StylePlanTests(StylePlanFixture):
         ticket, = self.ledger().ticket_open(family + "-unit")
         return ticket
 
+    def approved_findings_blocking_structure(self) -> tuple[Path, Path, str]:
+        """Approved modules work at the only pending structure file, blocking a names read there."""
+        plan = self.modules_unit()
+        structure = self.rule("structure", "tier: D\nfamily: modules\ninput_scope: file\n")
+        _ = self.rule("read")
+        self.sync()
+        issue = self.borrowing_decision(structure, "modules", self.sources[0], count=2)
+        for path in self.sources[1:]:
+            self.record(structure, path, self.tip)
+        return plan, issue, structure
+
+    def test_refill_builds_approved_findings_before_structure_on_the_same_file(self) -> None:
+        plan, issue, _ = self.approved_findings_blocking_structure()
+        ticket = self.select_for_family("modules", plan)
+        self.assertEqual((ticket["kind"], ticket["files"]), ("proposal", [self.sources[0]]))
+        self.assertEqual(set(ticket["finding_ids"]),
+                         {finding.finding_id for finding in self.ledger().proposal_findings(issue)})
+
+    def test_refill_builds_followed_approved_findings_before_structure_at_their_new_file(self) -> None:
+        structure = self.rule("structure", "tier: D\nfamily: modules\ninput_scope: file\n")
+        _ = self.rule("read")
+        old, current = self.sources[0], "crates/alpha/src/current.rs"
+        self.commit_files({old: "pub struct Parent {\n    old: u32,\n}\n"})
+        plan = self.modules_unit()
+        issue, (finding,) = self.judged_findings(structure, ((old, 2, "old: u32,"),))
+        _ = issue.write_text(issue.read_text().replace("unit: names-unit", "unit: modules-unit"))
+        self.write_generated_body(issue)
+        self.finish_judging()
+        _ = self.git("mv", old, current)
+        self.commit_to_every_checkout()
+        _ = self.git("merge", "--ff-only", "main", cwd=plan.parents[3])
+        for path in self.sources[1:]:
+            self.record(structure, path, self.tip)
+
+        # Following refreshes the generated decision, including its rule link. Use the same
+        # rule-origin fixture as the declaration-follow tests so refresh is not skipped.
+        with mock.patch.object(style_proposals, "github_rule_root",
+                               return_value=style_proposals.GitHubRuleRoot("example/nate_style", "main")):
+            ticket = self.select_for_family("modules", plan)
+
+        followed, = self.ledger().proposal_findings(issue)
+        self.assertEqual((followed.finding_id, followed.path), (finding.finding_id, current))
+        self.assertEqual((ticket["kind"], ticket["files"], ticket["finding_ids"]),
+                         ("proposal", [current], [finding.finding_id]))
+
+    def test_refill_selects_structure_when_its_file_no_longer_has_approved_findings(self) -> None:
+        plan, issue, _ = self.approved_findings_blocking_structure()
+        first = self.select_for_family("modules", plan)
+        self.assertEqual(first["kind"], "proposal")
+        self.ledger().ticket_drop(first["id"])
+        _ = issue.write_text(issue.read_text().replace("plan: approved", "plan: ''"))
+        ticket = self.select_for_family("modules", plan)
+        self.assertEqual((ticket["kind"], ticket["files"]), ("structure", [self.sources[0]]))
+        self.assertTrue(all(isinstance(finding.build_ticket, style_ledger.NoBuildTicket)
+                            for finding in self.ledger().proposal_findings(issue)))
+
+    def test_refill_selects_structure_after_the_approved_findings_ticket_merges(self) -> None:
+        plan, _, _ = self.approved_findings_blocking_structure()
+        first = self.select_for_family("modules", plan)
+        self.assertEqual(first["kind"], "proposal")
+        ledger = self.ledger()
+        ledger.ticket_checkpoint(first["id"], self.tip)
+        with mock.patch.object(berth_board, "read_board", return_value=self.board(*self.sources[1:])):
+            with mock.patch.object(style_proposals, "proposal_command"):
+                waiting = style_plan.next_phase("modules-unit", plan, self.repo)
+        self.assertIsInstance(waiting, style_plan.WaitingForMerge)
+        _ = ledger.ticket_merge(first["id"])
+        ticket = self.select_for_family("modules", plan)
+        self.assertEqual((ticket["kind"], ticket["files"]), ("structure", [self.sources[0]]))
+
+    def test_refill_resumes_the_same_approved_ticket_without_creating_structure_work(self) -> None:
+        plan, _, _ = self.approved_findings_blocking_structure()
+        first = self.select_for_family("modules", plan)
+        self.assertEqual(first["kind"], "proposal")
+        before = plan.read_bytes(), self.count_tickets(), first
+        second = self.select_for_family("modules", plan)
+        self.assertEqual((plan.read_bytes(), self.count_tickets(), second), before)
+
+    def test_queued_structure_yields_once_to_approved_findings_on_its_file(self) -> None:
+        plan, _, structure = self.approved_findings_blocking_structure()
+        ledger = self.ledger()
+        ledger.ticket_add("modules-unit-1", "modules-unit", "structure", "modules", "crates/alpha",
+                          [self.sources[0]], [structure])
+        ticket = self.select_for_family("modules", plan)
+        self.assertEqual((ticket["kind"], ticket["files"]), ("proposal", [self.sources[0]]))
+        self.assertEqual(self.count_tickets(), 3)  # The judging ticket, one dropped read, and one build.
+        self.assertEqual(ledger.queued_tickets("modules-unit"), ())
+        before = self.count_tickets()
+        self.assertEqual(self.select_for_family("modules", plan), ticket)
+        self.assertEqual(self.count_tickets(), before)
+
     def test_modules_reads_blocking_structure_before_approved_decisions(self) -> None:
         plan = self.modules_unit()
         structure = self.rule("structure", "tier: D\nfamily: modules\ninput_scope: file\n")

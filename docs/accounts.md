@@ -49,9 +49,22 @@ Each Claude group with no account has a note: `units: not configured; the role m
 
 Without `--stored`, a role map that cannot be fetched or read from cache refuses status with an error on stderr and exit 1, for both the table and JSON.
 
-On the Mac, the `account-usage` launchd user agent refreshes the usage store at
-login and every two minutes in the GUI login session, where the keychain is
-available. It runs `agent_notes.py usage-only`, which shares the agent-notes job's
+On the Mac, the `account-usage` launchd user agent polls at login and every 30
+seconds in the GUI login session, where the keychain is available. It runs
+`agent_notes.py usage-only --poll-seconds 30`, which reads `mac_usage.interval_seconds` from
+`config/agent_notes.toml` on each invocation (currently 60 seconds). Missing or
+invalid values refuse the read and name the file and key. Each account has its own
+eligibility time. A Claude read records its actual granted claim time, after
+credential lookup; a held claim leaves that account's time unchanged. Reads
+without a Claude claim record their start time. An account is due
+after the configured interval minus half the job's
+poll period, so jitter neither adds another poll nor causes adjacent polls to
+read. Without `--poll-seconds`, the full interval must elapse. The shared read
+guard uses the same cadence for this pass; natedev's cadence and the rate-limit
+backoff stay unchanged. The interval describes nominal attempts, not guaranteed
+successful readings. Polls with no due account exit silently without reading usage. The separate attempt
+history and lock live in `~/.local/state/agent-notes/usage-only/`.
+It shares the agent-notes job's
 live read and save step. It writes no notes, sends no quota alerts and runs
 neither the Codex pacer nor account moves. Natedev still owns those actions.
 Install the scripts before activating `modules/darwin/account-usage.nix`.
