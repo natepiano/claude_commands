@@ -6,6 +6,7 @@ import json
 import dailies_input
 import dailies_render
 import os
+import sqlite3
 import subprocess
 import sys
 import unittest
@@ -1641,7 +1642,8 @@ class DailiesInputTests(DailiesInputFixture):
         self.assertEqual(parsed.waiting.count, 1)
         created = datetime.fromisoformat(cast(str, summary["oldest_waiting"]))
         local_created = created.astimezone(ZoneInfo("America/Los_Angeles"))
-        self.assertEqual(parsed.waiting.oldest_pending_since, local_created)
+        self.assertEqual(parsed.waiting.oldest_pending_since.astimezone(ZoneInfo("UTC")),
+                         local_created.astimezone(ZoneInfo("UTC")))
         _ = self.output.write_text(json.dumps({
             "length": "simple", "zone": "America/Los_Angeles", "units": [],
             "children": [{"name": "hana-style", "open": 0, "report": saved}],
@@ -1650,6 +1652,28 @@ class DailiesInputTests(DailiesInputFixture):
         rendered = self.run_renderer(render_at.strftime("%Y-%m-%dT%H:%M"))
         self.assertEqual(rendered.returncode, 0, rendered.stderr)
         self.assertIn(" · hand-off waiting 5h", rendered.stdout)
+
+    def assert_handoff_age_at(self, created_at: str) -> None:
+        ledger_cli = self.style_ledger_cli
+
+        def with_fixed_creation_time(*arguments: str) -> subprocess.CompletedProcess[str]:
+            result = ledger_cli(*arguments)
+            if arguments[:2] == ("handoff", "add"):
+                # The ledger runs in a child: fix its saved clock in the disposable database.
+                database, = Path(self.env["STYLE_LEDGER_STATE_DIR"]).rglob("ledger.sqlite")
+                with sqlite3.connect(database) as connection:
+                    _ = connection.execute("UPDATE handoffs SET created_at=?, updated_at=?",
+                                           (created_at, created_at))
+            return result
+
+        with mock.patch.object(self, "style_ledger_cli", side_effect=with_fixed_creation_time):
+            self.test_unsent_handoff_age_from_the_ledger_flags_the_saved_style_report()
+
+    def test_unsent_handoff_age_in_the_first_fold_of_the_repeated_hour(self) -> None:
+        self.assert_handoff_age_at("2026-11-01T08:01:42.340892+00:00")
+
+    def test_unsent_handoff_age_in_the_second_fold_of_the_repeated_hour(self) -> None:
+        self.assert_handoff_age_at("2026-11-01T09:01:42.340892+00:00")
 
     def test_failed_or_invalid_summary_saves_unavailable_and_the_report_still_succeeds(self) -> None:
         self.mark_style_production()

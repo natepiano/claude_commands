@@ -22,8 +22,7 @@ import fake_showrunner
 from scripts.production import fake_unit_host
 
 from scripts.herdr import fake_herdr
-from scripts.direct import review_pool
-from scripts.production import staff, showrunners as pool_showrunners
+from scripts.production import staff, showrunners
 from scripts.production.cli_fixture import invoke_cli
 from scripts.production.rename_test_support import bind_staff_fixture
 from scripts.production.staff_test_support import StaffTestCase, unit_membership
@@ -35,9 +34,9 @@ import progress_history
 import tidy_wrapped
 import stall_watch
 from rename_state import RenameRefused
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 # load 136 on natedev, 2026-10-29
-TEST_HANG_GUARD_SECS = 300
 
 SCRIPT = Path(__file__).with_name("transfer_unit.py")
 
@@ -89,10 +88,10 @@ class UnitTransferFixture(StaffTestCase):
                                      for slug, session_id in (("demo", "test-showrunner"),
                                                                ("other", "other-showrunner"))}
         for module, name, value in (
-            (pool_showrunners, "NOTIFIER_STATE_DIR", self.root / "state/notifier"),
-            (pool_showrunners, "SHOWRUNNER_STATE_DIR", self.root / "state/showrunner"),
-            (pool_showrunners, "CONFIG", self.root / "home/.claude/showrunners.json"),
-            (pool_showrunners, "SESSIONS_DIR", self.root / "state/sessions"),
+            (showrunners, "NOTIFIER_STATE_DIR", self.root / "state/notifier"),
+            (showrunners, "SHOWRUNNER_STATE_DIR", self.root / "state/showrunner"),
+            (showrunners, "CONFIG", self.root / "home/.claude/showrunners.json"),
+            (showrunners, "SESSIONS_DIR", self.root / "state/sessions"),
             (progress_history, "SESSION_ROOTS", (self.root / "sessions",)),
             (pane_record, "RECORD_DIR", self.root / "home/.local/state/herdr-panes"),
             (pane_record, "PROC", self.root / "proc"),
@@ -123,7 +122,6 @@ class UnitTransferFixture(StaffTestCase):
             "SHOWRUNNER_STATE_DIR": str(self.root / "state/showrunner"),
             "STALL_WATCH_STATE_DIR": str(self.root / "state/stall-watch"),
             "RENAME_UNIT_STOP_WAIT": "0", "RENAME_UNIT_LIVE_WAIT": "0",
-            "REVIEW_POOL_STATE": str(self.root / "state/review-pool"),
             "SHOWRUNNERS_CONFIG": str(config / "showrunners.json"),
             "SHOWRUNNERS_SEND": str(self.root / "fake_send.py"),
             "TRANSFER_MESSAGE_LOG": str(self.root / "messages.jsonl"),
@@ -188,10 +186,6 @@ class UnitTransferFixture(StaffTestCase):
                    + shlex.join(["zsh", "/scripts/production_check.sh",
                                  str(self.giving / "docs/plans/demo-production.md")]) + "\n")
         self.write(self.stall_path("demo", "alpha-unit"), '{"stretch": 17}\n')
-        # A reviewer with no thread retires without a Codex call.
-        self.write(self.root / "state/review-pool/demo/pool.json", json.dumps({"generation": 1, "reviewers": {
-            "r1": {"type": "codex", "thread_id": "", "prime_hash": "h", "lease": {"unit": "alpha-unit", "ordinal": 3},
-                   "busy_pid": None, "reviews": 2}}}))
 
     def production_doc(self, slug: str, checkout: Path, *table: str) -> str:
         return "\n".join(["# Production — " + slug, "", "## Production Context", "",
@@ -338,8 +332,6 @@ class UnitTransferFixture(StaffTestCase):
             cwd = Path(cast(str, kwargs.get("cwd") or os.getcwd()))
             if command[0] == self.env["HERDR_BIN"]:
                 return invoke_cli(fake_herdr, lambda: fake_herdr.main(command[1:]), command[1:], environment, cwd)
-            if command[:2] == [sys.executable, str(transfer_unit.POOL)]:
-                return invoke_cli(review_pool, review_pool.main, command[2:], environment, cwd, production_state=True)
             return original_run(command, *args, **kwargs)
 
         with (mock.patch.object(retire_unit, "MAC_CLAIMS", self.root / "home/.local/state/mac-test/claims"),

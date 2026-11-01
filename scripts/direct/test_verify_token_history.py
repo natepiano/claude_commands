@@ -5,7 +5,8 @@ import subprocess
 import unittest
 from typing import cast
 from pathlib import Path
-from scripts.direct.verify_token_wait_test_support import VerifyTokenWaitFixture, VERIFY, TEST_HANG_GUARD_SECS
+from scripts.direct.verify_token_wait_test_support import VerifyTokenWaitFixture, VERIFY
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 class VerifyTokenHistoryTests(VerifyTokenWaitFixture):

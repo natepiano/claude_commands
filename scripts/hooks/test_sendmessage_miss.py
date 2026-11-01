@@ -16,6 +16,8 @@ from scripts.lib.socket_test_support import short_socket_directory
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
 from codex_test_support import loaded_session_daemon, write_codex_account
+from relay_identity import relay_session_name
+from relay_test_support import write_relay_session
 
 HOOK = Path(__file__).with_name("post-tool-use-sendmessage-miss.py")
 
@@ -45,7 +47,7 @@ class SendMessageMissTests(unittest.TestCase):
             "PROCESS_TABLE_PS": str(binaries / "ps"), "XDG_STATE_HOME": str(self.root / "state"),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"), "ROSTER_RUN_ROOT": str(self.root / "runs"),
             "NOTIFIER_STATE_DIR": str(self.root / "notifier"), "DESIGN_ROLES_STATE": str(self.root / "roles"),
-            "DESIGN_OWNERSHIP_STATE": str(self.root / "ownership"), "REVIEW_POOL_STATE": str(self.root / "pool"),
+            "DESIGN_OWNERSHIP_STATE": str(self.root / "ownership"),
             "UNIT_HISTORY_DIR": str(self.root / "history"),
         }
         self.peer_snapshot()
@@ -98,6 +100,38 @@ class SendMessageMissTests(unittest.TestCase):
         self.assertIn('python3 ~/.claude/scripts/message/send.py --to morty --from "<your session name>"', text)
         self.assertIn('--summary "<one line>" --file <message file>', text)
         self.assertFalse((self.root / "peer-read").exists())
+
+    def test_a_relay_name_miss_finds_the_real_senders_session(self) -> None:
+        write_relay_session(self.root / "sessions", self.root / "state/message", os.getpid(), "natedev")
+        with loaded_session_daemon(self.home, {"thread": "natedev"}):
+            text = self.additional_context(self.run_hook(relay_session_name("natedev")))
+        self.assertIn("natedev: codex freestanding, account codex2", text)
+        self.assertIn("codex:thread", text)
+        self.assertIn("--to natedev", text)
+        self.assertNotIn("--to relay/natedev", text)
+
+    def test_a_real_relay_form_name_is_preferred_even_when_a_live_relay_has_that_name(self) -> None:
+        name = relay_session_name("natedev")
+        write_relay_session(self.root / "sessions", self.root / "state/message", os.getpid(), "natedev")
+        with loaded_session_daemon(self.home, {"real-target": name, "sender": "natedev"}):
+            text = self.additional_context(self.run_hook(name))
+        self.assertIn("relay/natedev: codex freestanding", text)
+        self.assertIn("codex:real-target", text)
+        self.assertIn("--to relay/natedev", text)
+        self.assertNotIn("codex:sender", text)
+
+    def test_an_unverified_relay_form_name_is_never_redirected_to_its_apparent_sender(self) -> None:
+        name = relay_session_name("natedev")
+        write_relay_session(self.root / "sessions", self.root / "state/message", os.getpid(), "natedev")
+        path = self.root / f"state/message/relay_senders/{os.getpid()}.identity"
+        fields = cast(dict[str, str], json.loads(path.read_text()))
+        fields["started"] = "previous-process-lifetime"
+        _ = path.write_text(json.dumps(fields))
+        with loaded_session_daemon(self.home, {"sender": "natedev"}):
+            text = self.additional_context(self.run_hook(name))
+        self.assertIn("no session named 'relay/natedev'", text)
+        self.assertNotIn("codex:sender", text)
+        self.assertNotIn("--to natedev", text)
 
     def test_a_native_miss_matches_the_codex_name_without_regard_to_case(self) -> None:
         with loaded_session_daemon(self.home, {"thread": "morty"}):

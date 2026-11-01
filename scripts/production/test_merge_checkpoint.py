@@ -30,6 +30,26 @@ def setUpModule() -> None:
 
 @final
 class MergeCheckpointTests(MergeCheckpointFixture):
+    def test_failed_push_preserves_the_merge_branches_unpublished_tip(self) -> None:
+        self.write(self.checkout, "local-only.txt", "local commit must survive\n")
+        _ = self.git("add", "local-only.txt")
+        _ = self.git("commit", "-m", "local merge branch work not on origin")
+        before = self.git("rev-parse", "HEAD")
+        remote = self.git("rev-parse", "origin/production")
+        self.assertNotEqual(before, remote)
+        main = self.push_main_change("main-only.txt", "independent main work\n")
+        checkpoint = self.checkpoint()
+        hook = self.origin / "hooks/pre-receive"
+        _ = hook.write_text("#!/bin/sh\nexit 1\n")
+        hook.chmod(0o755)
+        result = self.run_checkpoint(checkpoint)
+        self.assertEqual(result.process.returncode, 1, result.process.stdout + result.process.stderr)
+        self.assertIn("push: failed", result.process.stdout)
+        self.assertEqual(self.git("rev-parse", "HEAD"), before)
+        self.assertEqual((self.checkout / "local-only.txt").read_text(), "local commit must survive\n")
+        self.assertEqual(self.git("rev-parse", "refs/heads/production", cwd=self.origin), remote)
+        self.assertEqual(self.git("rev-parse", "refs/heads/main", cwd=self.origin), main)
+
     def import_production_paths(self, *, review_rows: bool = True) -> Path:
         self.write(self.other, "outside/imported.txt", "other production\n")
         self.write(self.other, "outside/second.txt", "second imported path\n")
@@ -209,7 +229,9 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertEqual(accepted.process.returncode, 0, accepted.process.stderr + accepted.process.stdout)
         self.assertIn("scope: ok", accepted.process.stdout)
     def test_a_code_checkpoint_removes_its_phases_scratch_folders(self) -> None:
-        with mock.patch.dict(os.environ, self.env):
+        plan = self.root / "scratch-plan.md"
+        _ = plan.write_text("### Phase 2 — Checkpoint\n\n### Phase 3 — Later work\n")
+        with mock.patch.dict(os.environ, self.env), mock.patch.object(scratch, "registered_plan", return_value=plan):
             done = [scratch.new("phase:alpha-unit/2", word) for word in ("gate", "copy")]
             later = scratch.new("phase:alpha-unit/3")
         result = self.run_checkpoint(self.checkpoint())

@@ -2,7 +2,7 @@
 
 ## Which account am I on?
 
-The status line's first row shows this session's account label, after its role. To print it:
+The status line's first row shows its current staff assignment and path; its second row shows this session's account label. To print it:
 
 ```sh
 ~/.claude/scripts/lib/py ~/.claude/scripts/whoami/account.py
@@ -51,7 +51,7 @@ Without `--stored`, a role map that cannot be fetched or read from cache refuses
 
 On the Mac, the `account-usage` launchd user agent refreshes the usage store at
 login and every two minutes in the GUI login session, where the keychain is
-available. It runs `agent_notes.py usage-only`, which shares the notes timer's
+available. It runs `agent_notes.py usage-only`, which shares the agent-notes job's
 live read and save step. It writes no notes, sends no quota alerts and runs
 neither the Codex pacer nor account moves. Natedev still owns those actions.
 Install the scripts before activating `modules/darwin/account-usage.nix`.
@@ -63,17 +63,28 @@ Read cell into a failed attempt. With no previous reading, usage stays
 unavailable until a logged-in desktop refresh can read it. A readable credentials
 entry with no login token still asks for a session or manual login.
 
-The two-minute account-note timer reuses its last usage reports for less than ten minutes.
-It keeps the original reading times. Session tables, note session sections, the refusal
-watch and the unit watchdog still run on every timer pass. Weekly and five-hour warnings
-can follow the next usage read. The timer stores reports without credentials in
+Natedev's `agent-notes` job runs `scripts/maintenance/agent_notes_job.py`.
+Notes, quota warnings, the Codex pacer, refusal moves, crash recovery, phase-note
+pruning, the hana hierarchy note and the vault commit each run in a separate
+process with a time limit. `config/agent_notes.toml` owns their intervals and
+limits and is read on each run. A slow or failed part does not stop the other
+parts. Quota warnings and the pacer read after the notes part exits;
+the vault commit runs after the writers exit. A rerun skips completed parts
+until their next interval and retries failed parts.
+A part that leaves its note as it stands is logged as skipped and counts as
+completed for its interval; a source-command failure or timeout still fails
+the job. Completion times and the job lock live in `~/.local/state/agent-notes/job/`.
+
+Notes reuse usage reports for less than ten minutes, keeping their original
+reading times. Session tables and note session sections still refresh each notes
+pass. Usage reports without credentials stay in
 `~/.local/state/agent-notes/timer-usage.json`.
 
 An explicit refresh reads at once. A queued account move on the role-map host, a
 weekly or five-hour window at or below 10% remaining on an account in use, an active Claude fallback,
 a passed window reset, or a changed login or account selection also requires a live read.
 A new Claude refusal refreshes usage
-before placement if the timer reused reports; it does not repeat session collection.
+before placement when a new refusal needs a decision. It does not repeat the notes pass.
 An unchanged refusal already requested, cancelled, continued or assigned to a group
 does not refresh usage. A failed refusal refresh reports one line and keeps placement
 and the watchdog running with stored readings.
@@ -348,7 +359,7 @@ accounts.py next hold units 1 half-point --expect 1 claude4
 
 The list has showrunners, units and workers sections in that order, numbered from 1 within each group: “units 1: at 1% → claude4, hold 30 min”. Position 1 runs next; an empty log prints “nothing set up”. `move GROUP N M` moves position N to M, `remove GROUP N` removes it, and `add … --at N` inserts at positions 1 through the group’s size plus 1 (omission appends). Edits preserve other groups’ order and internal entry identities; ids are never shown or accepted in these commands. The Mac forwards group positions to natedev, which resolves and edits them under the watch and log locks; install both machines together. A head change immediately clears the displaced head’s hold and notice keys, so the new head starts its own hold on a later pass; an unchanged head keeps its hold.
 
-For units, showrunners and workers, the two-minute notes timer considers only the first entry per group; later entries wait until the head is recorded and removed, then become eligible on a later pass. Later Claude entries keep no hold until then. A due head that cannot run stays queued and tells showrunners once per changed reason (target already current, unreadable login, stale or missing reading, low target, unresolved refusal or refused preparation). A head targeting the current account blocks later entries too. The example holds units at 1% for 30 minutes, moves them to claude4, then holds again when claude4 reads low before moving them to claude2. Both groups may share an account; the Role cell then reads `units, showrunners`.
+For units, showrunners and workers, the agent-notes refusal part considers only the first entry per group; later entries wait until the head is recorded and removed, then become eligible on a later pass. Later Claude entries keep no hold until then. A due head that cannot run stays queued and tells showrunners once per changed reason (target already current, unreadable login, stale or missing reading, low target, unresolved refusal or refused preparation). A head targeting the current account blocks later entries too. The example holds units at 1% for 30 minutes, moves them to claude4, then holds again when claude4 reads low before moving them to claude2. Both groups may share an account; the Role cell then reads `units, showrunners`.
 
 `--hold-minutes N` is finite and nonnegative; omitted or zero moves immediately. `--hold half-point` instead estimates the time to use another 0.5 percentage point from the selected account’s weighted pace history, including usage by other groups sharing that account. One point per hour gives 30 minutes, rounded up to whole minutes; missing, zero or negative pace uses 40 minutes. The list shows, for example, “showrunners 1: at 1% → claude2, hold half a point (≈30 min)” or “hold half a point (40 min default: no pace history)”. The Mac prints natedev’s rendered list using natedev’s selection and readings; `next-read` remains machine JSON.
 
@@ -378,16 +389,16 @@ Install this version on both natedev and the Mac before adding the first workers
 
 A move checks the target's account readiness and usage before selecting it or stopping a session. It does not read old shutdown holds. Stop or resume failures print their reason; they create no move record, follow command or cancellation step.
 
-The notes pass on natedev checks units after account moves. It resumes a down unit after one pass of grace if the unit is not retired, has a worktree, and its run has not finished. A unit with no run record is standing by and can recover. It reads the production's Units table, live session marks and the unit's pane launch entry. A launch marked ended by a normal Claude exit is left closed. Unknown liveness leaves recovery evidence intact. The Mac does not run this check.
+The crash-recovery part on natedev checks units independently of account moves. It reads liveness once for all productions and shares one fresh confirmation when recovery needs it; live units cause no individual liveness subprocess. It resumes a down unit after one pass of grace if the unit is not retired, has a worktree, and its run has not finished. A unit with no run record is standing by and can recover. It reads the production's Units table, live session marks and the unit's pane launch entry. A launch marked ended by a normal Claude exit is left closed. Unknown liveness leaves recovery evidence intact. The Mac does not run this check.
 
-The watchdog submits each recovery to a detached user service and reads its result on a later notes pass. All submissions share a 30-second budget. A pending job prevents duplicate starts. The child checks that the pane launch has not changed, then calls `stop_resume.resume` for the same conversation on the launch entry's account, with the reason `unit watchdog recovery`. Shared resume opens a fresh tab when the old pane is gone. A failed resume returns its reason. Holds, shutdown records and recovery snapshots do not participate. Failed recovery tells the showrunner and sends the reviewed restart-failure push once per outage; failed delivery can retry. Alert claims remain in `~/.local/state/accounts/unit_outage_alerts.json`. A confirmed live observation clears only an older outage claim. Pending jobs, first-seen times and delivery status remain in `~/.local/state/accounts/unit_watchdog.json`; detached results stay beside it until the next pass reads them. Watchdog times use the user's configured time zone.
+The watchdog submits each recovery to a detached user service and reads its result on a later pass. All submissions share the configured dispatch budget. A pending job prevents duplicate starts. The child checks that the pane launch has not changed, then calls `stop_resume.resume` for the same conversation on the launch entry's account, with the reason `unit watchdog recovery`. Shared resume opens a fresh tab when the old pane is gone and supplies the resumed session's one restart prompt. A failed resume returns its reason for the job log and can retry. Live sessions receive nothing. The watchdog sends no showrunner notices or phone pushes, and keeps no notice queue or delivery state. The watchdog reads existing shutdown session records to exclude an intentional stop recorded at or after the pane launch; it rechecks before dispatch. A later explicit launch supersedes an older stop. Holds do not participate. Recovery snapshots and their readers are deleted. A confirmed live observation clears older move-alert claims; those alerts belong to account moves. Pending jobs and first-seen times remain in `~/.local/state/accounts/unit_watchdog.json`; detached results stay beside it until the next pass reads them. Watchdog log times use the user's configured time zone.
 
 
 ## Automatic Claude moves
 
-Watcher inventories read the existing desktop snapshot. They never invoke the snapshot updater, which itself runs the notes timer. This prevents a recursive notes update and keeps `--dry-run` read-only.
+Watcher inventories read live sessions and `staff.json` membership. They neither collect nor read a desktop snapshot. Maintenance now runs through the separate agent-notes job; a `--dry-run` still writes nothing.
 
-The argument-free notes timer checks local top-level sessions' last transcript entries for provider quota refusals. A refused unit or showrunner moves its whole group only when that group has no next entry; otherwise its head controls the account move. Owners outside either group move alone through the same stop-and-resume path, in their own local herdr tabs. The Mac usage refresher does not run this refusal check.
+The agent-notes job’s refusal part checks local top-level sessions' last transcript entries for provider quota refusals. A refused unit or showrunner moves its whole group only when that group has no next entry; otherwise its head controls the account move. Owners outside either group move alone through the same stop-and-resume path, in their own local herdr tabs. The Mac usage refresher does not run this refusal check.
 
 Group membership uses the lightweight listing; absent registration targets are checked separately. Manual move previews are described above.
 

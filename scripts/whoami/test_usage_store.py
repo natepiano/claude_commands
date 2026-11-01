@@ -20,12 +20,10 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.whoami import usage_store
 from scripts.whoami import agent_accounts
 from scripts.whoami.agent_accounts import NoWeeklyReadSkip, Quota, Report, StaleTokenSkip, UsageReadOutcome
-
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
 
 READ = datetime(2026, 10, 12, 14, 30, tzinfo=timezone.utc)
 RESETS = datetime(2026, 10, 15, 16, 0, tzinfo=timezone.utc)

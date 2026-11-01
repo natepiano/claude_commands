@@ -368,7 +368,10 @@ Run `python3 ~/.claude/scripts/production/production_lifecycle.py load
 the checkout, copies any state that `<SCRATCH>` holds and `STATE_DIR` does not, reads the last `### STATE` block of `LOG`, rebuilds each unit's
 last code checkpoint from first-parent merge history, and checks its herdr
 session. Use its lines to restore state. <StartUpdates/> registers this session
-again and retargets the instance. After a reboot, the herdr boot unit and `pane_restore.py` bring each pane back on its own account (`docs/as-built/herdr-restore.md`).
+again and retargets the instance. No boot restore unit is installed. `agents restart`
+restores selected sessions from recovery records on their own accounts. It starts or
+adopts herdr and opens a tab for each session. It does not run `pane_restore.py`
+for other panes. See `docs/as-built/herdr-restore.md`.
 
 When the production doc's **Production rules** say CI does not apply, pass
 `--no-ci` to this and every lifecycle subcommand.
@@ -604,7 +607,11 @@ notice to the unit director before any merge command runs:
    `--as-built`; with either, omit `--review-trial`, `--parallel` and `--delivers`. Add
    `--cancel-prior` only with `Push: validate_and_push` when this push supersedes
    an older queued or running CI run on the merge branch and no CI point is
-   watching its result or diagnosing a red run. The script checks ancestry,
+   watching its result or diagnosing a red run. Add `--bump` only for a user's
+   bump: merge and push the code checkpoint first, then gate the pushed tip
+   in a detached clone in the background; red goes to the unit and the
+   showrunner, green to the showrunner. It refuses `--shrink`, `--as-built`
+   and `--from-child`. The script checks ancestry,
    origin, scope and conflicts, reports overlaps with other units, merges,
    tests, reruns red packages, pushes, promotes, and records the result. Its
    first `held` or `failed` line stops the run. Send its final `send <unit>:`

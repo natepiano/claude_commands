@@ -6,14 +6,21 @@ from __future__ import annotations
 import json
 import os
 import stat
-import subprocess
 import sys
 import time
+import tomllib
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Literal, NotRequired, TypedDict, cast
+
+if __package__:
+    from .process_identity import process_start as process_start
+    from .relay_identity import RelayIdentity, live_relay_identity, relay_senders_directory
+else:
+    from process_identity import process_start as process_start
+    from relay_identity import RelayIdentity, live_relay_identity, relay_senders_directory
 
 
 # Claude's entrypoint for a print-mode run starts with this; an interactive session's is "cli".
@@ -35,6 +42,8 @@ class SessionRecord(TypedDict):
     # How Claude was started: "cli" for an interactive session, "sdk-cli" for a `claude -p` run.
     # Older records and callers may omit it; read_session normalizes absence to empty.
     entrypoint: NotRequired[str]
+    # The conversation's folder, for the exact staff-worktree join. Older records may omit it.
+    cwd: NotRequired[str]
 
 
 @dataclass(frozen=True)
@@ -81,6 +90,39 @@ class RegistryRead:
     unreadable: tuple[Path, ...]
 
 
+@dataclass(frozen=True)
+class SessionRetryPolicy:
+    registry_reads: int
+    registry_delay_seconds: float
+    resume_attempts: int
+    resume_delay_seconds: float
+
+
+def retry_policy() -> SessionRetryPolicy:
+    """Read tuning at use; a missing or invalid setting never invents a retry budget."""
+    path = Path(__file__).resolve().parents[2] / "config/session_retries.toml"
+    with path.open("rb") as source:
+        values = cast(dict[str, object], tomllib.load(source))
+    counts: list[int] = []
+    for key in ("registry_reads", "resume_attempts"):
+        value = values[key]
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise ValueError(f"{path}: {key} must be a positive integer")
+        counts.append(value)
+    delays: list[float] = []
+    for key in ("registry_delay_seconds", "resume_delay_seconds"):
+        value = values[key]
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or not 0 <= value < float("inf"):
+            raise ValueError(f"{path}: {key} must be finite and nonnegative")
+        delays.append(float(value))
+    return SessionRetryPolicy(counts[0], delays[0], counts[1], delays[1])
+
+
+@dataclass(frozen=True)
+class RegistryRecordGone:
+    """The file vanished, or its filename's process is proven gone."""
+
+
 def read_registry(*, dependencies: Callable[[Path], None] | None = None) -> RegistryRead:
     """Keep unreadable directories and records visible to complete observers."""
     directory = sessions_dir()
@@ -90,11 +132,11 @@ def read_registry(*, dependencies: Callable[[Path], None] | None = None) -> Regi
         return RegistryRead((), (directory,))
     entries: list[RegistryObservation] = []
     unreadable: list[Path] = []
+    policy = retry_policy()
     for path in paths:
-        try:
-            observation = _read_observation(path, dependencies=dependencies)
-        except FileNotFoundError:
-            continue  # A session can remove its registry entry after the directory read.
+        observation = _read_observation(path, policy, dependencies=dependencies)
+        if isinstance(observation, RegistryRecordGone):
+            continue
         if isinstance(observation, UnreadableSessionRecord):
             unreadable.append(path)
         else:
@@ -116,6 +158,7 @@ def parse_session(parsed: object) -> RegistryEntry:
     tmux = data.get("tmux")
     former = data.get("formerNames")
     entrypoint = data.get("entrypoint")
+    cwd = data.get("cwd")
     if (
         not isinstance(pid, int)
         or isinstance(pid, bool)
@@ -138,12 +181,13 @@ def parse_session(parsed: object) -> RegistryEntry:
         formerNames=[name for name in cast(list[object], former) if isinstance(name, str)]
         if isinstance(former, list) else [],
         entrypoint=entrypoint if isinstance(entrypoint, str) else "",
+        cwd=cwd if isinstance(cwd, str) else "",
     )
 
 
-def _read_observation(path: Path, *, dependencies: Callable[[Path], None] | None = None) -> RegistryObservation | UnreadableSessionRecord:
-    """Read across a concurrent registry rewrite, without hiding persistent corruption."""
-    for attempt in range(3):
+def _read_observation(path: Path, policy: SessionRetryPolicy, *, dependencies: Callable[[Path], None] | None = None) -> RegistryObservation | UnreadableSessionRecord | RegistryRecordGone:
+    """Reread a concurrent write; only a live unreadable record remains uncertain."""
+    for attempt in range(policy.registry_reads):
         try:
             if dependencies is not None:
                 dependencies(path)
@@ -152,20 +196,24 @@ def _read_observation(path: Path, *, dependencies: Callable[[Path], None] | None
             if not isinstance(record, UnreadableSessionRecord):
                 return RegistryObservation(record, cast(RegistryDetails, raw))
         except FileNotFoundError:
-            raise
+            return RegistryRecordGone()
         except (OSError, ValueError, TypeError):
             pass
-        if attempt < 2:
-            time.sleep(0.05)
+        if attempt + 1 < policy.registry_reads:
+            time.sleep(policy.registry_delay_seconds)
+    if path.stem.isdigit():
+        try:
+            os.kill(int(path.stem), 0)
+        except (ProcessLookupError, OverflowError):
+            return RegistryRecordGone()
+        except OSError:
+            pass  # A denied process probe does not prove absence.
     return UnreadableSessionRecord.FOUND
 
 
 def read_session(path: Path) -> RegistryEntry:
-    try:
-        observation = _read_observation(path)
-    except FileNotFoundError:
-        return UnreadableSessionRecord.FOUND
-    return observation if isinstance(observation, UnreadableSessionRecord) else observation.record
+    observation = _read_observation(path, retry_policy())
+    return observation.record if isinstance(observation, RegistryObservation) else UnreadableSessionRecord.FOUND
 
 
 def remote_control(record: SessionRecord) -> Literal["active", "absent"]:
@@ -181,40 +229,13 @@ def remote_control(record: SessionRecord) -> Literal["active", "absent"]:
     return "absent"
 
 
-def process_start(pid: int) -> str | None:
-    """The process identity stored in session records, in this platform's native units."""
-    if sys.platform == "darwin":
-        # Claude writes procStart under this locale and zone; other text never matches.
-        try:
-            result = subprocess.run(
-                ("ps", "-o", "lstart=", "-p", str(pid)),
-                capture_output=True,
-                text=True,
-                timeout=5,
-                check=False,
-                env={**os.environ, "LC_ALL": "C", "TZ": "UTC"},
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            return None
-        started = result.stdout.strip()
-        return started if result.returncode == 0 and started else None
-    try:
-        # The kernel can truncate the process name inside a UTF-8 character.
-        _, separator, fields = Path(f"/proc/{pid}/stat").read_bytes().rpartition(b")")
-        if not separator:
-            return None
-        started = fields.split()[19].decode("ascii")
-        return started if started.isdigit() else None
-    except (OSError, IndexError, UnicodeDecodeError):
-        return None
-
-
 def headless(record: SessionRecord) -> bool:
-    """A `claude -p` run, such as send.py's relay, which takes its sender's name for one message.
+    """A `claude -p` run, or a process identified by the relay launcher's PID record.
 
     It is no session: no roster lists it, and no name lookup finds it.
     """
-    return record.get("entrypoint", "").startswith(HEADLESS_ENTRYPOINT_PREFIX)
+    return (record.get("entrypoint", "").startswith(HEADLESS_ENTRYPOINT_PREFIX)
+            or isinstance(live_relay_identity(record["pid"], relay_senders_directory()), RelayIdentity))
 
 
 def running_session(record: SessionRecord) -> bool:
@@ -367,25 +388,9 @@ def main(argv: list[str]) -> int:
         return 2
 
     command, target = argv[1:]
-    directory = sessions_dir()
-    try:
-        paths = sorted(path for path in directory.iterdir() if path.suffix == ".json")
-    except OSError as error:
-        detail = str(error).splitlines()
-        print(
-            f"sessions: cannot list registry: {detail[0] if detail else type(error).__name__}",
-            file=sys.stderr,
-        )
-        return 3
-    reads: list[RegistryEntry] = []
-    for path in paths:
-        try:
-            observation = _read_observation(path)
-        except FileNotFoundError:
-            continue
-        reads.append(observation if isinstance(observation, UnreadableSessionRecord) else observation.record)
-    unreadable = any(read is UnreadableSessionRecord.FOUND for read in reads)
-    records = (read for read in reads if not isinstance(read, UnreadableSessionRecord))
+    registry = read_registry()
+    unreadable = bool(registry.unreadable)
+    records = (observation.record for observation in registry.entries)
     if command != "id" and target.startswith("session:"):
         matches = (record for record in records if record["sessionId"] == target[8:])
     elif command != "id":

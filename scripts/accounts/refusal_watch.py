@@ -638,7 +638,7 @@ def live_owners(*, only: frozenset[str] = NO_SESSION_FILTER) -> list[inventory_m
               if not only or session["sessionId"] in only
               if (identity := account.account_of(session["pid"], home_state=home_state)) is not None}
     for login in sorted(logins):
-        for session in inventory_module.inventory(login, only, refresh_desktops=False)["sessions"]:
+        for session in inventory_module.inventory(login, only)["sessions"]:
             if session["kind"] != "worker":
                 owners[session["session_id"]] = session
     return list(owners.values())
@@ -1276,19 +1276,19 @@ def renew_expired_logins(now: datetime, dry_run: bool) -> list[str]:
 
 @role_map.role_map_command
 def run(now: datetime | None = None, *, dry_run: bool = False, proof_group: frozenset[str] = NO_SESSION_FILTER,
-        refresh_usage: Callable[[], None] = lambda: None) -> list[str]:
+        refresh_usage: Callable[[], None] = lambda: None, recover_units: bool = True) -> list[str]:
     from scripts.accounts import unit_watchdog
 
     at = now or datetime.now(timezone.utc)
     if dry_run:
         return [*renew_expired_logins(at, True), *_run(at, True, proof_group),
-                *(unit_watchdog.run(at, dry_run=True) if not proof_group else [])]
+                *(unit_watchdog.run(at, dry_run=True) if not proof_group and recover_units else [])]
     with _watch_lock():
         renewed = renew_expired_logins(at, False)
         # A probe can save a reading after the pass started.
         after_renewal = max(at, datetime.now(timezone.utc)) if renewed else at
         return [*renewed, *_run(after_renewal, False, proof_group, refresh_usage=refresh_usage),
-                *(unit_watchdog.run(after_renewal, dry_run=False) if not proof_group else [])]
+                *(unit_watchdog.run(after_renewal, dry_run=False) if not proof_group and recover_units else [])]
 
 
 class WatchCommandLine(argparse.Namespace):

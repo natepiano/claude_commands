@@ -4,18 +4,20 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+from time import monotonic
 import os
 import re
 import shlex
 import shutil
 import subprocess
 import sys
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from enum import Enum
 from importlib import import_module
 from pathlib import Path
-from typing import NamedTuple, TypedDict, cast
+from typing import NamedTuple, TypedDict, cast, override
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -58,6 +60,40 @@ class ShowrunnerSettings(TypedDict):
     stall_minutes: float
     faults_to: str
     always: list[str]
+
+
+@dataclass(frozen=True)
+class ShowrunnerLookupFailure:
+    """A production whose session liveness could not be determined."""
+
+    production: str
+    reason: str
+
+    @property
+    def diagnostic(self) -> str:
+        return f"showrunners: skipping showrunner-{self.production}: {self.reason}"
+
+
+class ShowrunnerDiscovery(list[Showrunner]):
+    """Healthy registrations together with the lookup failures reported during discovery."""
+
+    lookup_failures: tuple[ShowrunnerLookupFailure, ...]
+
+    @override
+    def __init__(self, runners: Iterable[Showrunner] = (),
+                 failures: tuple[ShowrunnerLookupFailure, ...] = ()) -> None:
+        super().__init__(runners)
+        self.lookup_failures = failures
+
+    @property
+    def failures(self) -> tuple[str, ...]:
+        """The diagnostics reported during discovery, rendered from the lookup failures."""
+        return tuple(failure.diagnostic for failure in self.lookup_failures)
+
+    @property
+    def exit_code(self) -> int:
+        """Commands finish healthy work before returning a failure status."""
+        return int(bool(self.lookup_failures))
 
 
 class Timer(NamedTuple):
@@ -117,11 +153,17 @@ def load_settings_from(path: Path) -> ShowrunnerSettings:
         raise ValueError(f"{path}: {error}") from error
 
 
-def socket_for(target: str) -> str | None:
+def socket_for(target: str, *, deadline: float = math.inf) -> str | None:
     """The session's socket, or None when it is not running. Raises OSError when the session
     records cannot be read, which says nothing about whether it runs."""
-    result = subprocess.run([sys.executable, str(SESSIONS), "socket", target], capture_output=True,
-                            text=True, check=False)
+    remaining = deadline - monotonic()
+    if remaining <= 0:
+        raise TimeoutError(f"{target}: session lookup deadline exhausted; retained for the next pass")
+    try:
+        result = subprocess.run([sys.executable, str(SESSIONS), "socket", target], capture_output=True,
+                                text=True, check=False, timeout=remaining if math.isfinite(remaining) else None)
+    except subprocess.TimeoutExpired as error:
+        raise TimeoutError(f"{target}: session lookup timed out; retained for the next pass") from error
     # Exit 1 is no such live session. Any other failure is the lookup itself failing.
     if result.returncode not in (0, 1):
         reason = result.stderr.strip() or f"sessions.py exited {result.returncode}"
@@ -240,9 +282,11 @@ DISCOVER_SESSIONS = DiscoverSessions()
 
 
 def _registered(timer: Timer, *,
-                known_sessions: Mapping[str, SessionRecord] | DiscoverSessions = DISCOVER_SESSIONS) -> Showrunner:
+                known_sessions: Mapping[str, SessionRecord] | DiscoverSessions = DISCOVER_SESSIONS,
+                deadline: float = math.inf) -> Showrunner:
     if isinstance(known_sessions, DiscoverSessions):
-        socket = socket_for(timer.target) or ""
+        socket = (socket_for(timer.target, deadline=deadline) if math.isfinite(deadline)
+                  else socket_for(timer.target)) or ""
         name = _session_name(timer.target[8:]) if socket else ""
     else:
         record = known_sessions.get(timer.target[8:])
@@ -255,22 +299,33 @@ def _registered(timer: Timer, *,
 def registered_showrunners(
     state_dir: Path | None = None, *,
     known_sessions: Mapping[str, SessionRecord] | DiscoverSessions = DISCOVER_SESSIONS,
-) -> list[Showrunner]:
+    deadline: float = math.inf,
+) -> ShowrunnerDiscovery:
     """Every showrunner that has an update timer, running or not.
 
     The timer is addressed to the Claude session id and holds the production doc, so it is the one
     record of a showrunner and holds no name: the name is looked up here, at each call. Raises OSError
-    when a timer conf cannot be read or session records cannot say whether a showrunner runs;
-    an incomplete timer is left out, with the reason on stderr. Supplied live session records avoid
+    when a timer conf cannot be read. Incomplete registrations are left out with a warning as before.
+    A failed session lookup is left out with the reason on stderr and in the result's failures.
+    Commands must return its exit_code
+    after processing the healthy rows. Supplied live session records avoid
     rereading the registry or starting the sessions subprocess; an empty mapping means none are live.
     """
     found: list[Showrunner] = []
-    for source in read_sources(state_dir, unreadable=UnreadableTimerPolicy.RAISE):
+    failures: list[ShowrunnerLookupFailure] = []
+    sources = read_sources(state_dir, unreadable=UnreadableTimerPolicy.RAISE)
+    for index, source in enumerate(sources):
         try:
-            found.append(_registered(source.timer, known_sessions=known_sessions))
-        except (KeyError, ValueError, UnicodeError) as error:
-            print(f"showrunners: skipping showrunner-{source.timer.slug}: {error}", file=sys.stderr)
-    return found
+            # Share the remaining budget with later lookups and the caller's inspection work.
+            began = monotonic()
+            lookup_deadline = began + max(0.0, deadline - began) / (len(sources) - index + 1)
+            found.append(_registered(source.timer, known_sessions=known_sessions, deadline=lookup_deadline))
+        except (OSError, KeyError, ValueError, UnicodeError) as error:
+            failure = ShowrunnerLookupFailure(source.timer.slug, str(error))
+            if isinstance(error, OSError):
+                failures.append(failure)
+            print(failure.diagnostic, file=sys.stderr)
+    return ShowrunnerDiscovery(found, tuple(failures))
 
 
 def production_of(session_id: str, state_dir: Path | None = None) -> Path | None:
@@ -383,8 +438,19 @@ def canonical_slug(slug: str, state_dir: Path | None = None) -> str:
 
 def current_name(slug: str) -> str:
     """The name now of the production's showrunner. Empty while it is not running or has no update timer."""
+    return _name_in(slug, require_complete(registered_showrunners()))
+
+
+def require_complete(runners: list[Showrunner]) -> list[Showrunner]:
+    """Require a complete inventory before an absence or safety decision."""
+    if isinstance(runners, ShowrunnerDiscovery) and runners.lookup_failures:
+        raise OSError("; ".join(failure.reason for failure in runners.lookup_failures))
+    return runners
+
+
+def _name_in(slug: str, runners: list[Showrunner]) -> str:
     slug = canonical_slug(slug)
-    return next((runner["session"] for runner in registered_showrunners() if runner["slug"] == slug), "")
+    return next((runner["session"] for runner in runners if runner["slug"] == slug), "")
 
 
 def herdr_space(slug: str, doc: str) -> str:
@@ -406,18 +472,22 @@ def space_from_text(slug: str, text: str) -> str:
     return line[1] if line else slug
 
 
-def current_address(slug: str) -> str:
+def current_address(slug: str, *, deadline: float = math.inf) -> str:
     """Where `SendMessage` reaches the production's showrunner now: its session on this machine.
     Empty while it is not running or has no update timer."""
+    return _address_in(slug, require_complete(registered_showrunners(deadline=deadline)))
+
+
+def _address_in(slug: str, runners: list[Showrunner]) -> str:
     slug = canonical_slug(slug)
-    socket = next((runner["socket"] for runner in registered_showrunners() if runner["slug"] == slug), "")
+    socket = next((runner["socket"] for runner in runners if runner["slug"] == slug), "")
     return f"uds:{socket}" if socket else ""
 
 
 def named(showrunner: str) -> Showrunner:
     """The showrunner called `showrunner` now, or whose production has that slug."""
     slug = canonical_slug(showrunner)
-    runners = registered_showrunners()
+    runners = require_complete(registered_showrunners())
     # The production a slug resolves to wins over a session that happens to share the name.
     found = (next((runner for runner in runners if runner["slug"] == slug), None)
              or next((runner for runner in runners if runner["session"] == showrunner), None))
@@ -532,19 +602,28 @@ def main(argv: list[str]) -> int:
     args = parser.parse_args(argv)
     action = cast(str, args.action)
     try:
-        if action == "list":
-            for runner in registered_showrunners():
-                print(f"{runner['slug']}\t{runner['session'] or '<not running>'}\t{runner['zone']}"
-                      + f"\t{runner['doc']}")
-        elif action in ("name", "address"):
-            slug = cast(str, args.slug)
-            found = current_name(slug) if action == "name" else current_address(slug)
-            if not found:
-                raise ValueError(f"the showrunner of {slug} is not running")
-            print(found)
-        elif action in ("parent", "children", "root", "tree"):
+        if action in ("list", "name", "address", "tree"):
+            runners = registered_showrunners()
+            if action == "list":
+                for runner in runners:
+                    print(f"{runner['slug']}\t{runner['session'] or '<not running>'}\t{runner['zone']}"
+                          + f"\t{runner['doc']}")
+            elif action == "tree":
+                lines = cast(Callable[[list[Showrunner]], list[str]], import_module("showrunner_tree").tree_lines)(runners)
+                for line in lines:
+                    print(line)
+            else:
+                slug = cast(str, args.slug)
+                found = _name_in(slug, runners) if action == "name" else _address_in(slug, runners)
+                if not found and any(failure.production == canonical_slug(slug) for failure in runners.lookup_failures):
+                    return runners.exit_code
+                if not found:
+                    raise ValueError(f"the showrunner of {slug} is not running")
+                print(found)
+            return runners.exit_code
+        elif action in ("parent", "children", "root"):
             return cast(Callable[[str, str], int], import_module("showrunner_tree").main)(
-                action, cast(str, args.slug) if action != "tree" else "")
+                action, cast(str, args.slug))
         elif action in ("attach", "detach"):
             return cast(Callable[[str, str, str], int], import_module("showrunner_parent").main)(
                 action, cast(str, args.child), (cast(str | None, args.parent) or "") if action == "attach" else "")

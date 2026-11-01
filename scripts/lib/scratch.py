@@ -26,12 +26,12 @@ A task, and what ends it:
     `until:` DEFAULT_LIFE_SECONDS (24 h) from now.
 
 A folder lives in ROOT as `<task>-<word>-<6 chars>`; `--visible` (rows only) puts it in VISIBLE_ROOT
-as `<showrunner>-C<n>-<word>`, where cargo-port lists it. Each holds RECORD with its task, maker and
+as `<showrunner>-C<n>-<word>`, where cargo-port lists it. Each holds copy_record.RECORD with its task, maker and
 times. The hourly tmp sweep (scripts/lint/tmp_sweep.py) keeps a folder in ROOT while its task is
 open, and removes it when its until: time passes, or after 7 idle days whatever its task, since an
 ender can fail. A row's folder waits for its verdict, and VISIBLE_ROOT is never swept. A git
 worktree goes through `git worktree remove`, so its source repo keeps no stale entry. Removal
-first writes `.scratch-removing-<folder>.json` beside the folder and deletes RECORD last, so a
+first writes `.scratch-removing-<folder>.json` beside the folder and deletes copy_record.RECORD last, so a
 stop at any line leaves the task findable and a rerun of `end` finishes the removal.
 
 A hold keeps a folder that must stay where it is (a repo the user checks a change in). Its record
@@ -67,22 +67,19 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TypedDict, cast
+from typing import TYPE_CHECKING, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib import copy_record  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
 
-ROOT_ENV = "SCRATCH_ROOT"
 VISIBLE_ROOT_ENV = "SCRATCH_VISIBLE_ROOT"
-DEFAULT_ROOT = "/tmp/claude/scratch"
 DEFAULT_VISIBLE_ROOT = "~/rust/repro"
-RECORD = ".scratch.json"
 # A started removal keeps the record outside the folder until the folder is gone.
 REMOVAL_RECORD_PREFIX = ".scratch-removing-"
 REMOVAL_RECORD_SUFFIX = ".json"
 HOLDS_ENV = "SCRATCH_HOLDS"
 DEFAULT_HOLDS = "~/.local/state/scratch/holds.json"
-TASK = re.compile(r"(?P<kind>run|phase|row|gate|until|landed):(?P<name>[A-Za-z0-9][A-Za-z0-9_.-]*(?:/[A-Za-z0-9_./-]+)?)")
 UNTIL_FORMAT = "%Y-%m-%dT%H%MZ"
 DEFAULT_LIFE_SECONDS = 24 * 3600
 # A repo deeper than this inside a removed folder is not looked for; build output is never a repo.
@@ -94,7 +91,6 @@ SUFFIX_LENGTH = 6
 SUFFIX_CHARACTERS = string.ascii_lowercase + string.digits
 SESSION_VARIABLES = ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID")
 BUSY = ".claude-busy"
-COPIES_ENV = "SCRATCH_COPIES_ROOT"
 RECORD_LOCKS: ContextVar[frozenset[tuple[int, int]]] = ContextVar("scratch_record_locks", default=frozenset())
 USE_STAMP = ".lint-sweep-used"
 CACHE_TAG = "CACHEDIR.TAG"
@@ -102,22 +98,6 @@ CACHE_TAG_SIGNATURE = "Signature: 8a477f597d28d172789f06886806bc55"
 CARGO_TAG_LINE = "# This file is a cache directory tag created by cargo."
 STYLE_TARGET_NAME = "style-sync-target"
 STYLE_LOCK_NAME = "sync.lock"
-
-
-@dataclass(frozen=True)
-class Registered:
-    task: str
-    fields: dict[str, object]
-
-
-@dataclass(frozen=True)
-class NotRegistered:
-    pass
-
-
-@dataclass(frozen=True)
-class UnreadableRecord:
-    reason: str
 
 
 @dataclass(frozen=True)
@@ -152,27 +132,11 @@ def mark_cargo_cache(target: Path) -> None:
     (target / USE_STAMP).touch()
 
 
-def copies_root() -> Path:
-    configured = Path(os.environ.get(COPIES_ENV) or str(root().parent / "copies")).expanduser()
-    return Path(os.path.realpath(configured))
-
-
-def copy_folder(path: Path) -> Path | None:
-    """The copy that contains path; convert the path boundary to no copy here."""
-    base = copies_root()
-    resolved = path.resolve()
-    if resolved.is_relative_to(base):
-        parts = resolved.relative_to(base).parts
-        if len(parts) >= 2:
-            return base / parts[0] / parts[1]
-    return None
-
-
 def atomic_record(path: Path, fields: object) -> None:
     # A killed writer may leave its stage file. Keep copy stages in Git metadata,
     # where they cannot look like unsaved user work on the next run.
     git = path.parent / ".git"
-    staging = git if path.name == RECORD and git.is_dir() and not git.is_symlink() else path.parent
+    staging = git if path.name == copy_record.RECORD and git.is_dir() and not git.is_symlink() else path.parent
     with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=staging,
                                      prefix=f".{path.name}.", delete=False) as output:
         temporary = Path(output.name)
@@ -194,7 +158,7 @@ def exclude_copy_metadata(path: Path) -> None:
         text = exclude.read_text(encoding="utf-8")
     except FileNotFoundError:
         text = ""
-    patterns = [f"/{name}" for name in (RECORD, BUSY) if f"/{name}" not in text.splitlines()]
+    patterns = [f"/{name}" for name in (copy_record.RECORD, BUSY) if f"/{name}" not in text.splitlines()]
     if patterns:
         with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=exclude.parent, delete=False) as output:
             temporary = Path(output.name)
@@ -210,14 +174,14 @@ def exclude_copy_metadata(path: Path) -> None:
 def register_copy(path: Path, *, task: str, owner_unit: str, source_path: str, source_commit: str,
                   copy_commit: str, target_mode: str, seed_source: str, borrows_from: str,
                   land_target: str = "", run_dir: str = "", phase_id: str = "") -> None:
-    if copy_folder(path) != path.resolve() or path.is_symlink() or not path.is_dir():
-        raise ScratchError(f"{path}: a copy must be a folder at {copies_root()}/<pair>/<copy>")
-    def registered(record: Registered | NotRegistered | UnreadableRecord) -> dict[str, object]:
+    if copy_record.copy_folder(path) != path.resolve() or path.is_symlink() or not path.is_dir():
+        raise ScratchError(f"{path}: a copy must be a folder at {copy_record.copies_root()}/<pair>/<copy>")
+    def registered(record: copy_record.Registered | copy_record.NotRegistered | copy_record.UnreadableRecord) -> dict[str, object]:
         fields: dict[str, object] = dict(owner_unit=owner_unit, source_path=source_path,
             source_commit=source_commit, copy_commit=copy_commit, target_mode=target_mode, seed_source=seed_source,
             borrows_from=borrows_from,
             maker=maker(), created=time.time(), renewed=time.time())
-        if isinstance(record, Registered):
+        if isinstance(record, copy_record.Registered):
             fields["created"] = record.fields.get("created", fields["created"])
         return fields_for_task(fields, task, run_dir=run_dir, phase_id=phase_id, land_target=land_target)
 
@@ -226,7 +190,7 @@ def register_copy(path: Path, *, task: str, owner_unit: str, source_path: str, s
 
 @contextmanager
 def copy_lock(path: Path) -> Generator[None]:
-    folder = copy_folder(path)
+    folder = copy_record.copy_folder(path)
     if folder is None:
         yield
         return
@@ -244,9 +208,9 @@ def copy_lock(path: Path) -> Generator[None]:
             if (held.st_dev, held.st_ino) != (present.st_dev, present.st_ino):
                 raise ScratchError(f"{folder}: copy changed before its busy lock was acquired")
             pending = pending_removal(folder)
-            if isinstance(pending, UnreadableRecord):
+            if isinstance(pending, copy_record.UnreadableRecord):
                 raise ScratchError(pending.reason)
-            if isinstance(pending, Registered):
+            if isinstance(pending, copy_record.Registered):
                 raise ScratchError(f"{folder}: removal has already started; finish cleanup first")
             exclude_copy_metadata(folder)
         yield
@@ -264,7 +228,7 @@ def copy_record_lock(path: Path) -> Generator[None]:
 @contextmanager
 def directory_record_lock(path: Path, *, wait: bool) -> Generator[bool]:
     """Lock the directory still at path; readers can decline to wait on another copy."""
-    if copy_folder(path) != path.resolve():
+    if copy_record.copy_folder(path) != path.resolve():
         yield True
         return
     for attempt in range(3):
@@ -327,7 +291,7 @@ def busy_locks(path: Path, *, create: bool) -> Generator[bool]:
     held: list[int] = []
     acquired = True
     try:
-        folder = copy_folder(path)
+        folder = copy_record.copy_folder(path)
         marks = dict.fromkeys((path / BUSY, path.parent / BUSY, *((folder / BUSY,) if folder is not None else ())))
         try:
             for mark in marks:
@@ -354,10 +318,10 @@ def busy_locks(path: Path, *, create: bool) -> Generator[bool]:
 def hand_over(path: Path, owner: str, task: str, *, run_dir: str = "", land_target: str = "") -> None:
     if not WORD.fullmatch(owner):
         raise ScratchError(f"{owner!r}: invalid owner unit")
-    _ = checked_task(task, False)
+    validate_phase_task(checked_task(task, False))
 
-    def transferred(record: Registered | NotRegistered | UnreadableRecord) -> dict[str, object]:
-        if not isinstance(record, Registered):
+    def transferred(record: copy_record.Registered | copy_record.NotRegistered | copy_record.UnreadableRecord) -> dict[str, object]:
+        if not isinstance(record, copy_record.Registered):
             raise ScratchError(f"{path}: no readable copy record")
         return fields_for_task({**record.fields, "owner_unit": owner}, task, run_dir=run_dir, land_target=land_target)
 
@@ -383,14 +347,14 @@ def fields_for_task(fields: dict[str, object], task: str, *, run_dir: str = "", 
     return result
 
 
-def update_record(path: Path, change: Callable[[Registered | NotRegistered | UnreadableRecord], dict[str, object]],
-                  *, removal: bool = False) -> Registered:
+def update_record(path: Path, change: Callable[[copy_record.Registered | copy_record.NotRegistered | copy_record.UnreadableRecord], dict[str, object]],
+                  *, removal: bool = False) -> copy_record.Registered:
     """The only record-write path: read, change and publish under the directory lock."""
     with copy_record_lock(path):
-        pending = pending_removal(path) if copy_folder(path) == path.resolve() else NotRegistered()
-        if isinstance(pending, UnreadableRecord):
+        pending = pending_removal(path) if copy_record.copy_folder(path) == path.resolve() else copy_record.NotRegistered()
+        if isinstance(pending, copy_record.UnreadableRecord):
             raise ScratchError(pending.reason)
-        if isinstance(pending, Registered) and not removal:
+        if isinstance(pending, copy_record.Registered) and not removal:
             raise ScratchError(f"{path}: removal has already started; finish cleanup first")
         record = task_of(path)
         fields = change(record)
@@ -398,18 +362,18 @@ def update_record(path: Path, change: Callable[[Registered | NotRegistered | Unr
         if not isinstance(task, str):
             raise ScratchError(f"{path}: record needs a task")
         _ = checked_task(task, False)
-        if copy_folder(path) == path.resolve():
+        if copy_record.copy_folder(path) == path.resolve():
             directory = path.stat()
-            identity = record.fields.get("copy_id") if isinstance(record, Registered) else ""
+            identity = record.fields.get("copy_id") if isinstance(record, copy_record.Registered) else ""
             fields.update(copy_id=identity if isinstance(identity, str) and identity else secrets.token_hex(16),
                           copy_device=directory.st_dev, copy_inode=directory.st_ino)
             if removal:
                 fields["copy_path"] = str(path.resolve())
             else:
                 exclude_copy_metadata(path)
-        destination = removal_mark(path) if removal else path / RECORD
+        destination = removal_mark(path) if removal else path / copy_record.RECORD
         atomic_record(destination, fields)
-        return Registered(task, fields)
+        return copy_record.Registered(task, fields)
 
 
 class ScratchError(Exception):
@@ -429,10 +393,6 @@ class Hold(TypedDict):
     reason: str
     made: float
     ended: float
-
-
-def root() -> Path:
-    return Path(os.environ.get(ROOT_ENV) or DEFAULT_ROOT).expanduser()
 
 
 def visible_root() -> Path:
@@ -456,7 +416,7 @@ def parsed_until(text: str) -> str:
 
 def task_end(task: str, now: float | None = None) -> Live | Ended | Unknown:
     """End evidence for a deadline, or the reason its external end is still needed."""
-    match = TASK.fullmatch(task)
+    match = copy_record.TASK.fullmatch(task)
     if match is None:
         return Unknown(f"invalid task: {task}")
     if match["kind"] != "until":
@@ -473,7 +433,7 @@ def ended(task: str, now: float) -> bool:
 
 
 def checked_task(task: str, visible: bool) -> re.Match[str]:
-    match = TASK.fullmatch(task)
+    match = copy_record.TASK.fullmatch(task)
     if match is None:
         raise ScratchError(f"{task!r} is no task: use run:<id>, phase:<unit>/<phase>, gate:<id>, "
                            + "landed:<unit>/<branch>, row:<showrunner>-C<n> or --until <when>")
@@ -486,9 +446,58 @@ def checked_task(task: str, visible: bool) -> re.Match[str]:
     return match
 
 
+def registered_plan(unit: str) -> Path:
+    """Resolve the plan from the unit's staff parent and production record."""
+    from scripts.direct import phase_table
+    from scripts.production import proposals_table, staff, unit_lookup
+    if TYPE_CHECKING:
+        from scripts.production.production_units import Refusal
+    else:
+        from production_units import Refusal
+
+    try:
+        parent = unit_lookup.unit_parent(unit, record=staff.snapshot())
+        value = cast(object, json.loads(phase_table.show_production(Path(parent.doc))))
+    except (OSError, UnicodeError, ValueError, Refusal) as error:
+        raise ScratchError(f"{unit}: cannot resolve registered plan: {error}") from error
+    if not isinstance(value, dict):
+        raise ScratchError(f"{unit}: production plan records are not an object")
+    records = cast(dict[str, object], value)
+    plans = proposals_table.unit_plan_paths(records)
+    if unit not in plans:
+        record = records.get(unit)
+        cause = cast(dict[str, object], record).get("unavailable") if isinstance(record, dict) else None
+        raise ScratchError(f"{unit}: no registered plan in production {parent.doc}: "
+                           + (str(cause) if cause else "no Units row or plan"))
+    return plans[unit]
+
+
+def validate_phase_task(match: re.Match[str]) -> None:
+    """Validate a new phase assignment, without restricting legacy task cleanup."""
+    if match["kind"] != "phase":
+        return
+    from scripts.direct import plan_history
+
+    unit, separator, phase = match["name"].partition("/")
+    hint = "use a phase id from the unit's plan, gate:<id> or --until <when>"
+    if not separator or not phase:
+        raise ScratchError(f"{match[0]!r}: a phase task needs phase:<unit>/<phase>; {hint}")
+    try:
+        plan = registered_plan(unit)
+    except ScratchError as error:
+        raise ScratchError(f"{match[0]!r}: {error}; {hint}") from error
+    try:
+        phases = plan_history.plan_phases(plan)
+    except (OSError, UnicodeError) as error:
+        raise ScratchError(f"{unit}: cannot read registered plan {plan}: {error}; {hint}") from error
+    if not any(row["id"] == phase for row in phases):
+        raise ScratchError(f"{match[0]!r}: phase {phase!r} is not in registered plan {plan}; {hint}")
+
+
 def target(task: str, word: str, visible: bool) -> Path:
     """The new folder's path for the task; never one that exists."""
     match = checked_task(task, visible)
+    validate_phase_task(match)
     if word and not WORD.fullmatch(word):
         raise ScratchError(f"{word!r}: a name is letters, digits, - and _")
     if visible:
@@ -498,7 +507,7 @@ def target(task: str, word: str, visible: bool) -> Path:
         return path
     suffix = "".join(secrets.choice(SUFFIX_CHARACTERS) for _ in range(SUFFIX_LENGTH))
     slug = f"{match['kind']}-{match['name'].replace('/', '-')}"
-    return root() / "-".join(part for part in (slug, word, suffix) if part)
+    return copy_record.root() / "-".join(part for part in (slug, word, suffix) if part)
 
 
 def maker() -> str:
@@ -511,7 +520,7 @@ def task_or_default(task: str, now: float) -> str:
 
 def write_record(path: Path, task: str, now: float) -> None:
     _ = update_record(path, lambda record: fields_for_task(
-        {**(record.fields if isinstance(record, Registered) else {}),
+        {**(record.fields if isinstance(record, copy_record.Registered) else {}),
          "maker": maker(), "created": now, "renewed": now}, task))
 
 
@@ -539,20 +548,6 @@ def adopt(source: Path, task: str, word: str = "", visible: bool = False, now: f
     return path
 
 
-def read_record(path: Path) -> Registered | NotRegistered | UnreadableRecord:
-    try:
-        raw = cast(object, json.loads(path.read_text(encoding="utf-8")))
-    except FileNotFoundError:
-        return NotRegistered()
-    except (OSError, UnicodeError, ValueError) as error:
-        return UnreadableRecord(f"repair record {path}: {error}")
-    fields = cast(dict[str, object], raw) if isinstance(raw, dict) else {}
-    task = fields.get("task")
-    if not isinstance(task, str) or not TASK.fullmatch(task):
-        return UnreadableRecord(f"repair record {path}: invalid task")
-    return Registered(task, fields)
-
-
 def removal_mark(path: Path) -> Path:
     """The record a started removal keeps beside the folder, outside the tree it deletes."""
     return path.parent / f"{REMOVAL_RECORD_PREFIX}{path.name}{REMOVAL_RECORD_SUFFIX}"
@@ -577,11 +572,11 @@ def marked_folders(entries: Iterable[Path]) -> Iterator[Path]:
 
 def folder_record(path: Path) -> Path:
     """The file that holds path's task: its own record, else its removal mark."""
-    record = path / RECORD
+    record = path / copy_record.RECORD
     return record if record.is_file() else removal_mark(path)
 
 
-def pending_removal(path: Path) -> Registered | NotRegistered | UnreadableRecord:
+def pending_removal(path: Path) -> copy_record.Registered | copy_record.NotRegistered | copy_record.UnreadableRecord:
     """Removal evidence lives outside the tree; for a copy it names the exact copy it certifies."""
     record = checked_removal(path)
     if not isinstance(record, StaleRemoval):
@@ -594,35 +589,35 @@ def pending_removal(path: Path) -> Registered | NotRegistered | UnreadableRecord
             if not isinstance(current, StaleRemoval):
                 return current
             removal_mark(path).unlink(missing_ok=True)
-    return NotRegistered()
+    return copy_record.NotRegistered()
 
 
-def checked_removal(path: Path) -> Registered | NotRegistered | UnreadableRecord | StaleRemoval:
-    record = read_record(removal_mark(path))
-    if not isinstance(record, Registered) or copy_folder(path) != path.resolve():
+def checked_removal(path: Path) -> copy_record.Registered | copy_record.NotRegistered | copy_record.UnreadableRecord | StaleRemoval:
+    record = copy_record.read_record(removal_mark(path))
+    if not isinstance(record, copy_record.Registered) or copy_record.copy_folder(path) != path.resolve():
         return record
     if record.fields.get("copy_path") != str(path.resolve()):
-        return UnreadableRecord(f"repair removal record {removal_mark(path)}: copy path differs")
+        return copy_record.UnreadableRecord(f"repair removal record {removal_mark(path)}: copy path differs")
     try:
         directory = path.stat()
     except FileNotFoundError:
         return record
     except OSError as error:
-        return UnreadableRecord(f"repair copy identity {path}: {error}")
+        return copy_record.UnreadableRecord(f"repair copy identity {path}: {error}")
     device, inode = record.fields.get("copy_device"), record.fields.get("copy_inode")
     if not isinstance(device, int) or not isinstance(inode, int):
-        return UnreadableRecord(f"repair removal record {removal_mark(path)}: copy identity is missing")
-    present = read_record(path / RECORD)
-    different_record = (isinstance(present, Registered) and bool(present.fields.get("copy_id"))
+        return copy_record.UnreadableRecord(f"repair removal record {removal_mark(path)}: copy identity is missing")
+    present = copy_record.read_record(path / copy_record.RECORD)
+    different_record = (isinstance(present, copy_record.Registered) and bool(present.fields.get("copy_id"))
                         and present.fields.get("copy_id") != record.fields.get("copy_id"))
     if (device, inode) != (directory.st_dev, directory.st_ino) or different_record:
         return StaleRemoval()
     return record
 
 
-def task_of(path: Path) -> Registered | NotRegistered | UnreadableRecord:
-    record = read_record(path / RECORD)
-    return pending_removal(path) if isinstance(record, NotRegistered) else record
+def task_of(path: Path) -> copy_record.Registered | copy_record.NotRegistered | copy_record.UnreadableRecord:
+    record = copy_record.read_record(path / copy_record.RECORD)
+    return pending_removal(path) if isinstance(record, copy_record.NotRegistered) else record
 
 
 def pending_copy_paths(base: Path) -> Iterator[Path]:
@@ -635,7 +630,7 @@ def pending_copy_paths(base: Path) -> Iterator[Path]:
 
 def copy_paths() -> Iterator[Path]:
     """Each pair/copy without following links. An unreadable registry fails closed."""
-    base = copies_root()
+    base = copy_record.copies_root()
     if not base.exists():
         return
     for pair in base.iterdir():
@@ -648,42 +643,42 @@ def copy_paths() -> Iterator[Path]:
 def record_lifetime(path: Path, now: float, ending_task: str = "") -> Live | Ended | Unknown:
     """Read end evidence while the caller holds any required removal lock."""
     removal = pending_removal(path)
-    if isinstance(removal, Registered):
+    if isinstance(removal, copy_record.Registered):
         return Ended(f"removal started for task {removal.task}")
-    if isinstance(removal, UnreadableRecord):
+    if isinstance(removal, copy_record.UnreadableRecord):
         return Unknown(removal.reason)
     record = task_of(path)
-    if isinstance(record, UnreadableRecord):
+    if isinstance(record, copy_record.UnreadableRecord):
         return Unknown(record.reason)
-    if isinstance(record, NotRegistered):
-        return Unknown(f"repair record {path / RECORD}: copy is not registered")
+    if isinstance(record, copy_record.NotRegistered):
+        return Unknown(f"repair record {path / copy_record.RECORD}: copy is not registered")
     protection: Live | Ended | Unknown = Ended("no copy borrows from it")
     try:
         for child in copy_paths():
             if child.resolve() == path.resolve():
                 continue
-            if isinstance(pending_removal(child), Registered):
+            if isinstance(pending_removal(child), copy_record.Registered):
                 continue
             other = task_of(child)
-            if isinstance(other, NotRegistered):
-                protection = Unknown(f"repair record {child / RECORD}: cannot rule out borrowed objects")
+            if isinstance(other, copy_record.NotRegistered):
+                protection = Unknown(f"repair record {child / copy_record.RECORD}: cannot rule out borrowed objects")
                 break
-            if isinstance(other, UnreadableRecord):
+            if isinstance(other, copy_record.UnreadableRecord):
                 protection = Unknown(other.reason + "; cannot rule out borrowed objects")
                 break
             borrowed = other.fields.get("borrows_from", "")
             if not isinstance(borrowed, str):
-                protection = Unknown(f"repair record {child / RECORD}: invalid borrows_from")
+                protection = Unknown(f"repair record {child / copy_record.RECORD}: invalid borrows_from")
                 break
             if borrowed and Path(borrowed).resolve() == (path / ".git").resolve():
                 protection = Live(f"borrowed: {child} still uses its git objects")
                 break
     except OSError as error:
-        protection = Unknown(f"repair copies registry {copies_root()}: {error}")
+        protection = Unknown(f"repair copies registry {copy_record.copies_root()}: {error}")
     if record.task.startswith("phase:"):
         run, phase = record.fields.get("run_dir"), record.fields.get("phase_id")
         if not isinstance(run, str) or not run or not isinstance(phase, str) or not phase:
-            return Unknown(f"repair record {path / RECORD}: phase needs run_dir and phase_id")
+            return Unknown(f"repair record {path / copy_record.RECORD}: phase needs run_dir and phase_id")
         progress = Path(run) / "progress_history_state.json"
         try:
             raw = cast(object, json.loads(progress.read_text(encoding="utf-8")))
@@ -716,10 +711,10 @@ def record_lifetime(path: Path, now: float, ending_task: str = "") -> Live | End
         branch = record.task.split("/", 1)[-1]
         target = record.fields.get("land_target", "origin/main") or "origin/main"
         if not isinstance(target, str):
-            return Unknown(f"repair land target in {path / RECORD}")
+            return Unknown(f"repair land target in {path / copy_record.RECORD}")
         source = record.fields.get("source_path")
         if not isinstance(source, str) or not source:
-            return Unknown(f"repair source checkout in {path / RECORD}: source_path is missing")
+            return Unknown(f"repair source checkout in {path / copy_record.RECORD}: source_path is missing")
         source_path = Path(source)
         try:
             if not source_path.is_dir():
@@ -745,7 +740,7 @@ def record_lifetime(path: Path, now: float, ending_task: str = "") -> Live | End
     return protection if isinstance(deadline, Ended) and not isinstance(protection, Ended) else deadline
 
 
-def task_has_end_evidence(record: Registered) -> bool:
+def task_has_end_evidence(record: copy_record.Registered) -> bool:
     at = record.fields.get("ended", 0)
     return record.fields.get("ended_task") == record.task and isinstance(at, (int, float)) and at > 0
 
@@ -760,18 +755,18 @@ def lifetime(path: Path, now: float | None = None) -> Live | Ended | Unknown:
 def folders() -> list[Folder]:
     """Every recorded scratch folder, including interrupted removals, in both roots."""
     candidates: dict[Path, None] = {}
-    for base in (root(), visible_root()):
+    for base in (copy_record.root(), visible_root()):
         try:
             entries = sorted(base.iterdir())
         except OSError:
             continue
         listed = {path for path in entries if path.is_dir()} | set(marked_folders(entries))
         candidates.update(dict.fromkeys(sorted(listed)))
-    candidates.update(dict.fromkeys((*copy_paths(), *pending_copy_paths(copies_root()))))
+    candidates.update(dict.fromkeys((*copy_paths(), *pending_copy_paths(copy_record.copies_root()))))
     found: list[Folder] = []
     for path in candidates:
-        record = task_of(path) if not path.is_symlink() else NotRegistered()
-        if isinstance(record, Registered):
+        record = task_of(path) if not path.is_symlink() else copy_record.NotRegistered()
+        if isinstance(record, copy_record.Registered):
             found.append(Folder(path, record.task, folder_record(path).stat().st_mtime))
     return found
 
@@ -779,14 +774,14 @@ def folders() -> list[Folder]:
 def renew(path: Path, now: float | None = None) -> None:
     moment = time.time() if now is None else now
 
-    def renewed(record: Registered | NotRegistered | UnreadableRecord) -> dict[str, object]:
-        if not isinstance(record, Registered):
+    def renewed(record: copy_record.Registered | copy_record.NotRegistered | copy_record.UnreadableRecord) -> dict[str, object]:
+        if not isinstance(record, copy_record.Registered):
             raise ScratchError(f"{path} is no scratch folder")
         return {**record.fields, "renewed": moment}
 
     with copy_record_lock(path):
         _ = update_record(path, renewed)
-        os.utime(path / RECORD, (moment, moment))
+        os.utime(path / copy_record.RECORD, (moment, moment))
 
 
 def remove(path: Path) -> None:
@@ -796,7 +791,7 @@ def remove(path: Path) -> None:
         _ = subprocess.run(["git", "-C", str(path), "worktree", "remove", "--force", str(path)],
                            capture_output=True, check=False)
     if os.path.lexists(path):
-        for child in sorted(path.iterdir(), key=lambda child: (child.name == RECORD, child.name)):
+        for child in sorted(path.iterdir(), key=lambda child: (child.name == copy_record.RECORD, child.name)):
             if child.is_dir() and not child.is_symlink():
                 shutil.rmtree(child)
             else:
@@ -809,17 +804,17 @@ def remove_marked(path: Path, delete: Callable[[Path], None]) -> None:
     A rerun finds the task in the mark after the folder's record or the folder is gone. A copy
     needs a readable record; callers of a copy hold its removal lock. An unrecorded folder
     (a held one) gets no mark."""
-    def removing(record: Registered | NotRegistered | UnreadableRecord) -> dict[str, object]:
-        if not isinstance(record, Registered):
+    def removing(record: copy_record.Registered | copy_record.NotRegistered | copy_record.UnreadableRecord) -> dict[str, object]:
+        if not isinstance(record, copy_record.Registered):
             raise ScratchError(f"{path}: no readable record for removal")
         return dict(record.fields)
 
-    copy = copy_folder(path) == path.resolve()
+    copy = copy_record.copy_folder(path) == path.resolve()
     with copy_record_lock(path):
         pending = pending_removal(path)
-        if isinstance(pending, UnreadableRecord) and copy:
+        if isinstance(pending, copy_record.UnreadableRecord) and copy:
             raise ScratchError(pending.reason)
-        if isinstance(pending, NotRegistered) and (copy or isinstance(read_record(path / RECORD), Registered)):
+        if isinstance(pending, copy_record.NotRegistered) and (copy or isinstance(copy_record.read_record(path / copy_record.RECORD), copy_record.Registered)):
             _ = update_record(path, removing, removal=True)
         delete(path)
         removal_mark(path).unlink(missing_ok=True)
@@ -828,7 +823,7 @@ def remove_marked(path: Path, delete: Callable[[Path], None]) -> None:
 def clear_finished_copy_removals(base: Path) -> None:
     """A stop after the tree went away may leave only its outside removal record."""
     for path in pending_copy_paths(base):
-        if not os.path.lexists(path) and isinstance(pending_removal(path), Registered):
+        if not os.path.lexists(path) and isinstance(pending_removal(path), copy_record.Registered):
             with removal_lock(path) as idle:
                 if idle and not os.path.lexists(path):
                     removal_mark(path).unlink(missing_ok=True)
@@ -947,7 +942,7 @@ def end(task: str, now: float | None = None, *, keep: Callable[[Path], bool] = l
     moment = time.time() if now is None else now
     for folder in folders():
         if folder.task == task and not keep(folder.path):
-            if copy_folder(folder.path) is not None:
+            if copy_record.copy_folder(folder.path) is not None:
                 if end_copy(folder.path, task, moment):
                     removed.append(folder.path)
             else:
@@ -960,7 +955,7 @@ def end(task: str, now: float | None = None, *, keep: Callable[[Path], bool] = l
             continue
         changed = True
         held = Path(path)
-        copies = Path(os.path.realpath(copies_root()))
+        copies = Path(os.path.realpath(copy_record.copies_root()))
         if copies.is_relative_to(held.resolve()) or held.parent == copies:
             for copy in list(copy_paths()):
                 if copy.is_relative_to(held) and not keep(copy) and end_copy(copy, task, moment, require_task=False):
@@ -979,7 +974,7 @@ def end(task: str, now: float | None = None, *, keep: Callable[[Path], bool] = l
                 continue
             del found[path]
             continue
-        if os.path.lexists(held) and copy_folder(held) is not None:
+        if os.path.lexists(held) and copy_record.copy_folder(held) is not None:
             if end_copy(held, task, moment):
                 removed.append(held)
                 del found[path]
@@ -1001,12 +996,12 @@ def end(task: str, now: float | None = None, *, keep: Callable[[Path], bool] = l
 def end_copy(path: Path, task: str, now: float, *, require_task: bool = True) -> bool:
     with removal_lock(path) as idle, copy_record_lock(path):
         record = task_of(path)
-        if not isinstance(record, Registered) or require_task and record.task != task:
+        if not isinstance(record, copy_record.Registered) or require_task and record.task != task:
             return False
         pending = pending_removal(path)
-        if record.task == task and isinstance(pending, NotRegistered) and not task_has_end_evidence(record):
-            def task_ended(current: Registered | NotRegistered | UnreadableRecord) -> dict[str, object]:
-                if not isinstance(current, Registered) or current.task != task:
+        if record.task == task and isinstance(pending, copy_record.NotRegistered) and not task_has_end_evidence(record):
+            def task_ended(current: copy_record.Registered | copy_record.NotRegistered | copy_record.UnreadableRecord) -> dict[str, object]:
+                if not isinstance(current, copy_record.Registered) or current.task != task:
                     raise ScratchError(f"{path}: task changed while recording its end")
                 return {**current.fields, "ended": now, "ended_task": task}
 
@@ -1016,7 +1011,7 @@ def end_copy(path: Path, task: str, now: float, *, require_task: bool = True) ->
         state = record_lifetime(path, now)
         if not isinstance(state, Ended):
             return False
-        if not isinstance(pending, Registered) and unsaved_work(path) is not None:
+        if not isinstance(pending, copy_record.Registered) and unsaved_work(path) is not None:
             return False
         remove_marked(path, remove)
         return True

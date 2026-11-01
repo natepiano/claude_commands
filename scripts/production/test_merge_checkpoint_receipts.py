@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 
 from scripts.production.merge_checkpoint_test_support import MergeCheckpointFixture, SCRIPT, configure_test_environment
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 def setUpModule() -> None:
@@ -39,7 +40,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertEqual(self.receipts(), [receipt])
         readback = subprocess.run([sys.executable, str(SCRIPT.parent.parent / "direct" / "progress_history.py"),
                                    "receipts", "--project", "hana", "--merge-commit", merge], cwd=self.checkout, env=self.env,
-                                  capture_output=True, text=True, check=False, timeout=300)
+                                  capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(readback.returncode, 0, readback.stderr)
         report = cast(dict[str, object], json.loads(readback.stdout))
         self.assertEqual((report["covered_n"], report["missing_n"], report["receipts"]), (1, 0, [receipt]))
@@ -96,7 +97,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         merge = self.git("rev-parse", "HEAD")
         result = subprocess.run([sys.executable, str(SCRIPT.parent.parent / "direct" / "progress_history.py"),
                                  "receipts", "--merge-commit", merge], cwd=self.checkout, env=self.env,
-                                capture_output=True, text=True, check=False, timeout=300)
+                                capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stderr)
         report = cast(dict[str, object], json.loads(result.stdout))
         self.assertEqual((report["covered_n"], report["missing_n"], report["missing"]),
@@ -114,7 +115,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
             ["start-phase", "--session-dir", str(session), "--phase-id", "3", "--phase-title", "Parallel"],
         ):
             result = subprocess.run([sys.executable, str(recorder), *arguments], cwd=self.unit, env=self.env,
-                                    capture_output=True, text=True, check=False, timeout=300)
+                                    capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
             self.assertEqual(result.returncode, 0, result.stderr)
         _ = (self.state / "fail-checkpoint-test").touch()
         failed = self.run_checkpoint(checkpoint)
@@ -142,12 +143,12 @@ class MergeCheckpointTests(MergeCheckpointFixture):
             ["finish-phase", "--session-dir", str(session), "--phase-id", "2", "--status", "completed"],
         ):
             recorded = subprocess.run([sys.executable, str(recorder), *arguments], env=self.env, cwd=self.unit,
-                                      capture_output=True, text=True, check=False, timeout=300)
+                                      capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
             self.assertEqual(recorded.returncode, 0, recorded.stderr)
         merged = self.run_checkpoint(checkpoint)
         self.assertEqual(merged.process.returncode, 0, merged.process.stdout + merged.process.stderr)
         read = subprocess.run([sys.executable, str(recorder), "waits", "--session-dir", str(session)],
-                              env=self.env, cwd=self.unit, capture_output=True, text=True, check=False, timeout=300)
+                              env=self.env, cwd=self.unit, capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(read.returncode, 0, read.stderr)
         report = cast(dict[str, object], json.loads(read.stdout))
         wait, = cast(list[dict[str, object]], report["waits"])

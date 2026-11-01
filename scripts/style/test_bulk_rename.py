@@ -27,11 +27,9 @@ import style_ledger
 from ledger_test_support import remove_generation_schema
 import style_rules
 from scripts.direct.test_verify_untested_examples import rust_tool_path, workspace_metadata
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from approved_renames import AppliedInCode, BindingRename, NoBindingScope, binding_rename_check, binding_scope, rename_declaration
 
-
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
 
 class ScriptedServer:
     def __init__(self, edit: Callable[[str, int, str], tuple[bulk.SourceEdit, ...]]) -> None:

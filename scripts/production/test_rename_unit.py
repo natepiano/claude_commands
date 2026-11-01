@@ -3,22 +3,39 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import unittest
 from pathlib import Path
 from typing import cast, final
+from unittest import mock
+from scripts.astra import design_roles
+from scripts.astra.design_role_test_support import write_empty_binding_record
 from scripts.production import staff
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 
 
-from scripts.production.rename_unit_test_support import UnitRenameFixture, SCRIPT, SLUG, TEST_HANG_GUARD_SECS
+from scripts.production.rename_unit_test_support import UnitRenameFixture, SCRIPT, SLUG
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 @final
 class UnitRenameTests(UnitRenameFixture):
+    def test_bad_unrelated_record_warns_once_across_move_and_verification(self) -> None:
+        with mock.patch.dict(os.environ, self.env):
+            bad = write_empty_binding_record(self.checkout, design_roles.UnitHolder('unrelated', 'other-unit'),
+                                             lifecycle=design_roles.RoleOpen('unrelated-thread'))
+        completed = self.rename('apply')
+        self.assert_ok(completed)
+        self.assertEqual(completed.stderr.splitlines(), [f'warning: {bad}: missing or invalid repository'])
+        self.assertTrue(bad.is_file())
+        verified = self.rename('verify')
+        self.assert_ok(verified)
+        self.assertEqual(verified.stderr.splitlines(), [f'warning: {bad}: missing or invalid repository'])
+
     def test_rename_unit_preserves_staff_and_worker_identity(self) -> None:
         row = next(row for row in staff.snapshot().find(kind="unit") if row.name == "alpha")
         worker = staff.ensure("worker", name="impl1", parent=row.id)
@@ -98,11 +115,6 @@ class UnitRenameTests(UnitRenameFixture):
         self.assertIn("alpha-unit history stays in prose.", plan)
         self.assertFalse(self.stall_path("alpha-unit").exists())
         self.assertTrue(self.stall_path("gamma-unit").exists())
-        pool = cast(dict[str, dict[str, dict[str, object]]],
-                    json.loads((self.root / "state/review-pool/demo/pool.json").read_text()))
-        self.assertEqual(pool["reviewers"]["r1"]["lease"], {"unit": "gamma-unit", "ordinal": 3})
-        self.assertEqual(pool["reviewers"]["r1"]["thread_id"], "thread-r1")
-        self.assertEqual(cast(dict[str, object], pool["reviewers"]["r2"]["lease"])["unit"], "mul_add-unit")
         started = cast(dict[str, object], json.loads((self.root / "history/runs/run-1.jsonl").read_text().splitlines()[0]))
         self.assertEqual((started["working_dir"], started["branch"], started["plan_doc"]),
                          (str(new), "demo-gamma", f"{new}/docs/plans/alpha.md"))

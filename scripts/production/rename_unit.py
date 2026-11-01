@@ -55,7 +55,6 @@ import proposals_folder  # noqa: E402
 import retire_unit  # noqa: E402
 import pane_record  # noqa: E402
 import rename_state  # noqa: E402
-import review_pool  # noqa: E402
 from scripts.production import showrunners  # noqa: E402
 import stall_watch  # noqa: E402
 import unit_lookup  # noqa: E402
@@ -67,6 +66,7 @@ from rename_state import RenameRefused, read_json, write_json, write_text  # noq
 from unit_move import PathMove, git  # noqa: E402
 from user_zone import user_zone  # noqa: E402
 from scripts.production import staff, staff_sources
+from scripts.astra import design_roles
 
 if TYPE_CHECKING:
     from scripts.style import style_ledger
@@ -591,7 +591,6 @@ def _merge_rename(rename: UnitRename, save: Callable[[], None]) -> None:
 
 
 def _move_state(rename: UnitRename, _save: Callable[[], None]) -> None:
-    from scripts.astra import design_roles
     from scripts.direct import workers
     workers.rename_unit(rename.slug, rename.old, rename.new,
                         runs=tuple(set((*retire_unit.runs_of(Path(rename.old_worktree)),
@@ -617,10 +616,6 @@ def _move_state(rename: UnitRename, _save: Callable[[], None]) -> None:
         _ = rename_state.rename_outstanding(path.parent.parent.name, ((rename.old, rename.new), *paths))
     unit_move.move(PathMove(stall_watch.stretch_path(rename.slug, rename.old),
                             stall_watch.stretch_path(rename.slug, rename.new)))
-    try:
-        _ = review_pool.rename_unit(rename.slug, rename.old, rename.new)
-    except review_pool.PoolError as error:
-        raise RenameRefused(str(error)) from error
     old, new = Path(rename.old_worktree), Path(rename.new_worktree)
     run = unit_move.newest_run(old) or unit_move.newest_run(new)
     if run is not None:
@@ -782,7 +777,7 @@ def stop_unit(rename: StopTarget, save: Callable[[], None]) -> None:
         found = unit_lookup.marked_unit(rename.slug, rename.old)
         if rename.session_id and (found is None or isinstance(found.claude, unit_lookup.LiveClaude)
                                   and found.claude.session_id != rename.session_id):
-            found = next((marked for _, marked in unit_lookup.observed_unit_marks()
+            found = next((marked for _, marked in unit_lookup.observed_staff_marks()
                           if isinstance(marked.claude, unit_lookup.LiveClaude)
                           and marked.claude.session_id == rename.session_id), None)
     except OSError as error:
@@ -1118,7 +1113,6 @@ def _state_failures(rename: UnitRename) -> list[str]:
     identity = phase_table.production_identity(read_production(Path(rename.doc)))
     failures.extend(f"{note}: phase note still names {rename.old}"
                     for note in phase_table.owned_notes(identity, rename.old))
-    from scripts.astra import design_roles
     failures.extend(design_roles.rename_failures(rename.slug, rename.old, rename.old_worktree))
     return failures
 
@@ -1137,7 +1131,7 @@ def _session_failures(rename: UnitRename) -> list[str]:
         failures.append(f"{rename.new} is not running; relaunch it with shutdown.py restart --here --only {rename.session_id}")
     # When the id already matched, the mark is the new id too; only the session name changed.
     if not rename.id_matches:
-        for slug, old in unit_lookup.observed_unit_marks():
+        for slug, old in unit_lookup.observed_staff_marks():
             if (slug == rename.slug and old.unit == rename.old
                     and isinstance(old.claude, (unit_lookup.LiveClaude, unit_lookup.ClaudeUnknown))):
                 failures.append(f"a session still carries the mark {rename.old}: "
@@ -1408,7 +1402,7 @@ def apply(slug: str, old: str, new: str, scratch: Path) -> UnitRename:
     slug = showrunners.canonical_slug(slug)
     path = rename_state.unit_journal(slug)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with unit_move.production_lock():
+    with unit_move.production_lock(), design_roles.record_operation():
         if rename_state.unfinished(rename_state.production_journal(slug)):
             raise RenameRefused(f"{slug}: finish the production rename first")
         rename = _resumed(path, old, new)

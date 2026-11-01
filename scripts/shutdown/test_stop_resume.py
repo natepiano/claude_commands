@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import fcntl
 import json
 import os
 import shlex
@@ -11,18 +12,22 @@ import tempfile
 import time
 import unittest
 from collections.abc import Callable
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from threading import Barrier, Lock, local
 from typing import cast, final, override
 from unittest.mock import Mock, call, patch
 
 from scripts.accounts import accounts
+from scripts.whoami import account
 from scripts.shutdown import stop_resume
+from scripts.production import showrunners, staff_sources, stall_watch
+from scripts.shutdown.inventory import PausedSeat
 import herdr
 import pane_record
 import sessions
 import shutdown
+import unit_lookup
 from test_pane_restore import FakeClient
 
 
@@ -60,6 +65,7 @@ class StopResumeTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         _ = self.enterContext(patch.object(accounts, "accounts_home", return_value=self.root))
+        _ = self.enterContext(patch.object(account, "process_config_dir", side_effect=self.process_account))
         _ = self.enterContext(patch.object(herdr, "repository_root", return_value=self.root))
         _ = self.enterContext(patch.object(herdr, "repository_trust_key", return_value=self.root))
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "", "SHUTDOWN_STATE_DIR": str(self.root / "shutdown")})))
@@ -67,6 +73,8 @@ class StopResumeTests(unittest.TestCase):
         _ = self.enterContext(patch.object(herdr, "Herdr", return_value=self.client))
         _ = self.enterContext(patch.object(pane_record, "RECORD_DIR", self.root / "panes"))
         pane_record.write("agents", self.entry)
+        _ = self.enterContext(patch.object(stall_watch, "STATE_DIR",
+                                         Path(self.enterContext(tempfile.TemporaryDirectory()))))
         _ = self.enterContext(patch.object(sessions, "session_liveness", self.observe))
         _ = self.enterContext(patch.object(sessions, "process_start", return_value="generation-1"))
         _ = self.enterContext(patch.object(sessions, "process_liveness", self.process))
@@ -79,6 +87,9 @@ class StopResumeTests(unittest.TestCase):
         _ = self.enterContext(patch("unit_runs.held", return_value=[]))
         _ = self.enterContext(patch.object(pane_record, "seed", self.seed))
         _ = self.enterContext(patch.object(stop_resume, "_detach", self.detach))
+
+    def process_account(self, _pid: int) -> account.ConfiguredClaudeFolder:
+        return account.ConfiguredClaudeFolder(self.root / (".claude4" if self.launched else ".claude3"))
 
     def advance(self, seconds: float) -> None:
         self.clock.elapsed += seconds
@@ -109,6 +120,23 @@ class StopResumeTests(unittest.TestCase):
         return (sessions.LiveSessionProcess(123) if call(123, signal.SIGKILL) not in self.kill.call_args_list
                 else sessions.SessionNotLive())
 
+    def test_saved_review_resumes_without_retired_allocation_options(self) -> None:
+        run, cwd = str(self.root / "worker run"), str(self.root / "working tree")
+        task = [run, cwd, "old prompt.md", "review", "check this change", "reviewing", "2"]
+        command = ["bash", str(stop_resume.SCRIPTS / "direct/review.sh"),
+                   "--pool", "code", "--lease", "x/y/7", "--phase", "3p", "--lens", "contract",
+                   "--slot", "review", *task]
+        seat = PausedSeat(run_dir=run, seat="review2", role="review", thread_id="same-thread",
+                          turn_live=True, launcher_command=command)
+        expected = [*command[:2], "--phase", "3p", "--lens", "contract", "--to", "review2",
+                    run, cwd, str(Path(run) / "review2.resume-prompt.md"), *task[3:]]
+        rebuilt = stop_resume.resume_worker_command(seat, cwd)
+        self.assertEqual(shlex.split(rebuilt), expected)
+        self.assertNotIn("--pool", shlex.split(rebuilt))
+        self.assertNotIn("--lease", shlex.split(rebuilt))
+        seat["launcher_command"] = shlex.split(rebuilt)
+        self.assertEqual(stop_resume.resume_worker_command(seat, cwd), rebuilt)
+
     def test_recovery_opens_a_fresh_tab_for_a_missing_pane_then_uses_the_shared_resume(self) -> None:
         self.client.rows.clear()
         def open_tab(space: str, title: str, cwd: str, environment: dict[str, str]) -> str:
@@ -136,12 +164,228 @@ class StopResumeTests(unittest.TestCase):
         self.assertLessEqual(self.clock.elapsed, 0.1)
         self.assertEqual(self.kill.call_args_list, [call(123, signal.SIGTERM)])
 
+    def prompt_retirement_fixture(self, *, alerted: bool) -> Path:
+        """Publish cancellation requests for the watcher with an isolated send.py recorder."""
+        self.entry["environment"].update({"SHOWRUNNER_UNIT": "production", "SHOWRUNNER_UNIT_ID": "alpha"})
+        pane_record.write("agents", self.entry)
+        state = self.root / "stall-watch"
+        state.mkdir(exist_ok=True)
+        sender = self.root / "retire.py"
+        log = self.root / "retire.json"
+        _ = sender.write_text("import json, pathlib, sys\n"
+                              + f"pathlib.Path({str(log)!r}).write_text(json.dumps(sys.argv[1:]))\n")
+        _ = self.enterContext(patch.object(stall_watch, "STATE_DIR", state))
+        _ = self.enterContext(patch.object(stall_watch, "SEND", sender))
+        _ = self.enterContext(patch.object(showrunners, "canonical_slug", return_value="production"))
+        prompt = stall_watch.PromptWait(session_id="sid-alpha", created=0,
+            key="stall-watch:prompt:production:alpha", since=0, alerted=alerted, tool="permission", retiring=False, told=60)
+        stall_watch.save_prompt(stall_watch.prompt_path("production", "alpha"), prompt)
+        return log
+
+    def assert_prompt_cancellation_requested(self, log: Path) -> None:
+        self.assertFalse(log.exists(), "stop and move must never send")
+        path = stall_watch.prompt_path("production", "alpha")
+        self.assertTrue(path.exists())
+        requests = list(stall_watch.STATE_DIR.glob("*.prompt.cancel.json"))
+        self.assertTrue(requests)
+        for request in requests:
+            record = cast(dict[str, object], json.loads(request.read_text()))
+            self.assertEqual(set(record), {"session_id", "at"})
+            self.assertEqual(record["session_id"], "sid-alpha")
+            self.assertIsInstance(record["at"], (float, int))
+
+    def drain_prompt_cancellations(self) -> None:
+        with (patch.object(showrunners, "load_settings", return_value={}),
+              patch.object(showrunners, "registered_showrunners", return_value=showrunners.ShowrunnerDiscovery()),
+              patch.object(stall_watch, "processes", return_value=[]),
+              patch.object(stall_watch, "prompt_grace_seconds", return_value=120),
+              patch.object(unit_lookup, "read_run_states", return_value=unit_lookup.RunStates({}))):
+            _ = stall_watch.tick(100)
+
+    def test_stop_requests_prompt_cancellation_before_returning_without_sending(self) -> None:
+        log = self.prompt_retirement_fixture(alerted=True)
+        self.assertEqual(stop_resume.stop("alpha"), stop_resume.NotRunning("sid-alpha"))
+        self.assert_prompt_cancellation_requested(log)
+
+    def test_move_requests_prompt_cancellation_before_resuming_without_sending(self) -> None:
+        log = self.prompt_retirement_fixture(alerted=False)
+        def start_after_request(*arguments: str) -> str:
+            self.assertIn("exec", self._typed(arguments))
+            self.assert_prompt_cancellation_requested(log)
+            return ""
+        self.start.side_effect = start_after_request
+        self.assertEqual(stop_resume.move("alpha", "claude4", why="limit"),
+                         stop_resume.ClaudeUp("sid-alpha", "w1:p2", "claude4"))
+        self.assert_prompt_cancellation_requested(log)
+
+    def test_failed_prompt_retirement_stays_requested_until_the_watcher_confirms_it(self) -> None:
+        log = self.prompt_retirement_fixture(alerted=True)
+        sender = self.root / "retire.py"
+        original = sender.read_text()
+        _ = sender.write_text(original + "raise SystemExit(3)\n")
+        self.assertEqual(stop_resume.stop("alpha"), stop_resume.NotRunning("sid-alpha"))
+        self.assert_prompt_cancellation_requested(log)
+        errors = io.StringIO()
+        with redirect_stderr(errors):
+            self.drain_prompt_cancellations()
+        self.assertIn("stall-watch: retire:", errors.getvalue())
+        path = stall_watch.prompt_path("production", "alpha")
+        self.assertTrue(list(stall_watch.STATE_DIR.glob("*.prompt.cancel.json")))
+        _ = sender.write_text(original)
+        self.drain_prompt_cancellations()
+        self.assertFalse(path.exists())
+        self.assertEqual(list(stall_watch.STATE_DIR.glob("*.prompt.cancel.json")), [])
+        self.assertEqual(json.loads(log.read_text()), ["retire", "--to", "user", "--from", "stall-watch",
+                                                      "--key", "stall-watch:prompt:production:alpha"])
+
+    def test_cancellation_key_errors_cannot_prevent_stop_bookkeeping_or_move_resume(self) -> None:
+        self.live.return_value = sessions.LiveSessionProcess(123)
+        self.process.side_effect = [sessions.LiveSessionProcess(123), sessions.SessionNotLive()]
+        errors = io.StringIO()
+        with (patch.object(stall_watch, "retire_session_prompt", side_effect=KeyError("session_id")),
+              redirect_stderr(errors)):
+            self.assertEqual(stop_resume.stop("alpha"), stop_resume.Stopped("sid-alpha", 123))
+        self.assertTrue(pane_record.read("agents")["w1:p2"].get("ended"))
+        self.assertIn("sid-alpha: prompt cancellation:", errors.getvalue())
+        pane_record.write("agents", self.entry)
+        self.live.return_value = sessions.SessionNotLive()
+        self.process.side_effect = None
+        self.process.return_value = sessions.LiveSessionProcess(456)
+        with (patch.object(stall_watch, "retire_session_prompt", side_effect=KeyError("session_id")),
+              redirect_stderr(errors)):
+            self.assertIsInstance(stop_resume.move("alpha", "claude4", why="limit"), stop_resume.ClaudeUp)
+        self.assertEqual(errors.getvalue().count("prompt cancellation:"), 2)
+
+    def test_stop_and_move_never_take_a_held_watcher_lock(self) -> None:
+        log = self.prompt_retirement_fixture(alerted=True)
+        real_flock = fcntl.flock
+        forbidden_attempts: list[tuple[int, int]] = []
+        with (stall_watch.STATE_DIR / "lock").open("a+") as lock:
+            real_flock(lock, fcntl.LOCK_EX)
+            held = os.fstat(lock.fileno())
+            watcher_identity = (held.st_dev, held.st_ino)
+
+            def forbid_watcher_lock(file: int | io.IOBase, operation: int) -> None:
+                descriptor = file if isinstance(file, int) else file.fileno()
+                stat = os.fstat(descriptor)
+                identity = (stat.st_dev, stat.st_ino)
+                if identity == watcher_identity:
+                    forbidden_attempts.append(identity)
+                    raise AssertionError("watcher lock must not be acquired")
+                real_flock(file, operation)
+
+            with patch.object(fcntl, "flock", side_effect=forbid_watcher_lock):
+                self.assertEqual(stop_resume.stop("alpha"), stop_resume.NotRunning("sid-alpha"))
+                self.assertIsInstance(stop_resume.move("alpha", "claude4", why="limit"), stop_resume.ClaudeUp)
+        self.assertEqual(forbidden_attempts, [], "stop and move must never attempt the watcher lock")
+        self.assert_prompt_cancellation_requested(log)
+
+    def test_a_delayed_cancellation_never_retires_a_resumed_sessions_new_prompt(self) -> None:
+        log = self.prompt_retirement_fixture(alerted=True)
+        self.assertEqual(stop_resume.stop("alpha"), stop_resume.NotRunning("sid-alpha"))
+        path = stall_watch.prompt_path("production", "alpha")
+        stall_watch.save_prompt(path, stall_watch.PromptWait(session_id="sid-alpha", created=time.time() + 1,
+            key="stall-watch:prompt:production:alpha", since=200, alerted=False, tool="new-request", retiring=False))
+        self.drain_prompt_cancellations()
+        self.assertFalse(log.exists())
+        self.assertEqual(list(stall_watch.STATE_DIR.glob("*.prompt.cancel.json")), [])
+        saved = stall_watch.saved_prompt(path)
+        assert saved is not None
+        self.assertEqual((saved["since"], saved["retiring"]), (200, False))
+
+    def test_a_malformed_cancellation_does_not_stop_valid_requests(self) -> None:
+        log = self.prompt_retirement_fixture(alerted=True)
+        self.assertEqual(stop_resume.stop("alpha"), stop_resume.NotRunning("sid-alpha"))
+        bad = stall_watch.STATE_DIR / "aaa.prompt.cancel.json"
+        _ = bad.write_text("{")
+        errors = io.StringIO()
+        with redirect_stderr(errors):
+            self.drain_prompt_cancellations()
+        self.assertIn(str(bad), errors.getvalue())
+        self.assertTrue(bad.exists())
+        self.assertTrue(log.exists())
+        self.assertFalse(stall_watch.prompt_path("production", "alpha").exists())
+
+    def test_a_mac_stop_publishes_cancellation_without_any_lookup(self) -> None:
+        log = self.prompt_retirement_fixture(alerted=True)
+        with (patch("platform.system", return_value="Darwin"),
+              patch.object(pane_record, "launch_for_session", side_effect=AssertionError("no launch lookup")) as launch,
+              patch.object(staff_sources, "unit_parent", side_effect=AssertionError("no remote lookup")) as parent,
+              patch.object(showrunners, "socket_for", side_effect=AssertionError("no socket lookup")) as socket):
+            self.assertEqual(stop_resume.stop("alpha"), stop_resume.NotRunning("sid-alpha"))
+        launch.assert_not_called()
+        parent.assert_not_called()
+        socket.assert_not_called()
+        self.assert_prompt_cancellation_requested(log)
+
+    def test_launch_deletion_after_stop_cannot_lose_the_old_alerts_cancellation(self) -> None:
+        log = self.prompt_retirement_fixture(alerted=True)
+        self.assertEqual(stop_resume.stop("alpha"), stop_resume.NotRunning("sid-alpha"))
+        # retire_unit removes launch records after stop and before the next watcher pass.
+        pane_record.record_path("agents").unlink()
+        self.drain_prompt_cancellations()
+        self.assertEqual(json.loads(log.read_text()), ["retire", "--to", "user", "--from", "stall-watch",
+                                                      "--key", "stall-watch:prompt:production:alpha"])
+        self.assertFalse(stall_watch.prompt_path("production", "alpha").exists())
+        self.assertEqual(list(stall_watch.STATE_DIR.glob("*.prompt.cancel.json")), [])
+
+    def test_missing_pane_recovery_does_not_duplicate_a_live_session(self) -> None:
+        self.client.rows.clear()
+        self.live.return_value = sessions.LiveSessionProcess(123)
+        with patch.object(self.client, "open_tab") as opened:
+            result = stop_resume.resume("sid-alpha", why="recovery", restore_missing=True)
+        self.assertEqual(result, stop_resume.ClaudeUp("sid-alpha", "w1:p2", "claude3"))
+        opened.assert_not_called()
+        self.start.assert_not_called()
+
     def test_seed_reads_only_the_selected_session_pane(self) -> None:
         self.add_beta()
         _ = stop_resume.stop("alpha")
         self.seed.assert_called_once()
         select = cast(Callable[[herdr.PaneIdentity], bool], self.seed.call_args.kwargs["select"])
         self.assertEqual([pane["pane_id"] for pane in self.client.panes() if select(pane)], ["w1:p2"])
+
+    def test_move_resume_failure_is_pending_and_rerun_finishes_without_restopping(self) -> None:
+        self.start.side_effect = herdr.HerdrFailure("registry temporarily unreadable")
+        with patch.object(stop_resume, "_stop", return_value=stop_resume.Stopped("sid-alpha", 123)):
+            pending = stop_resume.move("alpha", "claude4", why="limit")
+        self.assertIsInstance(pending, stop_resume.ResumePending)
+        assert isinstance(pending, stop_resume.ResumePending)
+        self.assertEqual(accounts.move_result_line(pending),
+                         "sid-alpha: stopped, resume pending: registry temporarily unreadable")
+        self.start.side_effect = None
+        self.assertEqual(stop_resume.move("alpha", "claude4", why="limit"),
+                         stop_resume.ClaudeUp("sid-alpha", "w1:p2", "claude4"))
+        self.start.reset_mock()
+        self.seed.reset_mock()
+        before = pane_record.record_path("agents").read_bytes()
+        with patch.object(stop_resume, "_stop", side_effect=AssertionError("rerun stopped the destination")), \
+                patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "sid-alpha"}):
+            self.assertEqual(stop_resume.move("alpha", "claude4", why="limit"),
+                             stop_resume.ClaudeUp("sid-alpha", "w1:p2", "claude4"))
+        self.start.assert_not_called()
+        self.seed.assert_not_called()
+        self.detach.assert_called_once()  # Only the successful resume's stay check, never a rerun handoff.
+        self.assertEqual(pane_record.record_path("agents").read_bytes(), before)
+
+    def test_resume_retries_a_transient_registry_failure_without_an_extra_launch(self) -> None:
+        self.live.side_effect = [sessions.SessionLivenessUnknown("registry mid-write"), sessions.SessionNotLive(),
+                                 sessions.SessionNotLive()]
+        self.assertEqual(stop_resume.resume("alpha", to="claude4", why="finish pending move"),
+                         stop_resume.ClaudeUp("sid-alpha", "w1:p2", "claude4"))
+        self.start.assert_called_once()
+
+    def test_shutdown_resume_finishes_a_pending_move_and_reruns_with_one_line(self) -> None:
+        self.start.side_effect = herdr.HerdrFailure("cannot start yet")
+        self.assertIsInstance(stop_resume.move("alpha", "claude4", why="limit"), stop_resume.ResumePending)
+        self.start.side_effect = None
+        for _ in range(2):
+            output = io.StringIO()
+            with redirect_stdout(output):
+                status = shutdown.main(["resume", "alpha", "--why", "finish move"])
+            self.assertEqual(status, 0, output.getvalue())
+            self.assertEqual(len(output.getvalue().splitlines()), 1)
+            self.assertIn("Claude is up on claude4", output.getvalue())
 
     def test_move_copies_source_folder_trust_to_the_target_before_start(self) -> None:
         target = self.root / ".claude4/.claude.json"
@@ -167,8 +411,8 @@ class StopResumeTests(unittest.TestCase):
             _ = (self.root / f".{label}/.claude.json").write_text('{"projects": {}}')
         results = stop_resume.move_sessions(["alpha"], "claude4", why="usage limit")
         result = results[0]
-        self.assertIsInstance(result, stop_resume.ResumeFailed)
-        assert isinstance(result, stop_resume.ResumeFailed)
+        self.assertIsInstance(result, stop_resume.ResumePending)
+        assert isinstance(result, stop_resume.ResumePending)
         command = accounts.trust_command(self.root, accounts.NamedAccount("claude4", self.root / ".claude4"))
         self.assertIn("Claude has not trusted this folder", result.reason)
         self.assertIn(f"Run: {command}", result.reason)
@@ -249,7 +493,8 @@ class StopResumeTests(unittest.TestCase):
         self.assertEqual(self.kill.call_args_list, [call(123, signal.SIGTERM)])
 
     def test_registry_removal_does_not_resume_until_the_saved_process_exits(self) -> None:
-        self.live.side_effect = [sessions.LiveSessionProcess(123), sessions.SessionNotLive(), sessions.SessionNotLive()]
+        self.live.side_effect = [sessions.LiveSessionProcess(123), sessions.LiveSessionProcess(123),
+                                 sessions.SessionNotLive(), sessions.SessionNotLive()]
         self.process.side_effect = self.alive_until_kill
         def start(*_command: str) -> str:
             self.assertGreater(self.process.call_count, 4, "registry deletion is not process exit")
@@ -301,7 +546,8 @@ class StopResumeTests(unittest.TestCase):
 
     def test_detached_batch_uses_the_same_moves_and_logs_each_member(self) -> None:
         log = self.root / "batch.log"
-        self.live.side_effect = [sessions.LiveSessionProcess(123), sessions.SessionNotLive(), sessions.SessionNotLive()]
+        self.live.side_effect = [sessions.LiveSessionProcess(123), sessions.LiveSessionProcess(123),
+                                 sessions.SessionNotLive(), sessions.SessionNotLive()]
         self.process.side_effect = [sessions.LiveSessionProcess(123), sessions.SessionNotLive()]
         with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "sid-alpha"}), patch.object(subprocess, "run") as run, patch.object(subprocess, "Popen") as popen:
             result = stop_resume.main(["batch", "--target", "claude4", "--why", "limit", "--log", str(log), "alpha", "missing"])
@@ -353,9 +599,9 @@ class StopResumeTests(unittest.TestCase):
         self.kill.assert_not_called()
         self.start.assert_not_called()
 
-    def test_resume_refuses_a_live_session_without_starting(self) -> None:
+    def test_resume_leaves_a_live_session_on_its_account_without_starting(self) -> None:
         self.live.return_value = sessions.LiveSessionProcess(123)
-        self.assertEqual(stop_resume.resume("alpha", why="maintenance"), stop_resume.ResumeFailed("sid-alpha", "Claude is still running"))
+        self.assertEqual(stop_resume.resume("alpha", why="maintenance"), stop_resume.ClaudeUp("sid-alpha", "w1:p2", "claude3"))
         self.start.assert_not_called()
 
     def test_resume_runs_account_exec_in_its_own_pane_with_one_message(self) -> None:
@@ -583,7 +829,8 @@ class StopResumeTests(unittest.TestCase):
             self.assertEqual(stop_resume.resume("alpha", why="maintenance"), stop_resume.ClaudeUp("sid-alpha", "w1:p2", "claude3"))
 
     def test_move_stops_then_runs_the_target_account_in_the_same_pane(self) -> None:
-        self.live.side_effect = [sessions.LiveSessionProcess(123), sessions.SessionNotLive(), sessions.SessionNotLive()]
+        self.live.side_effect = [sessions.LiveSessionProcess(123), sessions.LiveSessionProcess(123),
+                                 sessions.SessionNotLive(), sessions.SessionNotLive()]
         self.process.side_effect = [sessions.LiveSessionProcess(123), sessions.SessionNotLive()]
         result = stop_resume.move("alpha", "claude4", why="weekly limit")
         self.assertEqual(result, stop_resume.ClaudeUp("sid-alpha", "w1:p2", "claude4"))
@@ -651,8 +898,8 @@ class StopResumeTests(unittest.TestCase):
         with patch.object(stop_resume, "_stop", side_effect=stop_one), patch.object(stop_resume, "resume", side_effect=resume_one):
             results = stop_resume.move_sessions(["stop-error", "resume-error", "gone-tab", "good"], "claude4", why="limit")
         self.assertEqual(results, [stop_resume.StopFailed("stop-error", "cannot signal"),
-            stop_resume.ResumeFailed("resume-error", "cannot run"),
-            stop_resume.ResumeFailed("gone-tab", "session has no tab after stop"), stop_resume.ClaudeUp("good", "own-pane", "claude4")])
+            stop_resume.ResumePending("resume-error", "claude4", "cannot run"),
+            stop_resume.ResumePending("gone-tab", "claude4", "session has no tab after stop"), stop_resume.ClaudeUp("good", "own-pane", "claude4")])
 
     def test_warning_precedes_all_stops_and_is_limited_to_fifteen_seconds(self) -> None:
         events: list[str] = []
@@ -677,7 +924,7 @@ class StopResumeTests(unittest.TestCase):
         self.launched.clear()
         self.live.return_value = sessions.LiveSessionProcess(123)
         with redirect_stdout(io.StringIO()) as output:
-            self.assertEqual(shutdown.main(["resume", "alpha", "--why", "maintenance"]), 1)
+            self.assertEqual(shutdown.main(["resume", "alpha", "--why", "maintenance"]), 0)
         self.assertEqual(len(output.getvalue().splitlines()), 1)
 
 

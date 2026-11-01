@@ -150,9 +150,7 @@ class RefusalWatchTests(unittest.TestCase):
         identity = accounts.account_identity(directory.path)
         return account.Account("claude", identity.login, identity.label) if isinstance(identity, agent_accounts.NumberedAccount) else None
 
-    def inventory_for(self, login: str, only: frozenset[str] = NO_SESSION_FILTER, *,
-                      refresh_desktops: bool = True) -> inventory.Inventory:
-        self.assertFalse(refresh_desktops, "the watcher must read the desktop snapshot without invoking its timer")
+    def inventory_for(self, login: str, only: frozenset[str] = NO_SESSION_FILTER) -> inventory.Inventory:
         owners = [owner for owner in self.owners
                   if (identity := self.process_account(owner["pid"], home_state=account.home_account_state())) is not None
                   and identity.login.casefold() == login.casefold()
@@ -1118,10 +1116,9 @@ class RefusalWatchTests(unittest.TestCase):
         fresh = herdr.HerdrProcess(owner["pid"], herdr.HerdrPlace("agents", "new-pane"),
             {"SHOWRUNNER_UNIT": "fixture", "SHOWRUNNER_UNIT_ID": "new-unit"}, "claude", str(self.home))
         original_inventory = self.inventory_for
-        def observed(login: str, only: frozenset[str] = NO_SESSION_FILTER, *,
-                     refresh_desktops: bool = True) -> inventory.Inventory:
+        def observed(login: str, only: frozenset[str] = NO_SESSION_FILTER) -> inventory.Inventory:
             rows = herdr.herdr_processes()
-            found = original_inventory(login, only, refresh_desktops=refresh_desktops)
+            found = original_inventory(login, only)
             if not rows:
                 # The report predates the new marked pane, so this is top-level.
                 ungrouped: list[inventory.Session] = []
@@ -2334,7 +2331,7 @@ class RefusalWatchTests(unittest.TestCase):
         _ = self.owner("unit", host="unit")
         _ = self.transcript("unit")
         original = accounts.move_sessions
-        def requested(ids: tuple[str, ...], target: str, *, why: str) -> tuple[stop_resume.ClaudeUp | stop_resume.MoveHandedOff | accounts.SessionMoveRefused, ...]:
+        def requested(ids: tuple[str, ...], target: str, *, why: str) -> tuple[accounts.SessionMoveOutcome, ...]:
             self.assertEqual(stored_group_labels(path)["units"], target)
             return original(ids, target, why=why)
         with patch.object(accounts, "move_sessions", side_effect=requested):
@@ -2556,7 +2553,7 @@ class RefusalWatchTests(unittest.TestCase):
         _ = self.groups()
         _ = self.owner("unit", host="unit")
         def manual_inventory(login: str, only: frozenset[str] = NO_SESSION_FILTER, **_options: object) -> inventory.Inventory:
-            return self.inventory_for(login, only, refresh_desktops=False)
+            return self.inventory_for(login, only)
         with patch.object(inventory, "inventory", side_effect=manual_inventory):
             result = accounts.move("unit", "claude3")
         self.assertIsInstance(result, accounts.MoveRefused)

@@ -54,10 +54,31 @@ class ProductionNameTests(unittest.TestCase):
 
 @final
 class LifecycleTests(LifecycleFixture):
+    def test_open_excludes_the_log_once_and_rerun_keeps_the_shared_exclude_file(self) -> None:
+        result = self.run_lifecycle("open", "--no-ci", "--session", "test-showrunner")
+        self.assert_step(result, "ok")
+        exclude = self.checkout / self.git("rev-parse", "--git-common-dir") / "info/exclude"
+        before = exclude.read_bytes(), exclude.stat().st_mtime_ns, self.log.read_bytes()
+        self.assertEqual(exclude.read_text().splitlines().count("production.log"), 1)
+        self.assertEqual(self.git("check-ignore", "production.log"), "production.log")
+        self.assertEqual(self.git("ls-files", "production.log"), "")
+        again = self.run_lifecycle("open", "--no-ci", "--session", "test-showrunner")
+        self.assert_step(again, "ok")
+        self.assertEqual((exclude.read_bytes(), exclude.stat().st_mtime_ns, self.log.read_bytes()), before)
+
+    def test_open_refuses_a_log_negated_by_gitignore_without_publishing_it(self) -> None:
+        self.write(self.checkout / ".gitignore", "!production.log\n")
+        _ = self.git("add", ".gitignore")
+        _ = self.git("commit", "-m", "Negate log exclusion")
+        result = self.run_lifecycle("open", "--no-ci", "--session", "test-showrunner")
+        self.assert_step(result, "failed")
+        self.assertIn("production.log", result.stdout)
+        self.assertFalse(self.log.exists())
+
     @override
     def setUp(self) -> None:
         super().setUp()
-        _ = self.staff.write_document({"schema": 1, "rows": []})
+        _ = self.staff.write_document({"schema": 2, "rows": []})
         _ = self.enterContext(mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", self.state / "notifier"))
 
     @override
@@ -627,6 +648,17 @@ class LifecycleTests(LifecycleFixture):
         self.assert_step(result, "held")
         self.assertIn("wrap: held", result.stdout)
 
+    def test_wrap_refuses_unknown_child_liveness(self) -> None:
+        partial = showrunners.ShowrunnerDiscovery([], (
+            showrunners.ShowrunnerLookupFailure("kid", "kid session registry unreadable"),))
+        with (mock.patch.object(showrunner_tree, "stored_children", return_value=["kid"]),
+              mock.patch.object(showrunners, "registered_showrunners", return_value=partial)):
+            with self.assertRaises(production_lifecycle.LifecycleStop) as stopped:
+                _ = production_lifecycle.refuse_running_children("example", staff.snapshot())
+        self.assertEqual(stopped.exception.step, "children")
+        self.assertEqual(stopped.exception.state, "failed")
+        self.assertEqual(str(stopped.exception), "kid session registry unreadable")
+
     def test_wrap_held_at_close_out_keeps_its_style_child_attached_and_untold(self) -> None:
         self.running()
         self.production_doc("running", close_out="- Delete the cache")
@@ -640,7 +672,7 @@ class LifecycleTests(LifecycleFixture):
         )
         production = read_production(self.doc)
         with (mock.patch.object(showrunner_tree, "stored_children", return_value=("kid",)),
-              mock.patch.object(showrunners, "registered_showrunners", return_value=[child]),
+              mock.patch.object(showrunners, "registered_showrunners", return_value=showrunners.ShowrunnerDiscovery([child])),
               mock.patch.object(showrunner_parent, "detach") as detach,
               mock.patch.object(showrunners, "tell_others", return_value=showrunners.NoticeDelivery()) as tell,
               contextlib.redirect_stdout(io.StringIO())):

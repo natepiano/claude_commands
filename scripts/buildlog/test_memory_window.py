@@ -10,25 +10,46 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import cast, override
+from typing import TYPE_CHECKING, cast, override
 from unittest.mock import patch
 
 import index
 import memory
+from cgroup_test_support import CPU, GIB, IO_LINES, slice_reading, write_cgroup
 import store
 from test_index import Record, call, encode, point_root_at, sample, step
-
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
+if TYPE_CHECKING:
+    from ..lib import test_hang_guard
+else:
+    from scripts.lib import test_hang_guard
 
 CLI = Path(__file__).with_name("cli.py")
-GIB = 2**30
 START = "2026-10-04T23:30-07:00"
 END = "2026-10-05T00:30-07:00"
 START_UTC = "2026-10-05T06:30:00.000Z"
 END_UTC = "2026-10-05T07:30:00.000Z"
+
+
+def write_lint_config(root: Path, adjustment: int | str, *, include_adjustment: bool = True) -> Path:
+    path = root / "lint.conf"
+    _ = path.write_text(f"build_oom_score_adj={adjustment}\n" if include_adjustment else "clippy=on\n")
+    return path
+
+
+def journal_entry(at: datetime, message: str) -> Record:
+    return {"__REALTIME_TIMESTAMP": str(int(at.timestamp() * 1_000_000)), "MESSAGE": message}
+
+
+def earlyoom_message(pid: int, *, command: str = "rustc", adj: int | None = 500,
+                     cmdline: str | None = None, signal: str = "SIGTERM") -> str:
+    message = f'sending {signal} to process {pid} uid 1000 "{command}": oom_score 1053'
+    if adj is not None:
+        message += f", oom_score_adj {adj}"
+    if cmdline is not None:
+        message += f', cmdline "{cmdline}"'
+    return message
 
 
 def present_slice(high: int, peak: int, *, max_events: int = 0, stall_some_us: int = 0) -> Record:
@@ -57,6 +78,15 @@ def snapshot(at: str, high: int, peak: int, *, ci: Record | None = None) -> Reco
 def setUpModule() -> None:
     """The times these tests expect are Pacific; the user's zone setting must not change them."""
     unittest.enterModuleContext(patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
+
+
+def isolated_journal(test: unittest.TestCase) -> MemoryWindowTests:
+    fixture = MemoryWindowTests(methodName="runTest")
+    test.addCleanup(fixture.doCleanups)
+    fixture.setUp()
+    fixture.stub_journal(early=[], kernel=[])
+    _ = cast(object, test.enterContext(patch.dict(os.environ, {"PATH": fixture.env()["PATH"]})))
+    return fixture
 
 
 class MemoryWindowTests(unittest.TestCase):
@@ -92,39 +122,94 @@ class MemoryWindowTests(unittest.TestCase):
             capture_output=True,
             text=True,
             check=False,
-            timeout=TEST_HANG_GUARD_SECS,
+            timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
 
     def write(self, path: Path, *records: Record) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         _ = path.write_bytes(b"".join(encode(record) for record in records))
 
-    def stub_journal(self) -> None:
-        early = {
-            "__REALTIME_TIMESTAMP": str(int(datetime.fromisoformat("2026-10-05T06:59:00+00:00").timestamp() * 1_000_000)),
-            "MESSAGE": 'sending SIGTERM to process 123 uid 1000 "rustc": memory low',
-        }
-        kernel_builds = {
-            "__REALTIME_TIMESTAMP": str(int(datetime.fromisoformat("2026-10-05T07:01:00+00:00").timestamp() * 1_000_000)),
-            "MESSAGE": "oom-kill:constraint=CONSTRAINT_MEMCG,oom_memcg=/user.slice/builds.slice,task_memcg=/x,task=rustc,pid=234,uid=1000",
-        }
-        kernel_ci = {
-            "__REALTIME_TIMESTAMP": str(int(datetime.fromisoformat("2026-10-05T07:02:00+00:00").timestamp() * 1_000_000)),
-            "MESSAGE": "oom-kill:constraint=CONSTRAINT_MEMCG,oom_memcg=/hana.slice/hana-ci.slice,task_memcg=/x,task=rustc,pid=345,uid=1001",
-        }
+    def stub_journal(self, *, early: list[Record] | None = None,
+                     kernel: list[Record] | None = None, exit_code: int = 0) -> None:
+        default_early = journal_entry(datetime.fromisoformat("2026-10-05T06:59:00+00:00"),
+                                      'sending SIGTERM to process 123 uid 1000 "rustc": memory low')
+        kernel_builds = journal_entry(datetime.fromisoformat("2026-10-05T07:01:00+00:00"),
+            "oom-kill:constraint=CONSTRAINT_MEMCG,oom_memcg=/user.slice/builds.slice,task_memcg=/x,task=rustc,pid=234,uid=1000")
+        kernel_ci = journal_entry(datetime.fromisoformat("2026-10-05T07:02:00+00:00"),
+            "oom-kill:constraint=CONSTRAINT_MEMCG,oom_memcg=/hana.slice/hana-ci.slice,task_memcg=/x,task=rustc,pid=345,uid=1001")
         data = self.base / "journal.json"
-        _ = data.write_text(json.dumps({"early": [early], "kernel": [kernel_builds, kernel_ci]}))
+        _ = data.write_text(json.dumps({"early": [default_early] if early is None else early,
+                                       "kernel": [kernel_builds, kernel_ci] if kernel is None else kernel}))
         journal = self.fake_bin / "journalctl"
         script = "\n".join([
             "#!/usr/bin/env python3",
             "import json, sys",
             f"with open({str(self.base / 'journal-args.jsonl')!r}, 'a', encoding='utf-8') as out: out.write(json.dumps(sys.argv[1:]) + '\\n')",
+            f"if {exit_code}: sys.exit({exit_code})",
             f"rows = json.load(open({str(data)!r}, encoding='utf-8'))",
             "kind = 'kernel' if '-k' in sys.argv else 'early'",
             "for row in rows[kind]: print(json.dumps(row))",
         ])
         _ = journal.write_text(script + "\n")
         journal.chmod(0o755)
+
+    def earlyoom(self) -> list[memory.EarlyoomKill] | memory.JournalUnavailable:
+        with patch.dict(os.environ, self.env()), patch.object(store, "host_name", return_value="natedev"):
+            return memory.earlyoom_kills(datetime.fromisoformat(START_UTC), datetime.fromisoformat(END_UTC))
+
+    def test_earlyoom_reader_classifies_gate_target_programs_and_other_kills(self) -> None:
+        at = datetime.fromisoformat(START_UTC)
+        messages = [
+            earlyoom_message(101, cmdline="/usr/bin/rustc --crate-name hana"),
+            earlyoom_message(102, command="hana-test", signal="SIGKILL", adj=200,
+                             cmdline="/work/hana/target/debug/deps/hana-abc --test"),
+            earlyoom_message(103, command="python", adj=200,
+                             cmdline="/usr/bin/python /work/target/debug/helper"),
+            earlyoom_message(104, command="legacy", adj=None),
+        ]
+        self.stub_journal(early=[
+            journal_entry(at - timedelta(seconds=1), messages[0]),
+            journal_entry(at, "sending SIGTERM when mem avail <=  5.00% and swap free <= 100.00%,"),
+            *(journal_entry(at + timedelta(minutes=number), message)
+              for number, message in enumerate(messages)),
+            journal_entry(datetime.fromisoformat(END_UTC), messages[0]),
+        ], kernel=[])
+        kills = self.earlyoom()
+        if not isinstance(kills, list):
+            self.fail("the fixture journal was unavailable")
+        self.assertEqual([(kill.at, kill.pid, kill.command) for kill in kills], [
+            (at, 101, "rustc"), (at + timedelta(minutes=1), 102, "hana-test"),
+            (at + timedelta(minutes=2), 103, "python"), (at + timedelta(minutes=3), 104, "legacy"),
+        ])
+        self.assertEqual([kill.oom_score_adj for kill in kills],
+                         [500, 200, 200, memory.OomScoreAdjUnavailable.VALUE])
+        self.assertEqual([kill.is_build for kill in kills], [True, True, False, False])
+        self.assertEqual([kill.outside_build_gate for kill in kills], [False, True, False, False])
+        self.assertEqual(kills[1].cmdline, "/work/hana/target/debug/deps/hana-abc --test")
+        self.assertIs(kills[3].cmdline, memory.CmdlineUnavailable.VALUE)
+
+    def test_earlyoom_unavailable_is_distinct_from_an_empty_journal_and_mac_never_reads_it(self) -> None:
+        self.stub_journal(early=[], kernel=[], exit_code=1)
+        self.assertIs(self.earlyoom(), memory.JournalUnavailable.VALUE)
+        self.stub_journal(early=[], kernel=[])
+        self.assertEqual(self.earlyoom(), [])
+        before = (self.base / "journal-args.jsonl").read_bytes()
+        with patch.dict(os.environ, self.env()), patch.object(store, "host_name", return_value="macbook"):
+            result = memory.earlyoom_kills(datetime.fromisoformat(START_UTC), datetime.fromisoformat(END_UTC))
+        self.assertIs(result, memory.JournalUnavailable.VALUE)
+        self.assertEqual((self.base / "journal-args.jsonl").read_bytes(), before)
+
+    def test_target_program_with_unquoted_apostrophe_arguments_is_a_build_kill(self) -> None:
+        at = datetime.fromisoformat(START_UTC)
+        self.stub_journal(early=[journal_entry(at, earlyoom_message(
+            105, adj=200, cmdline="/work/hana/target/debug/deps/test-abc --case O'Reilly"))], kernel=[])
+        kills = self.earlyoom()
+        if not isinstance(kills, list):
+            self.fail("the fixture journal was unavailable")
+        self.assertEqual(len(kills), 1)
+        self.assertTrue(kills[0].is_build)
+        self.assertTrue(kills[0].outside_build_gate)
+        self.assertEqual(kills[0].cmdline, "/work/hana/target/debug/deps/test-abc --case O'Reilly")
 
     def test_snapshot_cli_prints_and_appends_exactly_one_record_from_fake_cgroups(self) -> None:
         builds = self.base / "builds.slice"
@@ -152,7 +237,9 @@ class MemoryWindowTests(unittest.TestCase):
         self.assertEqual(recorded["host"], socket.gethostname().split(".")[0])
         self.assertTrue(str(recorded["at"]).endswith("Z"))
         slices = cast(dict[str, Record], recorded["slices"])
-        self.assertEqual(slices["builds"], {
+        self.assertEqual({key: slices["builds"][key] for key in (
+            "state", "events", "peak_bytes", "swap_peak_bytes", "high", "max", "swap_max", "stall_some_us"
+        )}, {
             "state": "present", "events": {"high": 2, "max": 3, "oom_kill": 1},
             "peak_bytes": 8 * GIB, "swap_peak_bytes": GIB,
             "high": 26 * GIB, "max": "max", "swap_max": 4 * GIB,
@@ -186,6 +273,64 @@ class MemoryWindowTests(unittest.TestCase):
         self.assertEqual(state["state"], "present")
         if state["state"] == "present":
             self.assertEqual(state["stall_some_us"], "unavailable")
+
+    def test_usage_hours_cli_reads_only_isolated_index_and_prints_counted_memory(self) -> None:
+        stamp = "2026-10-02T12:00:00Z"
+        slices = {"builds": slice_reading(12 * GIB), "ci": {"state": "absent"}}
+        self.write(self.root / "natedev/samples-2026-10.jsonl",
+                   sample(stamp, slices=slices))
+        result = self.cli("usage-hours", "2026-10-02")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Average GiB held", result.stdout)
+        row = next(line for line in result.stdout.splitlines() if "2026-10-02 05:00 -0700" in line)
+        self.assertIn("12.0 (1)", row)
+        self.assertIn("3.0 (1)", row)
+        self.assertTrue((self.root / "index.sqlite").is_file())
+
+    def test_slice_capture_keeps_whole_charge_components_and_stacked_devices_separate(self) -> None:
+        builds = self.base / "builds.slice"
+        write_cgroup(builds)
+        state = memory.slice_state(builds)
+        self.assertEqual(state["state"], "present")
+        if state["state"] != "present":
+            self.fail("fixture slice was lost")
+        self.assertEqual(state["current_bytes"], 12 * GIB)
+        self.assertEqual(state["swap_current_bytes"], 2 * GIB)
+        self.assertEqual(state["max_bytes"], 44 * GIB)
+        self.assertEqual(state["stat"], {"anon": 4 * GIB, "file": 6 * GIB,
+                         "kernel": 2 * GIB, "shmem": GIB, "inactive_file": 3 * GIB, "sock": 17,
+                         "file_mapped": 19, "file_dirty": 23, "file_writeback": 29, "active_file": 31, "slab": 37})
+        self.assertNotIn("zswap", state["stat"])
+        self.assertEqual(state["cpu"], CPU)
+        self.assertEqual(state["identity"], builds.stat().st_ino)
+        traffic = state["io"]
+        self.assertEqual(traffic["state"], "measured")
+        if traffic["state"] != "measured":
+            self.fail("fixture IO was lost")
+        self.assertEqual([row["raw"] for row in traffic["devices"]], list(IO_LINES))
+        self.assertEqual([row["device"] for row in traffic["devices"]], ["254:0", "259:0", "253:0"])
+
+    def test_unreadable_slice_file_preserves_other_fields_and_ci(self) -> None:
+        builds, ci = self.base / "builds.slice", self.base / "ci.slice"
+        write_cgroup(builds, with_io=False)
+        write_cgroup(ci)
+        (builds / "memory.current").unlink()
+        (builds / "memory.current").mkdir()
+        with patch.dict(os.environ, self.env()):
+            result = memory.snapshot()
+        slices = result["slices"]
+        head = slices["builds"]
+        self.assertEqual(head["state"], "present")
+        if head["state"] != "present":
+            self.fail("one unavailable file discarded slice")
+        self.assertEqual(head["current_bytes"], "unavailable")
+        self.assertEqual(head["io"], {"state": "unavailable"})
+        self.assertEqual(head["cpu"], CPU)
+        self.assertEqual(head["stat"]["anon"], 4 * GIB)
+        other = slices["ci"]
+        self.assertEqual(other["state"], "present")
+        if other["state"] == "present":
+            self.assertEqual(other["current_bytes"], 12 * GIB)
 
     def test_ci_window_reports_max_hits_oom_kills_and_stall_seconds(self) -> None:
         self.stub_journal()

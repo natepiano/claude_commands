@@ -20,7 +20,8 @@ from typing import cast
 from unittest import mock
 
 from scripts.production import staff
-from scripts.production.staff_test_support import CHECKOUT, PROCESS_TIMEOUT, STAFF_SCRIPT, StaffTestCase
+from scripts.production.staff_test_support import CHECKOUT, STAFF_SCRIPT, StaffTestCase
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 MISSING_ID = staff.StaffId("s00000000000")
@@ -44,7 +45,7 @@ def concurrent_ensure(
     """Release both real writer processes together and return an id or failure."""
     with result:
         try:
-            _ = ready.wait(timeout=PROCESS_TIMEOUT)
+            _ = ready.wait(timeout=TEST_HANG_GUARD_SECS)
             row = staff.ensure(kind, name=name, parent=parent)
             result.send((True, str(row.id)))
         except Exception as error:
@@ -52,6 +53,156 @@ def concurrent_ensure(
 
 
 class StaffTests(StaffTestCase):
+    def test_restored_unit_survives_its_previous_pending_retirement(self) -> None:
+        parent = staff.ensure("showrunner", name="sdlc")
+        unit = staff.ensure("unit", name="models", parent=parent.id)
+        staff.defer_retire((unit.id,))
+        _ = staff.retire(unit.id)
+        self.assertIsNone(staff.by_id(unit.id))
+        self.assertEqual(staff.snapshot().pending_retire, (unit.id,))
+
+        restored = staff.restore_unit(unit.id, name=unit.name, parent=parent.id)
+        self.assertEqual(staff.snapshot().pending_retire, ())
+        self.assertEqual(staff.retire_pending(), ())
+        self.assertEqual(staff.by_id(unit.id), restored)
+        self.assertEqual((restored.id, restored.kind, restored.name, restored.parent),
+                         (unit.id, "unit", unit.name, parent.id))
+
+    def test_restore_unit_recovers_the_requested_id_and_rerun_writes_nothing(self) -> None:
+        parent = staff.ensure("showrunner", name="sdlc")
+        unit = staff.restore_unit(MISSING_ID, name="models", parent=parent.id)
+        self.assertEqual((unit.id, unit.kind, unit.name, unit.parent), (MISSING_ID, "unit", "models", parent.id))
+        self.assertEqual(staff.by_id(MISSING_ID), unit)
+        before = self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns
+        self.assertEqual(staff.restore_unit(MISSING_ID, name="models", parent=parent.id), unit)
+        self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), before)
+
+    def test_restore_unit_refuses_an_id_or_name_held_by_another_row(self) -> None:
+        parent, unit, worker = self.tree()
+        other = staff.ensure("showrunner", name="other")
+        for held_id in (parent.id, worker.id, unit.id):
+            with self.subTest(held_id=held_id):
+                self.assert_refused(lambda: staff.restore_unit(held_id, name="restored", parent=other.id))
+        self.assert_refused(lambda: staff.restore_unit(MISSING_ID, name=unit.name, parent=parent.id))
+        restored = staff.restore_unit(MISSING_ID, name=unit.name, parent=other.id)
+        self.assertEqual((restored.id, restored.parent), (MISSING_ID, other.id))
+        self.assertEqual(staff.by_id(unit.id), unit)
+
+    def test_restore_unit_from_mac_uses_the_owner_and_is_idempotent_through_the_cli(self) -> None:
+        parent = staff.ensure("showrunner", name="sdlc")
+        with self.machine("mac"):
+            restored = staff.restore_unit(MISSING_ID, name="models", parent=parent.id)
+            before = self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns
+            self.assertEqual(staff.restore_unit(MISSING_ID, name="models", parent=parent.id), restored)
+        self.assertEqual((restored.id, restored.kind, restored.name, restored.parent),
+                         (MISSING_ID, "unit", "models", parent.id))
+        self.assertEqual(staff.by_id(MISSING_ID), restored)
+        self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), before)
+        self.assertEqual(self.ssh_commands(), [
+            ["restore-unit", MISSING_ID, "--name=models", "--parent", parent.id, "--json"],
+            ["restore-unit", MISSING_ID, "--name=models", "--parent", parent.id, "--json"],
+        ])
+        self.assertFalse(self.mac_file.exists())
+        _ = self.assert_rerun("restore-unit", MISSING_ID, "--name=models", "--parent", parent.id)
+        self.assertEqual(staff.by_id(MISSING_ID), restored)
+
+    def test_schema_one_rewrites_as_two_without_inventing_worktrees_or_docs(self) -> None:
+        runner, unit, worker = self.tree()
+        _ = self.write_document({"schema": 1, "rows": [row.to_json() for row in (runner, unit, worker)]})
+        record = staff.snapshot()
+        read_unit, read_runner = record.by_id(unit.id), record.by_id(runner.id)
+        assert read_unit is not None and read_runner is not None
+        self.assertIsInstance(read_unit.worktree, staff.WorktreeUnfilled)
+        self.assertIsInstance(read_runner.doc, staff.DocUnfilled)
+        _ = staff.rename(unit.id, "renamed")
+        document = cast(dict[str, object], json.loads(self.staff_file.read_text()))
+        self.assertEqual(document["schema"], 2)
+        rows = cast(list[dict[str, object]], document["rows"])
+        self.assertEqual({row["id"] for row in rows}, {runner.id, unit.id, worker.id})
+        self.assertTrue(all("worktree" not in row and "doc" not in row for row in rows))
+
+    def test_partial_fill_survives_an_ordinary_staff_write(self) -> None:
+        runner, unit, _ = self.tree()
+        other = staff.ensure("unit", name="unfilled", parent=runner.id)
+        location = staff.PresentWorktree("natedev", self.root / "filled")
+        _ = staff.set_worktree(unit.id, location)
+        worker = staff.ensure_worker("test", other.id)
+        record = staff.snapshot()
+        filled = record.by_id(unit.id)
+        assert filled is not None
+        self.assertEqual(filled.worktree, location)
+        for row_id in (runner.id, other.id, worker.id):
+            row = record.by_id(row_id)
+            assert row is not None
+            self.assertNotIn("worktree", row.to_json())
+            self.assertNotIn("doc", row.to_json())
+        self.assertEqual(json.loads(self.staff_file.read_text())["schema"], 2)
+
+    def test_worktree_and_doc_fields_are_admitted_only_on_their_row_kinds(self) -> None:
+        runner, unit, worker = self.tree()
+        for row, key, state in ((runner, "worktree", "present"), (worker, "worktree", "removed"),
+                                (unit, "doc", "live"), (worker, "doc", "wrapped")):
+            with self.subTest(kind=row.kind, key=key), self.assertRaises(staff.StaffUnreadable):
+                _ = staff.StaffRow.from_json({**row.to_json(), key: {
+                    "machine": "natedev", "path": str(self.root / "location"), "state": state,
+                }})
+        for row, key, state in ((unit, "worktree", "present"), (runner, "doc", "live")):
+            for location in ({"machine": "natedev", "path": "relative", "state": state},
+                             {"machine": "natedev", "path": str(self.root), "state": "guessed"}):
+                with self.subTest(key=key, location=location), self.assertRaises(staff.StaffUnreadable):
+                    _ = staff.StaffRow.from_json({**row.to_json(), key: location})
+
+    def test_worktree_and_doc_setters_are_idempotent_and_refuse_duplicate_live_locations(self) -> None:
+        runner, unit, worker = self.tree()
+        other = staff.ensure("unit", name="other", parent=runner.id)
+        path, doc = self.root / "worktree", self.root / "production.md"
+        _ = self.assert_rerun("set-worktree", unit.id, "--machine", "natedev", "--path", str(path), "--state", "present")
+        _ = self.assert_rerun("set-doc", runner.id, "--machine", "natedev", "--path", str(doc), "--state", "live")
+        before = self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns
+        _ = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", path))
+        _ = staff.set_doc(runner.id, staff.LiveDoc("natedev", doc))
+        self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), before)
+        self.assert_refused(lambda: staff.set_worktree(other.id, staff.PresentWorktree("natedev", path)))
+        for wrong in (runner, worker):
+            self.assert_refused(lambda: staff.set_worktree(wrong.id, staff.PresentWorktree("natedev", path)))
+        for wrong in (unit, worker):
+            self.assert_refused(lambda: staff.set_doc(wrong.id, staff.LiveDoc("natedev", doc)))
+        _ = staff.set_worktree(unit.id, staff.RemovedWorktree("natedev", path))
+        claimed = staff.set_worktree(other.id, staff.PresentWorktree("natedev", path))
+        self.assertEqual(staff.snapshot().by_worktree("natedev", path), claimed)
+        wrapped = staff.set_doc(runner.id, staff.WrappedDoc("natedev", doc))
+        self.assertEqual(staff.StaffRow.from_json(wrapped.to_json()), wrapped)
+
+    def test_snapshot_finds_present_worktrees_by_machine_and_containing_path(self) -> None:
+        runner, unit, _ = self.tree()
+        path = self.root / "checkout"
+        _ = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", path))
+        _ = staff.set_doc(runner.id, staff.LiveDoc("natedev", path / "production.md"))
+        record = staff.snapshot()
+        self.assertEqual(record.by_worktree("natedev", path), record.by_id(unit.id))
+        self.assertEqual(record.by_worktree("natedev", path / "src/file.py"), record.by_id(unit.id))
+        self.assertIsNone(record.by_worktree("mac", path))
+        self.assertIsNone(record.by_worktree("natedev", self.root / "checkout-other"))
+        self.assertEqual(record.by_doc("natedev", path / "production.md"), record.by_id(runner.id))
+        self.assertIsNone(record.by_doc("mac", path / "production.md"))
+        self.assertIsNone(record.by_doc("natedev", path / "other.md"))
+        _ = staff.set_worktree(unit.id, staff.RemovedWorktree("natedev", path))
+        self.assertIsNone(staff.snapshot().by_worktree("natedev", path))
+
+    def test_remote_setters_use_one_owner_write_and_preserve_the_other_field(self) -> None:
+        runner, unit, _ = self.tree()
+        path = self.root / "mac" / "worktree"
+        with self.machine("mac"):
+            self.assertNotIn("STAFF_FILE", os.environ)
+            changed = staff.set_worktree(unit.id, staff.PresentWorktree("mac", path))
+            self.assertEqual(changed.worktree, staff.PresentWorktree("mac", path))
+            changed_doc = staff.set_doc(runner.id, staff.LiveDoc("mac", path / "production.md"))
+        commands = self.ssh_commands()
+        self.assertEqual([command[0] for command in commands], ["set-worktree", "set-doc"])
+        self.assertEqual(staff.by_id(unit.id), changed)
+        self.assertEqual(staff.by_id(runner.id), changed_doc)
+        self.assertFalse(self.mac_file.exists())
+
     def test_launcher_names_are_accepted_without_a_fixed_role_suffix(self) -> None:
         runner = staff.ensure("showrunner", name="sdlc")
         unit = staff.ensure("unit", name="models", parent=runner.id)
@@ -62,7 +213,7 @@ class StaffTests(StaffTestCase):
             with self.subTest(prefix=prefix, slot=slot):
                 result = subprocess.run(["bash", str(CHECKOUT / "scripts/direct/worker_name.sh"),
                                          str(self.root), slot, "impl", prefix],
-                                        capture_output=True, text=True, check=True, timeout=PROCESS_TIMEOUT)
+                                        capture_output=True, text=True, check=True, timeout=TEST_HANG_GUARD_SECS)
                 name = result.stdout.strip()
                 _ = staff.WorkerName.parse(name)
                 row = staff.ensure_worker(name, unit.id)
@@ -139,9 +290,9 @@ class StaffTests(StaffTestCase):
                 processes.append(process)
                 process.start()
                 send.close()
-            _ = ready.wait(timeout=PROCESS_TIMEOUT)
+            _ = ready.wait(timeout=TEST_HANG_GUARD_SECS)
             for process in processes:
-                process.join(timeout=PROCESS_TIMEOUT)
+                process.join(timeout=TEST_HANG_GUARD_SECS)
                 self.assertFalse(process.is_alive(), "concurrent staff writer did not finish")
                 self.assertEqual(process.exitcode, 0)
             ids: list[str] = []
@@ -154,7 +305,7 @@ class StaffTests(StaffTestCase):
             for process in processes:
                 if process.is_alive():
                     process.terminate()
-                process.join(timeout=PROCESS_TIMEOUT)
+                process.join(timeout=TEST_HANG_GUARD_SECS)
                 process.close()
             for result in results:
                 result.close()
@@ -398,7 +549,7 @@ class StaffTests(StaffTestCase):
     def test_file_uses_canonical_sorted_rows_and_no_cached_path(self) -> None:
         _ = self.tree()
         rows = staff.find()
-        expected = {"schema": 1, "rows": [row.to_json() for row in sorted(rows, key=lambda row: row.id)]}
+        expected = {"schema": 2, "rows": [row.to_json() for row in sorted(rows, key=lambda row: row.id)]}
         self.assertEqual(self.staff_file.read_text(), json.dumps(expected, indent=2, sort_keys=True) + "\n")
         original = self.staff_file.read_bytes()
         elsewhere = self.root / "elsewhere" / "staff.json"
@@ -421,7 +572,7 @@ class StaffTests(StaffTestCase):
         showrunner, unit, worker = self.tree()
         valid = showrunner.to_json()
         malformed: list[object] = [
-            [], {"schema": 2, "rows": []}, {"schema": 1, "rows": {}},
+            [], {"schema": 3, "rows": []}, {"schema": 1, "rows": {}},
             {"schema": 1, "rows": [{**valid, "kind": "visitor"}]},
             {"schema": 1, "rows": [{**valid, "id": 4}]},
             {"schema": 1, "rows": [{**valid, "name": False}]},
@@ -511,7 +662,7 @@ class StaffTests(StaffTestCase):
         before = self.staff_file.read_bytes()
         killed = subprocess.run(
             [sys.executable, "-c", KILLED_WRITER], cwd=CHECKOUT,
-            capture_output=True, text=True, check=False, timeout=PROCESS_TIMEOUT,
+            capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
         )
         self.assertEqual(killed.returncode, 73, killed.stderr)
         self.assertEqual(self.staff_file.read_bytes(), before)
@@ -724,7 +875,7 @@ class StaffTests(StaffTestCase):
                     pending = self.start_script(STAFF_SCRIPT, "move", unit.id, f"--parent={destination.id}", "--json")
                     self.assert_operation_blocks(pending, listener)
                 self.assertEqual(staff.by_id(unit.id), unit)
-            output, errors = pending.communicate(timeout=PROCESS_TIMEOUT)
+            output, errors = pending.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(pending.returncode, 0, errors)
         self.assertEqual(cast(object, json.loads(output)), replace(unit, parent=destination.id).to_json())
         self.assertEqual(staff.by_id(unit.id), replace(unit, parent=destination.id))
@@ -763,12 +914,12 @@ class StaffTests(StaffTestCase):
                 "from scripts.production import staff; " +
                 "exec(\"with staff.operation():\\n staff.ensure('showrunner', name='child')\")"],
                 cwd=CHECKOUT, pass_fds=staff.operation_fds(), capture_output=True,
-                text=True, timeout=PROCESS_TIMEOUT, check=False)
+                text=True, timeout=TEST_HANG_GUARD_SECS, check=False)
             self.assertEqual(child.returncode, 0, child.stderr)
             with self.lock_notice(self.staff_file.parent / "operation.lock") as listener:
                 seed = self.start_script(STAFF_SCRIPT, "ensure", "showrunner", "--name=after")
                 self.assert_operation_blocks(seed, listener)
-        output, errors = seed.communicate(timeout=PROCESS_TIMEOUT)
+        output, errors = seed.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(seed.returncode, 0, output + errors)
         self.assertEqual({row.name for row in staff.snapshot().rows}, {"outer", "child", "after"})
 
@@ -779,13 +930,13 @@ class StaffTests(StaffTestCase):
             exited = subprocess.Popen([sys.executable, "-c",
                 "import fcntl, sys; fcntl.flock(int(sys.argv[1]), fcntl.LOCK_EX)", str(inherited.fileno())],
                 pass_fds=(inherited.fileno(),))
-            self.assertEqual(exited.wait(timeout=PROCESS_TIMEOUT), 0)
+            self.assertEqual(exited.wait(timeout=TEST_HANG_GUARD_SECS), 0)
             environment = {**os.environ, "STAFF_OPERATION_FD": str(inherited.fileno())}
             child = subprocess.run([sys.executable, "-c",
                 "from scripts.production import staff; " +
                 "exec(\"with staff.operation():\\n staff.ensure('showrunner', name='orphan')\")"],
                 cwd=CHECKOUT, env=environment, pass_fds=(inherited.fileno(),), capture_output=True,
-                text=True, timeout=3, check=False)
+                text=True, timeout=TEST_HANG_GUARD_SECS, check=False)
         self.assertEqual(child.returncode, 0, child.stderr)
         self.assertEqual([row.name for row in staff.find()], ["orphan"])
 
@@ -813,7 +964,7 @@ class StaffTests(StaffTestCase):
                     env=environment, pass_fds=(unlocked.fileno(),), stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE, text=True)
                 self.assert_operation_blocks(child, listener)
-        output, errors = child.communicate(timeout=PROCESS_TIMEOUT)
+        output, errors = child.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(child.returncode, 0, output + errors)
         self.assertEqual(len(staff.find(kind="showrunner")), 1)
 

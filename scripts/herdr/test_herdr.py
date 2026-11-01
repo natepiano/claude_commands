@@ -12,6 +12,7 @@ import os
 import signal
 import subprocess
 import shutil
+import math
 import sys
 import tempfile
 import time
@@ -21,9 +22,6 @@ from types import SimpleNamespace
 from typing import BinaryIO, cast, final, override
 from unittest.mock import Mock, call, patch
 
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
-
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -31,7 +29,9 @@ import herdr
 import fake_herdr
 import trust_survey
 from fake_herdr import CommandResponse
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff
+from scripts.message.sessions_test_support import copy_session_modules
 from scripts.production.staff_test_support import isolated_staff_file, unit_membership
 
 GIT_BINARY = shutil.which("git") or "git"
@@ -1381,6 +1381,9 @@ class HerdrTests(unittest.TestCase):
         isolated.mkdir(parents=True)
         _ = shutil.copy2(Path(herdr.__file__), isolated / "herdr.py")
         _ = shutil.copy2(Path(herdr.__file__).with_name("place.py"), isolated / "place.py")
+        _ = shutil.copy2(Path(herdr.__file__).with_name("pane_launch.py"), isolated / "pane_launch.py")
+        message = isolated.parent / "message"
+        copy_session_modules(message)
         library = isolated.parent / "lib"
         library.mkdir()
         _ = shutil.copy2(Path(herdr.__file__).resolve().parents[1] / "lib/nix_env.py", library / "nix_env.py")
@@ -3280,6 +3283,21 @@ class HerdrTests(unittest.TestCase):
         with self.assertRaises(herdr.AgentBlocked):
             _ = self.herdr.wait_until("pane-1", "done", 20)
 
+    def test_pane_reads_share_the_absolute_deadline_and_keep_the_default_timeout(self) -> None:
+        reply = subprocess.CompletedProcess(["fixture"], 0, '{"result":{"agents":[]}}', "")
+        with (patch.object(time, "monotonic", return_value=100.0),
+              patch.object(herdr, "run_program", return_value=reply) as program):
+            for deadline, expected in ((100.25, 0.25), (99.0, 0.0), (200.0, 10.0)):
+                with self.subTest(deadline=deadline):
+                    _ = self.herdr.read("pane-1", 40, joined=True, ansi=False, deadline=deadline)
+                    self.assertEqual(cast(float, program.call_args.kwargs["timeout"]), expected)
+                    self.assertEqual(self.herdr.agents(deadline=deadline), [])
+                    self.assertEqual(cast(float, program.call_args.kwargs["timeout"]), expected)
+            _ = self.herdr.read("pane-1", 40, joined=False, ansi=False)
+            self.assertEqual(cast(float, program.call_args.kwargs["timeout"]), 10.0)
+            self.assertEqual(self.herdr.agents(), [])
+            self.assertEqual(cast(float, program.call_args.kwargs["timeout"]), 10.0)
+
     def test_read_sources_formats_keys_and_close(self) -> None:
         _ = self.herdr.read("pane-1", 40, joined=False, ansi=False)
         _ = self.herdr.read("pane-1", 80, joined=True, ansi=True)
@@ -3573,7 +3591,7 @@ class HerdrTests(unittest.TestCase):
         })
         _ = self.process(13, 10, ["/bin/codex"], {"HERDR_PANE_ID": "pane-codex"})
         import unit_lookup as lookup
-        import unit_marks
+        from scripts.production import session_staff
 
         def current_slug(slug: str) -> str:
             return slug
@@ -3584,7 +3602,7 @@ class HerdrTests(unittest.TestCase):
               }]),
               patch.object(lookup, "_claudes", return_value=(
                   {12: live}, lookup.UnreadAt({}, lookup.RecordsRead()))),
-              patch.object(unit_marks, "lookup_slug", side_effect=current_slug),
+              patch.object(session_staff, "lookup_slug", side_effect=current_slug),
               patch.object(roster, "_process_account", return_value=roster.AccountLabel("codex2")),
               patch.object(herdr, "_process_sessions", wraps=PROCESS_SESSIONS) as scans):
             def read_callers() -> tuple[object, object, object]:
@@ -3934,6 +3952,10 @@ class LayoutHerdr(herdr.Herdr):
         self.tabs: list[dict[str, str]] = []
         self.count: int = 0
 
+    def require_time(self, deadline: float) -> None:
+        if time.monotonic() >= deadline:
+            raise herdr.HerdrFailure("fixture command deadline exhausted")
+
     def new_id(self, kind: str) -> str:
         self.count += 1
         return f"{kind}{self.count}"
@@ -3947,7 +3969,8 @@ class LayoutHerdr(herdr.Herdr):
         return [(label, [tab["label"] for tab in self.tabs if tab["workspace_id"] == ident]) for ident, label in self.spaces]
 
     @override
-    def result(self, *arguments: str) -> dict[str, object]:
+    def result(self, *arguments: str, deadline: float = math.inf) -> dict[str, object]:
+        self.require_time(deadline)
         words = list(arguments)
         match words[:2]:
             case ["workspace", "list"]:
@@ -3978,7 +4001,8 @@ class LayoutHerdr(herdr.Herdr):
         return herdr.PaneAtShell()
 
     @override
-    def run(self, *arguments: str) -> str:
+    def run(self, *arguments: str, deadline: float = math.inf) -> str:
+        self.require_time(deadline)
         words = list(arguments)
         match words[:2]:
             case ["tab", "rename"]:
@@ -3999,21 +4023,23 @@ class TitledLayoutHerdr(LayoutHerdr):
     """Record tab and pane renames through the real layout code."""
 
     @override
-    def result(self, *arguments: str) -> dict[str, object]:
+    def result(self, *arguments: str, deadline: float = math.inf) -> dict[str, object]:
+        self.require_time(deadline)
         if arguments[:2] == ("agent", "list"):
             return {"agents": []}
         if arguments[:2] == ("pane", "list"):
             return {"panes": [{"pane_id": tab["pane_id"], "tab_id": tab["tab_id"],
                                "workspace_id": tab["workspace_id"],
                                "label": tab.get("pane_label", tab["label"])} for tab in self.tabs]}
-        return super().result(*arguments)
+        return super().result(*arguments, deadline=deadline)
 
     @override
-    def run(self, *arguments: str) -> str:
+    def run(self, *arguments: str, deadline: float = math.inf) -> str:
+        self.require_time(deadline)
         if arguments[:2] == ("pane", "rename"):
             next(tab for tab in self.tabs if tab["pane_id"] == arguments[2])["pane_label"] = arguments[3]
             return "{}"
-        return super().run(*arguments)
+        return super().run(*arguments, deadline=deadline)
 
 
 @final

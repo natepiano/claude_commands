@@ -13,11 +13,16 @@ import unittest
 from contextlib import closing
 from datetime import datetime
 from pathlib import Path
-from typing import cast, override
+from typing import TYPE_CHECKING, cast, override
 from unittest import mock
 
 import index
+from cgroup_test_support import CPU, GIB, slice_reading
 import parse
+if TYPE_CHECKING:
+    from ..lib import test_hang_guard
+else:
+    from scripts.lib import test_hang_guard
 from record import TARGET_DIR_UNSET
 from store import UNKNOWN_IDENTITY
 
@@ -543,6 +548,31 @@ class IndexTests(unittest.TestCase):
         self.assertEqual(self.rows("SELECT mem_wait_s FROM steps ORDER BY id"), [(7,), (None,)])
         self.assertEqual(self.rows("SELECT builds_anon_bytes, ci_anon_bytes FROM samples ORDER BY at"), [(2**30, 2 * 2**30), (None, None)])
 
+    def test_raw_sample_resources_and_scope_counters_survive_schema_rebuild(self) -> None:
+        slices = {"builds": slice_reading(12 * GIB), "ci": slice_reading(3 * GIB, identity=99)}
+        filesystem = {"state": "measured", "total": 100 * GIB, "used": 60 * GIB, "free": 30 * GIB,
+                      "device": "254:0", "device_name": "dm-0"}
+        pools = {"builds": {"state": "measured", "free_pool_tokens": 17}, "ci": {"state": "unavailable"}}
+        scope = {"cpu": CPU, "io": {"state": "unavailable"}, "identity": 42}
+        path = self.root / "natedev" / "samples-2026-10.jsonl"
+        self.write(path, sample(STAMP), sample("2026-10-02T12:01:00Z", slices=slices,
+                                             filesystem=filesystem, jobserver=pools))
+        self.write(self.host_file, step("resources", scope_resources=scope))
+        original = path.read_bytes()
+        self.assertEqual(index.update(), 3)
+        self.assertEqual(self.rows("SELECT slices, filesystem, jobserver FROM samples ORDER BY at")[0],
+                         (None, None, None))
+        encoded = self.rows("SELECT slices, filesystem, jobserver FROM samples ORDER BY at")[1]
+        self.assertEqual([json.loads(cast(str, value)) for value in encoded], [slices, filesystem, pools])
+        self.assertEqual(json.loads(cast(str, self.rows("SELECT scope_resources FROM steps")[0][0])), scope)
+        with closing(sqlite3.connect(index.index_path())) as connection:
+            _ = connection.execute("PRAGMA user_version = 25")
+            connection.commit()
+        self.assertEqual(index.update(), 3)
+        self.assertEqual(self.rows("PRAGMA user_version"), [(26,)])
+        self.assertEqual(path.read_bytes(), original)
+        self.assertEqual(json.loads(cast(str, self.rows("SELECT slices FROM samples ORDER BY at")[1][0])), slices)
+
     def test_cpu_io_sample_columns_preserve_old_nulls_and_new_counters(self) -> None:
         path = self.root / "natedev" / "samples-2026-10.jsonl"
         self.write(path, sample(STAMP), sample("2026-10-02T12:01:00.000Z",
@@ -580,7 +610,7 @@ class IndexTests(unittest.TestCase):
 
     def test_schema_command_lists_samples_and_stall_columns(self) -> None:
         result = subprocess.run(
-            [sys.executable, str(CLI), "schema"], capture_output=True, text=True, check=False, timeout=60
+            [sys.executable, str(CLI), "schema"], capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("TABLE samples", result.stdout)
@@ -603,7 +633,8 @@ class IndexTests(unittest.TestCase):
             [(None, None), ("performance", since)],
         )
         self.assertEqual(path.read_bytes(), original)
-        self.assertEqual(index.SAMPLE_COLUMNS[-2:], [
+        self.assertEqual([column for column in index.SAMPLE_COLUMNS
+                          if column[0] in ("power_profile", "power_profile_since")], [
             ("power_profile", "TEXT", "power-profiles-daemon profile; NULL when not recorded"),
             ("power_profile_since", "TEXT", "UTC ISO mtime of the daemon's state file: when the profile was set"),
         ])
@@ -927,7 +958,7 @@ class IndexTests(unittest.TestCase):
 
     def test_schema_describes_target_and_hold_wait(self) -> None:
         result = subprocess.run(
-            [sys.executable, str(CLI), "schema"], capture_output=True, text=True, check=False, timeout=60,
+            [sys.executable, str(CLI), "schema"], capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertRegex(result.stdout, r"target\s+TEXT\s+where the call was when it ended: mac, natedev, or empty")
@@ -1028,7 +1059,7 @@ class IndexTests(unittest.TestCase):
             capture_output=True,
             text=True,
             check=False,
-            timeout=60,
+            timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         rows = cast(list[dict[str, object]], json.loads(result.stdout))
@@ -1042,7 +1073,7 @@ class IndexTests(unittest.TestCase):
             capture_output=True,
             text=True,
             check=False,
-            timeout=60,
+            timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
         self.assertEqual(failed.returncode, 1)
         self.assertIn("readonly", failed.stderr)

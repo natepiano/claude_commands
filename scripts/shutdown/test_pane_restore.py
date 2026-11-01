@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import math
 import os
 import subprocess
 import sys
@@ -35,7 +36,8 @@ class FakeClient(herdr.Herdr):
         self.start_error: herdr.HerdrFailure | None = None
 
     @override
-    def result(self, *arguments: str) -> dict[str, object]:
+    def result(self, *arguments: str, deadline: float = math.inf) -> dict[str, object]:
+        del deadline
         if arguments[:2] == ("workspace", "list"):
             return {"workspaces": [{"workspace_id": "w1", "label": "demo"}]}
         if arguments[:2] == ("pane", "list"):
@@ -145,6 +147,26 @@ class PaneRestoreTests(unittest.TestCase):
         self.assertEqual(code, 0, output)
         self.assertEqual(len(self.opened), 1)
         self.assertIn("resumed sid-alpha", output)
+
+    def test_restore_supplies_the_staff_owners_session_labels_to_the_new_tab(self) -> None:
+        from scripts.production import staff, session_staff, showrunners
+
+        parent = staff.StaffRow(staff.StaffId("s123456789aa"), "showrunner", "demo", None)
+        owner = staff.StaffRow(staff.StaffId("s123456789ab"), "unit", "alpha", parent.id)
+        document = "# Production — demo\n\n## Units\n\n| Unit | Plan |\n| --- | --- |\n| `alpha-unit` | standby |\n"
+        source = showrunners.ShowrunnerSource(
+            showrunners.Timer("demo", "session:runner", self.root / "demo.md", "UTC"), document)
+        self.entry(environment={"STAFF_ID": owner.id})
+        membership = session_staff.LaunchMembership(staff.StaffSnapshot((parent, owner)),
+            session_staff.MemberSources({"demo": source}, ()))
+        with mock.patch.object(session_staff.LaunchMembership, "read", return_value=membership):
+            code, output = self.run_restore(self.restored())
+        self.assertEqual(code, 0, output)
+        self.assertEqual(len(self.opened), 1)
+        environment = self.opened[0][4]
+        self.assertEqual({key: environment.get(key) for key in herdr.MEMBER_MARKS}, {
+            "STAFF_ID": owner.id, "SHOWRUNNER_UNIT": "demo", "SHOWRUNNER_UNIT_ID": "alpha-unit"})
+        self.assertEqual(environment["CLAUDE_CONFIG_DIR"], str(self.config))
 
     def test_a_pane_is_left_as_it_is_for_each_reason_and_named(self) -> None:
         cases: list[tuple[dict[str, object], str, str]] = [

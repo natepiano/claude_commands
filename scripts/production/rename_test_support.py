@@ -40,6 +40,7 @@ import unit_move
 import unit_names
 import unit_lookup
 from cli_fixture import invoke_cli
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 SCRIPT = Path(__file__).with_name("rename.py")
 
@@ -203,7 +204,6 @@ runpy.run_path(sys.argv[0], run_name="__main__")
 '''
 
 # load 136 on natedev, 2026-10-29
-TEST_HANG_GUARD_SECS = 300
 
 def run_rename(arguments: list[str], environment: dict[str, str], cwd: Path,
                wrapper: str = "") -> subprocess.CompletedProcess[str]:
@@ -235,7 +235,6 @@ def run_rename(arguments: list[str], environment: dict[str, str], cwd: Path,
             (tidy_wrapped, {"STATE_DIR": Path(environment["SHOWRUNNER_STATE_DIR"]),
                             "NOTIFIER_STATE_DIR": Path(environment["NOTIFIER_STATE_DIR"])}),
             (stall_watch, {"STATE_DIR": Path(environment["STALL_WATCH_STATE_DIR"])}),
-            (rename, {"REVIEW_POOL_STATE": Path(environment["REVIEW_POOL_STATE"])}),
         ):
             for name, value in fields.items():
                 _ = scope.enter_context(mock.patch.object(module, name, value))
@@ -315,7 +314,6 @@ class ProductionRenameFixture(StaffTestCase):
         self.notifier: Path = Path()
         self.state: Path = Path()
         self.stall: Path = Path()
-        self.pool: Path = Path()
         self.worktrees: Path = Path()
         self.env: dict[str, str] = {}
         self.old_tip: str = ""
@@ -363,7 +361,6 @@ class ProductionRenameFixture(StaffTestCase):
         self.notifier = self.root / "state/notifier"
         self.state = self.root / "state/showrunner"
         self.stall = self.root / "state/stall-watch"
-        self.pool = self.root / "state/review-pool"
         self.worktrees = self.home / "worktrees"
         self.env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
         self.env.update({
@@ -378,7 +375,7 @@ class ProductionRenameFixture(StaffTestCase):
             "NOTIFIER_STATE_DIR": str(self.notifier),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "state/sessions"),
             "SHOWRUNNER_STATE_DIR": str(self.state),
-            "STALL_WATCH_STATE_DIR": str(self.stall), "REVIEW_POOL_STATE": str(self.pool),
+            "STALL_WATCH_STATE_DIR": str(self.stall),
             "SHOWRUNNERS_CONFIG": str(self.home / ".claude/showrunners.json"),
             "UNIT_ACTIVE_DIR": str(self.root / "active"),
             "UNIT_HISTORY_DIR": str(self.root / "history"),
@@ -394,7 +391,7 @@ class ProductionRenameFixture(StaffTestCase):
         })
 
     def build_fixture(self) -> None:
-        for path in (self.home, self.checkout, self.notifier, self.stall, self.pool, self.worktrees):
+        for path in (self.home, self.checkout, self.notifier, self.stall, self.worktrees):
             path.mkdir(parents=True)
         config = self.home / ".claude"
         config.mkdir()
@@ -437,8 +434,6 @@ class ProductionRenameFixture(StaffTestCase):
         for unit in UNITS:
             self.write(self.stall_path(OLD, unit), json.dumps({"unit": unit, "stretch": 17}) + "\n")
         self.write(self.stall_path("unrelated", "alpha-unit"), '{"stretch": 99}\n')
-        self.write(self.pool / "old/pool.json", '{"generation": 7, "reviewers": {}}\n')
-        self.write(self.pool / "old/alpha-unit/2", "retained reviewer lease\n")
 
     def write(self, path: Path, content: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -623,9 +618,6 @@ class ProductionRenameFixture(StaffTestCase):
         self.assertEqual((self.state / "child/parent").read_text(), "new\n")
         self.assertEqual((self.state / "other/parent").read_text(), "oldish\n")
         self.assertEqual(self.stall_path("unrelated", "alpha-unit").read_text(), '{"stretch": 99}\n')
-        self.assertFalse((self.pool / "old").exists())
-        self.assertEqual((self.pool / "new/pool.json").read_text(), '{"generation": 7, "reviewers": {}}\n')
-        self.assertEqual((self.pool / "new/alpha-unit/2").read_text(), "retained reviewer lease\n")
         self.assertEqual(self.git("rev-parse", OLD), self.old_tip)
         self.assertEqual(self.git("rev-parse", "new^"), self.old_tip)
         self.assertEqual(self.git("log", "-1", "--format=%s", NEW), "chore(new): rename production from old")
@@ -637,7 +629,7 @@ class ProductionRenameFixture(StaffTestCase):
         self.assertEqual(self.git("ls-remote", "origin", "refs/heads/new"), f"{new_tip}\trefs/heads/new")
         self.assertEqual(self.git("ls-remote", "origin", "refs/heads/old"), f"{self.old_tip}\trefs/heads/old")
         self.assertEqual(self.git("status", "--porcelain"), "")
-        self.assertEqual(self.completed_steps(), 9)
+        self.assertEqual(self.completed_steps(), 8)
         self.assertIs(self.journal()["done"], False)
 
     def held_design(self, repository_id: str, checkout: Path, holder: design_roles.Holder) -> design_roles.HeldDesign:
