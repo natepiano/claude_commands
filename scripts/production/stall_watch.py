@@ -36,6 +36,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "shutdown"))
 
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.process_failure import failure_detail
 from scripts.lib.process_group import send_process_group
 
 import production_units
@@ -233,22 +234,16 @@ class ProcessSnapshotFailure(NamedTuple):
     reason: str
 
 
-class CommandCompleted(NamedTuple):
-    stdout: str
-    stderr: str
-    returncode: int
-
-
 class CommandFailure(NamedTuple):
     reason: str
 
 
 def finish_process(process: subprocess.Popen[str], work_deadline: float,
-                   cleanup_deadline: float) -> CommandCompleted | CommandFailure:
+                   cleanup_deadline: float) -> subprocess.CompletedProcess[str] | CommandFailure:
     """Bound both pipe reads and reaping; kill only the group this watcher started."""
     try:
         out, err = process.communicate(timeout=max(0, work_deadline - time.monotonic()))
-        return CommandCompleted(out, err, process.returncode)
+        return subprocess.CompletedProcess(process.args, process.returncode, out, err)
     except subprocess.TimeoutExpired:
         try:
             send_process_group(process.pid, signal.SIGKILL)
@@ -280,7 +275,7 @@ def processes(*, deadline: float, limits: SenderLimits | None = None) -> Process
     if isinstance(result, CommandFailure):
         return ProcessSnapshotFailure(result.reason)
     if result.returncode != 0:
-        return ProcessSnapshotFailure(f"ps exited {result.returncode}: {result.stderr.strip()}")
+        return ProcessSnapshotFailure(f"ps exited {result.returncode}: {failure_detail(result)}")
     rows = ProcessRows()
     for line in result.stdout.splitlines():
         match = re.match(r"\s*(\d+)\s+(\d+)\s+(.*)", line)
@@ -1104,7 +1099,7 @@ def send_all(pending: list[Delivery], now: float, *, deadline: float = math.inf,
             print(f"stall-watch: {item.kind}: send {result.reason}", file=sys.stderr)
             continue
         if result.returncode != 0:
-            print(f"stall-watch: {item.kind}: {result.stderr.strip() or result.stdout.strip() or result.returncode}", file=sys.stderr)
+            print(f"stall-watch: {item.kind}: {failure_detail(result)}", file=sys.stderr)
             continue
         if item.kind == "retire":
             prompt = saved_prompt(item.state_path)

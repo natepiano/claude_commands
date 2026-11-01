@@ -2248,6 +2248,34 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
             snapshot = stall_watch.processes(deadline=time.monotonic() + 1)
         self.assertIsInstance(snapshot, stall_watch.ProcessSnapshotFailure)
 
+    def test_failed_commands_report_both_output_streams(self) -> None:
+        script = self.root / "failed-command"
+        executable(script, "#!/usr/bin/env python3\nimport sys\n"
+                   + "print('output evidence')\nprint('error evidence', file=sys.stderr)\nsys.exit(7)\n")
+        with (mock.patch.dict(os.environ, self.environment),
+              mock.patch.object(stall_watch, "PS", str(script))):
+            snapshot = stall_watch.processes(deadline=time.monotonic() + 5)
+        self.assertIsInstance(snapshot, stall_watch.ProcessSnapshotFailure)
+        if not isinstance(snapshot, stall_watch.ProcessSnapshotFailure):
+            self.fail("a failed command must not become process rows")
+        self.assertIn("ps exited 7:", snapshot.reason)
+        self.assertIn("stderr: error evidence", snapshot.reason)
+        self.assertIn("stdout: output evidence", snapshot.reason)
+        for kind in ("bump", "retire"):
+            with self.subTest(kind=kind):
+                state = self.root / "failed.prompt.json"
+                stall_watch.save_prompt(state, stall_watch.PromptWait(session_id="stopped", created=START,
+                    key="failed-alert", since=START, alerted=True, tool="", retiring=True))
+                saved = state.read_bytes()
+                errors = io.StringIO()
+                with (mock.patch.dict(os.environ, self.environment), redirect_stderr(errors),
+                      mock.patch.object(stall_watch, "STATE_DIR", self.root)):
+                    stall_watch.send_all([stall_watch.Delivery(state, kind, [str(script)])], START,
+                                         deadline=time.monotonic() + 5)
+                self.assertIn(f"stall-watch: {kind}: stderr: error evidence", errors.getvalue())
+                self.assertIn("stdout: output evidence", errors.getvalue())
+                self.assertEqual(state.read_bytes(), saved)
+
     def test_sender_timeout_kills_a_grandchild_holding_the_output_pipe(self) -> None:
         script = self.root / "relay.py"
         pid_file = self.root / "grandchild.pid"
