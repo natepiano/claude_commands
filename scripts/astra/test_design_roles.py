@@ -1,6 +1,8 @@
 """Exercise durable design identity with local stores and a recording mesh transport."""
 from __future__ import annotations
 
+from scripts.production import worker_admission
+
 from scripts.lib.signal_test_support import install_signal_pid_guard
 from scripts.lib.test_agents_registry import write_registry
 
@@ -100,6 +102,12 @@ class DurableRolesTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        from scripts.production.staff_test_support import StaffTestCase, production_membership
+        membership = StaffTestCase()
+        membership.setUp()
+        self.addCleanup(membership.doCleanups)
+        _ = membership.production("demo", "design-unit")
+        production_membership("demo", "design-unit")
         self.repository = self.root / "checkout"
         self.repository.mkdir()
         _ = (self.repository / "design.md").write_text("# Design\n")
@@ -154,7 +162,9 @@ class DurableRolesTests(unittest.TestCase):
     def instance(self, design: design_roles.HeldDesign, role: Role) -> design_roles.RoleInstance:
         return next(instance for instance in design.roles if instance.role == role)
 
-    def launch(self, design: design_roles.HeldDesign, role: Role, prompt: Path, model: str, effort: str) -> str:
+    def launch(self, design: design_roles.HeldDesign, role: Role, prompt: Path, model: str, effort: str, *,
+               admitted: worker_admission.WorkerAdmitted) -> str:
+        self.assertEqual(admitted.row.name, self.instance(design, role).name)
         self.assertTrue(prompt.is_file())
         self.assertEqual((model, effort), ("gpt-fixture", "xhigh") if role == "designer"
                          else ("gpt-review-fixture", "high"))
@@ -196,6 +206,16 @@ class DurableRolesTests(unittest.TestCase):
         prompt = self.root / "assignment.md"
         _ = prompt.write_text(text)
         return design_roles.resume(design.placement.design_id + "/" + role, prompt)
+
+    def test_staff_refusal_does_not_claim_or_launch_an_astra_role(self) -> None:
+        from scripts.production import staff
+        with patch.object(staff, "ensure_worker", side_effect=staff.StaffRefused("write refused")):
+            with self.assertRaisesRegex(ValueError, "staff: demo-design-astra-designer: not opened: write refused"):
+                _ = self.open_designer()
+        self.assertEqual(self.launches, [])
+        self.assertTrue(all(isinstance(role.lifecycle, design_roles.RoleNotOpened) and not role.lifecycle.claim
+                            for path in design_roles.state_root().glob("*/design.json")
+                            for role in design_roles.read_design(path.parent.name).roles))
 
     def test_damaged_design_roster_refuses_publication_without_erasing_ownership(self) -> None:
         design = self.open_designer()
@@ -1191,6 +1211,8 @@ class DurableRolesTests(unittest.TestCase):
         path = damage_binding_repository(damaged)
         before = path.read_bytes(), path.stat().st_mtime_ns
         _ = (self.repository / "moving.md").write_text("# Moving design\n")
+        from scripts.production.staff_test_support import unit_membership
+        _ = unit_membership("demo", "moving-unit")
         holder = design_roles.UnitHolder("demo", "moving-unit")
         moving = design_roles.open_role("fixture-repo", "moving.md", "designer", holder, "moving",
                                        binding=self.binding(self.run_a))
