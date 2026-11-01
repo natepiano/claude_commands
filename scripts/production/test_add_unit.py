@@ -13,9 +13,11 @@ import subprocess
 import sys
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from datetime import datetime, tzinfo
 from pathlib import Path
 from typing import cast, final
 from unittest.mock import call, patch
+from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "shutdown"))
@@ -32,6 +34,9 @@ from scripts.herdr.fake_herdr import CommandResponse
 from add_unit_test_support import AddUnitTestCase, configure_test_zone, SCRIPT, SHARED, RemoteControlDeadlineClock
 
 
+LAUNCHED_AT = datetime(2026, 10, 6, 12, tzinfo=ZoneInfo("America/Los_Angeles"))
+
+
 def setUpModule() -> None:
     configure_test_zone()
 
@@ -40,6 +45,23 @@ from scripts.production import staff
 
 @final
 class AddUnitLaunchTests(AddUnitTestCase):
+    def pin_launch_clock(self) -> None:
+        def now(zone: tzinfo | None = None) -> datetime:
+            return LAUNCHED_AT.astimezone(zone)
+
+        _ = self.enterContext(patch.object(add_unit, "datetime", wraps=datetime, now=now))
+        # Keep the subprocess CLI check while giving it the same clock as in-process calls.
+        script = self.root / "clocked_add_unit.py"
+        _ = script.write_text(
+            "import sys\nfrom datetime import datetime\nfrom unittest.mock import patch\n"
+            + f"sys.path.insert(0, {str(Path(add_unit.__file__).parent)!r})\n"
+            + "import add_unit\n"
+            + f"at = datetime.fromisoformat({LAUNCHED_AT.isoformat()!r})\n"
+            + "with patch.object(add_unit, 'datetime', wraps=datetime) as clock:\n"
+            + "    clock.now.side_effect = lambda zone: at.astimezone(zone)\n"
+            + "    raise SystemExit(add_unit.main(sys.argv[1:]))\n", encoding="utf-8")
+        _ = self.enterContext(patch("add_unit_test_support.SCRIPT", script))
+
     def test_unit_under_another_production_refuses_with_move_command_without_changing_its_row(self) -> None:
         old_doc = self.staff.production("old", "alpha-unit", workspace="original")
         original = staff.ensure("showrunner", name="original")
@@ -243,6 +265,7 @@ class AddUnitLaunchTests(AddUnitTestCase):
         self.assert_no_launch_change(document, head)
 
     def test_standby_launch_records_state_without_writing_a_plan(self) -> None:
+        self.pin_launch_clock()
         _ = self.successful("alpha", "--standby", "--port", "8123", "--owns", "src/alpha", subprocess_cli=True)
         worktree = self.root / "project-alpha"
         self.assertIn(self.unit_row(plan="standby", port="8123", owns="src/alpha"),
@@ -266,7 +289,7 @@ class AddUnitLaunchTests(AddUnitTestCase):
         self.assertIn(prompt, command)
         self.assert_director_flags("opus", "xhigh")
         self.assertRegex(self.log.read_text(),
-                         r"^- \d\d:\d\d PDT: added alpha-unit \(standby\), worktree ")
+                         rf"^- {LAUNCHED_AT:%H:%M %Z}: added alpha-unit \(standby\), worktree ")
 
     def test_permanent_launch_writes_a_permanent_row_and_says_wrap_keeps_it(self) -> None:
         _ = self.successful("alpha", "--permanent")
@@ -316,6 +339,7 @@ class AddUnitLaunchTests(AddUnitTestCase):
                 self.assertEqual(self.servers_started(), [])
 
     def test_plan_adds_row_commits_worktree_launches_and_records(self) -> None:
+        self.pin_launch_clock()
         pushed = self.git("--git-dir", str(self.origin), "rev-parse", "refs/heads/build-followups")
         result = self.successful("alpha", "--plan", "docs/plans/given.md", "--port", "8123",
                                  "--owns", "src/alpha")
@@ -360,7 +384,7 @@ class AddUnitLaunchTests(AddUnitTestCase):
         # Adding a unit registers nothing: the showrunner's update timer already names the doc.
         self.assertFalse(self.config.exists())
         self.assertRegex(self.log.read_text(),
-                         r"^- \d\d:\d\d PDT: added alpha-unit \(plan\), worktree ")
+                         rf"^- {LAUNCHED_AT:%H:%M %Z}: added alpha-unit \(plan\), worktree ")
         self.assertEqual(len(self.log.read_text().splitlines()), 1)
         self.assertIn("alpha-unit started: herdr session attach agents, workspace director, tab alpha", result.stdout)
 
@@ -483,6 +507,7 @@ class AddUnitLaunchTests(AddUnitTestCase):
                          "build-followups")
 
     def test_brief_commits_stub_with_verbatim_words_and_approval_prompt(self) -> None:
+        self.pin_launch_clock()
         words = "Investigate the slow build.\nKeep the user's exact wording."
         result = self.successful("alpha", "--brief", words)
         stub = self.checkout / "docs/plans/build-followups-alpha.md"
@@ -492,7 +517,7 @@ class AddUnitLaunchTests(AddUnitTestCase):
         self.assertIn("> **Production: build-followups** — unit `alpha-unit`; production doc", content)
         self.assertIn("## Source", content)
         self.assertIn(words, content)
-        self.assertRegex(content, r"\d{4}-\d\d-\d\d.*PDT")
+        self.assertIn(f"{LAUNCHED_AT:%Y-%m-%d %H:%M %Z}", content)
         self.assertIn(self.unit_row(plan="docs/plans/build-followups-alpha.md"), self.doc.read_text())
         self.assertEqual(set(self.git("show", "--pretty=format:", "--name-only", "HEAD").splitlines()),
                          {"docs/plans/build-followups-production.md", "docs/plans/build-followups-alpha.md"})
