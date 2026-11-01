@@ -523,7 +523,7 @@ class _WorkerSources:
             fields = self.checked(path)
             if fields.get("family") == "claude":
                 observe(fields)
-        ledger = run / "workers"
+        ledger = run / unit_runs.WORKERS_LOG
         if ledger.exists():
             self.dependencies(ledger)
             for line in ledger.read_text(encoding="utf-8").splitlines():
@@ -568,7 +568,7 @@ class _WorkerSources:
                 _problem(f"{path} worker {name}", error)
 
     def claude_workers(self, run: Path) -> None:
-        ledger = run / "workers"
+        ledger = run / unit_runs.WORKERS_LOG
         launches = sorted(run.glob("impl_worker_*.json"))
         if not ledger.exists() and not launches:
             return
