@@ -10,6 +10,22 @@ The status line's first row shows its current staff assignment and path; its sec
 
 `/whoami` shows Claude accounts used by local live sessions, omitting unused Claude accounts. Before this machine cuts over, its legacy `~/.claude` login is also included. It also shows every Codex home; with multiple homes, the home in use is marked `(workers)`. It does not identify this session's account.
 
+## Trusted worktrees
+
+Run `~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py trust` to trust
+folders listed in `[trust].folders` in `config/accounts.toml` (currently `~/worktrees`)
+in the shared Claude home and every numbered Claude home. New account seeds use
+the same list. The command preserves other settings and permissions, reports each
+home independently, and leaves already trusted files unchanged. It uses the account
+home flock and Claude's normal config directory lock, waits through held locks,
+recovers locks over ten seconds stale, and reports a home if bounded retries expire.
+Preparation, content fsync, directory fsync and cleanup run outside Claude's lock;
+only a fresh byte comparison and replacement run under it. A changed file is rebuilt
+before retrying, and publication that has already used its budget is refused.
+Claude saves that skip the lock can still
+overwrite any writer's changes; rerun the command if a trust prompt returns.
+It never opens a session.
+
 ## Every account in one table
 
 `/showrunner:accounts` prints one table: a row for each numbered `~/.claudeN`, logged in or not; `~/.claude` is the shared config home and has no account row, then a row for each `~/.codexN`. The legacy `~/.codex` has a row only while it holds a login. Noted accounts whose home is absent or blocked by a file or broken link, and whose login no home holds, get `not set up` rows. In a terminal:

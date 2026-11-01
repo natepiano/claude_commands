@@ -35,7 +35,7 @@ def remove_dead_temporary_files(path: Path) -> None:
 
 
 @contextmanager
-def _flushed_temporary_file(path: Path, content: str | bytes) -> Generator[Path]:
+def _flushed_temporary_file(path: Path, content: str | bytes, *, mode: int = 0o600) -> Generator[Path]:
     """Keep a complete, private sibling file until publication finishes."""
     path.parent.mkdir(parents=True, exist_ok=True)
     remove_dead_temporary_files(path)
@@ -45,6 +45,7 @@ def _flushed_temporary_file(path: Path, content: str | bytes) -> Generator[Path]
         with cast(TextIO | BinaryIO, os.fdopen(
                 descriptor, "w" if isinstance(content, str) else "wb",
                 encoding="utf-8" if isinstance(content, str) else None)) as stream:
+            os.fchmod(stream.fileno(), mode)
             if isinstance(content, str):
                 _ = cast(TextIO, stream).write(content)
             else:
@@ -62,6 +63,18 @@ class AtomicPublicationFailed(OSError):
 
 class AtomicDurabilityUnconfirmed(OSError):
     """Complete new content is visible, but directory durability is unconfirmed."""
+
+
+@contextmanager
+def prepared_replacement(path: Path, content: str | bytes, *, mode: int) -> Generator[Path]:
+    """Prepare and fsync a sibling; the caller owns replace and folder sync.
+
+    The caller supplies the source mode and checks it again before replacement.
+    Keep this context outside publication locks: preparation scans stale files,
+    writes and syncs content, and exiting removes an unused temporary file.
+    """
+    with _flushed_temporary_file(path, content, mode=mode) as temporary:
+        yield temporary
 
 
 def write_text_atomic(path: Path, text: str) -> None:
