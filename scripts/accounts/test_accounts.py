@@ -20,6 +20,7 @@ import json
 import os
 import selectors
 import shlex
+import stat
 import subprocess
 import tempfile
 import time
@@ -166,6 +167,7 @@ class AccountsTests(unittest.TestCase):
         self.root = Path()
         self.home = Path()
         self.main_dir = Path()
+        self.trust_config = Path()
         # The live reading the status table gets for a folder; a folder without one cannot be read.
         self.live: dict[Path, agent_accounts.Report] = {}
         self.read_claude_live = agent_accounts.claude_live
@@ -194,6 +196,7 @@ class AccountsTests(unittest.TestCase):
             self.enterContext(scratch_account_home(self.home, environment)),
         )
         del environment_context
+        self.trust_config = accounts.trust_settings_file()
         _ = self.enterContext(patch.object(quota_alert, "STATE", self.root / "quota_alert.json"))
         _ = self.enterContext(patch.object(run_out, "READINGS_LOG", self.root / "pace.jsonl"))
         self.live = {}
@@ -1804,6 +1807,330 @@ class AccountsTests(unittest.TestCase):
         result, stdout, stderr = self.run_cli("burn", "--since", "2026-10-09T00:00:00Z", "--until", "2026-10-10T00:00:00Z")
         self.assertEqual((result, stdout), (1, ""))
         self.assertIn("invalid role change", stderr)
+
+    def write_trust_fixture(self) -> tuple[Path, ...]:
+        _ = self.trust_config.write_text('[trust]\nfolders = ["~/worktrees", "~/other trees"]\n')
+        paths = [self.home / ".claude.json"]
+        for number in (1, 2):
+            home = self.home / f".claude{number}"
+            home.mkdir()
+            paths.append(home / ".claude.json")
+        for path in paths:
+            _ = path.write_text(json.dumps({"keep": [1, 2], "projects": {
+                str(self.home / "worktrees"): {"hasTrustDialogAccepted": False, "keep": "here"},
+                "/elsewhere": {"hasTrustDialogAccepted": False, "other": [1]},
+            }}))
+            path.chmod(0o640)
+        return tuple(paths)
+
+    def start_trust_writer(self, path: Path) -> subprocess.Popen[str]:
+        """An independent lock-respecting save, with only scratch config paths."""
+        script = '''
+import json, os, sys, time
+from pathlib import Path
+path = Path(sys.argv[1])
+lock = path.with_name(path.name + ".lock")
+deadline = time.monotonic() + 5
+announced = False
+while True:
+    try:
+        lock.mkdir()
+        break
+    except FileExistsError:
+        if not announced:
+            print("blocked", flush=True)
+            announced = True
+        if time.monotonic() >= deadline:
+            raise TimeoutError("fixture lock not released")
+        time.sleep(0.001)
+try:
+    print("acquired", flush=True)
+    sys.stdin.readline()
+    current = json.loads(path.read_text())
+    current["other writer"] = "retained"
+    temporary = path.with_name(path.name + ".writer")
+    temporary.write_text(json.dumps(current))
+    temporary.chmod(path.stat().st_mode)
+    os.replace(temporary, path)
+finally:
+    lock.rmdir()
+'''
+        process = subprocess.Popen([sys.executable, "-c", script, str(path)],
+                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, text=True)
+
+        def close_writer() -> None:
+            if process.poll() is None:
+                process.kill()
+            _ = process.communicate(timeout=5)
+
+        self.addCleanup(close_writer)
+        return process
+
+    def test_trust_waiting_writer_saves_after_publication_and_preserves_both_changes(self) -> None:
+        paths = self.write_trust_fixture()
+        publish = os.replace
+        writers: list[subprocess.Popen[str]] = []
+
+        def publish_with_contender(temporary: Path, path: Path) -> None:
+            if path == paths[0]:
+                writer = self.start_trust_writer(path)
+                writers.append(writer)
+                assert writer.stdout is not None and writer.stdin is not None
+                # This hook is after trust's compare and before its replace.
+                self.assertEqual(writer.stdout.readline(), "blocked\n")
+                _ = writer.stdin.write("save\n")
+                writer.stdin.flush()
+                self.assertIsNone(writer.poll())
+            publish(temporary, path)
+
+        with patch.object(os, "replace", side_effect=publish_with_contender):
+            code, _output, error = self.run_cli("trust")
+        self.assertEqual(code, 0, error)
+        writer = writers[0]
+        stdout, stderr = writer.communicate(timeout=5)
+        self.assertEqual((writer.returncode, stdout, stderr), (0, "acquired\n", ""))
+        final = accounts.read_json_object(paths[0])
+        self.assertEqual(final["other writer"], "retained")
+        self.assertEqual(final["projects"], accounts.read_json_object(paths[1])["projects"])
+
+    def test_trust_waits_for_held_lock_then_reads_the_holders_change(self) -> None:
+        paths = self.write_trust_fixture()
+        writer = self.start_trust_writer(paths[0])
+        assert writer.stdout is not None and writer.stdin is not None
+        self.assertEqual(writer.stdout.readline(), "acquired\n")
+        sleep = time.sleep
+
+        def release_holder(delay: float) -> None:
+            assert writer.stdin is not None
+            _ = writer.stdin.write("save\n")
+            writer.stdin.flush()
+            sleep(delay)
+
+        with patch.object(time, "sleep", side_effect=release_holder) as waited:
+            code, _output, error = self.run_cli("trust")
+        self.assertEqual(code, 0, error)
+        self.assertTrue(waited.called)
+        stdout, stderr = writer.communicate(timeout=5)
+        self.assertEqual((writer.returncode, stdout, stderr), (0, "", ""))
+        final = accounts.read_json_object(paths[0])
+        self.assertEqual(final["other writer"], "retained")
+        self.assertEqual(final["projects"], accounts.read_json_object(paths[1])["projects"])
+
+    def test_trust_recovers_a_stale_lock_using_claudes_mtime_rule(self) -> None:
+        paths = self.write_trust_fixture()
+        lock = paths[0].with_name(paths[0].name + ".lock")
+        lock.mkdir()
+        stale = time.time() - 11
+        os.utime(lock, (stale, stale))
+        code, _output, error = self.run_cli("trust")
+        self.assertEqual(code, 0, error)
+        self.assertFalse(lock.exists())
+        self.assertEqual(accounts.read_json_object(paths[0])["projects"],
+                         accounts.read_json_object(paths[1])["projects"])
+
+    def test_trust_bounds_held_lock_retries_and_continues_other_homes(self) -> None:
+        paths = self.write_trust_fixture()
+        lock = paths[0].with_name(paths[0].name + ".lock")
+        lock.mkdir()
+        before = paths[0].read_bytes()
+        with patch.object(time, "sleep") as waited:
+            code, output, error = self.run_cli("trust")
+        self.assertEqual((code, output), (1, "claude1: trust updated\nclaude2: trust updated\n"))
+        self.assertIn("~/.claude: trust failed: Claude config lock still held after retries", error)
+        self.assertEqual(waited.call_count, len(accounts.CLAUDE_CONFIG_LOCK_RETRIES))
+        self.assertEqual(paths[0].read_bytes(), before)
+        self.assertTrue(lock.is_dir())
+
+    def test_trust_refuses_publication_when_its_short_lock_budget_is_used(self) -> None:
+        paths = self.write_trust_fixture()
+        before = [path.read_bytes() for path in paths]
+        with patch.object(time, "monotonic", side_effect=[0, 1] * len(paths)):
+            code, output, error = self.run_cli("trust")
+        self.assertEqual((code, output), (1, ""))
+        self.assertEqual(error.count("publication budget exceeded"), len(paths))
+        self.assertEqual([path.read_bytes() for path in paths], before)
+        self.assertFalse(any(path.with_name(path.name + ".lock").exists() for path in paths))
+
+    def test_trust_slow_preparation_leaves_lock_free_and_rebuilds_concurrent_changes(self) -> None:
+        paths = self.write_trust_fixture()
+        prepare = atomic_file.prepared_replacement
+        lock_config = accounts.claude_config_lock
+        sync = os.fsync
+        preparation_times: list[float] = []
+        hold_times: list[float] = []
+        preparations: list[Path] = []
+
+        def assert_locks_free() -> None:
+            self.assertFalse(any(path.with_name(path.name + ".lock").exists() for path in paths))
+
+        @contextmanager
+        def slow_preparation(path: Path, content: str | bytes, *, mode: int) -> Generator[Path]:
+            assert_locks_free()
+            preparations.append(path)
+            with prepare(path, content, mode=mode) as temporary:
+                assert_locks_free()
+                self.assertEqual(temporary.stat().st_mode & 0o777, 0o640)
+                if len(preparations) == 1:
+                    started = time.perf_counter()
+                    time.sleep(1.6)  # Longer than Claude's boot retry-abort window.
+                    assert_locks_free()
+                    writer = self.start_trust_writer(path)
+                    assert writer.stdout is not None
+                    self.assertEqual(writer.stdout.readline(), "acquired\n")
+                    stdout, stderr = writer.communicate("save\n", timeout=5)
+                    self.assertEqual((writer.returncode, stdout, stderr), (0, "", ""))
+                    preparation_times.append(time.perf_counter() - started)
+                yield temporary
+                assert_locks_free()
+            assert_locks_free()
+
+        @contextmanager
+        def timed_lock(path: Path) -> Generator[accounts.ClaudeConfigLock]:
+            with lock_config(path) as ownership:
+                started = time.perf_counter()
+                yield ownership
+            hold_times.append(time.perf_counter() - started)
+
+        def sync_without_lock(descriptor: int) -> None:
+            assert_locks_free()
+            sync(descriptor)
+
+        with (patch.object(atomic_file, "prepared_replacement", side_effect=slow_preparation),
+              patch.object(accounts, "claude_config_lock", side_effect=timed_lock),
+              patch.object(os, "fsync", side_effect=sync_without_lock)):
+            code, _output, error = self.run_cli("trust")
+        self.assertEqual(code, 0, error)
+        self.assertGreater(preparation_times[0], 1.5)
+        self.assertEqual(len(hold_times), len(paths) + 1)
+        self.assertLess(max(hold_times), min(accounts.CLAUDE_CONFIG_LOCK_RETRIES) / 2)
+        self.assertEqual(preparations.count(paths[0]), 2)
+        final = accounts.read_json_object(paths[0])
+        self.assertEqual(final["other writer"], "retained")
+        self.assertEqual(final["projects"], accounts.read_json_object(paths[1])["projects"])
+        self.assertTrue(all(path.stat().st_mode & 0o777 == 0o640 for path in paths))
+        self.assertFalse(list(self.home.rglob("*.tmp")))
+
+    def test_trust_rebuilds_when_permissions_tighten_during_preparation(self) -> None:
+        paths = self.write_trust_fixture()
+        paths[0].chmod(0o644)
+        sync = os.fsync
+        replace = os.replace
+        prepared_modes: list[int] = []
+
+        def tighten_during_sync(descriptor: int) -> None:
+            if stat.S_ISREG(os.fstat(descriptor).st_mode):
+                prepared_modes.append(os.fstat(descriptor).st_mode & 0o777)
+                if len(prepared_modes) == 1:
+                    self.assertFalse(paths[0].with_name(paths[0].name + ".lock").exists())
+                    paths[0].chmod(0o600)
+            sync(descriptor)
+
+        def publish(temporary: Path, destination: Path) -> None:
+            self.assertEqual(temporary.stat().st_mode & 0o777, destination.stat().st_mode & 0o777)
+            replace(temporary, destination)
+
+        with (patch.object(os, "fsync", side_effect=tighten_during_sync),
+              patch.object(os, "replace", side_effect=publish)):
+            code, _output, error = self.run_cli("trust")
+        self.assertEqual(code, 0, error)
+        self.assertEqual(prepared_modes, [0o644, 0o600, 0o640, 0o640])
+        self.assertEqual(paths[0].stat().st_mode & 0o777, 0o600)
+        self.assertEqual(accounts.read_json_object(paths[0])["projects"],
+                         accounts.read_json_object(paths[1])["projects"])
+        self.assertFalse(list(self.home.rglob("*.tmp")))
+
+    def test_trust_changes_only_configured_project_bits_in_every_home_and_reruns_unchanged(self) -> None:
+        paths = self.write_trust_fixture()
+        originals = [accounts.read_json_object(path) for path in paths]
+        code, output, error = self.run_cli("trust")
+        self.assertEqual(code, 0, error)
+        self.assertEqual(output.splitlines(), ["~/.claude: trust updated", "claude1: trust updated", "claude2: trust updated"])
+        self.assertIn("unlocked Claude save", error)
+        for path, original in zip(paths, originals):
+            with self.subTest(path=path.name, home=path.parent.name):
+                expected_projects = cast(dict[str, object], original["projects"])
+                expected_projects[str(self.home / "worktrees")] = {"hasTrustDialogAccepted": True, "keep": "here"}
+                expected_projects[str(self.home / "other trees")] = {"hasTrustDialogAccepted": True}
+                self.assertEqual(accounts.read_json_object(path), original)
+                self.assertEqual(path.stat().st_mode & 0o777, 0o640)
+        before = [(path.read_bytes(), path.stat().st_mtime_ns) for path in paths]
+        self.assertEqual(self.run_cli("trust")[:2], (0,
+            "~/.claude: trust unchanged\nclaude1: trust unchanged\nclaude2: trust unchanged\n"))
+        self.assertEqual([(path.read_bytes(), path.stat().st_mtime_ns) for path in paths], before)
+
+    def test_trust_retries_an_intervening_writer_before_publish_and_after_publish(self) -> None:
+        paths = self.write_trust_fixture()
+        apply = accounts.with_trusted_folders
+        publish = os.replace
+        before_publish = True
+        after_publish = True
+
+        def competing_change(source: dict[str, object], folders: tuple[str, ...]) -> dict[str, object]:
+            nonlocal before_publish
+            if before_publish:
+                before_publish = False
+                current = accounts.read_json_object(paths[0])
+                current["concurrent before"] = "retained"
+                _ = paths[0].write_text(json.dumps(current))
+            return apply(source, folders)
+
+        def competing_publish(temporary: Path, path: Path) -> None:
+            nonlocal after_publish
+            publish(temporary, path)
+            if after_publish:
+                after_publish = False
+                # An unlocked writer uses its earlier snapshot after our replace.
+                _ = path.write_text(json.dumps({"concurrent before": "retained", "concurrent after": True}))
+
+        with (patch.object(accounts, "with_trusted_folders", side_effect=competing_change),
+              patch.object(os, "replace", side_effect=competing_publish)):
+            code, _output, error = self.run_cli("trust")
+        self.assertEqual(code, 0, error)
+        final = accounts.read_json_object(paths[0])
+        self.assertEqual(final["concurrent before"], "retained")
+        self.assertIs(final["concurrent after"], True)
+        self.assertEqual(final["projects"], {
+            str(self.home / "worktrees"): {"hasTrustDialogAccepted": True},
+            str(self.home / "other trees"): {"hasTrustDialogAccepted": True},
+        })
+
+    def test_trust_reports_missing_and_unreadable_files_and_continues_other_homes(self) -> None:
+        paths = self.write_trust_fixture()
+        paths[0].unlink()
+        read = Path.read_bytes
+
+        def unreadable(path: Path) -> bytes:
+            if path == paths[1]:
+                raise PermissionError("fixture unreadable")
+            return read(path)
+
+        with patch.object(Path, "read_bytes", new=unreadable):
+            code, output, error = self.run_cli("trust")
+        self.assertEqual((code, output), (1, "claude2: trust updated\n"))
+        self.assertIn("~/.claude: trust failed:", error)
+        self.assertIn("claude1: trust failed: fixture unreadable", error)
+        self.assertFalse(paths[0].exists())
+        self.assertEqual(accounts.read_json_object(paths[2])["projects"], {
+            str(self.home / "worktrees"): {"hasTrustDialogAccepted": True, "keep": "here"},
+            str(self.home / "other trees"): {"hasTrustDialogAccepted": True},
+            "/elsewhere": {"hasTrustDialogAccepted": False, "other": [1]},
+        })
+
+    def test_new_account_seed_uses_trusted_folders_from_configuration_at_use(self) -> None:
+        _ = self.trust_config.write_text('[trust]\nfolders = ["~/configured root"]\n')
+        _ = (self.home / ".claude.json").write_text('{"hasCompletedOnboarding": true}')
+        self.assertEqual(accounts.setup("claude2"), [])
+        seeded = accounts.read_json_object(self.home / ".claude2/.claude.json")
+        self.assertEqual(seeded, {"hasCompletedOnboarding": True, "projects": {
+            str(self.home / "configured root"): {"hasTrustDialogAccepted": True},
+        }})
+        self.assertEqual((self.home / ".claude2/.claude.json").stat().st_mode & 0o777, 0o600)
+        _ = self.trust_config.write_text('[trust]\nfolders = ["~/different root"]\n')
+        self.assertEqual(accounts.setup("claude3"), [])
+        self.assertEqual(accounts.read_json_object(self.home / ".claude3/.claude.json")["projects"], {
+            str(self.home / "different root"): {"hasTrustDialogAccepted": True},
+        })
 
     def test_shared_entries_are_the_documented_complete_set(self) -> None:
         self.assertEqual(tuple(accounts.SHARED), EXPECTED_SHARED)

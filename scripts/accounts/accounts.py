@@ -12,6 +12,7 @@ import io
 import json
 import math
 import os
+import random
 import re
 import shlex
 import shutil
@@ -20,6 +21,8 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
+import tomllib
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextvars import ContextVar
 from collections.abc import Callable, Generator, Mapping, Sequence
@@ -822,11 +825,174 @@ def _identity_link_problems(
     ]
 
 
-def _read_json_object(path: Path | io.StringIO) -> dict[str, object]:
+def read_json_object(path: Path | io.StringIO) -> dict[str, object]:
     decoded = cast(object, json.loads(path.read_text(encoding="utf-8") if isinstance(path, Path) else path.read()))
     if not isinstance(decoded, dict):
         raise ValueError("expected a JSON object")
     return cast(dict[str, object], decoded)
+
+
+def trust_settings_file() -> Path:
+    return REPOSITORY_ROOT / "config" / "accounts.toml"
+
+
+def trusted_folders() -> tuple[str, ...]:
+    """Configured absolute project paths, resolved for this machine at use."""
+    path = trust_settings_file()
+    try:
+        document = tomllib.loads(path.read_text(encoding="utf-8"))
+        section = cast(object, document.get("trust"))
+        if not isinstance(section, dict):
+            raise ValueError("expected [trust] folders")
+        folders = cast(dict[str, object], section).get("folders")
+        if not isinstance(folders, list):
+            raise ValueError("trust.folders must be a list of paths")
+        result: list[str] = []
+        for folder in cast(list[object], folders):
+            if not isinstance(folder, str) or not folder or not Path(folder).expanduser().is_absolute():
+                raise ValueError("trust.folders must contain absolute or ~/ paths")
+            result.append(str(Path(folder).expanduser().absolute()))
+        return tuple(dict.fromkeys(result))
+    except (OSError, ValueError) as error:
+        raise AccountsError(f"accounts: {path}: {error}") from error
+
+
+def with_trusted_folders(source: dict[str, object], folders: tuple[str, ...]) -> dict[str, object]:
+    """Change only the configured projects' trust bit; seed and repair share it."""
+    if not folders:
+        return source
+    raw_projects = source.get("projects", {})
+    if not isinstance(raw_projects, dict):
+        raise ValueError("projects must be an object")
+    projects = dict(cast(dict[str, object], raw_projects))
+    for folder in folders:
+        raw_project = projects.get(folder, {})
+        if not isinstance(raw_project, dict):
+            raise ValueError("configured trust project must be an object")
+        projects[folder] = {**cast(dict[str, object], raw_project), "hasTrustDialogAccepted": True}
+    return {**source, "projects": projects}
+
+
+@contextmanager
+def _account_home_lock(home: Path) -> Generator[None]:
+    """Serialize account-file publication with setup's directory flock."""
+    directory = os.open(home, os.O_RDONLY)
+    try:
+        fcntl.flock(directory, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(directory)
+
+
+# Claude Code 2.1.296: xi/RTs and proper-lockfile Nt/rt in the installed
+# executable. These are interoperability values, not our own retry policy.
+CLAUDE_CONFIG_LOCK_RETRIES = (0.2, 0.4, 0.8, 1.6, 3.2, 4.0)
+CLAUDE_CONFIG_LOCK_STALE_SECONDS = 10.0
+
+
+@dataclass(frozen=True)
+class ClaudeConfigLock:
+    """Ownership of Claude's directory lock for one short publication."""
+
+    path: Path
+    inode: int
+    publish_before: float
+
+    def require_current(self) -> None:
+        if self.path.stat().st_ino != self.inode:
+            raise OSError("Claude config lock ownership changed")
+        if time.monotonic() >= self.publish_before:
+            raise TimeoutError("Claude config lock publication budget exceeded; rerun trust")
+
+
+@contextmanager
+def claude_config_lock(path: Path) -> Generator[ClaudeConfigLock]:
+    """Wait like Claude, recovering only locks whose mtime is over 10s old.
+
+    Our critical section has no waits: its publication budget is half Claude's
+    shortest retry, also below its 1.5s boot retry-abort window. No heartbeat is
+    needed for such a short hold (Claude normally updates its lock every 5s).
+    """
+    lock = path.with_name(path.name + ".lock")
+    for attempt in range(len(CLAUDE_CONFIG_LOCK_RETRIES) + 1):
+        if _try_claude_config_lock(lock):
+            break
+        if attempt == len(CLAUDE_CONFIG_LOCK_RETRIES):
+            raise TimeoutError("Claude config lock still held after retries; rerun trust")
+        time.sleep(CLAUDE_CONFIG_LOCK_RETRIES[attempt] * (1 + random.random()))
+    ownership = ClaudeConfigLock(lock, lock.stat().st_ino,
+                                time.monotonic() + min(CLAUDE_CONFIG_LOCK_RETRIES) / 2)
+    try:
+        yield ownership
+    finally:
+        # A stolen/replaced lock belongs to its new writer, even on failure.
+        try:
+            if lock.stat().st_ino == ownership.inode:
+                lock.rmdir()
+        except FileNotFoundError:
+            pass
+
+
+def _try_claude_config_lock(lock: Path) -> bool:
+    try:
+        lock.mkdir(mode=0o700)
+        return True
+    except FileExistsError:
+        pass
+    try:
+        if lock.stat().st_mtime >= time.time() - CLAUDE_CONFIG_LOCK_STALE_SECONDS:
+            return False
+        lock.rmdir()
+    except FileNotFoundError:
+        pass
+    # Like proper-lockfile, make only one fresh acquisition after stale removal.
+    try:
+        lock.mkdir(mode=0o700)
+        return True
+    except FileExistsError:
+        return False
+
+
+def _trust_file(home: Path, path: Path, folders: tuple[str, ...]) -> bool:
+    if home.is_symlink() or path.is_symlink():
+        raise ValueError("linked account configuration refused")
+    with _account_home_lock(home):
+        while True:
+            before_mode = stat.S_IMODE(path.stat().st_mode)
+            before = path.read_bytes()
+            original = read_json_object(io.StringIO(before.decode("utf-8")))
+            updated = with_trusted_folders(original, folders)
+            if updated == original:
+                return False
+            published = json.dumps(updated, indent=2, ensure_ascii=False) + "\n"
+            with atomic_file.prepared_replacement(path, published, mode=before_mode) as temporary:
+                with claude_config_lock(path) as ownership:
+                    if path.read_bytes() != before or stat.S_IMODE(path.stat().st_mode) != before_mode:
+                        continue
+                    ownership.require_current()
+                    os.replace(temporary, path)
+                atomic_file.sync_folder(path.parent)
+                if path.read_bytes() == published.encode("utf-8"):
+                    return True
+                # Release before retrying a detected unlocked writer's change.
+
+
+def trust_accounts() -> int:
+    """Apply configured trust to each home independently without inspecting identity."""
+    folders = trusted_folders()
+    homes = [NamedAccount("~/.claude", main_config_dir()), *_existing_named_accounts()]
+    failures = False
+    for home in homes:
+        path = accounts_home() / ".claude.json" if home.dir == main_config_dir() else home.dir / ".claude.json"
+        try:
+            changed = _trust_file(home.dir, path, folders)
+            state = "updated" if changed else "unchanged"
+            print(f"{home.label}: trust {state}")
+        except (OSError, ValueError) as error:
+            print(f"{home.label}: trust failed: {error}", file=sys.stderr)
+            failures = True
+    print("A later unlocked Claude save can overwrite trust; rerun accounts.py trust if prompted.", file=sys.stderr)
+    return int(failures)
 
 
 def _filtered_seed(source: dict[str, object]) -> ClaudeConfigSeed:
@@ -847,7 +1013,7 @@ def _filtered_seed(source: dict[str, object]) -> ClaudeConfigSeed:
             }
             projects[project_path] = cast(ProjectSeed, cast(object, filtered))
         seed["projects"] = projects
-    return cast(ClaudeConfigSeed, cast(object, seed))
+    return cast(ClaudeConfigSeed, cast(object, with_trusted_folders(seed, trusted_folders())))
 
 
 def _seed_config(destination: Path) -> list[str]:
@@ -857,20 +1023,15 @@ def _seed_config(destination: Path) -> list[str]:
         ]
     source = accounts_home() / ".claude.json"
     try:
-        directory = os.open(destination.parent, os.O_RDONLY)
-        try:
-            # Serialize seed cleanup and publication within this account home.
-            fcntl.flock(directory, fcntl.LOCK_EX)
+        with _account_home_lock(destination.parent):
             atomic_file.remove_dead_temporary_files(destination)
             if destination.exists():
                 existing = destination.lstat()
                 if not stat.S_ISREG(existing.st_mode) or existing.st_size:
                     return []
                 destination.unlink()
-            seed = _filtered_seed(_read_json_object(source))
+            seed = _filtered_seed(read_json_object(source))
             _ = atomic_file.create_text_atomic(destination, json.dumps(seed, indent=2, sort_keys=True) + "\n")
-        finally:
-            os.close(directory)
     except (OSError, ValueError, TypeError) as error:
         return [f"accounts: could not seed {destination} from {source}: {error}"]
     return []
@@ -943,7 +1104,7 @@ def _shared_link_problems(
 def _directory_identity(config_dir: Path) -> ClaudeDirectoryIdentity:
     path = agent_accounts.claude_config_file(config_dir)
     try:
-        values = _read_json_object(path)
+        values = read_json_object(path)
     except FileNotFoundError:
         return ClaudeDirectoryLoggedOut()
     except (OSError, ValueError, UnicodeError) as error:
@@ -994,7 +1155,7 @@ def _private_identity_problems(destination: Path) -> list[str]:
             continue
         try:
             if name == ".credentials.json":
-                _ = _read_json_object(path)
+                _ = read_json_object(path)
             else:
                 _ = path.read_text(encoding="utf-8")
         except FileNotFoundError:
@@ -2355,7 +2516,7 @@ def resolve_history_label(label: str, at: str, *, login: str = "") -> ResolvedHi
         if isinstance(parsed, note_file.NumberedAccountLabel) and parsed.tool == tool:
             return ResolvedHistoryLabel(parsed.label)
     try:
-        rows = _read_json_object(accounts_config_file()).get("home_cutovers", [])
+        rows = read_json_object(accounts_config_file()).get("home_cutovers", [])
         stamp = datetime.fromisoformat(at)
         if stamp.tzinfo is None or not isinstance(rows, list):
             return HistoricalAccountUnresolved()
@@ -2526,7 +2687,7 @@ class MacHomeCutover(HomeCutover):
 
 def _record_home_cutover(journal: HomeCutover) -> None:
     with _roles_lock():
-        configuration = _read_json_object(accounts_config_file()) if accounts_config_file().exists() else {}
+        configuration = read_json_object(accounts_config_file()) if accounts_config_file().exists() else {}
         rows = configuration.get("home_cutovers", [])
         if not isinstance(rows, list):
             raise AccountsError("accounts: invalid home_cutovers history")
@@ -2669,7 +2830,7 @@ def _clear_leftover_home_account(journal_path: Path) -> bool:
             original = source.read()
     except FileNotFoundError:
         return False
-    seed = _read_json_object(io.StringIO(original))
+    seed = read_json_object(io.StringIO(original))
     credentials = main_config_dir() / ".credentials.json"
     if credentials.is_symlink() or credentials.exists():
         return False
@@ -2708,7 +2869,7 @@ def _cutover_home_macos(label: str, *, undo: bool) -> None:
             _cutover_session_check(main_config_dir())
             if _clear_leftover_home_account(path):
                 return
-        raw = _read_json_object(path) if path.exists() else {}
+        raw = read_json_object(path) if path.exists() else {}
         if raw and raw.get("platform") != "darwin":
             raise AccountsError("accounts: finish the recorded cutover on its original platform")
         if raw:
@@ -2733,7 +2894,7 @@ def _cutover_home_macos(label: str, *, undo: bool) -> None:
         numbered_path = destination / ".claude.json"
         if any(item.is_symlink() for item in (main_config_dir(), destination, seed_path, numbered_path)):
             raise AccountsError("accounts: cutover homes and identity files must not be links")
-        seed = _read_json_object(seed_path)
+        seed = read_json_object(seed_path)
         if raw:
             journal = cast(MacHomeCutover, cast(object, raw))
         else:
@@ -2760,7 +2921,7 @@ def _cutover_home_macos(label: str, *, undo: bool) -> None:
         if journal["state"] == "undoing":
             raise AccountsError("accounts: finish undo before starting again")
         expected = _account_note(journal["label"])
-        numbered = _read_json_object(numbered_path) if numbered_path.exists() else {}
+        numbered = read_json_object(numbered_path) if numbered_path.exists() else {}
         numbered_oauth = _mac_oauth_account(numbered)
         source_oauth = journal["oauthAccount"]
         if source_oauth["accountUuid"] != numbered_oauth["accountUuid"]:
@@ -2854,7 +3015,7 @@ def cutover_codex_home(label: str, *, undo: bool = False) -> None:
     with path.with_suffix(".lock").open("a") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         try:
-            raw = _read_json_object(path)
+            raw = read_json_object(path)
         except FileNotFoundError:
             raw = {}
         if raw and not undo and raw.get("state") in ("complete", "undone") and _codex_home_login(source):
@@ -2976,7 +3137,7 @@ def cutover_home(label: str = "", *, undo: bool = False) -> None:
             if _clear_leftover_home_account(path):
                 return
         try:
-            raw = _read_json_object(path)
+            raw = read_json_object(path)
         except FileNotFoundError:
             raw = {}
         if raw and not undo and raw.get("state") in ("complete", "undone"):
@@ -3009,8 +3170,8 @@ def cutover_home(label: str = "", *, undo: bool = False) -> None:
             raise AccountsError("accounts: cutover homes must be real directories")
         seed_path = accounts_home() / ".claude.json"
         numbered_path = destination / ".claude.json"
-        seed = _read_json_object(seed_path)
-        numbered = _read_json_object(numbered_path) if numbered_path.exists() else {}
+        seed = read_json_object(seed_path)
+        numbered = read_json_object(numbered_path) if numbered_path.exists() else {}
         home_credentials = main_config_dir() / ".credentials.json"
         numbered_credentials = destination / ".credentials.json"
         if any(item.is_symlink() for item in (seed_path, numbered_path, home_credentials, numbered_credentials)):
@@ -3682,7 +3843,7 @@ def _mcp_server_names(config_file: Path, project: Path) -> ReadMcpConfiguration 
     try:
         with config_file.open(encoding="utf-8") as stream:
             source = ExistingMcpFile(stream.read(), stat.S_IMODE(os.fstat(stream.fileno()).st_mode))
-        configuration = _read_json_object(io.StringIO(source.text))
+        configuration = read_json_object(io.StringIO(source.text))
     except FileNotFoundError:
         # Claude can start without a configuration file.
         return ReadMcpConfiguration(frozenset(), MissingMcpFile())
@@ -5349,6 +5510,7 @@ def _routing_status_lines(entries: list[moves.JournalEntry], zone: tzinfo) -> li
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="action")
+    _ = commands.add_parser("trust", help="trust configured folders in every Claude home")
     _ = commands.add_parser("role-map-read")
     writer = commands.add_parser("role-map-write")
     _ = writer.add_argument("change")
@@ -5461,6 +5623,8 @@ def main(argv: list[str]) -> int:
     if hasattr(options, "label"):
         options.label = note_file.canonical_label(options.label)
     try:
+        if options.action == "trust":
+            return trust_accounts()
         if options.action in ("next-read", "next-write"):
             if not role_map.is_role_map_host():
                 raise AccountsError("accounts: account moves belong on natedev")
