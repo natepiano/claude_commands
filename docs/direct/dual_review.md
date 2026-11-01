@@ -99,32 +99,42 @@ Contract under <WritePromptContract/>. Its standing-instructions line names
 A broad review's prompt names its lens per <TeamReview/> and asks that lens's
 questions, plus its style assignment below; a closure review names no lens.
 
-The phase style review starts **owed**. Append this assignment to the
-`contract` reviewer's broad prompt, or to the next closure reviewer's prompt
-while it remains owed, with concrete paths and the baseline commit filled in:
-
-```
-## Phase style review
-
-Read ~/.claude/commands/unit/style_review.md in full and apply <StyleReview/>
-with since <phase_baseline commit> and <SESSION_DIR>/style/<phase id> as the
-diff directory. Save its table and result, including Off or an error, to
-<SESSION_DIR>/phase_style_review_<phase id>.md. Include every style finding
-and the report path in your normal review summary for <Synthesize/>.
-```
+The phase style review starts **owed**. While owed, dispatch the `contract`
+reviewer through `assign.sh --role review --style-since <phase_baseline commit>`
+with the normal phase, run, worktree and prompt options below. The director
+passes the option, never assignment text. The runner prepares fresh input
+from that baseline through the working tree, including untracked files. To
+pin a committed range and exclude other work in flight, also pass
+`--style-until <end commit>`; both commits are validated before dispatch.
+The runner saves input under the phase's `style/` folder,
+appends `config/review/style.md` once and
+saves the returned marked report as `${PHASE_DIR}/phase_style_review.md`.
+Its `style_review_state.json` records **complete** or **owed** and the input
+and report paths. Earlier pass inputs and reports remain in their directories.
+The reviewer stays read-only: preparation and report saving belong to the
+runner. See <StyleReview/> for the manual caller of the same helper.
 
 The assignment becomes **complete** only when a reviewer returns the report
-for this phase and baseline, with a finished result (findings, Pass, Off, or
-No changes to review) and includes its findings in the normal summary for
-<Synthesize/>. A canceled or failed dispatch, missing report, invalid baseline,
-or errored report leaves it owed, even if an artifact was written. Resume the
-assigned reviewer thread where possible; retain its completed guide load.
-Never assign style to two reviewers at once. Once complete, later reviewers
-check style repairs through existing finding ids without repeating the pass.
-The phase cannot converge while style is owed; if no repair needs closure,
-dispatch a reviewer for the owed assignment alone. The director reads the
-ledger and result for <RunSummary/> and never substitutes a guide load or rule
-walk.
+with a finished result (findings or Pass) and includes its findings in the
+normal review summary for <Synthesize/>. The runner completes Off or No
+changes to review without sending an assignment. A canceled or failed dispatch,
+missing markers, invalid baseline or errored report leaves it owed, even if an
+artifact was written. Preparation errors do not stop the code review.
+
+For an owed retry, use the same `--style-since` option on the next closure
+`assign.sh --role review` dispatch, with `--to` naming the same reviewer; it receives fresh input
+and retains its completed guide load. Keep `--style-until` too when reviewing
+a pinned range. The runner refuses a second style dispatch while the phase
+has a live owner, naming that dispatch; cancel or finish it before retrying.
+A dead launcher releases ownership on the next dispatch.
+Once complete, later reviewers check style repairs through finding ids
+without repeating the pass. The phase cannot converge while style is owed;
+if no repair needs closure, dispatch that reviewer with the owed assignment
+alone. The director reads the ledger and result for <RunSummary/> and never
+substitutes a guide load or rule walk. Early reviews cannot carry this option:
+style input requires the final phase diff.
+The alternate `review.sh` entry point accepts the same range options and uses the
+same preparation and capture module, `scripts/lint/style_review.py`.
 
 Every code review prompt, under any lens and in a closure review, also asks
 this, verbatim:
