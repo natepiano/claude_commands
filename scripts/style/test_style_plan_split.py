@@ -488,6 +488,18 @@ class AllStyleProductionsTests(unittest.TestCase):
             self.assertEqual((code, output.getvalue(), errors.getvalue()),
                              (0, "split-all: natedev build hold in force; skipped\n", ""))
 
+    def test_all_splits_healthy_productions_but_reports_incomplete_discovery(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            runner = self.runner(Path(folder), "healthy")
+            partial = showrunners.ShowrunnerDiscovery([runner], (
+                showrunners.ShowrunnerLookupFailure("missing", "fixture lookup failed"),))
+            with (mock.patch.object(showrunners, "registered_showrunners", return_value=partial),
+                  mock.patch.object(build_hold, "natedev_holds", return_value=build_hold.NatedevHolds(())),
+                  mock.patch.object(style_plan, "split_all", return_value=0) as split,
+                  redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO())):
+                self.assertEqual(style_plan.main(["split-all", "--all"]), 1)
+            split.assert_called_once_with(Path(runner["doc"]))
+
     def test_all_reports_a_discovery_failure_as_a_command_failure(self) -> None:
         output, errors = io.StringIO(), io.StringIO()
         with (mock.patch.object(showrunners, "registered_showrunners", side_effect=OSError("no timers")),

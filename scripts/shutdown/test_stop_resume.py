@@ -196,11 +196,11 @@ class StopResumeTests(unittest.TestCase):
 
     def drain_prompt_cancellations(self) -> None:
         with (patch.object(showrunners, "load_settings", return_value={}),
-              patch.object(showrunners, "registered_showrunners", return_value=[]),
+              patch.object(showrunners, "registered_showrunners", return_value=showrunners.ShowrunnerDiscovery()),
               patch.object(stall_watch, "processes", return_value=[]),
               patch.object(stall_watch, "prompt_grace_seconds", return_value=120),
               patch.object(unit_lookup, "read_run_states", return_value=unit_lookup.RunStates({}))):
-            stall_watch.tick(100)
+            _ = stall_watch.tick(100)
 
     def test_stop_requests_prompt_cancellation_before_returning_without_sending(self) -> None:
         log = self.prompt_retirement_fixture(alerted=True)

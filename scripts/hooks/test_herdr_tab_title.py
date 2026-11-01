@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import math
 import sys
 import tempfile
 import unittest
@@ -94,10 +95,12 @@ class HerdrTabTitleTests(unittest.TestCase):
                                    "label": "showrunner-fixer"}
         tab: dict[str, object] = {"tab_id": "w3:t2", "label": "showrunner-fixer"}
 
-        def result(_client: herdr.Herdr, *arguments: str) -> dict[str, object]:
+        def result(_client: herdr.Herdr, *arguments: str, deadline: float = math.inf) -> dict[str, object]:
+            del deadline
             return {"panes": [pane]} if arguments == ("pane", "list") else {"tabs": [tab]}
 
-        def run(_client: herdr.Herdr, *arguments: str) -> str:
+        def run(_client: herdr.Herdr, *arguments: str, deadline: float = math.inf) -> str:
+            del deadline
             target = pane if arguments[0] == "pane" else tab
             target["label"] = arguments[-1]
             return ""

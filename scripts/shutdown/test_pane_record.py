@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -82,8 +83,8 @@ class PaneRecordTests(unittest.TestCase):
     def test_seed_process_info_reads_only_selected_panes_and_defaults_to_all(self) -> None:
         client = FakeClient([{"pane_id": pane, "workspace_id": "w1"} for pane in ("w1:p1", "w1:p2", "w2:p1")])
         original = client.result
-        def result(*arguments: str) -> dict[str, object]:
-            return {"process_info": {"foreground_processes": []}} if arguments[:2] == ("pane", "process-info") else original(*arguments)
+        def result(*arguments: str, deadline: float = math.inf) -> dict[str, object]:
+            return {"process_info": {"foreground_processes": []}} if arguments[:2] == ("pane", "process-info") else original(*arguments, deadline=deadline)
         info = mock.Mock(side_effect=result)
         with mock.patch.object(herdr, "Herdr", return_value=client), mock.patch.object(client, "result", info):
             _ = pane_record.seed("agents", select=lambda pane: pane["pane_id"] == "w1:p2")

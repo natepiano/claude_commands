@@ -123,6 +123,15 @@ class Stretch(TypedDict):
     reported_status: str
 
 
+class PaneInspection(NamedTuple):
+    slug: str
+    configured: showrunners.Showrunner
+    zone: ZoneInfo
+    live: dict[str, str]
+    name: str
+    unit: unit_lookup.MarkedUnit
+
+
 class PromptWait(TypedDict):
     session_id: str
     created: float
@@ -510,6 +519,39 @@ def prompt_grace_seconds() -> float:
     except (KeyError, ValueError) as error:
         raise ValueError(f"invalid prompt_grace_seconds: {error}") from error
     return grace
+
+
+def delivery_reserve_seconds() -> float:
+    """Leave the configured part of the pass for alert delivery."""
+    try:
+        reserve = float(watch_config(status_defaults=True)["delivery_reserve_seconds"])
+        if not math.isfinite(reserve) or reserve < 0:
+            raise ValueError("expected a finite nonnegative number")
+        return reserve
+    except (OSError, KeyError, ValueError) as error:
+        print(f"stall-watch: invalid delivery reserve: {error}; using zero reserve", file=sys.stderr)
+        return 0.0
+
+
+def inspection_order(work: list[PaneInspection]) -> list[PaneInspection]:
+    """Start after the last pass's first attempt, even when that read exhausted its budget."""
+    work = sorted(work, key=lambda item: (item.slug, item.name))
+    cursor = ("", "")
+    try:
+        value = cast(object, json.loads((STATE_DIR / "inspection.cursor").read_text(encoding="utf-8")))
+        if not isinstance(value, dict):
+            raise ValueError("expected a production and unit")
+        fields = cast(dict[str, object], value)
+        slug, unit = fields.get("slug"), fields.get("unit")
+        if not isinstance(slug, str) or not slug or not isinstance(unit, str) or not unit:
+            raise ValueError("expected a production and unit")
+        cursor = (slug, unit)
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError) as error:
+        print(f"stall-watch: inspection cursor: {error}; starting at the first unit", file=sys.stderr)
+    first = next((index for index, item in enumerate(work) if (item.slug, item.name) > cursor), 0)
+    return work[first:] + work[:first]
 
 
 def retire_session_prompt(session_id: str) -> None:
@@ -916,10 +958,15 @@ def prompt_owner(slug: str, unit: str, socket: str, pane: str, prompt: PromptWai
     return delivery(prompt_path(slug, unit), "prompt-owner", socket, key, text)
 
 
+def saved_stretch(path: Path) -> Stretch:
+    old = cast(Stretch, json.loads(path.read_text(encoding="utf-8")))
+    _ = old.setdefault("reported_status", "")
+    return old
+
+
 def read_stretch(path: Path, pane_hash: str, now: float) -> Stretch:
     try:
-        old = cast(Stretch, json.loads(path.read_text(encoding="utf-8")))
-        _ = old.setdefault("reported_status", "")
+        old = saved_stretch(path)
         if (old["pane_hash"] == pane_hash or old["bump_sent"] or old["tell_sent"]
                 or old.get("reported_status")):
             return old
@@ -1015,7 +1062,15 @@ def retry_cases(now: float, *, deadline: float = math.inf) -> None:
                 save_prompt(path, prompt)
 
 
-def tick(now: float, *, deadline: float = math.inf) -> None:
+def pane_budget_left(name: str, deadline: float) -> bool:
+    """Expired inspection never changes a unit's saved prompt or idle stretch."""
+    if time.monotonic() < deadline:
+        return True
+    print(f"stall-watch: {name}: pane inspection deadline exhausted; state retained", file=sys.stderr)
+    return False
+
+
+def tick(now: float, *, deadline: float = math.inf) -> int:
     deadline = min(deadline, time.monotonic() + 110)
     PROMPT_WARNINGS.clear()
     pending = reconcile_prompts()
@@ -1027,18 +1082,17 @@ def tick(now: float, *, deadline: float = math.inf) -> None:
     except (OSError, ValueError) as error:
         print(f"stall-watch: using zero prompt grace: {error}", file=sys.stderr)
         grace = 0
+    inspection_deadline = deadline - delivery_reserve_seconds()
     rows = processes()
-    runners: list[showrunners.Showrunner] = []
+    runners = showrunners.ShowrunnerDiscovery()
     try:
         runs = unit_lookup.read_run_states()
     except (OSError, UnicodeError) as error:
         print(f"stall-watch: units: their run state is unknown: {error}", file=sys.stderr)
         runs = unit_lookup.RunStates({})
     else:
-        try:
-            runners = showrunners.registered_showrunners(deadline=deadline)
-        except TimeoutError as error:
-            print(f"stall-watch: discovery: {error}; work retained", file=sys.stderr)
+        runners = showrunners.registered_showrunners(deadline=inspection_deadline)
+    work: list[PaneInspection] = []
     for configured in runners:
         # A showrunner that is not running has no one to tell: its units are not watched.
         showrunner_socket = configured["socket"]
@@ -1059,106 +1113,122 @@ def tick(now: float, *, deadline: float = math.inf) -> None:
         except (OSError, UnicodeError, ValueError, production_units.Refusal) as error:
             print(f"stall-watch: {configured['slug']}: its units are not watched: {error}", file=sys.stderr)
             continue
-        for name, unit in marked.items():
-            if any(item.state_path == prompt_path(slug, name) for item in pending):
-                continue
-            # A unit is watched while the newest /unit:direct run in its worktree is unfinished.
-            running = name in live and runs.state(Path(live[name])) is unit_lookup.UnitState.RUNNING
-            if not running:
-                if (retire := forget(slug, name)) is not None:
-                    pending.append(retire)
-                continue
-            claude = unit.claude
-            if not isinstance(claude, unit_lookup.LiveClaude):
-                if isinstance(claude, unit_lookup.ClaudeUnknown):
-                    print(f"stall-watch: {name}: {claude.reason}", file=sys.stderr)
-                # A prompt is not on screen without its Claude.
-                elif (retire := end_prompt(slug, name)) is not None:
-                    pending.append(retire)
-                continue
-            observed_at = time.time()
-            if isinstance(prompt_record(prompt_path(slug, name)), InvalidPrompt):
-                continue
-            try:
-                pane = read_place(unit.place, 400, joined=True).strip()
-            except (OSError, HerdrFailure) as error:
-                print(f"stall-watch: {name}: {error}", file=sys.stderr)
-                continue
-            pid, session_id, socket = claude.pid, claude.session_id, claude.socket
-            path = stretch_path(slug, name)
-            waiting = prompt_path(slug, name)
-            # None: herdr cannot say, so the unit is watched as not blocked, and its prompt is not ended.
-            blocked: bool | None
-            try:
-                blocked = agent_status(unit.place) == BLOCKED
-            except (OSError, HerdrFailure) as error:
-                print(f"stall-watch: {name}: its herdr state is unknown: {error}", file=sys.stderr)
-                blocked = None
-            if blocked:
-                # It waits on the user, not on itself: the idle clock starts again after the prompt.
-                save_stretch(path, Stretch(pane_hash=hashlib.sha256(pane.encode()).hexdigest(), since=now,
-                                           bump_sent=False, tell_sent=False, reported_status=""))
-                # Claude Code denies a prompt with the auto-deny banner by itself: the user gets no alert.
-                if auto_denied(pane):
-                    if (retire := end_prompt(slug, name)) is not None:
-                        pending.append(retire)
-                    continue
-                call = pending_tool(session_id)
-                prompt = read_prompt(waiting, now, session_id, prompt_key(slug, name), observed_at, call)
-                save_prompt(waiting, prompt)
-                if prompt["retiring"]:
-                    pending.append(retire_alert(slug, name))
-                elif not prompt["retiring"] and now - prompt["since"] >= PROMPT_ALERT_SECONDS:
-                    if "told" not in prompt:
-                        pending.append(prompt_owner(slug, name, showrunner_socket, pane, prompt, call))
-                    if not prompt["alerted"] and now - prompt["since"] >= PROMPT_ALERT_SECONDS + grace:
-                        pending.append(prompt_alert(slug, name, pane, prompt["since"], zone, call,
-                                                    prompt_report(slug, name, session_id, call, prompt["since"])))
-                continue
-            if blocked is not None and (retire := end_prompt(slug, name)) is not None:
+        work.extend(PaneInspection(slug, configured, zone, live, name, unit) for name, unit in marked.items())
+    inspection_started = False
+    for slug, configured, zone, live, name, unit in inspection_order(work):
+        showrunner_socket = configured["socket"]
+        if any(item.state_path == prompt_path(slug, name) for item in pending):
+            continue
+        # A unit is watched while the newest /unit:direct run in its worktree is unfinished.
+        running = name in live and runs.state(Path(live[name])) is unit_lookup.UnitState.RUNNING
+        if not running:
+            if (retire := forget(slug, name)) is not None:
                 pending.append(retire)
-            stretch = read_stretch(path, hashlib.sha256(pane.encode()).hexdigest(), now)
-            turns = list(TURN_END.finditer(pane))
-            turn = turns[-1] if turns else transcript_turn_end(session_id)
-            last = turn.group("status").strip() if turn else "none on screen"
-            try:
-                deferred = bool(turn) and status_defers_bump(last, (*(live.keys() - {name}), configured["session"], slug))
-            except (OSError, UnicodeError, KeyError, ValueError, re.error, IndexError) as error:
-                print(f"stall-watch: {name}: no bump: invalid status rule: {error}", file=sys.stderr)
+            continue
+        claude = unit.claude
+        if not isinstance(claude, unit_lookup.LiveClaude):
+            if isinstance(claude, unit_lookup.ClaudeUnknown):
+                print(f"stall-watch: {name}: {claude.reason}", file=sys.stderr)
+            # A prompt is not on screen without its Claude.
+            elif (retire := end_prompt(slug, name)) is not None:
+                pending.append(retire)
+            continue
+        observed_at = time.time()
+        path = stretch_path(slug, name)
+        if isinstance(prompt_record(prompt_path(slug, name)), InvalidPrompt):
+            continue
+        if not pane_budget_left(name, inspection_deadline):
+            continue
+        if not inspection_started:
+            # Progress belongs to the attempted read, independent of its alert state or outcome.
+            write_text_atomic(STATE_DIR / "inspection.cursor", json.dumps({"slug": slug, "unit": name}) + "\n")
+            inspection_started = True
+        try:
+            pane = read_place(unit.place, 400, joined=True, deadline=inspection_deadline).strip()
+        except (OSError, HerdrFailure) as error:
+            print(f"stall-watch: {name}: {error}", file=sys.stderr)
+            continue
+        pid, session_id, socket = claude.pid, claude.session_id, claude.socket
+        waiting = prompt_path(slug, name)
+        # None: herdr cannot say, so the unit is watched as not blocked, and its prompt is not ended.
+        blocked: bool | None
+        if not pane_budget_left(name, inspection_deadline):
+            continue
+        try:
+            blocked = agent_status(unit.place, deadline=inspection_deadline) == BLOCKED
+        except (OSError, HerdrFailure) as error:
+            print(f"stall-watch: {name}: its herdr state is unknown: {error}", file=sys.stderr)
+            if time.monotonic() >= inspection_deadline:
                 continue
-            # A hold that states when it ends waits like a gate until then; the idle clock starts after it.
-            held_until = (stated_hold_end(turn.group(0), now, zone)
-                          if turn and turn.group("kind") == HOLDING_KIND else None)
-            if deferred or (turn and (turn.group("kind") in WAITING_KINDS or (held_until is not None and held_until > now))
-                            and not context_near_compaction(session_id)):
-                stretch = Stretch(pane_hash=hashlib.sha256(pane.encode()).hexdigest(), since=now,
-                                  bump_sent=False, tell_sent=False, reported_status="")
-                save_stretch(path, stretch)
+            blocked = None
+        if not pane_budget_left(name, inspection_deadline):
+            continue
+        if blocked:
+            # It waits on the user, not on itself: the idle clock starts again after the prompt.
+            save_stretch(path, Stretch(pane_hash=hashlib.sha256(pane.encode()).hexdigest(), since=now,
+                                       bump_sent=False, tell_sent=False, reported_status=""))
+            # Claude Code denies a prompt with the auto-deny banner by itself: the user gets no alert.
+            if auto_denied(pane):
+                if (retire := end_prompt(slug, name)) is not None:
+                    pending.append(retire)
                 continue
-            running_work = work_running(pid, rows, (slug, unit.unit))
-            if running_work or (stretch["reported_status"] and last != stretch["reported_status"]):
-                stretch = Stretch(pane_hash=hashlib.sha256(pane.encode()).hexdigest(), since=now,
-                                  bump_sent=False, tell_sent=False, reported_status="")
-            elif not stretch["reported_status"]:
-                stretch["since"] = max(stretch["since"], min(latest_transcript_activity(session_id), now))
+            call = pending_tool(session_id)
+            prompt = read_prompt(waiting, now, session_id, prompt_key(slug, name), observed_at, call)
+            save_prompt(waiting, prompt)
+            if prompt["retiring"]:
+                pending.append(retire_alert(slug, name))
+            elif not prompt["retiring"] and now - prompt["since"] >= PROMPT_ALERT_SECONDS:
+                if "told" not in prompt:
+                    pending.append(prompt_owner(slug, name, showrunner_socket, pane, prompt, call))
+                if not prompt["alerted"] and now - prompt["since"] >= PROMPT_ALERT_SECONDS + grace:
+                    pending.append(prompt_alert(slug, name, pane, prompt["since"], zone, call,
+                                                prompt_report(slug, name, session_id, call, prompt["since"])))
+            continue
+        if blocked is not None and (retire := end_prompt(slug, name)) is not None:
+            pending.append(retire)
+        stretch = read_stretch(path, hashlib.sha256(pane.encode()).hexdigest(), now)
+        turns = list(TURN_END.finditer(pane))
+        turn = turns[-1] if turns else transcript_turn_end(session_id)
+        last = turn.group("status").strip() if turn else "none on screen"
+        try:
+            deferred = bool(turn) and status_defers_bump(last, (*(live.keys() - {name}), configured["session"], slug))
+        except (OSError, UnicodeError, KeyError, ValueError, re.error, IndexError) as error:
+            print(f"stall-watch: {name}: no bump: invalid status rule: {error}", file=sys.stderr)
+            continue
+        # A hold that states when it ends waits like a gate until then; the idle clock starts after it.
+        held_until = (stated_hold_end(turn.group(0), now, zone)
+                      if turn and turn.group("kind") == HOLDING_KIND else None)
+        if deferred or (turn and (turn.group("kind") in WAITING_KINDS or (held_until is not None and held_until > now))
+                        and not context_near_compaction(session_id)):
+            stretch = Stretch(pane_hash=hashlib.sha256(pane.encode()).hexdigest(), since=now,
+                              bump_sent=False, tell_sent=False, reported_status="")
             save_stretch(path, stretch)
-            since = stretch["since"]
-            if now - since < settings["stall_minutes"] * 60 or running_work:
-                continue
-            since_text = datetime.fromtimestamp(since, zone).strftime("%H:%M %Z")
-            key = f"stall-watch:{name}:{int(since)}"
-            if not stretch["reported_status"]:
-                stretch["reported_status"] = last
-                save_stretch(path, stretch)
-            if not stretch["bump_sent"]:
-                text = (f"stall-watch: you have been idle since {since_text} with nothing running. "
-                        "Continue your run; if you are waiting on someone, say on whom in one line.")
-                pending.append(delivery(path, "bump", socket, f"{key}:bump", text))
-            if not stretch["tell_sent"] and showrunner_socket:
-                text = f"{name} idle since {since_text}, nothing running; bumped. Last status: {last}"
-                pending.append(delivery(path, "tell", showrunner_socket, f"{key}:tell", text))
+            continue
+        running_work = work_running(pid, rows, (slug, unit.unit))
+        if running_work or (stretch["reported_status"] and last != stretch["reported_status"]):
+            stretch = Stretch(pane_hash=hashlib.sha256(pane.encode()).hexdigest(), since=now,
+                              bump_sent=False, tell_sent=False, reported_status="")
+        elif not stretch["reported_status"]:
+            stretch["since"] = max(stretch["since"], min(latest_transcript_activity(session_id), now))
+        save_stretch(path, stretch)
+        since = stretch["since"]
+        if now - since < settings["stall_minutes"] * 60 or running_work:
+            continue
+        since_text = datetime.fromtimestamp(since, zone).strftime("%H:%M %Z")
+        key = f"stall-watch:{name}:{int(since)}"
+        if not stretch["reported_status"]:
+            stretch["reported_status"] = last
+            save_stretch(path, stretch)
+        if not stretch["bump_sent"]:
+            text = (f"stall-watch: you have been idle since {since_text} with nothing running. "
+                    "Continue your run; if you are waiting on someone, say on whom in one line.")
+            pending.append(delivery(path, "bump", socket, f"{key}:bump", text))
+        if not stretch["tell_sent"] and showrunner_socket:
+            text = f"{name} idle since {since_text}, nothing running; bumped. Last status: {last}"
+            pending.append(delivery(path, "tell", showrunner_socket, f"{key}:tell", text))
     send_all(pending, now, deadline=deadline)
     finish_cancellations(cancellations.requests)
+    return runners.exit_code
 
 
 def main() -> int:
@@ -1170,10 +1240,10 @@ def main() -> int:
             return 0
         began = time.monotonic()
         now = float(os.environ.get("STALL_WATCH_NOW_EPOCH") or time.time())
-        tick(now, deadline=began + 110)
+        exit_code = tick(now, deadline=began + 110)
         # The pass also reminds the owner of each permission case still open after 30 minutes.
         rca.remind(datetime.fromtimestamp(now, ZoneInfo("UTC")), deadline=began + 110)
-    return 0
+    return exit_code
 
 
 if __name__ == "__main__":

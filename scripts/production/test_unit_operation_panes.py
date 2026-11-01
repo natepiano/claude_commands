@@ -1,6 +1,7 @@
 """Unit operations close only the unit's exact session-qualified pane after stopping."""
 from __future__ import annotations
 
+import math
 import os
 import sys
 import tempfile
@@ -64,10 +65,10 @@ class UnitOperationPaneTests(unittest.TestCase):
         self.assertEqual([row.place for row in herdr.herdr_processes() if row.pid == 991555],
                          [herdr.HerdrPlace('other', 'w1:p1')])
         run = herdr.Herdr.run
-        def close_after_cleanup(client: herdr.Herdr, *arguments: str) -> str:
+        def close_after_cleanup(client: herdr.Herdr, *arguments: str, deadline: float = math.inf) -> str:
             if arguments[:2] == ('pane', 'close'):
                 self.assertEqual(self.pane.lifecycle, ['workers cleaned'])
-            return run(client, *arguments)
+            return run(client, *arguments, deadline=deadline)
         with mock.patch.object(herdr.Herdr, 'run', close_after_cleanup):
             self.stop()
         self.assertEqual(self.pane.close_calls(), [['--session','agents','pane','close','w1:p1']])

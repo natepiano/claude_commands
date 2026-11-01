@@ -395,7 +395,7 @@ def resolve(production: str, session: str = "") -> BoardSubtree | NoBoardSubtree
         return NoBoardSubtree()
     if root is None:
         return NoBoardSubtree()
-    by_slug = {runner["slug"]: runner for runner in showrunners.registered_showrunners()}
+    by_slug = {runner["slug"]: runner for runner in showrunners.require_complete(showrunners.registered_showrunners())}
     slugs = {row.id: slug for slug, row in members.items()}
     boards: list[showrunners.Showrunner] = []
     level = [root]
@@ -453,7 +453,7 @@ def main(arguments: list[str]) -> int:
             files.append(str(path))
     watch_sources = {showrunners.NOTIFIER_STATE_DIR, showrunners.SHOWRUNNER_STATE_DIR}
     watch_sources.update(showrunners.SHOWRUNNER_STATE_DIR / runner["slug"]
-                         for runner in showrunners.registered_showrunners())
+                         for runner in showrunners.require_complete(showrunners.registered_showrunners()))
     watch = existing_sources(watch_sources)
     print(json.dumps({"files": files, "watch": watch}))
     return 0

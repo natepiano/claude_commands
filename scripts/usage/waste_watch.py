@@ -178,7 +178,7 @@ def registered_showrunners() -> ShowrunnerLookup:
     from scripts.production import showrunners
 
     try:
-        runners = showrunners.registered_showrunners()
+        runners = showrunners.require_complete(showrunners.registered_showrunners())
     except OSError as error:
         return ShowrunnerLookupFailed(f"showrunner lookup failed: {' '.join(str(error).split())}")
     return ShowrunnersFound(tuple(

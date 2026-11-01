@@ -214,12 +214,15 @@ def registered_showrunners(
     )
     showrunners.SESSIONS_DIR = sessions_directory
     errors = io.StringIO()
+    registered: list[showrunners.Showrunner] = []
     try:
         with contextlib.redirect_stderr(errors):
-            registered = showrunners.registered_showrunners(state, known_sessions=known_sessions)
+            discovery = showrunners.registered_showrunners(state, known_sessions=known_sessions)
+        registered = list(discovery)
+        for failure in discovery.lookup_failures:
+            problem(problems, "showrunners", failure.diagnostic)
     except (OSError, ValueError) as error:
         problem(problems, "showrunners", error)
-        registered = []
     for line in errors.getvalue().splitlines():
         if line.strip():
             problem(problems, "showrunners", line.strip())

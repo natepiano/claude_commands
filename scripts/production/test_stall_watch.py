@@ -38,6 +38,7 @@ import fake_unit_host
 from fake_unit_host import HostedUnit
 import fake_herdr
 import stall_watch
+from session_pane import HerdrFailure, read_place, agent_status
 import context_usage
 import rca
 from cli_fixture import invoke_cli
@@ -452,12 +453,12 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
               mock.patch.object(stall_watch, "processes", return_value=[]),
               mock.patch.object(stall_watch, "STATE_DIR", self.state),
               mock.patch.object(showrunners, "load_settings", return_value={}),
-              mock.patch.object(showrunners, "registered_showrunners", return_value=runners),
+              mock.patch.object(showrunners, "registered_showrunners", return_value=showrunners.ShowrunnerDiscovery(runners)),
               mock.patch.object(lookup, "marked_units", return_value=marked),
               mock.patch.object(lookup, "read_run_states", wraps=lookup.read_run_states) as reads,
               mock.patch.object(stall_watch, "forget", return_value=None) as forget,
               mock.patch.object(stall_watch, "send_all") as send):
-            stall_watch.tick(START)
+            _ = stall_watch.tick(START)
             reads.assert_called_once_with()
             self.assertEqual(forget.call_count, 4)
             send.assert_called_once_with([], START, deadline=mock.ANY)
@@ -477,11 +478,206 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
                                   NOTIFIER_STATE_DIR=self.notifier),
               mock.patch.object(unit_lookup, "read_run_states", return_value=unit_lookup.RunStates({})),
               redirect_stderr(errors)):
-            stall_watch.tick(START + 60, deadline=began + 0.15)
+            _ = stall_watch.tick(START + 60, deadline=began + 0.15)
         self.assertLess(time.monotonic() - began, 1.5)
-        self.assertEqual(errors.getvalue().count("stall-watch: discovery:"), 1)
+        self.assertEqual(errors.getvalue().count("showrunners: skipping showrunner-showrunner:"), 1)
         self.assertEqual(self.prompt_state().read_text(), saved)
         self.assertEqual(self.sent(), [])
+
+    def test_failed_production_discovery_still_alerts_the_healthy_production(self) -> None:
+        self.assertEqual(self.tick(START).returncode, 0)
+        self.configure({"aaa-stalled": [], "showrunner": ["unit-one"]})
+        self.production("aaa-stalled", (), target="session:stalled-id",
+                        doc=self.root / "aaa-stalled-production.md")
+        original = showrunners.socket_for
+
+        def lookup(target: str, *, deadline: float) -> str | None:
+            if target == "session:stalled-id":
+                raise TimeoutError("fixture lookup timed out; retained")
+            return original(target, deadline=deadline)
+
+        with mock.patch.object(showrunners, "socket_for", side_effect=lookup):
+            result = self.tick(START + 300)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stderr.count("fixture lookup timed out; retained"), 1)
+        self.assertEqual(len(self.sent()), 2)
+        self.assertEqual({item["to"] for item in self.sent()},
+                         {f"uds:{self.root / 'sid-unit-one.sock'}", f"uds:{self.root / 'show-id.sock'}"})
+
+    def test_slow_discovery_and_inspection_keep_skipped_state_for_the_next_pass(self) -> None:
+        _ = self.unit("unit-two")
+        self.configure({"showrunner": ["unit-one", "unit-two"]})
+        for pane in self.panes.values():
+            pane.update(pane=EDIT_PROMPT, agent_status="blocked")
+        self.assertEqual(self.tick(START).returncode, 0)
+        saved = {path: path.read_bytes() for path in self.state.glob("*.json")}
+        original = showrunners.registered_showrunners
+        for stage in ("text", "status"):
+            (self.state / "inspection.cursor").unlink(missing_ok=True)
+            clock = [0.0]
+
+            def discover(*, deadline: float) -> showrunners.ShowrunnerDiscovery:
+                found = original(deadline=deadline)
+                clock[0] = 98.0
+                return found
+
+            def inspect(place: unit_lookup.Place, *arguments: object, **keywords: object) -> str:
+                self.assertEqual(place.pane, "w1:p1")
+                self.assertTrue(arguments)
+                self.assertEqual(keywords["deadline"], 100.0)
+                if stage == "text":
+                    clock[0] = 100.0
+                    raise HerdrFailure("fixture pane deadline exhausted")
+                return EDIT_PROMPT
+
+            def status(place: unit_lookup.Place, *, deadline: float) -> str:
+                self.assertEqual(place.pane, "w1:p1")
+                self.assertEqual(deadline - clock[0], 2.0)
+                clock[0] = deadline
+                raise HerdrFailure("fixture status deadline exhausted")
+
+            with (self.subTest(stage=stage),
+                  mock.patch.object(time, "monotonic", side_effect=lambda: clock[0]),
+                  mock.patch.object(showrunners, "monotonic", side_effect=lambda: clock[0]),
+                  mock.patch.object(showrunners, "registered_showrunners", side_effect=discover),
+                  mock.patch.object(stall_watch, "read_place", side_effect=inspect) as reads,
+                  mock.patch.object(stall_watch, "agent_status", side_effect=status) as statuses):
+                result = self.tick(START + 60)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertLessEqual(clock[0], 110.0)
+                self.assertEqual(reads.call_count, 1)
+                self.assertEqual(statuses.call_count, int(stage == "status"))
+                self.assertEqual(result.stderr.count("stall-watch: unit-one:"), 1)
+                self.assertEqual(result.stderr.count("stall-watch: unit-two:"), 1)
+                self.assertEqual({path: path.read_bytes() for path in self.state.glob("*.json")}, saved)
+                self.assertEqual(self.sent(), [])
+        with (mock.patch.object(stall_watch, "read_place", wraps=read_place) as reads,
+              mock.patch.object(stall_watch, "agent_status", wraps=agent_status) as statuses):
+            result = self.tick(START + 61)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(reads.call_count, 2)
+        self.assertEqual(statuses.call_count, 2)
+        self.assertEqual(len(self.prompt_notices()), 2)
+        self.assertEqual(len(self.prompt_followups()), 2)
+
+    def test_exhausted_first_attempt_rotates_without_changing_alert_state(self) -> None:
+        _ = self.unit("unit-two")
+        self.configure({"showrunner": ["unit-one", "unit-two"]})
+        self.assertEqual(self.tick(START).returncode, 0)
+        saved = {path: path.read_bytes() for path in self.state.glob("*.json")}
+        original = showrunners.registered_showrunners
+        for stage in ("text", "status", "text-failure", "status-failure"):
+            with self.subTest(stage=stage):
+                for path, content in saved.items():
+                    _ = path.write_bytes(content)
+                _ = self.send_log.write_text("")
+                (self.state / "inspection.cursor").unlink(missing_ok=True)
+                clock = [0.0]
+                reads: list[str] = []
+
+                def discover(*, deadline: float) -> showrunners.ShowrunnerDiscovery:
+                    found = original(deadline=deadline)
+                    clock[0] = 98.0
+                    return found
+
+                def inspect(place: unit_lookup.Place, *arguments: object, **keywords: object) -> str:
+                    del arguments
+                    reads.append(place.pane)
+                    if place.pane == "w1:p1" and stage.startswith("text"):
+                        clock[0] = cast(float, keywords["deadline"])
+                        if stage.endswith("failure"):
+                            raise HerdrFailure("fixture text deadline exhausted")
+                    return PANE
+
+                def status(place: unit_lookup.Place, *, deadline: float) -> str:
+                    if place.pane == "w1:p1" and stage.startswith("status"):
+                        clock[0] = deadline
+                        if stage.endswith("failure"):
+                            raise HerdrFailure("fixture status deadline exhausted")
+                    return "idle"
+
+                for pass_number in range(2):
+                    clock[0] = 0.0
+                    reads.clear()
+                    with (mock.patch.object(time, "monotonic", side_effect=lambda: clock[0]),
+                          mock.patch.object(showrunners, "monotonic", side_effect=lambda: clock[0]),
+                          mock.patch.object(showrunners, "registered_showrunners", side_effect=discover),
+                          mock.patch.object(stall_watch, "read_place", side_effect=inspect),
+                          mock.patch.object(stall_watch, "agent_status", side_effect=status)):
+                        result = self.tick(START + 300 + pass_number)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertLessEqual(clock[0], 100.0)
+                    slow = self.state / (hashlib.sha256(b"showrunner\0unit-one").hexdigest() + ".json")
+                    self.assertEqual(slow.read_bytes(), saved[slow])
+                    if pass_number == 0:
+                        self.assertEqual(reads, ["w1:p1"])
+                        self.assertEqual({path: path.read_bytes() for path in saved}, saved)
+                        self.assertEqual(self.sent(), [])
+                    else:
+                        self.assertEqual(reads[0], "w2:p1")
+                        self.assertEqual(len(self.sent()), 2, "a found alert must use this pass's reserve")
+                        self.assertIn(f"uds:{self.root / 'sid-unit-two.sock'}", {item["to"] for item in self.sent()})
+
+    def test_persistently_slow_leading_panes_cannot_starve_later_alerts(self) -> None:
+        names = ["unit-one", *(f"unit-{number}" for number in range(2, 14))]
+        for name in names[1:]:
+            _ = self.unit(name)
+        self.configure({"showrunner": names})
+        self.assertEqual(self.tick(START).returncode, 0)
+        clock = [0.0]
+        inspected: list[str] = []
+        ordered_panes = [f"w{names.index(name) + 1}:p1" for name in sorted(names)]
+        previous_first = ordered_panes[0]
+
+        def slow(place: unit_lookup.Place, *arguments: object, **keywords: object) -> str:
+            del arguments, keywords
+            inspected.append(place.pane)
+            clock[0] += 10.0
+            return PANE
+
+        for pass_number in range(len(names)):
+            clock[0] = 0.0
+            inspected.clear()
+            with (mock.patch.object(time, "monotonic", side_effect=lambda: clock[0]),
+                  mock.patch.object(showrunners, "monotonic", side_effect=lambda: clock[0]),
+                  mock.patch.object(stall_watch, "read_place", side_effect=slow),
+                  mock.patch.object(stall_watch, "agent_status", return_value="idle")):
+                result = self.tick(START + 300 + pass_number)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertLessEqual(clock[0], 100.0)
+            if pass_number == 0:
+                self.assertEqual(len(self.sent()), 18, "alerts found in this pass must use its reserve")
+            expected = ordered_panes[(ordered_panes.index(previous_first) + 1) % len(names)]
+            self.assertEqual(inspected[0], expected, "the last pass's first attempt yields to its successor")
+            previous_first = inspected[0]
+        self.assertEqual(len(self.sent()), len(names) * 2)
+        self.assertEqual({item["to"] for item in self.sent() if item["to"] != f"uds:{self.root / 'show-id.sock'}"},
+                         {f"uds:{self.root / ('sid-' + name + '.sock')}" for name in names})
+
+    def test_failed_leading_reads_do_not_starve_a_healthy_pane(self) -> None:
+        names = ["unit-one", *(f"unit-{number}" for number in range(2, 14))]
+        for name in names[1:]:
+            _ = self.unit(name)
+        self.configure({"showrunner": names})
+        self.assertEqual(self.tick(START).returncode, 0)
+        clock = [0.0]
+
+        def inspect(place: unit_lookup.Place, *arguments: object, **keywords: object) -> str:
+            del arguments, keywords
+            clock[0] += 10.0
+            if place.pane != "w13:p1":
+                raise HerdrFailure("fixture reader unavailable")
+            return PANE
+
+        for pass_number in range(len(names)):
+            clock[0] = 0.0
+            with (mock.patch.object(time, "monotonic", side_effect=lambda: clock[0]),
+                  mock.patch.object(showrunners, "monotonic", side_effect=lambda: clock[0]),
+                  mock.patch.object(stall_watch, "read_place", side_effect=inspect),
+                  mock.patch.object(stall_watch, "agent_status", return_value="idle")):
+                self.assertEqual(self.tick(START + 300 + pass_number).returncode, 0)
+        self.assertEqual(len(self.sent()), 2)
+        self.assertIn(f"uds:{self.root / 'sid-unit-13.sock'}", {item["to"] for item in self.sent()})
 
     def test_a_herdr_unit_is_watched_through_a_joined_400_line_read(self) -> None:
         self.panes["unit-one"]["label"] = "native"
@@ -768,8 +964,9 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
         _ = transcript.write_text(tool_call("Edit", {"file_path": "note.txt"}, START - 300))
         wall = [float(START)]
 
-        def stop_after_status(*arguments: object) -> str:
+        def stop_after_status(*arguments: object, **keywords: object) -> str:
             self.assertTrue(arguments)
+            self.assertTrue(keywords)
             wall[0] = START + 1
             self.stop_unit().unlink()
             self.panes.clear()

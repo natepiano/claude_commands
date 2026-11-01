@@ -107,8 +107,8 @@ class UnitWatchdogTests(unittest.TestCase):
         _ = self.enterContext(patch.object(sessions, "session_liveness", side_effect=self.session_liveness))
         _ = self.enterContext(patch.object(unit_lookup, "runs_dir", return_value=self.runs))
         _ = self.enterContext(patch.object(unit_lookup, "every_marked_unit", side_effect=self.marked))
-        _ = self.enterContext(patch.object(showrunners, "registered_showrunners", return_value=[
-            showrunners.Showrunner(session="fixture-showrunner", socket="/fixture.sock", slug="fixture", zone="UTC", doc=str(self.doc))]))
+        _ = self.enterContext(patch.object(showrunners, "registered_showrunners", return_value=showrunners.ShowrunnerDiscovery([
+            showrunners.Showrunner(session="fixture-showrunner", socket="/fixture.sock", slug="fixture", zone="UTC", doc=str(self.doc))])))
         _ = self.enterContext(patch.object(showrunners, "tell", side_effect=self.tell))
         _ = self.enterContext(patch.object(quota_alert, "tell_user", return_value=quota_alert.PushSent()))
         _ = self.enterContext(patch.object(subprocess, "run", side_effect=self.command))
@@ -215,6 +215,28 @@ class UnitWatchdogTests(unittest.TestCase):
         self.commands.clear()
         failure = unit_watchdog._restart(source.label, source.session["session_id"], source.identity)  # pyright: ignore[reportPrivateUsage]
         return failure, self.commands
+
+    def test_partial_discovery_keeps_unobserved_recovery_and_checks_healthy_units(self) -> None:
+        _ = self.add_unit("alpha")
+        self.die("alpha")
+        _ = self.pass_at(0)
+        saved = unit_watchdog._read_state()  # pyright: ignore[reportPrivateUsage]
+        saved["missing"] = unit_watchdog.DownOutage(
+            first_seen=NOW.isoformat(), alert_context=unit_watchdog.RecoveryOwner(production="missing", unit="beta"),
+            job=unit_watchdog.RecoveryJob(result=str(self.home / "pending-result"), started=NOW.isoformat(), source="fixture"))
+        unit_watchdog._write_state(saved)  # pyright: ignore[reportPrivateUsage]
+        runner = showrunners.Showrunner(session="fixture-showrunner", socket="/fixture.sock", slug="fixture",
+                                       zone="UTC", doc=str(self.doc))
+        partial = showrunners.ShowrunnerDiscovery([runner], (
+            showrunners.ShowrunnerLookupFailure("missing", "fixture lookup unavailable"),))
+        with patch.object(showrunners, "registered_showrunners", return_value=partial):
+            with self.assertRaisesRegex(OSError, "fixture lookup unavailable"):
+                _ = self.pass_at(2)
+        current = unit_watchdog._read_state()  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(current["missing"], saved["missing"])
+        self.assertIn("job", current["alpha"], "the healthy production must still start recovery")
+        self.complete_jobs()
+        self.assertEqual(len(self.commands), 1)
 
     def test_interrupted_cleanup_resumes_without_sending_notices_to_live_sessions(self) -> None:
         for name in ("alpha", "beta", "gamma"):
