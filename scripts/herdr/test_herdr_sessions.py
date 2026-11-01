@@ -213,6 +213,17 @@ class HerdrSessionsTests(unittest.TestCase):
                                            ["--session", "agents", "pane", "list"],
                                            ["--session", "other", "pane", "list"]])
 
+    def test_partial_discovery_does_not_mislabel_an_unknown_showrunner_standalone(self) -> None:
+        self.respond(["agents"], tabs=("unknown",))
+        self.server(100, "agents")
+        self.claude(101, 100, "director", pane="w1:p1")
+        partial = showrunners.ShowrunnerDiscovery([], (
+            showrunners.ShowrunnerLookupFailure("director", "fixture lookup failed"),))
+        with patch.object(herdr_sessions, "registered_showrunners", return_value=partial):
+            code, output, errors = self.call("list")
+        self.assertEqual((code, output), (3, ""))
+        self.assertIn("fixture lookup failed", errors)
+
     def test_unit_role_takes_precedence_over_showrunner(self) -> None:
         self.respond(["agents"], tabs=("unit",))
         self.server(100, "agents")

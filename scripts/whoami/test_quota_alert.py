@@ -17,6 +17,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.whoami import quota_alert_test_support as support
 import quota_alert
+from scripts.production import showrunners
 from scripts.whoami import agent_accounts
 from scripts.whoami.agent_accounts import Quota, Report
 from scripts.whoami import usage_store
@@ -228,6 +229,12 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
                               self.now + timedelta(minutes=2))
         self.assertEqual(self.sent, [])
         self.assertEqual(self.noted[-1].values["account"], "codex2")
+
+    def test_partial_discovery_uses_the_unknown_inventory_fallback(self) -> None:
+        partial = showrunners.ShowrunnerDiscovery(running("healthy"), (
+            showrunners.ShowrunnerLookupFailure("missing", "fixture lookup failed"),))
+        with mock.patch.object(quota_alert, "registered_showrunners", return_value=partial):
+            self.assertEqual(quota_alert.showrunners_now(), [])
 
     def test_retained_notice_recipients_include_configured_sessions_and_showrunners_once(self) -> None:
         with (mock.patch.object(quota_alert, "recipients", REAL_RECIPIENTS),

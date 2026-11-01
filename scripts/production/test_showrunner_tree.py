@@ -21,6 +21,17 @@ from scripts.production import staff
 
 
 class ShowrunnerTreeTests(test_showrunners.ShowrunnerFixture):
+    def test_attach_refuses_unknown_liveness_instead_of_accepting_a_partial_inventory(self) -> None:
+        self.showrunner("top")
+        self.showrunner("kid")
+        partial = showrunners.ShowrunnerDiscovery([], (
+            showrunners.ShowrunnerLookupFailure("kid", "kid lookup failed"),))
+        with (mock.patch.object(showrunners, "registered_showrunners", return_value=partial),
+              mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", self.notifier)):
+            with self.assertRaisesRegex(OSError, "kid lookup failed"):
+                showrunner_tree.check_attach("kid", "top")
+        self.assertFalse((self.state / "kid/parent").exists())
+
     def test_attach_retries_routing_notices_after_the_parent_was_saved(self) -> None:
         self.showrunner("top")
         self.showrunner("mid")

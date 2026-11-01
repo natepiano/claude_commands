@@ -370,7 +370,11 @@ def refuse_running_children(slug: str, record: staff.StaffSnapshot) -> RunningSt
         children = showrunner_tree.stored_children(slug, record=record)
         styles: list[str] = []
         running: list[str] = []
-        for child in showrunners.registered_showrunners():
+        discovered = showrunners.registered_showrunners()
+        failures = [failure.reason for failure in discovered.lookup_failures if failure.production in children]
+        if failures:
+            raise OSError("; ".join(failures))
+        for child in discovered:
             if child["slug"] not in children or not child["socket"]:
                 continue
             lines = Path(child["doc"]).read_text(encoding="utf-8").splitlines()
