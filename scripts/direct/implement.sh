@@ -168,11 +168,6 @@ fi
 # rather than by path: the python3 on PATH is Apple 3.9 on the Mac, and this
 # repo needs >= 3.11.
 PY="${SCRIPT_DIR}/../lib/py"
-"$PY" "${SCRIPT_DIR}/worker_state.py" "${SESSION_DIR}"
-mkdir -p "${ARTIFACT_DIR}"
-# Every dispatch names the run's director in the run folder (unit_runs.py), which the
-# production tree reads: a marker names one run per director, and a director runs phases side by side.
-"$PY" "${SCRIPT_DIR}/../lib/unit_runs.py" record-director "${SESSION_DIR}" || true
 SUMMARY_FILE="${ARTIFACT_DIR}/impl_summary${SLOT}.txt"
 # Truncate at launch: the "done" post below names this path unconditionally, so a
 # worker that reports on the board without writing a summary would otherwise leave
@@ -203,7 +198,7 @@ if [[ ! "${COMPACT_ABOVE_TOKENS}" =~ ^[0-9]+$ ]] || (( COMPACT_ABOVE_TOKENS <= 0
 fi
 
 source "${SCRIPT_DIR}/../agents/agents_config.sh"
-if ! agents_resolve "${TASK}" 2>"${LOG_FILE}"; then
+if ! agents_resolve "${TASK}"; then
   exit 1
 fi
 CODEX_MESH="${UNIT_CODEX_MESH:-$(_agents_registry_get direct.options codex_mesh)}"
@@ -402,6 +397,16 @@ with worker_claim_lock(root):
             print(turn_id)
 PY
 }
+
+# Admission precedes claims, reservations and pass/artifact publication, including attach.
+if [[ "${AGENT_FAMILY}" == "claude" ]]; then
+  PYTHONPATH="${SCRIPT_DIR}/../..${PYTHONPATH:+:${PYTHONPATH}}" "$PY" -m scripts.production.worker_fill admit --name "${MESH_NAME}" --run "${SESSION_DIR}" || exit 2
+fi
+
+"$PY" "${SCRIPT_DIR}/worker_state.py" "${SESSION_DIR}"
+mkdir -p "${ARTIFACT_DIR}"
+# A director marker names one run, including phases running beside each other.
+"$PY" "${SCRIPT_DIR}/../lib/unit_runs.py" record-director "${SESSION_DIR}" || true
 
 if [[ -n "${FOLLOW_TO}" ]]; then
   export FOLLOW_LAUNCHER_PID="$$"

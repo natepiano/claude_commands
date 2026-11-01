@@ -26,6 +26,7 @@ from scripts.agents import codex_mesh
 from scripts.direct import workers
 from scripts.direct.worker_state import worker_claim_lock, worker_record_path
 from scripts.astra import design_roles
+from scripts.production import worker_admission
 from scripts.lib import tunables, unit_runs
 from scripts.usage.agents_log import LENSES
 
@@ -617,6 +618,12 @@ def main() -> int:
             return 3
         worker = resolved.stdout.strip()
         reservation = workers.allocation_for_follow(run, worker)
+    try:
+        _ = worker_admission.admit(worker, run)
+    except ValueError as error:
+        workers.release_allocation(run, worker, reservation)
+        print(str(error), file=sys.stderr)
+        return 2
     env["UNIT_TEAM_ROLE"] = worker
     env["UNIT_PASS_OWNER"] = "launcher"
     dispatch = Dispatch(args, run, cwd, prompt, phase, role, worker, family, model, effort, tier, env, reservation)

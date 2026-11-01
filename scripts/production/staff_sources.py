@@ -31,6 +31,7 @@ from scripts.production.showrunners import (  # noqa: E402
 )
 import unit_names  # noqa: E402
 from scripts.production import staff, unit_config  # noqa: E402
+from scripts.production.worker_admission import parent as worker_parent  # noqa: E402
 from scripts.direct import workers  # noqa: E402
 from scripts.astra import astra_roles, design_roles  # noqa: E402
 from scripts.lib import unit_runs, git_exclude  # noqa: E402
@@ -262,19 +263,28 @@ class _WorkerSources:
             environment = launch["environment"]
             staff_id = environment.get("STAFF_ID", "")
             row = self.record.by_id(staff.StaffId(staff_id)) if staff_id else None
-            if row is None and not staff_id and environment.get("SHOWRUNNER_UNIT_ID"):
-                found = self.sources.member(ObservedUnit(environment["SHOWRUNNER_UNIT_ID"]), self.record)
-                row = found.row if isinstance(found, MemberFound) else None
+            if (row is None or row.kind not in ("unit", "showrunner", "worker")) and environment.get("SHOWRUNNER_UNIT_ID"):
+                try:
+                    owner = self.recorded_owner(staff_id=staff_id, unit=environment["SHOWRUNNER_UNIT_ID"],
+                                                production=environment.get("SHOWRUNNER_UNIT", ""))
+                except (ValueError, staff.StaffUnreadable) as error:
+                    _problem(f"launch {launch['session_id']}", error)
+                    continue
+                self.sessions[launch["session_id"]] = owner
+                if isinstance(owner.match, staff.StaffRow):
+                    self.identities[owner.match.id] = {"claude": launch["session_id"]}
+                continue
             if row is not None:
                 self.identities[row.id] = {"claude": launch["session_id"]}
                 if row.kind != "worker":
                     self.sessions[launch["session_id"]] = WorkerOwner(f"staff:{row.id}", row)
-            elif not staff_id and environment.get("SHOWRUNNER_UNIT_ID"):
-                try:
-                    self.sessions[launch["session_id"]] = self.owner(UnitMember(
-                        environment.get("SHOWRUNNER_UNIT", ""), environment["SHOWRUNNER_UNIT_ID"]))
-                except ValueError:
-                    pass
+
+    def recorded_owner(self, *, staff_id: str = "", production: str = "", unit: str = "") -> WorkerOwner:
+        selected = worker_parent(self.record, self.sources, staff_id=staff_id,
+                                 production=production, unit=unit, pending=tuple(self.members.values()))
+        if isinstance(selected, staff.StaffRow):
+            return WorkerOwner(f"staff:{selected.id}", selected)
+        return WorkerOwner(selected.key, staff.NewSeedMember())
 
     def _record_run_owner(self, run: Path) -> WorkerOwner:
         director_path = run / unit_runs.DIRECTOR_FILE
@@ -284,8 +294,8 @@ class _WorkerSources:
             return self.sessions[director]
         state = self.read(run / workers.STATE)
         slug, unit = _text(state.get("production")), _text(state.get("unit"))
-        if slug and unit:
-            return self.owner(UnitMember(slug, unit))
+        if slug or unit:
+            return self.recorded_owner(production=slug, unit=unit)
         raise ValueError(f"director {director!r} has no staff parent")
 
     def _run_owner(self, run: Path) -> WorkerOwner:
@@ -337,27 +347,32 @@ class _WorkerSources:
                 name = _text(fields.get("name")) or key
                 # Reuse the ledger's decoder; its public locked reader also writes and recovers.
                 worker = workers._decode_worker(name, fields)  # pyright: ignore[reportPrivateUsage]
-                current = self.record.by_id(staff.StaffId(_text(fields.get("staff_id")) or key))
-                parent = owner
-                if current is not None and current.kind == "worker" and current.parent is not None:
-                    row = self.record.by_id(current.parent)
-                    if row is not None:
-                        parent = WorkerOwner(f"staff:{row.id}", row)
-                        name = current.name
-                if parent is None:
-                    try:
-                        parent = self.owner(UnitMember(path.parent.name, path.stem))
-                    except ValueError:
-                        # An adhoc stem is a worktree name and digest; `.claude-<digest>` names no unit.
-                        observed = ObservedUnit(path.stem)
-                        found = (self.sources.member(observed, self.record)
-                                 if unit_names.NAME.fullmatch(path.stem) else NoSuchMember(observed))
-                        if isinstance(found, MemberFound):
-                            parent = WorkerOwner(f"staff:{found.row.id}", found.row)
-                        elif isinstance(worker.ownership, workers.HeldBy):
-                            parent = self._run_owner(Path(worker.ownership.run))
-                        else:
-                            raise ValueError("worker ledger has no current staff parent")
+                try:
+                    current = self.record.by_id(staff.StaffId(_text(fields.get("staff_id")) or key))
+                    parent = owner
+                    if current is not None and current.kind == "worker" and current.parent is not None:
+                        row = self.record.by_id(current.parent)
+                        if row is not None:
+                            parent = WorkerOwner(f"staff:{row.id}", row)
+                            name = current.name
+                    if parent is None:
+                        try:
+                            parent = self.owner(UnitMember(path.parent.name, path.stem))
+                        except ValueError:
+                            # An adhoc stem is a worktree name and digest; `.claude-<digest>` names no unit.
+                            observed = ObservedUnit(path.stem)
+                            found = (self.sources.member(observed, self.record)
+                                     if unit_names.NAME.fullmatch(path.stem) else NoSuchMember(observed))
+                            if isinstance(found, MemberFound):
+                                parent = WorkerOwner(f"staff:{found.row.id}", found.row)
+                            elif isinstance(worker.ownership, workers.HeldBy):
+                                parent = self._run_owner(Path(worker.ownership.run))
+                            else:
+                                raise ValueError("worker ledger has no current staff parent")
+                except (ValueError, staff.StaffRefused, staff.StaffUnreadable, OSError):
+                    if isinstance(worker.ownership, (workers.Retired, workers.Adopted)):
+                        continue
+                    raise
                 self.ledger_names.add((parent.key, name))
                 if isinstance(worker.ownership, (workers.Retired, workers.Adopted)):
                     continue
@@ -372,7 +387,7 @@ class _WorkerSources:
                     self.add(WorkerObservation(name, parent, _role(worker.role), identity))
                 if isinstance(worker.ownership, workers.HeldBy):
                     self.runs.add(Path(worker.ownership.run))
-            except (ValueError, staff.StaffRefused, workers.WorkerUnavailable, OSError) as error:
+            except (ValueError, staff.StaffRefused, workers.WorkerUnavailable, OSError, staff.StaffUnreadable) as error:
                 _problem(f"{path} worker {key}", error)
 
     def run_live(self, run: Path) -> bool:
@@ -403,7 +418,7 @@ class _WorkerSources:
                 if isinstance(identity, BackendUnavailable):
                     _problem(f"{path} worker {name}", "worker backend is unavailable")
                 self.add(WorkerObservation(name, parent, _role(_text(entry.get("role"))), identity))
-            except (ValueError, OSError, staff.StaffRefused) as error:
+            except (ValueError, OSError, staff.StaffRefused, staff.StaffUnreadable) as error:
                 _problem(f"{path} worker {name}", error)
 
     def claude_workers(self, run: Path) -> None:
@@ -516,7 +531,7 @@ class _WorkerSources:
                 if (run / workers.ROSTER).exists():
                     self.roster(run)
                 self.claude_workers(run)
-            except (OSError, UnicodeError, ValueError) as error:
+            except (OSError, UnicodeError, ValueError, staff.StaffUnreadable) as error:
                 _problem(run, error)
         for path in sorted(design_roles.state_root().glob("*/design.json")):
             self.design(path.parent.name)

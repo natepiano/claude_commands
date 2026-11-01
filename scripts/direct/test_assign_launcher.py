@@ -148,6 +148,22 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
         return [cast(dict[str, object], json.loads(line)) for line in
                 (self.history / "runs" / f"{self.session_dir.name}.jsonl").read_text().splitlines()]
 
+    def test_dispatch_has_a_durable_worker_row_before_submitting_work(self) -> None:
+        from scripts.production import staff
+        _ = self.successful()
+        name = next(iter(self.assignment_records()))
+        rows = staff.snapshot().find(kind="worker", parent=staff.StaffId(os.environ["STAFF_ID"]))
+        self.assertEqual([row.name for row in rows], [name])
+
+    def test_unreadable_staff_starts_no_worker(self) -> None:
+        record = Path(os.environ["STAFF_FILE"])
+        _ = record.write_text("{broken")
+        result = self.launch()
+        self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
+        self.assertIn("staff: impl: not opened:", result.stderr)
+        self.assertEqual(self.methods("thread/start"), [])
+        self.assertEqual(record.read_text(), "{broken")
+
     def test_rerun_review_dispatch_keeps_its_lens_and_read_only_thread(self) -> None:
         _ = self.successful("review", "--lens", "rerun", "--pass", "1")
         starts = self.methods("thread/start")
