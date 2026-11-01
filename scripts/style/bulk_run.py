@@ -182,17 +182,19 @@ class RenameSources:
 
 
 def current_finding(ledger: ledger_api.Ledger, finding: ledger_api.HeldFinding, head: str,
-                   sources: RenameSources) -> ledger_api.HeldFinding | bulk.Refusal:
+                   sources: RenameSources, checkout: Path
+                   ) -> ledger_api.HeldFinding | bulk.Refusal:
     """Shared site lineage plus exact physical declaration bytes, before any edits.
 
     Whitespace and line terminators count. A follow is provenance, never a new judgment.
     If original coordinates cannot be recovered unambiguously, a worker must judge again.
+    The ledger owns lineage; the planner's checkout owns current physical bytes.
     """
     evidence = ledger.finding_site(finding, head)
     judged = ledger.judged_commit(finding)
     if not isinstance(evidence, ledger_api.UnchangedSite) or not isinstance(judged, ledger_api.JudgedCommit):
         return bulk.Refusal(finding.finding_id, "changed since judged: site lineage is not unchanged or the judged commit is missing")
-    path = ledger.repo / evidence.path
+    path = checkout / evidence.path
     if path.resolve() != path or not path.is_file() or path.suffix != ".rs":
         return bulk.Refusal(finding.finding_id, "finding path is not a regular Rust file")
     if evidence.path not in sources.current:
@@ -214,8 +216,9 @@ def current_finding(ledger: ledger_api.Ledger, finding: ledger_api.HeldFinding, 
 
 
 def current_rename(ledger: ledger_api.Ledger, finding: ledger_api.HeldFinding, head: str,
-                   sources: RenameSources) -> bulk.RenameFinding | bulk.Refusal:
-    current = current_finding(ledger, finding, head, sources)
+                   sources: RenameSources, checkout: Path
+                   ) -> bulk.RenameFinding | bulk.Refusal:
+    current = current_finding(ledger, finding, head, sources, checkout)
     if isinstance(current, bulk.Refusal):
         return current
     source = sources.current[current.path]
@@ -460,7 +463,7 @@ def plan_renames(repo: Path, ledger: ledger_api.Ledger, base: str, selected: Sel
     groups: dict[str, list[bulk.RenameFinding]] = defaultdict(list)
     for finding in selected.findings:
         try:
-            rename = current_rename(ledger, finding, base, sources)
+            rename = current_rename(ledger, finding, base, sources, repo)
             if isinstance(rename, bulk.Refusal):
                 refused[finding.finding_id] = rename.reason
             else:
@@ -486,7 +489,7 @@ def plan_constants(repo: Path, ledger: ledger_api.Ledger, base: str, selected: S
     refused: dict[str, str] = {}
     findings: list[ledger_api.HeldFinding] = []
     for finding in selected.findings:
-        current = current_finding(ledger, finding, base, sources)
+        current = current_finding(ledger, finding, base, sources, repo)
         if isinstance(current, bulk.Refusal):
             refused[finding.finding_id] = current.reason
         else:

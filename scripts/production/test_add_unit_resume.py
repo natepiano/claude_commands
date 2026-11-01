@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "shutdown"))
 import add_unit
 import production_units
 from unit_lookup import ProductionMembers, unit_is_retired
-from scripts.production import staff
+from scripts.production import staff, unit_config
 import launch_permission
 import unit_lookup
 import sessions
@@ -43,6 +43,24 @@ def setUpModule() -> None:
 
 @final
 class AddUnitResumeTests(AddUnitTestCase):
+    def test_resume_preserves_existing_config_settings_and_launches_with_the_same_staff_id(self) -> None:
+        self.commit_prepared_row(self.unit_row())
+        worktree = self.root / "project-alpha"
+        _ = self.git("worktree", "add", str(worktree), "-b", "build-followups-alpha")
+        row = unit_membership(fixture_showrunner_name("build-followups", self.doc), "alpha-unit")
+        row = staff.set_worktree(row.id, staff.PresentWorktree("natedev", worktree))
+        saved = unit_config.UnitConfig(unit_config.PlanFile(Path("docs/plans/given.md")),
+                                      unit_config.AppPort(8123), ("nightly-review", "build-check"))
+        unit_config.write(worktree, saved)
+        path = worktree / ".unit.toml"
+        before = path.read_bytes(), path.stat().st_mtime_ns
+        _ = self.successful("alpha", "--resume", "session-123", "--cwd", str(worktree))
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+        self.assertEqual(unit_config.read(worktree), saved)
+        self.assertEqual(staff.by_id(row.id), row)
+        self.assertEqual(self.pane_environment()["STAFF_ID"], row.id)
+        self.assertEqual(self.git("ls-files", ".unit.toml", cwd=worktree), "")
+
     def test_unreadable_staff_refuses_resume_before_closing_its_stopped_pane(self) -> None:
         prior = self.root / "prior-session"
         prior.mkdir()
@@ -124,6 +142,8 @@ class AddUnitResumeTests(AddUnitTestCase):
                 self.assertEqual(plan_cell_is_retired(plan_cell), expected)
 
     def test_retired_readers_use_marker_on_production_rows(self) -> None:
+        row = unit_membership(fixture_showrunner_name("build-followups", self.doc), "stalls-unit")
+        _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.root / "retired-stalls"))
         lines = [
             "## Units",
             "| Unit | Plan | Worktree | Branch | Session | Port | Owns |",
@@ -139,6 +159,8 @@ class AddUnitResumeTests(AddUnitTestCase):
                          ["enh-showrunner-unit", "model-study-unit"])
 
     def test_retired_units_include_retired_name_and_exclude_live_name(self) -> None:
+        row = unit_membership("show", "old-unit")
+        _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.root / "retired-old"))
         lines = [
             "## Units",
             "| Unit | Plan | Worktree | Branch | Session | Port | Owns |",
@@ -225,6 +247,11 @@ class AddUnitResumeTests(AddUnitTestCase):
         self.assertEqual(self.pane_environment()[unit_lookup.UNIT_MARK], "alpha-unit")
         self.assertIn(str(prior), self.opened())
         self.assertIn("attached session-123 as alpha-unit: one process, pid 202", result.stdout)
+        row = unit_membership(fixture_showrunner_name("build-followups", self.doc), "alpha-unit")
+        self.assertEqual(row.worktree, staff.PresentWorktree("natedev", self.root / "project-alpha"))
+        self.assertEqual(self.pane_environment()["STAFF_ID"], row.id)
+        self.assertEqual(unit_config.read(self.root / "project-alpha"),
+                         unit_config.UnitConfig(unit_config.PermanentPlan(), unit_config.NoAppPort(), ()))
 
     def test_attach_requires_cwd_supported_mode_and_exclusive_session_flag(self) -> None:
         document, head = self.doc.read_text(), self.git("rev-parse", "HEAD")
@@ -315,39 +342,49 @@ class AddUnitResumeTests(AddUnitTestCase):
                          f"add_unit: unit trunk-unit resumes in {elsewhere.resolve()}; its Units row names {recorded}\n")
         self.assert_no_launch_change(document, head)
 
-    def test_retired_plan_resumes_in_its_start_folder_without_recreating_the_worktree(self) -> None:
+    def test_retired_plan_resume_cannot_bypass_the_retained_row_restore(self) -> None:
         prior = self.root / "prior-session"
         prior.mkdir()
         self.commit_prepared_row(self.unit_row(
             plan=f"(retired 2026-10-28, worktree removed, session session-123, folder {prior}) "
                  + "`docs/plans/given.md` (run done)"))
+        row = unit_membership(fixture_showrunner_name("build-followups", self.doc), "alpha-unit")
+        row = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.root / "project-alpha"))
         before = self.repository_state()
         head = self.git("rev-parse", "HEAD")
 
         with patch.object(add_unit, "ensure_worktree") as worktree_step:
-            _ = self.successful("alpha", "--plan", "docs/plans/given.md", "--resume", "session-123",
-                                "--cwd", str(prior))
+            result = self.cli("alpha", "--plan", "docs/plans/given.md", "--resume", "session-123",
+                              "--cwd", str(prior))
 
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertEqual(result.stderr, "add_unit: unit alpha-unit is retired; resume that unit, "
+                         + "or remove it for good to free the name\n")
         worktree_step.assert_not_called()
         starts = [row for row in self.herdr_calls() if row[2:4] == ["agent", "start"]]
-        self.assertEqual(len(starts), 1)
-        self.assertEqual(starts[0][starts[0].index("--resume") + 1], "session-123")
-        self.assertEqual(self.opened()[self.opened().index("--cwd") + 1], str(prior))
+        self.assertEqual(starts, [])
+        self.assertEqual(staff.by_id(row.id), row)
         self.assertEqual(self.repository_state(), before)
         self.assertEqual(self.git("rev-parse", "HEAD"), head)
         self.assertFalse((self.root / "project-alpha").exists())
 
-    def test_retired_permanent_resume_ignores_an_existing_branch_without_a_worktree(self) -> None:
+    def test_retired_permanent_resume_keeps_the_existing_branch_and_refuses_admission(self) -> None:
         prior = self.root / "prior-session"
         prior.mkdir()
         self.commit_prepared_row(self.unit_row(
             plan="(retired 2026-10-28, worktree removed, session session-123) permanent"))
         _ = self.git("branch", "build-followups-alpha")
+        row = unit_membership(fixture_showrunner_name("build-followups", self.doc), "alpha-unit")
+        row = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.root / "project-alpha"))
         before = self.repository_state()
 
-        _ = self.successful("alpha", "--permanent", "--resume", "session-123", "--cwd", str(prior))
+        result = self.cli("alpha", "--permanent", "--resume", "session-123", "--cwd", str(prior))
 
-        self.assertEqual(self.opened()[self.opened().index("--cwd") + 1], str(prior))
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertEqual(result.stderr, "add_unit: unit alpha-unit is retired; resume that unit, "
+                         + "or remove it for good to free the name\n")
+        self.assertFalse(any(call[2:4] == ["agent", "start"] for call in self.herdr_calls()))
+        self.assertEqual(staff.by_id(row.id), row)
         self.assertEqual(self.repository_state(), before)
         self.assertFalse((self.root / "project-alpha").exists())
 
@@ -632,19 +669,23 @@ class RetiredRowTests(ShutdownTestCase):
             return unit_is_retired(cells, ProductionMembers("show")), asked.call_count
 
     def test_membership_lasts_until_the_staff_row_is_retired(self) -> None:
-        self.assertEqual(self.retired(self.linked, gone=False), (True, 0))
+        self.assertEqual(self.retired(self.linked, gone=False), (False, 0))
         row = unit_membership("show", "some-unit")
         for worktree in (self.missing, self.linked, self.main):
             for gone in (True, False):
                 with self.subTest(worktree=worktree, gone=gone):
                     self.assertEqual(self.retired(worktree, gone=gone), (False, 0))
         self.assertEqual(self.retired(self.linked, gone=False, plan="retired after completion"), (False, 0))
-        _ = staff.retire(row.id)
+        staff.defer_retire((row.id,))
+        _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.linked))
+        self.assertEqual(staff.retire_pending(), ())
         self.assertEqual(self.retired(self.linked, gone=False), (True, 0))
 
     def test_a_whole_table_reads_one_snapshot_and_no_herdr_membership(self) -> None:
         lines = [*OLD_HEADER, self.row("first", self.missing), self.row("second", self.missing)]
         _ = unit_membership("show", "second-unit")
+        first = unit_membership("show", "first-unit")
+        _ = staff.set_worktree(first.id, staff.RemovedWorktree("natedev", self.missing))
         with (patch.object(unit_lookup, "marked_units", side_effect=OSError("herdr could not list sessions")) as asked,
               patch.object(staff, "snapshot", wraps=staff.snapshot) as reads):
             self.assertEqual(retired_units(lines, "show"), {"first-unit"})
@@ -653,6 +694,9 @@ class RetiredRowTests(ShutdownTestCase):
 
     def test_every_list_drops_a_unit_that_is_gone(self) -> None:
         _ = unit_membership("show", "parked-unit")
+        for name in ("marked-unit", "gone-unit"):
+            row = unit_membership("show", name)
+            _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.missing))
         lines = [
             *OLD_HEADER,
             self.row("marked", self.linked, "retired after completion"),

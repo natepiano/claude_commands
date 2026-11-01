@@ -127,6 +127,8 @@ class PromoteShowrunnerTests(unittest.TestCase):
         self.child_doc = self.worktree / "child-production.md"
         _ = self.child_doc.write_text(doc_text(self.worktree))
         commit_all(self.worktree)
+        self.staff.register_production("parent", self.parent_doc)
+        self.staff.register_production("child", self.child_doc)
         session_records = self.root / "sessions"
         session_records.mkdir()
         _ = (session_records / f"{PID}.json").write_text(json.dumps({"status": "idle"}))
@@ -242,25 +244,30 @@ class PromoteShowrunnerTests(unittest.TestCase):
         unit = self.staff_unit()
         original_ensure = staff.ensure
         for after in (False, True):
-            def interrupted_add(kind: staff.Kind, *, name: str, parent: staff.StaffId | None = None) -> staff.StaffRow:
+            def interrupted_add(kind: staff.Kind, *, name: str, parent: staff.StaffId | None = None,
+                                worktree: staff.PresentWorktree | staff.RemovedWorktree | staff.WorktreeUnfilled = staff.WORKTREE_UNFILLED,
+                                doc: staff.LiveDoc | staff.WrappedDoc | staff.DocUnfilled = staff.DOC_UNFILLED) -> staff.StaffRow:
                 if after:
-                    _ = original_ensure(kind, name=name, parent=parent)
+                    _ = original_ensure(kind, name=name, parent=parent, worktree=worktree, doc=doc)
                 raise RuntimeError("stopped at staff ensure")
             with mock.patch.object(staff, "ensure", side_effect=interrupted_add):
                 with self.assertRaisesRegex(RuntimeError, "stopped at staff ensure"):
                     _ = self.run_main()
             self.assert_nothing_stopped()
-        original = staff.retire
-        def interrupted(staff_id: staff.StaffId) -> staff.StaffRow | None:
-            _ = original(staff_id)
+        original = staff.set_worktree
+        def interrupted(staff_id: staff.StaffId, value: staff.PresentWorktree | staff.RemovedWorktree) -> staff.StaffRow:
+            _ = original(staff_id, value)
             raise RuntimeError("stopped after staff retirement")
-        with mock.patch.object(staff, "retire", side_effect=interrupted):
+        with mock.patch.object(staff, "set_worktree", side_effect=interrupted):
             with self.assertRaisesRegex(RuntimeError, "stopped after staff retirement"):
                 _ = self.run_main()
         self.marked.clear()
         code, output, errors = self.run_main()
         self.assertEqual(code, 0, output + errors)
-        self.assertIsNone(staff.by_id(unit.id))
+        retained = staff.by_id(unit.id)
+        assert retained is not None
+        self.assertEqual((retained.id, retained.parent, retained.worktree),
+                         (unit.id, unit.parent, staff.RemovedWorktree("natedev", self.worktree)))
         self.assertTrue(any(row.name == "child" for row in staff.find(kind="showrunner")))
         data, document = self.staff.staff_file.read_bytes(), self.parent_doc.read_bytes()
         code, output, errors = self.run_main()
@@ -292,7 +299,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
         self.assertEqual(code, 0, output + errors)
         child = staff.by_path("child")
         assert child is not None
-        _ = staff.retire(child.id)
+        _ = staff.set_doc(child.id, staff.WrappedDoc("natedev", self.child_doc))
         code, output, errors = self.run_main()
         self.assertEqual(code, 2, output + errors)
         self.assertNotIn("already promoted", output)
@@ -480,7 +487,10 @@ class PromoteShowrunnerTests(unittest.TestCase):
         code, out, err = self.run_main()
         self.assertEqual((code, err), (1, ""), out)
         self.assertTrue(plan_cell_is_retired(self.demo_row()["Plan"]))
-        self.assertIsNone(staff.by_id(unit.id))
+        retained = staff.by_id(unit.id)
+        assert retained is not None
+        self.assertEqual((retained.id, retained.parent, retained.worktree),
+                         (unit.id, unit.parent, staff.RemovedWorktree("natedev", self.worktree)))
         self.assertIsNotNone(staff.by_path("child"))
 
     def test_promoted_unit_staff_retires_while_attachment_is_still_owed(self) -> None:
@@ -489,7 +499,10 @@ class PromoteShowrunnerTests(unittest.TestCase):
         code, out, err = self.run_main()
         self.assertEqual((code, err), (1, ""), out)
         self.assertTrue(plan_cell_is_retired(self.demo_row()["Plan"]))
-        self.assertIsNone(staff.by_id(unit.id))
+        retained = staff.by_id(unit.id)
+        assert retained is not None
+        self.assertEqual((retained.id, retained.parent, retained.worktree),
+                         (unit.id, unit.parent, staff.RemovedWorktree("natedev", self.worktree)))
 
     def test_unready_showrunner_whose_retire_fails_reports_the_row_as_owed(self) -> None:
         self.started = add_showrunner.SESSION_NOT_READY

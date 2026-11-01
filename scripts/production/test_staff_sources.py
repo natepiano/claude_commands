@@ -185,10 +185,208 @@ class StaffSourcesTests(StaffTestCase):
         self.assertEqual(output, "unchanged\n")
         self.assertEqual((self.staff_file.read_bytes(), (folder / ".unit.toml").read_bytes()), before)
 
-    def fill_result(self, *, dry_run: bool = False) -> tuple[int, str, str]:
+    def fill_result(self, *, dry_run: bool = False, retired: bool = False) -> tuple[int, str, str]:
         with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
-            code = staff_sources.fill(dry_run=dry_run)
+            code = staff_sources.fill(dry_run=dry_run, retired=retired)
         return code, output.getvalue(), errors.getvalue()
+
+    def test_retired_fill_recovers_a_missing_session_from_its_interactive_transcript(self) -> None:
+        doc = self.retired_fill_production("sdlc", "models-unit")
+        row = unit_membership("sdlc", "models-unit")
+        write_text_atomic(doc, doc.read_text().replace(
+            "session session-models-unit, folder " + str(self.root / "original/models-unit"), "session "))
+        folder = self.source_root / "worktrees/models-unit"
+        _ = self.session_transcript("recovered-director", folder)
+        code, output, errors = self.fill_result(retired=True)
+        self.assertEqual(code, 0, output + errors)
+        parked = unit_config.read_parked(row.id)
+        assert isinstance(parked, unit_config.UnitConfig)
+        assert isinstance(parked.retired, unit_config.RetiredSession)
+        self.assertEqual(parked.retired.session_id, "recovered-director")
+        self.assertEqual(parked.retired.start_folder, unit_config.RecordedStartFolder(folder))
+        retained = staff.by_id(row.id)
+        assert retained is not None
+        self.assertEqual(retained.id, row.id)
+        path = unit_config.parked_path(row.id)
+        before = path.read_bytes(), path.stat().st_mtime_ns, self.staff_file.read_bytes()
+        code, output, errors = self.fill_result(retired=True)
+        self.assertEqual(code, 0, output + errors)
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns, self.staff_file.read_bytes()), before)
+
+    def test_live_staff_roots_a_surviving_style_child_and_keeps_its_unit_after_parent_wrap(self) -> None:
+        parent_doc = self.production("parent")
+        style_doc = self.production("style", "names-unit", parent="parent")
+        write_text_atomic(style_doc, "- **Kind:** style\n" + style_doc.read_text())
+        self.pane("w1:style", session_id="session-style", environment={})
+        self.pane("w1:names", session_id="session-names", environment={
+            "SHOWRUNNER_UNIT": "style", "SHOWRUNNER_UNIT_ID": "names-unit"})
+        _ = self.session_record("session-style", "style")
+        _ = self.session_record("session-names", "names-unit")
+        _ = self.seed()
+        parent = next(row for row in staff.find(kind="showrunner") if row.name == "parent")
+        child = next(row for row in staff.find(kind="showrunner") if row.name == "style")
+        unit = unit_membership("style", "names-unit")
+        _ = staff.set_doc(parent.id, staff.WrappedDoc("natedev", parent_doc))
+        before = self.staff_file.read_bytes()
+        members = cast(list[dict[str, object]], staff_sources.live()["members"])
+        by_id = {entry["id"]: entry for entry in members}
+        self.assertNotIn(parent.id, by_id)
+        self.assertIn(child.id, by_id)
+        self.assertIsNone(by_id[child.id]["parent"])
+        self.assertEqual(by_id[unit.id]["parent"], child.id)
+        self.assertEqual(staff.by_id(child.id), child)
+        self.assertEqual(self.staff_file.read_bytes(), before)
+
+    def test_retired_fill_parks_verified_facts_keeps_identity_and_finishes_unchanged(self) -> None:
+        doc = self.retired_fill_production("sdlc", "models-unit")
+        row = unit_membership("sdlc", "models-unit")
+        row = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.source_root / "worktrees/models-unit"))
+        active_before = staff.active(staff.snapshot(), "unit")
+        code, output, errors = self.fill_result(retired=True)
+        self.assertEqual(code, 0, output + errors)
+        current = staff.by_id(row.id)
+        assert current is not None
+        self.assertEqual(current, replace(row, worktree=staff.RemovedWorktree(
+            "natedev", self.source_root / "worktrees/models-unit")))
+        saved = unit_config.read_parked(row.id)
+        self.assertEqual(saved, unit_config.UnitConfig(unit_config.StandbyPlan(), unit_config.NoAppPort(), (),
+            unit_config.RetiredSession("2026-10-31", "session-models-unit",
+                unit_config.RecordedStartFolder(self.root / "original/models-unit"), unit_config.Branch("models-unit"))))
+        self.assertEqual(staff.active(staff.snapshot(), "unit"), active_before)
+        parked = unit_config.parked_path(row.id)
+        before = [(path.read_bytes(), path.stat().st_mtime_ns) for path in (self.staff_file, parked, doc)]
+        code, output, errors = self.fill_result(retired=True)
+        self.assertEqual((code, output, errors), (0, "unchanged\n", ""))
+        self.assertEqual([(path.read_bytes(), path.stat().st_mtime_ns) for path in (self.staff_file, parked, doc)], before)
+
+    def test_retired_fill_dry_run_has_no_staff_config_or_exclude_writes(self) -> None:
+        doc = self.retired_fill_production("sdlc", "models-unit")
+        row = unit_membership("sdlc", "models-unit")
+        paths = (self.staff_file, doc, doc.parents[1] / ".git/info/exclude")
+        before = [(path.read_bytes(), path.stat().st_mtime_ns) for path in paths]
+        with (mock.patch.object(staff, "ensure", side_effect=AssertionError("dry-run admission")),
+              mock.patch.object(staff, "set_worktree", side_effect=AssertionError("dry-run state change")),
+              mock.patch.object(unit_config, "write_parked", side_effect=AssertionError("dry-run parked write"))):
+            code, output, errors = self.fill_result(retired=True, dry_run=True)
+        self.assertEqual(code, 0, output + errors)
+        self.assertIn("source ", output)
+        self.assertEqual([(path.read_bytes(), path.stat().st_mtime_ns) for path in paths], before)
+        self.assertFalse(unit_config.parked_path(row.id).exists())
+
+    def test_retired_fill_admits_a_missing_wrapped_parent_and_unit_without_a_timer_or_active_members(self) -> None:
+        doc = self.retired_fill_production("sdlc", "models-unit", wrapped=True)
+        record = staff.snapshot()
+        self.forget_rows(*(row.id for row in record.rows))
+        timer = Path(os.environ["NOTIFIER_STATE_DIR"]) / "showrunner-sdlc/conf"
+        timer.unlink()
+        # The existing repository manifest can discover an ignored archived doc from a raw location.
+        anchor_parent = staff.ensure("showrunner", name="archive", doc=staff.WrappedDoc("natedev", doc))
+        anchor = staff.ensure("unit", name="anchor", parent=anchor_parent.id,
+                              worktree=staff.RemovedWorktree("natedev", doc.parents[1]))
+        code, output, errors = self.fill_result(retired=True)
+        self.assertEqual(code, 0, output + errors)
+        runner = next(row for row in staff.find(kind="showrunner") if row.name == "sdlc")
+        unit = next(row for row in staff.find(kind="unit") if row.name == "models")
+        self.assertEqual(runner.doc, staff.WrappedDoc("natedev", doc))
+        self.assertEqual(unit.parent, runner.id)
+        self.assertIsInstance(unit.worktree, staff.RemovedWorktree)
+        self.assertIsInstance(unit_config.read_parked(unit.id), unit_config.UnitConfig)
+        self.assertEqual(staff.active(staff.snapshot(), "unit"), ())
+        self.assertEqual(staff.active(staff.snapshot(), "showrunner"), ())
+        self.assertFalse(timer.exists())
+        self.assertEqual(staff.by_id(anchor.id), anchor)
+
+    def test_retired_fill_preserves_an_active_location_and_reports_both_conflicting_paths(self) -> None:
+        doc = self.retired_fill_production("sdlc", "models-unit")
+        row = unit_membership("sdlc", "models-unit")
+        current = staff.set_worktree(row.id, staff.PresentWorktree("natedev", self.root / "current-models"))
+        before = self.staff_file.read_bytes()
+        code, output, errors = self.fill_result(retired=True)
+        self.assertEqual(code, 1, output + errors)
+        self.assertIn(str(doc), errors)
+        self.assertIn(str(self.root / "current-models"), errors)
+        self.assertIn(str(self.source_root / "worktrees/models-unit"), errors)
+        self.assertEqual(staff.by_id(row.id), current)
+        self.assertEqual(self.staff_file.read_bytes(), before)
+        self.assertFalse(unit_config.parked_path(row.id).exists())
+
+    def test_retired_fill_uses_a_unique_transcript_folder_and_reports_each_ambiguous_path(self) -> None:
+        doc = self.retired_fill_production("sdlc", "models-unit")
+        row = unit_membership("sdlc", "models-unit")
+        text = doc.read_text().replace(f", folder {self.root / 'original/models-unit'}", "")
+        write_text_atomic(doc, text)
+        code, output, errors = self.fill_result(retired=True)
+        self.assertEqual(code, 1, output + errors)
+        self.assertIn("transcript", errors)
+        self.assertFalse(unit_config.parked_path(row.id).exists())
+        first = self.session_transcript("session-models-unit", self.root / "first")
+        second = self.session_transcript("session-models-unit", self.root / "second")
+        code, output, errors = self.fill_result(retired=True)
+        self.assertEqual(code, 1, output + errors)
+        self.assertIn(str(first.parent), errors)
+        self.assertIn(str(second.parent), errors)
+        self.assertFalse(unit_config.parked_path(row.id).exists())
+        second.unlink()
+        code, output, errors = self.fill_result(retired=True)
+        self.assertEqual(code, 0, output + errors)
+        saved = unit_config.read_parked(row.id)
+        assert isinstance(saved, unit_config.UnitConfig)
+        assert isinstance(saved.retired, unit_config.RetiredSession)
+        self.assertEqual(saved.retired.start_folder, unit_config.RecordedStartFolder(self.root / "first"))
+
+    def test_retired_fill_does_not_borrow_a_same_named_session_from_another_production(self) -> None:
+        doc = self.retired_fill_production("sdlc", "models-unit")
+        row = unit_membership("sdlc", "models-unit")
+        write_text_atomic(doc, doc.read_text().replace("session session-models-unit", "session "))
+        other_doc = self.production("tools")
+        self.units_doc(other_doc, ("models-unit",), workspace="tools")
+        _ = unit_membership("tools", "models-unit")
+        self.pane("w1:other", session_id="unrelated-session", environment={
+            "SHOWRUNNER_UNIT": "tools", "SHOWRUNNER_UNIT_ID": "models-unit"})
+        _ = self.session_transcript("unrelated-session", self.root / "other-production")
+        code, output, errors = self.fill_result(retired=True)
+        self.assertEqual(code, 1, output + errors)
+        self.assertIn("no unique recorded director session", errors)
+        self.assertFalse(unit_config.parked_path(row.id).exists())
+
+    def test_retired_fill_reports_missing_branch_and_session_per_row_and_finishes_an_independent_row(self) -> None:
+        doc = self.retired_fill_production("sdlc", "bad-branch-unit", "bad-session-unit", "complete-unit")
+        text = doc.read_text().replace("| `bad-branch-unit` | (retired", "| — | (retired")
+        text = text.replace("session session-bad-session-unit, folder " + str(self.root / "original/bad-session-unit"),
+                            "session ")
+        write_text_atomic(doc, text)
+        code, output, errors = self.fill_result(retired=True)
+        self.assertEqual(code, 1, output + errors)
+        for name, reason in (("bad-branch-unit", "Branch"), ("bad-session-unit", "session")):
+            line = next(index for index, value in enumerate(text.splitlines(), 1) if value.startswith(f"| `{name}` |"))
+            self.assertIn(f"{doc}:{line} {name}:", errors)
+            self.assertIn(reason, errors)
+            self.assertFalse(unit_config.parked_path(unit_membership("sdlc", name).id).exists())
+        complete = next(row for row in staff.find(kind="unit") if row.name == "complete")
+        self.assertIsInstance(complete.worktree, staff.RemovedWorktree)
+        self.assertIsInstance(unit_config.read_parked(complete.id), unit_config.UnitConfig)
+
+    def test_retired_fill_recovers_after_row_and_parked_publication_without_changing_saved_facts(self) -> None:
+        _ = self.retired_fill_production("sdlc", "models-unit")
+        row = unit_membership("sdlc", "models-unit")
+        publisher = unit_config.write_parked
+        for after in (False, True):
+            def interrupted(identity: staff.StaffId, config: unit_config.UnitConfig) -> None:
+                if after:
+                    publisher(identity, config)
+                raise OSError("stopped at parked publication")
+            with mock.patch.object(unit_config, "write_parked", side_effect=interrupted):
+                code, output, errors = self.fill_result(retired=True)
+            self.assertEqual(code, 1, output + errors)
+            self.assertIn("stopped at parked publication", errors)
+            current = staff.by_id(row.id)
+            assert current is not None
+            self.assertIsInstance(current.worktree, staff.RemovedWorktree)
+        parked = unit_config.parked_path(row.id)
+        before = parked.read_bytes(), parked.stat().st_mtime_ns
+        code, output, errors = self.fill_result(retired=True)
+        self.assertEqual((code, output, errors), (0, "unchanged\n", ""))
+        self.assertEqual((parked.read_bytes(), parked.stat().st_mtime_ns), before)
 
     def test_fill_reports_a_branch_tip_document_without_a_live_file_instead_of_filling_it(self) -> None:
         doc = self.fill_production("sdlc")
@@ -255,8 +453,7 @@ class StaffSourcesTests(StaffTestCase):
         doc = self.fill_production("sdlc", "missing-unit", "retired-unit")
         text = doc.read_text().replace("`retired-unit` | `standby`", "`retired-unit` | retired")
         write_text_atomic(doc, text)
-        for name in ("missing-unit", "retired-unit"):
-            _ = staff.retire(unit_membership("sdlc", name).id)
+        self.forget_rows(*(unit_membership("sdlc", name).id for name in ("missing-unit", "retired-unit")))
         identities = [row.id for row in staff.snapshot().rows]
         code, output, errors = self.fill_result()
         self.assertEqual((code, errors), (0, ""), output)
@@ -1110,14 +1307,14 @@ class StaffSourcesTests(StaffTestCase):
             old_marks = ProductionMembers("sdlc", record=record)
             new_marks = ProductionMembers("receiving", record=record)
             cells = production_units.unit_table(old_lines)[0]
-            self.assertTrue(unit_is_retired(cells, old_marks))
+            self.assertFalse(unit_is_retired(cells, old_marks))
             self.assertFalse(unit_is_retired(cells, new_marks))
         self.assertEqual(old_rows, [])
         self.assertEqual(len(new_rows), 1)
         self.assertEqual(production_units.cell_value(new_rows[0]["Unit"]), "models-unit")
         self.assertEqual(new_rows[0]["Worktree"], cells["Worktree"])
         self.assertEqual(new_rows[0]["Plan"], cells["Plan"])
-        self.assertEqual(retired, {"models-unit"})
+        self.assertEqual(retired, set())
         self.assertEqual(record.find(kind="unit", parent=original.id), [])
 
     def test_unit_parent_agrees_with_showrunner_members_after_transfer(self) -> None:

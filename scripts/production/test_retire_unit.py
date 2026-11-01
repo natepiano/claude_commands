@@ -10,13 +10,16 @@ import math
 import os
 import signal
 import shutil
+import time
 import subprocess
 import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, final, override
+from typing import TYPE_CHECKING, cast, final, override
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -28,6 +31,7 @@ from scripts.direct import workers  # noqa: E402
 import add_unit
 import herdr
 import retire_unit
+import production_units
 import unit_lookup
 import unit_move
 from herdr import HerdrPlace
@@ -47,12 +51,16 @@ from scripts.lib import process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.shutdown import stop_resume
 import pane_record
-from scripts.production import staff
 from scripts.production.staff import StaffId
+from scripts.production import staff, unit_config
+from scripts.production.rename_rerun_test_support import saved_fixture
+from scripts.lib import tunables
+from scripts.agents import worker_lifecycle
 
 DIRECTOR = "11111111-1111-1111-1111-111111111111"
 # The fixture replaces the lookup; a test of the lookup itself puts it back.
 CLAUDE_SESSIONS = retire_unit.claude_sessions
+RUN_COMMAND = retire_unit.run
 SEAT = "22222222-2222-2222-2222-222222222222"
 STOP_SESSION = stop_resume.stop
 
@@ -84,6 +92,242 @@ class RetireUnitTests(unittest.TestCase):
     marked: unit_lookup.MarkedUnit | None = None
     config: Path = Path()
     unit_staff_id: StaffId = StaffId("")
+
+    def limits(self, *, poll: str = "0.2", wait: str = "10", command: str = "900") -> Path:
+        path = self.root / "production.conf"
+        _ = path.write_text(f"RETIRE_POLL_SECONDS={poll}\nRETIRE_TERM_WAIT_SECONDS={wait}\n"
+                            + f"RETIRE_COMMAND_TIMEOUT_SECONDS={command}\n")
+        return path
+
+    def prepared_retirement(self) -> staff.StaffRow:
+        row = next(row for row in staff.find(kind="unit") if row.name == "alpha")
+        filled = staff.set_worktree(row.id, staff.PresentWorktree("natedev", self.worktree))
+        unit_config.write(self.worktree, unit_config.UnitConfig(unit_config.PlanFile(Path("docs/plans/alpha.md")),
+                                                               unit_config.AppPort(1), ("scripts",)))
+        return filled
+
+    def test_a_failed_park_keeps_the_worktree_branch_and_present_staff_row(self) -> None:
+        row = self.prepared_retirement()
+        document = self.doc.read_bytes()
+        with mock.patch.object(unit_config, "park", side_effect=unit_config.ConfigRefused("fixture park failed")):
+            code, output = self.retire()
+        self.assertEqual(code, 1, output)
+        self.assertIn("fixture park failed", output)
+        self.assertTrue(self.worktree.is_dir())
+        self.assertEqual(git(self.checkout, "branch", "--list", "alpha-branch"), "+ alpha-branch")
+        self.assertEqual(staff.by_id(row.id), row)
+        self.assertEqual(self.doc.read_bytes(), document)
+
+    def test_missing_conversation_evidence_refuses_before_park_stop_or_removal(self) -> None:
+        row = self.prepared_retirement()
+        self.marked = None
+        self.claude = []
+        shutil.rmtree(self.config / "projects")
+        _ = pane_record.forget_unit("alpha-unit")
+        before = self.doc.read_bytes(), self.staff.staff_file.read_bytes()
+        with mock.patch.object(unit_config, "park", side_effect=AssertionError("park before session proof")):
+            code, output = self.retire()
+        self.assertEqual(code, 1, output)
+        self.assertTrue(self.worktree.is_dir())
+        self.assertEqual(staff.by_id(row.id), row)
+        self.assertFalse(unit_config.parked_path(row.id).exists())
+        self.assertEqual(self.stops(), [])
+        self.assertEqual((self.doc.read_bytes(), self.staff.staff_file.read_bytes()), before)
+
+    def test_a_units_table_branch_disagreeing_with_git_refuses_before_park_or_stop(self) -> None:
+        row = self.prepared_retirement()
+        _ = self.doc.write_text(self.doc.read_text().replace("| alpha-branch |", "| stale-branch |"))
+        with mock.patch.object(unit_config, "park") as park:
+            code, output = self.retire()
+        self.assertEqual(code, 1, output)
+        self.assertIn("alpha-branch", output)
+        self.assertIn("stale-branch", output)
+        park.assert_not_called()
+        self.assertEqual(self.stops(), [])
+        self.assertEqual(staff.by_id(row.id), row)
+        self.assertTrue(self.worktree.is_dir())
+
+    def test_failed_worktree_removal_leaves_the_row_present_and_preserves_parked_session_facts(self) -> None:
+        row = self.prepared_retirement()
+        with mock.patch.object(retire_unit, "remove", return_value=["fixture removal refused"]):
+            code, output = self.retire()
+        self.assertEqual(code, 1, output)
+        self.assertIn("fixture removal refused", output)
+        self.assertEqual(staff.by_id(row.id), row)
+        self.assertTrue(self.worktree.is_dir())
+        parked = unit_config.read_parked(row.id)
+        assert isinstance(parked, unit_config.UnitConfig)
+        assert isinstance(parked.retired, unit_config.RetiredSession)
+        self.assertEqual(parked.retired.session_id, DIRECTOR)
+        self.assertEqual(parked.retired.branch, unit_config.Branch("alpha-branch"))
+
+    def test_retirement_recovers_at_each_removal_boundary_across_a_date_change_without_rewriting_facts(self) -> None:
+        row = self.prepared_retirement()
+        park = unit_config.park
+        remove = retire_unit.remove
+        field = staff.set_worktree
+        with saved_fixture(self.root) as restore, saved_fixture(self.staff.root) as restore_staff:
+            for boundary in ("park", "worktree", "branch", "remove", "field"):
+                with self.subTest(boundary=boundary):
+                    restore()
+                    restore_staff()
+                    self.claude = []
+                    self.marked = None
+
+                    def parked_then_stop(unit: staff.StaffId, worktree: Path, facts: unit_config.RetiredSession) -> None:
+                        park(unit, worktree, facts)
+                        raise OSError("fixture interrupted after park")
+
+                    def removed_then_stop(unit: retire_unit.Unit) -> list[str]:
+                        errors = remove(unit)
+                        self.assertEqual(errors, [])
+                        raise OSError("fixture interrupted after remove")
+
+                    def field_then_stop(identity: staff.StaffId,
+                                        value: staff.PresentWorktree | staff.RemovedWorktree) -> staff.StaffRow:
+                        _ = field(identity, value)
+                        raise OSError("fixture interrupted after field")
+
+                    def command_then_stop(argv: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+                        result = self.fake_run(argv, cwd)
+                        operation = argv[3:] if argv[:1] == ["git"] else []
+                        stopped = (boundary == "worktree" and operation[:2] == ["worktree", "remove"]
+                                   or boundary == "branch" and operation[:2] == ["branch", "-D"])
+                        if stopped and result.returncode == 0:
+                            raise OSError(f"fixture interrupted after {boundary}")
+                        return result
+
+                    target = mock.patch.object(unit_config, "park", side_effect=parked_then_stop) if boundary == "park" else (
+                        mock.patch.object(retire_unit, "remove", side_effect=removed_then_stop) if boundary == "remove" else
+                        mock.patch.object(staff, "set_worktree", side_effect=field_then_stop) if boundary == "field" else
+                        mock.patch.object(retire_unit, "run", side_effect=command_then_stop))
+                    with target, mock.patch.object(retire_unit, "datetime", wraps=datetime) as clock:
+                        clock.now = mock.Mock(return_value=datetime(2026, 10, 31, 12, tzinfo=UTC))
+                        code, output = self.retire()
+                    self.assertEqual(code, 1, output)
+                    self.assertIn("fixture interrupted", output)
+                    parked_path = unit_config.parked_path(row.id)
+                    parked = parked_path.read_bytes(), parked_path.stat().st_mtime_ns
+                    with mock.patch.object(retire_unit, "datetime", wraps=datetime) as clock:
+                        clock.now = mock.Mock(return_value=datetime(2026, 11, 1, 12, tzinfo=UTC))
+                        code, output = self.retire()
+                    self.assertEqual(code, 0, output)
+                    retained = staff.by_id(row.id)
+                    assert retained is not None
+                    self.assertEqual((retained.name, retained.parent, retained.worktree),
+                                     (row.name, row.parent, staff.RemovedWorktree("natedev", self.worktree)))
+                    self.assertFalse(self.worktree.exists())
+                    self.assertEqual((parked_path.read_bytes(), parked_path.stat().st_mtime_ns), parked)
+                    config = unit_config.read_parked(row.id)
+                    assert isinstance(config, unit_config.UnitConfig)
+                    assert isinstance(config.retired, unit_config.RetiredSession)
+                    self.assertEqual(config.retired.date, "2026-10-31")
+                    self.assertIn("retired 2026-10-31", self.doc.read_text())
+                    calls, data, doc = self.calls.copy(), self.staff.staff_file.read_bytes(), self.doc.read_bytes()
+                    code, output = self.retire()
+                    self.assertEqual(code, 0, output)
+                    self.assertEqual(len(output.splitlines()), 1)
+                    self.assertEqual((self.calls, self.staff.staff_file.read_bytes(), self.doc.read_bytes()), (calls, data, doc))
+
+    def test_retirement_commands_use_only_the_remaining_operation_budget(self) -> None:
+        path = self.limits(command="900")
+        with (mock.patch.dict(os.environ, {"PRODUCTION_CONFIG": str(path)}),
+              mock.patch.object(time, "monotonic", return_value=100.0),
+              worker_lifecycle.operation_deadline(deadline=100.25),
+              mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as run):
+            _ = RUN_COMMAND(["fixture-command"])
+            self.assertEqual(run.call_args.kwargs["timeout"], 0.25)
+        with (mock.patch.dict(os.environ, {"PRODUCTION_CONFIG": str(path)}),
+              mock.patch.object(time, "monotonic", return_value=100.0),
+              worker_lifecycle.operation_deadline(deadline=99.0),
+              mock.patch.object(subprocess, "run") as run):
+            with self.assertRaises(worker_lifecycle.OperationDeadlineExpired):
+                _ = RUN_COMMAND(["fixture-command"])
+            run.assert_not_called()
+
+    def test_retirement_sigterm_wait_stops_at_the_shared_operation_deadline(self) -> None:
+        path = self.limits(poll="1", wait="10")
+        now = 100.0
+        sleeps: list[float] = []
+
+        def sleep(seconds: float) -> None:
+            nonlocal now
+            sleeps.append(seconds)
+            now += seconds
+
+        with (mock.patch.dict(os.environ, {"PRODUCTION_CONFIG": str(path)}),
+              mock.patch.object(time, "monotonic", side_effect=lambda: now),
+              mock.patch.object(time, "sleep", side_effect=sleep),
+              mock.patch.object(os, "kill") as send,
+              mock.patch.object(retire_unit, "_alive", return_value=True),
+              worker_lifecycle.operation_deadline(deadline=100.25)):
+            with self.assertRaises(worker_lifecycle.OperationDeadlineExpired):
+                _ = retire_unit.terminate([1234], {1234: "fixture"})
+        send.assert_called_once_with(1234, signal.SIGTERM)
+        self.assertEqual(sleeps, [0.25])
+
+    def test_changed_command_timeout_is_read_at_each_use_without_reloading_the_module(self) -> None:
+        path = self.limits(command="17")
+        with mock.patch.dict(os.environ, {"PRODUCTION_CONFIG": str(path)}), \
+                mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as run:
+            _ = RUN_COMMAND(["fixture-command"])
+            self.assertEqual(run.call_args.kwargs["timeout"], 17)
+            _ = self.limits(command="23")
+            _ = RUN_COMMAND(["fixture-command"])
+            self.assertEqual(run.call_args.kwargs["timeout"], 23)
+
+    def test_changed_poll_and_term_wait_control_real_sigterm_loop_and_cap_the_last_sleep(self) -> None:
+        path = self.limits()
+        with mock.patch.dict(os.environ, {"PRODUCTION_CONFIG": str(path)}):
+            for poll, wait in ((0.3, 0.8), (0.7, 1.2)):
+                with self.subTest(poll=poll, wait=wait):
+                    _ = self.limits(poll=str(poll), wait=str(wait))
+                    with (mock.patch.object(os, "kill") as send_signal,
+                          mock.patch.object(retire_unit, "_alive", return_value=True),
+                          mock.patch.object(time, "monotonic", side_effect=[0, 0, wait - 0.1, wait]),
+                          mock.patch.object(time, "sleep") as sleep):
+                        left = retire_unit.terminate([1234], {1234: "fixture"})
+                    send_signal.assert_called_once_with(1234, signal.SIGTERM)
+                    self.assertEqual(len(sleep.call_args_list), 2)
+                    self.assertEqual(sleep.call_args_list[0].args, (poll,))
+                    self.assertAlmostEqual(cast(float, sleep.call_args_list[1].args[0]), 0.1)
+                    self.assertEqual(left, ["fixture: still runs after SIGTERM"])
+
+    def test_an_explicit_shorter_wait_caps_the_configured_term_wait(self) -> None:
+        path = self.limits(poll="1", wait="10")
+        with (mock.patch.dict(os.environ, {"PRODUCTION_CONFIG": str(path)}),
+              mock.patch.object(os, "kill"),
+              mock.patch.object(retire_unit, "_alive", return_value=True),
+              mock.patch.object(time, "monotonic", side_effect=[0, 0, 0.1]),
+              mock.patch.object(time, "sleep") as sleep):
+            _ = retire_unit.terminate([1234], {1234: "fixture"}, wait=0.1)
+        sleep.assert_called_once_with(0.1)
+
+    def test_missing_invalid_or_nonfinite_retirement_limits_refuse_before_stopping_or_removal(self) -> None:
+        path = self.limits()
+        before = self.doc.read_bytes(), self.staff.staff_file.read_bytes()
+        for key in ("RETIRE_POLL_SECONDS", "RETIRE_TERM_WAIT_SECONDS", "RETIRE_COMMAND_TIMEOUT_SECONDS"):
+            for value in (None, "broken", "nan", "inf", "0", "-1"):
+                with self.subTest(key=key, value=value):
+                    _ = self.limits()
+                    lines = path.read_text().splitlines()
+                    _ = path.write_text("\n".join(line if not line.startswith(key + "=") else
+                                                (f"{key}={value}" if value is not None else "") for line in lines) + "\n")
+                    with mock.patch.dict(os.environ, {"PRODUCTION_CONFIG": str(path)}):
+                        code, output = self.retire()
+                    self.assertEqual(code, 1, output)
+                    self.assertIn(str(path), output)
+                    self.assertIn(key, output)
+                    self.assertTrue(self.worktree.exists())
+                    self.assertEqual(self.stops(), [])
+                    self.assertEqual((self.doc.read_bytes(), self.staff.staff_file.read_bytes()), before)
+
+    def test_a_missing_retirement_config_file_refuses_with_its_path_and_key(self) -> None:
+        path = self.root / "missing.conf"
+        with mock.patch.dict(os.environ, {"PRODUCTION_CONFIG": str(path)}), self.assertRaises(tunables.TunableUnusable) as error:
+            _ = RUN_COMMAND(["fixture-command"])
+        self.assertIn(str(path), str(error.exception))
+        self.assertIn("RETIRE_COMMAND_TIMEOUT_SECONDS", str(error.exception))
 
     @override
     def setUp(self) -> None:
@@ -134,7 +378,10 @@ class RetireUnitTests(unittest.TestCase):
         self.claude = [session(DIRECTOR, "alpha", 4101), session(SEAT, "alpha-seat", 4102)]
         self.staff.register_production("alpha", self.doc)
         parent = staff.ensure("showrunner", name="alpha")
-        self.unit_staff_id = staff.ensure("unit", name="alpha", parent=parent.id).id
+        self.unit_staff_id = staff.ensure("unit", name="alpha", parent=parent.id,
+                         worktree=staff.PresentWorktree("natedev", self.worktree)).id
+        unit_config.write(self.worktree, unit_config.UnitConfig(unit_config.PlanFile(Path("docs/plans/alpha.md")),
+                                                               unit_config.AppPort(1), ("scripts",)))
         production = read_production(self.doc)
 
         def production_of(_slug: str) -> Production:
@@ -286,42 +533,50 @@ class RetireUnitTests(unittest.TestCase):
         code, output = self.retire()
         self.assertEqual(code, 0, output)
         self.assert_saved_retirement(ref, tip)
-        self.assertIsNone(staff.by_id(unit.id))
-        self.assertIn(f", staff {unit.id}", self.doc.read_text())
+        self.assertEqual(staff.by_id(unit.id), replace(unit, worktree=staff.RemovedWorktree("natedev", self.worktree)))
         self.assertIn("alpha-unit", unit_lookup.retired_units(self.doc.read_text().splitlines(), "alpha"))
 
-    def test_replaying_an_old_retirement_keeps_a_reused_name_in_another_production(self) -> None:
+    def test_retired_unit_name_refuses_new_admission_and_retirement_rerun_keeps_the_row(self) -> None:
         old = next(row for row in staff.find(kind="unit") if row.name == "alpha")
         code, output = self.retire()
         self.assertEqual(code, 0, output)
-        self.assertIsNone(staff.by_id(old.id))
+        retained = staff.by_id(old.id)
+        assert retained is not None
+        self.assertEqual(retained.worktree, staff.RemovedWorktree("natedev", self.worktree))
         new_doc = self.staff.production("receiving")
         _ = new_doc.write_text("- **Merge branch:** main\n"
                                + f"- **Showrunner checkout:** {self.checkout}\n- **Log:** log.md\n"
                                + new_doc.read_text())
         receiving = staff.ensure("showrunner", name="receiving")
-        replacement = add_unit.ensure_staff_unit(read_production(self.staff.source_root / "receiving-production.md"),
-                                                "alpha-unit")
-        self.assertEqual(replacement.parent, receiving.id)
+        before = self.staff.staff_file.read_bytes(), self.staff.staff_file.stat().st_mtime_ns
+        with self.assertRaisesRegex(production_units.Refusal, "resume.*remove.*free the name"):
+            _ = add_unit.ensure_staff_unit(read_production(self.staff.source_root / "receiving-production.md"),
+                                          "alpha-unit")
+        self.assertEqual(staff.by_id(old.id), retained)
+        self.assertEqual(staff.by_id(receiving.id), receiving)
+        self.assertEqual((self.staff.staff_file.read_bytes(), self.staff.staff_file.stat().st_mtime_ns), before)
         self.assertFalse(self.marked and self.marked.staff_id)
         code, output = self.retire()
         self.assertEqual(code, 0, output)
-        self.assertEqual(staff.by_id(replacement.id), replacement)
+        self.assertEqual(staff.by_id(old.id), retained)
 
     def test_retire_unit_rerun(self) -> None:
         runner, unit = self.staff_unit()
-        original = staff.retire
+        original = staff.set_worktree
         for after in (False, True):
-            def interrupted(staff_id: staff.StaffId) -> staff.StaffRow | None:
+            def interrupted(staff_id: staff.StaffId, value: staff.PresentWorktree | staff.RemovedWorktree) -> staff.StaffRow:
                 if after:
-                    _ = original(staff_id)
+                    _ = original(staff_id, value)
                 raise RuntimeError("stopped at staff retirement")
-            with mock.patch.object(staff, "retire", side_effect=interrupted):
+            with mock.patch.object(staff, "set_worktree", side_effect=interrupted):
                 with self.assertRaisesRegex(RuntimeError, "stopped at staff retirement"):
                     _ = self.retire()
         code, output = self.retire()
         self.assertEqual(code, 0, output)
-        self.assertIsNone(staff.by_id(unit.id))
+        retained = staff.by_id(unit.id)
+        assert retained is not None
+        self.assertEqual((retained.id, retained.parent, retained.worktree),
+                         (unit.id, unit.parent, staff.RemovedWorktree("natedev", self.worktree)))
         self.assertEqual(staff.by_id(runner.id), runner)
         data, document = self.staff.staff_file.read_bytes(), self.doc.read_bytes()
         code, output = self.retire()
@@ -361,9 +616,8 @@ class RetireUnitTests(unittest.TestCase):
         unit = next(row for row in staff.find(kind="unit") if row.name == "alpha")
         code, output = self.retire()
         self.assertEqual(code, 0, output)
-        self.assertIn(f", staff {unit.id}", self.doc.read_text())
         self.assertNotIn(", ref ", self.doc.read_text())
-        self.assertIsNone(staff.by_id(unit.id))
+        self.assertEqual(staff.by_id(unit.id), replace(unit, worktree=staff.RemovedWorktree("natedev", self.worktree)))
         self.assertIn("alpha-unit", unit_lookup.retired_units(self.doc.read_text().splitlines(), "alpha"))
 
     def test_dead_mac_claim_does_not_prevent_the_already_retired_line(self) -> None:
@@ -589,9 +843,10 @@ class RetireUnitTests(unittest.TestCase):
         mark = retire_unit.mark_retired
         later_tip = ""
         def marked(unit: retire_unit.Unit, director: retire_unit.DirectorSession | retire_unit.NoDirectorSession,
-                   saved: retire_unit.SavedBranch | retire_unit.NoSavedBranch = retire_unit.NO_SAVED_BRANCH) -> bool:
+                   saved: retire_unit.SavedBranch | retire_unit.NoSavedBranch = retire_unit.NO_SAVED_BRANCH,
+                   *, date: str = "") -> bool:
             nonlocal later_tip
-            committed = mark(unit, director, saved)
+            committed = mark(unit, director, saved, date=date)
             if not later_tip:
                 later_tip = self.commit_later_work(self.worktree)
             return committed
@@ -1010,7 +1265,7 @@ class RetireUnitTests(unittest.TestCase):
         self.assertIn("alpha-unit retired", output)
         row = next(line for line in self.doc.read_text(encoding="utf-8").splitlines() if line.startswith("| alpha-unit"))
         self.assertRegex(row, r"^\| alpha-unit \| \(retired \d{4}-\d{2}-\d{2}, worktree removed, session "
-                         + DIRECTOR + rf", staff {self.unit_staff_id}\) docs/plans/alpha\.md \|")
+                         + DIRECTOR + r"\) docs/plans/alpha\.md \|")
         self.assertEqual(git(self.checkout, "log", "-1", "--format=%s"), "production(alpha): retire alpha-unit")
         self.assertEqual(git(self.checkout, "status", "--porcelain", "--untracked-files=no"), "")
         self.assertFalse(self.worktree.exists())
@@ -1125,7 +1380,7 @@ class RetireUnitTests(unittest.TestCase):
         code, output = self.retire()
 
         self.assertEqual(code, 0, output)
-        self.assertIn(f"worktree removed, session {DIRECTOR}, staff {self.unit_staff_id}) docs/plans/alpha.md", self.doc.read_text(encoding="utf-8"))
+        self.assertIn(f"worktree removed, session {DIRECTOR}) docs/plans/alpha.md", self.doc.read_text(encoding="utf-8"))
 
 
     def outside_director(self) -> Path:
@@ -1143,7 +1398,7 @@ class RetireUnitTests(unittest.TestCase):
         self.assertEqual(code, 0, output)
         self.assertIn(f"would stop: Claude session alpha ({DIRECTOR}, pid 4101)", output)
         self.assertNotIn("nothing to stop", output)
-        self.assertIn(f"session {DIRECTOR}, folder {folder}, staff {self.unit_staff_id})", output)
+        self.assertIn(f"session {DIRECTOR}, folder {folder})", output)
         self.assertEqual(self.stops(), [])
 
     def test_retires_the_marked_director_outside_the_worktree_and_records_its_start_folder(self) -> None:
@@ -1152,7 +1407,7 @@ class RetireUnitTests(unittest.TestCase):
         self.assertEqual(code, 0, output)
         self.assertIn(["stop_resume.stop", DIRECTOR], self.calls)
         self.assertEqual(pane_record.read("alpha"), {})
-        self.assertIn(f"session {DIRECTOR}, folder {folder}, staff {self.unit_staff_id})", self.doc.read_text())
+        self.assertIn(f"session {DIRECTOR}, folder {folder})", self.doc.read_text())
         self.assertFalse(self.worktree.exists())
 
     def test_retired_note_uses_the_folder_holding_a_renamed_directors_transcript(self) -> None:
@@ -1163,7 +1418,7 @@ class RetireUnitTests(unittest.TestCase):
                                             for cwd in (old, old, folder, folder)) + "\n")
         code, output = self.retire()
         self.assertEqual(code, 0, output)
-        self.assertIn(f"session {DIRECTOR}, folder {folder}, staff {self.unit_staff_id})", self.doc.read_text())
+        self.assertIn(f"session {DIRECTOR}, folder {folder})", self.doc.read_text())
         self.assertNotIn(str(old), self.doc.read_text())
         self.assertFalse(self.worktree.exists())
 
@@ -1260,7 +1515,7 @@ class RetireUnitTests(unittest.TestCase):
         self.assertIsNone(self.marked)
         code, output = self.retire()
         self.assertEqual(code, 0, output)
-        self.assertIn(f"session {DIRECTOR}, folder {folder}, staff {self.unit_staff_id})", self.doc.read_text())
+        self.assertIn(f"session {DIRECTOR}, folder {folder})", self.doc.read_text())
         self.assertFalse(self.worktree.exists())
         self.assertEqual(len([call for call in self.calls if call == ["stop_resume.stop", DIRECTOR]]), 1)
         self.assertEqual(pane_record.read("alpha"), {})

@@ -71,14 +71,19 @@ class StylePlanTests(StylePlanFixture):
         self.assertEqual(self.ledger().ticket_open("names-unit")[0]["crate"], "crates/alpha")
         self.assertEqual(self.sync_wait_rows(), [])
 
-    def test_names_reads_held_structure_and_preserves_unclassified_warning(self) -> None:
+    def test_names_skips_held_structure_and_preserves_unclassified_warning(self) -> None:
         _ = self.rule("structure", "tier: D\nfamily: modules\n")
         _ = self.rule("read")
         _ = self.rule("legacy", "")
         self.sync()
         with mock.patch.object(berth_board, "read_board", return_value=self.board(*self.sources)):
-            self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n",
-                                              "unclassified: 1 rules — pull nate_style\n"))
+            code, output, errors = self.run_next()
+        self.assertEqual((code, errors), (3, "unclassified: 1 rules — pull nate_style\n"))
+        self.assertIn("waiting for structure: crates/alpha, crates/beta\n", output)
+        self.assertEqual(self.ledger().ticket_open("names-unit"), ())
+        # Releasing the product holds makes the original structure read eligible.
+        self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n",
+                                          "unclassified: 1 rules — pull nate_style\n"))
         ticket, = self.ledger().ticket_open("names-unit")
         self.assertEqual((ticket["kind"], ticket["files"]), ("structure", list(self.sources[:2])))
         self.assertEqual(self.sync_wait_rows(), [])
@@ -95,14 +100,19 @@ class StylePlanTests(StylePlanFixture):
         self.assertEqual(self.count_tickets(), 0)
         self.assertEqual([row[0] for row in self.sync_wait_rows()], ["names-unit"])
 
-    def test_names_structure_read_excludes_crates_outside_its_pilot_scope(self) -> None:
+    def test_names_structure_wait_and_read_exclude_crates_outside_its_pilot_scope(self) -> None:
         _ = self.rule("structure", "tier: D\nfamily: modules\n")
         _ = self.rule("read")
         self.sync()
         _ = self.plan.write_text(self.plan_header().replace("## Phases", "**Pilot scope:** beta\n\n## Phases"))
 
         with mock.patch.object(berth_board, "read_board", return_value=self.board(*self.sources)):
-            self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n", ""))
+            code, output, errors = self.run_next()
+        self.assertEqual((code, errors), (3, ""))
+        self.assertIn("waiting for structure: crates/beta\n", output)
+        self.assertNotIn("crates/alpha", output)
+        self.assertEqual(self.ledger().ticket_open("names-unit"), ())
+        self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n", ""))
         ticket, = self.ledger().ticket_open("names-unit")
         self.assertEqual((ticket["kind"], ticket["crate"], ticket["files"]),
                          ("structure", "crates/beta", list(self.sources[2:])))
@@ -129,15 +139,22 @@ class StylePlanTests(StylePlanFixture):
         self.assertEqual([row[0] for row in self.sync_wait_rows()], ["modules-unit"])
 
 
-    def test_structure_read_starts_before_a_second_board_read(self) -> None:
+    def test_unheld_structure_read_starts_before_a_second_board_read(self) -> None:
         _ = self.rule("structure", "tier: D\nfamily: modules\n")
         _ = self.rule("read")
         self.sync()
-        with mock.patch.object(berth_board, "read_board", side_effect=[self.board(*self.sources),
+        with mock.patch.object(berth_board, "read_board", side_effect=[self.board(*self.sources[:2]),
                                AssertionError("unnecessary second board read")]) as board:
-            self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n", ""))
+            self.assertEqual(self.run_next(), (
+                0,
+                "structure stays with modules: global:rust/structure.md crates/alpha/src/lib.rs: no eligible structure ticket\n"
+                + "structure stays with modules: global:rust/structure.md crates/alpha/src/other.rs: no eligible structure ticket\n"
+                + "phase written: names-unit-1\n",
+                "",
+            ))
         self.assertEqual(board.call_count, 1)
         self.assertEqual(self.ledger().ticket_open("names-unit")[0]["kind"], "structure")
+        self.assertEqual(self.ledger().ticket_open("names-unit")[0]["files"], list(self.sources[2:]))
         self.assertEqual(self.sync_wait_rows(), [])
 
     def test_refill_rechecks_after_registering_a_wait_and_finds_the_just_merged_crate(self) -> None:
@@ -160,7 +177,7 @@ class StylePlanTests(StylePlanFixture):
         self.assertEqual(self.ledger().ticket_open("names-unit")[0]["crate"], "crates/alpha")
         self.assertEqual(self.sync_wait_rows(), [])
 
-    def test_refill_drops_a_busy_edit_ticket_once_and_reads_held_structure(self) -> None:
+    def test_refill_drops_a_busy_edit_ticket_once_and_reads_unheld_structure(self) -> None:
         _ = self.rule("structure", "tier: D\nfamily: modules\n")
         read = self.rule("read")
         self.sync()
@@ -168,12 +185,13 @@ class StylePlanTests(StylePlanFixture):
         ledger.ticket_add("names-unit-1", "names-unit", "read", "names", "crates/alpha",
                           list(self.sources[:2]), [read])
         output = io.StringIO()
-        with mock.patch.object(berth_board, "read_board", return_value=self.board(*self.sources)) as board, redirect_stdout(output):
+        with mock.patch.object(berth_board, "read_board", return_value=self.board(*self.sources[:2])) as board, redirect_stdout(output):
             result = style_plan.next_phase("names-unit", self.plan, self.repo)
         self.assertEqual(result, style_plan.PhaseWritten("names-unit-2"))
         self.assertEqual(board.call_count, 1)
         self.assertEqual(output.getvalue().count("dropped names-unit-1: files busy\n"), 1)
         self.assertEqual(ledger.ticket_open("names-unit")[0]["kind"], "structure")
+        self.assertEqual(ledger.ticket_open("names-unit")[0]["files"], list(self.sources[2:]))
         self.assertEqual(self.sync_wait_rows(), [])
         self.assertEqual(ledger.queued_tickets("names-unit"), ())
 

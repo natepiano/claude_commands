@@ -31,7 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "shutdown"))
 import add_unit
 import production_units
-from scripts.production import staff
+from scripts.production import staff, unit_config
 from cli_fixture import ImmutableGitSeed, invoke_cli
 import conversation_pause
 import unit_lookup
@@ -467,6 +467,7 @@ class AddUnitTestCase(ShutdownTestCase):
             _ = parser.add_argument("--" + flag, type=int if flag == "port" else str)
         _ = parser.add_argument("--standby", action="store_true")
         _ = parser.add_argument("--permanent", action="store_true")
+        _ = parser.add_argument("--responsibility", action="append", default=[])
         _ = parser.add_argument("--check", action="store_true")
         _ = parser.add_argument("--probe", action="store_true")
         _ = parser.add_argument("--source-fallback", action="store_true")
@@ -656,7 +657,22 @@ class AddUnitTestCase(ShutdownTestCase):
         worktree = self.root / "tool-based-ui-trunk"
         _ = self.git("worktree", "add", str(worktree), "-b", "init/catalyst-trunk")
         self.commit_prepared_row(self.unit_row("trunk", branch="init/catalyst-trunk", worktree=worktree))
+        _ = self.prepare_restored_worktree("trunk", worktree)
         return worktree
+
+    def prepare_restored_worktree(self, name: str, worktree: Path, *,
+                                  branch: str = "build-followups-alpha",
+                                  plan: str = "docs/plans/given.md") -> staff.StaffRow:
+        """Record the existing location and file a scheduled restore must keep."""
+        if not worktree.exists():
+            _ = self.git("worktree", "add", str(worktree), "-b", branch)
+        with patch.dict(os.environ, self.env):
+            row = unit_membership(fixture_showrunner_name("build-followups", self.doc), name)
+            row = staff.set_worktree(row.id, staff.PresentWorktree("natedev", worktree))
+            config_plan = (unit_config.StandbyPlan() if plan == "standby"
+                           else unit_config.PlanFile(Path(plan)))
+            unit_config.write(worktree, unit_config.UnitConfig(config_plan, unit_config.NoAppPort(), ()))
+        return row
 
     def run_with_marked_unit(
         self,
@@ -690,13 +706,27 @@ class AddUnitTestCase(ShutdownTestCase):
             if already_marked or isinstance(launch_kind, add_unit.UnitRestoreLaunch) else add_unit.NoUnitRow(),
             add_unit.DirectorAgent("opus", add_unit.DefaultEffort()),
         )
+        # These launcher tests replace worktree creation and preflight. Supply
+        # their real admission inputs before intercepting launcher commands.
+        if not request.worktree.exists():
+            _ = self.git("worktree", "add", "-b", request.branch, str(request.worktree), "build-followups")
+        with patch.dict(os.environ, self.env):
+            row = unit_membership(fixture_showrunner_name("build-followups", self.doc), request.unit_id)
+            _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", request.worktree))
+            unit_config.write(request.worktree, unit_config.UnitConfig(
+                unit_config.PlanFile(Path("docs/plans/given.md")), unit_config.NoAppPort(), ()))
+        git_run = subprocess.run
         commands: list[list[str]] = []
         launches: list[str] = []
 
         if isinstance(launch_kind, add_unit.UnitRestoreLaunch):
             _ = launch_kind.note.write_text("Resume this unit.", encoding="utf-8")
 
-        def run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        def run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            if command[0] == "git":
+                cwd = kwargs.get("cwd")
+                assert cwd is None or isinstance(cwd, (str, Path))
+                return git_run(command, cwd=cwd, capture_output=True, text=True, check=False)
             if "show-options" in command:
                 return subprocess.CompletedProcess(command, 0, "", "")
             if "launch-blocked" in command:

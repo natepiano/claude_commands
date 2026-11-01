@@ -1562,6 +1562,7 @@ def _tickets_from(repo: Path, ledger: style_ledger.Ledger, busy: BusyFiles, fami
                 available = {cell.path for cell in file_cells}
                 if manifest_cells:
                     available.add(manifest)
+                available = {path for path in available if not busy.contains(path)}
                 sites_by_rule = {rule_id: ledger.listed_sites(rule_id, crate)
                                  for rule_id in sorted({cell.rule for cell in structure})}
                 for files in sorted(read_slices(repo, tip, tuple(sorted(available)), _STRUCTURE_LIMITS)):
@@ -2444,7 +2445,7 @@ def _select_phase(
             if isinstance(checkpoint, WaitingForMerge):
                 return checkpoint
         if (index == 0 and in_scope and not uncertain and not ranked
-                and (ticket["kind"] == "structure" or not any(busy.contains(path) for path in edits.of_ticket(ticket)))):
+                and not any(busy.contains(path) for path in edits.of_ticket(ticket))):
             origin = ledger.ticket_origin(ticket["id"])
             findings = edits.ticket_findings(origin) if isinstance(origin, style_ledger.ApprovedProposal) else ()
             checkpoint = checkpoint_selection(predecessor, ledger, changes, edits.of_ticket(ticket), findings)

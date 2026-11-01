@@ -44,6 +44,147 @@ class UnitLookupTests(unittest.TestCase):
     records: Path = Path()
     environment: dict[str, str] = {}
 
+    def test_retirement_follows_the_retained_worktree_mark_and_restore_clears_it(self) -> None:
+        row = unit_membership("show", "marked-unit")
+        location = staff.PresentWorktree("natedev", self.root / "not-on-disk")
+        row = staff.set_worktree(row.id, location)
+        cells = {"Unit": "marked-unit", "Plan": "retired in an old document", "Worktree": "/stale"}
+        self.assertFalse(unit_lookup.unit_is_retired(cells, unit_lookup.ProductionMembers("show")))
+        removed = staff.set_worktree(row.id, staff.RemovedWorktree(location.machine, location.path))
+        cells["Plan"] = "docs/live-looking-plan.md"
+        self.assertTrue(unit_lookup.unit_is_retired(cells, unit_lookup.ProductionMembers("show")))
+        self.assertEqual(staff.by_id(row.id), removed)
+        restored = staff.restore_unit(row.id, location)
+        self.assertEqual((restored.id, restored.parent), (row.id, row.parent))
+        self.assertFalse(unit_lookup.unit_is_retired(cells, unit_lookup.ProductionMembers("show")))
+
+    def test_production_members_excludes_removed_children_and_wrapped_parents_but_keeps_raw_identity(self) -> None:
+        live = unit_membership("current", "live-unit")
+        retired = unit_membership("current", "retired-unit")
+        historical = unit_membership("wrapped", "historical-unit")
+        _ = staff.set_worktree(retired.id, staff.RemovedWorktree("natedev", self.root / "retired"))
+        assert historical.parent is not None
+        _ = staff.set_doc(historical.parent, staff.WrappedDoc("natedev", self.root / "archive.md"))
+        record = staff.snapshot()
+        sources = unit_lookup.MemberSources({}, ())
+        self.assertEqual(unit_lookup.production_members(record, sources), {"current": (live,), "show": ()})
+        self.assertIsNotNone(record.by_id(retired.id))
+        self.assertEqual(unit_lookup.unit_row("retired-unit", record, staff_id=retired.id).id, retired.id)
+
+    def test_retired_pane_marks_are_left_out_while_live_siblings_and_retained_identity_stay(self) -> None:
+        retired = unit_membership("show", "retired-unit")
+        live = unit_membership("show", "live-unit")
+        retired = staff.set_worktree(retired.id, staff.RemovedWorktree("natedev", self.root / "retired"))
+        record = staff.snapshot()
+        sources = unit_lookup.MemberSources({}, ())
+        for durable_id in (retired.id, ""):
+            with self.subTest(durable_id=bool(durable_id)):
+                fake_unit_host.write(self.environment, [
+                    marked("retired", "w1:p1", "retired-unit", STAFF_ID=durable_id),
+                    marked("live", "w2:p1", "live-unit", STAFF_ID=live.id),
+                ])
+                found = unit_lookup.marked_units("show", record=record)
+                self.assertEqual(list(found), ["live-unit"])
+                self.assertEqual(found["live-unit"].place, herdr.HerdrPlace("live", "w2:p1"))
+                selected = sources.member(unit_lookup.ObservedUnit("retired-unit", durable_id), record)
+                self.assertIsInstance(selected, unit_lookup.MemberFound)
+                assert isinstance(selected, unit_lookup.MemberFound)
+                self.assertEqual(selected.row, retired)
+                self.assertEqual(unit_lookup.unit_row("retired-unit", record, staff_id=retired.id), retired)
+
+    def test_pane_marks_under_a_wrapped_parent_are_left_out_without_hiding_other_units(self) -> None:
+        historical = unit_membership("wrapped", "historical-unit")
+        live = unit_membership("show", "live-unit")
+        assert historical.parent is not None
+        _ = staff.set_doc(historical.parent, staff.WrappedDoc("natedev", self.root / "wrapped.md"))
+        fake_unit_host.write(self.environment, [
+            marked("historical", "w1:p1", "historical-unit", slug="wrapped", STAFF_ID=historical.id),
+            marked("live", "w2:p1", "live-unit", STAFF_ID=live.id),
+        ])
+        found = unit_lookup.every_marked_unit(record=staff.snapshot())
+        self.assertEqual({slug: list(units) for slug, units in found.units.items()}, {"show": ["live-unit"]})
+        self.assertEqual(found.faults, {})
+
+    def test_active_pane_marks_with_missing_or_invalid_parents_still_refuse(self) -> None:
+        row = unit_membership("show", "active-unit")
+        record = staff.snapshot()
+        assert row.parent is not None
+        parent = record.by_id(row.parent)
+        assert parent is not None
+        missing = staff.StaffSnapshot(tuple(item for item in record.rows if item.id != parent.id))
+        parentless = staff.StaffSnapshot(tuple(replace(item, parent=None) if item.id == row.id else item
+                                              for item in record.rows))
+        invalid = staff.StaffSnapshot(tuple(replace(item, kind="worker") if item.id == parent.id else item
+                                           for item in record.rows))
+        pane = unit_lookup.MarkedUnit("active-unit", ClaudeNotRunning(), herdr.HerdrPlace("active", "w1:p1"),
+                                      staff_id=row.id)
+        for broken in (missing, parentless, invalid):
+            with self.subTest(rows=broken.rows):
+                found = unit_lookup.group_marked_units([("show", pane)], record=broken,
+                                                       sources=unit_lookup.MemberSources({}, ()))
+                self.assertEqual(found.units, {})
+                self.assertIn("active: no showrunner staff parent", found.production_fault("show"))
+
+    def test_retained_unit_cleanup_lookup_keeps_a_live_director_after_active_membership_excludes_it(self) -> None:
+        row = unit_membership("show", "retired-unit")
+        _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.root / "removed"))
+        fake_unit_host.write(self.environment, [marked("director", "w1:p1", "retired-unit", STAFF_ID=row.id)])
+        self.claude("director", "w1:p1")
+        record = staff.snapshot()
+        found = unit_lookup.marked_unit("show", "retired-unit", record=record)
+        self.assertIsNotNone(found)
+        assert found is not None
+        self.assertIsInstance(found.claude, LiveClaude)
+        assert isinstance(found.claude, LiveClaude)
+        self.assertEqual((found.claude.session_id, found.claude.pid), ("id-director", os.getpid()))
+        self.assertEqual(unit_lookup.marked_units("show", record=record), {})
+
+    def test_retained_unit_cleanup_lookup_keeps_unknown_session_evidence(self) -> None:
+        row = unit_membership("show", "retired-unit")
+        _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.root / "removed"))
+        fake_unit_host.write(self.environment, [marked("director", "w1:p1", "retired-unit", STAFF_ID=row.id)])
+        self.claude("director", "w1:p1")
+        _ = (self.records / "broken.json").write_text("{")
+        (self.records / "director-1.json").unlink()
+        found = unit_lookup.marked_unit("show", "retired-unit", record=staff.snapshot())
+        self.assertIsNotNone(found)
+        assert found is not None
+        self.assertIsInstance(found.claude, ClaudeUnknown)
+
+    def test_retained_unit_cleanup_lookup_still_refuses_duplicate_live_holders(self) -> None:
+        row = unit_membership("show", "retired-unit")
+        _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.root / "removed"))
+        fake_unit_host.write(self.environment, [
+            marked("first", "w1:p1", "retired-unit", STAFF_ID=row.id),
+            marked("second", "w2:p1", "retired-unit", STAFF_ID=row.id),
+        ])
+        self.live_hosts("w1:p1", "w2:p1")
+        with self.assertRaisesRegex(OSError, "retired-unit: its mark is on herdr sessions") as caught:
+            _ = unit_lookup.marked_unit("show", "retired-unit", record=staff.snapshot())
+        self.assertIn("herdr:first:w1:p1", str(caught.exception))
+        self.assertIn("herdr:second:w2:p1", str(caught.exception))
+
+    def test_retired_names_are_explicitly_listed_while_active_membership_excludes_the_retained_row(self) -> None:
+        retired = unit_membership("show", "retired-unit")
+        _ = staff.set_worktree(retired.id, staff.RemovedWorktree("natedev", self.root / "retired"))
+        lines = ["## Units", "| Unit | Plan | Worktree | Branch | Port | Owns |",
+                 "| --- | --- | --- | --- | --- | --- |",
+                 "| retired-unit | old.md | /missing | old | — | scripts |"]
+        with mock.patch.object(unit_lookup, "member_sources", return_value=unit_lookup.MemberSources({}, ())):
+            self.assertFalse(unit_lookup.ProductionMembers("show", record=staff.snapshot()).has("retired-unit"))
+            self.assertEqual(unit_lookup.retired_units(lines, "show", record=staff.snapshot()), {"retired-unit"})
+
+    def test_removed_same_name_does_not_make_an_active_units_orphan_metadata_ambiguous(self) -> None:
+        live = unit_membership("receiving", "alpha-unit")
+        old = unit_membership("former", "alpha-unit")
+        _ = staff.set_worktree(old.id, staff.RemovedWorktree("natedev", self.root / "old"))
+        cells = {"Unit": "alpha-unit", "Plan": "plan.md", "Worktree": "/live", "Branch": "alpha"}
+        lines = ["## Units", "", "| Unit | Plan | Worktree | Branch |", "| --- | --- | --- | --- |",
+                 "| alpha-unit | plan.md | /live | alpha |"]
+        metadata = unit_lookup.unit_metadata(staff.snapshot(), unit_lookup.MemberSources({}, ()),
+                                             documents={"old-doc": lines})
+        self.assertEqual(metadata, {live.id: cells})
+
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))

@@ -49,8 +49,12 @@ class AddUnitStaffRowTests(AddUnitTestCase):
     def test_missing_unit_is_added_under_the_requested_showrunner(self) -> None:
         with patch.dict(os.environ, self.env):
             production = production_units.read_production(self.doc)
+            _ = add_unit.ensure_staff_showrunner(production)
             before = staff.snapshot()
-            row = add_unit.ensure_staff_unit(production, "alpha-unit")
+            worktree = self.root / "project-alpha"
+            _ = self.git("worktree", "add", "-b", "build-followups-alpha", str(worktree), "build-followups")
+            row = add_unit.ensure_staff_unit(production, "alpha-unit",
+                                             worktree=staff.PresentWorktree("natedev", worktree))
             parent = before.by_path("director")
             self.assertIsNotNone(parent)
             assert parent is not None
