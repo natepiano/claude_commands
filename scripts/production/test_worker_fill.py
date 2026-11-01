@@ -5,6 +5,7 @@ import ast
 import io
 import os
 import json
+import shutil
 import subprocess
 from pathlib import Path
 from contextlib import redirect_stderr, redirect_stdout
@@ -13,7 +14,9 @@ from types import FunctionType
 from typing import cast, get_type_hints
 
 from scripts.agents import codex_mesh
+from scripts.herdr.herdr import HerdrPlace
 from scripts.production import staff, staff_sources, worker_fill, worker_admission
+import unit_lookup
 from scripts.production.staff_test_support import StaffTestCase, production_membership, unit_membership, showrunner_relationship
 
 
@@ -22,6 +25,140 @@ class WorkerFillTests(StaffTestCase):
         with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
             code = worker_fill.fill(dry_run=dry_run)
         return code, output.getvalue(), errors.getvalue()
+
+    def pause_ledger(self, path: Path, run: Path) -> None:
+        data = cast(dict[str, object], json.loads(path.read_text()))
+        entries = cast(dict[str, dict[str, object]], data["workers"])
+        for entry in entries.values():
+            entry["ownership"] = {"kind": "Paused"}
+            entry["events"] = [{"kind": "opened", "cause": "fixture launch", "run": str(run), "at": 1.0}]
+        self.write_json(path, data)
+
+    def test_paused_backends_follow_the_live_parent_without_a_run_and_rerun_unchanged(self) -> None:
+        _ = self.production("demo", "models-unit")
+        parent = unit_membership("demo", "models-unit")
+        _ = self.session_record("director", "models-unit")
+        self.pane("w1:models", session_id="director", environment={"STAFF_ID": parent.id})
+        run = self.worker_run("demo", "models-unit", "director")
+        path = self.ledger_worker(run, "demo", "models-unit", "impl", "impl", "thread-impl")
+        _ = self.ledger_worker(run, "demo", "models-unit", "helper", "test", "stopped-helper", family="claude")
+        self.pause_ledger(path, run)
+        shutil.rmtree(run)
+        with mock.patch.object(unit_lookup, "marked_unit", side_effect=AssertionError("live identity reread")):
+            code, output, errors = self.result()
+        self.assertEqual((code, errors), (0, ""), output + errors)
+        rows = staff.find(kind="worker", parent=parent.id)
+        self.assertEqual({row.name for row in rows}, {"impl", "helper"})
+        # Its filename still reflects former membership; durable worker ids take precedence.
+        data = cast(dict[str, object], json.loads(path.read_text()))
+        entries = cast(dict[str, dict[str, object]], data["workers"])
+        for row in rows:
+            entries[row.name]["staff_id"] = row.id
+        stale = path.parent.parent / "former" / "former-unit.json"
+        self.write_json(stale, data)
+        path.unlink()
+        before = self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns
+        self.assertEqual(self.result(), (0, "unchanged\n", ""))
+        self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), before)
+
+    def test_paused_workers_with_surviving_activity_override_unknown_director_evidence(self) -> None:
+        _ = self.production("demo", "models-unit")
+        parent = unit_membership("demo", "models-unit")
+        run = self.worker_run("demo", "models-unit", "gone-director")
+        path = self.ledger_worker(run, "demo", "models-unit", "impl", "impl", "loaded-thread")
+        _ = self.ledger_worker(run, "demo", "models-unit", "helper", "test", "live-helper", family="claude")
+        self.pause_ledger(path, run)
+        _ = self.session_record("live-helper", "helper")
+        roster = cast(dict[str, dict[str, object]], json.loads((run / "mesh_roster.json").read_text()))
+        roster["impl"]["launcher_pid"] = 0
+        self.write_json(run / "mesh_roster.json", roster)
+        loaded = mock.MagicMock(return_value={"loaded-thread"})
+        with mock.patch.object(unit_lookup, "marked_unit", side_effect=OSError("unreadable marks")):
+            with mock.patch.object(codex_mesh, "loaded_threads", loaded):
+                code, output, errors = self.result()
+                self.assertEqual(loaded.call_count, 1)
+        self.assertEqual((code, errors), (0, ""), output + errors)
+        self.assertEqual({row.name for row in staff.find(kind="worker", parent=parent.id)}, {"impl", "helper"})
+        self.assertNotIn("skipped", output)
+
+    def test_paused_inactive_ledger_counts_once_even_without_a_staff_parent(self) -> None:
+        production_membership("demo")
+        run = self.worker_run("demo", "gone-unit", "gone-director")
+        path = self.ledger_worker(run, "demo", "gone-unit", "impl", "impl", "dead-thread")
+        _ = self.ledger_worker(run, "demo", "gone-unit", "helper", "test", "dead-helper", family="claude")
+        self.pause_ledger(path, run)
+        shutil.rmtree(run)
+        with mock.patch.object(unit_lookup, "marked_unit", return_value=None):
+            self.assertEqual(self.result(), (0, "skipped 1 not current\nunchanged\n", ""))
+            self.assertEqual(self.result(), (0, "skipped 1 not current\nunchanged\n", ""))
+        self.assertEqual(staff.find(kind="worker"), [])
+
+    def test_paused_unreadable_or_incomplete_evidence_is_listed_and_never_counted(self) -> None:
+        _ = self.production("demo", "models-unit")
+        _ = unit_membership("demo", "models-unit")
+        run = self.worker_run("demo", "models-unit", "gone-director")
+        path = self.ledger_worker(run, "demo", "models-unit", "impl", "impl", "dead-thread")
+        _ = self.ledger_worker(run, "demo", "models-unit", "helper", "test", "dead-helper", family="claude")
+        self.pause_ledger(path, run)
+        shutil.rmtree(run)
+        with mock.patch.object(unit_lookup, "marked_unit", side_effect=OSError("unreadable marks")):
+            code, output, errors = self.result()
+        self.assertEqual(code, 1)
+        self.assertIn("unreadable marks", errors)
+        self.assertNotIn("skipped", output)
+        registry = self.source_root / "sessions" / "broken.json"
+        _ = registry.write_text("{unreadable")
+        with mock.patch.object(unit_lookup, "marked_unit", return_value=None):
+            code, output, errors = self.result()
+        self.assertEqual(code, 1)
+        self.assertIn("registry is incomplete", errors)
+        self.assertNotIn("skipped", output)
+        self.assertEqual(staff.find(kind="worker"), [])
+        registry.unlink()
+        server = run / "mesh_server.json"
+        self.write_json(server, {"pid": "unreadable", "port": 12345})
+        with mock.patch.object(unit_lookup, "marked_unit", return_value=None):
+            code, output, errors = self.result()
+        self.assertEqual(code, 1)
+        self.assertIn(str(server), errors)
+        self.assertNotIn("skipped", output)
+
+    def test_paused_director_mark_keeps_live_and_unknown_outcomes_distinct(self) -> None:
+        _ = self.production("demo", "models-unit")
+        parent = unit_membership("demo", "models-unit")
+        run = self.worker_run("demo", "models-unit", "former-director")
+        path = self.ledger_worker(run, "demo", "models-unit", "impl", "impl", "dead-thread")
+        self.pause_ledger(path, run)
+        shutil.rmtree(run)
+        place = HerdrPlace("agents", "w1:models")
+        unknown = unit_lookup.MarkedUnit("models-unit", unit_lookup.ClaudeUnknown("unreadable director session"), place)
+        with mock.patch.object(unit_lookup, "marked_unit", return_value=unknown):
+            code, output, errors = self.result()
+        self.assertEqual(code, 1)
+        self.assertIn("unreadable director session", errors)
+        self.assertNotIn("skipped", output)
+        live = unit_lookup.MarkedUnit("models-unit", unit_lookup.LiveClaude("models", "new-director", "", os.getpid()), place)
+        with mock.patch.object(unit_lookup, "marked_unit", return_value=live):
+            code, output, errors = self.result()
+        self.assertEqual((code, errors), (0, ""), output + errors)
+        self.assertEqual([row.name for row in staff.find(kind="worker", parent=parent.id)], ["impl"])
+
+    def test_missing_director_file_uses_run_started_history_for_active_ownership(self) -> None:
+        _ = self.production("demo", "models-unit")
+        parent = unit_membership("demo", "models-unit")
+        _ = self.session_record("director", "models-unit")
+        self.pane("w1:models", session_id="director", environment={"STAFF_ID": parent.id})
+        run = self.worker_run("", "", "director")
+        (run / "director").unlink()
+        history = run / "history.jsonl"
+        # The reader intentionally reads the first history line, as the producer writes it.
+        _ = history.write_text(json.dumps({"event_type": "run_started", "main_agent": {"session_id": "director"}}) + "\n")
+        self.write_json(run / "progress_history_state.json", {"history_file": str(history)})
+        _ = self.roster_worker(run, "impl", "impl", "thread-impl", status="paused")
+        code, output, errors = self.result()
+        self.assertEqual((code, errors), (0, ""), output + errors)
+        self.assertEqual([row.name for row in staff.find(kind="worker", parent=parent.id)], ["impl"])
+        self.assertEqual(self.result(), (0, "unchanged\n", ""))
 
     def test_fill_places_ledger_roster_and_claude_workers_under_their_unit_once(self) -> None:
         _ = self.production("demo", "models-unit")

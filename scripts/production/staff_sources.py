@@ -297,9 +297,7 @@ class _WorkerSources:
         return WorkerOwner(selected.key, staff.NewSeedMember())
 
     def _record_run_owner(self, run: Path) -> WorkerOwner:
-        director_path = run / unit_runs.DIRECTOR_FILE
-        self.inputs.add(str(director_path.absolute()))
-        director = director_path.read_text(encoding="utf-8").strip()
+        director = unit_runs.director(run, dependencies=self.dependencies)
         if director in self.sessions:
             return self.sessions[director]
         state = self.read(run / workers.STATE)
@@ -340,6 +338,95 @@ class _WorkerSources:
         session = _text(fields.get("worker_id")) or _text(fields.get("session_id"))
         return {"claude": session} if session else BackendUnavailable()
 
+    def ledger_owner(self, path: Path, worker: workers.UnitWorker, fields: Mapping[str, object],
+                     owner: WorkerOwner | None) -> tuple[str, WorkerOwner]:
+        current = self.record.by_id(staff.StaffId(_text(fields.get("staff_id")) or worker.name))
+        if current is not None and current.kind == "worker" and current.parent is not None:
+            row = self.record.by_id(current.parent)
+            if row is not None:
+                return current.name, WorkerOwner(f"staff:{row.id}", row)
+        if owner is not None:
+            return worker.name, owner
+        try:
+            return worker.name, self.owner(UnitMember(path.parent.name, path.stem))
+        except ValueError:
+            # An adhoc stem can name a worktree rather than a unit.
+            observed = ObservedUnit(path.stem)
+            found = (self.sources.member(observed, self.record)
+                     if unit_names.NAME.fullmatch(path.stem) else NoSuchMember(observed))
+            if isinstance(found, MemberFound):
+                return worker.name, WorkerOwner(f"staff:{found.row.id}", found.row)
+            if isinstance(worker.ownership, workers.HeldBy):
+                return worker.name, self._run_owner(Path(worker.ownership.run))
+            raise ValueError("worker ledger has no current staff parent")
+
+    def paused_director_live(self, path: Path, parent: WorkerOwner | None) -> bool:
+        """A cached live identity proves life; negative evidence needs a successful mark lookup."""
+        row = parent.match if parent is not None else staff.NewSeedMember()
+        if isinstance(row, staff.StaffRow):
+            identity = self.identities.get(row.id, {})
+            if identity.get("claude") in self.running:
+                return True
+            if row.kind == "unit":
+                slug = unit_lookup.row_production(row, self.record, self.sources).slug
+                unit = unit_names.unit_id(row.name)
+            elif row.kind == "showrunner":
+                if self.registry_incomplete:
+                    raise ValueError("director registry is incomplete")
+                if any(owner.match == row for owner in self.sessions.values()):
+                    return False
+                raise ValueError("showrunner director identity is unavailable")
+            else:
+                raise ValueError("worker ledger has no director parent")
+        else:
+            slug, unit = path.parent.name, path.stem
+            if not unit_names.NAME.fullmatch(unit):
+                raise ValueError("worker ledger director identity is unavailable")
+        marked = unit_lookup.marked_unit(slug, unit, record=self.record, sources=self.sources,
+                                         running=tuple(self.running.values()))
+        if marked is not None and isinstance(marked.claude, unit_lookup.LiveClaude):
+            return True
+        if marked is not None and isinstance(marked.claude, unit_lookup.ClaudeUnknown):
+            raise ValueError(marked.claude.reason)
+        if self.registry_incomplete:
+            raise ValueError("director registry is incomplete")
+        return False
+
+    def paused_current(self, path: Path, worker: workers.UnitWorker, parent: WorkerOwner | None) -> bool:
+        """Paused ownership has no run; its director or historical worker processes may still live."""
+        failures: list[Exception] = []
+        try:
+            if self.paused_director_live(path, parent):
+                return True
+        except (OSError, ValueError, staff.StaffUnreadable) as error:
+            failures.append(error)
+        backend = worker.backend
+        runs = {Path(event.run) for event in worker.events}
+        if isinstance(backend, workers.ClaudeSession):
+            if backend.session_id in self.running:
+                self.live_worker_runs.update(runs)
+                return True
+            if self.registry_incomplete:
+                failures.append(ValueError("Claude registry is incomplete"))
+        else:
+            if not runs:
+                failures.append(ValueError("paused Codex worker has no recorded event run"))
+            for run in sorted(runs):
+                try:
+                    roster = self.checked(run / workers.ROSTER) if (run / workers.ROSTER).exists() else {}
+                    entry = _object(roster.get(worker.name, {}))
+                    if self.worker_live(run, {**entry, "family": worker.family, "thread_id": backend.thread_id}):
+                        self.live_worker_runs.add(run)
+                        return True
+                except (OSError, ValueError) as error:
+                    failures.append(error)
+        if failures:
+            failure = ValueError(str(failures[0]))
+            for run in runs:
+                self.activity_unavailable[run] = failure
+            raise failure
+        return False
+
     def ledger(self, path: Path, owner: WorkerOwner | None = None) -> None:
         marker = (path.absolute(), owner.key if owner is not None else "")
         if marker in self.processed_ledgers:
@@ -352,12 +439,16 @@ class _WorkerSources:
             _problem(path, error)
             return
         inactive = 0
+        relevant = 0
+        unresolved = False
         for key, value in entries.items():
             try:
                 fields = _object(value)
                 name = _text(fields.get("name")) or key
                 # Reuse the ledger's decoder; its public locked reader also writes and recovers.
                 worker = workers._decode_worker(name, fields)  # pyright: ignore[reportPrivateUsage]
+                if not isinstance(worker.ownership, (workers.Retired, workers.Adopted)):
+                    relevant += 1
                 if isinstance(worker.ownership, workers.HeldBy):
                     run = Path(worker.ownership.run)
                     roster = self.checked(run / workers.ROSTER) if (run / workers.ROSTER).exists() else {}
@@ -374,41 +465,19 @@ class _WorkerSources:
                         self.runs.add(run)
                         continue
                     self.live_worker_runs.add(run)
-                elif isinstance(worker.ownership, workers.Paused):
-                    if isinstance(worker.backend, workers.ClaudeSession):
-                        if worker.backend.session_id not in self.running:
-                            if self.registry_incomplete:
-                                raise ValueError("Claude registry is incomplete")
-                            inactive += 1
-                            continue
-                    else:
-                        raise ValueError("paused Codex worker has no run activity record")
                 try:
-                    current = self.record.by_id(staff.StaffId(_text(fields.get("staff_id")) or key))
-                    parent = owner
-                    if current is not None and current.kind == "worker" and current.parent is not None:
-                        row = self.record.by_id(current.parent)
-                        if row is not None:
-                            parent = WorkerOwner(f"staff:{row.id}", row)
-                            name = current.name
-                    if parent is None:
-                        try:
-                            parent = self.owner(UnitMember(path.parent.name, path.stem))
-                        except ValueError:
-                            # An adhoc stem is a worktree name and digest; `.claude-<digest>` names no unit.
-                            observed = ObservedUnit(path.stem)
-                            found = (self.sources.member(observed, self.record)
-                                     if unit_names.NAME.fullmatch(path.stem) else NoSuchMember(observed))
-                            if isinstance(found, MemberFound):
-                                parent = WorkerOwner(f"staff:{found.row.id}", found.row)
-                            elif isinstance(worker.ownership, workers.HeldBy):
-                                parent = self._run_owner(Path(worker.ownership.run))
-                            else:
-                                raise ValueError("worker ledger has no current staff parent")
+                    name, parent = self.ledger_owner(
+                        path, worker, {**fields, "staff_id": _text(fields.get("staff_id")) or key}, owner)
                 except (ValueError, staff.StaffRefused, staff.StaffUnreadable, OSError):
                     if isinstance(worker.ownership, (workers.Retired, workers.Adopted)):
                         continue
+                    if isinstance(worker.ownership, workers.Paused) and not self.paused_current(path, worker, None):
+                        inactive += 1
+                        continue
                     raise
+                if isinstance(worker.ownership, workers.Paused) and not self.paused_current(path, worker, parent):
+                    inactive += 1
+                    continue
                 self.ledger_names.add((parent.key, name))
                 if isinstance(worker.ownership, (workers.Retired, workers.Adopted)):
                     continue
@@ -424,9 +493,10 @@ class _WorkerSources:
                 if isinstance(worker.ownership, workers.HeldBy):
                     self.runs.add(Path(worker.ownership.run))
             except (ValueError, staff.StaffRefused, workers.WorkerUnavailable, OSError, staff.StaffUnreadable) as error:
+                unresolved = True
                 _problem(f"{path} worker {key}", error)
 
-        if entries and inactive == len(entries) and path.absolute() not in self.unreadable:
+        if relevant and inactive == relevant and not unresolved and path.absolute() not in self.unreadable:
             self.skipped_ledgers.add(path.absolute())
 
     def checked(self, path: Path) -> dict[str, object]:
