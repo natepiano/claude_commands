@@ -425,12 +425,12 @@ class MacPromotionPathTests(unittest.TestCase):
 
     def test_tilde_mac_path_is_expanded_by_the_mac_shell(self) -> None:
         remote = self.remote_command("mac `~/.claude`")
-        self.assertTrue(remote.startswith('cd "$HOME"/.claude && git pull'), remote)
+        self.assertTrue(remote.startswith('cd "$HOME"/.claude && python3'), remote)
         self.assertNotIn(str(Path.home()) + "/.claude &&", remote)
 
     def test_absolute_mac_path_is_kept(self) -> None:
         remote = self.remote_command("/home/natepiano/.claude, mac /Users/someone/my repo")
-        self.assertTrue(remote.startswith("cd '/Users/someone/my repo' && git pull"), remote)
+        self.assertTrue(remote.startswith("cd '/Users/someone/my repo' && python3"), remote)
 
 
 if __name__ == "__main__":

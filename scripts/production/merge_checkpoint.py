@@ -40,6 +40,7 @@ from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
 from scripts.lib.atomic_file import write_text_atomic  # noqa: E402
 import sessions  # noqa: E402
 from scripts.lib.process_failure import failure_detail  # noqa: E402
+from scripts.lib import tunables  # noqa: E402
 
 # /zone queues a change for the Mac while it is offline; a promotion's Mac pull sends it.
 ZONE_SCRIPT = Path(__file__).resolve().parents[1] / "lib/zone.py"
@@ -961,9 +962,80 @@ def remote_path(path: PurePosixPath) -> str:
     return shlex.quote(text)
 
 
+# Run under the Mac's Python: fcntl is available there without a flock executable.
+MAC_PULL_PROGRAM = """import fcntl
+import pathlib
+import subprocess
+import sys
+import time
+
+source, lock_seconds, poll_seconds = sys.argv[1:]
+lock_fds = ()
+
+def git(*args):
+    return subprocess.run(['git', *args], check=True, stdout=subprocess.PIPE, text=True, pass_fds=lock_fds).stdout.strip()
+
+try:
+    common = pathlib.Path(git('rev-parse', '--git-common-dir'))
+    with (common / 'mac-promotion.lock').open('a') as lock:
+        lock_fds = (lock.fileno(),)
+        deadline = time.monotonic() + float(lock_seconds)
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError('Mac promotion lock timed out')
+                time.sleep(min(float(poll_seconds), remaining))
+        ref = 'refs/checkpoint/mac-promotion'
+        try:
+            git('fetch', '--no-write-fetch-head', source, '+main:' + ref)
+            tip = git('rev-parse', ref)
+            ancestor = subprocess.run(['git', 'merge-base', '--is-ancestor', tip, 'HEAD'], pass_fds=lock_fds)
+            if ancestor.returncode == 1:
+                print(git('merge', '--ff-only', tip))
+            elif ancestor.returncode:
+                ancestor.check_returncode()
+        finally:
+            primary_failed = sys.exc_info()[0] is not None
+            try:
+                git('update-ref', '-d', ref)
+            except (OSError, subprocess.CalledProcessError) as cleanup_error:
+                if not primary_failed:
+                    raise
+                print('Mac promotion ref cleanup: ' + str(cleanup_error), file=sys.stderr)
+except (OSError, subprocess.CalledProcessError) as error:
+    print(str(error), file=sys.stderr)
+    sys.exit(1)
+"""
+
+
+class MacPullLimits(NamedTuple):
+    lock_seconds: float
+    poll_seconds: float
+
+
+def mac_pull_limits() -> MacPullLimits:
+    path = Path(os.environ.get("MERGE_CHECKPOINT_CONFIG", Path(__file__).resolve().parents[2] / "config/merge_checkpoint.conf"))
+    def positive(key: str) -> float:
+        value = tunables.number(path, key, minimum=0, maximum=float("inf"))
+        if value <= 0:
+            raise tunables.TunableUnusable(f"{path}: {key} must be positive")
+        return value
+    return MacPullLimits(positive("MAC_PULL_LOCK_SECONDS"), positive("MAC_PULL_POLL_SECONDS"))
+
+
 def pull_mac_checkout(mac: PurePosixPath, source: Path) -> None:
-    remote = (f"cd {remote_path(mac)} && git pull --ff-only "
-              f"natedev:{shlex.quote(str(source))} main; printf 'rc=%s\\n' \"$?\"")
+    try:
+        limits = mac_pull_limits()
+    except tunables.TunableUnusable as error:
+        raise Stop("promote", "failed", str(error), "repair the Mac pull configuration and rerun this checkpoint") from error
+    # Keep the shell command on one line for checkpoint and lifecycle command logs.
+    program = "exec(" + repr(MAC_PULL_PROGRAM) + ")"
+    command = shlex.join(["python3", "-c", program, f"natedev:{source}", str(limits.lock_seconds), str(limits.poll_seconds)])
+    remote = f"cd {remote_path(mac)} && {command}; printf 'rc=%s\\n' \"$?\""
     result = subprocess.run(["ssh", "mac", remote], capture_output=True, text=True, check=False)
     match = re.search(r"(?:^|\n)rc=(\d+)", result.stdout)
     if result.returncode or match is None or int(match.group(1)):
