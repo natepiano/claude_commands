@@ -1173,10 +1173,10 @@ def approved_documentation_sites(ledger: style_ledger.Ledger, ticket_id: str,
         original = trees[base]
         if finding.path not in original.paths:
             continue
-        judged = ledger.judged_commit(finding)
-        if isinstance(judged, style_ledger.NoJudgedCommit):
+        anchor = ledger.finding_anchor(finding)
+        if isinstance(anchor, style_ledger.NeedsJudgment):
             continue
-        read = finding.follow.commit if isinstance(finding.follow, style_ledger.FollowedDeclaration) else judged.commit
+        read = anchor.commit
         if read not in trees:
             trees[read] = style_footprint.RevisionTree(ledger.repo, read)
         source = trees[read]
@@ -2685,7 +2685,8 @@ def _select_phase(
             elif finding.finding_id in moved:
                 gone[f"{finding.path} site moved to {moved[finding.finding_id]} in synced commit {tip}"].append(finding.finding_id)
             elif (finding.finding_id in site_evidence
-                  and not isinstance(site_evidence[finding.finding_id], style_ledger.UnchangedSite)):
+                  and not isinstance(site_evidence[finding.finding_id],
+                                     (style_ledger.UnchangedSite, style_ledger.FilingEligibleWithoutHistory))):
                 # A lower-rank finding judged at an older file builds only once the judgment that reads the file again
                 # holds it again; a judgment that does not hold it settles it.
                 judged_again = (superseding[finding.finding_id] if finding.finding_id in superseding
