@@ -40,17 +40,18 @@ from scripts.production import staff
 
 @final
 class AddUnitLaunchTests(AddUnitTestCase):
-    def test_adding_the_same_unit_name_to_another_production_creates_its_own_row(self) -> None:
+    def test_unit_under_another_production_refuses_with_move_command_without_changing_its_row(self) -> None:
         old_doc = self.staff.production("old", "alpha-unit", workspace="original")
         original = staff.ensure("showrunner", name="original")
         old = staff.ensure("unit", name="alpha", parent=original.id)
-        production = production_units.read_production(self.doc)
-        new = add_unit.ensure_staff_unit(production, "alpha-unit")
-        self.assertNotEqual(new.id, old.id)
-        self.assertNotEqual(new.parent, old.parent)
+        before = self.staff.staff_file.read_bytes()
+        result = self.cli("alpha", "--plan", "docs/plans/given.md")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertEqual(result.stderr,
+                         "add_unit: alpha is under original; to move it, run: staff.py move original/alpha build-followups\n")
         self.assertEqual(staff.by_id(old.id), old)
         self.assertIn("alpha-unit", old_doc.read_text())
-        self.assertEqual(add_unit.ensure_staff_unit(production, "alpha-unit"), new)
+        self.assertEqual(self.staff.staff_file.read_bytes(), before)
 
     def test_new_launch_carries_the_ensured_staff_identity(self) -> None:
         _ = self.successful("alpha", "--standby")

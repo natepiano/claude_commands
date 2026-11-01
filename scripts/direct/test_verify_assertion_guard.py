@@ -9,6 +9,7 @@ from typing import override
 
 from scripts.direct.test_assertion_guard import GitRepositoryFixture, TILE_NEW, TILE_OLD
 from scripts.direct import test_verify_lint_scope as verify_fixture
+from scripts.direct.verify_lint_scope_test_support import workspace_taplo_script
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 VERIFY = Path(__file__).with_name("verify.sh")
@@ -57,7 +58,7 @@ taplo() { :; }
 run() { "$@"; }
 cargo() { printf '{"workspace_root":"%s"}\n' "$TEST_REPO"; }
 '''
-        script += rulings_setup + "\ncase lint in\n    lint)\n" + case + "\nesac\n"
+        script += workspace_taplo_script(source) + rulings_setup + "\ncase lint in\n    lint)\n" + case + "\nesac\n"
         environment = {**self.environment, "HOME": str(self.home), "PY": sys.executable, "TEST_REPO": str(self.repo),
                        "ASSERTION_GUARD_SCRIPT": str(VERIFY.with_name("assertion_guard.py"))}
         for name in ("UNIT_SESSION_DIR", "UNIT_RUN_DIR", "PLAN_DELEGATE_BOARD_DIR", "WORKSPACE_ROOT"):

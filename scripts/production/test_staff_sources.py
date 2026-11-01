@@ -9,7 +9,7 @@ from collections import Counter
 from contextlib import AbstractContextManager, redirect_stderr, redirect_stdout
 from dataclasses import replace
 from pathlib import Path
-from typing import cast
+from typing import cast, override
 from unittest import mock
 
 
@@ -32,6 +32,159 @@ from unit_lookup import ProductionMembers, live_unit_table, retired_units, unit_
 
 
 class StaffSourcesTests(StaffTestCase):
+    @override
+    def fill_production(self, slug: str, *units: str) -> Path:
+        doc = super().fill_production(slug, *units)
+        write_text_atomic(doc, f"- **Showrunner checkout:** `{doc.parents[1]}`\n"
+                          + "- **Merge branch:** `main`\n" + doc.read_text())
+        return doc
+
+    def test_fill_uses_session_fallback_without_a_units_table_and_continues_after_a_missing_session(self) -> None:
+        doc = self.fill_production("sdlc", "fallback-unit", "unavailable-unit")
+        write_text_atomic(doc, doc.read_text().split("## Units")[0])
+        folder = self.source_root / "worktrees/fallback-unit"
+        config = unit_config.UnitConfig(unit_config.StandbyPlan(), unit_config.NoAppPort(), ())
+        unit_config.write(folder, config)
+        fallback = unit_membership("sdlc", "fallback-unit")
+        session = self.session_record("session-fallback", "fallback-unit")
+        value = cast(dict[str, object], json.loads(session.read_text()))
+        value["cwd"] = str(folder)
+        self.write_json(session, value)
+        self.pane("w1:fallback", session_id="session-fallback", environment={"STAFF_ID": fallback.id})
+        _ = self.fill_production("tools", "following-unit")
+        unavailable = unit_membership("sdlc", "unavailable-unit")
+        with mock.patch.object(staff, "snapshot", wraps=staff.snapshot) as reads:
+            code, output, errors = self.fill_result()
+        self.assertEqual(code, 1, output)
+        self.assertEqual(reads.call_count, 1)
+        self.assertIn(f"{unavailable.id} {unavailable.name}:", errors)
+        self.assertIn("Units", errors)
+        self.assertIn("no verified live session", errors)
+        self.assertEqual(unit_membership("sdlc", "fallback-unit").worktree,
+                         staff.PresentWorktree(remote.local_machine(), folder))
+        self.assertEqual(unit_config.read(folder), config)
+        following = unit_membership("tools", "following-unit")
+        self.assertIsInstance(following.worktree, staff.PresentWorktree)
+        self.assertIsInstance(unit_config.read(self.source_root / "worktrees/following-unit"), unit_config.UnitConfig)
+
+    def test_fill_requires_checkout_and_merge_branch_evidence_before_using_a_timer_document(self) -> None:
+        for slug, field in (("no-checkout", "Showrunner checkout"), ("no-branch", "Merge branch"),
+                            ("feature", "branch")):
+            with self.subTest(slug=slug):
+                doc = self.fill_production(slug, f"{slug}-unit")
+                if slug == "feature":
+                    _ = self.fixture_git(doc.parents[1], "checkout", "-b", "feature")
+                else:
+                    write_text_atomic(doc, "\n".join(line for line in doc.read_text().splitlines()
+                                                    if not line.startswith(f"- **{field}:**")) + "\n")
+                owner = next(row for row in staff.find(kind="showrunner") if row.name == slug)
+                code, output, errors = self.fill_result()
+                self.assertEqual(code, 1, output)
+                self.assertIn(f"{owner.id} {owner.name}:", errors)
+                self.assertIn(field, errors)
+                current = staff.by_id(owner.id)
+                assert current is not None
+                self.assertIsInstance(current.doc, staff.DocUnfilled)
+                self.assertIsInstance(unit_membership(slug, f"{slug}-unit").worktree, staff.WorktreeUnfilled)
+                self.assertFalse((self.source_root / f"worktrees/{slug}-unit/.unit.toml").exists())
+
+    def test_fill_keeps_a_saved_doc_but_never_uses_it_to_fill_children_without_a_timer(self) -> None:
+        doc = self.fill_production("sdlc", "stale-unit")
+        owner = next(row for row in staff.find(kind="showrunner") if row.name == "sdlc")
+        saved = staff.LiveDoc(remote.local_machine(), doc)
+        _ = staff.set_doc(owner.id, saved)
+        timer = Path(os.environ["NOTIFIER_STATE_DIR"]) / "showrunner-sdlc/conf"
+        timer.unlink()
+        timer.parent.rmdir()
+        _ = self.session_record("session-sdlc", "sdlc")
+        self.pane("w1:showrunner", session_id="session-sdlc", environment={"STAFF_ID": owner.id})
+        code, output, errors = self.fill_result()
+        child = unit_membership("sdlc", "stale-unit")
+        self.assertEqual(code, 1, output)
+        self.assertIn(f"{child.id} {child.name}:", errors)
+        self.assertIn("no timer names its live production document", errors)
+        self.assertNotIn(f"{owner.id} {owner.name}:", errors)
+        current = staff.by_id(owner.id)
+        assert current is not None
+        self.assertEqual(current.doc, saved)
+        self.assertIsInstance(child.worktree, staff.WorktreeUnfilled)
+        self.assertFalse((self.source_root / "worktrees/stale-unit/.unit.toml").exists())
+
+    def test_fill_reports_an_unreadable_timer_document_even_without_a_live_session(self) -> None:
+        for slug in ("missing", "undecodable"):
+            with self.subTest(slug=slug):
+                doc = self.fill_production(slug)
+                owner = next(row for row in staff.find(kind="showrunner") if row.name == slug)
+                if slug == "missing":
+                    doc.unlink()
+                else:
+                    _ = doc.write_bytes(b"\xff")
+                code, output, errors = self.fill_result()
+                self.assertEqual(code, 1, output)
+                self.assertIn(f"{owner.id} {owner.name}:", errors)
+                self.assertIn(str(doc), errors)
+                self.assertIn("production doc could not be read", errors)
+                current = staff.by_id(owner.id)
+                assert current is not None
+                self.assertIsInstance(current.doc, staff.DocUnfilled)
+
+    def test_fill_reports_the_nested_timer_owner_when_its_document_is_unreadable(self) -> None:
+        doc = self.fill_production("builds")
+        root = staff.ensure("showrunner", name="natedev")
+        owner = next(row for row in staff.find(kind="showrunner") if row.name == "builds")
+        owner = staff.move(owner.id, root.id)
+        other_root = staff.ensure("showrunner", name="other")
+        other = staff.ensure("showrunner", name="other-builds", parent=other_root.id)
+        # Timer names can predate the current staff name. Its retained target
+        # launch, rather than the timer slug or the unreadable doc, binds it.
+        old_timer = Path(os.environ["NOTIFIER_STATE_DIR"]) / "showrunner-builds"
+        (old_timer / "conf").unlink()
+        old_timer.rmdir()
+        self.register_production("legacy-builds", doc)
+        self.pane("w1:builds", session_id="session-legacy-builds", environment={"STAFF_ID": owner.id})
+        for missing in (True, False):
+            with self.subTest(missing=missing):
+                if missing:
+                    doc.unlink()
+                else:
+                    _ = doc.write_bytes(b"\xff")
+                before = self.staff_file.read_bytes()
+                with mock.patch.object(staff, "snapshot", wraps=staff.snapshot) as reads:
+                    code, output, errors = self.fill_result()
+                self.assertEqual(code, 1, output)
+                self.assertEqual(reads.call_count, 1)
+                self.assertIn(f"{owner.id} {owner.name}:", errors)
+                self.assertIn(str(doc), errors)
+                self.assertIn("production doc could not be read", errors)
+                self.assertNotIn(f"{other.id} {other.name}:", errors)
+                self.assertNotIn("unchanged", output)
+                self.assertEqual(self.staff_file.read_bytes(), before)
+                current = staff.by_id(owner.id)
+                assert current is not None
+                self.assertIsInstance(current.doc, staff.DocUnfilled)
+
+    def test_fill_reports_configuration_recovery_failure_for_an_already_filled_worktree(self) -> None:
+        _ = self.fill_production("sdlc", "recovering-unit")
+        folder = self.source_root / "worktrees/recovering-unit"
+        row = unit_membership("sdlc", "recovering-unit")
+        _ = staff.set_worktree(row.id, staff.PresentWorktree(remote.local_machine(), folder))
+        with mock.patch.object(unit_config, "write", side_effect=OSError("configuration publication refused")):
+            code, output, errors = self.fill_result()
+        self.assertEqual(code, 1, output)
+        self.assertIn(f"recovery {row.id} {row.name}: configuration publication refused", errors)
+        self.assertNotIn(f"\n{row.id} {row.name}:", "\n" + errors)
+        self.assertFalse((folder / ".unit.toml").exists())
+        current = unit_membership("sdlc", "recovering-unit")
+        self.assertEqual(current.worktree, staff.PresentWorktree(remote.local_machine(), folder))
+        code, output, errors = self.fill_result()
+        self.assertEqual((code, errors), (0, ""), output)
+        self.assertIsInstance(unit_config.read(folder), unit_config.UnitConfig)
+        before = self.staff_file.read_bytes(), (folder / ".unit.toml").read_bytes()
+        code, output, errors = self.fill_result()
+        self.assertEqual((code, errors), (0, ""), output)
+        self.assertEqual(output, "unchanged\n")
+        self.assertEqual((self.staff_file.read_bytes(), (folder / ".unit.toml").read_bytes()), before)
+
     def fill_result(self, *, dry_run: bool = False) -> tuple[int, str, str]:
         with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
             code = staff_sources.fill(dry_run=dry_run)
@@ -47,9 +200,8 @@ class StaffSourcesTests(StaffTestCase):
         _ = self.fixture_git(repository, "commit", "-m", "document at branch tip")
         missing.unlink()
         code, output, errors = self.fill_result()
-        self.assertEqual(code, 1, output)
-        self.assertIn(str(missing), errors)
-        self.assertIn(f"live production doc is missing: {missing}", errors)
+        self.assertEqual((code, errors), (0, ""), output)
+        self.assertNotIn(str(missing), output)
         current = staff.by_id(owner.id)
         assert current is not None
         self.assertIsInstance(current.doc, staff.DocUnfilled)
@@ -60,16 +212,15 @@ class StaffSourcesTests(StaffTestCase):
         other = doc.parent / "elsewhere" / doc.name
         other.parent.mkdir()
         write_text_atomic(other, doc.read_text())
-        before = self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns
         code, output, errors = self.fill_result()
-        self.assertEqual(code, 1, output)
-        self.assertIn(str(doc), errors)
-        self.assertIn(str(other), errors)
-        self.assertIn("conflict", errors.lower())
-        self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), before)
+        self.assertEqual((code, errors), (0, ""), output)
+        self.assertIn(str(doc), output)
+        self.assertNotIn(str(other), output)
+        owner = next(row for row in staff.find(kind="showrunner") if row.name == "sdlc")
+        self.assertEqual(owner.doc, staff.LiveDoc(remote.local_machine(), doc))
 
     def test_fill_preserves_conflicting_locations_accepts_equal_ones_and_fills_unfilled_fields(self) -> None:
-        doc = self.fill_production("sdlc")
+        _ = self.fill_production("sdlc")
         owner = next(row for row in staff.find(kind="showrunner") if row.name == "sdlc")
         old_doc = staff.LiveDoc("mac", self.root / "other-checkout/docs/sdlc-production.md")
         _ = staff.set_doc(owner.id, old_doc)
@@ -84,11 +235,7 @@ class StaffSourcesTests(StaffTestCase):
         equal_worktree = staff.PresentWorktree(remote.local_machine(), self.source_root / "worktrees/equal-unit")
         _ = staff.set_worktree(equal.id, equal_worktree)
         code, output, errors = self.fill_result()
-        self.assertEqual(code, 1, output)
-        self.assertIn(str(doc), errors)
-        self.assertIn(str(old_doc.path), errors)
-        self.assertIn(str(prior_worktree.path), errors)
-        self.assertIn("conflict", errors.lower())
+        self.assertEqual((code, errors), (0, ""), output)
         rows = staff.snapshot()
         for identity, expected in ((owner.id, old_doc), (tools.id, same_doc)):
             current = rows.by_id(identity)
@@ -111,11 +258,8 @@ class StaffSourcesTests(StaffTestCase):
         for name in ("missing-unit", "retired-unit"):
             _ = staff.retire(unit_membership("sdlc", name).id)
         identities = [row.id for row in staff.snapshot().rows]
-        line = next(index for index, text_line in enumerate(text.splitlines(), 1) if "`missing-unit`" in text_line)
         code, output, errors = self.fill_result()
-        self.assertEqual(code, 1, output)
-        self.assertIn(f"{doc}:{line} missing-unit:", errors)
-        self.assertIn("staff", errors.lower())
+        self.assertEqual((code, errors), (0, ""), output)
         self.assertEqual([row.id for row in staff.snapshot().rows], identities)
         self.assertEqual(staff.find(kind="unit"), [])
         for name in ("missing-unit", "retired-unit"):
@@ -125,10 +269,13 @@ class StaffSourcesTests(StaffTestCase):
         doc = self.fill_production("sdlc", "broken-unit", "complete-unit")
         text = doc.read_text().replace("`broken-unit` |", "`invalid/name-unit` |", 1)
         write_text_atomic(doc, text)
-        line = next(index for index, text_line in enumerate(text.splitlines(), 1) if "`invalid/name-unit`" in text_line)
+        broken = unit_membership("sdlc", "broken-unit")
         code, output, errors = self.fill_result()
         self.assertEqual(code, 1, output)
-        self.assertIn(f"{doc}:{line} invalid/name-unit:", errors)
+        self.assertEqual(errors, f"{broken.id} {broken.name}: no verified live session supplies its working folder\n")
+        current = staff.by_id(broken.id)
+        assert current is not None
+        self.assertIsInstance(current.worktree, staff.WorktreeUnfilled)
         complete = unit_membership("sdlc", "complete-unit")
         self.assertEqual(complete.worktree, staff.PresentWorktree(remote.local_machine(), self.source_root / "worktrees/complete-unit"))
         self.assertIsInstance(unit_config.read(self.source_root / "worktrees/complete-unit"), unit_config.UnitConfig)
@@ -298,14 +445,24 @@ class StaffSourcesTests(StaffTestCase):
         self.write_json(Path(os.environ["SHOWRUNNERS_CONFIG"]), {"always": ["registry-only"]})
         code, output, errors = self.fill_result()
         self.assertEqual(code, 1, output)
-        self.assertRegex(errors, r"sdlc-production\.md:\d+ missing-unit:.*Worktree")
-        self.assertRegex(errors, r"sdlc-production\.md:\d+ wrong-unit:.*branch")
-        self.assertRegex(errors, r"sdlc-production\.md:\d+ conflict-unit:.*conflict")
-        self.assertIn("missing-production", errors)
-        self.assertIn("registry-only", errors)
-        self.assertIn("no source holds", errors)
-        self.assertTrue((self.source_root / "worktrees/complete-unit/.unit.toml").exists())
-        for name in ("missing-unit", "wrong-unit", "conflict-unit"):
+        missing_row = unit_membership("sdlc", "missing-unit")
+        wrong_row = unit_membership("sdlc", "wrong-unit")
+        reports = errors.splitlines()
+        self.assertEqual(len(reports), 2)
+        self.assertTrue(any(line.startswith(f"{missing_row.id} {missing_row.name}: ")
+                            and str(doc) + ":" in line and "Worktree" in line for line in reports))
+        self.assertTrue(any(line.startswith(f"{wrong_row.id} {wrong_row.name}: ")
+                            and str(doc) + ":" in line and "branch" in line for line in reports))
+        self.assertNotIn("missing-production", errors)
+        self.assertNotIn("registry-only", errors)
+        for name in ("complete-unit", "conflict-unit"):
+            folder = self.source_root / "worktrees" / name
+            row = unit_membership("sdlc", name)
+            self.assertEqual(row.worktree, staff.PresentWorktree(remote.local_machine(), folder))
+            config = unit_config.read(folder)
+            assert isinstance(config, unit_config.UnitConfig)
+            self.assertEqual(config.plan, unit_config.StandbyPlan())
+        for name in ("missing-unit", "wrong-unit"):
             row = unit_membership("sdlc", name)
             self.assertIsInstance(row.worktree, staff.WorktreeUnfilled)
             self.assertFalse((self.source_root / "worktrees" / name / ".unit.toml").exists())
@@ -327,12 +484,17 @@ class StaffSourcesTests(StaffTestCase):
         old = staff.ensure("showrunner", name="wrapped")
         code, output, errors = self.fill_result()
         self.assertEqual((code, errors), (0, ""), output)
-        self.assertIn("refs/heads/main", output)
-        self.assertIn("docs/branch-only-production.md", output)
-        self.assertIn(str(ignored), output)
+        self.assertNotIn("refs/heads/main", output)
+        self.assertNotIn(str(archived), output)
+        self.assertNotIn(str(ignored), output)
+        self.assertNotIn(str(wrapped), output)
+        live_owner = next(row for row in staff.find(kind="showrunner") if row.name == "sdlc")
+        self.assertEqual(live_owner.doc, staff.LiveDoc(remote.local_machine(), doc))
+        style_owner = next(row for row in staff.find(kind="showrunner") if row.name == "style")
+        self.assertIsInstance(style_owner.doc, staff.DocUnfilled)
         self.assertEqual(self.fixture_git(repository, "ls-files", "--", str(ignored)), "")
         branch_row = next(row for row in staff.find(kind="showrunner") if row.name == "branch-only")
-        self.assertEqual(branch_row.doc, staff.LiveDoc(remote.local_machine(), archived))
+        self.assertIsInstance(branch_row.doc, staff.DocUnfilled)
         old_row = staff.by_id(old.id)
         assert old_row is not None
         self.assertIsInstance(old_row.doc, staff.DocUnfilled)
