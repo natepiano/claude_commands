@@ -18,6 +18,7 @@ import errno
 import fcntl
 import json
 import os
+import random
 import selectors
 import shlex
 import stat
@@ -34,7 +35,7 @@ from typing import Literal, Self, TextIO, TypedDict, cast, final, override
 from unittest.mock import AsyncMock, MagicMock, call, patch
 from zoneinfo import ZoneInfo
 
-from scripts.accounts.home_test_support import scratch_account_home
+from scripts.accounts.home_test_support import scratch_account_home, write_account_settings
 from scripts.accounts import accounts, next_moves, refusal_watch, refusals, role_map
 from scripts.accounts.nix_env_fake import fake_nix_loader, imports_with_nix_loader, installed_program
 from scripts.lib import atomic_file
@@ -1809,7 +1810,7 @@ class AccountsTests(unittest.TestCase):
         self.assertIn("invalid role change", stderr)
 
     def write_trust_fixture(self) -> tuple[Path, ...]:
-        _ = self.trust_config.write_text('[trust]\nfolders = ["~/worktrees", "~/other trees"]\n')
+        write_account_settings(self.trust_config, folders=("~/worktrees", "~/other trees"))
         paths = [self.home / ".claude.json"]
         for number in (1, 2):
             home = self.home / f".claude{number}"
@@ -1822,6 +1823,15 @@ class AccountsTests(unittest.TestCase):
             }}))
             path.chmod(0o640)
         return tuple(paths)
+
+    def trust_home_snapshot(self) -> dict[Path, tuple[int, int, int, int, bytes]]:
+        """Notice content, metadata, directory, link and temporary-file changes."""
+        result: dict[Path, tuple[int, int, int, int, bytes]] = {}
+        for path in (self.home, *self.home.rglob("*")):
+            metadata = path.lstat()
+            content = os.readlink(path).encode() if path.is_symlink() else path.read_bytes() if path.is_file() else b""
+            result[path] = (metadata.st_mode, metadata.st_ino, metadata.st_mtime_ns, metadata.st_ctime_ns, content)
+        return result
 
     def start_trust_writer(self, path: Path) -> subprocess.Popen[str]:
         """An independent lock-respecting save, with only scratch config paths."""
@@ -1938,9 +1948,141 @@ finally:
             code, output, error = self.run_cli("trust")
         self.assertEqual((code, output), (1, "claude1: trust updated\nclaude2: trust updated\n"))
         self.assertIn("~/.claude: trust failed: Claude config lock still held after retries", error)
-        self.assertEqual(waited.call_count, len(accounts.CLAUDE_CONFIG_LOCK_RETRIES))
+        self.assertEqual(waited.call_count, 2)
         self.assertEqual(paths[0].read_bytes(), before)
         self.assertTrue(lock.is_dir())
+
+    def test_trust_lock_uses_configured_retries_stale_age_and_budget_at_use(self) -> None:
+        paths = self.write_trust_fixture()
+        path = paths[0]
+        lock = path.with_name(path.name + ".lock")
+        lock.mkdir()
+        aged = time.time() - 200
+        os.utime(lock, (aged, aged))
+        write_account_settings(self.trust_config, retries=(0.6, 0.8), stale_seconds=300)
+        with (patch.object(time, "sleep") as waited,
+              patch.object(random, "random", return_value=0)):
+            with self.assertRaisesRegex(TimeoutError, "still held after retries"):
+                with accounts.claude_config_lock(path, accounts.trust_configuration().lock_policy):
+                    self.fail("a lock younger than the configured stale age must remain held")
+        self.assertEqual(waited.call_args_list, [call(0.6), call(0.8)])
+        self.assertTrue(lock.is_dir())
+        # A changed config applies to the next use; no module-level timing cache.
+        write_account_settings(self.trust_config, retries=(0.1,), stale_seconds=100)
+        with patch.object(time, "monotonic", return_value=40):
+            with accounts.claude_config_lock(path, accounts.trust_configuration().lock_policy) as ownership:
+                self.assertAlmostEqual(ownership.publish_before, 40.05)
+                ownership.require_current()
+        self.assertFalse(lock.exists())
+
+    def test_trust_refuses_missing_empty_or_invalid_lock_settings_without_writing(self) -> None:
+        paths = self.write_trust_fixture()
+        before = [path.read_bytes() for path in paths]
+        trust_section = self.trust_config.read_text().split("[claude_config_lock]", 1)[0]
+        cases = (
+            ("", "[claude_config_lock]"),
+            ("stale_seconds = 10", "retries"),
+            ("retries = []\nstale_seconds = 10", "retries"),
+            ('retries = ""\nstale_seconds = 10', "retries"),
+            ("retries = 1\nstale_seconds = 10", "retries"),
+            ("retries = [0]\nstale_seconds = 10", "retries"),
+            ("retries = [-1]\nstale_seconds = 10", "retries"),
+            ('retries = ["bad"]\nstale_seconds = 10', "retries"),
+            ("retries = [true]\nstale_seconds = 10", "retries"),
+            ("retries = [nan]\nstale_seconds = 10", "retries"),
+            ("retries = [inf]\nstale_seconds = 10", "retries"),
+            (f"retries = [{'9' * 400}]\nstale_seconds = 10", "retries"),
+            ("retries = [0.2]", "stale_seconds"),
+            ('retries = [0.2]\nstale_seconds = ""', "stale_seconds"),
+            ("retries = [0.2]\nstale_seconds = []", "stale_seconds"),
+            ("retries = [0.2]\nstale_seconds = 0", "stale_seconds"),
+            ("retries = [0.2]\nstale_seconds = -1", "stale_seconds"),
+            ("retries = [0.2]\nstale_seconds = true", "stale_seconds"),
+            ("retries = [0.2]\nstale_seconds = nan", "stale_seconds"),
+            ("retries = [0.2]\nstale_seconds = inf", "stale_seconds"),
+            (f"retries = [0.2]\nstale_seconds = {'9' * 400}", "stale_seconds"),
+        )
+        for trusted in (False, True):
+            if trusted:
+                write_account_settings(self.trust_config, folders=("~/worktrees", "~/other trees"))
+                code, _output, error = self.run_cli("trust")
+                self.assertEqual(code, 0, error)
+                before = [path.read_bytes() for path in paths]
+            for section, key in cases:
+                with self.subTest(trusted=trusted, key=key, section=section):
+                    _ = self.trust_config.write_text(
+                        trust_section + ("[claude_config_lock]\n" + section if section else "")
+                    )
+                    snapshot = self.trust_home_snapshot()
+                    with (patch.object(fcntl, "flock") as locked,
+                          patch.object(atomic_file, "prepared_replacement") as prepared,
+                          patch.object(atomic_file, "remove_dead_temporary_files") as cleaned):
+                        code, output, error = self.run_cli("trust")
+                    self.assertEqual((code, output), (1, ""))
+                    self.assertIn(str(self.trust_config), error)
+                    self.assertIn(key, error)
+                    self.assertEqual(len(error.splitlines()), 1)
+                    self.assertEqual([path.read_bytes() for path in paths], before)
+                    self.assertFalse(any(path.with_name(path.name + ".lock").exists() for path in paths))
+                    self.assertEqual(self.trust_home_snapshot(), snapshot)
+                    locked.assert_not_called()
+                    prepared.assert_not_called()
+                    cleaned.assert_not_called()
+
+    def test_seed_refuses_invalid_configuration_before_creating_or_cleaning_any_home(self) -> None:
+        paths = self.write_trust_fixture()
+        abandoned = paths[1].with_name(f".{paths[1].name}.999999999.abandoned.tmp")
+        _ = abandoned.write_text("retain until configuration is valid")
+        for settings, problem in (
+            ("[trust]\nfolders = []\n[claude_config_lock]\nretries = []\nstale_seconds = 10\n",
+             "claude_config_lock.retries must be a non-empty list"),
+            ("[trust]\nfolders = [false]\n[claude_config_lock]\nretries = [0.2]\nstale_seconds = 10\n",
+             "trust.folders must contain absolute or ~/ paths"),
+        ):
+            _ = self.trust_config.write_text(settings)
+            for label in ("claude1", "claude3"):
+                with self.subTest(label=label, problem=problem):
+                    snapshot = self.trust_home_snapshot()
+                    with (patch.object(fcntl, "flock") as locked,
+                          patch.object(atomic_file, "remove_dead_temporary_files") as cleaned):
+                        code, output, error = self.run_cli("setup", label)
+                    self.assertEqual((code, output), (1, ""))
+                    self.assertIn(problem, error)
+                    self.assertEqual(len(error.splitlines()), 1)
+                    self.assertEqual(self.trust_home_snapshot(), snapshot)
+                    locked.assert_not_called()
+                    cleaned.assert_not_called()
+
+    def test_trust_and_seed_read_one_validated_configuration_before_home_locks(self) -> None:
+        self.write_main_config()
+        read = Path.read_text
+        flock = fcntl.flock
+        for arguments in (("trust",), ("setup", "claude2")):
+            with self.subTest(arguments=arguments):
+                write_account_settings(self.trust_config, folders=("~/worktrees",))
+                reads: list[Path] = []
+
+                def read_settings(
+                    path: Path, encoding: str | None = None, errors: str | None = None,
+                    newline: str | None = None,
+                ) -> str:
+                    if path == self.trust_config:
+                        reads.append(path)
+                    return read(path, encoding=encoding, errors=errors, newline=newline)
+
+                def change_settings_after_validation(descriptor: int, operation: int) -> None:
+                    self.assertEqual(reads, [self.trust_config])
+                    _ = self.trust_config.write_text("[trust]\nfolders = []\n[claude_config_lock]\nretries = []\n")
+                    flock(descriptor, operation)
+
+                with (patch.object(Path, "read_text", new=read_settings),
+                      patch.object(fcntl, "flock", side_effect=change_settings_after_validation)):
+                    code, _output, error = self.run_cli(*arguments)
+                self.assertEqual(code, 0, error)
+                self.assertEqual(reads, [self.trust_config])
+                seeded = self.home / ".claude2/.claude.json" if arguments[0] == "setup" else self.home / ".claude.json"
+                projects = cast(dict[str, object], accounts.read_json_object(seeded)["projects"])
+                self.assertEqual(projects[str(self.home / "worktrees")], {"hasTrustDialogAccepted": True})
 
     def test_trust_refuses_publication_when_its_short_lock_budget_is_used(self) -> None:
         paths = self.write_trust_fixture()
@@ -1986,8 +2128,8 @@ finally:
             assert_locks_free()
 
         @contextmanager
-        def timed_lock(path: Path) -> Generator[accounts.ClaudeConfigLock]:
-            with lock_config(path) as ownership:
+        def timed_lock(path: Path, policy: accounts.ClaudeConfigLockPolicy) -> Generator[accounts.ClaudeConfigLock]:
+            with lock_config(path, policy) as ownership:
                 started = time.perf_counter()
                 yield ownership
             hold_times.append(time.perf_counter() - started)
@@ -2003,7 +2145,7 @@ finally:
         self.assertEqual(code, 0, error)
         self.assertGreater(preparation_times[0], 1.5)
         self.assertEqual(len(hold_times), len(paths) + 1)
-        self.assertLess(max(hold_times), min(accounts.CLAUDE_CONFIG_LOCK_RETRIES) / 2)
+        self.assertLess(max(hold_times), 0.1)
         self.assertEqual(preparations.count(paths[0]), 2)
         final = accounts.read_json_object(paths[0])
         self.assertEqual(final["other writer"], "retained")
@@ -2118,7 +2260,7 @@ finally:
         })
 
     def test_new_account_seed_uses_trusted_folders_from_configuration_at_use(self) -> None:
-        _ = self.trust_config.write_text('[trust]\nfolders = ["~/configured root"]\n')
+        write_account_settings(self.trust_config, folders=("~/configured root",))
         _ = (self.home / ".claude.json").write_text('{"hasCompletedOnboarding": true}')
         self.assertEqual(accounts.setup("claude2"), [])
         seeded = accounts.read_json_object(self.home / ".claude2/.claude.json")
@@ -2126,7 +2268,7 @@ finally:
             str(self.home / "configured root"): {"hasTrustDialogAccepted": True},
         }})
         self.assertEqual((self.home / ".claude2/.claude.json").stat().st_mode & 0o777, 0o600)
-        _ = self.trust_config.write_text('[trust]\nfolders = ["~/different root"]\n')
+        write_account_settings(self.trust_config, folders=("~/different root",))
         self.assertEqual(accounts.setup("claude3"), [])
         self.assertEqual(accounts.read_json_object(self.home / ".claude3/.claude.json")["projects"], {
             str(self.home / "different root"): {"hasTrustDialogAccepted": True},
@@ -2791,7 +2933,7 @@ finally:
             getattr(accounts, "_repair_link"),
         )
         seed_config = cast(
-            Callable[[Path], list[str]],
+            Callable[[Path, accounts.TrustConfiguration], list[str]],
             getattr(accounts, "_seed_config"),
         )
         source = self.main_dir / "settings.json"
@@ -2803,7 +2945,7 @@ finally:
         self.assertEqual(repair_link(link, source), [])
         self.assertEqual(repair_link(link, source), [])
         self.write_main_config()
-        self.assertEqual(seed_config(account_dir / ".claude.json"), [])
+        self.assertEqual(seed_config(account_dir / ".claude.json", accounts.trust_configuration()), [])
 
     def test_setup_replaces_a_wrong_target_link(self) -> None:
         self.write_main_config()
