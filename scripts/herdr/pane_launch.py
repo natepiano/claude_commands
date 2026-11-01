@@ -56,16 +56,18 @@ def read(path: Path) -> dict[str, PaneLaunch]:
         return {}
 
 
-def _validated_launch(path: Path, pane_id: str, value: object) -> PaneLaunch:
+def _validated_launch(path: Path, pane_id: str, value: object, *, required_strings: frozenset[str]) -> PaneLaunch:
     location = f"{path}: pane {pane_id}"
     if not isinstance(value, dict):
         raise ValueError(f"{location}: launch must be an object")
     launch = cast(dict[str, object], value)
     for field in ("pane_id", "session_id", "config_dir", "cwd", "name", "model", "written_at"):
+        if field not in launch and field not in required_strings:
+            continue
         if not isinstance(launch.get(field), str):
             raise ValueError(f"{location}: {field} must be a string")
     for field in ("remote_control", "flags_read", "ended"):
-        if field == "ended" and field not in launch:
+        if field not in launch:
             continue
         if not isinstance(launch.get(field), bool):
             raise ValueError(f"{location}: {field} must be a boolean")
@@ -78,16 +80,19 @@ def _validated_launch(path: Path, pane_id: str, value: object) -> PaneLaunch:
 
 
 def read_strict(path: Path) -> dict[str, PaneLaunch]:
-    """Refuse damaged evidence before a repair can rewrite its history."""
-    return {pane: _validated_launch(path, pane, value) for pane, value in read_entries(path).items()}
+    """Require identity evidence; refuse damage in any present launch field."""
+    required_strings = frozenset({"session_id", "written_at"})
+    return {pane: _validated_launch(path, pane, value, required_strings=required_strings)
+            for pane, value in read_entries(path).items()}
 
 
 def read_valid_entries(path: Path) -> dict[str, PaneLaunch]:
     """Keep usable evidence for a readout without losing a damaged entry's siblings."""
     valid: dict[str, PaneLaunch] = {}
+    required_strings = frozenset({"session_id", "written_at", "config_dir"})
     for pane, value in read_entries(path).items():
         try:
-            valid[pane] = _validated_launch(path, pane, value)
+            valid[pane] = _validated_launch(path, pane, value, required_strings=required_strings)
         except ValueError:
             continue
     return valid

@@ -187,6 +187,12 @@ class PaneRecordTests(unittest.TestCase):
         self.assertEqual(self.entries()["w1:p2"]["environment"], {"ENABLE_TOOL_SEARCH": "true"})
 
     def test_repair_recovers_history_and_staff_identity_without_changing_conversations(self) -> None:
+        self.assert_repair_recovers_history(legacy=False)
+
+    def test_repair_recovers_identity_from_a_three_field_launch_without_name_or_cwd(self) -> None:
+        self.assert_repair_recovers_history(legacy=True)
+
+    def assert_repair_recovers_history(self, *, legacy: bool) -> None:
         from scripts.production import staff, session_staff
         from scripts.shutdown import pane_record
         from scripts.production.staff_test_support import isolated_staff_file, unit_membership
@@ -200,16 +206,20 @@ class PaneRecordTests(unittest.TestCase):
                 "SHOWRUNNER_UNIT": "demo", "SHOWRUNNER_UNIT_ID": "alpha-unit"}, ["claude"])
             old["written_at"] = "2026-10-30T00:00:00+00:00"
             new = pane_record.launch("new", "sid-alpha", "/new", {"ENABLE_TOOL_SEARCH": "true"}, ["claude"])
+            retained: dict[str, object] = dict(new)
+            if legacy:
+                retained = {key: value for key, value in retained.items()
+                            if key in {"session_id", "written_at", "environment"}}
             # Reproduce the damaged store without passing through the now-preserving writer.
             self.records.mkdir(parents=True, exist_ok=True)
             path = self.records / "agents.json"
-            _ = path.write_text(json.dumps({"old": old, "new": new}))
+            _ = path.write_text(json.dumps({"old": old, "new": retained}))
             membership = session_staff.LaunchMembership(staff.snapshot(), session_staff.MemberSources({}, (old, new)))
             with (mock.patch.object(session_staff.LaunchMembership, "read", return_value=membership),
                   mock.patch.object(sessions, "running_sessions", return_value=[])):
                 self.assertEqual(len(session_staff.repair_marks()), 1)
                 repaired = pane_record.read_strict("agents")
-                expected = {**new, "environment": {**old["environment"], **new["environment"], "STAFF_ID": owner.id}}
+                expected = {**retained, "environment": {**old["environment"], **new["environment"], "STAFF_ID": owner.id}}
                 self.assertEqual(repaired["new"], expected)
                 self.assertEqual(repaired["old"], old)
                 before = (path.read_bytes(), path.stat().st_mtime_ns)

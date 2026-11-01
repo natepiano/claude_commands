@@ -400,8 +400,11 @@ class AccountsTests(unittest.TestCase):
     def test_stored_role_counts_skip_a_newer_launch_with_a_non_string_config_dir(self) -> None:
         self.assert_stored_role_counts("damaged folder")
 
+    def test_stored_role_counts_keep_a_unit_without_legacy_launch_flags(self) -> None:
+        self.assert_stored_role_counts("legacy flags")
+
     def assert_stored_role_counts(self, evidence: Literal[
-        "unit marks", "staff identity", "damaged history", "damaged sibling", "damaged folder",
+        "unit marks", "staff identity", "damaged history", "damaged sibling", "damaged folder", "legacy flags",
     ]) -> None:
         from scripts.message import sessions
         from scripts.shutdown import inventory
@@ -440,7 +443,9 @@ class AccountsTests(unittest.TestCase):
         # A repeated registry identity is still one session.
         owners.append(owners[0])
         history: dict[str, object] = dict(launches)
-        if evidence == "damaged sibling":
+        if evidence == "legacy flags":
+            history["unit-a"] = {key: value for key, value in launches["unit-a"].items() if key != "flags_read"}
+        elif evidence == "damaged sibling":
             history["broken-pane"] = {}
         elif evidence == "damaged folder":
             damaged: dict[str, object] = dict(launches["unit-a"])
