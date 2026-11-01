@@ -21,11 +21,52 @@ from typing import TypedDict, cast, override
 from unittest import mock
 import rules
 import style_ledger
-from approved_renames import AppliedCheck
+from approved_renames import AppliedCheck, TYPE_NAMED_PARAMETER_RULE
 import style_plan
 import style_rules
 import declarations
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+
+
+MACHINE_RENAME_BEFORE = ("struct ImplItem;\nenum SurfaceReferenceMatch { Found }\nfn impl_item_surface_reference(\n"
+                         "    item: &ImplItem,\n) -> bool { inspect(item) }\n")
+MACHINE_RENAME_AFTER = ("struct ImplItem;\nenum SurfaceReferenceMatch { Found }\n"
+                        "fn impl_item_surface_reference(\n    item: &ImplItem,\n"
+                        ") -> SurfaceReferenceMatch { inspect(item) }\n")
+
+
+def machine_rename_fixture(ledger: style_ledger.Ledger, definition: rules.Rule, repo: Path,
+                           proposal: Path, current: str = MACHINE_RENAME_AFTER,
+                           rule_text: str = TYPE_NAMED_PARAMETER_RULE
+                           ) -> tuple[style_ledger.HeldFinding, str]:
+    """The real return-type/owner-change shape, using normal judgment and filing records."""
+    def git(*arguments: str) -> str:
+        return subprocess.run(["git", "-C", str(repo), *arguments], capture_output=True,
+                              text=True, check=True).stdout.strip()
+    _ = definition.path.write_text(rule_text)
+    definition = next(rule for rule in rules.load_rules(repo) if rule.rule_id == definition.rule_id)
+    path = repo / "src/lib.rs"
+    _ = path.write_text(MACHINE_RENAME_BEFORE)
+    _ = git("add", ".")
+    _ = git("commit", "-qm", "old judged parameter")
+    base = git("rev-parse", "HEAD")
+    ledger.set_tip(base)
+    ledger.ticket_add("machine-read-1", "machine-read", "read", "names", ".", ["src/lib.rs"], [definition.rule_id])
+    ledger.ticket_assign("machine-read-1", "main")
+    _ = ledger.ticket_base("machine-read-1")
+    finding = ledger.hold(definition.rule_id, "src/lib.rs", 4, MACHINE_RENAME_BEFORE.splitlines()[3],
+                          "rename", "item", "impl_item", definition.blob, "machine-read-1")
+    ledger.record(definition.rule_id, "src/lib.rs", base, definition.blob, "held", ticket="machine-read-1",
+                  input_scope=style_ledger.DeclaredInputScope.RULE)
+    _ = proposal.write_text("---\nunit: names-unit\nplan: /tmp/names.md\n---\nApproved rename\n")
+    ledger.file_held(finding.finding_id, proposal)
+    ledger.ticket_drop("machine-read-1")
+    _ = path.write_text(current)
+    _ = git("add", ".")
+    _ = git("commit", "-qm", "owner return type changed")
+    tip = git("rev-parse", "HEAD")
+    ledger.set_tip(tip)
+    return ledger.named_held((finding.finding_id,))[0], tip
 
 
 # A release checkpoints the current worktree; each fake berth keeps its own board.

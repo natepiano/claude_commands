@@ -40,6 +40,7 @@ import declarations
 import finding_sites
 from finding_sites import (FilingEligibleWithoutHistory as FilingEligibleWithoutHistory,
                            FindingAnchor as FindingAnchor, NeedsJudgment as NeedsJudgment,
+                           RenameJudgmentSite as RenameJudgmentSite,
                            SiteEvidence as SiteEvidence, UnchangedSite as UnchangedSite)
 import style_rules
 from approved_renames import (AppliedCheck, AppliedInCode, ApprovedRename, BindingProof, BindingRename, FileRename, Folder, MissingFile,
@@ -5482,6 +5483,46 @@ class Ledger:
                 return UnchangedSite(finding.path, mapped, anchor)
             return NeedsJudgment("enclosing item, owner, imports or original inputs changed")
         return NeedsJudgment("unchanged source site not proved")
+
+    def finding_input_identity(self, finding: HeldFinding) -> str:
+        """The judgment row and source history; execution ownership is deliberately separate."""
+        self._refresh_site_rows()
+        fields = (finding.rule, finding.rule_blob, finding.path, finding.line, finding.text,
+                  finding.kind, finding.before, finding.after, finding.ticket,
+                  asdict(finding.follow), asdict(self._finding_histories[finding.finding_id]))
+        return hashlib.sha256(json.dumps(fields, sort_keys=True).encode()).hexdigest()
+
+    def rename_judgment_site(self, finding: HeldFinding, at: str) -> RenameJudgmentSite | NeedsJudgment:
+        """Offer only changed owners/lines for a fresh proof, preserving every history barrier.
+
+        This does not judge a rename. The shared executor must still prove rule applicability,
+        references and all safety constraints before publishing fresh evidence.
+        """
+        evidence = self._site_proof(finding, at)
+        if not isinstance(evidence, NeedsJudgment):
+            return NeedsJudgment("site does not require a fresh judgment")
+        if evidence.reason not in {"unchanged source site not proved",
+                                   "enclosing item, owner, imports or original inputs changed"}:
+            return evidence
+        definition = next((rule for rule in self._load_rules() if rule.rule_id == base_rule(finding.rule)), None)
+        if definition is None or definition.blob != finding.rule_blob:
+            return NeedsJudgment("rule changed since judged")
+        if definition.name != "prefer-type-named-fields-and-bindings" or finding.kind != "rename":
+            return NeedsJudgment("rule applicability is not machine-checkable")
+        tip = self._tip(at)
+        try:
+            self._check_cell_path(definition, finding.path, tip)
+        except LedgerError as error:
+            return NeedsJudgment(str(error))
+        anchor = self.finding_anchor(finding)
+        if isinstance(anchor, NeedsJudgment):
+            return anchor
+        # Use the shared diff mapper, including replacement hunks. A location is only a
+        # candidate: no coordinate mapping by itself licenses changed code.
+        mapped = self._outside_mapping(anchor.commit, tip.commit, finding.path, anchor.line)
+        if not isinstance(mapped, declarations.MappedDeclaration):
+            return NeedsJudgment("current declaration location is unproved")
+        return RenameJudgmentSite(FindingAnchor(tip.commit, mapped.path, mapped.line))
 
     def _declaration_outcome(self, finding: HeldFinding, tip: RepositoryTip, rust_files: frozenset[str],
                              approved: Callable[[Path], bool], renames: tuple[BuiltRename, ...],

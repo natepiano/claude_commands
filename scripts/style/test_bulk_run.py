@@ -19,6 +19,7 @@ from typing import cast, override
 import bulk_run as run
 import bulk_rename as bulk
 import rules
+from ledger_test_support import machine_rename_fixture, MACHINE_RENAME_AFTER
 import style_ledger as ledger_api
 from approved_renames import BindingRename, NoBindingScope, rename_declaration
 from test_bulk_rename import CargoProjectTests, ScriptedServer, word_edits, stop_after_edit, stop_process
@@ -935,7 +936,7 @@ class WorkspaceRunTests(CargoProjectTests):
         ledger.set_tip(self.git("rev-parse", "HEAD"))
         report = self.execute(ledger, definition)
         self.assertEqual(report["refusals"], {findings[0].finding_id:
-            "changed since judged: unchanged source site not proved"})
+            "fresh judgment: rule applicability is not machine-checkable for this declaration"})
         self.assertEqual(report["applied_ids"], [findings[1].finding_id])
         self.assertIn("let old = 2", path.read_text())
         self.assertIn("let number", (self.repo / "beta/src/lib.rs").read_text())
@@ -1586,6 +1587,146 @@ class WorkspaceRunTests(CargoProjectTests):
                          {finding.finding_id for finding in selected.findings})
         self.assertTrue(all("let old" in file.original for file in planned.files))
         self.assertTrue(all("let number" in file.edited for file in planned.files))
+
+
+class FreshMachineJudgmentTests(CargoProjectTests):
+    def fresh_case(self, current: str = MACHINE_RENAME_AFTER
+                   ) -> tuple[ledger_api.Ledger, ledger_api.HeldFinding, str]:
+        ledger = self.ledger()
+        definition = next(rule for rule in rules.load_rules(self.repo)
+                          if rule.name == "prefer-type-named-fields-and-bindings")
+        finding, tip = machine_rename_fixture(ledger, definition, self.repo, self.root / "fresh.md", current)
+        return ledger, finding, tip
+
+    def prove(self, ledger: ledger_api.Ledger, finding: ledger_api.HeldFinding, tip: str
+              ) -> run.FreshMachineJudgment | bulk.Refusal:
+        server = ScriptedServer(lambda text, _offset, new: word_edits(text, "item", new))
+        return run.fresh_machine_judgment(ledger, finding, tip, self.repo, server,
+                                         run.PlanningFileAvailability(self.repo, lambda _repo, _path: None))
+
+    def test_return_type_and_owner_change_gets_a_new_judgment_without_changing_the_old_one(self) -> None:
+        ledger, finding, tip = self.fresh_case()
+        self.assertIsInstance(ledger.finding_site(finding, tip), ledger_api.NeedsJudgment)
+        old = ledger.finding_anchor(finding)
+        server = ScriptedServer(lambda text, _offset, new: word_edits(text, "item", new))
+        plan = run.plan_renames(self.repo, ledger, tip, run.Selection((finding,), ()), server,
+                                run.PlanningFileAvailability(self.repo, lambda _repo, _path: None))
+        self.assertEqual(plan.refusals, ())
+        self.assertEqual([item.finding.finding_id for file in plan.files for item in file.kept], [finding.finding_id])
+        judgment, = plan.judgments
+        self.assertIsInstance(judgment, run.FreshMachineJudgment)
+        self.assertEqual(judgment.anchor, ledger_api.FindingAnchor(tip, "src/lib.rs", 4))
+        sources = run.RenameSources()
+        sources.judgments[finding.finding_id] = judgment
+        self.assertIsInstance(run.current_rename(ledger, finding, tip, sources, self.repo), bulk.RenameFinding)
+        self.assertEqual(ledger.finding_anchor(finding), old)
+        self.assertEqual((self.repo / "src/lib.rs").read_text(), MACHINE_RENAME_AFTER)
+
+    def test_fresh_judgment_refuses_a_shadowing_destination_binding(self) -> None:
+        source = MACHINE_RENAME_AFTER.replace("inspect(item)", "let impl_item = item; inspect(item)")
+        ledger, finding, tip = self.fresh_case(source)
+        result = self.prove(ledger, finding, tip)
+        self.assertIsInstance(result, bulk.Refusal)
+        assert isinstance(result, bulk.Refusal)
+        self.assertIn("capture", result.reason)
+
+    def test_fresh_judgment_refuses_a_changed_pinned_rule(self) -> None:
+        ledger, finding, tip = self.fresh_case()
+        definition = next(rule for rule in rules.load_rules(self.repo) if rule.rule_id == finding.rule)
+        _ = definition.path.write_text(definition.path.read_text() + "Changed rule requirement\n")
+        result = self.prove(ledger, finding, tip)
+        self.assertIsInstance(result, bulk.Refusal)
+        assert isinstance(result, bulk.Refusal)
+        self.assertIn("rule changed", result.reason)
+
+    def test_planner_reports_the_changed_rule_instead_of_the_earlier_site_refusal(self) -> None:
+        ledger, finding, tip = self.fresh_case()
+        definition = next(rule for rule in rules.load_rules(self.repo) if rule.rule_id == finding.rule)
+        _ = definition.path.write_text(definition.path.read_text() + "Changed rule requirement\n")
+        server = ScriptedServer(lambda text, _offset, new: word_edits(text, "item", new))
+        plan = run.plan_renames(self.repo, ledger, tip, run.Selection((finding,), ()), server,
+                                run.PlanningFileAvailability(self.repo, lambda _repo, _path: None))
+        self.assertEqual(plan.refusals, (bulk.Refusal(finding.finding_id,
+                              "changed since judged: rule changed since judged"),))
+        self.assertEqual(plan.judgments, ())
+
+    def test_local_rule_conditions_cannot_be_replaced_by_the_filename_contract(self) -> None:
+        ledger = self.ledger()
+        folder = self.repo / "docs/style"
+        folder.mkdir(parents=True)
+        text = ("---\ntier: C\nfamily: names\ninput_scope: file\n---\n"
+                "# Type-named parameters\n\n"
+                "Only in functions returning bool, name a parameter after its type.\n")
+        _ = (folder / "prefer-type-named-fields-and-bindings.md").write_text(text)
+        definition = next(rule for rule in rules.load_rules(self.repo) if rule.origin == "local")
+        finding, tip = machine_rename_fixture(ledger, definition, self.repo, self.root / "fresh.md", rule_text=text)
+        server = ScriptedServer(lambda source, _offset, new: word_edits(source, "item", new))
+        plan = run.plan_renames(self.repo, ledger, tip, run.Selection((finding,), ()), server,
+                                run.PlanningFileAvailability(self.repo, lambda _repo, _path: None))
+        self.assertEqual(plan.refusals, (bulk.Refusal(finding.finding_id,
+                              "fresh judgment: rule has no recognized machine-checkable contract"),))
+        self.assertEqual(plan.judgments, ())
+        self.assertEqual(plan.files, ())
+
+    def test_fresh_judgment_never_overrides_a_declined_decision(self) -> None:
+        ledger, finding, tip = self.fresh_case()
+        assert isinstance(finding.state, ledger_api.Filed)
+        _ = finding.state.proposal.write_text("---\nstyle_answer: declined\n---\nNo\n")
+        result = self.prove(ledger, finding, tip)
+        self.assertIsInstance(result, bulk.Refusal)
+        assert isinstance(result, bulk.Refusal)
+        self.assertIn("decision not approved", result.reason)
+
+    def test_fresh_judgment_refuses_unresolved_module_instances(self) -> None:
+        ledger, finding, tip = self.fresh_case(MACHINE_RENAME_AFTER + "mod missing;\n")
+        result = self.prove(ledger, finding, tip)
+        self.assertIsInstance(result, bulk.Refusal)
+        assert isinstance(result, bulk.Refusal)
+        self.assertIn("coverage unavailable", result.reason)
+
+    def test_changed_declaration_with_a_still_applicable_type_name_gets_a_new_judgment(self) -> None:
+        ledger, finding, tip = self.fresh_case(MACHINE_RENAME_AFTER.replace("item: &ImplItem", "item: &mut ImplItem"))
+        self.assertIsInstance(ledger.finding_site(finding, tip), ledger_api.NeedsJudgment)
+        result = self.prove(ledger, finding, tip)
+        self.assertIsInstance(result, run.FreshMachineJudgment)
+        assert isinstance(result, run.FreshMachineJudgment)
+        sources = run.RenameSources()
+        sources.judgments[finding.finding_id] = result
+        self.assertIsInstance(run.current_rename(ledger, finding, tip, sources, self.repo), bulk.RenameFinding)
+
+    def test_changed_declaration_that_no_longer_declares_the_old_name_is_refused(self) -> None:
+        ledger, finding, tip = self.fresh_case(MACHINE_RENAME_AFTER.replace("item: &ImplItem", "other: &ImplItem"))
+        result = self.prove(ledger, finding, tip)
+        self.assertIsInstance(result, bulk.Refusal)
+        assert isinstance(result, bulk.Refusal)
+        self.assertIn("declaration", result.reason)
+
+    def test_current_parameter_type_must_still_justify_the_requested_name(self) -> None:
+        ledger, finding, tip = self.fresh_case(MACHINE_RENAME_AFTER.replace("item: &ImplItem", "item: &OtherType"))
+        result = self.prove(ledger, finding, tip)
+        self.assertIsInstance(result, bulk.Refusal)
+        assert isinstance(result, bulk.Refusal)
+        self.assertIn("current parameter", result.reason)
+
+    def test_frozen_judgment_does_not_accept_another_tip_or_new_physical_bytes(self) -> None:
+        ledger, finding, tip = self.fresh_case()
+        result = self.prove(ledger, finding, tip)
+        self.assertIsInstance(result, run.FreshMachineJudgment)
+        assert isinstance(result, run.FreshMachineJudgment)
+        self.assertIn("tip changed", run.validate_machine_judgment(ledger, finding, "another-tip", self.repo, result))
+        _ = (self.repo / finding.path).write_text(MACHINE_RENAME_AFTER.replace("inspect(item)", "changed(item)"))
+        self.assertIn("source inputs changed", run.validate_machine_judgment(ledger, finding, tip, self.repo, result))
+
+    def test_fresh_judgment_never_overrides_a_withdrawn_finding(self) -> None:
+        ledger, finding, tip = self.fresh_case()
+        self.assertIsInstance(self.prove(ledger, finding, tip), run.FreshMachineJudgment)
+        with closing(sqlite3.connect(ledger.database)) as connection, connection:
+            _ = connection.execute("UPDATE held_findings SET state='withdrawn' WHERE finding_id=?", (finding.finding_id,))
+        withdrawn, = ledger.named_held((finding.finding_id,))
+        result = self.prove(ledger, withdrawn, tip)
+        self.assertIsInstance(result, bulk.Refusal)
+        assert isinstance(result, bulk.Refusal)
+        self.assertIn("not an open Rust finding", result.reason)
 
 
 if __name__ == "__main__":
