@@ -2480,6 +2480,14 @@ def _select_phase(
               if any(isinstance(finding.state, style_ledger.Filed) for finding in following.values())
               else style_proposals.FollowRun(style_ledger.DeclarationReading(tip, ()), (), ()))
     outcomes = {outcome.finding.finding_id: outcome for outcome in follow.reading.outcomes}
+    # Read followed locations once for both scheduling and the decision loop. COUNT uses the rows
+    # follow proved without writing them; reloading the ledger there would restore the old sites.
+    decision_findings = {
+        issue: (tuple(projected_follow_findings(style_ledger.DeclarationReading(
+                    follow.reading.tip, tuple(outcomes[finding.finding_id] for finding in findings))).values())
+                if selection == FamilySelection.COUNT and issue not in follow.skipped else _unbuilt_findings(ledger, issue))
+        for issue, findings in unbuilt.items()}
+    pending_decision_files = frozenset(finding.path for findings in decision_findings.values() for finding in findings)
     for index, ticket in enumerate(queued):
         in_scope = crate_in_scope(scope, ticket["crate"])
         # A file rename whose edit the gate cannot prove is dropped, and its finding waits on the decision path below.
@@ -2488,6 +2496,9 @@ def _select_phase(
         skipped = any(issue in follow.skipped for issue in ledger.ticket_proposals(ticket["id"]))
         ranked = (("skipped by the declaration step",) if skipped else
                   _rank_waits(ledger, ticket, family, waits, scopes, tip)) if index == 0 and in_scope and not uncertain else ()
+        if (index == 0 and in_scope and ticket["kind"] != "proposal"
+                and pending_decision_files.intersection(ticket["files"])):
+            ranked = (*ranked, "approved findings await build")
         if index == 0 and in_scope and isinstance(predecessor, WaitingCheckpoint):
             if uncertain:
                 raise style_ledger.LedgerError("selected footprint is uncertain")
@@ -2525,6 +2536,7 @@ def _select_phase(
     if queued:
         unbuilt = {issue.path: _unbuilt_findings(ledger, issue.path) for issue in decisions
                    if issue.value("style_rule") in definitions}
+        decision_findings = unbuilt
     def take_reads(candidates: tuple[TicketSelection, ...], reason: str = borrow_reason) -> PhaseWritten | WaitingForMerge | WaitingForSync | NoAvailableWork:
         overlap_wait: WaitingForMerge | NoCheckpointBlock = NoCheckpointBlock()
         for selected in candidates:
@@ -2581,7 +2593,8 @@ def _select_phase(
 
     if selection == FamilySelection.OWN and family == "modules":
         refill = _refill_cells(ledger, cells, base, family, scope, waits, definitions)
-        priority = blocking_reads(refill)
+        priority = tuple(ticket for ticket in blocking_reads(refill)
+                         if not pending_decision_files.intersection(ticket.files))
         if priority:
             result = take_reads(priority)
             if isinstance(result, PhaseWritten):
@@ -2639,11 +2652,7 @@ def _select_phase(
         read = {outcome.finding.finding_id for outcome in own if not isinstance(outcome, style_ledger.DeclarationNotRead)}
         withdrew = any(isinstance(outcome, style_ledger.DeclarationRemoved) for outcome in own)
         built = any(isinstance(outcome, style_ledger.DeclarationRenamed) for outcome in own)
-        # COUNT follows without writing: use the rows that follow proved, including new
-        # locations and settled findings. Reloading the ledger here would restore old sites.
-        kept = (tuple(projected_follow_findings(style_ledger.DeclarationReading(follow.reading.tip, own)).values())
-                if selection == FamilySelection.COUNT else _unbuilt_findings(ledger, issue.path))
-        findings = tuple(finding for finding in kept
+        findings = tuple(finding for finding in decision_findings[issue.path]
                          if finding.finding_id not in left and (selection == FamilySelection.OWN
                              or not style_ledger.rule_changed_since_judged(finding, definitions)))
         # File presence is current even for a previously read declaration; moved-site proof needs only unread findings.
