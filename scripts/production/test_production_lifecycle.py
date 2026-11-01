@@ -2,17 +2,15 @@
 
 from __future__ import annotations
 
-import ast
 import contextlib
 from dataclasses import replace
 import io
 import json
 import os
-import shlex
 import sys
 import unittest
 from pathlib import Path
-from typing import cast, final, override
+from typing import final, override
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -610,9 +608,6 @@ class LifecycleTests(LifecycleFixture):
         self.assertEqual(self.git("rev-parse", "main", cwd=self.origin), old_main)
 
     def test_promote_main_pulls_mac_with_and_without_ci(self) -> None:
-        config = self.root / "merge_checkpoint.conf"
-        self.write(config, "MAC_PULL_LOCK_SECONDS=7\nMAC_PULL_POLL_SECONDS=0.25\n")
-        self.env["MERGE_CHECKPOINT_CONFIG"] = str(config)
         self.running()
         _ = self.merge_tip()
         destination = self.promotion_checkout("installed")
@@ -630,12 +625,7 @@ class LifecycleTests(LifecycleFixture):
             calls = [line for line in self.calls().splitlines() if line.startswith("ssh ")]
             self.assertEqual(len(calls), 1)
             self.assertIn("ssh mac", calls[0])
-            words = shlex.split(calls[0].removeprefix("ssh mac "))
-            self.assertEqual(words[3:5], ["python3", "-c"])
-            self.assertEqual(words[6:9], [f"natedev:{destination}", "7.0", "0.25;"])
-            program = cast(str, ast.literal_eval(words[5].removeprefix("exec(").removesuffix(")")))
-            self.assertIn("git('fetch', '--no-write-fetch-head', source, '+main:' + ref)", program)
-            self.assertIn("git('merge', '--ff-only', tip)", program)
+            self.assertIn(f"git pull --ff-only natedev:{destination} main", calls[0])
         _ = (self.state / "mac-rc").write_text("1\n")
         failed = self.run_lifecycle("promote-main", "--no-ci")
         self.assert_step(failed, "failed")
