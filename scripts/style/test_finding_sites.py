@@ -191,7 +191,7 @@ class FindingSitesTests(unittest.TestCase):
                   "fn work() {\n    let old = 791;\n}\n")
         ledger, _, finding = fixture.site_fixture(source=source, line=5)
         tip = fixture.commit_tip(ledger, {PARENT_FILE: "// heading\n" + source})
-        expected = style_ledger.UnchangedSite(PARENT_FILE, 6)
+        expected = fixture.expected_site(ledger, finding, PARENT_FILE, 6)
         self.assertEqual(fixture.strict_site(ledger, finding, tip), expected)
         self.assertEqual(ledger.finding_site(finding, tip), expected)
         old, new = finding_sites.SourceSites(source), finding_sites.SourceSites("// heading\n" + source)
@@ -384,9 +384,9 @@ class FindingSitesTests(unittest.TestCase):
         ledger, _, finding = fixture.site_fixture(source=source, line=3)
         tip = fixture.commit_tip(ledger, {"crates/alpha/src/other.rs": "fn unrelated() {}\n"})
         self.assertEqual(fixture.strict_site(ledger, finding, tip),
-                         style_ledger.UnchangedSite(PARENT_FILE, 3))
+                         fixture.expected_site(ledger, finding, PARENT_FILE, 3))
         self.assertEqual(ledger.finding_site(finding, tip),
-                         style_ledger.UnchangedSite(PARENT_FILE, 3))
+                         fixture.expected_site(ledger, finding, PARENT_FILE, 3))
 
 
 if __name__ == "__main__":
