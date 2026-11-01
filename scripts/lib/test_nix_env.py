@@ -14,7 +14,7 @@ from unittest.mock import patch
 TEST_HANG_GUARD_SECS = 300
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.lib import nix_env, scratch
+from scripts.lib import copy_record, nix_env, scratch
 from scripts.lib.nix_env_test_support import HELPER, NixFixture
 
 
@@ -296,11 +296,11 @@ class RegisteredCopyTests(GitNixFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
-        self.env[scratch.COPIES_ENV] = str(self.root / "copies")
-        os.environ[scratch.COPIES_ENV] = self.env[scratch.COPIES_ENV]
+        self.env[copy_record.COPIES_ENV] = str(self.root / "copies")
+        os.environ[copy_record.COPIES_ENV] = self.env[copy_record.COPIES_ENV]
 
     def clone(self, repository: Path) -> Path:
-        checkout = scratch.copies_root() / "pair/copy"
+        checkout = copy_record.copies_root() / "pair/copy"
         checkout.parent.mkdir(parents=True)
         _ = self.git(self.root, "clone", "--shared", str(repository), str(checkout))
         return checkout
@@ -365,7 +365,7 @@ class RegisteredCopyTests(GitNixFixture):
         foreign_commit = self.git(other, "rev-parse", "HEAD")
         _ = (checkout / ".envrc").write_text(changed_envrc, encoding="utf-8")
         _ = scratch.update_record(checkout, lambda record: {
-            **(record.fields if isinstance(record, scratch.Registered) else {}),
+            **(record.fields if isinstance(record, copy_record.Registered) else {}),
             "source_commit": foreign_commit})
 
         with patch.dict(os.environ, {"GIT_DIR": str(other / ".git")}):
@@ -409,5 +409,5 @@ class RegisteredCopyTests(GitNixFixture):
         self.register(repository, checkout)
         outside = self.root / "outside-copy"
         _ = self.envrc(outside)
-        _ = (outside / scratch.RECORD).write_bytes((checkout / scratch.RECORD).read_bytes())
+        _ = (outside / copy_record.RECORD).write_bytes((checkout / copy_record.RECORD).read_bytes())
         self.assert_explicit_approval_required(outside)

@@ -96,7 +96,7 @@ def _git_environment() -> dict[str, str]:
 
 def registered_copy(envrc: Path) -> bool:
     """Prove a copy's envrc matches its recorded commit in a trusted source."""
-    # Keep scratch and subprocess off the no-envrc and trusted-root paths.
+    # Keep copy_record and subprocess off the no-envrc and trusted-root paths.
     import subprocess
 
     try:
@@ -106,12 +106,12 @@ def registered_copy(envrc: Path) -> bool:
         repository_root = str(Path(__file__).resolve().parents[2])
         if repository_root not in sys.path:
             sys.path.insert(0, repository_root)
-        from scripts.lib import scratch
+        from scripts.lib import copy_record
 
-        if envrc.name != ".envrc" or scratch.copy_folder(folder) != folder:
+        if envrc.name != ".envrc" or copy_record.copy_folder(folder) != folder:
             return False
-        record = scratch.read_record(folder / scratch.RECORD)
-        if not isinstance(record, scratch.Registered):
+        record = copy_record.read_record(folder / copy_record.RECORD)
+        if not isinstance(record, copy_record.Registered):
             return False
         source_path = record.fields.get("source_path")
         source_commit = record.fields.get("source_commit")

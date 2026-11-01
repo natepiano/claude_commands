@@ -159,6 +159,7 @@
     {
       "root": "scripts/lint",
       "extraPaths": [
+        ".",
         "scripts/lint",
         "scripts/lib"
       ]

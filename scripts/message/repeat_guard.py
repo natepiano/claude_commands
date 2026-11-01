@@ -1,7 +1,7 @@
 """Local repeat decisions and a durable notice outbox; no delivery or discovery here.
 
 The pure transition is also the log replay. One sender record serializes concurrent
-receivers; one durable notice request per episode covers all of them.
+receivers; literal-repeat episodes cover receivers together; rate episodes belong to one receiver.
 """
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ import threading
 import subprocess
 import time
 import sys
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Iterator
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -36,7 +36,7 @@ PHONE_TEXT = "message.repeat_flood"
 class Limits:
     window_seconds: int
     repeat_count: int
-    sender_rate_count: int
+    receiver_rate_count: int
     max_senders: int
     max_keys: int
     preview_characters: int
@@ -133,12 +133,18 @@ class Notice:
 
 
 @dataclass
+class ReceiverRate:
+    first: float
+    count: int
+    episode: Flood
+
+
+@dataclass
 class SenderState:
     sender: str
     host: str
     last: float
-    rate_first: float
-    rate_count: int = 0
+    rates: dict[str, ReceiverRate] = field(default_factory=dict)
     receivers: dict[str, Receiver] = field(default_factory=dict)
     floods: dict[str, Flood] = field(default_factory=dict)
     notices: list[Notice] = field(default_factory=list)
@@ -152,13 +158,39 @@ class Decision:
     copies: int = 0
 
 
+def rate_identity(receiver: str) -> str:
+    return "rate:" + digest(receiver)
+
+
+def active_floods(state: SenderState) -> Iterator[tuple[str, Flood]]:
+    """Literal episodes and receiver-rate episodes share outbox retention and delivery."""
+    yield from state.floods.items()
+    for receiver, rate in state.rates.items():
+        yield rate_identity(receiver), rate.episode
+
+
+def request_notices(state: SenderState, flood: Flood, identity: str,
+                    kinds: tuple[Literal["owner", "phone"], ...], at: float, limits: Limits) -> bool:
+    episode = digest(state.sender + "\0" + identity + "\0" + str(flood.first))
+    missing: list[Literal["owner", "phone"]] = [
+        kind for kind in kinds if not any(notice.id == episode and notice.kind == kind for notice in state.notices)]
+    if len(state.notices) + len(missing) > 2 * limits.max_keys:
+        warn("notice outbox capacity reached")
+        return False
+    for kind in missing:
+        state.notices.append(Notice(kind, flood.text, flood.first, at, flood.count, len(flood.receivers), episode, created=at))
+    return True
+
+
 def expire(state: SenderState, at: float, limits: Limits) -> None:
     """Counter expiry never discards unfinished outbox work before its age limit."""
     state.floods = {key: value for key, value in state.floods.items()
                     if at - value.last < limits.window_seconds}
+    state.rates = {key: value for key, value in state.rates.items()
+                   if at - value.episode.last < limits.window_seconds}
     state.receivers = {key: value for key, value in state.receivers.items()
                        if at - value.last < limits.window_seconds}
-    live = {digest(state.sender + "\0" + key + "\0" + str(value.first)) for key, value in state.floods.items()}
+    live = {digest(state.sender + "\0" + key + "\0" + str(value.first)) for key, value in active_floods(state)}
     state.notices = [notice for notice in state.notices
                      if (notice.status in ("delivered", "queued") and notice.id in live)
                      or (notice.status not in ("delivered", "queued")
@@ -174,13 +206,27 @@ def transition(state: SenderState, attempt: Attempt, limits: Limits) -> Decision
         state.receivers.clear()
         state.floods.clear()
         state.holds.clear()
-        state.rate_first, state.rate_count = at, 0
+        state.rates.clear()
         state.identity_version = 2
     normalized = normalize(attempt.text)
     identity = digest("literal-v2\0" + normalized)
     state.last = at
     expire(state, at, limits)
     receiver_key = digest(attempt.receiver + "\0" + identity)
+    held = receiver_key in state.receivers and state.receivers[receiver_key].count + 1 >= limits.repeat_count
+    if attempt.receiver not in state.rates and len(state.rates) < limits.max_keys:
+        state.rates[attempt.receiver] = ReceiverRate(at, 0, Flood(
+            f"Many distinct messages to {attempt.receiver}; first: " + normalized[:limits.preview_characters],
+            at, at, receivers=[attempt.receiver]))
+    if attempt.receiver in state.rates:
+        counter = state.rates[attempt.receiver]
+        if at - counter.first >= limits.window_seconds:
+            counter.first, counter.count = at, 0
+        counter.count += 1
+        counter.episode.count += 1
+        counter.episode.last = at
+        if not held and counter.count >= limits.receiver_rate_count:
+            _ = request_notices(state, counter.episode, rate_identity(attempt.receiver), ("owner",), at, limits)
     if receiver_key not in state.receivers:
         if len(state.receivers) >= limits.max_keys:
             return Decision()
@@ -197,26 +243,10 @@ def transition(state: SenderState, attempt: Attempt, limits: Limits) -> Decision
     flood.last = at
     if attempt.receiver not in flood.receivers and len(flood.receivers) < limits.max_keys:
         flood.receivers.append(attempt.receiver)
-    if at - state.rate_first >= limits.window_seconds:
-        state.rate_first, state.rate_count = at, 0
-    state.rate_count += 1
     held = receiver.count >= limits.repeat_count
-    if not held and state.rate_count >= limits.sender_rate_count:
-        rate = state.floods.setdefault("rate", Flood("Many distinct messages; latest: " + flood.text,
-                                                       state.rate_first, at))
-        rate.count, rate.last = state.rate_count, at
-        rate.receivers = sorted({name for item in state.floods.values() for name in item.receivers})[:limits.max_keys]
-        flood, identity = rate, "rate"
-    episode = digest(state.sender + "\0" + identity + "\0" + str(flood.first))
-    kinds: tuple[Literal["owner", "phone"], ...] = (("owner", "phone") if held else
-        ("owner",) if state.rate_count >= limits.sender_rate_count else ())
-    missing = [kind for kind in kinds if not any(notice.id == episode and notice.kind == kind for notice in state.notices)]
-    if len(state.notices) + len(missing) > 2 * limits.max_keys:
-        warn("notice outbox capacity reached")
+    kinds: tuple[Literal["owner", "phone"], ...] = ("owner", "phone") if held else ()
+    if not request_notices(state, flood, identity, kinds, at, limits):
         return Decision()
-    for kind in kinds:
-        if not any(notice.id == episode and notice.kind == kind for notice in state.notices):
-            state.notices.append(Notice(kind, flood.text, flood.first, at, flood.count, len(flood.receivers), episode, created=at))
     if held:
         state.holds = [*state.holds, at][-limits.max_keys:]
     return Decision(held, receiver.count)
@@ -243,9 +273,29 @@ def decode(text: str) -> SenderState:
             raise ValueError("expected state string")
         return value
 
+    def flood(value: object) -> Flood:
+        item = object_map(value)
+        names = item["receivers"]
+        if not isinstance(names, list):
+            raise ValueError("expected receiver list")
+        return Flood(string(item["text"]), number(item["first"]), number(item["last"]),
+            int(number(item["count"], integer=True)), [string(name) for name in cast(list[object], names)])
+
     raw = object_map(cast(object, json.loads(text)))
-    state = SenderState(string(raw["sender"]), string(raw["host"]), number(raw["last"]),
-                        number(raw["rate_first"]), int(number(raw["rate_count"], integer=True)))
+    state = SenderState(string(raw["sender"]), string(raw["host"]), number(raw["last"]))
+    # Validate the old counters, but never carry sender-wide traffic into a receiver.
+    if "rate_first" in raw or "rate_count" in raw:
+        _ = number(raw["rate_first"])
+        _ = number(raw["rate_count"], integer=True)
+    rates: object = raw["rates"] if "rates" in raw else {}
+    if "rates" not in raw and not {"rate_first", "rate_count"} <= raw.keys():
+        raise ValueError("missing receiver rate state")
+    for key, value in object_map(rates).items():
+        item = object_map(value)
+        state.rates[key] = ReceiverRate(number(item["first"]),
+            int(number(item["count"], integer=True)), flood(item["episode"]))
+        if state.rates[key].episode.receivers != [key]:
+            raise ValueError("invalid rate receiver")
     state.identity_version = int(number(raw.get("identity_version", 1), integer=True))
     if state.identity_version not in (1, 2):
         raise ValueError("unknown counter identity version")
@@ -254,12 +304,7 @@ def decode(text: str) -> SenderState:
         state.receivers[key] = Receiver(string(item["normalized"]), number(item["first"]),
             int(number(item["count"], integer=True)), number(item["last"]))
     for key, value in object_map(raw["floods"]).items():
-        item = object_map(value)
-        names = item["receivers"]
-        if not isinstance(names, list):
-            raise ValueError("expected receiver list")
-        state.floods[key] = Flood(string(item["text"]), number(item["first"]), number(item["last"]),
-            int(number(item["count"], integer=True)), [string(name) for name in cast(list[object], names)])
+        state.floods[key] = flood(value)
     notices = raw["notices"]
     holds = raw["holds"]
     if not isinstance(notices, list) or not isinstance(holds, list):
@@ -274,6 +319,10 @@ def decode(text: str) -> SenderState:
             int(number(item["receivers"], integer=True)), string(item["id"]),
             status, number(item.get("created", item["last"]))))
     state.holds = [number(value) for value in cast(list[object], holds)]
+    # Sender-wide rate episodes are obsolete, including their pending notices.
+    _ = state.floods.pop("rate", None)
+    state.notices = [notice for notice in state.notices
+                     if notice.id != digest(state.sender + "\0rate\0" + str(notice.first))]
     return state
 
 
@@ -306,7 +355,7 @@ def _stored_check(root: Path, attempt: Attempt, *, event: bool = False) -> Decis
             if path.exists():
                 try:
                     state = decode(path.read_text())
-                    if state.sender != attempt.sender or len(state.receivers) > limits.max_keys or len(state.floods) > limits.max_keys:
+                    if state.sender != attempt.sender or len(state.receivers) > limits.max_keys or len(state.floods) > limits.max_keys or len(state.rates) > limits.max_keys:
                         raise ValueError("invalid sender or state capacity")
                 except Exception:
                     path.unlink(missing_ok=True)
@@ -317,7 +366,7 @@ def _stored_check(root: Path, attempt: Attempt, *, event: bool = False) -> Decis
                     fcntl.flock(capacity, fcntl.LOCK_EX | fcntl.LOCK_NB)
                     if len(list(root.glob("*.json"))) >= limits.max_senders:
                         raise ValueError("sender state capacity reached")
-                    state = SenderState(attempt.sender, attempt.host, attempt.at, attempt.at)
+                    state = SenderState(attempt.sender, attempt.host, attempt.at)
                     write_text_atomic(path, json.dumps(asdict(state)))
                 finally:
                     os.close(capacity)
@@ -485,7 +534,7 @@ def drain(root: Path, deliver: Callable[[SenderState, Notice, Limits], NoticeOut
                         continue
                     pending: list[Notice] = []
                     for notice in state.notices:
-                        flood = next((item for item in state.floods.values()
+                        flood = next((item for _, item in active_floods(state)
                                       if item.first == notice.first and item.text == notice.text), None)
                         if notice.status == "claimed":
                             notice.status = "unknown"

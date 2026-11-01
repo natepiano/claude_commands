@@ -16,7 +16,7 @@ from scripts.production import merge_gate
 from scripts.production.merge_gate_test_support import TEST_HANG_GUARD_SECS, gate_suites, wait_for_file
 from scripts.production.merge_gate_suites_test_support import GateSuitesFixture
 from scripts.lint import memory_admit
-from scripts.lib import scratch
+from scripts.lib import copy_record
 
 
 @final
@@ -115,7 +115,7 @@ class MergeGateResourcesTests(GateSuitesFixture):
 
         with self.observing_admission(observed), \
                 mock.patch.object(time, "sleep", side_effect=free_slot), \
-                mock.patch.object(scratch, "copy_folder", return_value=self.checkout):
+                mock.patch.object(copy_record, "copy_folder", return_value=self.checkout):
             result = self.run_gate("--tests-only")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(waited, {"memory", "slot"})
