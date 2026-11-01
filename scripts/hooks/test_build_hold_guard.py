@@ -14,11 +14,10 @@ from unittest import mock
 
 from scripts.build_hold.test_hold_applies import REFUSAL
 from scripts.hooks.build_hold_guard_test_support import TemporaryGuardTest, hold_applies, invoke_hook
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 HOOK = Path(__file__).with_name("pre-tool-use-build-hold-guard.py")
 FRONT = HOOK.with_suffix(".sh")
-# load 136 on natedev, 2026-10-29
-TEST_HANG_GUARD_SECS = 300
 CARGO_BUILDS = ("build", "b", "check", "c", "clippy", "test", "t", "nextest", "run", "r",
                 "bench", "doc", "d", "rustc", "rustdoc", "fix", "install", "mend", "miri")
 MERGE_GATE_COMMANDS = (

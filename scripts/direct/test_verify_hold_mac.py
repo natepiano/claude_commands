@@ -10,9 +10,9 @@ from typing import cast
 from scripts.direct.verify_hold_wait_test_support import (
     INVOKE,
     LINT_STEP,
-    TEST_HANG_GUARD_SECS,
     VerifyHoldWaitFixture,
 )
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 class VerifyHoldWaitTests(VerifyHoldWaitFixture):

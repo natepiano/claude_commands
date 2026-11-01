@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import unittest
 from typing import final
-from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, HANG_GUARD_S as HANG_GUARD_S, VERIFY as VERIFY, stub_build_tool_path as stub_build_tool_path, CARGO_STUB as CARGO_STUB, RUSTC_STUB as RUSTC_STUB, CallRecord as CallRecord
+from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, VERIFY as VERIFY, stub_build_tool_path as stub_build_tool_path, CARGO_STUB as CARGO_STUB, RUSTC_STUB as RUSTC_STUB, CallRecord as CallRecord
 
 
 @final

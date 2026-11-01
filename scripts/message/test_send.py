@@ -21,12 +21,14 @@ from contextlib import AbstractContextManager, closing, contextmanager, redirect
 from datetime import datetime, timedelta, timezone
 from functools import partial
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, TextIO, cast, override
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "shutdown"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib.signal_test_support import install_signal_pid_guard
 from scripts.lib.socket_test_support import ShortUnixSocket, short_socket_directory
 import send
 import repeat_guard
@@ -55,6 +57,11 @@ else:
 from test_support import ShutdownTestCase, ShutdownSendLeaf
 from user_zone import user_zone
 from user_action import REFUSED_BEFORE_SENDING, ActionRequired, NoActionRequired, first_line
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+
+
+def setUpModule() -> None:
+    install_signal_pid_guard()
 
 
 def stream(*events: dict[str, object]) -> str:
@@ -1114,7 +1121,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         state = self.root / "cli-state"
         result = subprocess.run([sys.executable, "-c", program, str(Path(send.__file__)), "ack", "notice"],
                                 env={**os.environ, "XDG_STATE_HOME": str(state)},
-                                capture_output=True, text=True, check=False, timeout=300)
+                                capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("notice", result.stdout)
         with mock.patch.object(send, "STATE", state / "message"):
@@ -2262,7 +2269,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
 
     def test_template_fix_notice_runs_once_per_id_per_day_without_delaying_the_push(self) -> None:
         record: dict[str, object] = {"text_id": "quota", "title": "Choose an account", "action": "Choose retry.", "body": "The work stopped.", "failed_rules": ["reader-starts-cold"], "findings": [{"rule": "reader-starts-cold", "quote": "an account"}], "sent_despite_failed_review": True}
-        with mock.patch.object(subprocess, "Popen") as launch:
+        with mock.patch.object(subprocess, "Popen", return_value=SimpleNamespace(pid=4321)) as launch:
             send.template_fix_notice(record)
             send.template_fix_notice(record)
             send.template_fix_notice(dict(record, text_id="disk"))
@@ -2272,14 +2279,14 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             self.assertIn("reader-starts-cold", command[-1])
             self.assertIn("The work stopped.", command[-1])
         tomorrow = send.now() + timedelta(days=1)
-        with mock.patch.object(send, "now", return_value=tomorrow), mock.patch.object(subprocess, "Popen") as launch:
+        with mock.patch.object(send, "now", return_value=tomorrow), mock.patch.object(subprocess, "Popen", return_value=SimpleNamespace(pid=4321)) as launch:
             send.template_fix_notice(record)
             launch.assert_called_once()
 
     def test_a_user_specified_template_gets_no_fix_notice(self) -> None:
         record: dict[str, object] = {"text_id": "nate.adhoc", "title": "natedev it is ready", "body": "It is ready.\n\nadhoc",
                                      "failed_rules": ["reader-starts-cold"], "sent_despite_failed_review": True}
-        with mock.patch.object(subprocess, "Popen") as launch:
+        with mock.patch.object(subprocess, "Popen", return_value=SimpleNamespace(pid=4321)) as launch:
             send.template_fix_notice(record)
             launch.assert_not_called()
 
@@ -2318,7 +2325,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
                 real_flock(fd, operation)
             with (mock.patch.object(fcntl, "flock", side_effect=require_nonblocking),
                   mock.patch.object(send, "run", return_value=(0, "pushover: reviewed JSON: " + json.dumps(record), "")),
-                  mock.patch.object(subprocess, "Popen") as launch):
+                  mock.patch.object(subprocess, "Popen", return_value=SimpleNamespace(pid=4321)) as launch):
                 result = send.user(message, "decision", ActionRequired("Choose retry."), 145, text_id="quota")
             launch.assert_not_called()
         self.assertEqual(result.outcome, "sent")
@@ -2337,7 +2344,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
                 send.template_fix_notice({"text_id": "disk"})
                 send.template_fix_notice({"text_id": "quota"})
         with (mock.patch.object(fcntl, "flock", side_effect=compete_during_claim),
-              mock.patch.object(subprocess, "Popen") as launch):
+              mock.patch.object(subprocess, "Popen", return_value=SimpleNamespace(pid=4321)) as launch):
             send.template_fix_notice({"text_id": "quota"})
             send.template_fix_notice({"text_id": "disk"})
             send.template_fix_notice({"text_id": "quota"})

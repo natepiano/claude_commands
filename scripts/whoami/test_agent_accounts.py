@@ -24,11 +24,9 @@ from typing import final, override
 from unittest.mock import patch
 
 from scripts.whoami import agent_accounts, usage_store
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.whoami.agent_accounts import command_json
 
-
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
 
 def folder_service(folder: Path) -> str:
     """Independent vector from the service-name contract supplied by the director."""

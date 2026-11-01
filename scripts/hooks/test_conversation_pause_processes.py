@@ -13,9 +13,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
 
 from scripts.hooks.conversation_pause_test_support import (
-    LIBRARY, PROMPT_HOOK, QUESTION, TEST_HANG_GUARD_SECS, ConversationPauseFixture,
+    LIBRARY, PROMPT_HOOK, QUESTION, ConversationPauseFixture,
     asked_read, cross_session,
 )
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 class ConversationPauseProcessTests(ConversationPauseFixture):
@@ -44,7 +45,6 @@ class ConversationPauseProcessTests(ConversationPauseFixture):
             result = self.run_prompt(
                 "hello",
                 extra_env={"CONVERSATION_PAUSE_HOOK_BUDGET": "1"},
-                timeout=TEST_HANG_GUARD_SECS,
             )
         self.assertEqual((result.returncode, result.stdout), (0, ""))
         self.assertEqual(len(result.stderr.splitlines()), 1)
@@ -56,7 +56,6 @@ class ConversationPauseProcessTests(ConversationPauseFixture):
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
             result = self.run_stop(
                 extra_env={"CONVERSATION_PAUSE_HOOK_BUDGET": "1"},
-                timeout=TEST_HANG_GUARD_SECS,
             )
         self.assertEqual((result.returncode, result.stdout), (0, ""))
         self.assertEqual(len(result.stderr.splitlines()), 1)
@@ -70,7 +69,6 @@ class ConversationPauseProcessTests(ConversationPauseFixture):
                 "CONVERSATION_PAUSE_HOOK_BUDGET": "1",
                 "STOP_HOLD": "1",
             },
-            timeout=TEST_HANG_GUARD_SECS,
         )
         self.assertEqual((result.returncode, result.stdout), (0, ""))
         self.assertEqual(len(result.stderr.splitlines()), 1)
