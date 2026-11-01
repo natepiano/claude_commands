@@ -766,23 +766,66 @@ class CodexHomeCutoverTests(unittest.TestCase):
         lines = [line for line in reading.notes if "~/.codex" in line]
         self.assertEqual(len(lines), 1)
         self.assertIn("this login has no account note", lines[0])
-        self.assertIn("add ~/rust/hanadocs/agents/codexN.md with login: codex-cutover@example.invalid", lines[0])
+        self.assertIn("add ~/rust/hanadocs/agents/codexN.md with the login for ~/.codex", lines[0])
         self.assertIn("accounts.py cutover-home <codexN>", lines[0])
         self.assertEqual(accounts.unnoted_home_line(self.source, "codex-cutover@example.invalid"), original)
+
+    def test_status_repairs_a_conflicting_numbered_login_instead_of_recommending_cutover(self) -> None:
+        self.target.mkdir()
+        _ = (self.target / "auth.json").write_text("synthetic occupied identity")
+        target_before = file_state(self.target / "auth.json")
+        source_before = file_state(self.source / "auth.json")
+
+        def identity(home: Path) -> str:
+            return {self.source: "codex-cutover@example.invalid",
+                    self.target: "other@example.invalid"}.get(home, "")
+
+        with (patch.object(agent_accounts, "codex_email_on_disk", side_effect=identity),
+              patch.object(accounts, "_stored_usage", return_value={}),
+              patch.object(accounts, "is_test_login", return_value=False)):
+            reading = accounts.read_status(source=accounts.StoredUsageOnly())
+        expected = ("codex2: wrong sign-in; ~/.codex2 holds a different login from codex2; "
+            + f"stop what uses ~/.codex2, then run env CODEX_HOME={shlex.quote(str(self.target))} "
+            + "codex login to sign in as codex2")
+        self.assertEqual([line for line in reading.notes if line.startswith("codex2:")], [expected])
+        document = cast(accounts.StatusDocument, json.loads(accounts.render_status_json(reading)))
+        self.assertEqual([line for line in document["problems"] if line.startswith("codex2:")], [expected])
+        printed = next(line for line in reading.notes if line.startswith("codex2:"))
+        command = printed.split("then run ", 1)[1].removesuffix(" to sign in as codex2")
+        self.assertEqual(shlex.split(command), ["env", f"CODEX_HOME={self.target}", "codex", "login"])
+        binary = self.home / "login tools"
+        binary.mkdir()
+        program = binary / "codex"
+        _ = program.write_text('#!/bin/sh\nprintf \'%s\\n\' "$CODEX_HOME" "$@"\n')
+        program.chmod(0o700)
+        environment = {**os.environ, "PATH": f"{binary}{os.pathsep}{os.defpath}",
+            "CODEX_HOME": str(self.home / ".codex1")}
+        shell = "alias codex='exit 79'\n" + command
+        with subprocess.Popen(["/bin/sh", "-c", shell],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=environment) as process:
+            output, error = process.communicate()
+        self.assertEqual((process.returncode, output, error), (0, f"{self.target}\nlogin\n", ""))
+        for output in (accounts.render_status_table(reading), accounts.render_status_json(reading)):
+            self.assertNotIn("cutover-home codex2", output)
+            self.assertNotIn("codex-cutover@example.invalid", output)
+            self.assertNotIn("other@example.invalid", output)
+        self.assertEqual(file_state(self.target / "auth.json"), target_before)
+        self.assertEqual(file_state(self.source / "auth.json"), source_before)
+        self.assertFalse(self.journal.exists())
 
     def test_status_names_legacy_login_only_until_cutover_and_omits_signed_out_default_row(self) -> None:
         # This reserved address models a normal provider login for cutover.
         with (patch.object(accounts, "_stored_usage", return_value={}),
               patch.object(accounts, "is_test_login", return_value=False)):
             before = accounts.status_report()
-            self.assertIn("~/.codex still holds a login; run accounts.py cutover-home codex2", before)
+            self.assertIn("~/.codex still holds codex2's login; stop what uses ~/.codex (such as the ChatGPT app), then run accounts.py cutover-home codex2", before)
             self.assertEqual(self.run_cutover(), 0)
             after = accounts.status_report()
-            self.assertNotIn("~/.codex still holds a login", after)
+            self.assertNotIn("~/.codex still holds codex2's login", after)
             self.assertNotIn("~/.codex", [row.folder for row in accounts.codex_statuses(self.target)])
             self.assertIn("~/.codex2", after)
             self.assertEqual(self.run_cutover(undo=True), 0)
-            self.assertIn("~/.codex still holds a login; run accounts.py cutover-home codex2", accounts.status_report())
+            self.assertIn("~/.codex still holds codex2's login; stop what uses ~/.codex (such as the ChatGPT app), then run accounts.py cutover-home codex2", accounts.status_report())
 
 
 class CodexCutoverProcessListingTests(unittest.TestCase):

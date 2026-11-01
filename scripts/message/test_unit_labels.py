@@ -9,12 +9,39 @@ import sys
 import tempfile
 from typing import TYPE_CHECKING, cast
 import unittest
+from unittest import mock
 
 if TYPE_CHECKING:
     from scripts.message.sessions import SessionRecord
 
 
 class FileOnlyLabelTests(unittest.TestCase):
+    def test_failed_discovery_keeps_healthy_rows_and_reports_each_problem_once(self) -> None:
+        from scripts.message import unit_labels
+        from scripts.production import showrunners
+
+        healthy = showrunners.Showrunner(session="healthy", socket="", slug="healthy",
+                                         zone="UTC", doc="/fixture/healthy-production.md")
+        failure = showrunners.ShowrunnerLookupFailure("missing", "session records are unreadable")
+        discovery = showrunners.ShowrunnerDiscovery([healthy], (failure,))
+        for emits_diagnostic in (False, True):
+            with self.subTest(emits_diagnostic=emits_diagnostic):
+                def discover(*arguments: object, **keywords: object) -> showrunners.ShowrunnerDiscovery:
+                    del arguments, keywords
+                    if emits_diagnostic:
+                        print(failure.diagnostic, file=sys.stderr)
+                    return discovery
+
+                problems: list[str] = []
+                with (tempfile.TemporaryDirectory() as directory,
+                      mock.patch.object(showrunners, "SESSIONS_DIR", Path(directory)),
+                      mock.patch.object(showrunners, "registered_showrunners", side_effect=discover)):
+                    rows = unit_labels.registered_showrunners({
+                        "NOTIFIER_STATE_DIR": directory, "NOTIFIER_SESSIONS_DIR": directory,
+                    }, problems, known_sessions={})
+                self.assertEqual(rows, [healthy])
+                self.assertEqual(problems, [f"showrunners: {failure.diagnostic}"])
+
     def test_a_known_session_resolves_without_loading_herdr(self) -> None:
         record: SessionRecord = {
             "pid": 123, "sessionId": "queue-reader", "name": "queue-reader-test",

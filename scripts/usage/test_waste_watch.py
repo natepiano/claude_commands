@@ -15,8 +15,11 @@ from typing import cast, final, override
 from unittest import mock
 
 from scripts.usage import collect, usage_report, waste_watch
+from scripts.production import showrunners
 from scripts.usage.test_collect import FAILING_WATCH, CollectorFixture
 
+
+REAL_DISCOVERY = waste_watch.registered_showrunners
 
 NOW = datetime(2026, 10, 16, 12, 0, tzinfo=timezone.utc)
 ADDRESS = "uds:/invented/showrunner.sock"
@@ -105,6 +108,16 @@ class WasteWatchTests(unittest.TestCase):
     def alert_times(self) -> dict[str, str]:
         path = self.db_path.parent / "waste_watch.json"
         return cast(dict[str, str], json.loads(path.read_text(encoding="utf-8"))) if path.exists() else {}
+
+    def test_partial_discovery_keeps_the_lookup_unknown_instead_of_complete(self) -> None:
+        partial = showrunners.ShowrunnerDiscovery([], (
+            showrunners.ShowrunnerLookupFailure("missing", "fixture lookup failed"),))
+        # The fixture normally replaces this wrapper; exercise the real library entry here.
+        with mock.patch.object(showrunners, "registered_showrunners", return_value=partial):
+            found = REAL_DISCOVERY()
+        self.assertIsInstance(found, waste_watch.ShowrunnerLookupFailed)
+        assert isinstance(found, waste_watch.ShowrunnerLookupFailed)
+        self.assertIn("fixture lookup failed", found.reason)
 
     def test_wait_share_over_ten_percent_on_a_million_weighted_tokens_is_sent_to_the_showrunner(self) -> None:
         self.request("worker-one", 0, 900_000)

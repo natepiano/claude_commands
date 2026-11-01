@@ -437,6 +437,54 @@ Split 2026-10-31 (unit director, packaging): this phase is the staff side: the w
 
 **Acceptance gate:** the affected suites pass; basedpyright 0/0; `staff.py show --json --live` prints schema 2 on a fixture staff record; a second seed run changes nothing.
 
+### Phase 3m — Worker rows now: each admission writes the row; a fill adds the open workers  · status: done
+
+**The worker command (user, 2026-10-31).** This design replaces the admission part of the Work Order below; the worker fill stays, for workers live now only.
+
+User-approved design, 2026-10-31 ~16:55 EDT ("yes go for workers and agents").
+
+One script: scripts/production/worker.py. /unit:worker and /showrunner:worker both run it. The parent comes from the caller's own STAFF_ID (unit director -> its unit row; showrunner -> its showrunner row); nobody types a parent; no name pattern becomes a parent.
+
+Verbs:
+- list: the caller's current workers: name, role, busy | idle | stopped.
+- assign <role> <prompt>: gives work to the first idle worker in that role (impl, then impl2, ...); resumes a stopped one. When every worker in the role is busy it refuses with one line naming them. It never opens a new worker by itself, except the first use rule below.
+- add <role>: one more worker in the role (impl2 after impl). Writes the staff row first; if the row cannot be written, starts nothing (fail closed).
+- end <name>: stops the worker and deletes its row. No history in staff (logs stay in run folders).
+- restore: brings back every worker that has a row on its same Codex thread or Claude session. A running worker is left alone; a rerun changes nothing, exit 0, one line.
+- check: read-only; exit 0 only when every row has a running or resumable worker; prints each wrong row.
+
+Rules:
+- The rows are the current worker set. No ended state: ending deletes the row.
+- Default team, made on a unit's first assign: impl, fix, review, test (user, 2026-10-31). Astra roles are made on first assign.
+- Names: role, then role2, role3, using the lowest free number.
+- Row holds name, role, parent, backend identity (Codex thread id + Codex home, or Claude session id).
+- Only worker.py starts workers. A Codex or Claude agent started any other way is not a worker: no row, and check ignores it.
+- Restore points: `agents up` / `agents restart` (today shutdown.py restart, also reached by herdr-up.sh) call worker.py restore for each session they bring back; retire_unit stops the unit's workers and keeps their rows; resume_unit calls worker.py restore.
+- Transport (Codex mesh today, herdr panes later) stays inside worker.py; no command changes when panes land.
+
+Goes after worker.py lands (next step): implement.sh, review.sh, assign.sh/assign.py, workers.py (its selection moves into worker.py: one selector), remove_workers.py, the worker use of agent_bg.sh and design_roles.open_role. /unit:direct and the showrunner commands call /unit:worker and /showrunner:worker.
+The one-time worker fill adds rows only for workers live now.
+
+
+**Depends on:** 3l (`staff.ensure_worker`) and 3q. Not on models F024: `ensure_worker` takes only `staff.json.lock` (`staff.py:734`).
+
+#### Work Order
+
+User order (via sdlc, 2026-10-31 16:2x EDT): "no put workers in staff now" and "the most important thing is getting the staff file correct - everything flows from it". This step goes ahead of 3r's other work and Phase 6. Rows are added only. No reader switches. F024's lock order stays for 3n's end and stop paths.
+
+Goal: every open worker of every live unit has a staff row (kind worker, parent = its unit's row), and each new admission writes its row.
+
+Spec:
+1. Admission writes. At each worker admission point call `staff.ensure_worker(name, parent)` (scripts/production/staff.py:734; it takes only staff.json.lock): the Codex open (`codex_mesh.open_unit_worker`, scripts/agents/codex_mesh.py:6450, and the start that opens a thread), the Claude worker open in `assign.py` / `assign.sh`, and the Astra open `design_roles.open_role` (scripts/astra/design_roles.py:721). Call it while no roster, inbox or lifecycle lock is held (the docstring at staff.py:735). The parent is the unit's staff row, found with `staff_sources.member(UnitMember(slug, unit), staff.snapshot())` from the run's own unit facts or the director's `STAFF_ID`; never from a name pattern. A rerun of the same admission is a no-op (ensure). Fail closed (user, 2026-10-31: "without fail"): the open writes the row first; when the parent cannot be found or the staff write refuses, the open refuses with one line `staff: <worker>: not opened: <reason>`, exit 2, and starts nothing. Every open path shares the one admission function. Each raw worker start takes a typed `WorkerAdmitted` value that only `ensure_worker` returns, so the type checker refuses a start without a row, and a repo-scan test fails on any raw start outside the start functions. A parent is a unit or a showrunner (showrunner-held Astra roles).
+2. Worker fill. New `scripts/production/worker_fill.py` (`fill` and `fill --dry-run`): read the current worker ledgers of each live unit (the unit worker ledger and roster, docs/as-built/long-lived-workers.md; the Astra role records) and add a row for each open worker under its unit. A worker whose unit or name cannot be placed is written nowhere and listed as `<source>:<line or key> <worker>: <what is missing>`; exit 1 while the list is not empty, after writing every complete row. A rerun of a finished fill prints one line `unchanged` and exits 0. Showrunner-held Astra roles: list them (parent rule waits for sdlc), do not write.
+3. No reader changes. `staff.py show` lists the workers under their units.
+
+Files: scripts/agents/codex_mesh.py (models unit's file: keep the diff small; models reviews it before merge), scripts/direct/assign.py, scripts/astra/design_roles.py, scripts/production/worker_fill.py (new), scripts/production/test_worker_fill.py (new), scripts/agents/test_codex_mesh.py, scripts/astra/test_design_roles.py, scripts/direct/test_assign_launcher.py. Not staff_sources.py (3r holds it).
+
+Acceptance gate: basedpyright 0/0 on changed files and every caller module; named suites pass; tests: admission writes the row with the right parent, a rerun writes nothing, a missing parent opens the worker and prints the line, the fill places each ledger worker, lists the unplaceable ones and exits 1, a finished rerun prints `unchanged` exits 0 and changes no byte; real run: `worker_fill.py fill --dry-run` then `fill` on the live staff file, `staff.py show` lists the workers under their units, a real rerun prints one line and exits 0.
+
+**One assign command (user, 2026-10-31).** `assign` (`scripts/direct/assign.py`, `assign.sh`) is the only way a worker is added to a unit or a showrunner. It writes the staff row first and starts nothing when it cannot. A Codex or Claude agent started any other way is not a worker: it gets no row, and the staff check ignores it. The old launch scripts go (user, 2026-10-31: "we get rid of the former (ancient) delegate or review or whatever other scripts exist"): after 3m, one step lists every script that starts or dispatches a worker, moves its callers and command docs to `assign`, and deletes it.
+
 ### Phase 3n — Workers on the staff record (call sites)  · status: todo
 
 **Depends on:** 3l, 3p, 3q (this phase reads 3q's schema 2 and writes 3), and the models unit's F024 checkpoint 3b67af71 on `origin/natedev-models` (the lock order, `worker_lifecycle.acquire_flock` and the `stop` path): merge it before any edit.
@@ -589,7 +637,17 @@ Split from 3l on 2026-10-31; the same user ask and the same sdlc acceptance as 3
 
 **Acceptance gate:** basedpyright 0/0 on changed files and every caller module; `test_staff*`, `test_staff_sources*`, `test_unit_config*`, `test_git_exclude*`, `test_production_lifecycle*`, `test_add_style*`, `test_tunables*`, `test_findings*` pass; a missing key, a missing file and a bad value each raise `TunableUnusable` naming the file and key; schema tests: a schema 1 file reads and writes back as 2 with every row unfilled, an ordinary staff write during a partial fill keeps the unfilled rows, a unit row with a `doc` and a showrunner row with a `worktree` are refused; `unit_config` tests for each recovery case of Spec item 4; `git_exclude` tests: a tracked `.unit.toml` and a `.gitignore` negation each refuse; the real fill on natedev and on the Mac prints its manifest, lists every missing fact for sdlc and writes the rest; the active-unit list of `live_units.py` on natedev is the same before and after the fill; a fill stopped after one unit's row write and run again ends equal to one clean run; a rerun of a finished fill prints `unchanged`, changes no byte and exits 0; in a filled worktree `git ls-files --error-unmatch .unit.toml` fails and `git check-ignore -q .unit.toml` passes; full gate green.
 
-### Phase 3r — Writers keep the worktree, the doc and `.unit.toml` current; retired rows filled  · status: todo
+### Phase 3k — `verify.sh lint` checks tracked TOML only  · status: todo
+
+**Depends on:** 3q. Live repair (sdlc, 2026-10-31): the 16:24 fill wrote `.unit.toml` in a format that `taplo fmt --check` rejects under each repository's own `taplo.toml` (`align_entries`, `reorder_keys`), so `verify.sh lint` fails in up to 31 worktrees with clean code.
+
+#### Work Order
+
+**Goal:** `unit_config.write` and `write_parked` emit the text that `taplo fmt` gives under the target repository's own config, and a fill rerun rewrites each existing file that differs; a second rerun changes nothing.
+
+**Acceptance gate:** basedpyright 0/0 on changed files and callers; `test_unit_config*` and `test_staff_sources*` pass, with a test that runs taplo on the writer's output under an aligning config; the live rerun rewrites the files, `taplo fmt --check .unit.toml` passes in each filled worktree, and a second rerun prints `unchanged` with no byte changed.
+
+### Phase 3r — Writers keep the worktree, the doc and `.unit.toml` current; retired rows filled  · status: done
 
 **Depends on:** 3q.
 
@@ -634,6 +692,92 @@ Split from 3l on 2026-10-31; the same user ask and the same sdlc acceptance as 3
 **Constraints from prior phases:** Phase 3q (`set_worktree`, `set_doc`, the unfilled states, `unit_config.park`, `restore`, `discard_parked`, `place`, `git_exclude.ensure_excluded`, `tunables`, the fill and its manifest). Phase 3 (each tool writes its row and checks the staff step before any change). Delegation Context → Staff design (2026-10-31), Rerun-safe tools, Lifecycle reruns keep the pane, No hard-coded config.
 
 **Acceptance gate:** basedpyright 0/0 on changed files and every caller module; the named suites pass; the active-unit list of `live_units.py` and of the roster on natedev is the same before and after the retired backfill (the backfill adds no active unit); a real add, retire and resume of a throwaway unit: the file sits in the worktree, then in `~/.local/state/staff/units/<staff id>.toml`, then back, the row's worktree state follows, the row stays after the retire, and the resumed worktree is on the branch it had; the backfill proof: the parked file of `guild-process-unit` holds session `842c2149-c59b-4abd-934c-ba61d14944ad`, its folder (from the transcript folder) and its branch, and a real `resume_unit.py sdlc guild-process-unit --dry-run` passes from the parked file alone; a resume with neither file refuses with the line above and changes nothing; a retire stopped after the park, a resume stopped after the restore and a resume stopped after the launch and before `discard_parked` each finish on rerun, and the last keeps the session facts until then; a real `rename_unit.py` of a throwaway unit leaves the row's worktree on the moved folder, and one stopped after the folder move sets it on rerun; `fill --retired` lists every missing fact for sdlc, a stop after one unit finishes on rerun, and a rerun of a finished run prints `unchanged` and exits 0; a rerun of each finished tool changes nothing and exits 0; `staff_sources.py fill --dry-run` then reports `unchanged`; a changed `config/production.conf` value takes effect with no code change; item 11: a real `add_unit.py` launch of a throwaway unit, a real `add_showrunner.py` launch, a real `resume_unit.py` and a real account move each leave a pane launch record whose environment carries `STAFF_ID=<the row's id>` (read from `~/.local/state/herdr-panes/`), a real relaunch of herdr-unit (or a throwaway unit) then shows its right showrunner, not `unassigned`, in each session reader that printed `unassigned` (`roster.py`, `usage_report.py`; the checkpoint notice names the one the user saw), and a rerun of each changes nothing and exits 0; full gate green.
+
+### Phase 3i — Read-only staff check lists every wrong row  · status: done
+
+**Depends on:** 3m. Runs beside 3r (sdlc showrunner, 2026-11-01); lands after it, since both change `staff_sources.py`.
+
+#### Work Order
+
+**Goal:** one read-only command, `staff_check.py`, lists every wrong staff row and exits 0 only when every row is right, so sdlc can see what is still wrong.
+
+**Spec (sdlc showrunner, 2026-11-01):**
+1. Safe to rerun: it writes no file, row, mark or lock.
+2. One row per live session: each live Claude or Codex session that carries a `STAFF_ID` names exactly one existing row, and one row has at most one live session.
+3. Each parent is live where the row is live, and is the correct kind. A record the staff reader refuses (a missing parent, a wrong parent kind) exits 2 with the reader's reason.
+4. Each unit row's worktree, and each showrunner row's doc, exists and belongs to that row; a retired row's `RemovedWorktree` is right.
+5. Each live worker is under its unit's row. Worker liveness is the shared scanner's answer (`staff_sources.observe_workers`), the same one the fill uses.
+6. It lists wrong rows, one line each (`<row id> <name>: <what is wrong>`), then one count line; evidence it cannot settle is listed as uncertain, never filled in. Exit 1 when it lists a line, 2 when a source cannot be read.
+7. A new file that reads staff through the one existing reader (`staff.snapshot()` and the existing joins), with no copy of their logic. Any strict read it needs leaves the existing callers' behavior as it is.
+
+**Files:** new `scripts/production/staff_check.py` and `scripts/production/test_staff_check.py`; the smallest accessors in `scripts/production/staff_sources.py`, `scripts/production/session_staff.py`, `scripts/production/showrunners.py`, `scripts/herdr/herdr.py`.
+
+**Workers:** `1 writer` — `fix`, in its own clone.
+
+**Acceptance gate:** basedpyright 0/0 on changed files and their callers; `test_staff_check.py`, `test_staff.py`, `test_staff_sources.py` pass; a real run on natedev lists only real wrong rows (its output goes to sdlc); two runs print the same bytes and change nothing on disk.
+
+### Phase 3j — Today's staff passes the staff check  · status: done
+
+**Depends on:** 3r and 3i (on main at `1d8bc1b62`). Runs beside 3h (user, via sdlc showrunner, 2026-11-01: "you should fix the current staffing in parallel").
+
+#### Work Order
+
+**Goal:** `staff_check.py` from main on today's `staff.json` exits 0, with a real fix for each of the 98 lines it printed at 08:05 EST, and the showrunner's rerun confirms it.
+
+**Spec:** sdlc showrunner, 2026-11-01. Back up `staff.json` before each write, write under the staff lock, and prove a rerun of each step changes nothing.
+1. The five live sessions on removed ids are not restarted. A one-time data repair sets the three right rows' own ids to the ids the live sessions carry (herdr-unit `s9a4ebb73262` → `s9c5de6a34d9`, shutdown-unit `s1255ec654c7` → `s6d4efbdc187`, style-unit `s0a2a001f59e` → `s4869eee4762`), keeps them under sdlc, and moves their workers' parent to match. The handler then shows all three under sdlc.
+2. The 82 hana workers with no row: if they are live, place them; if not, the check's liveness rule is wrong and is fixed.
+3. The 8 double-session lines: the check sees a Codex worker as a worker, not as the unit's second session.
+4. The five rows with no worktree, organon's missing doc worktree and the delegate roster worker with an empty role: each is fixed from evidence; what has no evidence is listed for sdlc.
+5. The retired fill reads no scratch copy under `/tmp` and then adds the retired rows, with ids that fit Phase 3h's session-id design.
+
+**Files:**
+- `scripts/production/staff_check.py`
+- `scripts/production/test_staff_check.py`
+- `scripts/production/staff_sources.py`
+- `scripts/production/test_staff_sources.py`
+
+**Workers:** `1 writer, 1 tester` — item 1 is a data repair by the `fix` slot with no repository file; items 2–5 go to `impl` and `test` once the evidence names their causes.
+
+**Acceptance gate:** basedpyright 0/0 on changed files and their callers; the changed modules' tests pass; the full merge gate passes. Live, from main: a backup before each write; the item 1 repair and each fill print `unchanged` on rerun and change no byte; `staff.py show` and the handler show herdr-unit, shutdown-unit and style-unit under sdlc with their workers; `staff_check.py` exits 0 on two runs with the same bytes, and the showrunner's rerun exits 0.
+
+### Phase 3h — Staff row ids are the Claude session and Codex thread ids  · status: todo
+
+**Depends on:** 3j (lands after it; both change `staff_sources.py` and `staff_check.py`). User ruling, 2026-11-01, via the sdlc showrunner: "the session id's should be the session id's that come from claude and codex - they are unique and durable and will not drift and we have no assignment responsibvility".
+
+#### Work Order
+
+**Goal:** each staff row's id is its member's own session id, staff makes no id, and `STAFF_ID` and its copies go.
+
+**Spec:** sdlc showrunner rulings, 2026-11-01. Evidence: run folder `phases/3h/review_findings_1.txt`, `review_findings_2.txt`, `clear_mac/results.md`.
+1. A row's id is the Claude `sessionId` (registry `~/.claude/sessions/<pid>.json`, transcript name) or the Codex thread id (`CODEX_THREAD_ID`, roster `thread_id`, rollout `session_meta.payload.id`). A parent is the parent's id. The generator (`staff.py:712`) and the `s…` pattern (`staff.py:32`) go; no id mapping or alias table.
+2. `STAFF_ID` and its copies go: a session reads its own id from its runtime (Claude: its registry `sessionId`, or in a hook the input `session_id` and the environment `CLAUDE_CODE_SESSION_ID`; the Claude process environment itself has no `CLAUDE_CODE_SESSION_ID`, proved live 2026-11-01. Codex: `CODEX_THREAD_ID`), and a restart record keeps no identity. One owner switches every caller: the 30 files in `phases/3h/id_callers.txt`, `statusline.jq:119` and `promote_showrunner.py:327`.
+3. Admission writes a worker's row after `thread/start` returns its thread id (`worker_admission.py:91` writes it before today). A thread with no row (a stop between the two) is listed by `staff_check.py`; a test pins it.
+4. An id that changes takes effect at once, in one write under the staff lock, with the children's parents: a replaced Codex thread (`codex_mesh.py:5603-5607`) when it is replaced; a Claude session that `/clear` gives a new id (proved live 2026-11-01: SessionEnd with reason `clear` and the old id, then 0.19 s later SessionStart with source `clear` and the new id, before the next prompt) from a SessionStart hook with source `clear`, registered in `settings.json`, which finds the one row by the session's worktree or doc and writes the new id from its input. No gap and no restart (sdlc ruling, 2026-11-01). When the hook does not fire or finds no single row, it changes no row, and `staff_check.py` lists the session; a test pins each case. Compaction and moves keep the id.
+5. Migration, one script: backup, staff lock, rekey each row to its one proved id (179 rows) and every reference (204 parents, parked unit files, `refs/retired/<id>`, rename and transfer journals, receipt owners). The 24 workers whose owner records disagree get no row; each writes one at its next admission. The `metrics-visualization` unit row has no session field: list it for sdlc. The retired rows land here with their session ids (sdlc ruling: no `s…` ids made only to be replaced); a retired unit with no recorded session, and the four guilds units with no showrunner row, are listed. A rerun prints `unchanged`; a run stopped part way finishes on rerun.
+6. Mac (read 2026-11-01): one live session, with no row and no `STAFF_ID`; no Mac staff record. A Mac session joins at admission with its own id, read through `roster.py:1422`.
+7. Kept from the earlier 3h: removing a row refuses while a live session carries its id, and names it; the handler shows a session with no row one way; `worker_admission.py` names what it could not find.
+
+**Files:**
+- `scripts/production/staff.py`
+- `scripts/production/staff_sources.py`
+- `scripts/production/staff_check.py`
+- `scripts/production/session_staff.py`
+- `scripts/production/session_labels.py`
+- `scripts/production/worker_admission.py`
+- `scripts/production/promote_showrunner.py`
+- `scripts/production/add_unit.py`
+- `scripts/production/retire_unit.py`
+- `scripts/production/unit_config.py`
+- `scripts/agents/codex_mesh.py`
+- `scripts/shutdown/pane_record.py`
+- `scripts/message/roster.py`
+- `settings.json`
+- `scripts/`
+
+**Workers:** `1 writer, 1 tester` — `impl` and `test`, in one clone.
+
+**Acceptance gate:** basedpyright 0/0 on changed files and their callers; the changed modules' tests pass; the full merge gate passes. Live, from main: a backup; the migration's dry run, real run and rerun (`unchanged`, same sha256); `staff_check.py` exits 0 on two runs with the same bytes; each live session's row id equals the id its runtime reports; shutdown-unit restarted (idle) keeps its id; no new process carries `STAFF_ID`.
 
 ### Phase 3s — The one join answers from the row  · status: todo
 
@@ -681,6 +825,7 @@ Split from 3l on 2026-10-31; the same user ask and the same sdlc acceptance as 3
 2. Each reads who exists and who reports to whom from one snapshot, and each fact from the resolver. A timer still gives its session, socket, zone and interval through `showrunners.timer_for` (decision 16); its doc comes from the showrunner row. The excluded files keep their `production_units` import until Phase 4c moves it. `resume_unit.py` and `retire_unit.py` stop reading the retired note: the parked file holds it. `add_unit.py` finds an existing unit by its row, not by its Units row.
 3. The Owns scope check of `merge_checkpoint.py` (:243-248, :583) is not changed here; Phase 4b deletes it.
 4. History stays history: a reader that reports who owned a past commit or run keeps what the artifact recorded (old 3i rule).
+5. **The resume recovery type states its guarantee (moved here from the Phase 3r closure review, 2026-11-01).** `resume_unit.py:89` holds `recovery: UnitConfig | NoRetiredSession`. A `UnitConfig` can lack the retirement facts, and the sentinel means only that no recovery file is outstanding, so the callers keep the guarantee by procedure. Replace it with one named recovery type whose retirement facts are mandatory, and a separate `NoRecoveryRequired` state. A test pins that a recovery value without the retirement facts cannot be made.
 
 **Files:**
 - `scripts/production/{add_showrunner,add_unit,change_review,ci_points,codex_winddown,completion_receipt,footer_counts,log_backup,merge_checkpoint,merge_gate,next_item,production_lifecycle,promote_showrunner,proposals_folder,proposals_table,prune_phase_notes,resume_unit,retire_unit,roles_audit,stall_watch,style_units,unit_run,update_registration,waiting}.py` — the readers item 1 lists (ac680222); a reader the search finds at dispatch joins them.

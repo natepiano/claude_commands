@@ -7,6 +7,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from typing import cast, override
@@ -112,6 +113,19 @@ class SessionPaneTests(unittest.TestCase):
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertEqual(result.stdout, output)
                     self.assertEqual(self.log("herdr")[-1], command)
+
+    def test_pane_text_and_status_forward_the_same_deadline_to_execution(self) -> None:
+        place = HerdrPlace("native", "w1:p1")
+        reply = subprocess.CompletedProcess(["fixture"], 0,
+            '{"result":{"agents":[{"pane_id":"w1:p1","agent":"claude","agent_status":"blocked"}]}}', "")
+        with (mock.patch.object(time, "monotonic", return_value=100.0),
+              mock.patch("herdr.run_program", return_value=reply) as program):
+            for deadline, expected in ((100.5, 0.5), (99.0, 0.0), (float("inf"), 10.0)):
+                with self.subTest(deadline=deadline):
+                    self.assertEqual(session_pane.read_place(place, deadline=deadline), reply.stdout)
+                    self.assertEqual(cast(float, program.call_args.kwargs["timeout"]), expected)
+                    self.assertEqual(session_pane.agent_status(place, deadline=deadline), "blocked")
+                    self.assertEqual(cast(float, program.call_args.kwargs["timeout"]), expected)
 
     def test_every_verb_targets_the_units_herdr_pane(self) -> None:
         target = ("unit", "show", "herdr-unit")

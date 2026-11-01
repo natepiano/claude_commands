@@ -37,6 +37,9 @@ else:
     from user_action import NoActionRequired
 from scripts.accounts import accounts
 from scripts.lib import nix_env
+from scripts.production import staff
+from scripts.production.staff_test_support import isolated_staff_file, unit_membership
+from scripts.shutdown.remote import local_machine
 from scripts.lib.nix_env_test_support import NixFixture
 from scripts.whoami import account
 from scripts.shutdown import launch_permission
@@ -148,8 +151,11 @@ class HerdrLaunchTests(NixFixture):
             branch="fixture", worktree=self.root / "unused-checkout", plan=add_unit.Standby(),
             port=add_unit.OmittedCell(), owns=add_unit.OmittedCell(), session=add_unit.ResumedSession("sid", self.work),
             launch_kind=add_unit.NewWorkLaunch(), timeout=1)
-        self.refusal(lambda: add_unit.launch_session(request, add_unit.DirectorAgent("opus", add_unit.DefaultEffort()),
-            "resume", accounts.NamedAccount("claude3", self.home / ".claude3")))
+        with isolated_staff_file(self.root / "staff.json", self.env):
+            member = unit_membership("child", "unit")
+            member = staff.set_worktree(member.id, staff.PresentWorktree(local_machine(), request.worktree))
+            self.refusal(lambda: add_unit.launch_session(request, add_unit.DirectorAgent("opus", add_unit.DefaultEffort()),
+                "resume", accounts.NamedAccount("claude3", self.home / ".claude3"), staff_id=member.id))
 
     def test_add_showrunner_uses_requested_cwd_before_opening(self) -> None:
         self.refusal(lambda: add_showrunner.launch(self.production(), "opus", "high", None, self.work,

@@ -299,6 +299,7 @@ def run(now: datetime, *, dry_run: bool) -> list[str]:
 def _run(now: datetime, *, dry_run: bool) -> list[str]:
     """Check local production units, under the watcher's lock."""
     lines: list[str] = []
+    runners = showrunners.ShowrunnerDiscovery()
     from scripts.maintenance.settings import settings
     limits = settings()
     dispatch_deadline = time.monotonic() + limits.recovery_dispatch_seconds
@@ -314,7 +315,11 @@ def _run(now: datetime, *, dry_run: bool) -> list[str]:
         def unit_observations() -> unit_lookup.MarkedProductions:
             return unit_lookup.every_marked_unit()
 
-        retained: dict[str, DownOutage] = {}
+        observed = {runner["slug"] for runner in runners}
+        # Absence from a partial inventory is not evidence that a recovery ended.
+        retained = ({key: outage for key, outage in state.items()
+                     if "alert_context" not in outage or outage["alert_context"]["production"] not in observed}
+                    if runners.lookup_failures else {})
         for runner in runners:
             if not runner["doc"]:
                 continue
@@ -449,6 +454,10 @@ def _run(now: datetime, *, dry_run: bool) -> list[str]:
             _write_state(retained)
     except (OSError, ValueError) as error:
         lines.append(f"watchdog: {error}")
+    if runners.lookup_failures:
+        for line in lines:
+            print(line)
+        _ = showrunners.require_complete(runners)
     return lines
 
 

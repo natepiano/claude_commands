@@ -37,15 +37,18 @@ the reason:
 When nothing is left running, the Units row's Plan cell gets
 `(retired <date>, worktree removed, session <id>)`, committed on the merge branch (the next merge
 push takes it out). The session is the unit director's last one: the live session that carries the
-unit's mark, else the newest interactive transcript under the worktree. `/showrunner:resume_unit`
+unit's session label, else the newest interactive transcript under the worktree. `/showrunner:resume_unit`
 resumes it. For unmerged work the note also keeps `, ref refs/retired/<staff id>, tip <SHA>`.
 The retired ref stays on origin until resume restores and checks the tip. Then the worktree, the local
 branch and the origin branch are removed. When something still runs, nothing is marked or removed:
 the output says what, and a rerun resumes.
 
-Retire removes the unit's staff row and records `staff <id>` in the note. Resume restores that id.
-To remove a retired unit for good, remove its Units row and delete its `origin` ref
-`refs/retired/<id>` if it has one.
+Retire parks `.unit.toml` with the session, folder and branch before removal, and keeps the unit's
+staff row with `RemovedWorktree`. Resume restores that same row and parent.
+To free a retired unit's name, remove its Units row and delete its `origin` ref
+`refs/retired/<id>` if it has one. Keep the retired identity and rename it to an unused archival name:
+`staff.py rename <id> --name <archival-name>`. The old name is then available for a new unit;
+the archived row keeps its removed worktree and historical parent.
 
 `--dry-run` prints each refusal and everything it would stop and remove, and changes nothing.
 

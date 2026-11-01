@@ -13,6 +13,7 @@ from scripts.lib import test_hang_guard
 
 from scripts.lib.test_agents_registry import registry_text, write_registry
 
+from functools import cached_property
 import json
 import os
 import shutil
@@ -250,6 +251,14 @@ class ImplementLauncherFixture(LauncherFixture):
         super().setUp()
         self.prompt_file: Path = self.root / "implementation_prompt.md"
         self.implement_script = self.root / "scripts" / "direct" / "implement.sh"
+        _ = self.staff_parent
+
+    @cached_property
+    def staff_parent(self) -> str:
+        from scripts.production.staff_test_support import isolated_staff_file, unit_membership
+        with isolated_staff_file(self.root / "staff.json", {}):
+            parent = unit_membership("fixture", "fixture-unit")
+        return parent.id
 
     @override
     def prepare_fixture(self) -> None:
@@ -265,6 +274,10 @@ class ImplementLauncherFixture(LauncherFixture):
                 "ASTRA_AFTER_FAILED_FIXES=2", "",
             ), AGENTS_REGISTRY,
         )
+        # A phase launch captures HEAD before opening its worker, as a real checked-out phase does.
+        _ = subprocess.run(["git", "-C", str(self.working_dir), "-c", "user.name=Test",
+                            "-c", "user.email=test@example.invalid", "commit", "-q", "--allow-empty",
+                            "-m", "base"], check=True, capture_output=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
         notes = self.root / "notes"
         notes.mkdir()
         _ = (notes / "claude2.md").write_text("---\nlogin: worker@example.invalid\n---\n")
@@ -300,6 +313,8 @@ class ImplementLauncherFixture(LauncherFixture):
     @override
     def environment(self) -> dict[str, str]:
         environment = launcher_environment(self.root)
+        environment["STAFF_FILE"] = str(self.root / "staff.json")
+        environment["STAFF_ID"] = self.staff_parent
         environment["AGENT_NOTES_DIR"] = str(self.root / "notes")
         # The copied shell helper uses the real account policy, while identity
         # and configuration stay in this fixture's home.

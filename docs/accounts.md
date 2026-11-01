@@ -31,7 +31,7 @@ The status line's first row shows its current staff assignment and path; its sec
 
 Each Codex account can stay signed in in its own home. The table's `workers` role follows natedev's shared role map. An unset workers role refuses to launch; it never falls back to `~/.codex`. A caller's `CODEX_HOME` does not change the `workers` role. Signed-in spares get usage readings too; their notes stay inactive and raise no quota alerts. Freestanding Codex sessions keep their own process home.
 
-Times are in the user's zone setting (`config/user_zone.conf`). The numbers are each account's last good reading: the usage service refuses many reads, so the two-minute updater saves each one it gets, and an account with none in the last 10 minutes is read once more. `unavailable` means no reading is held for a window that is still open. Credits older than ten minutes show `stale since <time>` rather than a balance. The board fetches stale Codex readings itself on both Linux and the Mac; `--stored` makes no live request. Each Codex login has one row, even when two homes hold it; duplicate-home problems still name the homes. The Read cell shows the last good read. A `*` marks a failed latest attempt. An old read also shows its month and day, such as `10-17 20:15 EDT*`. One footnote per failed account gives the cause and the next step. A good read clears the star and footnote. The default table shows only accounts; `--detail` also shows unknown entries. Lines under the table name failed checks and MCP servers that differ from `~/.claude`.
+Times are in the user's zone setting (`config/user_zone.conf`). The numbers are each account's last good reading: the usage service refuses many reads, so the two-minute updater saves each one it gets, and an account with none in the last 10 minutes is read once more. `unavailable` means no reading is held for a window that is still open. Credits older than ten minutes show `stale since <time>` rather than a balance. The board fetches stale Codex readings itself on both Linux and the Mac; `--stored` makes no live request. Each Codex login has one row, even when two homes hold it; duplicate-home problems still name the homes. The Read cell shows the last good read. A `*` marks a failed latest attempt. An old read also shows its month and day, such as `10-17 20:15 EDT*`. One footnote per failed account gives the cause and the next step. Its reading time includes the month and day when it is not from today. It names the last usage attempt time, or says no usage read has been attempted; it does not promise when another read will run. A good read clears the star and footnote. The default table shows only accounts; `--detail` also shows unknown entries. Lines under the table name failed checks and MCP servers that differ from `~/.claude`.
 
 `status --json` prints `{"accounts": [...], "problems": [...]}` from the same readings as the table, in the same account order. `problems` contains the lines below the normal table. Each account has `label`, `tool` (`claude` or `codex`), `roles`, `weekly_left_percent`, `resets_at`, `credits`, `use_credits` and `read_at`. Roles are a list, so one Claude account can hold both `units` and `showrunners`; Codex roles are `workers` or `spare`. Missing readings are null. Reset and read times are ISO 8601 UTC strings. Credits are a number, `"unlimited"`, or null; Claude has null credits and `use_credits: false`. Codex `use_credits` is true unless its note says `use_credits: off`.
 
@@ -39,19 +39,32 @@ The JSON has no login or folder fields. `--json` cannot be combined with `--deta
 
 Each problem below the table uses one form: `<home or account>: <what is wrong>; <cause>; <step to fix it>`. An MCP server difference is the one exception. It has one line per account, server and direction, and it counts only the projects where the account differs from the same project in `~/.claude`: `claude2 turns brp off in 3 projects where ~/.claude does not: ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py mcp-repair claude2 brp`. The home scope counts as the project `~`; both files read the same `~/.claude` project. The command at the end makes that server match the baseline in every differing project. It writes atomically, preserves the file mode and keeps a `.claude.json.mcp-backup-<time>` beside the account file. It preserves other servers and account settings. The read-only `mcp-projects <account> <server> <off|on>` command remains available to inspect those paths before a repair. The table and JSON `problems` use the same lines; JSON omits the `* ` footnote prefix. A direct folder or sign-in check replaces the empty-row summary for that cause.
 
-A login in the legacy home with no account note has one line, rather than separate usage-read, cutover and note hints. The line names the missing note, gives its `login:` value, then gives the cutover command. Other checks keep their facts and commands.
+A login in the legacy home with no account note has one line, rather than separate usage-read, cutover and note hints. The line names the missing note and asks for the account's login, then gives the cutover command. Problem lines use account labels and never print a login. Other checks keep their facts and commands.
 
 A reserved test-domain login has its own cause. For example: `~/.codex: test sign-in is stored; a test wrote ~/.codex/auth.json at 2026-10-29 01:14 UTC; delete ~/.codex/auth.json`. The time is the file's modification time in the user's zone. Reserved domains include `.invalid`, `.test`, `.example`, `.localhost`, `example.com`, `example.net` and `example.org`, including subdomains. Status prints no account-note or cutover step for a test sign-in. It deletes nothing.
 
 Each Claude group with no account has a note: `units: not configured; the role map selects no account; run accounts.py move units <claudeN>` (or `showrunners`). A configured group has no such note; its account has the group in the Role column. The JSON `problems` list has the same notes.
 
-`status --stored`, with or without `--json`, skips every live usage read, subprocess and network call. It shows saved readings regardless of their age; `read_at` records when they were read. On natedev it reads the local role map; elsewhere it reads only `role_map_cache.json`, without ssh or a cache write. If no usable cache exists, roles are empty and `problems` names the missing map. Other commands keep their normal role-map fetch and cache behavior.
+`status --stored`, with or without `--json`, skips every live usage read, subprocess and network call. It shows saved readings regardless of their age; `read_at` records when they were read. On natedev it reads the local role map; elsewhere it reads only `role_map_cache.json`, without ssh or a cache write. Using this saved map is expected in stored mode and adds no problem line. If no usable cache exists, roles are empty and `problems` names the missing map. Other commands keep their normal role-map fetch and cache behavior.
 
 Without `--stored`, a role map that cannot be fetched or read from cache refuses status with an error on stderr and exit 1, for both the table and JSON.
 
-On the Mac, the `account-usage` launchd user agent refreshes the usage store at
-login and every two minutes in the GUI login session, where the keychain is
-available. It runs `agent_notes.py usage-only`, which shares the agent-notes job's
+On the Mac, the `account-usage` launchd user agent polls at login and every 30
+seconds in the GUI login session, where the keychain is available. It runs
+`agent_notes.py usage-only --poll-seconds 30`, which reads `mac_usage.interval_seconds` from
+`config/agent_notes.toml` on each invocation (currently 60 seconds). Missing or
+invalid values refuse the read and name the file and key. Each account has its own
+eligibility time. A Claude read records its actual granted claim time, after
+credential lookup; a held claim leaves that account's time unchanged. Reads
+without a Claude claim record their start time. An account is due
+after the configured interval minus half the job's
+poll period, so jitter neither adds another poll nor causes adjacent polls to
+read. Without `--poll-seconds`, the full interval must elapse. The shared read
+guard uses the same cadence for this pass; natedev's cadence and the rate-limit
+backoff stay unchanged. The interval describes nominal attempts, not guaranteed
+successful readings. Polls with no due account exit silently without reading usage. The separate attempt
+history and lock live in `~/.local/state/agent-notes/usage-only/`.
+It shares the agent-notes job's
 live read and save step. It writes no notes, sends no quota alerts and runs
 neither the Codex pacer nor account moves. Natedev still owns those actions.
 Install the scripts before activating `modules/darwin/account-usage.nix`.
@@ -202,7 +215,7 @@ On Linux, in a terminal after its legacy sessions have stopped:
 
 On Linux this moves the login into `~/.claude2` by rename, refuses an occupied destination and live legacy sessions, and journals the operation before moving identity files. Rerun after an interruption to finish. `cutover-home --undo` reverses it after sessions on the destination stop. No live cutover is part of installing this code. natedev cut over on 2026-10-15 and the Mac on 2026-10-16: on both machines `~/.claude` holds no login and claude2's login lives in `~/.claude2`.
 
-For the Mac's separate step, the director first prepares `~/.claude2` and arranges for legacy sessions to stop. The user launches that numbered account and runs `/login` once inside it:
+For the Mac's separate step, the director first prepares `~/.claude2` and arranges for legacy sessions to stop. The full board step is: in a Mac Terminal, run `accounts.py exec claude2`, then `/login`, then `/exit`, then `accounts.py cutover-home claude2`; never `/logout`. The user launches that numbered account and runs `/login` once inside it:
 
 ```sh
 ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py exec claude2
@@ -228,7 +241,7 @@ On each machine, stop every Codex process using `~/.codex`, including its long-l
 
 The command verifies the account note, prepares the numbered home's shared links, and renames only `auth.json`; it never copies credentials. If the numbered home already holds the same login, it preserves that identity and moves the legacy `auth.json` into a private, dated archive beside the cutover journal instead. A different or unreadable numbered login still refuses. Undo restores the archived legacy file and leaves the numbered identity in place. It then prints setup's wait line and starts Codex once on the numbered home, reporting done only after Codex answers `initialize`, which can take up to 20 minutes while the shared session index builds. If that startup fails, the login move stays complete and the command exits non-zero naming `accounts.py setup codex2`, which finishes the index. A live process on the source, or an unreadable process environment, refuses the move with its pid and the step to stop it. The private `cutover-codex-home.json` journal lets a rerun finish after an interruption. A completed rerun changes nothing. `cutover-home codex2 --undo` renames the login back after all processes on `~/.codex2` stop; bare `cutover-home --undo` still applies to Claude.
 
-After this cutover on natedev and the Mac, `~/.codex` holds no login on either machine and remains the shared configuration and session store. Running the Codex executable without `CODEX_HOME` is signed out; the `codex` alias (`accounts.py exec workers`) still selects the mapped numbered home. Until cutover, status prints `codex2: legacy login is stored; ~/.codex still holds a login; run accounts.py cutover-home codex2`; afterwards that home has no account row.
+After this cutover on natedev and the Mac, `~/.codex` holds no login on either machine and remains the shared configuration and session store. Running the Codex executable without `CODEX_HOME` is signed out; the `codex` alias (`accounts.py exec workers`) still selects the mapped numbered home. Until cutover, status prints `codex2: ~/.codex still holds codex2's login; stop what uses ~/.codex (such as the ChatGPT app), then run accounts.py cutover-home codex2`. When the numbered home holds the same login, this one line also covers that duplicate; afterwards the shared home has no account row.
 
 ## Move a session
 
@@ -303,10 +316,10 @@ Before printing the command, setup waits for Codex to finish indexing the shared
 Run the printed command in a terminal and sign in as codex1:
 
 ```sh
-CODEX_HOME=~/.codex1 codex login
+env CODEX_HOME="$HOME/.codex1" codex login
 ```
 
-Keep `CODEX_HOME` on that command so the login stays in the numbered home; workers always use their mapped account. Do not sign in to the shared `~/.codex` home.
+Keep `env CODEX_HOME` on that command so it runs the binary directly and the login stays in the numbered home; workers always use their mapped account. Do not sign in to the shared `~/.codex` home.
 
 Then run `/showrunner:accounts`. The new home's row shows `spare` and its own numbers until selected for workers. To check the home directly, use `/showrunner:accounts check codex1`. Problems under the table name missing, broken or replaced shared links, the wrong login, or a login held by another home; `--detail` also lists unknown entries. Keep each login in one home: two homes on one login break token refresh.
 

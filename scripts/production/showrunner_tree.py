@@ -16,9 +16,9 @@ def parent_edges(*, record: staff.StaffSnapshot | None = None) -> dict[str, str]
     """Join showrunner parent ids from one snapshot to their production slugs."""
     record = staff.snapshot() if record is None else record
     members = staff_sources.showrunner_members(record)
-    names = {row.id: row.name for row in record.find(kind="showrunner")}
-    names.update({row.id: slug for slug, row in members.items()})
-    return {names[row.id]: names[row.parent] for row in record.find(kind="showrunner")
+    names = {row.id: row.name for row in staff.active(record, "showrunner")}
+    names.update({row.id: slug for slug, row in members.items() if row.id in names})
+    return {names[row.id]: names[row.parent] for row in staff.active(record, "showrunner")
             if row.parent is not None and row.parent in names}
 
 
@@ -124,7 +124,7 @@ def check_attach(child: str, parent: str, *, record: staff.StaffSnapshot | None 
             raise ValueError(f"{slug} has no update timer, so it has no showrunner to attach")
     if child == parent:
         raise ValueError(f"{child} cannot report to itself")
-    for runner in showrunners.registered_showrunners():
+    for runner in showrunners.require_complete(showrunners.registered_showrunners()):
         if runner["slug"] in (child, parent) and runner["socket"] and (why := showrunners.name_refusal(runner["slug"], runner["session"])):
             raise ValueError(why)
     tree = edges(record=record)
@@ -184,8 +184,10 @@ def release_edges(slug: str, released: WrapRelease, *, record: staff.StaffSnapsh
 def main(action: str, slug: str) -> int:
     """Answer the reporting-tree verbs parsed by the showrunner command."""
     if action == "tree":
-        for line in tree_lines(showrunners.registered_showrunners()):
+        runners = showrunners.registered_showrunners()
+        for line in tree_lines(runners):
             print(line)
+        _ = showrunners.require_complete(runners)
     else:
         slug = showrunners.canonical_slug(slug)
         if slug not in showrunners.timer_slugs():
