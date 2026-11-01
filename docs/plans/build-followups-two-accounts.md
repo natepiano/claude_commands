@@ -3051,7 +3051,7 @@ Found 2026-11-01: a leftover `oauthAccount` with no credential that `cutover-hom
 
 **As-built:** `cutover-home` removes leftover account data (dated private backup, atomic write) when no credential file or keychain entry exists, also after a complete journal; an already-clean home exits 0 with one line and no write. `accounts.py exec claudeN` refuses a wrong sign-in with the label only and prints `env -u CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR=<home> claude`, then `/login`; `docs/accounts.md` matches. The brp job and its setup check share one script that removes user-scope brp and registers brp at local scope in `~/rust/{hana,nateroids,bevy_brp}` for `~/.claude` and each numbered home, writing only on a difference: /etc/nixos branch `accounts-brp-local-scope` (881cc227), pushed by the showrunner. Also: `mac_usage.interval_seconds` went back to 120, because at 60 the provider answered 429 across the four Claude accounts in turn while Codex read fine. One repair round (credential-file check on macOS; clean-home rerun).
 
-### Phase 101m — The accounts board shows how many sessions use each role  · status: todo
+### Phase 101m — The accounts board shows how many sessions use each role  · status: done
 
 User 2026-11-01: "i want the accounts-board modified to add the count of the role and swap the column order account, left, role, count, resets, credits, enabled, in use, read". Also: "if two roles are on one account show the counts for each separated by comma in the same order that you output the role names". The user found the `in use` column empty; it marks an account that spends paid credits, so it is blank in normal use. Director call: keep it in the order the user gave. The user asked to tell the handler unit about the change.
 
