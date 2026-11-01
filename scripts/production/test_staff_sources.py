@@ -645,6 +645,9 @@ class StaffSourcesTests(StaffTestCase):
         })
         self.write_json(gone / "mesh_server.json", {"pid": 0, "codex_home": str(self.root / "codex")})
         _ = self.roster_worker(gone, "fix3", "fix", "thread-dead-run")
+        dead_roster = cast(dict[str, dict[str, object]], json.loads((gone / "mesh_roster.json").read_text()))
+        dead_roster["fix3"]["launcher_pid"] = 0
+        self.write_json(gone / "mesh_roster.json", dead_roster)
         _, errors = self.seed()
         self.assertNotIn("conflicting worker identities", errors)
         workers = staff.find(kind="worker")
@@ -770,6 +773,7 @@ class StaffSourcesTests(StaffTestCase):
     def test_worker_seed_imports_ledger_and_roster_once_and_keeps_replacement_identity(self) -> None:
         _ = self.production("sdlc", "models-unit")
         run = self.worker_run("sdlc", "models-unit", "session-models")
+        _ = self.session_record("session-models", "models-unit")
         ledger = self.ledger_worker(run, "sdlc", "models-unit", "impl", "impl", "thread-first")
         _ = self.ledger_worker(run, "sdlc", "models-unit", "test", "test", "session-test", family="claude")
         _ = self.ledger_worker(run, "sdlc", "models-unit", "fix3", "fix", "thread-ended", retired=True)

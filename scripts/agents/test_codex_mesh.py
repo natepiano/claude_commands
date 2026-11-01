@@ -17442,6 +17442,48 @@ class ServerRecordTests(unittest.TestCase):
         self.spawned.append(process)
         return process.pid
 
+    def test_loaded_threads_reads_current_and_retired_pages_under_one_deadline(self) -> None:
+        current = self.session_dir / codex_mesh.SERVER_FILE
+        retired = self.session_dir / codex_mesh.RETIRED_FILE
+        _ = current.write_text(json.dumps({"pid": os.getpid(), "port": 12345}))
+        _ = retired.write_text(json.dumps({"servers": [{"pid": os.getpid(), "port": 12346}]}))
+        deadline = time.monotonic() + TEST_HANG_GUARD_SECS
+        rpc = MagicMock()
+        close = MagicMock()
+        client = MagicMock(call=rpc, close=close)
+        with patch.object(codex_mesh, "Client", return_value=client) as clients:
+            rpc.side_effect = [
+                {"result": {"data": ["current"], "nextCursor": "page2"}},
+                {"result": {"data": ["second"]}},
+                {"result": {"data": ["retired"]}}]
+            self.assertEqual(codex_mesh.loaded_threads(self.session_dir, deadline),
+                             {"current", "second", "retired"})
+        self.assertEqual([entry.args[0] for entry in clients.call_args_list], [12345, 12346])
+        self.assertEqual([entry.kwargs["operation_deadline"] for entry in clients.call_args_list],
+                         [deadline, deadline])
+        self.assertEqual(rpc.call_args_list[1].args,
+                         ("thread/loaded/list", {"cursor": "page2"}))
+        self.assertEqual(close.call_count, 2)
+
+    def test_loaded_threads_never_returns_partial_results_or_connects_after_deadline(self) -> None:
+        _ = (self.session_dir / codex_mesh.SERVER_FILE).write_text(
+            json.dumps({"pid": os.getpid(), "port": 12345}))
+        retired = self.session_dir / codex_mesh.RETIRED_FILE
+        _ = retired.write_text(json.dumps({"servers": [{"pid": os.getpid(), "port": 12346}]}))
+        rpc = MagicMock()
+        close = MagicMock()
+        client = MagicMock(call=rpc, close=close)
+        with patch.object(codex_mesh, "Client", return_value=client):
+            rpc.side_effect = [
+                {"result": {"data": ["current"]}}, {"error": {"message": "probe failed"}}]
+            with self.assertRaisesRegex(ValueError, str(retired)):
+                _ = codex_mesh.loaded_threads(self.session_dir, time.monotonic() + TEST_HANG_GUARD_SECS)
+        self.assertEqual(close.call_count, 2)
+        with patch.object(codex_mesh, "Client") as clients:
+            with self.assertRaisesRegex(ValueError, "timed out"):
+                _ = codex_mesh.loaded_threads(self.session_dir, time.monotonic())
+            clients.assert_not_called()
+
     def test_failed_start_signals_only_real_process_ids_above_one(self) -> None:
         invalid: tuple[object, ...] = (MagicMock(), 1, 0, -1, True, "5", None)
         # Check the safety net against spies, never against a kernel signal send.

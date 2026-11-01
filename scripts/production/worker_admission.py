@@ -1,6 +1,7 @@
 """Publish worker membership before any process, thread or lifecycle lock."""
 from __future__ import annotations
 
+from collections.abc import Callable
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass
 import io
@@ -9,7 +10,7 @@ from pathlib import Path
 
 from scripts.agents import worker_lifecycle
 from scripts.lib import unit_runs
-from scripts.production import staff, session_staff
+from scripts.production import staff, session_staff, showrunners
 
 
 class AdmissionRefused(ValueError):
@@ -21,6 +22,38 @@ class WorkerAdmitted:
     """Staff membership was published before any worker process can start."""
 
     row: staff.StaffRow
+
+
+def showrunner_member(record: staff.StaffSnapshot, sources: session_staff.MemberSources,
+                      slug: str, *, dependencies: Callable[[Path], None] | None = None
+                      ) -> session_staff.MemberFound | session_staff.NoSuchMember:
+    """Resolve a holder's former slug only through its recorded rename journal."""
+    selector = session_staff.ShowrunnerMember(slug)
+    found = sources.member(selector, record)
+    if isinstance(found, session_staff.MemberFound):
+        return found
+    matches: dict[staff.StaffId, staff.StaffRow] = {}
+    for path in sorted(showrunners.SHOWRUNNER_STATE_DIR.glob("*/rename.json")):
+        if dependencies is not None:
+            dependencies(path)
+        try:
+            journal = worker_lifecycle.read_json_object(path)
+            old, new = journal.get("old"), journal.get("new")
+            if not isinstance(old, str) or not old or not isinstance(new, str) or not new:
+                raise ValueError("rename journal needs old and new slugs")
+        except (OSError, ValueError) as error:
+            raise staff.StaffUnreadable(f"{path}: {error}") from error
+        source = sources.productions.get(new)
+        former = showrunners.former_slugs(source.document) if source is not None else ()
+        # Formerly is supporting evidence, never a replacement for the journal.
+        if slug != old or (former and old not in former):
+            continue
+        current = sources.member(session_staff.ShowrunnerMember(new), record)
+        if isinstance(current, session_staff.MemberFound):
+            matches[current.row.id] = current.row
+    if len(matches) > 1:
+        raise staff.StaffUnreadable(f"{slug}: no unique renamed showrunner staff entry")
+    return session_staff.MemberFound(next(iter(matches.values()))) if matches else found
 
 
 def parent(record: staff.StaffSnapshot, sources: session_staff.MemberSources | None = None, *,
@@ -38,7 +71,7 @@ def parent(record: staff.StaffSnapshot, sources: session_staff.MemberSources | N
         found = session_staff.unit_match(session_staff.ObservedUnit(unit), record)
     else:
         sources = sources if sources is not None else session_staff.member_sources()
-        found = sources.member(session_staff.ShowrunnerMember(production), record)
+        found = showrunner_member(record, sources, production)
     if isinstance(found, session_staff.NoSuchMember):
         if unit:
             from scripts.production import unit_names
