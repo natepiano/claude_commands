@@ -52,7 +52,7 @@ Without `--stored`, a role map that cannot be fetched or read from cache refuses
 On the Mac, the `account-usage` launchd user agent polls at login and every 30
 seconds in the GUI login session, where the keychain is available. It runs
 `agent_notes.py usage-only --poll-seconds 30`, which reads `mac_usage.interval_seconds` from
-`config/agent_notes.toml` on each invocation (currently 60 seconds). Missing or
+`config/agent_notes.toml` on each invocation (currently 120 seconds: 60 drew rate limits across the Claude accounts). Missing or
 invalid values refuse the read and name the file and key. Each account has its own
 eligibility time. A Claude read records its actual granted claim time, after
 credential lookup; a held claim leaves that account's time unchanged. Reads
@@ -187,17 +187,16 @@ claude3
 If the directory holds another login, the alias refuses with:
 
 ```text
-accounts: ~/.claude3 is logged in as <login>, not claude3; see Log out and in in ~/.claude/docs/accounts.md
+accounts: ~/.claude3 holds a different login from claude3; run env -u CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR=~/.claude3 claude, then /login as claude3
 ```
 
-Start that directory directly, then log out and log in as claude3. `env -u` drops an inherited `CLAUDE_CODE_OAUTH_TOKEN`, which would otherwise override the directory's login:
+Run the direct command from the refusal in a separate terminal, then `/login` as claude3. It bypasses the account alias that refused the wrong sign-in. `env -u` drops an inherited `CLAUDE_CODE_OAUTH_TOKEN`, which would otherwise override the directory's login:
 
 ```sh
 env -u CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR=~/.claude3 claude
 ```
 
 ```text
-/logout
 /login
 ```
 
@@ -227,7 +226,7 @@ After the new login is checked, exit that session and run this in a Terminal on 
 ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py cutover-home claude2
 ```
 
-The command checks that the new and legacy logins are the same account before changing anything. It keeps the shared seed's other settings, removes its `oauthAccount`, and removes only the old local `Claude Code-credentials` keychain copy by service name. The server login is untouched. Never `/logout`. Named-folder usage readings use that folder's own keychain entry and never fall back to the old copy. An interrupted cutover can be finished by rerunning the command. On the Mac, `--undo` restores the home identity settings; signing in to `~/.claude` again requires `/login`, as its output explains.
+The command checks that the new and legacy logins are the same account before changing anything. It keeps the shared seed's other settings, removes its `oauthAccount`, and removes only the old local `Claude Code-credentials` keychain copy by service name. The server login is untouched. Never `/logout`. If the shared home has no credential but its JSON still has an `oauthAccount`, the board instead tells you to run `cutover-home claude2` directly in a Mac Terminal. It removes only that leftover block, even after a completed cutover or when the block names another account. A `.credentials.json` file prevents this cleanup on either platform; on the Mac, a keychain entry also prevents it. It keeps an exact, private `.claude.json.identity-backup-<time>` beside the file, writes the remaining settings atomically with their existing permissions, and leaves numbered homes and the completed journal unchanged. Rerunning the cleanup without a cutover journal succeeds with one line and changes no file. No new `/login` is needed for that cleanup. Named-folder usage readings use that folder's own keychain entry and never fall back to the old copy. An interrupted cutover can be finished by rerunning the command. On the Mac, `--undo` restores the home identity settings; signing in to `~/.claude` again requires `/login`, as its output explains.
 
 Historical `default`, `~/.claude` or `~/.codex` records resolve from their own login or a dated cutover entry in `config/accounts.json`, covering only records before that cutover and matching the tool. Without evidence they stay unresolved; today's login never names a past record. A resolved resume uses the numbered account's folder.
 
@@ -448,3 +447,7 @@ Account notes use numbered filenames such as `claude1.md` and `codex2.md`; their
 
 A signed-in numbered home without a matching account note is never selectable. Status names the numbered folder and missing note; the corresponding `~/.codex` / `codexN.md` line remains for a Codex home. Add its numbered note before selecting it;
 an unrelated numbered account remains usable.
+
+### brp registration at login
+
+The `claude-brp-mcp` login job registers brp only at local scope in existing `~/rust/hana`, `~/rust/nateroids` and `~/rust/bevy_brp` checkouts, for the shared Claude home and each numbered home. It removes user-scope brp registrations so other projects do not inherit the server. The setup check verifies those same local registrations. A correct registration is left untouched.
