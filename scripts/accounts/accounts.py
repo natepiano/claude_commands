@@ -1070,7 +1070,8 @@ def _inspect_account_directory(
         wrong_login = identity.login.casefold() != expected.login.casefold()
         if wrong_login:
             problems.append(
-                f"accounts: ~/.claude{_label_number(label)} is logged in as {identity.login}, not {label}; see Log out and in in ~/.claude/docs/accounts.md"
+                f"accounts: ~/.claude{_label_number(label)} holds a different login from {label}; "
+                + f"run {_claude_login_command(destination)}, then /login as {label}"
             )
     if links:
         return AccountDirectoryBrokenLinks(tuple(problems), state_source)
@@ -2595,6 +2596,11 @@ def _cutover_session_check(folder: Path) -> None:
             raise AccountsError(f"accounts: a live session uses {folder}; stop it before cutover-home")
 
 
+def _claude_login_command(directory: Path) -> str:
+    """Reach this home directly without a shell alias or an inherited token."""
+    return f"env -u CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR={shlex.quote(str(directory))} claude"
+
+
 MAC_HOME_LOGIN_STEP = ("in a Mac Terminal, run accounts.py exec claude2, then /login, then /exit, "
                        + "then accounts.py cutover-home claude2; never /logout")
 
@@ -2653,6 +2659,41 @@ def _mac_oauth_account(values: dict[str, object]) -> dict[str, object]:
     return identity
 
 
+def _clear_leftover_home_account(journal_path: Path) -> bool:
+    """Remove only uncredentialed home identity data, preserving a private backup."""
+    seed_path = accounts_home() / ".claude.json"
+    if main_config_dir().is_symlink() or seed_path.is_symlink():
+        raise AccountsError("accounts: cutover homes and identity files must not be links")
+    try:
+        with seed_path.open(encoding="utf-8", newline="") as source:
+            original = source.read()
+    except FileNotFoundError:
+        return False
+    seed = _read_json_object(io.StringIO(original))
+    credentials = main_config_dir() / ".credentials.json"
+    if credentials.is_symlink() or credentials.exists():
+        return False
+    if "oauthAccount" not in seed and journal_path.exists():
+        return False
+    if sys.platform == "darwin":
+        if not _mac_login_keychain_visible():
+            raise AccountsError("accounts: this session cannot see the Mac's login keychain; "
+                                + "run cutover-home in a Terminal on the Mac")
+        if _mac_keychain_has_entry(main_config_dir()):
+            return False
+    if "oauthAccount" not in seed:
+        print("accounts: home account data is already clear")
+        return True
+    backup = seed_path.with_name(seed_path.name + ".identity-backup-"
+        + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ"))
+    if not atomic_file.create_text_atomic(backup, original):
+        raise AccountsError("accounts: identity backup already exists; no configuration changed")
+    del seed["oauthAccount"]
+    atomic_file.write_text_atomic(seed_path, json.dumps(seed) + "\n")
+    print("accounts: removed leftover home account data; dated backup kept beside ~/.claude.json")
+    return True
+
+
 def _cutover_home_macos(label: str, *, undo: bool) -> None:
     """Retire the legacy login only after the user's numbered login is verified."""
     path = accounts_home() / ".local/state/accounts/cutover-home.json"
@@ -2661,6 +2702,12 @@ def _cutover_home_macos(label: str, *, undo: bool) -> None:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         if path.is_symlink():
             raise AccountsError("accounts: cutover journal must not be a link")
+        if label:
+            label = numbered_account_label(label, "claude").label
+        if not undo:
+            _cutover_session_check(main_config_dir())
+            if _clear_leftover_home_account(path):
+                return
         raw = _read_json_object(path) if path.exists() else {}
         if raw and raw.get("platform") != "darwin":
             raise AccountsError("accounts: finish the recorded cutover on its original platform")
@@ -2680,7 +2727,8 @@ def _cutover_home_macos(label: str, *, undo: bool) -> None:
                 raise AccountsError("accounts: no cutover to undo")
             label = numbered_account_label(label, "claude").label
         destination = account_dir(label)
-        _cutover_session_check(destination if undo else main_config_dir())
+        if undo:
+            _cutover_session_check(destination)
         seed_path = accounts_home() / ".claude.json"
         numbered_path = destination / ".claude.json"
         if any(item.is_symlink() for item in (main_config_dir(), destination, seed_path, numbered_path)):
@@ -2921,6 +2969,12 @@ def cutover_home(label: str = "", *, undo: bool = False) -> None:
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     with path.with_suffix(".lock").open("a") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        if label:
+            label = numbered_account_label(label, "claude").label
+        if not undo:
+            _cutover_session_check(main_config_dir())
+            if _clear_leftover_home_account(path):
+                return
         try:
             raw = _read_json_object(path)
         except FileNotFoundError:
@@ -2949,7 +3003,8 @@ def cutover_home(label: str = "", *, undo: bool = False) -> None:
             journal = HomeCutover(label=label, login=identity.login,
                                   at=datetime.now(timezone.utc).isoformat(), state="moving")
         destination = account_dir(journal["label"])
-        _cutover_session_check(destination if undo else main_config_dir())
+        if undo:
+            _cutover_session_check(destination)
         if destination.is_symlink() or main_config_dir().is_symlink():
             raise AccountsError("accounts: cutover homes must be real directories")
         seed_path = accounts_home() / ".claude.json"
@@ -4531,6 +4586,8 @@ def status_check_problem(text: str, subject: str, *, setup: str, login: str,
                        else f"sign in at {folder}; {login}")
         return StatusProblem(subject, "not logged in", ProblemCause("signed out", "the home has no readable sign-in"),
             ProblemStep(instruction))
+    if " holds a different login from " in primary:
+        return StatusProblem(subject, "wrong sign-in", ProblemCause("wrong login", primary), step)
     if " is logged in as " in primary:
         return StatusProblem(subject, "wrong sign-in", ProblemCause("wrong login", primary.split(" is logged in as ", 1)[0] + f" holds a different login from {subject}"),
             step if separator else ProblemStep(login))
@@ -4835,7 +4892,7 @@ def _read_status(source: UsageSource, *, detail: bool) -> StatusReading:
         *(_status_row(status, usage.get(usage_store.key("Codex", status.login)), now,
             (status.role,) if status.role in (CODEX_ROLE, "spare") else ()) for status in codex),
     )
-    home_step = MAC_HOME_LOGIN_STEP if sys.platform == "darwin" else "run accounts.py cutover-home"
+    home_step = "run accounts.py cutover-home"
     all_statuses: list[AccountStatus | CodexStatus] = [*statuses, *codex]
     diagnostics_by_status = [_status_problems(status, detail=detail, zone=zone) for status in all_statuses]
     diagnostics = [problem for local in diagnostics_by_status for problem in local]
@@ -4857,6 +4914,10 @@ def _read_status(source: UsageSource, *, detail: bool) -> StatusReading:
         if is_test_login(main_login.login):
             problems.append(test_login_problem("~/.claude", agent_accounts.claude_config_file(main_config_dir()), zone))
         else:
+            if sys.platform == "darwin":
+                home_step = ("in a Mac Terminal, run accounts.py cutover-home claude2; never /logout"
+                             if _mac_login_keychain_visible() and not _mac_keychain_has_entry(main_config_dir())
+                             else MAC_HOME_LOGIN_STEP)
             problems.append(StatusProblem("~/.claude", "legacy login is stored", ProblemCause("legacy", "the home still holds a login"), ProblemStep(home_step)))
     codex_home = accounts_home() / ".codex"
     codex_login = _codex_home_login(codex_home)
@@ -5398,7 +5459,7 @@ def main(argv: list[str]) -> int:
                     print("Keep CODEX_HOME on that command: codex login without it signs ~/.codex out and in; workers always use their mapped account.")
                 return 1 if problems else 0
             destination = account_dir(options.label)
-            print(f"env -u CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR={shlex.quote(str(destination))} claude")
+            print(_claude_login_command(destination))
             print("/login")
             return 1 if problems else 0
         if options.action == "check":

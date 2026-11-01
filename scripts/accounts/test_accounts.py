@@ -827,7 +827,30 @@ class AccountsTests(unittest.TestCase):
         self.assertIsInstance(result, accounts.AccountRefused)
         assert isinstance(result, accounts.AccountRefused)
         self.assertEqual(result.reason,
-            "accounts: ~/.claude3 is logged in as other@example.invalid, not claude3; see Log out and in in ~/.claude/docs/accounts.md")
+            ("accounts: ~/.claude3 holds a different login from claude3; run "
+            + f"env -u CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR={shlex.quote(str(accounts.account_dir('claude3')))} claude, then /login as claude3"))
+
+    def test_wrong_login_recovery_bypasses_the_alias_and_clears_the_inherited_token(self) -> None:
+        self.login_directory("claude3", "expected@example.invalid")
+        self.write_identity("claude3", "other@example.invalid")
+        refused = accounts.prepared_account("claude3", resume=False)
+        self.assertIsInstance(refused, accounts.AccountRefused)
+        assert isinstance(refused, accounts.AccountRefused)
+        command = refused.reason.split("; run ", 1)[1].split(", then /login", 1)[0]
+        self.assertEqual(command, "env -u CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR="
+            + shlex.quote(str(accounts.account_dir("claude3"))) + " claude")
+        self.assertNotIn("other@example.invalid", refused.reason)
+        code, setup, errors = self.run_cli("setup", "claude3")
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(setup.splitlines()[0], command)
+        program = self.home / ".local/bin/claude"
+        _ = program.write_text('#!/bin/sh\nprintf "%s\\n%s\\n" "$CLAUDE_CONFIG_DIR" "${CLAUDE_CODE_OAUTH_TOKEN-unset}"\n')
+        result = subprocess.run(["bash", "-c", "shopt -s expand_aliases\nalias claude='exit 77'\n" + command],
+            env={**os.environ, "PATH": str(program.parent) + os.pathsep + os.defpath,
+                 "CLAUDE_CODE_OAUTH_TOKEN": "fixture-inherited"},
+            capture_output=True, text=True, check=False)
+        self.assertEqual((result.returncode, result.stderr), (0, ""))
+        self.assertEqual(result.stdout.splitlines(), [str(accounts.account_dir("claude3")), "unset"])
 
     def test_group_launch_prepares_configured_account_for_new_work_and_resumes(self) -> None:
         """F006: every launch checks readiness without selecting another account."""
@@ -1008,7 +1031,8 @@ class AccountsTests(unittest.TestCase):
         self.login_directory("claude2", "main@example.invalid", default=True)
         self.login_directory("claude3", "expected@example.invalid")
         self.write_identity("claude3", "other@example.invalid")
-        line = "accounts: ~/.claude3 is logged in as other@example.invalid, not claude3; see Log out and in in ~/.claude/docs/accounts.md"
+        line = ("accounts: ~/.claude3 holds a different login from claude3; run "
+            + f"env -u CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR={shlex.quote(str(accounts.account_dir('claude3')))} claude, then /login as claude3")
         self.assertIsInstance(accounts.account_directory_readiness("claude3"), accounts.AccountDirectoryWrongLogin)
         self.assertEqual(accounts.check("claude3"), [line])
         with patch.object(os, "execvpe") as launch:
@@ -1016,7 +1040,7 @@ class AccountsTests(unittest.TestCase):
         launch.assert_not_called()
         result = self.run_cli("status")
         self.assertRegex(result[1], r"\| ~/\.claude3 +\| claude3 +\|")
-        self.assertIn("claude3: wrong sign-in; ~/.claude3 holds a different login from claude3; see Log out and in in ~/.claude/docs/accounts.md", result[1].splitlines())
+        self.assertIn("claude3: wrong sign-in; " + line.removeprefix("accounts: "), result[1].splitlines())
         self.assertNotIn("other@example.invalid", result[1])
         self.assertEqual(accounts.account_identity(accounts.account_dir("claude3")), agent_accounts.UnnotedLogin(self.home / ".claude3", "other@example.invalid"))
 
@@ -1322,7 +1346,8 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual(len(problems), 3)
         self.assertIn("projects", problems[0])
         self.assertIn(".credentials.json", problems[1])
-        self.assertIn("logged in as other@example.invalid", problems[2])
+        self.assertIn("holds a different login from claude3", problems[2])
+        self.assertNotIn("other@example.invalid", problems[2])
 
     def test_check_missing_note_alone_excludes_an_otherwise_matching_account(self) -> None:
         self.login_directory("claude2", "main@example.invalid", default=True)
@@ -2512,10 +2537,31 @@ class AccountsTests(unittest.TestCase):
     # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_mac_status_describes_accounts_without_creating_any(self) -> None:
-        with patch.object(sys, "platform", "darwin"):
+        with (patch.object(sys, "platform", "darwin"),
+              patch.object(accounts, "_mac_login_keychain_visible", return_value=True),
+              patch.object(accounts, "_mac_keychain_has_entry", return_value=True)):
             self.assert_status_describes_accounts_without_creating_any(
                 "in a Mac Terminal, run accounts.py exec claude2, then /login, then /exit, "
                 + "then accounts.py cutover-home claude2; never /logout")
+
+    # Reserved fixtures model provider accounts in this status test.
+    @patch.object(accounts, "is_test_login", new=provider_fixture_login)
+    def test_mac_leftover_identity_step_clears_it_without_another_login(self) -> None:
+        self.login_directory("claude2", "main@example.invalid", default=True)
+        self.write_main_config()
+        with (patch.object(sys, "platform", "darwin"),
+              patch.object(accounts, "_mac_login_keychain_visible", return_value=True),
+              patch.object(accounts, "_mac_keychain_has_entry", return_value=False),
+              patch.object(accounts, "_claude_process_ids", return_value=[])):
+            code, output, error = self.run_cli("status", "--stored")
+            self.assertEqual((code, error), (0, ""))
+            self.assertIn("~/.claude: legacy login is stored; the home still holds a login; "
+                + "in a Mac Terminal, run accounts.py cutover-home claude2; never /logout", output)
+            self.assertNotIn("then /login", output)
+            self.assertEqual(self.run_cli("cutover-home", "claude2")[0], 0)
+            code, output, error = self.run_cli("status", "--stored")
+            self.assertEqual((code, error), (0, ""))
+            self.assertNotIn("legacy login is stored", output)
 
     def assert_status_describes_accounts_without_creating_any(self, home_step: str) -> None:
         _ = (self.main_dir / "README.md").write_text("repo entry", encoding="utf-8")
