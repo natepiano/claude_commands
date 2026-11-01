@@ -1541,6 +1541,53 @@ class UnreadPathAttribute:
     reason: str
 
 
+class PathAttributeMode(StrEnum):
+    DIRECT = "direct"
+    CONDITIONAL = "conditional"
+
+
+@dataclass(frozen=True)
+class PathAttributeMeta:
+    """A path attribute meta item, excluding cfg predicates and unrelated attribute arguments."""
+    begin: int
+    index: int
+    end: int
+    mode: PathAttributeMode
+
+
+def path_attribute_metas(words: tuple[str, ...]) -> tuple[PathAttributeMeta, ...]:
+    """Interpret attribute roles once: only cfg_attr payloads recursively contain attributes."""
+    words = tuple(word.removeprefix("r#") for word in words)
+    ends = style_footprint.delimiter_ends(words)
+    result: list[PathAttributeMeta] = []
+
+    def meta(begin: int, start: int, stop: int, mode: PathAttributeMode) -> None:
+        if words[start:start + 1] == ("path",) and words[start + 1:start + 2] != ("::",):
+            result.append(PathAttributeMeta(begin, start, stop, mode))
+        elif words[start:start + 2] == ("cfg_attr", "("):
+            finish = ends.get(start + 1, stop)
+            cursor = start + 2
+            # The first comma-delimited argument is a predicate, never an attribute.
+            parts: list[tuple[int, int]] = []
+            part = cursor
+            while cursor < finish:
+                if words[cursor] in {"(", "[", "{"}:
+                    cursor = ends.get(cursor, finish)
+                elif words[cursor] == ",":
+                    parts.append((part, cursor))
+                    part = cursor + 1
+                cursor += 1
+            parts.append((part, finish))
+            for part, end in parts[1:]:
+                if part < end:
+                    meta(begin, part, end, PathAttributeMode.CONDITIONAL)
+
+    for begin, end in style_footprint.attribute_spans(words):
+        opening = begin + (2 if words[begin + 1] == "!" else 1)
+        meta(begin, opening + 1, end - 1, PathAttributeMode.DIRECT)
+    return tuple(result)
+
+
 def _path_attributes(path: str, content: bytes) -> tuple[MountedFile | MountedFolder | UnreadPathAttribute, ...]:
     """The `path` attributes of a Rust file, also those inside `cfg_attr`, read from its code words.
 
@@ -1564,16 +1611,18 @@ def _path_attributes(path: str, content: bytes) -> tuple[MountedFile | MountedFo
     owners = style_footprint.attribute_owners(words)
     file = PurePosixPath(path)
     read: list[tuple[int, tuple[int, ...], str | UnreadPathAttribute]] = []
-    for begin, end in style_footprint.attribute_spans(words):
-        for index in (index for index in range(begin, end) if words[index] == "path"):
-            literal = PLAIN_STRING.fullmatch(words[index + 2]) if words[index + 1:index + 2] == ("=",) else None
-            chain = tuple(sorted(block for block in blocks if block < index < ends.get(block, len(words))))
-            if any(start < index < stop for start, stop in macros):
-                read.append((begin, chain, UnreadPathAttribute(path, "holds a path attribute in a macro")))
-            elif literal is None or literal.group(1).startswith("/"):
-                read.append((begin, chain, UnreadPathAttribute(path, "holds a path attribute that is not a relative string")))
-            else:
-                read.append((begin, chain, literal.group(1)))
+    for attribute in path_attribute_metas(words):
+        begin, index = attribute.begin, attribute.index
+        literal = (PLAIN_STRING.fullmatch(words[index + 2])
+                   if words[index + 1:attribute.end][:1] == ("=",)
+                   and attribute.end == index + 3 else None)
+        chain = tuple(sorted(block for block in blocks if block < index < ends.get(block, len(words))))
+        if any(start < index < stop for start, stop in macros):
+            read.append((begin, chain, UnreadPathAttribute(path, "holds a path attribute in a macro")))
+        elif literal is None or literal.group(1).startswith("/"):
+            read.append((begin, chain, UnreadPathAttribute(path, "holds a path attribute that is not a relative string")))
+        else:
+            read.append((begin, chain, literal.group(1)))
     # The `{` of each inline module whose outer path attribute names its folder.
     inline_owner = {begin: owners[begin] + 2 for begin, _, _ in read
                     if owners.get(begin) is not None and words[owners[begin]] == "mod" and owners[begin] + 2 in blocks}

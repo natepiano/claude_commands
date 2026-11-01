@@ -29,6 +29,22 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 @final
 class StyleLedgerRecordsTests(LedgerTestCase):
+    def test_path_attributes_classify_meta_roles_and_nested_cfg_attr_payloads(self) -> None:
+        from style_ledger import _path_attributes  # pyright: ignore[reportPrivateUsage]
+        data = ('#[cfg(path = "predicate.rs")] fn f() {} '
+                '#[cfg_attr(path = "predicate.rs", allow(dead_code))] fn g() {} '
+                '#[custom(path = "argument.rs")] fn h() {} '
+                '#[path::metadata(path = "argument.rs")] fn j() {}')
+        self.assertEqual(_path_attributes("src/lib.rs", data.encode()), ())
+        source = ('#[cfg_attr(path = "predicate.rs", '
+                  'cfg_attr(all(), path = "child.rs"))] mod child; '
+                  '#[path="direct.rs"] mod direct; '
+                  '#[r#path="raw.rs"] mod raw;')
+        mounts = _path_attributes("src/lib.rs", source.encode())
+        self.assertEqual(mounts, (style_ledger.MountedFile("src/lib.rs", ("src/child.rs",)),
+                                 style_ledger.MountedFile("src/lib.rs", ("src/direct.rs",)),
+                                 style_ledger.MountedFile("src/lib.rs", ("src/raw.rs",))))
+
     def test_tree_entries_share_commit_and_bare_tree_inventory(self) -> None:
         path = self.sources[0]
         _ = self.git("update-index", "--chmod=+x", path)

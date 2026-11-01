@@ -26,6 +26,7 @@ import coverage_report
 import rules
 import style_ledger as ledger_api
 import style_proposals
+import style_footprint
 from style_ledger import _path_attributes  # pyright: ignore[reportPrivateUsage]
 
 
@@ -123,6 +124,86 @@ def changed(repo: Path, base: str, tip: str) -> tuple[str, ...]:
                                       base, tip).split("\0")))
 
 
+def invoked_source_loaders(parsed: bulk.BindingText) -> tuple[tuple[int, int, frozenset[str]], ...]:
+    """Resolve invoked builtin paths through the import owner's use trees and lexical scopes.
+
+    Qualified reexports and alias chains retain literal loading edges. Multiple possible
+    bindings contribute all their loader identities rather than silently admitting a target.
+    Tokenization, macro boundaries, grouped imports and scope extents stay with their owners.
+    """
+    words = tuple(word.removeprefix("r#") for word in parsed.words)
+    trees = style_footprint.use_trees(words, style_footprint.code_item_starts(words))
+    context = style_footprint.import_context(words)
+    imports: dict[tuple[tuple[str, ...], str], list[tuple[tuple[str, ...], int]]]
+    imports = defaultdict(list)
+    loaders = {"include", "include_str", "include_bytes"}
+
+    def module(index: int) -> tuple[str, ...]:
+        return tuple(name.split("@")[0] for name in context.scopes[index].module)
+
+    for index, prefix in trees.prefixes.items():
+        if words[index] == "*" or words[index + 1:index + 2] == ("::",):
+            continue
+        target = (*prefix, words[index])
+        if words[index] == "self" and prefix:
+            target = prefix
+        bound = words[index + 2] if words[index + 1:index + 2] == ("as",) else target[-1]
+        keyword = trees.keywords[index]
+        imports[module(keyword), bound].append((target, keyword))
+
+    def bound_loaders(owner: tuple[str, ...], name: str, suffix: tuple[str, ...], site: int,
+                      seen: frozenset[tuple[int, str]]) -> set[str]:
+        found: set[str] = set()
+        for target, keyword in imports.get((owner, name), ()):
+            block = context.scopes[keyword].block
+            if ((keyword, name) in seen
+                    or (block >= 0 and block not in context.module_blocks
+                        and not block < site < context.block_ends[block])):
+                continue
+            found.update(resolve((*target, *suffix), keyword, seen | {(keyword, name)}))
+        return found
+
+    def qualified_loaders(parts: tuple[str, ...], site: int,
+                          seen: frozenset[tuple[int, str]]) -> set[str]:
+        found: set[str] = set()
+        for index, name in enumerate(parts):
+            found.update(bound_loaders(parts[:index], name, parts[index + 1:], site, seen))
+        return found
+
+    def resolve(parts: tuple[str, ...], site: int,
+                seen: frozenset[tuple[int, str]]) -> set[str]:
+        if not parts:
+            return set()
+        head, last = parts[0], parts[-1]
+        if len(parts) == 2 and head in {"std", "core"} and last in loaders:
+            return {last}
+        owner = module(site)
+        found = {head} if len(parts) == 1 and head in loaders else set[str]()
+        if head in style_footprint.PATH_ANCHORS:
+            target = style_footprint.resolved_module(parts, owner)
+            if not isinstance(target, style_footprint.UnresolvedPath) and target:
+                found.update(qualified_loaders(target, site, seen))
+            return found
+        for depth in range(len(owner), -1, -1):
+            found.update(qualified_loaders((*owner[:depth], *parts), site, seen))
+        return found
+
+    result: list[tuple[int, int, frozenset[str]]] = []
+    for bang, stop in parsed.macros:
+        # BindingText owns real macro boundaries. Field/method names, imports,
+        # strings and comments do not establish a loader invocation.
+        start = bang - 1
+        while (start >= 2 and words[start - 1] == "::"
+               and style_footprint.IDENTIFIER.fullmatch(words[start - 2])):
+            start -= 2
+        if words[max(0, start - 1):start] == (".",):
+            continue
+        names = resolve(words[start:bang:2], bang, frozenset())
+        if names:
+            result.append((bang, stop, frozenset(names)))
+    return tuple(result)
+
+
 class SourceOwnership:
     """Frozen package/target discovery plus conservative Rust source-loading evidence.
 
@@ -134,12 +215,15 @@ class SourceOwnership:
     def __init__(self, repo: Path, commit: str, members: tuple[rules.WorkspaceMember, ...]) -> None:
         self.directories: tuple[str, ...] = tuple(member.directory for member in members)
         self.owners: dict[str, set[str]] = {}
+        self.sources: dict[str, bulk.BindingText] = {}
         self.uncertain: dict[str, list[str]] = defaultdict(list)
+        self.inline_folders: dict[str, set[str]] = defaultdict(set)
         inventory = ledger_api.tree_entries(repo, commit)
         blobs = {path: entry.object for path, entry in inventory.items()
                  if path.endswith(".rs") and entry.kind == "blob"
                  and entry.mode in ledger_api.REGULAR_FILE_MODES}
         edges: dict[str, set[str]] = defaultdict(set)
+        inline_contexts: set[tuple[str, bulk.ModuleLoadingDirectory]] = set()
         for path, entry in inventory.items():
             if path.endswith(".rs"):
                 self.owners[path] = {self.home(path)}
@@ -152,22 +236,23 @@ class SourceOwnership:
             except (bulk.BulkRenameError, UnicodeError) as error:
                 self.uncertain[path].append(str(error))
                 continue
+            self.sources[path] = parsed
             for mount in _path_attributes(path, source.encode()):
                 if isinstance(mount, ledger_api.UnreadPathAttribute):
                     self.uncertain[path].append(mount.reason)
                 elif isinstance(mount, ledger_api.MountedFolder):
-                    for folder in mount.readings:
-                        edges[path].update(name for name in blobs if name.startswith(folder + "/"))
+                    inline_contexts.add((path, bulk.OwnedModuleDirectory(Path(path).parent)))
+                    self.inline_folders[path].update(mount.readings)
                 else:
-                    edges[path].update(mount.readings)
-            for bang, stop in parsed.macros:
-                word = parsed.words[bang - 1].removeprefix("r#")
-                if word not in {"include", "include_str", "include_bytes"}:
-                    continue
-                # BindingText owns real macro token-tree boundaries. Field/method names,
-                # imports, strings and comments do not establish a loader invocation.
-                if parsed.words[max(0, bang - 2):bang - 1] == (".",):
-                    continue
+                    # The ledger keeps alternative lexical readings. Only existing sources
+                    # can be loaded; a missing alternative is not another ambiguous loader.
+                    readings = set(mount.readings) & self.owners.keys()
+                    edges[path].update(readings)
+                    if not readings:
+                        self.uncertain[path].append(
+                            "missing or external source " + ", ".join(mount.readings))
+            for bang, stop, names in invoked_source_loaders(parsed):
+                word = "/".join(sorted(names))
                 arguments = parsed.words[bang + 2:stop - 1]
                 if arguments[-1:] == (",",):
                     arguments = arguments[:-1]
@@ -176,7 +261,7 @@ class SourceOwnership:
                     self.uncertain[path].append(f"nonliteral {word} source loader")
                 elif literal[1].endswith(".rs"):
                     edges[path].add(posixpath.normpath(str(Path(path).parent / literal[1])))
-                elif word == "include":
+                elif "include" in names:
                     self.uncertain[path].append("include! code outside the Rust source inventory")
         # Target roots can be configured outside their package directory.
         # Inspect the exact frozen manifests and paths in a read-only exported checkout.
@@ -186,34 +271,75 @@ class SourceOwnership:
                     self.uncertain[source].append(f"missing or external source {target}")
         self.edges: dict[str, frozenset[str]] = {
             source: frozenset(targets & self.owners.keys()) for source, targets in edges.items()}
+        self.module_contexts: set[tuple[str, bulk.ModuleLoadingDirectory]] = {
+            (target, bulk.OwnedModuleDirectory(Path(target).parent))
+            for source, targets in self.edges.items() for target in targets
+            if self.home(source) != self.home(target)} | inline_contexts
         self.propagate()
 
     def propagate(self) -> None:
-        """Conservatively include descendants of mounted modules without another module walker.
+        """Share only mounted sources and their transitive module descendants, never a package.
 
-        A cross-package loader makes the target's whole physical package ambiguous. This first
-        form deliberately refuses more than the discovered module closure, including children
-        reached through ordinary mod declarations; it cannot miss those shared descendants.
+        bulk_rename owns lexical child-module resolution, including explicit paths and inline
+        modules. An unproved route makes only its declaring file uncertain; it does not guess
+        at other sources in the package. An unproved inline mount also protects the sources
+        in its literal loading folders until the module owner can prove the child routes.
+        All lookups use this frozen inventory.
         """
-        packages: dict[str, list[str]] = defaultdict(list)
-        for path in self.owners:
-            packages[self.home(path)].append(path)
-        pending = True
+        pending = list(self.module_contexts)
+        known_paths = {path for path, _ in self.module_contexts}
+        visited: set[tuple[str, bulk.ModuleLoadingDirectory]] = set()
         while pending:
-            pending = False
+            path, loading = pending.pop()
+            if (path, loading) in visited or path not in self.sources:
+                continue
+            visited.add((path, loading))
+            parsed = self.sources[path]
+            for target in self.edges.get(path, ()):
+                if target not in known_paths:
+                    context = (target, bulk.OwnedModuleDirectory(Path(target).parent))
+                    self.module_contexts.add(context)
+                    known_paths.add(target)
+                    pending.append(context)
+            explicit = bulk.module_file_path_evidence(
+                Path(path), parsed, bulk.ModulePathUse.INCLUDING_INLINE)
+            routes = bulk.module_source_routes(Path(path), parsed, loading, explicit.paths,
+                                               lambda child: posixpath.normpath(str(child)) in self.owners,
+                                               explicit.failures)
+            for route in routes:
+                match route:
+                    case bulk.UnprovedModuleSource():
+                        if route.reason not in self.uncertain[path]:
+                            self.uncertain[path].append(route.reason)
+                        if parsed.words[route.declaration + 2:route.declaration + 3] == ("{",):
+                            reason = f"unproved inline mount in {path}: {route.reason}"
+                            for target in self.owners:
+                                if (any(Path(target).is_relative_to(folder)
+                                        for folder in self.inline_folders.get(path, ()))
+                                        and reason not in self.uncertain[target]):
+                                    self.uncertain[target].append(reason)
+                    case bulk.ExternalModuleSource():
+                        child = posixpath.normpath(str(route.path))
+                        if child not in self.owners:
+                            reason = f"missing or external source {child}"
+                            if reason not in self.uncertain[path]:
+                                self.uncertain[path].append(reason)
+                            continue
+                        self.edges[path] = self.edges.get(path, frozenset()) | {child}
+                        known_paths.add(child)
+                        self.module_contexts.add((child, route.loading))
+                        pending.append((child, route.loading))
+                    case bulk.InlineModuleSource():
+                        pass  # Its out-of-line children are already resolved by the module owner.
+        changed = True
+        while changed:
+            changed = False
             for source, targets in self.edges.items():
                 for target in targets:
                     owners = self.owners[target]
                     previous = len(owners)
                     owners.update(self.owners[source])
-                    pending |= len(owners) != previous
-            for directory, paths in packages.items():
-                readers = {owner for path in paths for owner in self.owners[path]}
-                if readers != {directory}:
-                    for path in paths:
-                        previous = len(self.owners[path])
-                        self.owners[path].update(readers)
-                        pending |= len(self.owners[path]) != previous
+                    changed |= len(owners) != previous
 
     def target_roots(self, checkout: Path, members: tuple[rules.WorkspaceMember, ...]) -> None:
         for member in members:
@@ -227,6 +353,8 @@ class SourceOwnership:
                     self.uncertain[path].append("target absent from frozen sources")
                 else:
                     self.owners[path].add(member.directory)
+                    if self.home(path) != member.directory:
+                        self.module_contexts.add((path, bulk.OwnedModuleDirectory(Path(path).parent)))
         self.propagate()
 
     def home(self, path: str) -> str:
@@ -440,12 +568,32 @@ class CrateRun:
         if run.git(checkout, "remote", "get-url", "origin") != str(self.repo):
             raise bulk.BulkRenameError("unrelated execution checkout")
 
-    def abandon(self, manifest: Manifest, record: CrateRecord, reason: str) -> None:
+    def publish_refusals(self, manifest: Manifest, record: CrateRecord,
+                         refused: dict[str, str]) -> None:
+        """Under the claim lock, save evidence before releasing membership; retries are idempotent."""
+        self.owned(record)
+        assert "tickets" in record
+        recorded = {row["finding_id"]: row for row in manifest["refusals"]}
+        for identity, reason in refused.items():
+            recorded[identity] = {"finding_id": identity, "reason": reason}
+        manifest["refusals"] = list(recorded.values())
+        self.save(manifest)
+        for ticket in sorted(set(record["tickets"].values())):
+            published = {row.finding_id for row in self.ledger.bulk_refusals(ticket)}
+            pending = {identity: reason for identity, reason in refused.items()
+                       if record["tickets"][identity] == ticket and identity not in published}
+            if pending:
+                _ = self.ledger.bulk_release(ticket, pending)
+
+    def abandon(self, manifest: Manifest, record: CrateRecord, reason: str,
+                refused: dict[str, str]) -> None:
         # A tested result is pending publication, never abandoned or silently released.
         if CrateStage(record["stage"]) in {CrateStage.TESTED, CrateStage.IMPORTED,
                                           CrateStage.CHECKPOINT_PUBLISHED, CrateStage.INTEGRATED}:
             raise bulk.BulkRenameError("tested result remains pending: " + reason)
         with ledger_api.refill_lock(self.repo):
+            if "tickets" in record:
+                self.publish_refusals(manifest, record, refused)
             for ticket in set(record.get("tickets", {}).values()):
                 assert "owner" in record
                 self.ledger.ticket_drop_batch(ticket, ledger_api.BatchOwner(record["owner"]))
@@ -479,7 +627,7 @@ class CrateRun:
                     with ledger_api.refill_lock(self.repo):
                         for ticket in bulk.object_list(journal["tickets"]):
                             self.ledger.ticket_drop_batch(str(ticket), owner)
-                self.abandon(manifest, record, "interrupted claim; its journal owns any released claims")
+                self.abandon(manifest, record, "interrupted claim; its journal owns any released claims", {})
                 return manifest
             if stage == CrateStage.SELECTED:
                 if not record["selected"]:
@@ -489,7 +637,7 @@ class CrateRun:
                         ticket_ids = sorted({ticket for tickets in holders.values() for ticket in tickets})
                         noun = "finding" if len(holders) == 1 else "findings"
                         reason += f": {len(holders)} {noun} held by open tickets: " + ", ".join(ticket_ids)
-                    self.abandon(manifest, record, reason)
+                    self.abandon(manifest, record, reason, {})
                     return manifest
                 with ledger_api.refill_lock(self.repo):
                     # The canonical worker branch must precede ticket assignment and base recording.
@@ -540,10 +688,11 @@ class CrateRun:
                 self.save(manifest)
                 stage = CrateStage.CLAIMED
             if stage == CrateStage.CLAIMED:
+                refused: dict[str, str] = {}
                 try:
-                    self.execute(manifest, record, intent, definition, planner, runner, available, executor)
+                    self.execute(manifest, record, intent, definition, planner, runner, available, executor, refused)
                 except Exception as error:
-                    self.abandon(manifest, record, str(error))
+                    self.abandon(manifest, record, str(error), refused)
                     return manifest
                 stage = CrateStage(record["stage"])
             if stage == CrateStage.COMMITTED:
@@ -561,7 +710,8 @@ class CrateRun:
                     raise bulk.BulkRenameError("worker files changed after commit")
                 result = run.test_tree(checkout, commit, result_evidence["tree"], runner, {})
                 if result.code:
-                    self.abandon(manifest, record, "tests failed: " + run.first_failing_test(result))
+                    self.abandon(manifest, record, "tests failed: " + run.first_failing_test(result),
+                                 result_evidence["refusals"])
                     return manifest
                 record["stage"] = CrateStage.TESTED
                 self.save(manifest)
@@ -572,16 +722,11 @@ class CrateRun:
             if stage == CrateStage.IMPORTED:
                 result_evidence = self.result(record)
                 with ledger_api.refill_lock(self.repo):
-                    self.owned(record)
+                    self.publish_refusals(manifest, record, result_evidence["refusals"])
                     # Refusal decisions are durable in the tested result before releasing membership.
                     # A partial checkpoint resume must not call bulk_release on checkpointed tickets.
                     built_tickets = {record["tickets"][identity] for identity in result_evidence["findings"]}
                     for ticket in sorted(set(record["tickets"].values())):
-                        recorded = {row.finding_id for row in self.ledger.bulk_refusals(ticket)}
-                        pending = {identity: reason for identity, reason in result_evidence["refusals"].items()
-                                   if record["tickets"][identity] == ticket and identity not in recorded}
-                        if pending:
-                            _ = self.ledger.bulk_release(ticket, pending)
                         if ticket not in built_tickets:
                             self.ledger.ticket_drop_batch(ticket, ledger_api.BatchOwner(record["owner"]))
                     for ticket in sorted(built_tickets):
@@ -597,7 +742,8 @@ class CrateRun:
 
     def execute(self, manifest: Manifest, record: CrateRecord, intent: run.WorkspaceIntent,
                 definition: rules.Rule, planner: Planner, runner: run.Runner,
-                available: Callable[[Path, str], None], executor: PlanExecutor | ExecutionService) -> None:
+                available: Callable[[Path, str], None], executor: PlanExecutor | ExecutionService,
+                refused: dict[str, str]) -> None:
         assert "tickets" in record and "owner" in record
         checkout, base = Path(record["checkout"]), manifest["base"]
         def unchanged_base() -> None:
@@ -612,8 +758,11 @@ class CrateRun:
             ownership.require(record["directory"], (path,))
             available(self.repo, path)
         selected = run.Selection(self.ledger.named_held(record["tickets"]), ())
-        refused: dict[str, str] = {}
         availability = run.PlanningFileAvailability(checkout, boundary)
+
+        def remember_refusals(planned: run.PlannedEdits) -> run.PlannedEdits:
+            refused.update((item.finding_id, item.reason) for item in planned.refusals)
+            return planned
 
         def admitted(identities: frozenset[str]) -> run.PlannedEdits:
             findings: list[ledger_api.HeldFinding] = []
@@ -626,18 +775,18 @@ class CrateRun:
                     refused[finding.finding_id] = str(error)
                 else:
                     findings.append(finding)
-            rebuilt = planner(checkout, self.ledger, base, run.Selection(tuple(findings), ()),
-                              availability, definition)
+            rebuilt = remember_refusals(planner(
+                checkout, self.ledger, base, run.Selection(tuple(findings), ()),
+                availability, definition))
             # The shared plan owner removes whole dependent edit groups, including files
             # introduced by a planner. No overlay may precede this boundary check.
-            return run.available_constant_plan(rebuilt, availability)
+            return remember_refusals(run.available_constant_plan(rebuilt, availability))
 
         planned = admitted(frozenset(record["tickets"]))
         unchanged_base()
         record["stage"] = CrateStage.EDITED
         self.save(manifest)
         while True:
-            refused.update((item.finding_id, item.reason) for item in planned.refusals)
             if not planned.files:
                 validated = ValidatedEdits((), (), refused)
             elif isinstance(executor, ExecutionService):
@@ -655,17 +804,8 @@ class CrateRun:
             refused.update(validated.refusals)
             kept, surviving = validated.paths, validated.findings
             if not surviving:
-                # Even an entirely refused selection retains every reason and uses the
-                # ledger's normal refusal publication before the untested claims are dropped.
-                with ledger_api.refill_lock(self.repo):
-                    self.owned(record)
-                    for ticket in sorted(set(record["tickets"].values())):
-                        reasons = {identity: refused.get(identity, "not retained by crate planner")
-                                   for identity, owner in record["tickets"].items() if owner == ticket}
-                        _ = self.ledger.bulk_release(ticket, reasons)
-                    manifest["refusals"].extend({"finding_id": identity, "reason": reason}
-                                                for identity, reason in refused.items())
-                    self.save(manifest)
+                refused.update((identity, "not retained by crate planner")
+                               for identity in record["tickets"] if identity not in refused)
                 raise bulk.BulkRenameError("no surviving findings: " + "; ".join(sorted(set(refused.values()))))
             _ = run.git(checkout, "add", "--", *sorted(kept))
             tree = run.git(checkout, "write-tree")
@@ -688,8 +828,10 @@ class CrateRun:
             rollback.set_plan(planned)
             rollback.restore(sorted(kept))
             planned = admitted(frozenset(surviving) - removed)
-        refused = {identity: refused.get(identity, "not retained by crate planner")
-                   for identity in record["tickets"] if identity not in surviving}
+        refused.update((identity, "not retained by crate planner")
+                       for identity in record["tickets"] if identity not in surviving and identity not in refused)
+        for identity in surviving:
+            _ = refused.pop(identity, "")
         commit = run.git(checkout, "commit-tree", tree, "-p", base, "-m",
                          f"style({definition.name}): crate batch\n\nTested-Tree: {tree}\nRun: {self.run_id}")
         result: CommitEvidence = {"commit": commit, "tree": tree, "paths": sorted(kept),
