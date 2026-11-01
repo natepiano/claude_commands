@@ -14,7 +14,7 @@
 | taplo fmt `--check` | the same `lint` | the workspace TOML, run from the cargo workspace root |
 | clippy `--all-targets --all-features` | the same `lint` | the workspace |
 | rustdoc `-D warnings` | `verify.sh doc`, run by the unit director as the last command before the checkpoint commit | the workspace |
-| style review | the unit director's main review in `<DualReview/>`, pass 1 only | the phase's diff from `${PHASE_DIR}/phase_baseline`, untracked files included |
+| style review | the reviewer worker assigned by `<ReviewPromptContract/>` | the phase's diff from `${PHASE_DIR}/phase_baseline`, untracked files included |
 
 `verify.sh lint` runs its stages in this order: assertion guard, mend, fmt, taplo, clippy. The assertion guard reads one `git diff -U0` and the commit messages from the base, and reports removed, weaker, changed (a note that does not block), test removed and test turned off; it judges a multi-line assertion as one whole statement and ignores whitespace, so a reflow or a move is no finding. A finding blocks unless an `Assertion-Change: <path>::<test> — <why>` line in the run's work orders (`UNIT_SESSION_DIR`) or a commit message names it. It takes about 0.5 s on the 87,000-line cargo-liner-tile checkpoint e21d5b93. On that checkpoint it reports 73 blocking findings, four of them weaker, among them `draw.rs:2644`; `grep -e weaker -e blocking` on its output keeps only the weaker lines and the total. Mend rewrites the code first. Fmt formats what mend wrote. The clippy stage runs `cargo clippy --fix` and fmt, repeated while a pass changes the tree, at most three times. Then it updates the cache key and judges. Every clippy run in this path uses `--keep-going`. Workspace rustdoc runs separately through `verify.sh doc` after staging, immediately before the checkpoint commit; its exact-tree pass record is mandatory. See [Lint-step fix](build-followups-mul-add.md#lint-step-fix) for the pass rules.
 
@@ -23,25 +23,21 @@
 - `docs/direct/phase_checks.md` — the one definition of `<PhaseChecks/>`.
 - `commands/unit/style_review.md` — the one definition of `<StyleReview/>`, and the `/unit:style_review [since <ref>]` command for a run by hand.
 - `docs/direct/launch_implementation.md` — before a phase's first dispatch, step 1 saves `git rev-parse HEAD` to `${PHASE_DIR}/phase_baseline` (`${SESSION_DIR}/phases/<phase id>/`) and stops if that fails. Repairs keep the baseline.
-- `docs/direct/dual_review.md` — on pass 1 the main review reads `style_review.md` and applies `<StyleReview/>` with `since <phase_baseline commit>` and `${SESSION_DIR}` as the diff directory. It saves the result, `Off` or an error included, to `${SESSION_DIR}/phase_style_review_<phase-id>.md`. Blind reviewers never audit style, and later passes do not walk the checklist again.
-- `docs/direct/write_prompt_contract.md` — item 2 tells every worker not to open `rust_style` or run `load-rust-style.sh`; item 6 puts the fixing rules into every repair prompt's Work Specification.
+- `docs/direct/dual_review.md` — `<ReviewPromptContract/>` owns the style assignment's completion and retry rules, baseline and artifact paths. It assigns a reviewer until the phase result returns, including after cancellation. The director reads the findings ledger and reported result.
+- `docs/direct/write_prompt_contract.md` — item 2 keeps implementation, fix and test workers from loading the guide; reviewer prompts follow `<ReviewPromptContract/>`. Item 6 supplies the repair rules.
 - `commands/unit/direct.md` — names `<PhaseChecks/>` in TagReferenceContract, names `verify.sh lint` in VerificationContract as the phase lint checks under `<PhaseChecks/>`, and runs the step at ExecutionSteps step 6 (`<PhaseChecks/>` at `<DualReview/>`). It also holds `<FixDispatch/>`, `<FinalGate/>`, and the RunSummary `**Style review:**` line (each phase's reviewed range and result).
 - `scripts/direct/verify.sh` — the `lint`, `doc` and `final` arms. There is no `fmt` arm.
 - `config/lint.conf` and `scripts/lint/lint_config.sh` — the on/off switches.
 
-**The style review** (`<StyleReview/>`)
+**The style review**
 
-1. Reads the switches with `lint_config.sh export`. With `LINT_OP_STYLE_REVIEW=off` it reports `Style review: Off` and stops.
-2. Makes a diff directory for this invocation: the directory the caller names, or a fresh `mktemp -d /tmp/claude/style-review.XXXXXX`.
-3. Checks the baseline with `git rev-parse --verify`. An invalid baseline or a failed tracked `git diff <since>` stops the review; neither is ever read as an empty or passing review.
-4. Appends untracked files as all-additions diffs.
-5. When any path in the diff is `.rs`, `Cargo.toml` or `Cargo.lock`, loads the guide with `load-rust-style.sh` and walks every numbered checklist rule against the additions, one table row per rule (`Pass` / `VIOLATION … at path:line` / `Skip`).
-6. Always runs `banned_words_lib.py --diff`.
-7. Opens every violation in the caller's ledger. With no ledger (a run by hand), violations are reported in the table.
+`commands/unit/style_review.md` defines the switches, diff scan, guide load,
+checklist and reporting. The reviewer uses that contract without a second
+rule list in its standing instructions.
 
 **How findings flow**
 
-- The main review opens each style violation with `findings.py open --caught-by main` (severity, title, file, line) and keeps the returned ids for `<Synthesize/>`, which does not open them again.
+- The reviewer includes style violations in its normal findings summary. `<Synthesize/>` confirms, deduplicates and opens them with `--caught-by worker --lens contract`, using the same severity gate and closure process as code findings. The reviewer does not write the ledger.
 - A lint failure is fixed by the worker that ran `lint`, before it reports done.
 - Workers start `test` as soon as the code is ready. Lint and test can run in either order, and both must pass before the phase is done. A test counts only if no later lint changed a file; when `git diff --stat` shows that a later lint changed a file, the worker runs test once more. Neither runs again on an unchanged tree. `<VerificationContract/>` defines these rules.
 - PhaseChecks findings pass the ledger's severity gate like any other finding: round 1 gates blockers and minors, later rounds gate blockers only, nits never gate.
@@ -63,7 +59,7 @@
 
 **`/unit:checkpoint`** requires a smoke result and a `converged` phase findings ledger. Every Cargo checkpoint needs an exact-tree pass from workspace `verify.sh doc`, run as its own command after staging and immediately before committing. A failure returns through `<FixDispatch/>`, then staging and `doc` repeat. In every repository, the checkpoint commit goes first in its Bash call; commands after it are allowed. The hook reads literal or reused subjects and treats an unreadable subject as a checkpoint. See `<CheckpointCommit/>` (`commands/unit/checkpoint.md`) for all cases and message forms. It does not rerun formatting.
 
-**A phase with no Rust change** has no lint run. Its style review skips the guide, marks the checklist `Skip (no Rust change)`, and runs only the banned-words scan.
+**A phase with no Rust change** has no lint run. `<StyleReview/>` defines its remaining review scope.
 
 **By hand.** `/unit:style_review [since <ref>]` reviews the working tree against `HEAD` by default (staged, unstaged and untracked), or against `<ref>`. It needs no active run and reports violations in its table.
 
@@ -72,7 +68,7 @@
 - Each of the seven checks runs at the place `<PhaseChecks/>` names. The lint check owns its multiply-add repair rounds and the format and judgment that follow them.
 - After the last phase, lint and style review do not repeat: `verify.sh final` stays check plus tests, `verify.sh` has no `fmt` arm, and `<FinalGate/>`, `<FinalGateCommit/>` and `/unit:checkpoint` do not lint, reformat or style-review. Each later Cargo checkpoint still needs its rustdoc pass.
 - `commands/unit/style_review.md` is the one source of the style review. The phase review reads it at the point of use and never restates it.
-- Workers never load the style guide. The unit director's main review is the only place style is audited in a phase.
+- The assigned reviewer owns phase style review; the director, implementation, fix and test workers do not load the guide. The reviewer loads it once per applicable phase under `<StyleReview/>`.
 - A contract file stays the one definition of its tag. Call sites name `<PhaseChecks/>` and `<StyleReview/>` and never restate them.
 - An off check reports `Off`, never clean, and no replacement check runs.
 - A cargo mend `--fix` rollback is a hard stop. `verify.sh` names it (and points at `/mend_fix`), and the repair prompt says to stop and keep the tree for inspection.
@@ -82,7 +78,7 @@
 
 ## Calibration / gotchas
 
-- **The diff directory belongs to one invocation.** A run passes `${SESSION_DIR}`; a run by hand gets a fresh `mktemp -d`. A fixed shared path would let concurrent units scan each other's diffs.
+- **The diff directory belongs to one invocation.** Use the caller-supplied directory under `<StyleReview/>`; phase paths come from `<ReviewPromptContract/>`. A fixed shared path would let concurrent units scan each other's diffs.
 - **The baseline is the phase's starting `HEAD`**, saved before dispatch, so the review covers committed, staged, unstaged and untracked work since then.
 - **fmt picks members by what differs from HEAD**, not from the phase baseline. Mend can rewrite a member the phase did not edit, and fmt covers that member too. Rustdoc covers the whole workspace.
 - **Repos outside this one** (`~/rust/*/CLAUDE.md`, `~/rust/*/docs`, `~/rust/nate_style`, `/etc/nixos`) may still name `/clippy`. Hits there are reported to the showrunner, not edited from here.
