@@ -1016,7 +1016,8 @@ class AccountsTests(unittest.TestCase):
         launch.assert_not_called()
         result = self.run_cli("status")
         self.assertRegex(result[1], r"\| ~/\.claude3 +\| claude3 +\|")
-        self.assertIn("claude3: wrong sign-in; " + line.removeprefix("accounts: "), result[1].splitlines())
+        self.assertIn("claude3: wrong sign-in; ~/.claude3 holds a different login from claude3; see Log out and in in ~/.claude/docs/accounts.md", result[1].splitlines())
+        self.assertNotIn("other@example.invalid", result[1])
         self.assertEqual(accounts.account_identity(accounts.account_dir("claude3")), agent_accounts.UnnotedLogin(self.home / ".claude3", "other@example.invalid"))
 
     def test_exec_repairs_broken_shared_links_before_launching_a_logged_out_account(self) -> None:
@@ -1154,7 +1155,7 @@ class AccountsTests(unittest.TestCase):
         _ = (Path(os.environ["AGENT_NOTES_DIR"]) / "claude3.md").write_bytes(b"\xff")
         result = self.run_cli("status")
         self.assertEqual((result[0], result[2]), (0, ""))
-        self.assertIn("with login: unit@example.invalid", result[1])
+        self.assertIn("repair the account note for claude3 with its login", result[1])
         self.assertIn("cannot read", result[1])
         self.assertRegex(result[1], r"\| ~/\.claude4 +\| claude4 +\|")
         selection = accounts.claude_account_selection()
@@ -2512,7 +2513,9 @@ class AccountsTests(unittest.TestCase):
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_mac_status_describes_accounts_without_creating_any(self) -> None:
         with patch.object(sys, "platform", "darwin"):
-            self.assert_status_describes_accounts_without_creating_any(accounts.MAC_HOME_LOGIN_STEP)
+            self.assert_status_describes_accounts_without_creating_any(
+                "in a Mac Terminal, run accounts.py exec claude2, then /login, then /exit, "
+                + "then accounts.py cutover-home claude2; never /logout")
 
     def assert_status_describes_accounts_without_creating_any(self, home_step: str) -> None:
         _ = (self.main_dir / "README.md").write_text("repo entry", encoding="utf-8")
@@ -2640,7 +2643,7 @@ class AccountsTests(unittest.TestCase):
                 self.assertIn(str(failure), problems[0])
                 self.assertIn("restore access to natedev", problems[0])
 
-    def test_stored_role_map_problem_says_no_fetch_was_attempted(self) -> None:
+    def test_stored_role_map_with_cached_assignments_lists_no_problem(self) -> None:
         cache = role_map.role_map_cache_file()
         cache.parent.mkdir(parents=True, exist_ok=True)
         _ = cache.write_text(json.dumps({"at": "2026-10-16T15:24:00+00:00", "map": {
@@ -2652,10 +2655,7 @@ class AccountsTests(unittest.TestCase):
             self.assertEqual((code, error), (0, ""))
             lines = (cast(list[str], json.loads(output)["problems"]) if flags else output.splitlines())
             problems = [line for line in lines if line.startswith("role map: using saved assignments;")]
-            self.assertEqual(len(problems), 1)
-            self.assertIn("no fetch was attempted", problems[0])
-            self.assertIn("2026-10-16", problems[0])
-            self.assertNotIn("unreachable", problems[0])
+            self.assertEqual(problems, [])
 
     def test_piped_status_replays_held_warning_before_the_final_error(self) -> None:
         def failed_read(*_args: object, **_kwargs: object) -> accounts.StatusReading:
@@ -2804,11 +2804,12 @@ class AccountsTests(unittest.TestCase):
                         self.assertEqual((code, output), (1, ""))
                         self.assertTrue(error.rstrip().endswith("fixture later failure; check the account folders and role map"))
                         if diagnostic.endswith("map"):
-                            expected_map = ("role map: using saved assignments; map saved at 2026-10-16 08:24 PDT; "
-                                + ("stored mode; no fetch was attempted; run accounts.py status to fetch current assignments"
-                                   if diagnostic == "stored map" else
-                                   "natedev fetch failed: fixture offline; restore access to natedev; run accounts.py status again"))
-                            self.assertIn(expected_map, error.splitlines())
+                            if diagnostic == "stored map":
+                                self.assertNotIn("role map: using saved assignments;", error)
+                            else:
+                                expected_map = ("role map: using saved assignments; map saved at 2026-10-16 08:24 PDT; "
+                                    + "natedev fetch failed: fixture offline; restore access to natedev; run accounts.py status again")
+                                self.assertIn(expected_map, error.splitlines())
                         else:
                             self.assertIn("fixture unmatched warning", error)
                             if diagnostic == "recovered save":
@@ -3247,12 +3248,12 @@ class AccountsTests(unittest.TestCase):
             if fault == "missing":
                 note.unlink(missing_ok=True)
                 expected_note = (f"claude2: not selectable; claude2 has no account note at {note}; "
-                    + "add ~/rust/hanadocs/agents/claudeN.md with login: fixture@notexample.com; run accounts.py setup claude2")
+                    + "add ~/rust/hanadocs/agents/claudeN.md with the login for claude2; run accounts.py setup claude2")
             else:
                 _ = note.write_text("---\nname: no login\n---\n")
                 expected_note = (f"claude2: cannot read {note}; fixture note denied; " if fault == "unreadable" else
                     f"claude2: not selectable; {note} has no readable login in its frontmatter; ")
-                expected_note += "repair the account note with login: fixture@notexample.com; run accounts.py setup claude2"
+                expected_note += "repair the account note for claude2 with its login; run accounts.py setup claude2"
             expected = ["workers: not configured; the role map selects no account; run accounts.py set-role workers <codexN>", expected_note]
             for flags in ((), ("--json",)):
                 with (self.subTest(fault=fault, flags=flags),
@@ -4616,7 +4617,7 @@ class AccountsTests(unittest.TestCase):
         result, stdout, stderr = self.run_cli("setup", "codex1")
 
         self.assertEqual((result, stderr), (0, ""))
-        self.assertIn("CODEX_HOME=~/.codex1 codex login", stdout)
+        self.assertIn(f"env CODEX_HOME={shlex.quote(str(self.home / '.codex1'))} codex login", stdout)
         home = self.home / ".codex1"
         self.assertTrue(home.is_dir())
         self.assertFalse(home.is_symlink())
@@ -5110,9 +5111,9 @@ class AccountsTests(unittest.TestCase):
             (agent_accounts.UsageReadOutcome.REFUSED_401,
              "the usage service did not accept this login; start a session on it to check it"),
             (agent_accounts.UsageReadOutcome.RATE_LIMITED_429,
-             "the usage service is busy; this shows the reading from 05:29; next try in 2 min"),
+             "the usage service is busy; this shows the reading from 01-02 05:29; no usage read has been attempted"),
             (agent_accounts.UsageReadOutcome.ERROR,
-             "the usage read failed; this shows the reading from 05:29; next try in 2 min"),
+             "the usage read failed; this shows the reading from 01-02 05:29; no usage read has been attempted"),
         )
         for outcome, reason in cases:
             with self.subTest(outcome=outcome):
@@ -5145,11 +5146,11 @@ class AccountsTests(unittest.TestCase):
         at = datetime(2026, 10, 19, 15, 11, tzinfo=timezone.utc)
         cases = (
             (agent_accounts.UsageReadOutcome.RATE_LIMITED_429,
-             "the usage service is busy; this shows the reading from 08:09; next try after 08:21",
-             "the usage service is busy; no reading is stored yet; next try after 08:21"),
+             "the usage service is busy; this shows the reading from 10-19 08:09; last read attempted at 10-19 08:11",
+             "the usage service is busy; no reading is stored yet; last read attempted at 10-19 08:11"),
             (agent_accounts.UsageReadOutcome.ERROR,
-             "the usage read failed; this shows the reading from 08:09; next try in 2 min",
-             "the usage read failed; no reading is stored yet; next try in 2 min"),
+             "the usage read failed; this shows the reading from 10-19 08:09; last read attempted at 10-19 08:11",
+             "the usage read failed; no reading is stored yet; last read attempted at 10-19 08:11"),
             (agent_accounts.UsageReadOutcome.REFUSED_401,
              "the usage service did not accept this login; start a session on it to check it",
              "the usage service did not accept this login; start a session on it to check it"),
@@ -5196,7 +5197,7 @@ class AccountsTests(unittest.TestCase):
         code, output, error = self.run_cli("status")
         self.assertEqual((code, error), (0, ""))
         self.assertIn("01-02 05:29 PST*", output)
-        self.assertIn("the usage service is busy; this shows the reading from 05:29; next try in 2 min", output)
+        self.assertIn("the usage service is busy; this shows the reading from 01-02 05:29; no usage read has been attempted", output)
         self.assertEqual(usage_store.store_file().read_bytes(), before)
 
     # Reserved fixtures model provider accounts in this status test.
@@ -5215,7 +5216,7 @@ class AccountsTests(unittest.TestCase):
         row = next(line for line in output.splitlines() if "| claude2 " in line)
         self.assertEqual(row.split("|")[-2].strip(), "01-02 05:29 PST*")
         self.assertEqual([line for line in output.splitlines() if line.startswith("* ")],
-                         ["* claude2: usage unavailable; the usage read failed; this shows the reading from 05:29; next try in 2 min"])
+                         ["* claude2: usage unavailable; the usage read failed; this shows the reading from 01-02 05:29; no usage read has been attempted"])
         self.assertEqual(usage_store.load()["idle@example.invalid"].get("weekly"), window)
         self.live_reads.assert_called_once_with(directory)
 
@@ -5239,7 +5240,7 @@ class AccountsTests(unittest.TestCase):
         row = next(line for line in output.splitlines() if "| claude2 " in line)
         self.assertEqual(row.split("|")[-2].strip(), "01-02 05:29 PST*")
         self.assertEqual([line for line in output.splitlines() if line.startswith("* ")],
-                         ["* claude2: usage unavailable; the usage read failed; this shows the reading from 05:29; next try in 2 min"])
+                         ["* claude2: usage unavailable; the usage read failed; this shows the reading from 01-02 05:29; no usage read has been attempted"])
         self.live_reads.assert_not_called()
 
     # Reserved fixtures model provider accounts in this status test.
@@ -5275,7 +5276,7 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual((code, error), (0, ""))
         row = next(line for line in output.splitlines() if "| codex1 " in line)
         self.assertEqual(row.split("|")[-2].strip(), "01-02 05:29 PST*")
-        self.assertIn("* codex1: usage unavailable; Codex did not start at ~/.codex1; this shows the reading from 05:29; run /showrunner:accounts setup codex1 and try again; next try in 2 min", output)
+        self.assertIn("* codex1: usage unavailable; Codex did not start at ~/.codex1; this shows the reading from 01-02 05:29; run /showrunner:accounts setup codex1 and try again; no usage read has been attempted", output)
         self.assertIn("/showrunner:accounts setup codex1", row)
 
     # Reserved fixtures model provider accounts in this status test.
@@ -6093,7 +6094,7 @@ class AccountsTests(unittest.TestCase):
         self.write_note("codex1", "target@example.invalid")
         result, stdout, stderr = self.run_cli("setup", "codex1")
         self.assertEqual((result, stderr), (0, ""))
-        command = stdout.index("CODEX_HOME=~/.codex1 codex login")
+        command = stdout.index(f"env CODEX_HOME={shlex.quote(str(self.home / '.codex1'))} codex login")
         warning = stdout[command:].splitlines()[1:]
         self.assertTrue(warning)
         self.assertIn("~/.codex", " ".join(warning))
@@ -6147,7 +6148,7 @@ _ = sys.stdin.read()
                 process.kill()
                 output, errors = process.communicate()
         self.assertEqual((process.returncode, errors), (0, ""))
-        self.assertIn("CODEX_HOME=~/.codex1 codex login", output)
+        self.assertIn(f"env CODEX_HOME={shlex.quote(str(self.home / '.codex1'))} codex login", output)
 
     def test_table_workers_role_ignores_conflicting_process_home(self) -> None:
         default, target = self.workers_fixture()
@@ -6215,7 +6216,7 @@ _ = sys.stdin.read()
         lines = stdout.splitlines()
         self.assertIn("initialize", lines[0])
         self.assertIn("limit", lines[0].lower())
-        self.assertLess(stdout.index("initialize"), stdout.index("CODEX_HOME=~/.codex1 codex login"))
+        self.assertLess(stdout.index("initialize"), stdout.index(f"env CODEX_HOME={shlex.quote(str(self.home / '.codex1'))} codex login"))
 
     def test_legacy_unit_role_file_leaves_workers_unconfigured(self) -> None:
         config = accounts.accounts_config_file()
@@ -6624,7 +6625,7 @@ class PickerTests(unittest.TestCase):
         self.assertEqual(accounts.placement("units", self.now, exclude=frozenset()).label, "claude3")
         code, stdout, stderr = self.group_cli("status")
         self.assertEqual((code, stderr), (0, ""))
-        self.assertIn(f"claude2: not selectable; claude2 has no account note at {self.home / 'notes/claude2.md'}; add ~/rust/hanadocs/agents/claudeN.md with login: main@example.invalid; run accounts.py setup claude2", stdout.splitlines())
+        self.assertIn(f"claude2: not selectable; claude2 has no account note at {self.home / 'notes/claude2.md'}; add ~/rust/hanadocs/agents/claudeN.md with the login for claude2; run accounts.py setup claude2", stdout.splitlines())
         for command in (("move", "units", "claude2"), ("move", "some-session", "claude2"),
                         ("exec", "claude2"), ("move", "units", "default")):
             with self.subTest(command=command):
@@ -6645,7 +6646,7 @@ class PickerTests(unittest.TestCase):
         self.assertEqual(accounts.group_label(groups, "units"), "home account unresolved")
         code, stdout, stderr = self.group_cli("status")
         self.assertEqual((code, stderr), (0, ""))
-        self.assertIn(f"claude2: not selectable; claude2 has no account note at {self.home / 'notes/claude2.md'}; add ~/rust/hanadocs/agents/claudeN.md with login: main@example.invalid; run accounts.py setup claude2", stdout.splitlines())
+        self.assertIn(f"claude2: not selectable; claude2 has no account note at {self.home / 'notes/claude2.md'}; add ~/rust/hanadocs/agents/claudeN.md with the login for claude2; run accounts.py setup claude2", stdout.splitlines())
         with self.assertRaisesRegex(accounts.AccountsError, "home account unresolved"):
             _ = accounts.role_account("unit")
         self.assertEqual(path.read_bytes(), original)
@@ -6665,7 +6666,7 @@ class PickerTests(unittest.TestCase):
         self.assertIsInstance(picked, accounts.NoAccountWithRoom)
         code, stdout, stderr = self.group_cli("status")
         self.assertEqual((code, stderr), (0, ""))
-        self.assertIn("~/.codex: not selectable; this login has no account note; add ~/rust/hanadocs/agents/codexN.md with login: unnoted@example.invalid; then run accounts.py cutover-home <codexN>", stdout.splitlines())
+        self.assertIn("~/.codex: not selectable; this login has no account note; add ~/rust/hanadocs/agents/codexN.md with the login for ~/.codex; then run accounts.py cutover-home <codexN>", stdout.splitlines())
         for command in (("swap", "workers", "codex1"), ("set-role", "workers", "codex1"),
                         ("swap", "workers", "default")):
             with self.subTest(command=command):
@@ -7236,6 +7237,36 @@ class SharedStatusDocumentTests(unittest.TestCase):
         self.assertEqual(status["problems"], ["Fixture problem."])
         return cast(list[dict[str, object]], status["accounts"])[0]
 
+    def test_usage_failure_timing_names_the_last_attempt_without_promising_a_retry(self) -> None:
+        now = datetime(2026, 11, 1, 12, tzinfo=timezone.utc)
+        read = datetime(2026, 10, 16, 10, 58, tzinfo=timezone.utc)
+        read_problem = cast(Callable[..., list[accounts.StatusProblem]], getattr(accounts, "_read_failure_problem"))
+        for outcome in (agent_accounts.UsageReadOutcome.ERROR, agent_accounts.UsageReadOutcome.RATE_LIMITED_429):
+            cases = (
+                (now, "last read attempted at 12:00"),
+                (now - timedelta(minutes=3), "last read attempted at 11:57"),
+                (now - timedelta(minutes=3, seconds=1), "last read attempted at 11:56"),
+                (read, "last read attempted at 10-16 10:58"),
+                (accounts.StatusUnavailable(), "no usage read has been attempted"),
+                (now + timedelta(minutes=1), "last read attempted at 12:01"),
+            )
+            for attempted, step in cases:
+                with self.subTest(outcome=outcome, attempted=attempted):
+                    row = replace(self.row(), read_at=read, attempted_at=attempted, read_outcome=outcome)
+                    problems = read_problem(row, timezone.utc, now=now)
+                    cause = "the usage read failed" if outcome == agent_accounts.UsageReadOutcome.ERROR else "the usage service is busy"
+                    line = f"* ~/.codex1: usage unavailable; {cause}; this shows the reading from 10-16 10:58; {step}"
+                    self.assertEqual([accounts.render_status_problem(problem) for problem in problems], [line])
+                    reading = replace(self.reading(row), notes=(line,), checked_at=now)
+                    self.assertIn(line, accounts.render_status_table(reading))
+                    self.assertEqual(cast(accounts.StatusDocument, json.loads(accounts.render_status_json(reading)))["problems"],
+                        [line.removeprefix("* ")])
+                    self.assertNotIn("next try", line)
+        row = replace(self.row(), read_at=now, attempted_at=now, read_outcome=agent_accounts.UsageReadOutcome.ERROR)
+        line = accounts.render_status_problem(read_problem(row, timezone.utc, now=now)[0])
+        self.assertIn("this shows the reading from 12:00; last read attempted at 12:00", line)
+        self.assertNotIn("11-01", line)
+
     def test_access_requires_a_stored_reading_and_an_ok_or_held_latest_outcome(self) -> None:
         for outcome in agent_accounts.UsageReadOutcome:
             for has_reading in (True, False):
@@ -7293,7 +7324,7 @@ class StatusProblemCauseTests(unittest.TestCase):
         _ = self.enterContext(patch.object(subprocess, "run", side_effect=AssertionError("no real child")))
         _ = self.enterContext(patch.object(subprocess, "Popen", side_effect=AssertionError("no real child")))
 
-    def reading(self, login: str, *, noted: bool = False) -> accounts.StatusReading:
+    def reading(self, login: str, *, noted: bool = False, diagnostics: tuple[str, ...] = ()) -> accounts.StatusReading:
         home = self.home / ".codex"
         home.mkdir(exist_ok=True)
         auth = home / "auth.json"
@@ -7302,7 +7333,7 @@ class StatusProblemCauseTests(unittest.TestCase):
         os.utime(auth, (at.timestamp(), at.timestamp()))
         status = accounts.CodexStatus("~/.codex", home, True, True,
             "codex1" if noted else accounts.NO_VALUE, login, "workers",
-            () if noted else (accounts.unnoted_home_line(home, login),), ())
+            diagnostics if noted else (accounts.unnoted_home_line(home, login), *diagnostics), ())
         usage = {usage_store.key("Codex", login): usage_store.StoredUsage(
             read_outcome=agent_accounts.UsageReadOutcome.ERROR,
             attempt_outcome=agent_accounts.UsageReadOutcome.ERROR, attempted_at=at.isoformat())}
@@ -7485,6 +7516,40 @@ class StatusProblemCauseTests(unittest.TestCase):
         self.assertTrue(any("test wrote" in line for line in reading.notes))
         self.assertFalse(any("account note" in line or "setup claude2" in line or "cutover-home" in line for line in reading.notes))
 
+    def test_legacy_codex_duplicate_has_one_complete_step_and_no_login_in_either_view(self) -> None:
+        for login in ("private-owner@provider.io", "private-account-id"):
+            with self.subTest(identity=login.split("@")[-1]):
+                diagnostic = f"accounts: ~/.codex and ~/.codex1 hold {login}; keep each login in one home"
+                reading = self.reading(login, noted=True, diagnostics=(diagnostic,))
+                expected = ("codex1: ~/.codex still holds codex1's login; stop what uses ~/.codex "
+                    + "(such as the ChatGPT app), then run accounts.py cutover-home codex1")
+                lines = [line for line in reading.notes if "~/.codex" in line]
+                self.assertEqual(lines, [expected])
+                document = cast(accounts.StatusDocument, json.loads(accounts.render_status_json(reading)))
+                self.assertEqual([line for line in document["problems"] if "~/.codex" in line], [expected])
+                self.assertNotIn(login, accounts.render_status_table(reading))
+                self.assertNotIn(login, accounts.render_status_json(reading))
+
+    def test_status_identity_and_note_repairs_never_print_the_login(self) -> None:
+        for login in ("private-owner@provider.io", "private-account-id"):
+            for fault in ("wrong login", "missing note", "unreadable note", "unnoted"):
+                with self.subTest(identity=login.split("@")[-1], fault=fault):
+                    directory = self.home / ".claude2"
+                    note = self.home / "notes/claude2.md"
+                    diagnostics = {
+                        "wrong login": f"accounts: ~/.claude2 is logged in as {login}, not claude2",
+                        "missing note": f"accounts: claude2 has no account note at {note}",
+                        "unreadable note": f"accounts: {note} has no readable login in its frontmatter",
+                        "unnoted": accounts.unnoted_home_line(directory, login),
+                    }
+                    status = accounts.AccountStatus("~/.claude2", directory, True, True, True,
+                        "claude2", login, "", (diagnostics[fault],), (), accounts.McpServerDifferences())
+                    reading = self.status_with([status], [], usage_store.StoredUsage())
+                    self.assertTrue(any(line.startswith("claude2:") for line in reading.notes))
+                    for line in reading.notes:
+                        self.assertNotIn(login, line)
+                    self.assertNotIn(login, accounts.render_status_json(reading))
+
     def test_duplicate_home_diagnostic_is_one_line_when_both_rows_have_one_account(self) -> None:
         statuses = self.codex_inventory(duplicate=True)
         self.assertEqual([status.label for status in statuses], ["codex1"])
@@ -7515,8 +7580,10 @@ class StatusProblemCauseTests(unittest.TestCase):
                 "units: not configured; the role map selects no account; run accounts.py move units <claudeN>",
                 "showrunners: not configured; the role map selects no account; run accounts.py move showrunners <claudeN>",
             ]
-            for first, second in (("~/.codex", "~/.codex1"), ("~/.codex", "~/.codex2"), ("~/.codex1", "~/.codex2")):
-                expected.append(f"codex1: login is stored in two homes; {first} and {second} are logged in as fixture@notexample.com; two homes on one login break token refresh; keep each login in one home")
+            expected.extend((
+                "codex1: ~/.codex still holds codex1's login; stop what uses ~/.codex (such as the ChatGPT app), then run accounts.py cutover-home codex1",
+                "codex1: login is stored in two homes; ~/.codex1 and ~/.codex2 store codex1's login; two homes on one login break token refresh; keep each login in one home",
+            ))
             lines = list(reading.notes)
             observed.append(sorted(lines))
             self.assertCountEqual(lines, expected)
@@ -7550,19 +7617,21 @@ class StatusProblemCauseTests(unittest.TestCase):
                     reading = accounts.read_status()
                 at = reading.rows[0].read_at
                 self.assertIsInstance(at, datetime)
-                previous = f"this shows the reading from {cast(datetime, at):%H:%M}"
+                local = cast(datetime, at)
+                previous = "this shows the reading from " + local.strftime(
+                    "%H:%M" if local.date() == reading.checked_at.date() else "%m-%d %H:%M")
                 expected = [
                     "units: not configured; the role map selects no account; run accounts.py move units <claudeN>",
                     "showrunners: not configured; the role map selects no account; run accounts.py move showrunners <claudeN>",
                     "* codex1: usage unavailable; Codex did not start at ~/.codex1; " + previous
                         + "; run accounts.py setup codex1 and try again"
-                        + ("; next try in 2 min" if outcome == agent_accounts.UsageReadOutcome.ERROR else
+                        + ("; no usage read has been attempted" if outcome == agent_accounts.UsageReadOutcome.ERROR else
                            "; start a session on it to check it" if outcome == agent_accounts.UsageReadOutcome.REFUSED_401 else ""),
-                    "codex1: login is stored in two homes; ~/.codex1 and ~/.codex2 are logged in as fixture@notexample.com; two homes on one login break token refresh; keep each login in one home",
+                    "codex1: login is stored in two homes; ~/.codex1 and ~/.codex2 store codex1's login; two homes on one login break token refresh; keep each login in one home",
                 ]
                 if outcome != agent_accounts.UsageReadOutcome.OK:
                     expected.append("* codex1: usage unavailable; " + (
-                        "the usage read failed; " + previous + "; next try in 2 min"
+                        "the usage read failed; " + previous + "; no usage read has been attempted"
                         if outcome == agent_accounts.UsageReadOutcome.ERROR else
                         "the usage service did not accept this login; start a session on it to check it"))
                 terminal = accounts.render_status_table(reading).splitlines()
@@ -7609,7 +7678,7 @@ class StatusProblemCauseTests(unittest.TestCase):
         reading = self.status_with(statuses, [], usage_store.StoredUsage(
             read_outcome=agent_accounts.UsageReadOutcome.ERROR,
             attempt_outcome=agent_accounts.UsageReadOutcome.ERROR))
-        line = "* claude2: usage unavailable; the usage read failed; no reading is stored yet; next try in 2 min"
+        line = "* claude2: usage unavailable; the usage read failed; no reading is stored yet; no usage read has been attempted"
         self.assertIn(line, reading.notes)
         self.assertIn(line, accounts.render_status_table(reading).splitlines())
         self.assertIn(line.removeprefix("* "), cast(accounts.StatusDocument,
@@ -7625,7 +7694,7 @@ class StatusProblemCauseTests(unittest.TestCase):
             weekly=usage_store.StoredWindow(left=50, resets="2026-11-01T01:14:00+00:00", at="2026-10-29T01:14:00+00:00"), attempted_at="2026-10-29T01:20:00+00:00")
         lines = self.status_with([status], [], usage).notes
         self.assertTrue(any("cannot read" in line for line in lines))
-        self.assertIn("* claude2: usage unavailable; the usage service is busy; this shows the reading from 01:14; next try after 01:30", lines)
+        self.assertIn("* claude2: usage unavailable; the usage service is busy; this shows the reading from 10-29 01:14; last read attempted at 10-29 01:20", lines)
 
     def test_test_signin_with_malformed_or_unreadable_note_has_only_delete_advice(self) -> None:
         directory = self.home / ".claude2"
@@ -7673,7 +7742,7 @@ class StatusProblemCauseTests(unittest.TestCase):
             failures = [line for line in lines if "Codex did not start" in line]
             self.assertEqual(len(failures), 1)
             self.assertIn("~/.codex1", failures[0])
-            self.assertIn("reading from 01:14", failures[0])
+            self.assertIn("reading from 10-29 01:14", failures[0])
             self.assertIn("accounts.py setup codex1", failures[0])
 
     def test_duplicate_identity_keeps_independent_rate_limit_and_its_times(self) -> None:
@@ -7698,7 +7767,7 @@ class StatusProblemCauseTests(unittest.TestCase):
             attempted_at="2026-10-29T01:20:00+00:00")
         lines = self.status_with([], statuses, usage).notes
         for number in (1, 2):
-            self.assertIn(f"* codex{number}: usage unavailable; the usage service is busy; this shows the reading from 01:14; next try after 01:30", lines)
+            self.assertIn(f"* codex{number}: usage unavailable; the usage service is busy; this shows the reading from 10-29 01:14; last read attempted at 10-29 01:20", lines)
         self.assertEqual(len([line for line in lines if "login is stored in two homes;" in line]), 1)
         duplicate = next(line for line in lines if "login is stored in two homes;" in line)
         self.assertIn("~/.codex1", duplicate)
@@ -7755,7 +7824,7 @@ class StatusProblemCauseTests(unittest.TestCase):
         lines = [line for line in self.status_with([], [status], usage).notes if "codex1:" in line]
         self.assertEqual(len(lines), 1)
         self.assertIn("Codex did not start", lines[0])
-        self.assertIn("reading from 01:14", lines[0])
+        self.assertIn("reading from 10-29 01:14", lines[0])
         self.assertIn("accounts.py setup codex1", lines[0])
 
     def test_invalid_existing_claude_identity_requires_login_repair(self) -> None:
@@ -7794,7 +7863,7 @@ class StatusProblemCauseTests(unittest.TestCase):
             "showrunners: not configured; the role map selects no account; run accounts.py move showrunners <claudeN>",
             "codex1: test sign-in is stored; a test wrote ~/.codex/auth.json at 2026-10-29 01:14 UTC; delete ~/.codex/auth.json",
             "codex1: test sign-in is stored; a test wrote ~/.codex1/auth.json at 2026-10-29 01:15 UTC; delete ~/.codex1/auth.json",
-            "codex1: login is stored in two homes; ~/.codex and ~/.codex1 are logged in as fixture@example.invalid; two homes on one login break token refresh; keep each login in one home",
+            "codex1: login is stored in two homes; ~/.codex and ~/.codex1 store codex1's login; two homes on one login break token refresh; keep each login in one home",
         ]
         self.assertCountEqual(accounts.render_status_table(reading).split("\n\n", 1)[1].strip().splitlines(), expected)
         self.assertCountEqual(cast(accounts.StatusDocument, json.loads(accounts.render_status_json(reading)))["problems"], expected)
@@ -7830,11 +7899,11 @@ class StatusProblemCauseTests(unittest.TestCase):
         reading = self.reading("fixture@notexample.com")
         lines = [line for line in reading.notes if "~/.codex" in line]
         self.assertEqual(len(lines), 2)
-        self.assertIn("* ~/.codex: usage unavailable; the usage read failed; no reading is stored yet; next try in 2 min", lines)
+        self.assertIn("* ~/.codex: usage unavailable; the usage read failed; no reading is stored yet; last read attempted at 10-29 01:14", lines)
         lines = [line for line in lines if "no account note" in line]
         self.assertEqual(len(lines), 1)
         self.assertIn("no account note", lines[0])
-        self.assertIn("login: fixture@notexample.com", lines[0])
+        self.assertIn("with the login for ~/.codex", lines[0])
         self.assertIn("accounts.py cutover-home", lines[0])
         self.assertNotIn("usage read failed", lines[0])
 
@@ -7901,7 +7970,7 @@ class StatusProblemCauseTests(unittest.TestCase):
             (f"accounts: {directory} is not logged in", "signed out", "no readable sign-in", "/login"),
             (f"accounts: could not read {directory}: permission denied", "access", "permission denied", "permissions"),
             ("accounts: claude2 has no account note at /fixture/claude2.md", "note", "/fixture/claude2.md", "add the account note"),
-            ("accounts: ~/.claude2 is logged in as owner@example.invalid, not claude2", "wrong login", "owner@example.invalid", "/login"),
+            ("accounts: ~/.claude2 is logged in as owner@example.invalid, not claude2", "wrong login", "holds a different login from claude2", "/login"),
             ("accounts: units has no account; run accounts.py move units <claudeN>", "role", "selects no account", "accounts.py move units"),
             ("accounts: units is on claude2, which is not set up on this machine; run accounts.py setup claude2", "role", "claude2", "accounts.py setup claude2"),
             ("accounts: cannot read role map from natedev; no usable map", "role", "no usable map", "restore access"),
@@ -7934,9 +8003,9 @@ class StatusProblemCauseTests(unittest.TestCase):
     def test_all_problem_parts_use_one_renderer_and_named_absence_variants(self) -> None:
         problem = accounts.StatusProblem("codex1", "usage unavailable",
             accounts.ProblemCause("usage", "the service is busy"),
-            accounts.ProblemStep("next try after 01:24"), footnote=True)
+            accounts.ProblemStep("last read attempted at 01:14"), footnote=True)
         self.assertEqual(accounts.render_status_problem(problem),
-            "* codex1: usage unavailable; the service is busy; next try after 01:24")
+            "* codex1: usage unavailable; the service is busy; last read attempted at 01:14")
         self.assertEqual(accounts.render_status_problem(accounts.StatusProblem("codex1", "check failed",
             accounts.NoSeparateCause(), accounts.NoUserStep())), "codex1: check failed")
 
