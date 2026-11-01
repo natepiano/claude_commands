@@ -1458,10 +1458,12 @@ class StaffSourcesTests(StaffTestCase):
     def test_showrunner_discovery_still_raises_unreadable_session_records(self) -> None:
         _ = self.production("sdlc")
         failure = OSError("session records are unreadable")
-        with mock.patch.object(showrunners, "socket_for", side_effect=failure):
-            with self.assertRaises(OSError) as raised:
-                _ = showrunners.registered_showrunners()
-        self.assertIs(raised.exception, failure)
+        errors = io.StringIO()
+        with mock.patch.object(showrunners, "socket_for", side_effect=failure), redirect_stderr(errors):
+            self.assertEqual(showrunners.registered_showrunners(), [])
+        self.assertEqual(len(errors.getvalue().splitlines()), 1)
+        self.assertIn("showrunner-sdlc", errors.getvalue())
+        self.assertIn("session records are unreadable", errors.getvalue())
 
     def test_a_stale_mac_retirement_keeps_a_unit_transferred_since_the_snapshot(self) -> None:
         old = staff.ensure("showrunner", name="old")

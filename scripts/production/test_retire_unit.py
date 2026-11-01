@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import io
 import json
+import math
 import os
 import signal
 import shutil
@@ -183,7 +184,8 @@ class RetireUnitTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(pane_record, "RECORD_DIR", self.root / "panes"))
         pane_record.write("alpha", pane_record.launch("w1:p1", DIRECTOR, str(self.worktree),
             {"CLAUDE_CONFIG_DIR": str(self.config), "SHOWRUNNER_UNIT_ID": "alpha-unit"}, ["claude", "-n", "alpha"]))
-        def process_info(*_arguments: str) -> dict[str, object]:
+        def process_info(*_arguments: str, deadline: float = math.inf) -> dict[str, object]:
+            del deadline
             # Existing cases launch Claude with exec: it replaces the pane's shell.
             pid = self.marked.claude.pid if self.marked and isinstance(self.marked.claude, unit_lookup.LiveClaude) else 4101
             return {"process_info": {"shell_pid": pid}}

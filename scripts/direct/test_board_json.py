@@ -20,7 +20,7 @@ from unittest.mock import patch
 
 from scripts.direct import board_json
 from scripts.lib import unit_runs
-from scripts.production import fake_showrunner, showrunner_parent, staff
+from scripts.production import fake_showrunner, showrunner_parent, staff, showrunners
 from scripts.production.cli_fixture import invoke_cli
 from scripts.production.staff_test_support import isolated_staff_file, production_membership, showrunner_launch
 from scripts.shutdown import pane_record
@@ -646,6 +646,18 @@ class BoardJsonTests(unittest.TestCase):
 
         self.assertEqual([doc["production"] for doc in documents],
                          [root.slug, child.slug, sibling.slug, grandchild.slug])
+
+    def test_partial_discovery_does_not_publish_an_incomplete_subtree(self) -> None:
+        root = self.production("root")
+        child = self.production("child")
+        self.attach(child.slug, root.slug)
+        partial = showrunners.ShowrunnerDiscovery([], (
+            showrunners.ShowrunnerLookupFailure(child.slug, "fixture lookup failed"),))
+        with patch.object(showrunners, "registered_showrunners", return_value=partial):
+            with self.assertRaisesRegex(OSError, "fixture lookup failed"):
+                _ = board_json.main(["--production", root.slug])
+        self.assertFalse((self.output / "root.json").exists())
+        self.assertFalse((self.output / "child.json").exists())
 
     def test_descendant_not_in_the_registered_showrunners_is_left_out(self) -> None:
         root = self.production("root")

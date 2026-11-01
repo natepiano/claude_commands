@@ -22,6 +22,7 @@ import signal
 import shlex
 import shutil
 import subprocess
+import math
 import sys
 import time
 import tomllib
@@ -869,7 +870,10 @@ def unmarked_environment() -> dict[str, str]:
     return child_environment({key: value for key, value in os.environ.items() if key not in MEMBER_MARKS})
 
 
-def run_program(argv: list[str], timeout: float = 10.0, *,
+PROGRAM_TIMEOUT_SECONDS = 10.0
+
+
+def run_program(argv: list[str], timeout: float = PROGRAM_TIMEOUT_SECONDS, *,
                 environment: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
     try:
         return subprocess.run(argv, capture_output=True, text=True, check=False, timeout=timeout,
@@ -1065,10 +1069,11 @@ class Herdr:
         """The outside-pane targeting form verified with herdr 0.9.0."""
         return [self.binary, "--session", self.session, *arguments]
 
-    def run(self, *arguments: str) -> str:
+    def run(self, *arguments: str, deadline: float = math.inf) -> str:
+        """Run within the caller's monotonic deadline, retaining the usual 10 s cap."""
         context = f"herdr {' '.join(arguments[:2])}"
         try:
-            result = run_program(self.argv(*arguments))
+            result = run_program(self.argv(*arguments), timeout=min(PROGRAM_TIMEOUT_SECONDS, max(0.0, deadline - time.monotonic())))
         except subprocess.TimeoutExpired as error:
             raise HerdrFailure(f"{context}: no answer after {error.timeout:g} s") from error
         require_success(result, context)
@@ -1078,8 +1083,9 @@ class Herdr:
         """Run an argv command in an existing pane; herdr types its text into the shell."""
         _ = self.run("pane", "run", pane, shlex.join(command))
 
-    def result(self, *arguments: str) -> dict[str, object]:
-        reply = decode_object(self.run(*arguments), "herdr response")
+    def result(self, *arguments: str, deadline: float = math.inf) -> dict[str, object]:
+        output = self.run(*arguments) if deadline == math.inf else self.run(*arguments, deadline=deadline)
+        reply = decode_object(output, "herdr response")
         return json_object(reply.get("result"), "herdr result")
 
     def panes(self) -> list[PaneIdentity]:
@@ -1844,12 +1850,12 @@ class Herdr:
             raise AgentBlocked("agent blocked at a trust, permission or question prompt", "agent_blocked")
         return ObservedAgentState(status)
 
-    def read(self, pane: str, lines: int, *, joined: bool, ansi: bool) -> str:
+    def read(self, pane: str, lines: int, *, joined: bool, ansi: bool, deadline: float = math.inf) -> str:
         arguments = ["pane", "read", pane, "--source", "recent-unwrapped" if joined else "recent",
                      "--lines", str(lines)]
         if ansi:
             arguments.extend(["--format", "ansi"])
-        return self.run(*arguments)
+        return self.run(*arguments, deadline=deadline)
 
     def send_keys(self, pane: str, *keys: str) -> None:
         _ = self.run("pane", "send-keys", pane, *keys)
@@ -1862,8 +1868,8 @@ class Herdr:
             if error.code != "pane_not_found":
                 raise
 
-    def agents(self) -> list[AgentOccupant]:
-        result = self.result("agent", "list")
+    def agents(self, *, deadline: float = math.inf) -> list[AgentOccupant]:
+        result = self.result("agent", "list", deadline=deadline)
         agents: list[AgentOccupant] = []
         for item in json_items(result.get("agents"), "herdr agent list"):
             agent = json_object(item, "herdr agent")

@@ -66,6 +66,7 @@ from scripts.direct import assign, plan_history, progress_history, worker_state,
 from scripts.direct.recorder_fixture import invoke_recorder
 from scripts.lib import atomic_file, nix_env, unit_runs
 from scripts.message import process_table, sessions, unit_labels, roster as message_roster
+from scripts.production import showrunners
 from scripts.usage import agents_log
 from scripts.accounts import accounts, moves, refusals, role_map
 from scripts.astra import astra_work, design_roles
@@ -470,6 +471,18 @@ def setUpModule() -> None:
     restore_usage = set_environment("USAGE_STATE_DIR", usage.name)
     restore_home = set_environment("HOME", home.name)
     unittest.addModuleCleanup(set_environment("XDG_STATE_HOME", str(Path(home.name) / "state")))
+    # Account-change notices resolve the user zone through discovery, whose paths
+    # were cached at import before HOME changed. Isolate both it and child processes.
+    for attribute, variable, directory in (
+        ("NOTIFIER_STATE_DIR", "NOTIFIER_STATE_DIR", "notifier"),
+        ("SESSIONS_DIR", "NOTIFIER_SESSIONS_DIR", "sessions"),
+    ):
+        path = Path(home.name) / directory
+        path.mkdir()
+        unittest.addModuleCleanup(set_environment(variable, str(path)))
+        discovery_path = patch.object(showrunners, attribute, path)
+        _ = discovery_path.start()
+        unittest.addModuleCleanup(discovery_path.stop)
     restore_notes = set_environment("AGENT_NOTES_DIR", home.name)
     unittest.addModuleCleanup(set_environment("AGENTS_CONFIG_PUBLISH", "0"))
     # Tier tests never read the caller's registry, config, or pacer choice.
