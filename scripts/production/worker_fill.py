@@ -9,12 +9,14 @@ import io
 from pathlib import Path
 import re
 import sys
+import time
 from typing import override
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.production import staff, staff_sources, unit_lookup
 from scripts.direct import workers
 from scripts.astra import design_roles
+from scripts.agents import codex_mesh
 
 
 from scripts.production.worker_admission import (
@@ -34,7 +36,23 @@ class FillSources(staff_sources._WorkerSources):  # pyright: ignore[reportPrivat
     def __init__(self, record: staff.StaffSnapshot, sources: unit_lookup.MemberSources) -> None:
         self.source: WorkerSource = WorkerSource(Path("."), "record")
         self.locations: dict[tuple[str, str], WorkerSource] = {}
+        self.thread_activity: dict[Path, set[str] | ValueError] = {}
         super().__init__(record, sources)
+
+    @override
+    def codex_thread_live(self, run: Path, thread: str) -> bool:
+        if run not in self.thread_activity:
+            for filename in (codex_mesh.SERVER_FILE, codex_mesh.RETIRED_FILE):
+                self.dependencies(run / filename)
+            deadline = time.monotonic() + codex_mesh.THREAD_RELEASE_TIMEOUT_SECS
+            try:
+                self.thread_activity[run] = codex_mesh.loaded_threads(run, deadline)
+            except ValueError as error:
+                self.thread_activity[run] = error
+        activity = self.thread_activity[run]
+        if isinstance(activity, ValueError):
+            raise activity
+        return thread in activity
 
     @override
     def add(self, observed: staff_sources.WorkerObservation) -> None:
@@ -78,16 +96,17 @@ def fill(*, dry_run: bool = False) -> int:
         line = line.removeprefix("staff sources: ")
         match = re.fullmatch(r"(.*) worker (.*?): (.*)", line)
         problems.append(f"{match[1]}:workers {match[2]}: {match[3]}" if match else f"{line}:record ?: source unavailable")
-    active = {row.id for row in record.find(kind="unit") if not isinstance(row.worktree, staff.RemovedWorktree)}
+    active = {row.id for row in record.rows if row.kind in ("unit", "showrunner")
+              and not isinstance(row.worktree, staff.RemovedWorktree) and not isinstance(row.doc, staff.WrappedDoc)}
     for observed in observations:
         location = sources.locations[(observed.owner.key, observed.name)]
         prefix = f"{location.path}:{location.key} {observed.name}"
         parent = observed.owner.match
-        if not isinstance(parent, staff.StaffRow) or parent.kind != "unit":
-            problems.append(f"{prefix}: showrunner-held worker needs a unit parent ruling")
+        if not isinstance(parent, staff.StaffRow) or parent.kind not in ("unit", "showrunner"):
+            problems.append(f"{prefix}: worker has no current staff parent")
             continue
         if parent.id not in active:
-            problems.append(f"{prefix}: unit {parent.id} is not live")
+            problems.append(f"{prefix}: parent {parent.id} is not live")
             continue
         if any(row.name == observed.name for row in record.find(kind="worker", parent=parent.id)):
             continue
@@ -100,6 +119,9 @@ def fill(*, dry_run: bool = False) -> int:
             problems.append(f"{prefix}: {error}")
     for problem in dict.fromkeys(problems):
         print(problem, file=sys.stderr)
+    skipped = len(sources.skipped_runs) + len(sources.skipped_ledgers)
+    if skipped:
+        print(f"skipped {skipped} not current")
     if not placed and not problems:
         print("unchanged")
     else:

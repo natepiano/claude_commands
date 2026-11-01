@@ -2044,6 +2044,44 @@ def _loaded_thread_ids(client: Client, deadline: float) -> set[str]:
     raise SystemExit("loaded-thread list timed out")
 
 
+def loaded_threads(run: Path, deadline: float) -> set[str]:
+    """Observe every live run server completely within one monotonic deadline."""
+    records: list[tuple[Path, dict[str, object]]] = []
+    for filename in (SERVER_FILE, RETIRED_FILE):
+        path = run / filename
+        if not path.exists():
+            continue
+        try:
+            record = worker_lifecycle.validate_worker_state(path, worker_lifecycle.read_json_object(path))
+        except worker_lifecycle.WorkerStateUnreadable as error:
+            raise ValueError(f"{path}: Codex thread activity is unavailable: {error}") from error
+        if filename == RETIRED_FILE:
+            records.extend((path, _as_dict(entry)) for entry in cast(list[object], record["servers"]))
+        else:
+            records.append((path, record))
+    loaded: set[str] = set()
+    ports: set[int] = set()
+    for path, record in records:
+        port, pid = record["port"], record["pid"]
+        if type(port) is not int or not 0 < port <= 65535:
+            raise worker_lifecycle.WorkerStateUnreadable(path, "invalid server port")
+        assert isinstance(pid, int)
+        if not _pid_alive(pid) or port in ports:
+            continue
+        ports.add(port)
+        try:
+            if time.monotonic() >= deadline:
+                raise TimeoutError("loaded-thread observation timed out")
+            client = Client(port, f"staff-fill-{os.getpid()}", operation_deadline=deadline)
+            try:
+                loaded.update(_loaded_thread_ids(client, deadline))
+            finally:
+                client.close()
+        except (SystemExit, OSError, ValueError, worker_lifecycle.OperationDeadlineExpired) as error:
+            raise ValueError(f"{path}: Codex thread activity is unavailable: {error}") from error
+    return loaded
+
+
 def _server_holds(port: int, thread_id: str) -> bool:
     try:
         client = Client(port, f"worker-lookup-{os.getpid()}")

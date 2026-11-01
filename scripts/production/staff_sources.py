@@ -31,7 +31,7 @@ from scripts.production.showrunners import (  # noqa: E402
 )
 import unit_names  # noqa: E402
 from scripts.production import staff, unit_config  # noqa: E402
-from scripts.production.worker_admission import parent as worker_parent  # noqa: E402
+from scripts.production.worker_admission import parent as worker_parent, showrunner_member  # noqa: E402
 from scripts.direct import workers  # noqa: E402
 from scripts.astra import astra_roles, design_roles  # noqa: E402
 from scripts.lib import unit_runs, git_exclude  # noqa: E402
@@ -203,6 +203,12 @@ class _WorkerSources:
         self.sources: _MemberSources = sources
         self.members: dict[str, staff.SeedMember] = {entry.key: entry for entry in members}
         self.objects: dict[Path, dict[str, object]] = {}
+        self.unreadable: set[Path] = set()
+        self.skipped_runs: set[Path] = set()
+        self.skipped_ledgers: set[Path] = set()
+        self.run_activity: dict[Path, bool] = {}
+        self.live_worker_runs: set[Path] = set()
+        self.activity_unavailable: dict[Path, ValueError] = {}
         self.observed: dict[tuple[str, str], WorkerObservation] = {}
         self.identities: dict[staff.StaffId, dict[str, str]] = {}
         self.sessions: dict[str, WorkerOwner] = {}
@@ -216,6 +222,7 @@ class _WorkerSources:
         self.blocked_threads: set[str] = set()
         self.ledger_names: set[tuple[str, str]] = set()
         registry = sessions.read_registry(dependencies=self.dependencies)
+        self.registry_incomplete: bool = bool(registry.unreadable)
         for path in registry.unreadable:
             if path.exists():
                 _problem(path, "session registry is unreadable")
@@ -232,11 +239,13 @@ class _WorkerSources:
                 self.objects[path] = _object(cast(object, json.loads(path.read_text(encoding="utf-8"))))
             except (OSError, UnicodeError, ValueError) as error:
                 _problem(path, error)
+                self.unreadable.add(path)
                 self.objects[path] = {}
         return self.objects[path]
 
     def owner(self, selector: ShowrunnerMember | UnitMember) -> WorkerOwner:
-        found = self.sources.member(selector, self.record)
+        found = (showrunner_member(self.record, self.sources, selector.slug, dependencies=self.dependencies)
+                 if isinstance(selector, ShowrunnerMember) else self.sources.member(selector, self.record))
         if isinstance(found, MemberFound):
             return WorkerOwner(f"staff:{found.row.id}", found.row)
         key = (_showrunner_key(selector.slug) if isinstance(selector, ShowrunnerMember)
@@ -251,7 +260,8 @@ class _WorkerSources:
         for slug, source in self.sources.productions.items():
             try:
                 owner = self.owner(ShowrunnerMember(slug))
-            except ValueError:
+            except (ValueError, staff.StaffUnreadable) as error:
+                _problem(source.timer.doc, error)
                 continue
             session_id = source.timer.target.removeprefix("session:")
             self.sessions[session_id] = owner
@@ -341,12 +351,38 @@ class _WorkerSources:
         except ValueError as error:
             _problem(path, error)
             return
+        inactive = 0
         for key, value in entries.items():
             try:
                 fields = _object(value)
                 name = _text(fields.get("name")) or key
                 # Reuse the ledger's decoder; its public locked reader also writes and recovers.
                 worker = workers._decode_worker(name, fields)  # pyright: ignore[reportPrivateUsage]
+                if isinstance(worker.ownership, workers.HeldBy):
+                    run = Path(worker.ownership.run)
+                    roster = self.checked(run / workers.ROSTER) if (run / workers.ROSTER).exists() else {}
+                    entry = _object(roster.get(name, {}))
+                    backend = worker.backend
+                    activity: dict[str, object] = {**entry, "family": worker.family}
+                    if isinstance(backend, workers.CodexThread):
+                        activity["thread_id"] = backend.thread_id
+                    else:
+                        activity["session_id"] = backend.session_id
+                        activity["worker_id"] = backend.session_id
+                    if not self.current_worker(run, activity):
+                        inactive += 1
+                        self.runs.add(run)
+                        continue
+                    self.live_worker_runs.add(run)
+                elif isinstance(worker.ownership, workers.Paused):
+                    if isinstance(worker.backend, workers.ClaudeSession):
+                        if worker.backend.session_id not in self.running:
+                            if self.registry_incomplete:
+                                raise ValueError("Claude registry is incomplete")
+                            inactive += 1
+                            continue
+                    else:
+                        raise ValueError("paused Codex worker has no run activity record")
                 try:
                     current = self.record.by_id(staff.StaffId(_text(fields.get("staff_id")) or key))
                     parent = owner
@@ -390,14 +426,122 @@ class _WorkerSources:
             except (ValueError, staff.StaffRefused, workers.WorkerUnavailable, OSError, staff.StaffUnreadable) as error:
                 _problem(f"{path} worker {key}", error)
 
-    def run_live(self, run: Path) -> bool:
+        if entries and inactive == len(entries) and path.absolute() not in self.unreadable:
+            self.skipped_ledgers.add(path.absolute())
+
+    def checked(self, path: Path) -> dict[str, object]:
+        data = self.read(path)
+        if path.absolute() in self.unreadable:
+            raise ValueError(f"{path}: current activity is unavailable")
+        return data
+
+    def director_live(self, run: Path) -> bool:
         if run not in self.directors:
             self.directors[run] = workers.resolve_live_unit_director(
                 run, self.record, self.sources, tuple(self.running.values()), self.dependencies)
-        if isinstance(self.directors[run], workers.LiveUnitDirector):
+        live = isinstance(self.directors[run], workers.LiveUnitDirector)
+        if not live and self.registry_incomplete:
+            raise ValueError(f"{run}: director registry is incomplete")
+        return live
+
+    def worker_live(self, run: Path, fields: Mapping[str, object]) -> bool:
+        """Use the Claude registry or a Codex process/loaded thread, never a saved status."""
+        family = _text(fields.get("family")) or "codex"
+        if family == "claude":
+            session = _text(fields.get("worker_id")) or _text(fields.get("session_id"))
+            if not session:
+                raise ValueError("Claude worker session is unavailable")
+            if session in self.running:
+                return True
+            if self.registry_incomplete:
+                raise ValueError(f"{session}: Claude registry is incomplete")
+            return False
+        if _alive(fields.get("launcher_pid")):
             return True
-        server = run / "mesh_server.json"
-        return server.exists() and _alive(self.read(server).get("pid"))
+        thread = _text(fields.get("thread_id"))
+        if not thread:
+            raise ValueError("Codex worker thread is unavailable")
+        return self.codex_thread_live(run, thread)
+
+    def codex_thread_live(self, run: Path, thread: str) -> bool:
+        # This coarse display/seed check can keep a stale worker while its server lives.
+        del thread
+        current = run / "mesh_server.json"
+        if current.exists() and _alive(self.checked(current).get("pid")):
+            return True
+        retired = run / "mesh_retired.json"
+        if retired.exists():
+            servers = self.checked(retired).get("servers")
+            if not isinstance(servers, list):
+                raise ValueError(f"{retired}: invalid retired server list")
+            return any(_alive(_object(entry).get("pid")) for entry in cast(list[object], servers))
+        return False
+
+    def current_worker(self, run: Path, fields: Mapping[str, object]) -> bool:
+        """Positive worker or director evidence wins over uncertainty in the other."""
+        try:
+            failure: ValueError | None = None
+            try:
+                if self.director_live(run):
+                    return True
+            except ValueError as error:
+                failure = error
+            if self.worker_live(run, fields):
+                return True
+            if failure is not None:
+                raise failure
+            return False
+        except ValueError as error:
+            self.activity_unavailable[run] = error
+            raise
+
+    def run_live(self, run: Path) -> bool:
+        """Prove activity before ownership; uncertain evidence is never an inactive skip."""
+        if run in self.run_activity:
+            return self.run_activity[run]
+        live = run in self.live_worker_runs
+        failures = ([self.activity_unavailable[run]] if run in self.activity_unavailable else [])
+        try:
+            live = self.director_live(run) or live
+        except ValueError as error:
+            failures.append(error)
+
+        def observe(fields: Mapping[str, object]) -> None:
+            nonlocal live
+            if not live:
+                try:
+                    live = self.worker_live(run, fields)
+                except ValueError as error:
+                    failures.append(error)
+        roster = run / workers.ROSTER
+        if roster.exists():
+            for value in self.checked(roster).values():
+                entry = _object(value)
+                if entry.get("status") in ("starting", "running", "paused", "waiting_capacity"):
+                    observe(entry)
+        for path in sorted(run.glob("impl_worker_*.json")):
+            fields = self.checked(path)
+            if fields.get("family") == "claude":
+                observe(fields)
+        ledger = run / unit_runs.WORKERS_LOG
+        if ledger.exists():
+            self.dependencies(ledger)
+            for line in ledger.read_text(encoding="utf-8").splitlines():
+                short, separator, _name = line.partition("\t")
+                if not separator or not short:
+                    raise ValueError(f"{ledger}: invalid Claude workers ledger entry")
+                matches = [session for session in self.running if session.startswith(short)]
+                if len(matches) > 1:
+                    raise ValueError(f"{ledger}: ambiguous Claude session prefix {short}")
+                if not matches and self.registry_incomplete:
+                    failures.append(ValueError(f"{ledger}: Claude registry is incomplete"))
+                live = bool(matches) or live
+        if not live and failures:
+            raise failures[0]
+        self.run_activity[run] = live
+        if not live:
+            self.skipped_runs.add(run.absolute())
+        return live
 
     def roster(self, run: Path, owner: WorkerOwner | None = None) -> None:
         path = run / workers.ROSTER
@@ -407,6 +551,8 @@ class _WorkerSources:
             try:
                 entry = _object(value)
                 if entry.get("status") not in ("starting", "running", "paused", "waiting_capacity"):
+                    continue
+                if not self.current_worker(run, entry):
                     continue
                 parent = owner if owner is not None else self._run_owner(run)
                 ledger = _text(entry.get("unit_ledger"))
@@ -422,11 +568,13 @@ class _WorkerSources:
                 _problem(f"{path} worker {name}", error)
 
     def claude_workers(self, run: Path) -> None:
-        ledger = run / "workers"
+        ledger = run / unit_runs.WORKERS_LOG
         launches = sorted(run.glob("impl_worker_*.json"))
         if not ledger.exists() and not launches:
             return
         try:
+            if not self.run_live(run):
+                return
             owner = self._run_owner(run)
             board = Path(__file__).resolve().parents[1] / "direct/board.sh"
             result = subprocess.run(["bash", str(board), "roles", str(run)], capture_output=True,
@@ -484,7 +632,7 @@ class _WorkerSources:
                 else:
                     self.observed = {key: entry for key, entry in self.observed.items() if entry.identity != identity}
                 self.add(WorkerObservation(instance.name, owner, cast(LiveRole, f"astra-{instance.role}"), identity))
-        except (ValueError, OSError, KeyError, staff.StaffRefused) as error:
+        except (ValueError, OSError, KeyError, staff.StaffRefused, staff.StaffUnreadable) as error:
             _problem(path, error)
 
     def astra(self, path: Path) -> None:
@@ -499,8 +647,13 @@ class _WorkerSources:
                 self.design(lifetime.design_id)
                 return
             if isinstance(lifetime, astra_roles.MeshWorker):
-                entry = _object(self.read(Path(lifetime.session_dir) / workers.ROSTER).get(lifetime.worker))
-                if entry.get("status") not in ("starting", "running", "paused", "waiting_capacity", "done"):
+                run = Path(lifetime.session_dir)
+                if not self.run_live(run):
+                    return
+                entry = _object(self.checked(run / workers.ROSTER).get(lifetime.worker))
+                if entry.get("status") not in ("starting", "running", "paused", "waiting_capacity"):
+                    return
+                if not self.current_worker(run, entry):
                     return
                 name = lifetime.worker
             else:
