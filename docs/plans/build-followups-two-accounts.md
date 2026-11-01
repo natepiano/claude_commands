@@ -3038,3 +3038,24 @@ Showrunner defect 2026-10-31 09:3x EDT, reported by hana: the validation line op
 User 2026-11-01 07:4x EST: "please look at the problems coming from the script feeding the accounts board and correct them". Seen on the Mac board (stored-mode `accounts.py status`).
 
 **As-built:** a stored-mode read with a cached role map lists no role-map problem; with no cache it refuses as before. A usage reading not from today shows its date (`10-29 01:14`). The retry promise is gone: the line says `last read attempted at <time>` or `no usage read has been attempted`, because the notes timer can reuse a failed report for ten minutes. `MAC_HOME_LOGIN_STEP` gives the whole Mac step: `accounts.py exec claude2`, `/login`, `/exit`, then `accounts.py cutover-home claude2`, never `/logout`. When `~/.codex` and the numbered home hold the same login, one line reads `~/.codex still holds codex2's login; stop what uses ~/.codex (such as the ChatGPT app), then run accounts.py cutover-home codex2`; when the numbered home holds another login, one label-only line gives its repair instead of a cutover that would refuse. The login command is one shared `env CODEX_HOME=<quoted home> codex login`, which the `codex` alias cannot redirect, also used by `setup codexN`. No problem line prints a login; a test fails if one holds a fixture login. Review: two lenses found F001 (cutover step for a home holding another login) and F002 (false retry promise); two fix rounds; closure approved.
+
+### Phase 101k — The Mac reads account usage at an interval set in config, now one minute  · status: done · d7b8562d
+
+User 2026-11-01 09:2x EST, through the Mac session: "make that interval configurable - and to make the refresh interval 1 minute instead of 2 minutes". Director call: the key is for the Mac read only; natedev's usage read stays in `[parts.notes]` (120 s), because that pass also routes quota and moves sessions.
+
+**As-built:** `mac_usage.interval_seconds = 60` in `config/agent_notes.toml`, read at use; a bad or huge value refuses with the file and key. `agent_notes.py usage-only --poll-seconds 30` reads an account when its own last granted claim is at least interval minus half a poll (45 s) old, so start jitter never skips a poll and one slow account never delays another; a held claim leaves that account's time unchanged. The shared claim guard and the 600 s rate-limit backoff stay; natedev's 90 s guard is unchanged. Due checks share `scripts/maintenance/schedule.py` with `agent_notes_job.py`. Tests script two accounts with 0 s, 15 s and changing credential latency and assert per-account gaps of 45–90 s. The Mac job change (30 s launchd poll, `--poll-seconds 30`) is on /etc/nixos branch `accounts-mac-usage-interval` (afb41714), pushed by the showrunner; it takes effect after a Mac `rebuild`. Three repair rounds; the third used an Astra design.
+
+### Phase 101l — A legacy-login line and the brp registration each stay fixed  · status: todo
+
+Found 2026-11-01. (1) On the Mac, `~/.claude.json` held another account's `oauthAccount` with no keychain credential; `cutover-home claude2` returned early (journal complete since 10-16), and the printed step ("one /login in ~/.claude2") could not clear it. (2) On natedev, the login job `claude-brp-mcp` (`/etc/nixos/modules/common/claude-code.nix`) registers brp at user scope in `~/.claude.json` at each login, which undid the user's 10-28 rule (brp only in hana, nateroids and bevy_brp). The board then told claude1-4 to turn brp on in about 35 projects. The director removed the user-scope entry at 09:3x.
+
+**Depends on:** 101k (same worker).
+
+#### Work Order
+
+- **Leftover account data.** When `~/.claude` has no credential but `~/.claude.json` still names an account, `cutover-home` removes only that account data (dated backup, atomic write) even when the journal is complete, and status prints that step. No `/logout`.
+- **brp only in its repos.** The login job and its setup check register brp at local scope in `$HOME/rust/{hana,nateroids,bevy_brp}` for `~/.claude` and each numbered home, and never at user scope; a run that changes nothing writes nothing. Workers write the new module text to the phase folder; the director commits it to a nixos branch.
+- **Wrong sign-in recovery.** `accounts.py exec claudeN` refuses a home signed in to another account, but `docs/accounts.md` "Log out and in" sends the user to that same command for `/login`. Give the refusal a working step that reaches `/login` on that home, and make the doc match. The refusal prints the label, never the login (today it prints the email).
+- Tests for the first and third items; the second is checked by `nix-instantiate --parse` and a dry read of the script.
+
+**Files:** `scripts/accounts/accounts.py`, its tests, `docs/accounts.md`; nixos `modules/common/claude-code.nix` through the director.

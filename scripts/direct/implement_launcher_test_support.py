@@ -274,6 +274,10 @@ class ImplementLauncherFixture(LauncherFixture):
                 "ASTRA_AFTER_FAILED_FIXES=2", "",
             ), AGENTS_REGISTRY,
         )
+        # A phase launch captures HEAD before opening its worker, as a real checked-out phase does.
+        _ = subprocess.run(["git", "-C", str(self.working_dir), "-c", "user.name=Test",
+                            "-c", "user.email=test@example.invalid", "commit", "-q", "--allow-empty",
+                            "-m", "base"], check=True, capture_output=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
         notes = self.root / "notes"
         notes.mkdir()
         _ = (notes / "claude2.md").write_text("---\nlogin: worker@example.invalid\n---\n")

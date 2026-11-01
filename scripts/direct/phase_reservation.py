@@ -57,6 +57,7 @@ from typing import NamedTuple, cast, overload
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.agents import worker_lifecycle
 
 if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -358,6 +359,29 @@ def _record_worktree(directory: Path, root: Path) -> None:
             raise StateRefused(f"phase worktree is {previous.root}; cannot claim it in {root}")
     directory.mkdir(parents=True, exist_ok=True)
     write_text_atomic(directory / WORKTREE_FILE, str(root) + "\n")
+
+
+def _record_baselines(directory: Path, root: Path) -> None:
+    """Keep the first launch's commit and working-tree status through every later launch."""
+    baseline = directory / BASELINE_FILE
+    # Keep the lock inode: concurrent launchers must serialize the existence check and both writes.
+    # Closing the handle also releases a crashed launcher's lock, allowing the next claim to retry.
+    with baseline.with_name(BASELINE_FILE + ".lock").open("a") as lock:
+        worker_lifecycle.acquire_flock(lock)
+        if baseline.exists():
+            try:
+                _ = commit_id(root, baseline.read_text().strip())
+            except StateRefused as refused:
+                raise StateRefused(f"phase baseline {baseline} is not a commit in {root}: {refused}") from refused
+            return
+        head = commit_id(root, "HEAD")
+        status = subprocess.run(["git", "-C", str(root), "status", "--short"], capture_output=True,
+                                text=True, check=False, stdin=subprocess.DEVNULL)
+        if status.returncode != 0:
+            raise StateRefused(f"git status --short failed in {root}: {status.stderr.strip()}")
+        # Publish the baseline last: after an interrupted status write, the next claim retries both.
+        write_text_atomic(directory / BASELINE_STATUS_FILE, status.stdout)
+        write_text_atomic(baseline, head + "\n")
 
 
 def open_phases(session_dir: Path) -> list[OpenPhase]:
@@ -827,7 +851,8 @@ def _claim_command(args: argparse.Namespace) -> int:
     root = root.resolve()
     try:
         _record_worktree(directory, root)
-    except StateRefused as refused:
+        _record_baselines(directory, root)
+    except (StateRefused, OSError) as refused:
         print(f"phase_reservation: {refused}", file=sys.stderr)
         return 2
     phases = open_phases(session_dir)

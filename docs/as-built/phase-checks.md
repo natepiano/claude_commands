@@ -22,7 +22,7 @@
 
 - `docs/direct/phase_checks.md` — the one definition of `<PhaseChecks/>`.
 - `commands/unit/style_review.md` — the one definition of `<StyleReview/>`, and the `/unit:style_review [since <ref>]` command for a run by hand.
-- `docs/direct/launch_implementation.md` — before a phase's first dispatch, step 1 saves `git rev-parse HEAD` to `${PHASE_DIR}/phase_baseline` (`${SESSION_DIR}/phases/<phase id>/`) and stops if that fails. Repairs keep the baseline.
+- `docs/direct/launch_implementation.md` — the launcher's `phase_reservation.py claim` saves the repository's full `HEAD` id to `${PHASE_DIR}/phase_baseline` and `git status --short` to `${PHASE_DIR}/progress_baseline_status` on the first launch, before the worker opens; a git failure stops the launch. Later launches, including repairs and reopened phases, keep both baselines. Ad hoc work uses `${SESSION_DIR}/phases/adhoc`.
 - `docs/direct/dual_review.md` — `<ReviewPromptContract/>` owns the style assignment's completion and retry rules, baseline and artifact paths. It assigns a reviewer until the phase result returns, including after cancellation. The director reads the findings ledger and reported result.
 - `docs/direct/write_prompt_contract.md` — item 2 keeps implementation, fix and test workers from loading the guide; reviewer prompts follow `<ReviewPromptContract/>`. Item 6 supplies the repair rules.
 - `commands/unit/direct.md` — names `<PhaseChecks/>` in TagReferenceContract, names `verify.sh lint` in VerificationContract as the phase lint checks under `<PhaseChecks/>`, and runs the step at ExecutionSteps step 6 (`<PhaseChecks/>` at `<DualReview/>`). It also holds `<FixDispatch/>`, `<FinalGate/>`, and the RunSummary `**Style review:**` line (each phase's reviewed range and result).
