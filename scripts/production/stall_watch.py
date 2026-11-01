@@ -424,33 +424,6 @@ def transcript_turn_end(session_id: str) -> re.Match[str] | None:
     return None
 
 
-def run_has_open_phase(record: unit_lookup.RunRecord) -> bool:
-    """An unfinished run between assignments has no work for an idle bump to resume."""
-    phases: set[str] = set()
-    with record.path.open("rb") as history:
-        for line in history:
-            # Most history is worker progress, not phase lifecycle. Escaped JSON names
-            # still need decoding so they have the same meaning as their plain spelling.
-            if b'"phase_started"' not in line and b'"phase_finished"' not in line and b"\\u" not in line:
-                continue
-            try:
-                event = cast(object, json.loads(line))
-            except ValueError:
-                continue
-            if not isinstance(event, dict):
-                continue
-            fields = cast(dict[str, object], event)
-            kind = fields.get("event_type")
-            identity = fields.get("phase_instance_id") or fields.get("phase_id")
-            if not isinstance(identity, str) or not identity:
-                continue
-            if kind == "phase_started":
-                phases.add(identity)
-            elif kind == "phase_finished":
-                phases.discard(identity)
-    return bool(phases)
-
-
 def blocks_of(entry: TranscriptEntry) -> list[ContentBlock]:
     content = entry.get("message", {}).get("content")
     return content if isinstance(content, list) else []
@@ -1285,21 +1258,10 @@ def tick(now: float, *, deadline: float = math.inf) -> int:
             blocked = None
         if not pane_budget_left(name, inspection_deadline):
             continue
-        record = runs.records[str(Path(live[name]).expanduser().resolve())]
-        try:
-            has_open_phase = run_has_open_phase(record)
-        except (OSError, UnicodeError) as error:
-            print(f"stall-watch: {name}: its open phase is unknown: {error}", file=sys.stderr)
-            has_open_phase = False
-        else:
-            if not has_open_phase:
-                # Only a known absence of work clears idle state; unreadable history retains it.
-                path.unlink(missing_ok=True)
         if blocked:
             # It waits on the user, not on itself: the idle clock starts again after the prompt.
-            if has_open_phase:
-                save_stretch(path, Stretch(pane_hash=hashlib.sha256(pane.encode()).hexdigest(), since=now,
-                                           bump_sent=False, tell_sent=False, reported_status=""))
+            save_stretch(path, Stretch(pane_hash=hashlib.sha256(pane.encode()).hexdigest(), since=now,
+                                       bump_sent=False, tell_sent=False, reported_status=""))
             # Claude Code denies a prompt with the auto-deny banner by itself: the user gets no alert.
             if auto_denied(pane):
                 if (retire := end_prompt(slug, name)) is not None:
@@ -1319,8 +1281,6 @@ def tick(now: float, *, deadline: float = math.inf) -> int:
             continue
         if blocked is not None and (retire := end_prompt(slug, name)) is not None:
             pending.append(retire)
-        if not has_open_phase:
-            continue
         stretch = read_stretch(path, hashlib.sha256(pane.encode()).hexdigest(), now)
         turns = list(TURN_END.finditer(pane))
         # A resumed or compacted pane can retain an older turn. The session's last
