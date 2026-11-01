@@ -12,6 +12,7 @@ from typing import override
 from unittest import mock
 import unittest
 
+from scripts.lib import unit_runs
 from scripts.production import staff, staff_check, staff_sources, unit_lookup, showrunners
 from scripts.production.staff_test_support import StaffTestCase
 from scripts.message import process_table
@@ -293,6 +294,36 @@ class StaffCheckTests(StaffTestCase):
         stale = staff.set_worktree(stale.id, staff.PresentWorktree("natedev", folder))
         output = self.assert_wrong(stale, "uncertain: no document worktree bound to this unit")
         self.assertNotIn(f"{self.fixture.unit.id} {self.fixture.unit.name}:", output)
+
+    def test_delegate_without_a_server_is_silent_but_a_live_server_keeps_the_role_problem(self) -> None:
+        _ = self.session_record("director", "models-unit")
+        self.pane("w1:models", session_id="director", environment={"STAFF_ID": self.fixture.unit.id})
+        delegate_root = self.source_root / "delegate"
+        with (mock.patch.object(unit_runs, "FORMER_RUN_ROOT", delegate_root),
+              mock.patch.dict(os.environ, {"ROSTER_RUN_ROOT": str(delegate_root)})):
+            run = self.worker_run("sdlc", "models-unit", "director")
+            roster = self.roster_worker(run, "delegate", "", "thread-paused", status="paused")
+            server = run / "mesh_server.json"
+            server_record = server.read_text()
+            server.unlink()
+            before = self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns
+            for server_present in (False, True):
+                with self.subTest(server_present=server_present):
+                    if server_present:
+                        _ = server.write_text(server_record)
+                    workers = staff_sources.observe_workers(staff.snapshot(), unit_lookup.member_sources())
+                    evidence = replace(self.fixture.evidence, workers=workers)
+                    code, output = self.check(evidence)
+                    if server_present:
+                        self.assertEqual(code, 1, output)
+                        self.assertIn(str(roster), output)
+                        self.assertIn("missing or invalid recorded worker role", output)
+                    else:
+                        self.assertEqual((code, output), (0, "checked 3 rows; 0 wrong\n"))
+                        self.assertEqual(workers.workers, ())
+                        self.assertEqual(workers.diagnostics, ())
+                    self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), before)
+                    self.assertNotIn("delegate", [row.name for row in staff.find(kind="worker")])
 
     def test_a_paused_worker_without_a_recorded_role_remains_an_audit_problem(self) -> None:
         _ = self.session_record("session-models", "models-unit")
