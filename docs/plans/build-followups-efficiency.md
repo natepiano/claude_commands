@@ -173,3 +173,47 @@ The one style block in `render_markdown` keeps top-level text in a centered 48re
 **Gotchas:** files that `.envrc` loads, for example `flake.nix`, are not checked and may differ from the source commit. A `GIT_DIR` in the caller's environment would redirect both git calls to another repository, so `_git_environment()` is the only environment either call gets.
 
 **Ruled out:** a blanket `direnv allow` for every copy; checking the files that `.envrc` loads.
+
+### Phase 16 — nix_env reads the copy record without importing scratch  · status: done
+
+**Source:** the showrunner of natedev, 2026-10-31: main's basedpyright gate shows import-cycle errors from phase 15; sdlc's merges wait on the fix.
+
+**Defect:** `nix_env.registered_copy` imports `scripts.lib.scratch`. `scratch.py` reaches `unit_lookup` → `herdr` → `nix_env`, and `codex_mesh` / `mesh_runs` import `nix_env`, so a full-tree `basedpyright` on `origin/main` reports `Cycle detected in import chain` (17 errors; every chain holds the edge `nix_env.py → scratch.py`). basedpyright counts function-local imports.
+
+#### Work Order
+
+**Goal:** `nix_env` reads a copy's record through a leaf module, so a full-tree `basedpyright` reports no `Cycle detected` and the type gate on main is green.
+
+**Spec:**
+A new leaf module `scripts/lib/copy_record.py` owns what `nix_env` needs to read a copy's record. It imports nothing from `scripts` (standard library only; keep the `from __future__ import annotations` style `scratch.py` uses). It takes these names from `scripts/lib/scratch.py`, and their definitions are deleted there: `ROOT_ENV`, `DEFAULT_ROOT`, `COPIES_ENV`, `RECORD`, `TASK`, `root()`, `copies_root()`, `copy_folder()`, `Registered`, `NotRegistered`, `UnreadableRecord` and `read_record()` (scratch.py lines 77-80, 97, 108-116, 155-168, 434-435, 591-602 at 57914ed2). The module docstring says in one or two lines what it holds and why it is a leaf: `nix_env` imports it, and `scratch.py` reaches `herdr`, which imports `nix_env`. Add a name to the list only when a listed name needs it (for example `root()` needs `ROOT_ENV` and `DEFAULT_ROOT`; `read_record` needs `TASK`, `json`, `cast`); no other `scratch.py` name moves.
+
+One owner switches every caller. For each moved name, use LSP `findReferences` and change every reference to `copy_record.<name>`, in `scratch.py` and in every other file: code, tests and `docs/`. `scratch.py` and every other module call through the module (`from scripts.lib import copy_record`, then `copy_record.copy_folder(...)`), never `from scripts.lib.copy_record import name`, so one `mock.patch.object(copy_record, "copy_folder", ...)` reaches every caller. `scripts/production/test_merge_gate_suites_resources.py:118` must patch `copy_record.copy_folder` after the move. No alias, re-export, wrapper or second copy of a moved name stays in `scratch.py`. `scratch.py` keeps its own constants and types that the moved code does not need.
+
+`scripts/lib/nix_env.py` `registered_copy` imports `copy_record` (function-local, as `scratch` was now) instead of `scratch` and uses `copy_record.RECORD`, `copy_record.copy_folder`, `copy_record.read_record`, `copy_record.Registered`. Its rule, its git calls, its `sys.path` handling and its tests do not change except for the renamed references; the `sys.path` insert stays because `copy_record` is imported by its package path.
+
+Docs: `docs/as-built/nix-shell-launch.md` must name `copy_record.copy_folder` / `copy_record.read_record` / `copy_record.Registered`. Grep `docs/` for every other doc that names a moved symbol with a `scratch.` prefix (`docs/plans/builds-resources.md` has one: read it; correct it if it states how things are now, leave it if it records a finished phase). Add a short as-built line for `copy_record.py` to `docs/as-built/nix-shell-launch.md` only if that doc already describes the record reader; otherwise do not add a new doc.
+
+**Files:**
+- `scripts/lib/copy_record.py` — new leaf module (the moved definitions).
+- `scripts/lib/scratch.py` — moved definitions deleted; calls through `copy_record`.
+- `scripts/lib/nix_env.py` — `registered_copy` imports `copy_record`.
+- `scripts/lib/test_scratch.py`, `scripts/lib/test_nix_env.py` — references switched.
+- `scripts/lint/tmp_sweep.py`, `scripts/lint/test_tmp_sweep.py`, `scripts/lint/test_folder_audit.py` — references switched.
+- `scripts/production/test_change_review.py`, `scripts/production/test_merge_gate_suites_resources.py` — references switched; the patch target moves.
+- `docs/as-built/nix-shell-launch.md` — `copy_record` names.
+- `docs/plans/builds-resources.md` — one `scratch.` mention of a moved name; read it, correct it only if it states how things are now.
+- `pyrightconfig.json` — the `scripts/lint` execution environment gains `"."` in `extraPaths`, so `from scripts.lib import copy_record` resolves there as it does in the other environments.
+
+**Workers:** 1 writer — nothing splits: one rename-and-move across the files above, and a second writer would edit the same references.
+- `impl` — every file in Files; hub: `scripts/lib/scratch.py`.
+
+**State:** none.
+
+**Constraints from prior phases:** `registered_copy` (phase 15) runs git only in the recorded source repository with every `GIT_*` variable removed; `trusted_envrc` passes the unresolved `.envrc` path so the symlink check works; the `scratch` import was function-local after a once-only `sys.path` insert. Keep all of that; only the module name changes. basedpyright counts function-local imports in `reportImportCycles`, so a function-local import does not hide a cycle.
+
+**Acceptance gate:**
+- `python3 -m unittest scripts.lib.test_nix_env scripts.lib.test_nix_env_launches scripts.lib.test_nix_env_integration scripts.lib.test_scratch scripts.lib.test_user_zone scripts.lint.test_tmp_sweep scripts.lint.test_folder_audit scripts.production.test_change_review scripts.production.test_merge_gate_suites_resources` passes from the repo root; no assertion weakened.
+- `basedpyright` on every changed Python file reports `0 errors, 0 warnings, 0 notes`.
+- A full-tree `basedpyright` (no file arguments) from the repo root prints no `Cycle detected` line; the unit director runs it after the worker reports (it takes minutes, so the worker does not).
+- `grep -rn "scratch\.\(copy_folder\|read_record\|Registered\|NotRegistered\|UnreadableRecord\|RECORD\|TASK\|COPIES_ENV\|ROOT_ENV\|DEFAULT_ROOT\|copies_root\|root\)\b" scripts docs` finds no use of a moved name through `scratch`.
+- `docs/as-built/nix-shell-launch.md` says `copy_record`.

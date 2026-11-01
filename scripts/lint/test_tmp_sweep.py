@@ -29,6 +29,8 @@ else:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
     import sessions
 
+from scripts.lib import copy_record
+
 DAY = 86_400
 LIVE_SESSION = "11111111-2222-3333-4444-555555555555"
 ENDED_SESSION = "66666666-7777-8888-9999-000000000000"
@@ -140,7 +142,7 @@ class CopyTests(TmpSweepCase):
         path.mkdir(parents=True)
         record: dict[str, object] = {"task": "until:2000-01-01T0000Z", "owner_unit": "maker-unit"}
         record.update(fields)
-        _ = write(path / scratch.RECORD, json.dumps(record))
+        _ = write(path / copy_record.RECORD, json.dumps(record))
         self.enterContext(mock.patch.dict(os.environ, {"SCRATCH_COPIES_ROOT": str(self.tmp / "copies")}))
         self.now += 8 * DAY
         return path
@@ -153,7 +155,7 @@ class CopyTests(TmpSweepCase):
         self.assertTrue(live.exists())
         self.assertTrue(live.parent.exists())
         self.assertIn(str(self.tmp / "copies"), result.kept[tmp_sweep.ROOT])
-        _ = write(live / scratch.RECORD, json.dumps({"task": "until:2000-01-01T0000Z"}))
+        _ = write(live / copy_record.RECORD, json.dumps({"task": "until:2000-01-01T0000Z"}))
         self.now += 8 * DAY
         _ = self.sweep()
         self.assertFalse(live.parent.exists())
@@ -161,7 +163,7 @@ class CopyTests(TmpSweepCase):
 
     def test_dry_run_does_not_add_a_busy_mark_to_an_unregistered_copy(self) -> None:
         path = self.copy("unknown")
-        (path / scratch.RECORD).unlink()
+        (path / copy_record.RECORD).unlink()
         _ = self.sweep(True)
         self.assertFalse((path / scratch.BUSY).exists())
 
@@ -170,13 +172,13 @@ class CopyTests(TmpSweepCase):
         child = self.copy("child", borrows_from=str(parent / ".git"))
 
         def stopped_removal(folder: str) -> None:
-            (Path(folder) / scratch.RECORD).unlink()
+            (Path(folder) / copy_record.RECORD).unlink()
             raise OSError("stopped after record unlink")
 
         with mock.patch.object(tmp_sweep, "delete_tree", side_effect=stopped_removal):
             result = self.sweep()
         self.assertTrue(result.failed)
-        self.assertFalse((child / scratch.RECORD).exists())
+        self.assertFalse((child / copy_record.RECORD).exists())
         _ = self.sweep()
         self.assertFalse(child.exists())
         self.assertFalse(parent.exists())
@@ -208,13 +210,13 @@ class CopyTests(TmpSweepCase):
 
     def test_busy_copy_keeps_even_without_a_record_and_rechecks_before_delete(self) -> None:
         path = self.copy("busy")
-        (path / scratch.RECORD).unlink()
+        (path / copy_record.RECORD).unlink()
         with (path / ".claude-busy").open("w") as holder:
             fcntl.flock(holder, fcntl.LOCK_SH)
             result = self.sweep()
         self.assertTrue(path.is_dir())
         self.assertTrue(any("busy" in reason and str(path) in paths for reason, paths in result.kept.items()))
-        _ = write(path / scratch.RECORD, json.dumps({"task": "until:2000-01-01T0000Z"}))
+        _ = write(path / copy_record.RECORD, json.dumps({"task": "until:2000-01-01T0000Z"}))
         original = tmp_sweep.remove_entry
         with (path / ".claude-busy").open("a") as holder:
             def start_before_remove(entry: tmp_sweep.RemovableEntry, result: tmp_sweep.Sweep, dry_run: bool) -> bool:
@@ -229,7 +231,7 @@ class CopyTests(TmpSweepCase):
         progress = write(run / "progress_history_state.json", json.dumps({"phase": {"id": "21", "status": "active"}}))
         live = self.copy("phase", task="phase:maker-unit/21", run_dir=str(run), phase_id="21")
         unknown = self.copy("unknown")
-        _ = (unknown / scratch.RECORD).write_text("bad json")
+        _ = (unknown / copy_record.RECORD).write_text("bad json")
         self.now += 30 * DAY
         result = self.sweep(True)
         self.assertTrue(live.is_dir())
@@ -289,7 +291,7 @@ class CopyTests(TmpSweepCase):
         self.assertTrue(parent.is_dir())
         self.assertTrue(child.is_dir())
         self.assertTrue(any("borrow" in reason and str(parent) in paths for reason, paths in result.kept.items()))
-        _ = (child / scratch.RECORD).write_text(json.dumps({"task": "until:2000-01-01T0000Z",
+        _ = (child / copy_record.RECORD).write_text(json.dumps({"task": "until:2000-01-01T0000Z",
                                                            "borrows_from": str(parent / ".git")}))
         _ = self.sweep()
         self.assertTrue(parent.is_dir())
