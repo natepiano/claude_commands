@@ -1582,6 +1582,25 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
                         self.assertFalse(stretch["bump_sent"])
                         self.assertFalse(stretch["tell_sent"])
 
+    def test_latest_transcript_wait_on_natedev_overrides_a_stale_pane(self) -> None:
+        self.panes["unit-one"]["pane"] = "— holding: waiting on the second blind code reviewer\n"
+        transcript = self.projects / "project/sid-unit-one.jsonl"
+        waiting = "— holding: no job: waiting on natedev for the next assignment"
+        _ = transcript.write_text(json.dumps(self.said({"type": "text", "text": waiting})) + "\n")
+        os.utime(transcript, (START - 3600, START - 3600))
+        for at in (START, START + 600):
+            result = self.tick(at)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(self.sent(), [])
+        # An actual new assignment still recovers if its own work stops.
+        _ = transcript.write_text(json.dumps(self.said({"type": "text", "text": PANE})) + "\n")
+        os.utime(transcript, (START - 3600, START - 3600))
+        self.assertEqual(self.tick(START + 601).returncode, 0)
+        self.assertEqual(self.tick(START + 901).returncode, 0)
+        tell, = [item for item in self.sent() if item["key"].endswith(":tell")]
+        self.assertIn(f"Last status: {PANE.strip()}", tell["text"])
+        self.assertEqual(len(self.sent()), 2)
+
     def test_a_resumed_unit_gets_a_fresh_idle_stretch_before_its_bump(self) -> None:
         self.panes["unit-one"]["pane"] = "holding: paused until the showrunner says resume\n"
         for at in (START, START + 3600):

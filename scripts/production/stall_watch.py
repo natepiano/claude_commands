@@ -396,9 +396,9 @@ def lines_from_end(path: Path, block: int = 1 << 20) -> Iterator[bytes]:
 def transcript_turn_end(session_id: str) -> re.Match[str] | None:
     """The turn-end line closing the session's last assistant text, read from its transcript.
 
-    Compaction clears the pane, so a unit that ended its turn and then compacted while idle shows no
-    turn-end line on screen; its transcript still ends with that text. A tool call after the text
-    means the turn went on, so there is no turn-end line.
+    Read before the pane, whose text can be stale after resume or compaction. The pane supplies
+    the fallback when the transcript has no usable turn end. A tool call after the text means
+    the turn went on, so there is no turn-end line.
     """
     try:
         transcript = sessions.latest_transcript(session_id, PROJECTS_DIR)
@@ -1283,7 +1283,9 @@ def tick(now: float, *, deadline: float = math.inf) -> int:
             pending.append(retire)
         stretch = read_stretch(path, hashlib.sha256(pane.encode()).hexdigest(), now)
         turns = list(TURN_END.finditer(pane))
-        turn = turns[-1] if turns else transcript_turn_end(session_id)
+        # A resumed or compacted pane can retain an older turn. The session's last
+        # assistant text is authoritative when it supplies a turn-end status.
+        turn = transcript_turn_end(session_id) or (turns[-1] if turns else None)
         last = turn.group("status").strip() if turn else "none on screen"
         try:
             deferred = bool(turn) and status_defers_bump(last, (*(live.keys() - {name}), configured["session"], slug))
