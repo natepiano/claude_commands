@@ -182,18 +182,19 @@ class PrivateReadings:
         self.counts["host"] += 1
         return gate.read_meminfo(self.root / "meminfo")
 
-    def pressure(self, host: gate.HostMemory) -> gate.Pressure:
+    def pressure(self, host: gate.HostMemory, policy: gate.AdmissionPolicy) -> gate.Pressure:
         self.counts["pressure"] += 1
-        return gate.read_pressure(host)
+        return gate.read_pressure(host, policy=policy)
 
     def compilers(self) -> list[gate.StepMemory]:
         self.counts["compilers"] += 1
         return gate.sccache_memory()
 
     def reservation(self, path: Path, row: gate.Reservation, now: datetime,
-                    processes: dict[int, gate.ProcessIdentity], proc: Path) -> gate.StepMemory:
+                    processes: dict[int, gate.ProcessIdentity], proc: Path,
+                    policy: gate.AdmissionPolicy) -> gate.StepMemory:
         self.counts[f"reservation:{row['pid']}"] += 1
-        return gate.reservation_memory(path, row, now, processes, proc)
+        return gate.reservation_memory(path, row, now, processes, proc, policy)
 
 
 class SocketPeer:
@@ -341,7 +342,7 @@ class AdmissionFixture(ExitStack):
             capture_output=True, timeout=3, check=False)
         if probe.returncode:
             raise unittest.SkipTest("real transient scope needs a user systemd manager")
-        child: subprocess.Popen[bytes] = subprocess.Popen(["systemd-run", "--user", "--scope", "--quiet", f"--unit={unit}",
+        child: subprocess.Popen[bytes] = subprocess.Popen(["systemd-run", "--user", "--scope", "--quiet", "--expand-environment=no", f"--unit={unit}",
             "sh", "-c", "echo $$; sleep 300 & wait"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         def stop() -> None:
             _ = subprocess.run(["systemctl", "--user", "stop", unit], capture_output=True,

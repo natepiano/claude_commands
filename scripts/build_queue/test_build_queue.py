@@ -23,6 +23,7 @@ from scripts.build_queue.queue_fixture import (
 from scripts.build_queue.queue_lines import QueueLines, Span, plain, terminal_width
 from scripts.buildlog import store
 from scripts.lint import memory_admit
+from scripts.lint.test_memory_admit import write_memory_config
 from scripts.message import roster, unit_labels
 from scripts.message.unit_labels import UnitLabels, unit_labels_for
 from scripts.production import staff
@@ -49,7 +50,9 @@ class QueueTests(unittest.TestCase):
         self.fixture = self.enterContext(QueueFixture(captured=False))
         self.root = self.fixture.root
         self.labels_read = cast(LabelReadMock, self.enterContext(mock.patch.object(unit_labels, "unit_labels_for", return_value={})))
-        self.enterContext(mock.patch.dict(os.environ, {"COLUMNS": "100"}))
+        config = self.root / "lint.conf"
+        write_memory_config(config)
+        self.enterContext(mock.patch.dict(os.environ, {"COLUMNS": "100", "LINT_CONFIG_FILE": str(config)}))
 
     @staticmethod
     def entry(session: str, name: str) -> tuple[str, UnitLabels]:
@@ -60,10 +63,10 @@ class QueueTests(unittest.TestCase):
             head_facts.read_head_facts(reading), head_facts.read_pace(reading.explanation.now), zone)
 
     def render(self, view: memory_admit.QueueView, columns: int = 400) -> str:
-        return plain(queue_view.render_view(self.model(queue_read_fixture(view)), columns))
+        return plain(queue_view.render_view(self.model(queue_read_fixture(view, policy=memory_admit.DEFAULT_ADMISSION_POLICY)), columns))
 
     def checks(self, view: memory_admit.QueueView) -> str:
-        model = self.model(queue_read_fixture(view))
+        model = self.model(queue_read_fixture(view, policy=memory_admit.DEFAULT_ADMISSION_POLICY))
         return plain(queue_view.check_lines(queue_view.step_checks(model, 1), model))
 
     def invoke(self, reading: memory_admit.QueueRead, *arguments: str) -> tuple[int, str, str]:
@@ -74,6 +77,19 @@ class QueueTests(unittest.TestCase):
             status = build_queue.main()
         read.assert_called_once_with()
         return status, output.getvalue(), errors.getvalue()
+
+    def test_queue_command_warns_about_a_missing_key_once_per_process(self) -> None:
+        config = self.root / "policy.conf"
+        _ = config.write_text("[memory]\n")
+        with mock.patch.dict(os.environ, {"LINT_CONFIG_FILE": str(config)}), \
+             mock.patch.object(memory_admit, "_warned_config_fallbacks", set[memory_admit.ConfigFallback]()), \
+             mock.patch.object(memory_admit, "queue_read", return_value=memory_admit.QueueBusy()), \
+             mock.patch("sys.argv", ["build_queue.py"]), \
+             redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as errors:
+            self.assertEqual(build_queue.main(), 0)
+            self.assertEqual(build_queue.main(), 0)
+        self.assertEqual(errors.getvalue().count(
+            "memory admission: lint.conf [memory] head_seconds is missing; using 600\n"), 1)
 
     def snapshot(self, reading: memory_admit.QueueRead, *arguments: str) -> QueueLines:
         status, output, errors = self.invoke(reading, "--json", "--columns", "400", *arguments)
@@ -103,7 +119,7 @@ class QueueTests(unittest.TestCase):
                                        ((younger,), 1, "behind an older step that fits")):
             for labels in ({"older-id": UnitLabels("shown-older")}, {}):
                 with self.subTest(steps=steps, labels=labels):
-                    reading = queue_read_fixture(memory_admit.QueueView(steps, (), 20 * GIB, 0, 3 * GIB, NOW))
+                    reading = queue_read_fixture(memory_admit.QueueView(steps, (), 20 * GIB, 0, 3 * GIB, NOW), policy=memory_admit.DEFAULT_ADMISSION_POLICY)
                     model = replace(self.model(reading), labels=labels)
                     line = queue_card.order_check(model, place)
                     self.assertIn(expected, plain([line]))
@@ -111,11 +127,11 @@ class QueueTests(unittest.TestCase):
 
     def test_expired_head_json_paints_the_same_sixty_column_error_as_inline(self) -> None:
         _ = self.fixture.waiter(500, "id-expired", "expired")
-        inputs = self.fixture.inputs()
+        inputs = self.fixture.inputs(policy=memory_admit.DEFAULT_ADMISSION_POLICY)
         path, row = inputs.ordered[0]
         reading = memory_admit.queue_read_from(replace(inputs, pressure=memory_admit.NoPressureHold(),
             ordered=[(path, {**row, "estimated_at": NOW - 600})]),
-            memory_admit.resolve_admission_limits(60 * GIB))
+            memory_admit.resolve_admission_limits(60 * GIB), policy=memory_admit.DEFAULT_ADMISSION_POLICY)
         status, output, errors = self.invoke(reading, "--json", "--columns", "60")
         self.assertEqual((status, errors), (0, ""))
         data = cast(QueueLines, json.loads(output))
@@ -158,8 +174,8 @@ class QueueTests(unittest.TestCase):
 
     def test_bump_leaves_snapshot_bytes_untouched(self) -> None:
         _ = self.fixture.waiter(100, "head-id", "head")
-        inputs = self.fixture.inputs()
-        memory_admit.write_queue_snapshot(self.fixture.directory, inputs)
+        inputs = self.fixture.inputs(policy=memory_admit.DEFAULT_ADMISSION_POLICY)
+        memory_admit.write_queue_snapshot(self.fixture.directory, inputs, policy=memory_admit.DEFAULT_ADMISSION_POLICY)
         path = self.fixture.directory / "queue.json"
         before = (path.read_bytes(), path.stat().st_mtime_ns)
         with mock.patch.object(memory_admit, "queue_read", side_effect=AssertionError("bump read snapshot")):
@@ -422,7 +438,7 @@ class QueueTests(unittest.TestCase):
         waiting = memory_admit.WaitingStep(10, "worker-id", "old-name", "nextest", "/tmp/tree",
                                           NOW - 300, 12 * GIB, memory_admit.ReadyForAdmission())
         view = memory_admit.QueueView((waiting, ), running, 20 * GIB, 2 * GIB, 3 * GIB, NOW)
-        reading = queue_read_fixture(view)
+        reading = queue_read_fixture(view, policy=memory_admit.DEFAULT_ADMISSION_POLICY)
         data = self.snapshot(reading)
         status, text, errors = self.invoke(reading, "--columns", "400")
         self.assertEqual(status, 0, errors)
@@ -440,7 +456,7 @@ class QueueTests(unittest.TestCase):
         self.assertNotIn("Roster:", text)
 
     def test_json_empty_tables_are_arrays_and_do_not_invent_a_head(self) -> None:
-        data = self.snapshot(queue_read_fixture(memory_admit.QueueView((), (), 20 * GIB, 0, GIB, NOW)))
+        data = self.snapshot(queue_read_fixture(memory_admit.QueueView((), (), 20 * GIB, 0, GIB, NOW), policy=memory_admit.DEFAULT_ADMISSION_POLICY))
         self.assertIsInstance(data["lines"], list)
         text = self.snapshot_text(data)
         self.assertIn("Build queue · 10:46", text)
@@ -491,9 +507,9 @@ class QueueTests(unittest.TestCase):
             limits=memory_admit.AdmissionLimits(20 * GIB, 3 * GIB))
         row:memory_admit.Waiter = {"pid":10, "start_time":"10", "need":12 * GIB, "since":NOW - 300}
         head = memory_admit.WaitingStep(10, "head", "head-worker", "check", "/tmp/head", row["since"], 12 * GIB,
-            memory_admit.head_wait_reason(decision, 12 * GIB, 30 * GIB, row, NOW))
+            memory_admit.head_wait_reason(decision, 12 * GIB, 30 * GIB, row, NOW, policy=memory_admit.DEFAULT_ADMISSION_POLICY))
         view = memory_admit.QueueView((head,), running, 30 * GIB, 4 * GIB, 3 * GIB, NOW)
-        model = self.model(queue_read_fixture(view))
+        model = self.model(queue_read_fixture(view, policy=memory_admit.DEFAULT_ADMISSION_POLICY))
         text = self.checks(view) + "\n" + plain(queue_card.render_selection(model, "holder", 400))
         text += "\n" + plain(queue_card.render_selection(model, "starting", 400))
         self.assertIn("14.8 of 20.0 GiB held; needs 12.0", text)
@@ -534,7 +550,7 @@ class QueueTests(unittest.TestCase):
             memory_admit.ReadyForAdmission()) for index, (session, name) in enumerate(identities, 1))
         running = tuple(memory_admit.RunningStep(session, name, "clippy", f"/tmp/tree-{index}", GIB, memory_admit.MeasuredMemory(GIB))
             for index, (session, name) in enumerate(identities, 1))
-        model = self.model(queue_read_fixture(memory_admit.QueueView(waiting, running, 20 * GIB, 0, GIB, NOW)))
+        model = self.model(queue_read_fixture(memory_admit.QueueView(waiting, running, 20 * GIB, 0, GIB, NOW), policy=memory_admit.DEFAULT_ADMISSION_POLICY))
         text = "\n".join(plain(queue_card.render_selection(model, session, 400)).splitlines()[0]
                          + "\n" + plain(queue_card.render_selection(model, session, 400)).splitlines()[-1]
                          for session, _ in identities)
@@ -548,7 +564,7 @@ class QueueTests(unittest.TestCase):
         self.labels_read.return_value = {"known":UnitLabels("live-name", "builds")}
         running = (memory_admit.RunningStep("known", "old", "mend", "/tmp/tree", GIB, memory_admit.MeasuredMemory(GIB)),
             memory_admit.RunningStep("unknown", "recorded", "doc", "/tmp/other", GIB, memory_admit.MeasuredMemory(GIB)))
-        reading = queue_read_fixture(memory_admit.QueueView((), running, 20 * GIB, 0, GIB, NOW))
+        reading = queue_read_fixture(memory_admit.QueueView((), running, 20 * GIB, 0, GIB, NOW), policy=memory_admit.DEFAULT_ADMISSION_POLICY)
         status, text, errors = self.invoke(reading, "known")
         other_status, other, other_errors = self.invoke(reading, "unknown")
         self.assertEqual((other_status, other_errors), (0, ""))
@@ -562,7 +578,7 @@ class QueueTests(unittest.TestCase):
         self.labels_read.return_value = {"style-id":UnitLabels("style-impl", "cargo-liner", "cargo-liner-style-types")}
         waiting = memory_admit.WaitingStep(10, "style-id", "recorded-name", "nextest", "/tmp/style", NOW, GIB, memory_admit.ReadyForAdmission())
         running = memory_admit.RunningStep("style-id", "recorded-name", "clippy", "/tmp/style", GIB, memory_admit.MeasuredMemory(GIB))
-        status, text, errors = self.invoke(queue_read_fixture(memory_admit.QueueView((waiting, ), (running, ), 20 * GIB, 0, GIB, NOW)), "--columns", "140")
+        status, text, errors = self.invoke(queue_read_fixture(memory_admit.QueueView((waiting, ), (running, ), 20 * GIB, 0, GIB, NOW), policy=memory_admit.DEFAULT_ADMISSION_POLICY), "--columns", "140")
         self.assertEqual(status, 0, errors)
         self.assertIn("cargo-liner", text)
         self.assertIn("style-types", text)
@@ -575,7 +591,7 @@ class QueueTests(unittest.TestCase):
     def test_failed_label_files_preserve_both_steps_with_fallback_names(self) -> None:
         waiting = memory_admit.WaitingStep(10, "missing", "recorded", "nextest", "/tmp/tree", NOW, GIB, memory_admit.ReadyForAdmission())
         running = memory_admit.RunningStep("also-missing", "", "doc", "/tmp/folder", GIB, memory_admit.MeasuredMemory(GIB))
-        reading = queue_read_fixture(memory_admit.QueueView((waiting, ), (running, ), 20 * GIB, 0, GIB, NOW))
+        reading = queue_read_fixture(memory_admit.QueueView((waiting, ), (running, ), 20 * GIB, 0, GIB, NOW), policy=memory_admit.DEFAULT_ADMISSION_POLICY)
         with mock.patch.object(unit_labels, "unit_labels_for", unit_labels_for), \
              mock.patch.object(staff, "snapshot", return_value=staff.StaffSnapshot(())), \
              mock.patch.object(unit_labels, "newest_sessions", side_effect=OSError("session files unavailable")) as sessions:
@@ -617,7 +633,7 @@ class QueueTests(unittest.TestCase):
         first = memory_admit.WaitingStep(10, "head-id", "clone88ci", "nextest", "/tmp/head", NOW - 2400, GIB, memory_admit.ReadyForAdmission())
         follower = memory_admit.WaitingStep(11, "follower-id", "follower", "doc", "/tmp/follower", NOW - 300, GIB,
             memory_admit.BehindHead("clone88ci", NOW - 2400, "head-id"))
-        model = self.model(queue_read_fixture(memory_admit.QueueView((first, follower), (), 20 * GIB, 0, GIB, NOW)))
+        model = self.model(queue_read_fixture(memory_admit.QueueView((first, follower), (), 20 * GIB, 0, GIB, NOW), policy=memory_admit.DEFAULT_ADMISSION_POLICY))
         text = plain(queue_card.render_card(model, [2], 400))
         self.assertIn("organon-ci88", text)
         self.assertIn("  #1 ", text)
@@ -631,7 +647,7 @@ class QueueTests(unittest.TestCase):
         head = memory_admit.WaitingStep(
             10, "head-id", "clone88ci", "check", "/tmp/clone88", now - 2400,
             int(10.9 * GIB), memory_admit.head_wait_reason(decision, int(10.9 * GIB), int(23.1 * GIB),
-                {"pid": 10, "start_time": "10", "need": int(10.9 * GIB), "since": now - 2400}, now),
+                {"pid": 10, "start_time": "10", "need": int(10.9 * GIB), "since": now - 2400}, now, policy=memory_admit.DEFAULT_ADMISSION_POLICY),
         )
         follower = memory_admit.WaitingStep(
             11, "follower-id", "", "doc", "/tmp/tree", now - 300,
@@ -643,7 +659,7 @@ class QueueTests(unittest.TestCase):
         self.labels_read.return_value = {"head-id": UnitLabels("clone88ci", "builds", "clone88ci"),
                                          "follower-id": UnitLabels("tree", "builds", "tree")}
         text = self.checks(view)
-        rows = waiting_rows(queue_view.render_view(self.model(queue_read_fixture(view)), 400))
+        rows = waiting_rows(queue_view.render_view(self.model(queue_read_fixture(view, policy=memory_admit.DEFAULT_ADMISSION_POLICY)), 400))
         self.assertEqual(len(rows), 2)
         self.assertIn(" 40 ", rows[0])
         self.assertIn("10.9", rows[0])
@@ -682,7 +698,7 @@ class QueueTests(unittest.TestCase):
         running = (memory_admit.RunningStep("session-id", "unit", "lint", "/tmp/tree", 8 * GIB, memory_admit.MeasuredMemory(int(1.2 * GIB))),
             memory_admit.RunningStep("other-id", "link", "build", "/tmp/link", 4 * GIB, memory_admit.MeasuredMemory(5 * GIB)))
         view = memory_admit.QueueView((), running, 20 * GIB, 8 * GIB, GIB, NOW)
-        model = self.model(queue_read_fixture(view))
+        model = self.model(queue_read_fixture(view, policy=memory_admit.DEFAULT_ADMISSION_POLICY))
         text = "\n".join(plain(queue_card.render_selection(model, step.session_id, 400)) for step in running)
         rows = [row for row in text.splitlines() if "runs now:" in row]
         self.assertEqual(len(rows), 2)
@@ -695,7 +711,7 @@ class QueueTests(unittest.TestCase):
     def test_pending_and_ended_steps_do_not_report_zero_measured_use(self) -> None:
         pending = memory_admit.RunningStep("first", "", "check", "/one", 8 * GIB, memory_admit.PromisedMemory(8 * GIB))
         ended = memory_admit.RunningStep("second", "", "test", "/two", 12 * GIB, memory_admit.GoneMemory())
-        model = self.model(queue_read_fixture(memory_admit.QueueView((), (pending, ended), 20 * GIB, 8 * GIB, GIB, NOW)))
+        model = self.model(queue_read_fixture(memory_admit.QueueView((), (pending, ended), 20 * GIB, 8 * GIB, GIB, NOW), policy=memory_admit.DEFAULT_ADMISSION_POLICY))
         text = plain(queue_card.render_selection(model, "first", 400))
         row = next(row for row in text.splitlines() if "runs now:" in row)
         self.assertIn("8.0", row)
@@ -705,7 +721,7 @@ class QueueTests(unittest.TestCase):
         self.assertNotIn("0.0", row)
 
     def test_empty_queue_reads_once_without_subprocess_or_wait(self) -> None:
-        reading = queue_read_fixture(memory_admit.QueueView((), (), 20 * GIB, 0, GIB, NOW))
+        reading = queue_read_fixture(memory_admit.QueueView((), (), 20 * GIB, 0, GIB, NOW), policy=memory_admit.DEFAULT_ADMISSION_POLICY)
         output = io.StringIO()
         with mock.patch.object(memory_admit, "queue_read", return_value=reading) as read, \
              mock.patch("subprocess.run", side_effect=AssertionError("no subprocess")), \
@@ -721,7 +737,7 @@ class QueueTests(unittest.TestCase):
     def test_one_row_per_table_uses_names_and_escapes_cell_text(self) -> None:
         waiting = memory_admit.WaitingStep(10, "hidden-id", "", "doc", "/tmp/hana/", NOW - 60, GIB, memory_admit.ReadyForAdmission())
         running = memory_admit.RunningStep("other-hidden-id", "lfo|trunk\nunit", "check", "/tmp/lfo", 2 * GIB, memory_admit.MeasuredMemory(GIB))
-        model = self.model(queue_read_fixture(memory_admit.QueueView((waiting,), (running,), 20 * GIB, GIB, GIB, NOW)))
+        model = self.model(queue_read_fixture(memory_admit.QueueView((waiting,), (running,), 20 * GIB, GIB, GIB, NOW), policy=memory_admit.DEFAULT_ADMISSION_POLICY))
         text = plain(queue_card.render_selection(model, "hana", 400)) + "\n"
         text += plain(queue_card.render_selection(model, "other-hidden-id", 400))
         self.assertIn("lfo|trunk unit", text)
@@ -734,7 +750,7 @@ class QueueTests(unittest.TestCase):
             12 * GIB, memory_admit.NeedsMemory(12 * GIB, 20 * GIB)) for pid in range(10000))
         running = tuple(memory_admit.RunningStep(f"session-{pid}", "", "test", f"/tmp/tree-{pid}", 8 * GIB,
             memory_admit.MeasuredMemory(GIB)) for pid in range(10000))
-        model = self.model(queue_read_fixture(memory_admit.QueueView(waiting, running, 20 * GIB, 10 * GIB, GIB, NOW)))
+        model = self.model(queue_read_fixture(memory_admit.QueueView(waiting, running, 20 * GIB, 10 * GIB, GIB, NOW), policy=memory_admit.DEFAULT_ADMISSION_POLICY))
         started = time.perf_counter()
         lines = queue_view.render_view(model, 100)
         elapsed = time.perf_counter() - started
@@ -752,7 +768,7 @@ class QueueTests(unittest.TestCase):
         waiting = memory_admit.WaitingStep(
             10, "head-id", "unit", "nextest", "/tmp/tree", NOW - 2400, need,
             memory_admit.head_wait_reason(decision, need, available,
-                {"pid": 10, "start_time": "10", "need": need, "since": NOW - 2400}, NOW))
+                {"pid": 10, "start_time": "10", "need": need, "since": NOW - 2400}, NOW, policy=memory_admit.DEFAULT_ADMISSION_POLICY))
         view = memory_admit.QueueView((waiting, ), (), available, 0, 3 * GIB, NOW)
         text = self.checks(view)
         self.assertIn("10.9", text)
@@ -794,7 +810,7 @@ class QueueTests(unittest.TestCase):
         waiting = memory_admit.WaitingStep(
             10, "head-id", "unit", "clippy", "/tmp/tree", NOW - 2400, 3 * GIB,
             memory_admit.head_wait_reason(decision, 3 * GIB, 5 * GIB,
-                {"pid": 10, "start_time": "10", "need": 3 * GIB, "since": NOW - 2400}, NOW),
+                {"pid": 10, "start_time": "10", "need": 3 * GIB, "since": NOW - 2400}, NOW, policy=memory_admit.DEFAULT_ADMISSION_POLICY),
         )
         view = memory_admit.QueueView((waiting, ), (), 5 * GIB, 4 * GIB, 3 * GIB, NOW)
         text = self.checks(view)
@@ -817,7 +833,7 @@ class QueueTests(unittest.TestCase):
         waiting = memory_admit.WaitingStep(
             10, "waiting-id", "unit", "nextest", "/tmp/tree", NOW - 2400,
             need, memory_admit.head_wait_reason(decision, need, available,
-                {"pid": 10, "start_time": "10", "need": need, "since": NOW - 2400}, NOW),
+                {"pid": 10, "start_time": "10", "need": need, "since": NOW - 2400}, NOW, policy=memory_admit.DEFAULT_ADMISSION_POLICY),
         )
         view = memory_admit.QueueView((waiting, ), (), available, 0, 3 * GIB, NOW)
         text = self.checks(view)
@@ -829,7 +845,7 @@ class QueueTests(unittest.TestCase):
         waiting = memory_admit.WaitingStep(
             10, "waiting-id", "unit", "nextest", "/tmp/tree", NOW - 2400,
             need, memory_admit.head_wait_reason(decision, need, available,
-                {"pid": 10, "start_time": "10", "need": need, "since": NOW - 2400}, NOW),
+                {"pid": 10, "start_time": "10", "need": need, "since": NOW - 2400}, NOW, policy=memory_admit.DEFAULT_ADMISSION_POLICY),
         )
         view = memory_admit.QueueView((waiting, ), (), available, 0, 3 * GIB, NOW)
         text = self.checks(view)
@@ -841,7 +857,7 @@ class QueueTests(unittest.TestCase):
         decision = memory_admit.decide(available, 60 * GIB, need, [])
         row: memory_admit.Waiter = {"pid": 10, "start_time": "10", "need": need, "since": NOW - 300}
         head = memory_admit.WaitingStep(10, "head", "head-worker", "check", "/tmp/head", row["since"], need,
-                                       memory_admit.head_wait_reason(decision, need, available, row, NOW))
+                                       memory_admit.head_wait_reason(decision, need, available, row, NOW, policy=memory_admit.DEFAULT_ADMISSION_POLICY))
         view = memory_admit.QueueView((head, ), (), available, 0, 3 * GIB, NOW)
         with mock.patch.object(memory_admit, "decide", side_effect=AssertionError("one decision")):
             text = self.checks(view)
@@ -855,7 +871,7 @@ class QueueTests(unittest.TestCase):
                                            pressure=memory_admit.MemoryPressure(23.4))
         row: memory_admit.Waiter = {"pid": 10, "start_time": "10", "need": need, "since": NOW - 300}
         head = memory_admit.WaitingStep(10, "head", "head-worker", "check", "/tmp/head", row["since"], need,
-                                       memory_admit.head_wait_reason(decision, need, available, row, NOW))
+                                       memory_admit.head_wait_reason(decision, need, available, row, NOW, policy=memory_admit.DEFAULT_ADMISSION_POLICY))
         running = memory_admit.RunningStep("other", "other", "doc", "/tmp/other", 19 * GIB,
                                           memory_admit.MeasuredMemory(19 * GIB))
         text = self.checks(memory_admit.QueueView((head, ), (running, ), available, 0, 3 * GIB, NOW))
@@ -902,10 +918,10 @@ class QueueTests(unittest.TestCase):
                     row["priority_since"] = now
                 waiting = memory_admit.WaitingStep(
                     10, "waiting-id", "unit", "nextest", "/tmp/tree", row["since"], need,
-                    memory_admit.head_wait_reason(decision, need, available, row, now))
+                    memory_admit.head_wait_reason(decision, need, available, row, now, policy=memory_admit.DEFAULT_ADMISSION_POLICY))
                 follower = replace(waiting, pid=11, reason=memory_admit.BehindHead("unit", row["since"], "waiting-id"))
                 view = memory_admit.QueueView((waiting, follower), (), available, 0, 3 * GIB, now)
-                reading = queue_read_fixture(view)
+                reading = queue_read_fixture(view, policy=memory_admit.DEFAULT_ADMISSION_POLICY)
                 head = reading.explanation.head
                 if not isinstance(head, memory_admit.HeadExplanation):
                     self.fail("fixture needs a head")
@@ -1008,7 +1024,7 @@ class QueueTests(unittest.TestCase):
         self.assertIn("/build:queue bump <unit>", docs)
 
     def test_explicit_columns_override_environment_for_text_and_json(self) -> None:
-        reading = queue_read_fixture(memory_admit.QueueView((), (), 20 * GIB, 0, GIB, NOW))
+        reading = queue_read_fixture(memory_admit.QueueView((), (), 20 * GIB, 0, GIB, NOW), policy=memory_admit.DEFAULT_ADMISSION_POLICY)
         with mock.patch.dict(os.environ, {"COLUMNS":"80"}):
             for args, expected in ((["--json"], 80), (["--json", "--columns", "60"], 60)):
                 status, text, errors = self.invoke(reading, *args)
@@ -1031,7 +1047,7 @@ class QueueTests(unittest.TestCase):
                 self.assertEqual(build_queue.default_columns(), 140)
 
     def test_cli_card_no_match_succeeds_without_a_bump(self) -> None:
-        reading = queue_read_fixture(memory_admit.QueueView((), (), 20 * GIB, 0, GIB, NOW))
+        reading = queue_read_fixture(memory_admit.QueueView((), (), 20 * GIB, 0, GIB, NOW), policy=memory_admit.DEFAULT_ADMISSION_POLICY)
         with mock.patch.object(memory_admit, "run_priority", side_effect=AssertionError("card cannot move queue")):
             status, text, errors = self.invoke(reading, "nobody")
         self.assertEqual((status, text, errors), (0, "No waiting or running step matches nobody.\n", ""))
