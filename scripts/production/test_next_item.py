@@ -171,6 +171,20 @@ class NextItemTests(unittest.TestCase):
         self.assertEqual(urgency.pinned(queue.name), "C1")
         self.assertEqual(urgency.ended(queue.name), {})
 
+    def test_prepared_changes_keep_the_queue_order_and_move_without_reading_the_lists_again(self) -> None:
+        prepared = change_review.ChangeQueue("change-demo", change_review.row_entries([
+            {"#": "C1", "Change": "First", "Merged": "2026-10-01"},
+            {"#": "C2", "Change": "Second", "Merged": "2026-10-02"},
+        ]))
+        with mock.patch.object(change_review, "change_queue", side_effect=AssertionError("list read")), \
+                mock.patch.object(next_item, "read_queue", side_effect=AssertionError("queue read")):
+            queue = next_item.change_queue(PRODUCTION, prepared=prepared)
+            self.assertEqual([entry.item for entry in queue.entries], [
+                "C1 First\n  How to check: \n  Merged: 2026-10-01", "C2 Second\n  How to check: \n  Merged: 2026-10-02"])
+            self.assertEqual(next_item.move_to_end("change", PRODUCTION, key="C1", prepared=prepared),
+                             "change: moved C1 to the end")
+        self.assertEqual([entry.key for entry in urgency.queue_order(queue.entries, queue.name)], ["C2", "C1"])
+
     def test_the_efficiency_and_change_lists_read_their_real_files(self) -> None:
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         _ = unit_membership("demo", "fixture-unit")
