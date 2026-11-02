@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Delete a wrapped production's reminder state, counts, reports and state folder.
 
-Closed question records remain in the proposals store.
+Closed question records remain in the production's question folder.
 
 Usage: tidy_wrapped.py <production doc>...
 
@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import production_units
+from proposals_folder import issues_folder
 
 if TYPE_CHECKING:
     from update_registration import QuestionStaff
@@ -46,15 +47,22 @@ def owned_paths(slug: str) -> tuple[Path, ...]:
             STATE_DIR / "reports" / f"{slug}.json", STATE_DIR / slug)
 
 
+def can_hold_questions(document: Path) -> bool:
+    """Check for question storage before reading the staff record."""
+    return issues_folder(document) is not None or any(
+        path.is_dir() for path in STATE_DIR.glob("*/questions")
+    )
+
+
 def tidy(slug: str, document: Path | None = None, *, identities: QuestionStaff | None = None) -> list[Path]:
     """Close the production's questions and delete its state files."""
-    from update_registration import QuestionStaff, close_questions
-    from proposals_folder import issues_folder
+    from update_registration import QuestionFolder, QuestionStaff, close_questions, question_folder
 
     paths = owned_paths(slug)
-    if document is not None and issues_folder(document) is not None:
+    if document is not None and can_hold_questions(document):
         identities = identities if identities is not None else QuestionStaff.read()
-        close_questions(document, identities)
+        if isinstance(question_folder(document, identities), QuestionFolder):
+            close_questions(document, identities)
     removed: list[Path] = []
     for path in paths:
         if path.is_dir() and not path.is_symlink():
@@ -86,15 +94,14 @@ def main(argv: list[str]) -> int:
         print("usage: tidy_wrapped.py <production doc>...", file=sys.stderr)
         return 2
     from update_registration import QuestionStaff, RegistrationFailure
-    from proposals_folder import issues_folder
 
     identities: QuestionStaff | None = None
     failed = False
     for name in argv:
         try:
             slug = wrapped_slug(Path(name))
-            if issues_folder(Path(name)) is not None:
-                identities = identities if identities is not None else QuestionStaff.read()
+            if identities is None and can_hold_questions(Path(name)):
+                identities = QuestionStaff.read()
             removed = tidy(slug, Path(name), identities=identities)
         except (TidyRefused, RegistrationFailure, OSError, UnicodeError, ValueError) as error:
             print(f"kept: {error}", file=sys.stderr)
