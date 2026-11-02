@@ -17,6 +17,7 @@ from typing import cast, final, override
 from unittest.mock import patch
 
 from scripts.agents import codex_mesh, test_codex_mesh as mesh_fixture
+from scripts.production.staff_test_support import fixture_runtime_id
 from scripts.direct import workers
 from scripts.direct.recorder_fixture import communicate_launcher, invoke_recorder
 
@@ -152,8 +153,22 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
         from scripts.production import staff
         _ = self.successful()
         name = next(iter(self.assignment_records()))
-        rows = staff.snapshot().find(kind="worker", parent=staff.StaffId(os.environ["STAFF_ID"]))
+        rows = staff.snapshot().find(kind="worker", parent=staff.StaffId(os.environ["CODEX_THREAD_ID"]))
         self.assertEqual([row.name for row in rows], [name])
+
+    def test_assignment_dispatch_uses_the_backend_thread_as_the_published_worker_id(self) -> None:
+        from scripts.production import staff
+        _ = self.successful()
+        records = self.assignment_records()
+        self.assertEqual(len(records), 1)
+        name, record = next(iter(records.items()))
+        thread = str(record["thread_id"])
+        row = staff.by_id(staff.StaffId(thread))
+        self.assertIsNotNone(row)
+        assert row is not None
+        self.assertEqual((row.id, row.name, row.parent), (thread, name, os.environ["CODEX_THREAD_ID"]))
+        self.assertTrue(self.claims)
+        self.assertTrue(all(str(entry["thread_id"]) == row.id for entry in self.claims))
 
     def test_unreadable_staff_starts_no_worker(self) -> None:
         record = Path(os.environ["STAFF_FILE"])
@@ -409,7 +424,7 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
         _ = self.successful("review", "--lens", "contract", "--pass", "1")
         name, before = next(iter(self.assignment_records().items()))
         self.failing_method = "thread/resume"
-        self.next_thread_id = "replacement-implementation-thread"
+        self.next_thread_id = fixture_runtime_id("replacement-implementation-thread")
         _ = self.successful("implement", "--to", name)
         after = self.assignment_records()[name]
         self.assertNotEqual(after["thread_id"], before["thread_id"])
@@ -504,7 +519,7 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
 
     def test_two_implementation_workers_have_distinct_board_slot_keys(self) -> None:
         _ = self.successful("implement", "--new-worker", "impl")
-        self.next_thread_id = "second-implementation-thread"
+        self.next_thread_id = fixture_runtime_id("second-implementation-thread")
         _ = self.successful("implement", "--new-worker", "impl2")
         registrations = [line for line in (self.session_dir / "board.log").read_text().splitlines()
                          if "] register:" in line]
@@ -551,16 +566,18 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
         shutil.rmtree(self.history)
         shutil.rmtree(self.session_dir / "phases", ignore_errors=True)
         script, prepared = self.prepare_launcher()
-        director = "fresh-assignment-director"
-        transcript = Path.home() / ".claude/projects/assign-fixture" / f"{director}.jsonl"
+        director = os.environ["CODEX_THREAD_ID"]
+        transcript = Path.home() / ".codex/sessions" / f"rollout-{director}.jsonl"
         transcript.parent.mkdir(parents=True, exist_ok=True)
-        _ = transcript.write_text(json.dumps({"type": "assistant", "message": {"model": "fixture-director"},
-                                              "effort": "high"}) + "\n")
+        _ = transcript.write_text("\n".join(json.dumps(record) for record in (
+            {"type": "session_meta", "payload": {"id": director}},
+            {"type": "turn_context", "payload": {"model": "fixture-director", "effort": "high"}},
+        )) + "\n")
         self.addCleanup(transcript.unlink, missing_ok=True)
         environment = os.environ.copy()
         for key in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "UNIT_RUN_DIR", "UNIT_SESSION_DIR"):
             _ = environment.pop(key, None)
-        environment["CLAUDE_CODE_SESSION_ID"] = director
+        environment["CODEX_THREAD_ID"] = director
         with patch.dict(os.environ, environment, clear=True):
             result = self.launch(session=False, script=script)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -571,10 +588,11 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
         self.assertTrue(any(event.get("event_type") == "pass_finished" for event in self.events()))
 
     def test_default_session_uses_the_callers_marker_instead_of_starting_another_run(self) -> None:
-        marker = Path(os.environ["UNIT_ACTIVE_DIR"]) / "fixture-caller"
+        caller = os.environ["CODEX_THREAD_ID"]
+        marker = Path(os.environ["UNIT_ACTIVE_DIR"]) / caller
         marker.parent.mkdir(parents=True, exist_ok=True)
         _ = marker.write_text(str(self.session_dir))
-        with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "fixture-caller"}):
+        with patch.dict(os.environ, {"CODEX_THREAD_ID": caller}):
             result = self.launch(session=False)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.turn_starts, 1)

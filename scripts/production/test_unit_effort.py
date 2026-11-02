@@ -24,7 +24,7 @@ from unit_effort import Ready, Skipped
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import agents_registry  # noqa: E402
-from scripts.production.staff_test_support import isolated_staff_file, unit_membership
+from scripts.production.staff_test_support import isolated_staff_file, unit_membership, fixture_runtime_id
 
 RULE_TOP = "──── review ──────────"
 RULE = "───────────────────────────"
@@ -98,13 +98,16 @@ class UnitEffortTests(unittest.TestCase):
             HostedUnit("trunk", "w3:p1", {"SHOWRUNNER_UNIT": "tool-based-ui", "SHOWRUNNER_UNIT_ID": "trunk-unit"}, screen("❯ \x1b[2mtry this\x1b[22m")),
             HostedUnit("notes", "w4:p1", {}, EMPTY),
         ]
+        identities: dict[str, str] = {}
         for unit in units:
             if "SHOWRUNNER_UNIT_ID" in unit.marks:
-                _ = unit_membership(unit.marks["SHOWRUNNER_UNIT"], unit.marks["SHOWRUNNER_UNIT_ID"])
+                row = unit_membership(unit.marks["SHOWRUNNER_UNIT"], unit.marks["SHOWRUNNER_UNIT_ID"])
+                identities[unit.session] = row.id
         fake_unit_host.write(os.environ, units)
         for index, unit in enumerate(units):
             _ = (self.records / f"{unit.session}.json").write_text(json.dumps({
-                "pid": 991001 + index * 2, "sessionId": f"id-{unit.session}", "name": unit.session,
+                "pid": 991001 + index * 2,
+                "sessionId": identities.get(unit.session, fixture_runtime_id(unit.session)), "name": unit.session,
                 "messagingSocketPath": str(self.root / f"{unit.session}.sock"), "updatedAt": 1,
                 "tmux": ""}), encoding="utf-8")
 

@@ -192,8 +192,7 @@ def session_showrunner(session_id: str, *, record: staff.StaffSnapshot,
     launches = [launch for launch in sources.launches if launch["session_id"] == session_id]
     if not launches:
         return NoSessionShowrunner()
-    environment = max(launches, key=lambda launch: launch["written_at"])["environment"]
-    row = record.by_id(staff.StaffId(environment.get("STAFF_ID", "")))
+    row = record.by_current_session(session_id)
     while row is not None:
         if row.kind == "showrunner":
             return MemberFound(row)
@@ -208,7 +207,7 @@ def unit_parent(unit: str, session_id: str = "", *, record: staff.StaffSnapshot,
     launches = [launch for launch in sources.launches if session_id and launch["session_id"] == session_id]
     environment = max(launches, key=lambda launch: launch["written_at"])["environment"] if launches else {}
     if launches:
-        row = unit_row(environment.get(UNIT_MARK, unit), record, staff_id=environment.get("STAFF_ID", ""))
+        row = unit_row(environment.get(UNIT_MARK, unit), record, staff_id=session_id)
     else:
         selected = sources.member(ObservedUnit(unit), record)
         if isinstance(selected, NoSuchMember):
@@ -400,7 +399,7 @@ def _herdr_marked(claudes: dict[int, LiveClaude], unread: UnreadAt,
         if place.session not in running:
             continue
         slug, unit = process.marks.get(PRODUCTION_MARK, ""), process.marks.get(UNIT_MARK, "")
-        staff_id = process.marks.get("STAFF_ID", "")
+        staff_id = claudes[process.pid].session_id if process.pid in claudes else ""
         if not unit and not staff_id:
             continue
         claude: Claude

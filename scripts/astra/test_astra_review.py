@@ -17,6 +17,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.astra import astra_review  # noqa: E402
 from scripts.astra import astra_work, design_roles  # noqa: E402
+from scripts.production import staff  # noqa: E402
 from scripts.astra.design_role_test_support import write_mesh_server_record  # noqa: E402
 from scripts.lib.signal_test_support import install_signal_pid_guard  # noqa: E402
 
@@ -128,6 +129,7 @@ class AstraReviewTests(unittest.TestCase):
             _ = reply.write_text("Held reviewer evidence.\n")
 
         with patch.dict(os.environ, {**self.environment, "CLAUDE_CODE_SESSION_ID": "fixture-holder"}), \
+                patch.object(staff, "runtime_id", return_value="fixture-holder"), \
                 patch.object(design_roles, "resolve_holder", return_value=design_roles.HolderReach("fixture-holder")), \
                 patch.object(design_roles, "resolve_model", return_value=("fixture-model", "xhigh")), \
                 patch.object(design_roles, "dispatch_turn", side_effect=dispatch), \
@@ -153,6 +155,7 @@ class AstraReviewTests(unittest.TestCase):
 
     def test_busy_held_reviewer_is_reported_without_a_fresh_thread_or_prompt(self) -> None:
         with patch.dict(os.environ, {**self.environment, "CLAUDE_CODE_SESSION_ID": "fixture-holder"}), \
+                patch.object(staff, "runtime_id", return_value="fixture-holder"), \
                 patch.object(design_roles, "resolve_holder", return_value=design_roles.HolderReach("fixture-holder")), \
                 patch.object(design_roles, "dispatch_turn", side_effect=AssertionError("busy role dispatched")), \
                 patch.object(astra_review, "workers_label", side_effect=AssertionError("busy role used fresh exec")), \

@@ -152,11 +152,11 @@ class RelaunchTests(ShutdownTestCase):
         environment = {"HOME": str(self.root), "PATH": os.defpath, "HERDR_ENV": "1",
             "HERDR_SESSION": "agents", "HERDR_PANE_ID": "w1:p2",
             "HERDR_PANE_RECORD_DIR": str(self.root / "panes"), "SHUTDOWN_STATE_DIR": str(self.state)}
-        marks = {"SHOWRUNNER_UNIT": "demo", "SHOWRUNNER_UNIT_ID": "alpha-unit", "STAFF_ID": "s123456789ab"}
+        marks = {"SHOWRUNNER_UNIT": "demo", "SHOWRUNNER_UNIT_ID": "alpha-unit"}
         with patch.object(pane_record, "RECORD_DIR", self.root / "panes"):
-            pane_record.write("agents", pane_record.launch("w1:p2", "conversation", str(self.root), marks, ["claude"]))
-        for identity, prompt in (("conversation", []), ("conversation", ["existing resume prompt"]),
-                                 ("wrong-conversation", []), ("conversation", [])):
+            pane_record.write("agents", pane_record.launch("w1:p2", "2d058b83-b9da-46fd-9e87-877cd3f50a52", str(self.root), marks, ["claude"]))
+        for identity, prompt in (("2d058b83-b9da-46fd-9e87-877cd3f50a52", []), ("2d058b83-b9da-46fd-9e87-877cd3f50a52", ["existing resume prompt"]),
+                                 ("8b6ff791-f212-484b-828b-8970d9524043", []), ("2d058b83-b9da-46fd-9e87-877cd3f50a52", [])):
             with self.subTest(identity=identity, prompt=prompt):
                 arguments = ["claude", "--remote-control", "alpha 2026-10-31", "--settings", "{}", "--resume", identity, *prompt]
                 child = subprocess.run([sys.executable, str(SUPERVISOR), "run", "--", *arguments],
@@ -164,10 +164,10 @@ class RelaunchTests(ShutdownTestCase):
                 self.assertEqual(child.returncode, 0, child.stderr)
                 observed = cast(dict[str, object], json.loads(output.read_text()))
                 expected = arguments[1:]
-                if identity == "conversation" and not prompt:
+                if identity == "2d058b83-b9da-46fd-9e87-877cd3f50a52" and not prompt:
                     expected = [*expected, resume_message("the herdr server restarted")]
                 self.assertEqual(observed["argv"], expected)
-                self.assertEqual(observed["marks"], marks if identity == "conversation" else {})
+                self.assertEqual(observed["marks"], marks if identity == "2d058b83-b9da-46fd-9e87-877cd3f50a52" else {})
 
     def test_staged_request_relaunches_with_same_parent_pid_and_new_environment(self) -> None:
         process = self.start(self.waiting_child())

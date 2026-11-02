@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.production.staff_test_support import fixture_member
+
 import json
 import os
 import subprocess
@@ -80,15 +82,15 @@ class UnitRenameTests(UnitRenameFixture):
 
     def test_rename_unit_preserves_staff_and_worker_identity(self) -> None:
         row = next(row for row in staff.snapshot().find(kind="unit") if row.name == "alpha")
-        worker = staff.ensure("worker", name="impl1", parent=row.id)
+        worker = fixture_member("worker", name="impl1", parent=row.id)
         self.assert_ok(self.rename("apply"))
-        self.assertEqual(staff.snapshot().by_id(row.id), staff.StaffRow(row.id, "unit", "gamma", row.parent))
+        self.assertEqual(staff.snapshot().by_id(row.id), staff.StaffRow(row.id, "unit", "gamma", row.parent, current_session=row.id))
         self.assertEqual(staff.snapshot().by_id(worker.id), worker)
         self.assertEqual(self.journal()["staff_id"], row.id)
 
     def test_taken_staff_name_refuses_before_sources_change(self) -> None:
         row = staff.snapshot().find(kind="showrunner")[0]
-        _ = staff.ensure("unit", name="gamma", parent=row.id)
+        _ = fixture_member("unit", name="gamma", parent=row.id)
         before = self.snapshot()
         failed = self.rename("apply")
         self.assertEqual(failed.returncode, 2, failed.stderr)

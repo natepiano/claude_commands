@@ -176,7 +176,18 @@ REPLY_FILE="${ARTIFACT_DIR}/impl_reply${SLOT}.txt"
 STATUS_FILE="${ARTIFACT_DIR}/impl_status${SLOT}"
 LOG_FILE="${ARTIFACT_DIR}/impl_agent${SLOT}.log"
 AGENT_FILE="${ARTIFACT_DIR}/impl_agent${SLOT}"
-BG_ID_FILE="${ARTIFACT_DIR}/impl_bg_id${SLOT}"
+# Backend observations follow the durable worker address, including a repair
+# worker dispatched through the original implementation slot.
+BG_ID_KEY="$("$PY" - "${SCRIPT_DIR}" "${SESSION_DIR}" "${MESH_NAME}" "${TEAM_ROLE}" "${PASS_KIND}" <<'PY'
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from worker_state import worker_record_path
+record = worker_record_path(Path(sys.argv[2]), sys.argv[3], sys.argv[4], role=sys.argv[5])
+print(record.stem.removeprefix("impl_worker_"))
+PY
+)"
+BG_ID_FILE="${ARTIFACT_DIR}/impl_bg_id_${BG_ID_KEY}"
 BOARD_HELPER="${SCRIPT_DIR}/board.sh"
 HEARTBEAT_HELPER="${SCRIPT_DIR}/../agents/heartbeat.sh"
 HEARTBEAT_FILE="${SESSION_DIR}/heartbeat.log"
@@ -400,7 +411,7 @@ PY
 
 # Admission precedes claims, reservations and pass/artifact publication, including attach.
 if [[ "${AGENT_FAMILY}" == "claude" ]]; then
-  PYTHONPATH="${SCRIPT_DIR}/../..${PYTHONPATH:+:${PYTHONPATH}}" "$PY" -m scripts.production.worker_fill admit --name "${MESH_NAME}" --run "${SESSION_DIR}" || exit 2
+  PYTHONPATH="${SCRIPT_DIR}/../..${PYTHONPATH:+:${PYTHONPATH}}" "$PY" -m scripts.production.worker_fill admit --name "${MESH_NAME}" --run "${SESSION_DIR}" --role "${PASS_KIND}" || exit 2
 fi
 
 "$PY" "${SCRIPT_DIR}/worker_state.py" "${SESSION_DIR}"
@@ -526,7 +537,7 @@ if [[ -n "${FOLLOW_TO}" ]]; then
   cat "${PROMPT_FILE}" > "${FOLLOW_MESSAGE}"
   printf '\n\nAs your last act, write impl_summary%s.txt, then post done on the board.\n' "${SLOT}" >> "${FOLLOW_MESSAGE}"
   if [[ "${AGENT_FAMILY}" == "claude" ]]; then
-    bash "${SCRIPT_DIR}/../agents/agent_bg.sh" --attach \
+    AGENT_BG_ROLE="${PASS_KIND}" bash "${SCRIPT_DIR}/../agents/agent_bg.sh" --attach \
       "${MESH_NAME}" "${WORKING_DIR}" "${FOLLOW_MESSAGE}" "${SUMMARY_FILE}" \
       "${LOG_FILE}" "${BG_ID_FILE}" "${AGENT_MODEL}" &
   elif [[ "${USE_CODEX_MESH}" == "1" ]]; then
@@ -541,7 +552,7 @@ if [[ -n "${FOLLOW_TO}" ]]; then
     exit 2
   fi
 elif [[ "${AGENT_FAMILY}" == "claude" ]]; then
-  AGENT_BG_WORKERS=1 AGENT_BG_EFFORT="${AGENT_EFFORT:-}" AGENT_BG_LEDGER="${SESSION_DIR}/workers" bash "${SCRIPT_DIR}/../agents/agent_bg.sh" \
+  AGENT_BG_ROLE="${PASS_KIND}" AGENT_BG_WORKERS=1 AGENT_BG_EFFORT="${AGENT_EFFORT:-}" AGENT_BG_LEDGER="${SESSION_DIR}/workers" bash "${SCRIPT_DIR}/../agents/agent_bg.sh" \
     "${MESH_NAME}" "${WORKING_DIR}" "${PROMPT_FILE}" "${SUMMARY_FILE}" \
     "${LOG_FILE}" "${BG_ID_FILE}" "${AGENT_MODEL}" &
 elif [[ "${USE_CODEX_MESH}" == "1" ]]; then

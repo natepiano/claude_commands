@@ -26,7 +26,7 @@ from scripts.agents import codex_mesh
 from scripts.direct import workers
 from scripts.direct.worker_state import worker_claim_lock, worker_record_path
 from scripts.astra import design_roles
-from scripts.production import worker_admission
+from scripts.production import staff, worker_admission
 from scripts.lib import tunables, unit_runs
 from scripts.usage.agents_log import LENSES
 
@@ -144,9 +144,10 @@ def authorized_paths(args: Arguments, cwd: Path) -> list[str]:
 
 
 def prepare_run(args: Arguments, cwd: Path, prompt: Path, env: dict[str, str]) -> tuple[Path, str]:
+    director = staff.runtime_id()
     session = args.session_dir
     if not session:
-        marker = unit_runs.marker(os.environ.get("CLAUDE_CODE_SESSION_ID", ""), os.environ.get("UNIT_ACTIVE_DIR"))
+        marker = unit_runs.marker(director, os.environ.get("UNIT_ACTIVE_DIR"))
         if marker.is_file():
             session = marker.read_text().strip()
         elif unit_runs.environ("RUN_DIR"):
@@ -172,7 +173,7 @@ def prepare_run(args: Arguments, cwd: Path, prompt: Path, env: dict[str, str]) -
         title = identity.group(2).strip() if identity else text(stored_phase.get("title")) or "Assignment"
         _ = call([PYTHON, PROGRESS, "start-phase", "--session-dir", str(run), "--phase-id", phase,
                   "--phase-title", title], env)
-    unit_runs.record_director(run, os.environ.get("CLAUDE_CODE_SESSION_ID", ""))
+    unit_runs.record_director(run, director)
     return run, phase
 
 
@@ -619,7 +620,7 @@ def main() -> int:
         worker = resolved.stdout.strip()
         reservation = workers.allocation_for_follow(run, worker)
     try:
-        _ = worker_admission.admit(worker, run)
+        _ = worker_admission.admit(worker, run, role=role)
     except ValueError as error:
         workers.release_allocation(run, worker, reservation)
         print(str(error), file=sys.stderr)

@@ -716,7 +716,7 @@ Split from 3l on 2026-10-31; the same user ask and the same sdlc acceptance as 3
 
 **Ruled out:** a new skip line kind.
 
-### Phase 3h — Staff row ids are the Claude session and Codex thread ids  · status: todo
+### Phase 3h — Staff row ids are the Claude session and Codex thread ids  · status: done
 
 **Depends on:** 3j. All identity callers and worker starters switch in this landing.
 
@@ -742,6 +742,8 @@ Split from 3l on 2026-10-31; the same user ask and the same sdlc acceptance as 3
 - `scripts/hooks/staff_session_identity.py`, `scripts/hooks/session-start-pane-record.py`, `settings.json` — new clear hook, pane recording and hook order.
 - `scripts/production/staff_test_support.py`, `scripts/production/test_staff.py`, `scripts/production/test_staff_sources.py`, `scripts/production/test_staff_check.py`, `scripts/production/test_worker_fill.py`, `scripts/production/test_worker_admission.py`, `scripts/production/test_migrate_staff_ids.py`, `scripts/production/test_add_unit.py`, `scripts/production/test_add_showrunner.py`, `scripts/production/test_add_unit_resume.py`, `scripts/production/test_add_unit_restore.py`, `scripts/production/test_retire_unit.py`, `scripts/production/test_production_lifecycle.py`, `scripts/production/test_resume_unit.py`, `scripts/production/test_promote_showrunner.py`, `scripts/production/test_completion_receipt.py`, `scripts/production/test_rename.py`, `scripts/production/test_rename_unit.py`, `scripts/production/test_transfer_unit.py`, `scripts/production/test_staff_move.py`, `scripts/production/test_unit_config.py`, `scripts/production/test_unit_lookup.py`, `scripts/production/test_session_labels.py` — fixtures and caller regressions.
 - `scripts/hooks/test_staff_session_identity.py`, `scripts/agents/test_codex_mesh.py`, `scripts/direct/test_assign_launcher.py`, `scripts/direct/test_workers.py`, `scripts/direct/test_board_json.py`, `scripts/astra/test_design_roles.py`, `scripts/herdr/test_herdr.py`, `scripts/shutdown/test_pane_record.py`, `scripts/shutdown/test_pane_restore.py`, `scripts/shutdown/test_restart.py`, `scripts/shutdown/test_stop_resume.py`, `scripts/message/test_roster.py`, `scripts/message/test_unit_labels.py`, `scripts/statusline/test_statusline.py` — starter, hook, reader and restore tests. Add each test of an identity caller found by the dispatch search to this lane before editing it.
+- `scripts/direct/implement.sh`, `scripts/ask_a_friend/launch_friend.sh`, `scripts/herdr/herdr_sessions.py`, `scripts/hooks/session-end-pane-record.py`, `scripts/message/notifier.sh`, `scripts/message/sessions.py`, `scripts/production/showrunners.py`, `scripts/statusline/statusline.sh` — identity callers the dispatch search found.
+- `scripts/agents/test_agent_bg.py`, `scripts/agents/test_agent_exec.py`, `scripts/astra/test_astra_review.py`, `scripts/direct/implement_launcher_test_support.py`, `scripts/direct/test_implement_launcher_claude.py`, `scripts/direct/test_phase_table.py`, `scripts/herdr/test_herdr_sessions.py`, `scripts/herdr/test_recorded_marks.py`, `scripts/hooks/test_berth_hook.py`, `scripts/lib/test_nix_env_launches.py`, `scripts/lib/test_relaunch.py`, `scripts/lib/test_scratch.py`, `scripts/message/test_notifier.py`, `scripts/message/test_top_level.py`, `scripts/shutdown/test_inventory.py`, `scripts/shutdown/test_shutdown_status.py`, `scripts/shutdown/test_staff_parent.py`, and the `scripts/production/` fixtures (`*_test_support.py`, `fake_unit_host.py`) and caller tests (`test_add_unit_accounts.py`, `test_add_unit_rerun.py`, `test_add_unit_staff_row.py`, `test_broadcast.py`, `test_codex_winddown.py`, `test_live_units.py`, `test_merge_checkpoint_bump.py`, `test_production_tree.py`, `test_rename_unit_*.py`, `test_rename_units.py`, `test_rename_workers.py`, `test_showrunner_parent.py`, `test_showrunner_tree.py`, `test_showrunners.py`, `test_stall_watch.py`, `test_transfer_unit_pane_shell.py`, `test_unit_effort.py`, `test_unit_operation_panes.py`, `test_waiting.py`) — their regressions, moved to native ids.
 
 
 
@@ -752,6 +754,29 @@ Split from 3l on 2026-10-31; the same user ask and the same sdlc acceptance as 3
 **Constraints from prior phases:** Phase 3j's one bound document and shared scratch-source check remain. Preserve its option-bearing app-server regression and the all-source-route scratch regression. Phase 3r keeps retired identities and configuration; current membership hides inactive rows, but stop and check retain live, unknown and duplicate process evidence. Use the one atomic writer. Later phases use native runtime lookup and these two admission types, never restore `STAFF_ID`.
 
 **Acceptance gate:** basedpyright 0/0 on changed files and callers; affected suites and full merge gate pass. Tests cover every starter, interruption after backend creation, publication refusal, failed cleanup, fresh Claude worker/unit/showrunner ids, replacement and adoption, worker-only clear, repeated clear, held and failed hooks, and remote uncertainty. Hold the clear hook before staff publication and prove that the checker lists the new session while staff bytes stay unchanged; release it and prove one atomic row/child rekey. Interrupt migration after each reference-store write and before and after the staff write; reruns finish without duplicate rows or lost facts. Publish proved retired rows, stop after one, and finish on rerun; missing evidence stays listed and gets no row. From main, take a new backup and snapshot, run migration preview, real run and rerun, compare hashes, and check runtime ids for every proved member on both machines. Two checks of that fresh state have identical output; every remaining line has a named missing fact and no fixable identity defect. A missing historical fact does not block 3h. The 3h completeness proof lists each published runtime identity and each unresolved member; later deletion gates require no unresolved identity or unfilled location. An idle shutdown-unit restart keeps its native id; no new process or launch record carries `STAFF_ID`.
+
+### Phase 3h2 — `unit <id>` tells the user about one member  · status: todo
+
+**Depends on:** 3h and its live migration (records use native ids from then on). Lands right after the live move. User ask, relayed by the sdlc showrunner (2026-11-01): "make sure there's a simple tool i can use to do a reverse lookup - command line tool - short like \"unit\" and if i do unit followe dby an ID it telle ms what i need to know about the unit."
+
+#### Work Order
+
+**Goal:** a `unit` command on PATH takes an id and prints what the user needs to know about that staff member, in a few short lines.
+
+**Spec:**
+1. **Input.** A full id or a short unique prefix of a row `id` or `current_session`, for any row kind (showrunner, unit, worker), retired rows included.
+2. **Output.** A few short lines: name, kind, parent's name, machine and worktree, branch (from git), plan doc, live tab, current session id.
+3. **Errors.** An unknown or ambiguous id prints one clear line (an ambiguous prefix names the matches) and exits non-zero.
+4. **Thin.** One command over the existing staff read (`staff.snapshot()` and the existing joins); no new data, store or cache.
+
+**Files:**
+- the `unit` command (a new script and its PATH entry), its test.
+
+**Workers:** `1 writer + 1 tester`
+
+**State:** none.
+
+**Acceptance gate:** basedpyright 0/0; its tests pass; on natedev after the live migration, `unit <prefix>` for one showrunner, one unit, one worker and one retired row each prints the fields above, and an unknown and an ambiguous prefix each print one line and exit non-zero.
 
 ### Phase 3s — The one join answers from the row  · status: todo
 

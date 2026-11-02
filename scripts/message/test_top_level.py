@@ -24,6 +24,7 @@ import herdr
 import sessions
 import top_level
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.production import staff
 
 NO_SHOWRUNNER = roster.NoShowrunner()
 NO_DIRECTOR = roster.NoDirector()
@@ -52,7 +53,7 @@ class TopLevelTests(unittest.TestCase):
             "HOME": str(self.folder), "PATH": f"{binaries}{os.pathsep}{os.environ.get('PATH', '')}",
             "SSH_RECORD": str(self.folder / "ssh.log"),
             "NOTIFIER_SESSIONS_DIR": str(self.folder),
-            "CLAUDE_CODE_SESSION_ID": "current-id", "CODEX_THREAD_ID": "",
+            "CLAUDE_CODE_SESSION_ID": "019b3a40-4250-7000-8000-000000000201", "CODEX_THREAD_ID": "",
             "BUILD_HOLD_DIR": str(self.folder / "holders"),
             "BUILD_HOLD_RELEASE_DIR": str(self.folder / "release"),
             "ROSTER_RUN_ROOT": str(self.folder / "runs"),
@@ -60,6 +61,7 @@ class TopLevelTests(unittest.TestCase):
             "PROCESS_TABLE_PS": f"cat {self.folder / 'ps'}",
         }, clear=True))
         _ = self.enterContext(environment_context)
+        _ = self.enterContext(mock.patch.object(staff, "runtime_id", return_value="019b3a40-4250-7000-8000-000000000201"))
         self.rows, self.records, self.problems = [], [], []
         self.warnings = []
         _ = self.enterContext(mock.patch.object(roster, "roster", side_effect=self.fixture_roster))
@@ -179,7 +181,7 @@ class TopLevelTests(unittest.TestCase):
         self.assertEqual(missing.session_id, "missing-id")
 
     def test_own_id_is_left_out_while_another_session_with_its_name_is_sent(self) -> None:
-        _ = self.add("shared", session_id="current-id", file_name="current")
+        _ = self.add("shared", session_id="019b3a40-4250-7000-8000-000000000201", file_name="current")
         other = self.add("shared", session_id="other-id", file_name="other")
         result, lines, errors, recorded = self.run_main()
         self.assertEqual((result, errors), (0, []))
@@ -188,7 +190,8 @@ class TopLevelTests(unittest.TestCase):
 
     def test_plain_shell_leaves_nobody_out(self) -> None:
         address = self.add("reachable")
-        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": ""}):
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": ""}), \
+                mock.patch.object(staff, "runtime_id", return_value=""):
             result, lines, errors, recorded = self.run_main()
         self.assertEqual((result, errors), (0, []))
         self.assertEqual(lines, [f"reachable\tuds:{address}"])
@@ -273,12 +276,12 @@ class TopLevelTests(unittest.TestCase):
         self.assertEqual((result, lines, errors, recorded), (0, [], [], []))
 
     def test_codex_identity_does_not_exclude_its_inherited_claude_parent(self) -> None:
-        address = self.add("parent", session_id="current-id")
+        address = self.add("parent", session_id="019b3a40-4250-7000-8000-000000000201")
         with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "codex-child"}):
             result, lines, errors, recorded = self.run_main()
         self.assertEqual((result, errors), (0, []))
         self.assertEqual(lines, [f"parent\tuds:{address}"])
-        self.assertEqual(recorded, [("parent", "current-id")])
+        self.assertEqual(recorded, [("parent", "019b3a40-4250-7000-8000-000000000201")])
 
 
 class TopLevelRunningRecordTests(unittest.TestCase):
@@ -319,6 +322,7 @@ class TopLevelRunningRecordTests(unittest.TestCase):
             "ROSTER_CODEX_SOCKET": str(self.folder / "no-daemon.sock"),
         }, clear=True))
         _ = self.enterContext(environment)
+        _ = self.enterContext(mock.patch.object(staff, "runtime_id", return_value=""))
         _ = self.enterContext(mock.patch.object(process_table, "snapshot", return_value={}))
         _ = self.enterContext(mock.patch.object(codex_daemon, "loaded_sessions", return_value=[]))
         # The roster lists herdr panes; a live herdr on the test machine would reach the real server.
@@ -329,7 +333,7 @@ class TopLevelRunningRecordTests(unittest.TestCase):
         assert started is not None
         self.process_starts[pid] = started
         record = sessions.SessionRecord(
-            pid=pid, sessionId="shared-id", name="shared", messagingSocketPath=socket_path,
+            pid=pid, sessionId="019b3a40-4250-7000-8000-000000000202", name="shared", messagingSocketPath=socket_path,
             updatedAt=updated, tmux="", formerNames=[], procStart=proc_start or started,
         )
         _ = (self.directory / f"{pid}.json").write_text(json.dumps(record), encoding="utf-8")
@@ -356,7 +360,7 @@ class TopLevelRunningRecordTests(unittest.TestCase):
         self.write_record(os.getpid(), socket_path=str(self.socket_path), updated=10)
         self.write_record(self.child_pid, socket_path="", updated=20)
         self.assertEqual(self.run_main(), (
-            0, "", "not reachable: shared [shared-id] has no messaging socket\n", [],
+            0, "", "not reachable: shared [019b3a40-4250-7000-8000-000000000202] has no messaging socket\n", [],
         ))
 
     def test_socketless_record_with_another_process_start_is_not_listed(self) -> None:
@@ -366,13 +370,14 @@ class TopLevelRunningRecordTests(unittest.TestCase):
     def test_running_session_without_socket_is_reported_and_not_recorded(self) -> None:
         self.write_record(os.getpid(), socket_path="", updated=10)
         self.assertEqual(self.run_main(), (
-            0, "", "not reachable: shared [shared-id] has no messaging socket\n", [],
+            0, "", "not reachable: shared [019b3a40-4250-7000-8000-000000000202] has no messaging socket\n", [],
         ))
 
     def test_sender_without_socket_is_left_out_by_its_session_identity(self) -> None:
         self.write_record(os.getpid(), socket_path=str(self.socket_path), updated=10)
         self.write_record(self.child_pid, socket_path="", updated=20)
-        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "shared-id"}):
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "019b3a40-4250-7000-8000-000000000202"}), \
+                mock.patch.object(staff, "runtime_id", return_value="019b3a40-4250-7000-8000-000000000202"):
             found = roster.roster(os.environ, roster.ThisMachine())
             self.assertEqual(len(found.entries), 1)
             self.assertEqual(found.entries[0].reach, roster.CannotReceiveMessages("no messaging socket"))
@@ -383,7 +388,7 @@ class TopLevelRunningRecordTests(unittest.TestCase):
         self.write_record(os.getpid(), socket_path=str(self.socket_path), updated=10)
         self.write_record(self.child_pid, socket_path=str(self.folder / "missing.sock"), updated=20)
         self.assertEqual(self.run_main(), (
-            0, "", "not reachable: shared [shared-id] has no messaging socket\n", [],
+            0, "", "not reachable: shared [019b3a40-4250-7000-8000-000000000202] has no messaging socket\n", [],
         ))
 
 

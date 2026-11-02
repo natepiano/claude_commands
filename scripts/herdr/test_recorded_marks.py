@@ -37,10 +37,10 @@ class RecordedMarksTests(unittest.TestCase):
     def test_saved_marks_require_the_live_process_conversation_and_exact_pane(self) -> None:
         pid = os.getpid()
         place = herdr.HerdrPlace("agents", "w1:p1")
-        identity = {"STAFF_ID": "s123456789ab", "SHOWRUNNER_UNIT": "demo", "SHOWRUNNER_UNIT_ID": "alpha-unit"}
-        entry = pane_record.launch(place.pane, "conversation", "/fixture", identity, ["claude"])
+        identity = {"SHOWRUNNER_UNIT": "demo", "SHOWRUNNER_UNIT_ID": "alpha-unit"}
+        entry = pane_record.launch(place.pane, "2d058b83-b9da-46fd-9e87-877cd3f50a52", "/fixture", identity, ["claude"])
         pane_record.write(place.session, entry)
-        registry = {"pid": pid, "sessionId": "conversation", "name": "alpha", "updatedAt": 1,
+        registry = {"pid": pid, "sessionId": "2d058b83-b9da-46fd-9e87-877cd3f50a52", "name": "alpha", "updatedAt": 1,
                     "messagingSocketPath": "", "procStart": sessions.process_start(pid)}
         path = self.registry / f"{pid}.json"
         row = herdr.HerdrProcess(pid, place, {}, "claude", "/fixture")
@@ -49,7 +49,7 @@ class RecordedMarksTests(unittest.TestCase):
                 with self.subTest(case=case):
                     recorded = dict(registry)
                     if case == "wrong-session":
-                        recorded["sessionId"] = "different-conversation"
+                        recorded["sessionId"] = "8b6ff791-f212-484b-828b-8970d9524043"
                     if case == "dead":
                         recorded["procStart"] = "different-process-start"
                     _ = path.write_text(json.dumps(recorded))
@@ -63,12 +63,12 @@ class RecordedMarksTests(unittest.TestCase):
 
     def test_discovery_reads_one_pane_file_and_only_missing_sessions(self) -> None:
         pid = os.getpid()
-        labels = {"STAFF_ID": "s123456789ab", "SHOWRUNNER_UNIT": "demo", "SHOWRUNNER_UNIT_ID": "alpha-unit"}
+        labels = {"SHOWRUNNER_UNIT": "demo", "SHOWRUNNER_UNIT_ID": "alpha-unit"}
         places = [herdr.HerdrPlace("agents", pane) for pane in ("w1:p1", "w2:p1", "w3:p1")]
         for place in places:
-            pane_record.write(place.session, pane_record.launch(place.pane, "conversation", "/fixture", labels, ["claude"]))
+            pane_record.write(place.session, pane_record.launch(place.pane, "2d058b83-b9da-46fd-9e87-877cd3f50a52", "/fixture", labels, ["claude"]))
         _ = (self.registry / f"{pid}.json").write_text(json.dumps({
-            "pid": pid, "sessionId": "conversation", "name": "alpha", "updatedAt": 1,
+            "pid": pid, "sessionId": "2d058b83-b9da-46fd-9e87-877cd3f50a52", "name": "alpha", "updatedAt": 1,
             "messagingSocketPath": "", "procStart": sessions.process_start(pid)}))
         rows = [herdr.HerdrProcess(pid, place, labels if index == 0 else {}, "claude", "/fixture")
                 for index, place in enumerate(places)]

@@ -3,7 +3,7 @@
 One file per herdr session, `~/.local/state/herdr-panes/<session>.json`, maps HERDR_PANE_ID to the
 launch of the Claude in that pane: its account folder, its cwd, its name and model flags and the
 environment marks it started with. The SessionStart hook (`session-start-pane-record.py`) writes
-the entry from its own Claude process at every start, resume, clear and compaction, so a pane
+the entry from its own Claude process at every start, resume and compaction, so a pane
 started by hand is covered the same as one restart or add_unit started (user, 2026-10-19).
 
 The conversation id is herdr's: its own hook keeps `agent_session` for each pane. The id here is
@@ -51,7 +51,7 @@ from probe_session import PROBE_ENV  # noqa: E402
 
 RECORD_DIR = pane_launch.record_directory()
 # The launch environment a resume must give back. Credentials never enter the record.
-KEPT_NAMES = frozenset({"ENABLE_TOOL_SEARCH", "STAFF_ID", PROBE_ENV})
+KEPT_NAMES = frozenset({"ENABLE_TOOL_SEARCH", PROBE_ENV})
 KEPT_PREFIXES = ("SHOWRUNNER_",)
 # Claude flags whose value the resume repeats; every other argument stays out of the record.
 NAME_FLAGS = frozenset({"-n", "--name"})
@@ -106,10 +106,26 @@ def launches() -> list[PaneLaunch]:
 
 def launch_for_session(session_id: str) -> PaneLaunch | None:
     """Read a conversation's newest launch, including account moves and intentional exits."""
-    matches = [entry for entry in launches() if entry["session_id"] == session_id]
+    from scripts.production import staff
+
+    owner = staff.initial_snapshot().by_current_session(session_id)
+    reference = owner.id if owner is not None else session_id
+    matches = [entry for entry in launches() if entry["session_id"] in (reference, session_id)]
     if not matches:
         return None
     return max(matches, key=lambda entry: entry["written_at"])
+
+
+def resume_launch(entry: PaneLaunch) -> PaneLaunch:
+    """Resolve a retained member reference to its current conversation for resume."""
+    from scripts.production import staff
+
+    owner = staff.initial_snapshot().by_id(staff.StaffId(entry["session_id"]))
+    if owner is None or owner.current_session == entry["session_id"]:
+        return entry
+    current = entry.copy()
+    current["session_id"] = owner.current_session
+    return current
 
 
 @contextmanager
@@ -129,7 +145,16 @@ def save(session: str, entries: dict[str, PaneLaunch]) -> None:
 
 
 def write(session: str, launch: PaneLaunch) -> None:
-    """Write the supplied launch unchanged; label recovery belongs to record_membership."""
+    """Persist a member's fixed reference; keep the supplied launch observations."""
+    from scripts.production import staff
+
+    try:
+        owner = staff.initial_snapshot().by_current_session(launch["session_id"])
+    except (staff.StaffUnreadable, OSError, ValueError):
+        owner = None
+    if owner is not None and owner.id != launch["session_id"]:
+        launch = launch.copy()
+        launch["session_id"] = owner.id
     with locked(session):
         entries = read(session)
         if entries.get(launch["pane_id"]) == launch:
@@ -144,23 +169,44 @@ def retained_environment(launch: PaneLaunch, history: Sequence[PaneLaunch]) -> d
     for previous in sorted(history, key=lambda item: item["written_at"]):
         if previous["session_id"] == launch["session_id"]:
             environment.update({key: value for key, value in previous["environment"].items()
-                                if (key in herdr.MEMBER_MARKS or key.startswith(KEPT_PREFIXES))
-                                and not (launch["environment"].get("STAFF_ID") and key in herdr.MEMBER_MARKS)})
-    environment.update(launch["environment"])
+                                if key in herdr.MEMBER_MARKS or key.startswith(KEPT_PREFIXES)})
+    environment.update({key: value for key, value in launch["environment"].items() if key != "STAFF_ID"})
     return environment
 
 
 def matching_launch(place: herdr.HerdrPlace, session_id: str) -> PaneLaunch | None:
     """A pane's retained launch is evidence only for that exact conversation."""
-    return pane_launch.matching_launch(read(place.session), place, session_id)
+    entries = read(place.session)
+    exact = pane_launch.matching_launch(entries, place, session_id)
+    if exact is not None:
+        return exact
+    from scripts.production import staff
+
+    owner = staff.initial_snapshot().by_current_session(session_id)
+    if owner is None:
+        return None
+    retained = pane_launch.matching_launch(entries, place, owner.id)
+    if retained is None:
+        return None
+    projected = retained.copy()
+    projected["session_id"] = session_id
+    return projected
 
 
 def end(session: str, pane_id: str, session_id: str) -> None:
     """Mark the pane's entry ended when it is still this conversation's."""
+    from scripts.production import staff
+
+    record = staff.initial_snapshot()
+    owner = record.by_current_session(session_id)
+    stale = record.by_id(staff.StaffId(session_id))
+    if owner is None and stale is not None:
+        return
+    reference = owner.id if owner is not None else session_id
     with locked(session):
         entries = read(session)
         entry = entries.get(pane_id)
-        if entry is None or entry["session_id"] != session_id:
+        if entry is None or entry["session_id"] not in (reference, session_id):
             return
         entry["ended"] = True
         save(session, entries)
@@ -313,6 +359,11 @@ def running_launch(record: sessions.SessionRecord, place: herdr.HerdrPlace, cwd:
         raise ValueError(f"{record['sessionId']}: process is not Claude")
     entry = launch(place.pane, record["sessionId"], cwd, environment, arguments)
     entry["name"] = record["name"]
+    entry["pid"] = record["pid"]
+    started = sessions.process_start(record["pid"])
+    if not started:
+        raise ValueError(f"{record['sessionId']}: process start is unavailable")
+    entry["proc_start"] = started
     return entry
 
 
@@ -357,7 +408,14 @@ def seed(session: str, *, select: Callable[[herdr.PaneIdentity], bool] | None = 
             print(f"{pane_id}: no conversation id for {pid}")
             continue
         cwd = found[0].get("cwd")
-        write(session, launch(pane_id, session_id, cwd if isinstance(cwd, str) else "", environment, arguments))
+        entry = launch(pane_id, session_id, cwd if isinstance(cwd, str) else "", environment, arguments)
+        entry["pid"] = pid
+        started = sessions.process_start(pid)
+        if not started:
+            print(f"{pane_id}: process start is unavailable for {pid}")
+            continue
+        entry["proc_start"] = started
+        write(session, entry)
         print(f"{pane_id}: {pane.get('label') or ''} {session_id}")
     return 0
 

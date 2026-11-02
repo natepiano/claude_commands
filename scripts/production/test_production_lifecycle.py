@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.production.staff_test_support import fixture_member
+
 import contextlib
 from dataclasses import replace
 import io
@@ -135,10 +137,10 @@ class LifecycleTests(LifecycleFixture):
         child_name = "old-showrunner" if child == "example" else child
         above = rows.get(parent_name)
         if above is None:
-            above = staff.ensure("showrunner", name=parent_name)
+            above = fixture_member("showrunner", name=parent_name)
         below = rows.get(child_name)
         if below is None:
-            _ = staff.ensure("showrunner", name=child_name, parent=above.id)
+            _ = fixture_member("showrunner", name=child_name, parent=above.id)
         elif below.parent != above.id:
             _ = staff.move(below.id, above.id)
         return path
@@ -155,12 +157,12 @@ class LifecycleTests(LifecycleFixture):
 
     def staff_tree(self) -> tuple[staff.StaffRow, staff.StaffRow, staff.StaffRow, staff.StaffRow]:
         self.merged_units()
-        top = staff.ensure("showrunner", name="top")
+        top = fixture_member("showrunner", name="top")
         runner = next(row for row in staff.find(kind="showrunner") if row.name == "old-showrunner")
         runner = staff.move(runner.id, top.id)
-        alpha = staff.ensure("unit", name="alpha", parent=runner.id)
-        beta = staff.ensure("unit", name="beta", parent=runner.id)
-        child = staff.ensure("showrunner", name="kid", parent=runner.id)
+        alpha = fixture_member("unit", name="alpha", parent=runner.id)
+        beta = fixture_member("unit", name="beta", parent=runner.id)
+        child = fixture_member("showrunner", name="kid", parent=runner.id)
         for slug in ("top", "kid"):
             self.showrunner(slug, live=slug == "top")
         _ = self.reports_to("example", "top")
@@ -206,7 +208,7 @@ class LifecycleTests(LifecycleFixture):
 
     def test_wrap_with_workers_retires_pending_ids_on_an_already_wrapped_retry(self) -> None:
         runner, alpha, beta, child = self.staff_tree()
-        worker = staff.ensure("worker", name="impl1", parent=alpha.id)
+        worker = fixture_member("worker", name="impl1", parent=alpha.id)
         result = self.run_lifecycle("wrap", "--no-ci")
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn(worker.id, result.stdout)
@@ -225,7 +227,7 @@ class LifecycleTests(LifecycleFixture):
 
     def permanent_staff_tree(self) -> tuple[staff.StaffRow, staff.StaffRow, staff.StaffRow, staff.StaffRow, staff.StaffRow]:
         runner, alpha, beta, child = self.staff_tree()
-        permanent = staff.ensure("unit", name="nightly", parent=runner.id)
+        permanent = fixture_member("unit", name="nightly", parent=runner.id)
         text = self.doc.read_text().replace("## Close-out", "| nightly-unit | permanent | /not-here | nightly | — | — | — |\n\n## Close-out")
         self.write(self.doc, text)
         _ = self.git("add", str(self.doc))
