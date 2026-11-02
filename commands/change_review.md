@@ -83,15 +83,21 @@ The row keeps its id, its Merged cell and its place. It prints the new row.
 
 ## show
 
-Only when the user asks for "change review" or "the next change"
-(`/next change`). Run `show <production>`. It prints the current row:
-its id and change, how to check it, when it merged, and how many rows wait
-after it; or `nothing to review`. Say what changed, how to try it and what the
-user sees, even if already shown, then wait for the user's verdict in their
-reply. Never use a form; ask in one plain-text line.
+When the user asks to review changes, open the prepared page:
 
-Show one row per request. After its verdict, stop: never show the next row
-until the user asks for it (user, 2026-10-20).
+```sh
+"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/review_links/change_page.py"
+```
+
+1. Check the printed link with `curl` on the publishing machine.
+2. Give the link to the user.
+
+The page contains every waiting change, with staff-based showrunner tabs.
+The user selects Next in the browser.
+Answers save in the background.
+Do not ask for a batch size or take page answers in chat.
+
+The diagnostic command `show <production>` still prints the current row and count.
 
 The list keeps the order of `/next` (`commands/next.md`): the row `show`
 printed stays first until its verdict. When the user calls a row important,
