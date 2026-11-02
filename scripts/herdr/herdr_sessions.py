@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""List, attach, start or resume standalone Claude sessions, each a tab of the shared herdr session.
+"""List, attach, start or resume standalone Claude sessions in the shared herdr session.
 
-A standalone session opens in the shared session's `ad-hoc` workspace; nothing here starts a herdr
-session of its own (user, 2026-10-26).
+Each standalone session uses a workspace with its tab name.
+This module starts no separate herdr session.
 """
 
 from __future__ import annotations
@@ -33,7 +33,6 @@ from scripts.production import staff  # noqa: E402
 
 USAGE = "usage: herdr_sessions.py list [--on <host>] | sort-tabs | attach <name> | focus <name> | attach-remote <host> <name> | start [--name N] [--cwd D] [-- <claude args>] | resume <name> --session-id ID --cwd D [--config-dir D] [--restore] [--prompt-file P] [--attach] [-- <claude args>]"
 REMOTE_LIST_TIMEOUT = 15
-ADHOC_SPACE = "ad-hoc"
 
 
 @dataclass(frozen=True)
@@ -217,7 +216,7 @@ def _launch(verb: str, arguments: list[str]) -> int:
         if verb == "resume":
             claude_arguments.extend(["--resume", options.session_id])
         claude_arguments.extend(["-n", name])
-        launched = herdr.launch_agent(shared, ADHOC_SPACE, name, str(folder), pane_environment,
+        launched = herdr.launch_agent(shared, name, name, str(folder), pane_environment,
             kind="claude", agent=name, agent_arguments=claude_arguments, opening=opening, timeout_ms=90_000)
         if isinstance(launched, herdr.nix_env.Refused):
             raise herdr.HerdrFailure(launched.reason)
