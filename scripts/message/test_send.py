@@ -62,6 +62,7 @@ from user_zone import user_zone
 from user_action import REFUSED_BEFORE_SENDING, ActionRequired, NoActionRequired, first_line
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.message.repeat_guard_test_support import install_guard_test_budget
+from scripts.accounts.home_test_support import scratch_accounts_config
 
 
 def setUpModule() -> None:
@@ -149,6 +150,7 @@ class RelayAccountTests(unittest.TestCase):
                 with (
                     self.subTest(status=status),
                     mock.patch.dict(os.environ, {"HOME": str(home)}, clear=True),
+                    scratch_accounts_config(),
                     mock.patch.object(send, "claude_binary", return_value="claude"),
                     mock.patch.object(send, "STATE", home / "message-state"),
                     mock.patch.object(send, "run", return_value=(0, stream(INIT, call(delivered), answer(OK)), "")) as launch,
@@ -174,6 +176,7 @@ class RelayAccountTests(unittest.TestCase):
                 "oauthAccount": {"emailAddress": "legacy@example.invalid"}}))
             with (mock.patch.dict(os.environ, {"HOME": str(home), "CLAUDE_CODE_SESSION_ID": "caller",
                                               "CLAUDE_CODE_REMOTE_MEMORY_DIR": "inherited-memory"}, clear=True),
+                  scratch_accounts_config(),
                   mock.patch.object(send, "claude_binary", return_value="claude"),
                   mock.patch.object(send, "STATE", home / "message-state"),
                   mock.patch.object(send, "run", return_value=(0, "", "")) as launch):

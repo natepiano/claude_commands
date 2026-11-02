@@ -10,12 +10,66 @@ from pathlib import Path
 from typing import cast
 from unittest import mock
 
-from scripts.production.update_registration_test_support import RegistrationFixture, QuestionRegistration, registration, dailies_render, review
+from scripts.production.update_registration_test_support import RegistrationFixture, QuestionRegistration, registration, review
 
 from scripts.production.update_registration_test_support import setUpModule as setUpModule
 
 
 class RegistrationTests(RegistrationFixture):
+    def test_question_without_a_proposals_line_can_be_filed_listed_and_answered(self) -> None:
+        _ = self.doc.write_text("\n".join(line for line in self.doc.read_text().splitlines()
+                                         if not line.startswith("- **Proposals:**")) + "\n")
+        owner = self.fixture_staff_id()
+        folder = self.state / "showrunner" / owner / "questions"
+        state = self.question_state([{"text": "Choose the layout", "question": "Keep this layout?"}])
+        with mock.patch.object(review, "review_question", return_value=review.QuestionAccepted("Keep this layout?")):
+            filed = self.run_command("questions", "--state", str(state))
+        self.assertEqual(filed.returncode, 0, filed.stdout + filed.stderr)
+        records = list(folder.glob("question-*.md"))
+        self.assertEqual(len(records), 1)
+        record = records[0]
+        self.assertIn(f"asked_by: {owner}", record.read_text().splitlines())
+        self.assertEqual(self.open_rows()[0]["asked_by"], owner)
+        self.assertFalse(self.outstanding().exists())
+        self.assertEqual(list((self.root / "issues").iterdir()), [])
+
+        listed = self.run_command("questions-table")
+        self.assertEqual(listed.returncode, 0, listed.stdout + listed.stderr)
+        self.assertIn("Choose the layout", listed.stdout)
+        self.assertIn("waiting for your answer", listed.stdout)
+        answered = self.run_command("answer", "--item", "Choose the layout")
+        self.assertEqual(answered.returncode, 0, answered.stdout + answered.stderr)
+        self.assertIn("answer: ok", answered.stdout)
+        self.assertIn("status: closed", record.read_text().splitlines())
+        self.assertEqual(self.open_rows(), [])
+        listed_after_answer = self.run_command("questions-table")
+        self.assertEqual(listed_after_answer.returncode, 0, listed_after_answer.stdout + listed_after_answer.stderr)
+        self.assertEqual(listed_after_answer.stdout.strip(), "no open questions")
+
+    def test_question_migration_without_a_proposals_line_preserves_records_on_a_rerun(self) -> None:
+        _ = self.doc.write_text("\n".join(line for line in self.doc.read_text().splitlines()
+                                         if not line.startswith("- **Proposals:**")) + "\n")
+        owner = self.fixture_staff_id()
+        folder = self.state / "showrunner" / owner / "questions"
+        question = {"since": "2026-10-06T08:00", "text": "Choose the layout",
+                    "question": "Keep this layout?", "asked_by": str(owner)}
+        reminder = {"since": "2026-10-06T09:00", "text": "Review the colors"}
+        legacy = self.outstanding()
+        _ = legacy.write_text(json.dumps([question, reminder]) + "\n")
+        migrated = self.run_command("migrate-questions")
+        self.assertEqual(migrated.returncode, 0, migrated.stdout + migrated.stderr)
+        records = list(folder.glob("question-*.md"))
+        self.assertEqual(len(records), 1)
+        self.assertEqual(json.loads(legacy.read_text()), [reminder])
+        self.assertEqual(next(row for row in self.open_rows() if "question" in row), question)
+        self.assertEqual(list((self.root / "issues").iterdir()), [])
+        paths = [legacy, *records]
+        before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}
+        repeated = self.run_command("migrate-questions")
+        self.assertEqual(repeated.returncode, 0, repeated.stdout + repeated.stderr)
+        self.assertEqual(list(folder.glob("question-*.md")), records)
+        self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}, before)
+
     def test_stopped_list_rewrites_keep_prior_questions_and_ask_retry_registers_once(self) -> None:
         for action in ("ask", "mark-important", "questions"):
             with self.subTest(action=action):
@@ -32,7 +86,9 @@ class RegistrationTests(RegistrationFixture):
                 real_replace = os.replace
 
                 def stop(source: Path, destination: Path) -> None:
-                    if Path(destination) == path:
+                    target = Path(destination)
+                    if target == path or (action == "ask" and target.suffix == ".md"
+                                          and "record_type: question" in Path(source).read_text()):
                         raise OSError("question list replacement stopped")
                     real_replace(source, destination)
 
@@ -42,15 +98,16 @@ class RegistrationTests(RegistrationFixture):
                     self.assertEqual(failed.returncode, 2, failed.stdout + failed.stderr)
                     self.assertIn("question list replacement stopped", failed.stdout)
                     self.assertEqual(path.read_bytes(), before)
-                    self.assertEqual([item.text for item in dailies_render.read_outstanding(path)], ["Reminder", "unit question?"])
+                    self.assertEqual([item.text for item in self.read_items(path)], ["Reminder", "unit question?"])
                     if action == "ask":
                         entries = [cast(dict[str, object], json.loads(line)) for line in history.read_text().splitlines()]
                         self.assertEqual(sum(item["text"] == "new question?" for item in entries), 1)
                     retried = self.run_command(*command)
                 self.assertEqual(retried.returncode, 0, retried.stdout + retried.stderr)
-                saved = cast(list[dict[str, object]], json.loads(path.read_text()))
+                saved = self.open_rows()
                 unit_question = next(item for item in saved if item["text"] == "unit question?")
-                self.assertEqual((unit_question["question"], unit_question["asked_by"]), ("Keep the layout?", "alpha-unit"))
+                self.assertEqual((unit_question["question"], unit_question["asked_by"]),
+                                 ("Keep the layout?", self.fixture_staff_id("alpha-unit")))
                 if action == "ask":
                     self.assertEqual(sum(item["text"] == "new question?" for item in saved), 1)
                     entries = [cast(dict[str, object], json.loads(line)) for line in history.read_text().splitlines()]
@@ -80,7 +137,7 @@ class RegistrationTests(RegistrationFixture):
                 _ = self.run_ask("retry?", "Retry it?", "alpha-unit")
             self.assertEqual((path.read_bytes(), history.read_bytes()), before)
             _ = self.run_ask("retry?", "Retry it?", "alpha-unit")
-        self.assertEqual([item.text for item in dailies_render.read_outstanding(path)], ["Reminder", "retry?"])
+        self.assertEqual([item.text for item in self.read_items(path)], ["Reminder", "retry?"])
         entries = [cast(dict[str, object], json.loads(line)) for line in history.read_text().splitlines()]
         self.assertEqual([item["text"] for item in entries], ["Earlier registration", "retry?"])
 

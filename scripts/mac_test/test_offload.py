@@ -184,9 +184,9 @@ class OffloadSettingsTests(unittest.TestCase):
             with self.subTest(answer=answer):
                 response = subprocess.CompletedProcess(["ssh"], 0, answer, "")
                 with mock.patch.object(subprocess, "run", return_value=response) as run:
-                    self.assertEqual(offload.check_leftovers(config, "kept-host", HANA), expected)
+                    self.assertEqual(offload.check_leftovers(config.connection, "kept-host", HANA), expected)
                 arguments = cast(list[str], run.call_args.args[0])
-                self.assertEqual(arguments[:-1], ["ssh", *offload.ssh_options(config), "kept-host"])
+                self.assertEqual(arguments[:-1], ["ssh", *offload.ssh_options(config.connection), "kept-host"])
                 self.assertEqual(run.call_args.kwargs["timeout"], 10)
                 self.assertIn('pgrep -u "$(id -u)" -f "$mirror_command_pattern"', arguments[-1])
                 self.assertIn(f"mirror_command_pattern={shlex.quote(HANA_COMMAND_PATTERN)}\n", arguments[-1])
@@ -194,7 +194,7 @@ class OffloadSettingsTests(unittest.TestCase):
             with self.subTest(answer=answer):
                 response = subprocess.CompletedProcess(["ssh"], 0, answer, "")
                 with mock.patch.object(subprocess, "run", return_value=response):
-                    result = offload.check_leftovers(config, "kept-host", HANA)
+                    result = offload.check_leftovers(config.connection, "kept-host", HANA)
                 self.assertIsInstance(result, offload.LeftoverCheckFailed)
                 if isinstance(result, offload.LeftoverCheckFailed):
                     self.assertIn("answer could not be read", result.reason)
@@ -205,14 +205,14 @@ class OffloadSettingsTests(unittest.TestCase):
                                 (FileNotFoundError("ssh missing"), "could not start")):
             with self.subTest(error=type(error).__name__):
                 with mock.patch.object(subprocess, "run", side_effect=error):
-                    result = offload.check_leftovers(config, "kept-host", HANA)
+                    result = offload.check_leftovers(config.connection, "kept-host", HANA)
                 self.assertIsInstance(result, offload.LeftoverCheckFailed)
                 if isinstance(result, offload.LeftoverCheckFailed):
                     self.assertIn(expected, result.reason)
                     self.assertIn("10", result.reason)
         response = subprocess.CompletedProcess(["ssh"], 255, "", "connection\n refused\tby host")
         with mock.patch.object(subprocess, "run", return_value=response):
-            result = offload.check_leftovers(config, "kept-host", HANA)
+            result = offload.check_leftovers(config.connection, "kept-host", HANA)
         self.assertIsInstance(result, offload.LeftoverCheckFailed)
         if isinstance(result, offload.LeftoverCheckFailed):
             self.assertEqual(result.reason, "connection refused by host")
@@ -223,7 +223,7 @@ class OffloadSettingsTests(unittest.TestCase):
         _ = write_config_fixture(self.settings, "leftover_timeout_s=0.125\n", template="mac_test")
         config = offload.read_config(self.settings)
         with mock.patch.object(subprocess, "run", side_effect=subprocess.TimeoutExpired("ssh", 0.125)) as run:
-            result = offload.check_leftovers(config, "kept-host", HANA)
+            result = offload.check_leftovers(config.connection, "kept-host", HANA)
         self.assertEqual(run.call_args.kwargs["timeout"], 0.125)
         self.assertEqual(result, offload.LeftoverCheckFailed("SSH leftover check timed out after 0.125 s"))
         _ = write_config_fixture(self.settings, template="mac_test")

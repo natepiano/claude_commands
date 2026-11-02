@@ -18,6 +18,7 @@ from typing import Literal, Protocol, cast
 from uuid import uuid4
 
 from scripts.accounts import role_map
+from scripts.lib import conf
 
 
 class NextMoveError(ValueError):
@@ -146,7 +147,7 @@ def resolve_hold(mode: HoldMode, label: str, now: datetime) -> ResolvedHold:
     if isinstance(mode, FixedHold):
         return ResolvedHold(mode.minutes, mode)
     pace = account_pace(label, now)
-    minutes = math.ceil(30 / pace.points_per_hour) if isinstance(pace, PaceEstimate) else 40
+    minutes = math.ceil(conf.whole("accounts", "half_point_pace_minutes") / pace.points_per_hour) if isinstance(pace, PaceEstimate) else conf.whole("accounts", "hold_default_minutes")
     return ResolvedHold(minutes, pace)
 
 

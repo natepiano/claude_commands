@@ -38,10 +38,12 @@ class WaitingChange:
     page: change_page.AssignedReviewPage | UnavailableProduction
     row: dict[str, str]
     validation_requested: bool = False
+    question: change_page.NoQuestion | change_page.OpenQuestion | change_page.AnsweredQuestion = change_page.NoQuestion()
 
     @property
     def waiting(self) -> bool:
-        return not self.row.get("Verdict") and not self.validation_requested
+        return (not self.row.get("Verdict") and not self.validation_requested
+                and not (isinstance(self.question, change_page.OpenQuestion) and self.question.awaiting_answer))
 
 
 @dataclass(frozen=True)
@@ -348,9 +350,9 @@ def prepare(browser: ReviewBrowser, status: change_page.DeliveryStatus) -> Prepa
             doc = doc or source_doc
             page = (change_page.AssignedReviewPage(path, doc, (row["#"],), row_token(browser, key), tab)
                     if isinstance(doc, Path) else doc)
-            validation = delivery.slots(change_page.ReviewPage(path, path, (row["#"],), ""), row["#"]).validation
+            slots = delivery.slots(change_page.ReviewPage(path, path, (row["#"],), ""), row["#"])
             grouped.setdefault(tab, []).append(WaitingChange(
-                key, tab, page, row, isinstance(validation, change_page.ValidationRequested)))
+                key, tab, page, row, isinstance(slots.validation, change_page.ValidationRequested), slots.question))
     queues: dict[str, change_review.ChangeQueue] = {}
     changes: list[WaitingChange] = []
     for tab, items in sorted(grouped.items()):
@@ -383,6 +385,7 @@ def prepare(browser: ReviewBrowser, status: change_page.DeliveryStatus) -> Prepa
         changes.extend(by_key[entry.key] for entry in urgency.queue_order(prepared.entries, prepared.name))
         changes.extend(item for item in items if not item.waiting)
         queues[tab] = prepared
+    queues = dict(sorted(queues.items(), key=lambda item: not item[1].entries))
     return PreparedReviews(tuple(changes), queues, delivery)
 
 
@@ -392,18 +395,23 @@ def section(change: WaitingChange, status: change_page.DeliveryReadView) -> str:
         return f'''<section hidden data-key="{html.escape(change.key)}" data-tab="{html.escape(change.tab)}" data-pending="{str(change.waiting).lower()}">
 <p class="kind">{html.escape(row.get(change_review.KIND) or 'Kind not recorded')}</p>
 <div class="id">{html.escape(change.key)}</div><h1>{html.escape(row.get('Change', ''))}</h1>
-<h2>Proof</h2><pre>{html.escape(row.get(change_review.CHECK, ''))}</pre><p>{html.escape(page.reason)}</p></section>'''
+<h2>Proof</h2><pre>{html.escape(row.get(change_review.CHECK, ''))}</pre>
+{change_page.question_html(change.question)}<p>{html.escape(page.reason)}</p></section>'''
     verdict = row.get("Verdict", "")
     intent = status.slots(page, row["#"]).selected(bool(verdict))
     notice = ""
     retry = ""
     feedback = ""
     if isinstance(intent, change_page.DeliveryIntent):
-        feedback = intent.feedback
+        feedback = change.question.text if isinstance(change.question, change_page.OpenQuestion) else intent.feedback
         notice = ("The message may not have sent" if intent.state == "pending"
-                  else "Saved, but the message did not send" if verdict else "The validation message did not send")
+                  else "Saved, but the message did not send" if verdict
+                  else "The question message did not send" if isinstance(change.question, change_page.OpenQuestion)
+                  else "The validation message did not send")
         if not verdict:
-            retry = '<button type="button" data-resend>Send validation request again</button>'
+            retry = ('<button type="button" data-resend data-outcome="retry">Send question again</button>'
+                     if isinstance(change.question, change_page.OpenQuestion)
+                     else '<button type="button" data-resend>Send validation request again</button>')
     form = change_page.answer_form(page, change_page.AnswerNotice(row["#"], feedback=feedback))
     if verdict:
         form = f'''<form method="post"><input type="hidden" name="row" value="{html.escape(row['#'])}">
@@ -411,6 +419,10 @@ def section(change: WaitingChange, status: change_page.DeliveryReadView) -> str:
 <button name="outcome" value="retry">Send saved answer again</button></form>'''
     elif change.validation_requested:
         form = ""
+    elif isinstance(change.question, change_page.OpenQuestion):
+        form = (f'''<form method="post"><input type="hidden" name="row" value="{html.escape(row['#'])}">
+<input type="hidden" name="token" value="{html.escape(page.token)}">
+<input type="hidden" name="feedback" value=""></form>''' if retry else "")
     form = form.replace('<form method="post">', f'<form method="post" action="{change_page.PAGE_NAME}">')
     saved = (f'<p>Saved: {html.escape(verdict)}</p>' if verdict else
              '<p>The showrunner will validate this</p>' if change.validation_requested else "")
@@ -420,7 +432,7 @@ def section(change: WaitingChange, status: change_page.DeliveryReadView) -> str:
 <h1>{html.escape(row.get('Change', ''))}</h1>
 <h2>{'Proof' if row.get(change_review.KIND) == 'Read only' else 'How to check'}</h2>
 <pre>{html.escape(row.get(change_review.CHECK, ''))}</pre>
-{saved}<p role="status" data-save-state>{html.escape(notice)}</p>{form}{retry}</section>'''
+{change_page.question_html(change.question)}{saved}<p role="status" data-save-state>{html.escape(notice)}</p>{form}{retry}</section>'''
 
 
 def render(browser: ReviewBrowser, status: change_page.DeliveryStatus) -> bytes:
@@ -430,9 +442,11 @@ def render(browser: ReviewBrowser, status: change_page.DeliveryStatus) -> bytes:
                    for tab in prepared.queues)
     recovery = ''.join('<p><a href="#' + html.escape(urlencode({"showrunner": item.tab, "row": item.key}))
                        + '">Message needs attention: ' + html.escape(item.key) + '</a></p>'
-                       for item in prepared.changes if item.row.get("Verdict"))
+                       for item in prepared.changes if item.row.get("Verdict") or (
+                           isinstance(item.question, change_page.OpenQuestion)
+                           and isinstance(item.question.delivery, change_page.DeliveryIntent)))
     content = ('''<style>[hidden]{display:none!important}nav{display:flex;gap:4px;overflow-x:auto;padding-bottom:8px}
-nav button{white-space:nowrap;margin:0}nav button[aria-selected=true]{outline:2px solid currentColor}
+nav button{white-space:nowrap;margin:0}nav button[aria-selected=true]{outline:2px solid currentColor;outline-offset:-2px}
 section+section{border:0;margin:0;padding:0}
 .navigation{position:sticky;bottom:0;padding:12px 0;background:Canvas}button{min-height:44px}
 </style><h1>Changes to review</h1><nav role="tablist" aria-label="Showrunner">''' + tabs + '</nav>' + recovery
@@ -443,7 +457,7 @@ section+section{border:0;margin:0;padding:0}
     return change_page.document(content)
 
 
-def submit(browser: ReviewBrowser, body: str, status: change_page.DeliveryStatus) -> tuple[change_page.MessageDelivery, str]:
+def submit(browser: ReviewBrowser, body: str, status: change_page.DeliveryStatus) -> tuple[change_page.MessageDelivery | change_page.NoMessageDelivery, str]:
     fields = parse_qs(body, keep_blank_values=True, strict_parsing=True)
     if set(fields) != {"row", "token", "outcome", "feedback"} or any(len(value) != 1 for value in fields.values()):
         raise change_page.AnswerRefused("use the answer form on this page")
@@ -483,7 +497,7 @@ def submit(browser: ReviewBrowser, body: str, status: change_page.DeliveryStatus
         queue = replace(queue, entries=[*queue.entries, replace(entry, key=change_page.queue_key(found.page, found.row["#"]))])
     delivery = change_page.submit(found.page, rewritten, status, prepared=queue)
     answer = ""
-    if fields["outcome"] != ["validate"]:
+    if fields["outcome"] not in (["validate"], ["question"]):
         answer = next(row.get("Verdict", "") for row in change_review.review_rows(found.page.review_list)
                       if row["#"] == found.row["#"])
     return delivery, answer
@@ -526,7 +540,7 @@ async function save(row,form,outcome){
   const response=await fetch(form.action,{method:'POST',body:data,headers:{Accept:'application/json'}});
   const reply=await response.json();
   if(!response.ok) throw new Error(reply.reason || 'The answer could not be saved. Try again.');
-  state.textContent=reply.answer ? 'Saved: '+reply.answer : 'The showrunner will validate this';
+  state.textContent=reply.answer ? 'Saved: '+reply.answer : outcome==='question' || row.querySelector('[data-resend][data-outcome="retry"]') ? 'The showrunner will answer this' : 'The showrunner will validate this';
   row.dataset.saveState='saved';
   row.dataset.pending='false';form.hidden=true;
   row.querySelector('[data-resend]')?.remove();
@@ -544,6 +558,6 @@ rows.forEach(row=>{
  if(!form) return;
  form.addEventListener('submit',event=>{event.preventDefault();save(row,form,event.submitter.value);});
  const retry=row.querySelector('[data-resend]');
- if(retry) retry.onclick=()=>save(row,form,'validate'); });
+ if(retry) retry.onclick=()=>save(row,form,retry.dataset.outcome || 'validate'); });
 window.addEventListener('hashchange',()=>{if(location.hash!==shownHash) navigation++;show();});show();
 '''
