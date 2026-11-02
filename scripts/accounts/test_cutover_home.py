@@ -818,7 +818,7 @@ class CodexHomeCutoverTests(unittest.TestCase):
         self.assertIn("a test wrote ~/.codex/auth.json at 2026-10-29 01:14 UTC", lines[0])
         self.assertIn("delete ~/.codex/auth.json", lines[0])
         self.assertNotIn("cutover-home", lines[0])
-        self.assertNotIn("agents/codexN.md", lines[0])
+        self.assertNotIn("~/notes/codexN.md", lines[0])
         self.assertTrue((self.source / "auth.json").exists())
 
     def test_status_merges_ordinary_unnoted_legacy_codex_repairs_without_changing_launch_error(self) -> None:
@@ -831,7 +831,7 @@ class CodexHomeCutoverTests(unittest.TestCase):
         lines = [line for line in reading.notes if "~/.codex" in line]
         self.assertEqual(len(lines), 1)
         self.assertIn("this login has no account note", lines[0])
-        self.assertIn("add ~/rust/hanadocs/agents/codexN.md with the login for ~/.codex", lines[0])
+        self.assertIn("add ~/notes/codexN.md with the login for ~/.codex", lines[0])
         self.assertIn("accounts.py cutover-home <codexN>", lines[0])
         self.assertEqual(accounts.unnoted_home_line(self.source, "codex-cutover@example.invalid"), original)
 

@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.signal_test_support import install_signal_pid_guard
 from scripts.whoami.note_file import note_name
 
+import ast
 import io
 from importlib import import_module
 import base64
@@ -35,16 +36,16 @@ from typing import Literal, Self, TextIO, TypedDict, cast, final, override
 from unittest.mock import AsyncMock, MagicMock, call, patch
 from zoneinfo import ZoneInfo
 
-from scripts.accounts.home_test_support import scratch_account_home, write_account_settings
+from scripts.accounts.home_test_support import clear_notes_directory_cache, scratch_account_home, write_account_settings
 from scripts.accounts import accounts, next_moves, refusal_watch, refusals, role_map
 from scripts.accounts.nix_env_fake import fake_nix_loader, imports_with_nix_loader, installed_program
-from scripts.lib import atomic_file
+from scripts.lib import atomic_file, conf
 from scripts.production import showrunners
 from scripts.shutdown import remote
 from scripts.agents import codex_mesh
 from scripts.message import roster
 from scripts.accounts import moves, worker_names
-from scripts.whoami import account
+from scripts.whoami import account, note_file
 from scripts.whoami import agent_accounts
 from scripts.whoami import usage_store
 import quota_alert
@@ -83,6 +84,58 @@ def setUpModule() -> None:
     root = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory())).resolve()
     _ = unittest.enterModuleContext(patch.object(accounts, "WORKERS_RUN_ROOTS", (root / "worker-runs",)))
     _ = unittest.enterModuleContext(patch.object(role_map, "is_role_map_host", return_value=True))
+
+
+
+class AccountsConfigurationTests(unittest.TestCase):
+    @override
+    def setUp(self) -> None:
+        clear_notes_directory_cache()
+        self.addCleanup(clear_notes_directory_cache)
+
+    def test_each_accounts_key_has_a_typed_reader_and_parses(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        with tempfile.TemporaryDirectory() as temporary:
+            config = Path(temporary) / "accounts.conf"
+            _ = config.write_bytes((root / "config/accounts.conf").read_bytes())
+            with patch.dict(os.environ, {"CONF_DIR": temporary}):
+                configured = conf.values("accounts")
+                readers: dict[str, set[str]] = {}
+                sources = [*(root / "scripts/accounts").glob("*.py"), root / "scripts/whoami/note_file.py"]
+                for source in sources:
+                    if source.name.startswith("test_"):
+                        continue
+                    for node in ast.walk(ast.parse(source.read_text())):
+                        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                                and isinstance(node.func.value, ast.Name) and node.func.value.id == "conf"
+                                and len(node.args) == 2 and isinstance(node.args[0], ast.Constant)
+                                and node.args[0].value == "accounts" and isinstance(node.args[1], ast.Constant)
+                                and isinstance(node.args[1].value, str)):
+                            readers.setdefault(node.args[1].value, set()).add(node.func.attr)
+                self.assertEqual(set(configured), set(readers))
+                for key, kinds in readers.items():
+                    with self.subTest(key=key):
+                        self.assertEqual(len(kinds), 1)
+                        kind = next(iter(kinds))
+                        self.assertIn(kind, ("whole", "number", "text"))
+                        if kind == "whole":
+                            self.assertEqual(conf.whole("accounts", key), int(configured[key]))
+                        elif kind == "number":
+                            self.assertEqual(conf.number("accounts", key), float(configured[key]))
+                        else:
+                            self.assertEqual(conf.text("accounts", key), configured[key])
+
+    def test_usage_age_changes_without_a_module_reload(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        with tempfile.TemporaryDirectory() as temporary:
+            config = Path(temporary) / "accounts.conf"
+            contents = (root / "config/accounts.conf").read_text()
+            _ = config.write_text(contents)
+            with patch.dict(os.environ, {"CONF_DIR": temporary}):
+                now = datetime(2026, 11, 2, tzinfo=timezone.utc)
+                self.assertTrue(cast(Callable[[datetime, datetime], bool], getattr(accounts, "_reading_is_old"))(now - timedelta(minutes=11), now))
+                _ = config.write_text(contents.replace("usage_stale_minutes=10", "usage_stale_minutes=12"))
+                self.assertFalse(cast(Callable[[datetime, datetime], bool], getattr(accounts, "_reading_is_old"))(now - timedelta(minutes=11), now))
 
 
 def failed_read_cell(read: datetime) -> str:
@@ -4152,7 +4205,7 @@ finally:
             if fault == "missing":
                 note.unlink(missing_ok=True)
                 expected_note = (f"claude2: not selectable; claude2 has no account note at {note}; "
-                    + "add ~/rust/hanadocs/agents/claudeN.md with the login for claude2; run accounts.py setup claude2")
+                    + f"add {note.parent}/claudeN.md with the login for claude2; run accounts.py setup claude2")
             else:
                 _ = note.write_text("---\nname: no login\n---\n")
                 expected_note = (f"claude2: cannot read {note}; fixture note denied; " if fault == "unreadable" else
@@ -7600,7 +7653,7 @@ class PickerTests(unittest.TestCase):
         self.assertEqual(accounts.placement("units", self.now, exclude=frozenset()).label, "claude3")
         code, stdout, stderr = self.group_cli("status")
         self.assertEqual((code, stderr), (0, ""))
-        self.assertIn(f"claude2: not selectable; claude2 has no account note at {self.home / 'notes/claude2.md'}; add ~/rust/hanadocs/agents/claudeN.md with the login for claude2; run accounts.py setup claude2", stdout.splitlines())
+        self.assertIn(f"claude2: not selectable; claude2 has no account note at {self.home / 'notes/claude2.md'}; add ~/notes/claudeN.md with the login for claude2; run accounts.py setup claude2", stdout.splitlines())
         for command in (("move", "units", "claude2"), ("move", "some-session", "claude2"),
                         ("exec", "claude2"), ("move", "units", "default")):
             with self.subTest(command=command):
@@ -7621,7 +7674,7 @@ class PickerTests(unittest.TestCase):
         self.assertEqual(accounts.group_label(groups, "units"), "home account unresolved")
         code, stdout, stderr = self.group_cli("status")
         self.assertEqual((code, stderr), (0, ""))
-        self.assertIn(f"claude2: not selectable; claude2 has no account note at {self.home / 'notes/claude2.md'}; add ~/rust/hanadocs/agents/claudeN.md with the login for claude2; run accounts.py setup claude2", stdout.splitlines())
+        self.assertIn(f"claude2: not selectable; claude2 has no account note at {self.home / 'notes/claude2.md'}; add ~/notes/claudeN.md with the login for claude2; run accounts.py setup claude2", stdout.splitlines())
         with self.assertRaisesRegex(accounts.AccountsError, "home account unresolved"):
             _ = accounts.role_account("unit")
         self.assertEqual(path.read_bytes(), original)
@@ -7635,13 +7688,13 @@ class PickerTests(unittest.TestCase):
         self.reading("Codex", "unnoted@example.invalid", 90, 1)
         self.reading("Codex", "spare@example.invalid", 50, 3)
         message = ("~/.codex — no account note, not selectable: add "
-                   "~/rust/hanadocs/agents/codexN.md with login: unnoted@example.invalid")
+                   "~/notes/codexN.md with login: unnoted@example.invalid")
         self.assert_picked("codex2", tool="codex")
         picked = accounts.pick("codex", self.now, exclude=frozenset({"codex2"}))
         self.assertIsInstance(picked, accounts.NoAccountWithRoom)
         code, stdout, stderr = self.group_cli("status")
         self.assertEqual((code, stderr), (0, ""))
-        self.assertIn("~/.codex: not selectable; this login has no account note; add ~/rust/hanadocs/agents/codexN.md with the login for ~/.codex; then run accounts.py cutover-home <codexN>", stdout.splitlines())
+        self.assertIn("~/.codex: not selectable; this login has no account note; add ~/notes/codexN.md with the login for ~/.codex; then run accounts.py cutover-home <codexN>", stdout.splitlines())
         for command in (("swap", "workers", "codex1"), ("set-role", "workers", "codex1"),
                         ("swap", "workers", "default")):
             with self.subTest(command=command):
@@ -7650,6 +7703,26 @@ class PickerTests(unittest.TestCase):
                 self.assertIn(message, stdout + stderr)
         self.assertEqual(self.group_cli("set-role", "workers", "codex2")[0], 0)
         self.assertEqual(accounts.role_account("workers").label, "codex2")
+
+    @patch.object(accounts, "is_test_login", new=provider_fixture_login)
+    def test_missing_note_repairs_name_the_configured_notes_folder(self) -> None:
+        self.codex("default", "fixture-codex")
+        notes = self.home / "configured-notes"
+        _ = (self.home / "notes").rename(notes)
+        (notes / "claude2.md").unlink()
+        (notes / "codex1.md").unlink()
+        config = Path(os.environ["CONF_DIR"]) / "accounts.conf"
+        _ = config.write_text(config.read_text().replace(
+            "notes_directory=~/rust/hanadocs/agents", f"notes_directory={notes}"))
+        clear_notes_directory_cache()
+        _ = os.environ.pop("AGENT_NOTES_DIR", None)
+        self.assertEqual(note_file.notes_dir(), notes)
+        code, stdout, stderr = self.group_cli("status", "--stored")
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertIn("add ~/configured-notes/claudeN.md with the login for claude2", stdout)
+        self.assertIn("add ~/configured-notes/codexN.md with the login for ~/.codex", stdout)
+        self.assertIn("add ~/configured-notes/codexN.md", accounts.unnoted_home_line(self.home / ".codex", "fixture"))
+        self.assertNotIn("~/rust/hanadocs/agents", stdout)
 
     def test_reports_and_refusals_never_name_an_account_default_even_with_legacy_journal(self) -> None:
         self.codex("default", "worker@example.invalid")
@@ -7842,6 +7915,20 @@ class PickerTests(unittest.TestCase):
                 result = accounts.placement(group, self.now, exclude=frozenset({"claude1", "claude2"}))
                 self.assertEqual(result.label, "claude3")
                 self.assertNotIsInstance(result.reason, accounts.GroupNoRoom)
+
+    def test_picker_messages_use_the_configured_reading_age(self) -> None:
+        config = conf.path("accounts")
+        _ = config.write_text(config.read_text().replace("usage_stale_minutes=10", "usage_stale_minutes=5"))
+        for login in ("main@example.invalid", "first@example.invalid", "third@example.invalid"):
+            self.reading("Claude", login, 50, 2, age=timedelta(minutes=6))
+        _, output, _ = self.selection(explain=True)
+        self.assertIn("has room; no reading in the last 5 minutes", output)
+        self.assertNotIn("last 10 minutes", output)
+        self.codex("codex1", "worker@example.invalid")
+        self.reading("Codex", "worker@example.invalid", 50, 2, age=timedelta(minutes=6))
+        _, output, _ = self.selection(tool="codex", explain=True)
+        self.assertIn("no reading in the last 5 minutes", output)
+        self.assertNotIn("last 10 minutes", output)
 
     def test_picker_without_fresh_readings_skips_refused_keep(self) -> None:
         usage_store.store_file().unlink()
@@ -8881,7 +8968,7 @@ class StatusProblemCauseTests(unittest.TestCase):
             with self.subTest(domain=domain):
                 lines = self.reading("fixture@" + domain).notes
                 self.assertFalse(any("test wrote" in line or "delete " in line for line in lines))
-                self.assertTrue(any("accounts.py cutover-home" in line and "add ~/rust" in line for line in lines))
+                self.assertTrue(any("accounts.py cutover-home" in line and "add ~/notes/" in line for line in lines))
 
     def test_reserved_login_reports_the_test_file_and_write_time_without_account_steps(self) -> None:
         for domain in ("invalid", "test", "example", "localhost", "one.invalid", "one.test",
@@ -8896,7 +8983,7 @@ class StatusProblemCauseTests(unittest.TestCase):
                     self.assertIn("auth.json", line)
                     self.assertIn("2026-10-29 01:14 UTC", line)
                     self.assertIn("delete ~/.codex/auth.json", line)
-                    self.assertFalse(any("cutover-home" in note or "add ~/rust" in note
+                    self.assertFalse(any("cutover-home" in note or "add ~/notes/" in note
                                          for note in reading.notes))
                     self.assertTrue(any("usage read failed" in note for note in reading.notes))
                     problems = cast(list[str], json.loads(accounts.render_status_json(reading))["problems"])
