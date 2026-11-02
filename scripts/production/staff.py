@@ -712,7 +712,11 @@ def _row_by_path(rows: Sequence[StaffRow], names: str) -> StaffRow | None:
 
 
 def _lookup(rows: list[StaffRow], target: str) -> StaffRow | None:
-    return _row_by_id(rows, StaffId(target)) or _row_by_path(rows, target)
+    record = StaffSnapshot(tuple(rows))
+    row = record.by_member_reference(target) or record.by_path(target)
+    if row is None and Path(target).is_absolute():
+        return record.by_worktree(remote.local_machine(), Path(target))
+    return row
 
 
 def by_id(staff_id: StaffId) -> StaffRow | None:
@@ -1230,7 +1234,7 @@ def _parser() -> argparse.ArgumentParser:
     _ = show.add_argument("--live", action="store_true", help="show live member identities")
     _ = show.add_argument("--under", help="parent staff id or path")
     _ = show.add_argument("--snapshot", action="store_true", help=argparse.SUPPRESS)
-    get = verbs.add_parser("get", help="find a member by id or path")
+    get = verbs.add_parser("get", help="find a member by id, names path or worktree path")
     _ = get.add_argument("target")
     add = verbs.add_parser("ensure", help=argparse.SUPPRESS)
     _ = add.add_argument("kind", choices=_KINDS)

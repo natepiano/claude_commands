@@ -378,6 +378,17 @@ class PushAuditTest(unittest.TestCase):
         self.assertIn(REGISTERED_TEXT, output)
         self.assertIn("hana", output)
 
+    def test_both_footer_generations_keep_the_registered_identity_and_body_match(self) -> None:
+        for separator in ("\n", " · "):
+            with self.subTest(separator=separator):
+                push = self.push("Footer generations", text_id=REGISTERED_TEXT)
+                push["message"] = str(push["message"]).replace("\nTemplate:", separator + "Template:")
+                self.save(self.pushes, [push])
+                self.save(self.reviews, [self.failed_review("Footer generations")])
+                output = self.report()
+                self.assertIn("ApprovedRegisteredText", detail_section(output))
+                self.assertIn(REGISTERED_TEXT, output)
+
     def test_registered_text_id_can_come_from_review_or_delivered_footer(self) -> None:
         for review_id, footer_id in ((REGISTERED_TEXT, ""), ("", REGISTERED_TEXT)):
             with self.subTest(review_id=review_id, footer_id=footer_id):
