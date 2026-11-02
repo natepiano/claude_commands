@@ -28,6 +28,39 @@ class Setting:
 Result = TypeVar("Result")
 
 
+@dataclass(frozen=True)
+class UsableLiveValue[Value]:
+    value: Value
+
+
+@dataclass(frozen=True)
+class RecoveredValue[Value]:
+    value: Value
+    reason: str
+
+
+@dataclass(frozen=True)
+class UnavailableValue:
+    reason: str
+
+
+def value_origin(file: str | Path, key: str, convert: Callable[[str], Result]
+                 ) -> UsableLiveValue[Result] | RecoveredValue[Result] | UnavailableValue:
+    """Expose live validation without granting recovered values the same guarantee."""
+    source = path(file)
+    try:
+        setting = _setting(_parse(source.read_text(encoding="utf-8")), key)
+        return UsableLiveValue(_converted(setting, convert))
+    except (OSError, UnicodeError, ValueError, ArithmeticError) as error:
+        reason = f"{source}: {key}: {error}"
+    for committed in _committed_files(source):
+        try:
+            return RecoveredValue(_converted(_setting(_parse(committed), key), convert), reason)
+        except (ValueError, ArithmeticError):
+            continue
+    return UnavailableValue(reason)
+
+
 def directory() -> Path:
     """Return the live configuration folder, or the test fixture override."""
     return Path(os.environ.get("CONF_DIR") or "~/.claude/config").expanduser()

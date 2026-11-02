@@ -50,14 +50,17 @@ from targets import (
 )
 import offload
 import mac_test
+import conf
 from atomic_file import write_text_atomic
 import build_hold
 import override_guard
 from user_zone import user_zone
 if TYPE_CHECKING:
     from ..message import roster
+    from ..aws_target import ledger as cost_ledger
 else:
     from scripts.message import roster
+    from scripts.aws_target import ledger as cost_ledger
 
 
 
@@ -244,7 +247,9 @@ def ssh_target_eligibility(target: SshTarget, repo_root: Path, package: str,
         return ExcludedTarget(target, routing.reason)
     if kind not in ("test", "check", "doc"):
         return ExcludedTarget(target, "local kind")
-    config = offload.read_config(target.settings)
+    config = ssh_target_config(target)
+    if isinstance(config, ExcludedTarget):
+        return config
     verb: offload.MacVerb = "nextest" if kind == "test" else kind
     policy = offload.mac_step_eligibility(config, repo_root, package, verb, target.name)
     if isinstance(policy, offload.IneligibleMacStep):
@@ -256,6 +261,33 @@ def ssh_target_eligibility(target: SshTarget, repo_root: Path, package: str,
     if isinstance(offload.probe_reachability(offload.ProcessController(), config), offload.UnreachableHost):
         return ExcludedTarget(target, "unreachable")
     return EligibleTarget(target)
+
+
+def aws_spending_exclusion(target: SshTarget) -> str:
+    """Check AWS spending before reading the execution settings."""
+    if target.platform != "linux" or (target.name != "aws" and target.settings.name != "aws_target.conf"):
+        return ""
+    if conf.text(target.settings, "offload") != "on":
+        return "off"
+    decision = cost_ledger.spending_guard(target.settings, mac_test.state_paths(target.name).directory)
+    if isinstance(decision, cost_ledger.SpendingAllowed):
+        return ""
+    print(f"build targets: {target.name}: spending refused: {decision.reason}", file=sys.stderr)
+    return "spending_limit" if isinstance(decision, cost_ledger.SpendingRefused) else "spending_unavailable"
+
+
+def ssh_target_config(target: SshTarget) -> offload.OffloadConfig | ExcludedTarget:
+    """Exclude unusable AWS settings without stopping selection for other targets."""
+    try:
+        reason = aws_spending_exclusion(target)
+        if reason:
+            return ExcludedTarget(target, reason)
+        return offload.read_config(target.settings)
+    except conf.Unusable as error:
+        if target.platform != "linux" or (target.name != "aws" and target.settings.name != "aws_target.conf"):
+            raise
+        print(f"build targets: {target.name}: spending refused: {error}", file=sys.stderr)
+        return ExcludedTarget(target, "spending_unavailable")
 
 
 def owns_wait_claim(paths: mac_test.StatePaths, repo_root: str, pid: int) -> bool:
@@ -271,6 +303,57 @@ def owns_wait_claim(paths: mac_test.StatePaths, repo_root: str, pid: int) -> boo
                    for claim in mac_test.read_claims(paths))
 
 
+def cleanup_refused_claims(target: SshTarget, args: CliArguments) -> None:
+    """Recover retained cleanup ownership without granting permission to execute."""
+    paths = mac_test.state_paths(target.name)
+    scope = mac_test.target_claim_scope(paths, args.repo_root)
+    if not isinstance(scope, mac_test.RepositoryScope):
+        return
+    start = mac_test.process_start_time(args.pid)
+    if start is None:
+        return
+    with mac_test.locked(paths.lock):
+        claims = tuple(claim for claim in mac_test.read_claims(paths)
+                       if mac_test.scopes_overlap(claim.scope, scope) and "remote_host" in claim.record
+                       and (mac_test.run_is_kept(claim.record)
+                            or (claim.record.get("cleanup_pending") and claim.record["pid"] == args.pid
+                                and claim.record["proc_start"] == start)))
+    if not claims:
+        return
+    try:
+        # Cleanup reads only connection settings. Execution stays disabled.
+        config = offload.OffloadConfig(
+            enabled=False, host=conf.text(target.settings, "host"),
+            connect_timeout_s=conf.number(target.settings, "connect_timeout_s"),
+            probe_timeout_s=0, unreachable_backoff_s=0, free_floor_gib=0,
+            default_target_budget_gib="", values={}, source=target.settings,
+        )
+    except conf.Unusable as error:
+        print(f"build targets: {target.name}: cleanup settings unavailable: {error}", file=sys.stderr)
+        return
+    owner = mac_test.CliArguments()
+    owner.pid = args.pid
+    for claim in claims:
+        with mac_test.locked(paths.lock):
+            if mac_test.read_run(claim.path) != claim.record or "remote_host" not in claim.record:
+                continue
+            with redirect_stdout(io.StringIO()):
+                attempt = mac_test.take_over_kept_claim(owner, claim, claim.record)
+            if not isinstance(attempt, mac_test.ClaimFinished) or attempt.status != 13:
+                continue
+        try:
+            checked = offload.check_leftovers(config, claim.record["remote_host"],
+                                              offload.KnownRepository(scope.name, scope.key), target.name,
+                                              claim.record.get("slot", 1))
+        except conf.Unusable as error:
+            print(f"build targets: {target.name}: cleanup settings unavailable: {error}", file=sys.stderr)
+            continue
+        if isinstance(checked, offload.LeftoversEnded):
+            with mac_test.locked(paths.lock):
+                if mac_test.read_run(claim.path) == claim.record:
+                    claim.path.unlink(missing_ok=True)
+
+
 def command_reserve(args: CliArguments) -> int:
     """Reserve before a queue leave; the wait process owns the reservation."""
     destination = Path(args.reservation_file)
@@ -281,9 +364,12 @@ def command_reserve(args: CliArguments) -> int:
             if settings != str(target.settings):
                 destination.unlink()
                 return 1
-            paths = mac_test.state_paths(name)
-            if (not args.target or name == args.target) and owns_wait_claim(paths, args.repo_root, args.pid):
-                return 0
+            config = ssh_target_config(target)
+            if not isinstance(config, ExcludedTarget):
+                if config.enabled:
+                    paths = mac_test.state_paths(name)
+                    if (not args.target or name == args.target) and owns_wait_claim(paths, args.repo_root, args.pid):
+                        return 0
         destination.unlink(missing_ok=True)
     if args.kind not in ("test", "check", "doc", "lint"):
         return 1
@@ -293,7 +379,11 @@ def command_reserve(args: CliArguments) -> int:
     for target in read_targets():
         if not isinstance(target, SshTarget) or (args.target and target.name != args.target):
             continue
-        config = offload.read_config(target.settings)
+        config = ssh_target_config(target)
+        if isinstance(config, ExcludedTarget):
+            if config.reason != "off":
+                cleanup_refused_claims(target, args)
+            continue
         policy = offload.mac_step_eligibility(config, Path(args.repo_root), args.package, verb, target.name)
         if isinstance(policy, offload.IneligibleMacStep):
             continue
