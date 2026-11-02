@@ -26,7 +26,7 @@ from scripts.lib import urgency
 from scripts.production import change_review, next_item, showrunners, staff
 from scripts.production.staff_test_support import fixture_member
 from scripts.feature_log import feature_log
-from scripts.review_links import change_browser, change_page, serve
+from scripts.review_links import change_browser, change_page, review_link, serve
 
 
 @dataclass(frozen=True)
@@ -70,6 +70,8 @@ class BrowserForms(HTMLParser):
         self.tabs: dict[str, str] = {}
         self.save_urls: dict[str, str] = {}
         self.counts: dict[str, int] = {}
+        self.pending: dict[str, bool] = {}
+        self.outcomes: dict[str, list[str]] = {}
         self.current: str = ""
         self.count_tab: str = ""
         self.read_count: bool = False
@@ -81,10 +83,14 @@ class BrowserForms(HTMLParser):
             self.current = values["data-key"] or ""
             self.rows[self.current] = {}
             self.tabs[self.current] = values.get("data-tab") or ""
+            self.pending[self.current] = values.get("data-pending") == "true"
+            self.outcomes[self.current] = []
         if tag == "input" and self.current and values.get("name"):
             self.rows[self.current][values["name"] or ""] = values.get("value") or ""
         if tag == "form" and self.current and values.get("method") == "post":
             self.save_urls[self.current] = values.get("action") or ""
+        if tag == "button" and self.current and values.get("name") == "outcome":
+            self.outcomes[self.current].append(values.get("value") or "")
         if tag == "button" and values.get("data-showrunner"):
             self.count_tab = values["data-showrunner"] or ""
         if tag == "span" and "data-count" in values:
@@ -492,6 +498,130 @@ class ChangePageTests(unittest.TestCase):
         del path
         self.assertEqual(forms.rows, {})
         self.assertIn('page-owner (<span data-count>0</span>)', body)
+
+    def test_validation_requests_leave_the_browser_queue_after_delivery_and_a_fresh_prepare(self) -> None:
+        path, forms, body = self.browser()
+        del body
+        self.delivery_done.clear()
+        reply = self.http_request(path, self.browser_fields(forms, "page-owner/C1", "validate", "Check the proof"))
+        self.assertEqual(reply.status, 200)
+        self.assertTrue(self.delivery_done.wait(TEST_HANG_GUARD_SECS))
+        browser = change_browser.page_at(self.root, path)
+        status = change_page.DeliveryStatus(self.root)
+        prepared = change_browser.prepare(browser, status)
+        self.assertEqual([item.key for item in prepared.changes if item.waiting], ["page-owner/C2", "page-owner/C3"])
+        self.assertEqual([entry.key for entry in prepared.queues["page-owner"].entries], ["C2", "C3"])
+        self.assertFalse(any(row.get("Verdict") for row in change_review.review_rows(self.review_list)))
+        fresh = BrowserForms()
+        content = change_browser.render(browser, change_page.DeliveryStatus(self.root)).decode()
+        fresh.feed(content)
+        self.assertEqual(fresh.counts["page-owner"], 2)
+        self.assertFalse(fresh.pending["page-owner/C1"])
+        self.assertEqual(fresh.outcomes["page-owner/C1"], [])
+        self.assertNotIn("page-owner/C1", fresh.save_urls)
+        self.assertIn("The showrunner will validate this", content)
+        self.assertIn("C1: the user asks you to validate this", self.messages[0][2])
+        queue = next_item.change_queue(self.production)
+        self.assertEqual(urgency.queue_order(queue.entries, queue.name)[-1].key, "C1")
+
+    def test_removing_a_validation_record_restores_waiting_until_a_verdict_saves(self) -> None:
+        path, forms, body = self.browser()
+        del body
+        status = change_page.DeliveryStatus(self.root)
+        browser = change_browser.page_at(self.root, path)
+        delivery, answer = change_browser.submit(browser, urlencode(
+            self.browser_fields(forms, "page-owner/C1", "validate")), status)
+        self.assertEqual(answer, "")
+        status.record(delivery, False)
+        self.assertNotIn("page-owner/C1", [item.key for item in change_browser.prepare(browser, status).changes if item.waiting])
+        status.path(delivery.page, "C1").unlink()
+        self.assertIn("page-owner/C1", [item.key for item in change_browser.prepare(browser, status).changes if item.waiting])
+        _ = change_review.record_verdict(self.review_list, "C1", "works", date(2026, 11, 2), self.production)
+        prepared = change_browser.prepare(browser, change_page.DeliveryStatus(self.root))
+        self.assertNotIn("page-owner/C1", [item.key for item in prepared.changes if item.waiting])
+        refreshed = BrowserForms()
+        refreshed.feed(change_browser.render(browser, status).decode())
+        self.assertEqual(refreshed.counts["page-owner"], 2)
+
+    def test_unsent_validation_records_keep_the_waiting_count_and_resend_control(self) -> None:
+        path, forms, body = self.browser()
+        del forms, body
+        browser = change_browser.page_at(self.root, path)
+        status = change_page.DeliveryStatus(self.root)
+        for failed in (False, True):
+            with self.subTest(state="failed" if failed else "pending"):
+                attempt = status.begin(self.page, "C1", "validation", "Keep these words")
+                if failed:
+                    status.record(change_page.MessageDelivery(self.page, "C1", (), "", attempt), True)
+                prepared = change_browser.prepare(browser, change_page.DeliveryStatus(self.root))
+                self.assertIn("page-owner/C1", [item.key for item in prepared.changes if item.waiting])
+                self.assertIn("C1", [entry.key for entry in prepared.queues["page-owner"].entries])
+                content = change_browser.render(browser, change_page.DeliveryStatus(self.root)).decode()
+                refreshed = BrowserForms()
+                refreshed.feed(content)
+                self.assertEqual(refreshed.counts["page-owner"], 3)
+                self.assertTrue(refreshed.pending["page-owner/C1"])
+                self.assertIn('data-resend>Send validation request again</button>', content)
+                self.assertIn("The validation message did not send" if failed else "The message may not have sent", content)
+
+    def test_failed_validation_delivery_stays_in_the_count_and_can_retry(self) -> None:
+        path, forms, body = self.browser()
+        del body
+        fields = self.browser_fields(forms, "page-owner/C1", "validate", "Keep <these> words")
+        with patch.object(change_page, "send_message", side_effect=RuntimeError("socket unavailable")):
+            self.delivery_done.clear()
+            self.assertEqual(self.http_request(path, fields).status, 200)
+            self.assertTrue(self.delivery_done.wait(TEST_HANG_GUARD_SECS))
+        failed = BrowserForms()
+        failed.feed(self.request(path, {}).body)
+        self.assertEqual(failed.counts["page-owner"], 3)
+        self.assertTrue(failed.pending["page-owner/C1"])
+        self.assertEqual(failed.outcomes["page-owner/C1"], ["works", "not works", "validate", "feedback"])
+        self.assertEqual(failed.rows["page-owner/C1"]["feedback"], "Keep <these> words")
+        self.delivery_done.clear()
+        self.assertEqual(self.http_request(path, self.browser_fields(
+            failed, "page-owner/C1", "validate", failed.rows["page-owner/C1"]["feedback"])).status, 200)
+        self.assertTrue(self.delivery_done.wait(TEST_HANG_GUARD_SECS))
+        self.assertIn("Keep <these> words", self.messages[-1][2])
+        self.assertNotIn("Send validation request again", self.request(path, {}).body)
+
+    def test_a_failed_validation_save_keeps_the_waiting_count(self) -> None:
+        path, forms, body = self.browser()
+        del body
+        with patch.object(next_item, "move_to_end", side_effect=OSError("queue unavailable")):
+            reply = self.http_request(path, self.browser_fields(forms, "page-owner/C1", "validate", "Keep this answer"))
+        self.assertEqual(reply.status, 503)
+        refreshed = BrowserForms()
+        refreshed.feed(self.request(path, {}).body)
+        self.assertEqual(refreshed.counts["page-owner"], 3)
+        self.assertTrue(refreshed.pending["page-owner/C1"])
+
+    def test_browser_feedback_removes_the_count_only_after_its_verdict_saves(self) -> None:
+        path, forms, body = self.browser()
+        del body
+        self.delivery_done.clear()
+        reply = self.http_request(path, self.browser_fields(forms, "page-owner/C1", "feedback", "Needs a clearer proof"))
+        self.assertEqual(reply.status, 200)
+        self.assertEqual(json.loads(reply.body), {"answer": "Needs a clearer proof"})
+        self.assertTrue(self.delivery_done.wait(TEST_HANG_GUARD_SECS))
+        row = next(row for row in change_review.review_rows(self.review_list) if row["#"] == "C1")
+        self.assertEqual(row["Verdict"], "Needs a clearer proof")
+        self.assertFalse(change_review.lands(row["Verdict"]))
+        refreshed = BrowserForms()
+        refreshed.feed(self.request(path, {}).body)
+        self.assertEqual(refreshed.counts["page-owner"], 2)
+
+    def test_browser_markup_supplies_waiting_rows_and_navigation_after_saves(self) -> None:
+        path, forms, body = self.browser()
+        del path
+        self.assertEqual(forms.pending, dict.fromkeys(forms.rows, True))
+        self.assertEqual(forms.outcomes["page-owner/C1"], ["works", "not works", "validate", "feedback"])
+        self.assertIn('data-next hidden>Next', body)
+        self.assertIn('<p data-left></p>', body)
+        self.assertIn("current===row && tab===row.dataset.tab && navigation===position", body)
+        self.assertIn("row.dataset.pending='false';form.hidden=true", body)
+        self.assertIn("go(following?.dataset.key || '')", body)
+        self.assertNotIn("rows.push(row)", body)
 
     def test_submit_writes_through_verdict_and_a_fresh_get_reads_the_saved_record(self) -> None:
         reply = self.request(self.page_path, self.answer())
@@ -1186,13 +1316,17 @@ class ChangePageTests(unittest.TestCase):
                 status.record(first_delivery, True)
                 after = status.slots(self.page, "C1")
                 self.assertEqual(after.verdict if other == "verdict" else after.validation, remaining)
-                self.assertIsInstance(after.validation if first == "validation" else after.verdict,
-                                      change_page.NoDelivery)
+                if first == "validation":
+                    self.assertEqual(after.validation, change_page.ValidationRequested(validation, "Keep these words"))
+                else:
+                    self.assertIsInstance(after.verdict, change_page.NoDelivery)
                 stored = status.path(self.page, "C1").read_text(encoding="utf-8")
-                self.assertNotIn(f'"{first}"', stored)
+                self.assertEqual(f'"{first}"' in stored, first == "validation")
                 self.assertIn(f'"{other}"', stored)
                 status.record(other_delivery, False)
-                self.assertFalse(status.path(self.page, "C1").exists())
+                self.assertEqual(status.slots(self.page, "C1").validation,
+                                 change_page.ValidationRequested(validation, "Keep these words"))
+                self.assertIsInstance(status.slots(self.page, "C1").verdict, change_page.NoDelivery)
 
     def test_single_intent_records_migrate_to_their_kind_without_losing_feedback(self) -> None:
         status = change_page.DeliveryStatus(self.root)
@@ -1261,14 +1395,14 @@ class ChangePageTests(unittest.TestCase):
         checked = threading.Event()
         release = threading.Event()
         entering = threading.Event()
-        unlink = Path.unlink
+        replace_file = review_link.replace_file
 
-        def pause_before_delete(path: Path, missing_ok: bool = False) -> None:
+        def pause_before_write(path: Path, content: bytes) -> None:
             if path == status.path(self.page, "C1") and threading.current_thread().name.startswith("old-attempt"):
                 checked.set()
                 if not release.wait(TEST_HANG_GUARD_SECS):
                     raise RuntimeError("the old attempt was not released")
-            unlink(path, missing_ok=missing_ok)
+            replace_file(path, content)
 
         def newer_failure() -> str:
             entering.set()
@@ -1276,7 +1410,7 @@ class ChangePageTests(unittest.TestCase):
             status.record(change_page.MessageDelivery(self.page, "C1", (), "", newer), True)
             return newer
 
-        with patch.object(Path, "unlink", new=pause_before_delete), \
+        with patch.object(review_link, "replace_file", new=pause_before_write), \
                 ThreadPoolExecutor(max_workers=1, thread_name_prefix="old-attempt") as old_worker, \
                 ThreadPoolExecutor(max_workers=1) as new_worker:
             previous = old_worker.submit(status.record, old, False)
