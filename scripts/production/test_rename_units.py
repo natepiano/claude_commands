@@ -24,7 +24,7 @@ class ProductionRenameTests(support.ProductionRenameFixture):
         assert row is not None
         old, new = self.unit_worktree(OLD, "alpha-unit"), self.unit_worktree(NEW, "alpha-unit")
         _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", old))
-        unit_config.write(old, unit_config.UnitConfig(unit_config.PlanFile(Path("docs/plans/alpha-unit.md")),
+        _ = unit_config.write(old, unit_config.UnitConfig(unit_config.PlanFile(Path("docs/plans/alpha-unit.md")),
                                                     unit_config.AppPort(8080), ("review",)))
         config = (old / ".unit.toml").read_bytes()
         self.assert_success(self.run_rename("apply"))

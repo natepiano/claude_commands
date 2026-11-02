@@ -54,8 +54,8 @@ class UnitConfigFixture(unittest.TestCase):
                                          unit_config.Branch("feature/worker"))
 
     def park_config(self) -> None:
-        unit_config.write(self.worktree, self.config())
-        unit_config.park(self.unit, self.worktree, self.retirement())
+        _ = unit_config.write(self.worktree, self.config())
+        _ = unit_config.park(self.unit, self.worktree, self.retirement())
 
     def file_versions(self) -> dict[Path, tuple[bytes, int]]:
         return {path: (path.read_bytes(), path.stat().st_mtime_ns)

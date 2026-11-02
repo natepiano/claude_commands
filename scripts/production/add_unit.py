@@ -1390,7 +1390,7 @@ def admit_unit(request: UnitLaunch) -> UnitAdmissionPending | UnitMembershipPubl
     if row is not None:
         row = ensure_staff_unit(request.production, request.unit_id, worktree=location,
                                 runtime_id=request.session.session_id if isinstance(request.session, ResumedSession) else "")
-    unit_config.write(request.worktree, config)
+    _ = unit_config.write(request.worktree, config)
     return UnitMembershipPublished(row) if row is not None else UnitAdmissionPending()
 
 
