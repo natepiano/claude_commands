@@ -287,7 +287,7 @@ The builds showrunner asked (2026-10-31): merge `origin/builds` (a546fe66, the v
 
 **Ruled out:** a `PR_SET_CHILD_SUBREAPER` reaper wrapper for the unscoped path (it needs an ECHILD-confirmed completion message and a new Popen contract).
 
-### Phase 4i — A queue place with no memory scope stops a detached descendant before release  · status: todo
+### Phase 4i — A queue place with no memory scope stops a detached descendant before release  · status: done
 **Depends on:** Phase 4h (`queue_place.py`)
 **Blocked by:** none past Phase 4h. Routed from Phase 4h finding F002, 2026-11-01.
 
