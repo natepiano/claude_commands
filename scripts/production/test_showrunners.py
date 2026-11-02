@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.production.staff_test_support import fixture_member, fixture_runtime_id
+
 import json
 import io
 from contextlib import redirect_stderr, redirect_stdout
@@ -23,6 +25,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lib.atomic_file import write_text_atomic
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -150,7 +153,7 @@ raise SystemExit(1)
                 "NOTIFIER_STATE_DIR": str(self.notifier), "NOTIFIER_SESSIONS_DIR": str(self.sessions),
                 "SHOWRUNNERS_SESSIONS": str(self.sessions_script),
                 "SHOWRUNNER_STATE_DIR": str(self.state), "SHOWRUNNERS_SEND": str(self.send_script),
-                "TEST_SENT": str(self.sent), "CLAUDE_CODE_SESSION_ID": caller,
+                "TEST_SENT": str(self.sent), "CLAUDE_CODE_SESSION_ID": caller, "CODEX_THREAD_ID": caller,
                 **fake_unit_host.environment(self.root), "HERDR_PANE_ID": pane}
 
     @override
@@ -173,14 +176,18 @@ raise SystemExit(1)
     def showrunner(self, slug: str, *, running: bool = True, formerly: tuple[str, ...] = (), name: str = "") -> None:
         """One production with an update timer, its showrunner named `name`, else its slug, when it runs."""
         doc = self.root / f"{slug}-production.md"
-        self.instance(f"showrunner-{slug}", target=f"session:{slug}-id", doc=doc)
+        row = fixture_member("showrunner", name=slug)
+        self.instance(f"showrunner-{slug}", target=f"session:{row.id}", doc=doc)
         if formerly:
             names = ", ".join(f"`{old}`" for old in formerly)
             _ = doc.write_text(f"# Production\n\n## Production Context\n\n- **Formerly:** {names}\n",
                                encoding="utf-8")
         if running:
-            _ = self.record(name or slug, f"{slug}-id")
-        _ = staff.ensure("showrunner", name=slug)
+            pid = self.record(name or slug, row.id)
+            path = self.sessions / f"{pid}.json"
+            value = cast(dict[str, object], json.loads(path.read_text()))
+            value["messagingSocketPath"] = str(self.root / f"{slug}-id.sock")
+            write_text_atomic(path, json.dumps(value) + "\n")
 
     def messages(self) -> list[tuple[str, str]]:
         """Each message sent, as the socket it went to and its text."""
@@ -197,8 +204,8 @@ raise SystemExit(1)
     def recorded_parent(self, child: str, parent: str) -> None:
         """Prepare authoritative edges alongside the legacy files still written by tools."""
         record = staff.initial_snapshot()
-        parent_row = record.by_path(parent) or staff.ensure("showrunner", name=parent)
-        child_row = record.by_path(child) or staff.ensure("showrunner", name=child)
+        parent_row = record.by_path(parent) or fixture_member("showrunner", name=parent)
+        child_row = record.by_path(child) or fixture_member("showrunner", name=child)
         _ = staff.move(child_row.id, parent_row.id)
         self.stored_parent(child, parent)
 
@@ -441,6 +448,20 @@ class ShowrunnerRegistryTests(ShowrunnerFixture):
         self.assertIn("show\trenamed\t", self.successful("list"))
         self.assertEqual(self.successful("name", "show"), "renamed\n")
         self.assertFalse(self.config.exists())
+
+    def test_address_follows_current_session_after_clear_while_timer_keeps_fixed_owner(self) -> None:
+        self.showrunner("demo", running=False)
+        row = staff.by_path("demo")
+        assert row is not None
+        current = staff.native_id(fixture_runtime_id("showrunner-after-clear"))
+        _ = staff.update_current_session(row.current_session, current)
+        _ = self.record("still-demo", current)
+        configuration = self.notifier / "showrunner-demo" / "conf"
+        before = configuration.read_bytes(), configuration.stat().st_mtime_ns
+        self.assertEqual(self.successful("address", "demo"), f"uds:{self.root / (current + '.sock')}\n")
+        self.assertEqual(self.successful("name", "demo"), "still-demo\n")
+        self.assertEqual((configuration.read_bytes(), configuration.stat().st_mtime_ns), before)
+        self.assertIn("TARGET=session:" + row.id, configuration.read_text())
 
     def test_a_stopped_timer_still_names_its_showrunner(self) -> None:
         # A production on demand keeps its timer stopped, and the timer is still the showrunner's record.

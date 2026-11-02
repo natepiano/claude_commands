@@ -663,17 +663,19 @@ class MoveResumeAccount:
 
 @dataclass(frozen=True)
 class ResumeConversation:
-    """The launch account has a transcript for this session."""
+    """The launch account has a transcript for this exact current conversation."""
+
+    session_id: str
 
 
 @dataclass(frozen=True)
 class StartFreshConversation:
-    """Keep the session identity when its launch account has no transcript."""
+    """Let Claude create a native identity when its launch account has no transcript."""
 
 
 def _conversation_launch(session_id: str, config_dir: Path) -> ResumeConversation | StartFreshConversation:
     if any(path.is_file() for path in (config_dir / "projects").glob("*/" + session_id + ".jsonl")):
-        return ResumeConversation()
+        return ResumeConversation(session_id)
     return StartFreshConversation()
 
 
@@ -741,15 +743,16 @@ def _resume_parts(session: Session, prompt: str, target: str = "", *, login: str
     if probe or session.get("probe", False):
         environment[PROBE_ENV] = "1"
     launch_config_dir = accounts.account_dir(target) if target else config_dir
-    conversation = _conversation_launch(session["session_id"], launch_config_dir)
     model = session["model"]
     entry = pane_record.PaneLaunch(pane_id="", session_id=session["session_id"], config_dir=str(config_dir),
         cwd=session["cwd"], name=session["name"], model=model["name"] if model["kind"] == "model" else "",
         remote_control=True, environment=environment, flags_read=True, ended=False, written_at=at)
+    entry = pane_record.resume_launch(entry)
+    conversation = _conversation_launch(entry["session_id"], launch_config_dir)
     environment = session_staff.record_membership(entry)["environment"]
     argv = stop_resume.resume_arguments(entry)
     if isinstance(conversation, StartFreshConversation):
-        argv[0] = "--session-id"
+        del argv[:2]
     return ResumeParts(session["cwd"], environment, tuple(argv), prompt, account, conversation)
 
 
@@ -1159,10 +1162,18 @@ def _herdr_launch(
                 # The session resumes in its own new tab, so a busy old pane is left as it is.
                 print(f"herdr {name}:{destination.pane_id}: pane runs {', '.join(activity.commands)}; left open")
         _record_scheduled_restart_prompt(session["session_id"], parts.opening_prompt, dry_run=False)
+        def publish_identity(transcript: herdr.SessionTranscript) -> None:
+            previous = staff.StaffId(session["session_id"])
+            record = staff.initial_snapshot()
+            owner = record.by_id(previous) or record.by_current_session(previous)
+            if owner is not None and owner.current_session != transcript.session_id:
+                _ = staff.update_current_session(owner.current_session, staff.native_id(transcript.session_id))
+
+        expected_identity = parts.conversation.session_id if isinstance(parts.conversation, ResumeConversation) else ""
         launched = herdr.launch_prepared_agent(name, herdr_space(session), session["name"], prepared_environment,
             kind="claude", agent=session["name"], agent_arguments=list(parts.claude_arguments),
             opening=herdr.OpeningPrompt(parts.opening_prompt,
-                herdr.SessionTranscript(config_dir, session["session_id"])), timeout_ms=90_000)
+                herdr.SessionTranscript(config_dir, expected_identity), publish_identity), timeout_ms=90_000)
         pane, outcome = launched.pane, launched.outcome
         _present_restored_pane(server, client, pane, session["name"])
         if isinstance(parts.conversation, StartFreshConversation):

@@ -10,6 +10,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import unittest
 from contextlib import closing, redirect_stdout
 from pathlib import Path
@@ -33,6 +34,372 @@ from style_plan_test_support import StylePlanFixture
 
 @final
 class StylePlanTests(StylePlanFixture):
+    def test_gate_and_checkpoint_use_only_current_parameter_blockers(self) -> None:
+        from test_approved_renames import PARAMETER_CHANGES
+        for label, source, current, blocked in PARAMETER_CHANGES:
+            with self.subTest(parameter=label):
+                case = StylePlanTests()
+                root = Path(case.enterContext(tempfile.TemporaryDirectory())) / "case"
+                _ = case.enterContext(mock.patch.object(StylePlanTests, "fixture_root", root))
+                case.setUp()
+                try:
+                    ticket, ledger, finding, issue, path = case.outer_binding_ticket(source)
+                    case.write(path, current)
+                    build_base = case.commit()
+                    with closing(sqlite3.connect(ledger.database)) as connection, connection:
+                        _ = connection.execute("UPDATE tickets SET base=? WHERE id=?", (build_base, ticket))
+                    case.write(path, current.replace("|g| g", "|checkout_info| checkout_info"))
+                    first = case.reference_gate(ticket)
+                    if blocked:
+                        self.assertEqual(first[0], 1, first)
+                        self.assertIn("blocked by outer binding", first[1])
+                    else:
+                        self.assertEqual(first, (0, "approved proposal\n"))
+                    before = ledger.database.read_bytes()
+                    self.assertEqual(case.reference_gate(ticket), first)
+                    self.assertEqual(ledger.database.read_bytes(), before)
+                    checkpoint = case.commit()
+                    ledger = case.ledger()
+                    ledger.set_tip(checkpoint, "main")
+                    ledger.ticket_checkpoint(ticket, checkpoint)
+                    refused = ledger.ticket_merge(ticket)
+                    reopened, = case.ledger().proposal_findings(issue)
+                    self.assertEqual(reopened.finding_id, finding.finding_id)
+                    if blocked:
+                        self.assertEqual(len(refused), 1)
+                        self.assertIsInstance(refused[0].cause, style_ledger.OuterBindingBlocked)
+                        self.assertEqual(reopened.state, style_ledger.Filed(issue))
+                    else:
+                        self.assertEqual(refused, ())
+                        self.assertIsInstance(reopened.state, style_ledger.Built)
+                finally:
+                    case.tearDown()
+                    case.doCleanups()
+
+    def test_unread_local_body_refuses_gate_and_checkpoint_after_a_signature_change(self) -> None:
+        from test_approved_renames import UNREAD_LOCAL_BODIES
+        for label, source in UNREAD_LOCAL_BODIES:
+            with self.subTest(body=label):
+                case = StylePlanTests()
+                root = Path(case.enterContext(tempfile.TemporaryDirectory())) / "case"
+                _ = case.enterContext(mock.patch.object(StylePlanTests, "fixture_root", root))
+                case.setUp()
+                try:
+                    ticket, ledger, finding, issue, path = case.outer_binding_ticket(source)
+                    current = source.replace("label()", "label(extra: usize)").replace("|g| g", "|checkout_info| checkout_info")
+                    case.write(path, current)
+                    first = case.reference_gate(ticket)
+                    self.assertEqual(first[0], 1, first)
+                    self.assertIn("containing item body unread", first[1])
+                    before = ledger.database.read_bytes()
+                    self.assertEqual(case.reference_gate(ticket), first)
+                    self.assertEqual(ledger.database.read_bytes(), before)
+                    checkpoint = case.commit()
+                    ledger = case.ledger()
+                    ledger.set_tip(checkpoint, "main")
+                    ledger.ticket_checkpoint(ticket, checkpoint)
+                    refused = ledger.ticket_merge(ticket)
+                    self.assertEqual(len(refused), 1)
+                    self.assertIsInstance(refused[0].cause, style_ledger.OuterBindingUnproved)
+                    reopened, = case.ledger().proposal_findings(issue)
+                    self.assertEqual(reopened.finding_id, finding.finding_id)
+                    self.assertEqual(reopened.state, style_ledger.Filed(issue))
+                    self.assertIsInstance(reopened.rename_disposition, style_ledger.OuterBindingUnproved)
+                finally:
+                    case.tearDown()
+                    case.doCleanups()
+
+    def test_proved_item_with_unread_body_passes_gate_and_checkpoint(self) -> None:
+        from test_approved_renames import UNREAD_ITEM_BODIES
+        for label, source in UNREAD_ITEM_BODIES:
+            with self.subTest(body=label):
+                case = StylePlanTests()
+                root = Path(case.enterContext(tempfile.TemporaryDirectory())) / "case"
+                _ = case.enterContext(mock.patch.object(StylePlanTests, "fixture_root", root))
+                case.setUp()
+                try:
+                    ticket, ledger, finding, issue, path = case.outer_binding_ticket(source)
+                    case.write(path, source.replace("fn g(", "fn checkout_info("))
+                    self.assertEqual(case.reference_gate(ticket), (0, "approved proposal\n"))
+                    checkpoint = case.commit()
+                    ledger = case.ledger()
+                    ledger.set_tip(checkpoint, "main")
+                    ledger.ticket_checkpoint(ticket, checkpoint)
+                    refused = ledger.ticket_merge(ticket)
+                    self.assertFalse(any(isinstance(row.cause, style_ledger.OuterBindingBlocked | style_ledger.OuterBindingUnproved)
+                                         for row in refused), refused)
+                    current, = case.ledger().proposal_findings(issue)
+                    self.assertEqual(current.finding_id, finding.finding_id)
+                    self.assertNotIsInstance(current.rename_disposition, style_ledger.OuterBindingBlocked | style_ledger.OuterBindingUnproved)
+                finally:
+                    case.tearDown()
+                    case.doCleanups()
+
+    def test_generic_parameters_refuse_gate_and_checkpoint(self) -> None:
+        from test_approved_renames import GENERIC_PARAMETER_BINDINGS
+        self.assert_local_declarations_refuse_gate_and_checkpoint(GENERIC_PARAMETER_BINDINGS)
+
+    def assert_local_declarations_refuse_gate_and_checkpoint(self, forms: tuple[tuple[str, str], ...]) -> None:
+        for label, source in forms:
+            with self.subTest(form=label):
+                case = StylePlanTests()
+                root = Path(case.enterContext(tempfile.TemporaryDirectory())) / "case"
+                _ = case.enterContext(mock.patch.object(StylePlanTests, "fixture_root", root))
+                case.setUp()
+                try:
+                    ticket, ledger, finding, issue, path = case.outer_binding_ticket(source)
+                    with closing(sqlite3.connect(ledger.database)) as connection, connection:
+                        _ = connection.execute("UPDATE tickets SET base='' WHERE id=?", (ticket,))
+                    first = case.reference_gate(ticket)
+                    self.assertEqual(first[0], 1, first)
+                    before = ledger.database.read_bytes()
+                    self.assertEqual(case.reference_gate(ticket), first)
+                    self.assertEqual(ledger.database.read_bytes(), before)
+                    case.write(path, re.sub(r"\bg\b", "checkout_info", source))
+                    checkpoint = case.commit()
+                    ledger = case.ledger()
+                    ledger.set_tip(checkpoint, "main")
+                    ledger.ticket_checkpoint(ticket, checkpoint)
+                    refused = ledger.ticket_merge(ticket)
+                    self.assertEqual(len(refused), 1)
+                    self.assertIsInstance(refused[0].cause, style_ledger.OuterBindingBlocked | style_ledger.OuterBindingUnproved)
+                    current, = case.ledger().proposal_findings(issue)
+                    self.assertEqual(current.finding_id, finding.finding_id)
+                    self.assertEqual(current.state, style_ledger.Filed(issue))
+                finally:
+                    case.tearDown()
+                    case.doCleanups()
+
+    def test_field_expression_bindings_refuse_gate_and_checkpoint(self) -> None:
+        from test_approved_renames import FIELD_EXPRESSION_BINDINGS
+        self.assert_local_declarations_refuse_gate_and_checkpoint(FIELD_EXPRESSION_BINDINGS)
+
+    def test_gate_anchor_matrix_never_adopts_a_build_coordinate_or_current_sibling(self) -> None:
+        from test_approved_renames import IDENTICAL_BINDING_ITEMS
+        for probe in ("missing_anchor", "later_field", "removed", "raw_pair"):
+            with self.subTest(probe=probe):
+                case = StylePlanTests()
+                root = Path(case.enterContext(tempfile.TemporaryDirectory())) / "case"
+                _ = case.enterContext(mock.patch.object(StylePlanTests, "fixture_root", root))
+                case.setUp()
+                try:
+                    source = IDENTICAL_BINDING_ITEMS
+                    if probe == "raw_pair":
+                        source = source.replace("|g| g", "|r#g| r#g", 1)
+                    ticket, ledger, finding, issue, path = case.outer_binding_ticket(source)
+                    current = source.replace("first()", "first(checkout_info: usize)")
+                    comparison = ""
+                    if probe == "later_field":
+                        case.write(path, "struct Other {\n    g: usize,\n}\n")
+                        comparison = case.commit()
+                    if probe == "removed":
+                        current = source.replace("map(|g| g + 1)", "consume(42)", 1)
+                    if probe == "missing_anchor":
+                        current = source[source.index("fn second"):]+source[:source.index("fn second")]
+                    with closing(sqlite3.connect(ledger.database)) as connection, connection:
+                        _ = connection.execute("UPDATE tickets SET base=? WHERE id=?", (comparison, ticket))
+                        if probe == "missing_anchor":
+                            _ = connection.execute("UPDATE held_findings SET anchor_commit='',ticket='missing-judgment' WHERE finding_id=?", (finding.finding_id,))
+                        if probe == "raw_pair":
+                            _ = connection.execute("UPDATE held_findings SET before='r#g' WHERE finding_id=?", (finding.finding_id,))
+                    case.write(path, current)
+                    first = case.reference_gate(ticket)
+                    self.assertEqual(first[0], 1, first)
+                    before = ledger.database.read_bytes()
+                    self.assertEqual(case.reference_gate(ticket), first)
+                    self.assertEqual(ledger.database.read_bytes(), before)
+                    checkpoint = case.commit()
+                    ledger = case.ledger()
+                    ledger.set_tip(checkpoint, "main")
+                    ledger.ticket_checkpoint(ticket, checkpoint)
+                    refused = ledger.ticket_merge(ticket)
+                    self.assertEqual(len(refused), 1)
+                    current_finding, = case.ledger().proposal_findings(issue)
+                    self.assertEqual(current_finding.state, style_ledger.Filed(issue))
+                    self.assertIsInstance(current_finding.rename_disposition, style_ledger.OuterBindingBlocked | style_ledger.OuterBindingUnproved)
+                finally:
+                    case.tearDown()
+                    case.doCleanups()
+
+    def test_gate_and_checkpoint_cannot_admit_an_identical_sibling_instead_of_the_recorded_item(self) -> None:
+        from test_approved_renames import IDENTICAL_BINDING_ITEMS
+        source = IDENTICAL_BINDING_ITEMS
+        ticket, ledger, finding, issue, path = self.outer_binding_ticket(source)
+        edited = source.replace("first()", "first(checkout_info: usize)").replace("|g| g", "|checkout_info| checkout_info", 1)
+        self.write(path, edited)
+        code, output = self.reference_gate(ticket)
+        self.assertEqual(code, 1, output)
+        self.assertIn("rename blocked by outer binding 'checkout_info' at line 1", output)
+        checkpoint = self.commit()
+        ledger = self.ledger()
+        ledger.set_tip(checkpoint, "main")
+        ledger.ticket_checkpoint(ticket, checkpoint)
+        refused = ledger.ticket_merge(ticket)
+        self.assertEqual(len(refused), 1)
+        self.assertIsInstance(refused[0].cause, style_ledger.OuterBindingBlocked)
+        self.assertEqual(ledger.proposal_findings(issue)[0].finding_id, finding.finding_id)
+        self.assertEqual(ledger.proposal_findings(issue)[0].state, style_ledger.Filed(issue))
+
+    def test_gate_and_checkpoint_refuse_a_duplicate_recorded_item_path(self) -> None:
+        from test_approved_renames import DUPLICATE_BINDING_ITEM_PATH
+        source = DUPLICATE_BINDING_ITEM_PATH
+        ticket, ledger, finding, issue, path = self.outer_binding_ticket(source)
+        self.write(path, source.replace("|g| g", "|checkout_info| checkout_info", 1))
+        code, output = self.reference_gate(ticket)
+        self.assertEqual(code, 1, output)
+        self.assertIn("recorded item path is not unique", output)
+        checkpoint = self.commit()
+        ledger = self.ledger()
+        ledger.set_tip(checkpoint, "main")
+        ledger.ticket_checkpoint(ticket, checkpoint)
+        refused = ledger.ticket_merge(ticket)
+        self.assertEqual(len(refused), 1)
+        self.assertIsInstance(refused[0].cause, style_ledger.OuterBindingUnproved)
+        self.assertEqual(ledger.proposal_findings(issue)[0].finding_id, finding.finding_id)
+        self.assertEqual(ledger.proposal_findings(issue)[0].state, style_ledger.Filed(issue))
+
+    def test_gate_and_checkpoint_accept_a_precisely_proved_format_capture_rename(self) -> None:
+        from test_approved_renames import CAPTURE_BINDING_ITEM
+        ticket, ledger, finding, issue, path = self.outer_binding_ticket(CAPTURE_BINDING_ITEM)
+        edited = CAPTURE_BINDING_ITEM.replace("g =", "checkout_info =").replace("{g}", "{checkout_info}")
+        self.write(path, edited)
+        self.assertEqual(self.reference_gate(ticket), (0, "approved proposal\n"))
+        checkpoint = self.commit()
+        ledger = self.ledger()
+        ledger.set_tip(checkpoint, "main")
+        ledger.ticket_checkpoint(ticket, checkpoint)
+        self.assertEqual(ledger.ticket_merge(ticket), ())
+        self.assertEqual(ledger.proposal_findings(issue)[0].finding_id, finding.finding_id)
+        self.assertIsInstance(ledger.proposal_findings(issue)[0].state, style_ledger.Built)
+
+    def test_gate_and_checkpoint_read_a_later_outer_binding_from_the_current_item(self) -> None:
+        source = "fn label() {\n    map(|g| g + 1)\n}\n"
+        ticket, ledger, finding, issue, path = self.outer_binding_ticket(source)
+        edited = source.replace("label()", "label(checkout_info: usize)").replace("|g| g", "|checkout_info| checkout_info")
+        self.write(path, edited)
+        first = self.reference_gate(ticket)
+        self.assertEqual(first, (1, f"review: {finding.finding_id}: rename blocked by outer binding "
+                                   + f"'checkout_info' at line 1 in {path}\n"))
+        self.assertEqual(self.reference_gate(ticket), first)
+        checkpoint = self.commit()
+        ledger = self.ledger()
+        ledger.set_tip(checkpoint, "main")
+        ledger.ticket_checkpoint(ticket, checkpoint)
+        refused = ledger.ticket_merge(ticket)
+        self.assertEqual(len(refused), 1)
+        self.assertIsInstance(refused[0].cause, style_ledger.OuterBindingBlocked)
+        self.assertEqual(ledger.proposal_findings(issue)[0].state, style_ledger.Filed(issue))
+
+    def test_gate_and_checkpoint_refuse_an_impl_inner_attribute(self) -> None:
+        self.assert_inner_attribute_refuses_gate_and_checkpoint("impl")
+
+    def test_gate_and_checkpoint_refuse_a_trait_inner_attribute(self) -> None:
+        self.assert_inner_attribute_refuses_gate_and_checkpoint("trait")
+
+    def assert_inner_attribute_refuses_gate_and_checkpoint(self, kind: str) -> None:
+        from test_approved_renames import INHERITED_INNER_ATTRIBUTES
+        source = next(source for label, source in INHERITED_INNER_ATTRIBUTES if label == kind)
+        ticket, ledger, finding, issue, path = self.outer_binding_ticket(source)
+        self.write(path, source.replace("|g| g", "|checkout_info| checkout_info"))
+        code, output = self.reference_gate(ticket)
+        self.assertEqual(code, 1, output)
+        self.assertIn("unresolved attribute macro 'inject'", output)
+        checkpoint = self.commit()
+        ledger = self.ledger()
+        ledger.set_tip(checkpoint, "main")
+        ledger.ticket_checkpoint(ticket, checkpoint)
+        refused = ledger.ticket_merge(ticket)
+        self.assertEqual(len(refused), 1)
+        self.assertIsInstance(refused[0].cause, style_ledger.OuterBindingUnproved)
+        self.assertEqual(ledger.proposal_findings(issue)[0].finding_id, finding.finding_id)
+        self.assertEqual(ledger.proposal_findings(issue)[0].state, style_ledger.Filed(issue))
+
+    def test_gate_and_checkpoint_keep_stale_local_admission_terminal(self) -> None:
+        source = "fn label(checkout_info: usize) {\n    map(|g| g + 1)\n}\n"
+        ticket, ledger, finding, issue, path = self.outer_binding_ticket(source)
+        with closing(sqlite3.connect(ledger.database)) as connection, connection:
+            _ = connection.execute("UPDATE held_findings SET text=? WHERE finding_id=?",
+                                   (finding.text + " // stale judgment", finding.finding_id))
+        first = self.reference_gate(ticket)
+        self.assertEqual(first, (1, f"review: {finding.finding_id}: rename blocked by outer binding "
+                                    + f"'checkout_info' at line 1 in {path}\n"))
+        self.assertEqual(self.reference_gate(ticket), first)
+        ledger = self.ledger()
+        current, = ledger.proposal_findings(issue)
+        self.assertIsInstance(current.rename_disposition, style_ledger.OuterBindingBlocked)
+        assert isinstance(current.rename_disposition, style_ledger.OuterBindingBlocked)
+        self.assertEqual(current.state, style_ledger.Filed(issue))
+        checkpoint = self.git("rev-parse", "HEAD")
+        ledger.set_tip(checkpoint, "main")
+        ledger.ticket_checkpoint(ticket, checkpoint)
+        self.assertEqual(ledger.ticket_merge(ticket), (
+            style_ledger.FindingNotBuilt(current.finding_id, current.rename_disposition),))
+        self.assertEqual(ledger.proposal_findings(issue)[0].state, style_ledger.Filed(issue))
+
+    def test_gate_refuses_an_inherited_inner_attribute_after_the_rename(self) -> None:
+        source = "mod outer { #![inject] fn label() {\n    map(|g| g + 1)\n} }\n"
+        ticket, ledger, finding, issue, path = self.outer_binding_ticket(source)
+        self.write(path, source.replace("|g| g", "|checkout_info| checkout_info"))
+        code, output = self.reference_gate(ticket)
+        self.assertEqual(code, 1, output)
+        self.assertIn("unresolved attribute macro 'inject'", output)
+        current, = ledger.proposal_findings(issue)
+        self.assertIsInstance(current.rename_disposition, style_ledger.OuterBindingUnproved)
+        self.assertEqual(current.state, style_ledger.Filed(issue))
+        self.assertEqual(current.finding_id, finding.finding_id)
+
+    def test_gate_records_the_outer_binding_block_and_repeating_it_changes_nothing(self) -> None:
+        source = "fn label(checkout_info: usize) -> usize {\n    map(|g| g + 1)\n}\n"
+        ticket, ledger, finding, issue, path = self.outer_binding_ticket(source)
+        first = self.reference_gate(ticket)
+        self.assertEqual(first, (1, f"review: {finding.finding_id}: rename blocked by outer binding "
+                                   + f"'checkout_info' at line 1 in {path}\n"))
+        current, = ledger.proposal_findings(issue)
+        self.assertIsInstance(current.rename_disposition, style_ledger.OuterBindingBlocked)
+        self.assertEqual(current.state, style_ledger.Filed(issue))
+        with closing(sqlite3.connect(ledger.database)) as connection:
+            before = connection.execute("SELECT * FROM rename_outer_binding_blocks").fetchall()
+        database = ledger.database.read_bytes()
+        self.assertEqual(self.reference_gate(ticket), first)
+        self.assertEqual(ledger.database.read_bytes(), database)
+        with closing(sqlite3.connect(ledger.database)) as connection:
+            self.assertEqual(connection.execute("SELECT * FROM rename_outer_binding_blocks").fetchall(), before)
+
+    def test_gate_persists_an_unproved_attribute_outcome_and_is_idempotent(self) -> None:
+        source = "#[inject] fn label() {\n    map(|g| g + 1)\n}\n"
+        ticket, ledger, finding, issue, path = self.outer_binding_ticket(source)
+        expected = (1, f"review: {finding.finding_id}: unresolved attribute macro 'inject' at line 1 in {path}\n")
+        self.assertEqual(self.reference_gate(ticket), expected)
+        current, = ledger.proposal_findings(issue)
+        self.assertIsInstance(current.rename_disposition, style_ledger.OuterBindingUnproved)
+        self.assertEqual(current.state, style_ledger.Filed(issue))
+        before = ledger.database.read_bytes()
+        self.assertEqual(self.reference_gate(ticket), expected)
+        self.assertEqual(ledger.database.read_bytes(), before)
+        self.assertEqual(self.ledger().named_held((finding.finding_id,))[0].rename_disposition, current.rename_disposition)
+
+    def outer_binding_ticket(self, source: str) -> tuple[str, style_ledger.Ledger, style_ledger.HeldFinding, Path, str]:
+        path = self.sources[0]
+        self.write(path, source)
+        self.commit_to_every_checkout()
+        rule = self.rule("prefer-type-named-fields-and-bindings", "tier: C\nfamily: names\ninput_scope: file\n")
+        issue = self.approved_decision(rule, (), "rename")
+        ledger = self.ledger()
+        blob = next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == rule)
+        judging = ledger.next_ticket_id("judging")
+        ledger.ticket_add(judging, "judging", "read", "names", ".", [path], [rule])
+        ledger.ticket_assign(judging, "main")
+        _ = ledger.ticket_base(judging)
+        finding = ledger.hold(rule, path, 2, source.splitlines()[1], "rename", "g", "checkout_info", blob, judging)
+        ledger.file_held(finding.finding_id, issue)
+        ledger.ticket_drop(judging)
+        ticket = "names-unit-1"
+        ledger.ticket_add(ticket, "names-unit", "proposal", "names", "crates/alpha", [path], [rule],
+                          proposal=str(issue), finding_ids=(finding.finding_id,))
+        ledger.ticket_assign(ticket, "main")
+        _ = ledger.ticket_base(ticket)
+        return ticket, ledger, finding, issue, path
+
     def approved_documentation_ticket(
         self, source: str = "//! The old module name.\n\n//! Other documentation.\nfn value() {}\n", line: int = 1,
     ) -> tuple[str, Path]:

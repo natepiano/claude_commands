@@ -1,6 +1,8 @@
 """Parent writers keep staff identities and source edges in agreement."""
 from __future__ import annotations
 
+from scripts.production.staff_test_support import fixture_member
+
 import io
 import os
 from contextlib import redirect_stderr, redirect_stdout
@@ -26,8 +28,8 @@ class ShowrunnerParentTests(StaffTestCase):
     def members(self) -> tuple[staff.StaffRow, staff.StaffRow]:
         _ = self.production("sdlc", workspace="tools")
         _ = self.production("parent", workspace="umbrella")
-        child = staff.ensure("showrunner", name="tools")
-        parent = staff.ensure("showrunner", name="umbrella")
+        child = fixture_member("showrunner", name="tools")
+        parent = fixture_member("showrunner", name="umbrella")
         with staff.operation():
             pass
         return child, parent
@@ -40,7 +42,7 @@ class ShowrunnerParentTests(StaffTestCase):
         child, parent = self.members()
         script = Path(showrunners.__file__)
         _ = self.script(script, "attach", "sdlc", "parent")
-        self.assertEqual(staff.snapshot().by_id(child.id), staff.StaffRow(child.id, "showrunner", "tools", parent.id))
+        self.assertEqual(staff.snapshot().by_id(child.id), staff.StaffRow(child.id, "showrunner", "tools", parent.id, current_session=child.id))
         source = Path(os.environ["SHOWRUNNER_STATE_DIR"]) / "sdlc/parent"
         self.assertEqual(source.read_text(), "parent\n")
         _ = self.script(script, "detach", "sdlc")
@@ -65,7 +67,7 @@ class ShowrunnerParentTests(StaffTestCase):
                     self.assertIn("done", finished.getvalue())
                     notices.assert_not_called()
                     self.assertEqual(self.source_files(), expected)
-                    self.assertEqual(staff.snapshot().by_id(child.id), staff.StaffRow(child.id, "showrunner", "tools", parent.id))
+                    self.assertEqual(staff.snapshot().by_id(child.id), staff.StaffRow(child.id, "showrunner", "tools", parent.id, current_session=child.id))
 
     def test_detach_rerun(self) -> None:
         child, parent = self.members()
@@ -134,12 +136,12 @@ class ShowrunnerParentTests(StaffTestCase):
                 self.assertEqual(set(cast(dict[str, str], notices.call_args.args[0])), {"sdlc", "parent"})
                 self.assertFalse(pending.exists())
                 self.assertEqual(staff.snapshot().by_id(child.id),
-                                 staff.StaffRow(child.id, "showrunner", "tools", parent.id if action == "attach" else None))
+                                 staff.StaffRow(child.id, "showrunner", "tools", parent.id if action == "attach" else None, current_session=child.id))
 
     def test_release_uses_the_capture_after_edges_have_been_removed(self) -> None:
         child_row, parent_row = self.members()
         _ = self.production("leaf")
-        _ = staff.ensure("showrunner", name="leaf", parent=child_row.id)
+        _ = fixture_member("showrunner", name="leaf", parent=child_row.id)
         _ = staff.move(child_row.id, parent_row.id)
         state = Path(os.environ["SHOWRUNNER_STATE_DIR"])
         for child, parent in (("sdlc", "parent"), ("leaf", "sdlc")):
@@ -157,7 +159,7 @@ class ShowrunnerParentTests(StaffTestCase):
     def test_release_retry_preserves_edges_attached_after_capture(self) -> None:
         child_row, parent_row = self.members()
         _ = self.production("leaf")
-        leaf_row = staff.ensure("showrunner", name="leaf", parent=child_row.id)
+        leaf_row = fixture_member("showrunner", name="leaf", parent=child_row.id)
         _ = staff.move(child_row.id, parent_row.id)
         state = Path(os.environ["SHOWRUNNER_STATE_DIR"])
         original = {"sdlc": "parent", "leaf": "sdlc"}
@@ -165,7 +167,7 @@ class ShowrunnerParentTests(StaffTestCase):
             write_text_atomic(state / child / "parent", parent + "\n")
         capture = showrunner_tree.edges_to_release("sdlc")
         showrunner_tree.release_edges("sdlc", capture)
-        replacement = staff.ensure("showrunner", name="replacement")
+        replacement = fixture_member("showrunner", name="replacement")
         _ = staff.move(child_row.id, replacement.id)
         _ = staff.move(leaf_row.id, replacement.id)
         for child in original:

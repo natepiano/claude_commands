@@ -30,7 +30,7 @@ import dailies_render
 import merge_checkpoint
 from scripts.production import production_doc, staff
 from scripts.shutdown.remote import local_machine
-from scripts.production.staff_test_support import isolated_staff_file, unit_membership
+from scripts.production.staff_test_support import isolated_staff_file, showrunner_relationship, unit_membership
 from fake_showrunner import write_timer
 import update_registration
 import waiting
@@ -157,8 +157,8 @@ class WaitingTests(unittest.TestCase):
         self.host_pids = {}
         fake_unit_host.write(os.environ, [
             fake_unit_host.HostedUnit(unit, f"w{index}:p1", {"SHOWRUNNER_UNIT": "example", "SHOWRUNNER_UNIT_ID": unit})
-            for index, unit in enumerate((ALPHA, BETA, GAMMA), start=1)])
-        for index, unit in enumerate((ALPHA, BETA, GAMMA), start=1):
+            for index, unit in enumerate((ALPHA, BETA), start=1)])
+        for index, unit in enumerate((ALPHA, BETA), start=1):
             self.claude(unit, f"w{index}:p1")
         self.env = {**os.environ, "HOME": str(home), "WAITING_TEST_BOARD": str(self.board),
                     "WAITING_TEST_SENDS": str(self.sends),
@@ -242,7 +242,7 @@ class WaitingTests(unittest.TestCase):
         pid = self.host_pids[pane]
         fake_unit_host.place_process(os.environ, pid, pane)
         self.write(self.root / "sessions" / f"{pane.removeprefix("w").split(":")[0]}.json", json.dumps({
-            "pid": pid, "sessionId": f"id-{name}", "name": name, "messagingSocketPath": str(path),
+            "pid": pid, "sessionId": unit_membership("showrunner-example", (ALPHA, BETA, GAMMA)[int(pane[1:].split(":")[0]) - 1]).id, "name": name, "messagingSocketPath": str(path),
             "updatedAt": 1, "tmux": ""}))
 
     def production_doc(self) -> None:
@@ -262,7 +262,9 @@ class WaitingTests(unittest.TestCase):
             "", "## Production rules", "", "- Merge each phase and push the merge branch.", "",
         )))
 
-        _ = write_timer(self.root / "notifier", "example", "example-session", "", self.doc)
+        owner = showrunner_relationship("showrunner-example")
+        _ = staff.set_doc(owner.id, staff.LiveDoc("natedev", self.doc))
+        _ = write_timer(self.root / "notifier", "example", owner.id, "", self.doc)
         for unit in (ALPHA, BETA):
             _ = unit_membership("showrunner-example", unit)
 

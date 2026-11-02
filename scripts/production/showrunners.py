@@ -35,6 +35,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 from user_zone import user_zone_name  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "message"))
 from sessions import SessionRecord, messaging_socket_exists  # noqa: E402
+from scripts.production import staff  # noqa: E402
 
 RULES = "Read the Nested showrunners rules in ~/.claude/commands/showrunner/produce.md."
 
@@ -228,7 +229,8 @@ def _session_name(session_id: str) -> str:
     raise ValueError(f"session {session_id} has no live named process")
 
 
-def _source(instance: Path, *, dependencies: Callable[[Path], None] | None = None) -> ShowrunnerSource:
+def _source(instance: Path, *, dependencies: Callable[[Path], None] | None = None,
+            expected_document: Path | None = None) -> ShowrunnerSource:
     fields = _fields(instance / "conf", dependencies=dependencies)
     target = fields["TARGET"]
     if not target.startswith("session:") or not target[8:]:
@@ -236,6 +238,8 @@ def _source(instance: Path, *, dependencies: Callable[[Path], None] | None = Non
     doc = _checked_doc(fields.get("CHECK"))
     if isinstance(doc, NoCheckedDoc):
         raise ValueError(doc.reason)
+    if expected_document is not None and doc.path.resolve() != expected_document.resolve():
+        raise ValueError(f"{instance}: timer document differs from stored document {expected_document}")
     if dependencies is not None:
         dependencies(doc.path)
     try:
@@ -244,6 +248,11 @@ def _source(instance: Path, *, dependencies: Callable[[Path], None] | None = Non
         raise ValueError(f"production doc could not be read: {error}") from error
     timer = Timer(instance.name.removeprefix("showrunner-"), target, doc.path, user_zone_name())
     return ShowrunnerSource(timer, document)
+
+
+def read_bound_source(instance: Path, document: Path) -> ShowrunnerSource:
+    """Read a timer only when its document agrees with the caller's stored owner."""
+    return _source(instance, expected_document=document)
 
 
 def _timer(instance: Path) -> Timer:
@@ -284,15 +293,27 @@ class DiscoverSessions(NamedTuple):
 DISCOVER_SESSIONS = DiscoverSessions()
 
 
+class DiscoverMembership(NamedTuple):
+    """Read staff when no report snapshot was supplied."""
+
+
+DISCOVER_MEMBERSHIP = DiscoverMembership()
+
+
 def _registered(timer: Timer, *,
                 known_sessions: Mapping[str, SessionRecord] | DiscoverSessions = DISCOVER_SESSIONS,
-                deadline: float = math.inf) -> Showrunner:
+                deadline: float = math.inf,
+                membership: staff.StaffSnapshot | None = None) -> Showrunner:
+    membership = membership if membership is not None else staff.initial_snapshot()
+    owner = membership.by_id(staff.StaffId(timer.target[8:]))
+    current = owner.current_session if owner is not None else timer.target[8:]
+    target = "session:" + current
     if isinstance(known_sessions, DiscoverSessions):
-        socket = (socket_for(timer.target, deadline=deadline) if math.isfinite(deadline)
-                  else socket_for(timer.target)) or ""
-        name = _session_name(timer.target[8:]) if socket else ""
+        socket = (socket_for(target, deadline=deadline) if math.isfinite(deadline)
+                  else socket_for(target)) or ""
+        name = _session_name(current) if socket else ""
     else:
-        record = known_sessions.get(timer.target[8:])
+        record = known_sessions.get(current)
         live = record is not None and messaging_socket_exists(record)
         socket = record["messagingSocketPath"] if record is not None and live else ""
         name = record["name"] if record is not None and live else ""
@@ -303,6 +324,7 @@ def registered_showrunners(
     state_dir: Path | None = None, *,
     known_sessions: Mapping[str, SessionRecord] | DiscoverSessions = DISCOVER_SESSIONS,
     deadline: float = math.inf,
+    membership: staff.StaffSnapshot | DiscoverMembership = DISCOVER_MEMBERSHIP,
 ) -> ShowrunnerDiscovery:
     """Every showrunner that has an update timer, running or not.
 
@@ -317,12 +339,13 @@ def registered_showrunners(
     found: list[Showrunner] = []
     failures: list[ShowrunnerLookupFailure] = []
     sources = read_sources(state_dir, unreadable=UnreadableTimerPolicy.RAISE)
+    membership = staff.initial_snapshot() if isinstance(membership, DiscoverMembership) else membership
     for index, source in enumerate(sources):
         try:
             # Share the remaining budget with later lookups and the caller's inspection work.
             began = monotonic()
             lookup_deadline = began + max(0.0, deadline - began) / (len(sources) - index + 1)
-            found.append(_registered(source.timer, known_sessions=known_sessions, deadline=lookup_deadline))
+            found.append(_registered(source.timer, known_sessions=known_sessions, deadline=lookup_deadline, membership=membership))
         except (OSError, KeyError, ValueError, UnicodeError) as error:
             failure = ShowrunnerLookupFailure(source.timer.slug, str(error))
             if isinstance(error, OSError):
@@ -333,13 +356,15 @@ def registered_showrunners(
 
 def production_of(session_id: str, state_dir: Path | None = None) -> Path | None:
     """The production doc of the showrunner whose update timer is addressed to `session_id`."""
+    owner = staff.initial_snapshot().by_current_session(session_id) if session_id else None
+    reference = owner.id if owner is not None else session_id
     for instance in sorted((state_dir or NOTIFIER_STATE_DIR).glob("showrunner-*")):
         try:
             target = _fields(instance / "conf").get("TARGET")
         except (OSError, UnicodeError):
             continue
         doc = checked_doc(instance)
-        if session_id and target == f"session:{session_id}" and isinstance(doc, CheckedDoc):
+        if session_id and target == f"session:{reference}" and isinstance(doc, CheckedDoc):
             return doc.path
     return None
 
@@ -518,7 +543,7 @@ def timer_slugs(state_dir: Path | None = None) -> set[str]:
 
 def own_slug() -> str:
     """The production this session runs as showrunner. Empty when it runs none."""
-    doc = production_of(os.environ.get("CLAUDE_CODE_SESSION_ID", ""))
+    doc = production_of(staff.runtime_id())
     return production_slug(str(doc)) if doc is not None else ""
 
 

@@ -176,8 +176,8 @@ class PushTextTests(unittest.TestCase):
         self.assertFalse(entry.agent_written)
         self.assertEqual(push_texts.fingerprint(entry), push_texts.fingerprint(replace(entry, agent_written=True)))
 
-    def test_only_nate_adhoc_is_agent_written_and_its_approval_is_current(self) -> None:
-        self.assertEqual([entry.id for entry in push_texts.catalog() if push_texts.agent_written(entry.id)], ["nate.adhoc"])
+    def test_agent_written_entries_and_nate_approval_are_current(self) -> None:
+        self.assertEqual([entry.id for entry in push_texts.catalog() if push_texts.agent_written(entry.id)], ["alert.blocked", "alert.decision", "nate.adhoc"])
         self.assertFalse(push_texts.agent_written("unknown"))
         self.assertRegex(push_texts.approval_date("nate.adhoc"), r"^\d{4}-\d{2}-\d{2}$")
 
