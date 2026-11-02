@@ -173,7 +173,7 @@ class ResumeUnitTests(unittest.TestCase):
     def retained_config(self, *, plan: str = "docs/plans/alpha.md", folder: Path | None = None) -> None:
         row = next(row for row in staff.find(kind="unit") if row.name == "alpha")
         unit_config.discard_parked(row.id)
-        unit_config.write_parked(row.id, unit_config.UnitConfig(unit_config.PlanFile(Path(plan)),
+        _ = unit_config.write_parked(row.id, unit_config.UnitConfig(unit_config.PlanFile(Path(plan)),
             unit_config.AppPort(1), ("scripts",), unit_config.RetiredSession("2026-10-20", DIRECTOR,
                 unit_config.RecordedStartFolder(folder or self.worktree), unit_config.Branch("alpha-branch"))))
 
@@ -228,7 +228,7 @@ class ResumeUnitTests(unittest.TestCase):
             unit_config.AppPort(1), ("scripts",),
             unit_config.RetiredSession("2026-10-20", DIRECTOR,
                 unit_config.RecordedStartFolder(self.worktree), unit_config.Branch("alpha-branch")))
-        unit_config.write_parked(row.id, saved)
+        _ = unit_config.write_parked(row.id, saved)
         parked = unit_config.parked_path(row.id)
         retained = parked.read_bytes(), parked.stat().st_mtime_ns
         original = staff.restore_unit

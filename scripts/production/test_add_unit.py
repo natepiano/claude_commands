@@ -141,7 +141,7 @@ class AddUnitLaunchTests(AddUnitTestCase):
     def test_an_existing_config_port_conflict_refuses_before_admission_or_launch(self) -> None:
         worktree = self.root / "project-alpha"
         _ = self.git("worktree", "add", "-b", "build-followups-alpha", str(worktree), "build-followups")
-        unit_config.write(worktree, unit_config.UnitConfig(
+        _ = unit_config.write(worktree, unit_config.UnitConfig(
             unit_config.PlanFile(Path("docs/plans/given.md")), unit_config.AppPort(8123), ()))
         path = worktree / ".unit.toml"
         before = path.read_bytes(), path.stat().st_mtime_ns, self.staff.staff_file.read_bytes(), self.doc.read_bytes()

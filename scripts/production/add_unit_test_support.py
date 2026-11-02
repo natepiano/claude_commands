@@ -695,7 +695,7 @@ class AddUnitTestCase(ShutdownTestCase):
             row = staff.set_worktree(row.id, staff.PresentWorktree("natedev", worktree))
             config_plan = (unit_config.StandbyPlan() if plan == "standby"
                            else unit_config.PlanFile(Path(plan)))
-            unit_config.write(worktree, unit_config.UnitConfig(config_plan, unit_config.NoAppPort(), ()))
+            _ = unit_config.write(worktree, unit_config.UnitConfig(config_plan, unit_config.NoAppPort(), ()))
         return row
 
     def run_with_marked_unit(
@@ -737,7 +737,7 @@ class AddUnitTestCase(ShutdownTestCase):
         with patch.dict(os.environ, self.env):
             row = unit_membership(fixture_showrunner_name("build-followups", self.doc), request.unit_id)
             _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", request.worktree))
-            unit_config.write(request.worktree, unit_config.UnitConfig(
+            _ = unit_config.write(request.worktree, unit_config.UnitConfig(
                 unit_config.PlanFile(Path("docs/plans/given.md")), unit_config.NoAppPort(), ()))
         git_run = subprocess.run
         commands: list[list[str]] = []

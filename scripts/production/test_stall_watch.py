@@ -26,6 +26,7 @@ from typing import cast, override
 from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib import unit_runs
 from scripts.lib.test_agents_registry import write_registry
 from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -129,10 +130,15 @@ class StallWatchTests(unittest.TestCase):
         # A unit's Plan cell and the state mark on its herdr pane, where a test sets one.
         self.plans: dict[str, str] = {}
         self.states: dict[str, str] = {}
+        self.run_records: dict[str, list[dict[str, object]]] = {}
+        self.unheld_runs: set[str] = set()
+        self.director_overrides: dict[str, str] = {}
 
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(short_socket_directory()))
+        _ = cast(object, self.enterContext(mock.patch.multiple(
+            unit_runs, RUN_ROOT=self.root / "held", FORMER_RUN_ROOT=self.root / "former-held")))
         self.environment["HERDR_PANE_RECORD_DIR"] = str(self.root / "pane-records")
         self.enterContext(isolated_staff_file(self.root / "staff.json", self.environment))
         self.bin = self.root / "bin"
@@ -363,7 +369,7 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
         _ = responses_path.write_text(json.dumps(responses))
         for unit, data in zip(units, self.panes.values()):
             fake_unit_host.place_process(self.environment, int(data["pid"]), unit.pane)
-        # A unit's run state is read from the record of the newest /unit:direct run in its worktree.
+        # Staff sessions identify the directors in these temporary run records.
         runs = self.root / "history/runs"
         runs.mkdir(parents=True, exist_ok=True)
         for record in runs.iterdir():
@@ -373,13 +379,28 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
             if state == "standing-by":
                 continue
             events = [{"event_type": "run_started", "run_started_at": 1.0,
-                       "working_dir": str(Path(f"/tmp/no-worktree-of-{name}").resolve())},
+                       "working_dir": str(Path(f"/tmp/no-worktree-of-{name}").resolve()),
+                       "main_agent": {"session_id": unit_session(name)}},
                       *([{"event_type": "run_finished"}] if state == "run-finished" else [])]
             _ = (runs / f"{name}.jsonl").write_text("".join(json.dumps(event) + "\n" for event in events))
+        for run_id, events in self.run_records.items():
+            _ = (runs / f"{run_id}.jsonl").write_text("".join(json.dumps(event) + "\n" for event in events))
+        for history in runs.iterdir():
+            folder = self.root / "held" / history.stem
+            if history.stem in self.unheld_runs:
+                continue
+            folder.mkdir(parents=True, exist_ok=True)
+            _ = (folder / unit_runs.STATE_FILE).write_text(json.dumps({"history_file": str(history)}))
+            if history.stem in self.director_overrides:
+                unit_runs.record_director(folder, self.director_overrides[history.stem])
         environment = {**self.environment, "STALL_WATCH_NOW_EPOCH": str(at),
                        "STALL_TEST_SEND_TOGETHER": str(together)}
         if subprocess_cli:
-            return subprocess.run([sys.executable, str(SCRIPT)], env=environment,
+            wrapper = ("import runpy,sys; from pathlib import Path; from scripts.lib import unit_runs; "
+                       + "unit_runs.RUN_ROOT=Path(sys.argv[1]); unit_runs.FORMER_RUN_ROOT=Path(sys.argv[2]); "
+                       + "runpy.run_path(sys.argv[3],run_name='__main__')")
+            return subprocess.run([sys.executable, "-c", wrapper, str(self.root / "held"),
+                                   str(self.root / "former-held"), str(SCRIPT)], env=environment,
                                   capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         # Keep herdr.run_program, its sanitized environment, and every parser.
         # Only the recording fake's interpreter startup is removed.
@@ -456,11 +477,205 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
             return []
         return [json.loads(line) for line in self.send_log.read_text().splitlines()]
 
+    def moved_director_run(self, *, finished: bool = False) -> Path:
+        """Keep stale staff and document paths while the held run uses another worktree."""
+        self.states["unit-one"] = "run-finished"
+        worktree = self.root / "current-worktree"
+        row = next(row for row in staff.find(kind="unit") if row.current_session == unit_session("unit-one"))
+        self.run_records["active-run"] = [
+            {"event_type": "run_started", "run_started_at": 2.0, "working_dir": str(worktree),
+             "main_agent": {"session_id": row.current_session}},
+            *([{"event_type": "run_finished"}] if finished else []),
+        ]
+        return worktree
+
+    def test_staff_director_in_another_worktree_is_bumped_once_per_stretch(self) -> None:
+        current = self.moved_director_run()
+        doc = self.root / "showrunner-production.md"
+        self.assertNotIn(str(current), doc.read_text())
+        row = next(row for row in staff.find(kind="unit") if row.current_session == unit_session("unit-one"))
+        self.assertNotEqual(row.worktree, staff.PresentWorktree(local_machine(), current))
+        self.assertEqual(self.tick(START).returncode, 0)
+        result = self.tick(START + 600)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual({item["key"].rsplit(":", 1)[-1] for item in self.sent()}, {"bump", "tell"})
+        self.assertTrue(any("idle since" in item["text"] and "nothing running; bumped" in item["text"]
+                            for item in self.sent()))
+        self.assertIn("inspected showrunner/unit-one: idle bump requested", result.stdout)
+        saved = {path: path.read_bytes() for path in self.state.glob("*.json")}
+        again = self.tick(START + 660)
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertEqual(len(self.sent()), 2)
+        self.assertEqual({path: path.read_bytes() for path in self.state.glob("*.json")}, saved)
+
+    def test_running_work_of_the_staff_director_resets_the_stretch(self) -> None:
+        _ = self.moved_director_run()
+        pid = int(self.panes["unit-one"]["pid"])
+        self.assertEqual(self.tick(START).returncode, 0)
+        self.process_rows.append(f"900001 {pid} bash compile-in-current-worktree")
+        result = self.tick(START + 600)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.sent(), [])
+        self.assertIn("inspected showrunner/unit-one: running", result.stdout)
+        saved = cast(dict[str, object], json.loads(
+            (self.state / stall_watch.stretch_path("showrunner", "unit-one").name).read_text()))
+        self.assertEqual(saved["since"], START + 600)
+        _ = self.process_rows.pop()
+        self.assertEqual(self.tick(START + 601).returncode, 0)
+        self.assertEqual(self.sent(), [])
+
+    def test_finished_staff_director_run_is_not_eligible(self) -> None:
+        _ = self.moved_director_run(finished=True)
+        self.assertEqual(self.tick(START).returncode, 0)
+        result = self.tick(START + 600)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("inspected showrunner/unit-one:", result.stdout)
+        self.assertEqual(self.sent(), [])
+        self.assertFalse((self.state / stall_watch.stretch_path("showrunner", "unit-one").name).exists())
+
+    def test_replacement_director_uses_the_recorded_director_of_the_held_run(self) -> None:
+        _ = self.moved_director_run()
+        old_session = unit_session("unit-old")
+        self.run_records["active-run"][0]["main_agent"] = {"session_id": old_session}
+        self.director_overrides["active-run"] = unit_session("unit-one")
+        _ = self.unit("unit-old")
+        self.states["unit-old"] = "standing-by"
+        self.configure({"showrunner": ["unit-one", "unit-old"]})
+        self.assertEqual(self.tick(START).returncode, 0)
+        result = self.tick(START + 600)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("inspected showrunner/unit-one: idle bump requested", result.stdout)
+        self.assertNotIn("inspected showrunner/unit-old:", result.stdout)
+        self.assertEqual(len(self.sent()), 2)
+
+    def test_staff_director_without_a_held_run_is_not_eligible(self) -> None:
+        self.unheld_runs.add("unit-one")
+        self.assertEqual(self.tick(START).returncode, 0)
+        result = self.tick(START + 600)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("inspected showrunner/unit-one:", result.stdout)
+        self.assertEqual(self.sent(), [])
+
+    def test_damaged_held_history_preserves_only_its_units_state(self) -> None:
+        _ = self.unit("unit-two")
+        self.configure({"showrunner": ["unit-one", "unit-two"]})
+        self.assertEqual(self.tick(START).returncode, 0)
+        path = self.state / stall_watch.stretch_path("showrunner", "unit-one").name
+        saved = path.read_bytes()
+        scan = unit_runs.held_by_session
+        damaged = self.root / "history/runs/unit-one.jsonl"
+
+        def damage() -> dict[str, list[str]]:
+            folders = scan()
+            with damaged.open("ab") as handle:
+                _ = handle.write(b"\xff\n")
+            return folders
+
+        with mock.patch.object(unit_runs, "held_by_session", side_effect=damage):
+            result = self.tick(START + 600)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(path.read_bytes(), saved)
+        lines = [line for line in result.stdout.splitlines() if "unit-one" in line]
+        self.assertEqual(len(lines), 1)
+        self.assertIn(str(damaged), lines[0])
+        self.assertIn("run unknown", lines[0])
+        self.assertIn("inspected showrunner/unit-two: idle bump requested", result.stdout)
+        self.assertEqual(len(self.sent()), 2)
+        self.assertTrue(all("unit-two" in item["key"] for item in self.sent()))
+
+    def test_one_director_read_per_folder_serves_multiple_units(self) -> None:
+        _ = self.unit("unit-two")
+        self.configure({"showrunner": ["unit-one", "unit-two"]})
+        with mock.patch.object(unit_runs, "director", wraps=unit_runs.director) as directors:
+            result = self.tick(START)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), ["inspected showrunner/unit-one: fresh",
+                                                     "inspected showrunner/unit-two: fresh"])
+        self.assertEqual(directors.call_count, 2)
+        self.assertEqual({call.args[0] for call in directors.call_args_list},
+                         {self.root / "held/unit-one", self.root / "held/unit-two"})
+
+    def test_bad_unheld_history_header_and_tail_do_not_affect_units(self) -> None:
+        scan = unit_runs.held_by_session
+
+        def damage() -> dict[str, list[str]]:
+            folders = scan()
+            _ = (self.root / "history/runs/unheld.jsonl").write_bytes(b"not JSON\n\xff\n")
+            return folders
+
+        with (mock.patch.object(unit_runs, "held_by_session", side_effect=damage),
+              mock.patch.object(unit_lookup, "read_run_states", side_effect=AssertionError("eager history read"))):
+            result = self.tick(START)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), ["inspected showrunner/unit-one: fresh"])
+        self.assertEqual(self.sent(), [])
+
+    def test_inspection_deadline_prevents_later_history_reads_and_state_changes(self) -> None:
+        _ = self.unit("unit-two")
+        self.configure({"showrunner": ["unit-one", "unit-two"]})
+        self.assertEqual(self.tick(START).returncode, 0)
+        saved = {path: path.read_bytes() for path in self.state.glob("*.json")}
+        (self.state / "inspection.cursor").unlink(missing_ok=True)
+        clock = [0.0]
+        original = unit_lookup.HeldRunLookup.unfinished_held_run
+        sessions: list[str] = []
+
+        def lookup(runs: unit_lookup.HeldRunLookup, session: str) -> unit_lookup.HeldRun | unit_lookup.HeldRunUnknown | unit_lookup.NoUnfinishedRun:
+            sessions.append(session)
+            found = original(runs, session)
+            clock[0] = 100.0
+            return found
+
+        with (mock.patch.object(time, "monotonic", side_effect=lambda: clock[0]),
+              mock.patch.object(showrunners, "monotonic", side_effect=lambda: clock[0]),
+              mock.patch.object(unit_lookup.HeldRunLookup, "unfinished_held_run", lookup),
+              mock.patch.object(unit_runs, "held_by_session", wraps=unit_runs.held_by_session) as scan,
+              mock.patch.object(stall_watch, "read_place") as panes):
+            result = self.tick(START + 600)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        scan.assert_called_once_with()
+        self.assertEqual(sessions, [unit_session("unit-one")])
+        panes.assert_not_called()
+        self.assertEqual({path: path.read_bytes() for path in saved}, saved)
+        self.assertEqual(self.sent(), [])
+
+    def test_one_staff_snapshot_supplies_discovery_and_unit_membership(self) -> None:
+        with (mock.patch.object(staff, "snapshot", wraps=staff.snapshot) as snapshots,
+              mock.patch.object(showrunners, "registered_showrunners", wraps=showrunners.registered_showrunners) as discover):
+            result = self.tick(START)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        snapshots.assert_called_once_with()
+        self.assertIsInstance(cast(object, discover.call_args.kwargs["membership"]), staff.StaffSnapshot)
+
+    def test_staff_unit_without_a_document_row_is_still_inspected(self) -> None:
+        doc = self.root / "showrunner-production.md"
+        _ = doc.write_text("\n".join(line for line in doc.read_text().splitlines() if "| unit-one |" not in line))
+        self.assertEqual(self.tick(START).returncode, 0)
+        result = self.tick(START + 600)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("inspected showrunner/unit-one: idle bump requested", result.stdout)
+        self.assertEqual({item["key"].rsplit(":", 1)[-1] for item in self.sent()}, {"bump", "tell"})
+
+    def test_inspection_log_names_each_unit_without_sending(self) -> None:
+        _ = self.unit("unit-two")
+        self.configure({"showrunner": ["unit-one", "unit-two"]})
+        with (mock.patch.object(stall_watch, "send_all") as sends,
+              mock.patch.object(stall_watch, "delivery") as delivery):
+            result = self.tick(START)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), ["inspected showrunner/unit-one: fresh",
+                                                     "inspected showrunner/unit-two: fresh"])
+        delivery.assert_not_called()
+        sends.assert_called_once_with([], START, deadline=mock.ANY,
+            limits=stall_watch.sender_limits(stall_watch.watch_config(packaged_only=True)))
+        self.assertEqual(self.sent(), [])
+
     def test_one_tick_reads_run_records_once_across_productions_and_units(self) -> None:
         import stall_watch
         from scripts.production import showrunners
         import unit_lookup as lookup
         runners: list[showrunners.Showrunner] = []
+        marked: dict[str, dict[str, lookup.MarkedUnit]] = {}
         for slug in ("first", "second"):
             doc = self.root / f"{slug}-production.md"
             _ = doc.write_text("\n".join(("# Production", f"- **Production slug:** {slug}", "## Units",
@@ -469,17 +684,22 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
                                f"| beta | docs/beta.md | {self.root / 'beta'} |", "")))
             runners.append(showrunners.Showrunner(session=slug, socket="/fixture.sock",
                             slug=slug, zone="UTC", doc=str(doc)))
-            for unit in ("alpha", "beta"):
-                _ = unit_membership(slug, unit)
-        marked = {name: lookup.MarkedUnit(name, lookup.ClaudeNotRunning(), lookup.Place("fixture", name))
-                  for name in ("alpha", "beta")}
+            marked[slug] = {}
+            for name in ("alpha", "beta"):
+                row = unit_membership(slug, name)
+                marked[slug][name] = lookup.MarkedUnit(name, lookup.ClaudeNotRunning(), lookup.Place("fixture", name),
+                                                     staff_id=row.current_session)
+
+        def marked_units(slug: str, *, record: staff.StaffSnapshot) -> dict[str, lookup.MarkedUnit]:
+            del record
+            return marked[slug]
         with (mock.patch.dict(os.environ, self.environment),
               mock.patch.object(stall_watch, "processes", return_value=[]),
               mock.patch.object(stall_watch, "STATE_DIR", self.state),
               mock.patch.object(showrunners, "load_settings", return_value={}),
               mock.patch.object(showrunners, "registered_showrunners", return_value=showrunners.ShowrunnerDiscovery(runners)),
-              mock.patch.object(lookup, "marked_units", return_value=marked),
-              mock.patch.object(lookup, "read_run_states", wraps=lookup.read_run_states) as reads,
+              mock.patch.object(lookup, "marked_units", side_effect=marked_units),
+              mock.patch.object(unit_runs, "held_by_session", wraps=unit_runs.held_by_session) as reads,
               mock.patch.object(stall_watch, "forget", return_value=None) as forget,
               mock.patch.object(stall_watch, "send_all") as send):
             _ = stall_watch.tick(START)
@@ -542,8 +762,8 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
             (self.state / "inspection.cursor").unlink(missing_ok=True)
             clock = [0.0]
 
-            def discover(*, deadline: float) -> showrunners.ShowrunnerDiscovery:
-                found = original(deadline=deadline)
+            def discover(*, deadline: float, membership: staff.StaffSnapshot) -> showrunners.ShowrunnerDiscovery:
+                found = original(deadline=deadline, membership=membership)
                 clock[0] = 98.0
                 return found
 
@@ -601,8 +821,8 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
                 clock = [0.0]
                 reads: list[str] = []
 
-                def discover(*, deadline: float) -> showrunners.ShowrunnerDiscovery:
-                    found = original(deadline=deadline)
+                def discover(*, deadline: float, membership: staff.StaffSnapshot) -> showrunners.ShowrunnerDiscovery:
+                    found = original(deadline=deadline, membership=membership)
                     clock[0] = 98.0
                     return found
 

@@ -237,6 +237,62 @@ class RunRecord(NamedTuple):
     state: UnitState
 
 
+class HeldRun(NamedTuple):
+    """A directed run and its recorded worktree and state."""
+
+    path: Path
+    worktree: Path
+    state: UnitState
+
+
+@dataclass(frozen=True)
+class NoUnfinishedRun:
+    """The director holds no run with an unfinished history."""
+
+
+@dataclass(frozen=True)
+class HeldRunUnknown:
+    """A held history cannot establish the unit's run state."""
+
+    path: Path
+    reason: str
+
+
+class HeldRunLookup:
+    """Read only held histories and retain each result for one watch pass."""
+
+    def __init__(self) -> None:
+        self._folders: dict[str, list[str]] | None = None
+        self._histories: dict[Path, HeldRun | HeldRunUnknown] = {}
+
+    def unfinished_held_run(self, session_id: str) -> HeldRun | HeldRunUnknown | NoUnfinishedRun:
+        if not session_id:
+            return NoUnfinishedRun()
+        if self._folders is None:
+            self._folders = unit_runs.held_by_session()
+        for folder in unit_runs.held(session_id, scanned=self._folders):
+            path = runs_dir() / (Path(folder).name + ".jsonl")
+            if path not in self._histories:
+                try:
+                    with path.open("rb") as handle:
+                        first = _event(handle.readline().decode("utf-8"))
+                    if first is None or first.get("event_type") != "run_started":
+                        raise ValueError("history does not start with run_started")
+                    worktree = first.get("working_dir")
+                    if not isinstance(worktree, str) or not worktree:
+                        raise ValueError("run_started has no worktree")
+                    last = _last_event(path)
+                    state = (UnitState.RUN_FINISHED if last is not None
+                             and last.get("event_type") == "run_finished" else UnitState.RUNNING)
+                    self._histories[path] = HeldRun(path, Path(worktree).expanduser().resolve(), state)
+                except (OSError, UnicodeError, ValueError) as error:
+                    self._histories[path] = HeldRunUnknown(path, str(error))
+            run = self._histories[path]
+            if isinstance(run, HeldRunUnknown) or run.state is UnitState.RUNNING:
+                return run
+        return NoUnfinishedRun()
+
+
 class RunStates(NamedTuple):
     # Keep the recorded spelling: unit_move matches working_dir exactly.
     records: dict[str, RunRecord]

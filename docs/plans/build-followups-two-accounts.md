@@ -3074,3 +3074,26 @@ User 2026-11-01: the role count of 68 workers counted idle workers too; asked fo
 natedev showrunner 2026-11-01 (C35, cef58b5c): prove each started-hold form that `next list` prints.
 
 **As-built:** `test_started_fixed_expired_and_no_pace_holds_list_exact_rows_without_state_changes` runs the real `next list` path on scratch state for a fixed hold with time left, a fixed hold that is over, and the 40-minute default with no pace history. Each case asserts the full line and unchanged hold state. The half-point line with a pace stays in `test_started_hold_row_is_shared_by_list_add_hold_reply_and_the_mac`. Tests only.
+
+### Phase 101q — /theme never blocks a promotion  · status: done · 378b778c
+
+natedev showrunner 2026-11-02: the user ran /theme at 09:06 EST; Claude Code wrote `theme` into live `~/.claude/settings.json`, and merge_gate refused every promotion because the tracked file differed from HEAD.
+
+**As-built:** `theme` joins the per-machine keys in `scripts/settings/settings_local_keys.sh` (with `model`, `effortLevel`, `modelSettings`, `extraKnownMarketplaces`). The clean filter strips it, the sidecar keeps it, and the smudge restores it. The committed `settings.json` has no `theme`. `test_settings_local_keys.py` fixtures give each machine a different theme and still clean to one blob.
+
+### Phase 101r — The Mac renews an expired Claude login by itself  · status: done · ef9480b6
+
+User 2026-11-02: "i want accounts renewal on the mac for sure". natedev renewed idle logins in its notes job's refusal-watch pass; the Mac ran only `agent_notes.py usage-only`, which never renewed.
+
+**As-built:** `agent_notes.py usage-only` (Mac launchd job, nixos `modules/darwin/account-usage.nix`) runs `refusal_watch.renew_expired_logins` as a dry run after it saves usage. When an account is due, it starts `agent_notes.py renew-logins` as a detached child (`start_new_session`) and returns: launchd runs one job instance, so the usage job never waits on a 120 s probe. `renew-logins` holds the `login-renewal` schedule lock and calls the same function, which keeps the hourly limit and `~/.local/state/accounts/login_renewals.json`. Two repair rounds (F001: the probe held the usage job, first by its lock, then by launchd's one instance). Style review PASS. Live proof: the Mac after promotion.
+
+### Phase 101s — The accounts board has no read column  · status: todo
+
+User 2026-11-02: remove the `read` column from the accounts board; an account that cannot be read shows in the problems, not in a permanent column. Start after 101r. Keep handler-unit (cargo-handler shows accounts) told of each change.
+
+**Goal:** the board shows account, left, role, busy, shell, idle, total, resets, credits, enabled; a failed or old reading shows only as a problem line and the red dot.
+**Spec:** drop the `read` column and the narrow-layout `read … ago` fact in `mods/unit-board/hooks/accounts.tsx`. Keep `read_at` and `read_ok` in the JSON (the dot and cargo-handler read them). Check that every read failure the status computes reaches the problems list; add any that does not. Update `docs/accounts.md` where it lists the board columns.
+**Files:**
+- mods/unit-board/hooks/accounts.tsx
+- mods/unit-board/tests/accounts.test.ts
+- docs/accounts.md

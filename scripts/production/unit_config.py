@@ -3,6 +3,9 @@ from __future__ import annotations
 
 import json
 import re
+import os
+from subprocess import run as run_taplo
+import tempfile
 import tomllib
 from dataclasses import dataclass, field, replace
 from datetime import date as CalendarDate
@@ -97,11 +100,32 @@ class NoRetiredSession:
 
 
 @dataclass(frozen=True)
+class RepositoryTaploConfig:
+    text: str
+
+
+@dataclass(frozen=True)
+class DefaultTaploConfig:
+    """Use taplo's default formatting options."""
+
+
+@dataclass(frozen=True)
+class Published:
+    """The writer replaced the target with the formatted bytes."""
+
+
+@dataclass(frozen=True)
+class AlreadyCurrent:
+    """The target already contains the formatted bytes."""
+
+
+@dataclass(frozen=True)
 class UnitConfig:
     plan: PlanFile | StandbyPlan | PermanentPlan
     port: AppPort | NoAppPort
     responsibilities: tuple[str, ...]
     retired: RetiredSession | NoRetiredSession = field(default_factory=NoRetiredSession)
+    formatting: RepositoryTaploConfig | DefaultTaploConfig = field(default_factory=DefaultTaploConfig, compare=False)
 
     def __post_init__(self) -> None:
         for name in self.responsibilities:
@@ -151,7 +175,7 @@ def _string(fields: dict[str, object], key: str) -> str:
 
 
 def _decode(fields: dict[str, object]) -> UnitConfig:
-    unknown = set(fields) - {"plan", "port", "responsibilities", "retired"}
+    unknown = set(fields) - {"plan", "port", "responsibilities", "retired", "taplo_config"}
     if unknown:
         raise ConfigRefused(f"unknown key: {sorted(unknown)[0]}")
     plan_text = _string(fields, "plan")
@@ -183,7 +207,8 @@ def _decode(fields: dict[str, object]) -> UnitConfig:
         retired = RetiredSession(_string(facts, "date"), _string(facts, "session"),
                                  RecordedStartFolder(Path(folder)) if folder else UnrecordedStartFolder(),
                                  Branch(_string(facts, "branch")))
-    return UnitConfig(plan, port, tuple(duties), retired)
+    formatting = RepositoryTaploConfig(_string(fields, "taplo_config")) if "taplo_config" in fields else DefaultTaploConfig()
+    return UnitConfig(plan, port, tuple(duties), retired, formatting)
 
 
 def _read_file(path: Path, *, cleanup: bool = True) -> UnitConfig | ConfigMissing:
@@ -216,6 +241,8 @@ def _fields(config: UnitConfig) -> dict[str, object]:
     if isinstance(config.port, AppPort):
         fields["port"] = config.port.number
     fields["responsibilities"] = list(config.responsibilities)
+    if isinstance(config.formatting, RepositoryTaploConfig):
+        fields["taplo_config"] = config.formatting.text
     if isinstance(config.retired, RetiredSession):
         facts = config.retired
         fields["retired"] = {"date": facts.date, "session": facts.session_id,
@@ -236,20 +263,79 @@ def _text(config: UnitConfig) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _publish(path: Path, config: UnitConfig) -> None:
-    current = _read_file(path)
-    if current != config:
-        atomic_file.write_text_atomic(path, _text(config))
-    if _read_file(path) != config:
+def repository_formatting(worktree: Path) -> RepositoryTaploConfig | DefaultTaploConfig:
+    """Read the repository's taplo configuration when the caller needs it."""
+    for name in (".taplo.toml", "taplo.toml"):
+        try:
+            return RepositoryTaploConfig((worktree / name).read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            continue
+    return DefaultTaploConfig()
+
+
+def _formatted(config: UnitConfig, worktree: Path | UnrecordedStartFolder,
+               formatting: RepositoryTaploConfig | DefaultTaploConfig) -> bytes:
+    """Run taplo with explicit configuration and a repository-relative input path."""
+    try:
+        with tempfile.TemporaryDirectory(prefix="unit-taplo-") as directory:
+            root = worktree if isinstance(worktree, Path) and worktree.is_dir() else Path(directory)
+            options: list[str] = []
+            if isinstance(formatting, RepositoryTaploConfig):
+                settings = Path(directory) / "taplo.toml"
+                for name in (".taplo.toml", "taplo.toml"):
+                    candidate = root / name
+                    if candidate.is_file() and candidate.read_text(encoding="utf-8") == formatting.text:
+                        settings = candidate
+                        break
+                if settings.parent == Path(directory):
+                    root = Path(directory)
+                    atomic_file.write_text_atomic(settings, formatting.text)
+                options.extend(("--config", str(settings)))
+            command = ["taplo", "fmt", "--no-auto-config", *options,
+                       "--stdin-filepath", str(root / ".unit.toml"), "-"]
+            environment = dict(os.environ)
+            _ = environment.pop("TAPLO_CONFIG", None)
+            result = run_taplo(command, input=_text(config).encode("utf-8"),
+                               capture_output=True, check=False, cwd=root, env=environment)
+    except (OSError, UnicodeError) as error:
+        raise ConfigRefused(f"{worktree}: cannot format configuration with taplo: {error}") from error
+    if result.returncode:
+        raise ConfigRefused(f"{worktree}: taplo failed: {result.stderr.decode('utf-8', errors='replace').strip()}")
+    if _decode(cast(dict[str, object], tomllib.loads(result.stdout.decode("utf-8")))) != config:
+        raise ConfigRefused(f"{worktree}: taplo changed configuration values")
+    return result.stdout
+
+
+def _differs(path: Path, text: bytes) -> bool:
+    try:
+        return path.read_bytes() != text
+    except FileNotFoundError:
+        return True
+
+
+def _publish(path: Path, config: UnitConfig, text: bytes) -> Published | AlreadyCurrent:
+    changed = _differs(path, text)
+    if changed:
+        atomic_file.write_bytes_atomic(path, text)
+    if _differs(path, text) or _read_file(path) != config:
         raise ConfigRefused(f"{path}: configuration did not match after publication")
+    return Published() if changed else AlreadyCurrent()
 
 
-def write(worktree: Path, config: UnitConfig) -> None:
+def needs_write(worktree: Path, config: UnitConfig) -> bool:
+    """Compare the current bytes with the repository's formatted configuration."""
+    desired = replace(config, formatting=DefaultTaploConfig())
+    return _differs(worktree / ".unit.toml", _formatted(desired, worktree, repository_formatting(worktree)))
+
+
+def write(worktree: Path, config: UnitConfig) -> Published | AlreadyCurrent:
     """Publish only after git proves the file is untracked and ignored."""
     if not isinstance(config.retired, NoRetiredSession):
         raise ConfigRefused(f"{worktree / '.unit.toml'}: retirement facts belong in the parked file")
+    desired = replace(config, formatting=DefaultTaploConfig())
+    formatted = _formatted(desired, worktree, repository_formatting(worktree))
     git_exclude.ensure_excluded(worktree, "/.unit.toml")
-    _publish(worktree / ".unit.toml", config)
+    return _publish(worktree / ".unit.toml", desired, formatted)
 
 
 def first_difference(left: UnitConfig, right: UnitConfig) -> str:
@@ -282,7 +368,29 @@ def place(unit: StaffId, worktree: Path, *, cleanup: bool = True) -> InWorktree 
     return Nowhere()
 
 
-def write_parked(unit: StaffId, config: UnitConfig) -> None:
+def _parked_config(unit: StaffId, config: UnitConfig) -> UnitConfig:
+    if isinstance(config.retired, RetiredSession) and isinstance(config.retired.start_folder, RecordedStartFolder):
+        worktree = config.retired.start_folder.path
+        if worktree.is_dir():
+            return replace(config, formatting=repository_formatting(worktree))
+    saved = read_parked(unit, cleanup=False)
+    formatting = (saved.formatting if isinstance(saved, UnitConfig)
+                  and isinstance(saved.formatting, RepositoryTaploConfig) else config.formatting)
+    return replace(config, formatting=formatting)
+
+
+def _parked_text(config: UnitConfig) -> bytes:
+    worktree = (config.retired.start_folder.path if isinstance(config.retired, RetiredSession)
+                and isinstance(config.retired.start_folder, RecordedStartFolder) else UnrecordedStartFolder())
+    return _formatted(config, worktree, config.formatting)
+
+
+def parked_needs_write(unit: StaffId, config: UnitConfig) -> bool:
+    """Compare retained bytes with the recorded repository formatting."""
+    return _differs(parked_path(unit), _parked_text(_parked_config(unit, config)))
+
+
+def write_parked(unit: StaffId, config: UnitConfig) -> Published | AlreadyCurrent:
     """Publish complete retired facts once; never overwrite different retained facts."""
     if not isinstance(config.retired, RetiredSession):
         raise ConfigRefused(f"{parked_path(unit)}: parked configuration requires retirement facts")
@@ -292,23 +400,24 @@ def write_parked(unit: StaffId, config: UnitConfig) -> None:
         key = first_difference(saved, config)
         if key:
             raise ConfigRefused(f"{path}: {key} differs; no file was changed")
-    _publish(path, config)
+    desired = _parked_config(unit, config)
+    return _publish(path, desired, _parked_text(desired))
 
 
-def park(unit: StaffId, worktree: Path, retired: RetiredSession) -> None:
+def park(unit: StaffId, worktree: Path, retired: RetiredSession) -> Published | AlreadyCurrent:
     """Verify the retained copy before retire removes the worktree."""
     source_path, saved_path = worktree / ".unit.toml", parked_path(unit)
     source, saved = _read_file(source_path), _read_file(saved_path)
     if isinstance(source, ConfigMissing):
         if isinstance(saved, UnitConfig) and saved.retired == retired:
-            return
+            return write_parked(unit, saved)
         raise ConfigRefused(source.reason)
-    desired = replace(source, retired=retired)
+    desired = replace(source, retired=retired, formatting=repository_formatting(worktree))
     if isinstance(saved, UnitConfig):
         _check_pair(source_path, saved_path, source, saved)
         if saved.retired != retired:
             raise ConfigRefused(f"{source_path} and {saved_path}: retired differs; no file was changed")
-    write_parked(unit, desired)
+    return write_parked(unit, desired)
 
 
 def restore(unit: StaffId, worktree: Path) -> None:
@@ -322,7 +431,7 @@ def restore(unit: StaffId, worktree: Path) -> None:
         raise ConfigRefused(saved.reason)
     if isinstance(live, UnitConfig):
         _check_pair(live_path, saved_path, live, saved)
-    write(worktree, replace(saved, retired=NoRetiredSession()))
+    _ = write(worktree, replace(saved, retired=NoRetiredSession()))
 
 
 def discard_parked(unit: StaffId) -> None:
