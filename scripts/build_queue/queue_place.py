@@ -84,6 +84,11 @@ def suite_scope_prefix() -> list[str]:
     if in_builds_slice():
         print("Module scope skipped: gate already runs in builds.slice", flush=True)
         return []
+    return probe_scope_prefix()
+
+
+def probe_scope_prefix() -> list[str]:
+    """Check whether the user manager can start a separate program scope."""
     prefix = ["systemd-run", "--user", "--scope", "--quiet", "--collect",
               "--expand-environment=no", "--slice=builds.slice", "--"]
     try:
@@ -170,11 +175,16 @@ class ProgramTree:
 
 
 @dataclass
+class ScopedProgram:
+    """The published scope contains every program descendant."""
+
+
+@dataclass
 class StartedProgram:
     process: subprocess.Popen[bytes]
     stopped: threading.Event
     sampler: threading.Thread
-    tree: ProgramTree
+    tracking: ScopedProgram | ProgramTree
 
 
 def scope_start(sidecar: Path, holder_pid: int, holder_start: str, argv: Sequence[str]) -> None:
@@ -191,14 +201,45 @@ def scope_start(sidecar: Path, holder_pid: int, holder_start: str, argv: Sequenc
     raise QueuePlaceRefused("the program did not enter its memory scope")
 
 
+def scope_members(scope: Path) -> set[int]:
+    """Read current scope members, including members of nested scopes."""
+    members: set[int] = set()
+    for path in scope.rglob("cgroup.procs"):
+        try:
+            members.update(int(pid) for pid in path.read_text().split())
+        except FileNotFoundError:
+            continue
+    return members
+
+
+def stop_scope(scope: Path, deadline: float, sample_seconds: float) -> None:
+    """Stop scope members until the scope is empty."""
+    while members := scope_members(scope):
+        number = signal.SIGKILL if time.monotonic() >= deadline else signal.SIGTERM
+        killed_scope = False
+        if number == signal.SIGKILL:
+            try:
+                _ = (scope / "cgroup.kill").write_text("1\n")
+                killed_scope = True
+            except FileNotFoundError:
+                pass
+        if not killed_scope:
+            for pid in members:
+                try:
+                    os.kill(pid, number)
+                except ProcessLookupError:
+                    pass
+        time.sleep(min(sample_seconds, max(0, deadline - time.monotonic()))
+                   if number == signal.SIGTERM else sample_seconds)
+
+
 def program_members(tree: ProgramTree, sidecar: Path) -> dict[int, str]:
     """Find observed tree members and scope members, including nested scopes."""
     members: set[int] = set()
     try:
         scope = sidecar.read_text().strip()
         if scope:
-            for path in Path(scope).rglob("cgroup.procs"):
-                members.update(int(pid) for pid in path.read_text().split())
+            members = scope_members(Path(scope))
     except FileNotFoundError:
         pass
     return tree.live_members(members)
@@ -233,8 +274,13 @@ class QueuePlace:
         if not popen_arguments.get("start_new_session", True):
             raise QueuePlaceRefused("a queued program must start in its own process group")
         popen_arguments["start_new_session"] = True
-        with redirect_stdout(sys.stderr):
-            prefix = suite_scope_prefix()
+        prefix: list[str] = []
+        if os.environ.get("BUILDLOG_SCOPE") != "0":
+            with redirect_stdout(sys.stderr):
+                prefix = probe_scope_prefix()
+            if not prefix:
+                raise QueuePlaceRefused(
+                    "the queued program requires a memory scope; set BUILDLOG_SCOPE=0 only for tests")
         holder_pid = os.getpid()
         holder_start = memory_admit.process_start_time(holder_pid)
         if holder_start is None:
@@ -245,12 +291,14 @@ class QueuePlace:
         with defer_start_signals():
             process = subprocess.Popen(command, **popen_arguments)
             stopped = threading.Event()
-            tree = ProgramTree(process.pid)
-            start = memory_admit.process_start_time(process.pid)
-            if start is not None:
-                tree.observed[process.pid] = start
-            sampler = threading.Thread(target=self._sample, args=(tree, stopped, bool(prefix)), daemon=True)
-            self.program = StartedProgram(process, stopped, sampler, tree)
+            tracking: ScopedProgram | ProgramTree = ScopedProgram()
+            if not prefix:
+                tracking = ProgramTree(process.pid)
+                start = memory_admit.process_start_time(process.pid)
+                if start is not None:
+                    tracking.observed[process.pid] = start
+            sampler = threading.Thread(target=self._sample, args=(tracking, stopped), daemon=True)
+            self.program = StartedProgram(process, stopped, sampler, tracking)
             sampler.start()
             if prefix:
                 while not self.sidecar.read_text().strip():
@@ -259,10 +307,9 @@ class QueuePlace:
                     time.sleep(memory_admit.read_memory_config().program_sample_seconds)
         return process
 
-    def _sample(self, tree: ProgramTree, stopped: threading.Event, scoped: bool) -> None:
+    def _sample(self, tracking: ScopedProgram | ProgramTree, stopped: threading.Event) -> None:
         while True:
             try:
-                members = program_members(tree, self.sidecar)
                 scope = self.sidecar.read_text().strip()
                 if scope:
                     stat = Path(scope) / "memory.stat"
@@ -270,7 +317,8 @@ class QueuePlace:
                     anon = next(int(line.split()[1]) for line in stat.read_text().splitlines()
                                 if line.startswith("anon "))
                     self.observe(anon, anon)
-                elif not scoped:
+                elif isinstance(tracking, ProgramTree):
+                    members = program_members(tracking, self.sidecar)
                     proc = Path(os.environ.get("BUILDLOG_PROC", "/proc"))
                     matching = set(members)
                     if proc != Path("/proc"):
@@ -293,20 +341,23 @@ class QueuePlace:
             completed = process.poll()
             config = memory_admit.read_memory_config()
             deadline = time.monotonic() + config.program_stop_seconds
-            members = program_members(program.tree, self.sidecar)
-            while members:
-                number = signal.SIGKILL if time.monotonic() >= deadline else signal.SIGTERM
-                for pid, start in members.items():
-                    try:
-                        if memory_admit.process_start_time(pid) == start:
-                            os.kill(pid, number)
-                    except ProcessLookupError:
-                        pass
-                _ = process.poll()
-                time.sleep(min(config.program_sample_seconds,
-                               max(0, deadline - time.monotonic())) if number == signal.SIGTERM
-                           else config.program_sample_seconds)
-                members = program_members(program.tree, self.sidecar)
+            if isinstance(program.tracking, ScopedProgram):
+                stop_scope(Path(self.sidecar.read_text().strip()), deadline, config.program_sample_seconds)
+            else:
+                members = program_members(program.tracking, self.sidecar)
+                while members:
+                    number = signal.SIGKILL if time.monotonic() >= deadline else signal.SIGTERM
+                    for pid, start in members.items():
+                        try:
+                            if memory_admit.process_start_time(pid) == start:
+                                os.kill(pid, number)
+                        except ProcessLookupError:
+                            pass
+                    _ = process.poll()
+                    time.sleep(min(config.program_sample_seconds,
+                                   max(0, deadline - time.monotonic())) if number == signal.SIGTERM
+                               else config.program_sample_seconds)
+                    members = program_members(program.tracking, self.sidecar)
             _ = process.wait()
             if completed is not None and not failed:
                 self.status = completed
