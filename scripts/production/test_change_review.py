@@ -69,6 +69,26 @@ def setUpModule() -> None:
     _ = unittest.enterModuleContext(mock.patch.object(showrunners, "timer_docs", return_value={}))
 
 
+class ReviewKindTest(unittest.TestCase):
+    def test_set_kind_is_recorded_once_and_survives_the_verdict_with_its_proof(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "change-review - sample.md"
+            _ = change_review.append_rows(path, [GRID], date(2026, 11, 1), "abc12345", PRODUCTION)
+            self.assertEqual(run("set-kind", "--production", DOC, "--list", str(path), "--row", "C1",
+                                 "--kind", "Read only")[0], 0)
+            row = change_review.review_rows(path)[0]
+            self.assertEqual(row["Kind"], "Read only")
+            before = path.read_bytes()
+            self.assertEqual(run("set-kind", "--production", DOC, "--list", str(path), "--row", "C1",
+                                 "--kind", "hidden")[0], 1)
+            self.assertEqual(path.read_bytes(), before)
+            self.assertEqual(run("verdict", "--production", DOC, "--list", str(path), "--row", "C1",
+                                 "--verdict", "works")[0], 0)
+            saved = change_review.review_rows(path)[0]
+            self.assertEqual((saved["Kind"], saved[change_review.CHECK], saved["Verdict"]),
+                             ("Read only", GRID.how(), "works"))
+
+
 class ParseTest(unittest.TestCase):
     def test_a_visible_line_a_none_line_and_a_malformed_line(self) -> None:
         self.assertEqual(change_review.entries(f"checkpoint(x): y\n\n{SEE}\nChange-Review: none — scripts only\n"
