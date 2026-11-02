@@ -2328,16 +2328,135 @@ class AtomicWorkerStateTests(MeshCommandFixture):
 
     def test_legacy_zero_byte_inbox_requires_recovery_instead_of_assuming_no_work(self) -> None:
         path = self.session_dir / "worker.pending.json"
-        _ = path.write_bytes(b"")
         for operation in ("read", "write"):
             with self.subTest(operation=operation):
-                def access() -> object:
-                    with codex_mesh._pending_file(str(self.session_dir), "worker") as inbox:  # pyright: ignore[reportPrivateUsage]
-                        if operation == "read":
-                            return codex_mesh._pending_for_thread(inbox, THREAD_ID)  # pyright: ignore[reportPrivateUsage]
-                        return codex_mesh._write_pending(inbox, THREAD_ID, ["new work"])  # pyright: ignore[reportPrivateUsage]
-                self.assert_unreadable_state(path, access)
-                self.assertEqual(path.read_bytes(), b"")
+                _ = path.write_bytes(b"")
+                original_inode = path.stat().st_ino
+                with contextlib.redirect_stderr(io.StringIO()) as errors:
+                    if operation == "read":
+                        self.assertEqual(worker_lifecycle.read_worker_state(path), {})
+                    else:
+                        with codex_mesh._pending_file(str(self.session_dir), "worker") as inbox:  # pyright: ignore[reportPrivateUsage]
+                            codex_mesh._write_pending(inbox, THREAD_ID, ["new work"])  # pyright: ignore[reportPrivateUsage]
+                    stored = worker_lifecycle.read_worker_state(path)
+                archived = [item for item in path.parent.glob(path.name + ".empty-legacy-*")
+                            if item.stat().st_ino == original_inode]
+                self.assertEqual(len(archived), 1, "recovery must rename the original evidence")
+                self.assertEqual(archived[0].read_bytes(), b"")
+                _ = datetime.strptime(archived[0].name.split(".empty-legacy-")[1], "%Y%m%dT%H%M%S.%fZ")
+                self.assertEqual(len(errors.getvalue().splitlines()), 1)
+                self.assertIn(str(path), errors.getvalue())
+                self.assertIn(archived[0].name, errors.getvalue())
+                self.assertIn("may have lost messages", errors.getvalue())
+                if operation == "read":
+                    self.assertFalse(path.exists())
+                    self.assertEqual(stored, {})
+                else:
+                    self.assertEqual(stored["messages"], ["new work"])
+
+    def test_resolve_reuses_worker_after_quarantining_its_zero_byte_pending_file(self) -> None:
+        self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "done", "role": "impl",
+                                           "codex_home": str(self.home / ".codex"), "port": self.server.port}})
+        path = self.session_dir / "worker.pending.json"
+        _ = path.write_bytes(b"")
+        with (patch.dict(os.environ, {"UNIT_WORKERS_STATE": str(self.home / "unit-workers")}),
+              contextlib.redirect_stderr(io.StringIO()) as errors):
+            self.assertEqual(unit_workers.resolve(self.session_dir, "impl"), "worker")
+        archived, = path.parent.glob(path.name + ".empty-legacy-*")
+        self.assertEqual(archived.read_bytes(), b"")
+        self.assertFalse(path.exists())
+        self.assertEqual(len(errors.getvalue().splitlines()), 1, errors.getvalue())
+        self.assertIn(str(path), errors.getvalue())
+        self.assertIn("may have lost messages", errors.getvalue())
+        self.assertTrue(self.worker_record()["allocation_pending"])
+        self.assertEqual(self.worker_record()["thread_id"], THREAD_ID)
+        self.assertEqual(self.methods("thread/start"), [])
+
+    def test_resolve_refuses_nonempty_corrupt_pending_without_quarantining_it(self) -> None:
+        self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "done", "role": "impl"}})
+        path = self.session_dir / "worker.pending.json"
+        for content in (b'{"thread_id":', b" ", b"\xff"):
+            with self.subTest(content=content):
+                _ = path.write_bytes(content)
+                with (patch.dict(os.environ, {"UNIT_WORKERS_STATE": str(self.home / "unit-workers")}),
+                      contextlib.redirect_stderr(io.StringIO()) as errors):
+                    self.assert_unreadable_state(path, lambda: unit_workers.resolve(self.session_dir, "impl"))
+                self.assertEqual(path.read_bytes(), content)
+                self.assertEqual(list(path.parent.glob(path.name + ".empty-legacy-*")), [])
+                self.assertEqual(errors.getvalue(), "")
+                self.assertNotIn("allocation_pending", self.worker_record())
+                self.assertEqual(self.methods("thread/start"), [])
+
+    def test_empty_inbox_recovery_rereads_under_lock_before_quarantining(self) -> None:
+        path = self.session_dir / "worker.pending.json"
+        _ = path.write_bytes(b"")
+        published = json.dumps({"thread_id": THREAD_ID, "messages": ["concurrent message"]})
+        lock = worker_lifecycle.locked_state
+
+        @contextlib.contextmanager
+        def publish_before_lock(path: Path) -> Generator[worker_lifecycle.WorkerStateFile]:
+            atomic_file.write_text_atomic(path, published)
+            with lock(path) as state:
+                yield state
+
+        with (patch.object(worker_lifecycle, "locked_state", publish_before_lock),
+              contextlib.redirect_stderr(io.StringIO()) as errors):
+            stored = worker_lifecycle.read_worker_state(path)
+        self.assertEqual(stored["messages"], ["concurrent message"])
+        self.assertEqual(path.read_text(), published)
+        self.assertEqual(list(path.parent.glob(path.name + ".empty-legacy-*")), [])
+        self.assertEqual(errors.getvalue(), "")
+
+    def test_shared_empty_inbox_readers_defer_quarantine_until_an_exclusive_read(self) -> None:
+        path = self.session_dir / "worker.pending.json"
+        _ = path.write_bytes(b"")
+        ready = threading.Barrier(2, timeout=TEST_HANG_GUARD_SECS)
+
+        def shared_read() -> dict[str, object]:
+            with worker_lifecycle.locked_state(path, mode=fcntl.LOCK_SH) as state:
+                _ = ready.wait()
+                stored = state.read_object()
+                _ = ready.wait()
+                return stored
+
+        with (contextlib.redirect_stderr(io.StringIO()) as errors,
+              ThreadPoolExecutor(max_workers=2) as pool):
+            readers = [pool.submit(shared_read) for _ in range(2)]
+            for reader in readers:
+                self.assertEqual(reader.result(TEST_HANG_GUARD_SECS), {})
+            self.assertEqual(path.read_bytes(), b"")
+            self.assertEqual(list(path.parent.glob(path.name + ".empty-legacy-*")), [])
+            self.assertEqual(errors.getvalue(), "")
+            with worker_lifecycle.locked_state(path) as state:
+                self.assertEqual(state.read_object(), {})
+        archived, = path.parent.glob(path.name + ".empty-legacy-*")
+        self.assertEqual(archived.read_bytes(), b"")
+        self.assertFalse(path.exists())
+        self.assertEqual(len(errors.getvalue().splitlines()), 1)
+
+    def test_concurrent_empty_inbox_readers_quarantine_once(self) -> None:
+        path = self.session_dir / "worker.pending.json"
+        _ = path.write_bytes(b"")
+        ready = threading.Barrier(2, timeout=TEST_HANG_GUARD_SECS)
+        lock = worker_lifecycle.locked_state
+
+        @contextlib.contextmanager
+        def lock_after_both_read(path: Path) -> Generator[worker_lifecycle.WorkerStateFile]:
+            _ = ready.wait()
+            with lock(path) as state:
+                yield state
+
+        with (patch.object(worker_lifecycle, "locked_state", lock_after_both_read),
+              contextlib.redirect_stderr(io.StringIO()) as errors,
+              ThreadPoolExecutor(max_workers=2) as pool):
+            readers = [pool.submit(worker_lifecycle.read_worker_state, path) for _ in range(2)]
+            for reader in readers:
+                self.assertEqual(reader.result(TEST_HANG_GUARD_SECS), {})
+        archived, = path.parent.glob(path.name + ".empty-legacy-*")
+        self.assertEqual(archived.read_bytes(), b"")
+        self.assertFalse(path.exists())
+        self.assertEqual(len(errors.getvalue().splitlines()), 1)
+        self.assertIn(str(path), errors.getvalue())
 
     def test_missing_inbox_stays_absent_until_its_first_complete_publication(self) -> None:
         path = self.session_dir / "worker.pending.json"
