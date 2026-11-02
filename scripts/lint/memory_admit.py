@@ -1523,6 +1523,57 @@ def test_phase_margin() -> float:
     return _test_phase_margin_value(config_values(_lint_config_path()).get("test_phase_margin", ""))
 
 
+FALLBACK_RUNNING_PASS_SECONDS = 5.0
+
+
+def _positive_config_seconds(key: str, fallback: float) -> float:
+    raw = config_values(_lint_config_path()).get(key, "")
+    try:
+        value = float(raw)
+    except ValueError:
+        return fallback
+    return value if math.isfinite(value) and value > 0 else fallback
+
+
+def running_pass_seconds() -> float:
+    return _positive_config_seconds("running_pass_seconds", FALLBACK_RUNNING_PASS_SECONDS)
+
+def request_max_bytes() -> int:
+    """Bound admission input while allowing large build argument lists."""
+    raw = config_values(_lint_config_path()).get("request_max_bytes", "")
+    try:
+        value = int(raw)
+    except ValueError:
+        return 1048576
+    return value if value > 0 else 1048576
+
+def waiting_pass_seconds() -> float:
+    return _positive_config_seconds("waiting_pass_seconds", 1.0)
+
+def wait_reply_seconds() -> float:
+    return _positive_config_seconds("wait_reply_seconds", 60.0)
+
+def replay_retention_seconds() -> float:
+    return _positive_config_seconds("replay_retention_seconds", 86400.0)
+
+def reconnect_seconds() -> float:
+    return _positive_config_seconds("reconnect_seconds", 2.0)
+
+def silence_seconds() -> float:
+    return _positive_config_seconds("silence_seconds", 120.0)
+
+def outage_notice_seconds() -> float:
+    return _positive_config_seconds("outage_notice_seconds", 60.0)
+
+def source_check_seconds() -> float:
+    return _positive_config_seconds("source_check_seconds", 1.0)
+
+def source_settle_seconds() -> float:
+    return _positive_config_seconds("source_settle_seconds", 2.0)
+
+def override_reconnect_seconds() -> float:
+    return _positive_config_seconds("override_reconnect_seconds", 10.0)
+
 def resolve_admission_limits(total: int | UnknownHostTotal) -> AdmissionLimits:
     return AdmissionLimits(build_budget_bytes(), total * 5 // 100 if isinstance(total, int) else 0)
 
@@ -1956,9 +2007,11 @@ def test_phase_need_from_rows(rows: Iterable[Mapping[str, object]],
     return TestPhaseNeed(max(FILTERED_FLOOR, need), len(peaks), width, recorded_width, form)
 
 
-def test_phase_need(row: Mapping[str, object], host: str, now: datetime, root: Path) -> TestPhaseNeed | NoTestPhaseNeed:
+def test_phase_need(row: Mapping[str, object], host: str, now: datetime, root: Path, *,
+                    history_path: Path | None = None) -> TestPhaseNeed | NoTestPhaseNeed:
     try:
-        need = test_phase_need_from_rows(anonymous_history_rows(root / "admission/anon_peaks.jsonl"), row, host, now)
+        path = history_path if history_path is not None else root / "admission/anon_peaks.jsonl"
+        need = test_phase_need_from_rows(anonymous_history_rows(path), row, host, now)
         return replace(need, margin=test_phase_margin()) if isinstance(need, TestPhaseNeed) else need
     except OSError:
         return NoTestPhaseNeed("no_history")
