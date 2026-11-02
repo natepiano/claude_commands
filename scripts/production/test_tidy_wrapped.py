@@ -10,6 +10,9 @@ import unittest
 from pathlib import Path
 from typing import override
 
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.production.staff_test_support import isolated_staff_file
+
 SCRIPT = Path(__file__).with_name("tidy_wrapped.py")
 
 
@@ -28,6 +31,7 @@ class TidyWrappedTests(unittest.TestCase):
         self.state = self.root / "showrunner"
         self.notifier = self.root / "notifier"
         self.notifier.mkdir()
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
 
     def write(self, path: Path, content: str) -> Path:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -45,7 +49,8 @@ class TidyWrappedTests(unittest.TestCase):
     def run_tidy(self, *docs: Path) -> subprocess.CompletedProcess[str]:
         env = {**os.environ, "SHOWRUNNER_STATE_DIR": str(self.state), "NOTIFIER_STATE_DIR": str(self.notifier)}
         return subprocess.run([sys.executable, str(SCRIPT), *map(str, docs)], env=env,
-                              capture_output=True, text=True, check=False)
+                              capture_output=True, text=True, check=False,
+                              timeout=TEST_HANG_GUARD_SECS)
 
     def test_a_wrapped_production_loses_its_own_files_and_keeps_the_others(self) -> None:
         own = self.state_files("done")

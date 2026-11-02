@@ -30,9 +30,9 @@ from dailies_counts import CountsFailure, production_counts
 from dailies_render import (LENGTHS, InputError, ReportsEvery, ReportsOnDemand, StateRefused, StyleSummary,
                             as_list, as_map, check_render_state, due, last_report,
                             local_now, parse_child_report, parse_range_end, parse_report, parse_time,
-                            parse_style_summary, read_outstanding)
+                            parse_style_summary)
 from merge_checkpoint import ChildHandoffEntry, NoMerge, git, merge_branch_history
-from update_registration import (RegistrationFailure, UpdatesOnDemand, adopt_moved_state, outstanding_file,
+from update_registration import (QuestionStaff, read_open_items, RegistrationFailure, UpdatesOnDemand, adopt_moved_state, outstanding_file,
                                  update_schedule)
 from waiting import EtaNotYetRequested, EtaRequested, eta_requested, update_state
 
@@ -768,6 +768,13 @@ def last_report_path(slug: str) -> Path:
 
 def child_fields(child: str, now: datetime, zone: ZoneInfo, *, expand: bool, record: staff.StaffSnapshot | None = None) -> JsonMap:
     """One production directly below this one: its saved report, and what waits on the user in it and below it."""
+    identities = QuestionStaff.for_record(record) if record is not None else QuestionStaff.read()
+    return child_fields_with_questions(child, now, zone, expand=expand, identities=identities)
+
+
+def child_fields_with_questions(child: str, now: datetime, zone: ZoneInfo, *, expand: bool,
+                               identities: QuestionStaff) -> JsonMap:
+    """Read one child report with the command's shared question identities."""
     fields: JsonMap = {"name": child, "expand": expand}
     path = last_report_path(child)
     try:
@@ -780,17 +787,23 @@ def child_fields(child: str, now: datetime, zone: ZoneInfo, *, expand: bool, rec
         report("children", "unavailable", f"{child}: {error}")
     else:
         fields["report"] = saved
-    waiting = 0
-    unreadable: list[str] = []
-    for slug in (child, *showrunner_tree.descendants_of(child, record=record)):
-        try:
-            waiting += len(due(read_outstanding(outstanding_file(slug)), now))
-        except (InputError, OSError, ValueError):
-            unreadable.append(slug)
+    waiting, unreadable = child_question_counts(child, now, identities)
     fields["open"] = waiting
     if unreadable:
         fields["unreadable"] = unreadable
     return fields
+
+
+def child_question_counts(child: str, now: datetime, identities: QuestionStaff) -> tuple[int, list[str]]:
+    """Count descendant questions with one command's joined staff identities."""
+    waiting = 0
+    unreadable: list[str] = []
+    for slug in identities.slugs(child, below=True):
+        try:
+            waiting += len(due(read_open_items(outstanding_file(slug), identities=identities), now))
+        except (InputError, OSError, ValueError):
+            unreadable.append(slug)
+    return waiting, unreadable
 
 
 def style_summary(production: Production) -> JsonMap:
@@ -1043,7 +1056,9 @@ def run(args: argparse.Namespace) -> int:
                              + (f"choose from {', '.join(children)} or {EXPAND_ALL}" if children
                                 else "no production reports to it"))
     if children:
-        result["children"] = [child_fields(child, now, production.zone, expand=EXPAND_ALL in expand or child in expand, record=staff_record)
+        identities = QuestionStaff.for_record(staff_record)
+        result["children"] = [child_fields_with_questions(child, now, production.zone,
+                              expand=EXPAND_ALL in expand or child in expand, identities=identities)
                               for child in children]
         report("children", "ok", f"{len(children)} below: {', '.join(children)}")
     # A bad config line costs only the counts line, never the report.

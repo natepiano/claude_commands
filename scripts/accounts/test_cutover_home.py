@@ -38,6 +38,10 @@ def file_state(path: Path) -> tuple[int, int, int, int, int, int]:
     return (status.st_dev, status.st_ino, status.st_mode, status.st_size, status.st_mtime_ns, status.st_ctime_ns)
 
 
+def setUpModule() -> None:
+    _ = unittest.enterModuleContext(patch.object(accounts, "_start_session_counts_fetch", return_value=True))
+
+
 class HomeCutoverTests(unittest.TestCase):
     home: Path = Path()
 

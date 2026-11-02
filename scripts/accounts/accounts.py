@@ -485,6 +485,7 @@ class CommandLine(argparse.Namespace):
     change: str = ""
     server: str = ""
     direction: McpDirection = "off"
+    counts_lock: int = -1
 
 
 
@@ -4447,6 +4448,7 @@ class StatusRow:
     read_outcome: agent_accounts.UsageReadOutcome
     attempted_at: datetime | StatusUnavailable
     role_counts: tuple[RoleSessionCounts | NoRoleCount, ...] = ()
+    role_counts_by_machine: dict[str, dict[str, RoleSessionCountsDocument]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -4465,6 +4467,7 @@ class StatusAccountDocument(TypedDict):
     tool: Literal["claude", "codex"]
     roles: list[str]
     role_counts: list[RoleSessionCountsDocument | None]
+    role_counts_by_machine: dict[str, dict[str, RoleSessionCountsDocument]]
     weekly_left_percent: float | None
     resets_at: str | None
     credits: float | Literal["unlimited"] | None
@@ -4585,6 +4588,7 @@ def render_status_json(reading: StatusReading) -> str:
                 shell=count.shell if isinstance(count.shell, int) else None, idle=count.idle, total=count.total)
                 if isinstance(count, RoleSessionCounts) else None for count in
                 (row.role_counts or tuple(NoRoleCount() for _role in row.roles))],
+            role_counts_by_machine=row.role_counts_by_machine,
             weekly_left_percent=None if isinstance(row.weekly_left_percent, (StatusUnavailable, WeeklyNotReadSince)) else row.weekly_left_percent,
             resets_at=None if isinstance(row.resets_at, StatusUnavailable) else row.resets_at.astimezone(timezone.utc).isoformat(),
             credits=None if isinstance(row.credits, StatusUnavailable) else row.credits,
@@ -5178,6 +5182,8 @@ def _read_status(source: UsageSource, *, detail: bool) -> StatusReading:
             (status.role,) if status.role in (CODEX_ROLE, "spare") else ()) for status in codex),
     )
     rows, session_inputs = _count_role_sessions(rows)
+    rows, count_problems = _machine_role_counts(rows, now, source)
+    session_inputs = (*session_inputs, str(_session_counts_cache()))
     home_step = "run accounts.py cutover-home"
     all_statuses: list[AccountStatus | CodexStatus] = [*statuses, *codex]
     diagnostics_by_status = [_status_problems(status, detail=detail, zone=zone) for status in all_statuses]
@@ -5225,6 +5231,7 @@ def _read_status(source: UsageSource, *, detail: bool) -> StatusReading:
     for problem in problems:
         _observe_status_problem(problem)
     notes = [render_status_problem(problem) for problem in merge_status_problems(problems)]
+    notes.extend(count_problems)
     detail_lines: tuple[str, ...] = ()
     if detail:
         journal = moves.read_journal()
@@ -5387,8 +5394,8 @@ def status_report(*, detail: bool = False, source: UsageSource = REFRESH_STALE_U
 WORKERS_RUN_ROOTS = unit_runs.run_roots()
 
 
-def _count_role_sessions(rows: tuple[StatusRow, ...]) -> tuple[tuple[StatusRow, ...], tuple[str, ...]]:
-    """Count local owners from the detail view's registries, without host discovery."""
+def _local_session_counts() -> tuple[dict[tuple[Path, str], dict[str, str]], tuple[str, ...]]:
+    """Read local registries without account checks or host discovery."""
     from scripts.message import sessions
     from scripts.shutdown import inventory
     from scripts.herdr import pane_launch
@@ -5457,11 +5464,143 @@ def _count_role_sessions(rows: tuple[StatusRow, ...]) -> tuple[tuple[StatusRow, 
         if home and listed_mesh_worker(cast(MeshWorker, cast(object, entry))):
             counts.setdefault((Path(home), "workers"), {})[str(run / name)] = (
                 "busy" if entry.get("status") in ("running", "starting") else "idle")
+    return counts, tuple(str(path) for path in sorted(inputs))
+
+
+def _count_role_sessions(rows: tuple[StatusRow, ...]) -> tuple[tuple[StatusRow, ...], tuple[str, ...]]:
+    """Count local members without changing saved state."""
+    counts, inputs = _local_session_counts()
     counted = tuple(replace(row, role_counts=tuple(
         NoRoleCount() if role == "spare" else _role_session_counts(
             tuple(counts.get((Path(row.folder).expanduser(), role), {}).values()), row.tool)
         for role in row.roles)) for row in rows)
-    return counted, tuple(str(path) for path in sorted(inputs))
+    return counted, inputs
+
+
+class MachineSessionCounts(TypedDict):
+    machine: str
+    at: str
+    accounts: dict[str, dict[str, RoleSessionCountsDocument]]
+
+
+def _session_counts_cache() -> Path:
+    return accounts_home() / ".local/state/accounts/peer_session_counts.json"
+
+
+def _session_counts_machine() -> str:
+    """Use the workstation alias paired with the shared peer resolver."""
+    return "mac" if remote.other_machine() == "natedev" else "natedev"
+
+
+def _session_counts_document(counts: dict[tuple[Path, str], dict[str, str]]) -> MachineSessionCounts:
+    mapped: dict[tuple[str, str], dict[str, str]] = {}
+    for (directory, role), members in counts.items():
+        label = directory.name.removeprefix(".")
+        if re.fullmatch(r"codex(?:[1-9][0-9]*)?", label):
+            label = codex_home_label(directory)
+        if not re.fullmatch(r"(?:claude|codex)[1-9][0-9]*", label):
+            continue
+        mapped.setdefault((label, role), {}).update(members)
+    values: dict[str, dict[str, RoleSessionCountsDocument]] = {}
+    for (label, role), members in mapped.items():
+        tool = "codex" if label.startswith("codex") else "claude"
+        count = _role_session_counts(tuple(members.values()), tool)
+        values.setdefault(label, {})[role] = RoleSessionCountsDocument(busy=count.busy,
+            shell=count.shell if isinstance(count.shell, int) else None, idle=count.idle, total=count.total)
+    document = MachineSessionCounts(machine=_session_counts_machine(),
+        at=datetime.now(timezone.utc).isoformat(), accounts=values)
+    return document
+
+
+def _decode_session_counts(text: str, machine: str) -> MachineSessionCounts:
+    value = cast(object, json.loads(text))
+    if not isinstance(value, dict):
+        raise ValueError("invalid session counts")
+    fields = cast(dict[str, object], value)
+    stamp, accounts = fields.get("at"), fields.get("accounts")
+    if fields.get("machine") != machine or not isinstance(stamp, str) or _stored_time(stamp) is None or not isinstance(accounts, dict):
+        raise ValueError("invalid session counts")
+    checked: dict[str, dict[str, RoleSessionCountsDocument]] = {}
+    for label, roles in cast(dict[str, object], accounts).items():
+        if not re.fullmatch(r"(?:claude|codex)[1-9][0-9]*", label) or not isinstance(roles, dict):
+            raise ValueError("invalid account counts")
+        checked[label] = {}
+        for role, raw in cast(dict[str, object], roles).items():
+            if role not in ("units", "showrunners", "workers") or not isinstance(raw, dict):
+                raise ValueError("invalid role counts")
+            count = cast(dict[str, object], raw)
+            busy, shell, idle, total = (count.get(key) for key in ("busy", "shell", "idle", "total"))
+            if (type(busy) is not int or type(idle) is not int or type(total) is not int
+                    or (shell is not None and type(shell) is not int)):
+                raise ValueError("invalid activity counts")
+            if min(busy, idle, total, shell or 0) < 0 or busy + (shell or 0) + idle != total:
+                raise ValueError("invalid count total")
+            if (label.startswith("codex")) != (shell is None):
+                raise ValueError("invalid shell count")
+            checked[label][role] = RoleSessionCountsDocument(busy=busy, shell=shell, idle=idle, total=total)
+    return MachineSessionCounts(machine=machine, at=stamp, accounts=checked)
+
+
+def _fetch_session_counts() -> int:
+    """Fetch only the other machine's local counts through the shared transport."""
+    try:
+        machine = remote.other_machine()
+        document = _decode_session_counts(role_map.ssh_role_map(("session-counts-read",), machine=machine), machine)
+        atomic_file.write_text_atomic(_session_counts_cache(), json.dumps(document))
+    except (OSError, ValueError, subprocess.SubprocessError):
+        atomic_file.write_text_atomic(_session_counts_cache(), json.dumps({"unavailable": True}))
+        return 1
+    return 0
+
+
+def _start_session_counts_fetch() -> bool:
+    """Transfer a nonblocking lock to one detached fetch process."""
+    try:
+        path = _session_counts_cache().with_suffix(".lock")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+            _ = subprocess.Popen([sys.executable, str(Path(__file__).resolve()),
+                "session-counts-fetch", "--counts-lock", str(lock.fileno())],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=True, pass_fds=(lock.fileno(),))
+    except OSError:
+        return False
+    return True
+
+
+def _machine_role_counts(
+    rows: tuple[StatusRow, ...], now: datetime, source: UsageSource = REFRESH_STALE_USAGE,
+) -> tuple[tuple[StatusRow, ...], tuple[str, ...]]:
+    local, peer = _session_counts_machine(), remote.other_machine()
+    try:
+        document = _decode_session_counts(_session_counts_cache().read_text(), peer)
+        stamp = _stored_time(document["at"])
+        if stamp is None or _reading_is_old(stamp, now):
+            raise ValueError("old counts")
+        peer_accounts = document["accounts"]
+        available = True
+    except (OSError, ValueError):
+        peer_accounts = {}
+        available = False
+    if isinstance(source, RefreshStaleUsage):
+        started = _start_session_counts_fetch()
+        available = available and started
+    if not available:
+        peer_accounts = {}
+    counted: list[StatusRow] = []
+    for row in rows:
+        local_counts = {role: RoleSessionCountsDocument(busy=count.busy,
+            shell=count.shell if isinstance(count.shell, int) else None, idle=count.idle, total=count.total)
+            for role, count in zip(row.roles, row.role_counts) if isinstance(count, RoleSessionCounts)}
+        machines = {local: local_counts}
+        if available:
+            machines[peer] = peer_accounts.get(row.label, {})
+        counted.append(replace(row, role_counts_by_machine=machines))
+    return tuple(counted), (() if available else (f"{peer} unavailable: counts are {local} only",))
 
 
 def _role_session_counts(states: tuple[str, ...], tool: Literal["claude", "codex"]) -> RoleSessionCounts:
@@ -5638,6 +5777,9 @@ def _parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="action")
     _ = commands.add_parser("trust", help="trust configured folders in every Claude home")
     _ = commands.add_parser("role-map-read")
+    _ = commands.add_parser("session-counts-read")
+    counts_fetch = commands.add_parser("session-counts-fetch")
+    _ = counts_fetch.add_argument("--counts-lock", type=int, required=True)
     writer = commands.add_parser("role-map-write")
     _ = writer.add_argument("change")
     _ = commands.add_parser("next-read")
@@ -5749,6 +5891,15 @@ def main(argv: list[str]) -> int:
     if hasattr(options, "label"):
         options.label = note_file.canonical_label(options.label)
     try:
+        if options.action == "session-counts-read":
+            counts, _inputs = _local_session_counts()
+            print(json.dumps(_session_counts_document(counts)))
+            return 0
+        if options.action == "session-counts-fetch":
+            try:
+                return _fetch_session_counts()
+            finally:
+                os.close(options.counts_lock)
         if options.action == "trust":
             return trust_accounts()
         if options.action in ("next-read", "next-write"):

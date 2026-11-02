@@ -181,7 +181,7 @@ class ChangePageTests(unittest.TestCase):
         self.delivery_done = threading.Event()
         deliver = change_page.deliver
 
-        def finish_delivery(delivery: change_page.MessageDelivery, status: change_page.DeliveryStatus) -> None:
+        def finish_delivery(delivery: change_page.MessageDelivery | change_page.NoMessageDelivery, status: change_page.DeliveryStatus) -> None:
             try:
                 deliver(delivery, status)
             finally:
@@ -235,6 +235,14 @@ class ChangePageTests(unittest.TestCase):
     def browser_fields(self, forms: BrowserForms, key: str, outcome: str = "works", feedback: str = "") -> dict[str, str]:
         return forms.rows[key] | {"row": key, "outcome": outcome, "feedback": feedback}
 
+    def answer_question(self, text: str, row: str = "C1", *, question_id: str = "") -> subprocess.CompletedProcess[str]:
+        if not question_id:
+            question = change_page.DeliveryStatus(self.root).slots(self.page, row).question
+            question_id = question.question_id if not isinstance(question, change_page.NoQuestion) else "unknown"
+        return subprocess.run([sys.executable, change_page.__file__, "answer-question", "--production", str(self.production),
+                               "--list", str(self.review_list), "--row", row, "--question", question_id, "--text", text],
+                              capture_output=True, text=True, check=False)
+
     def test_all_lists_load_once_and_the_browser_contains_the_whole_waiting_queue(self) -> None:
         other = self.temporary / "change-review - another.md"
         _ = change_review.append_rows(other, [change_review.Visible("Other change", "Read the proof", "It agrees")],
@@ -269,6 +277,48 @@ class ChangePageTests(unittest.TestCase):
         refreshed = BrowserForms()
         refreshed.feed(self.request(path, {}).body)
         self.assertEqual(list(refreshed.rows), ["page-owner/C2", "page-owner/C3", "page-owner/C1"])
+
+    def test_tabs_with_waiting_changes_keep_their_order_before_empty_tabs(self) -> None:
+        other = self.temporary / "change-review - zeta.md"
+        _ = change_review.append_rows(other, [change_review.Visible("Other change", "Read", "Proof")],
+                                      date(2026, 11, 2), "", self.production)
+        path, forms, body = self.browser()
+        browser = change_browser.page_at(self.root, path)
+        prepared = change_browser.prepare(browser, change_page.DeliveryStatus(self.root))
+        self.assertEqual(list(prepared.queues), ["page-owner", "zeta", "demo"])
+        self.assertEqual(list(forms.counts.items()), [("page-owner", 3), ("zeta", 1), ("demo", 0)])
+        self.assertIn("tabs[0]?.dataset.showrunner", body)
+
+    def test_sent_validation_and_question_tabs_sort_after_waiting_tabs(self) -> None:
+        other = self.temporary / "change-review - alpha.md"
+        _ = change_review.append_rows(other, [change_review.Visible("Other change", "Read", "Proof")],
+                                      date(2026, 11, 2), "", self.production)
+        page = change_page.ReviewPage(other, self.production, ("C1",), "")
+        status = change_page.DeliveryStatus(self.root)
+        for kind in ("validation", "question"):
+            with self.subTest(kind=kind):
+                status.path(page, "C1").unlink(missing_ok=True)
+                if kind == "validation":
+                    attempt = status.begin(page, "C1", "validation")
+                else:
+                    question = status.ask(page, "C1", "Which change?")
+                    if not isinstance(question, change_page.QuestionDelivery):
+                        self.fail("a new question must create a message attempt")
+                    attempt = question.attempt
+                path, pending, body = self.browser()
+                del body
+                self.assertEqual(list(pending.counts.items()), [("alpha", 1), ("page-owner", 3), ("demo", 0)])
+                status.record(change_page.MessageDelivery(page, "C1", (), "", attempt), False)
+                forms = BrowserForms()
+                forms.feed(self.request(path, {}).body)
+                self.assertEqual(list(forms.counts.items()), [("page-owner", 3), ("alpha", 0), ("demo", 0)])
+                prepared = change_browser.prepare(change_browser.page_at(self.root, path), change_page.DeliveryStatus(self.root))
+                self.assertEqual(list(prepared.queues), ["page-owner", "alpha", "demo"])
+
+    def test_the_selected_tab_outline_stays_inside_its_scroll_container(self) -> None:
+        path, forms, body = self.browser()
+        del path, forms
+        self.assertIn("nav button[aria-selected=true]{outline:2px solid currentColor;outline-offset:-2px}", body)
 
     def test_production_aliases_share_one_document_read_per_page_request(self) -> None:
         runner = fixture_member("showrunner", name="sdlc", doc=staff.LiveDoc("natedev", self.production))
@@ -532,6 +582,8 @@ class ChangePageTests(unittest.TestCase):
         delivery, answer = change_browser.submit(browser, urlencode(
             self.browser_fields(forms, "page-owner/C1", "validate")), status)
         self.assertEqual(answer, "")
+        if isinstance(delivery, change_page.NoMessageDelivery):
+            self.fail("the validation request must create a delivery attempt")
         status.record(delivery, False)
         self.assertNotIn("page-owner/C1", [item.key for item in change_browser.prepare(browser, status).changes if item.waiting])
         status.path(delivery.page, "C1").unlink()
@@ -576,7 +628,7 @@ class ChangePageTests(unittest.TestCase):
         failed.feed(self.request(path, {}).body)
         self.assertEqual(failed.counts["page-owner"], 3)
         self.assertTrue(failed.pending["page-owner/C1"])
-        self.assertEqual(failed.outcomes["page-owner/C1"], ["works", "not works", "validate", "feedback"])
+        self.assertEqual(failed.outcomes["page-owner/C1"], ["works", "not works", "validate", "feedback", "question"])
         self.assertEqual(failed.rows["page-owner/C1"]["feedback"], "Keep <these> words")
         self.delivery_done.clear()
         self.assertEqual(self.http_request(path, self.browser_fields(
@@ -611,11 +663,279 @@ class ChangePageTests(unittest.TestCase):
         refreshed.feed(self.request(path, {}).body)
         self.assertEqual(refreshed.counts["page-owner"], 2)
 
+    def test_an_open_question_leaves_waiting_rows_counts_and_next_after_a_fresh_prepare(self) -> None:
+        path, forms, body = self.browser()
+        del body
+        self.delivery_done.clear()
+        reply = self.http_request(path, self.browser_fields(forms, "page-owner/C1", "question", "What does <this> change?"))
+        self.assertEqual(reply.status, 200)
+        self.assertEqual(json.loads(reply.body), {"answer": ""})
+        self.assertTrue(self.delivery_done.wait(TEST_HANG_GUARD_SECS))
+        browser = change_browser.page_at(self.root, path)
+        prepared = change_browser.prepare(browser, change_page.DeliveryStatus(self.root))
+        self.assertEqual([item.key for item in prepared.changes if item.waiting], ["page-owner/C2", "page-owner/C3"])
+        self.assertEqual([entry.key for entry in prepared.queues["page-owner"].entries], ["C2", "C3"])
+        refreshed = BrowserForms()
+        content = change_browser.render(browser, change_page.DeliveryStatus(self.root)).decode()
+        refreshed.feed(content)
+        self.assertEqual(refreshed.counts["page-owner"], 2)
+        self.assertFalse(refreshed.pending["page-owner/C1"])
+        self.assertEqual(refreshed.outcomes["page-owner/C1"], [])
+        self.assertIn('<h2>Question</h2><p>What does &lt;this&gt; change?</p>', content)
+        self.assertIn("The showrunner will answer this", content)
+        self.assertEqual([recipient for recipient, _, _ in self.messages], ["page-owner"])
+        message = self.messages[0][2]
+        for text in ("C1: the user asks a question", f"List: {self.review_list}", f"Production: {self.production}",
+                     "Change: Numbered moves", "Question: What does <this> change?"):
+            self.assertIn(text, message)
+        question = change_page.DeliveryStatus(self.root).slots(self.page, "C1").question
+        if not isinstance(question, change_page.OpenQuestion):
+            self.fail("the sent question must remain open")
+        self.assertIn(f"Question id: {question.question_id}", message.splitlines())
+        self.assertFalse(any(row.get("Verdict") for row in change_review.review_rows(self.review_list)))
+
+    def test_answer_question_restores_the_row_and_shows_the_answer_before_another_question_or_verdict(self) -> None:
+        path, forms, body = self.browser()
+        del body
+        self.delivery_done.clear()
+        self.assertEqual(self.http_request(path, self.browser_fields(forms, "page-owner/C1", "question", "Which groups?")).status, 200)
+        self.assertTrue(self.delivery_done.wait(TEST_HANG_GUARD_SECS))
+        result = self.answer_question("The <numbered> groups.")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        browser = change_browser.page_at(self.root, path)
+        prepared = change_browser.prepare(browser, change_page.DeliveryStatus(self.root))
+        self.assertIn("page-owner/C1", [item.key for item in prepared.changes if item.waiting])
+        self.assertIn("C1", [entry.key for entry in prepared.queues["page-owner"].entries])
+        content = self.request(path, {}).body
+        refreshed = BrowserForms()
+        refreshed.feed(content)
+        self.assertEqual(refreshed.counts["page-owner"], 3)
+        self.assertEqual(refreshed.outcomes["page-owner/C1"], ["works", "not works", "validate", "feedback", "question"])
+        start = content.index('data-key="page-owner/C1"')
+        section = content[start:content.index('</section>', start)]
+        self.assertIn('<h2>Question</h2><p>Which groups?</p><h2>Answer</h2><p>The &lt;numbered&gt; groups.</p>', section)
+        self.assertLess(section.index('<h1>Numbered moves</h1>'), section.index('<h2>Question</h2>'))
+        self.delivery_done.clear()
+        self.assertEqual(self.http_request(path, self.browser_fields(refreshed, "page-owner/C1", "question", "Does it include nested groups?")).status, 200)
+        self.assertTrue(self.delivery_done.wait(TEST_HANG_GUARD_SECS))
+        self.assertEqual(self.answer_question("Yes, it includes nested groups.").returncode, 0)
+        self.delivery_done.clear()
+        self.assertEqual(self.http_request(path, self.browser_fields(refreshed, "page-owner/C1", "works")).status, 200)
+        self.assertTrue(self.delivery_done.wait(TEST_HANG_GUARD_SECS))
+        self.assertEqual(next(row["Verdict"] for row in change_review.review_rows(self.review_list) if row["#"] == "C1"), "works")
+
+    def test_answer_question_refuses_missing_questions_and_changes_nothing_on_an_identical_rerun(self) -> None:
+        result = self.answer_question("There is no question.")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("no open question", result.stderr)
+        status = change_page.DeliveryStatus(self.root)
+        _ = status.ask(self.page, "C1", "Which groups?")
+        self.assertEqual(self.answer_question("All groups.").returncode, 0)
+        record = status.path(self.page, "C1")
+        before = (record.read_bytes(), record.stat().st_mtime_ns, self.review_list.read_bytes())
+        result = self.answer_question("All groups.")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((record.read_bytes(), record.stat().st_mtime_ns, self.review_list.read_bytes()), before)
+        self.assertEqual(self.answer_question("Some groups.").returncode, 1)
+        self.assertEqual(record.read_bytes(), before[0])
+
+    def test_question_posts_refuse_empty_text_and_line_breaks_without_saving_or_sending(self) -> None:
+        path, forms, body = self.browser()
+        del body
+        before = self.review_list.read_bytes()
+        for text in ("", "   ", "First\nSecond", "First\rSecond", "First\r\nSecond", "First\u2028Second", "Which groups?\u2028"):
+            with self.subTest(text=text):
+                reply = self.http_request(path, self.browser_fields(forms, "page-owner/C1", "question", text))
+                self.assertEqual(reply.status, 400)
+        reply = self.http_request(path, self.browser_fields(forms, "page-owner/C1", "feedback", "First\u2028Second"))
+        self.assertEqual(reply.status, 400)
+        self.assertEqual(self.review_list.read_bytes(), before)
+        self.assertEqual(self.messages, [])
+        self.assertFalse(change_page.DeliveryStatus(self.root).path(self.page, "C1").exists())
+
+    def test_question_sends_after_the_response_and_repeated_posts_do_not_write_or_send_twice(self) -> None:
+        path, forms, body = self.browser()
+        del body
+        fields = self.browser_fields(forms, "page-owner/C1", "question", "Which groups?")
+        entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+        deliver = change_page.deliver
+
+        def hold_delivery(delivery: change_page.MessageDelivery | change_page.NoMessageDelivery, status: change_page.DeliveryStatus) -> None:
+            if isinstance(delivery, change_page.NoMessageDelivery):
+                return
+            entered.set()
+            if not release.wait(TEST_HANG_GUARD_SECS):
+                raise RuntimeError("the question delivery was not released")
+            try:
+                deliver(delivery, status)
+            finally:
+                finished.set()
+
+        with patch.object(change_page, "deliver", side_effect=hold_delivery):
+            try:
+                self.assertEqual(self.http_request(path, fields).status, 200)
+                self.assertTrue(entered.wait(TEST_HANG_GUARD_SECS))
+                record = change_page.DeliveryStatus(self.root).path(self.page, "C1")
+                pending = (record.read_bytes(), record.stat().st_mtime_ns)
+                self.assertEqual(self.http_request(path, fields).status, 200)
+                self.assertEqual((record.read_bytes(), record.stat().st_mtime_ns), pending)
+                self.assertEqual(self.messages, [])
+            finally:
+                release.set()
+                self.assertTrue(finished.wait(TEST_HANG_GUARD_SECS))
+        sent = (record.read_bytes(), record.stat().st_mtime_ns)
+        self.delivery_done.clear()
+        self.assertEqual(self.http_request(path, fields).status, 200)
+        self.assertTrue(self.delivery_done.wait(TEST_HANG_GUARD_SECS))
+        self.assertEqual((record.read_bytes(), record.stat().st_mtime_ns), sent)
+        self.assertEqual(len(self.messages), 1)
+
+    def test_a_failed_question_delivery_has_a_visible_retry_with_the_saved_question(self) -> None:
+        path, forms, body = self.browser()
+        del body
+        fields = self.browser_fields(forms, "page-owner/C1", "question", "Which <groups>?")
+        with patch.object(change_page, "send_message", side_effect=RuntimeError("socket unavailable")):
+            self.delivery_done.clear()
+            self.assertEqual(self.http_request(path, fields).status, 200)
+            self.assertTrue(self.delivery_done.wait(TEST_HANG_GUARD_SECS))
+        content = self.request(path, {}).body
+        refreshed = BrowserForms()
+        refreshed.feed(content)
+        self.assertEqual(refreshed.counts["page-owner"], 3)
+        prepared = change_browser.prepare(change_browser.page_at(self.root, path), change_page.DeliveryStatus(self.root))
+        self.assertIn("page-owner/C1", [item.key for item in prepared.changes if item.waiting])
+        self.assertIn("C1", [entry.key for entry in prepared.queues["page-owner"].entries])
+        self.assertIn('Message needs attention: page-owner/C1', content)
+        self.assertIn('data-resend data-outcome="retry">Send question again</button>', content)
+        self.assertIn("The question message did not send", content)
+        self.assertEqual(refreshed.rows["page-owner/C1"]["feedback"], "")
+        self.delivery_done.clear()
+        self.assertEqual(self.http_request(path, self.browser_fields(refreshed, "page-owner/C1", "retry",
+                                                                  refreshed.rows["page-owner/C1"]["feedback"])).status, 200)
+        self.assertTrue(self.delivery_done.wait(TEST_HANG_GUARD_SECS))
+        self.assertEqual(len(self.messages), 1)
+        self.assertIn("Question: Which <groups>?", self.messages[0][2])
+        self.assertNotIn("Send question again", self.request(path, {}).body)
+
+    def test_a_failed_question_save_keeps_the_row_waiting(self) -> None:
+        path, forms, body = self.browser()
+        del body
+        with patch.object(change_page.DeliveryStatus, "write_slots", side_effect=OSError("record unavailable")):
+            reply = self.http_request(path, self.browser_fields(forms, "page-owner/C1", "question", "Which groups?"))
+        self.assertEqual(reply.status, 503)
+        refreshed = BrowserForms()
+        refreshed.feed(self.request(path, {}).body)
+        self.assertEqual(refreshed.counts["page-owner"], 3)
+        self.assertTrue(refreshed.pending["page-owner/C1"])
+        self.assertEqual(self.messages, [])
+
+    def test_an_old_answer_cannot_answer_a_new_question(self) -> None:
+        status = change_page.DeliveryStatus(self.root)
+        first = status.ask(self.page, "C1", "Which groups?")
+        if not isinstance(first, change_page.QuestionDelivery):
+            self.fail("a new question must create a message attempt")
+        result = self.answer_question("All groups.", question_id=first.question_id)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        record = status.path(self.page, "C1")
+        answered = (record.read_bytes(), record.stat().st_mtime_ns)
+        result = self.answer_question("All groups.", question_id=first.question_id)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((record.read_bytes(), record.stat().st_mtime_ns), answered)
+        self.assertEqual(self.answer_question("Some groups.", question_id=first.question_id).returncode, 1)
+        second = status.ask(self.page, "C1", "Does it include nested groups?")
+        if not isinstance(second, change_page.QuestionDelivery):
+            self.fail("an answered row must accept a new question")
+        self.assertNotEqual(first.question_id, second.question_id)
+        pending = (record.read_bytes(), record.stat().st_mtime_ns)
+        result = self.answer_question("All groups.", question_id=first.question_id)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(len(result.stderr.splitlines()), 1)
+        self.assertIn("question id", result.stderr)
+        self.assertEqual((record.read_bytes(), record.stat().st_mtime_ns), pending)
+        question = status.slots(self.page, "C1").question
+        if not isinstance(question, change_page.OpenQuestion):
+            self.fail("the second question must remain open")
+        self.assertEqual(question.question_id, second.question_id)
+        self.assertEqual(question.text, "Does it include nested groups?")
+
+    def test_a_stale_question_resend_cannot_reopen_an_answered_question(self) -> None:
+        path, forms, body = self.browser()
+        del body
+        status = change_page.DeliveryStatus(self.root)
+        self.delivery_done.clear()
+        self.assertEqual(self.http_request(path, self.browser_fields(forms, "page-owner/C1", "question", "Which groups?")).status, 200)
+        self.assertTrue(self.delivery_done.wait(TEST_HANG_GUARD_SECS))
+        record = status.path(self.page, "C1")
+        sent = (record.read_bytes(), record.stat().st_mtime_ns)
+        retry = self.browser_fields(forms, "page-owner/C1", "retry")
+        self.assertEqual(self.http_request(path, retry).status, 400)
+        self.assertEqual((record.read_bytes(), record.stat().st_mtime_ns), sent)
+        self.assertEqual(self.answer_question("All groups.").returncode, 0)
+        answered = (record.read_bytes(), record.stat().st_mtime_ns)
+        reply = self.http_request(path, retry)
+        self.assertEqual(reply.status, 400)
+        self.assertEqual(json.loads(reply.body), {"reason": "Check the answer and submit it again."})
+        self.assertEqual((record.read_bytes(), record.stat().st_mtime_ns), answered)
+        self.assertEqual(len(self.messages), 1)
+
+    def test_a_pending_question_stays_waiting_and_refuses_a_retry_during_delivery(self) -> None:
+        path, forms, body = self.browser()
+        del forms, body
+        status = change_page.DeliveryStatus(self.root)
+        first = status.ask(self.page, "C1", "Which groups?")
+        self.assertIsInstance(first, change_page.QuestionDelivery)
+        record = status.path(self.page, "C1")
+        pending = (record.read_bytes(), record.stat().st_mtime_ns)
+        with self.assertRaisesRegex(change_page.AnswerRefused, "no question to send again"):
+            _ = status.retry_question(self.page, "C1")
+        self.assertIsInstance(status.ask(self.page, "C1", "Which groups?"), change_page.NoDelivery)
+        self.assertEqual((record.read_bytes(), record.stat().st_mtime_ns), pending)
+        browser = change_browser.page_at(self.root, path)
+        prepared = change_browser.prepare(browser, change_page.DeliveryStatus(self.root))
+        self.assertIn("page-owner/C1", [item.key for item in prepared.changes if item.waiting])
+        self.assertIn("C1", [entry.key for entry in prepared.queues["page-owner"].entries])
+        content = self.request(path, {}).body
+        refreshed = BrowserForms()
+        refreshed.feed(content)
+        self.assertEqual(refreshed.counts["page-owner"], 3)
+        self.assertTrue(refreshed.pending["page-owner/C1"])
+        self.assertIn("The message may not have sent", content)
+        self.assertIn('data-resend data-outcome="retry">Send question again</button>', content)
+
+    def test_a_fresh_question_post_cannot_retry_a_failed_question(self) -> None:
+        path, forms, body = self.browser()
+        del body
+        fields = self.browser_fields(forms, "page-owner/C1", "question", "Which groups?")
+        with patch.object(change_page, "send_message", side_effect=RuntimeError("socket unavailable")):
+            self.delivery_done.clear()
+            self.assertEqual(self.http_request(path, fields).status, 200)
+            self.assertTrue(self.delivery_done.wait(TEST_HANG_GUARD_SECS))
+        record = change_page.DeliveryStatus(self.root).path(self.page, "C1")
+        failed = (record.read_bytes(), record.stat().st_mtime_ns)
+        self.delivery_done.clear()
+        self.assertEqual(self.http_request(path, fields).status, 200)
+        self.assertTrue(self.delivery_done.wait(TEST_HANG_GUARD_SECS))
+        self.assertEqual((record.read_bytes(), record.stat().st_mtime_ns), failed)
+        self.assertEqual(self.messages, [])
+
+    def test_a_server_restart_can_retry_a_pending_question_without_an_old_result_changing_the_retry(self) -> None:
+        status = change_page.DeliveryStatus(self.root)
+        old = status.ask(self.page, "C1", "Which groups?")
+        restarted = change_page.DeliveryStatus(self.root)
+        new = restarted.retry_question(self.page, "C1")
+        if not isinstance(old, change_page.QuestionDelivery):
+            self.fail("a restart must allow recovery of an unfinished message")
+        newer = change_page.MessageDelivery(self.page, "C1", (), "", new.attempt)
+        restarted.record(newer, True)
+        status.record(change_page.MessageDelivery(self.page, "C1", (), "", old.attempt), False)
+        self.assertEqual(restarted.slots(self.page, "C1").question,
+                         change_page.OpenQuestion(old.question_id, "Which groups?", change_page.DeliveryIntent(new.attempt, "failed", "question")))
+
     def test_browser_markup_supplies_waiting_rows_and_navigation_after_saves(self) -> None:
         path, forms, body = self.browser()
         del path
         self.assertEqual(forms.pending, dict.fromkeys(forms.rows, True))
-        self.assertEqual(forms.outcomes["page-owner/C1"], ["works", "not works", "validate", "feedback"])
+        self.assertEqual(forms.outcomes["page-owner/C1"], ["works", "not works", "validate", "feedback", "question"])
         self.assertIn('data-next hidden>Next', body)
         self.assertIn('<p data-left></p>', body)
         self.assertIn("current===row && tab===row.dataset.tab && navigation===position", body)

@@ -28,6 +28,7 @@ send_role_map_command = role_map.ssh_role_map
 
 def setUpModule() -> None:
     install_signal_pid_guard()
+    _ = unittest.enterModuleContext(patch.object(accounts, "_start_session_counts_fetch", return_value=True))
 
 
 class RoleMapReadTime(datetime):
