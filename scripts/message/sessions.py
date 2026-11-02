@@ -45,6 +45,8 @@ class SessionRecord(TypedDict):
     entrypoint: NotRequired[str]
     # The conversation's folder, for the exact staff-worktree join. Older records may omit it.
     cwd: NotRequired[str]
+    # Older records omit status. The reader converts absence to an empty string.
+    status: NotRequired[str]
 
 
 @dataclass(frozen=True)
@@ -160,6 +162,7 @@ def parse_session(parsed: object) -> RegistryEntry:
     former = data.get("formerNames")
     entrypoint = data.get("entrypoint")
     cwd = data.get("cwd")
+    status = data.get("status")
     if (
         not isinstance(pid, int)
         or isinstance(pid, bool)
@@ -183,6 +186,7 @@ def parse_session(parsed: object) -> RegistryEntry:
         if isinstance(former, list) else [],
         entrypoint=entrypoint if isinstance(entrypoint, str) else "",
         cwd=cwd if isinstance(cwd, str) else "",
+        status=status if isinstance(status, str) else "",
     )
 
 

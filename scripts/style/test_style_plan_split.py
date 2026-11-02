@@ -26,9 +26,9 @@ import style_plan
 from scripts.production import showrunners
 from scripts.production.staff_test_support import isolated_staff_file, production_membership
 from scripts.build_hold import build_hold
+from scripts.build_queue import queue_place
 import live_units
 import unit_lookup
-import merge_gate
 import unit_plans
 import style_proposals
 
@@ -542,7 +542,7 @@ class RefillRecordingTests(unittest.TestCase):
                                       + f"| names-unit | docs/names.md | {root / 'gone'} | style-names |\n")
             output, errors = io.StringIO(), io.StringIO()
             with (mock.patch.object(unit_lookup, "marked_units", return_value={}),
-                  mock.patch.object(merge_gate, "suite_scope_prefix", side_effect=AssertionError("no child for a retired unit")),
+                  mock.patch.object(queue_place, "suite_scope_prefix", side_effect=AssertionError("no child for a retired unit")),
                   redirect_stdout(output), redirect_stderr(errors)):
                 code = style_plan.main(["split-all", "--production", str(production)])
             self.assertEqual((code, output.getvalue(), errors.getvalue()), (0, "no style units\n", ""))
@@ -579,7 +579,7 @@ class RefillRecordingTests(unittest.TestCase):
                 return subprocess.CompletedProcess(command, 0, f"{unit}: 1/2/3/4 in 0.25 min\n", "")
 
             output = io.StringIO()
-            with (mock.patch.object(merge_gate, "suite_scope_prefix", return_value=[
+            with (mock.patch.object(queue_place, "suite_scope_prefix", return_value=[
                     "systemd-run", "--user", "--scope", "--slice=builds.slice"]),
                   mock.patch.object(subprocess, "run", side_effect=child), redirect_stdout(output)):
                 code = style_plan.main(["split-all", "--production", str(production)])

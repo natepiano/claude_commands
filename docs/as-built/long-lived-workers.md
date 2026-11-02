@@ -543,13 +543,14 @@ and reports the doubt. Board narration omits unavailable enrichment. Missing fil
 remain distinct: `resolve` checks ledger-owned names and exact thread identities
 before any new allocation, so a missing roster does not establish a new run.
 A missing inbox has no persisted messages. Before `1a8adf46`, the pending writer
-truncated the live file before writing JSON, so a zero-byte inbox can be evidence of lost messages.
-An exclusive reader locks and rereads that file, renames it beside the original as
-`<worker>.pending.json.empty-legacy-<UTC timestamp>`, logs one line naming the file and reason,
-then continues with an empty queue; shared readers return an empty queue and defer quarantine
-until an exclusive read, while non-empty corrupt content still refuses. A newly
-cleared inbox contains `{"thread_id":"","messages":[],"accepting_messages":true}`;
-thread-specific queues carry the same fields with their exact identity and close flag.
+truncated the live file before writing JSON. Thus, a zero-byte inbox can indicate lost messages.
+An exclusive reader locks and rereads that file. It renames the file beside the original as
+`<worker>.pending.json.empty-legacy-<UTC timestamp>`. It logs one line with the file and reason.
+It then returns `{}`, which represents a valid empty queue. A shared reader also returns `{}`
+but leaves the file for an exclusive reader to quarantine. Readers also accept `{}` in a pending
+file as an empty queue. Non-empty records must pass all queue field checks.
+A newly cleared inbox contains `{"thread_id":"","messages":[],"accepting_messages":true}`.
+Queues for specific threads carry the same fields with their exact identity and close flag.
 
 `workers.py repair-roster --session-dir RUN` explicitly reconstructs missing rows
 from the current run's unit ledger. It preserves surviving rows, writes damaged

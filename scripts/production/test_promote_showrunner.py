@@ -135,7 +135,8 @@ class PromoteShowrunnerTests(unittest.TestCase):
         _ = fixture_member("unit", name="demo", parent=parent_row.id, runtime_id=SESSION)
         session_records = self.root / "sessions"
         session_records.mkdir()
-        _ = (session_records / f"{PID}.json").write_text(json.dumps({"status": "idle"}))
+        _ = (session_records / f"{PID}.json").write_text(json.dumps({"pid": PID, "sessionId": SESSION, "name": "demo",
+            "messagingSocketPath": "", "updatedAt": 1, "status": "idle"}))
         self.events, self.alive, self.started = [], [True, True, False], 0
         _ = (self.root / "herdr-responses.json").write_text(json.dumps({"default": {"code": 0, "stdout": ""}}))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
@@ -429,7 +430,10 @@ class PromoteShowrunnerTests(unittest.TestCase):
             self.child_refusal = "child already has a running showrunner"
 
         def mid_turn() -> None:
-            _ = (self.root / "sessions" / f"{PID}.json").write_text(json.dumps({"status": "busy"}))
+            path = self.root / "sessions" / f"{PID}.json"
+            data = cast(dict[str, object], json.loads(path.read_text()))
+            data["status"] = "busy"
+            _ = path.write_text(json.dumps(data))
 
         def form() -> None:
             self.pane = unit_effort.Skipped("a form, prompt or menu is open")

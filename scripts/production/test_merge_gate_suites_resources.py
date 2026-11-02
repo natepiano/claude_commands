@@ -1,6 +1,7 @@
 """Merge gate suites contracts."""
 
 from __future__ import annotations
+from scripts.build_queue import queue_place
 
 import unittest
 import io
@@ -388,7 +389,7 @@ class MergeGateResourcesTests(GateSuitesFixture):
             kill(job)
 
         with mock.patch.dict(os.environ, self.environment), \
-                mock.patch.object(merge_gate, "in_builds_slice", return_value=False), \
+                mock.patch.object(queue_place, "in_builds_slice", return_value=False), \
                 mock.patch("scripts.production.merge_gate.time.monotonic", side_effect=module_clock), \
                 mock.patch.object(merge_gate, "process_memory_mib", side_effect=sample), \
                 mock.patch.object(merge_gate, "kill_job_group", side_effect=kill_module), redirect_stdout(output):
