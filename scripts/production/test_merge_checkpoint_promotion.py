@@ -225,8 +225,8 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertNotIn("into: " + str(self.root / "mac-installed"), result.process.stdout)
     def test_mac_pull_retries_once_then_succeeds(self) -> None:
         config = self.root / "merge_checkpoint.conf"
-        _ = config.write_text("MAC_PULL_TRIES=3\nMAC_PULL_RETRY_SECONDS=0\n")
-        self.env["MERGE_CHECKPOINT_CONFIG"] = str(config)
+        _ = config.write_text("# whole: 1..\nMAC_PULL_TRIES=3\n# range: 0..\nMAC_PULL_RETRY_SECONDS=0\n")
+        self.env["CONF_DIR"] = str(Path(config).parent)
         self.promotions = str(self.promote) + ", mac " + str(self.root / "mac-installed")
         self.production_doc()
         self.executable(self.bin / "ssh", STUB.replace('if name == "ssh":\n',
@@ -243,8 +243,8 @@ class MergeCheckpointTests(MergeCheckpointFixture):
 
     def test_mac_pull_stops_after_configured_tries_with_the_last_failure(self) -> None:
         config = self.root / "merge_checkpoint.conf"
-        _ = config.write_text("MAC_PULL_TRIES=2\nMAC_PULL_RETRY_SECONDS=0\n")
-        self.env["MERGE_CHECKPOINT_CONFIG"] = str(config)
+        _ = config.write_text("# whole: 1..\nMAC_PULL_TRIES=2\n# range: 0..\nMAC_PULL_RETRY_SECONDS=0\n")
+        self.env["CONF_DIR"] = str(Path(config).parent)
         self.promotions = str(self.promote) + ", mac " + str(self.root / "mac-installed")
         self.production_doc()
         _ = (self.state / "mac-rc").write_text("128\n")

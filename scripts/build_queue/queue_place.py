@@ -15,10 +15,15 @@ import sys
 import tempfile
 import threading
 import time
-from typing import BinaryIO, TypedDict, Unpack
+from typing import TYPE_CHECKING, BinaryIO, TypedDict, Unpack
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lint import memory_admit
+
+if TYPE_CHECKING:
+    from scripts.lib import conf
+else:
+    import conf
 
 
 @dataclass(frozen=True)
@@ -369,7 +374,10 @@ def _stop_holder(number: int, _frame: object) -> None:
 def queue_place(program: str, repo: Path, *,
                 sizing: memory_admit.FixedCapSizing | memory_admit.HistoryPeakSizing | ConfiguredFirstPeak = CONFIGURED_FIRST_PEAK,
                 before_check: Callable[[], None] = no_hold_wait) -> Generator[QueuePlace]:
-    config = memory_admit.memory_config()
+    try:
+        config = memory_admit.memory_config()
+    except conf.Unusable as error:
+        raise QueuePlaceRefused(str(error)) from error
     if isinstance(sizing, ConfiguredFirstPeak):
         first = config.program_first_peaks.get(program)
         if first is None:

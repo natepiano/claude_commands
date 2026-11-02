@@ -60,7 +60,7 @@ def configured_scope_command(root: Path, config: Path, *,
     result = BuildAdmissionTests(methodName="runTest").run_invoke(
         root, 'printf "%s" "$BUILDLOG_SCOPE_SH"', [], environment={
             "LINT_CONFIG_READER": str(reader),
-            "LINT_CONFIG_FILE": str(config),
+            "LINT_CONFIG_FILE": str(config), "CONF_DIR": str(Path(config).parent),
         },
     )
     if result.returncode != 0:
@@ -92,24 +92,24 @@ def require_score_below_500(test: unittest.TestCase) -> None:
 
 class BuildOomScoreAdjReaderTests(unittest.TestCase):
     python_reader: list[str] = [
-        sys.executable, "-c", "from scripts.lint.config_values import build_oom_score_adj; "
-        + "print(build_oom_score_adj())",
+        sys.executable, "-c", "from scripts.lib import conf; "
+        + 'print(conf.whole("lint", "build_oom_score_adj"))',
     ]
 
     def read_config(self, config: Path, command: list[str]) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             command, capture_output=True, text=True, check=False,
-            env={**os.environ, "HOME": str(config.parent), "LINT_CONFIG_FILE": str(config),
+            env={**os.environ, "HOME": str(config.parent), "LINT_CONFIG_FILE": str(config), "CONF_DIR": str(Path(config).parent),
                  "PYTHONPATH": str(INVOKE.resolve().parents[2])},
             timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
 
-    def assert_readers(self, config: Path, expected: int, *, warns: bool) -> None:
+    def assert_readers(self, config: Path, expected: int, *, warns: bool, python: bool = False) -> None:
         readers = (
             ("shell", ["bash", "-c", 'set -euo pipefail; source "$1"; '
                        + 'lint_config_build_oom_score_adj adjustment; printf "%s\\n" "$adjustment"',
                        "config-reader-test", str(LINT_CONFIG_READER)]),
-            ("python", self.python_reader),
+            *(((("python", self.python_reader),) if python else ())),
         )
         for reader, command in readers:
             with self.subTest(reader=reader):
@@ -134,18 +134,36 @@ class BuildOomScoreAdjReaderTests(unittest.TestCase):
             config = write_lint_config(Path(directory), 650, include_adjustment=False)
             self.assert_readers(config, 500, warns=False)
 
-    def test_python_reader_warns_once_for_undecodable_config_and_uses_default(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            config = write_lint_config(Path(directory), 650)
-            _ = config.write_bytes(b"\xff")
-            result = self.read_config(config, self.python_reader)
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertEqual(result.stdout, "500\n")
-            self.assertEqual(
-                result.stderr,
-                f"warning: {config}: 'utf-8' codec can't decode byte 0xff in position 0: "
-                + "invalid start byte — using 500\n",
-            )
+    def test_python_reader_recovers_committed_values_and_refuses_without_history(self) -> None:
+        from scripts.lint.memory_test_support import commit_config_fixture
+
+        for damage in ("missing file", "missing key", "bad encoding", "", "abc", "2000", "-1001"):
+            with self.subTest(damage=damage), tempfile.TemporaryDirectory() as directory:
+                config = write_lint_config(Path(directory), 650)
+                _ = config.write_text("# whole: -1000..1000\nbuild_oom_score_adj=650\n")
+                commit_config_fixture(config)
+                if damage == "missing file":
+                    config.unlink()
+                elif damage == "missing key":
+                    _ = config.write_text("other=1\n")
+                elif damage == "bad encoding":
+                    _ = config.write_bytes(b"\xff")
+                else:
+                    _ = config.write_text(f"# whole: -1000..1000\nbuild_oom_score_adj={damage}\n")
+                result = self.read_config(config, self.python_reader)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, "650\n")
+                self.assertEqual(len(result.stderr.splitlines()), 1)
+                self.assertIn(str(config), result.stderr)
+                self.assertIn("build_oom_score_adj", result.stderr)
+                # A fresh private folder has no revision to recover.
+                empty = Path(directory) / "no-history/lint.conf"
+                empty.parent.mkdir()
+                _ = empty.write_text("# whole: -1000..1000\nbuild_oom_score_adj=bad\n")
+                refused = self.read_config(empty, self.python_reader)
+                # This folder is still under the fixture repo; the file itself has no history.
+                self.assertNotEqual(refused.returncode, 0)
+                self.assertIn("Unusable", refused.stderr)
 
     def test_present_invalid_value_warns_once_and_uses_default(self) -> None:
         for value in ("", " # comment", "abc", "2000", "-1001"):
@@ -157,7 +175,7 @@ class BuildOomScoreAdjReaderTests(unittest.TestCase):
         for value in (650, -1000, 0, 1000):
             with self.subTest(value=value), tempfile.TemporaryDirectory() as directory:
                 config = write_lint_config(Path(directory), value)
-                self.assert_readers(config, value, warns=False)
+                self.assert_readers(config, value, warns=False, python=True)
 
 
 class BuildScopeTests(unittest.TestCase):

@@ -30,7 +30,6 @@ from scripts.lib.atomic_file import write_text_atomic
 
 CONFIG = Path(__file__).resolve().parents[2] / "config/send_repeat_guard.conf"
 NOTICE_SENDER = "send-repeat-guard"
-PHONE_TEXT = "message.repeat_flood"
 
 
 @dataclass(frozen=True)
@@ -122,7 +121,7 @@ class Flood:
 
 @dataclass
 class Notice:
-    kind: Literal["owner", "phone"]
+    kind: Literal["owner"]
     text: str
     first: float
     last: float
@@ -170,16 +169,16 @@ def active_floods(state: SenderState) -> Iterator[tuple[str, Flood]]:
         yield rate_identity(receiver), rate.episode
 
 
-def request_notices(state: SenderState, flood: Flood, identity: str,
-                    kinds: tuple[Literal["owner", "phone"], ...], at: float, limits: Limits) -> bool:
+def request_owner_notice(state: SenderState, flood: Flood, identity: str,
+                         at: float, limits: Limits) -> bool:
     episode = digest(state.sender + "\0" + identity + "\0" + str(flood.first))
-    missing: list[Literal["owner", "phone"]] = [
-        kind for kind in kinds if not any(notice.id == episode and notice.kind == kind for notice in state.notices)]
-    if len(state.notices) + len(missing) > 2 * limits.max_keys:
+    if any(notice.id == episode for notice in state.notices):
+        return True
+    if len(state.notices) >= 2 * limits.max_keys:
         warn("notice outbox capacity reached")
         return False
-    for kind in missing:
-        state.notices.append(Notice(kind, flood.text, flood.first, at, flood.count, len(flood.receivers), episode, created=at))
+    state.notices.append(Notice("owner", flood.text, flood.first, at, flood.count,
+                                len(flood.receivers), episode, created=at))
     return True
 
 
@@ -227,7 +226,7 @@ def transition(state: SenderState, attempt: Attempt, limits: Limits) -> Decision
         counter.episode.count += 1
         counter.episode.last = at
         if not held and counter.count >= limits.receiver_rate_count:
-            _ = request_notices(state, counter.episode, rate_identity(attempt.receiver), ("owner",), at, limits)
+            _ = request_owner_notice(state, counter.episode, rate_identity(attempt.receiver), at, limits)
     if receiver_key not in state.receivers:
         if len(state.receivers) >= limits.max_keys:
             return Decision()
@@ -245,8 +244,7 @@ def transition(state: SenderState, attempt: Attempt, limits: Limits) -> Decision
     if attempt.receiver not in flood.receivers and len(flood.receivers) < limits.max_keys:
         flood.receivers.append(attempt.receiver)
     held = receiver.count >= limits.repeat_count
-    kinds: tuple[Literal["owner", "phone"], ...] = ("owner", "phone") if held else ()
-    if not request_notices(state, flood, identity, kinds, at, limits):
+    if held and not request_owner_notice(state, flood, identity, at, limits):
         return Decision()
     if held:
         state.holds = [*state.holds, at][-limits.max_keys:]
@@ -312,8 +310,11 @@ def decode(text: str) -> SenderState:
         raise ValueError("expected notices and holds lists")
     for value in cast(list[object], notices):
         item = object_map(value)
-        kind, status = item["kind"], item["status"]
-        if kind not in ("owner", "phone") or status not in ("pending", "claimed", "delivered", "queued", "unknown"):
+        kind = string(item["kind"])
+        if kind == "phone":
+            continue
+        status = item["status"]
+        if kind != "owner" or status not in ("pending", "claimed", "delivered", "queued", "unknown"):
             raise ValueError("invalid notice state")
         state.notices.append(Notice(kind, string(item["text"]),
             number(item["first"]), number(item["last"]), int(number(item["copies"], integer=True)),
@@ -507,10 +508,10 @@ NoticeOutcome = Literal["delivered", "queued", "failed", "unknown"]
 
 def drain(root: Path, deliver: Callable[[SenderState, Notice, Limits], NoticeOutcome], at: float, *,
           cleanup_seconds: float = 0) -> None:
-    """The sender record owns one durable request per episode and notice kind.
+    """The sender record owns one durable owner request per episode.
 
     Unknown/interrupted delivery retries: at-least-once accepts a rare duplicate
-    after provider acceptance, rather than silently losing a phone alert.
+    after provider acceptance, rather than silently losing an owner notice.
     """
     limits = configuration()
     if isinstance(limits, GuardUnavailable):

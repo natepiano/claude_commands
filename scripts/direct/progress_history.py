@@ -195,9 +195,8 @@ class FindingTally(TypedDict):
     reopened: int
 
 
-# direct.conf, whose digest a pass records. `UNIT_CONFIG` overrides the
+# direct.conf, whose digest a pass records. `CONF_DIR` overrides the
 # path so the tests read a fixture rather than the machine's live settings.
-DEFAULT_CONFIG_PATH = Path("~/.claude/config/direct.conf").expanduser()
 
 # A pass already records the agent identity it resolved to, so the digest covers
 # what that identity cannot: the assignment tables that produced it and the
@@ -276,8 +275,7 @@ def _contract_revision() -> ContractRevision:
 
 
 def _config_path() -> Path:
-    configured = os.environ.get("UNIT_CONFIG") or os.environ.get("PLAN_DELEGATE_CONFIG")
-    return Path(configured) if configured else DEFAULT_CONFIG_PATH
+    return Path(os.environ.get("CONF_DIR") or "~/.claude/config").expanduser() / "direct.conf"
 
 
 def _agents_config_path() -> Path:

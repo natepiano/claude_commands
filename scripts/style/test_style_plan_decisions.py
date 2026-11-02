@@ -259,10 +259,10 @@ class StylePlanTests(StylePlanFixture):
         site = self.sources[0]
         source = "fn work() {\n    consume(791);\n}\n"
         self.commit_files({site: source})
-        issue, (finding,) = self.judged_findings(rule, ((site, 2, source.splitlines()[1]),), kind="restructure")
+        issue, (finding,) = self.judged_findings(rule, ((site, 2, source.splitlines()[1]),), kind="restructure",
+                                               clean_before_holding=True)
         self.write_generated_body(issue)
         ledger = self.ledger()
-        self.record(rule, site, self.tip, "modules-unit-1")
         self.commit_files({site: "fn sibling() {}\n" + source})
         _ = self.refill_decisions()
         ticket, = ledger.ticket_open("names-unit")

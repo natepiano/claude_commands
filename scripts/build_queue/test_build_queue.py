@@ -24,6 +24,7 @@ from scripts.build_queue.queue_lines import QueueLines, Span, plain, terminal_wi
 from scripts.buildlog import store
 from scripts.lint import memory_admit
 from scripts.lint.test_memory_admit import write_memory_config
+from scripts.lint.memory_test_support import commit_config_fixture
 from scripts.message import roster, unit_labels
 from scripts.message.unit_labels import UnitLabels, unit_labels_for
 from scripts.production import staff
@@ -52,7 +53,7 @@ class QueueTests(unittest.TestCase):
         self.labels_read = cast(LabelReadMock, self.enterContext(mock.patch.object(unit_labels, "unit_labels_for", return_value={})))
         config = self.root / "lint.conf"
         write_memory_config(config)
-        self.enterContext(mock.patch.dict(os.environ, {"COLUMNS": "100", "LINT_CONFIG_FILE": str(config)}))
+        self.enterContext(mock.patch.dict(os.environ, {"COLUMNS": "100", "CONF_DIR": str(config.parent)}))
 
     @staticmethod
     def entry(session: str, name: str) -> tuple[str, UnitLabels]:
@@ -79,17 +80,17 @@ class QueueTests(unittest.TestCase):
         return status, output.getvalue(), errors.getvalue()
 
     def test_queue_command_warns_about_a_missing_key_once_per_process(self) -> None:
-        config = self.root / "policy.conf"
-        _ = config.write_text("[memory]\n")
-        with mock.patch.dict(os.environ, {"LINT_CONFIG_FILE": str(config)}), \
-             mock.patch.object(memory_admit, "_warned_config_fallbacks", set[memory_admit.ConfigFallback]()), \
+        config = self.root / "lint.conf"
+        commit_config_fixture(config)
+        write_memory_config(config, head_seconds=None)
+        with mock.patch.dict(os.environ, {"CONF_DIR": str(config.parent)}), \
              mock.patch.object(memory_admit, "queue_read", return_value=memory_admit.QueueBusy()), \
              mock.patch("sys.argv", ["build_queue.py"]), \
              redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as errors:
             self.assertEqual(build_queue.main(), 0)
             self.assertEqual(build_queue.main(), 0)
-        self.assertEqual(errors.getvalue().count(
-            "memory admission: lint.conf [memory] head_seconds is missing; using 600\n"), 1)
+        self.assertEqual(errors.getvalue().count("head_seconds="), 2)
+        self.assertIn("key is missing", errors.getvalue())
 
     def snapshot(self, reading: memory_admit.QueueRead, *arguments: str) -> QueueLines:
         status, output, errors = self.invoke(reading, "--json", "--columns", "400", *arguments)

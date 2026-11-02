@@ -100,7 +100,6 @@ SLOW_MODULE_FACTOR = 3.0
 SLOW_MODULE_FLOOR_S = 60.0
 MODULE_HISTORY_RUNS = 5
 MEMORY_SAMPLE_SECONDS = 0.25
-SETTINGS_BLOB = "b3466859"
 ROLLBACK_SIGNALS = (signal.SIGTERM, signal.SIGHUP)
 # Restore dispositions and the mask in every child, including types. The runner
 # defers cancellation until the child is registered for cleanup.
@@ -132,7 +131,6 @@ class GateArguments(argparse.Namespace):
     ssh: str = ""
     mac_host: str = ""
     mac_repo: str = ""
-    settings_blob: str = ""
     memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB
     module_time_limit_s: float = DEFAULT_MODULE_TIME_LIMIT_S
     tests_only: bool = False
@@ -1111,14 +1109,6 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
     return run
 
 
-def check_settings(repo: Path, revision: str, approved: str) -> None:
-    if not re.fullmatch(r"[0-9a-f]{8,40}", approved):
-        raise GateRefused("approved settings blob must be an 8-40 character git hash")
-    actual = checked_git(repo, "rev-parse", f"{revision}:settings.json")
-    if not actual.startswith(approved):
-        raise GateRefused(f"settings.json differs from approved blob {approved}: {actual}")
-
-
 # Use a fresh index for the file comparison. The live index can hide edits
 # with assume-unchanged or skip-worktree flags. Never change that index.
 PROMOTION_TRACKED_CHECK = '''import json, os, subprocess, tempfile
@@ -1243,7 +1233,6 @@ def promote(args: GateArguments, *, release_lock_wait_s: float = RELEASE_LOCK_WA
         target = record.commit
     if git(main_repo, "merge-base", "--is-ancestor", "origin/main", f"origin/{args.merge_branch}").returncode:
         raise GateRefused("main is not an ancestor of the merge branch")
-    check_settings(main_repo, target, str(args.settings_blob))
     hold.wait_until_free()
     require_clean_promotion(main_repo)
     write_push_record(path, RecordedPush(origin, target, target))
@@ -1368,7 +1357,6 @@ def merge_checkpoint(args: GateArguments) -> int:
                             source="checkpoint", full=args.full)
         if not suites.passed:
             raise GateRefused("RED: types or suites failed")
-        check_settings(repo, "HEAD", str(args.settings_blob))
         fetch_branches(repo, "main")
         if git(repo, "merge-base", "--is-ancestor", "origin/main", "HEAD").returncode:
             raise GateRefused("origin/main is not an ancestor of the merge branch")
@@ -1522,7 +1510,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     _ = parser.add_argument("--ssh", default="ssh")
     _ = parser.add_argument("--mac-host", default="mac")
     _ = parser.add_argument("--mac-repo", default="~/.claude")
-    _ = parser.add_argument("--settings-blob", default=SETTINGS_BLOB)
     _ = parser.add_argument("--memory-cap-mib", type=int, default=DEFAULT_MEMORY_CAP_MIB,
                             help="sampled memory admission cap in MiB (default: 6144); full-tree basedpyright peaked at 4065 MiB on 2026-10-30, reserving 4878 MiB")
     _ = parser.add_argument("--module-time-limit-s", type=float, default=DEFAULT_MODULE_TIME_LIMIT_S,

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.lint.memory_test_support import config_environment
+
 import json
 import os
 import subprocess
@@ -202,7 +204,7 @@ esac
             "MAC_TEST_STATE_DIR": str(self.root / "mac-state"),
             "VERIFY_MAC_RUNNER": str(self.root / "no-mac-runner"),
             "LINT_CONFIG_READER": str(reader),
-            "LINT_CONFIG_FILE": str(reader),
+            "LINT_CONFIG_FILE": str(reader), **config_environment(self.root),
             "UNIT_SESSION_DIR": str(self.root / "session"),
         }
 

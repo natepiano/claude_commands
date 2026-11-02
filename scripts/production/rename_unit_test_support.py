@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from scripts.lint.memory_test_support import config_environment
 import hashlib
 import shutil
 import json
@@ -116,6 +117,7 @@ class UnitRenameFixture(StaffTestCase):
         config = self.home / ".claude"
         self.env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
         self.env.update({
+            **config_environment(self.root),
             "UNIT_WORKERS_STATE": str(self.root / "state/unit-workers"),
             "RETIRE_UNIT_RUN_ROOT": str(self.root / "runs"),
             "HOME": str(self.home), "CLAUDE_CONFIG_DIR": str(config),

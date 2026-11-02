@@ -21,7 +21,7 @@ from collections.abc import Callable, Generator, Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 import contextlib
 from contextlib import closing, redirect_stdout
-from dataclasses import fields, replace
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import IO, TYPE_CHECKING, BinaryIO, Literal, Protocol, TextIO, cast, override
@@ -32,10 +32,11 @@ from zoneinfo import ZoneInfo
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import memory_admit as gate
+import conf
 from memory_admit import _queue_read_live  # pyright: ignore[reportPrivateUsage]
 import nextest_budget as budget
 from build_shape import BuildShape, build_shape
-from memory_test_support import fake_memory_readings, gate_isolation_environment
+from memory_test_support import fake_memory_readings, gate_isolation_environment, write_config_fixture, write_config_fault, commit_config_fixture
 if TYPE_CHECKING:
     from ..lib import test_hang_guard
     from ..lib.atomic_file import write_text_atomic
@@ -86,26 +87,21 @@ def write_history_rows(root: Path, rows: Iterable[dict[str, object]]) -> None:
 
 def write_memory_config(path: Path, **changes: str | None) -> None:
     """Write one complete, private memory configuration for admission consumers."""
-    timing, pressure = gate.DEFAULT_ADMISSION_POLICY.timing, gate.DEFAULT_ADMISSION_POLICY.pressure
-    values: dict[str, str | None] = {
-        "ramp_seconds": str(timing.ramp_seconds), "head_seconds": str(timing.head_seconds),
-        "strict_seconds": str(timing.strict_seconds), "backfill_seconds": str(timing.backfill_seconds),
-        "recovery_start_seconds": str(timing.recovery_start_seconds),
-        "recovery_window_seconds": str(timing.recovery_window_seconds),
-        "full_pressure_limit": str(pressure.full_avg10_limit),
-        "swap_used_limit": str(pressure.swap_used_limit),
-        "some_pressure_limit": str(pressure.some_avg10_limit),
-        "test_phase_margin": str(gate.FALLBACK_TEST_PHASE_MARGIN),
-        "peak_hold_seconds": str(gate.DEFAULT_ADMISSION_POLICY.peak_hold.default_seconds),
-    }
-    for field in fields(gate.DEFAULT_MEMORY_CONFIG):
-        value = cast(object, getattr(gate.DEFAULT_MEMORY_CONFIG, field.name))
-        if isinstance(value, (int, float)):
-            key = "build_budget_gib" if field.name == "build_budget_bytes" else field.name
-            values[key] = str(value / GIB if field.name == "build_budget_bytes" else value)
-    values.update(changes)
-    _ = path.write_text("[memory]\n" + "".join(
-        f"{key}={value}\n" for key, value in values.items() if value is not None))
+    _ = write_config_fixture(path)
+    lines = [line for line in path.read_text().splitlines()
+             if not line.startswith(("program_first_peak_gib.", "peak_hold_seconds."))]
+    for key, value in changes.items():
+        indices = [index for index, line in enumerate(lines) if line.partition("=")[0].strip() == key]
+        if indices:
+            index = indices[0]
+            if value is None:
+                del lines[index]
+            else:
+                lines[index] = f"{key}={value}"
+        elif value is not None:
+            form = "whole: 1.." if key.startswith("peak_hold_seconds.") else "range: 5e-324..1.6742321987285425e299"
+            lines.extend((f"# {form}", f"{key}={value}"))
+    _ = path.write_text("\n".join(lines) + "\n")
 
 
 def assert_unfinished_history_ignored(test: unittest.TestCase, path: Path,
@@ -149,6 +145,7 @@ def stop_history_append(history_store: object, tail: HistoryAppendStop
 
 def setUpModule() -> None:
     root = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
+    _ = write_config_fixture(root / "lint.conf", "build_budget_gib=21")
     _ = (root / "meminfo").write_text("MemTotal: 67108864 kB\nMemAvailable: 67108864 kB\n")
     _ = (root / "pressure").write_text(
         "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\n"
@@ -162,7 +159,7 @@ def setUpModule() -> None:
             "BUILDLOG_LIVE_MEMORY_TRIPWIRE", str(root / "live-memory-reads.jsonl")
         ),
         "BUILDLOG_BUILD_BUDGET_GIB": "20",
-        "LINT_CONFIG_FILE": str(root / "lint.conf"),
+        "LINT_CONFIG_FILE": str(root / "lint.conf"), "CONF_DIR": str(Path(root / "lint.conf").parent),
         "BUILDLOG_BUILDS_CGROUP": str(root / "builds.slice"),
         "USER_ZONE": "America/New_York",
     })))
@@ -190,18 +187,20 @@ class BuildBudgetTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.config = Path(self.enterContext(tempfile.TemporaryDirectory())) / "lint.conf"
-        _ = cast(object, self.enterContext(patch.dict(os.environ, {"LINT_CONFIG_FILE": str(self.config)})))
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"LINT_CONFIG_FILE": str(self.config), "CONF_DIR": str(Path(self.config).parent)})))
         _ = os.environ.pop("BUILDLOG_BUILD_BUDGET_GIB", None)
+        _ = write_config_fixture(self.config, "build_budget_gib=21")
+        commit_config_fixture(self.config)
 
     def test_positive_environment_budget_wins_without_reading_config(self) -> None:
-        _ = self.config.write_text("[memory]\nbuild_budget_gib=7.25\n")
+        _ = write_config_fault(self.config, "[memory]\nbuild_budget_gib=7.25\n")
         with patch.dict(os.environ, {"BUILDLOG_BUILD_BUDGET_GIB": "31.5"}), \
-             patch.object(gate, "config_values", side_effect=AssertionError("environment wins")):
+             patch.object(conf, "number", side_effect=AssertionError("environment wins")):
             self.assertEqual(gate.build_budget_bytes(), int(31.5 * GIB))
 
     def test_config_budget_is_read_again_after_each_change(self) -> None:
         for budget in ("7.25", "8"):
-            _ = self.config.write_text(f"[memory]\nbuild_budget_gib={budget} # trial\n")
+            _ = write_config_fault(self.config, f"[memory]\nbuild_budget_gib={budget} # trial\n")
             self.assertEqual(gate.build_budget_bytes(), int(float(budget) * GIB))
             self.assertEqual(gate.decide(60 * GIB, 60 * GIB, GIB, []).budget,
                              int(float(budget) * GIB))
@@ -209,7 +208,7 @@ class BuildBudgetTests(unittest.TestCase):
                              int(float(budget) * GIB))
 
     def test_invalid_environment_budget_uses_config(self) -> None:
-        _ = self.config.write_text("[memory]\nbuild_budget_gib=9\n")
+        _ = write_config_fault(self.config, "[memory]\nbuild_budget_gib=9\n")
         for budget in ("", "bad", "0", "-1", "nan", "inf", "1e999"):
             with self.subTest(budget=budget), patch.dict(os.environ, {"BUILDLOG_BUILD_BUDGET_GIB": budget}):
                 self.assertEqual(gate.build_budget_bytes(), 9 * GIB)
@@ -219,7 +218,7 @@ class BuildBudgetTests(unittest.TestCase):
         for setting in ("[memory]\n", *(f"[memory]\nbuild_budget_gib={value}\n"
                          for value in ("", "bad", "0", "-1", "nan", "inf", "1e999"))):
             with self.subTest(setting=setting):
-                _ = self.config.write_text(setting)
+                _ = write_config_fault(self.config, setting)
                 self.assertEqual(gate.build_budget_bytes(), 21 * GIB)
 
 
@@ -227,11 +226,11 @@ class BuildBudgetTests(unittest.TestCase):
         self.assertEqual(gate.read_memory_config().running_pass_seconds, 5)
         for raw in ("", "abc", "-5", "nan"):
             with self.subTest(raw=raw):
-                _ = self.config.write_text(f"[memory]\nrunning_pass_seconds={raw}\n")
-                self.assertEqual(gate.read_memory_config().running_pass_seconds, 5)
+                _ = write_config_fault(self.config, f"[memory]\nrunning_pass_seconds={raw}\n")
+                self.assertEqual(gate.running_pass_seconds(), 5)
         for seconds in (3, 7.5):
-            _ = self.config.write_text(f"[memory]\nrunning_pass_seconds={seconds}\n")
-            self.assertEqual(gate.read_memory_config().running_pass_seconds, seconds)
+            _ = write_config_fault(self.config, f"[memory]\nrunning_pass_seconds={seconds}\n")
+            self.assertEqual(gate.running_pass_seconds(), seconds)
 
     def test_service_intervals_use_positive_finite_config_and_read_each_use(self) -> None:
         readers = (
@@ -247,23 +246,23 @@ class BuildBudgetTests(unittest.TestCase):
         )
         for key, reader, fallback in readers:
             with self.subTest(key=key):
-                _ = self.config.write_text("[memory]\n")
+                _ = write_config_fault(self.config, "[memory]\n")
                 self.assertEqual(reader(), fallback)
                 for raw in ("abc", "-5", "nan", "inf", "0"):
-                    _ = self.config.write_text(f"[memory]\n{key}={raw}\n")
+                    _ = write_config_fault(self.config, f"[memory]\n{key}={raw}\n")
                     self.assertEqual(reader(), fallback)
                 for seconds in (3, 7.5):
-                    _ = self.config.write_text(f"[memory]\n{key}={seconds}\n")
+                    _ = write_config_fault(self.config, f"[memory]\n{key}={seconds}\n")
                     self.assertEqual(reader(), seconds)
 
     def test_request_size_limit_uses_positive_integer_config_at_each_use(self) -> None:
         self.assertEqual(gate.request_max_bytes(), 1048576)
         for raw in ("", "abc", "-5", "nan", "inf", "0", "1.5"):
             with self.subTest(raw=raw):
-                _ = self.config.write_text(f"[memory]\nrequest_max_bytes={raw}\n")
+                _ = write_config_fault(self.config, f"[memory]\nrequest_max_bytes={raw}\n")
                 self.assertEqual(gate.request_max_bytes(), 1048576)
         for size in (70000, 2097152):
-            _ = self.config.write_text(f"[memory]\nrequest_max_bytes={size}\n")
+            _ = write_config_fault(self.config, f"[memory]\nrequest_max_bytes={size}\n")
             self.assertEqual(gate.request_max_bytes(), size)
 
 
@@ -1559,15 +1558,18 @@ class MemoryQueueFixture(unittest.TestCase):
 class TestPhaseChargeTests(MemoryQueueFixture):
     """The real reservation reader, estimator and finalizer share one private ledger."""
 
-    phase_need: gate.TestPhaseNeed = gate.TestPhaseNeed(2 * GIB, 10, 8, 8, "same_width")
+    phase_need: gate.TestPhaseNeed  # pyright: ignore[reportUninitializedInstanceVariable]
 
     @override
     def setUp(self) -> None:
         super().setUp()
         self.enterContext(patch.dict(os.environ, {
             **fake_memory_readings(self.root), "BUILDLOG_BUILD_BUDGET_GIB": "21",
-            "LINT_CONFIG_FILE": str(self.root / "lint.conf"),
+            "LINT_CONFIG_FILE": str(self.root / "lint.conf"), "CONF_DIR": str(Path(self.root / "lint.conf").parent),
         }))
+        _ = write_config_fixture(self.root / "lint.conf", "test_phase_margin=1.2\n")
+        commit_config_fixture(self.root / "lint.conf")
+        self.phase_need = gate.TestPhaseNeed(2 * GIB, 10, 8, 8, "same_width")
         _ = self.enterContext(patch.object(store, "host_name", return_value="test-host"))
         _ = self.enterContext(patch.object(time, "time", return_value=NOW.timestamp()))
 
@@ -1626,14 +1628,14 @@ class TestPhaseChargeTests(MemoryQueueFixture):
         config = self.root / "lint.conf"
         for margin in (1.5, 1.25):
             with self.subTest(margin=margin):
-                _ = config.write_text(f"[memory]\ntest_phase_margin={margin}\n")
+                _ = write_config_fault(config, f"[memory]\ntest_phase_margin={margin}\n")
                 need = gate.test_phase_need(gate.read_reservation(path), "test-host", NOW, self.root)
                 self.assertEqual(need, gate.TestPhaseNeed(2 * GIB, 1, 8, 8, "same_width", margin))
                 gate.update_reservation(path, {"test_phase_need": gate.test_phase_need_record(need)}, self.root)
-                _ = config.write_text("[memory]\ntest_phase_margin=2\n")
+                _ = write_config_fault(config, "[memory]\ntest_phase_margin=2\n")
                 self.assertEqual(gate.build_charge(self.memory(path)), math.ceil(5 * GIB * margin))
         self.readings[100] = gate.MeasuredMemory(GIB * 2 // 5)
-        _ = config.write_text("[memory]\ntest_phase_margin=1.5\n")
+        _ = write_config_fault(config, "[memory]\ntest_phase_margin=1.5\n")
         need = gate.test_phase_need(gate.read_reservation(path), "test-host", NOW, self.root)
         gate.update_reservation(path, {"test_phase_need": gate.test_phase_need_record(need)}, self.root)
         phase = gate.test_phase_path(gate.read_reservation(path))
@@ -1652,9 +1654,9 @@ class TestPhaseChargeTests(MemoryQueueFixture):
                 if setting is None:
                     config.unlink(missing_ok=True)
                 else:
-                    _ = config.write_text(setting)
+                    _ = write_config_fault(config, setting)
                 need = gate.test_phase_need(gate.read_reservation(path), "test-host", NOW, self.root)
-                self.assertEqual(need, replace(self.phase_need, runs=1, margin=gate.FALLBACK_TEST_PHASE_MARGIN))
+                self.assertEqual(need, replace(self.phase_need, runs=1, margin=1.2))
                 gate.update_reservation(path, {"test_phase_need": gate.test_phase_need_record(need)}, self.root)
                 self.assertEqual(gate.build_charge(self.memory(path)), math.ceil(2 * GIB * 1.2))
 
@@ -1840,7 +1842,7 @@ class TestPhaseChargeTests(MemoryQueueFixture):
         path = self.phase_step()
         _ = self.waiter(300, NOW_EPOCH - 1, "head", "head", need=18)
         config = self.root / "lint.conf"
-        _ = config.write_text("[memory]\ntest_phase_margin=1.5\n")
+        _ = write_config_fault(config, "[memory]\ntest_phase_margin=1.5\n")
         readings = gate.QueueSnapshotReadings(gate.process_table(self.root / "proc"), {},
             host=gate.HostMemory(60 * GIB, 60 * GIB), pressure=gate.NoPressureHold(),
             recovery=gate.NoRecoverySpacing(), compilers=[], policy=gate.DEFAULT_ADMISSION_POLICY)
@@ -1852,13 +1854,13 @@ class TestPhaseChargeTests(MemoryQueueFixture):
             self.fail("the head must expose its admission decision")
         self.assertEqual(reason.decision.state, "admit")
         self.assertEqual(reason.decision.charged, 3 * GIB)
-        _ = config.write_text("[memory]\ntest_phase_margin=2\n")
+        _ = write_config_fault(config, "[memory]\ntest_phase_margin=2\n")
         gate.update_reservation(path, {"test_phase_need": gate.test_phase_need_record(
             replace(self.phase_need, margin=2))}, self.root)
         changed_inputs = gate.gather_queue_inputs(gate.admission_dir(self.root),
             gate.process_table(self.root / "proc"), NOW_EPOCH, readings=readings, policy=gate.DEFAULT_ADMISSION_POLICY)
         self.assertEqual(gate.resolve_admission_limits(60 * GIB), limits)
-        with patch.object(gate, "config_values", side_effect=AssertionError("pure pass read config")):
+        with patch.object(conf, "number", side_effect=AssertionError("pure pass read config")):
             self.assertEqual(gate.queue_read_from(inputs, limits, policy=gate.DEFAULT_ADMISSION_POLICY), before)
             self.assertEqual(gate.admission_pass(inputs, NOW_EPOCH, limits, policy=gate.DEFAULT_ADMISSION_POLICY).rows[0].decision,
                              reason.decision)
@@ -1868,7 +1870,7 @@ class TestPhaseChargeTests(MemoryQueueFixture):
             self.fail("the head must expose its changed admission decision")
         self.assertEqual(changed_reason.decision.charged, 4 * GIB)
         self.assertEqual(changed_reason.decision.state, "hold")
-        with patch.object(gate, "config_values", side_effect=AssertionError("pure pass read config")):
+        with patch.object(conf, "number", side_effect=AssertionError("pure pass read config")):
             self.assertEqual(gate.admission_pass(changed_inputs, NOW_EPOCH, limits, policy=gate.DEFAULT_ADMISSION_POLICY).rows[0].decision,
                              changed_reason.decision)
 
@@ -1928,7 +1930,7 @@ class TestPhaseChargeTests(MemoryQueueFixture):
 
     def test_finalizer_keeps_the_margin_written_at_admission_after_config_changes(self) -> None:
         config = self.root / "lint.conf"
-        _ = config.write_text("[memory]\ntest_phase_margin=1.2\n")
+        _ = write_config_fault(config, "[memory]\ntest_phase_margin=1.2\n")
         self.phase_samples([2 * GIB])
         _ = self.meminfo.write_text(f"MemAvailable: {60 * GIB // 1024} kB\nMemTotal: {60 * GIB // 1024} kB\n")
         sidecar = self.root / "100.cgroup"
@@ -1955,7 +1957,7 @@ class TestPhaseChargeTests(MemoryQueueFixture):
                          gate.TestPhaseCharge(math.ceil(3 * GIB * 1.2), 3 * GIB, need, NOW_EPOCH - 30))
         self.assertEqual(self.select_charge(past_ramp).decision.charged, math.ceil(3 * GIB * 1.2))
         selected = cast(dict[str, object], json.loads(gate.test_phase_charge_use_path(path).read_text()))
-        _ = config.write_text("[memory]\ntest_phase_margin=2\n")
+        _ = write_config_fault(config, "[memory]\ntest_phase_margin=2\n")
         self.assertEqual(gate.build_charge(self.memory(path, past_ramp)), math.ceil(3 * GIB * 1.2))
         _ = gate.finalize_reservation(path, gate.read_reservation(path), gate.Completed(), past_ramp, 0)
         final = list(gate.anonymous_history_rows(self.root / "admission/anon_peaks.jsonl"))[-1]
@@ -2982,10 +2984,10 @@ class BuildFinalizerTests(BuildPromiseFixture):
         before = {file: file.read_bytes() for file in files}
         read_text = Path.read_text
 
-        def fail_peak_read(file: Path) -> str:
+        def fail_peak_read(file: Path, *, encoding: str | None = None) -> str:
             if file == maximum:
                 raise PermissionError("peak temporarily unreadable")
-            return read_text(file)
+            return read_text(file, encoding=encoding)
 
         with patch.object(Path, "read_text", fail_peak_read), contextlib.suppress(OSError):
             gate.release(path, 137, self.root)
@@ -6541,7 +6543,9 @@ class QueueExplanationTests(MemoryQueueFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
+        write_memory_config(self.root / "lint.conf")
         self.enterContext(patch.dict(os.environ, {
+            "CONF_DIR": str(self.root),
             "BUILDLOG_MEMINFO": str(self.meminfo), "BUILDLOG_BUILD_BUDGET_GIB": "21",
             "BUILDLOG_MEMORY_PRESSURE": str(self.root / "pressure"),
         }))
@@ -7486,6 +7490,7 @@ class ConfiguredAdmissionPolicyTests(MemoryQueueFixture):
             **fake_memory_readings(self.root), "LINT_CONFIG_FILE": str(self.config),
         })))
         self.write_config()
+        commit_config_fixture(self.config)
 
     def write_config(self, **changes: str | None) -> None:
         write_memory_config(self.config, **changes)
@@ -7592,55 +7597,44 @@ class ConfiguredAdmissionPolicyTests(MemoryQueueFixture):
         self.assertNotEqual(snapshot.policy, gate.read_memory_config().policy)
 
     def test_overflowing_config_budget_falls_back_and_diagnoses_even_with_an_environment_override(self) -> None:
+        baseline = gate.read_memory_config().build_budget_bytes
         self.write_config(build_budget_gib="1e308")
-        for override, expected in (("", gate.FALLBACK_BUILD_BUDGET_BYTES), ("24", 24 * GIB)):
-            with self.subTest(override=override), patch.dict(os.environ, {"BUILDLOG_BUILD_BUDGET_GIB": override}):
+        for override, expected in (("", baseline), ("24", 24 * GIB)):
+            with self.subTest(override=override), patch.dict(os.environ, {"BUILDLOG_BUILD_BUDGET_GIB": override}), \
+                 contextlib.redirect_stderr(io.StringIO()) as errors:
                 config = gate.read_memory_config()
-                self.assertEqual(config.build_budget_bytes, gate.FALLBACK_BUILD_BUDGET_BYTES)
-                self.assertEqual([item for item in config.fallbacks if item.key == "build_budget_gib"],
-                    [gate.ConfigFallback("build_budget_gib", gate.InvalidValue("1e308"),
-                                         gate.FALLBACK_BUILD_BUDGET_BYTES / GIB)])
+                self.assertEqual(config.build_budget_bytes, baseline)
                 result = self.check(need=1, free=60)
                 self.assertEqual(result.decision.budget, expected)
                 self.assertEqual(result.decision.state, "admit")
+            self.assertIn("build_budget_gib='1e308'", errors.getvalue())
 
     def test_invalid_policy_values_name_the_default_and_the_bad_input(self) -> None:
-        defaults = gate.DEFAULT_ADMISSION_POLICY
-        cases = (
-            ("ramp_seconds", defaults.timing.ramp_seconds),
-            ("head_seconds", defaults.timing.head_seconds),
-            ("strict_seconds", defaults.timing.strict_seconds),
-            ("backfill_seconds", defaults.timing.backfill_seconds),
-            ("recovery_start_seconds", defaults.timing.recovery_start_seconds),
-            ("recovery_window_seconds", defaults.timing.recovery_window_seconds),
-            ("full_pressure_limit", defaults.pressure.full_avg10_limit),
-            ("swap_used_limit", defaults.pressure.swap_used_limit),
-            ("some_pressure_limit", defaults.pressure.some_avg10_limit),
-            ("test_phase_margin", gate.FALLBACK_TEST_PHASE_MARGIN),
-            ("peak_hold_seconds", defaults.peak_hold.default_seconds),
-        )
-        for key, used in cases:
+        baseline = gate.read_memory_config()
+        keys = ("ramp_seconds", "head_seconds", "strict_seconds", "backfill_seconds",
+                "recovery_start_seconds", "recovery_window_seconds", "full_pressure_limit",
+                "swap_used_limit", "some_pressure_limit", "test_phase_margin", "peak_hold_seconds")
+        for key in keys:
             for raw in (None, "abc", "-5", "nan", "inf", "0"):
                 with self.subTest(key=key, raw=raw):
                     self.write_config(**{key: raw})
                     with contextlib.redirect_stderr(io.StringIO()) as errors:
                         config = gate.read_memory_config()
-                    found = gate.MissingValue() if raw is None else gate.InvalidValue(raw)
-                    self.assertEqual([item for item in config.fallbacks if item.key == key],
-                                     [gate.ConfigFallback(key, found, used)])
-                    self.assertEqual(config.policy, defaults)
-                    self.assertEqual(config.test_phase_margin, gate.FALLBACK_TEST_PHASE_MARGIN)
-                    self.assertEqual(errors.getvalue(), "")
-        for key, _ in cases[:6]:
+                    self.assertEqual(config, baseline)
+                    self.assertIn(key, errors.getvalue())
+                    self.assertIn("warning:", errors.getvalue())
+        for key in keys[:6]:
             self.write_config(**{key: "1.5"})
-            self.assertEqual(len([item for item in gate.read_memory_config().fallbacks if item.key == key]), 1)
+            with contextlib.redirect_stderr(io.StringIO()) as errors:
+                self.assertEqual(gate.read_memory_config(), baseline)
+            self.assertIn(key, errors.getvalue())
 
     def test_one_config_read_supplies_policy_margin_budget_and_service_intervals(self) -> None:
         self.write_config(head_seconds="321", test_phase_margin="1.7", build_budget_gib="9.5",
                           running_pass_seconds="3")
-        with patch.object(gate, "config_values", wraps=getattr(gate, "config_values")) as reader:
+        with patch.object(conf, "values", wraps=conf.values) as reader:
             config = gate.read_memory_config()
-        reader.assert_called_once_with(str(self.config))
+        reader.assert_called_once_with("lint")
         self.assertEqual(config.policy.timing.head_seconds, 321)
         self.assertEqual(config.test_phase_margin, 1.7)
         self.assertEqual(config.build_budget_bytes, int(9.5 * GIB))
@@ -7662,39 +7656,31 @@ class ConfiguredAdmissionPolicyTests(MemoryQueueFixture):
         self.write_config()
         config = gate.read_memory_config()
         self.assertEqual(dict(config.program_first_peaks), {})
-        self.assertFalse(any(item.key.startswith("program_first_peak_gib.") for item in config.fallbacks))
 
     def test_invalid_program_first_peak_is_diagnosed_without_authorizing_a_size(self) -> None:
         key = "program_first_peak_gib.rust-analyzer"
         for raw in ("abc", "0", "-1", "nan", "inf", "1e308"):
             with self.subTest(raw=raw):
                 self.write_config(**{key: raw, "program_first_peak_gib.indexer": "2"})
-                with contextlib.redirect_stderr(io.StringIO()) as errors:
-                    config = gate.read_memory_config()
-                self.assertNotIn("rust-analyzer", config.program_first_peaks)
-                self.assertEqual(config.program_first_peaks["indexer"], 2 * GIB)
-                self.assertEqual([item.found for item in config.fallbacks if item.key == key],
-                                 [gate.InvalidValue(raw)])
-                self.assertEqual([item.used for item in config.fallbacks if item.key == key],
-                                 [gate.ProgramSizeUnavailable()])
-                self.assertEqual(errors.getvalue(), "")
+                with contextlib.redirect_stderr(io.StringIO()) as errors, self.assertRaises(conf.Unusable):
+                    _ = gate.read_memory_config()
+                self.assertIn(key, errors.getvalue())
+                self.assertIn(raw, errors.getvalue())
 
     def test_warning_boundary_reports_each_fallback_once_and_checker_stays_silent(self) -> None:
         self.write_config(head_seconds="abc", ramp_seconds=None)
-        with patch.object(gate, "_warned_config_fallbacks", set[gate.ConfigFallback]()), \
-             contextlib.redirect_stderr(io.StringIO()) as errors:
-            _ = gate.memory_config()
-            _ = gate.memory_config()
-        self.assertEqual(errors.getvalue().count(
-            'memory admission: lint.conf [memory] head_seconds "abc" is not valid; using 600\n'), 1)
-        self.assertEqual(errors.getvalue().count(
-            'memory admission: lint.conf [memory] ramp_seconds is missing; using 120\n'), 1)
+        for _attempt in range(2):
+            with contextlib.redirect_stderr(io.StringIO()) as errors:
+                config = gate.memory_config()
+            self.assertIn("head_seconds='abc'", errors.getvalue())
+            self.assertIn("ramp_seconds='<missing>'", errors.getvalue())
+            self.assertEqual(config.policy.timing.head_seconds, 600)
         with contextlib.redirect_stderr(io.StringIO()) as errors:
             checked = self.check(need=8, free=0)
             fields = self.shell_fields(checked)
-        self.assertEqual(errors.getvalue(), "")
+        self.assertIn("head_seconds", errors.getvalue())
         self.assertEqual(fields[0], "hold")
-        self.assertEqual(checked.policy.timing.head_seconds, gate.DEFAULT_ADMISSION_POLICY.timing.head_seconds)
+        self.assertEqual(checked.policy.timing.head_seconds, 600)
 
     def test_changed_head_age_applies_to_the_next_check_without_restart(self) -> None:
         since = NOW_EPOCH - 450
@@ -7776,8 +7762,6 @@ class ConfiguredAdmissionPolicyTests(MemoryQueueFixture):
         with contextlib.redirect_stderr(io.StringIO()) as errors:
             config = gate.memory_config()
         self.assertEqual(config.policy.peak_hold.seconds_for("merge-gate"), 900)
-        self.assertEqual([item for item in config.fallbacks if item.key == "peak_hold_seconds.merge-gate"],
-                         [])
         self.assertEqual(errors.getvalue(), "")
 
     def test_peak_hold_changes_only_the_configured_step_kind_at_next_read(self) -> None:
@@ -7808,10 +7792,10 @@ class ConfiguredAdmissionPolicyTests(MemoryQueueFixture):
         for raw in ("abc", "-5", "nan", "1.5"):
             with self.subTest(raw=raw):
                 self.write_config(**{"peak_hold_seconds": "900", key: raw})
-                config = gate.read_memory_config()
-                self.assertEqual(config.policy.peak_hold.seconds_for("merge-gate"), 900)
-                self.assertEqual([item for item in config.fallbacks if item.key == key],
-                                 [gate.ConfigFallback(key, gate.InvalidValue(raw), 900)])
+                with contextlib.redirect_stderr(io.StringIO()) as errors, self.assertRaises(conf.Unusable):
+                    _ = gate.read_memory_config()
+                self.assertIn(key, errors.getvalue())
+                self.assertIn(raw, errors.getvalue())
 
 
 if __name__ == "__main__":

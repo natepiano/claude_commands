@@ -178,6 +178,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypeGuard, TypedDict, cast, overload, override
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+import conf
 from process_failure import failure_detail
 from user_zone import user_zone  # noqa: E402
 if TYPE_CHECKING:
@@ -185,7 +186,6 @@ if TYPE_CHECKING:
     from ..lib import scratch
     from ..lib.atomic_file import write_text_atomic
     from ..buildlog import record, store
-    from .config_values import config_values as config_values
     from ..notify.push_texts import RenderedPush
     from ..notify import review
 else:
@@ -196,16 +196,12 @@ else:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "buildlog"))
     import record
     import store
-    from config_values import config_values as config_values
 
 GIB = 1 << 30
 MIB = 1 << 20
 DAY_SECONDS = 86_400
-DEFAULT_BUDGET_GIB = 24.0
 BUDGET_ENV = "LINT_SWEEP_BUDGET_GIB"
 BUDGET_KEY = "sweep_budget_gib"
-CONFIG_ENV = "LINT_CONFIG_FILE"
-DEFAULT_CONFIG = os.path.join("~", ".claude", "config", "lint.conf")
 GIT_DIR = ".git"
 GITDIR_PREFIX = "gitdir:"
 COMMONDIR_FILE = "commondir"
@@ -242,7 +238,6 @@ MAX_TREE_DEPTH = 3
 FLOOR_KEY = "sweep_free_floor_gib"
 RECENT_KEY = "recent_minutes"
 FLOOR_LOCK_ALERT_KEY = "floor_lock_alert_minutes"
-DEFAULT_RECENT_MINUTES = 60.0
 FLOOR_ONLY_FLAG = "--floor-only"
 USE_STAMP = scratch.USE_STAMP
 # Every cargo target directory on natedev was under one of these (2026-10-21). ~/.cache came in when
@@ -873,13 +868,7 @@ def alert_floor_lock(path: str, free: int, floor: int) -> None:
         holder = floor_lock_holder(path)
         if not isinstance(holder, KnownFloorLockHolder):
             return
-        config = os.path.expanduser(os.environ.get(CONFIG_ENV) or DEFAULT_CONFIG)
-        values = config_values(config)
-        seconds = size_bytes(values.get(FLOOR_LOCK_ALERT_KEY, ""), 60)
-        if seconds is None:
-            print(f"lint sweep: {FLOOR_LOCK_ALERT_KEY} in {config} must be a non-negative number of minutes",
-                  file=sys.stderr)
-            return
+        seconds = int(conf.number("lint", FLOOR_LOCK_ALERT_KEY) * 60)
         now = time.time()
         if now - holder.started_at < seconds:
             return
@@ -1931,7 +1920,7 @@ def scan_floor_roots(roots: list[str], trees: dict[str, list[str]]) -> Scan:
 
 
 def sweep(roots: list[str], trees: list[str], budget: int, source: str, dry_run: bool,
-          recent_minutes: float = DEFAULT_RECENT_MINUTES) -> int:
+          recent_minutes: float) -> int:
     if not dry_run:
         recover_pending_trims(roots)
     scan = scan_roots(roots, trees)
@@ -2985,12 +2974,12 @@ def budget_bytes(environ: dict[str, str], config: str, repo: str | None) -> tupl
     raw = environ.get(BUDGET_ENV, "")
     if raw:
         return size_bytes(raw, GIB), f"{BUDGET_ENV} in the environment"
-    values = config_values(config)
+    values = conf.values(Path(config))
     keys = [f"{BUDGET_KEY}.{repo}", BUDGET_KEY] if repo else [BUDGET_KEY]
     for key in keys:
         if values.get(key):
             return size_bytes(values[key], GIB), f"{key} in {config}"
-    return int(DEFAULT_BUDGET_GIB * GIB), f"the default, no {BUDGET_KEY} in {config}"
+    return int(conf.number(Path(config), BUDGET_KEY) * GIB), f"{BUDGET_KEY} in {config}"
 
 
 def doc_index_bytes() -> int | None:
@@ -3292,14 +3281,15 @@ def main(argv: list[str]) -> int:
         else:
             print(f"lint sweep: unknown argument {arg}", file=sys.stderr)
             return 2
-    config = os.path.expanduser(os.environ.get(CONFIG_ENV) or DEFAULT_CONFIG)
-    values = config_values(config)
-    recent_seconds = size_bytes(values.get(RECENT_KEY, str(DEFAULT_RECENT_MINUTES)), 60)
-    if recent_seconds is None:
-        print(f"lint sweep: {RECENT_KEY} in {config} must be a non-negative number of minutes", file=sys.stderr)
+    config = str(conf.path("lint"))
+    try:
+        values = conf.values(Path(config))
+        recent_seconds = int(conf.number("lint", RECENT_KEY) * 60)
+        floor, floor_key = floor_bytes(values, socket.gethostname())
+    except conf.Unusable as error:
+        print(f"lint sweep: {error}", file=sys.stderr)
         return 2
     recent_minutes = recent_seconds / 60
-    floor, floor_key = floor_bytes(values, socket.gethostname())
     if floor is None and floor_key is not None:
         print(f"lint sweep: {floor_key} in {config} must be a non-negative number of GiB", file=sys.stderr)
         return 2
@@ -3312,7 +3302,7 @@ def main(argv: list[str]) -> int:
 
 
 def sweep_workspace(target_dir: str | None, config: str, dry_run: bool,
-                    recent_minutes: float = DEFAULT_RECENT_MINUTES) -> int:
+                    recent_minutes: float) -> int:
     """Sweep target_dir, or the working directory's workspace, to its budget."""
     budget, source = budget_bytes(dict(os.environ), config, repo_name(os.getcwd()))
     if budget is None:

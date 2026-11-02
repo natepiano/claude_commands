@@ -37,6 +37,7 @@ else:
 from scripts.production.rename_unit_test_support import SLUG, UnitRenameFixture
 from scripts.production.fake_unit_host import stopped_record
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lint.memory_test_support import config_environment
 
 
 # An app-server's idle-stop watcher, as codex_mesh starts it: the run folder is its fourth argument.
@@ -94,6 +95,7 @@ class RunProcessTests(unittest.TestCase):
         _ = self.enterContext(isolated_parents())
         PARENTS["alpha-unit"] = staff_sources.UnitProduction(SLUG, "/fixture/demo-production.md")
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(mock.patch.dict(os.environ, config_environment(self.root / "config")))
         self.worktree = self.root / "claude-demo-alpha"
         other = self.root / "claude-demo-beta"
         mine = self.run_folder("run-a", self.worktree)

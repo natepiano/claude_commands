@@ -66,7 +66,7 @@ from rename_state import RenameRefused, read_json, write_json, write_text  # noq
 from unit_move import PathMove, git  # noqa: E402
 from user_zone import user_zone  # noqa: E402
 from scripts.production import staff, staff_sources
-from scripts.lib import git_exclude, tunables
+from scripts.lib import git_exclude, conf
 from scripts.astra import design_roles
 
 if TYPE_CHECKING:
@@ -1550,7 +1550,7 @@ def _main(argv: list[str]) -> int:
         print(f"rename_unit: {error}", file=sys.stderr)
         return 2
     except (RenameRefused, production_units.Refusal, unit_names.BadName, WorkerUnavailable,
-            git_exclude.ExcludeRefused, tunables.TunableUnusable, subprocess.SubprocessError,
+            git_exclude.ExcludeRefused, conf.Unusable, subprocess.SubprocessError,
             OSError, UnicodeError) as error:
         print(f"rename_unit: {error}", file=sys.stderr)
         return 1

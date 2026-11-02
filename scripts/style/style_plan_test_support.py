@@ -483,7 +483,8 @@ class StylePlanFixture(unittest.TestCase):
         return issue
 
     def judged_findings(self, rule: str, sites: tuple[tuple[str, int, str], ...], *, kind: style_ledger.FindingKind = "type",
-                        before: str = "before", after: str = "after") -> tuple[Path, tuple[style_ledger.HeldFinding, ...]]:
+                        before: str = "before", after: str = "after",
+                        clean_before_holding: bool = False) -> tuple[Path, tuple[style_ledger.HeldFinding, ...]]:
         """Files findings at sites in an approved decision, leaving its judge open for further writes.
 
         They are type findings unless named.
@@ -494,6 +495,9 @@ class StylePlanFixture(unittest.TestCase):
         ledger.ticket_assign("modules-unit-1", "style/main")
         _ = ledger.ticket_base("modules-unit-1")
         blob = next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == rule)
+        if clean_before_holding:
+            for path in sorted({site[0] for site in sites}):
+                self.record(rule, path, self.tip, "modules-unit-1")
         findings = tuple(ledger.hold(rule, path, line, text, kind, before, after, blob, "modules-unit-1")
                          for path, line, text in sites)
         for finding in findings:
@@ -557,8 +561,7 @@ class StylePlanFixture(unittest.TestCase):
         rule = self.rule("read")
         site = self.sources[0]
         self.commit_files({site: "pub struct Parent {\n    old: u32,\n}\n"})
-        issue, (finding,) = self.judged_findings(rule, ((site, 2, "old: u32,"),))
-        self.record(rule, site, self.tip, "modules-unit-1")
+        issue, (finding,) = self.judged_findings(rule, ((site, 2, "old: u32,"),), clean_before_holding=True)
         self.commit_files({site: "pub struct Parent {\n    old: u32,\n}\n\npub struct Typed;\n"})
         output = self.refill_decisions()
         # The merge made the finding's cell stale, so the refill gives its file to a ticket that judges it again.
