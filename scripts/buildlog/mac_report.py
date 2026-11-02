@@ -14,6 +14,7 @@ from typing import Literal, TypeVar, cast
 
 import index
 import holds
+import record
 import store
 from offload import KnownMacJob, LostRunLeftovers, MacHolder, UnreadableMacHolder
 from mac_outcome import (
@@ -141,7 +142,7 @@ class MacFailureComparison:
 def read_test_tree_evidence(connection: sqlite3.Connection, start: str, end: str) -> TestTreeEvidence:
     """Read keyed nextest steps once in the range [start, end)."""
     rows = cast(list[tuple[object, ...]], connection.execute(
-        "SELECT s.call_id, s.caller, s.status, s.tree_key, c.package, c.command"
+        "SELECT s.call_id, s.caller, s.status, s.tree_key, c.package, c.command, s.target, s.host"
         + " FROM steps s JOIN calls c ON c.id = s.call_id"
         + " WHERE s.step = 'nextest' AND s.tree_key IS NOT NULL"
         + " AND s.started_at >= ? AND s.started_at < ?"
@@ -151,13 +152,17 @@ def read_test_tree_evidence(connection: sqlite3.Connection, start: str, end: str
     ).fetchall())
     mac_keys: dict[str, set[TestSelectionTree]] = {}
     local_passes: set[TestSelectionTree] = set()
-    for call_id, caller, status, tree_key, package, command in rows:
+    local_targets = record.local_targets()
+    local_hosts = {host for target in local_targets for host in record.target_hosts(target)}
+    for call_id, caller, status, tree_key, package, command, target, host in rows:
+        if caller == "verify-linux":
+            continue
         if not isinstance(tree_key, str) or not tree_key or not isinstance(package, str) or not isinstance(command, str):
             continue
         key = TestSelectionTree(package, command, tree_key)
         if is_mac_step(caller):
             mac_keys.setdefault(str(call_id), set()).add(key)
-        elif status == 0:
+        elif status == 0 and (target in local_targets if target else host in local_hosts):
             local_passes.add(key)
     return TestTreeEvidence(mac_keys, local_passes)
 

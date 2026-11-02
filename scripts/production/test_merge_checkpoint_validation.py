@@ -178,9 +178,9 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         sha = self.checkpoint()
         original_notify = merge_checkpoint.notify_style
 
-        def malformed_notification(checkout: Path, branch: str, tip: str) -> None:
+        def malformed_notification(checkout: Path, branch: str, tip: str) -> bool:
             with mock.patch("merge_checkpoint.subprocess.run", side_effect=ValueError("invalid production")):
-                original_notify(checkout, branch, tip)
+                return original_notify(checkout, branch, tip)
 
         arguments = [str(SCRIPT), "--production", str(self.doc), "alpha-unit", "2", sha,
                      "--started", STARTED, "--scratch", str(self.root / "scratch"),

@@ -80,7 +80,6 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
             "UNIT_HISTORY_DIR": str(self.history),
             "UNIT_ACTIVE_DIR": str(self.session_dir.parent / "active"),
             **config_environment(self.session_dir.parent),
-            "UNIT_CONFIG": str(self.session_dir.parent / "direct.conf"),
             "AGENTS_CONFIG_FILE": str(self.registry), "AGENTS_CONFIG_PUBLISH": "0",
             "CODEX_CATALOG_SYNC_STATE_FILE": str(checkpoint),
             "NOTIFIER_SESSIONS_DIR": str(self.session_dir.parent / "sessions"),
@@ -154,7 +153,7 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
         return cast(dict[str, dict[str, object]], read_object(self.session_dir / codex_mesh.ROSTER_FILE))
 
     def commit_project(self, message: str = "Initial fixture") -> None:
-        _ = subprocess.run(["git", "init", "-q"], cwd=self.project, check=True, capture_output=True)
+        _ = subprocess.run(["git", "init", "-q"], cwd=self.project, check=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS)
         _ = commit_repository(self.project, message)
 
     def prepare_style_project(self) -> None:
@@ -1157,7 +1156,7 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
         for arguments in (["init", "-q"], ["add", "plan.md"],
                           ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
                            "commit", "-qm", "Initial fixture"]):
-            _ = subprocess.run(["git", *arguments], cwd=self.project, check=True, capture_output=True)
+            _ = subprocess.run(["git", *arguments], cwd=self.project, check=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS)
 
         def review(option: str, name: str, pass_number: str) -> None:
             command = ["bash", str(ROOT / "scripts/direct/review.sh"), option, name, "--phase", "7",

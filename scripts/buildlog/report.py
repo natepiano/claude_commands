@@ -24,6 +24,7 @@ import health
 import memory
 import moments
 import store
+import record
 import sync
 import rust_release
 from mac_outcome import (
@@ -1569,15 +1570,18 @@ def day_range(day: str) -> tuple[str, str]:
 def reported_mac_calls(connection: sqlite3.Connection, day: str) -> list[ReportedTestCall]:
     start, end = day_range(day)
     pairing_end = (call_time(end).replace(tzinfo=UTC) + timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%M:%S")
+    targets = ("", *record.mac_targets(), *record.local_targets())
+    placeholders = ", ".join(["?"] * len(targets))
     rows = fetch(
         connection,
         "SELECT id, host, started_at, package, worktree, command, status, mac, mac_reason,"
         + " local_reason, mac_s, outcome, wall_s, token_wait_s, target,"
         + " coalesce(copy, ''), copy_s, copy_count, copy_natedev_s FROM calls"
         + " WHERE started_at >= ? AND started_at < ? AND tool = 'verify.sh' AND verb = 'test'"
+        + f" AND coalesce(target, '') IN ({placeholders})"
         + " AND (started_at < ? OR (mac = 'declined' AND mac_reason = 'local_flag'))"
         + " ORDER BY started_at, id",
-        start, pairing_end, end,
+        start, pairing_end, *targets, end,
     )
     # Steps can finish on the next day; select by their call's start, once.
     steps = fetch(
@@ -1666,6 +1670,12 @@ def median_duration(values: Sequence[float]) -> float:
     return nearest_rank(values, 50) if values else 0.0
 
 
+def mac_step_predicate(alias: str = "steps") -> str:
+    hosts = ", ".join("'" + name.replace("'", "''") + "'" for name in record.target_hosts("mac"))
+    return (f"({alias}.target = 'mac' OR (coalesce({alias}.target, '') = ''"
+            + f" AND {alias}.host IN ({hosts})))")
+
+
 def mac_section(connection: sqlite3.Connection, day: str) -> list[str]:
     """Steps recorded on Mac hosts, including calls started there directly."""
     start, end = day_range(day)
@@ -1674,7 +1684,7 @@ def mac_section(connection: sqlite3.Connection, day: str) -> list[str]:
         f"SELECT caller, step, count(*), sum({index.COUNTED_FAILURE}),"
         + " avg(duration_s), min(duration_s), max(duration_s), group_concat(duration_s),"
         + " avg(finished_s), sum(tests_run), sum(tests_failed), sum(duration_s)"
-        + " FROM steps WHERE started_at >= ? AND started_at < ? AND host <> 'natedev'"
+        + f" FROM steps WHERE started_at >= ? AND started_at < ? AND {mac_step_predicate()}"
         + " GROUP BY caller, step ORDER BY count(*) DESC, caller, step",
         start, end,
     )
@@ -2338,7 +2348,7 @@ def recorder_health_lines(day: str) -> list[str]:
                           f"{errors} recorder {error_word} since {local_time(since.isoformat())}")
                 if errors:
                     actions.append(f"see {store.ERRORS_DISPLAY_PATH}")
-        location = "the Mac" if machine is health.Machine.MAC else "natedev"
+        location = "the Mac" if machine is health.Machine.MAC else machine.value
         if not isinstance(state, health.FreshRecorderHealth) or state.snapshot.unfinished_records:
             actions.append("run buildlog launches")
         advice = "; ".join(f"{action} on {location}" for action in actions)

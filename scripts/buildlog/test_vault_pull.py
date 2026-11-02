@@ -345,7 +345,7 @@ class VaultPullTests(unittest.TestCase):
         self.assertIn("push", push)
         self.assertEqual(push[-2:], ["fixture-mac:rust/hanadocs", "refs/remotes/origin/main:refs/remotes/origin/main"])
         self.assertNotIn("--force", push)
-        self.assertEqual(ssh[:-1], ["ssh", *sync.SSH_OPTIONS, "fixture-mac"])
+        self.assertEqual(ssh[:-1], ["ssh", *sync.ssh_options(), "fixture-mac"])
         tokens = shlex.split(ssh[-1])
         for forbidden in ("cd", "stash", "reset", "checkout"):
             self.assertNotIn(forbidden, tokens)
