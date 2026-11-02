@@ -85,6 +85,7 @@ class CliArguments(argparse.Namespace):
         self.caller: str = ""
         self.reservation_file: str = ""
         self.target: str = ""
+        self.recover_only: bool = False
 
 
 def local_time(instant: datetime) -> str:
@@ -288,6 +289,7 @@ def command_reserve(args: CliArguments) -> int:
         return 1
     verb: offload.MacVerb = ("nextest" if args.kind == "test" else "clippy" if args.kind == "lint"
                             else cast(offload.MacVerb, args.kind))
+    busy_mac = False
     for target in read_targets():
         if not isinstance(target, SshTarget) or (args.target and target.name != args.target):
             continue
@@ -299,6 +301,15 @@ def command_reserve(args: CliArguments) -> int:
         if owns_wait_claim(paths, args.repo_root, args.pid):
             write_text_atomic(destination, f"{target.name}\t{target.settings}\n")
             return 0
+        if args.recover_only:
+            scope = mac_test.target_claim_scope(paths, args.repo_root)
+            with mac_test.locked(paths.lock):
+                retained = any(mac_test.scopes_overlap(claim.scope, scope)
+                               and mac_test.run_is_kept(claim.record)
+                               for claim in mac_test.read_claims(paths))
+            if not retained:
+                busy_mac = busy_mac or target.platform == "macos"
+                continue
         if mac_test.free_now(paths, target.settings, Path(args.repo_root)) not in ("free", "busy"):
             continue
         if isinstance(offload.probe_reachability(offload.ProcessController(), config), offload.UnreachableHost):
@@ -309,6 +320,8 @@ def command_reserve(args: CliArguments) -> int:
         with redirect_stdout(io.StringIO()):
             status = mac_test.command_claim_wait(claim, paths)
         if status not in (0, 13):
+            if status == 11 and target.platform == "macos":
+                busy_mac = True
             continue
         try:
             write_text_atomic(destination, f"{target.name}\t{target.settings}\n")
@@ -316,7 +329,7 @@ def command_reserve(args: CliArguments) -> int:
             _ = command_release_wait(args.pid)
             raise
         return 0
-    return 1
+    return 11 if busy_mac else 1
 
 
 def command_release_wait(pid: int) -> int:
@@ -650,6 +663,7 @@ def parser() -> argparse.ArgumentParser:
     _ = reserve.add_argument("--pid", type=positive_pid, required=True)
     _ = reserve.add_argument("--reservation-file", required=True)
     _ = reserve.add_argument("--target", default="")
+    _ = reserve.add_argument("--recover-only", action="store_true")
     release = commands.add_parser("release-wait")
     _ = release.add_argument("--pid", type=positive_pid, required=True)
     status = commands.add_parser("status")

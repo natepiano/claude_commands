@@ -311,6 +311,94 @@ raise SystemExit(subprocess.run([sys.executable, str(source / "scripts/build_tar
         self.assertEqual(self.ssh_events(), [])
         self.assertEqual(self.routing_record()["target"], "natedev")
 
+    def test_mac_memory_retry_cleans_a_retained_claim_after_its_owner_exits(self) -> None:
+        self.configure("natedev,mac")
+        self.enable_mac()
+        with mock.patch.dict(os.environ, self.environment), \
+             mock.patch.object(mac_test, "process_start_time", return_value="old-owner"):
+            paths = mac_test.state_paths("mac")
+            args = mac_test.CliArguments()
+            args.target, args.worktree, args.pid = "mac", str(self.root), 2147483000
+            args.what, args.remote = "test sample", "test-mac"
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(mac_test.command_claim(args, paths, watch_claim=False), 0)
+        self.release_memory_after_polls()
+        result = self.verify("test", "sample", "--no-cache", extra={
+            "VERIFY_MAC_TEST_SCRIPT": str(REPOSITORY / "scripts/mac_test/mac_test.py")})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        event, = self.ssh_events()
+        self.assertIn("claim:13", event["actions"])
+        self.assertLess(event["actions"].index("cleanup"), event["actions"].index("run"))
+        self.assertEqual(self.local_runs(), [])
+
+    def test_mac_memory_retry_recovers_its_claim_without_a_reservation_file(self) -> None:
+        self.configure("natedev,mac")
+        self.enable_mac()
+        self.release_memory_after_polls()
+        wrapper = self.root / "interrupted-reservation.py"
+        self.write_executable(wrapper, r'''
+import os
+from pathlib import Path
+import subprocess
+import sys
+source = Path(os.environ["TEST_SOURCE_REPO"])
+arguments = sys.argv[1:]
+result = subprocess.run([sys.executable, str(source / "scripts/build_targets/build_targets.py"),
+                         *arguments], check=False)
+marker = Path(os.environ["TEST_RUNNER_STATE"]) / "reservation-interrupted"
+if arguments[0] == "reserve" and result.returncode == 0 and not marker.exists():
+    destination = Path(arguments[arguments.index("--reservation-file") + 1])
+    destination.unlink()
+    marker.touch()
+    raise SystemExit(1)
+raise SystemExit(result.returncode)
+''')
+        result = self.verify("test", "sample", "--no-cache", extra={
+            "BUILD_TARGETS_SCRIPT": str(wrapper),
+            "VERIFY_MAC_TEST_SCRIPT": str(REPOSITORY / "scripts/mac_test/mac_test.py")})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue((self.runner_state / "reservation-interrupted").exists())
+        event, = self.ssh_events()
+        self.assertTrue(event["reserved"])
+        self.assertTrue(event["same_path"])
+        self.assertIn("claim:0", event["actions"])
+        self.assertEqual(self.local_runs(), [])
+
+    def test_named_mac_retry_reserves_its_target_while_the_default_mac_has_backoff(self) -> None:
+        self.configure("natedev,mac,mac2")
+        self.enable_mac()
+        registry = self.root / "build_targets.conf"
+        _ = registry.write_text(registry.read_text()
+                                + "kind.mac2=ssh\nplatform.mac2=macos\nsettings.mac2=mac2.conf\n")
+        _ = write_config_fixture(self.root / "mac2.conf", (self.root / "mac_test.conf").read_text(),
+                                 template="mac_test")
+        state = Path(self.environment["MAC_TEST_STATE_DIR"])
+        state.mkdir(parents=True, exist_ok=True)
+        _ = (state / "unreachable_until").write_text(str(10**12))
+        self.release_memory_after_polls()
+        result = self.verify("test", "sample", "--no-cache", extra={
+            "VERIFY_MAC_TEST_SCRIPT": str(REPOSITORY / "scripts/mac_test/mac_test.py")})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(self.ssh_events(), result.stdout + result.stderr)
+        event, = self.ssh_events()
+        self.assertEqual(event["target"], "mac2")
+        self.assertTrue(event["reserved"])
+        self.assertEqual(self.local_runs(), [])
+
+    def test_excluded_linux_target_does_not_record_a_mac_decline(self) -> None:
+        self.configure("natedev,mac,aws")
+        self.enable_mac()
+        self.write_executable(self.bin_directory / "ssh", '''#!/bin/sh
+case "$*" in *fake-aws*) exit 255 ;; esac
+printf 'free_gib=1000\\nhost=test-mac\\nrc=0\\n'
+''')
+        result = self.verify("test", "sample", "--no-cache")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.ssh_events(), [])
+        self.assertEqual(self.last_call()["mac"], "")
+        self.assertEqual(self.last_call()["mac_reason"], "")
+        self.assertEqual(len(self.local_runs()), 1)
+
     def test_queue_retry_cleans_retained_slots_after_their_owners_exit(self) -> None:
         self.configure("natedev,aws")
         claims = self.retain_slots()

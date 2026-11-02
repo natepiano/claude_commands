@@ -203,10 +203,7 @@ def protected_reason(
         if isinstance(record, step_record.StepRecord):
             if process.identity == build_hold.ProcessIdentity(record.pid, record.proc_start):
                 return f"step {call_id} controller stays alive to route the step"
-            if record.state in {
-                step_record.StepState.ON_MAC, step_record.StepState.WAITING_HOLD, step_record.StepState.WAITING_MAC,
-                step_record.StepState.LOCAL_NONCOMPILING,
-            }:
+            if record.state != step_record.StepState.ON_NATEDEV:
                 return f"step {call_id} is {record.state.value}"
         # Missing, stale and unreadable records grant no permission.
         return ""

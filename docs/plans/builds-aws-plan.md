@@ -272,7 +272,7 @@ Unresolved cleanup advances to another target without backoff. Missing completio
 
 **Ruled out:** A separate admission route; immediate retry of the unresolved target; AWS use of Mac lint policy.
 
-### Phase 5 — Repair verify and hold routes broken by SSH routing  · status: todo
+### Phase 5 — Repair verify and hold routes broken by SSH routing  · status: done
 **Depends on:** Phase 4
 
 #### Work Order
