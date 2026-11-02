@@ -334,7 +334,7 @@ def gate_reservation(repo: Path, cap_mib: int, temporary: Path, hold: BuildHoldW
     cap = cap_mib * (1 << 20)
     try:
         with queue_place("merge-gate", repo,
-                         sizing=memory_admit.HistoryPeakSizing(cap, memory_admit.FirstProgramPeak(cap), 0.0),
+                         sizing=memory_admit.FixedCapSizing(cap),
                          before_check=hold.wait_until_free) as place:
             yield place
     except QueuePlaceRefused as error:
