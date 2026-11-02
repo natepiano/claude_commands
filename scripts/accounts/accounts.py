@@ -5182,7 +5182,7 @@ def _read_status(source: UsageSource, *, detail: bool) -> StatusReading:
             (status.role,) if status.role in (CODEX_ROLE, "spare") else ()) for status in codex),
     )
     rows, session_inputs = _count_role_sessions(rows)
-    rows, count_problems = _machine_role_counts(rows, now)
+    rows, count_problems = _machine_role_counts(rows, now, source)
     session_inputs = (*session_inputs, str(_session_counts_cache()))
     home_step = "run accounts.py cutover-home"
     all_statuses: list[AccountStatus | CodexStatus] = [*statuses, *codex]
@@ -5468,9 +5468,8 @@ def _local_session_counts() -> tuple[dict[tuple[Path, str], dict[str, str]], tup
 
 
 def _count_role_sessions(rows: tuple[StatusRow, ...]) -> tuple[tuple[StatusRow, ...], tuple[str, ...]]:
-    """Count local members and publish their counts for the other machine."""
+    """Count local members without changing saved state."""
     counts, inputs = _local_session_counts()
-    _ = _publish_session_counts(counts)
     counted = tuple(replace(row, role_counts=tuple(
         NoRoleCount() if role == "spare" else _role_session_counts(
             tuple(counts.get((Path(row.folder).expanduser(), role), {}).values()), row.tool)
@@ -5484,12 +5483,8 @@ class MachineSessionCounts(TypedDict):
     accounts: dict[str, dict[str, RoleSessionCountsDocument]]
 
 
-def _session_counts_file() -> Path:
-    return accounts_home() / ".local/state/accounts/session_counts.json"
-
-
 def _session_counts_cache() -> Path:
-    return _session_counts_file().with_name("peer_session_counts.json")
+    return accounts_home() / ".local/state/accounts/peer_session_counts.json"
 
 
 def _session_counts_machine() -> str:
@@ -5497,7 +5492,7 @@ def _session_counts_machine() -> str:
     return "mac" if remote.other_machine() == "natedev" else "natedev"
 
 
-def _publish_session_counts(counts: dict[tuple[Path, str], dict[str, str]]) -> MachineSessionCounts:
+def _session_counts_document(counts: dict[tuple[Path, str], dict[str, str]]) -> MachineSessionCounts:
     mapped: dict[tuple[str, str], dict[str, str]] = {}
     for (directory, role), members in counts.items():
         label = directory.name.removeprefix(".")
@@ -5514,7 +5509,6 @@ def _publish_session_counts(counts: dict[tuple[Path, str], dict[str, str]]) -> M
             shell=count.shell if isinstance(count.shell, int) else None, idle=count.idle, total=count.total)
     document = MachineSessionCounts(machine=_session_counts_machine(),
         at=datetime.now(timezone.utc).isoformat(), accounts=values)
-    atomic_file.write_text_atomic(_session_counts_file(), json.dumps(document))
     return document
 
 
@@ -5578,7 +5572,9 @@ def _start_session_counts_fetch() -> bool:
     return True
 
 
-def _machine_role_counts(rows: tuple[StatusRow, ...], now: datetime) -> tuple[tuple[StatusRow, ...], tuple[str, ...]]:
+def _machine_role_counts(
+    rows: tuple[StatusRow, ...], now: datetime, source: UsageSource = REFRESH_STALE_USAGE,
+) -> tuple[tuple[StatusRow, ...], tuple[str, ...]]:
     local, peer = _session_counts_machine(), remote.other_machine()
     try:
         document = _decode_session_counts(_session_counts_cache().read_text(), peer)
@@ -5590,8 +5586,9 @@ def _machine_role_counts(rows: tuple[StatusRow, ...], now: datetime) -> tuple[tu
     except (OSError, ValueError):
         peer_accounts = {}
         available = False
-    started = _start_session_counts_fetch()
-    available = available and started
+    if isinstance(source, RefreshStaleUsage):
+        started = _start_session_counts_fetch()
+        available = available and started
     if not available:
         peer_accounts = {}
     counted: list[StatusRow] = []
@@ -5896,7 +5893,7 @@ def main(argv: list[str]) -> int:
     try:
         if options.action == "session-counts-read":
             counts, _inputs = _local_session_counts()
-            print(json.dumps(_publish_session_counts(counts)))
+            print(json.dumps(_session_counts_document(counts)))
             return 0
         if options.action == "session-counts-fetch":
             try:
