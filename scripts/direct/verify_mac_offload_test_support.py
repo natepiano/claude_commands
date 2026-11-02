@@ -261,7 +261,13 @@ if has "$@"; then
     wanted=--short
     if has "$@"; then printf 'abc1234\n'; exit 0; fi
 fi
-for wanted in status diff ls-files ls-tree; do if has "$@"; then exit 0; fi; done
+wanted=ls-files
+if has "$@"; then
+    wanted=--others
+    if ! has "$@"; then printf 'Cargo.toml\0'; fi
+    exit 0
+fi
+for wanted in status diff ls-tree; do if has "$@"; then exit 0; fi; done
 exit 1
 '''
 

@@ -44,6 +44,7 @@ import signal
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -51,14 +52,17 @@ from typing import TYPE_CHECKING, NamedTuple, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from scripts.production import staff, staff_sources
-from scripts.lib import process_group
+from scripts.production import staff, staff_sources, unit_config
+from scripts.shutdown.remote import local_machine
+from scripts.lib import process_group, tunables
+from scripts.agents import worker_lifecycle
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "message"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "shutdown"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "direct"))
+from atomic_file import write_text_atomic  # noqa: E402
 import add_unit  # noqa: E402
 import berth_board  # noqa: E402
 import production_units  # noqa: E402
@@ -85,9 +89,6 @@ MESH = SCRIPTS / "agents" / "codex_mesh.py"
 BUILD_HOLD = SCRIPTS / "build_hold" / "build_hold.py"
 MAC_CLAIMS = Path.home() / ".local/state/mac-test/claims"
 WAIT_MINUTES = 20.0
-POLL_SECONDS = 10.0
-# How long a process has to exit after SIGTERM before it is reported as still running.
-TERM_WAIT_SECONDS = 10.0
 # A run's folder of detached-run records (codex_mesh.DETACHED_RUNS_DIR).
 DETACHED_RUNS = "mesh_runs"
 RETIRED_NOTE = "(retired {date}, worktree removed{session})"
@@ -111,14 +112,6 @@ class NoSavedBranch:
 
 
 NO_SAVED_BRANCH = NoSavedBranch()
-
-
-def staff_id_in_note(plan: str) -> str:
-    note = re.match(r"^\s*\(retired ([^)]*)\)", plan)
-    identity = re.search(r", staff (s[a-z0-9]{11})(?=,|$)", note[1]) if note else None
-    if note and ", staff " in note[1] and identity is None:
-        raise Refused("retired note has an invalid staff id")
-    return identity[1] if identity else ""
 
 
 def saved_branch_in_note(plan: str) -> SavedBranch | NoSavedBranch:
@@ -175,11 +168,27 @@ class Found(NamedTuple):
     processes: tuple[int, ...]
 
 
+def configured_seconds(key: str) -> float:
+    """Read each retirement limit when it is used, without a fallback value."""
+    path = Path(os.environ.get("PRODUCTION_CONFIG", SCRIPTS.parent / "config/production.conf"))
+    value = tunables.number(path, key, minimum=0, maximum=float("inf"))
+    if value <= 0:
+        raise tunables.TunableUnusable(f"{path}: {key} must be greater than zero")
+    return value
+
+
 def run(argv: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
     """One command, without this session's id: shutdown then finds the account that holds the unit."""
     environment = {key: value for key, value in os.environ.items() if key != "CLAUDE_CODE_SESSION_ID"}
+    limit = configured_seconds("RETIRE_COMMAND_TIMEOUT_SECONDS")
+    operation_limit = worker_lifecycle.effective_deadline()
+    remaining = operation_limit
+    if operation_limit != worker_lifecycle.NO_LOCK_DEADLINE:
+        remaining = operation_limit - time.monotonic()
+        if remaining <= 0:
+            raise worker_lifecycle.OperationDeadlineExpired("retirement operation deadline expired")
     return subprocess.run(argv, pass_fds=staff.operation_fds(), cwd=cwd, env=environment, capture_output=True, text=True, check=False,
-                          timeout=900)
+                          timeout=min(limit, remaining))
 
 
 def failure(result: subprocess.CompletedProcess[str]) -> str:
@@ -326,7 +335,12 @@ def recorder_line_only(worktree: Path, path: str) -> bool:
 
 
 def refusals(unit: Unit) -> list[str]:
-    """Refuse unreadable pane ownership and uncommitted work before any stop."""
+    """What keeps the unit from retiring: uncommitted work, and commits the merge branch lacks.
+
+    A merge of the merge branch into the unit carries nothing of the unit's own, so only commits
+    that are not merges count."""
+    for key in ("RETIRE_COMMAND_TIMEOUT_SECONDS", "RETIRE_TERM_WAIT_SECONDS", "RETIRE_POLL_SECONDS"):
+        _ = configured_seconds(key)
     found: list[str] = []
     try:
         marked = unit_lookup.marked_unit(unit.production.slug, unit.name)
@@ -561,11 +575,13 @@ def transcript_resume_folder(transcript: Path) -> Path:
     raise Refused(f"transcript {transcript} has no cwd matching its project folder {transcript.parent.name}")
 
 
-def director_resume_folder(session_id: str) -> Path:
+def director_resume_folder(session_id: str, *, dependencies: Callable[[Path], None] | None = None) -> Path:
     transcripts = transcript_locations(session_id)
     if len(transcripts) != 1:
         places = ", ".join(str(path.parent) for path in transcripts) or "none"
         raise Refused(f"no account has the transcript of session {session_id} in exactly one project folder; found: {places}")
+    if dependencies is not None:
+        dependencies(transcripts[0])
     return transcript_resume_folder(transcripts[0])
 
 
@@ -585,9 +601,22 @@ def last_session(unit: Unit) -> str:
                 if entry["environment"].get("SHOWRUNNER_UNIT_ID") == unit.name and entry["session_id"]]
     if launches:
         return max(launches, key=lambda entry: entry["written_at"])["session_id"]
-    folder = unit_move.project_folder(str(unit.worktree))
-    transcripts = [path for directory in unit_move.config_dirs()
-                   for path in (directory / "projects" / folder).glob("*.jsonl") if _interactive(path)]
+    return last_interactive_session(unit.worktree)
+
+
+def last_interactive_session(worktree: Path, *, dependencies: Callable[[Path], None] | None = None) -> str:
+    """Recover the newest interactive transcript from this worktree's project folder."""
+    folder = unit_move.project_folder(str(worktree))
+    transcripts: set[Path] = set()
+    for directory in unit_move.config_dirs():
+        project = directory / "projects" / folder
+        if dependencies is not None:
+            dependencies(project)
+        for path in project.glob("*.jsonl"):
+            if dependencies is not None:
+                dependencies(path)
+            if _interactive(path):
+                transcripts.add(path.resolve())
     return max(transcripts, key=lambda path: path.stat().st_mtime).stem if transcripts else ""
 
 
@@ -596,17 +625,9 @@ def director_session(unit: Unit) -> DirectorSession | NoDirectorSession:
     return DirectorSession(session_id, director_resume_folder(session_id)) if session_id else NoDirectorSession()
 
 
-def retirement_staff_id(unit: Unit) -> str:
-    recorded = staff_id_in_note(unit_plan(unit))
-    if recorded:
-        return recorded
-    member = staff_sources.member(staff_sources.UnitMember(unit.production.slug, unit.name), staff.initial_snapshot())
-    return member.row.id if isinstance(member, staff_sources.MemberFound) else ""
-
-
 def retired_note(unit: Unit, director: DirectorSession | NoDirectorSession,
-                 saved: SavedBranch | NoSavedBranch = NO_SAVED_BRANCH) -> str:
-    date = datetime.now(unit.production.zone).strftime("%Y-%m-%d")
+                 saved: SavedBranch | NoSavedBranch = NO_SAVED_BRANCH, *, date: str = "") -> str:
+    date = date or datetime.now(unit.production.zone).strftime("%Y-%m-%d")
     session = ""
     if isinstance(director, DirectorSession):
         session = SESSION_NOTE.format(id=director.session_id)
@@ -614,10 +635,6 @@ def retired_note(unit: Unit, director: DirectorSession | NoDirectorSession,
             session += f", folder {director.resume_folder}"
     if isinstance(saved, SavedBranch):
         session += f", ref {saved.ref}, tip {saved.tip}"
-    identity = retirement_staff_id(unit)
-    if not identity:
-        raise Refused(f"{unit.name}: no staff id for the retired note")
-    session += f", staff {identity}"
     return RETIRED_NOTE.format(date=date, session=session)
 
 
@@ -695,7 +712,16 @@ def stop_sessions(unit: Unit, found: Found, wait_minutes: float, known_ids: froz
 
 
 def terminate(pids: list[int], what: dict[int, str], wait: float | None = None) -> list[str]:
-    """SIGTERM each pid; one alive after `wait` seconds (TERM_WAIT_SECONDS) comes back as still running."""
+    """SIGTERM each pid, observing the configured wait and poll limits."""
+    duration = configured_seconds("RETIRE_TERM_WAIT_SECONDS")
+    operation_limit = worker_lifecycle.effective_deadline()
+    started = time.monotonic()
+    if started >= operation_limit:
+        raise worker_lifecycle.OperationDeadlineExpired("retirement operation deadline expired")
+    poll = configured_seconds("RETIRE_POLL_SECONDS")
+    if wait is not None:
+        duration = min(duration, max(0, wait))
+    deadline = min(started + duration, operation_limit)
     signalled: set[int] = set()
     for pid in pids:
         try:
@@ -705,9 +731,14 @@ def terminate(pids: list[int], what: dict[int, str], wait: float | None = None) 
             continue
         except PermissionError as error:
             what[pid] += f": {error}"
-    deadline = time.monotonic() + (TERM_WAIT_SECONDS if wait is None else wait)
-    while any(_alive(pid) for pid in pids) and time.monotonic() < deadline:
-        time.sleep(0.2)
+    while any(_alive(pid) for pid in pids):
+        now = time.monotonic()
+        if now >= operation_limit:
+            raise worker_lifecycle.OperationDeadlineExpired("retirement operation deadline expired")
+        remaining = deadline - now
+        if remaining <= 0:
+            break
+        time.sleep(min(poll, remaining))
     left: list[str] = []
     for pid in pids:
         if _alive(pid):
@@ -738,6 +769,11 @@ def process_session(pid: int) -> str:
 
 def stop_orphan(unit: Unit, pid: int, recorded_session_id: str = "") -> list[str]:
     """Only a proven, isolated group of this stopped session can be ended."""
+    duration = configured_seconds("RETIRE_TERM_WAIT_SECONDS")
+    operation_limit = worker_lifecycle.effective_deadline()
+    if operation_limit != worker_lifecycle.NO_LOCK_DEADLINE and time.monotonic() >= operation_limit:
+        raise worker_lifecycle.OperationDeadlineExpired("retirement operation deadline expired")
+    poll = configured_seconds("RETIRE_POLL_SECONDS")
     description = process_description(pid)
     try:
         started = proc_start(pid)
@@ -779,20 +815,30 @@ def stop_orphan(unit: Unit, pid: int, recorded_session_id: str = "") -> list[str
                or not Path(f"/proc/{member}/cwd").resolve(strict=True).is_relative_to(unit.worktree.resolve())
                for member, birth in members) or proc_start(pid) != started:
             raise Refused("process identity changed before signal")
+        if operation_limit != worker_lifecycle.NO_LOCK_DEADLINE and time.monotonic() >= operation_limit:
+            raise worker_lifecycle.OperationDeadlineExpired("retirement operation deadline expired")
         process_group.send_process_group(pid, signal.SIGTERM)
+    except worker_lifecycle.OperationDeadlineExpired:
+        raise
     except ProcessLookupError:
         return []
     except (OSError, ValueError, Refused) as error:
         return [f"{description} works inside {unit.worktree}; stop it first: {error}"]
-    deadline = time.monotonic() + TERM_WAIT_SECONDS
+    deadline = min(time.monotonic() + duration, operation_limit)
     def still_running() -> bool:
         try:
             state = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").rsplit(")", 1)[1].split()[0]
         except (OSError, IndexError):
             return False
         return state != "Z" and proc_start(pid) == started and _alive(pid)
-    while still_running() and time.monotonic() < deadline:
-        time.sleep(0.2)
+    while still_running():
+        now = time.monotonic()
+        if now >= operation_limit:
+            raise worker_lifecycle.OperationDeadlineExpired("retirement operation deadline expired")
+        remaining = deadline - now
+        if remaining <= 0:
+            break
+        time.sleep(min(poll, remaining))
     if still_running():
         return [f"{description}: still runs after SIGTERM"]
     print(f"stopped: {description} of session {session_id}")
@@ -839,7 +885,7 @@ def stop_rest(unit: Unit, found: Found, recorded_session_id: str = "") -> list[s
 
 
 def mark_retired(unit: Unit, director: DirectorSession | NoDirectorSession,
-                 saved: SavedBranch | NoSavedBranch = NO_SAVED_BRANCH) -> bool:
+                 saved: SavedBranch | NoSavedBranch = NO_SAVED_BRANCH, *, date: str = "") -> bool:
     """Put the retired note in front of the Units row's Plan cell and commit the doc on the merge branch."""
     doc = unit.production.doc
     lines = doc.read_text(encoding="utf-8").split("\n")
@@ -851,9 +897,6 @@ def mark_retired(unit: Unit, director: DirectorSession | NoDirectorSession,
         if line in rows and production_units.cell_value(parts[headings.index("Unit") + 1].strip()) == unit.name:
             plan = parts[plan_at].strip()
             if production_units.plan_cell_is_retired(plan):
-                identity = retirement_staff_id(unit)
-                if identity and not staff_id_in_note(plan):
-                    plan = plan.replace(")", f", staff {identity})", 1)
                 if isinstance(saved, SavedBranch):
                     previous = saved_branch_in_note(plan)
                     if isinstance(previous, SavedBranch):
@@ -862,11 +905,11 @@ def mark_retired(unit: Unit, director: DirectorSession | NoDirectorSession,
                     else:
                         plan = plan.replace(")", f", ref {saved.ref}, tip {saved.tip})", 1)
             else:
-                plan = f"{retired_note(unit, director, saved)} {plan}"
+                plan = f"{retired_note(unit, director, saved, date=date)} {plan}"
             if plan != parts[plan_at].strip():
                 parts[plan_at] = f" {plan} "
                 lines[index] = "|".join(parts)
-                _ = doc.write_text("\n".join(lines), encoding="utf-8")
+                write_text_atomic(doc, "\n".join(lines))
             break
     committed = add_unit.commit_paths(unit.production, [doc], f"production({unit.production.slug}): retire {unit.name}")
     if committed:
@@ -921,29 +964,49 @@ def final_stop_check(unit: Unit, ids: frozenset[str]) -> list[str]:
     return left
 
 
+def prepare_retirement(unit: Unit, row: staff.StaffRow) -> unit_config.RetiredSession:
+    """Validate ownership and retain the original facts before the first destructive step."""
+    location = row.worktree
+    if isinstance(location, staff.WorktreeUnfilled):
+        raise Refused(f"{unit.name}: staff worktree is unfilled; run staff_sources.py fill")
+    if location.machine != local_machine() or location.path != unit.worktree:
+        raise Refused(f"{unit.name}: staff worktree conflicts with {unit.worktree} on {local_machine()}")
+    if unit.worktree.exists():
+        actual = run(["git", "-C", str(unit.worktree), "branch", "--show-current"])
+        if actual.returncode or actual.stdout.strip() != unit.branch:
+            raise Refused(f"{unit.name}: Units branch {unit.branch} conflicts with worktree branch {actual.stdout.strip()}")
+    saved = unit_config.read_parked(row.id, cleanup=False)
+    if isinstance(saved, unit_config.UnitConfig):
+        if not isinstance(saved.retired, unit_config.RetiredSession):
+            raise Refused(f"{unit.name}: parked retirement facts are incomplete")
+        if saved.retired.branch.value != unit.branch:
+            raise Refused(f"{unit.name}: parked branch {saved.retired.branch.value} conflicts with Units branch {unit.branch}")
+        return saved.retired
+    director = director_session(unit)
+    if not isinstance(director, DirectorSession):
+        raise Refused(f"{unit.name}: no recorded director session for retirement")
+    return unit_config.RetiredSession(datetime.now(unit.production.zone).strftime("%Y-%m-%d"),
+        director.session_id, unit_config.RecordedStartFolder(director.resume_folder), unit_config.Branch(unit.branch))
+
+
 def retire(unit: Unit, wait_minutes: float) -> int:
+    member = staff_sources.member(staff_sources.UnitMember(unit.production.slug, unit.name), staff.initial_snapshot())
+    if isinstance(member, staff_sources.NoSuchMember):
+        raise Refused(f"{unit.name}: no staff row; run staff_sources.py fill")
+    facts = prepare_retirement(unit, member.row)
+    already_retired = isinstance(member.row.worktree, staff.RemovedWorktree)
     refused = refusals(unit)
     if refused:
         print("\n".join(f"refused: {reason}" for reason in refused))
         return 1
-    member = staff_sources.member(staff_sources.UnitMember(unit.production.slug, unit.name), staff.initial_snapshot())
-    recorded = saved_branch_in_note(unit_plan(unit))
-    saved_on_origin = (isinstance(recorded, NoSavedBranch) or
-                       _git(unit, "ls-remote", "--exit-code", "origin", recorded.ref).stdout.splitlines()
-                       == [f"{recorded.tip}\t{recorded.ref}"])
+    unit_config.park(member.row.id, unit.worktree, facts)
     saved = preserve_branch(unit)
     pane = unit_move.unit_pane(unit_lookup.marked_unit(unit.production.slug, unit.name), unit.production.slug)
-    # Read before the stop: once stopped, the unit's mark is gone.
-    director = director_session(unit) if not unit.retired else NoDirectorSession()
-    session_id = director.session_id if isinstance(director, DirectorSession) else last_session(unit)
+    if not isinstance(facts.start_folder, unit_config.RecordedStartFolder):
+        raise Refused(f"{unit.name}: parked start folder is missing")
+    director = DirectorSession(facts.session_id, facts.start_folder.path)
+    session_id = facts.session_id
     found = gather(unit)
-    # Do not return early: a completed retirement still checks every stop and saved ref.
-    already_retired = (unit.retired and saved_on_origin
-                      and not isinstance(member, staff_sources.MemberFound)
-                      and not unit_move.exists(unit.worktree) and pane is None
-                      and not any(found._replace(claims=live_claims(found.claims)))
-                      and _git(unit, "show-ref", "--verify", "--quiet", f"refs/heads/{unit.branch}").returncode == 1
-                      and _git(unit, "ls-remote", "--exit-code", "--heads", "origin", unit.branch).returncode == 2)
     ids = {item["sessionId"] for item in found.claude}
     if session_id:
         ids.add(session_id)
@@ -982,21 +1045,18 @@ def retire(unit: Unit, wait_minutes: float) -> int:
     # All writers are stopped; include commits made during shutdown.
     saved = preserve_branch(unit, saved)
     # The note may have reached disk before its commit; finish it before removal.
-    committed = mark_retired(unit, director, saved)
+    committed = mark_retired(unit, director, saved, date=facts.date)
     failed = remove(unit)
     if failed:
         print("\n".join(f"not removed: {reason}" for reason in failed))
-    if isinstance(member, staff_sources.MemberFound):
-        workers = staff.find(kind="worker", parent=member.row.id)
-        for worker in workers:
-            print(f"kept worker {worker.id} {worker.name} under {member.row.name}")
-        if workers:
-            return 1
-        if not failed:
-            _ = staff.retire(member.row.id)
+    workers = staff.find(kind="worker", parent=member.row.id)
+    for worker in workers:
+        print(f"kept worker {worker.id} {worker.name} under {member.row.name}")
+    if workers:
+        return 1
     if not failed:
-        unchanged = already_retired and not committed
-        print(f"{unit.name} already retired" if unchanged else f"{unit.name} retired")
+        _ = staff.set_worktree(member.row.id, staff.RemovedWorktree(local_machine(), unit.worktree))
+        print(f"{unit.name} already retired" if already_retired and not committed else f"{unit.name} retired")
     return 1 if failed else 0
 
 
@@ -1009,13 +1069,15 @@ def _main(argv: list[str]) -> int:
     _ = parser.add_argument("--wait-minutes", type=float, default=WAIT_MINUTES)
     options = parser.parse_args(argv)
     try:
-        unit = find_unit(cast(str, options.slug), cast(str, options.unit))
-        if cast(bool, options.dry_run):
-            return dry_run(unit)
-        return retire(unit, cast(float, options.wait_minutes))
+        with worker_lifecycle.operation_deadline(timeout=configured_seconds("RETIRE_COMMAND_TIMEOUT_SECONDS")):
+            unit = find_unit(cast(str, options.slug), cast(str, options.unit))
+            if cast(bool, options.dry_run):
+                return dry_run(unit)
+            return retire(unit, cast(float, options.wait_minutes))
     except (staff.StaffRefused, staff.StaffUnreadable):
         raise
-    except (Refused, production_units.Refusal, unit_names.BadName, WorkerUnavailable, OSError) as error:
+    except (Refused, production_units.Refusal, unit_names.BadName, WorkerUnavailable, OSError,
+            tunables.TunableUnusable, unit_config.ConfigRefused, subprocess.SubprocessError) as error:
         print(f"refused: {error}")
         return 1
 

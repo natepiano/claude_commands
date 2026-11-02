@@ -240,6 +240,7 @@ from scripts.production.showrunners import (
     ShowrunnerSettings as ShowrunnerSettings,
     load_settings_from as load_settings_from,
     registered_showrunners as registered_showrunners,
+    require_complete,
     socket_for as socket_for,
 )
 
@@ -607,7 +608,7 @@ def load_config() -> Config:
 def showrunners_now() -> list[Showrunner]:
     """Every showrunner with an update timer. None when the session records cannot say who runs."""
     try:
-        return registered_showrunners()
+        return require_complete(registered_showrunners())
     except OSError as error:
         print(f"quota-alert: showrunners unknown: {error}", file=sys.stderr)
         return []

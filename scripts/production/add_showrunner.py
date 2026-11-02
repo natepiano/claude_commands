@@ -32,7 +32,8 @@ from uuid import uuid4
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from scripts.production import completion_receipt, staff, staff_sources
+from scripts.production import completion_receipt, staff
+from scripts.production.staff_sources import ensure_staff_showrunner as ensure_staff_showrunner
 
 from scripts.production import showrunners
 import showrunner_tree
@@ -231,18 +232,6 @@ def showrunner_appeared(slug: str) -> bool:
         time.sleep(POLL_S)
 
 
-
-def ensure_staff_showrunner(child: Production, caller: str) -> staff.StaffRow:
-    record = staff.initial_snapshot()
-    found = staff_sources.member(staff_sources.ShowrunnerMember(child.slug), record)
-    parent = staff_sources.member(staff_sources.ShowrunnerMember(caller), record)
-    if isinstance(parent, staff_sources.NoSuchMember):
-        doc = showrunners.timer_docs().get(caller)
-        if doc is not None:
-            parent = staff_sources.MemberFound(staff.ensure("showrunner", name=showrunners.herdr_space(caller, str(doc))))
-    row = (found.row if isinstance(found, staff_sources.MemberFound)
-           else staff.ensure("showrunner", name=showrunners.herdr_space(child.slug, str(child.doc))))
-    return row
 
 def _main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description="Start a lower production's showrunner in herdr and attach it.")

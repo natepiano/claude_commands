@@ -24,7 +24,7 @@ from sessions import SessionRecord, UnreadableSessionRecord, live_session, read_
 
 sys.path.insert(0, str(SCRIPTS.parent))
 sys.path.insert(0, str(SCRIPTS / "production"))
-from scripts.production.showrunners import registered_showrunners  # noqa: E402
+from scripts.production.showrunners import registered_showrunners, require_complete  # noqa: E402
 
 from scripts.shutdown import launch_permission  # noqa: E402
 from scripts.accounts import accounts  # noqa: E402
@@ -331,7 +331,7 @@ def _main(argv: list[str]) -> int:
             panes = read_panes(shared)
             names = claude_names()
             roles = unit_roles(herdr.Herdr(shared), panes)
-            showrunner_names = {runner["session"] for runner in registered_showrunners() if runner["session"]}
+            showrunner_names = {runner["session"] for runner in require_complete(registered_showrunners()) if runner["session"]}
             for row in panes:
                 pane = row["pane_id"]
                 claude = names.get(pane, "")

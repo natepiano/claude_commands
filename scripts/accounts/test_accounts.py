@@ -18,8 +18,10 @@ import errno
 import fcntl
 import json
 import os
+import random
 import selectors
 import shlex
+import stat
 import subprocess
 import tempfile
 import time
@@ -33,7 +35,7 @@ from typing import Literal, Self, TextIO, TypedDict, cast, final, override
 from unittest.mock import AsyncMock, MagicMock, call, patch
 from zoneinfo import ZoneInfo
 
-from scripts.accounts.home_test_support import scratch_account_home
+from scripts.accounts.home_test_support import scratch_account_home, write_account_settings
 from scripts.accounts import accounts, next_moves, refusal_watch, refusals, role_map
 from scripts.accounts.nix_env_fake import fake_nix_loader, imports_with_nix_loader, installed_program
 from scripts.lib import atomic_file
@@ -166,6 +168,7 @@ class AccountsTests(unittest.TestCase):
         self.root = Path()
         self.home = Path()
         self.main_dir = Path()
+        self.trust_config = Path()
         # The live reading the status table gets for a folder; a folder without one cannot be read.
         self.live: dict[Path, agent_accounts.Report] = {}
         self.read_claude_live = agent_accounts.claude_live
@@ -194,6 +197,7 @@ class AccountsTests(unittest.TestCase):
             self.enterContext(scratch_account_home(self.home, environment)),
         )
         del environment_context
+        self.trust_config = accounts.trust_settings_file()
         _ = self.enterContext(patch.object(quota_alert, "STATE", self.root / "quota_alert.json"))
         _ = self.enterContext(patch.object(run_out, "READINGS_LOG", self.root / "pace.jsonl"))
         self.live = {}
@@ -384,6 +388,114 @@ class AccountsTests(unittest.TestCase):
         for row in rows:
             self.assertEqual(len(row), len(accounts.TABLE_HEADINGS))
         return rows
+
+    def test_stored_json_counts_local_members_per_account_and_role_without_discovery(self) -> None:
+        self.assert_stored_role_counts("unit marks")
+
+    def test_stored_role_counts_resolve_a_unit_with_only_its_staff_identity(self) -> None:
+        self.assert_stored_role_counts("staff identity")
+
+    def test_stored_role_counts_skip_damaged_launch_history_and_keep_loading(self) -> None:
+        self.assert_stored_role_counts("damaged history")
+
+    def test_stored_role_counts_keep_valid_siblings_of_an_empty_launch_entry(self) -> None:
+        self.assert_stored_role_counts("damaged sibling")
+
+    def test_stored_role_counts_skip_a_newer_launch_with_a_non_string_config_dir(self) -> None:
+        self.assert_stored_role_counts("damaged folder")
+
+    def test_stored_role_counts_keep_a_unit_without_legacy_launch_flags(self) -> None:
+        self.assert_stored_role_counts("legacy flags")
+
+    def assert_stored_role_counts(self, evidence: Literal[
+        "unit marks", "staff identity", "damaged history", "damaged sibling", "damaged folder", "legacy flags",
+    ]) -> None:
+        from scripts.message import sessions
+        from scripts.shutdown import inventory
+        from scripts.herdr import pane_launch
+        from scripts.production import staff
+        from scripts.production.staff_test_support import unit_membership
+
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"STAFF_FILE": str(self.root / "staff.json")})))
+        members = {name: unit_membership("fixture", name) for name in ("a", "b", "c")}
+
+        self.login_directory("claude1", "units@notexample.com")
+        self.login_directory("claude2", "runners@notexample.com")
+        self.write_note("codex1", "workers@notexample.com")
+        self.codex_login("workers@notexample.com", self.home / ".codex1")
+        self.write_note("codex2", "spare@notexample.com")
+        self.codex_login("spare@notexample.com", self.home / ".codex2")
+        configuration = accounts.accounts_config_file()
+        configuration.parent.mkdir(parents=True, exist_ok=True)
+        _ = configuration.write_text('{"workers": "codex1"}')
+        records = self.root / "pane-records"
+        records.mkdir()
+        owners: list[sessions.SessionRecord] = []
+        launches: dict[str, pane_launch.PaneLaunch] = {}
+        for identity, label, unit in (("unit-a", "claude1", "a"), ("unit-b", "claude1", "b"),
+                                      ("runner-a", "claude2", ""), ("runner-b", "claude1", ""),
+                                      ("stopped", "claude1", "c"), ("plain", "claude1", "")):
+            launches[identity] = pane_launch.PaneLaunch(pane_id=identity, session_id=identity,
+                config_dir=str(self.home / ("." + label)), cwd=str(self.root), name=identity,
+                model="", remote_control=False, flags_read=True, written_at="2026-10-01T00:00:00Z",
+                environment={"SHOWRUNNER_UNIT_ID": unit} if unit else {})
+            if evidence == "staff identity" and unit:
+                launches[identity]["environment"] = {"STAFF_ID": members[unit].id}
+            if identity != "stopped":
+                owners.append(sessions.SessionRecord(pid=12345, sessionId=identity, name=identity,
+                    messagingSocketPath="/fake.sock", updatedAt=1, tmux="", formerNames=[]))
+        # A repeated registry identity is still one session.
+        owners.append(owners[0])
+        history: dict[str, object] = dict(launches)
+        if evidence == "legacy flags":
+            history["unit-a"] = {key: value for key, value in launches["unit-a"].items() if key != "flags_read"}
+        elif evidence == "damaged sibling":
+            history["broken-pane"] = {}
+        elif evidence == "damaged folder":
+            damaged: dict[str, object] = dict(launches["unit-a"])
+            damaged.update(config_dir=[], written_at="2026-10-02T00:00:00Z")
+            history["broken-pane"] = damaged
+        _ = (records / "fixture.json").write_text(json.dumps(history))
+        if evidence == "damaged history":
+            _ = (records / "damaged.json").write_text('{"broken-pane": {}}')
+        run = self.root / "worker-runs" / "run-one"
+        run.mkdir(parents=True)
+        _ = (run / "mesh_server.json").write_text(json.dumps({
+            "pid": 12345, "port": 123, "codex_home": str(self.home / ".codex1"),
+        }))
+        _ = (run / "mesh_roster.json").write_text(json.dumps({
+            "first": {"status": "running", "thread_id": "one", "port": 123},
+            "second": {"status": "done", "thread_id": "two", "port": 123},
+            "ended": {"status": "ended", "thread_id": "ended", "port": 123},
+        }))
+        runners = inventory.ShowrunnerRegistrations((
+            inventory.ShowrunnerRegistration("runner-a", "runner-a", ""),
+            inventory.ShowrunnerRegistration("runner-b", "runner-b", ""),
+        ))
+        cases: tuple[tuple[str, dict[str, tuple[list[str], list[int]]]], ...] = (
+            ("claude2", {"claude1": (["units"], [2]), "claude2": (["showrunners"], [1])}),
+            ("claude1", {"claude1": (["units", "showrunners"], [2, 1]), "claude2": ([], [])}),
+        )
+        for runner_label, expected in cases:
+            _ = accounts.set_group_account("units", "claude1", why="fixture")
+            _ = accounts.set_group_account("showrunners", runner_label, why="fixture")
+            with (self.subTest(runner_label=runner_label),
+                  patch.object(sessions, "live_sessions", return_value=owners),
+                  patch.object(pane_launch, "record_directory", return_value=records),
+                  # Even on a client machine, counts use only the retained local record.
+                  patch.object(staff, "snapshot", side_effect=AssertionError("no owner fetch")),
+                  patch.object(inventory, "showrunner_registrations", return_value=runners),
+                  patch.object(accounts, "_mesh_server_running", return_value=True),
+                  patch.object(accounts, "live_group_members", side_effect=AssertionError("rich inventory")),
+                  patch.object(subprocess, "run", side_effect=AssertionError("no process or network discovery")),
+                  patch.object(subprocess, "Popen", side_effect=AssertionError("no process or network discovery"))):
+                code, text, error = self.run_cli("status", "--stored", "--json")
+            self.assertEqual((code, error), (0, ""))
+            document = cast(accounts.StatusDocument, json.loads(text))
+            values = {row["label"]: (row["roles"], row["role_counts"]) for row in document["accounts"]}
+            self.assertEqual(values, {**expected, "codex1": (["workers"], [2]), "codex2": (["spare"], [None])})
+            self.assertIn(str(run / "mesh_roster.json"), document["session_inputs"])
+            self.assertIn(str(records / "fixture.json"), document["session_inputs"])
 
     def run_cli(self, *arguments: str) -> tuple[int, str, str]:
         stdout = io.StringIO()
@@ -827,7 +939,30 @@ class AccountsTests(unittest.TestCase):
         self.assertIsInstance(result, accounts.AccountRefused)
         assert isinstance(result, accounts.AccountRefused)
         self.assertEqual(result.reason,
-            "accounts: ~/.claude3 is logged in as other@example.invalid, not claude3; see Log out and in in ~/.claude/docs/accounts.md")
+            ("accounts: ~/.claude3 holds a different login from claude3; run "
+            + f"env -u CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR={shlex.quote(str(accounts.account_dir('claude3')))} claude, then /login as claude3"))
+
+    def test_wrong_login_recovery_bypasses_the_alias_and_clears_the_inherited_token(self) -> None:
+        self.login_directory("claude3", "expected@example.invalid")
+        self.write_identity("claude3", "other@example.invalid")
+        refused = accounts.prepared_account("claude3", resume=False)
+        self.assertIsInstance(refused, accounts.AccountRefused)
+        assert isinstance(refused, accounts.AccountRefused)
+        command = refused.reason.split("; run ", 1)[1].split(", then /login", 1)[0]
+        self.assertEqual(command, "env -u CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR="
+            + shlex.quote(str(accounts.account_dir("claude3"))) + " claude")
+        self.assertNotIn("other@example.invalid", refused.reason)
+        code, setup, errors = self.run_cli("setup", "claude3")
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(setup.splitlines()[0], command)
+        program = self.home / ".local/bin/claude"
+        _ = program.write_text('#!/bin/sh\nprintf "%s\\n%s\\n" "$CLAUDE_CONFIG_DIR" "${CLAUDE_CODE_OAUTH_TOKEN-unset}"\n')
+        result = subprocess.run(["bash", "-c", "shopt -s expand_aliases\nalias claude='exit 77'\n" + command],
+            env={**os.environ, "PATH": str(program.parent) + os.pathsep + os.defpath,
+                 "CLAUDE_CODE_OAUTH_TOKEN": "fixture-inherited"},
+            capture_output=True, text=True, check=False)
+        self.assertEqual((result.returncode, result.stderr), (0, ""))
+        self.assertEqual(result.stdout.splitlines(), [str(accounts.account_dir("claude3")), "unset"])
 
     def test_group_launch_prepares_configured_account_for_new_work_and_resumes(self) -> None:
         """F006: every launch checks readiness without selecting another account."""
@@ -1008,7 +1143,8 @@ class AccountsTests(unittest.TestCase):
         self.login_directory("claude2", "main@example.invalid", default=True)
         self.login_directory("claude3", "expected@example.invalid")
         self.write_identity("claude3", "other@example.invalid")
-        line = "accounts: ~/.claude3 is logged in as other@example.invalid, not claude3; see Log out and in in ~/.claude/docs/accounts.md"
+        line = ("accounts: ~/.claude3 holds a different login from claude3; run "
+            + f"env -u CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR={shlex.quote(str(accounts.account_dir('claude3')))} claude, then /login as claude3")
         self.assertIsInstance(accounts.account_directory_readiness("claude3"), accounts.AccountDirectoryWrongLogin)
         self.assertEqual(accounts.check("claude3"), [line])
         with patch.object(os, "execvpe") as launch:
@@ -1017,6 +1153,7 @@ class AccountsTests(unittest.TestCase):
         result = self.run_cli("status")
         self.assertRegex(result[1], r"\| ~/\.claude3 +\| claude3 +\|")
         self.assertIn("claude3: wrong sign-in; " + line.removeprefix("accounts: "), result[1].splitlines())
+        self.assertNotIn("other@example.invalid", result[1])
         self.assertEqual(accounts.account_identity(accounts.account_dir("claude3")), agent_accounts.UnnotedLogin(self.home / ".claude3", "other@example.invalid"))
 
     def test_exec_repairs_broken_shared_links_before_launching_a_logged_out_account(self) -> None:
@@ -1154,7 +1291,7 @@ class AccountsTests(unittest.TestCase):
         _ = (Path(os.environ["AGENT_NOTES_DIR"]) / "claude3.md").write_bytes(b"\xff")
         result = self.run_cli("status")
         self.assertEqual((result[0], result[2]), (0, ""))
-        self.assertIn("with login: unit@example.invalid", result[1])
+        self.assertIn("repair the account note for claude3 with its login", result[1])
         self.assertIn("cannot read", result[1])
         self.assertRegex(result[1], r"\| ~/\.claude4 +\| claude4 +\|")
         selection = accounts.claude_account_selection()
@@ -1321,7 +1458,8 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual(len(problems), 3)
         self.assertIn("projects", problems[0])
         self.assertIn(".credentials.json", problems[1])
-        self.assertIn("logged in as other@example.invalid", problems[2])
+        self.assertIn("holds a different login from claude3", problems[2])
+        self.assertNotIn("other@example.invalid", problems[2])
 
     def test_check_missing_note_alone_excludes_an_otherwise_matching_account(self) -> None:
         self.login_directory("claude2", "main@example.invalid", default=True)
@@ -1670,6 +1808,471 @@ class AccountsTests(unittest.TestCase):
         result, stdout, stderr = self.run_cli("burn", "--since", "2026-10-09T00:00:00Z", "--until", "2026-10-10T00:00:00Z")
         self.assertEqual((result, stdout), (1, ""))
         self.assertIn("invalid role change", stderr)
+
+    def write_trust_fixture(self) -> tuple[Path, ...]:
+        write_account_settings(self.trust_config, folders=("~/worktrees", "~/other trees"))
+        paths = [self.home / ".claude.json"]
+        for number in (1, 2):
+            home = self.home / f".claude{number}"
+            home.mkdir()
+            paths.append(home / ".claude.json")
+        for path in paths:
+            _ = path.write_text(json.dumps({"keep": [1, 2], "projects": {
+                str(self.home / "worktrees"): {"hasTrustDialogAccepted": False, "keep": "here"},
+                "/elsewhere": {"hasTrustDialogAccepted": False, "other": [1]},
+            }}))
+            path.chmod(0o640)
+        return tuple(paths)
+
+    def trust_home_snapshot(self) -> dict[Path, tuple[int, int, int, int, bytes]]:
+        """Notice content, metadata, directory, link and temporary-file changes."""
+        result: dict[Path, tuple[int, int, int, int, bytes]] = {}
+        for path in (self.home, *self.home.rglob("*")):
+            metadata = path.lstat()
+            content = os.readlink(path).encode() if path.is_symlink() else path.read_bytes() if path.is_file() else b""
+            result[path] = (metadata.st_mode, metadata.st_ino, metadata.st_mtime_ns, metadata.st_ctime_ns, content)
+        return result
+
+    def start_trust_writer(self, path: Path) -> subprocess.Popen[str]:
+        """An independent lock-respecting save, with only scratch config paths."""
+        script = '''
+import json, os, sys, time
+from pathlib import Path
+path = Path(sys.argv[1])
+lock = path.with_name(path.name + ".lock")
+deadline = time.monotonic() + 5
+announced = False
+while True:
+    try:
+        lock.mkdir()
+        break
+    except FileExistsError:
+        if not announced:
+            print("blocked", flush=True)
+            announced = True
+        if time.monotonic() >= deadline:
+            raise TimeoutError("fixture lock not released")
+        time.sleep(0.001)
+try:
+    print("acquired", flush=True)
+    sys.stdin.readline()
+    current = json.loads(path.read_text())
+    current["other writer"] = "retained"
+    temporary = path.with_name(path.name + ".writer")
+    temporary.write_text(json.dumps(current))
+    temporary.chmod(path.stat().st_mode)
+    os.replace(temporary, path)
+finally:
+    lock.rmdir()
+'''
+        process = subprocess.Popen([sys.executable, "-c", script, str(path)],
+                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, text=True)
+
+        def close_writer() -> None:
+            if process.poll() is None:
+                process.kill()
+            _ = process.communicate(timeout=5)
+
+        self.addCleanup(close_writer)
+        return process
+
+    def test_trust_waiting_writer_saves_after_publication_and_preserves_both_changes(self) -> None:
+        paths = self.write_trust_fixture()
+        publish = os.replace
+        writers: list[subprocess.Popen[str]] = []
+
+        def publish_with_contender(temporary: Path, path: Path) -> None:
+            if path == paths[0]:
+                writer = self.start_trust_writer(path)
+                writers.append(writer)
+                assert writer.stdout is not None and writer.stdin is not None
+                # This hook is after trust's compare and before its replace.
+                self.assertEqual(writer.stdout.readline(), "blocked\n")
+                _ = writer.stdin.write("save\n")
+                writer.stdin.flush()
+                self.assertIsNone(writer.poll())
+            publish(temporary, path)
+
+        with patch.object(os, "replace", side_effect=publish_with_contender):
+            code, _output, error = self.run_cli("trust")
+        self.assertEqual(code, 0, error)
+        writer = writers[0]
+        stdout, stderr = writer.communicate(timeout=5)
+        self.assertEqual((writer.returncode, stdout, stderr), (0, "acquired\n", ""))
+        final = accounts.read_json_object(paths[0])
+        self.assertEqual(final["other writer"], "retained")
+        self.assertEqual(final["projects"], accounts.read_json_object(paths[1])["projects"])
+
+    def test_trust_waits_for_held_lock_then_reads_the_holders_change(self) -> None:
+        paths = self.write_trust_fixture()
+        writer = self.start_trust_writer(paths[0])
+        assert writer.stdout is not None and writer.stdin is not None
+        self.assertEqual(writer.stdout.readline(), "acquired\n")
+        sleep = time.sleep
+
+        def release_holder(delay: float) -> None:
+            assert writer.stdin is not None
+            _ = writer.stdin.write("save\n")
+            writer.stdin.flush()
+            sleep(delay)
+
+        with patch.object(time, "sleep", side_effect=release_holder) as waited:
+            code, _output, error = self.run_cli("trust")
+        self.assertEqual(code, 0, error)
+        self.assertTrue(waited.called)
+        stdout, stderr = writer.communicate(timeout=5)
+        self.assertEqual((writer.returncode, stdout, stderr), (0, "", ""))
+        final = accounts.read_json_object(paths[0])
+        self.assertEqual(final["other writer"], "retained")
+        self.assertEqual(final["projects"], accounts.read_json_object(paths[1])["projects"])
+
+    def test_trust_recovers_a_stale_lock_using_claudes_mtime_rule(self) -> None:
+        paths = self.write_trust_fixture()
+        lock = paths[0].with_name(paths[0].name + ".lock")
+        lock.mkdir()
+        stale = time.time() - 11
+        os.utime(lock, (stale, stale))
+        code, _output, error = self.run_cli("trust")
+        self.assertEqual(code, 0, error)
+        self.assertFalse(lock.exists())
+        self.assertEqual(accounts.read_json_object(paths[0])["projects"],
+                         accounts.read_json_object(paths[1])["projects"])
+
+    def test_trust_bounds_held_lock_retries_and_continues_other_homes(self) -> None:
+        paths = self.write_trust_fixture()
+        lock = paths[0].with_name(paths[0].name + ".lock")
+        lock.mkdir()
+        before = paths[0].read_bytes()
+        with patch.object(time, "sleep") as waited:
+            code, output, error = self.run_cli("trust")
+        self.assertEqual((code, output), (1, "claude1: trust updated\nclaude2: trust updated\n"))
+        self.assertIn("~/.claude: trust failed: Claude config lock still held after retries", error)
+        self.assertEqual(waited.call_count, 2)
+        self.assertEqual(paths[0].read_bytes(), before)
+        self.assertTrue(lock.is_dir())
+
+    def test_trust_lock_uses_configured_retries_stale_age_and_budget_at_use(self) -> None:
+        paths = self.write_trust_fixture()
+        path = paths[0]
+        lock = path.with_name(path.name + ".lock")
+        lock.mkdir()
+        aged = time.time() - 200
+        os.utime(lock, (aged, aged))
+        write_account_settings(self.trust_config, retries=(0.6, 0.8), stale_seconds=300)
+        with (patch.object(time, "sleep") as waited,
+              patch.object(random, "random", return_value=0)):
+            with self.assertRaisesRegex(TimeoutError, "still held after retries"):
+                with accounts.claude_config_lock(path, accounts.trust_configuration().lock_policy):
+                    self.fail("a lock younger than the configured stale age must remain held")
+        self.assertEqual(waited.call_args_list, [call(0.6), call(0.8)])
+        self.assertTrue(lock.is_dir())
+        # A changed config applies to the next use; no module-level timing cache.
+        write_account_settings(self.trust_config, retries=(0.1,), stale_seconds=100)
+        with patch.object(time, "monotonic", return_value=40):
+            with accounts.claude_config_lock(path, accounts.trust_configuration().lock_policy) as ownership:
+                self.assertAlmostEqual(ownership.publish_before, 40.05)
+                ownership.require_current()
+        self.assertFalse(lock.exists())
+
+    def test_trust_refuses_missing_empty_or_invalid_lock_settings_without_writing(self) -> None:
+        paths = self.write_trust_fixture()
+        before = [path.read_bytes() for path in paths]
+        trust_section = self.trust_config.read_text().split("[claude_config_lock]", 1)[0]
+        cases = (
+            ("", "[claude_config_lock]"),
+            ("stale_seconds = 10", "retries"),
+            ("retries = []\nstale_seconds = 10", "retries"),
+            ('retries = ""\nstale_seconds = 10', "retries"),
+            ("retries = 1\nstale_seconds = 10", "retries"),
+            ("retries = [0]\nstale_seconds = 10", "retries"),
+            ("retries = [-1]\nstale_seconds = 10", "retries"),
+            ('retries = ["bad"]\nstale_seconds = 10', "retries"),
+            ("retries = [true]\nstale_seconds = 10", "retries"),
+            ("retries = [nan]\nstale_seconds = 10", "retries"),
+            ("retries = [inf]\nstale_seconds = 10", "retries"),
+            (f"retries = [{'9' * 400}]\nstale_seconds = 10", "retries"),
+            ("retries = [0.2]", "stale_seconds"),
+            ('retries = [0.2]\nstale_seconds = ""', "stale_seconds"),
+            ("retries = [0.2]\nstale_seconds = []", "stale_seconds"),
+            ("retries = [0.2]\nstale_seconds = 0", "stale_seconds"),
+            ("retries = [0.2]\nstale_seconds = -1", "stale_seconds"),
+            ("retries = [0.2]\nstale_seconds = true", "stale_seconds"),
+            ("retries = [0.2]\nstale_seconds = nan", "stale_seconds"),
+            ("retries = [0.2]\nstale_seconds = inf", "stale_seconds"),
+            (f"retries = [0.2]\nstale_seconds = {'9' * 400}", "stale_seconds"),
+        )
+        for trusted in (False, True):
+            if trusted:
+                write_account_settings(self.trust_config, folders=("~/worktrees", "~/other trees"))
+                code, _output, error = self.run_cli("trust")
+                self.assertEqual(code, 0, error)
+                before = [path.read_bytes() for path in paths]
+            for section, key in cases:
+                with self.subTest(trusted=trusted, key=key, section=section):
+                    _ = self.trust_config.write_text(
+                        trust_section + ("[claude_config_lock]\n" + section if section else "")
+                    )
+                    snapshot = self.trust_home_snapshot()
+                    with (patch.object(fcntl, "flock") as locked,
+                          patch.object(atomic_file, "prepared_replacement") as prepared,
+                          patch.object(atomic_file, "remove_dead_temporary_files") as cleaned):
+                        code, output, error = self.run_cli("trust")
+                    self.assertEqual((code, output), (1, ""))
+                    self.assertIn(str(self.trust_config), error)
+                    self.assertIn(key, error)
+                    self.assertEqual(len(error.splitlines()), 1)
+                    self.assertEqual([path.read_bytes() for path in paths], before)
+                    self.assertFalse(any(path.with_name(path.name + ".lock").exists() for path in paths))
+                    self.assertEqual(self.trust_home_snapshot(), snapshot)
+                    locked.assert_not_called()
+                    prepared.assert_not_called()
+                    cleaned.assert_not_called()
+
+    def test_seed_refuses_invalid_configuration_before_creating_or_cleaning_any_home(self) -> None:
+        paths = self.write_trust_fixture()
+        abandoned = paths[1].with_name(f".{paths[1].name}.999999999.abandoned.tmp")
+        _ = abandoned.write_text("retain until configuration is valid")
+        for settings, problem in (
+            ("[trust]\nfolders = []\n[claude_config_lock]\nretries = []\nstale_seconds = 10\n",
+             "claude_config_lock.retries must be a non-empty list"),
+            ("[trust]\nfolders = [false]\n[claude_config_lock]\nretries = [0.2]\nstale_seconds = 10\n",
+             "trust.folders must contain absolute or ~/ paths"),
+        ):
+            _ = self.trust_config.write_text(settings)
+            for label in ("claude1", "claude3"):
+                with self.subTest(label=label, problem=problem):
+                    snapshot = self.trust_home_snapshot()
+                    with (patch.object(fcntl, "flock") as locked,
+                          patch.object(atomic_file, "remove_dead_temporary_files") as cleaned):
+                        code, output, error = self.run_cli("setup", label)
+                    self.assertEqual((code, output), (1, ""))
+                    self.assertIn(problem, error)
+                    self.assertEqual(len(error.splitlines()), 1)
+                    self.assertEqual(self.trust_home_snapshot(), snapshot)
+                    locked.assert_not_called()
+                    cleaned.assert_not_called()
+
+    def test_trust_and_seed_read_one_validated_configuration_before_home_locks(self) -> None:
+        self.write_main_config()
+        read = Path.read_text
+        flock = fcntl.flock
+        for arguments in (("trust",), ("setup", "claude2")):
+            with self.subTest(arguments=arguments):
+                write_account_settings(self.trust_config, folders=("~/worktrees",))
+                reads: list[Path] = []
+
+                def read_settings(
+                    path: Path, encoding: str | None = None, errors: str | None = None,
+                    newline: str | None = None,
+                ) -> str:
+                    if path == self.trust_config:
+                        reads.append(path)
+                    return read(path, encoding=encoding, errors=errors, newline=newline)
+
+                def change_settings_after_validation(descriptor: int, operation: int) -> None:
+                    self.assertEqual(reads, [self.trust_config])
+                    _ = self.trust_config.write_text("[trust]\nfolders = []\n[claude_config_lock]\nretries = []\n")
+                    flock(descriptor, operation)
+
+                with (patch.object(Path, "read_text", new=read_settings),
+                      patch.object(fcntl, "flock", side_effect=change_settings_after_validation)):
+                    code, _output, error = self.run_cli(*arguments)
+                self.assertEqual(code, 0, error)
+                self.assertEqual(reads, [self.trust_config])
+                seeded = self.home / ".claude2/.claude.json" if arguments[0] == "setup" else self.home / ".claude.json"
+                projects = cast(dict[str, object], accounts.read_json_object(seeded)["projects"])
+                self.assertEqual(projects[str(self.home / "worktrees")], {"hasTrustDialogAccepted": True})
+
+    def test_trust_refuses_publication_when_its_short_lock_budget_is_used(self) -> None:
+        paths = self.write_trust_fixture()
+        before = [path.read_bytes() for path in paths]
+        with patch.object(time, "monotonic", side_effect=[0, 1] * len(paths)):
+            code, output, error = self.run_cli("trust")
+        self.assertEqual((code, output), (1, ""))
+        self.assertEqual(error.count("publication budget exceeded"), len(paths))
+        self.assertEqual([path.read_bytes() for path in paths], before)
+        self.assertFalse(any(path.with_name(path.name + ".lock").exists() for path in paths))
+
+    def test_trust_slow_preparation_leaves_lock_free_and_rebuilds_concurrent_changes(self) -> None:
+        paths = self.write_trust_fixture()
+        prepare = atomic_file.prepared_replacement
+        lock_config = accounts.claude_config_lock
+        sync = os.fsync
+        preparation_times: list[float] = []
+        hold_times: list[float] = []
+        preparations: list[Path] = []
+
+        def assert_locks_free() -> None:
+            self.assertFalse(any(path.with_name(path.name + ".lock").exists() for path in paths))
+
+        @contextmanager
+        def slow_preparation(path: Path, content: str | bytes, *, mode: int) -> Generator[Path]:
+            assert_locks_free()
+            preparations.append(path)
+            with prepare(path, content, mode=mode) as temporary:
+                assert_locks_free()
+                self.assertEqual(temporary.stat().st_mode & 0o777, 0o640)
+                if len(preparations) == 1:
+                    started = time.perf_counter()
+                    time.sleep(1.6)  # Longer than Claude's boot retry-abort window.
+                    assert_locks_free()
+                    writer = self.start_trust_writer(path)
+                    assert writer.stdout is not None
+                    self.assertEqual(writer.stdout.readline(), "acquired\n")
+                    stdout, stderr = writer.communicate("save\n", timeout=5)
+                    self.assertEqual((writer.returncode, stdout, stderr), (0, "", ""))
+                    preparation_times.append(time.perf_counter() - started)
+                yield temporary
+                assert_locks_free()
+            assert_locks_free()
+
+        @contextmanager
+        def timed_lock(path: Path, policy: accounts.ClaudeConfigLockPolicy) -> Generator[accounts.ClaudeConfigLock]:
+            with lock_config(path, policy) as ownership:
+                started = time.perf_counter()
+                yield ownership
+            hold_times.append(time.perf_counter() - started)
+
+        def sync_without_lock(descriptor: int) -> None:
+            assert_locks_free()
+            sync(descriptor)
+
+        with (patch.object(atomic_file, "prepared_replacement", side_effect=slow_preparation),
+              patch.object(accounts, "claude_config_lock", side_effect=timed_lock),
+              patch.object(os, "fsync", side_effect=sync_without_lock)):
+            code, _output, error = self.run_cli("trust")
+        self.assertEqual(code, 0, error)
+        self.assertGreater(preparation_times[0], 1.5)
+        self.assertEqual(len(hold_times), len(paths) + 1)
+        self.assertLess(max(hold_times), 0.1)
+        self.assertEqual(preparations.count(paths[0]), 2)
+        final = accounts.read_json_object(paths[0])
+        self.assertEqual(final["other writer"], "retained")
+        self.assertEqual(final["projects"], accounts.read_json_object(paths[1])["projects"])
+        self.assertTrue(all(path.stat().st_mode & 0o777 == 0o640 for path in paths))
+        self.assertFalse(list(self.home.rglob("*.tmp")))
+
+    def test_trust_rebuilds_when_permissions_tighten_during_preparation(self) -> None:
+        paths = self.write_trust_fixture()
+        paths[0].chmod(0o644)
+        sync = os.fsync
+        replace = os.replace
+        prepared_modes: list[int] = []
+
+        def tighten_during_sync(descriptor: int) -> None:
+            if stat.S_ISREG(os.fstat(descriptor).st_mode):
+                prepared_modes.append(os.fstat(descriptor).st_mode & 0o777)
+                if len(prepared_modes) == 1:
+                    self.assertFalse(paths[0].with_name(paths[0].name + ".lock").exists())
+                    paths[0].chmod(0o600)
+            sync(descriptor)
+
+        def publish(temporary: Path, destination: Path) -> None:
+            self.assertEqual(temporary.stat().st_mode & 0o777, destination.stat().st_mode & 0o777)
+            replace(temporary, destination)
+
+        with (patch.object(os, "fsync", side_effect=tighten_during_sync),
+              patch.object(os, "replace", side_effect=publish)):
+            code, _output, error = self.run_cli("trust")
+        self.assertEqual(code, 0, error)
+        self.assertEqual(prepared_modes, [0o644, 0o600, 0o640, 0o640])
+        self.assertEqual(paths[0].stat().st_mode & 0o777, 0o600)
+        self.assertEqual(accounts.read_json_object(paths[0])["projects"],
+                         accounts.read_json_object(paths[1])["projects"])
+        self.assertFalse(list(self.home.rglob("*.tmp")))
+
+    def test_trust_changes_only_configured_project_bits_in_every_home_and_reruns_unchanged(self) -> None:
+        paths = self.write_trust_fixture()
+        originals = [accounts.read_json_object(path) for path in paths]
+        code, output, error = self.run_cli("trust")
+        self.assertEqual(code, 0, error)
+        self.assertEqual(output.splitlines(), ["~/.claude: trust updated", "claude1: trust updated", "claude2: trust updated"])
+        self.assertIn("unlocked Claude save", error)
+        for path, original in zip(paths, originals):
+            with self.subTest(path=path.name, home=path.parent.name):
+                expected_projects = cast(dict[str, object], original["projects"])
+                expected_projects[str(self.home / "worktrees")] = {"hasTrustDialogAccepted": True, "keep": "here"}
+                expected_projects[str(self.home / "other trees")] = {"hasTrustDialogAccepted": True}
+                self.assertEqual(accounts.read_json_object(path), original)
+                self.assertEqual(path.stat().st_mode & 0o777, 0o640)
+        before = [(path.read_bytes(), path.stat().st_mtime_ns) for path in paths]
+        self.assertEqual(self.run_cli("trust")[:2], (0,
+            "~/.claude: trust unchanged\nclaude1: trust unchanged\nclaude2: trust unchanged\n"))
+        self.assertEqual([(path.read_bytes(), path.stat().st_mtime_ns) for path in paths], before)
+
+    def test_trust_retries_an_intervening_writer_before_publish_and_after_publish(self) -> None:
+        paths = self.write_trust_fixture()
+        apply = accounts.with_trusted_folders
+        publish = os.replace
+        before_publish = True
+        after_publish = True
+
+        def competing_change(source: dict[str, object], folders: tuple[str, ...]) -> dict[str, object]:
+            nonlocal before_publish
+            if before_publish:
+                before_publish = False
+                current = accounts.read_json_object(paths[0])
+                current["concurrent before"] = "retained"
+                _ = paths[0].write_text(json.dumps(current))
+            return apply(source, folders)
+
+        def competing_publish(temporary: Path, path: Path) -> None:
+            nonlocal after_publish
+            publish(temporary, path)
+            if after_publish:
+                after_publish = False
+                # An unlocked writer uses its earlier snapshot after our replace.
+                _ = path.write_text(json.dumps({"concurrent before": "retained", "concurrent after": True}))
+
+        with (patch.object(accounts, "with_trusted_folders", side_effect=competing_change),
+              patch.object(os, "replace", side_effect=competing_publish)):
+            code, _output, error = self.run_cli("trust")
+        self.assertEqual(code, 0, error)
+        final = accounts.read_json_object(paths[0])
+        self.assertEqual(final["concurrent before"], "retained")
+        self.assertIs(final["concurrent after"], True)
+        self.assertEqual(final["projects"], {
+            str(self.home / "worktrees"): {"hasTrustDialogAccepted": True},
+            str(self.home / "other trees"): {"hasTrustDialogAccepted": True},
+        })
+
+    def test_trust_reports_missing_and_unreadable_files_and_continues_other_homes(self) -> None:
+        paths = self.write_trust_fixture()
+        paths[0].unlink()
+        read = Path.read_bytes
+
+        def unreadable(path: Path) -> bytes:
+            if path == paths[1]:
+                raise PermissionError("fixture unreadable")
+            return read(path)
+
+        with patch.object(Path, "read_bytes", new=unreadable):
+            code, output, error = self.run_cli("trust")
+        self.assertEqual((code, output), (1, "claude2: trust updated\n"))
+        self.assertIn("~/.claude: trust failed:", error)
+        self.assertIn("claude1: trust failed: fixture unreadable", error)
+        self.assertFalse(paths[0].exists())
+        self.assertEqual(accounts.read_json_object(paths[2])["projects"], {
+            str(self.home / "worktrees"): {"hasTrustDialogAccepted": True, "keep": "here"},
+            str(self.home / "other trees"): {"hasTrustDialogAccepted": True},
+            "/elsewhere": {"hasTrustDialogAccepted": False, "other": [1]},
+        })
+
+    def test_new_account_seed_uses_trusted_folders_from_configuration_at_use(self) -> None:
+        write_account_settings(self.trust_config, folders=("~/configured root",))
+        _ = (self.home / ".claude.json").write_text('{"hasCompletedOnboarding": true}')
+        self.assertEqual(accounts.setup("claude2"), [])
+        seeded = accounts.read_json_object(self.home / ".claude2/.claude.json")
+        self.assertEqual(seeded, {"hasCompletedOnboarding": True, "projects": {
+            str(self.home / "configured root"): {"hasTrustDialogAccepted": True},
+        }})
+        self.assertEqual((self.home / ".claude2/.claude.json").stat().st_mode & 0o777, 0o600)
+        write_account_settings(self.trust_config, folders=("~/different root",))
+        self.assertEqual(accounts.setup("claude3"), [])
+        self.assertEqual(accounts.read_json_object(self.home / ".claude3/.claude.json")["projects"], {
+            str(self.home / "different root"): {"hasTrustDialogAccepted": True},
+        })
 
     def test_shared_entries_are_the_documented_complete_set(self) -> None:
         self.assertEqual(tuple(accounts.SHARED), EXPECTED_SHARED)
@@ -2330,7 +2933,7 @@ class AccountsTests(unittest.TestCase):
             getattr(accounts, "_repair_link"),
         )
         seed_config = cast(
-            Callable[[Path], list[str]],
+            Callable[[Path, accounts.TrustConfiguration], list[str]],
             getattr(accounts, "_seed_config"),
         )
         source = self.main_dir / "settings.json"
@@ -2342,7 +2945,7 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual(repair_link(link, source), [])
         self.assertEqual(repair_link(link, source), [])
         self.write_main_config()
-        self.assertEqual(seed_config(account_dir / ".claude.json"), [])
+        self.assertEqual(seed_config(account_dir / ".claude.json", accounts.trust_configuration()), [])
 
     def test_setup_replaces_a_wrong_target_link(self) -> None:
         self.write_main_config()
@@ -2511,8 +3114,31 @@ class AccountsTests(unittest.TestCase):
     # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_mac_status_describes_accounts_without_creating_any(self) -> None:
-        with patch.object(sys, "platform", "darwin"):
-            self.assert_status_describes_accounts_without_creating_any(accounts.MAC_HOME_LOGIN_STEP)
+        with (patch.object(sys, "platform", "darwin"),
+              patch.object(accounts, "_mac_login_keychain_visible", return_value=True),
+              patch.object(accounts, "_mac_keychain_has_entry", return_value=True)):
+            self.assert_status_describes_accounts_without_creating_any(
+                "in a Mac Terminal, run accounts.py exec claude2, then /login, then /exit, "
+                + "then accounts.py cutover-home claude2; never /logout")
+
+    # Reserved fixtures model provider accounts in this status test.
+    @patch.object(accounts, "is_test_login", new=provider_fixture_login)
+    def test_mac_leftover_identity_step_clears_it_without_another_login(self) -> None:
+        self.login_directory("claude2", "main@example.invalid", default=True)
+        self.write_main_config()
+        with (patch.object(sys, "platform", "darwin"),
+              patch.object(accounts, "_mac_login_keychain_visible", return_value=True),
+              patch.object(accounts, "_mac_keychain_has_entry", return_value=False),
+              patch.object(accounts, "_claude_process_ids", return_value=[])):
+            code, output, error = self.run_cli("status", "--stored")
+            self.assertEqual((code, error), (0, ""))
+            self.assertIn("~/.claude: legacy login is stored; the home still holds a login; "
+                + "in a Mac Terminal, run accounts.py cutover-home claude2; never /logout", output)
+            self.assertNotIn("then /login", output)
+            self.assertEqual(self.run_cli("cutover-home", "claude2")[0], 0)
+            code, output, error = self.run_cli("status", "--stored")
+            self.assertEqual((code, error), (0, ""))
+            self.assertNotIn("legacy login is stored", output)
 
     def assert_status_describes_accounts_without_creating_any(self, home_step: str) -> None:
         _ = (self.main_dir / "README.md").write_text("repo entry", encoding="utf-8")
@@ -2640,7 +3266,7 @@ class AccountsTests(unittest.TestCase):
                 self.assertIn(str(failure), problems[0])
                 self.assertIn("restore access to natedev", problems[0])
 
-    def test_stored_role_map_problem_says_no_fetch_was_attempted(self) -> None:
+    def test_stored_role_map_with_cached_assignments_lists_no_problem(self) -> None:
         cache = role_map.role_map_cache_file()
         cache.parent.mkdir(parents=True, exist_ok=True)
         _ = cache.write_text(json.dumps({"at": "2026-10-16T15:24:00+00:00", "map": {
@@ -2652,10 +3278,7 @@ class AccountsTests(unittest.TestCase):
             self.assertEqual((code, error), (0, ""))
             lines = (cast(list[str], json.loads(output)["problems"]) if flags else output.splitlines())
             problems = [line for line in lines if line.startswith("role map: using saved assignments;")]
-            self.assertEqual(len(problems), 1)
-            self.assertIn("no fetch was attempted", problems[0])
-            self.assertIn("2026-10-16", problems[0])
-            self.assertNotIn("unreachable", problems[0])
+            self.assertEqual(problems, [])
 
     def test_piped_status_replays_held_warning_before_the_final_error(self) -> None:
         def failed_read(*_args: object, **_kwargs: object) -> accounts.StatusReading:
@@ -2804,11 +3427,12 @@ class AccountsTests(unittest.TestCase):
                         self.assertEqual((code, output), (1, ""))
                         self.assertTrue(error.rstrip().endswith("fixture later failure; check the account folders and role map"))
                         if diagnostic.endswith("map"):
-                            expected_map = ("role map: using saved assignments; map saved at 2026-10-16 08:24 PDT; "
-                                + ("stored mode; no fetch was attempted; run accounts.py status to fetch current assignments"
-                                   if diagnostic == "stored map" else
-                                   "natedev fetch failed: fixture offline; restore access to natedev; run accounts.py status again"))
-                            self.assertIn(expected_map, error.splitlines())
+                            if diagnostic == "stored map":
+                                self.assertNotIn("role map: using saved assignments;", error)
+                            else:
+                                expected_map = ("role map: using saved assignments; map saved at 2026-10-16 08:24 PDT; "
+                                    + "natedev fetch failed: fixture offline; restore access to natedev; run accounts.py status again")
+                                self.assertIn(expected_map, error.splitlines())
                         else:
                             self.assertIn("fixture unmatched warning", error)
                             if diagnostic == "recovered save":
@@ -3247,12 +3871,12 @@ class AccountsTests(unittest.TestCase):
             if fault == "missing":
                 note.unlink(missing_ok=True)
                 expected_note = (f"claude2: not selectable; claude2 has no account note at {note}; "
-                    + "add ~/rust/hanadocs/agents/claudeN.md with login: fixture@notexample.com; run accounts.py setup claude2")
+                    + "add ~/rust/hanadocs/agents/claudeN.md with the login for claude2; run accounts.py setup claude2")
             else:
                 _ = note.write_text("---\nname: no login\n---\n")
                 expected_note = (f"claude2: cannot read {note}; fixture note denied; " if fault == "unreadable" else
                     f"claude2: not selectable; {note} has no readable login in its frontmatter; ")
-                expected_note += "repair the account note with login: fixture@notexample.com; run accounts.py setup claude2"
+                expected_note += "repair the account note for claude2 with its login; run accounts.py setup claude2"
             expected = ["workers: not configured; the role map selects no account; run accounts.py set-role workers <codexN>", expected_note]
             for flags in ((), ("--json",)):
                 with (self.subTest(fault=fault, flags=flags),
@@ -3579,7 +4203,7 @@ class AccountsTests(unittest.TestCase):
              "12%", weekly_cell, "—", "—", read_cell),
             ("~/.claude4", "claude4", "", *("—",) * 5),
         ])
-        self.assertIn("PDT", read_cell + weekly_cell)
+        self.assertRegex(read_cell, r"^\d\d:\d\d P[DS]T$")
         self.live_reads.assert_not_called()
         self.codex_reads.assert_not_awaited()
         self.assertFalse(accounts.account_dir("claude1").exists())
@@ -4430,9 +5054,9 @@ class AccountsTests(unittest.TestCase):
         code, output, error = self.run_cli("status", "--json")
         self.assertEqual((code, error), (0, ""))
         document = cast(dict[str, object], json.loads(output))
-        self.assertEqual(set(document), {"accounts", "problems"})
+        self.assertEqual(set(document), {"accounts", "problems", "session_inputs"})
         rows = cast(list[dict[str, object]], document["accounts"])
-        keys = {"label", "tool", "roles", "weekly_left_percent", "resets_at", "credits", "use_credits", "read_at",
+        keys = {"label", "tool", "roles", "role_counts", "weekly_left_percent", "resets_at", "credits", "use_credits", "read_at",
                 "read_ok", "credits_in_use"}
         self.assertTrue(all(set(row) == keys for row in rows))
         expected: list[tuple[str, str, list[str], float | None, str | None, float | str | None, bool, str | None]] = [
@@ -4616,7 +5240,7 @@ class AccountsTests(unittest.TestCase):
         result, stdout, stderr = self.run_cli("setup", "codex1")
 
         self.assertEqual((result, stderr), (0, ""))
-        self.assertIn("CODEX_HOME=~/.codex1 codex login", stdout)
+        self.assertIn(f"env CODEX_HOME={shlex.quote(str(self.home / '.codex1'))} codex login", stdout)
         home = self.home / ".codex1"
         self.assertTrue(home.is_dir())
         self.assertFalse(home.is_symlink())
@@ -5110,9 +5734,9 @@ class AccountsTests(unittest.TestCase):
             (agent_accounts.UsageReadOutcome.REFUSED_401,
              "the usage service did not accept this login; start a session on it to check it"),
             (agent_accounts.UsageReadOutcome.RATE_LIMITED_429,
-             "the usage service is busy; this shows the reading from 05:29; next try in 2 min"),
+             "the usage service is busy; this shows the reading from 01-02 05:29; no usage read has been attempted"),
             (agent_accounts.UsageReadOutcome.ERROR,
-             "the usage read failed; this shows the reading from 05:29; next try in 2 min"),
+             "the usage read failed; this shows the reading from 01-02 05:29; no usage read has been attempted"),
         )
         for outcome, reason in cases:
             with self.subTest(outcome=outcome):
@@ -5145,11 +5769,11 @@ class AccountsTests(unittest.TestCase):
         at = datetime(2026, 10, 19, 15, 11, tzinfo=timezone.utc)
         cases = (
             (agent_accounts.UsageReadOutcome.RATE_LIMITED_429,
-             "the usage service is busy; this shows the reading from 08:09; next try after 08:21",
-             "the usage service is busy; no reading is stored yet; next try after 08:21"),
+             "the usage service is busy; this shows the reading from 10-19 08:09; last read attempted at 10-19 08:11",
+             "the usage service is busy; no reading is stored yet; last read attempted at 10-19 08:11"),
             (agent_accounts.UsageReadOutcome.ERROR,
-             "the usage read failed; this shows the reading from 08:09; next try in 2 min",
-             "the usage read failed; no reading is stored yet; next try in 2 min"),
+             "the usage read failed; this shows the reading from 10-19 08:09; last read attempted at 10-19 08:11",
+             "the usage read failed; no reading is stored yet; last read attempted at 10-19 08:11"),
             (agent_accounts.UsageReadOutcome.REFUSED_401,
              "the usage service did not accept this login; start a session on it to check it",
              "the usage service did not accept this login; start a session on it to check it"),
@@ -5196,7 +5820,7 @@ class AccountsTests(unittest.TestCase):
         code, output, error = self.run_cli("status")
         self.assertEqual((code, error), (0, ""))
         self.assertIn("01-02 05:29 PST*", output)
-        self.assertIn("the usage service is busy; this shows the reading from 05:29; next try in 2 min", output)
+        self.assertIn("the usage service is busy; this shows the reading from 01-02 05:29; no usage read has been attempted", output)
         self.assertEqual(usage_store.store_file().read_bytes(), before)
 
     # Reserved fixtures model provider accounts in this status test.
@@ -5215,7 +5839,7 @@ class AccountsTests(unittest.TestCase):
         row = next(line for line in output.splitlines() if "| claude2 " in line)
         self.assertEqual(row.split("|")[-2].strip(), "01-02 05:29 PST*")
         self.assertEqual([line for line in output.splitlines() if line.startswith("* ")],
-                         ["* claude2: usage unavailable; the usage read failed; this shows the reading from 05:29; next try in 2 min"])
+                         ["* claude2: usage unavailable; the usage read failed; this shows the reading from 01-02 05:29; no usage read has been attempted"])
         self.assertEqual(usage_store.load()["idle@example.invalid"].get("weekly"), window)
         self.live_reads.assert_called_once_with(directory)
 
@@ -5239,7 +5863,7 @@ class AccountsTests(unittest.TestCase):
         row = next(line for line in output.splitlines() if "| claude2 " in line)
         self.assertEqual(row.split("|")[-2].strip(), "01-02 05:29 PST*")
         self.assertEqual([line for line in output.splitlines() if line.startswith("* ")],
-                         ["* claude2: usage unavailable; the usage read failed; this shows the reading from 05:29; next try in 2 min"])
+                         ["* claude2: usage unavailable; the usage read failed; this shows the reading from 01-02 05:29; no usage read has been attempted"])
         self.live_reads.assert_not_called()
 
     # Reserved fixtures model provider accounts in this status test.
@@ -5275,7 +5899,7 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual((code, error), (0, ""))
         row = next(line for line in output.splitlines() if "| codex1 " in line)
         self.assertEqual(row.split("|")[-2].strip(), "01-02 05:29 PST*")
-        self.assertIn("* codex1: usage unavailable; Codex did not start at ~/.codex1; this shows the reading from 05:29; run /showrunner:accounts setup codex1 and try again; next try in 2 min", output)
+        self.assertIn("* codex1: usage unavailable; Codex did not start at ~/.codex1; this shows the reading from 01-02 05:29; run /showrunner:accounts setup codex1 and try again; no usage read has been attempted", output)
         self.assertIn("/showrunner:accounts setup codex1", row)
 
     # Reserved fixtures model provider accounts in this status test.
@@ -6093,7 +6717,7 @@ class AccountsTests(unittest.TestCase):
         self.write_note("codex1", "target@example.invalid")
         result, stdout, stderr = self.run_cli("setup", "codex1")
         self.assertEqual((result, stderr), (0, ""))
-        command = stdout.index("CODEX_HOME=~/.codex1 codex login")
+        command = stdout.index(f"env CODEX_HOME={shlex.quote(str(self.home / '.codex1'))} codex login")
         warning = stdout[command:].splitlines()[1:]
         self.assertTrue(warning)
         self.assertIn("~/.codex", " ".join(warning))
@@ -6147,7 +6771,7 @@ _ = sys.stdin.read()
                 process.kill()
                 output, errors = process.communicate()
         self.assertEqual((process.returncode, errors), (0, ""))
-        self.assertIn("CODEX_HOME=~/.codex1 codex login", output)
+        self.assertIn(f"env CODEX_HOME={shlex.quote(str(self.home / '.codex1'))} codex login", output)
 
     def test_table_workers_role_ignores_conflicting_process_home(self) -> None:
         default, target = self.workers_fixture()
@@ -6215,7 +6839,7 @@ _ = sys.stdin.read()
         lines = stdout.splitlines()
         self.assertIn("initialize", lines[0])
         self.assertIn("limit", lines[0].lower())
-        self.assertLess(stdout.index("initialize"), stdout.index("CODEX_HOME=~/.codex1 codex login"))
+        self.assertLess(stdout.index("initialize"), stdout.index(f"env CODEX_HOME={shlex.quote(str(self.home / '.codex1'))} codex login"))
 
     def test_legacy_unit_role_file_leaves_workers_unconfigured(self) -> None:
         config = accounts.accounts_config_file()
@@ -6624,7 +7248,7 @@ class PickerTests(unittest.TestCase):
         self.assertEqual(accounts.placement("units", self.now, exclude=frozenset()).label, "claude3")
         code, stdout, stderr = self.group_cli("status")
         self.assertEqual((code, stderr), (0, ""))
-        self.assertIn(f"claude2: not selectable; claude2 has no account note at {self.home / 'notes/claude2.md'}; add ~/rust/hanadocs/agents/claudeN.md with login: main@example.invalid; run accounts.py setup claude2", stdout.splitlines())
+        self.assertIn(f"claude2: not selectable; claude2 has no account note at {self.home / 'notes/claude2.md'}; add ~/rust/hanadocs/agents/claudeN.md with the login for claude2; run accounts.py setup claude2", stdout.splitlines())
         for command in (("move", "units", "claude2"), ("move", "some-session", "claude2"),
                         ("exec", "claude2"), ("move", "units", "default")):
             with self.subTest(command=command):
@@ -6645,7 +7269,7 @@ class PickerTests(unittest.TestCase):
         self.assertEqual(accounts.group_label(groups, "units"), "home account unresolved")
         code, stdout, stderr = self.group_cli("status")
         self.assertEqual((code, stderr), (0, ""))
-        self.assertIn(f"claude2: not selectable; claude2 has no account note at {self.home / 'notes/claude2.md'}; add ~/rust/hanadocs/agents/claudeN.md with login: main@example.invalid; run accounts.py setup claude2", stdout.splitlines())
+        self.assertIn(f"claude2: not selectable; claude2 has no account note at {self.home / 'notes/claude2.md'}; add ~/rust/hanadocs/agents/claudeN.md with the login for claude2; run accounts.py setup claude2", stdout.splitlines())
         with self.assertRaisesRegex(accounts.AccountsError, "home account unresolved"):
             _ = accounts.role_account("unit")
         self.assertEqual(path.read_bytes(), original)
@@ -6665,7 +7289,7 @@ class PickerTests(unittest.TestCase):
         self.assertIsInstance(picked, accounts.NoAccountWithRoom)
         code, stdout, stderr = self.group_cli("status")
         self.assertEqual((code, stderr), (0, ""))
-        self.assertIn("~/.codex: not selectable; this login has no account note; add ~/rust/hanadocs/agents/codexN.md with login: unnoted@example.invalid; then run accounts.py cutover-home <codexN>", stdout.splitlines())
+        self.assertIn("~/.codex: not selectable; this login has no account note; add ~/rust/hanadocs/agents/codexN.md with the login for ~/.codex; then run accounts.py cutover-home <codexN>", stdout.splitlines())
         for command in (("swap", "workers", "codex1"), ("set-role", "workers", "codex1"),
                         ("swap", "workers", "default")):
             with self.subTest(command=command):
@@ -7223,7 +7847,7 @@ class SharedStatusDocumentTests(unittest.TestCase):
     def row(self) -> accounts.StatusRow:
         return accounts.StatusRow(
             label="fixture", tool="codex", folder="~/.codex1", login="fixture@example.invalid",
-            roles=("workers",), weekly_left_percent=60, resets_at=self.at + timedelta(days=1),
+            roles=("workers",), role_counts=(0,), weekly_left_percent=60, resets_at=self.at + timedelta(days=1),
             credits=13446, on_credits="no", use_credits=True, read_at=self.at,
             read_outcome=agent_accounts.UsageReadOutcome.OK, attempted_at=self.at)
 
@@ -7235,6 +7859,36 @@ class SharedStatusDocumentTests(unittest.TestCase):
         status = cast(dict[str, object], json.loads(accounts.render_status_json(self.reading(row))))
         self.assertEqual(status["problems"], ["Fixture problem."])
         return cast(list[dict[str, object]], status["accounts"])[0]
+
+    def test_usage_failure_timing_names_the_last_attempt_without_promising_a_retry(self) -> None:
+        now = datetime(2026, 11, 1, 12, tzinfo=timezone.utc)
+        read = datetime(2026, 10, 16, 10, 58, tzinfo=timezone.utc)
+        read_problem = cast(Callable[..., list[accounts.StatusProblem]], getattr(accounts, "_read_failure_problem"))
+        for outcome in (agent_accounts.UsageReadOutcome.ERROR, agent_accounts.UsageReadOutcome.RATE_LIMITED_429):
+            cases = (
+                (now, "last read attempted at 12:00"),
+                (now - timedelta(minutes=3), "last read attempted at 11:57"),
+                (now - timedelta(minutes=3, seconds=1), "last read attempted at 11:56"),
+                (read, "last read attempted at 10-16 10:58"),
+                (accounts.StatusUnavailable(), "no usage read has been attempted"),
+                (now + timedelta(minutes=1), "last read attempted at 12:01"),
+            )
+            for attempted, step in cases:
+                with self.subTest(outcome=outcome, attempted=attempted):
+                    row = replace(self.row(), read_at=read, attempted_at=attempted, read_outcome=outcome)
+                    problems = read_problem(row, timezone.utc, now=now)
+                    cause = "the usage read failed" if outcome == agent_accounts.UsageReadOutcome.ERROR else "the usage service is busy"
+                    line = f"* ~/.codex1: usage unavailable; {cause}; this shows the reading from 10-16 10:58; {step}"
+                    self.assertEqual([accounts.render_status_problem(problem) for problem in problems], [line])
+                    reading = replace(self.reading(row), notes=(line,), checked_at=now)
+                    self.assertIn(line, accounts.render_status_table(reading))
+                    self.assertEqual(cast(accounts.StatusDocument, json.loads(accounts.render_status_json(reading)))["problems"],
+                        [line.removeprefix("* ")])
+                    self.assertNotIn("next try", line)
+        row = replace(self.row(), read_at=now, attempted_at=now, read_outcome=agent_accounts.UsageReadOutcome.ERROR)
+        line = accounts.render_status_problem(read_problem(row, timezone.utc, now=now)[0])
+        self.assertIn("this shows the reading from 12:00; last read attempted at 12:00", line)
+        self.assertNotIn("11-01", line)
 
     def test_access_requires_a_stored_reading_and_an_ok_or_held_latest_outcome(self) -> None:
         for outcome in agent_accounts.UsageReadOutcome:
@@ -7271,7 +7925,7 @@ class SharedStatusDocumentTests(unittest.TestCase):
             '* Fixture problem.'
         ))
         self.assertEqual(self.document(self.row()), {
-            "label": "fixture", "tool": "codex", "roles": ["workers"],
+            "label": "fixture", "tool": "codex", "roles": ["workers"], "role_counts": [0],
             "weekly_left_percent": 60, "resets_at": "2026-10-17T18:00:00+00:00",
             "credits": 13446, "use_credits": True, "read_at": "2026-10-16T18:00:00+00:00",
             "read_ok": True, "credits_in_use": False,
@@ -7293,7 +7947,7 @@ class StatusProblemCauseTests(unittest.TestCase):
         _ = self.enterContext(patch.object(subprocess, "run", side_effect=AssertionError("no real child")))
         _ = self.enterContext(patch.object(subprocess, "Popen", side_effect=AssertionError("no real child")))
 
-    def reading(self, login: str, *, noted: bool = False) -> accounts.StatusReading:
+    def reading(self, login: str, *, noted: bool = False, diagnostics: tuple[str, ...] = ()) -> accounts.StatusReading:
         home = self.home / ".codex"
         home.mkdir(exist_ok=True)
         auth = home / "auth.json"
@@ -7302,7 +7956,7 @@ class StatusProblemCauseTests(unittest.TestCase):
         os.utime(auth, (at.timestamp(), at.timestamp()))
         status = accounts.CodexStatus("~/.codex", home, True, True,
             "codex1" if noted else accounts.NO_VALUE, login, "workers",
-            () if noted else (accounts.unnoted_home_line(home, login),), ())
+            diagnostics if noted else (accounts.unnoted_home_line(home, login), *diagnostics), ())
         usage = {usage_store.key("Codex", login): usage_store.StoredUsage(
             read_outcome=agent_accounts.UsageReadOutcome.ERROR,
             attempt_outcome=agent_accounts.UsageReadOutcome.ERROR, attempted_at=at.isoformat())}
@@ -7485,6 +8139,40 @@ class StatusProblemCauseTests(unittest.TestCase):
         self.assertTrue(any("test wrote" in line for line in reading.notes))
         self.assertFalse(any("account note" in line or "setup claude2" in line or "cutover-home" in line for line in reading.notes))
 
+    def test_legacy_codex_duplicate_has_one_complete_step_and_no_login_in_either_view(self) -> None:
+        for login in ("private-owner@provider.io", "private-account-id"):
+            with self.subTest(identity=login.split("@")[-1]):
+                diagnostic = f"accounts: ~/.codex and ~/.codex1 hold {login}; keep each login in one home"
+                reading = self.reading(login, noted=True, diagnostics=(diagnostic,))
+                expected = ("codex1: ~/.codex still holds codex1's login; stop what uses ~/.codex "
+                    + "(such as the ChatGPT app), then run accounts.py cutover-home codex1")
+                lines = [line for line in reading.notes if "~/.codex" in line]
+                self.assertEqual(lines, [expected])
+                document = cast(accounts.StatusDocument, json.loads(accounts.render_status_json(reading)))
+                self.assertEqual([line for line in document["problems"] if "~/.codex" in line], [expected])
+                self.assertNotIn(login, accounts.render_status_table(reading))
+                self.assertNotIn(login, accounts.render_status_json(reading))
+
+    def test_status_identity_and_note_repairs_never_print_the_login(self) -> None:
+        for login in ("private-owner@provider.io", "private-account-id"):
+            for fault in ("wrong login", "missing note", "unreadable note", "unnoted"):
+                with self.subTest(identity=login.split("@")[-1], fault=fault):
+                    directory = self.home / ".claude2"
+                    note = self.home / "notes/claude2.md"
+                    diagnostics = {
+                        "wrong login": f"accounts: ~/.claude2 is logged in as {login}, not claude2",
+                        "missing note": f"accounts: claude2 has no account note at {note}",
+                        "unreadable note": f"accounts: {note} has no readable login in its frontmatter",
+                        "unnoted": accounts.unnoted_home_line(directory, login),
+                    }
+                    status = accounts.AccountStatus("~/.claude2", directory, True, True, True,
+                        "claude2", login, "", (diagnostics[fault],), (), accounts.McpServerDifferences())
+                    reading = self.status_with([status], [], usage_store.StoredUsage())
+                    self.assertTrue(any(line.startswith("claude2:") for line in reading.notes))
+                    for line in reading.notes:
+                        self.assertNotIn(login, line)
+                    self.assertNotIn(login, accounts.render_status_json(reading))
+
     def test_duplicate_home_diagnostic_is_one_line_when_both_rows_have_one_account(self) -> None:
         statuses = self.codex_inventory(duplicate=True)
         self.assertEqual([status.label for status in statuses], ["codex1"])
@@ -7515,8 +8203,10 @@ class StatusProblemCauseTests(unittest.TestCase):
                 "units: not configured; the role map selects no account; run accounts.py move units <claudeN>",
                 "showrunners: not configured; the role map selects no account; run accounts.py move showrunners <claudeN>",
             ]
-            for first, second in (("~/.codex", "~/.codex1"), ("~/.codex", "~/.codex2"), ("~/.codex1", "~/.codex2")):
-                expected.append(f"codex1: login is stored in two homes; {first} and {second} are logged in as fixture@notexample.com; two homes on one login break token refresh; keep each login in one home")
+            expected.extend((
+                "codex1: ~/.codex still holds codex1's login; stop what uses ~/.codex (such as the ChatGPT app), then run accounts.py cutover-home codex1",
+                "codex1: login is stored in two homes; ~/.codex1 and ~/.codex2 store codex1's login; two homes on one login break token refresh; keep each login in one home",
+            ))
             lines = list(reading.notes)
             observed.append(sorted(lines))
             self.assertCountEqual(lines, expected)
@@ -7550,19 +8240,21 @@ class StatusProblemCauseTests(unittest.TestCase):
                     reading = accounts.read_status()
                 at = reading.rows[0].read_at
                 self.assertIsInstance(at, datetime)
-                previous = f"this shows the reading from {cast(datetime, at):%H:%M}"
+                local = cast(datetime, at)
+                previous = "this shows the reading from " + local.strftime(
+                    "%H:%M" if local.date() == reading.checked_at.date() else "%m-%d %H:%M")
                 expected = [
                     "units: not configured; the role map selects no account; run accounts.py move units <claudeN>",
                     "showrunners: not configured; the role map selects no account; run accounts.py move showrunners <claudeN>",
                     "* codex1: usage unavailable; Codex did not start at ~/.codex1; " + previous
                         + "; run accounts.py setup codex1 and try again"
-                        + ("; next try in 2 min" if outcome == agent_accounts.UsageReadOutcome.ERROR else
+                        + ("; no usage read has been attempted" if outcome == agent_accounts.UsageReadOutcome.ERROR else
                            "; start a session on it to check it" if outcome == agent_accounts.UsageReadOutcome.REFUSED_401 else ""),
-                    "codex1: login is stored in two homes; ~/.codex1 and ~/.codex2 are logged in as fixture@notexample.com; two homes on one login break token refresh; keep each login in one home",
+                    "codex1: login is stored in two homes; ~/.codex1 and ~/.codex2 store codex1's login; two homes on one login break token refresh; keep each login in one home",
                 ]
                 if outcome != agent_accounts.UsageReadOutcome.OK:
                     expected.append("* codex1: usage unavailable; " + (
-                        "the usage read failed; " + previous + "; next try in 2 min"
+                        "the usage read failed; " + previous + "; no usage read has been attempted"
                         if outcome == agent_accounts.UsageReadOutcome.ERROR else
                         "the usage service did not accept this login; start a session on it to check it"))
                 terminal = accounts.render_status_table(reading).splitlines()
@@ -7609,7 +8301,7 @@ class StatusProblemCauseTests(unittest.TestCase):
         reading = self.status_with(statuses, [], usage_store.StoredUsage(
             read_outcome=agent_accounts.UsageReadOutcome.ERROR,
             attempt_outcome=agent_accounts.UsageReadOutcome.ERROR))
-        line = "* claude2: usage unavailable; the usage read failed; no reading is stored yet; next try in 2 min"
+        line = "* claude2: usage unavailable; the usage read failed; no reading is stored yet; no usage read has been attempted"
         self.assertIn(line, reading.notes)
         self.assertIn(line, accounts.render_status_table(reading).splitlines())
         self.assertIn(line.removeprefix("* "), cast(accounts.StatusDocument,
@@ -7625,7 +8317,7 @@ class StatusProblemCauseTests(unittest.TestCase):
             weekly=usage_store.StoredWindow(left=50, resets="2026-11-01T01:14:00+00:00", at="2026-10-29T01:14:00+00:00"), attempted_at="2026-10-29T01:20:00+00:00")
         lines = self.status_with([status], [], usage).notes
         self.assertTrue(any("cannot read" in line for line in lines))
-        self.assertIn("* claude2: usage unavailable; the usage service is busy; this shows the reading from 01:14; next try after 01:30", lines)
+        self.assertIn("* claude2: usage unavailable; the usage service is busy; this shows the reading from 10-29 01:14; last read attempted at 10-29 01:20", lines)
 
     def test_test_signin_with_malformed_or_unreadable_note_has_only_delete_advice(self) -> None:
         directory = self.home / ".claude2"
@@ -7673,7 +8365,7 @@ class StatusProblemCauseTests(unittest.TestCase):
             failures = [line for line in lines if "Codex did not start" in line]
             self.assertEqual(len(failures), 1)
             self.assertIn("~/.codex1", failures[0])
-            self.assertIn("reading from 01:14", failures[0])
+            self.assertIn("reading from 10-29 01:14", failures[0])
             self.assertIn("accounts.py setup codex1", failures[0])
 
     def test_duplicate_identity_keeps_independent_rate_limit_and_its_times(self) -> None:
@@ -7698,7 +8390,7 @@ class StatusProblemCauseTests(unittest.TestCase):
             attempted_at="2026-10-29T01:20:00+00:00")
         lines = self.status_with([], statuses, usage).notes
         for number in (1, 2):
-            self.assertIn(f"* codex{number}: usage unavailable; the usage service is busy; this shows the reading from 01:14; next try after 01:30", lines)
+            self.assertIn(f"* codex{number}: usage unavailable; the usage service is busy; this shows the reading from 10-29 01:14; last read attempted at 10-29 01:20", lines)
         self.assertEqual(len([line for line in lines if "login is stored in two homes;" in line]), 1)
         duplicate = next(line for line in lines if "login is stored in two homes;" in line)
         self.assertIn("~/.codex1", duplicate)
@@ -7755,7 +8447,7 @@ class StatusProblemCauseTests(unittest.TestCase):
         lines = [line for line in self.status_with([], [status], usage).notes if "codex1:" in line]
         self.assertEqual(len(lines), 1)
         self.assertIn("Codex did not start", lines[0])
-        self.assertIn("reading from 01:14", lines[0])
+        self.assertIn("reading from 10-29 01:14", lines[0])
         self.assertIn("accounts.py setup codex1", lines[0])
 
     def test_invalid_existing_claude_identity_requires_login_repair(self) -> None:
@@ -7794,7 +8486,7 @@ class StatusProblemCauseTests(unittest.TestCase):
             "showrunners: not configured; the role map selects no account; run accounts.py move showrunners <claudeN>",
             "codex1: test sign-in is stored; a test wrote ~/.codex/auth.json at 2026-10-29 01:14 UTC; delete ~/.codex/auth.json",
             "codex1: test sign-in is stored; a test wrote ~/.codex1/auth.json at 2026-10-29 01:15 UTC; delete ~/.codex1/auth.json",
-            "codex1: login is stored in two homes; ~/.codex and ~/.codex1 are logged in as fixture@example.invalid; two homes on one login break token refresh; keep each login in one home",
+            "codex1: login is stored in two homes; ~/.codex and ~/.codex1 store codex1's login; two homes on one login break token refresh; keep each login in one home",
         ]
         self.assertCountEqual(accounts.render_status_table(reading).split("\n\n", 1)[1].strip().splitlines(), expected)
         self.assertCountEqual(cast(accounts.StatusDocument, json.loads(accounts.render_status_json(reading)))["problems"], expected)
@@ -7830,11 +8522,11 @@ class StatusProblemCauseTests(unittest.TestCase):
         reading = self.reading("fixture@notexample.com")
         lines = [line for line in reading.notes if "~/.codex" in line]
         self.assertEqual(len(lines), 2)
-        self.assertIn("* ~/.codex: usage unavailable; the usage read failed; no reading is stored yet; next try in 2 min", lines)
+        self.assertIn("* ~/.codex: usage unavailable; the usage read failed; no reading is stored yet; last read attempted at 10-29 01:14", lines)
         lines = [line for line in lines if "no account note" in line]
         self.assertEqual(len(lines), 1)
         self.assertIn("no account note", lines[0])
-        self.assertIn("login: fixture@notexample.com", lines[0])
+        self.assertIn("with the login for ~/.codex", lines[0])
         self.assertIn("accounts.py cutover-home", lines[0])
         self.assertNotIn("usage read failed", lines[0])
 
@@ -7901,7 +8593,7 @@ class StatusProblemCauseTests(unittest.TestCase):
             (f"accounts: {directory} is not logged in", "signed out", "no readable sign-in", "/login"),
             (f"accounts: could not read {directory}: permission denied", "access", "permission denied", "permissions"),
             ("accounts: claude2 has no account note at /fixture/claude2.md", "note", "/fixture/claude2.md", "add the account note"),
-            ("accounts: ~/.claude2 is logged in as owner@example.invalid, not claude2", "wrong login", "owner@example.invalid", "/login"),
+            ("accounts: ~/.claude2 is logged in as owner@example.invalid, not claude2", "wrong login", "holds a different login from claude2", "/login"),
             ("accounts: units has no account; run accounts.py move units <claudeN>", "role", "selects no account", "accounts.py move units"),
             ("accounts: units is on claude2, which is not set up on this machine; run accounts.py setup claude2", "role", "claude2", "accounts.py setup claude2"),
             ("accounts: cannot read role map from natedev; no usable map", "role", "no usable map", "restore access"),
@@ -7934,9 +8626,9 @@ class StatusProblemCauseTests(unittest.TestCase):
     def test_all_problem_parts_use_one_renderer_and_named_absence_variants(self) -> None:
         problem = accounts.StatusProblem("codex1", "usage unavailable",
             accounts.ProblemCause("usage", "the service is busy"),
-            accounts.ProblemStep("next try after 01:24"), footnote=True)
+            accounts.ProblemStep("last read attempted at 01:14"), footnote=True)
         self.assertEqual(accounts.render_status_problem(problem),
-            "* codex1: usage unavailable; the service is busy; next try after 01:24")
+            "* codex1: usage unavailable; the service is busy; last read attempted at 01:14")
         self.assertEqual(accounts.render_status_problem(accounts.StatusProblem("codex1", "check failed",
             accounts.NoSeparateCause(), accounts.NoUserStep())), "codex1: check failed")
 

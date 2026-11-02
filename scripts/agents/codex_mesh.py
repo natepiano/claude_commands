@@ -26,9 +26,9 @@ Verbs:
   serve  Start the session's app-server and record where it listens.
   start  Launch one worker as a named thread; block until its turn ends.
          The last reply lands in --summary-file, unless --reply-file names
-         where replies go: then the summary file belongs to the worker,
-         which writes it as its own last act, and the reply fills it only
-         when the worker left it empty.
+         where replies go. A writable worker may supply its own summary;
+         otherwise the runner fills the empty summary from the final reply.
+         Read-only reviewers return their entire result in that reply.
          With --resident, stay attached across turns instead: each finished
          turn is printed to stdout and delivered the same way, the thread
          keeps accepting `send`, and only `end` releases the block.
@@ -92,6 +92,8 @@ from scripts.agents import worker_lifecycle
 NO_LOCK_DEADLINE = worker_lifecycle.NO_LOCK_DEADLINE
 from scripts.lib import nix_env, process_group, unit_runs
 from scripts.lib.probe_session import PROBE_ENV
+from scripts.production import worker_admission
+from scripts.production.worker_admission import WorkerAdmitted
 from scripts.astra.design_roles import PhaseBoundDesigner, ReadOnlyReviewer, ThreadAccessPolicy
 from scripts.message import sessions, process_table
 from scripts.message import repeat_guard
@@ -2042,6 +2044,44 @@ def _loaded_thread_ids(client: Client, deadline: float) -> set[str]:
     raise SystemExit("loaded-thread list timed out")
 
 
+def loaded_threads(run: Path, deadline: float) -> set[str]:
+    """Observe every live run server completely within one monotonic deadline."""
+    records: list[tuple[Path, dict[str, object]]] = []
+    for filename in (SERVER_FILE, RETIRED_FILE):
+        path = run / filename
+        if not path.exists():
+            continue
+        try:
+            record = worker_lifecycle.validate_worker_state(path, worker_lifecycle.read_json_object(path))
+        except worker_lifecycle.WorkerStateUnreadable as error:
+            raise ValueError(f"{path}: Codex thread activity is unavailable: {error}") from error
+        if filename == RETIRED_FILE:
+            records.extend((path, _as_dict(entry)) for entry in cast(list[object], record["servers"]))
+        else:
+            records.append((path, record))
+    loaded: set[str] = set()
+    ports: set[int] = set()
+    for path, record in records:
+        port, pid = record["port"], record["pid"]
+        if type(port) is not int or not 0 < port <= 65535:
+            raise worker_lifecycle.WorkerStateUnreadable(path, "invalid server port")
+        assert isinstance(pid, int)
+        if not _pid_alive(pid) or port in ports:
+            continue
+        ports.add(port)
+        try:
+            if time.monotonic() >= deadline:
+                raise TimeoutError("loaded-thread observation timed out")
+            client = Client(port, f"staff-fill-{os.getpid()}", operation_deadline=deadline)
+            try:
+                loaded.update(_loaded_thread_ids(client, deadline))
+            finally:
+                client.close()
+        except (SystemExit, OSError, ValueError, worker_lifecycle.OperationDeadlineExpired) as error:
+            raise ValueError(f"{path}: Codex thread activity is unavailable: {error}") from error
+    return loaded
+
+
 def _server_holds(port: int, thread_id: str) -> bool:
     try:
         client = Client(port, f"worker-lookup-{os.getpid()}")
@@ -2526,10 +2566,10 @@ def _finish_summary(
     """Leave the worker's answer where the caller will read it.
 
     With no reply file the summary file receives the answer. With one, the
-    answer goes there, and the summary file is written only when the worker
-    left it empty: the launcher truncates it at launch and the worker fills
-    it as its last act, so a non-empty file is the worker's own summary and
-    the last chat reply must not replace it.
+    answer goes there, and fills the summary only when it is empty. Launchers
+    truncate the summary at launch. Read-only reviewers return their entire
+    result in the reply; writable workers may instead write their own summary.
+    A non-empty worker summary must not be replaced by the last chat reply.
     """
     if reply_path is None:
         _ = summary_path.write_text(final_answer + "\n", encoding="utf-8")
@@ -3693,6 +3733,11 @@ def command_start(args: argparse.Namespace) -> int:
     session_dir = _as_str(_attr(args, "session_dir"))
     name = _as_str(_attr(args, "name"))
     resident = getattr(args, "resident", False) is True
+    try:
+        staff_admission = worker_admission.admit(name, Path(session_dir))
+    except ValueError as error:
+        print(str(error), file=sys.stderr)
+        return 2
     with contextlib.ExitStack() as admission:
         membership = admission.enter_context(worker_lifecycle.lock_membership(session_dir))
         with worker_lifecycle.lock_worker(session_dir, name):
@@ -3703,7 +3748,7 @@ def command_start(args: argparse.Namespace) -> int:
                 return 2
             port, fresh_server = ensure_server(session_dir, cwd=_as_str(_attr(args, "cwd")) or None)
         outcome = _run_worker(args, port, started_here=fresh_server,
-                              admission=WorkerAdmission(admission, membership))
+                              admission=WorkerAdmission(admission, membership), staff_admission=staff_admission)
     if isinstance(outcome, WorkerLaunchRefused):
         return 2
     tested = fresh_server
@@ -3719,7 +3764,7 @@ def command_start(args: argparse.Namespace) -> int:
             membership = admission.enter_context(worker_lifecycle.lock_membership(session_dir))
             port, _fresh = ensure_server(session_dir, cwd=_as_str(_attr(args, "cwd")) or None)
             outcome = _run_worker(args, port, started_here=_fresh,
-                                  admission=WorkerAdmission(admission, membership))
+                                  admission=WorkerAdmission(admission, membership), staff_admission=staff_admission)
         tested = True
     if (isinstance(outcome, (FailedWithThread, CapacityRetriesExhausted))
             and isinstance(outcome.pending_refusal, PendingQuotaRefusal)):
@@ -3795,6 +3840,11 @@ def _follow_worker(args: argparse.Namespace) -> int:
         if reason:
             print(f"codex_mesh: {display_name}: {reason}; follow refused", file=sys.stderr)
             return 2
+    try:
+        staff_admission = _admit_worker(name, session_dir)
+    except ValueError as error:
+        print(str(error), file=sys.stderr)
+        return 2
     assert not isinstance(state, InvalidThread)
     thread_id = state.thread_id
     if not claim_pid and not _claim_follow(
@@ -3833,7 +3883,7 @@ def _follow_worker(args: argparse.Namespace) -> int:
             # Held under the pending lock: a message held while the roster moves to a replacement
             # thread waits here, then lands on the replacement with the ones carried over.
             with _pending_file(session_dir, name) as handle:
-                resumed = _resume_worker_thread(args, session_dir, name, thread_id, client, home)
+                resumed = _resume_worker_thread(args, session_dir, name, thread_id, client, home, staff_admission=staff_admission)
                 if resumed.thread_replaced:
                     carried = _pending_for_thread(handle, thread_id)
                     if carried:
@@ -4162,14 +4212,21 @@ def command_release_follow(args: argparse.Namespace) -> int:
 
 
 def _run_worker(args: argparse.Namespace, port: int, *, started_here: bool = False,
-                admission: WorkerAdmission | IndependentWorkerAdmission = INDEPENDENT_WORKER_ADMISSION) -> RunOutcome:
+                admission: WorkerAdmission | IndependentWorkerAdmission = INDEPENDENT_WORKER_ADMISSION,
+                staff_admission: WorkerAdmitted | None = None) -> RunOutcome:
     """Attach one worker to the app-server on `port` and run it to its end."""
     session_dir = _as_str(_attr(args, "session_dir"))
+    if staff_admission is None:
+        try:
+            staff_admission = worker_admission.admit(_as_str(_attr(args, "name")), Path(session_dir))
+        except ValueError as error:
+            print(str(error), file=sys.stderr)
+            return WorkerLaunchRefused()
     name = _as_str(_attr(args, "name"))
     timeout = _as_float(_attr(args, "timeout"), 86400.0)
     opened = time.time()
     try:
-        return _attach_and_run(args, port, session_dir, name, timeout, opened, started_here=started_here, admission=admission)
+        return _attach_and_run(args, port, session_dir, name, timeout, opened, started_here=started_here, admission=admission, staff_admission=staff_admission)
     except (ConnectionError, OSError, SystemExit) as exc:
         return FailedBeforeThread(str(exc) or exc.__class__.__name__, time.time() - opened,
             exc.serving if isinstance(exc, ServingRequestFailure) else NotBoundCodexServer(),
@@ -4209,9 +4266,11 @@ def _attach_and_run(
     name: str,
     timeout: float,
     opened: float,
-    *, started_here: bool = False,
+    *, staff_admission: WorkerAdmitted, started_here: bool = False,
     admission: WorkerAdmission | IndependentWorkerAdmission = INDEPENDENT_WORKER_ADMISSION,
 ) -> RunOutcome:
+    if staff_admission.row.name != name:
+        raise ValueError("staff admission names another worker")
     prompt = Path(_as_str(_attr(args, "prompt_file"))).read_text(encoding="utf-8")
     log_path = Path(_as_str(_attr(args, "log_file")))
 
@@ -5512,8 +5571,10 @@ def _refuse_taken_follow_up(client: Client, replacement: str, session_dir: str) 
 
 def _resume_worker_thread(
     args: argparse.Namespace, session_dir: str, name: str, thread_id: str, client: Client,
-    workers_home: Path,
+    workers_home: Path, *, staff_admission: WorkerAdmitted,
 ) -> _WorkerThreadForHome:
+    if staff_admission.row.name != name:
+        raise ValueError("staff admission names another worker")
     params = _resume_params(session_dir, name, thread_id)
     previous_record = _lookup(session_dir, name)
     instructions_file = _as_str(previous_record.get("instructions_file"))
@@ -5706,6 +5767,10 @@ def _move_idle_worker(
     *, message: str = "",
 ) -> WorkerMoveResult:
     """Check one new-turn boundary and move an idle thread onto the workers home."""
+    try:
+        staff_admission = _admit_worker(name, session_dir)
+    except ValueError as error:
+        return WorkerThreadStateUnknown(str(error))
     with worker_lifecycle.membership_operation(session_dir), worker_lifecycle.lock_worker(session_dir, name):
         owner = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
         if not RosterActiveLauncher(thread_id, (client.launcher_pid, os.getpid())).owns(owner):
@@ -5778,7 +5843,7 @@ def _move_idle_worker(
                     moved.launcher_pid = client.launcher_pid
                     _ = _bind_serving_server(moved, session_dir, started_here=_fresh)
                     try:
-                        resumed = _resume_worker_thread(args, session_dir, name, thread_id, moved, worker_home_for_turn)
+                        resumed = _resume_worker_thread(args, session_dir, name, thread_id, moved, worker_home_for_turn, staff_admission=staff_admission)
                         thread_id, replaced = resumed.thread_id, resumed.thread_replaced
                         if replaced:
                             _write_pending(handle, thread_id, messages)
@@ -6730,6 +6795,16 @@ class UnrecordedWorkerThread:
 def open_unit_worker(session_dir: str, name: str, role: str, *, model: str = "",
                      effort: str = "") -> dict[str, object]:
     """Open an idle thread; assignment starts its first turn later through follow."""
+    try:
+        admitted = worker_admission.admit(name, Path(session_dir))
+    except ValueError as error:
+        raise unit_workers.WorkerUnavailable(str(error)) from error
+    return _open_admitted_worker(session_dir, role, admitted, model=model, effort=effort)
+
+
+def _open_admitted_worker(session_dir: str, role: str, admitted: WorkerAdmitted, *,
+                          model: str, effort: str) -> dict[str, object]:
+    name = admitted.row.name
     with worker_lifecycle.membership_operation(session_dir):
         with worker_lifecycle.lock_worker(session_dir, name):
             command = ['bash', '-c',
@@ -6768,7 +6843,7 @@ def open_unit_worker(session_dir: str, name: str, role: str, *, model: str = "",
                 if not _update_roster_if_expected(session_dir, name, record, RosterAbsent()):
                     raise unit_workers.WorkerUnavailable(f"{name}: worker name was claimed")
                 allocation = NoThreadToRelease()
-                admitted = {**record, "codex_home": str(home)}
+                opened = {**record, "codex_home": str(home)}
             finally:
                 try:
                     if isinstance(allocation, UnrecordedWorkerThread):
@@ -6779,7 +6854,7 @@ def open_unit_worker(session_dir: str, name: str, role: str, *, model: str = "",
                 finally:
                     client.close()
         # Admission projection belongs here, after lifecycle and before membership release.
-        return admitted
+        return opened
 
 
 def command_adopt(args: argparse.Namespace) -> int:
@@ -8986,10 +9061,33 @@ def _failure_account_detail(error: BaseException, serving: CodexServingState) ->
     return f"{name} ({codex_home_display(serving.home)}): {error}"
 
 
+def _admit_worker(name: str, session_dir: str, *, held_design: str = "") -> WorkerAdmitted:
+    """Held roles belong to their recorded design holder, never the caller's session."""
+    recorded = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
+    held = held_design or _as_str(recorded.get("held_design_id"))
+    if held:
+        from scripts.astra import design_roles
+        holder = design_roles.read_design(held).holder
+        return worker_admission.admit(name, Path(session_dir), production=holder.production_slug,
+                                        unit=holder.unit_name if isinstance(holder, design_roles.UnitHolder) else "")
+    return worker_admission.admit(name, Path(session_dir))
+
+
 def command_prime(args: argparse.Namespace) -> int:
     """Create a read-only reviewer template without starting a turn."""
     session_dir = _as_str(_attr(args, "session_dir"))
     name = _as_str(_attr(args, "name"))
+    try:
+        admitted = _admit_worker(name, session_dir, held_design=_as_str(_attr(args, "held_design")))
+    except ValueError as error:
+        print(str(error), file=sys.stderr)
+        return 2
+    return _prime_admitted_worker(args, admitted)
+
+
+def _prime_admitted_worker(args: argparse.Namespace, admitted: WorkerAdmitted) -> int:
+    session_dir = _as_str(_attr(args, "session_dir"))
+    name = admitted.row.name
     with worker_lifecycle.membership_operation(session_dir), worker_lifecycle.lock_worker(session_dir, name):
         client: Client | None = None
         try:
@@ -9076,6 +9174,17 @@ def command_fork(args: argparse.Namespace) -> int:
     """Load a template and create a named read-only reviewer from it."""
     session_dir = _as_str(_attr(args, "session_dir"))
     name = _as_str(_attr(args, "name"))
+    try:
+        admitted = worker_admission.admit(name, Path(session_dir))
+    except ValueError as error:
+        print(str(error), file=sys.stderr)
+        return 2
+    return _fork_admitted_worker(args, admitted)
+
+
+def _fork_admitted_worker(args: argparse.Namespace, admitted: WorkerAdmitted) -> int:
+    session_dir = _as_str(_attr(args, "session_dir"))
+    name = admitted.row.name
     with worker_lifecycle.membership_operation(session_dir), worker_lifecycle.lock_workers(
             worker_lifecycle.WorkerIdentity(Path(session_dir), name),
             worker_lifecycle.WorkerIdentity(Path(session_dir), _as_str(_attr(args, "from_name")))):
@@ -9461,6 +9570,9 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     handler = cast("Callable[[argparse.Namespace], int]", _attr(args, "handler"))
     try:
+        if handler is command_start:
+            # Preserve the CLI's account-configuration refusal before any admission write.
+            _ = workers_home()
         return handler(args)
     except worker_lifecycle.WorkerStateUnreadable as error:
         print(f"codex_mesh: {error}; worker operation refused", file=sys.stderr)

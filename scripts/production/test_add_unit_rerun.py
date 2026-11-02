@@ -17,6 +17,7 @@ import resume_unit
 import retire_unit
 import atomic_file
 from production_units import read_production
+from scripts.production import staff, unit_config
 
 
 def setUpModule() -> None:
@@ -24,6 +25,64 @@ def setUpModule() -> None:
 
 
 class AddUnitRerunTests(AddUnitTestCase):
+    def test_retry_after_brief_commit_updates_the_worktree_before_launch(self) -> None:
+        commit = add_unit.commit_unit
+
+        def interrupted(request: add_unit.UnitLaunch, transition: add_unit.NoPlanTransition | add_unit.BriefToPlanTransition) -> None:
+            commit(request, transition)
+            raise OSError("stopped after brief commit")
+
+        with patch.object(add_unit, "commit_unit", side_effect=interrupted):
+            stopped = self.cli("alpha", "--brief", "Keep the committed brief in the unit worktree.")
+        self.assertEqual(stopped.returncode, 1, stopped.stdout + stopped.stderr)
+        worktree = self.root / "project-alpha"
+        config = unit_config.read(worktree)
+        assert isinstance(config, unit_config.UnitConfig)
+        assert isinstance(config.plan, unit_config.PlanFile)
+        self.assertFalse((worktree / config.plan.path).exists())
+        self.assertEqual(self.doc.read_text().count("| alpha-unit |"), 1)
+        _ = self.successful("alpha", "--brief", "Keep the committed brief in the unit worktree.")
+        self.assertEqual((worktree / config.plan.path).read_bytes(), (self.checkout / config.plan.path).read_bytes())
+        self.assertEqual(self.git("-C", str(worktree), "rev-parse", "HEAD"),
+                         self.git("rev-parse", "build-followups"))
+        row = next(row for row in staff.find(kind="unit") if row.name == "alpha")
+        before = (self.staff.staff_file.read_bytes(), self.doc.read_bytes(), (worktree / ".unit.toml").read_bytes(),
+                  self.git("-C", str(worktree), "rev-parse", "HEAD"))
+        starts = sum(command[2:4] == ["agent", "start"] for command in self.herdr_calls())
+        _ = self.successful("alpha", "--brief", "Keep the committed brief in the unit worktree.")
+        self.assertEqual((self.staff.staff_file.read_bytes(), self.doc.read_bytes(), (worktree / ".unit.toml").read_bytes(),
+                          self.git("-C", str(worktree), "rev-parse", "HEAD")), before)
+        self.assertEqual(staff.by_id(row.id), row)
+        self.assertEqual(sum(command[2:4] == ["agent", "start"] for command in self.herdr_calls()), starts)
+
+    def test_retry_after_config_publication_reuses_the_row_file_and_launch(self) -> None:
+        publish = unit_config.write
+
+        def interrupted(worktree: Path, config: unit_config.UnitConfig) -> None:
+            publish(worktree, config)
+            raise OSError("stopped after config publication")
+
+        arguments = ("alpha", "--plan", "docs/plans/given.md", "--port", "8123",
+                     "--responsibility", "nightly")
+        with patch.object(unit_config, "write", side_effect=interrupted):
+            stopped = self.cli(*arguments)
+        self.assertEqual(stopped.returncode, 1, stopped.stdout + stopped.stderr)
+        row = next(row for row in staff.find(kind="unit") if row.name == "alpha")
+        path = self.root / "project-alpha/.unit.toml"
+        self.assertEqual(row.worktree, staff.PresentWorktree("natedev", path.parent))
+        before = path.read_bytes(), path.stat().st_mtime_ns
+        self.assertFalse(any(command[2:4] == ["agent", "start"] for command in self.herdr_calls()))
+        _ = self.successful(*arguments)
+        self.assertEqual(staff.by_id(row.id), row)
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+        self.assertEqual(self.pane_environment()["STAFF_ID"], row.id)
+        calls = self.herdr_calls()
+        _ = self.successful(*arguments)
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+        self.assertEqual(staff.by_id(row.id), row)
+        self.assertEqual([command for command in self.herdr_calls()[len(calls):]
+                          if command[2:4] in (["agent", "start"], ["pane", "close"], ["tab", "create"])], [])
+
     def test_retired_resume_finishes_the_live_sessions_pending_opening(self) -> None:
         prior = self.root / "prior-session"
         prior.mkdir()
@@ -106,7 +165,7 @@ class AddUnitRerunTests(AddUnitTestCase):
               patch.object(sessions, "session_liveness", return_value=sessions.LiveSessionProcess(5678))):
             refused = self.cli("alpha", "--plan", "docs/plans/given.md")
         self.assertEqual(refused.returncode, 2, refused.stderr)
-        self.assertIn("pending opening does not name the marked unit's live session", refused.stderr)
+        self.assertIn("pending opening does not name the session that carries the unit's session label", refused.stderr)
         self.assertTrue((self.checkout / ".git/add-unit-openings/alpha-unit.json").exists())
 
     def test_unsubmitted_opening_on_rerun_is_a_refusal_then_can_finish(self) -> None:

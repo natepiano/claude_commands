@@ -334,6 +334,7 @@ class AddUnitAccountsTests(AddUnitTestCase):
 
     def test_restore_uses_its_pane_account_instead_of_the_current_group(self) -> None:
         self.commit_prepared_row(self.unit_row())
+        _ = self.prepare_restored_worktree("alpha", self.root / "project-alpha")
         directory = self.prepare_unit_account("claude1")
         other_directory = self.prepare_unit_account("claude3")
         self.env["CLAUDE_CONFIG_DIR"] = str(other_directory)

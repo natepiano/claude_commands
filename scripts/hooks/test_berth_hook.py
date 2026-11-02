@@ -60,6 +60,7 @@ class BerthHookTests(unittest.TestCase):
     session_dir: Path = Path()
     bin_dir: Path = Path()
     environment: dict[str, str] = {}
+    held_head: str = ""
 
     @override
     def setUp(self) -> None:
@@ -392,14 +393,15 @@ class BerthHookTests(unittest.TestCase):
         """Phase 15's own session maps to a reservation the board shows active, with the phase baseline written."""
         self.map_phase_session("15")
         self.board("active")
+        self.held_head = phase_reservation.commit_id(self.repo, "HEAD")
         _ = (phase_reservation.phase_directory(self.session_dir, "15") / phase_reservation.BASELINE_FILE).write_text(
-            HEAD + "\n")
+            self.held_head + "\n")
 
     def assert_held_without_a_check(self) -> None:
         self.assertEqual([call["argv"] for call in self.berth_calls()],
                          [["board", "--reservation", RESERVATION, "--json"]])
         self.assertEqual(self.state()["active_phase_reservation"], {
-            "reservation_id": RESERVATION, "coordination_run_id": RUN, "phase": "15", "phase_start_head": HEAD})
+            "reservation_id": RESERVATION, "coordination_run_id": RUN, "phase": "15", "phase_start_head": self.held_head})
 
     def test_an_edit_in_a_phase_that_holds_its_reservation_runs_no_berth_check(self) -> None:
         # The check took 77 s on 2026-10-29; Codex stops this hook at 30 s and refused the edit.

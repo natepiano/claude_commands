@@ -254,6 +254,14 @@ class NightlyProductionTests(NightlyReviewTests):
     def runners(self, *docs: tuple[str, str]) -> list[showrunners.Showrunner]:
         return [showrunners.Showrunner(session="", socket="", slug=slug, zone="", doc=doc) for slug, doc in docs]
 
+    def test_unknown_production_cannot_make_the_nightly_owner_appear_unique(self) -> None:
+        healthy = self.runners(("one", self.doc("one", "permanent")))
+        partial = showrunners.ShowrunnerDiscovery(healthy, (
+            showrunners.ShowrunnerLookupFailure("missing", "fixture lookup failed"),))
+        with mock.patch.object(showrunners, "registered_showrunners", return_value=partial):
+            with self.assertRaisesRegex(OSError, "fixture lookup failed"):
+                _ = nightly_review.nightly_production()
+
     def test_the_production_with_the_permanent_row_is_found(self) -> None:
         listed = self.runners(("one", self.doc("one", "standby")), ("two", self.doc("two", "permanent")))
         with mock.patch.object(showrunners, "registered_showrunners", return_value=listed):

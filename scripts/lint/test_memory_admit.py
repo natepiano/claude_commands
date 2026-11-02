@@ -199,6 +199,50 @@ class BuildBudgetTests(unittest.TestCase):
                 self.assertEqual(gate.build_budget_bytes(), 21 * GIB)
 
 
+    def test_running_pass_interval_uses_fallback_and_reads_config_at_each_use(self) -> None:
+        self.assertEqual(gate.running_pass_seconds(), 5)
+        for raw in ("", "abc", "-5", "nan"):
+            with self.subTest(raw=raw):
+                _ = self.config.write_text(f"[memory]\nrunning_pass_seconds={raw}\n")
+                self.assertEqual(gate.running_pass_seconds(), 5)
+        for seconds in (3, 7.5):
+            _ = self.config.write_text(f"[memory]\nrunning_pass_seconds={seconds}\n")
+            self.assertEqual(gate.running_pass_seconds(), seconds)
+
+    def test_service_intervals_use_positive_finite_config_and_read_each_use(self) -> None:
+        readers = (
+            ("waiting_pass_seconds", gate.waiting_pass_seconds, 1),
+            ("wait_reply_seconds", gate.wait_reply_seconds, 60),
+            ("replay_retention_seconds", gate.replay_retention_seconds, 86400),
+            ("reconnect_seconds", gate.reconnect_seconds, 2),
+            ("silence_seconds", gate.silence_seconds, 120),
+            ("outage_notice_seconds", gate.outage_notice_seconds, 60),
+            ("source_check_seconds", gate.source_check_seconds, 1),
+            ("source_settle_seconds", gate.source_settle_seconds, 2),
+            ("override_reconnect_seconds", gate.override_reconnect_seconds, 10),
+        )
+        for key, reader, fallback in readers:
+            with self.subTest(key=key):
+                _ = self.config.write_text("[memory]\n")
+                self.assertEqual(reader(), fallback)
+                for raw in ("abc", "-5", "nan", "inf", "0"):
+                    _ = self.config.write_text(f"[memory]\n{key}={raw}\n")
+                    self.assertEqual(reader(), fallback)
+                for seconds in (3, 7.5):
+                    _ = self.config.write_text(f"[memory]\n{key}={seconds}\n")
+                    self.assertEqual(reader(), seconds)
+
+    def test_request_size_limit_uses_positive_integer_config_at_each_use(self) -> None:
+        self.assertEqual(gate.request_max_bytes(), 1048576)
+        for raw in ("", "abc", "-5", "nan", "inf", "0", "1.5"):
+            with self.subTest(raw=raw):
+                _ = self.config.write_text(f"[memory]\nrequest_max_bytes={raw}\n")
+                self.assertEqual(gate.request_max_bytes(), 1048576)
+        for size in (70000, 2097152):
+            _ = self.config.write_text(f"[memory]\nrequest_max_bytes={size}\n")
+            self.assertEqual(gate.request_max_bytes(), size)
+
+
 class DecisionTests(unittest.TestCase):
     def test_alone_covers_need_and_earlyoom_reserve(self) -> None:
         result = gate.decide(23 * GIB, 60 * GIB, 20 * GIB, [])

@@ -30,6 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.astra import astra_work
 from scripts.agents import worker_lifecycle
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.production import worker_admission
 
 ROOT = Path(__file__).resolve().parents[2]
 Role = Literal['designer', 'reviewer']
@@ -689,11 +690,14 @@ def _mesh_context_fields(design: HeldDesign, reach: HolderReach) -> dict[str, ob
             'holder_session': reach.session_id, 'binding': _design_fields(design)['binding'], 'cwd': design.repository}
 
 
-def launch_thread(design: HeldDesign, role: Role, prompt: Path, model: str, effort: str) -> str:
+def launch_thread(design: HeldDesign, role: Role, prompt: Path, model: str, effort: str, *,
+                  admitted: worker_admission.WorkerAdmitted) -> str:
     """Start the reserved thread and keep its creation claim if the result is uncertain."""
     mesh = mesh_directory(design.placement.design_id)
     mesh.mkdir(parents=True, exist_ok=True)
-    name = _instance(design, role).name
+    name = admitted.row.name
+    if name != _instance(design, role).name:
+        raise RoleRefused("staff admission names another worker")
     policy = access_policy(design, role)
     result = subprocess.run([sys.executable, str(ROOT / 'scripts/agents/codex_mesh.py'), 'prime',
                              '--session-dir', str(mesh), '--name', name, '--cwd', design.repository,
@@ -788,6 +792,9 @@ def open_role(repository: str, document: str, role: Role, holder: Holder, area: 
         _validate_binding(design.binding, design.repository, role)
     model, effort = resolve_model(role)
     prompt, _ = _prompt(design, role, '')
+    admitted = worker_admission.admit(
+        instance.name, mesh_directory(design_id), production=holder.production_slug,
+        unit=holder.unit_name if isinstance(holder, UnitHolder) else '')
     with _lock(directory):
         current = read_design(design_id)
         instance = _instance(current, role)
@@ -800,7 +807,7 @@ def open_role(repository: str, document: str, role: Role, holder: Holder, area: 
         _save(design)
         _mesh_context(design, reach)
     # A failed or uncertain launch keeps its reserved claim; it cannot authorize replacement.
-    thread = launch_thread(design, role, prompt, model, effort)
+    thread = launch_thread(design, role, prompt, model, effort, admitted=admitted)
     with _lock(directory):
         current = read_design(design_id)
         if _instance(current, role).lifecycle != RoleNotOpened(claim):

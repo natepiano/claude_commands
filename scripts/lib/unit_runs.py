@@ -38,6 +38,8 @@ HEARTBEAT = "heartbeat.log"
 LIVE_HEARTBEAT_SECS = 600
 # The Claude session that directs the run, one line, rewritten by each dispatch.
 DIRECTOR_FILE = "director"
+# The run's Claude worker launch log, separate from the unit's durable worker ledger.
+WORKERS_LOG = "workers"
 # Names the run's history, whose first line is the `run_started` event `start-run` writes.
 STATE_FILE = "progress_history_state.json"
 # Every run's durable history: runs/, review_turns/, archives. The former name is read until
@@ -142,7 +144,7 @@ def _claude_worker(run: Path, session_id: str) -> bool:
         if record.get("family") == "claude" and record.get("worker_id") == session_id:
             return True
     try:
-        ledger = (run / "workers").read_text(encoding="utf-8").splitlines()
+        ledger = (run / WORKERS_LOG).read_text(encoding="utf-8").splitlines()
     except (OSError, UnicodeError):
         return False
     return any(short and session_id.startswith(short) for short in (line.partition("\t")[0].strip() for line in ledger))

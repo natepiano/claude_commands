@@ -9,6 +9,7 @@ export type CreditBalance = { kind: 'finite'; amount: number } | { kind: 'unlimi
 export interface AccountDisplay {
   label: string;
   roles: string[];
+  roleCounts: AccountReading<number>[];
   weekly: AccountReading<number>;
   resets: AccountReading<string>;
   credits: CreditBalance;
@@ -30,6 +31,7 @@ function reading<Value>(value: Value | null | undefined): AccountReading<Value> 
 export function accountDisplay(account: StoredAccount): AccountDisplay {
   return {
     label: account.label, roles: account.roles,
+    roleCounts: account.roles.map((_, index) => reading(account.role_counts?.[index])),
     weekly: reading(account.weekly_left_percent), resets: reading(account.resets_at),
     credits: account.credits === null ? { kind: 'unavailable' }
       : account.credits === 'unlimited' ? { kind: 'unlimited' } : { kind: 'finite', amount: account.credits },
@@ -72,7 +74,7 @@ function readAge(value: AccountReading<string>, now: number): string {
   return `${Math.floor(age / 86400)}d`;
 }
 
-type AccountColumn = 'dot' | 'label' | 'roles' | 'left' | 'resets' | 'credits' | 'enabled' | 'inUse' | 'read';
+type AccountColumn = 'dot' | 'label' | 'roles' | 'count' | 'left' | 'resets' | 'credits' | 'enabled' | 'inUse' | 'read';
 interface AccountRow {
   cells: Record<AccountColumn, BoardLine>;
   facts: BoardLine[];
@@ -93,7 +95,11 @@ function accountRow(account: AccountDisplay, zone: string, now: number): Account
   const balance = account.credits.kind === 'unavailable' ? '' : account.credits.kind === 'unlimited'
     ? 'unlimited' : new Intl.NumberFormat('en-US', { maximumFractionDigits: 0 }).format(account.credits.amount);
   const credits = [span(balance)];
+  const count = account.roleCounts.some(count => count.kind === 'available')
+    ? account.roleCounts.map(count => count.kind === 'available' ? String(count.value) : '').join(', ') : '';
   const facts = [[span(`${left} left`, tone)]];
+  if (account.roles.length) facts.push([span('role', 'inactive'), span(` ${account.roles.join(', ')}`)]);
+  if (count) facts.push([span('count', 'inactive'), span(` ${count}`)]);
   if (reset) facts.push([span('resets', 'inactive'), span(` ${reset}`)]);
   if (balance) facts.push([span('credits', 'inactive'), span(' '), ...credits]);
   if (account.useCredits) facts.push([span('enabled')]);
@@ -101,7 +107,7 @@ function accountRow(account: AccountDisplay, zone: string, now: number): Account
   if (read) facts.push([span('read', 'inactive'), span(` ${read} ago`)]);
   return { cells: {
     dot: [span('●', dot)], label: [span(account.label, 'default', 'bold')],
-    roles: [span(account.roles.join(', '))], left: [span(left, tone)],
+    roles: [span(account.roles.join(', '))], count: [span(count)], left: [span(left, tone)],
     resets: [span(reset)], credits, enabled: [span(account.useCredits ? 'yes' : '')],
     inUse: [span(account.creditsInUse ? 'yes' : '', 'warning')], read: [span(read)],
   }, facts };
@@ -143,8 +149,9 @@ function tableColumns(accounts: AccountRow[]): TableColumn[] {
   const columns: TableColumn[] = [
     { key: 'dot', heading: '', align: 'left', width: 0 },
     { key: 'label', heading: 'account', align: 'left', width: 0 },
-    { key: 'roles', heading: 'role', align: 'left', width: 0 },
     { key: 'left', heading: 'left', align: 'right', width: 0 },
+    { key: 'roles', heading: 'role', align: 'left', width: 0 },
+    { key: 'count', heading: 'count', align: 'right', width: 0 },
     { key: 'resets', heading: 'resets', align: 'right', width: 0 },
     { key: 'credits', heading: 'credits', align: 'right', width: 0 },
     { key: 'enabled', heading: 'enabled', align: 'left', width: 0 },
@@ -186,15 +193,14 @@ function accountLines(accounts: AccountRow[], width: number): BoardLine[] {
   if (tableWidth(columns) <= width) {
     return [tableLine(columns, header), ...accounts.map(row => tableLine(columns, row.cells))];
   }
-  const first = columns.slice(0, 4);
-  const second = columns.slice(4);
+  const first = columns.slice(0, 5);
+  const second = columns.slice(5);
   if (tableWidth(first) <= width && tableWidth(second, 2) <= width) {
     return [tableLine(first, header), tableLine(second, header, 2),
       ...accounts.flatMap(row => [tableLine(first, row.cells), tableLine(second, row.cells, 2)])];
   }
   return accounts.flatMap(row => {
     const heading = [...row.cells.dot, span(' '), ...row.cells.label];
-    if (lineWidth(row.cells.roles)) heading.push(span('  '), ...row.cells.roles);
     return [...wrapLine(heading, width), ...wrapFacts(row.facts, width)];
   });
 }

@@ -3,6 +3,7 @@ export interface StoredAccount {
   label: string;
   tool: 'claude' | 'codex';
   roles: string[];
+  role_counts: (number | null)[];
   weekly_left_percent: number | null;
   resets_at: string | null;
   credits: number | 'unlimited' | null;
@@ -14,4 +15,5 @@ export interface StoredAccount {
 export interface StoredAccountsStatus {
   accounts: StoredAccount[];
   problems: string[];
+  session_inputs?: string[];
 }

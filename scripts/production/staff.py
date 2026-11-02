@@ -117,6 +117,10 @@ class DocUnfilled:
     """The transitional record has no production document fact yet."""
 
 
+WORKTREE_UNFILLED = WorktreeUnfilled()
+DOC_UNFILLED = DocUnfilled()
+
+
 @dataclass(frozen=True)
 class StaffRow:
     id: StaffId
@@ -153,33 +157,38 @@ class StaffRow:
             raise StaffUnreadable("staff name must be a string")
         if parent is not None and (not isinstance(parent, str) or _ID.fullmatch(parent) is None):
             raise StaffUnreadable("invalid staff parent id")
-        worktree: PresentWorktree | RemovedWorktree | WorktreeUnfilled = WorktreeUnfilled()
-        doc: LiveDoc | WrappedDoc | DocUnfilled = DocUnfilled()
-        for key in ("worktree", "doc"):
-            if key not in fields:
-                continue
-            if kind != ("unit" if key == "worktree" else "showrunner"):
-                raise StaffUnreadable(f"{kind} cannot hold {key}")
-            raw = fields[key]
-            if not isinstance(raw, dict):
-                raise StaffUnreadable(f"{key} must be an object")
-            location = cast(dict[str, object], raw)
-            if set(location) != {"machine", "path", "state"}:
-                raise StaffUnreadable(f"{key} requires machine, path and state")
-            machine, path, state = (location.get(item) for item in ("machine", "path", "state"))
-            if not isinstance(machine, str) or not isinstance(path, str):
-                raise StaffUnreadable(f"invalid {key} location")
-            try:
-                if key == "worktree" and state in ("present", "removed"):
-                    worktree = PresentWorktree(machine, Path(path)) if state == "present" else RemovedWorktree(machine, Path(path))
-                elif key == "doc" and state in ("live", "wrapped"):
-                    doc = LiveDoc(machine, Path(path)) if state == "live" else WrappedDoc(machine, Path(path))
-                else:
-                    raise StaffUnreadable(f"invalid {key} state: {state!r}")
-            except StaffRefused as error:
-                raise StaffUnreadable(str(error)) from error
+        worktree, doc = _row_locations(kind, fields)
         return cls(StaffId(staff_id), kind, name,
                    StaffId(parent) if isinstance(parent, str) else None, worktree, doc)
+
+
+def _row_locations(kind: str, fields: dict[str, object]) -> tuple[PresentWorktree | RemovedWorktree | WorktreeUnfilled, LiveDoc | WrappedDoc | DocUnfilled]:
+    worktree: PresentWorktree | RemovedWorktree | WorktreeUnfilled = WorktreeUnfilled()
+    doc: LiveDoc | WrappedDoc | DocUnfilled = DocUnfilled()
+    for key in ("worktree", "doc"):
+        if key not in fields:
+            continue
+        if kind != ("unit" if key == "worktree" else "showrunner"):
+            raise StaffUnreadable(f"{kind} cannot hold {key}")
+        raw = fields[key]
+        if not isinstance(raw, dict):
+            raise StaffUnreadable(f"{key} must be an object")
+        location = cast(dict[str, object], raw)
+        if set(location) != {"machine", "path", "state"}:
+            raise StaffUnreadable(f"{key} requires machine, path and state")
+        machine, path, state = (location.get(item) for item in ("machine", "path", "state"))
+        if not isinstance(machine, str) or not isinstance(path, str):
+            raise StaffUnreadable(f"invalid {key} location")
+        try:
+            if key == "worktree" and state in ("present", "removed"):
+                worktree = PresentWorktree(machine, Path(path)) if state == "present" else RemovedWorktree(machine, Path(path))
+            elif key == "doc" and state in ("live", "wrapped"):
+                doc = LiveDoc(machine, Path(path)) if state == "live" else WrappedDoc(machine, Path(path))
+            else:
+                raise StaffUnreadable(f"invalid {key} state: {state!r}")
+        except StaffRefused as error:
+            raise StaffUnreadable(str(error)) from error
+    return worktree, doc
 
 
 @dataclass(frozen=True)
@@ -208,6 +217,13 @@ class StaffSnapshot:
         """An omitted kind or parent leaves that field unrestricted."""
         return [row for row in self.rows if (kind is None or row.kind == kind)
                 and (parent is None or row.parent == parent)]
+
+
+def active(record: StaffSnapshot, kind: Kind) -> tuple[StaffRow, ...]:
+    """Current members; raw identity and history readers keep using the snapshot."""
+    return tuple(row for row in record.rows if row.kind == kind
+                 and not isinstance(row.worktree, RemovedWorktree)
+                 and not isinstance(row.doc, WrappedDoc))
 
 
 @dataclass
@@ -581,6 +597,11 @@ def snapshot() -> StaffSnapshot:
     return _snapshot_value(cast(dict[str, object], value))
 
 
+def local_snapshot() -> StaffSnapshot:
+    """Read only this machine's retained record; never contact its remote owner."""
+    return _load()
+
+
 def initial_snapshot() -> StaffSnapshot:
     """Read a writer's starting record, including an installation not yet seeded."""
     try:
@@ -673,28 +694,50 @@ def _required(rows: list[StaffRow], staff_id: StaffId) -> StaffRow:
     return row
 
 
-def _ensure_row(rows: list[StaffRow], kind: Kind, name: str, parent: StaffId | None) -> StaffRow:
+def _ensure_row(rows: list[StaffRow], kind: Kind, name: str, parent: StaffId | None, *,
+                worktree: PresentWorktree | RemovedWorktree | WorktreeUnfilled = WORKTREE_UNFILLED,
+                doc: LiveDoc | WrappedDoc | DocUnfilled = DOC_UNFILLED) -> StaffRow:
+    if kind != "unit" and not isinstance(worktree, WorktreeUnfilled):
+        raise StaffRefused(f"{kind} cannot hold worktree")
+    if kind != "showrunner" and not isinstance(doc, DocUnfilled):
+        raise StaffRefused(f"{kind} cannot hold doc")
     existing = next((row for row in rows
                      if (row.kind, row.name, row.parent) == (kind, name, parent)), None)
     if existing is not None:
-        return existing
+        if not isinstance(worktree, WorktreeUnfilled) and not isinstance(existing.worktree, WorktreeUnfilled) and existing.worktree != worktree:
+            raise StaffRefused(f"{existing.id}: existing worktree conflicts with admission")
+        if not isinstance(doc, DocUnfilled) and not isinstance(existing.doc, DocUnfilled) and existing.doc != doc:
+            raise StaffRefused(f"{existing.id}: existing doc conflicts with admission")
+        admitted = replace(existing,
+                           worktree=existing.worktree if isinstance(worktree, WorktreeUnfilled) else worktree,
+                           doc=existing.doc if isinstance(doc, DocUnfilled) else doc)
+        rows[rows.index(existing)] = admitted
+        return admitted
     used = {row.id for row in rows}
     staff_id = StaffId("s" + uuid4().hex[:11])
     while staff_id in used:
         staff_id = StaffId("s" + uuid4().hex[:11])
-    row = StaffRow(staff_id, kind, name, parent)
+    row = StaffRow(staff_id, kind, name, parent, worktree, doc)
     rows.append(row)
     return row
 
 
-def ensure(kind: Kind, *, name: str, parent: StaffId | None = None) -> StaffRow:
+def ensure(kind: Kind, *, name: str, parent: StaffId | None = None,
+           worktree: PresentWorktree | RemovedWorktree | WorktreeUnfilled = WORKTREE_UNFILLED,
+           doc: LiveDoc | WrappedDoc | DocUnfilled = DOC_UNFILLED) -> StaffRow:
+    """Admit the identity and its location in the same owner transaction."""
     if not _is_owner():
         arguments = ["ensure", kind, f"--name={name}"]
         if parent is not None:
             arguments.extend(("--parent", parent))
+        if not isinstance(worktree, WorktreeUnfilled):
+            arguments.extend(("--worktree", worktree.machine, str(worktree.path),
+                              "present" if isinstance(worktree, PresentWorktree) else "removed"))
+        if not isinstance(doc, DocUnfilled):
+            arguments.extend(("--doc", doc.machine, str(doc.path), "live" if isinstance(doc, LiveDoc) else "wrapped"))
         return _remote_row(arguments)
 
-    return _transaction(lambda rows: _ensure_row(rows, kind, name, parent))
+    return _transaction(lambda rows: _ensure_row(rows, kind, name, parent, worktree=worktree, doc=doc))
 
 
 def ensure_worker(name: str, parent: StaffId) -> StaffRow:
@@ -706,25 +749,23 @@ def ensure_worker(name: str, parent: StaffId) -> StaffRow:
     return ensure("worker", name=name, parent=parent)
 
 
-def restore_unit(staff_id: StaffId, *, name: str, parent: StaffId) -> StaffRow:
-    """Restore a retired unit's identity without replacing another member."""
+def restore_unit(staff_id: StaffId, worktree: PresentWorktree) -> StaffRow:
+    """Reactivate the retained unit in place, preserving its identity and parent."""
     if not _is_owner():
-        return _remote_row(["restore-unit", staff_id, f"--name={name}", "--parent", parent])
-    if _ID.fullmatch(staff_id) is None:
-        raise StaffRefused(f"invalid staff id: {staff_id}")
+        return _remote_row(["restore-unit", staff_id, "--machine", worktree.machine, "--path", str(worktree.path)])
 
     def edit(rows: list[StaffRow], pending: set[StaffId]) -> StaffRow:
+        existing = _required(rows, staff_id)
+        if existing.kind != "unit":
+            raise StaffRefused("restore-unit requires a unit")
+        if isinstance(existing.worktree, WorktreeUnfilled):
+            raise StaffRefused(f"{existing.name}: staff worktree is unfilled; run staff_sources.py fill --retired")
+        if (existing.worktree.machine, existing.worktree.path) != (worktree.machine, worktree.path):
+            raise StaffRefused(f"{existing.name}: restore worktree conflicts with retained location")
         pending.discard(staff_id)
-        existing = _row_by_id(rows, staff_id)
-        if existing is not None:
-            if (existing.kind, existing.name, existing.parent) == ("unit", name, parent):
-                return existing
-            raise StaffRefused(f"staff id already belongs to another member: {staff_id}")
-        if any((row.kind, row.name, row.parent) == ("unit", name, parent) for row in rows):
-            raise StaffRefused(f"unit name already exists: {name}")
-        row = StaffRow(staff_id, "unit", name, parent)
-        rows.append(row)
-        return row
+        restored = replace(existing, worktree=worktree)
+        rows[rows.index(existing)] = restored
+        return restored
 
     return _record_transaction(edit)
 
@@ -801,18 +842,37 @@ def retire(staff_id: StaffId) -> StaffRow | None:
     return _transaction(lambda rows: _retire_row(rows, staff_id))
 
 
-def _retire_row(rows: list[StaffRow], staff_id: StaffId, *, worker_only: bool = False) -> StaffRow | None:
+def _retire_row(rows: list[StaffRow], staff_id: StaffId) -> StaffRow | None:
     row = _row_by_id(rows, staff_id)
     if row is None:
         return None
-    if worker_only and row.kind != "worker":
-        raise StaffRefused("row writes are for worker admission and retirement")
-    if row.kind == "showrunner" and any(child.parent == row.id and child.kind != "showrunner" for child in rows):
-        raise StaffRefused(f"showrunner {row.name} still has units or workers")
-    rows[:] = [replace(member, parent=None) if member.parent == staff_id else member
-               for member in rows if member.id != staff_id
-               and not (row.kind == "unit" and member.parent == staff_id)]
+    if row.kind != "worker":
+        raise StaffRefused("retire requires a worker; retain units and showrunners with their location state")
+    rows.remove(row)
     return row
+
+
+def _retain_retired(rows: list[StaffRow], row: StaffRow) -> bool:
+    """Finish one unheld retirement without deleting a row or changing an edge."""
+    if any(child.kind == "worker" and child.parent == row.id for child in rows):
+        return False
+    if row.kind == "unit":
+        if isinstance(row.worktree, WorktreeUnfilled):
+            print(f"staff: keeping {row.id}: worktree is unfilled", file=sys.stderr)
+            return False
+        changed = replace(row, worktree=RemovedWorktree(row.worktree.machine, row.worktree.path))
+    elif row.kind == "showrunner":
+        if any(child.kind == "unit" and child.parent == row.id
+               and not isinstance(child.worktree, RemovedWorktree) for child in rows):
+            return False
+        if isinstance(row.doc, DocUnfilled):
+            print(f"staff: keeping {row.id}: doc is unfilled", file=sys.stderr)
+            return False
+        changed = replace(row, doc=WrappedDoc(row.doc.machine, row.doc.path))
+    else:
+        raise StaffRefused("pending retirement is for units and showrunners")
+    rows[rows.index(row)] = changed
+    return True
 
 
 def defer_retire(staff_ids: Sequence[StaffId]) -> None:
@@ -847,9 +907,8 @@ def retire_pending() -> tuple[StaffId, ...]:
         for staff_id in ordered:
             row = _row_by_id(rows, staff_id)
             if row is not None:
-                if any(child.parent == staff_id and child.kind != "showrunner" for child in rows):
+                if not _retain_retired(rows, row):
                     continue
-                _ = _retire_row(rows, staff_id)
             pending.remove(staff_id)
         return tuple(sorted(pending))
 
@@ -922,8 +981,9 @@ def apply_seed(seed_input: SeedInput) -> StaffSnapshot:
                 print(f"seed: keeping unit {row.name}: parent changed", file=sys.stderr)
             elif any(child.kind == "worker" and child.parent == staff_id for child in rows):
                 print(f"seed: keeping unit {row.name}: worker rows remain", file=sys.stderr)
-            else:
-                rows.remove(row)
+                pending.add(staff_id)
+            elif not _retain_retired(rows, row):
+                pending.add(staff_id)
         return StaffSnapshot(tuple(sorted(rows, key=lambda row: row.id)), tuple(sorted(pending)))
 
     return _record_transaction(edit)
@@ -964,6 +1024,8 @@ class _Arguments(argparse.Namespace):
     machine: str = ""
     path: str = ""
     state: str = ""
+    worktree: list[str] | None = None
+    doc: list[str] | None = None
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -980,11 +1042,13 @@ def _parser() -> argparse.ArgumentParser:
     _ = add.add_argument("kind", choices=_KINDS)
     _ = add.add_argument("--name", required=True)
     _ = add.add_argument("--parent")
+    _ = add.add_argument("--worktree", nargs=3, metavar=("MACHINE", "PATH", "STATE"))
+    _ = add.add_argument("--doc", nargs=3, metavar=("MACHINE", "PATH", "STATE"))
     _ = add.add_argument("--row-write", action="store_true", help=argparse.SUPPRESS)
     restore_parser = verbs.add_parser("restore-unit", help=argparse.SUPPRESS)
     _ = restore_parser.add_argument("target")
-    _ = restore_parser.add_argument("--name", required=True)
-    _ = restore_parser.add_argument("--parent", required=True)
+    _ = restore_parser.add_argument("--machine", required=True)
+    _ = restore_parser.add_argument("--path", required=True)
     rename_parser = verbs.add_parser("rename", help=argparse.SUPPRESS)
     _ = rename_parser.add_argument("target")
     _ = rename_parser.add_argument("--name", required=True)
@@ -1036,10 +1100,17 @@ def _mutate(arguments: _Arguments) -> StaffRow | StaffSnapshot | tuple[StaffId, 
         return retire_pending()
     if arguments.verb == "ensure":
         assert arguments.kind is not None
-        return ensure(arguments.kind, name=arguments.name, parent=_parent(arguments.parent))
+        # The record decoder owns the location JSON boundary and wrong-kind checks.
+        value: dict[str, object] = {}
+        for key, location in (("worktree", arguments.worktree), ("doc", arguments.doc)):
+            if location is not None:
+                machine, path, state = location
+                value[key] = {"machine": machine, "path": path, "state": state}
+        worktree, doc = _row_locations(arguments.kind, value)
+        return ensure(arguments.kind, name=arguments.name, parent=_parent(arguments.parent),
+                      worktree=worktree, doc=doc)
     if arguments.verb == "restore-unit":
-        assert arguments.parent is not None
-        return restore_unit(StaffId(arguments.target), name=arguments.name, parent=StaffId(arguments.parent))
+        return restore_unit(StaffId(arguments.target), PresentWorktree(arguments.machine, Path(arguments.path)))
     if arguments.verb == "rename":
         return rename(StaffId(arguments.target), arguments.name)
     if arguments.verb == "move":
@@ -1047,7 +1118,7 @@ def _mutate(arguments: _Arguments) -> StaffRow | StaffSnapshot | tuple[StaffId, 
     if arguments.verb == "apply-seed":
         return apply_seed(SeedInput.from_json(_decode(sys.stdin.read())))
     if arguments.row_write and _is_owner():
-        return _transaction(lambda rows: _retire_row(rows, StaffId(arguments.target), worker_only=True))
+        return _transaction(lambda rows: _retire_row(rows, StaffId(arguments.target)))
     return retire(StaffId(arguments.target))
 
 

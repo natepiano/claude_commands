@@ -19,6 +19,13 @@ VERIFY = Path(__file__).with_name("verify.sh")
 SCRIPTS = VERIFY.parent.parent
 
 
+def workspace_taplo_script(source: str) -> str:
+    """Extract the production formatter for fixtures that run part of verify."""
+    return "workspace_taplo() (" + source.split(
+        "workspace_taplo() (", 1,
+    )[1].split("\n)\n", 1)[0] + "\n)\n"
+
+
 class CargoInvocation(TypedDict):
     args: list[str]
 
@@ -134,7 +141,7 @@ case " $* " in
         if [ -n "${TEST_GIT_UNTRACKED:-}" ] && [ -e "$PACKAGE_ROOT/$TEST_GIT_UNTRACKED" ]; then
             printf '?? %s\000' "$TEST_GIT_UNTRACKED"
         fi ;;
-    *" ls-files "*) : ;;
+    *" ls-files "*) printf 'Cargo.toml\000taplo.toml\000' ;;
     *) exit 1 ;;
 esac
 # An empty status still succeeds.
@@ -292,6 +299,53 @@ class VerifyLintScopeFixture(unittest.TestCase):
         _ = path.write_text("#!/bin/sh\n" + source, encoding="utf-8")
         path.chmod(0o755)
 
+    def use_real_toml_tools(self) -> None:
+        """Keep the lint fixture, replacing only its Git and Taplo stubs."""
+        for name in ("git", "taplo"):
+            executable = shutil.which(name)
+            if executable is None:
+                self.fail(f"fixture requires {name}")
+            self.write_executable(
+                self.root / "bin" / name,
+                f"import os, sys\nos.execv({executable!r}, [{executable!r}, *sys.argv[1:]])\n",
+            )
+        shutil.rmtree(self.root / ".git")
+        self.run_git("init", "--quiet", "--initial-branch=main")
+        # Logs and caches change during lint. Keep the untracked unit config
+        # visible, while explicitly adding every source/config used by a test.
+        _ = (self.root / ".git/info/exclude").write_text("/*\n!/.unit.toml\n", encoding="utf-8")
+        self.run_git("add", "--force", "--", "Cargo.toml", "taplo.toml", "src/lib.rs")
+        self.run_git("-c", "user.name=Lint fixture", "-c", "user.email=lint@example.invalid",
+                     "-c", "commit.gpgsign=false", "commit", "--quiet", "-m", "fixture")
+
+    def run_git(self, *arguments: str) -> None:
+        _ = subprocess.run(
+            ["git", "--literal-pathspecs", "-C", str(self.root), *arguments], env=self.environment,
+            capture_output=True, text=True, check=True, timeout=TEST_HANG_GUARD_SECS,
+        )
+
+    def toml_glob_neighbors(self, *, untracked_text: str) -> tuple[Path, Path]:
+        self.use_real_toml_tools()
+        tracked = self.root / "part[1].toml"
+        untracked = self.root / "part1.toml"
+        _ = tracked.write_text("value=1\n", encoding="utf-8")
+        _ = untracked.write_text(untracked_text, encoding="utf-8")
+        self.run_git("add", "--force", "--", tracked.name)
+        with self.assertRaises(subprocess.CalledProcessError) as missing:
+            self.run_git("ls-files", "--error-unmatch", "--", untracked.name)
+        self.assertEqual(missing.exception.returncode, 1)
+        return tracked, untracked
+
+    def invoke_workspace_taplo(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        """Exercise the production formatter without simulating a remote build hold."""
+        formatter = workspace_taplo_script(VERIFY.read_text(encoding="utf-8"))
+        return subprocess.run(
+            ["bash", "-c", 'set -euo pipefail\nrun() { "$@"; }\n' + formatter
+             + 'workspace_taplo "$@"', "taplo-fixture", *arguments],
+            cwd=self.root, env={**self.environment, "WORKSPACE_ROOT": str(self.root)},
+            capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
+        )
+
     def write_config(self, *, clippy: str) -> None:
         _ = self.config.write_text(
             f"mend=on\nfmt=on\nclippy={clippy}\ndoc=on\nsweep=off\n",
@@ -342,7 +396,9 @@ class VerifyLintScopeFixture(unittest.TestCase):
                 for line in self.taplo_events.read_text(encoding="utf-8").splitlines()]
 
     def assert_workspace_taplo_check(self) -> None:
-        self.assertEqual(self.taplo_calls(), [{"args": ["fmt", "--check"], "cwd": str(self.root)}])
+        self.assertEqual(self.taplo_calls(), [{
+            "args": ["fmt", "--check", "--", "Cargo.toml", "taplo.toml"], "cwd": str(self.root),
+        }])
 
     def calls(self, command: str) -> list[list[str]]:
         return [args[1:] for args in self.cargo_calls() if args[:1] == [command]]

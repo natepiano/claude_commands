@@ -410,7 +410,7 @@ def announce_quiet(running: int | QuietCountObservation) -> None:
 def count(session: str) -> int:
     try:
         runner = showrunners.named(session)
-    except ValueError as error:
+    except (OSError, ValueError) as error:
         print(error, file=sys.stderr)
         return 1
     units = live_unit_names(runner)
@@ -446,11 +446,13 @@ def instances() -> list[str]:
 def status() -> int:
     counts = current_counts()
     rows: dict[str, int] = {name: number for name, number in counts.items() if number}
-    for runner in showrunners.registered_showrunners():
+    discovered = showrunners.registered_showrunners()
+    for runner in discovered:
         rows.update(listed(runner["session"] or runner["slug"], live_unit_names(runner), counts))
     counting = ", ".join(name.removeprefix(INSTANCE) for name in instances())
     print(f"Wind-down: {'on for ' + counting if counting else 'off'}")
     print(render("Codex agents on this machine", rows, read_projections(), time.time()))
+    _ = showrunners.require_complete(discovered)
     return 0
 
 
@@ -460,13 +462,15 @@ def instance_name(session: str) -> str:
 
 def announce(sender: str, showrunner: str, unit: str) -> bool:
     """Send every showrunner and unit director its version at once and print each delivery."""
-    zones = {runner["session"]: runner["zone"] for runner in showrunners.registered_showrunners()}
+    discovered = showrunners.registered_showrunners()
+    zones = {runner["session"]: runner["zone"] for runner in discovered}
     named = {"sender": sender, "time": clock(zones.get(sender) or next(iter(zones.values()), "UTC")),
              "minutes": EVERY_MINUTES}
-    return broadcast.report(broadcast.broadcast(sender, {
+    delivered = broadcast.report(broadcast.broadcast(sender, {
         broadcast.Showrunners(): showrunner.format(**named),
         broadcast.UnitDirectors(): unit.format(**named),
     }))
+    return delivered and not discovered.lookup_failures
 
 
 def start_count(record: SessionRecord) -> bool:
@@ -489,12 +493,14 @@ def start(sender: str) -> int:
     for record in live_sessions():
         if record["name"]:
             _ = live.setdefault(record["name"], record)
-    for runner in showrunners.registered_showrunners():
+    discovered = showrunners.registered_showrunners()
+    for runner in discovered:
         if runner["session"] in live:
             counting = start_count(live[runner["session"]])
             every = every and counting
             print(f"{runner['session']}: "
                   + (f"counting every {EVERY_MINUTES} minutes" if counting else "count NOT started"))
+    _ = showrunners.require_complete(discovered)
     return 0 if every else 1
 
 
@@ -536,7 +542,7 @@ def main(arguments: list[str]) -> int:
             case _:
                 print(USAGE, file=sys.stderr)
                 return 2
-    except ValueError as error:
+    except (OSError, ValueError) as error:
         print(error, file=sys.stderr)
         return 1
 

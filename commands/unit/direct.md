@@ -129,6 +129,8 @@ The `plan:` commands a run uses are loaded the same way: Read the file, never
 the Skill tool. Claude Code puts every skill a session invoked back
 after each compaction for the rest of the session; a file loaded by Read is not.
 A call site's arguments are what that file calls `$ARGUMENTS`.
+For owed phase style, use the runner option in <ReviewPromptContract/>;
+the director neither prepares style inputs nor pastes a style assignment.
 </TagReferenceContract>
 
 <LongLivedWorkers>
@@ -549,8 +551,8 @@ recording the result.
 
 <FindingsLedger>
 Use `python3 ~/.claude/scripts/direct/findings.py <command> --session-dir
-"${SESSION_DIR}" --phase "<phase id>"` for confirmed style violations in the
-main review, or after <Synthesize/> confirms another issue. Each open phase has
+"${SESSION_DIR}" --phase "<phase id>"` after <Synthesize/> confirms an issue,
+including a reviewer's style finding. Each open phase has
 its own ledger, and `--phase` names which one: with two phases open, a call
 naming none is refused. Every launch names its phase (<PassOwnership/>), so the
 launcher's own `landed` and `abandon` reach that phase's ledger.
@@ -666,7 +668,7 @@ It sets the Codex poll timeout. A missing or non-positive integer is an error;
 tell the user to set it. No timer sends reports: a report comes only when
 someone asks (2026-10-19).
 
-Launcher work is a **pass**; unit-director work -- verification, smoke, style -- is
+Launcher work is a **pass**; unit-director work -- verification and smoke -- is
 an **activity**. `verify.sh` opens and closes its own whenever it runs with
 `--session-dir`; open one by hand for other unit-director work
 with
