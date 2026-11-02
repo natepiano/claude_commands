@@ -2874,6 +2874,7 @@ class StyleProposalsTests(unittest.TestCase):
             issue = self.file(ledger)[0]
             before = issue.read_bytes()
             blob = finding.rule_blob
+            _ = self.commit_tip(ledger, {finding.path: (self.repo / finding.path).read_text() + "\npub struct JudgedAgain;\n"})
             verdicts: tuple[tuple[style_ledger.Verdict, str], ...] = (
                 ("clean", finding.path), ("held", finding.path), ("exception", "beta/src/lib.rs"))
             for verdict, path in verdicts:

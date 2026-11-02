@@ -109,11 +109,10 @@ class StylePlanTests(StylePlanFixture):
         rule = self.rule("read")
         site = self.sources[0]
         self.commit_files({site: "pub struct Parent {\n    old: u32,\n}\n"})
-        issue, (finding,) = self.judged_findings(rule, ((site, 2, "old: u32,"),))
-        self.record(rule, site, self.tip, "modules-unit-1")
+        issue, (finding,) = self.judged_findings(rule, ((site, 2, "old: u32,"),), clean_before_holding=True)
         self.write_generated_body(issue)
         _ = self.git("rm", "-q", site)
-        self.commit_files({"crates/alpha/src/moved.rs": "pub struct Parent {\n    old: u32,\n}\n"})
+        self.commit_files({"crates/alpha/src/moved.rs": "pub struct Parent {\n    old: u32,\n}\n\npub struct Moved;\n"})
         _ = self.refill_decisions()
         followed, = self.ledger().proposal_findings(issue)
         self.assertEqual((followed.finding_id, followed.path), (finding.finding_id, "crates/alpha/src/moved.rs"))
@@ -126,11 +125,10 @@ class StylePlanTests(StylePlanFixture):
         rule = self.rule("read")
         site = self.sources[0]
         self.commit_files({site: "pub struct Parent {\n    old: u32,\n}\n"})
-        issue, _ = self.judged_findings(rule, ((site, 2, "old: u32,"),))
-        self.record(rule, site, self.tip, "modules-unit-1")
+        issue, _ = self.judged_findings(rule, ((site, 2, "old: u32,"),), clean_before_holding=True)
         self.write_generated_body(issue)
         _ = self.git("rm", "-q", site)
-        self.commit_files({"crates/alpha/src/moved.rs": "pub struct Parent {\n    old: u32,\n}\n"})
+        self.commit_files({"crates/alpha/src/moved.rs": "pub struct Parent {\n    old: u32,\n}\n\npub struct Moved;\n"})
         _ = self.refill_decisions()
         followed, = self.ledger().proposal_findings(issue)
         moved = self.tip
