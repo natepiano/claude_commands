@@ -1168,7 +1168,7 @@ condition: wrap neither waits on it nor retires its worktree or branch.
 - The showrunner writes no implementation code, tests or Work Orders in a unit's
   files.
 - Only the showrunner pushes the merge branch and main, never with force.
-  Units push only their own branch.
+  Units push only their own branch except <FastTrack/> (`commands/unit/fast_track.md`).
 - Merge only from a checkpoint notice. Never merge a visible change before a
   fresh design-check pass on its shots (<MergeCheckpoint/> step 3).
 - **An out-of-date as-built doc may always be corrected.** You and every unit
