@@ -1,5 +1,5 @@
 ---
-description: Put one showrunner under another, or take it out again - the lower one then reports to the higher one; each one still shows the user only its own production's items (`/next all-below` adds those below).
+description: Attach or detach child showrunners.
 argument-hint: "<child> [parent] | detach <child> | tree"
 ---
 

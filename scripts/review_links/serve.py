@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import ipaddress
+import json
 import os
 import re
 import shutil
@@ -16,12 +17,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING, BinaryIO, TypeVar, cast
 from urllib.parse import parse_qs, unquote, urlsplit
 
-if __package__:
-    from . import change_page
-    from .review_link import private_name
-else:
-    import change_page  # pyright: ignore[reportImplicitRelativeImport]
-    from review_link import private_name  # pyright: ignore[reportImplicitRelativeImport]
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.review_links import change_page, change_browser
+from scripts.review_links.review_link import private_name
 
 if TYPE_CHECKING:
     from typing import override
@@ -91,6 +89,23 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
     @override
     def send_head(self) -> BinaryIO | None:
         root = cast(ReviewLinksServer, self.server).root
+        try:
+            browser = change_browser.page_at(root, self.path)
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError) as error:
+            print(f"review-links browser: {error}", file=sys.stderr)
+            self.html_response(503, change_page.document("<p>This review page is not available.</p>"))
+            return None
+        else:
+            try:
+                content = change_browser.render(browser, cast(ReviewLinksServer, self.server).delivery_status)
+            except (OSError, ValueError, change_page.change_review.ChangeReviewError, change_page.Refusal) as error:
+                print(f"review-links browser: {error}", file=sys.stderr)
+                self.html_response(503, change_page.document("<p>This review page is not available.</p>"))
+                return None
+            self.html_response(200, content)
+            return None
         try:
             page = change_page.page_at(root, self.path)
         except FileNotFoundError:
@@ -182,6 +197,17 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             self.html_response(400, change_page.document("<p>Use the answer form on the review page.</p>"))
             return
         try:
+            browser = change_browser.page_at(server.root, self.path)
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError) as error:
+            print(f"review-links browser: {error}", file=sys.stderr)
+            self.html_response(404, change_page.document("<p>This review page is not available.</p>"))
+            return
+        else:
+            self.browser_answer(browser)
+            return
+        try:
             page = change_page.page_at(server.root, self.path)
         except (OSError, ValueError) as error:
             print(f"review-links page: {error}", file=sys.stderr)
@@ -215,6 +241,46 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 change_page.deliver(delivery, server.delivery_status)
             except OSError as error:
                 print(f"review-links delivery status: {error}", file=sys.stderr)
+
+    def browser_answer(self, browser: change_browser.ReviewBrowser) -> None:
+        server = cast(ReviewLinksServer, self.server)
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if length <= 0:
+                raise ValueError("empty answer")
+            body = self.rfile.read(length).decode("utf-8")
+            delivery, answer = change_browser.submit(browser, body, server.delivery_status)
+        except (ValueError, change_page.change_review.ChangeReviewError) as error:
+            self.browser_failure(400, "Check the answer and submit it again.", error)
+            return
+        except change_page.FeatureLogFailed as error:
+            self.browser_failure(503, "The feature log could not be updated.", error)
+            return
+        except (OSError, RuntimeError, subprocess.SubprocessError, change_page.Refusal) as error:
+            self.browser_failure(503, "The answer could not be saved. Try again.", error)
+            return
+        try:
+            self.json_response(200, {"answer": answer})
+        finally:
+            try:
+                change_page.deliver(delivery, server.delivery_status)
+            except OSError as error:
+                print(f"review-links delivery status: {error}", file=sys.stderr)
+
+    def browser_failure(self, status: int, reason: str, error: Exception) -> None:
+        print(f"review-links browser answer: {error}", file=sys.stderr)
+        self.json_response(status, {"reason": reason})
+
+    def json_response(self, status: int, fields: dict[str, str]) -> None:
+        content = json.dumps(fields).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(content)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        _ = self.wfile.write(content)
+        self.wfile.flush()
 
     @override
     def guess_type(self, path: str | os.PathLike[str]) -> str:

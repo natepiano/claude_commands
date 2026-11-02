@@ -1397,9 +1397,8 @@ def watch_pass(now: float, *, deadline: float, read_panes: Callable[[str], list[
                 text = (f"stall-watch: you have been idle since {since_text} with nothing running. "
                         "Continue your run; if you are waiting on someone, say on whom in one line.")
                 pending.append(delivery(path, "bump", socket, f"{key}:bump", text))
-            if not stretch["tell_sent"] and showrunner_socket:
-                text = (f"{name} holding since {since_text}, nothing running; not bumped. Last status: {last}"
-                        if holding else f"{name} idle since {since_text}, nothing running; bumped. Last status: {last}")
+            if not holding and not stretch["tell_sent"] and showrunner_socket:
+                text = f"{name} idle since {since_text}, nothing running; bumped. Last status: {last}"
                 pending.append(delivery(path, "tell", showrunner_socket, f"{key}:tell", text))
     send_all(pending, now, deadline=deadline, limits=sender.limits)
     finish_cancellations(cancellations.requests)

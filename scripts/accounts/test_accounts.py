@@ -40,6 +40,7 @@ from scripts.accounts import accounts, next_moves, refusal_watch, refusals, role
 from scripts.accounts.nix_env_fake import fake_nix_loader, imports_with_nix_loader, installed_program
 from scripts.lib import atomic_file
 from scripts.production import showrunners
+from scripts.shutdown import remote
 from scripts.agents import codex_mesh
 from scripts.message import roster
 from scripts.accounts import moves, worker_names
@@ -1343,7 +1344,7 @@ class AccountsTests(unittest.TestCase):
                 with (scratch_account_home(self.home, environment),
                       patch.object(sys.stdin, "isatty", return_value=tty),
                       patch.object(os, "execvpe") as launch):
-                    accounts.exec_account("claude3", ["--resume", "conversation-id"])
+                    _ = accounts.exec_account("claude3", ["--resume", "conversation-id"])
                 executable, argv, child_environment = cast(tuple[str, list[str], dict[str, str]], launch.call_args.args)
                 if tty and not supervised:
                     self.assertEqual(executable, sys.executable)
@@ -1402,6 +1403,88 @@ class AccountsTests(unittest.TestCase):
             self.assertEqual(accounts.renew_login("claude2"), accounts.LoginRenewalFailed(
                 f"claude program not found (looked in PATH and {program})"))
         self.live_reads.assert_not_called()
+
+    def test_codex_update_uses_the_shared_install_on_both_machines_without_account_checks(self) -> None:
+        program = "/fixture/codex"
+        for label in ("workers", "codex1", "codex2"):
+            for machine, peer in (("natedev", "mac"), ("mac", "natedev")):
+                with (self.subTest(label=label, machine=machine),
+                      patch.object(accounts, "launch_shell_environment", return_value={"CODEX_HOME": "/unused"}),
+                      patch.object(accounts, "resolve_program", return_value=program),
+                      patch.object(accounts, "role_account") as role,
+                      patch.object(accounts, "check_codex_target") as target,
+                      patch.object(remote, "local_machine", return_value=machine),
+                      patch.object(remote, "other_machine", return_value=peer),
+                      patch.object(os, "execvpe") as launch,
+                      patch.object(subprocess, "run", side_effect=[
+                          subprocess.CompletedProcess[str]([], 0),
+                          subprocess.CompletedProcess[str]([], 0, "codex-cli 0.166.0\n", ""),
+                          subprocess.CompletedProcess[str]([], 0, "codex-cli 0.166.0\n"),
+                      ]) as run):
+                    self.assertEqual(self.run_cli("exec", label, "update", "--yes"),
+                        (0, f"{machine}: codex-cli 0.166.0\n{peer}: codex-cli 0.166.0\n", ""))
+                    environment = {"CODEX_HOME": str(self.home / ".codex")}
+                    self.assertEqual(run.call_args_list, [
+                        call([program, "update", "--yes"], env=environment, check=False),
+                        call([program, "--version"], env=environment, capture_output=True, text=True, timeout=15, check=False),
+                        call(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", peer,
+                            'CODEX_HOME="$HOME/.codex" "$HOME/.local/bin/codex" update >&2 && "$HOME/.local/bin/codex" --version'],
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=600, check=False),
+                    ])
+                    role.assert_not_called()
+                    target.assert_not_called()
+                    launch.assert_not_called()
+
+    def test_codex_update_reports_remote_failures_without_remote_output(self) -> None:
+        failures = (
+            (subprocess.CompletedProcess[str]([], 255, "hidden"), "unreachable; run codex update there"),
+            (subprocess.TimeoutExpired("ssh", 600), "unreachable; run codex update there"),
+            (OSError("hidden"), "unreachable; run codex update there"),
+            (subprocess.CompletedProcess[str]([], 7, "hidden"), "update failed (exit 7)"),
+            (subprocess.CompletedProcess[str]([], 0, ""), "version read failed"),
+            (subprocess.CompletedProcess[str]([], 0, " \n"), "version read failed"),
+        )
+        for failure, detail in failures:
+            with (self.subTest(detail=detail, failure=type(failure).__name__),
+                  patch.object(accounts, "launch_shell_environment", return_value={}),
+                  patch.object(accounts, "resolve_program", return_value="/fixture/codex"),
+                  patch.object(remote, "local_machine", return_value="natedev"),
+                  patch.object(remote, "other_machine", return_value="mac"),
+                  patch.object(subprocess, "run", side_effect=[subprocess.CompletedProcess[str]([], 0),
+                      subprocess.CompletedProcess[str]([], 0, "codex-cli 0.166.0\n", ""), failure])):
+                self.assertEqual(self.run_cli("exec", "workers", "update"),
+                    (1, f"natedev: codex-cli 0.166.0\nmac: {detail}\n", ""))
+
+    def test_codex_update_still_updates_the_peer_after_a_local_failure(self) -> None:
+        for failure, detail in ((subprocess.CompletedProcess[str]([], 9), "update failed (exit 9)"),
+                                (OSError("hidden"), "codex could not start")):
+            with (self.subTest(detail=detail),
+                  patch.object(accounts, "launch_shell_environment", return_value={}),
+                  patch.object(accounts, "resolve_program", return_value="/fixture/codex"),
+                  patch.object(remote, "local_machine", return_value="natedev"),
+                  patch.object(remote, "other_machine", return_value="mac"),
+                  patch.object(subprocess, "run", side_effect=[failure,
+                      subprocess.CompletedProcess[str]([], 0, "codex-cli 0.166.0\n")]) as run):
+                self.assertEqual(self.run_cli("exec", "codex1", "update"),
+                    (1, f"natedev: {detail}\nmac: codex-cli 0.166.0\n", ""))
+                self.assertEqual(run.call_count, 2)
+
+    def test_codex_update_requires_a_successful_local_version_read(self) -> None:
+        failures = (
+            (subprocess.CompletedProcess[str]([], 4, "hidden", "hidden"), "version read failed (exit 4)"),
+            (subprocess.CompletedProcess[str]([], 0, "", "hidden"), "version read failed (exit 0)"),
+            (subprocess.TimeoutExpired("codex", 15), "version read timed out"),
+        )
+        for failure, detail in failures:
+            with (self.subTest(detail=detail),
+                  patch.object(accounts, "launch_shell_environment", return_value={}),
+                  patch.object(accounts, "resolve_program", return_value="/fixture/codex"),
+                  patch.object(remote, "local_machine", return_value="natedev"),
+                  patch.object(remote, "other_machine", return_value="mac"),
+                  patch.object(subprocess, "run", side_effect=[subprocess.CompletedProcess[str]([], 0), failure,
+                      subprocess.CompletedProcess[str]([], 0, "codex-cli 0.166.0\n")])):
+                self.assertEqual(self.run_cli("exec", "codex2", "update"),
+                    (1, f"natedev: {detail}\nmac: codex-cli 0.166.0\n", ""))
 
     def test_exec_codex_labels_use_the_home_holding_each_login_and_preserve_arguments(self) -> None:
         home, numbered = self.workers_fixture()

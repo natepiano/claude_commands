@@ -1,3 +1,7 @@
+---
+description: Send a small unit fix from its worktree.
+---
+
 # Fast-track a small fix
 
 <FastTrack>

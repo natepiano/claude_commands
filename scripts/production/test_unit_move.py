@@ -622,7 +622,7 @@ class UnitFolderMoveTests(FolderMoveFixture):
               mock.patch.object(accounts, "resolve_program", return_value="/fixture/claude"),
               mock.patch.object(sys.stdin, "isatty", return_value=True),
               mock.patch.object(os, "execvpe", side_effect=execute)):
-            accounts.exec_account("claude4", ["--resume", self.owner.current_session, "-n", "kept-name"])
+            _ = accounts.exec_account("claude4", ["--resume", self.owner.current_session, "-n", "kept-name"])
         command, = commands
         self.assertEqual(Path(command[1]).name, "relaunch.py")
         self.assertEqual(command[2:4], ["run", "--"])
@@ -693,7 +693,7 @@ class UnitFolderMoveTests(FolderMoveFixture):
                           mock.patch.object(accounts, "resolve_program", return_value="/fixture/claude"),
                           mock.patch.object(sys.stdin, "isatty", return_value=True),
                           mock.patch.object(os, "execvpe", side_effect=execute)):
-                        accounts.exec_account("claude4", arguments)
+                        _ = accounts.exec_account("claude4", arguments)
                     command, = commands
                     child, child_environment = relaunch.restored_launch(command[4:], environment)
                     if explicit_prompt:

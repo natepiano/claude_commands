@@ -1,5 +1,5 @@
 ---
-description: Compile a design/plan doc into a direct-ready phased implementation plan — strip design narrative, bake in the codebase context every phase needs, and front each phase with a self-contained Work Order so /unit:direct can dispatch by assembly with zero research.
+description: Create a plan with dispatchable phases.
 ---
 
 # Phase Plan

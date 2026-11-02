@@ -1,5 +1,5 @@
 ---
-description: Delete a shared style file and clean up every see_also reference and wikilink pointing at it.
+description: Delete a style file and its references.
 ---
 
 # Delete Style

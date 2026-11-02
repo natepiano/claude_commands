@@ -1,5 +1,5 @@
 ---
-description: Rename a production, move its units between runs, and retire its old merge branch.
+description: Rename a production and its records.
 argument-hint: "plan <old> <new> | apply <old> <new> | unit <new> <unit> | repair-workers <production> [--dry-run] | finish <new> | checkout <new> [<path>]"
 ---
 

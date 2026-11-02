@@ -1,5 +1,5 @@
 ---
-description: Launch a team of expert agents to review a topic across multiple dimensions and cycles, recording findings and surfacing unresolved decisions.
+description: Review a topic with expert agents.
 ---
 
 # Team Review

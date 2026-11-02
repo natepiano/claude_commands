@@ -1,5 +1,5 @@
 ---
-description: Review a caller's diff or the working tree against the style guide.
+description: Review a diff against the style guide.
 ---
 
 # Direct — style review

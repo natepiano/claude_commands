@@ -1,5 +1,5 @@
 ---
-description: File a finished proposal as a hanadocs issue, record the user's approval, and see it started and closed.
+description: File and manage a production proposal.
 ---
 
 # Proposal

@@ -1,5 +1,5 @@
 ---
-description: Stop or resume a local session, or restore recorded shutdowns.
+description: Stop, resume, or restore a session.
 argument-hint: 'stop SESSION | resume SESSION --why TEXT [--to claudeN] | status | restart | forget NAME_OR_ID'
 ---
 
