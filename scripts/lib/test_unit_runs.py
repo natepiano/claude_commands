@@ -149,6 +149,52 @@ class UnitRunsTest(unittest.TestCase):
                 self.assertEqual(unit_runs.main(["held", "sid-me", "--root", str(new), "--active", str(active)]), 0)
             self.assertEqual(shown.getvalue().splitlines(), [str(new / "run-marked"), str(new / "run-side")])
 
+    def test_shared_scan_keeps_a_late_marker_first_without_rereading_directors(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root, active = Path(folder) / "runs", Path(folder) / "active"
+            active.mkdir()
+            for name in ("a-run", "z-run", "other-run"):
+                run = root / name
+                run.mkdir(parents=True)
+                unit_runs.record_director(run, "other" if name == "other-run" else "director")
+            _ = (active / "director").write_text(str(root / "z-run") + "\n")
+            _ = (active / "other").write_text(str(root / "other-run") + "\n")
+            with patch.object(unit_runs, "director", wraps=unit_runs.director) as read:
+                scanned = unit_runs.held_by_session(root)
+                self.assertEqual(unit_runs.held("director", root, active, scanned=scanned),
+                                 [str(root / "z-run"), str(root / "a-run")])
+                self.assertEqual(unit_runs.held("other", root, active, scanned=scanned), [str(root / "other-run")])
+                self.assertEqual(read.call_count, 3)
+                self.assertEqual({call.args[0] for call in read.call_args_list}, set(root.iterdir()))
+
+    def test_marker_outside_the_scan_is_verified_and_keeps_its_spelling(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root, active, outside = Path(folder) / "runs", Path(folder) / "active", Path(folder) / "outside"
+            (root / "a-run").mkdir(parents=True)
+            outside.mkdir()
+            active.mkdir()
+            unit_runs.record_director(root / "a-run", "director")
+            unit_runs.record_director(outside, "director")
+            target = str(outside) + "/."
+            _ = (active / "director").write_text(target + "\n")
+            scanned = unit_runs.held_by_session(root)
+            self.assertEqual(unit_runs.held("director", root, active, scanned=scanned),
+                             [target, str(root / "a-run")])
+            self.assertEqual(unit_runs.held("director", root, active), [target, str(root / "a-run")])
+
+    def test_a_stale_marker_does_not_assign_another_directors_run(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root, active = Path(folder) / "runs", Path(folder) / "active"
+            run = root / "run"
+            run.mkdir(parents=True)
+            active.mkdir()
+            unit_runs.record_director(run, "replacement")
+            _ = (active / "original").write_text(str(run) + "\n")
+            scanned = unit_runs.held_by_session(root)
+            self.assertEqual(unit_runs.held("original", root, active, scanned=scanned), [])
+            self.assertEqual(unit_runs.held("original", root, active), [])
+            self.assertEqual(unit_runs.held("replacement", root, active, scanned=scanned), [str(run)])
+
     def test_held_without_a_marker_lists_only_the_directed_runs(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             runs, active = Path(folder) / "runs", Path(folder) / "active"
