@@ -229,9 +229,12 @@ class AdmissionFixture(ExitStack):
         if not hasattr(os, "pidfd_open") or not Path("/sys/fs/cgroup/cgroup.controllers").exists():
             raise unittest.SkipTest("admission service needs Linux pidfd and cgroup v2")
         self.root: Path = Path(self.enter_context(tempfile.TemporaryDirectory(prefix="admit-test-")))
+        # AF_UNIX addresses have a small byte limit; TMPDIR may be a deep merge checkout.
+        self.socket_dir: Path = Path(self.enter_context(
+            tempfile.TemporaryDirectory(prefix="admit-sock-", dir="/tmp")))
         self.state_dir: Path = self.root / "state"
         self.state_dir.mkdir()
-        self.socket_path: Path = self.root / "admission.sock"
+        self.socket_path: Path = self.socket_dir / "admission.sock"
         self.clock: FakeClock = FakeClock()
         self.fault: Faults = Faults()
         self.proc: TestProcesses = TestProcesses(self.root / "proc")

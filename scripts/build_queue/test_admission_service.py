@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from contextlib import redirect_stderr
+import io
 import math
 import errno
 import os
@@ -11,6 +13,7 @@ import select
 import signal
 import socket
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -22,6 +25,20 @@ from scripts.build_queue.admission_test_support import AdmissionFixture, GIB, In
 
 
 class ServiceTests(unittest.TestCase):
+    def test_socket_fixture_works_with_a_long_tmpdir(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="admit-long-", dir="/tmp") as root:
+            long_tmpdir = Path(root) / ("nested-" * 24)
+            long_tmpdir.mkdir()
+            with mock.patch.dict(os.environ, {"TMPDIR": str(long_tmpdir)}), \
+                 mock.patch.object(tempfile, "tempdir", str(long_tmpdir)), \
+                 AdmissionFixture() as fixture:
+                self.assertEqual(fixture.root.parent, long_tmpdir)
+                self.assertGreater(len(os.fsencode(fixture.root / "admission.sock")), 108)
+                self.assertLess(len(os.fsencode(fixture.socket_path)), 108)
+                self.assertTrue(fixture.socket_path.is_socket())
+                peer = fixture.connect(wire.ViewRequest())
+                self.assertTrue(any(isinstance(reply, wire.ViewReply) for reply in peer.replies()))
+
     def test_restored_override_grace_starts_at_listener_readiness_once_for_both_sockets(self) -> None:
         for inherited in (False, True):
             with self.subTest(inherited=inherited), AdmissionFixture() as fixture:
@@ -517,7 +534,7 @@ class ServiceTests(unittest.TestCase):
     def test_serve_binds_the_environment_socket_without_listen_fds(self) -> None:
         with AdmissionFixture() as fixture:
             fixture.server.close()
-            socket_path = fixture.root / "from-environment.sock"
+            socket_path = fixture.socket_dir / "from-environment.sock"
             run_once = service.AdmissionServer.run_once
             def one_turn(server: service.AdmissionServer) -> None:
                 run_once(server, 0)
@@ -920,7 +937,9 @@ class ServiceTests(unittest.TestCase):
                 self.assertTrue((fixture.state_dir / "state.json").exists())
 
     def test_serve_requires_explicit_state_dir(self) -> None:
-        with mock.patch.object(sys, "argv", ["admission_service", "serve"]):
+        stderr = io.StringIO()
+        with mock.patch.object(sys, "argv", ["admission_service", "serve"]), redirect_stderr(stderr):
             with self.assertRaises(SystemExit) as error:
                 _ = service.main()
             self.assertEqual(error.exception.code, 2)
+        self.assertIn("the following arguments are required: --state-dir", stderr.getvalue())
