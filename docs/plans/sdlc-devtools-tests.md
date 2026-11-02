@@ -320,6 +320,45 @@ A ruling for the local occurrence leaves the committed occurrence blocking.
 
 **Ruled out:** `merge_gate.py --promote-only --merge-branch main` (it refuses a local main behind origin/main); a worktree or a copied `.git` pointer for the copy; a full-suite fallback in the fast check.
 
+### Phase 7l — A fast fix during a checkpoint merge exits 0  · status: done
+**Depends on:** Phase 7d
+
+Source: Phase 7d live proof case 2, 2026-11-02 03:56 EST (showrunner ruling: "a bounded retry of that fetch on "cannot lock ref", and nothing more"). The fast fix pushed main while the showrunner's real `merge_checkpoint` ran. Then `reconcile` ran `git fetch origin main` in the director's worktree (`scripts/production/fast_track.py:589`). The showrunner's fetch updated the shared `refs/remotes/origin/main` at the same moment, so git printed `error: cannot lock ref 'refs/remotes/origin/main': is at <new> but expected <old>`. The command exited 1 after a good push, and restore and promotion did not run. A rerun finished them with exit 0.
+
+#### Work Order
+
+**Goal:** a fast fix that runs while another process fetches into the same repository exits 0 on the first run, with the push, restore and promotion done.
+
+**Spec:**
+1. One helper fetches origin main in the director's repository. Both fetches there use it: `reconcile` (`fast_track.py:589`) and `push_patch` (`fast_track.py:683`). The fetches in the temporary copy keep their current calls; the copy has its own refs.
+2. When the fetch fails and its stderr contains `cannot lock ref`, the helper waits `fetch_lock_wait_seconds`, then fetches again. It makes at most `fetch_lock_attempts` fetches in total.
+3. Any other fetch failure, and a lock failure on the last attempt, raises the current error with the current text. The exit codes stay: a failure before the push exits 2, a failure after the push exits 1.
+4. `config/fast_track.conf` gets `fetch_lock_attempts = 3` with a `# whole:` limit comment and `fetch_lock_wait_seconds = 0.5` with a `# range:` limit comment, read through `scripts/lib/conf.py` like the other keys. A missing or invalid key refuses and names the key, as for the other keys.
+5. `commands/unit/fast_track.md` names the two new keys in its list of keys that `config/fast_track.conf` sets.
+6. No other change.
+
+**Files:**
+- `scripts/production/fast_track.py` — the fetch helper and its two callers
+- `config/fast_track.conf` — `fetch_lock_attempts` and `fetch_lock_wait_seconds`
+- `commands/unit/fast_track.md` — the two keys
+- `scripts/production/test_fast_track.py` — regressions and the config fixture keys
+
+**Workers:** 1 writer + 1 tester
+- `impl` — `scripts/production/fast_track.py`, `config/fast_track.conf`, `commands/unit/fast_track.md`
+- `test` — `scripts/production/test_fast_track.py`, from this Spec alone
+
+**State:** none
+
+**Constraints from prior phases:** the Phase 7d As-built above and the Delegation Context invariants. Tests set `CONF_DIR` to a fixture folder whose keys carry the real limit comments. The fast check's process-group rule stays (`process_group.send_process_group` only).
+
+**Acceptance gate:** from the worktree root, `python3 -m unittest discover -s scripts/production -p test_fast_track.py` green, with these regressions red before the change:
+- a real `refs/remotes/origin/main.lock` in the fixture repository makes the post-push fetch fail with `cannot lock ref` on the first attempt only; the command exits 0, and restore and promotion are done;
+- a lock that stays for every attempt gives exit 1 with the push kept, and the fetch count equals `fetch_lock_attempts`;
+- a fetch failure without `cannot lock ref` is not retried;
+- each new config key, missing and invalid, refuses and names the key.
+
+`basedpyright` on each slot's Python files reads `0 errors, 0 warnings, 0 notes`. Live, by the director after the showrunner merges this phase: the same race as case 2 with a real `merge_checkpoint` at a set time exits 0 on the first run.
+
 ### Phase 7e — Every process-group kill checks its pid  · status: done
 
 #### As-built
