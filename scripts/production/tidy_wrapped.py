@@ -16,6 +16,8 @@ import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import production_units
+
 if TYPE_CHECKING:
     from update_registration import QuestionStaff
 
@@ -24,7 +26,6 @@ NOTIFIER_STATE_DIR = Path(os.environ.get("NOTIFIER_STATE_DIR") or Path.home() / 
 # The state folder holds these shared folders beside each production's own; a slug never names one.
 SHARED = frozenset(("footers-off", "review-paused", "outstanding", "counts", "reports"))
 SLUG = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
-WRAPPED = "> **Status: PRODUCTION — wrapped.**"
 
 
 class TidyRefused(Exception):
@@ -73,7 +74,7 @@ def wrapped_slug(doc: Path) -> str:
         raise TidyRefused(f"{doc}: production doc name must end in -production.md")
     lines = doc.read_text(encoding="utf-8").splitlines()
     status = next((line for line in lines if line.startswith("> **Status:")), "")
-    if not status.startswith(WRAPPED):
+    if not status.startswith(production_units.WRAPPED):
         raise TidyRefused(f"{doc}: not wrapped")
     if (NOTIFIER_STATE_DIR / f"showrunner-{slug}").exists():
         raise TidyRefused(f"{doc}: {slug} still has an update timer")
