@@ -609,13 +609,15 @@ class FeatureLogTests(unittest.TestCase):
 
     def test_project_of_never_forwards_and_maps_supported_origin_forms(self) -> None:
         cases = (
-            ("git@github.com:natepiano/cargo-liner.git\n", "cargo-liner"),
-            ("https://github.com/natepiano/bevy_brp\n", "bevy_brp"),
-            ("git@github.com:natepiano/claude_commands\n", "claude"),
-            ("https://github.com/someone/unknown.git\n", "none"),
+            ("git@github.com:natepiano/cargo-liner.git\n", "cargo-liner", False),
+            ("https://github.com/natepiano/bevy_brp\n", "bevy_brp", False),
+            ("git@github.com:natepiano/claude_commands\n", "claude", True),
+            ("https://github.com/natepiano/hana.git\n", "hana", True),
+            ("https://github.com/natepiano/nixos.git\n", "natedev", False),
+            ("https://github.com/someone/unknown.git\n", "none", False),
         )
         checkout = self.root / "checkout"
-        for origin, expected in cases:
+        for origin, expected, closes_by_change_review in cases:
             with self.subTest(origin):
                 ssh_runner = RecordingSshRunner(returncode=99)
                 git_runner = RecordingGitRunner(origin)
@@ -637,6 +639,8 @@ class FeatureLogTests(unittest.TestCase):
                             ["project-of", str(checkout)], ssh_runner
                         )
                 self.assertEqual(result, CliResult(0, f"{expected}\n", ""))
+                project = feature_log.PROJECTS.get(result.stdout.strip())
+                self.assertEqual(project.closes_by_change_review if project else False, closes_by_change_review)
                 self.assertEqual(ssh_runner.commands, [])
                 self.assertEqual(
                     git_runner.commands,

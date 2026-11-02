@@ -155,7 +155,7 @@ The one style block in `render_markdown` keeps top-level text in a centered 48re
 
 #### As-built
 
-`scripts/hooks/session-start-ste.py` reads `config/simplified-technical-english.md` from its own checkout and returns it as `additionalContext` for `SessionStart` and `SubagentStart`; a bad payload, a missing file or a read error exits 0 with no output. `scripts/hooks/codex_hooks.py` has two rows, `ste` (SessionStart) and `ste-subagent` (SubagentStart), both with matcher `*`; `_select_hooks` picks a hook by command, event and matcher so two events share one script with separate trust. Checkpoint 69374ebc on branch natedev-efficiency. Claude Code runs the hook from `settings.json` (user's go 2026-11-01): in the `SessionStart` group with matcher `startup|resume|clear|compact`, after `session-start-temp-root.py`, and in `SubagentStart`, after `session-start-agents-log.py`. The live Codex install and trust wait for the user.
+`scripts/hooks/session-start-ste.py` reads `config/simplified-technical-english.md` from its own checkout and returns it as `additionalContext` for `SessionStart` and `SubagentStart`; a bad payload, a missing file or a read error exits 0 with no output. `scripts/hooks/codex_hooks.py` has two rows, `ste` (SessionStart) and `ste-subagent` (SubagentStart), both with matcher `*`; `_select_hooks` picks a hook by command, event and matcher so two events share one script with separate trust. Checkpoint 69374ebc on branch natedev-efficiency. Claude Code runs the hook from `settings.json` (user's go 2026-11-01): in the `SessionStart` group with matcher `startup|resume|clear|compact`, after `session-start-temp-root.py`, and in `SubagentStart`, after `session-start-agents-log.py`. `codex_hooks.py install` added and trusted both STE handlers in `~/.codex`, `~/.codex1` and `~/.codex2` on natedev and on the Mac (user's go 2026-11-01). A live `codex exec` session in `~/.codex2` on each machine quoted the rule.
 
 ### Phase 15 — nix_env trusts copies.py copies  · status: done
 
@@ -194,3 +194,26 @@ The one style block in `render_markdown` keeps top-level text in a centered 48re
 **Gotchas:** `basedpyright` counts function-local imports in `reportImportCycles`, so a local import hides no cycle. `tmp_sweep.py` imports `scratch` by bare name and `scratch.py` inserts the repository root into `sys.path` first, so `scripts.lib.copy_record` there is the same module object and `isinstance` checks hold. The assertion guard reads `assert isinstance(record, scratch.Registered)` renamed to `copy_record` as a removed assertion; the checkpoint commit carries an `Assertion-Change:` ruling per test.
 
 **Ruled out:** an alias or re-export of a moved name in `scratch.py`; `from scripts.lib.copy_record import name` in callers; a function-local import as the way out of the cycle.
+
+### Phase 17 — The user answers a change review inside the review page  · status: done
+
+**Source:** the showrunner of natedev, 2026-11-01 20:20 EST, relaying the user: "can i provide the works or some other feedback in the page itself? that would be ideal". The answer goes in the Tailscale review link page, never in a claude.ai artifact.
+
+**Requirements (showrunner's order):**
+1. Each change on the page has a works control and a text box for other feedback.
+2. An answer saves on submit, shows as saved, and survives a reload.
+3. The answer goes into the existing change review record through `change_review.py verdict`; no second copy of the state.
+4. A "not works" answer or free text goes back to the owning unit with the user's words, through the existing path.
+5. No agent polls for answers: the showrunner gets a message when one arrives.
+6. The write path listens on the tailnet address only, accepts only a row that the page shows, and takes no path or command from the request.
+7. One command makes the page from a list of row numbers, so one row and a batch use the same path.
+8. Each change on the page shows its kind at the top, in plain words: "See in action" or "Read only". The user (2026-11-01, via the showrunner): "i just want to have it show what kind i'm looking at - i do want to know about the ones that i don't need to look at also".
+9. A "Read only" change appears on the page too, with what changed and the proof; it is never hidden or left out.
+10. The kind test: does the change alter something the user runs or sees? Yes is "See in action"; no is "Read only".
+11. The change list has no kind field today. Choose one source for the kind (one place only, for example a field in the change review record set through change_review.py), and name it in your summary.
+
+Keep the plain layout of the trial page (`http://100.103.14.30:8765/2r5p9n/C27.html`; source copy `/tmp/claude/unit/1ce2e169-3129-4f89-b65d-25ead85f2048/C27.html`). Simple comes first: the smallest change to `scripts/review_links` that meets this. No hard-coded configuration values. A nixos change goes to the showrunner as a branch.
+
+**Code facts:** `scripts/review_links/serve.py` serves review snapshots only on this machine's Tailscale IPv4 address (`SimpleHTTPRequestHandler`, `ThreadingHTTPServer`). `scripts/review_links/review_link.py` publishes and refreshes files at short review links. `scripts/production/change_review.py` has the `verdict` action (line ~1299). Tests: `scripts/review_links/test_review_link.py`, `test_serve.py`, `scripts/production/test_change_review.py`.
+
+**State:** the change review record (written only through `change_review.py verdict`).
