@@ -3,7 +3,7 @@
 One file per herdr session, `~/.local/state/herdr-panes/<session>.json`, maps HERDR_PANE_ID to the
 launch of the Claude in that pane: its account folder, its cwd, its name and model flags and the
 environment marks it started with. The SessionStart hook (`session-start-pane-record.py`) writes
-the entry from its own Claude process at every start, resume, clear and compaction, so a pane
+the entry from its own Claude process at every start, resume and compaction, so a pane
 started by hand is covered the same as one restart or add_unit started (user, 2026-10-19).
 
 The conversation id is herdr's: its own hook keeps `agent_session` for each pane. The id here is
@@ -33,8 +33,9 @@ import tempfile
 from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from dataclasses import dataclass
 from pathlib import Path
-from typing import NotRequired, TypedDict, cast
+from typing import cast
 
 SCRIPTS = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(SCRIPTS / "herdr"))
@@ -43,11 +44,14 @@ sys.path.insert(0, str(SCRIPTS / "whoami"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import herdr  # noqa: E402
+import pane_launch
+import sessions
+from pane_launch import PaneLaunch as PaneLaunch
 from probe_session import PROBE_ENV  # noqa: E402
 
-RECORD_DIR = Path(os.environ.get("HERDR_PANE_RECORD_DIR") or Path.home() / ".local/state/herdr-panes")
+RECORD_DIR = pane_launch.record_directory()
 # The launch environment a resume must give back. Credentials never enter the record.
-KEPT_NAMES = frozenset({"ENABLE_TOOL_SEARCH", "STAFF_ID", PROBE_ENV})
+KEPT_NAMES = frozenset({"ENABLE_TOOL_SEARCH", PROBE_ENV})
 KEPT_PREFIXES = ("SHOWRUNNER_",)
 # Claude flags whose value the resume repeats; every other argument stays out of the record.
 NAME_FLAGS = frozenset({"-n", "--name"})
@@ -56,89 +60,67 @@ ANCESTOR_LIMIT = 16
 PROC = Path(os.environ.get("HERDR_PROC", "/proc"))
 
 
-class PaneLaunch(TypedDict):
-    pane_id: str
-    session_id: str
-    config_dir: str
-    cwd: str
-    name: str
-    model: str
-    remote_control: bool
-    environment: dict[str, str]
-    # False when the launch flags could not be read: a restore refuses it.
-    flags_read: bool
-    ended: NotRequired[bool]
-    written_at: str
+def record_directory() -> Path:
+    """Use the configured store, including an explicit binding by an embedded caller."""
+    return RECORD_DIR
 
 
 def record_path(session: str) -> Path:
-    return RECORD_DIR / f"{session}.json"
-
-
-def _read_entries(session: str, *, dependencies: Callable[[Path], None] | None = None) -> dict[str, object]:
-    path = record_path(session)
-    if dependencies is not None:
-        dependencies(path)
-    try:
-        value = cast(object, json.loads(path.read_text(encoding="utf-8")))
-    except FileNotFoundError:
-        return {}
-    except ValueError as error:
-        raise ValueError(f"{path}: {error}") from error
-    if not isinstance(value, dict):
-        raise ValueError(f"{path}: pane records must be an object")
-    return cast(dict[str, object], value)
+    return record_directory() / f"{session}.json"
 
 
 def read_strict(session: str, *, dependencies: Callable[[Path], None] | None = None) -> dict[str, PaneLaunch]:
     """Read validated launch evidence; only an absent file means there are no entries."""
-    entries = _read_entries(session, dependencies=dependencies)
-    for pane_id, value in entries.items():
-        location = f"{record_path(session)}: pane {pane_id}"
-        if not isinstance(value, dict):
-            raise ValueError(f"{location}: launch must be an object")
-        launch = cast(dict[str, object], value)
-        environment = launch.get("environment")
-        if (not isinstance(launch.get("session_id"), str)
-                or not isinstance(launch.get("written_at"), str)
-                or not isinstance(environment, dict)
-                or not all(isinstance(name, str) and isinstance(setting, str)
-                           for name, setting in cast(dict[object, object], environment).items())):
-            raise ValueError(f"{location}: expected session_id and written_at strings and a string environment")
-    return cast(dict[str, PaneLaunch], entries)
+    path = record_path(session)
+    if dependencies is not None:
+        dependencies(path)
+    return pane_launch.read_strict(path)
 
 
 def read(session: str) -> dict[str, PaneLaunch]:
     """The session's entries by pane id; an absent or unreadable file reads as none."""
-    try:
-        return cast(dict[str, PaneLaunch], _read_entries(session))
-    except (OSError, ValueError):
-        return {}
+    return pane_launch.read(record_path(session))
 
 
 def launches() -> list[PaneLaunch]:
     """Read retained launches through the same per-session reader as restore."""
-    return [entry for path in RECORD_DIR.glob("*.json") for entry in read(path.stem).values()]
+    return [entry for path in record_directory().glob("*.json") for entry in read(path.stem).values()]
 
 
 def launch_for_session(session_id: str) -> PaneLaunch | None:
     """Read a conversation's newest launch, including account moves and intentional exits."""
-    matches = [entry for entry in launches() if entry["session_id"] == session_id]
+    from scripts.production import staff
+
+    owner = staff.initial_snapshot().by_current_session(session_id)
+    reference = owner.id if owner is not None else session_id
+    matches = [entry for entry in launches() if entry["session_id"] in (reference, session_id)]
     if not matches:
         return None
     return max(matches, key=lambda entry: entry["written_at"])
 
 
+def resume_launch(entry: PaneLaunch) -> PaneLaunch:
+    """Resolve a retained member reference to its current conversation for resume."""
+    from scripts.production import staff
+
+    owner = staff.initial_snapshot().by_id(staff.StaffId(entry["session_id"]))
+    if owner is None or owner.current_session == entry["session_id"]:
+        return entry
+    current = entry.copy()
+    current["session_id"] = owner.current_session
+    return current
+
+
 @contextmanager
-def _locked(session: str) -> Generator[None]:
-    RECORD_DIR.mkdir(parents=True, exist_ok=True)
-    with open(RECORD_DIR / f".{session}.lock", "w", encoding="utf-8") as lock:
+def locked(session: str) -> Generator[None]:
+    record_directory().mkdir(parents=True, exist_ok=True)
+    with open(record_directory() / f".{session}.lock", "w", encoding="utf-8") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         yield
 
 
-def _save(session: str, entries: dict[str, PaneLaunch]) -> None:
-    handle, temporary = tempfile.mkstemp(dir=RECORD_DIR, prefix=f".{session}.", suffix=".tmp")
+def save(session: str, entries: dict[str, PaneLaunch]) -> None:
+    handle, temporary = tempfile.mkstemp(dir=record_directory(), prefix=f".{session}.", suffix=".tmp")
     with os.fdopen(handle, "w", encoding="utf-8") as file:
         json.dump(entries, file, indent=2, sort_keys=True)
         _ = file.write("\n")
@@ -146,34 +128,83 @@ def _save(session: str, entries: dict[str, PaneLaunch]) -> None:
 
 
 def write(session: str, launch: PaneLaunch) -> None:
-    """Replace the pane's entry and keep every other pane's."""
-    with _locked(session):
+    """Persist a member's fixed reference; keep the supplied launch observations."""
+    from scripts.production import staff
+
+    try:
+        owner = staff.initial_snapshot().by_current_session(launch["session_id"])
+    except (staff.StaffUnreadable, OSError, ValueError):
+        owner = None
+    if owner is not None and owner.id != launch["session_id"]:
+        launch = launch.copy()
+        launch["session_id"] = owner.id
+    with locked(session):
         entries = read(session)
+        if entries.get(launch["pane_id"]) == launch:
+            return
         entries[launch["pane_id"]] = launch
-        _save(session, entries)
+        save(session, entries)
+
+
+def retained_environment(launch: PaneLaunch, history: Sequence[PaneLaunch]) -> dict[str, str]:
+    """Keep a conversation's identity when its terminal command lost the environment."""
+    environment: dict[str, str] = {}
+    for previous in sorted(history, key=lambda item: item["written_at"]):
+        if previous["session_id"] == launch["session_id"]:
+            environment.update({key: value for key, value in previous["environment"].items()
+                                if key in herdr.MEMBER_MARKS or key.startswith(KEPT_PREFIXES)})
+    environment.update({key: value for key, value in launch["environment"].items() if key != "STAFF_ID"})
+    return environment
+
+
+def matching_launch(place: herdr.HerdrPlace, session_id: str) -> PaneLaunch | None:
+    """A pane's retained launch is evidence only for that exact conversation."""
+    entries = read(place.session)
+    exact = pane_launch.matching_launch(entries, place, session_id)
+    if exact is not None:
+        return exact
+    from scripts.production import staff
+
+    owner = staff.initial_snapshot().by_current_session(session_id)
+    if owner is None:
+        return None
+    retained = pane_launch.matching_launch(entries, place, owner.id)
+    if retained is None:
+        return None
+    projected = retained.copy()
+    projected["session_id"] = session_id
+    return projected
 
 
 def end(session: str, pane_id: str, session_id: str) -> None:
     """Mark the pane's entry ended when it is still this conversation's."""
-    with _locked(session):
+    from scripts.production import staff
+
+    record = staff.initial_snapshot()
+    owner = record.by_current_session(session_id)
+    stale = record.by_id(staff.StaffId(session_id))
+    if owner is None and stale is not None:
+        return
+    reference = owner.id if owner is not None else session_id
+    with locked(session):
         entries = read(session)
         entry = entries.get(pane_id)
-        if entry is None or entry["session_id"] != session_id:
+        if entry is None or entry["session_id"] not in (reference, session_id):
             return
         entry["ended"] = True
-        _save(session, entries)
+        save(session, entries)
 
 
 def forget_unit(unit_id: str) -> list[str]:
     """Drop every entry of a unit's director, in each session's record; a rename relaunches it in a new pane."""
     dropped: list[str] = []
-    for path in sorted(RECORD_DIR.glob("*.json")):
-        with _locked(path.stem):
+    for path in sorted(record_directory().glob("*.json")):
+        with locked(path.stem):
             entries = read(path.stem)
             kept = {pane: entry for pane, entry in entries.items()
                     if entry["environment"].get("SHOWRUNNER_UNIT_ID") != unit_id}
             if len(kept) != len(entries):
-                _save(path.stem, kept)
+                save(path.stem, kept)
                 dropped.extend(f"{path.stem}:{pane}" for pane in entries if pane not in kept)
     return dropped
 
@@ -240,25 +271,51 @@ def claude_arguments(pid: int) -> list[str]:
     return []
 
 
-def _flag_value(arguments: Sequence[str], flags: frozenset[str]) -> str:
-    value = ""
-    for index, argument in enumerate(arguments):
-        name, equals, inline = argument.partition("=")
-        if name in flags:
-            value = inline if equals else (arguments[index + 1] if index + 1 < len(arguments) else "")
-    return value
+@dataclass(frozen=True)
+class ClaudeArguments:
+    values: dict[str, str]
+    has_prompt: bool
+
+    def value(self, flags: frozenset[str]) -> str:
+        return next((value for name, value in reversed(tuple(self.values.items())) if name in flags), "")
+
+
+# Claude options used by launch commands; all consumers share this parse.
+CLAUDE_VALUE_FLAGS = frozenset({"--resume", "-r", "--remote-control", "--settings",
+    "--model", "--name", "-n", "--permission-mode", "--session-id"})
+RESUME_FLAGS = frozenset({"--resume", "-r"})
+
+
+def parse_claude_arguments(arguments: Sequence[str]) -> ClaudeArguments:
+    values: dict[str, str] = {}
+    prompt = False
+    index = 1
+    while index < len(arguments):
+        argument = arguments[index]
+        index += 1
+        option, equals, value = argument.partition("=")
+        if option in CLAUDE_VALUE_FLAGS:
+            if not equals and index < len(arguments) and not arguments[index].startswith("-"):
+                value = arguments[index]
+                index += 1
+            _ = values.pop(option, None)
+            values[option] = value
+        elif not argument.startswith("-") or argument == "--":
+            prompt = True
+    return ClaudeArguments(values, prompt)
 
 
 def launch(pane_id: str, session_id: str, cwd: str, environment: Mapping[str, str],
            arguments: Sequence[str]) -> PaneLaunch:
     config_dir = environment.get("CLAUDE_CONFIG_DIR") or str(Path.home() / ".claude")
+    parsed = parse_claude_arguments(arguments)
     return {
         "pane_id": pane_id,
         "session_id": session_id,
         "config_dir": config_dir,
         "cwd": cwd,
-        "name": _flag_value(arguments, NAME_FLAGS),
-        "model": _flag_value(arguments, MODEL_FLAGS),
+        "name": parsed.value(NAME_FLAGS),
+        "model": parsed.value(MODEL_FLAGS),
         "remote_control": any(argument.partition("=")[0] == "--remote-control" for argument in arguments),
         "environment": {key: value for key, value in sorted(environment.items())
                         if key in KEPT_NAMES or key.startswith(KEPT_PREFIXES)},
@@ -273,6 +330,24 @@ def _process_environment(pid: int) -> dict[str, str]:
     if sys.platform == "darwin":
         return _mac_record(pid)[1]
     return _environment((PROC / str(pid) / "environ").read_bytes().split(b"\0"))
+
+
+def running_launch(record: sessions.SessionRecord, place: herdr.HerdrPlace, cwd: str) -> PaneLaunch:
+    """Capture one verified live Claude using the existing argv and environment readers."""
+    if not sessions.running_session(record):
+        raise ValueError(f"{record['sessionId']}: Claude is no longer running")
+    environment = _process_environment(record["pid"])
+    arguments = _arguments(record["pid"])
+    if not herdr.is_claude_process(arguments):
+        raise ValueError(f"{record['sessionId']}: process is not Claude")
+    entry = launch(place.pane, record["sessionId"], cwd, environment, arguments)
+    entry["name"] = record["name"]
+    entry["pid"] = record["pid"]
+    started = sessions.process_start(record["pid"])
+    if not started:
+        raise ValueError(f"{record['sessionId']}: process start is unavailable")
+    entry["proc_start"] = started
+    return entry
 
 
 def _conversation_of(config_dir: str, pid: int) -> str:
@@ -316,7 +391,14 @@ def seed(session: str, *, select: Callable[[herdr.PaneIdentity], bool] | None = 
             print(f"{pane_id}: no conversation id for {pid}")
             continue
         cwd = found[0].get("cwd")
-        write(session, launch(pane_id, session_id, cwd if isinstance(cwd, str) else "", environment, arguments))
+        entry = launch(pane_id, session_id, cwd if isinstance(cwd, str) else "", environment, arguments)
+        entry["pid"] = pid
+        started = sessions.process_start(pid)
+        if not started:
+            print(f"{pane_id}: process start is unavailable for {pid}")
+            continue
+        entry["proc_start"] = started
+        write(session, entry)
         print(f"{pane_id}: {pane.get('label') or ''} {session_id}")
     return 0
 

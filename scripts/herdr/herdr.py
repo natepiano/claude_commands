@@ -22,6 +22,7 @@ import signal
 import shlex
 import shutil
 import subprocess
+import math
 import sys
 import time
 import tomllib
@@ -43,9 +44,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from process_failure import failure_detail
 import nix_env as nix_env
 from place import HerdrPlace as HerdrPlace
+from pane_launch import MEMBER_MARKS as MEMBER_MARKS, UNIT_MARKS as UNIT_MARKS, RecordedLabels, StaffLabelsRead
 
 if TYPE_CHECKING:
     from scripts.production import staff
+    from scripts.production.session_labels import StaffLabels
 
 # Herdr requires agent-start timeouts strictly above this boundary.
 _AGENT_START_TIMEOUT_MINIMUM_MS = 3000
@@ -53,10 +56,6 @@ _AGENT_START_TIMEOUT_MINIMUM_MS = 3000
 _AGENT_START_TIMEOUT_MAXIMUM_MS = 300_000
 PROMPT_SETTLE_SECONDS = 10
 _PLATFORM = sys.platform
-# The marks that name a production unit. Only a unit's own launch sets them; a probe, or a herdr
-# server started from inside a unit, drops them so that the unit's lookup never finds a second session.
-UNIT_MARKS = ("SHOWRUNNER_UNIT", "SHOWRUNNER_UNIT_ID")
-MEMBER_MARKS = (*UNIT_MARKS, "STAFF_ID")
 NO_ENVIRONMENT_REMOVALS: frozenset[str] = frozenset()
 _NO_WORKSPACE_FILTER: frozenset[str] = frozenset()
 SHARED_SESSION = "agents"
@@ -268,10 +267,15 @@ class PromptSubmissionNotRequired:
 PromptSubmitOutcome = PromptSubmitted | PromptNotSubmitted
 
 
+def _no_staff_publication(transcript: SessionTranscript) -> None:
+    del transcript
+
+
 @dataclass(frozen=True)
 class OpeningPrompt:
     text: str
     transcript: SessionTranscript | UnspecifiedPromptTranscript = UnspecifiedPromptTranscript()
+    before_prompt: Callable[[SessionTranscript], object] = _no_staff_publication
 
 
 @dataclass(frozen=True)
@@ -862,9 +866,9 @@ def json_items(value: object, context: str) -> list[object]:
 
 
 def child_environment(environment: dict[str, str]) -> dict[str, str]:
-    """Keep the one-launch heal proof in its consuming process, never its children."""
+    """Keep launch proofs and retired identity hints out of child processes."""
     return {key: value for key, value in environment.items()
-            if key not in (nix_env.HEAL_SESSION_ENV, nix_env.HEAL_DIRECTORY_ENV)}
+            if key not in (nix_env.HEAL_SESSION_ENV, nix_env.HEAL_DIRECTORY_ENV, "STAFF_ID")}
 
 
 def unmarked_environment() -> dict[str, str]:
@@ -872,7 +876,10 @@ def unmarked_environment() -> dict[str, str]:
     return child_environment({key: value for key, value in os.environ.items() if key not in MEMBER_MARKS})
 
 
-def run_program(argv: list[str], timeout: float = 10.0, *,
+PROGRAM_TIMEOUT_SECONDS = 10.0
+
+
+def run_program(argv: list[str], timeout: float = PROGRAM_TIMEOUT_SECONDS, *,
                 environment: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
     try:
         return subprocess.run(argv, capture_output=True, text=True, check=False, timeout=timeout,
@@ -1068,10 +1075,11 @@ class Herdr:
         """The outside-pane targeting form verified with herdr 0.9.0."""
         return [self.binary, "--session", self.session, *arguments]
 
-    def run(self, *arguments: str) -> str:
+    def run(self, *arguments: str, deadline: float = math.inf) -> str:
+        """Run within the caller's monotonic deadline, retaining the usual 10 s cap."""
         context = f"herdr {' '.join(arguments[:2])}"
         try:
-            result = run_program(self.argv(*arguments))
+            result = run_program(self.argv(*arguments), timeout=min(PROGRAM_TIMEOUT_SECONDS, max(0.0, deadline - time.monotonic())))
         except subprocess.TimeoutExpired as error:
             raise HerdrFailure(f"{context}: no answer after {error.timeout:g} s") from error
         require_success(result, context)
@@ -1081,8 +1089,9 @@ class Herdr:
         """Run an argv command in an existing pane; herdr types its text into the shell."""
         _ = self.run("pane", "run", pane, shlex.join(command))
 
-    def result(self, *arguments: str) -> dict[str, object]:
-        reply = decode_object(self.run(*arguments), "herdr response")
+    def result(self, *arguments: str, deadline: float = math.inf) -> dict[str, object]:
+        output = self.run(*arguments) if deadline == math.inf else self.run(*arguments, deadline=deadline)
+        reply = decode_object(output, "herdr response")
         return json_object(reply.get("result"), "herdr result")
 
     def panes(self) -> list[PaneIdentity]:
@@ -1345,9 +1354,11 @@ class Herdr:
             tab = json_text(row.get("tab_id"), "herdr pane tab id")
             panes_of.setdefault(tab, []).append(json_text(row.get("pane_id"), "herdr pane id"))
         from scripts.production import staff
+        from scripts.production.session_labels import StaffLabels
 
         membership = staff.initial_snapshot() if record is None else record
-        classifier = UnitTabClassifier(self.session, herdr_processes(), membership)
+        classifier = UnitTabClassifier(
+            self.session, herdr_processes(membership=StaffLabels.for_record(membership)), membership)
         unit_director_titles = {
             json_text(tab.get("label"), "herdr tab label") for tab in tabs
             if isinstance(classifier.classify(
@@ -1479,6 +1490,18 @@ class Herdr:
                 screen = f"agent_not_ready; startup screen could not be read: {read_error}"
             raise AgentNotReady(screen) from error
         if isinstance(opening, OpeningPrompt):
+            if isinstance(opening.transcript, SessionTranscript):
+                transcript = opening.transcript
+                identity = self.native_session(pane, kind, max(0.1, deadline - time.monotonic()))
+                if transcript.session_id and transcript.session_id != identity:
+                    raise HerdrFailure(f"{transcript.session_id}: resumed registry identity differs: {identity}")
+                transcript = SessionTranscript(transcript.config_dir, identity)
+                try:
+                    _ = opening.before_prompt(transcript)
+                except Exception as error:
+                    # Only this launch owns this pane; its caller closes it on refusal.
+                    raise HerdrFailure(f"{transcript.session_id}: staff publication refused: {error}") from error
+                opening = OpeningPrompt(opening.text, transcript)
             return self.submit_opening_prompt(pane, opening, launched_at,
                                               max(0, int((deadline - time.monotonic()) * 1000)))
         return PromptSubmissionNotRequired()
@@ -1573,6 +1596,31 @@ class Herdr:
                         pass
         activity = AgentProcessPresent(tuple(identities)) if agent_present else PaneAtShell() if foreground == shell else PaneRunning(tuple(commands))
         return PaneStartupObservation(PaneShell(cast(int, shell)), activity)
+
+    def native_session(self, pane: str, kind: str, timeout: float) -> str:
+        """An exact foreground process and its live registry prove the backend id."""
+        from scripts.production import staff
+        result = run_program(self.argv("pane", "process-info", "--pane", pane), timeout=timeout)
+        require_success(result, "native pane processes")
+        payload = json_object(decode_object(result.stdout, "native pane processes").get("result"), "native pane result")
+        info = json_object(payload.get("process_info"), "native pane process info")
+        identities: set[str] = set()
+        for value in json_items(info.get("foreground_processes"), "native foreground processes"):
+            process = json_object(value, "native foreground process")
+            arguments = [json_text(arg, "native process argument")
+                         for arg in json_items(process.get("argv"), "native process argv")]
+            if not _is_agent_process(arguments, kind):
+                continue
+            pid = process.get("pid")
+            if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+                raise HerdrFailure("native process pid is unavailable")
+            identity = staff.runtime_id(pid)
+            if not identity:
+                raise HerdrFailure(f"pid {pid}: native registry identity is unavailable")
+            identities.add(identity)
+        if len(identities) != 1:
+            raise HerdrFailure("native registry identity is unavailable or ambiguous")
+        return next(iter(identities))
 
     def readiness(self, pane: str) -> WorkerReadiness:
         agent = json_object(self.result("agent", "get", pane).get("agent"), "herdr agent get")
@@ -1847,12 +1895,12 @@ class Herdr:
             raise AgentBlocked("agent blocked at a trust, permission or question prompt", "agent_blocked")
         return ObservedAgentState(status)
 
-    def read(self, pane: str, lines: int, *, joined: bool, ansi: bool) -> str:
+    def read(self, pane: str, lines: int, *, joined: bool, ansi: bool, deadline: float = math.inf) -> str:
         arguments = ["pane", "read", pane, "--source", "recent-unwrapped" if joined else "recent",
                      "--lines", str(lines)]
         if ansi:
             arguments.extend(["--format", "ansi"])
-        return self.run(*arguments)
+        return self.run(*arguments, deadline=deadline)
 
     def send_keys(self, pane: str, *keys: str) -> None:
         _ = self.run("pane", "send-keys", pane, *keys)
@@ -1865,8 +1913,8 @@ class Herdr:
             if error.code != "pane_not_found":
                 raise
 
-    def agents(self) -> list[AgentOccupant]:
-        result = self.result("agent", "list")
+    def agents(self, *, deadline: float = math.inf) -> list[AgentOccupant]:
+        result = self.result("agent", "list", deadline=deadline)
         agents: list[AgentOccupant] = []
         for item in json_items(result.get("agents"), "herdr agent list"):
             agent = json_object(item, "herdr agent")
@@ -2449,6 +2497,13 @@ def _process_environment(process: Path) -> dict[str, str]:
     return dict(entry.split("=", 1) for entry in process.joinpath("environ").read_bytes().decode(errors="replace").split("\0") if "=" in entry)
 
 
+def process_environment(pid: int) -> dict[str, str]:
+    """Read a process even outside herdr; a failed observation remains an error."""
+    if _platform() == "darwin":
+        return darwin_process_environment(pid)
+    return _process_environment(_proc_root() / str(pid))
+
+
 def _process_arguments(process: Path) -> list[str]:
     return [value for value in process.joinpath("cmdline").read_bytes().decode(errors="replace").split("\0") if value]
 
@@ -2470,6 +2525,11 @@ def _is_agent_process(arguments: list[str], kind: str) -> bool:
 def is_claude_process(arguments: list[str]) -> bool:
     """The argv is a Claude Code process, native or through node."""
     return _is_agent_process(arguments, "claude")
+
+
+def is_codex_process(arguments: list[str]) -> bool:
+    """The argv is a Codex process, native or through node."""
+    return _is_agent_process(arguments, "codex")
 
 
 def _startup_processes(shell: PaneShell, kind: str, tracked: set[AgentProcessIdentity]) -> AgentProcessPresent | PaneAtShell | PaneRunning | PaneProcessesUnreadable:
@@ -3160,14 +3220,15 @@ def _darwin_herdr_processes() -> list[HerdrProcess]:
     processes: list[HerdrProcess] = []
     for pid, session in sessions.items():
         try:
-            if isinstance(by_pid[pid].arguments, UnreadableProcessArguments):
+            arguments = by_pid[pid].arguments
+            if isinstance(arguments, UnreadableProcessArguments):
                 continue
             environment = darwin_process_environment(pid)
             place = _live_pane_reader.get()(session).place(
                 pid, environment, lambda ident: by_pid[ident].parent if ident in by_pid else 0)
             if isinstance(place, NotInHerdr):
                 continue
-            marks = {key: environment[key] for key in MEMBER_MARKS if key in environment}
+            marks = _process_marks(environment, list(arguments.argv))
             processes.append(HerdrProcess(pid, place, marks,
                                           Path(by_pid[pid].executable).name, _darwin_process_cwd(pid)))
         except (HerdrFailure, subprocess.TimeoutExpired):
@@ -3175,7 +3236,15 @@ def _darwin_herdr_processes() -> list[HerdrProcess]:
     return processes
 
 
-def has_unit_marks(environment: dict[str, str]) -> bool:
+def _process_marks(environment: dict[str, str], arguments: list[str]) -> dict[str, str]:
+    """Keep a native thread identity only on the Codex process that carries it."""
+    marks = {key: environment[key] for key in MEMBER_MARKS if key in environment}
+    if _is_agent_process(arguments, "codex") and (thread := environment.get("CODEX_THREAD_ID")):
+        marks["CODEX_THREAD_ID"] = thread
+    return marks
+
+
+def has_staff_marks(environment: dict[str, str]) -> bool:
     return all(environment.get(mark) for mark in UNIT_MARKS)
 
 
@@ -3199,11 +3268,15 @@ class UnitTabClassifier:
     by_workspace: dict[str, dict[str, UnitTab]]
 
     def __init__(self, session: str, processes: Sequence[HerdrProcess], record: staff.StaffSnapshot) -> None:
-        parents = {row.id: row for row in record.find(kind="showrunner")}
-        units: dict[str, UnitTab] = {row.id: UnitTab(row, parents[row.parent]) for row in record.find(kind="unit")
+        from scripts.production import staff
+
+        parents = {row.id: row for row in staff.active(record, "showrunner")}
+        units: dict[str, UnitTab] = {row.current_session: UnitTab(row, parents[row.parent]) for row in staff.active(record, "unit")
                                      if row.parent is not None and row.parent in parents}
         self.by_pane = {process.place.pane: units[ident] for process in processes
-                        if process.place.session == session and (ident := process.marks.get("STAFF_ID")) in units}
+                        if process.place.session == session
+                        and (ident := process.marks.get("CODEX_THREAD_ID")
+                             or process.marks.get("CLAUDE_CODE_SESSION_ID")) in units}
         self.by_workspace = {}
         for unit in units.values():
             self.by_workspace.setdefault(unit.parent.name, {})[unit.row.name] = unit
@@ -3248,7 +3321,7 @@ def _scan_herdr_processes() -> list[HerdrProcess]:
                 cwd = str(process.joinpath("cwd").resolve(strict=True))
             except (OSError, ValueError, RuntimeError) as error:
                 cwd = UnreadableCwd(str(error))
-            marks = {key: environment[key] for key in MEMBER_MARKS if key in environment}
+            marks = _process_marks(environment, arguments)
             processes.append(HerdrProcess(pid, place, marks, Path(arguments[0]).name, cwd))
         except (OSError, ValueError, RuntimeError):
             continue
@@ -3319,9 +3392,11 @@ def process_action() -> Generator[None]:
         _process_reader.reset(token)
 
 
-def herdr_processes() -> list[HerdrProcess]:
+def herdr_processes(*, membership: StaffLabels | StaffLabelsRead = StaffLabelsRead.PENDING) -> list[HerdrProcess]:
     """Read current processes, or the snapshot held by an explicit scope."""
-    return [HerdrProcess(row.pid, row.place, dict(row.marks), row.command, row.working_directory)
+    labels = RecordedLabels(membership)
+    return [HerdrProcess(row.pid, row.place, labels.resolve(row.pid, row.marks, lambda: row.place),
+                         row.command, row.working_directory)
             for row in _process_reader.get()()]
 
 
@@ -3380,10 +3455,11 @@ def agent_base_environment(environment: dict[str, str], unset_environment: froze
     base_env = dict(os.environ)
     for key in tuple(base_env):
         # scripts/lib/unit_env.sh and unit_runs.environ map every PLAN_DELEGATE_ alias to UNIT_.
-        if (key.startswith(("HERDR_", "CODEX_", "UNIT_", "PLAN_DELEGATE_", "SHOWRUNNER_", "CLAUDE_", "NIX_HEAL_"))
-                or key in {"ANTHROPIC_API_KEY", "SHELL", "TMUX", "TMUX_PANE", "SHUTDOWN_PARENT_LAUNCH_CLAIM", "STAFF_ID"}):
+        if (key.startswith(("HERDR_", "CODEX_", "UNIT_", "PLAN_DELEGATE_", "SHOWRUNNER_", "CLAUDE_", "STAFF_", "NIX_HEAL_"))
+                or key in {"ANTHROPIC_API_KEY", "SHELL", "TMUX", "TMUX_PANE", "SHUTDOWN_PARENT_LAUNCH_CLAIM"}):
             del base_env[key]
     base_env.update(environment)
+    _ = base_env.pop("STAFF_ID", None)
     for key in unset_environment:
         _ = base_env.pop(key, None)
     return child_environment(base_env)
@@ -3395,7 +3471,8 @@ def prepare_agent_environment(cwd: str, environment: dict[str, str],
     loaded = nix_env.ensure(Path(cwd), agent_base_environment(environment, unset_environment))
     if isinstance(loaded, nix_env.Refused):
         return loaded
-    launch_environment = {key: value for key, value in loaded.env.items() if key not in unset_environment}
+    launch_environment = {key: value for key, value in loaded.env.items()
+                          if key not in unset_environment and key != "STAFF_ID"}
     return PreparedAgentEnvironment(Path(cwd).resolve(), launch_environment)
 
 

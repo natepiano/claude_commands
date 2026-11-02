@@ -26,6 +26,7 @@ from scripts.production import showrunners as showrunners
 import dailies_render as dailies_render
 from production_units import read_production as read_production
 from scripts.production.cli_fixture import invoke_cli
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production.staff_test_support import (
     fixture_showrunner_name, isolated_staff_file, showrunner_launch, showrunner_relationship,
 )
@@ -77,10 +78,6 @@ else:
 def setUpModule() -> None:
     """The times these tests expect are Pacific; the user's zone setting must not change them."""
     unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
-
-
-# load 136 on natedev, 2026-10-29
-TEST_HANG_GUARD_SECS = 300
 
 
 class RegistrationFixture(unittest.TestCase):
@@ -269,10 +266,10 @@ class RegistrationFixture(unittest.TestCase):
         """A production with a complete update timer, so the tree counts it."""
         instance = self.state / "notifier" / f"showrunner-{slug}"
         instance.mkdir(parents=True)
-        _ = (instance / "conf").write_text(
-            f"TARGET=session:{slug}-session\nCHECK=zsh /x/production_check.sh {self.doc}\n", encoding="utf-8")
         row = showrunner_relationship(fixture_showrunner_name(slug, self.doc))
-        showrunner_launch(row, f"{slug}-session", self.env)
+        _ = (instance / "conf").write_text(
+            f"TARGET=session:{row.id}\nCHECK=zsh /x/production_check.sh {self.doc}\n", encoding="utf-8")
+        showrunner_launch(row, row.id, self.env)
 
     def attach(self, child: str, parent: str) -> None:
         _ = showrunner_relationship(fixture_showrunner_name(child, self.doc), fixture_showrunner_name(parent, self.doc))

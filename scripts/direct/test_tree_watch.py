@@ -9,9 +9,12 @@ import unittest
 from typing import final
 
 from scripts.direct.tree_watch_test_support import (
-    EventWatcher, TreeWatchFixture, WATCH_DEADLINE, TEST_HANG_GUARD_SECS,
+    EventWatcher,
+    TreeWatchFixture,
+    WATCH_DEADLINE,
     write_workspace as write_workspace,
 )
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 @final

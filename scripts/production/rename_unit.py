@@ -55,7 +55,6 @@ import proposals_folder  # noqa: E402
 import retire_unit  # noqa: E402
 import pane_record  # noqa: E402
 import rename_state  # noqa: E402
-import review_pool  # noqa: E402
 from scripts.production import showrunners  # noqa: E402
 import stall_watch  # noqa: E402
 import unit_lookup  # noqa: E402
@@ -67,6 +66,8 @@ from rename_state import RenameRefused, read_json, write_json, write_text  # noq
 from unit_move import PathMove, git  # noqa: E402
 from user_zone import user_zone  # noqa: E402
 from scripts.production import staff, staff_sources
+from scripts.lib import git_exclude, tunables
+from scripts.astra import design_roles
 
 if TYPE_CHECKING:
     from scripts.style import style_ledger
@@ -298,6 +299,30 @@ def _check_stopped(rename: UnitRename, *, relaunch: bool = False) -> None:
     relaunch may accept its recorded session already live under the new id."""
     try:
         marked = unit_lookup.marked_units(rename.slug)
+        # Membership omits unregistered runtimes. They still prevent reuse of
+        # a retained pane, so inspect occupancy before any relaunch or write.
+        places = {found.place: unit for unit in (rename.old, rename.new)
+                  if (found := marked.get(unit)) is not None}
+        if rename.pane_session and rename.pane_id:
+            places[herdr.HerdrPlace(rename.pane_session, rename.pane_id)] = rename.new
+        observations = unit_lookup.observed_staff_marks()
+        # An initially stopped unit has no journaled live pane. Its launch
+        # labels still identify an occupied destination to refuse, even when
+        # the replacement conversation has no staff row. This grants no row
+        # ownership to that conversation.
+        for slug, observed in observations:
+            if slug == rename.slug and observed.unit in (rename.old, rename.new):
+                _ = places.setdefault(observed.place, observed.unit)
+        for _, observed in observations:
+            if observed.place not in places:
+                continue
+            unit = places[observed.place]
+            if isinstance(observed.claude, unit_lookup.ClaudeUnknown):
+                raise RenameRefused(f"{unit}: cannot tell whether Claude is running: {observed.claude.reason}")
+            if (isinstance(observed.claude, unit_lookup.LiveClaude)
+                    and not (relaunch and unit == rename.new
+                             and observed.claude.session_id == rename.session_id)):
+                raise RenameRefused(f"{unit} has a live Claude; stop it first")
     except OSError as error:
         raise RenameRefused(f"{rename.old}: cannot tell whether Claude is running: {error}") from error
     relaunched = False
@@ -533,7 +558,22 @@ def _merge(rename: UnitRename, _save: Callable[[], None]) -> None:
     rename.merged = unit_move.merge_into(worktree, f"origin/{rename.merge_branch}", message)
 
 
+def relocate_staff_worktree(member_id: staff.StaffId, worktree: Path) -> None:
+    """Change a recorded worktree path without changing its lifecycle state."""
+    row = staff.by_id(member_id)
+    if row is None or row.kind != "unit":
+        raise RenameRefused(f"{member_id}: no matching unit staff row")
+    if isinstance(row.worktree, staff.WorktreeUnfilled):
+        return
+    _ = staff.set_worktree(member_id, dataclasses.replace(row.worktree, path=worktree))
+
+
 def _move_git(rename: UnitRename, _save: Callable[[], None]) -> None:
+    if isinstance(rename.staff_id, UnboundStaffMember):
+        raise RenameRefused(f"{rename.slug}/{rename.old}: no journaled staff identity")
+    source = Path(rename.old_worktree)
+    git_exclude.require_untracked_ignored(source if source.exists() else Path(rename.new_worktree),
+                                          ".unit.toml", planned_pattern="/.unit.toml")
     checkout = Path(rename.checkout)
     if rename.old_branch != rename.new_branch:
         unit_move.push_branch(checkout, rename.old_branch, rename.new_branch, rename.merged)
@@ -542,6 +582,9 @@ def _move_git(rename: UnitRename, _save: Callable[[], None]) -> None:
                                 Path(rename.new_worktree), rename.merged)
     elif rename.old_branch != rename.new_branch:
         _ = git(Path(rename.new_worktree), "switch", rename.new_branch)
+    worktree = Path(rename.new_worktree)
+    git_exclude.ensure_excluded(worktree, "/.unit.toml")
+    relocate_staff_worktree(rename.staff_id, worktree)
 
 
 def _move_claude(rename: UnitRename, _save: Callable[[], None]) -> None:
@@ -591,7 +634,6 @@ def _merge_rename(rename: UnitRename, save: Callable[[], None]) -> None:
 
 
 def _move_state(rename: UnitRename, _save: Callable[[], None]) -> None:
-    from scripts.astra import design_roles
     from scripts.direct import workers
     workers.rename_unit(rename.slug, rename.old, rename.new,
                         runs=tuple(set((*retire_unit.runs_of(Path(rename.old_worktree)),
@@ -617,10 +659,6 @@ def _move_state(rename: UnitRename, _save: Callable[[], None]) -> None:
         _ = rename_state.rename_outstanding(path.parent.parent.name, ((rename.old, rename.new), *paths))
     unit_move.move(PathMove(stall_watch.stretch_path(rename.slug, rename.old),
                             stall_watch.stretch_path(rename.slug, rename.new)))
-    try:
-        _ = review_pool.rename_unit(rename.slug, rename.old, rename.new)
-    except review_pool.PoolError as error:
-        raise RenameRefused(str(error)) from error
     old, new = Path(rename.old_worktree), Path(rename.new_worktree)
     run = unit_move.newest_run(old) or unit_move.newest_run(new)
     if run is not None:
@@ -782,7 +820,7 @@ def stop_unit(rename: StopTarget, save: Callable[[], None]) -> None:
         found = unit_lookup.marked_unit(rename.slug, rename.old)
         if rename.session_id and (found is None or isinstance(found.claude, unit_lookup.LiveClaude)
                                   and found.claude.session_id != rename.session_id):
-            found = next((marked for _, marked in unit_lookup.observed_unit_marks()
+            found = next((marked for _, marked in unit_lookup.observed_staff_marks()
                           if isinstance(marked.claude, unit_lookup.LiveClaude)
                           and marked.claude.session_id == rename.session_id), None)
     except OSError as error:
@@ -1118,7 +1156,6 @@ def _state_failures(rename: UnitRename) -> list[str]:
     identity = phase_table.production_identity(read_production(Path(rename.doc)))
     failures.extend(f"{note}: phase note still names {rename.old}"
                     for note in phase_table.owned_notes(identity, rename.old))
-    from scripts.astra import design_roles
     failures.extend(design_roles.rename_failures(rename.slug, rename.old, rename.old_worktree))
     return failures
 
@@ -1137,7 +1174,7 @@ def _session_failures(rename: UnitRename) -> list[str]:
         failures.append(f"{rename.new} is not running; relaunch it with shutdown.py restart --here --only {rename.session_id}")
     # When the id already matched, the mark is the new id too; only the session name changed.
     if not rename.id_matches:
-        for slug, old in unit_lookup.observed_unit_marks():
+        for slug, old in unit_lookup.observed_staff_marks():
             if (slug == rename.slug and old.unit == rename.old
                     and isinstance(old.claude, (unit_lookup.LiveClaude, unit_lookup.ClaudeUnknown))):
                 failures.append(f"a session still carries the mark {rename.old}: "
@@ -1408,7 +1445,7 @@ def apply(slug: str, old: str, new: str, scratch: Path) -> UnitRename:
     slug = showrunners.canonical_slug(slug)
     path = rename_state.unit_journal(slug)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with unit_move.production_lock():
+    with unit_move.production_lock(), design_roles.record_operation():
         if rename_state.unfinished(rename_state.production_journal(slug)):
             raise RenameRefused(f"{slug}: finish the production rename first")
         rename = _resumed(path, old, new)
@@ -1512,7 +1549,9 @@ def _main(argv: list[str]) -> int:
     except RenameWaiting as error:
         print(f"rename_unit: {error}", file=sys.stderr)
         return 2
-    except (RenameRefused, production_units.Refusal, unit_names.BadName, WorkerUnavailable, OSError, UnicodeError) as error:
+    except (RenameRefused, production_units.Refusal, unit_names.BadName, WorkerUnavailable,
+            git_exclude.ExcludeRefused, tunables.TunableUnusable, subprocess.SubprocessError,
+            OSError, UnicodeError) as error:
         print(f"rename_unit: {error}", file=sys.stderr)
         return 1
     for line in describe(rename):

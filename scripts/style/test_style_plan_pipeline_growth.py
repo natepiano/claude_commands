@@ -114,7 +114,8 @@ class StylePlanTests(StylePlanFixture):
         finding = ledger.named_held(origin.finding_ids)[0]
         tip = ledger.synced_commit()
         reading = style_ledger.DeclarationReading(tip, (
-            style_ledger.FindingSite(finding, style_ledger.UnchangedSite(self.sources[1], 1)),))
+            style_ledger.FindingSite(finding, style_ledger.UnchangedSite(self.sources[1], 1,
+                style_ledger.FindingAnchor(tip, finding.path, finding.line))),))
         with (mock.patch.object(style_ledger.Ledger, "_declaration_reading", return_value=reading),
               self.assertRaisesRegex(style_ledger.LedgerError, "overlap: " + self.sources[1])):
             _ = ledger.follow_declarations(origin.finding_ids, tip, lambda _: True)

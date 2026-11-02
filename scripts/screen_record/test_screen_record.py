@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import cast, override
 
 
+from scripts.lib.process_group import send_process_group
 SCRIPT = Path(__file__).with_name("screen_record.py")
 REAL_TIMEOUT = shutil.which("timeout")
 STUB_BODY = r'''
@@ -120,7 +121,7 @@ class ScreenRecordTests(unittest.TestCase):
         try:
             stdout, stderr = process.communicate(timeout=deadline)
         except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGKILL)
+            send_process_group(process.pid, signal.SIGKILL)
             _ = process.communicate()
             self.fail(f"screen recorder exceeded the {deadline} s test deadline")
         exit_code = process.returncode

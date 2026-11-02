@@ -3,8 +3,11 @@
 message sender: nothing real starts and nothing real is sent."""
 from __future__ import annotations
 
+from scripts.production.staff_test_support import ClaudeBackendFixture, StaffTestCase, fixture_member, fixture_runtime_id
+
 import io
 import json
+import math
 import os
 import shlex
 import subprocess
@@ -30,22 +33,54 @@ import herdr as runtime
 from scripts.herdr import herdr
 from scripts.herdr.fake_herdr import CommandResponse
 
-from scripts.production.add_showrunner_test_support import AddShowrunnerFixture, SCRIPT, TEST_HANG_GUARD_SECS
+from scripts.production.add_showrunner_test_support import AddShowrunnerFixture, SCRIPT
 
 
 from scripts.production import staff
 from scripts.production import completion_receipt
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.message import sessions
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+
+class NativeClaudeShowrunnerTests(StaffTestCase):
+    def test_fresh_showrunner_uses_the_observed_claude_id_before_its_opening_prompt(self) -> None:
+        document = self.production("demo")
+        _ = document.write_text(document.read_text() + "\n- **Merge branch:** `main`\n"
+                                + f"- **Showrunner checkout:** `{self.root}`\n- **Log:** `demo-log.md`\n")
+        child = production_units.read_production(document)
+        identity = fixture_runtime_id("fresh-Claude-showrunner")
+        backend = ClaudeBackendFixture(identity, self.root / "claude-account")
+        with (patch.object(runtime, "start_server"), patch.object(runtime, "launch_agent", side_effect=backend.launch)):
+            outcome = add_showrunner.launch(child, "fixture", "high", None, self.root,
+                accounts.NamedAccount("claude1", backend.configuration))
+        self.assertIsInstance(outcome, runtime.PromptSubmitted)
+        row = backend.before_opening.by_id(staff.StaffId(identity))
+        assert row is not None
+        self.assertEqual((row.id, row.name, row.parent), (identity, "demo", None))
+        self.assertNotIn("--session-id", backend.arguments)
+        self.assertNotIn("--resume", backend.arguments)
+        self.assertNotIn("STAFF_ID", backend.environment)
+
 
 class AddShowrunnerTests(AddShowrunnerFixture):
+    def test_new_showrunner_and_missing_parent_are_admitted_with_their_live_docs(self) -> None:
+        self.starts("cfc4564d-fed3-5803-9a4c-e3119733bb53", registers="kid")
+        result = self.run_command("kid")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        child = staff.by_path("kid")
+        parent = staff.by_path("top")
+        assert child is not None and parent is not None
+        self.assertEqual(child.doc, staff.LiveDoc("natedev", self.doc("kid")))
+        self.assertEqual(parent.doc, staff.LiveDoc("natedev", self.doc("top")))
+        self.assertEqual(child.parent, parent.id)
+
     @override
     def setUp(self) -> None:
         super().setUp()
-        _ = staff.ensure("showrunner", name="top")
+        _ = fixture_member("showrunner", name="top")
 
     def test_launch_passes_the_ensured_showrunner_staff_id_to_the_pane(self) -> None:
-        self.starts("kid-session", registers="kid")
+        self.starts("cfc4564d-fed3-5803-9a4c-e3119733bb53", registers="kid")
         result = self.run_command("kid")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         rows = [row for row in staff.find(kind="showrunner") if row.name == "kid"]
@@ -53,12 +88,42 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         opened = self.opened()
         environment = dict(opened[index + 1].split("=", 1)
                            for index, value in enumerate(opened) if value == "--env")
-        self.assertEqual(environment.get("STAFF_ID"), rows[0].id)
+        self.assertNotIn("STAFF_ID", environment)
+        pid = int(self.env["FAKE_CLAUDE_PID"])
+        registry = sessions.read_session(Path(self.env["NOTIFIER_SESSIONS_DIR"]) / f"{pid}.json")
+        assert not isinstance(registry, sessions.UnreadableSessionRecord)
+        self.assertEqual(registry["sessionId"], self.env["FAKE_CLAUDE_SESSION_ID"])
+        self.assertEqual(registry.get("procStart"), sessions.process_start(pid))
+        self.assertEqual((rows[0].id, rows[0].current_session), (registry["sessionId"], registry["sessionId"]))
+
+    def test_showrunner_and_unit_add_paths_share_the_live_doc_admission_writer(self) -> None:
+        import add_unit
+
+        self.starts("cfc4564d-fed3-5803-9a4c-e3119733bb53", registers="kid")
+        original = add_showrunner.ensure_staff_showrunner
+        self.assertIs(add_unit.ensure_staff_showrunner, original)
+        with (patch.object(add_showrunner, "ensure_staff_showrunner", wraps=original) as showrunner_admit,
+              patch.object(add_unit, "ensure_staff_showrunner", wraps=original) as unit_admit):
+            result = self.run_command("kid")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            child = next(row for row in staff.find(kind="showrunner") if row.name == "kid")
+            self.assertGreater(showrunner_admit.call_count, 0)
+            with (patch.dict(os.environ, self.env),
+                  patch.object(showrunners, "NOTIFIER_STATE_DIR", self.root / "notifier")):
+                unit = add_unit.ensure_staff_unit(production_units.read_production(self.doc("kid")), "probe-unit",
+                    worktree=staff.PresentWorktree("natedev", self.root / "probe"),
+                    runtime_id=fixture_runtime_id("probe-unit-backend"))
+            unit_admit.assert_called_once()
+        self.assertEqual(unit.parent, child.id)
+        self.assertEqual(staff.by_id(child.id), child)
+        self.assertEqual(child.doc, staff.LiveDoc("natedev", self.doc("kid")))
+        self.assertEqual(len([row for row in staff.find(kind="showrunner") if row.id == child.id]), 1)
 
     def test_existing_staff_parent_survives_a_stale_saved_parent_during_ensure(self) -> None:
-        self.timer("kid", "kid-session")
-        parent = staff.ensure("showrunner", name="other")
-        child = staff.ensure("showrunner", name="kid", parent=parent.id)
+        self.timer("kid", "cfc4564d-fed3-5803-9a4c-e3119733bb53")
+        parent = fixture_member("showrunner", name="other")
+        child = fixture_member("showrunner", name="kid", parent=parent.id,
+                             doc=staff.LiveDoc("natedev", self.doc("kid")))
         path = self.root / "showrunner/kid/parent"
         path.parent.mkdir(parents=True, exist_ok=True)
         write_text_atomic(path, "top\n")
@@ -70,28 +135,55 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         self.assertEqual((self.staff.staff_file.read_bytes(), path.read_bytes()), before)
 
     def assert_dead_launch_recovers(self, *, transcript_exists: bool) -> None:
-        self.starts("kid-session", registers="kid")
-        with patch.object(add_showrunner, "launch", side_effect=RuntimeError("stopped after saving launch")):
-            with self.assertRaisesRegex(RuntimeError, "stopped after saving launch"):
+        self.starts("cfc4564d-fed3-5803-9a4c-e3119733bb53", registers="kid")
+        class NativeCallbackInterrupted(BaseException):
+            """The backend was observed before this launcher process ended."""
+
+        def interrupted(child: production_units.Production, caller: str, *, runtime_id: str = "") -> staff.StaffRow:
+            self.assertEqual((child.slug, caller), ("kid", "top"))
+            self.assertEqual(runtime_id, "cfc4564d-fed3-5803-9a4c-e3119733bb53")
+            raise NativeCallbackInterrupted("stopped after saving launch")
+
+        before = self.staff.staff_file.read_bytes()
+        with patch.object(add_showrunner, "ensure_staff_showrunner", side_effect=interrupted):
+            with self.assertRaisesRegex(NativeCallbackInterrupted, "stopped after saving launch"):
                 _ = self.run_command("kid")
-        receipt = completion_receipt.read_receipt(self.root / "showrunner/kid/add_showrunner.json", staff.snapshot())
-        assert isinstance(receipt, completion_receipt.OwnedReceipt)
+        receipt = completion_receipt.read_launch_receipt(self.root / "showrunner/kid/add_showrunner.json", staff.initial_snapshot())
+        assert isinstance(receipt, completion_receipt.UnpublishedReceipt)
         identity = add_showrunner.ShowrunnerLaunch.from_receipt(receipt.fields)
+        self.assertEqual(receipt.identity, identity.session_id)
+        self.assertEqual(self.staff.staff_file.read_bytes(), before)
+        self.assertEqual(sum(row[2:4] == ["agent", "start"] for row in self.herdr_calls()), 1)
+        self.assertFalse(any(row[2:4] == ["agent", "prompt"] for row in self.herdr_calls()))
+        old_pid = int(self.env["FAKE_CLAUDE_PID"])
+        old_process = next(process for process in self.processes if process.pid == old_pid)
+        old_process.terminate()
+        _ = old_process.wait(timeout=TEST_HANG_GUARD_SECS)
+        returned_native = identity.session_id if transcript_exists else fixture_runtime_id("fresh-after-dead-showrunner")
+        self.starts(returned_native, registers="kid")
         if transcript_exists:
             transcript = identity.config_dir / "projects/fixture" / f"{identity.session_id}.jsonl"
             transcript.parent.mkdir(parents=True, exist_ok=True)
             write_text_atomic(transcript, '{}\n')
-        with patch.object(sessions, "session_liveness", return_value=sessions.SessionNotLive()):
-            recovered = self.run_command("kid")
+        recovered = self.run_command("kid")
         self.assertEqual(recovered.returncode, 0, recovered.stdout + recovered.stderr)
         starts = [row for row in self.herdr_calls() if row[2:4] == ["agent", "start"]]
-        self.assertEqual(len(starts), 1)
-        flag = "--resume" if transcript_exists else "--session-id"
-        self.assertEqual(starts[0][starts[0].index(flag) + 1], identity.session_id)
-        self.assertNotIn("--session-id" if transcript_exists else "--resume", starts[0])
+        self.assertEqual(len(starts), 2)
+        if transcript_exists:
+            self.assertEqual(starts[-1][starts[-1].index("--resume") + 1], identity.session_id)
+        else:
+            self.assertNotIn("--resume", starts[-1])
+        self.assertTrue(all("--session-id" not in command for command in starts))
         prompt = f"/showrunner:produce {self.doc('kid')}" + (" resume" if transcript_exists else "")
         self.assertEqual([row[-1] for row in self.herdr_calls() if row[2:4] == ["agent", "prompt"]], [prompt])
         self.assertEqual(self.parent_of("kid"), "top")
+        child = staff.by_path("kid")
+        assert child is not None
+        self.assertEqual((child.id, child.current_session), (returned_native, returned_native))
+        recovered_receipt = completion_receipt.read_launch_receipt(
+            self.root / "showrunner/kid/add_showrunner.json", staff.snapshot())
+        assert isinstance(recovered_receipt, completion_receipt.OwnedReceipt)
+        self.assertEqual(recovered_receipt.fields["session_id"], returned_native)
 
     def test_dead_saved_launch_resumes_its_transcript_with_the_resume_prompt(self) -> None:
         self.assert_dead_launch_recovers(transcript_exists=True)
@@ -100,7 +192,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         self.assert_dead_launch_recovers(transcript_exists=False)
 
     def assert_open_launch_recovers(self, prompt_submitted: bool) -> None:
-        self.starts("kid-session", registers="kid")
+        self.starts("cfc4564d-fed3-5803-9a4c-e3119733bb53", registers="kid")
         _ = self.on_start.pop(str(self.timer_conf("kid")))
         if prompt_submitted:
             with patch.object(add_showrunner, "showrunner_appeared", side_effect=RuntimeError("stopped before timer")):
@@ -112,11 +204,11 @@ class AddShowrunnerTests(AddShowrunnerFixture):
             self.assertEqual(first.returncode, add_showrunner.SESSION_NOT_READY, first.stderr)
         starts = sum(row[2:4] == ["agent", "start"] for row in self.herdr_calls())
         self.assertEqual(starts, 1)
-        self.assertNotIn("TARGET=session:kid-session", self.timer_conf("kid").read_text())
+        self.assertNotIn("TARGET=session:cfc4564d-fed3-5803-9a4c-e3119733bb53", self.timer_conf("kid").read_text())
 
         def register(slug: str) -> bool:
             self.assertEqual(slug, "kid")
-            _ = self.timer_conf(slug).write_text(self.timer_text(slug, "kid-session"))
+            _ = self.timer_conf(slug).write_text(self.timer_text(slug, "cfc4564d-fed3-5803-9a4c-e3119733bb53"))
             return True
 
         with (patch.object(sessions, "session_liveness", return_value=sessions.LiveSessionProcess(12345)),
@@ -139,53 +231,107 @@ class AddShowrunnerTests(AddShowrunnerFixture):
     def test_open_showrunner_submits_its_owed_prompt_without_second_launch(self) -> None:
         self.assert_open_launch_recovers(False)
 
+    def assert_observed_callback_recovers(self, after_publication: bool) -> None:
+        native = "cfc4564d-fed3-5803-9a4c-e3119733bb53"
+        self.starts(native, registers="kid")
+        original = add_showrunner.ensure_staff_showrunner
+        before = self.staff.staff_file.read_bytes()
+
+        class NativeCallbackInterrupted(BaseException):
+            """Process loss after native observation leaves the launch available for recovery."""
+
+        def interrupted(child: production_units.Production, caller: str, *, runtime_id: str = "") -> staff.StaffRow:
+            self.assertEqual(runtime_id, native)
+            if after_publication:
+                _ = original(child, caller, runtime_id=runtime_id)
+            raise NativeCallbackInterrupted("interrupted after native observation")
+
+        with patch.object(add_showrunner, "ensure_staff_showrunner", side_effect=interrupted):
+            with self.assertRaisesRegex(NativeCallbackInterrupted, "interrupted after native observation"):
+                _ = self.run_command("kid")
+        receipt_path = self.root / "showrunner/kid/add_showrunner.json"
+        receipt = completion_receipt.read_launch_receipt(receipt_path, staff.initial_snapshot())
+        if after_publication:
+            self.assertIsInstance(receipt, completion_receipt.OwnedReceipt)
+            assert isinstance(receipt, completion_receipt.OwnedReceipt)
+            self.assertEqual(receipt.owner.id, native)
+        else:
+            self.assertIsInstance(receipt, completion_receipt.UnpublishedReceipt)
+            assert isinstance(receipt, completion_receipt.UnpublishedReceipt)
+            self.assertEqual(receipt.identity, native)
+            self.assertIsInstance(completion_receipt.read_receipt(receipt_path, staff.initial_snapshot()),
+                                  completion_receipt.NoReceipt)
+            self.assertEqual(self.staff.staff_file.read_bytes(), before)
+        starts = [row for row in self.herdr_calls() if row[2:4] == ["agent", "start"]]
+        self.assertEqual(len(starts), 1)
+        self.assertNotIn("--session-id", starts[0])
+        self.assertEqual([row for row in self.herdr_calls() if row[2:4] == ["agent", "prompt"]], [])
+        submit = runtime.Herdr.submit_opening_prompt
+
+        def published_before_work(client: runtime.Herdr, pane: str, opening: runtime.OpeningPrompt,
+                                  launched_at: datetime, timeout_ms: int) -> runtime.PromptSubmitted | runtime.PromptNotSubmitted:
+            row = staff.by_id(staff.native_id(native))
+            parent = staff.by_path("top")
+            assert row is not None and parent is not None
+            self.assertEqual((row.id, row.kind, row.name, row.doc),
+                             (native, "showrunner", "kid", staff.LiveDoc("natedev", self.doc("kid"))))
+            return submit(client, pane, opening, launched_at, timeout_ms)
+
+        with (patch.object(runtime.Herdr, "submit_opening_prompt", new=published_before_work),
+              patch.object(runtime, "herdr_place_of", return_value=runtime.HerdrPlace("agents", "w1:p1"))):
+            recovered = self.run_command("kid")
+        self.assertEqual(recovered.returncode, 0, recovered.stdout + recovered.stderr)
+        self.assertEqual(sum(row[2:4] == ["agent", "start"] for row in self.herdr_calls()), 1)
+        self.assertEqual([row[-1] for row in self.herdr_calls() if row[2:4] == ["agent", "prompt"]],
+                         [f"/showrunner:produce {self.doc('kid')}"])
+        self.assertEqual(self.parent_of("kid"), "top")
+        self.assertEqual([row.id for row in staff.find(kind="showrunner") if row.name == "kid"], [native])
+        child, parent = staff.by_path("kid"), staff.by_path("top")
+        assert child is not None and parent is not None
+        self.assertEqual(child.parent, parent.id)
+
+    def test_observed_native_launch_recovers_before_staff_publication_without_a_second_backend(self) -> None:
+        self.assert_observed_callback_recovers(False)
+
+    def test_observed_native_launch_recovers_after_staff_publication_before_its_opening_work(self) -> None:
+        self.assert_observed_callback_recovers(True)
+
     def test_retired_showrunner_receipt_cannot_complete_a_new_add_request(self) -> None:
-        self.starts("kid-session", registers="kid")
+        self.starts("cfc4564d-fed3-5803-9a4c-e3119733bb53", registers="kid")
         first = self.run_command("kid")
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
         child = staff.by_path("kid")
         assert child is not None
-        _ = staff.retire(child.id)
+        wrapped = staff.set_doc(child.id, staff.WrappedDoc("natedev", self.doc("kid")))
         second = self.run_command("kid")
         self.assertEqual(second.returncode, 2, second.stdout + second.stderr)
         self.assertNotIn("already started", second.stdout)
-        self.assertIsNone(staff.by_id(child.id))
+        self.assertEqual(staff.by_id(child.id), wrapped)
 
     def test_add_showrunner_rerun(self) -> None:
-        self.starts("kid-session", registers="kid")
-        original = add_showrunner.ensure_staff_showrunner
-        for after in (False, True):
-            def interrupted(child: production_units.Production, caller: str) -> staff.StaffRow:
-                if after:
-                    _ = original(child, caller)
-                raise RuntimeError("stopped at staff step")
-            with patch.object(add_showrunner, "ensure_staff_showrunner", side_effect=interrupted):
-                with self.assertRaisesRegex(RuntimeError, "stopped at staff step"):
-                    _ = self.run_command("kid")
-            self.assertFalse(any(row[2:4] == ["agent", "start"] for row in self.herdr_calls()))
-        first = self.run_command("kid")
-        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        self.assert_observed_callback_recovers(False)
         rows = staff.snapshot().rows
         child = next(row for row in rows if row.name == "kid")
         parent = next(row for row in rows if row.name == "top")
         self.assertEqual(child.parent, parent.id)
         data, edge = self.staff.staff_file.read_bytes(), self.parent_of("kid")
         calls = sum(row[2:4] == ["agent", "start"] for row in self.herdr_calls())
-        again = self.run_command("kid")
+        with patch.object(runtime, "herdr_place_of", return_value=runtime.HerdrPlace("agents", "w1:p1")):
+            again = self.run_command("kid")
         self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
         self.assertIn("already started", again.stdout)
         self.assertEqual((self.staff.staff_file.read_bytes(), self.parent_of("kid")), (data, edge))
         self.assertEqual(sum(row[2:4] == ["agent", "start"] for row in self.herdr_calls()), calls)
 
     def test_new_showrunner_launches_on_picked_default_account_and_attaches_it(self) -> None:
-        self.starts("kid-session", registers="kid")
+        self.starts("cfc4564d-fed3-5803-9a4c-e3119733bb53", registers="kid")
         result = self.run_command("kid", subprocess_cli=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(result.stdout.splitlines()[:2],
                          ["started kid: herdr session attach agents, workspace kid, tab kid", "kid now reports to top"])
         self.assertEqual(self.parent_of("kid"), "top")
         # The parent ran the command and reads its output; only the child is told.
-        self.assertEqual(self.sent_to(), [f"uds:{self.root / 'kid-session.sock'}"])
+        self.assertEqual(self.sent_to(), [f"uds:{self.root / 'cfc4564d-fed3-5803-9a4c-e3119733bb53.sock'}"])
         calls = self.herdr_calls()
         self.assertIn(["--user", "start", "herdr-agents.service"], calls)
         opened = self.opened()
@@ -200,29 +346,33 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         self.assertEqual(opened[-1], "--no-focus")
         started = self.started()
         self.assertEqual(started[started.index("--") + 1:], ["--model", "opus", "--effort", "high",
-            "--session-id", started[started.index("--session-id") + 1], "--remote-control", "kid", "-n", "kid", "--settings", '{"disableAgentView": true}'])
+            "--remote-control", "kid", "-n", "kid", "--settings", '{"disableAgentView": true}'])
         self.assertEqual([row for row in calls if row[2:4] == ["agent", "prompt"]], [[
             "--session", "agents", "agent", "prompt", "w1:p1", f"/showrunner:produce {self.doc('kid')}"]])
 
     def test_resume_starts_in_the_given_directory_with_the_resume_prompt(self) -> None:
-        self.starts("abc-123", registers="kid")
+        self.starts("cfc4564d-fed3-5803-9a4c-e3119733bb53", registers="kid")
         elsewhere = self.root / "elsewhere"
         elsewhere.mkdir()
-        result = self.run_command("kid", "--resume", "abc-123", "--cwd", str(elsewhere), "--account", "claude2")
+        result = self.run_command("kid", "--resume", "cfc4564d-fed3-5803-9a4c-e3119733bb53", "--cwd", str(elsewhere), "--account", "claude2")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.opened()[7], str(elsewhere))
         args = self.started()
-        self.assertEqual(args[args.index("--resume") + 1], "abc-123")
+        self.assertEqual(args[args.index("--resume") + 1], "cfc4564d-fed3-5803-9a4c-e3119733bb53")
         self.assertIn(["--session", "agents", "agent", "prompt", "w1:p1",
                        f"/showrunner:produce {self.doc('kid')} resume"], self.herdr_calls())
-        alone = self.run_command("other", "--resume", "abc-123")
+        alone = self.run_command("other", "--resume", "cfc4564d-fed3-5803-9a4c-e3119733bb53")
         self.assertEqual(alone.returncode, 2)
         self.assertIn("--resume and --cwd go together", alone.stderr)
 
     def test_showrunner_shared_tab_retries_enter_with_the_selected_session_transcript(self) -> None:
         child = production_units.read_production(self.doc("kid"))
         selected = accounts.NamedAccount("claude3", self.root / "selected")
-        transcript = selected.dir / "projects/fixture/resumed-id.jsonl"
+        native = fixture_runtime_id("shared-tab-resumed-showrunner")
+        path, record = self.record(native, "kid")
+        _ = Path(path).write_text(record)
+        pid = cast(dict[str, object], json.loads(record))["pid"]
+        transcript = selected.dir / "projects/fixture" / f"{native}.jsonl"
         transcript.parent.mkdir(parents=True)
         text = f"/showrunner:produce {child.doc} resume"
         elapsed = 0.0
@@ -232,7 +382,8 @@ class AddShowrunnerTests(AddShowrunnerFixture):
             nonlocal elapsed
             elapsed += seconds
 
-        def visible(*_args: str) -> str:
+        def visible(*_args: str, deadline: float = math.inf) -> str:
+            del deadline
             return screen
 
         def turn(*, meta: bool) -> None:
@@ -253,7 +404,15 @@ class AddShowrunnerTests(AddShowrunnerFixture):
             screen = "────────\n❯ \n────────"
             turn(meta=False)
 
-        with (patch.object(runtime, "shared_session", return_value="agents"),
+        def native_process(command: list[str], *, timeout: float) -> subprocess.CompletedProcess[str]:
+            self.assertEqual(command[-4:], ["pane", "process-info", "--pane", "destination:p1"])
+            self.assertGreater(timeout, 0)
+            return subprocess.CompletedProcess(command, 0, json.dumps({"result": {"process_info": {
+                "foreground_processes": [{"pid": pid, "name": "claude", "argv": ["claude"]}]}}}), "")
+
+        with (patch.dict(os.environ, self.env),
+              patch.object(runtime, "run_program", side_effect=native_process),
+              patch.object(runtime, "shared_session", return_value="agents"),
               patch.object(runtime, "start_server"),
               patch.object(runtime, "open_tab", return_value="destination:p1") as tab,
               patch.object(runtime, "time", SimpleNamespace(monotonic=lambda: elapsed, sleep=advance)),
@@ -263,7 +422,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
               patch.object(runtime.Herdr, "prompt", autospec=True, side_effect=typed) as prompt,
               patch.object(runtime.Herdr, "run", side_effect=visible),
               patch.object(runtime.Herdr, "send_keys", autospec=True, side_effect=enter) as keys):
-            outcome = add_showrunner.launch(child, "opus", "high", "resumed-id", self.root, selected)
+            outcome = add_showrunner.launch(child, "opus", "high", native, self.root, selected)
         self.assertIsInstance(outcome, runtime.PromptSubmitted)
         self.assertEqual(prompt.call_count, 1)
         self.assertEqual(keys.call_count, 1)
@@ -291,7 +450,9 @@ class AddShowrunnerTests(AddShowrunnerFixture):
             assert isinstance(opening.transcript, runtime.SessionTranscript)
             self.assertEqual(opening.transcript.config_dir, Path(self.env["HOME"]) / ".claude2")
             arguments = cast(list[str], start.call_args.args[3])
-            self.assertEqual(opening.transcript.session_id, arguments[arguments.index("--session-id") + 1])
+            self.assertEqual(opening.transcript.session_id, "")
+            self.assertNotIn("--session-id", arguments)
+            self.assertIsNotNone(opening.before_prompt)
         self.assertEqual(self.parent_of("kid"), "")
 
     def test_new_showrunner_reads_stored_showrunners_account_despite_better_unit_reading(self) -> None:
@@ -312,7 +473,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
                  "target@example.invalid": {"weekly": {"left": 0, "at": now.isoformat(),
                   "resets": (now + timedelta(days=4)).isoformat()}}}
         _ = (home / ".local/state/agent-notes/usage.json").write_text(json.dumps(saved))
-        self.starts("kid-session", registers="kid")
+        self.starts("cfc4564d-fed3-5803-9a4c-e3119733bb53", registers="kid")
         before = path.read_bytes()
         result = self.run_command("kid")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -324,7 +485,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         """F004: live parent identity and readings cannot supply missing configuration."""
         path = self.configure_groups()
         path.unlink()
-        for options in ((), ("--resume", "abc-123", "--cwd", str(self.root))):
+        for options in ((), ("--resume", "cfc4564d-fed3-5803-9a4c-e3119733bb53", "--cwd", str(self.root))):
             with self.subTest(options=options):
                 result = self.run_command("kid", *options)
                 self.refused(result, "accounts.py move showrunners <claudeN>")
@@ -335,7 +496,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         """F004: both launch groups may use the same configured account."""
         directory = self.named_account()
         _ = self.configure_groups(units="claude3", showrunners="claude3")
-        self.starts("kid-session", registers="kid")
+        self.starts("cfc4564d-fed3-5803-9a4c-e3119733bb53", registers="kid")
         result = self.run_command("kid")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("CLAUDE_CONFIG_DIR=" + str(directory), self.opened())
@@ -349,7 +510,10 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         path = Path(self.env["HOME"]) / ".local/state/accounts/groups.json"
         before = path.read_bytes()
         result = self.run_command("kid")
-        self.refused(result, "logged in as other@example.invalid, not claude3")
+        self.refused(result, "~/.claude3 holds a different login from claude3; "
+                     + "run env -u CLAUDE_CODE_OAUTH_TOKEN "
+                     + f"CLAUDE_CONFIG_DIR={shlex.quote(str(directory))} claude, then /login as claude3")
+        self.assertNotIn("other@example.invalid", result.stdout + result.stderr)
         self.assertEqual(path.read_bytes(), before)
 
     def test_new_showrunner_repairs_a_wrong_shared_link_before_launching(self) -> None:
@@ -357,7 +521,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         linked = directory / "projects"
         linked.unlink()
         linked.symlink_to(Path(self.env["HOME"]) / "missing-projects")
-        self.starts("kid-session", registers="kid")
+        self.starts("cfc4564d-fed3-5803-9a4c-e3119733bb53", registers="kid")
         result = self.run_command("kid")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertTrue(linked.is_symlink())
@@ -399,7 +563,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         directory = Path(self.env["HOME"]) / "retained account"
         directory.mkdir()
         _ = (directory / ".claude.json").write_text("SECRET malformed account contents")
-        result = self.run_command("kid", "--resume", "abc-123", "--cwd", str(self.root),
+        result = self.run_command("kid", "--resume", "cfc4564d-fed3-5803-9a4c-e3119733bb53", "--cwd", str(self.root),
                                   "--config-dir", str(directory))
         self.refused(result, "claude2")
         self.assertNotIn("SECRET", result.stderr)
@@ -421,7 +585,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         _ = (directory / ".claude.json").write_text(json.dumps({
             "projects": {str(self.root): {"hasTrustDialogAccepted": True}}}))
         _ = self.named_account()
-        result = self.run_command("kid", "--resume", "abc-123", "--cwd", str(self.root),
+        result = self.run_command("kid", "--resume", "cfc4564d-fed3-5803-9a4c-e3119733bb53", "--cwd", str(self.root),
                                   "--config-dir", str(directory))
         self.refused(result, "claude3")
         self.assertEqual(self.events("systemd-run"), [])
@@ -430,8 +594,8 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         """F004: explicit matching directories are accepted after path resolution."""
         home = Path(self.env["HOME"])
         directory = self.named_account()
-        self.starts("abc-123", registers="kid")
-        result = self.run_command("kid", "--resume", "abc-123", "--cwd", str(self.root),
+        self.starts("cfc4564d-fed3-5803-9a4c-e3119733bb53", registers="kid")
+        result = self.run_command("kid", "--resume", "cfc4564d-fed3-5803-9a4c-e3119733bb53", "--cwd", str(self.root),
                                   "--config-dir", ".claude3", cwd=home)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("CLAUDE_CONFIG_DIR=" + str(directory), self.opened())
@@ -440,7 +604,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         directory = Path(self.env["HOME"]) / "retained"
         directory.mkdir()
         for options in (("--config-dir", str(directory)),
-                        ("--resume", "abc-123", "--cwd", str(self.root), "--config-dir", str(directory),
+                        ("--resume", "cfc4564d-fed3-5803-9a4c-e3119733bb53", "--cwd", str(self.root), "--config-dir", str(directory),
                          "--account", "claude2")):
             with self.subTest(options=options):
                 result = self.run_command("kid", *options)
@@ -452,8 +616,8 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         """F004: resume selection ignores the previous account."""
         directory = self.named_account()
         _ = (self.state / "kid@claude_config_dir").write_text(str(Path(self.env["HOME"]) / ".claude"))
-        self.starts("abc-123", registers="kid")
-        result = self.run_command("kid", "--resume", "abc-123", "--cwd", str(self.root))
+        self.starts("cfc4564d-fed3-5803-9a4c-e3119733bb53", registers="kid")
+        result = self.run_command("kid", "--resume", "cfc4564d-fed3-5803-9a4c-e3119733bb53", "--cwd", str(self.root))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("CLAUDE_CONFIG_DIR=" + str(directory), self.opened())
 
@@ -463,7 +627,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         self.resume_record()
         with patch.dict(os.environ, self.env, clear=True), \
                 patch.object(accounts, "role_account", wraps=accounts.role_account) as role:
-            selected = add_showrunner.account_for_launch(child, "abc-123")
+            selected = add_showrunner.account_for_launch(child, "cfc4564d-fed3-5803-9a4c-e3119733bb53")
         self.assertEqual(selected, accounts.NamedAccount("claude3", directory))
         role.assert_called_once_with("showrunner")
 
@@ -490,7 +654,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
             _ = (process / "environ").write_bytes(
                 ("\0".join(f"{key}={value}" for key, value in environment.items()) + "\0").encode()
             )
-        result = self.run_command("kid", "--resume", "abc-123", "--cwd", str(self.root), "--check")
+        result = self.run_command("kid", "--resume", "cfc4564d-fed3-5803-9a4c-e3119733bb53", "--cwd", str(self.root), "--check")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("check: ok", result.stdout)
         self.assertEqual(self.herdr_calls(), [["--session", "default", "session", "list", "--json"]])
@@ -499,7 +663,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         """F004: an explicit account must agree with the showrunners account."""
         _ = self.named_account()
         for options in (("--account", "claude2"),
-                        ("--resume", "abc-123", "--cwd", str(self.root), "--account", "claude2")):
+                        ("--resume", "cfc4564d-fed3-5803-9a4c-e3119733bb53", "--cwd", str(self.root), "--account", "claude2")):
             with self.subTest(options=options):
                 result = self.run_command("kid", *options)
                 self.refused(result, "claude3")
@@ -508,8 +672,8 @@ class AddShowrunnerTests(AddShowrunnerFixture):
     def test_showrunner_resume_without_recorded_account_uses_configured_group(self) -> None:
         """F004: configuration is sufficient for a resume with no retained account."""
         directory = self.named_account()
-        self.starts("abc-123", registers="kid")
-        result = self.run_command("kid", "--resume", "abc-123", "--cwd", str(self.root), "--account", "claude3")
+        self.starts("cfc4564d-fed3-5803-9a4c-e3119733bb53", registers="kid")
+        result = self.run_command("kid", "--resume", "cfc4564d-fed3-5803-9a4c-e3119733bb53", "--cwd", str(self.root), "--account", "claude3")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("CLAUDE_CONFIG_DIR=" + str(directory), self.opened())
 
@@ -517,7 +681,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         self.env["CLAUDE_CODE_OAUTH_TOKEN"] = "caller-token"
         self.env["SHOWRUNNER_UNIT"] = "parent"
         self.env["SHOWRUNNER_UNIT_ID"] = "parent-unit"
-        self.starts("kid-session", registers="kid")
+        self.starts("cfc4564d-fed3-5803-9a4c-e3119733bb53", registers="kid")
         result = self.run_command("kid")
         self.assertEqual(result.returncode, 0, result.stderr)
         environment = dict(value.split("=", 1) for flag, value in zip(self.opened()[8:], self.opened()[9:]) if flag == "--env")
@@ -562,7 +726,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
     def test_child_opens_its_tab_in_a_shared_server_that_already_runs(self) -> None:
         self.herdr_overrides["--session agents status server"] = CommandResponse(
             code=0, stdout="status: running\n")
-        self.starts("kid-session", registers="kid")
+        self.starts("cfc4564d-fed3-5803-9a4c-e3119733bb53", registers="kid")
         result = self.run_command("kid")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         calls = self.herdr_calls()
@@ -577,21 +741,22 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         assert "weekly" in held
         held["weekly"]["left"] = 0
         _ = file.write_text(json.dumps(saved))
-        self.starts("kid-session", registers="kid")
+        self.starts("cfc4564d-fed3-5803-9a4c-e3119733bb53", registers="kid")
         result = self.run_command("kid")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(f"CLAUDE_CONFIG_DIR={Path(self.env['HOME']) / '.claude2'}", self.opened())
 
     def test_a_timer_left_by_an_ended_session_does_not_stand_in_the_way(self) -> None:
         # The child ran before under this parent; its session ended, and its timer and its edge are still stored.
-        self.timer("kid", "abc-123")
+        self.timer("kid", "cfc4564d-fed3-5803-9a4c-e3119733bb53")
         edge = self.root / "showrunner" / "kid" / "parent"
         edge.parent.mkdir(parents=True)
         _ = edge.write_text("top\n", encoding="utf-8")
-        top = staff.ensure("showrunner", name="top")
-        _ = staff.ensure("showrunner", name="kid", parent=top.id)
-        self.starts("abc-123")
-        result = self.run_command("kid", "--resume", "abc-123", "--cwd", str(self.root), "--account", "claude2")
+        top = fixture_member("showrunner", name="top")
+        _ = fixture_member("showrunner", name="kid", parent=top.id,
+                           runtime_id="cfc4564d-fed3-5803-9a4c-e3119733bb53")
+        self.starts("cfc4564d-fed3-5803-9a4c-e3119733bb53")
+        result = self.run_command("kid", "--resume", "cfc4564d-fed3-5803-9a4c-e3119733bb53", "--cwd", str(self.root), "--account", "claude2")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(result.stdout.splitlines(), ["started kid: herdr session attach agents, workspace kid, tab kid", "kid already reports to top"])
         self.assertEqual(self.sent_to(), [])
@@ -622,7 +787,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
     def test_a_registry_unreadable_for_a_moment_during_the_wait_is_tried_again(self) -> None:
         self.flaky_registry(1)
         self.env["ADD_SHOWRUNNER_WAIT_S"] = "30"
-        self.starts("kid-session", registers="kid")
+        self.starts("cfc4564d-fed3-5803-9a4c-e3119733bb53", registers="kid")
         result = self.run_command("kid")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.parent_of("kid"), "top")
@@ -630,7 +795,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
     def test_showrunner_wait_retries_with_the_configured_interval(self) -> None:
         self.flaky_registry(1)
         self.env["ADD_SHOWRUNNER_WAIT_S"] = "300"
-        self.starts("kid-session", registers="kid")
+        self.starts("cfc4564d-fed3-5803-9a4c-e3119733bb53", registers="kid")
         polls = self.root / "polls.jsonl"
         result = self.run_command("kid")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -646,10 +811,10 @@ class AddShowrunnerTests(AddShowrunnerFixture):
 
     def test_a_registry_still_unreadable_at_the_deadline_leaves_the_child_unattached(self) -> None:
         self.flaky_registry(1000)
-        self.starts("kid-session", registers="kid")
+        self.starts("cfc4564d-fed3-5803-9a4c-e3119733bb53", registers="kid")
         result = self.run_command("kid")
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertIn("kid is not attached: cannot tell whether session:kid-session is running: "
+        self.assertIn("kid is not attached: cannot tell whether session:cfc4564d-fed3-5803-9a4c-e3119733bb53 is running: "
                       + "one or more registry files could not be read", result.stdout)
         self.assertEqual(self.parent_of("kid"), "")
 
@@ -681,8 +846,8 @@ class AddShowrunnerTests(AddShowrunnerFixture):
     def test_a_production_above_the_caller_is_refused(self) -> None:
         self.timer("middle", "middle-session")
         self.timer("grand", "grand-session")
-        grand = staff.ensure("showrunner", name="grand")
-        middle = staff.ensure("showrunner", name="middle", parent=grand.id)
+        grand = fixture_member("showrunner", name="grand")
+        middle = fixture_member("showrunner", name="middle", parent=grand.id)
         top = next(row for row in staff.find(kind="showrunner") if row.name == "top")
         _ = staff.move(top.id, middle.id)
         for child, parent in (("top", "middle"), ("middle", "grand")):
@@ -714,7 +879,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         self.trust(main)
         for folder in (main / "sub", self.root / "side"):
             with self.subTest(folder=folder.name):
-                result = self.run_command("kid", "--resume", "abc-123", "--cwd", str(folder), "--account", "claude2", "--check")
+                result = self.run_command("kid", "--resume", "cfc4564d-fed3-5803-9a4c-e3119733bb53", "--cwd", str(folder), "--account", "claude2", "--check")
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_a_trusted_parent_folder_does_not_cover_a_repository_below_it(self) -> None:
@@ -731,7 +896,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         self.assertEqual(self.herdr_calls(), [])
 
     def test_a_session_that_runs_no_production_is_refused(self) -> None:
-        self.env["CLAUDE_CODE_SESSION_ID"] = "no-such-session"
+        self.env["CODEX_THREAD_ID"] = fixture_runtime_id("unattached-showrunner-caller")
         self.refused(self.run_command("kid"), "this session runs no production, so it has nothing to attach kid to")
 
 

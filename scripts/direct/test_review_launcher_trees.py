@@ -16,11 +16,9 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
         finish = self.root / f"{session.name}-finish"
         environment = self.environment()
         environment["STUB_REVIEW_FINISH_FILE"] = str(finish)
-        running = [subprocess.Popen(["bash", str(self.review_script), "--pool", "code",
-                                     "--lease", f"builders:3:broad:{lens}:1",
-                                     *self.review_command(session, lens, "")[2:]],
+        running = [subprocess.Popen(self.unit_review_command(session, lens, slot="review" if index == 0 else f"review{index + 1}"),
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                    text=True, env=environment) for lens in lenses]
+                                    text=True, env=environment) for index, lens in enumerate(lenses)]
         try:
             wait_until(lambda: all((session / f"review_slot_{lens}").exists() for lens in lenses)
                        or any(process.poll() is not None for process in running),
@@ -183,7 +181,7 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
         for slot in ("impl", "test"):
             self.assertIn(f"[{slot}] register:", board)
 
-    def test_ignored_code_flags_both_lenses_run_at_once_without_overwriting_each_other(self) -> None:
+    def test_unit_reviewers_run_both_lenses_without_overwriting_each_other(self) -> None:
         """The whole reason the lens exists: two reviewers, one session dir.
 
         Unsuffixed artifacts and a shared pass slot made the reviewers of
@@ -283,7 +281,7 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
         for lens, slot in workers.items():
             self.assertIn(f"[{slot}] register: {lens} review up", board)
 
-    def test_ignored_code_flags_three_lenses_run_at_once_each_in_a_worker_of_its_own(self) -> None:
+    def test_three_lenses_run_at_once_each_in_a_unit_worker_of_its_own(self) -> None:
         """Each lens holds a separate reviewer and closes only its own pass."""
         session_dir = self.start_implementation("three-lenses")
         self.recorder("finish-pass", "--session-dir", str(session_dir), "--status", "completed")

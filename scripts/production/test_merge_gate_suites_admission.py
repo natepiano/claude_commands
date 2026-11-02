@@ -232,6 +232,24 @@ class SharedGateAdmissionTests(GateSuitesFixture):
 
 @final
 class MergeGateAdmissionTests(unittest.TestCase):
+    def test_swap_wait_reason_uses_the_policy_saved_in_the_check_result(self) -> None:
+        pressure = memory_admit.MemoryPressure(0, 40, 80)
+        peak = memory_admit.ExpectedPeak(memory_admit.GIB, "fallback", 0)
+        default = memory_admit.DEFAULT_ADMISSION_POLICY
+        result = memory_admit.CheckResult(
+            memory_admit.AdmissionDecision("hold", 0, 0, 0, 0, pressure=pressure), peak, [],
+            memory_admit.NotReserved("held"), "test", "merge-gate", 0,
+            memory_admit.GateProfile("test", "test", memory_admit.GIB,
+                                    memory_admit.NoGateHistory(memory_admit.GIB)), policy=default)
+        lower = replace(default, pressure=replace(default.pressure, swap_used_limit=70))
+        higher = replace(default, pressure=replace(default.pressure, swap_used_limit=90))
+        with mock.patch.object(memory_admit, "read_memory_config", side_effect=AssertionError("frozen check")), \
+             mock.patch.object(memory_admit, "memory_config", side_effect=AssertionError("frozen check")):
+            self.assertEqual(merge_gate.gate_wait_reasons(replace(result, policy=lower)),
+                             ("swap memory pressure",))
+            self.assertEqual(merge_gate.gate_wait_reasons(replace(result, policy=higher)),
+                             ("memory pressure",))
+
     def test_scope_probe_timeout_or_missing_command_runs_without_prefix(self) -> None:
         for error in (subprocess.TimeoutExpired("systemd-run", 10), FileNotFoundError("systemd-run")):
             with self.subTest(error=type(error).__name__), mock.patch.dict(os.environ, {"BUILDLOG_SCOPE": "1"}), \

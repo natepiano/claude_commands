@@ -111,7 +111,7 @@ def write_process(proc: Path, pid: int, used: int = 0) -> None:
         raise OSError("empty fixture memory")
 
 
-def queue_read_fixture(view: gate.QueueView) -> gate.QueueRead:
+def queue_read_fixture(view: gate.QueueView, policy: gate.AdmissionPolicy) -> gate.QueueRead:
     """Pair legacy rendering fixtures with explicit, already-decided explanation fields."""
     running = tuple(gate.ExplainedRunningStep(step, gate.AdmissionTimeNotRecorded(),
         step.promise, step.measured.bytes if isinstance(step.measured, gate.MeasuredMemory) else 0,
@@ -124,7 +124,7 @@ def queue_read_fixture(view: gate.QueueView) -> gate.QueueRead:
         step = view.waiting[0]
         reason = step.reason
         row: gate.Waiter = {"pid": step.pid, "start_time": "", "need": step.need, "since": step.since}
-        order = gate.head_window(row, view.now)
+        order = gate.head_window(row, view.now, policy=policy)
         decision = gate.AdmissionDecision("admit", step.need + view.reserve, view.promised, view.reserve, 0, budget=budget)
         if isinstance(reason, gate.HeadAdmissionStatus):
             decision, order = reason.decision, reason.backfill
@@ -148,16 +148,20 @@ def queue_read_fixture(view: gate.QueueView) -> gate.QueueRead:
                           limits=gate.AdmissionLimits(budget, view.reserve))
         followers.append(gate.LineWaiter(step, own.state == "admit", own,
                                          *gate.decision_checks(own, step.need, view.available)))
+    ordered: list[tuple[Path, gate.Waiter]] = [(Path(f"{step.pid}-{step.pid}.waiting"),
+        {"pid": step.pid, "start_time": str(step.pid), "need": step.need, "since": step.since,
+         "session_id": step.session_id, "session_name": step.session_name,
+         "step": step.step, "folder": step.folder}) for step in view.waiting]
+    inputs = gate.QueueInputs(ordered, view.running, (),
+        gate.HostMemory(view.available, gate.UnknownHostTotal()), gate.NoPressureHold(),
+        gate.NoRecoverySpacing(),
+        gate.NoHeadAdmissionOverride(), view.now)
     explanation = gate.QueueExplanation(view.now, host, running,
         gate.QueueMemoryTotals(sum(step.charged for step in running), sum(step.measured for step in running), view.promised),
         first, gate.WaitingLine(tuple(followers), len(followers), sum(row.fits_now for row in followers),
             min((row.waiter.need for row in followers), default=0),
             max((row.waiter.need for row in followers), default=0),
-            min((row.waiter.since for row in followers), default=view.now)))
-    ordered: list[tuple[Path, gate.Waiter]] = [(Path(f"{step.pid}-{step.pid}.waiting"),
-        {"pid": step.pid, "start_time": str(step.pid), "need": step.need, "since": step.since,
-         "session_id": step.session_id, "session_name": step.session_name,
-         "step": step.step, "folder": step.folder}) for step in view.waiting]
+            min((row.waiter.since for row in followers), default=view.now)), inputs, gate.AdmissionLimits(budget, view.reserve), policy=policy)
     return gate.QueueRead(view, explanation, ordered)
 
 
@@ -165,7 +169,7 @@ def head_reading(*, since: float = HEAD_NOW - 600, now: float = HEAD_NOW,
                  fields: dict[str, object] | None = None, step_name: str = "nextest") -> gate.QueueRead:
     step = gate.WaitingStep(123, "head-session", "head", step_name, "/tmp/head", since,
                             gate.GIB, gate.ReadyForAdmission())
-    reading = queue_read_fixture(gate.QueueView((step,), (), 30 * gate.GIB, 0, 3 * gate.GIB, now))
+    reading = queue_read_fixture(gate.QueueView((step,), (), 30 * gate.GIB, 0, 3 * gate.GIB, now), policy=gate.DEFAULT_ADMISSION_POLICY)
     row = cast(gate.Waiter, cast(object, {"pid": step.pid, "start_time": "123", "need": step.need,
                             "since": since, "session_id": step.session_id,
                             "session_name": step.session_name, "step": step.step,
@@ -268,9 +272,9 @@ class QueueFixture(ExitStack):
                  for at in ended]
         write_lines(self.directory / "anon_peaks.jsonl", lines, tail=tail)
 
-    def inputs(self) -> gate.QueueInputs:
+    def inputs(self, policy: gate.AdmissionPolicy) -> gate.QueueInputs:
         """Resolve the fixed 10:46 queue once, including raw pressure."""
-        return gate.gather_queue_inputs(self.directory, gate.process_table(self.proc), NOW)
+        return gate.gather_queue_inputs(self.directory, gate.process_table(self.proc), NOW, policy=policy)
 
     def read(self) -> gate.QueueRead:
         return gate.read_queue_pass(self.directory, gate.process_table(self.proc), NOW)

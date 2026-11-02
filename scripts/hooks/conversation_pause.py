@@ -20,10 +20,13 @@ from typing import TYPE_CHECKING, cast
 
 if TYPE_CHECKING:
     from ..lib import script_prompts, unit_runs
+    from ..message.relay_identity import message_sender_name
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
     import script_prompts
     import unit_runs
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
+    from relay_identity import message_sender_name
 
 
 QUIET_SECONDS = 900
@@ -353,7 +356,7 @@ def is_return_question(prompt: str) -> bool:
         return False
     opening_tag = text.partition(">")[0]
     match = FROM_NAME.search(opening_tag)
-    return match is not None and match.group(1) == WATCHER
+    return match is not None and message_sender_name(match.group(1)) == WATCHER
 
 
 def prompt_source(
@@ -369,7 +372,7 @@ def prompt_source(
     if CROSS_SESSION_TAG.match(text) is not None:
         opening_tag = text.partition(">")[0]
         match = FROM_NAME.search(opening_tag)
-        name = match.group(1) if match is not None else ""
+        name = message_sender_name(match.group(1)) if match is not None else ""
         return (PromptSource.SCHEDULED if name in JOB_SENDERS or name in senders()
                 else PromptSource.PEER)
     if (NOTICE_TAG.match(text) is not None

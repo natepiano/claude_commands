@@ -25,7 +25,7 @@ from scripts.direct import workers
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.production import fake_unit_host
 from scripts.production import staff
-from scripts.production.staff_test_support import StaffTestCase, isolated_source_readers
+from scripts.production.staff_test_support import fixture_member, unit_membership, StaffTestCase, isolated_source_readers
 from scripts.lib.atomic_file import write_text_atomic
 import fake_herdr
 import merge_checkpoint
@@ -40,6 +40,7 @@ import unit_move
 import unit_names
 import unit_lookup
 from cli_fixture import invoke_cli
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 SCRIPT = Path(__file__).with_name("rename.py")
 
@@ -203,7 +204,6 @@ runpy.run_path(sys.argv[0], run_name="__main__")
 '''
 
 # load 136 on natedev, 2026-10-29
-TEST_HANG_GUARD_SECS = 300
 
 def run_rename(arguments: list[str], environment: dict[str, str], cwd: Path,
                wrapper: str = "") -> subprocess.CompletedProcess[str]:
@@ -212,13 +212,13 @@ def run_rename(arguments: list[str], environment: dict[str, str], cwd: Path,
 
     def run(argv: Sequence[str], *, capture_output: bool = False, text: bool = False, check: bool = False,
             timeout: float | None = None, env: dict[str, str] | None = None,
-            cwd: str | Path | None = None) -> subprocess.CompletedProcess[str]:
+            cwd: str | Path | None = None, input: str | None = None) -> subprocess.CompletedProcess[str]:
         if argv[0] == str(Path(fake_herdr.__file__)):
             return invoke_cli(fake_herdr, lambda: fake_herdr.main(list(argv[1:])), list(argv[1:]),
                               dict(os.environ) if env is None else env,
                               Path.cwd() if cwd is None else Path(cwd))
         return real_run(argv, capture_output=capture_output, text=text, check=check,
-                        timeout=timeout, env=env, cwd=cwd)
+                        timeout=timeout, env=env, cwd=cwd, input=input)
 
     def trust_readback(seconds: float) -> None:
         # The fixtures have no concurrent Claude writer. The overwrite wrapper
@@ -235,7 +235,6 @@ def run_rename(arguments: list[str], environment: dict[str, str], cwd: Path,
             (tidy_wrapped, {"STATE_DIR": Path(environment["SHOWRUNNER_STATE_DIR"]),
                             "NOTIFIER_STATE_DIR": Path(environment["NOTIFIER_STATE_DIR"])}),
             (stall_watch, {"STATE_DIR": Path(environment["STALL_WATCH_STATE_DIR"])}),
-            (rename, {"REVIEW_POOL_STATE": Path(environment["REVIEW_POOL_STATE"])}),
         ):
             for name, value in fields.items():
                 _ = scope.enter_context(mock.patch.object(module, name, value))
@@ -298,9 +297,9 @@ def bind_staff_fixture(case: StaffTestCase, environment: dict[str, str], members
                 pass
     with staff.operation():
         for slug, units in members.items():
-            row = staff.ensure("showrunner", name=slug)
+            row = fixture_member("showrunner", name=slug)
             for unit in units:
-                _ = staff.ensure("unit", name=unit_names.name(unit), parent=row.id)
+                _ = fixture_member("unit", name=unit_names.name(unit), parent=row.id)
 
 
 class ProductionRenameFixture(StaffTestCase):
@@ -315,7 +314,6 @@ class ProductionRenameFixture(StaffTestCase):
         self.notifier: Path = Path()
         self.state: Path = Path()
         self.stall: Path = Path()
-        self.pool: Path = Path()
         self.worktrees: Path = Path()
         self.env: dict[str, str] = {}
         self.old_tip: str = ""
@@ -351,7 +349,7 @@ class ProductionRenameFixture(StaffTestCase):
         self.old_tip = self.fixture_tip
         bind_staff_fixture(self, self.env, {OLD: UNITS})
         production = next(row for row in staff.find(kind="showrunner") if row.name == OLD)
-        _ = staff.ensure("showrunner", name="child", parent=production.id)
+        _ = fixture_member("showrunner", name="child", parent=production.id)
 
     def bind_fixture(self, root: Path) -> None:
         self.root = root
@@ -363,7 +361,6 @@ class ProductionRenameFixture(StaffTestCase):
         self.notifier = self.root / "state/notifier"
         self.state = self.root / "state/showrunner"
         self.stall = self.root / "state/stall-watch"
-        self.pool = self.root / "state/review-pool"
         self.worktrees = self.home / "worktrees"
         self.env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
         self.env.update({
@@ -378,7 +375,7 @@ class ProductionRenameFixture(StaffTestCase):
             "NOTIFIER_STATE_DIR": str(self.notifier),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "state/sessions"),
             "SHOWRUNNER_STATE_DIR": str(self.state),
-            "STALL_WATCH_STATE_DIR": str(self.stall), "REVIEW_POOL_STATE": str(self.pool),
+            "STALL_WATCH_STATE_DIR": str(self.stall),
             "SHOWRUNNERS_CONFIG": str(self.home / ".claude/showrunners.json"),
             "UNIT_ACTIVE_DIR": str(self.root / "active"),
             "UNIT_HISTORY_DIR": str(self.root / "history"),
@@ -394,7 +391,7 @@ class ProductionRenameFixture(StaffTestCase):
         })
 
     def build_fixture(self) -> None:
-        for path in (self.home, self.checkout, self.notifier, self.stall, self.pool, self.worktrees):
+        for path in (self.home, self.checkout, self.notifier, self.stall, self.worktrees):
             path.mkdir(parents=True)
         config = self.home / ".claude"
         config.mkdir()
@@ -437,8 +434,6 @@ class ProductionRenameFixture(StaffTestCase):
         for unit in UNITS:
             self.write(self.stall_path(OLD, unit), json.dumps({"unit": unit, "stretch": 17}) + "\n")
         self.write(self.stall_path("unrelated", "alpha-unit"), '{"stretch": 99}\n')
-        self.write(self.pool / "old/pool.json", '{"generation": 7, "reviewers": {}}\n')
-        self.write(self.pool / "old/alpha-unit/2", "retained reviewer lease\n")
 
     def write(self, path: Path, content: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -514,8 +509,9 @@ class ProductionRenameFixture(StaffTestCase):
 
     def seed_shutdown_record(self, progress: str = "stopped") -> Path:
         old = self.unit_worktree(OLD, "alpha-unit")
+        native_session = unit_membership(OLD, "alpha-unit").id
         session: dict[str, object] = {
-            "session_id": "sid-alpha", "config_dir": str(self.home / ".claude"), "pid": 4242, "proc_start": "1",
+            "session_id": native_session, "config_dir": str(self.home / ".claude"), "pid": 4242, "proc_start": "1",
             "name": "alpha", "cwd": f"{old}/sub", "status": "idle", "updated_at": 0, "probe": False,
             "model": {"kind": "no reply yet"},
             "checkout": {"kind": "git", "path": str(old), "head": {"kind": "branch", "name": "old-alpha-unit"},
@@ -526,7 +522,7 @@ class ProductionRenameFixture(StaffTestCase):
                      "plan": {"kind": "plan", "path": f"{old}/docs/plans/alpha-unit.md"}}}
         worker = {**session, "session_id": "sid-worker", "name": "worker", "cwd": f"{old}/worker",
                   "kind": "worker", "host": {"kind": "terminal"},
-                  "owner": {"kind": "director", "session_id": "sid-alpha"}}
+                  "owner": {"kind": "director", "session_id": native_session}}
         saved: dict[str, object] = {
             "login": "owner@example.com", "label": "claude2", "machine": "natedev",
             "requested_at": "2026-10-09T21:49:10+00:00", "request_id": "request",
@@ -544,7 +540,7 @@ class ProductionRenameFixture(StaffTestCase):
                                  input=json.dumps(saved), env=self.env, capture_output=True, text=True,
                                  check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(created.returncode, 0, created.stderr)
-        return self.home / ".local/state/shutdown/owner@example.com/sessions/sid-alpha.json"
+        return self.home / ".local/state/shutdown/owner@example.com/sessions" / f"{native_session}.json"
 
     def marked_unit(self, unit: str) -> None:
         fake_unit_host.write(self.env, [fake_unit_host.HostedUnit(
@@ -557,7 +553,7 @@ class ProductionRenameFixture(StaffTestCase):
         held.bind(str(path))
         self.addCleanup(held.close)
         self.write(self.root / "state/sessions/live.json", json.dumps({
-            "pid": os.getpid(), "sessionId": "live-unit", "name": "unit-before-rename",
+            "pid": os.getpid(), "sessionId": unit_membership(OLD, "alpha-unit").id, "name": "unit-before-rename",
             "messagingSocketPath": str(path), "updatedAt": 1,
             "tmux": ""}))
 
@@ -623,9 +619,6 @@ class ProductionRenameFixture(StaffTestCase):
         self.assertEqual((self.state / "child/parent").read_text(), "new\n")
         self.assertEqual((self.state / "other/parent").read_text(), "oldish\n")
         self.assertEqual(self.stall_path("unrelated", "alpha-unit").read_text(), '{"stretch": 99}\n')
-        self.assertFalse((self.pool / "old").exists())
-        self.assertEqual((self.pool / "new/pool.json").read_text(), '{"generation": 7, "reviewers": {}}\n')
-        self.assertEqual((self.pool / "new/alpha-unit/2").read_text(), "retained reviewer lease\n")
         self.assertEqual(self.git("rev-parse", OLD), self.old_tip)
         self.assertEqual(self.git("rev-parse", "new^"), self.old_tip)
         self.assertEqual(self.git("log", "-1", "--format=%s", NEW), "chore(new): rename production from old")
@@ -637,7 +630,7 @@ class ProductionRenameFixture(StaffTestCase):
         self.assertEqual(self.git("ls-remote", "origin", "refs/heads/new"), f"{new_tip}\trefs/heads/new")
         self.assertEqual(self.git("ls-remote", "origin", "refs/heads/old"), f"{self.old_tip}\trefs/heads/old")
         self.assertEqual(self.git("status", "--porcelain"), "")
-        self.assertEqual(self.completed_steps(), 9)
+        self.assertEqual(self.completed_steps(), 8)
         self.assertIs(self.journal()["done"], False)
 
     def held_design(self, repository_id: str, checkout: Path, holder: design_roles.Holder) -> design_roles.HeldDesign:
@@ -673,12 +666,12 @@ class ProductionRenameFixture(StaffTestCase):
         with mock.patch.dict(os.environ, self.env):
             store = workers.ledger_for_run(run)
             worker = workers.UnitWorker("w7", "impl", "codex", "kept-model", "xhigh", {},
-                workers.CodexThread("kept-thread", str(self.root / "codex-home")), workers.Paused(),
+                workers.CodexThread("057316c9-bc95-50de-b3fc-9010799ce6e7", str(self.root / "codex-home")), workers.Paused(),
                 [workers.WorkerEvent("opened", "before move", str(run), 1.0)])
             with store.locked() as ledger:
                 ledger.workers["w7"] = worker
         self.write(run / workers.ROSTER, json.dumps({"w7": {
-            "thread_id": "kept-thread", "codex_home": str(self.root / "codex-home"),
+            "thread_id": "057316c9-bc95-50de-b3fc-9010799ce6e7", "codex_home": str(self.root / "codex-home"),
             "role": "impl", "family": "codex", "model": "kept-model", "effort": "xhigh",
             "status": "paused", "cwd": str(old / "subdir"), "unit_ledger": str(store.path)}}))
         return run

@@ -5,7 +5,10 @@ from __future__ import annotations
 from contextlib import closing
 import json
 import os
+import select
 import shutil
+import signal
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -16,14 +19,21 @@ from unittest import mock
 from pathlib import Path
 from typing import ClassVar, NamedTuple, cast, override
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+import process_group
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import merge_checkpoint
 import change_review
 from scripts.direct import progress_history
 from scripts.direct.recorder_fixture import invoke_recorder
-from scripts.production import staff
 from scripts.production.cli_fixture import invoke_cli
-from scripts.production.staff_test_support import isolated_staff_file
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.direct.wait_for_test_state import wait_until
+from scripts.lib.socket_test_support import short_socket_directory
+from scripts.production import fake_unit_host, staff
+from scripts.message import sessions
+from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file, production_membership, unit_membership
 
 
 def invoke_checkpoint(arguments: list[str], environment: dict[str, str], cwd: Path,
@@ -63,8 +73,6 @@ def invoke_checkpoint(arguments: list[str], environment: dict[str, str], cwd: Pa
 
 
 # Script completion deadlines only bound hangs; startup can be slow under load.
-# load 136 on natedev, 2026-10-29
-TEST_HANG_GUARD_SECS = 300
 
 SCRIPT = Path(__file__).with_name("merge_checkpoint.py")
 STARTED = "2026-10-06T12:00:00-07:00"
@@ -138,6 +146,67 @@ if name == "basedpyright":
     print("venv .venv subdirectory not found in venv path " + os.getcwd() + ".", file=sys.stderr)
     raise SystemExit(3)
 '''
+
+
+BUMP_TEST_STUB = STUB + '''
+import subprocess
+import uuid
+sys.path.insert(0, __TEST_REPOSITORY__)
+from scripts.direct.wait_for_test_state import wait_for_file
+from scripts.message import sessions
+
+def git(*arguments):
+    return subprocess.run(["git", *arguments], capture_output=True, text=True, check=True).stdout.strip()
+
+gate_pid = os.getppid()
+run = {"cwd": str(Path.cwd()), "head": git("rev-parse", "HEAD"),
+       "origin": git("ls-remote", os.environ["BUMP_TEST_ORIGIN"], "refs/heads/production").split()[0],
+       "branch": subprocess.run(["git", "symbolic-ref", "-q", "HEAD"], capture_output=True, text=True).stdout.strip(),
+       "gate_pid": gate_pid, "gate_start": sessions.process_start(gate_pid),
+       "session": os.getsid(0), "stdin_closed": os.read(0, 1) == b""}
+path = state / "gate-runs" / (uuid.uuid4().hex + ".json")
+temporary = path.with_suffix(".pending")
+temporary.write_text(json.dumps(run))
+temporary.replace(path)
+if (state / "gate-blocked").exists():
+    wait_for_file(state / "gate-release")
+fail_once = state / "gate-fail-once"
+if fail_once.exists():
+    fail_once.unlink()
+    raise SystemExit(1)
+if (state / "gate-red").exists() and "-E" not in args:
+    print("    FAIL [  0.1s] (1/1) fixture bump_contract_failed", flush=True)
+    raise SystemExit(1)
+'''.replace("__TEST_REPOSITORY__", repr(str(Path(__file__).resolve().parents[2])))
+
+BUMP_SEND_STUB = STUB + '''
+import uuid
+if (state / "stop-before-showrunner-notice").exists() and "showrunner" in args[args.index("--to") + 1]:
+    import signal
+    os.kill(os.getppid(), signal.SIGKILL)
+    raise SystemExit(1)
+retry = state / "send-fail-once"
+if retry.exists():
+    retry.unlink()
+    print("fixture send failed", file=sys.stderr, flush=True)
+    raise SystemExit(1)
+path = state / "gate-notices" / (uuid.uuid4().hex + ".json")
+temporary = path.with_suffix(".pending")
+temporary.write_text(json.dumps(args))
+temporary.replace(path)
+print("SENT: fixture", flush=True)
+'''
+
+
+class BumpGateObservation(NamedTuple):
+    checkout: Path
+    head: str
+    origin: str
+    branch: str
+    gate_pid: int
+    gate_start: str
+    session: int
+    stdin_closed: bool
 
 
 def configure_test_environment() -> None:
@@ -274,7 +343,7 @@ class MergeCheckpointFixture(unittest.TestCase):
             directory.mkdir(parents=True)
             self.executable(directory / name, STUB)
         with isolated_staff_file(Path(self.env["STAFF_FILE"]), self.env):
-            _ = staff.ensure("showrunner", name="example")
+            _ = fixture_member("showrunner", name="example")
         self.production_doc()
 
     def git(self, *args: str, cwd: Path | None = None) -> str:
@@ -349,6 +418,18 @@ class MergeCheckpointFixture(unittest.TestCase):
             _ = self.git("push", "origin", "alpha-branch", cwd=self.unit)
         return sha
 
+    def push_main_change(self, relative: str, content: str) -> str:
+        """Push an independent main fix through the fixture's private origin."""
+        writer = self.root / "main-fix-writer"
+        _ = self.git("clone", "-b", "main", str(self.origin), str(writer), cwd=self.root)
+        _ = self.git("config", "user.name", "Checkpoint Test", cwd=writer)
+        _ = self.git("config", "user.email", "checkpoint@example.invalid", cwd=writer)
+        self.write(writer, relative, content)
+        _ = self.git("add", relative, cwd=writer)
+        _ = self.git("commit", "-m", "independent main fix", cwd=writer)
+        _ = self.git("push", "origin", "main", cwd=writer)
+        return self.git("rev-parse", "HEAD", cwd=writer)
+
     def run_checkpoint(self, sha: str, *extra: str, phase: str = "2",
                        review: bool = True, trial: str = TRIAL,
                        delivers: str | None = DELIVERS, parallel: str | None = PARALLEL) -> MergeResult:
@@ -365,6 +446,163 @@ class MergeCheckpointFixture(unittest.TestCase):
         arguments.extend(extra)
         process = self.invoke(arguments)
         return MergeResult(process, before)
+
+    def prepare_bump_gate(self, *, red: bool = False, blocked: bool = True) -> None:
+        """Use the normal merge fixture with file handshakes and private recipients."""
+        for name in ("gate-runs", "gate-notices"):
+            (self.state / name).mkdir()
+        for enabled, marker in ((red, "gate-red"), (blocked, "gate-blocked")):
+            if enabled:
+                (self.state / marker).touch()
+        self.executable(self.bin / "checkpoint-test", BUMP_TEST_STUB)
+        self.executable(self.bin / "send.py", BUMP_SEND_STUB)
+        self.env["MERGE_CHECKPOINT_SEND"] = str(self.bin / "send.py")
+        self.env["BUMP_TEST_ORIGIN"] = str(self.origin)
+        self.env.update(fake_unit_host.environment(self.state))
+        with isolated_staff_file(Path(self.env["STAFF_FILE"]), self.env):
+            production_membership("example", "alpha-unit")
+            runner = fixture_member("showrunner", name="example")
+            director = unit_membership("example", "alpha-unit")
+        fake_unit_host.write(self.env, [fake_unit_host.HostedUnit(
+            "fixture-unit", "w1:p1", {"SHOWRUNNER_UNIT": "example", "SHOWRUNNER_UNIT_ID": "alpha-unit"},
+        )])
+        records = self.root / "sessions"
+        records.mkdir()
+        self.env["NOTIFIER_SESSIONS_DIR"] = str(records)
+        sockets = Path(self.enterContext(short_socket_directory()))
+        for name, pid in (("alpha", os.getpid()), ("showrunner", fake_unit_host.live_pid(self))):
+            address = sockets / (name + ".sock")
+            held = socket.socket(socket.AF_UNIX)
+            held.bind(str(address))
+            self.addCleanup(held.close)
+            if name == "alpha":
+                fake_unit_host.place_process(self.env, pid, "w1:p1")
+            _ = (records / (str(pid) + ".json")).write_text(json.dumps({
+                "pid": pid, "sessionId": director.id if name == "alpha" else runner.id, "name": name,
+                "messagingSocketPath": str(address), "updatedAt": 1,
+                "procStart": sessions.process_start(pid), "tmux": "",
+            }))
+        timer = self.root / "notifier/showrunner-example"
+        timer.mkdir(parents=True)
+        _ = (timer / "conf").write_text(
+            f"TARGET=session:{runner.id}\nCHECK=zsh /fixture/production_check.sh {self.doc}\n"
+        )
+        self.addCleanup(self.stop_bump_gates)
+
+    def refuse_bump_clone(self) -> None:
+        git = shutil.which("git")
+        assert git is not None
+        self.executable(self.bin / "git", "#!/usr/bin/env python3\nimport os, sys\n"
+                        + "arguments = sys.argv[1:]\n"
+                        + "if arguments[:1] == ['-C']: arguments = arguments[2:]\n"
+                        + "if arguments[:1] == ['clone']:\n"
+                        + "    print('fixture clone refused', file=sys.stderr)\n    raise SystemExit(1)\n"
+                        + f"os.execv({git!r}, [{git!r}, *sys.argv[1:]])\n")
+
+    def move_bump_recipients(self) -> None:
+        timer = self.root / "notifier/showrunner-example/conf"
+        timer_text = timer.read_text()
+        with isolated_staff_file(Path(self.env["STAFF_FILE"]), self.env):
+            for path in (self.root / "sessions").glob("*.json"):
+                row = cast(dict[str, object], json.loads(path.read_text()))
+                old_id = staff.native_id(cast(str, row["sessionId"]))
+                new_id = staff.native_id(fixture_runtime_id("moved-recipient:" + old_id))
+                _ = staff.update_current_session(old_id, new_id)
+                row["sessionId"] = new_id
+                row["name"] = cast(str, row["name"]) + "-moved"
+                _ = path.write_text(json.dumps(row))
+        _ = timer.write_text(timer_text)
+
+    def launch_competing_bump_gate(self, tip: str) -> subprocess.Popen[bytes]:
+        path = merge_checkpoint.checkpoint_step_record(self.checkout, tip, "bump-gate")
+        output = self.enterContext((self.state / "competing-gate.log").open("wb"))
+        process = subprocess.Popen(
+            [sys.executable, str(SCRIPT.with_name("bump_gate.py")), "--record", str(path)],
+            cwd=self.checkout, env=self.env, stdin=subprocess.DEVNULL,
+            stdout=output, stderr=subprocess.STDOUT, start_new_session=True,
+        )
+
+        def cleanup() -> None:
+            if process.poll() is None:
+                process_group.send_process_group(process.pid, signal.SIGKILL)
+            _ = process.wait(timeout=TEST_HANG_GUARD_SECS)
+
+        self.addCleanup(cleanup)
+        return process
+
+    def wait_competing_bump_gate(self, process: subprocess.Popen[bytes]) -> None:
+        wait_until(lambda: process.poll() is not None or len(self.bump_gate_runs()) > 1,
+                   self.state / "gate-runs", processes=(process,))
+
+    def bump_gate_record(self, tip: str) -> dict[str, object]:
+        path = merge_checkpoint.checkpoint_step_record(self.checkout, tip, "bump-gate")
+        return cast(dict[str, object], json.loads(path.read_text()))
+
+    def wait_bump_result(self, tip: str) -> dict[str, object]:
+        path = merge_checkpoint.checkpoint_step_record(self.checkout, tip, "bump-gate")
+        wait_until(lambda: path.exists() and self.bump_gate_record(tip)["result"] in ("red", "green"), path.parent)
+        record = self.bump_gate_record(tip)
+        pid = cast(int, record["pid"])
+        if pid:
+            self.wait_bump_process_exit(pid)
+        return record
+
+    def bump_gate_runs(self) -> list[BumpGateObservation]:
+        runs: list[BumpGateObservation] = []
+        for path in sorted((self.state / "gate-runs").glob("*.json")):
+            row = cast(dict[str, object], json.loads(path.read_text()))
+            runs.append(BumpGateObservation(
+                Path(cast(str, row["cwd"])), cast(str, row["head"]), cast(str, row["origin"]),
+                cast(str, row["branch"]), cast(int, row["gate_pid"]), cast(str, row["gate_start"]),
+                cast(int, row["session"]), cast(bool, row["stdin_closed"]),
+            ))
+        return runs
+
+    def wait_bump_gate_runs(self, count: int) -> list[BumpGateObservation]:
+        wait_until(lambda: len(self.bump_gate_runs()) >= count, self.state / "gate-runs")
+        return self.bump_gate_runs()
+
+    def bump_notices(self) -> list[list[str]]:
+        return [cast(list[str], json.loads(path.read_text()))
+                for path in sorted((self.state / "gate-notices").glob("*.json"))]
+
+    def release_bump_gate(self) -> None:
+        (self.state / "gate-release").touch()
+
+    def wait_bump_gate_exit(self, run: BumpGateObservation) -> None:
+        self.wait_bump_process_exit(run.gate_pid)
+
+    def wait_bump_process_exit(self, pid: int) -> None:
+        try:
+            descriptor = os.pidfd_open(pid)
+        except ProcessLookupError:
+            return
+        try:
+            self.assertTrue(select.select([descriptor], [], [], TEST_HANG_GUARD_SECS)[0],
+                            "background gate did not finish")
+        finally:
+            os.close(descriptor)
+        try:
+            _ = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            pass
+
+    def stop_bump_gate(self, run: BumpGateObservation) -> None:
+        if run.checkout == self.checkout:
+            return
+        if isinstance(sessions.process_liveness(run.gate_pid, run.gate_start), sessions.LiveSessionProcess):
+            self.assertEqual(os.getsid(run.gate_pid), run.gate_pid, "fixture gate must own its session")
+            process_group.send_process_group(run.gate_pid, signal.SIGKILL)
+            try:
+                _ = os.waitpid(run.gate_pid, 0)
+            except ChildProcessError:
+                pass
+        if run.checkout.exists():
+            shutil.rmtree(run.checkout)
+
+    def stop_bump_gates(self) -> None:
+        for run in self.bump_gate_runs():
+            self.stop_bump_gate(run)
 
     def events(self, command: str) -> list[list[str]]:
         path = self.state / "events.jsonl"

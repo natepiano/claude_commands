@@ -3,6 +3,8 @@
 and the transcripts are files the test writes: no Claude starts."""
 from __future__ import annotations
 
+from scripts.production.staff_test_support import fixture_member, fixture_runtime_id
+
 import io
 import json
 import multiprocessing
@@ -13,6 +15,7 @@ import tempfile
 import unittest
 from collections.abc import MutableMapping
 from contextlib import redirect_stdout
+from dataclasses import replace
 from pathlib import Path
 from multiprocessing.connection import Connection
 from typing import cast, final, override
@@ -25,12 +28,16 @@ import add_unit
 import retire_unit
 import unit_lookup
 import unit_move
+import test_retire_unit
 from production_units import Production, read_production
 import pane_record
+from herdr import HerdrPlace
 
-from scripts.production.staff_test_support import CHECKOUT, PROCESS_TIMEOUT, StaffTestCase
+from scripts.production.staff_test_support import CHECKOUT, StaffTestCase
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.production import staff
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.production import staff, unit_config
+from scripts.production.staff_test_support import unit_membership
 
 RUN_COMMAND = retire_unit.run
 
@@ -56,6 +63,57 @@ class ResumeUnitTests(unittest.TestCase):
     configs: list[Path] = []
     calls: list[list[str]] = []
     launch_code: int = 0
+
+    def test_current_config_only_resume_keeps_recovery_facts_after_a_failed_launch(self) -> None:
+        row = unit_membership("alpha", "alpha-unit")
+        saved = unit_config.read_parked(row.id)
+        assert isinstance(saved, unit_config.UnitConfig)
+        unit = resume_unit.find_unit("alpha", "alpha")
+        resume_unit.make_worktree(unit)
+        unit_config.restore(row.id, self.worktree)
+        unit_config.discard_parked(row.id)
+        self.launch_code = 1
+        code, output = self.resume()
+        self.assertEqual(code, 1, output)
+        present = staff.by_id(row.id)
+        self.assertEqual(present, replace(row, worktree=staff.PresentWorktree("natedev", self.worktree)))
+        recovered = unit_config.read_parked(row.id)
+        assert isinstance(recovered, unit_config.UnitConfig)
+        self.assertEqual(recovered.retired, saved.retired)
+        self.launch_code = 0
+        code, output = self.resume()
+        self.assertEqual(code, 0, output)
+        self.assertEqual(staff.by_id(row.id), present)
+        self.assertEqual(len(self.calls), 2)
+        self.assertEqual(self.calls[0], self.calls[1])
+        self.assertFalse(unit_config.parked_path(row.id).exists())
+        before = self.staff.staff_file.read_bytes(), self.doc.read_bytes()
+        code, output = self.resume()
+        self.assertEqual(code, 0, output)
+        self.assertIn("already resumed", output)
+        self.assertEqual(len(self.calls), 2)
+        self.assertEqual((self.staff.staff_file.read_bytes(), self.doc.read_bytes()), before)
+
+    def test_neither_config_refuses_with_the_backfill_instruction_before_any_change(self) -> None:
+        self.staff.register_production("alpha", self.doc)
+        row = unit_membership("alpha", "alpha-unit")
+        row = staff.update_current_session(row.current_session, staff.StaffId(DIRECTOR))
+        _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.worktree))
+        unit_config.discard_parked(row.id)
+        before = self.doc.read_bytes(), self.staff.staff_file.read_bytes(), git(self.checkout, "rev-parse", "HEAD")
+        for flags in ((), ("--dry-run",)):
+            with self.subTest(flags=flags):
+                code, output = self.resume(*flags)
+                self.assertEqual(code, 1, output)
+                self.assertEqual(output, f"alpha-unit: no .unit.toml in {self.worktree} or "
+                                 + f"~/.local/state/staff/units/{row.id}.toml; run staff_sources.py fill --retired "
+                                 + "or ask the showrunner\n")
+                self.assertFalse(self.worktree.exists())
+                self.assertEqual(unit_config.place(row.id, self.worktree), unit_config.Nowhere())
+                self.assertEqual(self.calls, [])
+                self.assertEqual((self.doc.read_bytes(), self.staff.staff_file.read_bytes(),
+                                  git(self.checkout, "rev-parse", "HEAD")), before)
+
 
     @override
     def setUp(self) -> None:
@@ -88,14 +146,34 @@ class ResumeUnitTests(unittest.TestCase):
             return production
 
         def not_marked(_slug: str, _name: str) -> unit_lookup.MarkedUnit | None:
-            return None
+            # The real pane writer retains a fixed owner; the live process resumes
+            # that owner's current conversation, which can differ after /clear.
+            owner = staff.by_current_session(DIRECTOR)
+            entries = [entry for entry in pane_record.launches()
+                       if owner is not None and entry["session_id"] == owner.id]
+            return (unit_lookup.MarkedUnit("alpha-unit", unit_lookup.LiveClaude("alpha", DIRECTOR, "fixture", 123),
+                                          HerdrPlace("agents", entries[-1]["pane_id"]))
+                    if entries else None)
 
         _ = self.enterContext(mock.patch.object(retire_unit, "production_of", production_of))
         _ = self.enterContext(mock.patch.object(retire_unit, "run", self.fake_run))
         _ = self.enterContext(mock.patch.object(unit_lookup, "marked_unit", not_marked))
         _ = self.enterContext(mock.patch.object(unit_move, "config_dirs", lambda: self.configs))
         _ = cast(MutableMapping[str, str], self.enterContext(
-            mock.patch.dict(os.environ, {"SHUTDOWN_STATE_DIR": str(self.root / "shutdown")})))
+            mock.patch.dict(os.environ, {"SHUTDOWN_STATE_DIR": str(self.root / "shutdown"),
+                                       "HERDR_PANE_RECORD_DIR": str(self.root / "pane-launches")})))
+        self.staff.register_production("alpha", self.doc)
+        row = unit_membership("alpha", "alpha-unit")
+        row = staff.update_current_session(row.current_session, staff.StaffId(DIRECTOR))
+        _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.worktree))
+        self.retained_config()
+
+    def retained_config(self, *, plan: str = "docs/plans/alpha.md", folder: Path | None = None) -> None:
+        row = next(row for row in staff.find(kind="unit") if row.name == "alpha")
+        unit_config.discard_parked(row.id)
+        unit_config.write_parked(row.id, unit_config.UnitConfig(unit_config.PlanFile(Path(plan)),
+            unit_config.AppPort(1), ("scripts",), unit_config.RetiredSession("2026-10-20", DIRECTOR,
+                unit_config.RecordedStartFolder(folder or self.worktree), unit_config.Branch("alpha-branch"))))
 
     def write_row(self, plan: str) -> None:
         _ = self.doc.write_text(
@@ -116,6 +194,9 @@ class ResumeUnitTests(unittest.TestCase):
         if argv[0] == "git":
             return subprocess.run(argv, cwd=cwd, capture_output=True, text=True, check=False)
         self.calls.append([Path(argv[1]).name, *argv[2:]])
+        if self.launch_code == 0:
+            pane_record.write("agents", pane_record.launch("w1:p1", DIRECTOR, str(self.worktree),
+                {}, ["claude", "--resume", DIRECTOR]))
         return subprocess.CompletedProcess(argv, self.launch_code, "", "launch failed" if self.launch_code else "")
 
     def resume(self, *arguments: str) -> tuple[int, str]:
@@ -138,16 +219,31 @@ class ResumeUnitTests(unittest.TestCase):
         self.assertIn("alpha-unit resumed", output)
 
     def test_resume_unit_rerun(self) -> None:
-        original = add_unit.ensure_staff_unit
+        self.staff.register_production("alpha", self.doc)
+        row = unit_membership("alpha", "alpha-unit")
+        row = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.worktree))
+        saved = unit_config.UnitConfig(unit_config.PlanFile(Path("docs/plans/alpha.md")),
+            unit_config.AppPort(1), ("scripts",),
+            unit_config.RetiredSession("2026-10-20", DIRECTOR,
+                unit_config.RecordedStartFolder(self.worktree), unit_config.Branch("alpha-branch")))
+        unit_config.write_parked(row.id, saved)
+        parked = unit_config.parked_path(row.id)
+        retained = parked.read_bytes(), parked.stat().st_mtime_ns
+        original = staff.restore_unit
         for after in (False, True):
-            def interrupted(production: Production, unit: str) -> staff.StaffRow:
+            def interrupted(identity: staff.StaffId,
+                            worktree: staff.PresentWorktree) -> staff.StaffRow:
                 if after:
-                    _ = original(production, unit)
+                    _ = original(identity, worktree)
                 raise RuntimeError("stopped at staff step")
-            with mock.patch.object(add_unit, "ensure_staff_unit", side_effect=interrupted):
+            with mock.patch.object(staff, "restore_unit", side_effect=interrupted):
                 with self.assertRaisesRegex(RuntimeError, "stopped at staff step"):
                     _ = self.resume()
-            self.assertFalse(self.worktree.exists())
+            self.assertTrue(self.worktree.is_dir())
+            self.assertEqual(unit_config.read(self.worktree),
+                             unit_config.UnitConfig(saved.plan, saved.port, saved.responsibilities))
+            self.assertEqual((parked.read_bytes(), parked.stat().st_mtime_ns), retained)
+            self.assertEqual(self.calls, [])
         code, output = self.resume()
         self.assertEqual(code, 0, output)
         rows = staff.find(kind="unit")
@@ -159,12 +255,199 @@ class ResumeUnitTests(unittest.TestCase):
         self.assertEqual((self.staff.staff_file.read_bytes(), self.doc.read_bytes()), (data, document))
         self.assertEqual(len(self.calls), 1)
 
+    def test_retire_then_resume_reuses_the_staff_identity_at_the_add_unit_boundary(self) -> None:
+        retirement = test_retire_unit.RetireUnitTests()
+        self.addCleanup(retirement.doCleanups)
+        retirement.setUp()
+        unit = next(row for row in staff.find(kind="unit") if row.name == "alpha")
+        ref, tip = retirement.unmerged_work()
+        self.assertEqual(ref, f"refs/retired/{unit.id}")
+        code, output = retirement.retire()
+        self.assertEqual(code, 0, output)
+        retirement.assert_saved_retirement(ref, tip)
+        self.assertEqual(staff.by_id(unit.id), replace(unit, worktree=staff.RemovedWorktree("natedev", retirement.worktree)))
+        self.assertIn("alpha-unit", unit_lookup.retired_units(retirement.doc.read_text().splitlines(), "alpha"))
+        launched_ids: list[staff.StaffId] = []
+        commands: list[list[str]] = []
+
+        def launch(argv: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+            if len(argv) > 1 and Path(argv[1]).name == "add_unit.py":
+                commands.append(argv)
+                production = read_production(Path(argv[argv.index("--production") + 1]))
+                row = add_unit.ensure_staff_unit(production, argv[4])
+                launched_ids.append(row.id)
+                retirement.marked = unit_lookup.MarkedUnit("alpha-unit",
+                    unit_lookup.LiveClaude("alpha", DIRECTOR, "fixture", 123), HerdrPlace("agents", "w1:p1"))
+                pane_record.write("agents", pane_record.launch("w1:p1", DIRECTOR, str(retirement.worktree),
+                    {}, ["claude", "--resume", DIRECTOR]))
+                return subprocess.CompletedProcess(argv, 0, "", "")
+            return retirement.fake_run(argv, cwd)
+
+        resumed = io.StringIO()
+        with mock.patch.object(retire_unit, "run", side_effect=launch), redirect_stdout(resumed):
+            code = resume_unit.main(["alpha", "alpha"])
+        self.assertEqual(code, 0, resumed.getvalue())
+        self.assertEqual(launched_ids, [unit.id])
+        self.assertEqual(len(commands), 1)
+        self.assertEqual(commands[0][commands[0].index("--resume") + 1], DIRECTOR)
+        self.assertEqual(staff.by_id(unit.id), unit)
+        self.assertEqual(staff.find(kind="unit", parent=unit.parent), [unit])
+        self.assertEqual(git(retirement.worktree, "rev-parse", "HEAD"), tip)
+        self.assertEqual(git(retirement.checkout, "ls-remote", "origin", ref), "")
+        before = (retirement.staff.staff_file.read_bytes(), retirement.doc.read_bytes(),
+                  git(retirement.checkout, "for-each-ref"))
+        with mock.patch.object(retire_unit, "run", side_effect=launch), redirect_stdout(io.StringIO()):
+            code = resume_unit.main(["alpha", "alpha"])
+        self.assertEqual(code, 0)
+        self.assertEqual(len(commands), 1)
+        self.assertEqual((retirement.staff.staff_file.read_bytes(), retirement.doc.read_bytes(),
+                          git(retirement.checkout, "for-each-ref")), before)
+
+    def saved_branch(self) -> tuple[str, str]:
+        ref = "refs/retired/fixture-unit"
+        _ = git(self.checkout, "checkout", "-q", "-b", "saved-work")
+        _ = (self.checkout / "unmerged.txt").write_text("keep this work\n")
+        _ = git(self.checkout, "add", "unmerged.txt")
+        _ = git(self.checkout, "commit", "-q", "-m", "unmerged unit work")
+        tip = git(self.checkout, "rev-parse", "HEAD")
+        _ = git(self.checkout, "push", "-q", "origin", f"HEAD:{ref}")
+        _ = git(self.checkout, "checkout", "-q", "main")
+        _ = git(self.checkout, "branch", "-D", "saved-work")
+        self.write_row(f"(retired 2026-10-20, worktree removed, session {DIRECTOR}, ref {ref}, tip {tip}) docs/plans/alpha.md")
+        _ = git(self.checkout, "add", self.doc.name)
+        _ = git(self.checkout, "commit", "-q", "-m", "record saved branch")
+        return ref, tip
+
+    def assert_saved_branch_resumed(self, ref: str, tip: str) -> None:
+        self.assertEqual(git(self.worktree, "rev-parse", "HEAD"), tip)
+        self.assertEqual(git(self.worktree, "branch", "--show-current"), "alpha-branch")
+        self.assertEqual((self.worktree / "unmerged.txt").read_text(), "keep this work\n")
+        self.assertEqual(git(self.checkout, "ls-remote", "origin", ref), "")
+        self.assertNotIn("retired", self.row())
+        self.assertIn(DIRECTOR, self.calls[-1])
+
+    def test_resume_restores_the_saved_tip_and_session_and_rerun_writes_nothing(self) -> None:
+        ref, tip = self.saved_branch()
+        code, output = self.resume()
+        self.assertEqual(code, 0, output)
+        self.assert_saved_branch_resumed(ref, tip)
+        before = (self.doc.read_bytes(), self.doc.stat().st_mtime_ns,
+                  self.staff.staff_file.read_bytes(), git(self.checkout, "rev-parse", "HEAD"))
+        calls = self.calls.copy()
+        code, output = self.resume()
+        self.assertEqual(code, 0, output)
+        self.assertEqual((self.doc.read_bytes(), self.doc.stat().st_mtime_ns,
+                          self.staff.staff_file.read_bytes(), git(self.checkout, "rev-parse", "HEAD")), before)
+        self.assertEqual(self.calls, calls)
+
+    def test_resume_finishes_after_worktree_creation_before_saved_ref_deletion(self) -> None:
+        ref, tip = self.saved_branch()
+        def interrupted(argv: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+            if "push" in argv and (ref in argv or f":{ref}" in argv) and ("--delete" in argv or f":{ref}" in argv):
+                return subprocess.CompletedProcess(argv, 1, "", "stop before saved ref deletion")
+            return self.fake_run(argv, cwd)
+        with mock.patch.object(retire_unit, "run", side_effect=interrupted):
+            code, output = self.resume()
+        self.assertEqual(code, 1, output)
+        self.assertEqual(git(self.worktree, "rev-parse", "HEAD"), tip)
+        self.assertEqual(git(self.checkout, "ls-remote", "origin", ref), f"{tip}\t{ref}")
+        code, output = self.resume()
+        self.assertEqual(code, 0, output)
+        self.assert_saved_branch_resumed(ref, tip)
+
+    def launch_with_commit(self, argv: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+        result = self.fake_run(argv, cwd)
+        if argv[0] != "git":
+            _ = (self.worktree / "director-work.txt").write_text("new director work\n")
+            _ = git(self.worktree, "add", "director-work.txt")
+            _ = git(self.worktree, "commit", "-q", "-m", "checkpoint(alpha): resumed work")
+        return result
+
+    def test_resume_retry_keeps_the_directors_new_commit_after_ref_deletion(self) -> None:
+        ref, tip = self.saved_branch()
+        with mock.patch.object(retire_unit, "run", side_effect=self.launch_with_commit), mock.patch.object(
+                resume_unit, "unmark", side_effect=OSError("stop before unmark")):
+            code, output = self.resume()
+        self.assertEqual(code, 1, output)
+        self.assertIn("stop before unmark", output)
+        later_tip = git(self.worktree, "rev-parse", "HEAD")
+        self.assertNotEqual(later_tip, tip)
+        self.assertEqual(git(self.worktree, "rev-parse", "HEAD^"), tip)
+        self.assertEqual(git(self.checkout, "ls-remote", "origin", ref), "")
+        self.assertIn("retired", self.row())
+        code, output = self.resume()
+        self.assertEqual(code, 0, output)
+        self.assert_saved_branch_resumed(ref, later_tip)
+        self.assertEqual((self.worktree / "director-work.txt").read_text(), "new director work\n")
+        before = (self.doc.read_bytes(), self.doc.stat().st_mtime_ns,
+                  self.staff.staff_file.read_bytes(), git(self.checkout, "rev-parse", "HEAD"), self.calls.copy())
+        code, output = self.resume()
+        self.assertEqual(code, 0, output)
+        self.assertEqual((self.doc.read_bytes(), self.doc.stat().st_mtime_ns,
+                          self.staff.staff_file.read_bytes(), git(self.checkout, "rev-parse", "HEAD"), self.calls), before)
+
+    def test_resume_retry_refuses_a_divergent_branch_after_ref_deletion(self) -> None:
+        ref, tip = self.saved_branch()
+        with mock.patch.object(resume_unit, "unmark", side_effect=OSError("stop before unmark")):
+            code, output = self.resume()
+        self.assertEqual(code, 1, output)
+        self.assertEqual(git(self.checkout, "ls-remote", "origin", ref), "")
+        _ = git(self.worktree, "checkout", "-q", "-B", "alpha-branch", f"{tip}^")
+        _ = self.launch_with_commit([sys.executable, "add_unit.py"])
+        divergent_tip = git(self.worktree, "rev-parse", "HEAD")
+        before, calls = self.doc.read_bytes(), self.calls.copy()
+        code, output = self.resume()
+        self.assertEqual(code, 1, output)
+        self.assertIn("expected saved tip", output)
+        self.assertEqual(self.doc.read_bytes(), before)
+        self.assertEqual(git(self.worktree, "rev-parse", "HEAD"), divergent_tip)
+        self.assertEqual(self.calls, calls)
+
+    def test_successful_launch_keeps_parked_facts_until_its_staff_pane_is_proven(self) -> None:
+        row = staff.find(kind="unit")[0]
+        saved = unit_config.parked_path(row.id).read_bytes()
+        document = self.doc.read_bytes()
+        with mock.patch.object(resume_unit, "resumed_session_proven", return_value=False):
+            code, output = self.resume()
+        self.assertEqual(code, 1, output)
+        self.assertIn("resumed native session identity is not proven", output)
+        self.assertEqual(unit_config.parked_path(row.id).read_bytes(), saved)
+        self.assertEqual(self.doc.read_bytes(), document)
+        self.assertEqual(len(self.calls), 1)
+        code, output = self.resume()
+        self.assertEqual(code, 0, output)
+        self.assertEqual(len(self.calls), 1)
+        self.assertFalse(unit_config.parked_path(row.id).exists())
+
+    def test_resume_proof_requires_the_exact_pane_owner_and_current_conversation(self) -> None:
+        row = staff.find(kind="unit")[0]
+        pane_record.write("agents", pane_record.launch("w1:p1", DIRECTOR, str(self.worktree),
+            {}, ["claude", "--resume", DIRECTOR]))
+        before = (self.staff.staff_file.read_bytes(), pane_record.record_path("agents").read_bytes(),
+                  unit_config.parked_path(row.id).read_bytes())
+        with self.subTest(evidence="fixed owner for the live current conversation"):
+            self.assertTrue(resume_unit.resumed_session_proven("alpha", "alpha-unit", DIRECTOR, row))
+        current = unit_lookup.MarkedUnit("alpha-unit",
+            unit_lookup.LiveClaude("alpha", DIRECTOR, "fixture", 123), HerdrPlace("agents", "w1:p1"))
+        other_session = fixture_runtime_id("unrelated-resume-conversation")
+        for marked, expected_session in (
+            (replace(current, place=HerdrPlace("agents", "w1:other")), DIRECTOR),
+            (replace(current, claude=unit_lookup.LiveClaude("alpha", other_session, "fixture", 123)), DIRECTOR),
+            (current, row.id),
+        ):
+            with self.subTest(marked=marked, expected_session=expected_session), mock.patch.object(
+                    unit_lookup, "marked_unit", return_value=marked):
+                self.assertFalse(resume_unit.resumed_session_proven("alpha", "alpha-unit", expected_session, row))
+        self.assertEqual((self.staff.staff_file.read_bytes(), pane_record.record_path("agents").read_bytes(),
+                          unit_config.parked_path(row.id).read_bytes()), before)
+
     def test_retired_unit_receipt_cannot_complete_a_new_incarnation(self) -> None:
         code, output = self.resume()
         self.assertEqual(code, 0, output)
         unit = staff.find(kind="unit")[0]
-        _ = staff.retire(unit.id)
-        replacement = staff.ensure("unit", name=unit.name, parent=unit.parent)
+        self.staff.forget_rows(unit.id)
+        replacement = fixture_member("unit", name=unit.name, parent=unit.parent,
+                                     runtime_id=fixture_runtime_id("replacement-unit-backend"))
         code, output = self.resume()
         self.assertEqual(code, 1, output)
         self.assertNotIn("already resumed", output)
@@ -187,6 +470,8 @@ class ResumeUnitTests(unittest.TestCase):
             "    doc = arguments[arguments.index('--production') + 1]",
             "    from pathlib import Path",
             "    row = add_unit.ensure_staff_unit(read_production(Path(doc)), arguments[2])",
+            "    import pane_record",
+            f"    pane_record.write('agents', pane_record.launch('w1:p1', {DIRECTOR!r}, {str(self.worktree)!r}, {{}}, ['claude']))",
             "    print(row.id)", "    return 0",
             "with patch.object(add_unit, '_main', side_effect=launch):",
             "    raise SystemExit(add_unit.main(sys.argv[1:]))", "",
@@ -197,7 +482,7 @@ class ResumeUnitTests(unittest.TestCase):
         child = cast(Connection, cast(object, second))
         original_unmark = resume_unit.unmark
         def finish(unit: resume_unit.RetiredUnit) -> None:
-            child.send(staff.snapshot().find(kind="unit")[0].id)
+            child.send((staff.snapshot().find(kind="unit")[0].id, bool(staff.operation_fds())))
             _ = cast(object, child.recv())
             original_unmark(unit)
         def run() -> None:
@@ -214,18 +499,22 @@ class ResumeUnitTests(unittest.TestCase):
             with self.staff.lock_notice(self.staff.staff_file.parent / "operation.lock") as listener:
                 process.start()
                 child.close()
-                self.assertTrue(parent.poll(PROCESS_TIMEOUT), "nested add_unit did not join resume's lock")
-                staff_id = staff.StaffId(cast(str, parent.recv()))
+                self.assertTrue(parent.poll(TEST_HANG_GUARD_SECS), "nested add_unit did not join resume's lock")
+                identity, lock_held = cast(tuple[str, bool], parent.recv())
+                self.assertIsInstance(identity, str, f"resume exited before unmark: {(identity, lock_held)!r}")
+                self.assertIsInstance(lock_held, bool)
+                staff_id = staff.StaffId(identity)
+                self.assertTrue(lock_held, "resume released its operation lock before clearing the retired note")
                 self.assertIn("retired", self.row())
                 seed = self.staff.start_script(CHECKOUT / "scripts/production/staff_sources.py", "seed")
                 self.staff.assert_operation_blocks(seed, listener)
                 parent.send("finish")
-                self.assertTrue(parent.poll(PROCESS_TIMEOUT), "resume did not clear the retired note")
+                self.assertTrue(parent.poll(TEST_HANG_GUARD_SECS), "resume did not clear the retired note")
                 code, output = cast(tuple[int, str], parent.recv())
                 self.assertEqual(code, 0, output)
-                process.join(timeout=PROCESS_TIMEOUT)
+                process.join(timeout=TEST_HANG_GUARD_SECS)
                 self.assertEqual(process.exitcode, 0)
-                output, errors = seed.communicate(timeout=PROCESS_TIMEOUT)
+                output, errors = seed.communicate(timeout=TEST_HANG_GUARD_SECS)
             self.assertEqual(seed.returncode, 0, output + errors)
             self.assertNotIn("retired", self.row())
             row = staff.by_id(staff_id)
@@ -238,11 +527,11 @@ class ResumeUnitTests(unittest.TestCase):
             child.close()
             if process.is_alive():
                 process.terminate()
-                process.join(timeout=PROCESS_TIMEOUT)
+                process.join(timeout=TEST_HANG_GUARD_SECS)
             process.close()
             if seed is not None and seed.returncode is None:
                 seed.kill()
-                _ = seed.communicate(timeout=PROCESS_TIMEOUT)
+                _ = seed.communicate(timeout=TEST_HANG_GUARD_SECS)
 
     def test_resumes_the_recorded_session_in_a_worktree_made_from_the_merge_branch(self) -> None:
         self.assert_resumed(*self.resume())
@@ -253,6 +542,7 @@ class ResumeUnitTests(unittest.TestCase):
         path.parent.mkdir(parents=True)
         _ = path.write_text("# Alpha as built\n\nThe plan is complete.\n", encoding="utf-8")
         self.write_row(f"(retired 2026-10-28, worktree removed, session {DIRECTOR}) `{plan}` (run done)")
+        self.retained_config(plan=plan)
         _ = git(self.checkout, "add", "-A")
         _ = git(self.checkout, "commit", "-q", "-m", "condensed plan")
 
@@ -302,13 +592,12 @@ class ResumeUnitTests(unittest.TestCase):
         self.assertEqual(git(self.worktree, "rev-parse", "HEAD"), worktree_head)
         self.assertNotIn("made: worktree", output)
 
-    def test_refusals_change_nothing(self) -> None:
-        for plan, expected in (("docs/plans/alpha.md", "alpha-unit is not retired"),):
-            with self.subTest(plan=plan):
-                self.write_row(plan)
-                code, output = self.resume()
-                self.assertEqual(code, 1, output)
-                self.assertIn(f"refused: {expected}", output)
+    def test_parked_facts_override_a_stale_note_but_transcript_and_branch_refusals_change_nothing(self) -> None:
+        self.write_row("docs/plans/alpha.md")
+        code, output = self.resume("--dry-run")
+        self.assertEqual(code, 0, output)
+        self.assertIn(f"would resume: session {DIRECTOR}", output)
+        self.assertEqual(self.calls, [])
         _ = git(self.checkout, "checkout", "-q", "--", self.doc.name)
         self.configs = [self.root / "claude3"]
         _ = git(self.checkout, "branch", "alpha-branch", "main")
@@ -330,19 +619,20 @@ class ResumeUnitTests(unittest.TestCase):
     def test_missing_session_refuses_both_dry_run_and_launch_when_no_evidence_exists(self) -> None:
         self.write_row("(retired 2026-10-28, worktree removed, session ) `docs/plans/alpha.md`")
         self.configs = [self.root / "empty-config"]
+        unit_config.discard_parked(staff.find(kind="unit")[0].id)
         before = self.doc.read_bytes()
         for flags in (("--dry-run",), ()):
             with self.subTest(flags=flags):
                 code, output = self.resume(*flags)
                 self.assertEqual(code, 1, output)
-                self.assertIn("refused: alpha-unit: its Units row names no session to resume", output)
+                self.assertIn("run staff_sources.py fill --retired or ask the showrunner", output)
                 self.assertNotIn("would resume:", output)
                 self.assertNotIn("resumed:", output)
                 self.assertEqual(self.calls, [])
                 self.assertFalse(self.worktree.exists())
                 self.assertEqual(self.doc.read_bytes(), before)
 
-    def test_missing_session_uses_the_units_newest_interactive_transcript(self) -> None:
+    def test_parked_session_survives_a_missing_note_and_newer_worker_transcripts(self) -> None:
         self.write_row("(retired 2026-10-28, worktree removed) docs/plans/alpha.md")
         older = self.configs[0] / "projects" / unit_move.project_folder(str(self.worktree)) / "older.jsonl"
         _ = older.write_text(json.dumps({"entrypoint": "cli", "cwd": str(self.worktree)}) + "\n")
@@ -355,7 +645,7 @@ class ResumeUnitTests(unittest.TestCase):
         self.assertEqual(self.calls, [])
         self.assert_resumed(*self.resume())
 
-    def test_missing_session_prefers_the_newest_retained_pane_launch(self) -> None:
+    def test_parked_session_survives_stale_retained_pane_launches(self) -> None:
         self.write_row("(retired 2026-10-28, worktree removed) docs/plans/alpha.md")
         for pane, identity, at in (("w1:p1", "older", "2026-10-27T23:00:00+00:00"),
                                     ("w1:p2", DIRECTOR, "2026-10-28T23:00:00+00:00")):
@@ -363,7 +653,15 @@ class ResumeUnitTests(unittest.TestCase):
                 {"SHOWRUNNER_UNIT_ID": "alpha-unit", "CLAUDE_CONFIG_DIR": str(self.configs[0])}, ["--resume", identity])
             launch["written_at"] = at
             pane_record.write("agents", launch)
-        self.assert_resumed(*self.resume())
+        current_backend = unit_lookup.marked_unit
+
+        def observed_backend(slug: str, name: str) -> unit_lookup.MarkedUnit | None:
+            # Retained pane files are historical evidence. Only the fake launch
+            # establishes a live backend for this test.
+            return current_backend(slug, name) if self.calls else None
+
+        with mock.patch.object(unit_lookup, "marked_unit", side_effect=observed_backend):
+            self.assert_resumed(*self.resume())
 
     def external_transcript(self) -> Path:
         for transcript in (self.configs[0] / "projects").glob(f"*/{DIRECTOR}.jsonl"):
@@ -371,19 +669,17 @@ class ResumeUnitTests(unittest.TestCase):
         folder = self.root / "original-checkout"
         folder.mkdir()
         self.transcript(self.configs[0], folder)
+        self.retained_config(folder=folder)
         return folder
 
-    def test_folder_note_resumes_in_the_start_folder_and_skips_worktree_and_branch_steps(self) -> None:
+    def test_folder_note_resumes_in_the_start_folder_and_restores_the_unit_worktree(self) -> None:
         folder = self.external_transcript()
         self.write_row(f"(retired 2026-10-28, worktree removed, session {DIRECTOR}, folder {folder}) `docs/plans/alpha.md` (run done)")
-        # Even a remaining branch is irrelevant when the director runs in a separate checkout.
-        _ = git(self.checkout, "branch", "alpha-branch", "main")
-        with mock.patch.object(resume_unit, "make_worktree", side_effect=AssertionError("worktree step must be skipped")):
-            code, output = self.resume()
+        code, output = self.resume()
         self.assertEqual(code, 0, output)
         self.assertEqual(self.calls, [["add_unit.py", "--production", str(self.doc), "alpha-unit", "--resume", DIRECTOR,
                                       "--cwd", str(folder), "--plan", "docs/plans/alpha.md"]])
-        self.assertFalse(self.worktree.exists())
+        self.assertTrue(self.worktree.is_dir())
         self.assertIn("| `docs/plans/alpha.md` (run done) |", self.row())
         self.assertNotIn("(retired", self.row())
 
@@ -391,13 +687,13 @@ class ResumeUnitTests(unittest.TestCase):
         folder = self.external_transcript()
         code, output = self.resume("--dry-run")
         self.assertEqual(code, 0, output)
-        self.assertIn(f"would skip: worktree and branch steps; session starts in {folder}", output)
+        self.assertIn(f"would make: worktree {self.worktree} on alpha-branch", output)
         self.assertIn(f"--cwd {folder}", output)
         self.assertEqual(self.calls, [])
         code, output = self.resume()
         self.assertEqual(code, 0, output)
         self.assertIn(["--cwd", str(folder)], [call[index:index + 2] for call in self.calls for index in range(len(call) - 1)])
-        self.assertFalse(self.worktree.exists())
+        self.assertTrue(self.worktree.is_dir())
 
     def test_renamed_transcript_resumes_in_its_current_project_folder(self) -> None:
         transcript = self.configs[0] / "projects" / unit_move.project_folder(str(self.worktree)) / f"{DIRECTOR}.jsonl"
@@ -450,6 +746,7 @@ class ResumeUnitTests(unittest.TestCase):
     def test_backtick_plan_keeps_its_retired_note_until_resume_and_preserves_the_raw_plan(self) -> None:
         plan = "`docs/as-built/feature-log.md` (run done)"
         self.write_row(f"(retired 2026-10-28, worktree removed, session {DIRECTOR}) {plan}")
+        self.retained_config(plan="docs/as-built/feature-log.md")
         code, output = self.resume()
         self.assertEqual(code, 0, output)
         self.assertEqual(self.calls[-1][-2:], ["--plan", "docs/as-built/feature-log.md"])

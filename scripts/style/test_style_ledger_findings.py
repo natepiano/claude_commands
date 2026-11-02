@@ -1324,7 +1324,7 @@ class StyleLedgerFindingsTests(LedgerTestCase):
         with closing(sqlite3.connect(ledger.database)) as connection, connection:
             _ = connection.execute("INSERT INTO held_findings SELECT ?,rule,path,line,text,kind,before,after,rule_blob,ticket,"
                                    + "state,proposal,created_at,updated_at,build_ticket,moved_from,withdrawn_by,person_read_by,"
-                                   + "duplicate_of,unwaived_by,followed_from,followed_from_line,followed_at,declaration_gone_at,waive_provenance,waived_by,built_at FROM held_findings "
+                                   + "duplicate_of,unwaived_by,followed_from,followed_from_line,followed_at,declaration_gone_at,waive_provenance,waived_by,built_at,anchor_commit,followed_from_commit FROM held_findings "
                                    + "WHERE finding_id=?", (twin, ids[1]))
         before = self.held_rows(ledger.database)
         for name, error in (
@@ -2153,10 +2153,10 @@ class StyleLedgerFindingsTests(LedgerTestCase):
             _ = self.commit_tip(other, {PARENT_FILE: source, MOVED_FILE: "// empty\n", TWIN_FILE: "// empty\n"})
             _, (finding_id,) = self.hold_parent(other, ((1, "fn original() {"),), kind="restructure")
             _ = self.commit_tip(other, {PARENT_FILE: source.replace("original", "renamed")})
-            judged = style_ledger.Ledger.judged_commit
+            judged = style_ledger.Ledger.finding_anchor
             wrote = False
 
-            def read_during_row_change(reader: style_ledger.Ledger, finding: style_ledger.HeldFinding) -> style_ledger.JudgedCommit | style_ledger.NoJudgedCommit:
+            def read_during_row_change(reader: style_ledger.Ledger, finding: style_ledger.HeldFinding) -> style_ledger.FindingAnchor | style_ledger.NeedsJudgment:
                 nonlocal wrote
                 if not wrote:
                     wrote = True
@@ -2164,7 +2164,7 @@ class StyleLedgerFindingsTests(LedgerTestCase):
                         _ = connection.execute("UPDATE held_findings SET text='fresh request' WHERE finding_id=?", (finding_id,))
                 return judged(reader, finding)
 
-            with mock.patch.object(style_ledger.Ledger, "judged_commit", read_during_row_change):
+            with mock.patch.object(style_ledger.Ledger, "finding_anchor", read_during_row_change):
                 outcome, = self.follow_approved(other, [finding_id])
             self.assertIsInstance(outcome, style_ledger.DeclarationMoved)
             row, = other.held_findings(style_ledger.AllHeldFindings())

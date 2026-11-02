@@ -17,7 +17,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import FrozenInstanceError
 from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
-from typing import TypedDict, cast, override
+from typing import TYPE_CHECKING, TypedDict, cast, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
@@ -29,9 +29,12 @@ from sessions import SessionRecord
 
 from build_hold_test_support import (
     IsolatedBuildHoldTest as IsolatedBuildHoldTest,
-    HoldEventRecord, SCRIPT, TEST_HANG_GUARD_SECS,
-    invoke_hold, recorded_hold_events, write_holder,
+    HoldEventRecord, SCRIPT, invoke_hold, recorded_hold_events, write_holder,
 )
+if TYPE_CHECKING:
+    from ..lib import test_hang_guard
+else:
+    from scripts.lib import test_hang_guard
 
 
 class PrivateReleaseBroadcastTest(IsolatedBuildHoldTest):
@@ -1001,7 +1004,7 @@ class CommandTests(PrivateReleaseBroadcastTest):
         held = self.run_cli(folder, "hold", "--holder", "holder", "--for", "the focused test")
         self.assertEqual(held.returncode, 0, held.stderr)
         received = subprocess.run(
-            ["python3", str(SCRIPT), "wait"], capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
+            ["python3", str(SCRIPT), "wait"], capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
             env={**os.environ, "CLAUDE_CODE_SESSION_ID": "received-session"},
         )
         self.assertEqual(received.returncode, 10, received.stderr)
@@ -1019,7 +1022,7 @@ class CommandTests(PrivateReleaseBroadcastTest):
                 return subprocess.run(
                     ["bash", "-c", 'python3 "$1" wait && printf "%s\\n" "$2" >> "$3"',
                      "wait-and-build", str(SCRIPT), phase, str(events)],
-                    capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
+                    capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
                 )
 
             free = attempt("no hold")
@@ -1341,7 +1344,7 @@ class HoldRecordingTests(PrivateReleaseBroadcastTest):
                 result = subprocess.run(
                     ["python3", str(SCRIPT), "hold", "--holder", "alice", "--for", "render checks",
                      "--proc-root", str(self.scratch / "proc")],
-                    env=dict(os.environ), capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS, check=False)
+                    env=dict(os.environ), capture_output=True, text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertIn("natedev is held for render checks.", result.stdout)
                 self.assertTrue((self.scratch / "holders" / "alice").is_file())

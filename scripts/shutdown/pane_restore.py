@@ -26,6 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import herdr  # noqa: E402
 import pane_record  # noqa: E402
 import sessions  # noqa: E402
+from scripts.production import session_staff  # noqa: E402
 from scripts.shutdown.stop_resume import resume_arguments  # noqa: E402
 from scripts.whoami.account import named_account_environment  # noqa: E402
 
@@ -58,12 +59,20 @@ def skip_reason(pane: herdr.TabSession, entry: pane_record.PaneLaunch | None, li
 def _resume(session: str, client: herdr.Herdr, pane: herdr.TabSession, entry: pane_record.PaneLaunch) -> None:
     if not isinstance(client.pane_activity(pane.pane_id), herdr.PaneAtShell):
         raise herdr.HerdrFailure("the pane runs a program")
+    entry = session_staff.record_membership(entry)
     environment = {**entry["environment"], **named_account_environment(Path(entry["config_dir"]))}
     title = pane.label or entry["name"]
     launched = herdr.launch_agent(session, pane.workspace, title, entry["cwd"], environment, "claude",
         resume_arguments(entry), herdr.NoOpeningPrompt(), START_TIMEOUT_MS, agent=title)
     if isinstance(launched, herdr.nix_env.Refused):
         raise herdr.HerdrFailure(launched.reason)
+    try:
+        identity = client.native_session(launched.pane, "claude", START_TIMEOUT_MS / 1000)
+        if identity != entry["session_id"]:
+            raise herdr.HerdrFailure(f"{entry['session_id']}: resumed registry identity differs: {identity}")
+    except (herdr.HerdrFailure, OSError):
+        client.close_tab_of(launched.pane)
+        raise
     # Ordering the tabs keeps each pane's id (herdr review, 2026-10-19).
     client.close_tab_of(pane.pane_id)
 
@@ -74,7 +83,8 @@ def restore(session: str, *, dry_run: bool) -> int:
     live = {item["sessionId"] for item in [*sessions.live_sessions(), *sessions.running_sessions()]}
     failures = 0
     for pane in client.tab_sessions():
-        entry = entries.get(pane.pane_id)
+        saved = entries.get(pane.pane_id)
+        entry = pane_record.resume_launch(saved) if saved is not None else None
         reason = skip_reason(pane, entry, live)
         if entry is None or reason:
             if reason:

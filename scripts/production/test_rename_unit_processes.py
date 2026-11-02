@@ -34,8 +34,9 @@ else:
     # rename_unit puts the shutdown folder on the path.
     import shutdown_record
 
-from scripts.production.rename_unit_test_support import SLUG, TEST_HANG_GUARD_SECS, UnitRenameFixture
+from scripts.production.rename_unit_test_support import SLUG, UnitRenameFixture
 from scripts.production.fake_unit_host import stopped_record
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 # An app-server's idle-stop watcher, as codex_mesh starts it: the run folder is its fourth argument.
@@ -127,6 +128,7 @@ class RunProcessTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(shutdown_record, "all_session_records", lambda: [STOPPED_RECORD]))
         _ = self.enterContext(mock.patch.object(unit_lookup, "marked_unit", return_value=None))
         _ = self.enterContext(mock.patch.object(unit_lookup, "marked_units", self.no_units))
+        _ = self.enterContext(mock.patch.object(unit_lookup, "observed_staff_marks", return_value=()))
 
     def run_folder(self, name: str, worktree: Path) -> Path:
         worktree.mkdir(parents=True, exist_ok=True)

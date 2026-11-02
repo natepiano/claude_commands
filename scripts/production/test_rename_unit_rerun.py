@@ -99,7 +99,7 @@ class UnitRenameRerunTests(UnitRenameFixture):
             shutdown(*arguments)
             # The private shutdown stand-in publishes the live unit only once.
             if not live:
-                live.append(self.mark_live("gamma-unit", "sid-alpha"))
+                live.append(self.mark_live("gamma-unit", "5ad615f2-4e04-5121-a102-9d6b2e2a6eb3"))
 
         with saved_fixture(self.root) as restore:
             with mock.patch.object(rename_unit, "run_shutdown", side_effect=restart):
@@ -188,7 +188,7 @@ class UnitRenameRerunTests(UnitRenameFixture):
 
         with mock.patch.object(rename_unit, "_save", side_effect=interrupted):
             self.assert_refused(self.rename("apply"), "stopped before relaunch progress save")
-        _ = self.mark_live("gamma-unit", "sid-unrelated")
+        _ = self.mark_live("gamma-unit", "8ca61a08-5cf2-5401-b624-d90a6ca60358")
         self.assert_refused(self.rename("apply"), "gamma-unit has a live Claude")
         self.assertEqual(self.journal()["step"], 9)
 

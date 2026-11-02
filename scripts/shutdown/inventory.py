@@ -6,18 +6,15 @@ from __future__ import annotations
 import json
 import os
 import re
-import shutil
 import shlex
 import socket
-import stat
 import subprocess
 import sys
 import time
-from collections.abc import Iterator, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, TypedDict, cast, override
+from typing import TYPE_CHECKING, Literal, TypedDict, cast
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 # Sibling imports need this folder. Append it so a caller's own modules
@@ -30,14 +27,12 @@ for dependency in ("whoami", "message", "production", "herdr", "direct", "lib", 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.whoami import account
-import conversation_pause
 from probe_session import PROBE_ENV
 import unit_runs
 if TYPE_CHECKING:
     from ..direct.worker_state import worker_ledger
 else:
     from worker_state import worker_ledger
-import detection_rules
 import herdr
 import sessions
 from sessions import process_start as _process_start
@@ -47,10 +42,6 @@ from scripts.whoami.account import Account, label_for
 
 
 from session_types import (
-    KnownBoot as KnownBoot,
-    BootNotRecorded as BootNotRecorded,
-    CompleteInventory as CompleteInventory,
-    PartialInventory as PartialInventory,
     InvalidInventory as InvalidInventory,
     parse_session as parse_session,
     wire_object as _wire_object,
@@ -99,14 +90,6 @@ from session_types import (
     TopLevelSession as TopLevelSession,
     Session as Session,
     TimerRestore as TimerRestore,
-    CodexSessionId as CodexSessionId,
-    CodexResumePicker as CodexResumePicker,
-    CodexLaunch as CodexLaunch,
-    SnapshotClaudeSession as SnapshotClaudeSession,
-    SnapshotCodexSession as SnapshotCodexSession,
-    SnapshotSession as SnapshotSession,
-    RecoveryHostProcess as RecoveryHostProcess,
-    RecoveryHostUnrecorded as RecoveryHostUnrecorded,
 )
 
 
@@ -126,7 +109,6 @@ def live_supervisor(host: WindowHost | TerminalHost) -> SupervisorIdentity | NoS
             and _process_start(identity["pid"]) == identity["proc_start"]):
         return identity
     return NoSupervisor(kind="no supervisor")
-
 
 
 @dataclass(frozen=True)
@@ -202,12 +184,6 @@ class UnitMarks:
     doc: str
     session_name: str
     session_host: Literal["herdr"]
-
-
-DESKTOP_HEADING = re.compile(r"^##\s+desktop:\s*(.+?)\s*$")
-SNAPSHOT_SESSION = re.compile(r"^`(.+)` · (\S+) · (.+?)\s*$")
-SNAPSHOT_COMMIT_PREFIX = "agent-sessions-snapshot: "
-RESUME_ID = re.compile(r"(?:^|\s)--resume\s+['\"]?([^\s'\"]+)")
 
 
 def parse_inventory(text: str) -> Inventory:
@@ -616,61 +592,10 @@ def _terminal_host(pid: int, desktop: Desktop) -> SessionHost:
     return {"kind": "unknown"}
 
 
-# The updater's main() also refreshes the vault's agent notes, which reads every Claude login.
-# Shutdown needs only the desktops; an updater from before the flag ignores it and stays correct.
-SKIP_AGENT_NOTES = "AGENT_SESSIONS_SKIP_AGENT_NOTES"
-
-
-def _snapshot_desktops(*, refresh: bool = True) -> dict[str, str]:
-    if sys.platform == "darwin":
-        return {}
-    snapshotter = (shutil.which("agent-sessions-snapshot")
-                   if refresh and os.environ.get("REFUSAL_WATCH_INVENTORY") != "read existing" else None)
-    if snapshotter is not None:
-        try:
-            _ = subprocess.run(
-                (snapshotter,),
-                capture_output=True,
-                text=True,
-                timeout=60,
-                check=False,
-                env={**os.environ, SKIP_AGENT_NOTES: "1"},
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            pass
-
-    snapshot = Path.home() / "rust/hanadocs/agent sessions.md"
-    try:
-        lines = snapshot.read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeError):
-        return {}
-    found: dict[str, str] = {}
-    desktop = ""
-    in_fence = False
-    has_session = False
-    for line in lines:
-        if line.startswith("```"):
-            in_fence = not in_fence
-            continue
-        if in_fence and has_session:
-            match = RESUME_ID.search(line)
-            if match is not None and desktop:
-                found[match.group(1)] = desktop
-            has_session = False
-            continue
-        heading = DESKTOP_HEADING.match(line)
-        if heading is not None:
-            desktop = heading.group(1)
-            continue
-        has_session = SNAPSHOT_SESSION.match(line) is not None
-    return found
-
-
 def _host(
     session: SessionFile,
     unit: UnitMarks | None,
     plans: dict[str, str],
-    desktops: dict[str, str],
 ) -> Host:
     session_id = _string(session.get("sessionId"))
     environment = _process_environment(session.get("pid", 0))
@@ -695,12 +620,7 @@ def _host(
         clients = herdr.attached_clients(place.session)
         return {"kind": "herdr", "herdr_session": place.session, "pane_id": place.pane,
                 "presentation": "attached window" if isinstance(clients, herdr.ClientsAttached) else "detached"}
-    desktop_name = desktops.get(session_id)
-    desktop: Desktop = (
-        {"kind": "named", "name": desktop_name}
-        if desktop_name is not None
-        else {"kind": "not in snapshot"}
-    )
+    desktop: Desktop = {"kind": "not in snapshot"}
     return _terminal_host(session.get("pid", 0), desktop)
 
 
@@ -727,10 +647,7 @@ def _checkout(cwd: str) -> CheckoutState:
     if any(result is None or result.returncode != 0 for result in (root, branch, head)):
         return {"kind": "not a checkout"}
     assert root is not None and branch is not None and head is not None
-    # The vault's snapshot job commits every minute or two and hanadocs-push pushes them,
-    # so they never block a stop; counting them, no session in the vault reads as pushed.
-    ahead_result = _git(cwd, "rev-list", "--count", "--invert-grep",
-                        f"--grep=^{SNAPSHOT_COMMIT_PREFIX}", "@{u}..HEAD")
+    ahead_result = _git(cwd, "rev-list", "--count", "@{u}..HEAD")
     upstream: Upstream = {"kind": "no upstream"}
     if ahead_result is not None and ahead_result.returncode == 0:
         try:
@@ -860,7 +777,7 @@ def _model(session_id: str, config_dir: Path) -> LastModel:
 def _launcher_command(pid: int) -> list[str]:
     """Find the nearest live launcher ancestor without flattening argv boundaries."""
     try:
-        darwin = _DarwinSnapshotProcesses().processes if sys.platform == "darwin" else {}
+        darwin = {process.pid: process for process in herdr._darwin_processes()} if sys.platform == "darwin" else {}  # pyright: ignore[reportPrivateUsage]
     except (OSError, herdr.HerdrFailure):
         return []
     visited: set[int] = set()
@@ -1038,7 +955,7 @@ def all_live_accounts() -> list[Inventory]:
     if not logins:
         return []
     def read_account(login: str) -> Inventory:
-        return inventory(login, refresh_desktops=False)
+        return inventory(login)
 
     with ThreadPoolExecutor(max_workers=len(logins)) as pool:
         return list(pool.map(read_account, logins))
@@ -1276,7 +1193,7 @@ def shutdown_processes(timeout: float = 5) -> ProcessObservation:
             cgroups: list[tuple[str, Path]] = []
             ownership_unreadable = False
             try:
-                environment = _snapshot_environment(process)
+                environment = dict(os.fsdecode(item).split("=", 1) for item in (process / "environ").read_bytes().split(b"\0") if b"=" in item)
             except OSError as error:
                 errors.append(f"pid {process.name}: environment unread: {error}")
             try:
@@ -1307,7 +1224,6 @@ def shutdown_processes(timeout: float = 5) -> ProcessObservation:
 def inventory(
     login: str,
     only: frozenset[str] = frozenset(),  # pyright: ignore[reportCallInDefaultInitializer]
-    *, refresh_desktops: bool = True,
 ) -> Inventory:
     """Return account sessions in ``only`` and their workers, or all when empty."""
     home_state = account.home_account_state()
@@ -1335,10 +1251,6 @@ def inventory(
         for _, entry in candidates
     )
     plans = _newest_unit_plans() if has_sessions else {}
-    desktops = (
-        (_snapshot_desktops() if refresh_desktops else _snapshot_desktops(refresh=False))
-        if has_sessions else {}
-    )
     found: list[Session] = []
     unattributed: list[UnattributedSession] = []
 
@@ -1351,7 +1263,7 @@ def inventory(
 
         session_id = entry.session_id
         found.append(_session_details(record, entry, directories=run_directories.get(session_id, []),
-            host=_host(record, units.get(session_id), plans, desktops), timers=_timers(session_id),
+            host=_host(record, units.get(session_id), plans), timers=_timers(session_id),
             environment=_process_environment(entry.pid), worker_owner=DirectorOwner(kind="director", session_id=worker_owners[session_id]) if session_id in worker_owners else NoDirector(kind="no director")))
 
     return {
@@ -1381,706 +1293,6 @@ def _session_details(record: SessionFile, entry: ListedSession, *, directories: 
     elif entry.kind == "worker":
         common["owner"] = worker_owner
     return parse_session(common, "observed session", require_updated_at=True)
-
-
-class ObservationFailure(OSError):
-    """One required source could not establish a complete observation."""
-
-
-@dataclass(frozen=True)
-class _SnapshotTimers:
-    registrations: tuple[ShowrunnerRegistration, ...]
-    targets: dict[str, list[str]]
-    enabled: dict[str, bool]
-
-
-def _snapshot_timers() -> _SnapshotTimers:
-    root = _notifier_state_dir()
-    try:
-        instances = list(root.iterdir())
-    except FileNotFoundError:
-        return _SnapshotTimers((), {}, {})
-    registrations: list[ShowrunnerRegistration] = []
-    targets: dict[str, list[str]] = {}
-    enabled: dict[str, bool] = {}
-    for instance in instances:
-        if not stat.S_ISDIR(instance.stat().st_mode):
-            continue
-        conf = instance / "conf"
-        try:
-            fields = dict(line.split("=", 1) for line in conf.read_text().splitlines() if "=" in line)
-        except FileNotFoundError:
-            if instance.name.startswith("showrunner-"):
-                raise ObservationFailure(f"production registration: {conf} is missing") from None
-            continue
-        target = fields.get("TARGET", "")
-        if target.startswith("session:") and target[8:]:
-            targets.setdefault(target[8:], []).append(instance.name)
-        try:
-            enabled[instance.name] = "ENABLED=1" in (instance / "state").read_text().splitlines()
-        except FileNotFoundError:
-            enabled[instance.name] = False
-        if not instance.name.startswith("showrunner-"):
-            continue
-        try:
-            command = shlex.split(fields.get("CHECK", ""))
-            index = next(index for index, token in enumerate(command) if Path(token).name == "production_check.sh")
-            doc = Path(command[index + 1])
-            if not doc.is_absolute() or not target.startswith("session:") or not target[8:]:
-                raise ValueError("missing production doc or session target")
-            _ = doc.read_text()
-        except (StopIteration, IndexError, ValueError) as error:
-            raise ObservationFailure(f"production registration {conf}: {error}") from error
-        registrations.append(ShowrunnerRegistration(target[8:], instance.name.removeprefix("showrunner-"), str(doc)))
-    return _SnapshotTimers(tuple(registrations), targets, enabled)
-
-
-def _snapshot_timer_restores(owner: Session, timers: _SnapshotTimers) -> list[TimerRestore]:
-    try:
-        pause = conversation_pause.read_record(conversation_pause.record_path(owner["session_id"]))
-    except FileNotFoundError:
-        pause = conversation_pause.NoPauseRecord.ABSENT
-    restores: dict[str, TimerRestore] = {}
-    if isinstance(pause, conversation_pause.PauseRecord):
-        restore = not isinstance(pause.phase, conversation_pause.KeptOff)
-        for instance in pause.instances:
-            restores[instance] = TimerRestore(instance=instance, was_enabled=restore)
-    for instance in owner["timers"]:
-        _ = restores.setdefault(instance, TimerRestore(instance=instance,
-            was_enabled=timers.enabled.get(instance, False)))
-    return list(restores.values())
-
-
-def _snapshot_environment(process: Path) -> dict[str, str]:
-    return dict(os.fsdecode(item).split("=", 1) for item in process.joinpath("environ").read_bytes().split(b"\0")
-                if b"=" in item)
-
-
-def _snapshot_stat(process: Path) -> tuple[str, int]:
-    fields = process.joinpath("stat").read_bytes().rpartition(b")")[2].split()
-    try:
-        started = fields[19].decode("ascii")
-        if not started.isdecimal():
-            raise ValueError("invalid process start")
-        return started, int(fields[4])
-    except (IndexError, ValueError, UnicodeError) as error:
-        raise ObservationFailure(f"process liveness {process}: malformed stat") from error
-
-
-class _SnapshotProcesses:
-    """Strict Linux observations; absence and unreadability remain distinct."""
-
-    def __init__(self) -> None:
-        self.root: Path = Path(os.environ.get("HERDR_PROC", "/proc"))
-
-    def boot(self) -> str:
-        value = self.root.joinpath("sys/kernel/random/boot_id").read_text().strip()
-        if not value:
-            raise ObservationFailure("boot id is empty")
-        return value
-
-    def paths(self) -> list[Path]:
-        return [path for path in self.root.iterdir() if path.name.isdecimal()]
-
-    def path(self, pid: int) -> Path:
-        return self.root / str(pid)
-
-    def exists(self, process: Path) -> bool:
-        return process.exists()
-
-    def identity(self, process: Path) -> tuple[str, int]:
-        return _snapshot_stat(process)
-
-    def environment(self, process: Path) -> dict[str, str]:
-        return _snapshot_environment(process)
-
-    def command(self, process: Path) -> str:
-        return process.joinpath("comm").read_text().strip() if process.stat().st_uid == os.getuid() else ""
-
-    def arguments(self, process: Path) -> list[str]:
-        return [os.fsdecode(item) for item in process.joinpath("cmdline").read_bytes().split(b"\0") if item]
-
-    def cwd(self, process: Path) -> str:
-        return str(process.joinpath("cwd").resolve(strict=True))
-
-    def rollout(self, process: Path, home: Path) -> CodexSessionId | CodexResumePicker:
-        return _codex_resume(process, home)
-
-    def started_at(self, process: Path) -> datetime:
-        started, _ = self.identity(process)
-        for line in (self.root / "stat").read_text().splitlines():
-            if line.startswith("btime "):
-                return datetime.fromtimestamp(int(line.split()[1]) +
-                    int(started) / os.sysconf("SC_CLK_TCK"), timezone.utc)
-        raise ObservationFailure("process start: boot time is missing")
-
-    def servers(self, processes: list[Path]) -> dict[str, RecoveryHostProcess]:
-        found: dict[str, RecoveryHostProcess] = {}
-        for pid, name in herdr._live_server_processes(processes).items():  # pyright: ignore[reportPrivateUsage]
-            started, _ = self.identity(self.path(pid))
-            found[name] = RecoveryHostProcess(kind="process", pid=pid, proc_start=started)
-        return found
-
-
-class _DarwinSnapshotProcesses(_SnapshotProcesses):
-    """One user-process observation, with native identity and file readers."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.processes: dict[int, herdr._UserProcess] = {  # pyright: ignore[reportPrivateUsage]
-            process.pid: process for process in herdr._darwin_processes()}  # pyright: ignore[reportPrivateUsage]
-        self.identities: dict[int, tuple[str, int]] = {}
-
-    @override
-    def boot(self) -> str:
-        program = os.environ.get("SHUTDOWN_SYSCTL", "sysctl")
-        result = herdr.run_program([program, "-n", "kern.bootsessionuuid"])
-        herdr.require_success(result, "boot session uuid")
-        value = result.stdout.strip()
-        if not value:
-            raise ObservationFailure("boot session uuid is empty")
-        return value
-
-    @override
-    def paths(self) -> list[Path]:
-        return [Path(str(pid)) for pid in self.processes]
-
-    @override
-    def path(self, pid: int) -> Path:
-        return Path(str(pid))
-
-    @override
-    def exists(self, process: Path) -> bool:
-        return int(process.name) in self.processes
-
-    @override
-    def identity(self, process: Path) -> tuple[str, int]:
-        pid = int(process.name)
-        if pid not in self.processes:
-            raise FileNotFoundError(f"process {pid} is absent")
-        if pid not in self.identities:
-            self.identities[pid] = herdr.darwin_process_identity(pid)
-        return self.identities[pid]
-
-    @override
-    def environment(self, process: Path) -> dict[str, str]:
-        return herdr.darwin_process_environment(int(process.name))
-
-    @override
-    def command(self, process: Path) -> str:
-        return Path(self.processes[int(process.name)].executable).name
-
-    @override
-    def arguments(self, process: Path) -> list[str]:
-        arguments = self.processes[int(process.name)].arguments
-        if isinstance(arguments, herdr.UnreadableProcessArguments):
-            raise ObservationFailure(arguments.reason)
-        return list(arguments.argv)
-
-    @override
-    def cwd(self, process: Path) -> str:
-        cwd = herdr._darwin_process_cwd(int(process.name))  # pyright: ignore[reportPrivateUsage]
-        if isinstance(cwd, herdr.UnreadableCwd):
-            raise ObservationFailure(cwd.detail)
-        return cwd
-
-    @override
-    def rollout(self, process: Path, home: Path) -> CodexSessionId | CodexResumePicker:
-        ids: set[str] = set()
-        for path in herdr.darwin_open_files(int(process.name)):
-            if path.is_relative_to(home / "sessions"):
-                match = _ROLLOUT_ID.fullmatch(path.name)
-                if match:
-                    ids.add(match[1].lower())
-        if len(ids) > 1:
-            raise ObservationFailure(f"Codex rollout {process}: more than one open session id")
-        return CodexSessionId(kind="session id", session_id=next(iter(ids))) if ids else CodexResumePicker(kind="picker")
-
-    @override
-    def started_at(self, process: Path) -> datetime:
-        started, _ = self.identity(process)
-        # darwin_process_identity reads lstart with LC_ALL=C and TZ=UTC.
-        return datetime.strptime(started, "%a %b %d %H:%M:%S %Y").replace(tzinfo=timezone.utc)
-
-    @override
-    def servers(self, processes: list[Path]) -> dict[str, RecoveryHostProcess]:
-        config = herdr._session_socket("default").parent  # pyright: ignore[reportPrivateUsage]
-        found: dict[str, RecoveryHostProcess] = {}
-        for listener in herdr._darwin_bound_sockets():  # pyright: ignore[reportPrivateUsage]
-            if listener.pid not in self.processes or listener.path.name != "herdr.sock":
-                continue
-            if listener.path == config / "herdr.sock":
-                name = "default"
-            elif listener.path.parent.parent == config / "sessions":
-                name = listener.path.parent.name
-            else:
-                continue
-            started, _ = self.identity(self.path(listener.pid))
-            if name in found and found[name]["pid"] != listener.pid:
-                raise ObservationFailure(f"herdr {name}: multiple socket holders")
-            found[name] = RecoveryHostProcess(kind="process", pid=listener.pid, proc_start=started)
-        return found
-
-    def terminal(self, pid: int, desktop: Desktop) -> tuple[SessionHost, RecoveryHostProcess | RecoveryHostUnrecorded]:
-        current, child = pid, 0
-        supervisor: SupervisorIdentity | NoSupervisor = NoSupervisor(kind="no supervisor")
-        parent = self.processes.get(self.processes[pid].parent)
-        if parent is not None and isinstance(parent.arguments, herdr.ReadProcessArguments) and any(
-                Path(argument).name == "relaunch.py" and
-                parent.arguments.argv[index + 1:index + 3] == ("run", "--")
-                for index, argument in enumerate(parent.arguments.argv)):
-            started, _ = self.identity(self.path(parent.pid))
-            supervisor = SupervisorIdentity(kind="supervisor", pid=parent.pid, proc_start=started)
-        seen: set[int] = set()
-        while current > 1 and current not in seen:
-            seen.add(current)
-            process = self.processes.get(current)
-            if process is None:
-                raise ObservationFailure(f"terminal ancestry {current}: process is missing")
-            kind = terminal_kind(process.executable)
-            if kind != "unknown":
-                started, _ = self.identity(self.path(current))
-                identity = RecoveryHostProcess(kind="process", pid=current, proc_start=started)
-                if (kind == "ghostty" or kind == "zed") and child:
-                    return WindowHost(kind=kind, window_shell=child, desktop=desktop,
-                        supervisor=supervisor if supervisor.get("pid") != child else NoSupervisor(kind="no supervisor")), identity
-                if kind == "terminal":
-                    if child and supervisor["kind"] == "supervisor" and supervisor["pid"] != child:
-                        return TerminalHost(kind="terminal", supervisor=supervisor), identity
-                    return TerminalHost(kind="terminal"), identity
-                return UnknownHost(kind="unknown"), identity
-            child, current = current, process.parent
-        return UnknownHost(kind="unknown"), RecoveryHostUnrecorded(kind="not recorded")
-
-
-def _snapshot_processes() -> _SnapshotProcesses:
-    return _DarwinSnapshotProcesses() if sys.platform == "darwin" else _SnapshotProcesses()
-
-
-@dataclass(frozen=True)
-class _SnapshotHosts:
-    native: dict[int, herdr.HerdrPlace]
-    presentation: dict[str, Literal["attached window", "detached"]]
-    desktops: dict[str, str]
-    servers: dict[str, RecoveryHostProcess]
-    reader: _SnapshotProcesses
-
-
-def _snapshot_native_hosts() -> tuple[dict[int, herdr.HerdrPlace], dict[str, Literal["attached window", "detached"]]]:
-    running = herdr.live_sessions()
-    places = {process.pid: process.place for process in herdr.herdr_processes()}
-    presentation: dict[str, Literal["attached window", "detached"]] = {}
-    for session in running:
-        clients = herdr.attached_clients(session["name"])
-        if isinstance(clients, herdr.ClientsUnreadable):
-            raise ObservationFailure(f"herdr clients {session['name']}: {clients.detail}")
-        presentation[session["name"]] = "attached window" if isinstance(clients, herdr.ClientsAttached) else "detached"
-    return places, presentation
-
-
-def _snapshot_host(pid: int, session_id: str, environment: dict[str, str], hosts: _SnapshotHosts) -> SessionHost:
-    if environment.get("TMUX_PANE"):
-        return UnknownHost(kind="unknown")
-    if environment.get("HERDR_PANE_ID"):
-        place = hosts.native.get(pid)
-        if place is None or place.session not in hosts.presentation:
-            raise ObservationFailure(f"herdr host for pid {pid}: pane could not be resolved")
-        return HerdrHost(kind="herdr", herdr_session=place.session, pane_id=place.pane,
-                         presentation=hosts.presentation[place.session])
-    desktop: Desktop = (NamedDesktop(kind="named", name=hosts.desktops[session_id])
-                        if session_id in hosts.desktops else DesktopNotInSnapshot(kind="not in snapshot"))
-    if isinstance(hosts.reader, _DarwinSnapshotProcesses):
-        return hosts.reader.terminal(pid, desktop)[0]
-    return _terminal_host(pid, desktop)
-
-
-def _snapshot_units(timers: _SnapshotTimers) -> dict[str, UnitMarks]:
-    every = unit_lookup.every_marked_unit()
-    if every.faults:
-        raise ObservationFailure("production unit marks: " + "; ".join(
-            f"{slug}: {every.production_fault(slug)}" for slug in sorted(every.faults)))
-    docs = {runner.slug: runner.doc for runner in timers.registrations}
-    units: dict[str, UnitMarks] = {}
-    for slug, marked in every.units.items():
-        for unit, row in marked.items():
-            if isinstance(row.claude, unit_lookup.ClaudeUnknown):
-                raise ObservationFailure(f"production {slug}/{unit}: {row.claude.reason}")
-            if not isinstance(row.claude, unit_lookup.LiveClaude):
-                raise ObservationFailure(f"production {slug}/{unit}: marked host has no independently confirmed Claude identity")
-            if slug not in docs:
-                raise ObservationFailure(f"production {slug}: live unit has no registered production doc")
-            units[row.claude.session_id] = UnitMarks(slug, unit, docs[slug], row.place.session, "herdr")
-    return units
-
-
-_CODEX_HEADLESS = frozenset({"exec", "app-server", "mcp", "mcp-server", "proto"})
-_CODEX_VALUE_OPTIONS = frozenset({"--config", "-c", "--model", "-m", "--profile", "-p", "--cd", "-C",
-                                  "--sandbox", "-s", "--ask-for-approval", "-a", "--enable", "--disable"})
-_ROLLOUT_ID = re.compile(r"^rollout-.*-([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\.jsonl$")
-
-
-def _codex_interactive(arguments: list[str]) -> bool:
-    index = 1
-    while index < len(arguments):
-        argument = arguments[index]
-        if argument in _CODEX_VALUE_OPTIONS:
-            index += 2
-        elif argument.startswith("-"):
-            index += 1
-        else:
-            return argument not in _CODEX_HEADLESS
-    return True
-
-
-class CodexDescriptorsUnreadable(ObservationFailure):
-    """The open-rollout identity could not be observed."""
-
-
-def _codex_resume(process: Path, home: Path) -> CodexSessionId | CodexResumePicker:
-    try:
-        descriptors = list((process / "fd").iterdir())
-    except OSError as error:
-        raise CodexDescriptorsUnreadable(f"Codex descriptors {process}: {error}") from error
-    ids: set[str] = set()
-    for descriptor in descriptors:
-        try:
-            path = Path(os.readlink(descriptor))
-        except OSError:
-            continue
-        if not path.is_relative_to(home / "sessions"):
-            continue
-        match = _ROLLOUT_ID.fullmatch(path.name)
-        if match:
-            ids.add(match[1].lower())
-    if len(ids) > 1:
-        raise ObservationFailure(f"Codex rollout {process}: more than one open session id")
-    return CodexSessionId(kind="session id", session_id=next(iter(ids))) if ids else CodexResumePicker(kind="picker")
-
-
-class _CodexSessionMetadata(TypedDict):
-    id: str
-    cwd: str
-    timestamp: str
-
-
-def _codex_rollout_metadata(line: str) -> _CodexSessionMetadata:
-    value = _wire_object(cast(object, json.loads(line)), "Codex rollout")
-    if value.get("type") != "session_meta":
-        raise ValueError("Codex rollout does not begin with session_meta")
-    payload = _wire_object(value.get("payload"), "Codex session_meta")
-    return _CodexSessionMetadata(id=_wire_string(payload.get("id"), "Codex session_meta.id"),
-        cwd=_wire_string(payload.get("cwd"), "Codex session_meta.cwd"),
-        timestamp=_wire_string(payload.get("timestamp"), "Codex session_meta.timestamp"))
-
-
-def _codex_rollout_paths(root: Path, first_day: date) -> Iterator[Path]:
-    """Enumerate relevant folders without glob's suppression of read errors."""
-    try:
-        years = list(root.iterdir())
-    except FileNotFoundError:
-        return
-    except OSError as error:
-        raise ObservationFailure(f"Codex sessions {root}: {error}") from error
-    try:
-        for year in years:
-            if not year.name.isdecimal() or int(year.name) < first_day.year or not stat.S_ISDIR(year.stat().st_mode):
-                continue
-            for month in year.iterdir():
-                if not month.name.isdecimal() or not stat.S_ISDIR(month.stat().st_mode):
-                    continue
-                if (int(year.name), int(month.name)) < (first_day.year, first_day.month):
-                    continue
-                for day in month.iterdir():
-                    if not day.name.isdecimal() or not stat.S_ISDIR(day.stat().st_mode):
-                        continue
-                    try:
-                        candidate_day = date(int(year.name), int(month.name), int(day.name))
-                    except ValueError:
-                        continue
-                    if candidate_day >= first_day:
-                        yield from day.iterdir()
-    except OSError as error:
-        raise ObservationFailure(f"Codex sessions {root}: {error}") from error
-
-
-def _codex_disk_resume(home: Path, cwd: str, started: datetime) -> CodexSessionId | CodexResumePicker:
-    """Consider only local day folders and the first line of each rollout."""
-    ids: set[str] = set()
-    for rollout in _codex_rollout_paths(home / "sessions", started.astimezone().date()):
-        match = _ROLLOUT_ID.fullmatch(rollout.name)
-        if not match:
-            continue
-        try:
-            with rollout.open(encoding="utf-8") as handle:
-                metadata = _codex_rollout_metadata(handle.readline())
-            timestamp = datetime.fromisoformat(metadata["timestamp"])
-        except (FileNotFoundError, ValueError, UnicodeError):
-            # A vanished or unfinished rollout is not evidence of an identity.
-            continue
-        if (timestamp.tzinfo is not None and timestamp >= started and
-                metadata["cwd"] == cwd and metadata["id"].lower() == match[1].lower()):
-            ids.add(metadata["id"].lower())
-            if len(ids) > 1:
-                return CodexResumePicker(kind="picker")
-    return CodexSessionId(kind="session id", session_id=next(iter(ids))) if ids else CodexResumePicker(kind="picker")
-
-
-def _observed_codex_resume(reader: _SnapshotProcesses, process: Path, home: Path,
-                           cwd: str) -> CodexSessionId | CodexResumePicker:
-    try:
-        resume = reader.rollout(process, home)
-    except CodexDescriptorsUnreadable:
-        resume = CodexResumePicker(kind="picker")
-    if resume["kind"] == "session id":
-        return resume
-    return _codex_disk_resume(home, cwd, reader.started_at(process))
-
-
-def _snapshot_codex(processes: list[Path], hosts: _SnapshotHosts, at: str) -> dict[str, list[SnapshotSession]]:
-    reader = hosts.reader
-    found: dict[str, list[SnapshotSession]] = {}
-    homes: dict[str, Path] = {}
-    for process in processes:
-        try:
-            if reader.command(process) != "codex":
-                continue
-            started, terminal = reader.identity(process)
-            arguments = reader.arguments(process)
-            if not terminal or not arguments or not _codex_interactive(arguments):
-                continue
-            environment = reader.environment(process)
-            home = Path(environment.get("CODEX_HOME") or Path.home() / ".codex").absolute()
-            cwd = reader.cwd(process)
-            resume = _observed_codex_resume(reader, process, home, cwd)
-            identity = resume["session_id"] if resume["kind"] == "session id" else f"codex-{process.name}-{started}"
-            login = "codex-" + home.name.casefold()
-            if login in homes and homes[login] != home:
-                raise ObservationFailure(f"Codex home collision: {homes[login]} and {home}")
-            homes[login] = home
-            owner = TopLevelSession(kind="top-level", session_id=identity, pid=int(process.name), proc_start=started,
-                name=f"codex-{process.name}", cwd=cwd, probe=False, status="unknown", updated_at=0,
-                model=NoReplyYet(kind="no reply yet"), checkout=_checkout(cwd), run_dirs=[], codex_servers=[], timers=[],
-                host=_snapshot_host(int(process.name), identity, environment, hosts))
-            found.setdefault(login, []).append(SnapshotCodexSession(agent="codex", session=owner,
-                codex=CodexLaunch(home=str(home), resume=resume), workers=[], timers=[], last_seen=at, state="running"))
-        except FileNotFoundError:
-            if reader.exists(process):
-                raise ObservationFailure(f"Codex observation {process}: required process data is missing") from None
-    return found
-
-
-def _snapshot_host_process(owner: Session, hosts: _SnapshotHosts) -> RecoveryHostProcess | RecoveryHostUnrecorded:
-    """Save the terminal process identity while its ancestry is still available."""
-    host = owner["host"]
-    reader = hosts.reader
-    if host["kind"] == "herdr":
-        return hosts.servers.get(host["herdr_session"], RecoveryHostUnrecorded(kind="not recorded"))
-    if host["kind"] == "unit" and host["session_host"] == "herdr":
-        return hosts.servers.get(host["session_name"], RecoveryHostUnrecorded(kind="not recorded"))
-    if host["kind"] not in {"ghostty", "zed", "terminal"}:
-        return RecoveryHostUnrecorded(kind="not recorded")
-    if isinstance(reader, _DarwinSnapshotProcesses):
-        return reader.terminal(owner["pid"], DesktopNotInSnapshot(kind="not in snapshot"))[1]
-    proc = Path(os.environ.get("HERDR_PROC", "/proc"))
-    current = owner["pid"]
-    seen: set[int] = set()
-    while current > 1 and current not in seen:
-        seen.add(current)
-        process = proc / str(current)
-        try:
-            command = process.joinpath("comm").read_text().strip()
-            if terminal_kind(command) != "unknown":
-                started, _ = reader.identity(process)
-                return RecoveryHostProcess(kind="process", pid=current, proc_start=started)
-            fields = process.joinpath("stat").read_text().rsplit(")", 1)[1].split()
-            current = int(fields[1])
-        except FileNotFoundError:
-            if reader.exists(process):
-                raise ObservationFailure(f"host ancestry {process}: required process data is missing") from None
-            break
-        except (IndexError, ValueError) as error:
-            raise ObservationFailure(f"host ancestry {process}: {error}") from error
-    return RecoveryHostUnrecorded(kind="not recorded")
-
-
-def _snapshot_gone_hosts(hosts: _SnapshotHosts, boot_id: str) -> frozenset[tuple[str, str]]:
-    """Positive host loss is distinct from an unavailable host identity."""
-    from shutdown_record import all_snapshots
-    gone: set[tuple[str, str]] = set()
-    reader = hosts.reader
-    for saved in all_snapshots():
-        for entry in saved["sessions"]:
-            if entry.get("boot_id") != boot_id or entry["state"] == "unresolved":
-                continue
-            host = entry["session"]["host"]
-            lost = False
-            identity = entry.get("host_process", RecoveryHostUnrecorded(kind="not recorded"))
-            if identity["kind"] == "process":
-                process = reader.path(identity["pid"])
-                try:
-                    started, _ = reader.identity(process)
-                    lost = started != identity["proc_start"]
-                except FileNotFoundError:
-                    if reader.exists(process):
-                        raise ObservationFailure(f"host process {identity['pid']}: stat is missing") from None
-                    lost = True
-            elif host["kind"] == "herdr":
-                lost = host["herdr_session"] not in hosts.presentation
-            elif host["kind"] == "unit" and host["session_host"] == "herdr":
-                lost = host["session_name"] not in hosts.presentation
-            if lost:
-                gone.add((saved["login"], entry["session"]["session_id"]))
-    return frozenset(gone)
-
-
-def snapshot_inventory() -> CompleteInventory | PartialInventory:
-    """Observe every account once, without changing timers, pauses or vault notes."""
-    failures: list[str] = []
-    registry = sessions.read_registry()
-    failures.extend(f"session registry: {path} is unreadable" for path in registry.unreadable)
-    try:
-        reader = _snapshot_processes()
-        boot_id = reader.boot()
-        home_state = account.home_account_state()
-        timers = _snapshot_timers()
-        units = _snapshot_units(timers)
-        native, presentation = _snapshot_native_hosts()
-        herdr.save_shared_layout(set(presentation))
-        _ = detection_rules.refresh(set(presentation), herdr.reload_agent_rules)
-        desktops = _snapshot_desktops(refresh=False)
-        processes = reader.paths()
-        # Socket ownership also distinguishes a replacement with the same session name.
-        servers = reader.servers(processes)
-        if isinstance(reader, _DarwinSnapshotProcesses):
-            missing = set(presentation) - servers.keys()
-            if missing:
-                raise ObservationFailure("herdr socket owners missing: " + ", ".join(sorted(missing)))
-        hosts = _SnapshotHosts(native, presentation, desktops, servers, reader)
-        run_directories = _active_run_directories()
-        ids = {item.record["sessionId"] for item in registry.entries}
-        worker_owners = _worker_owners(run_directories, ids)
-        plans = _newest_unit_plans()
-        gone_hosts = _snapshot_gone_hosts(hosts, boot_id)
-    except (OSError, ValueError, herdr.HerdrFailure, subprocess.SubprocessError) as error:
-        return PartialInventory(tuple([*failures, f"shared observations: {error}"]))
-    at = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    by_login: dict[str, list[Session]] = {}
-    labels: dict[str, str] = {}
-    productions = {timer.session_id: ProductionSession(timer.slug, timer.doc) for timer in timers.registrations}
-    for item in registry.entries:
-        registered, details = item.record, item.details
-        process = reader.path(registered["pid"])
-        try:
-            started, _ = reader.identity(process)
-            if registered.get("procStart") and registered.get("procStart") != started:
-                continue  # A positively different process is no longer this session.
-            if not registered.get("procStart"):
-                raise ObservationFailure(f"session {registered['sessionId']}: recorded process identity is missing")
-            data = cast(SessionFile, cast(object, {**registered, **details}))
-            if isinstance(reader, _DarwinSnapshotProcesses):
-                data["cwd"] = reader.cwd(process)
-            environment = reader.environment(process)
-            configured = environment.get("CLAUDE_CONFIG_DIR", "")
-            setting = account.ConfiguredClaudeFolder(Path(configured)) if configured else account.NoAccountSetting()
-            configuration = _configuration_from_setting(setting, home_state)
-            if isinstance(configuration, UnreadableSessionConfiguration):
-                raise ObservationFailure(f"account attribution pid {registered['pid']}: configuration is unreadable")
-            config, attributed = configuration.config_dir, configuration.account
-            production, unit = productions.get(registered["sessionId"]), units.get(registered["sessionId"])
-            kind: Literal["showrunner", "unit", "worker", "top-level"] = ("showrunner" if production else "unit" if unit else
-                "worker" if data.get("kind") == "bg" else "top-level")
-            entry = ListedSession(registered["sessionId"], registered["pid"], started, registered["name"], kind,
-                config, attributed.login.casefold(), production.slug if production else "", production.doc if production else "")
-            host: Host = (_host(data, unit, plans, desktops) if unit else
-                          _snapshot_host(entry.pid, entry.session_id, environment, hosts))
-            owner = _session_details(data, entry, directories=run_directories.get(entry.session_id, []), host=host,
-                timers=timers.targets.get(entry.session_id, []), environment=environment,
-                worker_owner=DirectorOwner(kind="director", session_id=worker_owners[entry.session_id]) if entry.session_id in worker_owners else NoDirector(kind="no director"))
-            by_login.setdefault(entry.login, []).append(owner)
-            labels[entry.login] = attributed.label
-        except FileNotFoundError as error:
-            if reader.exists(process):
-                failures.append(f"session {registered['sessionId']}: {error}")
-        except (OSError, ValueError, herdr.HerdrFailure, subprocess.SubprocessError) as error:
-            failures.append(f"session {registered['sessionId']}: {error}")
-    snapshots: dict[str, list[SnapshotSession]] = {}
-    all_owners = [owner for owners in by_login.values() for owner in owners]
-    owner_ids = {owner["session_id"] for owner in all_owners if owner["kind"] != "worker"}
-    live_ids = [owner["session_id"] for owner in all_owners]
-    if len(live_ids) != len(set(live_ids)):
-        failures.append("session registry: duplicate live session identities")
-    for login, owners in by_login.items():
-        for owner in owners:
-            if owner["kind"] == "worker":
-                if owner["owner"]["kind"] != "director" or owner["owner"]["session_id"] not in owner_ids:
-                    failures.append(f"worker {owner['session_id']}: owner could not be established")
-                continue
-            try:
-                workers: list[Session] = [worker for worker in all_owners if worker["kind"] == "worker" and
-                           worker["owner"]["kind"] == "director" and worker["owner"]["session_id"] == owner["session_id"]]
-                snapshots.setdefault(login, []).append(SnapshotClaudeSession(agent="claude", session=owner,
-                    workers=workers, timers=_snapshot_timer_restores(owner, timers), last_seen=at, state="running",
-                    boot_id=boot_id, host_process=_snapshot_host_process(owner, hosts)))
-            except (OSError, ValueError, herdr.HerdrFailure, subprocess.SubprocessError) as error:
-                failures.append(f"timer/pause intent {owner['session_id']}: {error}")
-    try:
-        for login, entries in _snapshot_codex(processes, hosts, at).items():
-            for item in entries:
-                item["boot_id"] = boot_id
-                item["host_process"] = _snapshot_host_process(item["session"], hosts)
-            snapshots[login] = entries
-            labels[login] = login
-    except (OSError, ValueError, herdr.HerdrFailure, subprocess.SubprocessError) as error:
-        failures.append(f"Codex observation: {error}")
-    return PartialInventory(tuple(failures)) if failures else CompleteInventory(_machine(), snapshots, labels, KnownBoot(boot_id), gone_hosts)
-
-
-@dataclass(frozen=True)
-class CodexLive:
-    pid: int
-
-
-@dataclass(frozen=True)
-class CodexGone:
-    """No current interactive Codex has the saved identity."""
-
-
-@dataclass(frozen=True)
-class CodexLivenessUnknown:
-    reason: str
-
-
-def codex_liveness(entry: SnapshotCodexSession) -> CodexLive | CodexGone | CodexLivenessUnknown:
-    """Check PID identity and rollout IDs independently of the saved account."""
-    try:
-        reader = _snapshot_processes()
-        processes = reader.paths()
-    except (OSError, herdr.HerdrFailure, subprocess.SubprocessError) as error:
-        return CodexLivenessUnknown(str(error))
-    failure = ""
-    for process in processes:
-        try:
-            if reader.command(process) != "codex":
-                continue
-            started, terminal = reader.identity(process)
-            argv = reader.arguments(process)
-            if not terminal or not argv or not _codex_interactive(argv):
-                continue
-            if int(process.name) == entry["session"]["pid"] and started == entry["session"]["proc_start"]:
-                return CodexLive(int(process.name))
-            if entry["codex"]["resume"]["kind"] != "session id":
-                continue
-            environment = reader.environment(process)
-            home = Path(environment.get("CODEX_HOME") or Path.home() / ".codex").absolute()
-            resume = reader.rollout(process, home)
-            if resume == entry["codex"]["resume"]:
-                return CodexLive(int(process.name))
-        except FileNotFoundError as error:
-            if reader.exists(process):
-                failure = str(error)
-        except (OSError, ValueError, herdr.HerdrFailure, subprocess.SubprocessError) as error:
-            failure = str(error)
-    return CodexLivenessUnknown(failure) if failure else CodexGone()
 
 
 class MatchingSession(TypedDict):

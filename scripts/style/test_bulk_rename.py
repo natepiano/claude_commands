@@ -27,11 +27,9 @@ import style_ledger
 from ledger_test_support import remove_generation_schema
 import style_rules
 from scripts.direct.test_verify_untested_examples import rust_tool_path, workspace_metadata
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from approved_renames import AppliedInCode, BindingRename, NoBindingScope, binding_rename_check, binding_scope, rename_declaration
 
-
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
 
 class ScriptedServer:
     def __init__(self, edit: Callable[[str, int, str], tuple[bulk.SourceEdit, ...]]) -> None:
@@ -1064,6 +1062,16 @@ class ValidationTests(CargoProjectTests):
         self.assertEqual(len({item.finding.finding_id for item in sample}), 60)
         self.assertEqual({item.kind for item in sample}, {"let", "closure"})
         self.assertEqual(len(bulk.sample_findings(findings[:3])), 3)
+
+    def test_blocking_writer_availability_retains_every_holder_as_typed_evidence(self) -> None:
+        writer = berth_board.Reservation("writer", "main", self.root / "writer", "refs/heads/writer",
+                                         ("src/lib.rs",), "active", "blocking")
+        reader = replace(writer, reservation_id="reader", edit_blocking_status="clear")
+        with mock.patch.object(berth_board, "read_board", return_value=berth_board.Board((reader, writer))):
+            with self.assertRaises(bulk.ReservationBlocked) as caught:
+                bulk.check_available(self.repo, "src/lib.rs")
+        self.assertEqual(caught.exception.path, "src/lib.rs")
+        self.assertEqual(caught.exception.holders, (writer,))
 
     def test_busy_path_or_unreadable_board_refuses_writes(self) -> None:
         reservation = berth_board.Reservation("other", "x", self.root / "other", "branch", ("src/lib.rs",), "active", "blocking")

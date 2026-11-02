@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import io
 import json
+import math
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import datetime
 from contextlib import redirect_stderr, redirect_stdout
 from collections.abc import Mapping
 from pathlib import Path
@@ -33,9 +35,12 @@ class FakeClient(herdr.Herdr):
         self.started: list[tuple[str, str, list[str]]] = []
         self.closed: list[str] = []
         self.start_error: herdr.HerdrFailure | None = None
+        self.native_ids: dict[str, str] = {}
+        self.prompts: list[tuple[str, herdr.OpeningPrompt]] = []
 
     @override
-    def result(self, *arguments: str) -> dict[str, object]:
+    def result(self, *arguments: str, deadline: float = math.inf) -> dict[str, object]:
+        del deadline
         if arguments[:2] == ("workspace", "list"):
             return {"workspaces": [{"workspace_id": "w1", "label": "demo"}]}
         if arguments[:2] == ("pane", "list"):
@@ -57,7 +62,23 @@ class FakeClient(herdr.Herdr):
         if self.start_error is not None:
             raise self.start_error
         self.started.append((name, pane, agent_arguments))
+        if "--resume" in agent_arguments:
+            self.native_ids[pane] = agent_arguments[agent_arguments.index("--resume") + 1]
         return herdr.PromptSubmissionNotRequired()
+
+    @override
+    def native_session(self, pane: str, kind: str, timeout: float) -> str:
+        del kind, timeout
+        if pane not in self.native_ids:
+            raise herdr.HerdrFailure(f"{pane}: fixture has no native process observation")
+        return self.native_ids[pane]
+
+    @override
+    def submit_opening_prompt(self, pane: str, opening: herdr.OpeningPrompt, launched_at: datetime,
+                              timeout_ms: int) -> herdr.PromptSubmitted:
+        del timeout_ms
+        self.prompts.append((pane, opening))
+        return herdr.PromptSubmitted(launched_at)
 
     @override
     def close_tab_of(self, pane: str) -> None:
@@ -80,7 +101,7 @@ class PaneRestoreTests(unittest.TestCase):
         self.root = Path(directory.name)
         self.config = self.root / ".claude3"
         (self.config / "projects/work").mkdir(parents=True)
-        _ = (self.config / "projects/work/sid-alpha.jsonl").write_text("{}\n")
+        _ = (self.config / "projects/work/019b3a40-4250-7000-8000-000000000102.jsonl").write_text("{}\n")
         def no_envrc(directory: Path, environment: Mapping[str, str]) -> herdr.nix_env.NoEnvrc:
             _ = directory
             return herdr.nix_env.NoEnvrc(dict(environment))
@@ -103,7 +124,7 @@ class PaneRestoreTests(unittest.TestCase):
         return "w1:p3"
 
     def entry(self, **changes: object) -> None:
-        launch = pane_record.launch("w1:p2", "sid-alpha", "/work/alpha",
+        launch = pane_record.launch("w1:p2", "019b3a40-4250-7000-8000-000000000102", "/work/alpha",
                                     {"CLAUDE_CONFIG_DIR": str(self.config), "SHOWRUNNER_UNIT": "demo",
                                      "CLAUDE_CODE_OAUTH_TOKEN": "secret"},
                                     ["claude", "-n", "alpha", "--remote-control", "alpha", "--model", "opus"])
@@ -116,7 +137,7 @@ class PaneRestoreTests(unittest.TestCase):
         return code, output.getvalue()
 
     @staticmethod
-    def restored(session_id: str = "sid-alpha") -> FakeClient:
+    def restored(session_id: str = "019b3a40-4250-7000-8000-000000000102") -> FakeClient:
         return FakeClient([{"pane_id": "w1:p2", "label": "alpha", "workspace_id": "w1",
                             "agent_session": {"kind": "id", "value": session_id}}])
 
@@ -128,30 +149,79 @@ class PaneRestoreTests(unittest.TestCase):
         (name, space, title, cwd, environment), = self.opened
         self.assertEqual((name, space, title, cwd), ("agents", "demo", "alpha", "/work/alpha"))
         self.assertEqual(environment["CLAUDE_CONFIG_DIR"], str(self.config))
+        self.assertNotIn("STAFF_ID", environment)
         self.assertEqual(environment["SHOWRUNNER_UNIT"], "demo")
         self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", environment)
         self.assertEqual(client.started, [("alpha", "w1:p3", [
-            "--resume", "sid-alpha", "-n", "alpha", "--remote-control", "alpha", "--model", "opus",
+            "--resume", "019b3a40-4250-7000-8000-000000000102", "-n", "alpha", "--remote-control", "alpha", "--model", "opus",
             "--settings", SETTINGS])])
         self.assertEqual(client.closed, ["w1:p2"])
+
+    def test_restore_resumes_current_session_from_a_fixed_owner_record_without_rewriting_it(self) -> None:
+        from scripts.production import staff
+        from scripts.production.staff_test_support import isolated_staff_file, isolated_source_readers, source_environment
+
+        path = self.root / "staff.json"
+        with (isolated_staff_file(path, {}),
+              mock.patch.dict(os.environ, source_environment(self.root / "sources")),
+              isolated_source_readers()):
+            parent = staff.ensure("showrunner", name="demo", runtime_id="019b3a40-4250-7000-8000-000000000101")
+            owner = staff.ensure("unit", name="alpha", parent=parent.id, runtime_id="019b3a40-4250-7000-8000-000000000102")
+            current = staff.native_id("019b3a40-4250-7000-8000-000000000103")
+            _ = staff.update_current_session(owner.current_session, current)
+            _ = (self.config / "projects/work" / f"{current}.jsonl").write_text("{}\n")
+            self.entry()
+            record = pane_record.record_path("agents")
+            before = path.read_bytes(), record.read_bytes(), record.stat().st_mtime_ns
+            client = self.restored(current)
+            code, output = self.run_restore(client)
+            self.assertEqual(code, 0, output)
+            self.assertEqual(len(client.started), 1)
+            arguments = client.started[0][2]
+            self.assertEqual(arguments[arguments.index("--resume") + 1], current)
+            self.assertNotIn(owner.id, arguments)
+            self.assertEqual(client.native_ids["w1:p3"], current)
+            self.assertEqual(client.closed, ["w1:p2"])
+            self.assertEqual((path.read_bytes(), record.read_bytes(), record.stat().st_mtime_ns), before)
 
     def test_stale_shutdown_state_does_not_prevent_restoring_a_stopped_pane(self) -> None:
         state = self.root / "shutdown/account/sessions"
         state.mkdir(parents=True)
-        _ = (state / "sid-alpha.json").write_text('{"session":{"session_id":"sid-alpha"}}')
+        _ = (state / "019b3a40-4250-7000-8000-000000000102.json").write_text('{"session":{"session_id":"019b3a40-4250-7000-8000-000000000102"}}')
         self.entry()
         with mock.patch.dict(os.environ, {"SHUTDOWN_STATE_DIR": str(state.parents[1])}):
             code, output = self.run_restore(self.restored())
         self.assertEqual(code, 0, output)
         self.assertEqual(len(self.opened), 1)
-        self.assertIn("resumed sid-alpha", output)
+        self.assertIn("resumed 019b3a40-4250-7000-8000-000000000102", output)
+
+    def test_restore_supplies_the_staff_owners_session_labels_to_the_new_tab(self) -> None:
+        from scripts.production import staff, session_staff, showrunners
+
+        parent = staff.StaffRow(staff.StaffId("019b3a40-4250-7000-8000-000000000101"), "showrunner", "demo", None, current_session=staff.StaffId("019b3a40-4250-7000-8000-000000000101"))
+        owner = staff.StaffRow(staff.StaffId("019b3a40-4250-7000-8000-000000000102"), "unit", "alpha", parent.id, current_session=staff.StaffId("019b3a40-4250-7000-8000-000000000102"))
+        document = "# Production — demo\n\n## Units\n\n| Unit | Plan |\n| --- | --- |\n| `alpha-unit` | standby |\n"
+        source = showrunners.ShowrunnerSource(
+            showrunners.Timer("demo", "session:runner", self.root / "demo.md", "UTC"), document)
+        self.entry(environment={"STAFF_ID": owner.id})
+        membership = session_staff.LaunchMembership(staff.StaffSnapshot((parent, owner)),
+            session_staff.MemberSources({"demo": source}, ()))
+        with mock.patch.object(session_staff.LaunchMembership, "read", return_value=membership):
+            code, output = self.run_restore(self.restored())
+        self.assertEqual(code, 0, output)
+        self.assertEqual(len(self.opened), 1)
+        environment = self.opened[0][4]
+        self.assertEqual({key: environment.get(key) for key in herdr.MEMBER_MARKS}, {
+            "SHOWRUNNER_UNIT": "demo", "SHOWRUNNER_UNIT_ID": "alpha-unit"})
+        self.assertEqual(environment["CLAUDE_CONFIG_DIR"], str(self.config))
+        self.assertNotIn("STAFF_ID", environment)
 
     def test_a_pane_is_left_as_it_is_for_each_reason_and_named(self) -> None:
         cases: list[tuple[dict[str, object], str, str]] = [
-            ({"ended": True}, "sid-alpha", "closed by hand"),
-            ({"flags_read": False}, "sid-alpha", "launch flags are unknown"),
+            ({"ended": True}, "019b3a40-4250-7000-8000-000000000102", "closed by hand"),
+            ({"flags_read": False}, "019b3a40-4250-7000-8000-000000000102", "launch flags are unknown"),
             ({"session_id": "sid-gone"}, "sid-gone", "no transcript of sid-gone"),
-            ({}, "sid-other", "herdr has sid-other, the entry sid-alpha"),
+            ({}, "sid-other", "herdr has sid-other, the entry 019b3a40-4250-7000-8000-000000000102"),
         ]
         for changes, herdr_id, reason in cases:
             with self.subTest(reason=reason):
@@ -161,7 +231,7 @@ class PaneRestoreTests(unittest.TestCase):
                 self.assertEqual((code, self.opened), (0, []))
                 self.assertIn(reason, output)
         self.entry()
-        self.live.append("sid-alpha")
+        self.live.append("019b3a40-4250-7000-8000-000000000102")
         _, output = self.run_restore(self.restored())
         self.assertIn("it already runs", output)
         self.assertEqual(self.opened, [])
@@ -175,26 +245,56 @@ class PaneRestoreTests(unittest.TestCase):
         self.assertIn("not resumed: agent not ready", output)
         self.assertEqual(client.closed, ["w1:p3"])
 
+    def test_restore_proves_the_native_resume_identity_before_closing_the_original_tab(self) -> None:
+        self.entry()
+        client = self.restored()
+
+        def observe(pane: str, kind: str, timeout: float) -> str:
+            self.assertEqual((pane, kind), ("w1:p3", "claude"))
+            self.assertGreater(timeout, 0)
+            self.assertEqual(client.closed, [])
+            self.assertEqual(len(client.started), 1)
+            return "019b3a40-4250-7000-8000-000000000102"
+
+        with mock.patch.object(client, "native_session", side_effect=observe):
+            code, output = self.run_restore(client)
+        self.assertEqual(code, 0, output)
+        self.assertEqual(client.closed, ["w1:p2"])
+
+    def test_restore_identity_mismatch_or_missing_proof_closes_only_the_new_tab(self) -> None:
+        self.entry()
+        for failure in ("019b3a40-4250-7000-8000-000000000199", herdr.HerdrFailure("registry unavailable")):
+            with self.subTest(proof=failure):
+                client = self.restored()
+                with mock.patch.object(client, "native_session", side_effect=(failure,) if isinstance(failure, str)
+                                       else failure):
+                    code, output = self.run_restore(client)
+                self.assertEqual(code, 1, output)
+                self.assertEqual(client.closed, ["w1:p3"])
+                self.assertIn("not resumed", output)
+
     def test_seed_writes_the_entry_of_each_running_claude(self) -> None:
         (self.root / "proc/4242").mkdir(parents=True)
         _ = (self.root / "proc/4242/environ").write_bytes(
             f"CLAUDE_CONFIG_DIR={self.config}\0SHOWRUNNER_UNIT=demo\0CLAUDE_CODE_OAUTH_TOKEN=secret\0".encode())
         (self.config / "sessions").mkdir()
-        _ = (self.config / "sessions/4242.json").write_text(json.dumps({"pid": 4242, "sessionId": "sid-alpha"}))
+        _ = (self.config / "sessions/4242.json").write_text(json.dumps({"pid": 4242, "sessionId": "019b3a40-4250-7000-8000-000000000102"}))
         client = FakeClient([{"pane_id": "w1:p2", "label": "alpha", "workspace_id": "w1"}])
-        with mock.patch.object(herdr, "Herdr", return_value=client), redirect_stdout(io.StringIO()):
+        with (mock.patch.object(herdr, "Herdr", return_value=client),
+              mock.patch.object(sessions, "process_start", return_value="fixture-generation"),
+              redirect_stdout(io.StringIO())):
             self.assertEqual(pane_record.seed("agents"), 0)
         entry = pane_record.read("agents")["w1:p2"]
         self.assertEqual((entry["session_id"], entry["config_dir"], entry["name"], entry["model"], entry["cwd"]),
-                         ("sid-alpha", str(self.config), "alpha", "opus", "/work/alpha"))
+                         ("019b3a40-4250-7000-8000-000000000102", str(self.config), "alpha", "opus", "/work/alpha"))
         self.assertEqual(entry["environment"], {"SHOWRUNNER_UNIT": "demo"})
 
     def test_the_end_hook_marks_only_an_end_by_hand_of_the_same_conversation(self) -> None:
         self.entry()
         environment = {"PATH": "", "HOME": str(self.root), "HERDR_ENV": "1", "HERDR_SESSION": "agents",
                        "HERDR_PANE_ID": "w1:p2", "HERDR_PANE_RECORD_DIR": str(self.root / "herdr-panes")}
-        for session_id, reason, ended in (("sid-alpha", "other", False), ("sid-old", "prompt_input_exit", False),
-                                          ("sid-alpha", "prompt_input_exit", True)):
+        for session_id, reason, ended in (("019b3a40-4250-7000-8000-000000000102", "other", False), ("sid-old", "prompt_input_exit", False),
+                                          ("019b3a40-4250-7000-8000-000000000102", "prompt_input_exit", True)):
             ran = subprocess.run([sys.executable, str(END_HOOK)], input=json.dumps(
                 {"session_id": session_id, "reason": reason}), env=environment, capture_output=True, text=True,
                 check=False, timeout=60)

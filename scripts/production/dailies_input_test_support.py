@@ -24,15 +24,13 @@ from unittest import mock
 from dailies_input import (Activity, Block, ClaudeNotRunning, Decision, FormWaiting, Running, SessionGone,
                            StillWaiting, TicksFailing, UnitRow, status_blocks)
 from unit_lookup import UnitState
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff, unit_names
 from scripts.production.staff_test_support import (
     fixture_showrunner_name, isolated_staff_file, showrunner_launch, showrunner_relationship,
     unit_membership,
 )
 
-
-# load 136 on natedev, 2026-10-29
-TEST_HANG_GUARD_SECS = 300
 
 SCRIPT = Path(__file__).with_name("dailies_input.py")
 RENDERER = SCRIPT.with_name("dailies_render.py")
@@ -535,10 +533,10 @@ class DailiesInputFixture(unittest.TestCase):
         """A production with a complete update timer, so the tree counts it."""
         instance = self.root / "notifier-state" / f"showrunner-{slug}"
         instance.mkdir(parents=True, exist_ok=True)
-        _ = (instance / "conf").write_text(
-            f"TARGET=session:{slug}-session\nCHECK=zsh /x/production_check.sh {self.doc}\n", encoding="utf-8")
         row = showrunner_relationship(fixture_showrunner_name(slug, self.doc))
-        showrunner_launch(row, f"{slug}-session", self.env)
+        _ = (instance / "conf").write_text(
+            f"TARGET=session:{row.id}\nCHECK=zsh /x/production_check.sh {self.doc}\n", encoding="utf-8")
+        showrunner_launch(row, row.id, self.env)
 
     def attach(self, child: str, parent: str) -> None:
         for slug in (child, parent):

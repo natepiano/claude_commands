@@ -12,13 +12,14 @@ from pathlib import Path
 from typing import final, override
 
 from scripts.usage.collect import MAC_HOST
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 # Script completion deadlines only bound hangs; startup can be slow under load.
 SCRIPT = Path(__file__).with_name("unit_run.py")
 REPOSITORY = SCRIPT.resolve().parents[2]
 EPOCH = datetime(2026, 10, 12, tzinfo=timezone.utc).timestamp()
-UNIT = "review-pool-unit"
+UNIT = "review-unit"
 SSH_STUB = r'''
 import json
 import os
@@ -60,7 +61,7 @@ class UnitRunTests(unittest.TestCase):
         self.history = self.root / "history"
         self.mac_history = self.root / "mac-history"
         self.production = self.root / "show-production.md"
-        self.worktree = self.root / "worktrees" / "review pool"
+        self.worktree = self.root / "worktrees" / "review"
         self.ssh_log = self.root / "ssh.jsonl"
         mac_home = self.root / "mac-home"
         mac_home.mkdir()
@@ -76,7 +77,6 @@ class UnitRunTests(unittest.TestCase):
             "XDG_CACHE_HOME": str(self.root / "cache"),
             "PATH": str(bin_directory) + os.pathsep + os.environ.get("PATH", ""),
             "UNIT_HISTORY_DIR": str(self.history),
-            "REVIEW_POOL_STATE": str(self.root / "review-pool"),
             "USAGE_STATE_DIR": str(self.root / "usage"),
             "UNIT_RUN_SSH_LOG": str(self.ssh_log),
             "UNIT_RUN_MAC_HOME": str(mac_home),
@@ -114,7 +114,7 @@ class UnitRunTests(unittest.TestCase):
     def run_script(self, *arguments: str, unit: str = UNIT) -> subprocess.CompletedProcess[str]:
         return subprocess.run([sys.executable, str(SCRIPT), "--production", str(self.production),
                                unit, *arguments], env=self.environment, capture_output=True,
-                              text=True, check=False, timeout=300)
+                              text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
 
     def assert_match(self, result: subprocess.CompletedProcess[str], run_id: str,
                      machine: str, seconds: float) -> None:

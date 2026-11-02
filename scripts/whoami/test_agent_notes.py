@@ -11,13 +11,17 @@ import sys
 import tempfile
 import unittest
 import urllib.request
-from contextlib import nullcontext, redirect_stderr, redirect_stdout
+from collections.abc import Generator
+from contextlib import contextmanager, nullcontext, redirect_stderr, redirect_stdout
+from dataclasses import dataclass, field
+from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from typing import TYPE_CHECKING, Self, cast, override
 from unittest.mock import MagicMock, call, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib.signal_test_support import install_signal_pid_guard
 from scripts.whoami.note_file import note_name
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -38,6 +42,7 @@ from agent_notes import local_reset
 from scripts.whoami.note_file import Note, read_note
 from scripts.accounts import accounts, refusal_watch, refusals, role_map
 from scripts.production import showrunners
+from scripts.maintenance.schedule import locked_history
 
 
 def apply_quota_and_write(notes: list[Note], report: Report, checked_at: datetime) -> list[str]:
@@ -57,15 +62,32 @@ def apply_quota_and_write(notes: list[Note], report: Report, checked_at: datetim
 
 
 def setUpModule() -> None:
+    install_signal_pid_guard()
     _ = unittest.enterModuleContext(patch.object(role_map, "is_role_map_host", return_value=True))
     root = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
     _ = unittest.enterModuleContext(patch.object(showrunners, "NOTIFIER_STATE_DIR", root))
+
+
+@dataclass
+class UsageReaderClock:
+    at: datetime
+    credential_latency_seconds: float = 0
+    latencies: dict[Path, float] = field(default_factory=dict)
+    observed: ContextVar[datetime] = field(default_factory=lambda: ContextVar[datetime]("usage_reader_time"))
+
+    def now(self) -> datetime:
+        return self.observed.get(self.at)
+
+    def set_time(self, at: datetime) -> None:
+        self.at = at
+        _ = self.observed.set(at)
 
 
 class AgentNotesTests(unittest.TestCase):
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
         self.root: Path = Path()
+        self.job_config: Path = Path()
         self.now: datetime = datetime.now(timezone.utc).replace(microsecond=0)
         self.future: datetime = self.now + timedelta(days=2)
         self.rows: MagicMock = MagicMock()
@@ -75,8 +97,11 @@ class AgentNotesTests(unittest.TestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
+        self.job_config = self.root / "agent_notes.toml"
+        _ = self.job_config.write_text("[mac_usage]\ninterval_seconds = 60\n")
         home_context = cast(object, self.enterContext(patch.dict(os.environ, {
             "HOME": str(self.root), "AGENT_NOTES_DIR": str(self.root),
+            "XDG_STATE_HOME": str(self.root / "state"), "AGENT_NOTES_JOB_CONFIG": str(self.job_config),
         })))
         del home_context
         _ = os.environ.pop("CLAUDE_CONFIG_DIR", None)
@@ -114,7 +139,9 @@ class AgentNotesTests(unittest.TestCase):
               patch.object(codex_pacer, "tick", side_effect=AssertionError("pacer")),
               patch.object(refusal_watch, "run", side_effect=AssertionError("routing"))):
             _ = agent_notes.main()
-        _ = reads.assert_awaited_once_with(selection, home)
+        _ = reads.assert_awaited_once()
+        self.assertEqual(reads.call_args.args, (selection, home))
+        self.assertIsInstance(cast(object, reads.call_args.kwargs["schedule"]), agent_accounts.ScheduledUsageReads)
         stored = usage_store.load()["desktop@example.invalid"]
         weekly = stored.get("weekly")
         self.assertIsNotNone(weekly)
@@ -125,6 +152,264 @@ class AgentNotesTests(unittest.TestCase):
         self.assertFalse(usage_store.timer_file().exists())
         self.assertFalse((self.root / "readings.jsonl").exists())
         self.rows.assert_not_called()
+
+    def test_usage_only_polls_skip_silently_and_start_jitter_does_not_add_a_poll(self) -> None:
+        for polls in ((120.8, 150.9, 179.9, 210.7, 240.2), (149.9, 180.1, 210.7, 240.2, 270.3)):
+            with (self.subTest(polls=polls), self.live_usage_reader() as (clock, http),
+                  patch.object(sys, "argv", ["agent_notes.py", "usage-only", "--poll-seconds", "30"]),
+                  redirect_stdout(io.StringIO()) as output):
+                history = self.root / "state/agent-notes/usage-only/completed.json"
+                history.unlink(missing_ok=True)
+                usage_store.store_file().unlink(missing_ok=True)
+                clock.set_time(self.now + timedelta(seconds=polls[0]))
+                agent_notes.main()
+                account_key = str(self.root / ".claude2")
+                self.assertEqual(json.loads(history.read_text()), {account_key: clock.at.timestamp()})
+                before = history.read_bytes(), history.stat().st_mtime_ns
+                clock.set_time(self.now + timedelta(seconds=polls[1]))
+                agent_notes.main()
+                self.assertEqual(http.call_count, 1)
+                self.assertEqual((history.read_bytes(), history.stat().st_mtime_ns), before)
+                self.assertEqual(output.getvalue(), "")
+                for index, at in enumerate(polls[2:], start=2):
+                    clock.set_time(self.now + timedelta(seconds=at))
+                    agent_notes.main()
+                    self.assertEqual(http.call_count, 2 if index < 4 else 3)
+                self.assertEqual(http.call_count, 3)
+                self.assertEqual(json.loads(history.read_text()), {account_key: clock.at.timestamp()})
+                self.assertEqual(output.getvalue(), "")
+        self.rows.assert_not_called()
+
+    def test_usage_only_reads_the_config_again_on_each_poll(self) -> None:
+        with self.live_usage_reader() as (clock, http):
+            clock.set_time(self.now + timedelta(seconds=120))
+            agent_notes.usage_only()
+            clock.set_time(self.now + timedelta(seconds=150))
+            agent_notes.usage_only()
+            self.assertEqual(http.call_count, 1)
+            _ = self.job_config.write_text("[mac_usage]\ninterval_seconds = 30\n")
+            agent_notes.usage_only()
+        self.assertEqual(http.call_count, 2)
+
+    def test_usage_only_records_failed_attempts_and_does_not_read_while_locked(self) -> None:
+        directory = self.root / "state/agent-notes/usage-only"
+        with (self.live_usage_reader(),
+              patch.object(agent_accounts, "claude_live", side_effect=OSError("fixture read failed")) as read,
+              redirect_stdout(io.StringIO()) as output):
+            with locked_history(directory):
+                agent_notes.usage_only()
+            read.assert_not_called()
+            with self.assertRaisesRegex(OSError, "fixture read failed"):
+                agent_notes.usage_only()
+            agent_notes.usage_only()
+            read.assert_called_once()
+        self.assertEqual(output.getvalue(), "")
+
+    def test_usage_only_waits_the_full_interval_without_a_poll_argument(self) -> None:
+        with self.live_usage_reader() as (clock, http):
+            clock.set_time(self.now + timedelta(seconds=149.9))
+            agent_notes.usage_only()
+            clock.set_time(self.now + timedelta(seconds=209.8))
+            agent_notes.usage_only()
+            self.assertEqual(http.call_count, 1)
+            clock.set_time(self.now + timedelta(seconds=209.9))
+            agent_notes.usage_only()
+            self.assertEqual(http.call_count, 2)
+
+    def test_usage_only_selection_failure_does_not_delay_the_next_read(self) -> None:
+        directory = self.root / "state/agent-notes/usage-only"
+        with (self.live_usage_reader() as reader,
+              patch.object(accounts, "claude_account_selection", side_effect=accounts.AccountsError("fixture selection"))):
+            with self.assertRaisesRegex(accounts.AccountsError, "fixture selection"):
+                agent_notes.usage_only()
+            self.assertFalse((directory / "completed.json").exists())
+            reader[1].assert_not_called()
+        with self.live_usage_reader() as (clock, http):
+            agent_notes.usage_only()
+            http.assert_called_once()
+            self.assertEqual(json.loads((directory / "completed.json").read_text()),
+                             {str(self.root / ".claude2"): clock.at.timestamp()})
+
+    @contextmanager
+    def live_usage_reader(self, *, account_count: int = 1) -> Generator[tuple[UsageReaderClock, MagicMock]]:
+        """Keep real concurrent readers and claims; isolate credentials, HTTP and per-thread time."""
+        directories = tuple(self.root / f".claude{index + 2}" for index in range(account_count))
+        logins = {directory: f"desktop{index or ''}@example.invalid" for index, directory in enumerate(directories)}
+        selection = agent_accounts.ClaudeAccountsInUse(
+            agent_accounts.UnreadableIdentity(self.root / ".claude", "fixture"), False, (),
+            frozenset(logins.values()), directories)
+        clock = UsageReaderClock(self.now)
+
+        def auth_status(*command: str, environment: dict[str, str]) -> agent_accounts.ClaudeAuthStatus:
+            self.assertEqual(command, ("claude", "auth", "status"))
+            directory = Path(environment["CLAUDE_CONFIG_DIR"])
+            return {"loggedIn": True, "email": logins[directory], "authMethod": "claude.ai"}
+
+        def credentials(config_dir: Path) -> agent_accounts.ClaudeCredentials:
+            self.assertIn(config_dir, directories)
+            latency = clock.latencies.get(config_dir, clock.credential_latency_seconds)
+            _ = clock.observed.set(clock.at + timedelta(seconds=latency))
+            return {"claudeAiOauth": {"accessToken": "fixture"}}
+
+        def usage_response(request: urllib.request.Request, *, timeout: int) -> io.BytesIO:
+            self.assertEqual(request.full_url, "https://api.anthropic.com/api/oauth/usage")
+            self.assertEqual(timeout, 15)
+            return io.BytesIO(json.dumps({"seven_day": {
+                "utilization": 25, "resets_at": self.future.isoformat()}}).encode())
+
+        class ObservationTime(datetime):
+            @classmethod
+            @override
+            def now(cls, tz: tzinfo | None = None) -> Self:
+                return cls.fromtimestamp(clock.now().timestamp(), tz)
+
+        with (patch.object(accounts, "claude_account_selection", return_value=selection),
+              patch.object(agent_notes, "resolve_workers_home", return_value=agent_accounts.NoWorkersHome("fixture")),
+              patch.object(agent_accounts, "codex_homes", return_value=[]),
+              patch.object(agent_accounts, "claude_on_disk", return_value=Report("Claude")),
+              patch.object(agent_accounts, "command_json", side_effect=auth_status),
+              patch.object(agent_accounts, "claude_credentials", side_effect=credentials),
+              patch.object(agent_accounts, "datetime", ObservationTime),
+              patch.object(urllib.request, "urlopen", side_effect=usage_response) as http,
+              patch.object(time, "time", side_effect=lambda: clock.now().timestamp())):
+            yield clock, http
+
+    def test_usage_only_cadence_reaches_real_claims_in_live_reader_threads(self) -> None:
+        with self.live_usage_reader() as (clock, http):
+            for elapsed in (0, 59.1, 119.4):
+                clock.set_time(self.now + timedelta(seconds=elapsed))
+                agent_notes.usage_only(poll_seconds=30)
+                stored = usage_store.load()["desktop@example.invalid"]
+                self.assertEqual(stored.get("attempted_at"), clock.at.isoformat())
+                self.assertEqual(stored.get("attempt_outcome"), agent_accounts.UsageReadOutcome.OK)
+            self.assertEqual(http.call_count, 3)
+            # The scoped Mac cadence must not shorten a later natedev read's guard.
+            clock.set_time(clock.at + timedelta(seconds=60))
+            self.assertEqual(agent_accounts.claude_live(self.root / ".claude2").usage_read_outcome,
+                             agent_accounts.UsageReadOutcome.HELD)
+            self.assertEqual(http.call_count, 3)
+
+    def test_usage_only_schedules_from_real_claims_after_variable_credential_latency(self) -> None:
+        for latencies, polls, granted_at in (
+            ((0, 15, 0), (120.8, 150.9, 179.9, 210.7, 240.2), (120.8, 194.9, 240.2)),
+            ((15, 0, 15), (120.8, 150.9, 179.9, 210.7, 240.2, 270.3), (135.8, 210.7, 285.3)),
+        ):
+            with self.subTest(latencies=latencies), self.live_usage_reader() as (clock, http):
+                history = self.root / "state/agent-notes/usage-only/completed.json"
+                history.unlink(missing_ok=True)
+                usage_store.store_file().unlink(missing_ok=True)
+                for poll in polls:
+                    clock.set_time(self.now + timedelta(seconds=poll))
+                    clock.credential_latency_seconds = latencies[min(http.call_count, len(latencies) - 1)]
+                    agent_notes.usage_only(poll_seconds=30)
+                    claimed = self.now + timedelta(seconds=granted_at[http.call_count - 1])
+                    self.assertEqual(usage_store.load()["desktop@example.invalid"].get("attempted_at"), claimed.isoformat())
+                    self.assertEqual(json.loads(history.read_text()), {str(self.root / ".claude2"): claimed.timestamp()})
+                self.assertEqual(http.call_count, 3)
+
+    def test_usage_only_held_real_claim_leaves_the_schedule_unchanged(self) -> None:
+        with self.live_usage_reader() as (clock, http):
+            agent_notes.usage_only(poll_seconds=30)
+            history = self.root / "state/agent-notes/usage-only/completed.json"
+            before = history.read_bytes(), history.stat().st_mtime_ns
+            clock.set_time(self.now + timedelta(seconds=30))
+            with usage_store.read_cadence(0):
+                report = agent_accounts.claude_live(self.root / ".claude2")
+            self.assertEqual(report.usage_read_outcome, agent_accounts.UsageReadOutcome.OK)
+            clock.set_time(self.now + timedelta(seconds=60))
+            agent_notes.usage_only(poll_seconds=30)
+            self.assertEqual(http.call_count, 2)
+            self.assertEqual((history.read_bytes(), history.stat().st_mtime_ns), before)
+            clock.set_time(self.now + timedelta(seconds=90))
+            agent_notes.usage_only(poll_seconds=30)
+            self.assertEqual(http.call_count, 3)
+            self.assertEqual(json.loads(history.read_text()), {str(self.root / ".claude2"): clock.at.timestamp()})
+
+    def test_usage_only_accounts_keep_independent_claim_times_with_credential_latency(self) -> None:
+        polls = (120.8, 150.9, 179.9, 210.7, 240.2, 270.3, 300.2)
+        for latencies, expected in (
+            (((0, 15),) * len(polls), ((120.8, 179.9, 240.2, 300.2), (135.8, 225.7, 315.2))),
+            (((0, 15), (0, 0), (15, 0), (0, 0), (0, 15), (15, 0), (0, 0)),
+             ((120.8, 194.9, 240.2, 300.2), (135.8, 210.7, 270.3))),
+        ):
+            with (self.subTest(latencies=latencies),
+                  self.live_usage_reader(account_count=2) as (clock, http)):
+                history = self.root / "state/agent-notes/usage-only/completed.json"
+                history.unlink(missing_ok=True)
+                usage_store.store_file().unlink(missing_ok=True)
+                directories = (self.root / ".claude2", self.root / ".claude3")
+                logins = ("desktop@example.invalid", "desktop1@example.invalid")
+                claims: tuple[list[float], list[float]] = ([], [])
+                for poll, latency in zip(polls, latencies, strict=True):
+                    clock.set_time(self.now + timedelta(seconds=poll))
+                    clock.latencies = dict(zip(directories, latency, strict=True))
+                    agent_notes.usage_only(poll_seconds=30)
+                    stored = usage_store.load()
+                    times = cast(dict[str, float], json.loads(history.read_text()))
+                    for index, (directory, login) in enumerate(zip(directories, logins, strict=True)):
+                        attempted = datetime.fromisoformat(stored[login].get("attempted_at", ""))
+                        self.assertEqual(times[str(directory)], attempted.timestamp())
+                        elapsed = (attempted - self.now).total_seconds()
+                        if not claims[index] or claims[index][-1] != elapsed:
+                            claims[index].append(elapsed)
+                        self.assertEqual(stored[login].get("attempt_outcome"), agent_accounts.UsageReadOutcome.OK)
+                for actual, wanted in zip(claims, expected, strict=True):
+                    self.assertEqual(tuple(actual), wanted)
+                    for earlier, later in zip(actual, actual[1:]):
+                        self.assertGreaterEqual(later - earlier, 45)
+                        self.assertLessEqual(later - earlier, 90)
+                self.assertEqual(http.call_count, sum(map(len, expected)))
+
+    def test_usage_only_a_granted_account_does_not_advance_another_held_account(self) -> None:
+        with self.live_usage_reader(account_count=2) as (clock, http):
+            clock.set_time(self.now + timedelta(seconds=120.8))
+            agent_notes.usage_only(poll_seconds=30)
+            history = self.root / "state/agent-notes/usage-only/completed.json"
+            clock.set_time(self.now + timedelta(seconds=135.8))
+            with usage_store.read_cadence(0):
+                report = agent_accounts.claude_live(self.root / ".claude3")
+            self.assertIsInstance(report.usage_read_claim, agent_accounts.UsageReadClaim)
+            self.assertEqual(report.usage_read_outcome, agent_accounts.UsageReadOutcome.OK)
+            # Both schedules are due, but B's newer real claim is only 44.1 seconds old.
+            clock.set_time(self.now + timedelta(seconds=179.9))
+            agent_notes.usage_only(poll_seconds=30)
+            times = cast(dict[str, float], json.loads(history.read_text()))
+            self.assertEqual(times[str(self.root / ".claude2")], clock.at.timestamp())
+            self.assertEqual(times[str(self.root / ".claude3")], (self.now + timedelta(seconds=120.8)).timestamp())
+            self.assertEqual(http.call_count, 4)
+            clock.set_time(self.now + timedelta(seconds=210.7))
+            agent_notes.usage_only(poll_seconds=30)
+            self.assertEqual(http.call_count, 5)
+            stored = usage_store.load()
+            self.assertEqual(stored["desktop1@example.invalid"].get("attempted_at"), clock.at.isoformat())
+            self.assertEqual(stored["desktop@example.invalid"].get("attempted_at"),
+                             (self.now + timedelta(seconds=179.9)).isoformat())
+            times = cast(dict[str, float], json.loads(history.read_text()))
+            self.assertEqual(times[str(self.root / ".claude3")], clock.at.timestamp())
+            self.assertEqual(times[str(self.root / ".claude2")], (self.now + timedelta(seconds=179.9)).timestamp())
+
+    def test_usage_only_refuses_missing_or_invalid_interval_with_file_and_key(self) -> None:
+        for text in ("", "[mac_usage]\n", "mac_usage = 60", "[mac_usage]\ninterval_seconds = 0",
+                     "[mac_usage]\ninterval_seconds = -1", "[mac_usage]\ninterval_seconds = true",
+                     '[mac_usage]\ninterval_seconds = "60"', "[mac_usage]\ninterval_seconds = nan",
+                     "[mac_usage]\ninterval_seconds = inf", "[mac_usage",
+                     "[mac_usage]\ninterval_seconds = " + "9" * 400):
+            with self.subTest(config=text):
+                _ = self.job_config.write_text(text)
+                with (patch.object(sys, "argv", ["agent_notes.py", "usage-only"]),
+                      patch.object(agent_notes, "refresh_usage") as read,
+                      self.assertRaises(SystemExit) as refusal):
+                    agent_notes.main()
+                self.assertEqual(str(refusal.exception),
+                    f"{self.job_config}: mac_usage.interval_seconds must be a finite positive number")
+                read.assert_not_called()
+                self.assertFalse((self.root / "state/agent-notes/usage-only").exists())
+        self.job_config.unlink()
+        with (patch.object(sys, "argv", ["agent_notes.py", "usage-only"]),
+              self.assertRaises(SystemExit) as refusal):
+            agent_notes.main()
+        self.assertIn(str(self.job_config), str(refusal.exception))
+        self.assertIn("mac_usage.interval_seconds", str(refusal.exception))
 
     def test_usage_only_reports_unavailable_credentials_without_changing_saved_notes(self) -> None:
         note = self.note("claude2.md", "desktop@example.invalid")

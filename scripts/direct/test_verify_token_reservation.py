@@ -9,6 +9,7 @@ import time
 import unittest
 from pathlib import Path
 from scripts.direct.verify_token_wait_test_support import VerifyTokenWaitFixture, VERIFY, BOARD
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 class VerifyTokenReservationTests(VerifyTokenWaitFixture):
@@ -48,8 +49,8 @@ class VerifyTokenReservationTests(VerifyTokenWaitFixture):
             self.wait_for_running(waiting, waiter)
             self.assertEqual(sorted(admission.glob("*.reservation")), held)
             _ = (self.root / "release").touch()
-            self.assertEqual(holder.wait(timeout=300), 0)
-            self.assertEqual(waiter.wait(timeout=300), 0, output.read_text())
+            self.assertEqual(holder.wait(timeout=TEST_HANG_GUARD_SECS), 0)
+            self.assertEqual(waiter.wait(timeout=TEST_HANG_GUARD_SECS), 0, output.read_text())
             self.assertEqual((self.root / "cargo-calls").read_text().count("check"), 2)
             self.assertEqual(list(admission.glob("*.reservation")), [])
             # The wait after the memory wait shows in the log; on 2026-10-22 its
@@ -64,7 +65,7 @@ class VerifyTokenReservationTests(VerifyTokenWaitFixture):
                 if process is not None:
                     if process.poll() is None:
                         self.end_group(process.pid)
-                    _ = process.wait(timeout=300)
+                    _ = process.wait(timeout=TEST_HANG_GUARD_SECS)
 
     def test_a_step_whose_call_is_gone_stops_waiting_for_the_token(self) -> None:
         # On 2026-10-20 a test killed a call's group and left its step, in a
@@ -90,16 +91,16 @@ class VerifyTokenReservationTests(VerifyTokenWaitFixture):
         call = self.start_memory_waiter(environment, output)
         peer = subprocess.Popen([real_sleep, "600"], start_new_session=True)
         self.started_groups.add(peer.pid)
-        self.addCleanup(peer.wait, 300)
+        self.addCleanup(peer.wait, TEST_HANG_GUARD_SECS)
         taken = subprocess.run(["bash", str(BOARD), "acquire", str(board), "peer", "cargo", "--pid", str(peer.pid),
                                 "--hold", "3600", "--wait", "0"],
-                               capture_output=True, text=True, check=False, timeout=300)
+                               capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(taken.returncode, 0, taken.stderr)
         _ = meminfo.write_text("MemAvailable: 50331648 kB\n")
         self.wait_for_running(waiting, call)
         os.kill(call.pid, signal.SIGKILL)
-        _ = call.wait(timeout=300)
-        deadline = time.monotonic() + 60
+        _ = call.wait(timeout=TEST_HANG_GUARD_SECS)
+        deadline = time.monotonic() + TEST_HANG_GUARD_SECS
         while (left := self.live_group_processes(call.pid)) and time.monotonic() < deadline:
             time.sleep(0.1)
         self.assertEqual(left, [], output.read_text(errors="replace"))

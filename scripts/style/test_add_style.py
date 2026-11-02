@@ -430,6 +430,8 @@ atomic_file.os.replace = interrupted_replace
         excluded = (self.repo / ".git/info/exclude").read_text()
         self.assertIn("/docs/style-production/\n", excluded)
         self.assertNotIn("/docs/style/\n", excluded)
+        self.assertEqual(self.git("-C", str(self.checkout), "ls-files", "--", str(self.doc),
+                                  "docs/style-production/"), "")
         self.assertEqual(self.git("status", "--porcelain", "--untracked-files=all"), "")
         self.assertEqual(self.git("-C", str(self.checkout), "status", "--porcelain", "--untracked-files=all"), "")
         self.assertEqual(self.sync()[:2], (self.initial_tip, "refs/heads/style/main"))

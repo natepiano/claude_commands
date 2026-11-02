@@ -12,6 +12,7 @@ import subprocess
 import time
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass, replace
+from datetime import datetime, timezone
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stdout
@@ -29,6 +30,7 @@ for dependency in ("shutdown", "herdr", "message", "whoami", "lib"):
 import herdr
 import pane_record
 from scripts.shutdown import folder_trust
+from scripts.production import session_staff
 from scripts.shutdown.stop_results import (
     Stopped as Stopped, NotRunning as NotRunning, StopFailed as StopFailed,
     ClaudeUp as ClaudeUp, ResumePending as ResumePending, MoveHandedOff as MoveHandedOff, ResumeFailed as ResumeFailed,
@@ -99,6 +101,8 @@ def stop(session: str) -> Stopped | NotRunning | StopFailed | SessionNotFound:
     """Stop on purpose; retain its launch for an explicit resume, not crash recovery."""
     _record_launches([session])
     result = _stop(session)
+    if isinstance(result, (Stopped, NotRunning)):
+        _retire_prompt(result.session_id)
     if isinstance(result, Stopped):
         try:
             owner = herdr.shared_session()
@@ -110,10 +114,25 @@ def stop(session: str) -> Stopped | NotRunning | StopFailed | SessionNotFound:
     return result
 
 
+def _retire_prompt(session_id: str) -> None:
+    """Publish only the session id and stop time; any failure is separate from stop or move."""
+    try:
+        from scripts.production.stall_watch import retire_session_prompt
+
+        retire_session_prompt(session_id)
+    except Exception as error:
+        print(f"{session_id}: prompt cancellation: {error}", file=sys.stderr)
+
+
 def _stop(session: str) -> Stopped | NotRunning | StopFailed | SessionNotFound:
     """Signal only the Claude identified by the session registry; leave workers alone."""
     identity = session
     try:
+        from scripts.production import staff
+
+        member = staff.initial_snapshot().by_id(staff.StaffId(session))
+        if member is not None:
+            session = identity = member.current_session
         tab = _tab_of(session)
         if isinstance(tab, SessionNotFound):
             return tab
@@ -155,6 +174,7 @@ def _stop(session: str) -> Stopped | NotRunning | StopFailed | SessionNotFound:
 
 
 def resume_arguments(entry: pane_record.PaneLaunch) -> list[str]:
+    entry = pane_record.resume_launch(entry)
     arguments = ["--resume", entry["session_id"]]
     if entry["name"]:
         arguments.extend(("-n", entry["name"]))
@@ -200,7 +220,7 @@ def resume_message(why: str, *, moved_from: str | None = None, moved_to: str | N
     return ("\n" if workers.seats else " ").join(lines)
 
 
-def _start_session(tab: herdr.TabSession, entry: pane_record.PaneLaunch, account: str, message: str) -> None:
+def _start_session(tab: herdr.TabSession, entry: pane_record.PaneLaunch, account: str, message: str) -> sessions.LiveSessionProcess:
     """Run the account command in the session's own pane, with one resume message."""
     client = herdr.Herdr(herdr.shared_session())
     pane = next((pane for pane in client.panes() if pane["pane_id"] == tab.pane_id), None)
@@ -208,10 +228,30 @@ def _start_session(tab: herdr.TabSession, entry: pane_record.PaneLaunch, account
         raise herdr.HerdrFailure(f"no pane {tab.pane_id!r}")
     # A tab moved between workspaces keeps its shell's old marks; hooks must see this pane.
     environment = {**entry["environment"], "HERDR_PANE_ID": tab.pane_id, "HERDR_WORKSPACE_ID": pane["workspace_id"]}
-    command = ["env", "-u", "HERDR_TAB_ID", *(f"{key}={value}" for key, value in environment.items()),
+    _ = environment.pop("STAFF_ID", None)
+    command = ["env", "-u", "HERDR_TAB_ID", "-u", "STAFF_ID", *(f"{key}={value}" for key, value in environment.items()),
                sys.executable, str(SCRIPTS / "accounts/accounts.py"), "exec", account,
-               *resume_arguments(entry), message]
+               *resume_arguments(entry)]
+    launched_at = datetime.now(timezone.utc)
     client.run_in_pane(tab.pane_id, command)
+    deadline = monotonic() + START_SECONDS
+    live = sessions.session_liveness(entry["session_id"])
+    while isinstance(live, sessions.SessionNotLive):
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            raise herdr.HerdrFailure("never started")
+        time.sleep(min(0.5, remaining))
+        live = sessions.session_liveness(entry["session_id"])
+    if isinstance(live, sessions.SessionLivenessUnknown):
+        raise herdr.HerdrFailure(live.reason)
+    identity = client.native_session(tab.pane_id, "claude", START_SECONDS)
+    if identity != entry["session_id"]:
+        raise herdr.HerdrFailure(f"{entry['session_id']}: resumed registry identity differs: {identity}")
+    opening = herdr.OpeningPrompt(message, herdr.SessionTranscript(Path(entry["config_dir"]), identity))
+    outcome = client.submit_opening_prompt(tab.pane_id, opening, launched_at, int(START_SECONDS * 1000))
+    if isinstance(outcome, herdr.PromptNotSubmitted):
+        raise herdr.HerdrFailure(f"{identity}: resume prompt not submitted: {outcome.reason}")
+    return live
 
 
 @dataclass(frozen=True)
@@ -235,6 +275,9 @@ def _running_on_account(identity: str, pane_id: str, target: str | None) -> Clau
     label = accounts.claude_config_label(setting.path)
     if target is not None and setting.path != accounts.account_dir(target):
         return RunningOnAnotherAccount(identity)
+    observed = herdr.Herdr(herdr.shared_session()).native_session(pane_id, "claude", START_SECONDS)
+    if observed != identity:
+        return ResumeFailed(identity, f"resumed registry identity differs: {observed}")
     return ClaudeUp(identity, pane_id, label)
 
 
@@ -255,6 +298,11 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
     began = monotonic()
     identity = session
     try:
+        from scripts.production import staff
+
+        member = staff.initial_snapshot().by_id(staff.StaffId(session))
+        if member is not None:
+            session = identity = member.current_session
         tab = _tab_of(session)
         client = herdr.Herdr(herdr.shared_session())
         if isinstance(tab, SessionNotFound):
@@ -268,6 +316,8 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
                 return SessionNotFound(session)
             identity = tab.session_id
             entry = pane_record.read(client.session).get(tab.pane_id)
+        if entry is not None:
+            entry = pane_record.resume_launch(entry)
         pane_id = entry["pane_id"] if isinstance(tab, SessionNotFound) and entry is not None else (
             tab.pane_id if isinstance(tab, herdr.TabSession) else "")
         running = _running_on_account(identity, pane_id, to)
@@ -281,6 +331,7 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
             return ResumeFailed(identity, "Claude was closed by hand")
         if not entry.get("flags_read", False):
             return ResumeFailed(identity, "pane launch flags are unknown")
+        entry = session_staff.record_membership(entry)
         from inventory import codex_seats
         import unit_runs
 
@@ -293,6 +344,7 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
         label = to if to is not None else accounts.claude_config_label(target_dir)
         if to is not None and entry["environment"].get("CLAUDE_CONFIG_DIR") != str(target_dir):
             entry = entry.copy()
+            entry["config_dir"] = str(target_dir)
             entry["environment"] = {**entry["environment"], "CLAUDE_CONFIG_DIR": str(target_dir)}
             pane_record.write(client.session, entry)
         trust = folder_trust.heal(Path(entry["cwd"]), target_dir, source)
@@ -319,18 +371,11 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
         if isinstance(live, sessions.SessionLivenessUnknown):
             return ResumeFailed(identity, live.reason)
         if isinstance(live, sessions.SessionNotLive):
-            _start_session(tab, entry, label, message)
-        deadline = monotonic() + START_SECONDS
-        while isinstance(live, sessions.SessionNotLive):
-            live = sessions.session_liveness(identity)
-            remaining = deadline - monotonic()
-            if not isinstance(live, sessions.SessionNotLive) or remaining <= 0:
-                break
-            time.sleep(min(0.5, remaining))
-        if isinstance(live, sessions.SessionLivenessUnknown):
-            return ResumeFailed(identity, live.reason)
-        if isinstance(live, sessions.SessionNotLive):
-            return ResumeFailed(identity, "never started")
+            live = _start_session(tab, entry, label, message)
+        else:
+            observed = client.native_session(tab.pane_id, "claude", START_SECONDS)
+            if observed != identity:
+                return ResumeFailed(identity, f"resumed registry identity differs: {observed}")
         generation = sessions.process_start(live.pid)
         if not generation:
             return ResumeFailed(identity, f"process identity unreadable for pid {live.pid}")
@@ -488,7 +533,10 @@ def move_sessions(sessions: list[str], target: str, *, why: str, warn_seconds: i
         stopped: list[Stopped | NotRunning | StopFailed | SessionNotFound | ClaudeUp] = []
         for session, future in zip(selected, stops):
             try:
-                stopped.append(future.result())
+                result = future.result()
+                if isinstance(result, (Stopped, NotRunning)):
+                    _retire_prompt(result.session_id)
+                stopped.append(result)
             except Exception as error:
                 stopped.append(StopFailed(session, str(error)))
         def resume_moved(identity: str) -> ClaudeUp | ResumeFailed | SessionNotFound:
@@ -583,14 +631,15 @@ def _resumed_launcher_command(command: list[str], seat: str, prompt: str) -> str
     index = next((i for i, arg in enumerate(command) if Path(arg).name in {"implement.sh", "review.sh"}), -1)
     if index < 0:
         return None
-    # Launchers accept option/value pairs followed by session_dir, cwd, prompt_file.
+    # Retain supported task options; saved commands may predate the current launcher.
+    supported = {"--phase", "--lens"} if Path(command[index]).name == "review.sh" else {"--phase", "--fix-cause"}
     position = index + 1
     options: list[str] = []
     while position < len(command) and command[position].startswith("--"):
         if position + 1 >= len(command):
             return None
         option, value = command[position], command[position + 1]
-        if option not in {"--slot", "--pool", "--lease", "--to"}:
+        if option in supported:
             options.extend((option, value))
         position += 2
     arguments = command[position:]

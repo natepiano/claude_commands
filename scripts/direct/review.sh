@@ -2,15 +2,13 @@
 # review.sh — Invoke the configured worker agent for a review.
 #
 # Usage: review.sh [--to <worker> | --slot <new-slot>]
-#                  [--phase <id>] <session_dir>
+#                  [--phase <id>] [--style-since <commit> [--style-until <commit>]] <session_dir>
 #                  [working_dir] [prompt_file] [task]
 #                  [role_description] [pass_activity] [pass_index] [lens]
 #                  [early_ready_file]
 #   --to reuses an open Codex worker. --slot opens a role-named Codex worker for
 #   this review and leaves its thread open for later `--to` dispatches.
-#   With no worker or pool flags, a fresh read-only reviewer runs once.
-#   Ignored --pool code / --lease flags select the unit's own reviewer when
-#   neither --to nor --slot names a worker.
+#   With no worker flags, a fresh read-only reviewer runs once.
 #   role_description — 1-2 lines describing this review's responsibility,
 #   written as a header block into the shared heartbeat log
 #   pass_activity — short user-facing description for the progress header
@@ -61,18 +59,19 @@ UNIT_ENV_SHIM="${BASH_SOURCE[0]%/*}/../lib/unit_env.sh"
 
 FOLLOW_TO=""
 NEW_SLOT=""
-POOL_TYPE=""
-POOL_LEASE=""
 # A phase running beside the current one names itself, so start-pass stamps this pass with it.
 PHASE_ID=""
+STYLE_SINCE=""
+STYLE_UNTIL=""
+STYLE_INPUT_DIR=""
 REQUESTED_LENS=""
 while [[ "${1:-}" == --* ]]; do
   case "$1" in
     --to) FOLLOW_TO="${2:?--to requires a worker}" ;;
     --slot) NEW_SLOT="${2:?--slot requires a slot}" ;;
-    --pool) POOL_TYPE="${2:?--pool requires a type}" ;;
-    --lease) POOL_LEASE="${2:?--lease requires slug/unit/phase}" ;;
     --lens) REQUESTED_LENS="${2:?--lens requires a lens}" ;;
+    --style-since) STYLE_SINCE="${2:?--style-since requires a baseline}" ;;
+    --style-until) STYLE_UNTIL="${2:?--style-until requires an end commit}" ;;
     --phase) PHASE_ID="${2:?--phase requires a phase id}" ;;
     *) echo "ERROR: unknown review option '$1'." >&2; exit 2 ;;
   esac
@@ -82,18 +81,6 @@ if [[ -n "${FOLLOW_TO}" && -n "${NEW_SLOT}" ]]; then
   echo "ERROR: --to excludes --slot." >&2
   exit 2
 fi
-if [[ "${POOL_TYPE}" == ui ]]; then
-  echo 'ERROR: --pool ui is retired; use the fresh Claude helper in <UXReview/> for the design check.' >&2
-  exit 2
-fi
-if [[ -n "${POOL_TYPE}" && "${POOL_TYPE}" != code ]]; then
-  echo "ERROR: --pool requires code or ui." >&2
-  exit 2
-fi
-if [[ -n "${POOL_TYPE}" || -n "${POOL_LEASE}" ]]; then
-  echo 'review.sh: --pool code and --lease are ignored; using the unit reviewer.' >&2
-fi
-
 SESSION_DIR="${1:?Usage: review.sh <session_dir> [working_dir] [prompt_file] [task] [role_description]}"
 # A named phase keeps its review files in its own directory, so two phases reviewing at once
 # never write the same pass's findings, status or log. Run-wide files stay in the session.
@@ -106,6 +93,14 @@ if [[ -n "${PHASE_ID}" ]]; then
     exit 2
   fi
   ARTIFACT_DIR="${SESSION_DIR}/phases/${PHASE_DIR_NAME}"
+fi
+if [[ -n "${STYLE_SINCE}" && ( -z "${PHASE_ID}" || -n "${9:-}" ) ]]; then
+  echo "ERROR: --style-since requires --phase and a final-diff dispatch (no early review)." >&2
+  exit 2
+fi
+if [[ -n "${STYLE_UNTIL}" && -z "${STYLE_SINCE}" ]]; then
+  echo "ERROR: --style-until requires --style-since." >&2
+  exit 2
 fi
 WORKING_DIR="${2:-$(pwd)}"
 PROMPT_FILE="${3:-${ARTIFACT_DIR}/review_prompt.md}"
@@ -182,8 +177,6 @@ PY="${SCRIPT_DIR}/../lib/py"
 MESH_SESSION_DIR="${SESSION_DIR}"
 MESH_CLAIMED=0
 TURN_THREAD_ID=""
-LEASE_ORDINAL=0
-PRIME_HASH=""
 TURN_FINDINGS_READY=0
 TURN_RAISED=0
 TURN_COUNT_READY=0
@@ -228,21 +221,7 @@ if [[ -f "${PROGRESS_STATE}" ]]; then
   fi
 fi
 
-if [[ -z "${FOLLOW_TO}" && -z "${NEW_SLOT}" && ( -n "${POOL_TYPE}" || -n "${POOL_LEASE}" ) ]]; then
-  RESOLVE_ERROR_FILE="${ARTIFACT_DIR}/review_resolve${SUFFIX}.$$.txt"
-  if FOLLOW_TO="$("$PY" "${SCRIPT_DIR}/workers.py" resolve --session-dir "${SESSION_DIR}" --working-dir "${WORKING_DIR}" --role review --owner-pid "$$" 2>"${RESOLVE_ERROR_FILE}")"; then
-    rm -f "${RESOLVE_ERROR_FILE}"
-  else
-    RESOLVE_CAUSE="$(tr '\n' ' ' < "${RESOLVE_ERROR_FILE}")"
-    rm -f "${RESOLVE_ERROR_FILE}"
-    echo "error" > "${STATUS_FILE}"
-    echo "ERROR: no unit reviewer: ${RESOLVE_CAUSE% }" >&2
-    exit 1
-  fi
-  REVIEW_WORKER="${FOLLOW_TO}"
-  TEAM_SLOT="${FOLLOW_TO##*-}"
-  export UNIT_TEAM_ROLE="${TEAM_SLOT}"
-fi
+
 # Resolution can change the worker slot after the launch check.
 if [[ -n "${REVIEW_WORKER}" ]]; then
   SEAT_SUFFIX="-${TEAM_SLOT}"
@@ -452,9 +431,8 @@ PY
 
 write_turn_record() {
   UNIT_LIB_DIR="${SCRIPT_DIR%/*}/lib" "$PY" - "${SESSION_DIR}" "${TURN_STARTED_AT}" "$$" "${TURN_RECORD_STATUS}" \
-    "" "" "${REVIEW_WORKER}" "${TURN_THREAD_ID}" \
-    "${TURN_LEASE}" "${TURN_PROGRESS}" "${LENS}" "${PASS_INDEX}" \
-    "${LEASE_ORDINAL}" "${PRIME_HASH}" "${TURN_RAISED}" <<'PY'
+    "${REVIEW_WORKER}" "${TURN_THREAD_ID}" \
+    "${TURN_PROGRESS}" "${LENS}" "${PASS_INDEX}" "${TURN_RAISED}" <<'PY'
 import itertools
 import json
 import os
@@ -462,19 +440,19 @@ import sys
 import time
 from pathlib import Path
 
-(session, started, pid, status, legacy_type, pool, reviewer, thread_id,
- lease, progress, lens, number, ordinal, prime_hash, raised) = sys.argv[1:]
+(session, started, pid, status, reviewer, thread_id,
+ progress, lens, number, raised) = sys.argv[1:]
 metadata = json.loads(progress)
 thread_id = thread_id or metadata.get("thread_id", "")
 unit, phase = metadata.get("unit", ""), metadata.get("phase", "")
 record = {
-    "arm": "own", "pool": pool,
+    "arm": "own",
     "reviewer": reviewer, "thread_id": thread_id, "unit": unit, "phase": phase,
     "phase_instance_id": metadata.get("phase_instance_id", ""),
     "history_file": metadata.get("history_file", ""),
     "kind": "ux" if lens == "ux" else "broad" if int(number) == 1 and lens else "closure",
     "lens": lens, "pass": int(number), "started_at": int(started),
-    "finished_at": time.time(), "lease_ordinal": int(ordinal), "prime_hash": prime_hash,
+    "finished_at": time.time(),
     "status": status, "raised": int(raised),
 }
 sys.path.insert(0, os.environ["UNIT_LIB_DIR"])
@@ -493,6 +471,19 @@ for sequence in itertools.count():
 PY
 }
 
+finish_style_review() {
+  [[ -n "${STYLE_INPUT_DIR}" ]] || return 0
+  "$PY" "${SCRIPT_DIR}/../lint/style_review.py" finish \
+    --input-dir "${STYLE_INPUT_DIR}" --result "${FINDINGS_FILE}" --dispatch-code "$1"
+}
+
+finish_fresh_exit() {
+  local code=$?
+  trap - EXIT
+  finish_style_review "${code}" || code=1
+  exit "${code}"
+}
+
 finish_review_exit() {
   local code=$?
   trap - EXIT
@@ -500,6 +491,7 @@ finish_review_exit() {
   if [[ "${code}" -ne 0 && "${TURN_FINDINGS_READY}" -eq 1 ]]; then
     echo error > "${STATUS_FILE}"
   fi
+  finish_style_review "${code}" || code=1
   count_turn_findings
   refresh_turn_thread_id
   if ! write_turn_record; then
@@ -523,7 +515,6 @@ interrupt_review() {
 
 if [[ -n "${FOLLOW_TO}" || -n "${NEW_SLOT}" ]]; then
   TURN_STARTED_AT="$(date +%s)"
-  TURN_LEASE=""
   # The record joins to the phase --phase names, the same phase start-pass stamps:
   # with phases open side by side, the newest open phase is often another one.
   TURN_PROGRESS="$("$PY" - "${PROGRESS_STATE}" "${SESSION_DIR}" "${FOLLOW_TO}" "${PHASE_ID}" <<'PY'
@@ -552,6 +543,20 @@ PY
   trap 'interrupt_review 143' TERM
   trap 'interrupt_review 130' INT
   trap 'interrupt_review 129' HUP
+else
+  trap finish_fresh_exit EXIT
+fi
+
+if [[ -n "${STYLE_SINCE}" ]]; then
+  STYLE_DIRECTORY_FILE="${ARTIFACT_DIR}/style_directory.$$.txt"
+  "$PY" "${SCRIPT_DIR}/../lint/style_review.py" prepare \
+    --working-dir "${WORKING_DIR}" --since "${STYLE_SINCE}" \
+    --until "${STYLE_UNTIL}" \
+    --phase-dir "${ARTIFACT_DIR}" --prompt "${PROMPT_FILE}" \
+    --owner-pid "$$" --pass-name "pass-${PASS_INDEX}${SUFFIX}" --directory-file "${STYLE_DIRECTORY_FILE}"
+  STYLE_INPUT_DIR="$(cat "${STYLE_DIRECTORY_FILE}")"
+  rm -f "${STYLE_DIRECTORY_FILE}"
+  PROMPT_FILE="${STYLE_INPUT_DIR}/prompt.md"
 fi
 
 # shellcheck source=/dev/null

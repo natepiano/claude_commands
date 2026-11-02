@@ -2,19 +2,24 @@
 from __future__ import annotations
 
 import io
+import fcntl
 import json
+import math
 import os
 import socket
+import signal
 import subprocess
 import sys
 import tempfile
 import unittest
+from threading import Thread
+from time import monotonic
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from typing import IO, NamedTuple, cast, override
+from typing import IO, cast, override
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -26,13 +31,21 @@ import rca  # noqa: E402
 import review  # noqa: E402
 import send  # noqa: E402
 import sessions  # noqa: E402
+import session_staff  # noqa: E402
 from scripts.production import showrunners  # noqa: E402
+from test_showrunners import stalled_session_reader  # noqa: E402
 import silence  # noqa: E402
 from user_action import NoActionRequired  # noqa: E402
 
 OPENED = datetime(2026, 10, 23, 13, 30, tzinfo=timezone.utc)
 SHOWRUNNER = "uds:/tmp/cargo-liner-show.sock"
-STUB = """import json, os, sys
+STUB = """import json, os, socket, sys
+if os.environ.get('RCA_TEST_BARRIER_SOCKET'):
+    with socket.socket(socket.AF_UNIX) as client:
+        client.settimeout(5)
+        client.connect(os.environ['RCA_TEST_BARRIER_SOCKET'])
+        client.sendall((sys.argv[sys.argv.index('--key') + 1] + '\\n').encode())
+        assert client.recv(16) == b'delivered'
 with open(os.environ['RCA_TEST_LOG'], 'a') as log:
     log.write(json.dumps(sys.argv[1:]) + '\\n')
 print(os.environ.get('RCA_TEST_OUTPUT', 'SENT: to the user'))
@@ -60,8 +73,9 @@ def same_slug(slug: str) -> str:
     return slug
 
 
-def showrunner_address(slug: str) -> str:
+def showrunner_address(slug: str, *, deadline: float = math.inf) -> str:
     """Only cargo-liner's showrunner runs."""
+    del deadline
     return SHOWRUNNER if slug == "cargo-liner" else ""
 
 
@@ -77,17 +91,10 @@ def flags(argv: list[str]) -> dict[str, str]:
     return found
 
 
-class Detached(NamedTuple):
-    """How a detached owner message started."""
-    stdin: Stream
-    log: str
-    start_new_session: bool
-
-
 class RcaTests(unittest.TestCase):
     root: Path = Path()
     log: Path = Path()
-    detached: list[Detached] = []
+    owner_processes: list[bool] = []
     # What the fake push review gives, by the draft it reads; None approves the draft.
     verdict: review.ReviewOutcome | None = None
     reviewed: list[review.Draft] = []
@@ -104,7 +111,7 @@ class RcaTests(unittest.TestCase):
         # A fixed clock: a case id carries the day, so a call with no time of its own opens 261023-<n> on any day.
         _ = self.enterContext(mock.patch.object(rca, "now", return_value=OPENED))
         (self.root / "sessions").mkdir()
-        removed = (rca.PRODUCTION_MARK, "CLAUDE_CODE_SESSION_ID", "RCA_TEST_EXIT")
+        removed = (session_staff.PRODUCTION_MARK, "CLAUDE_CODE_SESSION_ID", "RCA_TEST_EXIT")
         environment = {key: value for key, value in os.environ.items() if key not in removed}
         self.enterContext(mock.patch.dict(os.environ, environment | {
             "RCA_TEST_LOG": str(self.log), "USER_ZONE": "America/Puerto_Rico",
@@ -115,19 +122,15 @@ class RcaTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(review, "review", side_effect=self.review))
         _ = self.enterContext(mock.patch.object(showrunners, "canonical_slug", side_effect=same_slug))
         _ = self.enterContext(mock.patch.object(showrunners, "current_address", side_effect=showrunner_address))
-        self.detached = []
+        self.owner_processes = []
         _ = self.enterContext(mock.patch.object(subprocess, "Popen", self.popen))
 
     def popen(self, argv: list[str], *, stdin: Stream = None, stdout: Stream = None, stderr: Stream = None,
               text: bool = False, start_new_session: bool = False) -> subprocess.Popen[str]:
-        """Record how a detached owner message starts, then run it to its end, so a test reads what it sent.
-        A push's subprocess.run goes to the real Popen."""
-        if not start_new_session:
-            return REAL_POPEN(argv, stdin=stdin, stdout=stdout, stderr=stderr, text=text)
-        self.detached.append(Detached(stdin, "" if stdout is None or isinstance(stdout, int) else stdout.name, True))
-        process = REAL_POPEN(argv, stdin=stdin, stdout=stdout, stderr=stderr, text=True)
-        _ = process.wait()
-        return process
+        """Record whether send.py was detached, while running the real isolated sender."""
+        self.owner_processes.append(start_new_session)
+        return REAL_POPEN(argv, stdin=stdin, stdout=stdout, stderr=stderr, text=text,
+                          start_new_session=start_new_session)
 
     def review(self, draft: review.Draft, revision: bool, *, limit: float = 0) -> review.ReviewOutcome:
         del revision, limit
@@ -191,11 +194,82 @@ class RcaTests(unittest.TestCase):
                      f"4. After the fix merges, run `{rca.CALL} fixed 261023-1 --cause"):
             self.assertIn(part, sent["--text"])
         self.assertEqual(rca.CALL, "~/.claude/scripts/lib/py ~/.claude/scripts/message/rca.py")
-        # The message starts detached: the caller does not wait for its relay, and its output goes to the log.
-        self.assertEqual(self.detached, [Detached(subprocess.DEVNULL, str(self.root / "rca" / rca.OWNER_LOG), True)])
+        # The owner send completes before the caller returns, with its outcome in the log.
+        self.assertEqual(self.owner_processes, [False])
         logged = (self.root / "rca" / rca.OWNER_LOG).read_text().splitlines()
         self.assertTrue(logged[0].endswith(" rca-261023-1"))
         self.assertEqual(logged[1:], ["SENT: to the user"])
+
+    def test_owner_deliveries_finish_before_the_one_shot_process_group_ends(self) -> None:
+        _ = rca.open_case(HANDLER, OPENED)
+        socket_root = Path(self.enterContext(short_socket_directory()))
+        sender = self.root / "socket-send.py"
+        _ = sender.write_text("""import json, os, pathlib, socket, sys
+with socket.socket(socket.AF_UNIX) as client:
+    client.settimeout(10)
+    client.connect(os.environ['OWNER_TEST_SOCKET'])
+    client.sendall((json.dumps(sys.argv[1:]) + '\\n').encode())
+    assert client.recv(16) == b'delivered'
+pathlib.Path(os.environ['OWNER_TEST_RECEIPT']).write_text('delivered')
+print('SENT: fake owner socket')
+""")
+        caller = """import json, math, os, pathlib, subprocess, sys
+from scripts.production import stall_watch
+rca = stall_watch.rca
+rca.STATE = pathlib.Path(os.environ['OWNER_TEST_CASE_DIR'])
+def owner_address(production: str, *, deadline: float = math.inf) -> str:
+    del production, deadline
+    return 'fake-owner'
+rca.owner_address = owner_address
+if sys.argv[1] == 'rca':
+    case = rca.loaded('261023-1')
+    failure = rca.tell_owner(case)
+else:
+    path = stall_watch.STATE_DIR / 'owner.prompt.json'
+    path.parent.mkdir(parents=True, exist_ok=True)
+    stall_watch.save_prompt(path, stall_watch.PromptWait(session_id='owner', created=0, key='owner-key', since=0, alerted=False, tool='tool', retiring=False))
+    stall_watch.send_all([stall_watch.Delivery(path, 'prompt-owner',
+        [sys.executable, str(stall_watch.SEND), '--to', 'fake-owner', '--text', 'permission request'])], 60)
+    failure = ''
+pathlib.Path(os.environ['OWNER_TEST_RETURN']).write_text(json.dumps({
+    'failure': failure, 'delivered': pathlib.Path(os.environ['OWNER_TEST_RECEIPT']).exists()}))
+# A separate service manager can end the test's caller group without signalling its own group.
+subprocess.run([sys.executable, '-c',
+    "import pathlib, signal, sys; "
+    "sys.path.insert(0, str(pathlib.Path.cwd() / 'scripts' / 'lib')); "
+    "import process_group; "
+    "process_group.send_process_group(int(sys.argv[1]), signal.SIGTERM)",
+    str(os.getpgrp())], start_new_session=True, check=True)
+"""
+        for mode in ("rca", "stall-watch"):
+            with self.subTest(sender=mode), socket.socket(socket.AF_UNIX) as receiver:
+                address = socket_root / f"{mode}.sock"
+                receiver.bind(str(address))
+                receiver.listen()
+                receiver.settimeout(10)
+                receipt = self.root / f"{mode}.receipt"
+                returned = self.root / f"{mode}.returned"
+                environment = {**os.environ, "HOME": str(self.root),
+                    "XDG_STATE_HOME": str(self.root / "state"), "RCA_SEND": str(sender),
+                    "STALL_WATCH_SEND": str(sender), "STALL_WATCH_STATE_DIR": str(self.root / "stall"),
+                    "OWNER_TEST_SOCKET": str(address), "OWNER_TEST_RECEIPT": str(receipt),
+                    "OWNER_TEST_RETURN": str(returned), "OWNER_TEST_CASE_DIR": str(rca.STATE)}
+                with REAL_POPEN([sys.executable, "-c", caller, mode], cwd=Path(__file__).resolve().parents[2],
+                                env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, start_new_session=True) as process:
+                    try:
+                        with receiver.accept()[0] as connection:
+                            connection.settimeout(10)
+                            message = connection.recv(65536)
+                            self.assertIn(b"--text", message)
+                            connection.sendall(b"delivered")
+                        out, err = process.communicate(timeout=10)
+                    finally:
+                        if process.poll() is None:
+                            process.kill()
+                self.assertEqual(process.returncode, -signal.SIGTERM, out + err)
+                self.assertEqual(json.loads(returned.read_text()), {"failure": "", "delivered": True})
+                self.assertEqual(receipt.read_text(), "delivered")
 
     def test_the_same_session_and_commands_join_the_case_until_it_is_fixed(self) -> None:
         two = rca.Report("modules", "natedev", "auto_mode", ("implement.sh --to modules-impl",
@@ -212,7 +286,7 @@ class RcaTests(unittest.TestCase):
     def test_the_owner_is_natedev_without_a_running_showrunner_and_the_mark_names_the_production(self) -> None:
         _ = rca.open_case(HANDLER._replace(production=""), OPENED)
         _ = rca.open_case(HANDLER._replace(session="other", production="stopped-production"), OPENED)
-        with mock.patch.dict(os.environ, {rca.PRODUCTION_MARK: "cargo-liner"}):
+        with mock.patch.dict(os.environ, {session_staff.PRODUCTION_MARK: "cargo-liner"}):
             _ = rca.open_case(HANDLER._replace(session="marked", production=""), OPENED)
         self.assertEqual([flags(argv)["--to"] for argv in self.sends()], ["natedev", "natedev", SHOWRUNNER])
         self.assertEqual(self.case("261023-3")["production"], "cargo-liner")
@@ -220,7 +294,7 @@ class RcaTests(unittest.TestCase):
     def test_the_mark_is_the_one_unit_lookup_reads(self) -> None:
         sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
         import unit_lookup
-        self.assertEqual(rca.PRODUCTION_MARK, unit_lookup.PRODUCTION_MARK)
+        self.assertEqual(session_staff.PRODUCTION_MARK, unit_lookup.PRODUCTION_MARK)
 
     def test_a_by_hand_open_takes_the_newest_transcript_of_the_session_it_names(self) -> None:
         _ = self.transcript("-home-handler-old", "sid-handler", 1000)
@@ -437,6 +511,93 @@ class RcaTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"RCA_TEST_EXIT": "4", "RCA_TEST_OUTPUT": "HELD: not sent"}):
             self.assertEqual(self.quiet(["start", "261023-1", "--owner", "builds"])[:2], (1, "HELD: not sent\n"))
         self.assertEqual(self.case("261023-1")["status"], "started")
+
+    def test_pending_owner_notices_and_reminders_share_one_concurrent_delivery_budget(self) -> None:
+        for number in range(4):
+            _ = rca.open_case(HANDLER._replace(session=f"unit-{number}"), OPENED, defer_owner=True)
+            if number < 2:
+                case = self.case(f"261023-{number + 1}")
+                case["owner_told"] = True
+                rca.save(case)
+        root = Path(self.enterContext(short_socket_directory()))
+        address = root / "owners.sock"
+        failures: list[Exception] = []
+        received: list[str] = []
+        with socket.socket(socket.AF_UNIX) as listener:
+            listener.bind(str(address))
+            listener.listen(4)
+            listener.settimeout(5)
+
+            def acknowledge_batch() -> None:
+                connections: list[socket.socket] = []
+                try:
+                    while len(connections) < 4:
+                        connection = listener.accept()[0]
+                        connections.append(connection)
+                        connection.settimeout(5)
+                        received.append(connection.recv(4096).decode().strip())
+                    # No child can finish before every child has reached the receiver.
+                    for connection in connections:
+                        connection.sendall(b"delivered")
+                except Exception as error:
+                    failures.append(error)
+                finally:
+                    for connection in connections:
+                        connection.close()
+
+            receiver = Thread(target=acknowledge_batch)
+            receiver.start()
+            try:
+                with mock.patch.dict(os.environ, {"RCA_TEST_BARRIER_SOCKET": str(address)}):
+                    rca.remind(OPENED + timedelta(minutes=30), deadline=monotonic() + 5)
+            finally:
+                receiver.join(timeout=6)
+            self.assertFalse(receiver.is_alive())
+        self.assertEqual(failures, [])
+        self.assertCountEqual(received, ["rca-261023-1-remind", "rca-261023-2-remind",
+                                         "rca-261023-3", "rca-261023-4"])
+        self.assertTrue(self.case("261023-1")["reminded"])
+        self.assertTrue(self.case("261023-2")["reminded"])
+        self.assertTrue(self.case("261023-3").get("owner_told"))
+        self.assertTrue(self.case("261023-4").get("owner_told"))
+        _ = rca.open_case(HANDLER._replace(session="retry"), OPENED, defer_owner=True)
+        with redirect_stderr(io.StringIO()):
+            rca.remind(OPENED, deadline=monotonic())
+        self.assertFalse(self.case("261023-5").get("owner_told"))
+        rca.remind(OPENED, deadline=monotonic() + 5)
+        self.assertTrue(self.case("261023-5").get("owner_told"))
+        self.assertEqual(sum(flags(argv)["--key"] == "rca-261023-5" for argv in self.sends()), 1)
+
+    def test_a_contended_case_lock_stops_at_the_deadline_and_keeps_the_notice_pending(self) -> None:
+        _ = rca.open_case(HANDLER, OPENED, defer_owner=True)
+        errors = io.StringIO()
+        with (rca.STATE / ".lock").open("a+") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            began = monotonic()
+            with redirect_stderr(errors):
+                rca.remind(OPENED, deadline=began + 0.2)
+            self.assertLess(monotonic() - began, 1.5)
+        self.assertFalse(self.case("261023-1").get("owner_told", True))
+        self.assertEqual(errors.getvalue().count("owner delivery retained for retry"), 1)
+        self.assertIn("case lock deadline exhausted", errors.getvalue())
+        rca.remind(OPENED, deadline=monotonic() + 5)
+        self.assertTrue(self.case("261023-1").get("owner_told"))
+
+    def test_stalled_owner_lookup_ends_at_the_deadline_and_keeps_the_notice_pending(self) -> None:
+        _ = rca.open_case(HANDLER, OPENED, defer_owner=True)
+        reader = stalled_session_reader(self.root)
+        def lookup(slug: str, *, deadline: float) -> str:
+            return showrunners.socket_for(slug, deadline=deadline) or ""
+        errors = io.StringIO()
+        began = monotonic()
+        with (mock.patch.object(showrunners, "current_address", side_effect=lookup),
+              mock.patch.object(showrunners, "SESSIONS", reader), redirect_stderr(errors)):
+            rca.remind(OPENED, deadline=began + 0.15)
+        self.assertLess(monotonic() - began, 1.5)
+        self.assertEqual(errors.getvalue().count("owner delivery retained for retry"), 1)
+        self.assertIn("lookup timed out", errors.getvalue())
+        self.assertFalse(self.case("261023-1").get("owner_told", True))
+        self.assertEqual(self.sends(), [])
 
     def test_remind_tells_the_owner_once_of_a_case_open_30_minutes(self) -> None:
         _ = rca.open_case(HANDLER, OPENED)
