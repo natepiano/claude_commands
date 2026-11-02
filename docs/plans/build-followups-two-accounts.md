@@ -3110,3 +3110,44 @@ User 2026-11-02 (via the Mac session): "the accounts board should show the count
 natedev 2026-11-02 (urgent): main was red from 101u (069010236): `test_role_map` and `test_refusal_watch`, 4 failures and 1 error.
 
 **As-built:** `_count_role_sessions` counts in memory and writes no file; `_session_counts_document` (was `_publish_session_counts`) builds the document that `session-counts-read` prints, and `_session_counts_file` is gone. `_machine_role_counts` takes the status `UsageSource` and starts the detached fetch only for `RefreshStaleUsage`, so `status --stored` reads only `peer_session_counts.json` and opens no lock. `test_role_map.py`, `test_refusal_watch.py` and `test_cutover_home.py` stub `_start_session_counts_fetch` for the whole module. New test `test_stored_status_starts_no_counts_fetch_and_writes_nothing`. 3251 tests in the accounts modules and their importers pass. No code review ran (urgent red-main repair; the director read the diff).
+
+### Phase 101x — The Mac voice setting stays local  · status: done
+
+natedev 2026-11-02 (urgent): since about 16:00 EST the Mac takes no promotion. The user turned on voice on the Mac, so its `~/.claude/settings.json` has a new top-level `voice` key (`{enabled: true, mode: hold}`). Promotion and claude-sync refuse a tracked edit. Same class as `theme` in 101q.
+
+#### Work Order
+**Goal:** `voice` is a machine-local settings key, like `theme`; the Mac keeps its value and promotion and claude-sync accept the file.
+**Spec:**
+1. Add `voice` to `SETTINGS_LOCAL_KEYS_JSON` in `scripts/settings/settings_local_keys.sh`, with a comment line like the `theme` line.
+2. Add a test in `scripts/settings/test_settings_local_keys.py`, as for `theme`: a local `voice` object survives and a tracked copy gets no `voice` key.
+3. Do not touch the Mac or any live settings file.
+**Files:**
+- `scripts/settings/settings_local_keys.sh`
+- `scripts/settings/test_settings_local_keys.py`
+
+### Phase 101w — Account tunables live in config  · status: todo
+
+natedev 2026-11-02: the hard-coded values proposal, phase 3 (user approved 2026-11-01). Move each tunable value in the accounts code to config through `scripts/lib/conf.py`, with the same value.
+
+#### Work Order
+**Goal:** every tunable value in `scripts/accounts/` (a limit, a timeout, an interval, a size, an age, a count, a threshold, a path root) is read at use from `config/accounts.conf` through `scripts/lib/conf.py`, with its value unchanged.
+**Spec:**
+1. Inventory each tunable literal in the non-test modules of `scripts/accounts/`. A fixed format, protocol name, file name inside a state folder, or test value is not a tunable; leave it.
+2. Add one key per tunable to the new `config/accounts.conf`, with a comment line that says what it controls. Use the unit in the key name (`_seconds`, `_minutes`, `_percent`, `_bytes`).
+3. Read each key at use with `conf.whole`, `conf.number` or `conf.text`; no module-level copy, no second reader, no fallback literal in code.
+4. Keep every value exactly as it is now. Never change a value: the user approves each value change.
+5. Tests use `CONF_DIR` with a scratch copy of `config/accounts.conf`; add one test that each key in the file is read by the code and each value parses.
+6. docs/accounts.md: one short section that names `config/accounts.conf` and says a change needs no build.
+**Files:**
+- `config/accounts.conf`
+- `scripts/accounts/accounts.py`
+- `scripts/accounts/role_map.py`
+- `scripts/accounts/refusal_watch.py`
+- `scripts/accounts/next_moves.py`
+- `scripts/accounts/moves.py`
+- `scripts/accounts/unit_watchdog.py`
+- `scripts/accounts/new_account.py`
+- `scripts/accounts/refusals.py`
+- `scripts/accounts/outage_alerts.py`
+- `scripts/accounts/test_accounts.py`
+- `docs/accounts.md`
