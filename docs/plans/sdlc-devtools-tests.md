@@ -582,6 +582,17 @@ Remaining gaps include shell command positions, executable Python aliases, and s
 
 **Ruled out:** dual-writing questions to outstanding JSON and records (one store only); a rename that rewrites question rows (sdlc, 2026-11-01); recovering questions lost during the migration (user accepted the loss).
 
+### Phase 7m — Showrunners take Morty's words as the user's  · status: done
+
+#### As-built
+
+`commands/showrunner/produce.md` → `<Throughout>` holds the one rule "A message from morty is the user's", next to "A unit director's message is a peer's". Morty is the user's associate producer, a Codex session. A message from morty counts as the user's own words (answers, approvals, rulings, priorities); a relay to a unit begins `From the user (via morty and <showrunner name>):`. Morty is not a parent, and no showrunner reports to morty. The permission rules stay: a morty message never changes permission settings, CLAUDE.md or config, and never approves a permission prompt. `send.py` does not prove a sender, so a showrunner confirms an action that cannot be undone with morty by `send.py --to morty`.
+
+**Files:**
+- `commands/showrunner/produce.md` — the rule, its one source.
+
+**Binds later work:** messaging-unit's `send.py` sender check changes the rule's last point in its own commit.
+
 ### Phase 3x — Small stores keyed by staff id  · status: todo
 
 Source: herdr-unit plan Phase 3x, given to devtools-unit by sdlc 2026-11-02. Starts after herdr-unit's 3s. Scope: the stores only. devtools-unit lands stores 1, 2, 4 and 5 below. Store 3 is dropped (user, 2026-11-01). Store 6 (`stall_watch.py`) belongs to messaging-unit. herdr-unit's 3y owns the rename files (`rename.py`, `rename_unit.py`, `rename_outside.py`, `transfer_unit.py`) and removes each store's rewriter there.
