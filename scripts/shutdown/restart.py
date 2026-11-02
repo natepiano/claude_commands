@@ -700,19 +700,29 @@ class RecordedHerdrPane:
 
 @dataclass(frozen=True)
 class SharedHerdrTab:
-    """A new tab in the shared session, in the workspace named for the session's production."""
+    """A new tab in the shared session."""
     name: str
 
 
 HerdrDestination = RecordedHerdrPane | SharedHerdrTab
 
 
-def herdr_space(session: Session) -> str:
-    """The shared session's workspace for a Claude session: its production's, else `ad-hoc`."""
+def herdr_space(session: Session, record: staff.StaffSnapshot) -> str:
+    """Use the production workspace for a showrunner or unit, and the session name for other sessions."""
+    from scripts.production.showrunners import herdr_space as production_space, production_slug
+
     if session["kind"] == "showrunner":
-        from scripts.production.showrunners import herdr_space as production_space, production_slug
         return production_space(production_slug(session["doc"]), session["doc"])
-    return "ad-hoc"
+    if session["kind"] == "unit":
+        owner = record.by_member_reference(session["session_id"])
+        if owner is None or owner.kind != "unit":
+            raise staff.StaffUnreadable(f"{session['session_id']}: no unit staff row")
+        parent = record.by_id(owner.parent) if owner.parent is not None else None
+        if parent is None or parent.kind != "showrunner" or not isinstance(parent.doc, staff.LiveDoc):
+            raise staff.StaffUnreadable(f"{owner.id}: staff parent has no live production document")
+        doc = str(parent.doc.path)
+        return production_space(production_slug(doc), doc)
+    return session["name"]
 
 
 class HerdrDestinationTaken(OSError):
@@ -1129,9 +1139,10 @@ def _herdr_launch(
     name = destination.name
     config_dir = Path(environment["CLAUDE_CONFIG_DIR"])
     _heal_folder_trust(session, Path(parts.cwd), config_dir, dry_run=dry_run)
+    record = staff.initial_snapshot()
     if dry_run:
         location = (destination.pane_id if isinstance(destination, RecordedHerdrPane)
-                    else f"a new tab in {herdr_space(session)}")
+                    else f"a new tab in {herdr_space(session, record)}")
         print(f"herdr {name}: resume {session['session_id']} in {location}")
         return HerdrLaunch(herdr.ServerAdopted(), herdr.PromptNotSubmitted("dry run"))
     try:
@@ -1165,13 +1176,12 @@ def _herdr_launch(
         _record_scheduled_restart_prompt(session["session_id"], parts.opening_prompt, dry_run=False)
         def publish_identity(transcript: herdr.SessionTranscript) -> None:
             previous = staff.StaffId(session["session_id"])
-            record = staff.initial_snapshot()
             owner = record.by_id(previous) or record.by_current_session(previous)
             if owner is not None and owner.current_session != transcript.session_id:
                 _ = staff.update_current_session(owner.current_session, staff.native_id(transcript.session_id))
 
         expected_identity = parts.conversation.session_id if isinstance(parts.conversation, ResumeConversation) else ""
-        launched = herdr.launch_prepared_agent(name, herdr_space(session), session["name"], prepared_environment,
+        launched = herdr.launch_prepared_agent(name, herdr_space(session, record), session["name"], prepared_environment,
             kind="claude", agent=session["name"], agent_arguments=list(parts.claude_arguments),
             opening=herdr.OpeningPrompt(parts.opening_prompt,
                 herdr.SessionTranscript(config_dir, expected_identity), publish_identity), timeout_ms=90_000)
@@ -2613,23 +2623,13 @@ def progress_line(action: str, name: str, detail: str = "") -> None:
 
 
 def _restore_workspace_names(records: Sequence[SessionShutdown]) -> frozenset[str]:
-    from scripts.production.showrunners import herdr_space as production_space
+    record = staff.initial_snapshot()
     names: set[str] = set()
     for saved in records:
-        owner = saved["session"]
-        if owner["kind"] == "unit":
-            host = owner["host"]
-            if host["kind"] in {"unit", "legacy tmux unit"}:
-                try:
-                    parent = staff_sources.unit_parent(host["unit"], owner["session_id"])
-                    names.add(production_space(parent.slug, parent.doc))
-                except (OSError, ValueError):
-                    pass
-        else:
-            try:
-                names.add(herdr_space(owner))
-            except ValueError:
-                pass
+        try:
+            names.add(herdr_space(saved["session"], record))
+        except (OSError, ValueError):
+            pass
     return frozenset(names)
 
 

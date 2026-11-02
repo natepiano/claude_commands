@@ -120,7 +120,7 @@ Each item is my call under the decision criteria unless it names the user. A one
 
 Phase 3q → 3r → actual unit folder renames. Use the corrected current command, one unit at a time at its phase boundary. Keep its stop, restart and finished-rerun proofs. Neither these moves nor Phase 6 waits for 4g. Phase 6 starts at once beside 3q/3r and the models work. Phase 3n still waits for 3q and models F024 (`3b67af71`). Phase 4 follows 3r, with one owner for its shared files. Then 3n + 4 + 6 → 7 → 8 → 9 → shared 10/12/13 → shared 11/14 → 15 → drain and audited 18 → 19. Phase 11 consumes 10's resume contract. Phase 14 can be drafted beside 11 and is checked against its final code.
 
-**Rename track (sdlc ruling, 2026-11-01; replaces the earlier staff order).** After Phase 3h lands on main: the live move (`migrate_staff_ids.py` backup, dry run, real run, rerun; `staff_check` twice; a real `/clear`, a Codex thread replacement and a `herdr-up` rerun) → 3a (`unit <id>`) → the readers a rename would break: 3k, 3s, then 3t/3u/3v in one gate, 3w text with each landing, and Phase 4 → the records that hold a unit name (sdlc-rename-places.md): 3x, 3y, 3z, 4a → the deletions rename needs: 4b, 4c (after the Port audit into `.unit.toml`), 4d, 4e → 4g, rename on the row for every member kind and role. The old rewriting rename is never built; 3f8339f5 stays unmerged and gives only its tab retitle, kept-pane resume and finished-journal rerun. 4f (transfer) follows 4c and is not a rename prerequisite. No rename-track phase waits for Phase 15.
+**Rename track (sdlc ruling, 2026-11-01; replaces the earlier staff order).** After Phase 3h lands on main: the live move (`migrate_staff_ids.py` backup, dry run, real run, rerun; `staff_check` twice; a real `/clear`, a Codex thread replacement and a `herdr-up` rerun) → 3a (`unit <id>`) → the readers a rename would break: 3k, 3s, then 3t/3u/3v in one gate, 3w text with each landing, and Phase 4 → the records that hold a unit name (sdlc-rename-places.md): 3x, 3y, 3z, 4a → the deletions rename needs: 4b, 4c (after the Port audit into `.unit.toml`), 4d, 4e → 4g, with 4j (no ad-hoc workspace, right after the live move), 4h (folder move, after 4j) and 4i (questions, after 3a) landing before it, rename on the row for every member kind and role. The old rewriting rename is never built; 3f8339f5 stays unmerged and gives only its tab retitle, kept-pane resume and finished-journal rerun. 4f (transfer) follows 4c and is not a rename prerequisite. No rename-track phase waits for Phase 15.
 
 **Pane track, alongside.** 3n + 4 + 6 → 7 → 8 → 9 → shared 10/12/13 → shared 11/14 → 15 → drain and audited 18 → 19. Phase 5 still waits on the models unit. A hub file shared by both tracks has one writer at a time (Delegation Context → Isolation gate).
 
@@ -128,7 +128,7 @@ Targets: the old `fast_plan.md` dates are past. Each landing sends its own time 
 
 **Three kinds of order (sdlc, 2026-10-31 15:5x EDT).** A **Depends on** line distinguishes real inputs from scheduling and file ownership.
 - *Data prerequisites:* 3n needs 3h's native-id admission, 3q's tunables and models F024. `tunables` comes from 3q, not 3n. Phase 7 needs 3n's role, backend, deadline and stop APIs, Phase 4's names and Phase 6's primitives. Phase 13 uses the existing `session_staff` join; 3s extends it and keeps `session_labels` for labels. 4a needs 3t's doc reads and 3z's remaining stores. 4d needs 4c's last `fill --dry-run` audit. 4e needs 4d's fallback removal. 4f needs 4c's table removal. No pane phase needs the full 4g rebuild.
-- *Landing and gate rules:* 3t/3u/3v share a gate; ready 10/12/13 share a gate, then 11/14 share a gate. Merge each ready group as one batch and gate that exact final batch. Keep every phase's tests, types, review lenses, live probes, interruption and finished-rerun checks. A fix changes the batch; its required checks cover the final code. Both reviewers can review ready file groups at once and verify fixes. No phase uses a pass from an earlier tip. Delete barriers: 4b-4e wait for the conversions that read or hold what they delete (3s-3z, 4, 4a), not for Phase 15, and Phase 3h's native-id and location completeness proof on a fresh snapshot: no unresolved member identity or unfilled location. 3z keys the worker ledger path by the unit's fixed id (rename moves no file); Phase 18 deletes the ledger after drain. 4d and 4e name the completeness proof because they remove the fallback and labels. Phase 18 instead waits for no mesh pins or processes, no legacy consumers, and its history proof. It does not wait for 4g or unrelated staff stores.
+- *Landing and gate rules:* 3t/3u/3v share a gate; ready 10/12/13 share a gate, then 11/14 share a gate. Merge each ready group as one batch and gate that exact final batch. Keep every phase's tests, types, review lenses, live probes, interruption and finished-rerun checks. A fix changes the batch; its required checks cover the final code. Both reviewers can review ready file groups at once and verify fixes. No phase uses a pass from an earlier tip. Delete barriers: 4b-4e wait for the conversions that read or hold what they delete (3s-3z, 4, 4a), not for Phase 15, and Phase 3h's native-id and location completeness proof on a fresh snapshot: no unresolved member identity or unfilled location. The worker ledger gets no migration; rename keeps its small file move for it until Phase 18 deletes the ledger after drain (sdlc, 2026-11-01). 4d and 4e name the completeness proof because they remove the fallback and labels. Phase 18 instead waits for no mesh pins or processes, no legacy consumers, and its history proof. It does not wait for 4g or unrelated staff stores.
 - *File ownership:* each shared file has one writer. Publish the needed API first. Shared-file work can land in one ready batch; it does not make all later work wait for a whole unrelated phase. Live folder moves and store migrations still run one at a time. Each store keeps its own commit, stopped-run recovery proof and unchanged-rerun proof.
 
 | Phases | Parallel file groups | Files with one writer |
@@ -755,7 +755,7 @@ Split from 3l on 2026-10-31; the same user ask and the same sdlc acceptance as 3
 
 **Binds later work:** A reader joins a live session by `current_session` and a stored reference by `by_member_reference`; none reads `STAFF_ID`. The live migration runs on main before the `unit <id>` lookup phase. The phase that removes one-time scripts deletes `migrate_staff_ids.py`.
 
-**Gotchas:** Tests that reach herdr or real staff state fail only under `HERDR_BIN=/nonexistent/herdr`; gate with it. A read-only lookup must not clean up records. A checkpoint that changes test assertions needs one `Assertion-Change:` line per test.
+**Gotchas:** Tests that reach herdr or real staff state fail only under `HERDR_BIN=/nonexistent/herdr`; gate with it. A read-only lookup must not clean up records. A checkpoint that changes test assertions needs one `Assertion-Change:` line per test. A code change that reads a new record shape and the live move that writes that shape land in one step: 3h's `_ensure_row` compare ran on main before the migration, and worker admissions in that gap were refused (sdlc, 2026-11-01).
 
 **Ruled out:** rekeying the row id on `/clear`; an alias table or `STAFF_ID` copy; a persisted clear handoff journal.
 
@@ -1013,7 +1013,6 @@ Split from 3l on 2026-10-31; the same user ask and the same sdlc acceptance as 3
 - `scripts/production/rename_outside.py`, `scripts/production/next_item.py`, `scripts/production/dailies_counts.py`, `scripts/production/dailies_input.py`, `scripts/production/dailies_render.py`, `config/dailies.conf`, `commands/showrunner/dailies.md`, `scripts/astra/design_roles.py`, `scripts/production/rename_state.py`, `scripts/production/tidy_wrapped.py`, `scripts/production/review_pause.py`, `scripts/hooks/showrunner_footer.py`, `scripts/bevy_upgrade/upgrade_record.py`, `scripts/bevy_upgrade/bevy_upgrade.py`, `scripts/bevy_upgrade/upgrade_schedule.py`, `scripts/production/rename.py`, `scripts/production/rename_unit.py`, `commands/showrunner/produce.md` — the stores' writers and readers; every other reader that `grep -rn '<store path>' scripts` finds joins them.
 - `scripts/production/test_{next_item,dailies_counts,dailies_input,dailies_render,rename_state,tidy_wrapped,review_pause,rename,rename_unit}.py`, `scripts/astra/test_design_roles.py`, `scripts/hooks/test_showrunner_footer.py`, `scripts/bevy_upgrade/test_upgrade_record.py` — their tests.
 - `scripts/production/dailies_input_test_support.py`, `scripts/production/rename_test_support.py`, `scripts/production/rename_unit_test_support.py` — fixtures.
-- `scripts/production/update_registration.py`, `scripts/production/test_update_registration.py` — questions as their own type (Phase 3h review).
 
 **Workers:** `1 writer + 1 tester`
 - `impl` — the non-test files; hub: `scripts/production/rename_outside.py` (four stores lose their move there).
@@ -1022,7 +1021,6 @@ Split from 3l on 2026-10-31; the same user ask and the same sdlc acceptance as 3
 **State:** each store moves to staff-id keys, once.
 
 **Constraints from prior phases:** Phase 3x migration pattern. The Astra design files are the guild unit's; agree that part first.
-- Phase 3h review (2026-11-01): a separate landing makes open questions their own type beside proposals: filing, review, queues, answers and relay (`update_registration.py:667`), question counts, deferred and review states, and the asker by fixed id. Acceptance: a transferred or renamed asker still gets the answer; ordinary reminders keep their behavior.
 - Phase 3h review (2026-11-01): dailies memory is keyed by fixed id; the showrunner's unit table holds the fixed id with the name from staff; free-text notes are left alone. Test a design whose helpers never opened.
 
 **Acceptance gate:** for each of the seven stores, its own landing and real proof (Phase 3x rule): its suite passes, its rewriter is gone, its real migration stopped after the first file finishes on rerun and a rerun of the finished one changes nothing and exits 0; a real dailies run shows the same counts as before; a real `/showrunner:produce` session finds its state, prompt and report under the staff id; the Bevy notifier job fires once under the staff id; the Codex mirrors regenerate clean; full gate green.
@@ -1055,7 +1053,7 @@ Split from 3l on 2026-10-31; the same user ask and the same sdlc acceptance as 3
 
 **Constraints from prior phases:** Phase 3n (backend-identity record; the ledger keeps history events only); Phase 3x migration pattern.
 - Phase 3h review (2026-11-01): `style_ledger.next_ticket_id(unit)` (`style_ledger.py:2728`, `<unit>-N`) becomes one global counter (`14`, not `herdr-unit-14`; user: "this is basic database design"), with a migration of ticket references; the holder is the unit's fixed id.
-- Phase 3h review (2026-11-01): the worker ledger path `~/.local/state/unit-workers/<production>/<unit>.json` is keyed by the unit's fixed id, so rename moves no file (herdr-unit recommendation, sent to sdlc 2026-11-01); Phase 18 still deletes the ledger after drain.
+- Phase 3h review (2026-11-01; sdlc ruling): the worker ledger gets no key or path migration. Rename keeps its existing small file move for the ledger until Phase 18 deletes the ledger after drain. No new code for the ledger.
 - Phase 3h review (2026-11-01): the shutdown record holds the resume id with the name from staff; resume prompt text reads the folder from staff when sent.
 - Phase 3h review (2026-11-01): workers: `impl` — the shutdown and style source; `test` — their tests.
 
@@ -1261,7 +1259,7 @@ Split from 3l on 2026-10-31; the same user ask and the same sdlc acceptance as 3
 
 **Goal:** `transfer_unit.py` changes the unit row's parent and moves the live tab; it keeps no journal and moves no state. This absorbs old Phases 3j and 3m.
 
-**Spec:** Every state the journal moved is now keyed by staff id (Phases 3x-4a), the Units-table commits are gone (Phase 4c) and the pool is gone (Phase 3p). Delete `journal`, `STEPS`, `_load`, `_migrate_journal`, `_load_fields`, `_save`, `_completed_requests`, `_resumed`, `_check_journals`, `staff_move.PinnedUnit` when unused, and their tests and doc lines (Reference → Transfer journal inventory). A transfer is `staff.move` of the row, the herdr tab move to the new showrunner's workspace, and its messages. **Transfer operation record (Phase 3h review, 2026-11-01; sent to sdlc).** One record per transfer, `~/.local/state/staff/transfers/<operation id>.json`, written through `atomic_file` before the parent changes. It holds the unit's id, the old and new parent ids (so the old sender survives the parent change) and one entry per recipient (the unit, the new showrunner, the old showrunner), written after that message is sent. Delivery is at least once: a crash between a send and its entry repeats that one message on rerun, and each message names the operation id so its reader sees the same transfer. A→B, then B→A, then A→B are three operations with three records. **Old journals drain first.** Before the journal code goes, a check lists every `transfer_unit.json` whose steps are not all done; each is finished with the old tool, and the delete waits until the list is empty. A rerun after the parent changed moves only a tab still in the old workspace, sends no message twice, prints `unchanged` when all is done, and exits 0.
+**Spec:** Every state the journal moved is now keyed by staff id (Phases 3x-4a), the Units-table commits are gone (Phase 4c) and the pool is gone (Phase 3p). Delete `journal`, `STEPS`, `_load`, `_migrate_journal`, `_load_fields`, `_save`, `_completed_requests`, `_resumed`, `_check_journals`, `staff_move.PinnedUnit` when unused, and their tests and doc lines (Reference → Transfer journal inventory). A transfer is `staff.move` of the row, the herdr tab move to the new showrunner's workspace, and its messages. **Transfer operation record (Phase 3h review, 2026-11-01; sdlc approved).** The record holds only the operation id, its steps and their delivery state, never a copy of unit facts. A rerun with the same operation id changes nothing and exits 0. One record per transfer, `~/.local/state/staff/transfers/<operation id>.json`, written through `atomic_file` before the parent changes. It holds the unit's id, the old and new parent ids (so the old sender survives the parent change) and one entry per recipient (the unit, the new showrunner, the old showrunner), written after that message is sent. Delivery is at least once: a crash between a send and its entry repeats that one message on rerun, and each message names the operation id so its reader sees the same transfer. A→B, then B→A, then A→B are three operations with three records. **Old journals drain first.** Before the journal code goes, a check lists every `transfer_unit.json` whose steps are not all done; each is finished with the old tool, and the delete waits until the list is empty. A rerun after the parent changed moves only a tab still in the old workspace, sends no message twice, prints `unchanged` when all is done, and exits 0.
 
 **Files:**
 - `scripts/production/transfer_unit.py`, `scripts/production/staff_move.py`, `docs/as-built/unit-transfer.md`, `commands/showrunner/transfer_unit.md` — the transfer and its text.
@@ -1278,6 +1276,91 @@ Split from 3l on 2026-10-31; the same user ask and the same sdlc acceptance as 3
 
 **Acceptance gate:** `grep -nE '\bSTEPS\b|transfer_unit\.json|_migrate_journal' scripts/production/transfer_unit.py scripts/production/transfer_unit_test_support.py scripts/production/test_transfer_unit.py` finds nothing (`rename_unit.py` keeps its own `STEPS` until Phase 4g); the old-journal check lists none; tests stop a transfer after each message and show that a rerun sends each remaining message once; a real transfer of a throwaway unit moves its row parent and tab, keeps the same pane and terminal, and its stall alert, change rows and dailies follow with no rewrite; a transfer stopped after the row move finishes on rerun with each party told once; a rerun after it changes nothing and exits 0; full gate green.
 
+### Phase 4h — A unit folder moves with no rename  · status: todo
+
+**Depends on:** the 3h live move (every live row proved) and 3r. Not on 3s-4f. The user asked through Morty that folder moves come sooner (sdlc, 2026-11-01). It moves one folder; it rewrites no name.
+
+#### Work Order
+
+**Goal:** one command moves a unit's worktree folder, records the new path on the row, and resumes the same Claude or Codex session in its own tab and pane. A rerun changes nothing and exits 0.
+
+**Spec:**
+1. `unit_move.py move-folder --unit <staff id> --to <path>`. It runs only at the unit's phase boundary: no open run phase, and no process inside the folder except the unit's own session.
+2. One record per move, `~/.local/state/staff/folder_moves/<staff id>.json`, written through `atomic_file` before any change. It holds the old and new paths and the done state of each step. It holds no copy of unit facts.
+3. The steps, in order: stop the session and keep its pane at the shell; `git worktree move`; `staff.set_worktree` with the new path; the herdr launch record of that pane gets the new `cwd`; the unit's run record gets the new working folder (`unit_move.move_run`); resume the same `current_session` in the same pane from the new folder. Claude resumes with `--resume <id>`, Codex with `resume <thread id>`. A stopped unit moves with no stop and no resume: the move changes its records and it stays down (sdlc, 2026-11-01).
+4. Records that still hold the old path, and this phase changes each one: the git worktree admin files (git changes them), the staff row, the herdr launch record (on 2026-11-01 `herdr-up` dropped eight stale entries that held the old `claude-build-followups-<name>` folders; the eight units were live in their new folders, so a move that leaves the old path in the record leaves a stale entry), and the unit run record. Workers take the new folder at their next dispatch; a test proves one dispatch after the move. Trust and transcripts need no step: `~/worktrees` is trusted on every account, and resume finds a transcript by session id.
+5. A rerun after any step finishes the rest and keeps the pane. A rerun after the last step prints `unchanged` and exits 0. A move with the branch name is not this phase; 4g adds it.
+
+**Files:**
+- `scripts/production/unit_move.py`, `scripts/production/staff.py`, `scripts/shutdown/pane_record.py`, `commands/showrunner/rename_unit.md` — the move and its text.
+- `scripts/production/test_unit_move.py`, `scripts/shutdown/test_pane_record.py`, `scripts/production/rename_test_support.py` — tests and fixtures.
+
+**Workers:** `1 writer + 1 tester`
+- `impl` — the non-test files; hub: `scripts/production/unit_move.py`.
+- `test` — the tests and fixtures.
+
+**State:** one folder, its row path, its launch record and its run record.
+
+**Constraints from prior phases:** the row holds the worktree (3q) and writers keep it current (3r). Lifecycle reruns keep the pane. Reuse only the kept-pane resume and finished-record rerun from 3f8339f5. Every design works for Claude and Codex in any role and account.
+
+**Acceptance gate:** a real move of a stopped throwaway unit changes its folder and records and starts nothing; tests stop the move after each step and show that a rerun finishes it in the same pane; a real move of a throwaway Claude unit and a throwaway Codex unit resumes the same session id in the same pane and terminal from the new folder; `staff.py get <new folder>` finds the row; a `herdr-up` rerun after the move restores the unit; a rerun of each finished move prints `unchanged` and exits 0; full gate green.
+
+### Phase 4i — Questions are their own type  · status: todo
+
+**Depends on:** 3a. It lands before 4g, because a rename rewrites no questions (sdlc, 2026-11-01). The user asked for this through Morty.
+
+#### Work Order
+
+**Goal:** an open question is its own record type beside proposals, in the same store, and the asker is held by fixed staff id.
+
+**Spec:**
+1. Filing, review, queues, answers and relay (`update_registration.py:667`), question counts, and the deferred and review states treat a question as its own type. The asker is its fixed staff id, never a name.
+2. `/next question` stays as it is.
+3. One table command in the form of `/showrunner:proposals` lists the open questions. Its data is in the proposals store.
+
+**Files:**
+- `scripts/production/update_registration.py`, `scripts/production/test_update_registration.py` — the question type.
+- `commands/showrunner/proposals.md`, `commands/showrunner/question.md`, `commands/showrunner/questions.md` — the table command (new) beside the proposals table; their Codex mirrors regenerate, and a reader that `grep -rn question scripts/production` finds joins them.
+
+**Workers:** `1 writer + 1 tester`
+- `impl` — the non-test files; hub: `scripts/production/update_registration.py`.
+- `test` — the tests and fixtures.
+
+**State:** open questions in the proposals store, keyed by the asker's fixed id.
+
+**Constraints from prior phases:** Phase 3h fixed ids. A reader joins a stored reference by `by_member_reference`.
+
+**Acceptance gate:** a transferred or renamed asker still gets the answer; ordinary reminders keep their behavior; the table command lists a real open question; `/next question` behaves as before; a rerun of the store change changes nothing and exits 0; full gate green.
+
+### Phase 4j — No ad-hoc workspace  · status: done
+
+**Depends on:** the 3h live move. Not on 3s-4h. The user, through natedev (sdlc C48, 2026-11-01): "there should not be an ad-hoc". It lands before 4h.
+
+#### Work Order
+
+**Goal:** no code opens or names an `ad-hoc` workspace. A unit opens in its parent showrunner's production workspace. A standalone session opens in its own workspace, labeled with its tab name.
+
+**Spec:**
+1. `scripts/herdr/herdr_sessions.py`: delete `ADHOC_SPACE`. A standalone start or resume opens its tab in a workspace whose label is the tab name. `Herdr.open_tab` creates that workspace when no workspace has that label.
+2. `scripts/shutdown/restart.py` `herdr_space`: a showrunner keeps its production workspace. A unit takes the production workspace of its parent row (`showrunners.herdr_space`, as `add_unit.py:974` does). Any other session takes a workspace labeled with its own name. The fixed parent row is the only source for a unit; a name or folder is never used to find the parent.
+3. The standalone workspace rule is the director's call (sdlc may rule otherwise): one tab for each standalone session, and no shared catch-all workspace.
+4. Live tabs do not move. On 2026-11-01 the survey found 0 tabs in `ad-hoc` and all 46 live units in their production workspace.
+5. The code and `docs/as-built/herdr-adoption.md` (lines 5, 84, 105, 203) change in the same commit.
+
+**Files:**
+- `scripts/herdr/herdr_sessions.py`, `scripts/shutdown/restart.py`, `docs/as-built/herdr-adoption.md` — the rule and its text.
+- `scripts/herdr/test_herdr_sessions.py`, `scripts/shutdown/test_restart.py`, `scripts/herdr/test_herdr.py`, `scripts/accounts/test_launch_accounts.py` — tests and fixtures that name `ad-hoc`.
+
+**Workers:** `1 writer + 1 tester`
+- `impl` — the non-test files; hub: `scripts/herdr/herdr_sessions.py`.
+- `test` — the tests and fixtures.
+
+**State:** none stored. The workspace comes from the staff row at launch.
+
+**Constraints from prior phases:** Phase 3h fixed ids; a unit's parent is its row's `parent`. Tabs show the short session name only. Every design works for Claude and Codex in any role and account. `scripts/shutdown/restart.py` is a shared shutdown file: tell the shutdown unit before the edit lands.
+
+**Acceptance gate:** `git grep -n '"ad-hoc"' -- scripts` finds nothing outside a test that proves the name is gone; a throwaway standalone session opens in a workspace with its tab name; a restart of a throwaway standalone session and a throwaway unit puts each in its rule's workspace; a rerun of each opens no second tab; full gate green.
+
 ### Phase 4g — Rename rebuilt on the row  · status: todo
 
 **Depends on:** 4b, 4c, 4d, 4e and the records stage (3x, 3y, 3z, 4a). Last step of the rename track. No pane phase waits for it. Hash 3f8339f5 stays unmerged; reuse only its tab retitle, kept-pane resume and finished-journal rerun.
@@ -1289,7 +1372,7 @@ Split from 3l on 2026-10-31; the same user ask and the same sdlc acceptance as 3
 **Spec:**
 1. **Unit rename** (`rename_unit.py`): `staff.rename` of the row, `Herdr.retitle` of the tab and pane, and the session name at the next launch (Phase 4). No store, doc, prose or Units cell is rewritten: they hold the staff id. Hub files, Gates and plan headers are deleted before this phase (4b, 4d), so nothing lists them (`EDITED_COLUMNS` :82 and `_plan_text` :497 go). Same-name rename is the repair path: it changes only the parts that differ and prints `unchanged` when all match.
 2. **Folder and branch move** (`rename_unit.py --move-worktree --to-folder <path> --to-branch <name>`): both arguments are required, since no folder or branch comes from a name, and the journal records them before any move. At the unit's phase boundary and on its showrunner's word, `git worktree move` to the new folder, `git branch -m`, `staff.set_worktree` with the new path, and a relaunch in the new folder. The relaunch and the record use the row's worktree, never a `/tmp` or computed folder (the routed "Phase 3o" fix). A rerun after any step finishes the rest, and the pane is kept through every recovery (the relaunch reuses the same tab and pane).
-3. **Showrunner rename** (`rename.py`): `staff.rename` and the workspace and tab names; timers and stores already hold the id. Moving the doc file and merge branch is the same optional further step, with `--to-doc <path>` and `--to-branch <name>` journaled first and `staff.set_doc` after the move.
+3. **Showrunner rename** (`rename.py`): `staff.rename` and the workspace and tab names; timers and stores already hold the id. A rename to the name the row already holds still repairs a live session name, tab or workspace that differs from the row (sdlc, 2026-11-01, from the user on C48: the fps row's session runs as `performance`; the user runs `rename fps fps`, not a unit). It prints `unchanged` only when the row, session name, tab and workspace all agree. The same rule holds for a unit rename. Moving the doc file and merge branch is the same optional further step, with `--to-doc <path>` and `--to-branch <name>` journaled first and `staff.set_doc` after the move.
 5. **Tunables.** `rename_unit.py`'s `LIVE_WAIT_SECONDS` (:86, with its `RENAME_UNIT_LIVE_WAIT` environment override, which goes), `RUN_STOP_WAIT_SECONDS` (:89), `POLL_SECONDS` (:90) and the 900 s subprocess timeout (:671) move to `config/production.conf`, read at use through `tunables`, each as `min(configured limit, remaining deadline)` with a changed-config test.
 4. **Delete** `unit_rename_sweep.py` and its test, the `verify` sweep of `rename_unit.py`, `rename_state.py`'s rewriters, `rename_outside.py` and every move step left in `rename.py` and `rename_unit.py`; the rename journal keeps only the steps above.
 
@@ -1312,7 +1395,7 @@ Split from 3l on 2026-10-31; the same user ask and the same sdlc acceptance as 3
 - Phase 3h review (2026-11-01): no trust or transcript move: the accounts unit trusts `~/worktrees` once on every Claude account (a prerequisite, not a rename step), and `resume_unit.py:184` and `nightly_review.py:153` find a transcript by session id, not from the folder.
 - Phase 3h review (2026-11-01): worker rename in every role: `staff.rename` (`staff.py:940`) stops refusing workers. A Claude or Codex worker under a unit or a showrunner changes its row name, tab label and saved layout (`rename_saved_tab`); its fixed id, current session and recorded role do not change. A stopped worker renames with no live tab. Tests cover both backends and both holder kinds.
 
-**Acceptance gate:** `grep -rnE 'unit_rename_sweep|rename_scratch|pin_moves|_rewrite_children' scripts` finds nothing; `/showrunner:rename_unit style style` on a real unit prints `unchanged`; a real rename of a throwaway unit changes its row, tab and pane label and keeps the same pane and terminal; a real `--move-worktree` stopped after the folder move finishes on rerun, the row's worktree is the new folder, and the unit relaunches there in the same pane; a real showrunner doc move sets the row's doc; a changed `config/production.conf` rename value takes effect with no code change; a rerun of each finished rename changes nothing and exits 0; resume, retire and transfer pass after a rename; full gate green.
+**Acceptance gate:** `grep -rnE 'unit_rename_sweep|rename_scratch|pin_moves|_rewrite_children' scripts` finds nothing; `/showrunner:rename_unit style style` on a real unit whose names agree prints `unchanged`; a same-name rename of a throwaway showrunner and a throwaway unit whose live session name and tab differ from the row sets both to the row's name, and its rerun prints `unchanged`; a real rename of a throwaway unit changes its row, tab and pane label and keeps the same pane and terminal; a real `--move-worktree` stopped after the folder move finishes on rerun, the row's worktree is the new folder, and the unit relaunches there in the same pane; a real showrunner doc move sets the row's doc; a changed `config/production.conf` rename value takes effect with no code change; a rerun of each finished rename changes nothing and exits 0; resume, retire and transfer pass after a rename; full gate green.
 
 ### Phase 5 — Rename agents.conf to models.conf and /agent to /default_models  · status: todo
 
