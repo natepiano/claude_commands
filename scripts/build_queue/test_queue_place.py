@@ -586,6 +586,21 @@ class QueuePlaceTests(unittest.TestCase):
             self.assertEqual(fixture.children, [])
             self.assertEqual(list(fixture.directory.glob("*.reservation")), [])
 
+    def test_missing_or_invalid_program_peak_error_names_the_config_file_and_key(self) -> None:
+        key = "program_first_peak_gib.cargo"
+        cases: tuple[dict[str, str], ...] = ({}, {key: "invalid"})
+        for values in cases:
+            with self.subTest(values=values), QueuePlaceFixture() as fixture:
+                write_memory_config(fixture.config, **values)
+                with mock.patch.object(gate, "check", side_effect=AssertionError("admission must not start")):
+                    with self.assertRaises(queue.QueuePlaceRefused) as refused:
+                        with queue.queue_place("cargo", fixture.root):
+                            self.fail("an invalid program peak allowed a child")
+                self.assertIn(str(fixture.config), str(refused.exception))
+                self.assertIn(key, str(refused.exception))
+                self.assertEqual(fixture.children, [])
+                self.assertEqual(list(fixture.directory.glob("*.reservation")), [])
+
     def test_fixed_cap_ignores_history_at_start_and_after_head_seconds(self) -> None:
         with QueuePlaceFixture() as fixture:
             fixture.seed([2 * GIB] * 10)
