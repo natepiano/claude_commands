@@ -26,6 +26,7 @@ from urllib.parse import unquote, urlparse
 from collections import defaultdict
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
+from enum import StrEnum
 from functools import cache
 from pathlib import Path
 from types import MappingProxyType, TracebackType
@@ -62,6 +63,34 @@ def object_list(value: object) -> list[object]:
 class Refusal:
     finding_id: str
     reason: str
+
+
+class ReservationBlocked(BulkRenameError):
+    """A transient writer conflict, retaining cargo-berth's authority and holder."""
+
+    def __init__(self, path: str, holders: tuple[berth_board.Reservation, ...]) -> None:
+        super().__init__(f"{path}: another worktree holds the file")
+        self.path: str = path
+        self.holders: tuple[berth_board.Reservation, ...] = holders
+
+
+@dataclass(frozen=True)
+class PendingFinding:
+    finding_id: str
+    path: str
+    holders: tuple[berth_board.Reservation, ...]
+
+
+class PendingReservation(TypedDict):
+    finding_id: str
+    path: str
+    holders: list[dict[str, str]]
+
+
+def freeze_pending(item: PendingFinding) -> PendingReservation:
+    return {"finding_id": item.finding_id, "path": item.path,
+            "holders": [{"worktree": str(holder.holder_worktree_root), "branch": holder.holder_branch,
+                         "reservation_id": holder.reservation_id} for holder in item.holders]}
 
 
 @dataclass(frozen=True)
@@ -1261,25 +1290,47 @@ class RunSourceIndex:
         return coverage
 
 
-def cargo_target_roots(crate: Path) -> tuple[CargoSourceTarget, ...]:
-    """Read configured targets and Cargo's conventional target locations, without building."""
-    manifest = object_fields(tomllib.loads((crate / "Cargo.toml").read_text()))
+@dataclass(frozen=True)
+class FrozenCargoTargetInventory:
+    """A manifest and source paths from the same immutable repository tree."""
+
+    manifest: str
+    paths: frozenset[Path]
+
+
+def cargo_target_roots(crate: Path, *, frozen: FrozenCargoTargetInventory | None = None
+                       ) -> tuple[CargoSourceTarget, ...]:
+    """Read Cargo targets from disk or an explicit frozen manifest/source inventory."""
+    manifest = object_fields(tomllib.loads(
+        (crate / "Cargo.toml").read_text() if frozen is None else frozen.manifest))
+    def exists(path: Path) -> bool:
+        return path.exists() if frozen is None else Path(os.path.normpath(path)) in frozen.paths
+
     package = object_fields(manifest.get("package"))
     roots: list[CargoSourceTarget] = []
     library = object_fields(manifest.get("lib", {}))
-    if "lib" in manifest or package.get("autolib", True) and (crate / "src/lib.rs").exists():
+    if "lib" in manifest or package.get("autolib", True) and exists(crate / "src/lib.rs"):
         roots.append(CargoSourceTarget("lib", str(package.get("name")), crate / str(library.get("path", "src/lib.rs"))))
     for kind, folder, auto in (("bin", "src/bin", "autobins"), ("example", "examples", "autoexamples"),
                                ("test", "tests", "autotests"), ("bench", "benches", "autobenches")):
         discovered: dict[str, Path] = {}
         directory = crate / folder
-        if directory.exists():
-            for entry in sorted(directory.iterdir()):
-                if entry.suffix == ".rs" and entry.is_file():
-                    discovered[entry.stem] = entry
-                elif entry.is_dir() and (entry / "main.rs").exists():
-                    discovered[entry.name] = entry / "main.rs"
-        if kind == "bin" and (crate / "src/main.rs").exists():
+        if frozen is None:
+            entries = tuple(directory.iterdir()) if directory.exists() else ()
+        else:
+            # Recursive Git inventories contain leaf entries, never directories.
+            # A leaf at the folder itself (including a gitlink) cannot be searched.
+            if directory in frozen.paths:
+                raise BulkRenameError(
+                    f"source coverage unavailable: Cargo {kind} target folder {directory} is not a directory")
+            entries = tuple({directory / path.relative_to(directory).parts[0]
+                             for path in frozen.paths if path.is_relative_to(directory)})
+        for entry in sorted(entries):
+            if entry.suffix == ".rs" and (entry.is_file() if frozen is None else exists(entry)):
+                discovered[entry.stem] = entry
+            elif exists(entry / "main.rs"):
+                discovered[entry.name] = entry / "main.rs"
+        if kind == "bin" and exists(crate / "src/main.rs"):
             discovered[str(package.get("name"))] = crate / "src/main.rs"
         configured = object_list(manifest.get(kind, []))
         for value in configured:
@@ -1295,7 +1346,7 @@ def cargo_target_roots(crate: Path) -> tuple[CargoSourceTarget, ...]:
         if package.get(auto, True):
             roots.extend(CargoSourceTarget(kind, name, path) for name, path in sorted(discovered.items()))
     build = package.get("build", "build.rs")
-    if isinstance(build, str) and ("build" in package or (crate / build).exists()):
+    if isinstance(build, str) and ("build" in package or exists(crate / build)):
         roots.append(CargoSourceTarget("build", "build", crate / build))
     if not roots:
         raise BulkRenameError("source coverage unavailable: no Cargo target roots")
@@ -1303,55 +1354,167 @@ def cargo_target_roots(crate: Path) -> tuple[CargoSourceTarget, ...]:
 
 
 def module_path_attributes(path: Path, parsed: BindingText) -> dict[int, str]:
-    """Associate supported literal outer paths with their out-of-line mod owners."""
-    paths: dict[int, str] = {}
-    owners = style_footprint.attribute_owners(parsed.words)
-    macros = parsed.macros
-
-    def refuse(start: int, cause: str) -> None:
-        line = parsed.source.count("\n", 0, parsed.spans[start].start) + 1
-        raise BulkRenameError(f"unsupported source loader: {cause} in {path} at line {line}")
-
-    for start, end in style_footprint.attribute_spans(parsed.words):
-        if any(begin <= start < finish for begin, finish in macros):
-            continue  # Expansion-generated modules remain the phase 102 limitation.
-        inner = parsed.words[start + 1] == "!"
-        opening = start + (2 if inner else 1)
-        attribute = parsed.words[opening + 1:end - 1]
-        words = tuple(word.removeprefix("r#") for word in attribute)
-        if words[:1] == ("cfg_attr",) and any(words[i:i + 2] == ("path", "=") for i in range(len(words) - 1)):
-            refuse(start, "conditional path attribute")
-        if words[:1] != ("path",):
-            continue
-        if inner:
-            refuse(start, "inner path attribute")
-        owner = owners.get(start, -1)
-        if owner < 0 or parsed.words[owner] != "mod" or parsed.words[owner + 2:owner + 3] != (";",):
-            refuse(start, "path attribute requires an out-of-line module")
-        if owner in paths:
-            refuse(start, "duplicate path attributes")
-        if len(attribute) != 3 or attribute[1] != "=":
-            refuse(start, "nonliteral path attribute")
-        literal = attribute[2]
-        if literal.startswith('"') and literal.endswith('"'):
-            if "\\" in literal:
-                refuse(start, "escaped path string")
-            filename = literal[1:-1]
-        elif literal.startswith('r') and '"' in literal:
-            opening_quote = literal.index('"')
-            hashes = literal[1:opening_quote]
-            if hashes.strip('#') or not literal.endswith('"' + hashes):
-                refuse(start, "nonliteral path attribute")
-            filename = literal[opening_quote + 1:len(literal) - len(hashes) - 1]
-        else:
-            refuse(start, "nonliteral path attribute")
-            raise AssertionError("refuse always raises")
-        paths[owner] = filename
+    """Read paths and retain the rename source graph's refusal of include expansion."""
+    paths = module_file_paths(path, parsed)
     for i, word in enumerate(parsed.words):
         if (word.removeprefix("r#") == "include" and parsed.words[i + 1:i + 2] == ("!",)
-                and not any(begin <= i < finish for begin, finish in macros)):
-            refuse(i, "include!")
+                and not any(begin <= i < finish for begin, finish in parsed.macros)):
+            line = parsed.source.count("\n", 0, parsed.spans[i].start) + 1
+            raise BulkRenameError(f"unsupported source loader: include! in {path} at line {line}")
     return paths
+
+
+@dataclass(frozen=True)
+class UnprovedModuleSource:
+    """One declaration whose loading route cannot be proved; siblings retain their evidence."""
+    declaration: int
+    reason: str
+
+
+@dataclass(frozen=True)
+class ModulePathEvidence:
+    paths: dict[int, str]
+    failures: tuple[UnprovedModuleSource, ...]
+
+
+class ModulePathUse(StrEnum):
+    OUT_OF_LINE = "out-of-line rename layout"
+    INCLUDING_INLINE = "source ownership including inline modules"
+
+
+def module_file_path_evidence(path: Path, parsed: BindingText,
+                              use: ModulePathUse = ModulePathUse.OUT_OF_LINE) -> ModulePathEvidence:
+    """Associate literal outer paths and per-declaration failures with module owners."""
+    paths: dict[int, str] = {}
+    failures: list[UnprovedModuleSource] = []
+    match use:
+        case ModulePathUse.OUT_OF_LINE:
+            bodies = {(";",)}
+        case ModulePathUse.INCLUDING_INLINE:
+            bodies = {(";",), ("{",)}
+    owners = style_footprint.attribute_owners(parsed.words)
+    for attribute in style_ledger.path_attribute_metas(parsed.words):
+        start = attribute.begin
+        if any(begin <= start < finish for begin, finish in parsed.macros):
+            continue  # Expansion-generated modules remain the phase 102 limitation.
+        owner = owners.get(start, -1)
+        words = parsed.words[attribute.index:attribute.end]
+        cause = ""
+        match attribute.mode:
+            case style_ledger.PathAttributeMode.CONDITIONAL:
+                cause = "conditional path attribute"
+            case style_ledger.PathAttributeMode.DIRECT:
+                if parsed.words[start + 1] == "!":
+                    cause = "inner path attribute"
+                elif (owner < 0 or parsed.words[owner] != "mod"
+                      or parsed.words[owner + 2:owner + 3] not in bodies):
+                    cause = "path attribute requires an out-of-line module"
+                elif owner in paths:
+                    cause = "duplicate path attributes"
+                elif len(words) != 3 or words[1] != "=":
+                    cause = "nonliteral path attribute"
+                else:
+                    literal = words[2]
+                    if literal.startswith('"') and literal.endswith('"'):
+                        if "\\" in literal:
+                            cause = "escaped path string"
+                        else:
+                            paths[owner] = literal[1:-1]
+                    elif literal.startswith('r') and '"' in literal:
+                        opening = literal.index('"')
+                        hashes = literal[1:opening]
+                        if hashes.strip('#') or not literal.endswith('"' + hashes):
+                            cause = "nonliteral path attribute"
+                        else:
+                            paths[owner] = literal[opening + 1:len(literal) - len(hashes) - 1]
+                    else:
+                        cause = "nonliteral path attribute"
+        if cause:
+            line = parsed.source.count("\n", 0, parsed.spans[start].start) + 1
+            failures.append(UnprovedModuleSource(owner,
+                f"unsupported source loader: {cause} in {path} at line {line}"))
+    return ModulePathEvidence(paths, tuple(failures))
+
+
+def module_file_paths(path: Path, parsed: BindingText) -> dict[int, str]:
+    evidence = module_file_path_evidence(path, parsed)
+    if evidence.failures:
+        raise BulkRenameError(evidence.failures[0].reason)
+    return evidence.paths
+
+
+@dataclass(frozen=True)
+class ExternalModuleSource:
+    """A file module and the lexical directory used to resolve its own children."""
+    path: Path
+    loading: ModuleLoadingDirectory
+    ancestry: tuple[str, ...]
+    declaration_offset: int
+
+
+@dataclass(frozen=True)
+class InlineModuleSource:
+    """An inline module body within the declaring source file."""
+    declaration_offset: int
+    begin: int
+    end: int
+
+
+def module_source_routes(candidate: Path, parsed: BindingText, loading: ModuleLoadingDirectory,
+                         explicit_paths: dict[int, str], exists: Callable[[Path], bool],
+                         failures: tuple[UnprovedModuleSource, ...] = ()
+                         ) -> tuple[ExternalModuleSource | InlineModuleSource | UnprovedModuleSource, ...]:
+    """Resolve one file's module declarations; the caller owns traversal and its source snapshot."""
+    excluded = dict((*style_footprint.attribute_spans(parsed.words), *parsed.macros))
+    routes: list[ExternalModuleSource | InlineModuleSource | UnprovedModuleSource] = list(failures)
+    unproved = {failure.declaration for failure in failures}
+
+    def modules(start: int, finish: int, directory: ModuleLoadingDirectory, route: tuple[str, ...]) -> None:
+        i = start
+        while i < finish:
+            if i in excluded:
+                i = excluded[i]
+                continue
+            if (parsed.words[i] == "mod" and i + 2 < finish
+                    and parsed.spans[i + 1].token.kind == "identifier"):
+                name = parsed.words[i + 1].removeprefix("r#")
+                body = i + 2
+                if i in unproved:
+                    i = parsed.ends.get(body, body) + 1
+                    continue
+                if parsed.words[body] == ";":
+                    child_loading: ModuleLoadingDirectory
+                    if i in explicit_paths:
+                        selected = directory.directory / explicit_paths[i]
+                        child_loading = OwnedModuleDirectory(selected.parent)
+                    else:
+                        folder = directory.children()
+                        choices = (folder / (name + ".rs"), folder / name / "mod.rs")
+                        found = [choice for choice in choices if exists(choice)]
+                        if len(found) != 1:
+                            routes.append(UnprovedModuleSource(i,
+                                f"source coverage unavailable: module {name!r} in {candidate}: "
+                                + ("missing source" if not found else "ambiguous source")))
+                            i = body + 1
+                            continue
+                        selected = found[0]
+                        child_loading = (OwnedModuleDirectory(selected.parent) if selected.name == "mod.rs"
+                                         else FlatModuleDirectory(selected.parent, name))
+                    routes.append(ExternalModuleSource(selected, child_loading, (*route, name),
+                                                       parsed.spans[i + 1].start))
+                elif parsed.words[body] == "{" and body in parsed.ends:
+                    end = parsed.ends[body]
+                    routes.append(InlineModuleSource(parsed.spans[i + 1].start,
+                                                      parsed.spans[body].end, parsed.spans[end].start))
+                    folder = (directory.directory / explicit_paths[i] if i in explicit_paths
+                              else directory.children() / name)
+                    modules(body + 1, end, OwnedModuleDirectory(folder), (*route, name))
+                    i = end + 1
+                    continue
+            i += 1
+
+    modules(0, len(parsed.words), loading, ())
+    return tuple(routes)
 
 
 def crate_source_coverage(server: RenameServer, path: Path) -> CrateSourceCoverage:
@@ -1377,46 +1540,17 @@ def crate_source_coverage(server: RenameServer, path: Path) -> CrateSourceCovera
         instance = ModuleInstance(target, ancestry, candidate, canonical)
         instances.append(instance)
         active.add(canonical)
-        excluded = dict((*style_footprint.attribute_spans(parsed.words), *parsed.macros))
-
-        def modules(start: int, finish: int, directory: ModuleLoadingDirectory, route: tuple[str, ...]) -> None:
-            i = start
-            while i < finish:
-                if i in excluded:
-                    i = excluded[i]
-                    continue
-                if (parsed.words[i] == "mod" and i + 2 < finish
-                        and parsed.spans[i + 1].token.kind == "identifier"):
-                    name = parsed.words[i + 1].removeprefix("r#")
-                    body = i + 2
-                    if parsed.words[body] == ";":
-                        child_loading: ModuleLoadingDirectory
-                        if i in explicit_paths:
-                            selected = directory.directory / explicit_paths[i]
-                            child_loading = OwnedModuleDirectory(selected.parent)
-                        else:
-                            folder = directory.children()
-                            choices = (folder / (name + ".rs"), folder / name / "mod.rs")
-                            found = [choice for choice in choices if choice.exists()]
-                            if len(found) != 1:
-                                raise BulkRenameError(f"source coverage unavailable: module {name!r} in {candidate}: "
-                                                      + ("missing source" if not found else "ambiguous source"))
-                            selected = found[0]
-                            child_loading = (OwnedModuleDirectory(selected.parent) if selected.name == "mod.rs"
-                                             else FlatModuleDirectory(selected.parent, name))
-                        child = visit(selected, child_loading, target, (*route, name))
-                        declarations.append(ModuleDeclarationSource(instance, parsed.spans[i + 1].start,
-                                                                    child.path, 0, len(child.source)))
-                    elif parsed.words[body] == "{" and body in parsed.ends:
-                        end = parsed.ends[body]
-                        declarations.append(ModuleDeclarationSource(instance, parsed.spans[i + 1].start,
-                                                                    canonical, parsed.spans[body].end, parsed.spans[end].start))
-                        modules(body + 1, end, OwnedModuleDirectory(directory.children() / name), (*route, name))
-                        i = end + 1
-                        continue
-                i += 1
-
-        modules(0, len(parsed.words), loading, ancestry)
+        for route in module_source_routes(candidate, parsed, loading, explicit_paths, Path.exists):
+            match route:
+                case UnprovedModuleSource():
+                    raise BulkRenameError(route.reason)
+                case ExternalModuleSource():
+                    child = visit(route.path, route.loading, target, (*ancestry, *route.ancestry))
+                    declarations.append(ModuleDeclarationSource(instance, route.declaration_offset,
+                                                                child.path, 0, len(child.source)))
+                case InlineModuleSource():
+                    declarations.append(ModuleDeclarationSource(instance, route.declaration_offset,
+                                                                canonical, route.begin, route.end))
         active.remove(canonical)
         return document
 
@@ -1706,6 +1840,8 @@ def rename_file(server: RenameServer, path: Path, relative: str, source: str,
             # Validate every document before changing any server document.
             replacements = [(document, apply_edits(document.source, document.edits)) for document in documents]
             reads = verify_rename_references(server, path, offset, rename, replacements)
+        except ReservationBlocked:
+            raise
         except (BulkRenameError, OSError, UnicodeError, ValueError) as error:
             refused.append(Refusal(finding.finding_id, str(error)))
             continue
@@ -2015,8 +2151,10 @@ def check_available(repo: Path, path: str) -> None:
     board = berth_board.read_board(repo)
     if isinstance(board, berth_board.BoardUnavailable):
         raise BulkRenameError(f"cannot check reservation availability: {board.reason}")
-    if any(entry.blocks(path) and entry.holder_worktree_root.resolve() != repo for entry in board.reservations()):
-        raise BulkRenameError(f"{path}: another worktree holds the file")
+    holders = tuple(entry for entry in board.reservations()
+                    if entry.blocks(path) and entry.holder_worktree_root.resolve() != repo.resolve())
+    if holders:
+        raise ReservationBlocked(path, holders)
 
 
 def run_batch(repo: Path, ticket_id: str) -> Path:

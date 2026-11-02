@@ -17,6 +17,8 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.astra import astra_review  # noqa: E402
 from scripts.astra import astra_work, design_roles  # noqa: E402
+from scripts.astra.design_role_test_support import write_mesh_server_record  # noqa: E402
+from scripts.lib.signal_test_support import install_signal_pid_guard  # noqa: E402
 
 SCRIPT = Path(__file__).with_name("astra_review.py")
 # The stand-in for accounts.py: answers `role workers`, and for `exec` records its call and writes
@@ -57,6 +59,10 @@ class Call(TypedDict):
     argv: list[str]
     stdin: str
     cwd: str
+
+
+def setUpModule() -> None:
+    install_signal_pid_guard()
 
 
 class AstraReviewTests(unittest.TestCase):
@@ -105,7 +111,7 @@ class AstraReviewTests(unittest.TestCase):
         mesh.mkdir(parents=True)
         _ = (mesh / "mesh_roster.json").write_text(json.dumps({"demo-proposal-astra-reviewer": {
             "thread_id": "held-thread", "status": status, "held_design_id": design_id, "held_role": "reviewer"}}))
-        _ = (mesh / "mesh_server.json").write_text(json.dumps({"codex_home": str(self.root / "codex-home")}))
+        write_mesh_server_record(mesh, self.root / "codex-home")
         return design
 
     def test_document_with_a_held_reviewer_resumes_that_thread_and_saves_each_reply(self) -> None:

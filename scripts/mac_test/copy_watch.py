@@ -35,6 +35,7 @@ from typing import Literal, TypedDict, cast
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lint"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_hold"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+import process_group
 import override_guard
 import mac_test
 import offload
@@ -496,7 +497,7 @@ class Watch:
             stopped = Path(f"{self.request.info}.stopped")
             stopped.touch()
             try:
-                os.killpg(self.step.info.pgid, signal.SIGTERM)
+                process_group.send_process_group(self.step.info.pgid, signal.SIGTERM)
             except OSError:
                 stopped.unlink(missing_ok=True)
             else:

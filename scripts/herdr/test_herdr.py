@@ -12,6 +12,7 @@ import os
 import signal
 import subprocess
 import shutil
+import math
 import sys
 import tempfile
 import time
@@ -21,9 +22,6 @@ from types import SimpleNamespace
 from typing import BinaryIO, cast, final, override
 from unittest.mock import Mock, call, patch
 
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
-
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -31,7 +29,9 @@ import herdr
 import fake_herdr
 import trust_survey
 from fake_herdr import CommandResponse
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff
+from scripts.message.sessions_test_support import copy_session_modules
 from scripts.production.staff_test_support import isolated_staff_file, unit_membership
 
 GIT_BINARY = shutil.which("git") or "git"
@@ -1383,8 +1383,7 @@ class HerdrTests(unittest.TestCase):
         _ = shutil.copy2(Path(herdr.__file__).with_name("place.py"), isolated / "place.py")
         _ = shutil.copy2(Path(herdr.__file__).with_name("pane_launch.py"), isolated / "pane_launch.py")
         message = isolated.parent / "message"
-        message.mkdir()
-        _ = shutil.copy2(Path(herdr.__file__).resolve().parents[1] / "message/sessions.py", message / "sessions.py")
+        copy_session_modules(message)
         library = isolated.parent / "lib"
         library.mkdir()
         _ = shutil.copy2(Path(herdr.__file__).resolve().parents[1] / "lib/nix_env.py", library / "nix_env.py")
@@ -3284,6 +3283,21 @@ class HerdrTests(unittest.TestCase):
         with self.assertRaises(herdr.AgentBlocked):
             _ = self.herdr.wait_until("pane-1", "done", 20)
 
+    def test_pane_reads_share_the_absolute_deadline_and_keep_the_default_timeout(self) -> None:
+        reply = subprocess.CompletedProcess(["fixture"], 0, '{"result":{"agents":[]}}', "")
+        with (patch.object(time, "monotonic", return_value=100.0),
+              patch.object(herdr, "run_program", return_value=reply) as program):
+            for deadline, expected in ((100.25, 0.25), (99.0, 0.0), (200.0, 10.0)):
+                with self.subTest(deadline=deadline):
+                    _ = self.herdr.read("pane-1", 40, joined=True, ansi=False, deadline=deadline)
+                    self.assertEqual(cast(float, program.call_args.kwargs["timeout"]), expected)
+                    self.assertEqual(self.herdr.agents(deadline=deadline), [])
+                    self.assertEqual(cast(float, program.call_args.kwargs["timeout"]), expected)
+            _ = self.herdr.read("pane-1", 40, joined=False, ansi=False)
+            self.assertEqual(cast(float, program.call_args.kwargs["timeout"]), 10.0)
+            self.assertEqual(self.herdr.agents(), [])
+            self.assertEqual(cast(float, program.call_args.kwargs["timeout"]), 10.0)
+
     def test_read_sources_formats_keys_and_close(self) -> None:
         _ = self.herdr.read("pane-1", 40, joined=False, ansi=False)
         _ = self.herdr.read("pane-1", 80, joined=True, ansi=True)
@@ -3938,6 +3952,10 @@ class LayoutHerdr(herdr.Herdr):
         self.tabs: list[dict[str, str]] = []
         self.count: int = 0
 
+    def require_time(self, deadline: float) -> None:
+        if time.monotonic() >= deadline:
+            raise herdr.HerdrFailure("fixture command deadline exhausted")
+
     def new_id(self, kind: str) -> str:
         self.count += 1
         return f"{kind}{self.count}"
@@ -3951,7 +3969,8 @@ class LayoutHerdr(herdr.Herdr):
         return [(label, [tab["label"] for tab in self.tabs if tab["workspace_id"] == ident]) for ident, label in self.spaces]
 
     @override
-    def result(self, *arguments: str) -> dict[str, object]:
+    def result(self, *arguments: str, deadline: float = math.inf) -> dict[str, object]:
+        self.require_time(deadline)
         words = list(arguments)
         match words[:2]:
             case ["workspace", "list"]:
@@ -3982,7 +4001,8 @@ class LayoutHerdr(herdr.Herdr):
         return herdr.PaneAtShell()
 
     @override
-    def run(self, *arguments: str) -> str:
+    def run(self, *arguments: str, deadline: float = math.inf) -> str:
+        self.require_time(deadline)
         words = list(arguments)
         match words[:2]:
             case ["tab", "rename"]:
@@ -4003,21 +4023,23 @@ class TitledLayoutHerdr(LayoutHerdr):
     """Record tab and pane renames through the real layout code."""
 
     @override
-    def result(self, *arguments: str) -> dict[str, object]:
+    def result(self, *arguments: str, deadline: float = math.inf) -> dict[str, object]:
+        self.require_time(deadline)
         if arguments[:2] == ("agent", "list"):
             return {"agents": []}
         if arguments[:2] == ("pane", "list"):
             return {"panes": [{"pane_id": tab["pane_id"], "tab_id": tab["tab_id"],
                                "workspace_id": tab["workspace_id"],
                                "label": tab.get("pane_label", tab["label"])} for tab in self.tabs]}
-        return super().result(*arguments)
+        return super().result(*arguments, deadline=deadline)
 
     @override
-    def run(self, *arguments: str) -> str:
+    def run(self, *arguments: str, deadline: float = math.inf) -> str:
+        self.require_time(deadline)
         if arguments[:2] == ("pane", "rename"):
             next(tab for tab in self.tabs if tab["pane_id"] == arguments[2])["pane_label"] = arguments[3]
             return "{}"
-        return super().run(*arguments)
+        return super().run(*arguments, deadline=deadline)
 
 
 @final
@@ -4052,6 +4074,20 @@ class SavedLayoutTests(unittest.TestCase):
             for title in titles:
                 _ = client.open_tab(space, title, "/repo", {})
         return client
+
+    def test_retained_removed_units_and_wrapped_parents_do_not_classify_tabs_as_current_staff(self) -> None:
+        retired = unit_membership("current", "retired-unit")
+        old_child = unit_membership("wrapped", "child-unit")
+        _ = staff.set_worktree(retired.id, staff.RemovedWorktree("natedev", self.root / "retired"))
+        assert old_child.parent is not None
+        _ = staff.set_doc(old_child.parent, staff.WrappedDoc("natedev", self.root / "archive.md"))
+        processes = [herdr.HerdrProcess(1, herdr.HerdrPlace("fixture", "w1:p1"),
+                                       {"STAFF_ID": retired.id}, "claude", "/missing")]
+        classifier = herdr.UnitTabClassifier("fixture", processes, staff.snapshot())
+        self.assertIsInstance(classifier.classify("current", "retired", ["w1:p1"]), herdr.OtherTab)
+        self.assertIsInstance(classifier.classify("wrapped", "child", []), herdr.OtherTab)
+        self.assertFalse(classifier.has_unit_title("retired"))
+        self.assertFalse(classifier.has_unit_title("child"))
 
     def test_session_names_restore_saved_tab_order_and_resolve_each_pane(self) -> None:
         old = TitledLayoutHerdr()

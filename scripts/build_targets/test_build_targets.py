@@ -31,6 +31,10 @@ else:
     import record
     import store
 from test_targets import END, NOW, SHIPPED_CONFIG, SINCE, IsolatedTargetTest
+if TYPE_CHECKING:
+    from ..lib import test_hang_guard
+else:
+    from scripts.lib import test_hang_guard
 
 REAL_SUBPROCESS_RUN = subprocess.run
 REAL_SUBPROCESS_POPEN = subprocess.Popen
@@ -55,7 +59,7 @@ class FolderInvocationTests(unittest.TestCase):
             [sys.executable, "-m", "unittest",
              "test_build_targets.WaitLocalTests.test_hold_and_release_write_temp_log_without_writing_real_log"],
             cwd=Path(__file__).resolve().parent,
-            capture_output=True, text=True, check=False, timeout=30,
+            capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
@@ -651,7 +655,7 @@ class WaitLocalTests(IsolatedBuildTargetTest):
                     self.assertIsNone(process.poll())
                 _ = build_hold.release_cycle(self.holders, "hana")
                 for process in processes:
-                    output, errors = process.communicate(timeout=10)
+                    output, errors = process.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
                     self.assertEqual(process.returncode, 0, output + errors)
                 cycle = build_hold.read_cycle()
                 assert cycle is not None
@@ -660,7 +664,7 @@ class WaitLocalTests(IsolatedBuildTargetTest):
                 for process in processes:
                     if process.poll() is None:
                         process.terminate()
-                    _ = process.communicate(timeout=10)
+                    _ = process.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
 
 
     def test_unheld_call_skips_owner_and_admission_lookup(self) -> None:

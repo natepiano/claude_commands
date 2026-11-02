@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import fcntl
-import json
 import os
 import signal
 import subprocess
@@ -15,10 +13,12 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
+from scripts.lib import process_group
+from scripts.maintenance.schedule import ScheduleBusy, locked_history, schedule_directory
 from scripts.maintenance.settings import Part, Schedule, settings
 
 
@@ -52,7 +52,7 @@ def run_part(part: Part, cadence: Schedule, deadline: float) -> PartResult:
                 output, _ = child.communicate(timeout=remaining)
             except subprocess.TimeoutExpired:
                 try:
-                    os.killpg(child.pid, signal.SIGKILL)
+                    process_group.send_process_group(child.pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
                 output, _ = child.communicate()
@@ -65,35 +65,17 @@ def run_part(part: Part, cadence: Schedule, deadline: float) -> PartResult:
 
 def run_job() -> list[PartResult]:
     config = settings()
-    directory = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state"))) / "agent-notes/job"
-    directory.mkdir(parents=True, exist_ok=True)
-    with (directory / "lock").open("a") as lock:
-        try:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
+    with locked_history(schedule_directory("job")) as history:
+        if isinstance(history, ScheduleBusy):
             return [PartResult(part, Outcome.NOT_DUE, 0, 0, "another pass is running") for part in Part]
-        path = directory / "completed.json"
-        try:
-            saved = cast(object, json.loads(path.read_text(encoding="utf-8")))
-        except FileNotFoundError:
-            saved = {}
-        if not isinstance(saved, dict):
-            raise ValueError(f"{path}: expected completion times")
-        finished: dict[str, float] = {}
-        for name, value in cast(dict[str, object], saved).items():
-            if isinstance(value, (int, float)) and not isinstance(value, bool):
-                finished[name] = float(value)
         deadline = time.monotonic() + config.job.timeout_seconds
-        due = {part for part in Part if time.time() - finished.get(part.value, float('-inf')) >= config.parts[part].interval_seconds}
+        due = {part for part in Part if history.is_due(part.value, config.parts[part].interval_seconds, time.time())}
         results: dict[Part, PartResult] = {}
 
         def record(result: PartResult) -> None:
             results[result.part] = result
             if result.outcome in (Outcome.SUCCESS, Outcome.SKIPPED):
-                finished[result.part.value] = time.time()
-                temporary = path.with_suffix(".tmp")
-                _ = temporary.write_text(json.dumps(finished) + "\n", encoding="utf-8")
-                os.replace(temporary, path)
+                history.record(result.part.value, time.time())
 
         # Quota and the pacer read completed notes; the vault follows all writers.
         with ThreadPoolExecutor(max_workers=len(Part)) as pool:

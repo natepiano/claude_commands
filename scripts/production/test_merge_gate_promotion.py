@@ -15,7 +15,8 @@ from typing import final
 from contextlib import redirect_stdout
 from unittest import mock
 from scripts.production import merge_gate
-from scripts.production.merge_gate_test_support import MergeGateFixture, TEST_HANG_GUARD_SECS, wait_for_file
+from scripts.production.merge_gate_test_support import MergeGateFixture, wait_for_file
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 @final

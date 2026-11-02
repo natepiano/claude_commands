@@ -22,6 +22,7 @@ import signal
 import shlex
 import shutil
 import subprocess
+import math
 import sys
 import time
 import tomllib
@@ -869,7 +870,10 @@ def unmarked_environment() -> dict[str, str]:
     return child_environment({key: value for key, value in os.environ.items() if key not in MEMBER_MARKS})
 
 
-def run_program(argv: list[str], timeout: float = 10.0, *,
+PROGRAM_TIMEOUT_SECONDS = 10.0
+
+
+def run_program(argv: list[str], timeout: float = PROGRAM_TIMEOUT_SECONDS, *,
                 environment: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
     try:
         return subprocess.run(argv, capture_output=True, text=True, check=False, timeout=timeout,
@@ -1065,10 +1069,11 @@ class Herdr:
         """The outside-pane targeting form verified with herdr 0.9.0."""
         return [self.binary, "--session", self.session, *arguments]
 
-    def run(self, *arguments: str) -> str:
+    def run(self, *arguments: str, deadline: float = math.inf) -> str:
+        """Run within the caller's monotonic deadline, retaining the usual 10 s cap."""
         context = f"herdr {' '.join(arguments[:2])}"
         try:
-            result = run_program(self.argv(*arguments))
+            result = run_program(self.argv(*arguments), timeout=min(PROGRAM_TIMEOUT_SECONDS, max(0.0, deadline - time.monotonic())))
         except subprocess.TimeoutExpired as error:
             raise HerdrFailure(f"{context}: no answer after {error.timeout:g} s") from error
         require_success(result, context)
@@ -1078,8 +1083,9 @@ class Herdr:
         """Run an argv command in an existing pane; herdr types its text into the shell."""
         _ = self.run("pane", "run", pane, shlex.join(command))
 
-    def result(self, *arguments: str) -> dict[str, object]:
-        reply = decode_object(self.run(*arguments), "herdr response")
+    def result(self, *arguments: str, deadline: float = math.inf) -> dict[str, object]:
+        output = self.run(*arguments) if deadline == math.inf else self.run(*arguments, deadline=deadline)
+        reply = decode_object(output, "herdr response")
         return json_object(reply.get("result"), "herdr result")
 
     def panes(self) -> list[PaneIdentity]:
@@ -1844,12 +1850,12 @@ class Herdr:
             raise AgentBlocked("agent blocked at a trust, permission or question prompt", "agent_blocked")
         return ObservedAgentState(status)
 
-    def read(self, pane: str, lines: int, *, joined: bool, ansi: bool) -> str:
+    def read(self, pane: str, lines: int, *, joined: bool, ansi: bool, deadline: float = math.inf) -> str:
         arguments = ["pane", "read", pane, "--source", "recent-unwrapped" if joined else "recent",
                      "--lines", str(lines)]
         if ansi:
             arguments.extend(["--format", "ansi"])
-        return self.run(*arguments)
+        return self.run(*arguments, deadline=deadline)
 
     def send_keys(self, pane: str, *keys: str) -> None:
         _ = self.run("pane", "send-keys", pane, *keys)
@@ -1862,8 +1868,8 @@ class Herdr:
             if error.code != "pane_not_found":
                 raise
 
-    def agents(self) -> list[AgentOccupant]:
-        result = self.result("agent", "list")
+    def agents(self, *, deadline: float = math.inf) -> list[AgentOccupant]:
+        result = self.result("agent", "list", deadline=deadline)
         agents: list[AgentOccupant] = []
         for item in json_items(result.get("agents"), "herdr agent list"):
             agent = json_object(item, "herdr agent")
@@ -2446,6 +2452,13 @@ def _process_environment(process: Path) -> dict[str, str]:
     return dict(entry.split("=", 1) for entry in process.joinpath("environ").read_bytes().decode(errors="replace").split("\0") if "=" in entry)
 
 
+def process_environment(pid: int) -> dict[str, str]:
+    """Read a process even outside herdr; a failed observation remains an error."""
+    if _platform() == "darwin":
+        return darwin_process_environment(pid)
+    return _process_environment(_proc_root() / str(pid))
+
+
 def _process_arguments(process: Path) -> list[str]:
     return [value for value in process.joinpath("cmdline").read_bytes().decode(errors="replace").split("\0") if value]
 
@@ -2467,6 +2480,11 @@ def _is_agent_process(arguments: list[str], kind: str) -> bool:
 def is_claude_process(arguments: list[str]) -> bool:
     """The argv is a Claude Code process, native or through node."""
     return _is_agent_process(arguments, "claude")
+
+
+def is_codex_process(arguments: list[str]) -> bool:
+    """The argv is a Codex process, native or through node."""
+    return _is_agent_process(arguments, "codex")
 
 
 def _startup_processes(shell: PaneShell, kind: str, tracked: set[AgentProcessIdentity]) -> AgentProcessPresent | PaneAtShell | PaneRunning | PaneProcessesUnreadable:
@@ -3196,8 +3214,10 @@ class UnitTabClassifier:
     by_workspace: dict[str, dict[str, UnitTab]]
 
     def __init__(self, session: str, processes: Sequence[HerdrProcess], record: staff.StaffSnapshot) -> None:
-        parents = {row.id: row for row in record.find(kind="showrunner")}
-        units: dict[str, UnitTab] = {row.id: UnitTab(row, parents[row.parent]) for row in record.find(kind="unit")
+        from scripts.production import staff
+
+        parents = {row.id: row for row in staff.active(record, "showrunner")}
+        units: dict[str, UnitTab] = {row.id: UnitTab(row, parents[row.parent]) for row in staff.active(record, "unit")
                                      if row.parent is not None and row.parent in parents}
         self.by_pane = {process.place.pane: units[ident] for process in processes
                         if process.place.session == session and (ident := process.marks.get("STAFF_ID")) in units}

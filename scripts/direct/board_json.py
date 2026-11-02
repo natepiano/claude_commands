@@ -393,9 +393,9 @@ def resolve(production: str, session: str = "") -> BoardSubtree | NoBoardSubtree
     except staff.StaffUnreadable as error:
         print(f"board_json: {error}", file=sys.stderr)
         return NoBoardSubtree()
-    if root is None:
+    if root is None or root not in staff.active(record, "showrunner"):
         return NoBoardSubtree()
-    by_slug = {runner["slug"]: runner for runner in showrunners.registered_showrunners()}
+    by_slug = {runner["slug"]: runner for runner in showrunners.require_complete(showrunners.registered_showrunners())}
     slugs = {row.id: slug for slug, row in members.items()}
     boards: list[showrunners.Showrunner] = []
     level = [root]
@@ -404,7 +404,7 @@ def resolve(production: str, session: str = "") -> BoardSubtree | NoBoardSubtree
             slug = slugs.get(row.id, "")
             if slug in by_slug:
                 boards.append(by_slug[slug])
-        level = sorted((child for row in level for child in record.find(kind="showrunner", parent=row.id)),
+        level = sorted((child for row in level for child in staff.active(record, "showrunner") if child.parent == row.id),
                        key=lambda row: slugs.get(row.id, row.name))
     return BoardSubtree(record, tuple(boards))
 
@@ -453,7 +453,7 @@ def main(arguments: list[str]) -> int:
             files.append(str(path))
     watch_sources = {showrunners.NOTIFIER_STATE_DIR, showrunners.SHOWRUNNER_STATE_DIR}
     watch_sources.update(showrunners.SHOWRUNNER_STATE_DIR / runner["slug"]
-                         for runner in showrunners.registered_showrunners())
+                         for runner in showrunners.require_complete(showrunners.registered_showrunners()))
     watch = existing_sources(watch_sources)
     print(json.dumps({"files": files, "watch": watch}))
     return 0

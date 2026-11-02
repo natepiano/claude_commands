@@ -1,5 +1,7 @@
 # Two accounts: showrunners on one Claude account, unit directors on another
 
+Current maintenance: snapshot-removal replaces the historical snapshot-timer wiring below with `agent-notes` (`scripts/maintenance/agent_notes_job.py`, runtime schedules and limits in `config/agent_notes.toml`). `herdr-upkeep` owns layout saves and detection-rule refreshes, using `config/herdr_upkeep.toml`. The desktop note and shutdown recovery snapshots are deleted. Historical phase notes below describe the earlier implementation.
+
 > Scheduler update (2026-10-31): the agent-notes job in
 > `scripts/maintenance/agent_notes_job.py` now owns notes, quota alerts, the
 > pacer, refusal moves, crash recovery, phase-note pruning, the hierarchy note
@@ -3030,3 +3032,33 @@ User 2026-10-31 07:5x EDT: claude3 showed a red dot on the Mac board while signe
 Showrunner defect 2026-10-31 09:3x EDT, reported by hana: the validation line opened with memory-wait lines and hid a killed nextest; no log was kept.
 
 **As-built:** `ci_start` writes validation's stdout and stderr, in order, to `<state dir>/ci_validation.log`, replaced at each start and kept after the copy is removed. A failure reads `validation: failed — step <label> failed; log <path>` from the last `!!! VALIDATION FAILED at step: <label> !!!` line (`validate_ci.sh` `run_step`), or `exit <code>, no step named; log <path>`. The scan uses `errors="replace"`, so bytes that are not UTF-8 never hide the step. An `OSError` stays a `PointFailure("validation", …)`. `merge_checkpoint.push_validate` keeps `failure_detail`. Review: two lenses found F001 (strict UTF-8 scan); one fix round; closure approved.
+
+### Phase 101j — The account board lists only true problems, each with its full step  · status: done · b034f13e
+
+User 2026-11-01 07:4x EST: "please look at the problems coming from the script feeding the accounts board and correct them". Seen on the Mac board (stored-mode `accounts.py status`).
+
+**As-built:** a stored-mode read with a cached role map lists no role-map problem; with no cache it refuses as before. A usage reading not from today shows its date (`10-29 01:14`). The retry promise is gone: the line says `last read attempted at <time>` or `no usage read has been attempted`, because the notes timer can reuse a failed report for ten minutes. `MAC_HOME_LOGIN_STEP` gives the whole Mac step: `accounts.py exec claude2`, `/login`, `/exit`, then `accounts.py cutover-home claude2`, never `/logout`. When `~/.codex` and the numbered home hold the same login, one line reads `~/.codex still holds codex2's login; stop what uses ~/.codex (such as the ChatGPT app), then run accounts.py cutover-home codex2`; when the numbered home holds another login, one label-only line gives its repair instead of a cutover that would refuse. The login command is one shared `env CODEX_HOME=<quoted home> codex login`, which the `codex` alias cannot redirect, also used by `setup codexN`. No problem line prints a login; a test fails if one holds a fixture login. Review: two lenses found F001 (cutover step for a home holding another login) and F002 (false retry promise); two fix rounds; closure approved.
+
+### Phase 101k — The Mac reads account usage at an interval set in config, now one minute  · status: done · d7b8562d
+
+User 2026-11-01 09:2x EST, through the Mac session: "make that interval configurable - and to make the refresh interval 1 minute instead of 2 minutes". Director call: the key is for the Mac read only; natedev's usage read stays in `[parts.notes]` (120 s), because that pass also routes quota and moves sessions.
+
+**As-built:** `mac_usage.interval_seconds = 60` in `config/agent_notes.toml`, read at use; a bad or huge value refuses with the file and key. `agent_notes.py usage-only --poll-seconds 30` reads an account when its own last granted claim is at least interval minus half a poll (45 s) old, so start jitter never skips a poll and one slow account never delays another; a held claim leaves that account's time unchanged. The shared claim guard and the 600 s rate-limit backoff stay; natedev's 90 s guard is unchanged. Due checks share `scripts/maintenance/schedule.py` with `agent_notes_job.py`. Tests script two accounts with 0 s, 15 s and changing credential latency and assert per-account gaps of 45–90 s. The Mac job change (30 s launchd poll, `--poll-seconds 30`) is on /etc/nixos branch `accounts-mac-usage-interval` (afb41714), pushed by the showrunner; it takes effect after a Mac `rebuild`. Three repair rounds; the third used an Astra design.
+
+### Phase 101l — A legacy-login line and the brp registration each stay fixed  · status: done · 2967ed8b
+
+Found 2026-11-01: a leftover `oauthAccount` with no credential that `cutover-home` could not clear, and the nixos login job `claude-brp-mcp` re-adding brp at user scope at each login.
+
+**As-built:** `cutover-home` removes leftover account data (dated private backup, atomic write) when no credential file or keychain entry exists, also after a complete journal; an already-clean home exits 0 with one line and no write. `accounts.py exec claudeN` refuses a wrong sign-in with the label only and prints `env -u CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR=<home> claude`, then `/login`; `docs/accounts.md` matches. The brp job and its setup check share one script that removes user-scope brp and registers brp at local scope in `~/rust/{hana,nateroids,bevy_brp}` for `~/.claude` and each numbered home, writing only on a difference: /etc/nixos branch `accounts-brp-local-scope` (881cc227), pushed by the showrunner. Also: `mac_usage.interval_seconds` went back to 120, because at 60 the provider answered 429 across the four Claude accounts in turn while Codex read fine. One repair round (credential-file check on macOS; clean-home rerun).
+
+### Phase 101m — The accounts board shows how many sessions use each role  · status: done · ab8092aa
+
+User 2026-11-01: add a role count to the accounts board and order the columns account, left, role, count, resets, credits, enabled, in use, read; two roles show two counts in role order. The handler unit was told.
+
+**As-built:** `accounts.py` stored-status JSON carries `role_counts` per account: live members per role from the local session registry, launch history and the shared staff classifier, with no ssh or usage read. `mods/unit-board/hooks/accounts.tsx` shows the requested order; the count cell joins counts with `, ` in role order, blank for spare. `scripts/herdr/pane_launch.py` validates each history entry and skips only a damaged one. An unchanged board tick refreshes counts; a failed refresh keeps its retry. `in use` stays: it marks paid-credit use. Also fixed two tests the 101l gate turned red. Three repair rounds; style review PASS.
+
+### Phase 101n — Every Claude account trusts ~/worktrees  · status: done · fe60721b
+
+User 2026-11-01 (via the natedev showrunner and sdlc): trust `~/worktrees` once, so a new folder under it starts with no trust prompt. Claude Code carries trust from a parent folder to every folder below it, also after a move (herdr-unit test).
+
+**As-built:** `config/accounts.toml` `[trust] folders` lists `~/worktrees`. `accounts.py trust` sets `hasTrustDialogAccepted` for each folder in every Claude account file on the machine, touches no other key and prints one line per account; a rerun changes nothing. It follows Claude Code 2.1.296's `.claude.json.lock` protocol (waits for a held lock, 10 s stale rule; both timings in `[claude_config_lock]`, checked with the folders before any lock or write, fix c73d7e90), prepares and fsyncs outside the lock, and under the lock only compares bytes and mode and replaces (hold well under Claude's 1.5 s boot retry). A new account's seed carries the folders through the same helper. `scripts/lib/atomic_file.py` keeps late mode selection for its other callers. Residual, stated in `docs/accounts.md`: a Claude save that skips its own lock can lose any writer's change; rerun `trust`. Three repair rounds; style review PASS. Live apply and proof follow the user's confirmation.

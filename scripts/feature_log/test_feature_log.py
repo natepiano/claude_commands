@@ -17,15 +17,16 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from typing import Callable, Literal, NamedTuple, NotRequired, Protocol, TypedDict, cast, final, override
+from typing import TYPE_CHECKING, Callable, Literal, NamedTuple, NotRequired, Protocol, TypedDict, cast, final, override
 from unittest.mock import patch
 
 import feature_log
 from feature_log import locked, state_dir, vault_dir
+if TYPE_CHECKING:
+    from ..lib import test_hang_guard
+else:
+    from scripts.lib import test_hang_guard
 
-
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
 
 TODAY = "2026-10-10"
 EVENT_TIME = "2026-10-10T12:34:56-07:00"
@@ -3216,10 +3217,10 @@ class FeatureLogTests(unittest.TestCase):
                 stderr=subprocess.PIPE,
                 text=True, pass_fds=(attempted_write,),
             )
-            self.addCleanup(process.communicate, timeout=TEST_HANG_GUARD_SECS)
+            self.addCleanup(process.communicate, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
             self.addCleanup(process.kill)
             try:
-                ready, _, _ = select.select([attempted_read], [], [], TEST_HANG_GUARD_SECS)
+                ready, _, _ = select.select([attempted_read], [], [], test_hang_guard.TEST_HANG_GUARD_SECS)
                 self.assertEqual(ready, [attempted_read], "digest never attempted its held cursor lock")
                 self.assertEqual(os.read(attempted_read, 1), b"B")
                 self.assertIsNone(process.poll())
@@ -3227,10 +3228,10 @@ class FeatureLogTests(unittest.TestCase):
                 fcntl.flock(held_lock.fileno(), fcntl.LOCK_UN)
 
         try:
-            stdout, stderr = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+            stdout, stderr = process.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
         except subprocess.TimeoutExpired:
             process.kill()
-            _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+            _ = process.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
             raise
         self.assertEqual(process.returncode, 0, stderr)
         self.assertIn("+ locked digest result", stdout)

@@ -21,14 +21,52 @@ from typing import TypedDict, cast, override
 from unittest import mock
 import rules
 import style_ledger
-from approved_renames import AppliedCheck
+from approved_renames import AppliedCheck, TYPE_NAMED_PARAMETER_RULE
 import style_plan
 import style_rules
 import declarations
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
+MACHINE_RENAME_BEFORE = ("struct ImplItem;\nenum SurfaceReferenceMatch { Found }\nfn impl_item_surface_reference(\n"
+                         "    item: &ImplItem,\n) -> bool { inspect(item) }\n")
+MACHINE_RENAME_AFTER = ("struct ImplItem;\nenum SurfaceReferenceMatch { Found }\n"
+                        "fn impl_item_surface_reference(\n    item: &ImplItem,\n"
+                        ") -> SurfaceReferenceMatch { inspect(item) }\n")
+
+
+def machine_rename_fixture(ledger: style_ledger.Ledger, definition: rules.Rule, repo: Path,
+                           proposal: Path, current: str = MACHINE_RENAME_AFTER,
+                           rule_text: str = TYPE_NAMED_PARAMETER_RULE
+                           ) -> tuple[style_ledger.HeldFinding, str]:
+    """The real return-type/owner-change shape, using normal judgment and filing records."""
+    def git(*arguments: str) -> str:
+        return subprocess.run(["git", "-C", str(repo), *arguments], capture_output=True,
+                              text=True, check=True).stdout.strip()
+    _ = definition.path.write_text(rule_text)
+    definition = next(rule for rule in rules.load_rules(repo) if rule.rule_id == definition.rule_id)
+    path = repo / "src/lib.rs"
+    _ = path.write_text(MACHINE_RENAME_BEFORE)
+    _ = git("add", ".")
+    _ = git("commit", "-qm", "old judged parameter")
+    base = git("rev-parse", "HEAD")
+    ledger.set_tip(base)
+    ledger.ticket_add("machine-read-1", "machine-read", "read", "names", ".", ["src/lib.rs"], [definition.rule_id])
+    ledger.ticket_assign("machine-read-1", "main")
+    _ = ledger.ticket_base("machine-read-1")
+    finding = ledger.hold(definition.rule_id, "src/lib.rs", 4, MACHINE_RENAME_BEFORE.splitlines()[3],
+                          "rename", "item", "impl_item", definition.blob, "machine-read-1")
+    ledger.record(definition.rule_id, "src/lib.rs", base, definition.blob, "held", ticket="machine-read-1",
+                  input_scope=style_ledger.DeclaredInputScope.RULE)
+    _ = proposal.write_text("---\nunit: names-unit\nplan: /tmp/names.md\n---\nApproved rename\n")
+    ledger.file_held(finding.finding_id, proposal)
+    ledger.ticket_drop("machine-read-1")
+    _ = path.write_text(current)
+    _ = git("add", ".")
+    _ = git("commit", "-qm", "owner return type changed")
+    tip = git("rev-parse", "HEAD")
+    ledger.set_tip(tip)
+    return ledger.named_held((finding.finding_id,))[0], tip
 
 
 # A release checkpoints the current worktree; each fake berth keeps its own board.
@@ -85,10 +123,17 @@ def remove_generation_schema(connection: sqlite3.Connection) -> None:
     _ = connection.execute("DROP VIEW active_judgments")
     _ = connection.execute("DROP TABLE rule_generations")
     _ = connection.execute("ALTER TABLE judgments DROP COLUMN generation")
+    remove_finding_anchor_schema(connection)
     # Migration 29's view exists on copies that have already run it.
     for statement in style_ledger.MIGRATIONS[29].split(";"):
         if statement.strip():
             _ = connection.execute(statement)
+
+
+def remove_finding_anchor_schema(connection: sqlite3.Connection) -> None:
+    """A pre-32 fixture has no recorded source anchors."""
+    _ = connection.execute("ALTER TABLE held_findings DROP COLUMN anchor_commit")
+    _ = connection.execute("ALTER TABLE held_findings DROP COLUMN followed_from_commit")
 
 
 class LedgerTestCase(unittest.TestCase):
@@ -255,13 +300,30 @@ class LedgerTestCase(unittest.TestCase):
         proof = cast(Callable[[style_ledger.HeldFinding, str], style_ledger.SiteEvidence], getattr(ledger, "_site_proof"))
         return proof(finding, at)
 
+    def expected_site(self, ledger: style_ledger.Ledger, finding: style_ledger.HeldFinding,
+                      path: str, line: int) -> style_ledger.UnchangedSite:
+        anchor = ledger.finding_anchor(finding)
+        self.assertIsInstance(anchor, style_ledger.FindingAnchor)
+        assert isinstance(anchor, style_ledger.FindingAnchor)
+        return style_ledger.UnchangedSite(path, line, anchor)
+
+    def site_with_comment_checkpoint(self) -> tuple[style_ledger.Ledger, style_ledger.HeldFinding, str, str]:
+        """A real judgment at base, before its read ticket adds a leading comment."""
+        ledger, _, finding = self.site_fixture(
+            source="fn work(old: usize) -> usize { old }\n", line=1, keep_ticket_open=True)
+        base = self.git("rev-parse", "HEAD")
+        checkpoint = self.commit_tip(ledger, {PARENT_FILE: "// Judging ticket's comment.\nfn work(old: usize) -> usize { old }\n"})
+        ledger.ticket_checkpoint("judge-1", checkpoint)
+        ledger.ticket_drop("judge-1")
+        return ledger, finding, base, checkpoint
+
     def assert_extern_owner_move_refused(self, work: str) -> None:
         source = ("fn container() {\n    extern fn first() {\n        " + work
                   + " work() {\n            let old = 791;\n        }\n    }\n    extern fn second() {}\n}\n")
         ledger, _, finding = self.site_fixture(source=source, line=4)
         # Establish that the qualified items are readable, rather than merely refusing the whole file.
         tip = self.commit_tip(ledger, {PARENT_FILE: "// header\n" + source})
-        self.assertEqual(self.strict_site(ledger, finding, tip), style_ledger.UnchangedSite(PARENT_FILE, 5))
+        self.assertEqual(self.strict_site(ledger, finding, tip), self.expected_site(ledger, finding, PARENT_FILE, 5))
         moved = ("fn container() {\n    extern fn first() {}\n    extern fn second() {\n        " + work
                  + " work() {\n            let old = 791;\n        }\n    }\n}\n")
         tip = self.commit_tip(ledger, {PARENT_FILE: moved})

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 import unittest
@@ -170,7 +171,7 @@ class ImplementLauncherWorkerTests(support.ImplementLauncherFixture):
                 os.close(descriptor)
         finally:
             try:
-                os.killpg(process.pid, signal.SIGKILL)
+                send_process_group(process.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
             _ = process.communicate()

@@ -20,7 +20,7 @@ from unittest.mock import patch
 
 from scripts.direct import board_json
 from scripts.lib import unit_runs
-from scripts.production import fake_showrunner, showrunner_parent, staff
+from scripts.production import fake_showrunner, showrunner_parent, staff, showrunners
 from scripts.production.cli_fixture import invoke_cli
 from scripts.production.staff_test_support import isolated_staff_file, production_membership, showrunner_launch
 from scripts.shutdown import pane_record
@@ -53,6 +53,18 @@ class ProductionFixture:
 
 
 class BoardJsonTests(unittest.TestCase):
+    def test_wrapped_child_is_not_a_board_descendant_even_when_its_timer_and_parent_remain(self) -> None:
+        root = self.production("root")
+        child = self.production("wrapped", running=False)
+        self.attach(child.slug, root.slug)
+        old = next(row for row in staff.find(kind="showrunner") if row.name == child.slug)
+        _ = staff.set_doc(old.id, staff.WrappedDoc("natedev", child.document))
+        _, documents = self.generate("--production", root.slug)
+        self.assertEqual([document["production"] for document in documents], [root.slug])
+        retained = staff.by_id(old.id)
+        assert retained is not None
+        self.assertEqual(retained.parent, old.parent)
+
     root: Path = Path()
     history: Path = Path()
     run_root: Path = Path()
@@ -482,10 +494,16 @@ class BoardJsonTests(unittest.TestCase):
 
     def test_timer_target_without_a_launch_staff_id_does_not_place_a_session(self) -> None:
         _ = self.production(running=False)
+        # This session has never had a staff identity. The normal writer keeps
+        # identities from earlier launches of the same conversation.
+        with pane_record.locked("agents"):
+            pane_record.save("agents", {})
         launch = pane_record.launch("unmarked", "show-id", str(self.root),
                                     {"CLAUDE_CONFIG_DIR": str(self.root / "account")}, ["claude"])
         launch["written_at"] = "2099-01-01T00:00:00+00:00"
-        pane_record.write("agents", launch)
+        # Replace the fixture's earlier staff-bound launch; write() would
+        # correctly retain that conversation's STAFF_ID in the new launch.
+        pane_record.save("agents", {launch["pane_id"]: launch})
 
         response, documents = self.generate("--session", "show-id")
 
@@ -640,6 +658,18 @@ class BoardJsonTests(unittest.TestCase):
 
         self.assertEqual([doc["production"] for doc in documents],
                          [root.slug, child.slug, sibling.slug, grandchild.slug])
+
+    def test_partial_discovery_does_not_publish_an_incomplete_subtree(self) -> None:
+        root = self.production("root")
+        child = self.production("child")
+        self.attach(child.slug, root.slug)
+        partial = showrunners.ShowrunnerDiscovery([], (
+            showrunners.ShowrunnerLookupFailure(child.slug, "fixture lookup failed"),))
+        with patch.object(showrunners, "registered_showrunners", return_value=partial):
+            with self.assertRaisesRegex(OSError, "fixture lookup failed"):
+                _ = board_json.main(["--production", root.slug])
+        self.assertFalse((self.output / "root.json").exists())
+        self.assertFalse((self.output / "child.json").exists())
 
     def test_descendant_not_in_the_registered_showrunners_is_left_out(self) -> None:
         root = self.production("root")

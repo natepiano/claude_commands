@@ -24,14 +24,62 @@ from approved_renames import AppliedInCode
 
 
 from ledger_test_support import (remove_generation_schema, LedgerTestCase, LedgerStatus, PARENT_FILE)
-
-
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 @final
 class StyleLedgerRecordsTests(LedgerTestCase):
+    def test_path_attributes_classify_meta_roles_and_nested_cfg_attr_payloads(self) -> None:
+        from style_ledger import _path_attributes  # pyright: ignore[reportPrivateUsage]
+        data = ('#[cfg(path = "predicate.rs")] fn f() {} '
+                '#[cfg_attr(path = "predicate.rs", allow(dead_code))] fn g() {} '
+                '#[custom(path = "argument.rs")] fn h() {} '
+                '#[path::metadata(path = "argument.rs")] fn j() {}')
+        self.assertEqual(_path_attributes("src/lib.rs", data.encode()), ())
+        source = ('#[cfg_attr(path = "predicate.rs", '
+                  'cfg_attr(all(), path = "child.rs"))] mod child; '
+                  '#[path="direct.rs"] mod direct; '
+                  '#[r#path="raw.rs"] mod raw;')
+        mounts = _path_attributes("src/lib.rs", source.encode())
+        self.assertEqual(mounts, (style_ledger.MountedFile("src/lib.rs", ("src/child.rs",)),
+                                 style_ledger.MountedFile("src/lib.rs", ("src/direct.rs",)),
+                                 style_ledger.MountedFile("src/lib.rs", ("src/raw.rs",))))
+
+    def test_private_rule_scope_nests_and_restores_after_interruption(self) -> None:
+        rule_id = self.rule("private-rules")
+        private, nested = self.root / "private", self.root / "nested"
+        private.mkdir()
+        nested.mkdir()
+        roots: list[Path] = []
+        load = rules.load_rules
+
+        def observed(repo: Path) -> tuple[rules.Rule, ...]:
+            roots.append(repo)
+            return load(repo)
+
+        with self.ledger() as initial:
+            initial.set_tip(self.initial_tip)
+        invalid = self.repo / "docs/style/invalid.md"
+        invalid.parent.mkdir(parents=True)
+        _ = invalid.write_text("---\ninvalid: [\n")
+        with self.ledger() as ledger:
+            with mock.patch.object(rules, "load_rules", side_effect=observed):
+                with self.assertRaisesRegex(RuntimeError, "interrupted"):
+                    with ledger.rules_from_checkout(private):
+                        ledger.ticket_add("scope-1", "scope", "read", "names", "crates/alpha",
+                                          [self.sources[0]], [rule_id])
+                        with ledger.rules_from_checkout(nested):
+                            ledger.ticket_add("scope-2", "scope", "read", "names", "crates/alpha",
+                                              [self.sources[0]], [rule_id])
+                        ledger.ticket_add("scope-3", "scope", "read", "names", "crates/alpha",
+                                          [self.sources[0]], [rule_id])
+                        raise RuntimeError("interrupted")
+                invalid.unlink()
+                ledger.ticket_add("scope-4", "scope", "read", "names", "crates/alpha",
+                                  [self.sources[0]], [rule_id])
+            self.assertEqual(roots, [private, nested, private, self.repo])
+            self.assertEqual(ledger.repo, self.repo)
+
     def test_tree_entries_share_commit_and_bare_tree_inventory(self) -> None:
         path = self.sources[0]
         _ = self.git("update-index", "--chmod=+x", path)
