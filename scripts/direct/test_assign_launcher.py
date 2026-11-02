@@ -1,6 +1,8 @@
 """Named assignment dispatches through the real recorder and loopback app-server."""
 from __future__ import annotations
 
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
+
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 
 from scripts.lib.test_agents_registry import write_registry
@@ -76,7 +78,8 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
             "UNIT_WORKERS_STATE": str(self.session_dir.parent / "unit-workers"),
             "UNIT_HISTORY_DIR": str(self.history),
             "UNIT_ACTIVE_DIR": str(self.session_dir.parent / "active"),
-            "UNIT_CONFIG": str(ROOT / "config/direct.conf"),
+            **config_environment(self.session_dir.parent),
+            "UNIT_CONFIG": str(self.session_dir.parent / "direct.conf"),
             "AGENTS_CONFIG_FILE": str(self.registry), "AGENTS_CONFIG_PUBLISH": "0",
             "CODEX_CATALOG_SYNC_STATE_FILE": str(checkpoint),
             "NOTIFIER_SESSIONS_DIR": str(self.session_dir.parent / "sessions"),
@@ -156,8 +159,8 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
     def prepare_style_project(self) -> None:
         self.commit_project()
         config = self.session_dir.parent / "lint.conf"
-        _ = config.write_text("style_review=on\n")
-        _ = cast(object, self.patches.enter_context(patch.dict(os.environ, {"LINT_CONFIG_FILE": str(config)})))
+        _ = write_config_fixture(config, "style_review=on\n")
+        _ = cast(object, self.patches.enter_context(patch.dict(os.environ, {"LINT_CONFIG_FILE": str(config), "CONF_DIR": str(Path(config).parent)})))
 
     def events(self) -> list[dict[str, object]]:
         return [cast(dict[str, object], json.loads(line)) for line in
@@ -1189,8 +1192,8 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
 
     def test_changed_compaction_config_takes_effect_on_the_next_assignment(self) -> None:
         config = self.session_dir.parent / "direct.conf"
-        _ = config.write_text("UNIT_COMPACT_ABOVE_TOKENS=300000 # keep this context\n")
-        with patch.dict(os.environ, {"UNIT_CONFIG": str(config)}):
+        _ = write_config_fixture(config, "UNIT_COMPACT_ABOVE_TOKENS=300000 # keep this context\n")
+        with patch.dict(os.environ, {"CONF_DIR": str(Path(config).parent)}):
             _ = self.successful()
             name, record = next(iter(self.assignment_records().items()))
             thread = record["thread_id"]
@@ -1199,7 +1202,7 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
             self.context_sizes = [200_000, 200_000]
             _ = self.successful("implement", "--to", name)
             self.assertEqual(len(self.methods("thread/compact/start")), 0)
-            _ = config.write_text("UNIT_COMPACT_ABOVE_TOKENS=100000 # compact before the next turn\n")
+            _ = write_config_fixture(config, "UNIT_COMPACT_ABOVE_TOKENS=100000 # compact before the next turn\n")
             _ = self.successful("implement", "--to", name)
         self.assertEqual(len(self.methods("thread/compact/start")), 1)
         self.assertEqual(self.assignment_records()[name]["thread_id"], thread)

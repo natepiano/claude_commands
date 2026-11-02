@@ -40,7 +40,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from build_shape import BuildShape, NoBuildShape, build_shape, index_shapes, recorded_build_shape
 from user_zone import user_zone
 from atomic_file import write_text_atomic
-from config_values import config_values
+import conf
 
 
 from test_phase import (
@@ -102,13 +102,10 @@ FALLBACK = 12 * GIB
 # 111 natedev filtered single-test runs with no recompilation in the 14 days
 # to 2026-10-29 had anon p90 0.671 GiB and p95 0.784 GiB.
 FILTERED_FLOOR = GIB
-FALLBACK_TEST_PHASE_MARGIN = 1.2
 # On natedev, isolated hana nextest scopes had p90 anon / memory.peak 61%;
 # clippy had 65%, so 0.65 covers the measured p90 process-memory share.
 ANON_SHARE = 0.65
 HISTORY_DAYS = 14
-# Used only when neither the environment nor lint.conf supplies a valid budget.
-FALLBACK_BUILD_BUDGET_BYTES = 21 * GIB
 # Option C, 126 builds over 14 days to 2026-10-30: 1.314 covered every
 # replayed release step (including the 15.76 GiB incident).
 RELEASE_HEADROOM = 1.314
@@ -233,7 +230,7 @@ class TestPhaseNeed:
     width: int
     recorded_width: int
     form: TestPhaseNeedForm
-    margin: float = FALLBACK_TEST_PHASE_MARGIN
+    margin: float = field(default_factory=lambda: test_phase_margin())
 
 
 @dataclass(frozen=True)
@@ -1492,87 +1489,62 @@ def _positive_gib_bytes(raw: str) -> int | None:
     return None
 
 
-def _lint_config_path() -> str:
-    return os.path.expanduser(os.environ.get("LINT_CONFIG_FILE") or "~/.claude/config/lint.conf")
-
-
 def build_budget_bytes() -> int:
-    """Resolve the live budget: environment, lint.conf, then the fallback."""
+    """Read the environment override or the live configured build budget."""
     environment_budget = _positive_gib_bytes(os.environ.get("BUILDLOG_BUILD_BUDGET_GIB", ""))
     if environment_budget is not None:
         return environment_budget
-    config_budget = _positive_gib_bytes(config_values(_lint_config_path()).get("build_budget_gib", ""))
-    if config_budget is not None:
-        return config_budget
-    return FALLBACK_BUILD_BUDGET_BYTES
+    return max(1, int(conf.number("lint", "build_budget_gib") * GIB))
 
 
 def _test_phase_margin_value(raw: object) -> float:
-    """Validate configuration and stored margins at their shared boundary."""
+    """Read old stored margins through the live policy when not recorded."""
     if isinstance(raw, bool) or not isinstance(raw, (str, int, float)):
-        return FALLBACK_TEST_PHASE_MARGIN
+        return test_phase_margin()
     try:
         value = float(raw)
     except (ValueError, OverflowError):
-        return FALLBACK_TEST_PHASE_MARGIN
-    return value if math.isfinite(value) and value >= 1.0 else FALLBACK_TEST_PHASE_MARGIN
+        return test_phase_margin()
+    return value if math.isfinite(value) and value >= 1.0 else test_phase_margin()
 
 
 def test_phase_margin() -> float:
-    """Read the live test-phase margin through the shared lint configuration."""
-    return _test_phase_margin_value(config_values(_lint_config_path()).get("test_phase_margin", ""))
+    return conf.number("lint", "test_phase_margin")
 
-
-FALLBACK_RUNNING_PASS_SECONDS = 5.0
-
-
-def _positive_config_seconds(key: str, fallback: float) -> float:
-    raw = config_values(_lint_config_path()).get(key, "")
-    try:
-        value = float(raw)
-    except ValueError:
-        return fallback
-    return value if math.isfinite(value) and value > 0 else fallback
-
-
-def running_pass_seconds() -> float:
-    return _positive_config_seconds("running_pass_seconds", FALLBACK_RUNNING_PASS_SECONDS)
 
 def request_max_bytes() -> int:
-    """Bound admission input while allowing large build argument lists."""
-    raw = config_values(_lint_config_path()).get("request_max_bytes", "")
-    try:
-        value = int(raw)
-    except ValueError:
-        return 1048576
-    return value if value > 0 else 1048576
+    return conf.whole("lint", "request_max_bytes")
+
+def running_pass_seconds() -> float:
+    return conf.number("lint", "running_pass_seconds")
 
 def waiting_pass_seconds() -> float:
-    return _positive_config_seconds("waiting_pass_seconds", 1.0)
+    return conf.number("lint", "waiting_pass_seconds")
 
 def wait_reply_seconds() -> float:
-    return _positive_config_seconds("wait_reply_seconds", 60.0)
+    return conf.number("lint", "wait_reply_seconds")
 
 def replay_retention_seconds() -> float:
-    return _positive_config_seconds("replay_retention_seconds", 86400.0)
+    return conf.number("lint", "replay_retention_seconds")
 
 def reconnect_seconds() -> float:
-    return _positive_config_seconds("reconnect_seconds", 2.0)
+    return conf.number("lint", "reconnect_seconds")
 
 def silence_seconds() -> float:
-    return _positive_config_seconds("silence_seconds", 120.0)
+    return conf.number("lint", "silence_seconds")
 
 def outage_notice_seconds() -> float:
-    return _positive_config_seconds("outage_notice_seconds", 60.0)
+    return conf.number("lint", "outage_notice_seconds")
 
 def source_check_seconds() -> float:
-    return _positive_config_seconds("source_check_seconds", 1.0)
+    return conf.number("lint", "source_check_seconds")
 
 def source_settle_seconds() -> float:
-    return _positive_config_seconds("source_settle_seconds", 2.0)
+    return conf.number("lint", "source_settle_seconds")
 
 def override_reconnect_seconds() -> float:
-    return _positive_config_seconds("override_reconnect_seconds", 10.0)
+    return conf.number("lint", "override_reconnect_seconds")
+
 
 def resolve_admission_limits(total: int | UnknownHostTotal) -> AdmissionLimits:
     return AdmissionLimits(build_budget_bytes(), total * 5 // 100 if isinstance(total, int) else 0)

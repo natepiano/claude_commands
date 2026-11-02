@@ -178,7 +178,7 @@ from scripts.lib import user_zone
 
 root, working = map(Path, sys.argv[1:])
 caller = (os.environ.copy(), Path.cwd(), sys.argv.copy(), sys.path.copy(),
-          progress_history.DEFAULT_CONFIG_PATH, progress_history.DEFAULT_AGENTS_CONFIG_PATH,
+          progress_history.DEFAULT_AGENTS_CONFIG_PATH,
           user_zone.CONF, {sig: signal.getsignal(sig) for sig in
                           (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)})
 plan = working / 'cold-plan.md'
@@ -194,7 +194,7 @@ for number in (1, 2):
     environment = {**os.environ, 'HOME': str(home), 'USER_ZONE': 'UTC',
                    'UNIT_SYNC_WRITES': '0', 'UNIT_PASS_OWNER': 'launcher',
                    'UNIT_NOW_EPOCH': '1000'}
-    for key in ('UNIT_CONFIG', 'AGENTS_CONFIG_FILE', 'UNIT_HISTORY_DIR',
+    for key in ('CONF_DIR', 'AGENTS_CONFIG_FILE', 'UNIT_HISTORY_DIR',
                 'CODEX_THREAD_ID', 'CLAUDE_CODE_SESSION_ID'):
         environment.pop(key, None)
     session = home / 'session'
@@ -218,7 +218,7 @@ for number in (1, 2):
     assert started['config_digest'] == hashlib.sha256(registry.read_bytes() + settings.read_bytes()).hexdigest()[:12]
     assert progress_history._config_digest.cache_info().currsize == 0
     restored = (os.environ.copy(), Path.cwd(), sys.argv.copy(), sys.path.copy(),
-                progress_history.DEFAULT_CONFIG_PATH, progress_history.DEFAULT_AGENTS_CONFIG_PATH,
+                progress_history.DEFAULT_AGENTS_CONFIG_PATH,
                 user_zone.CONF, {sig: signal.getsignal(sig) for sig in caller[-1]})
     assert restored == caller, (restored, caller)
 print('two homes isolated; recorder lock retained; caller restored')
@@ -277,7 +277,7 @@ print('two homes isolated; recorder lock retained; caller restored')
     ) -> str:
         environment = os.environ.copy()
         environment["UNIT_HISTORY_DIR"] = str(self.history_dir)
-        environment["UNIT_CONFIG"] = str(self.config_file)
+        environment["CONF_DIR"] = str(Path(self.config_file).parent)
         environment["AGENTS_CONFIG_FILE"] = str(self.agents_config_file)
         environment["TZ"] = zone
         environment["USER_ZONE"] = zone
@@ -306,7 +306,7 @@ print('two homes isolated; recorder lock retained; caller restored')
     ) -> subprocess.CompletedProcess[str]:
         environment = os.environ.copy()
         environment["UNIT_HISTORY_DIR"] = str(self.history_dir)
-        environment["UNIT_CONFIG"] = str(self.config_file)
+        environment["CONF_DIR"] = str(Path(self.config_file).parent)
         environment["AGENTS_CONFIG_FILE"] = str(self.agents_config_file)
         environment["TZ"] = zone
         environment["USER_ZONE"] = zone
@@ -334,7 +334,7 @@ print('two homes isolated; recorder lock retained; caller restored')
     ) -> tuple[None, str, str]:
         environment = os.environ.copy()
         environment["UNIT_HISTORY_DIR"] = str(self.history_dir)
-        environment["UNIT_CONFIG"] = str(self.config_file)
+        environment["CONF_DIR"] = str(Path(self.config_file).parent)
         environment["AGENTS_CONFIG_FILE"] = str(self.agents_config_file)
         environment["UNIT_NOW_EPOCH"] = str(at)
         environment["UNIT_PASS_OWNER"] = "launcher"
@@ -2247,7 +2247,7 @@ print('two homes isolated; recorder lock retained; caller restored')
         commit = "f" * 40
         _ = self.run_command("checkpoint", "--session-dir", str(session), "--phase", "6", "--commit", commit, at=1015)
         environment = {**os.environ, "UNIT_HISTORY_DIR": str(self.history_dir), "UNIT_NOW_EPOCH": "1030",
-                       "UNIT_CONFIG": str(self.config_file), "AGENTS_CONFIG_FILE": str(self.agents_config_file)}
+                       "CONF_DIR": str(Path(self.config_file).parent), "AGENTS_CONFIG_FILE": str(self.agents_config_file)}
         self.isolate_recorder_roots(environment)
         self.isolate_identity(environment)
         finish_program = '''import sys
@@ -3190,7 +3190,7 @@ with patch.object(fcntl, "flock", admission):
         """Invoke the recorder the way a caller outside a launcher would, with `former` names added."""
         environment = os.environ.copy()
         environment["UNIT_HISTORY_DIR"] = str(self.history_dir)
-        environment["UNIT_CONFIG"] = str(self.config_file)
+        environment["CONF_DIR"] = str(Path(self.config_file).parent)
         environment["AGENTS_CONFIG_FILE"] = str(self.agents_config_file)
         environment["TZ"] = "UTC"
         environment["USER_ZONE"] = "UTC"
@@ -4291,17 +4291,17 @@ with patch.object(fcntl, "flock", admission):
         _ = self.config_file.write_text(
             "\n".join(
                 (
-                    "UNIT_PROGRESS_INTERVAL_SECONDS=180",
-                    "MIN_REPAIR_BUDGET=3",
-                    "REPAIR_ROUNDS_PER_FINDING=0.5",
-                    "RUNAWAY_ROUNDS=5",
-                    "MAX_FIX_ATTEMPTS=2",
-                    "MAX_REOPENS=2",
-                    "STALLED_ROUNDS=2",
-                    "MAX_CONSECUTIVE_SAME_KIND_PASSES=3",
-                    "MAX_REVIEW_CANCELLATIONS=1",
-                    "ROUTING_FROM_ROUND=4",
-                    "ASTRA_AFTER_FAILED_FIXES=2",
+                    "# whole: 1..", "UNIT_PROGRESS_INTERVAL_SECONDS=180",
+                    "# whole: 1..", "MIN_REPAIR_BUDGET=3",
+                    "# range: 5e-324..", "REPAIR_ROUNDS_PER_FINDING=0.5",
+                    "# whole: 1..", "RUNAWAY_ROUNDS=5",
+                    "# whole: 1..", "MAX_FIX_ATTEMPTS=2",
+                    "# whole: 1..", "MAX_REOPENS=2",
+                    "# whole: 1..", "STALLED_ROUNDS=2",
+                    "# whole: 1..", "MAX_CONSECUTIVE_SAME_KIND_PASSES=3",
+                    "# whole: 0..", "MAX_REVIEW_CANCELLATIONS=1",
+                    "# whole: 1..", "ROUTING_FROM_ROUND=4",
+                    "# whole: 1..", "ASTRA_AFTER_FAILED_FIXES=2",
                     "",
                 )
             ),
@@ -4311,7 +4311,7 @@ with patch.object(fcntl, "flock", admission):
     def run_findings(self, session_dir: Path, *arguments: str, at: int) -> str:
         environment = os.environ.copy()
         environment["UNIT_HISTORY_DIR"] = str(self.history_dir)
-        environment["UNIT_CONFIG"] = str(self.config_file)
+        environment["CONF_DIR"] = str(Path(self.config_file).parent)
         environment["TZ"] = "UTC"
         environment["USER_ZONE"] = "UTC"
         environment["UNIT_NOW_EPOCH"] = str(at)

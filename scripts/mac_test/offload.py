@@ -28,6 +28,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_hold"))
 import cargo_manifest
 import override_guard
 import sweep
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+import conf
 import treekey
 
 
@@ -220,7 +222,7 @@ NO_PRIOR_MAC_DECLINE = NoPriorMacDecline()
 
 @dataclass(frozen=True)
 class DefaultMacSettings:
-    """Select settings through MAC_TEST_CONFIG or its existing default."""
+    """Select the live Mac configuration unless an explicit settings path is supplied."""
 
 
 DEFAULT_MAC_SETTINGS = DefaultMacSettings()
@@ -238,11 +240,12 @@ class OffloadConfig:
     free_floor_gib: float
     default_target_budget_gib: str
     values: dict[str, str]
+    source: Path | DefaultMacSettings = DEFAULT_MAC_SETTINGS
 
     @property
     def leftover_timeout_s(self) -> float:
         """Bound the cleanup SSH call independently of the reachability probe."""
-        return positive_number(self.values, "leftover_timeout_s", 10.0)
+        return conf.number(config_path() if isinstance(self.source, DefaultMacSettings) else self.source, "leftover_timeout_s")
 
 
 @dataclass(frozen=True)
@@ -682,8 +685,7 @@ def report_cleanup(cleanup: CleanupOutcome) -> None:
 
 
 def config_path() -> Path:
-    configured = os.environ.get("MAC_TEST_CONFIG", "~/.claude/config/mac_test.conf")
-    return Path(configured).expanduser()
+    return conf.path("mac_test")
 
 
 def state_directory() -> Path:
@@ -691,28 +693,18 @@ def state_directory() -> Path:
     return Path(configured).expanduser()
 
 
-def positive_number(values: dict[str, str], key: str, default: float) -> float:
-    try:
-        value = float(values.get(key, str(default)))
-    except ValueError:
-        return default
-    return value if math.isfinite(value) and value > 0 else default
-
-
 def read_config(path: Path | DefaultMacSettings = DEFAULT_MAC_SETTINGS) -> OffloadConfig:
     settings = config_path() if isinstance(path, DefaultMacSettings) else path.expanduser()
-    values = sweep.config_values(str(settings))
     return OffloadConfig(
-        enabled=values.get("offload") == "on",
-        host=values.get("host", "mac"),
-        connect_timeout_s=positive_number(values, "connect_timeout_s", 6.0),
-        probe_timeout_s=positive_number(values, "probe_timeout_s", 15.0),
-        unreachable_backoff_s=positive_number(
-            values, "unreachable_backoff_s", 300.0
-        ),
-        free_floor_gib=positive_number(values, "free_floor_gib", 60.0),
-        default_target_budget_gib=values.get("mac_budget_gib", "24"),
-        values=values,
+        enabled=conf.text(settings, "offload") == "on",
+        host=conf.text(settings, "host"),
+        connect_timeout_s=conf.number(settings, "connect_timeout_s"),
+        probe_timeout_s=conf.number(settings, "probe_timeout_s"),
+        unreachable_backoff_s=conf.number(settings, "unreachable_backoff_s"),
+        free_floor_gib=conf.number(settings, "free_floor_gib"),
+        default_target_budget_gib=conf.text(settings, "mac_budget_gib"),
+        values=conf.values(settings),
+        source=settings,
     )
 
 

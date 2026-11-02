@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+
+
 import json
 import os
 import subprocess
@@ -12,6 +14,12 @@ import unittest
 from unittest import mock
 from pathlib import Path
 from typing import TYPE_CHECKING, cast, override
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
+if TYPE_CHECKING:
+    from ..lint.memory_test_support import config_environment
+else:
+    from memory_test_support import config_environment
 
 if TYPE_CHECKING:
     from ..direct.test_verify_untested_examples import FIXED_RUSTC, rust_tool_path
@@ -31,6 +39,8 @@ AT = "2026-10-04T21:00:00.000Z"
 
 def setUpModule() -> None:
     """The times these tests expect are Pacific; the user's zone setting must not change them."""
+    fixture_root = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
+    unittest.enterModuleContext(mock.patch.dict(os.environ, config_environment(fixture_root)))
     unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
 
 

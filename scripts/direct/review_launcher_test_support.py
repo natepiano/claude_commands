@@ -8,9 +8,14 @@ import json
 import shutil
 import subprocess
 from pathlib import Path
-from typing import TypedDict, cast, override
+from typing import TYPE_CHECKING, TypedDict, cast, override
 
 from scripts.direct.recorder_fixture import LauncherFixture, STUB_ATOMIC_JSON_WRITER, communicate_launcher, configure_launcher_fixture, launcher_environment, launcher_registry, prepare_launcher_runtime
+
+if TYPE_CHECKING:
+    from ..lint.memory_test_support import config_environment, write_config_fixture
+else:
+    from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 
 DIRECT_DIR = Path(__file__).parent
@@ -214,6 +219,8 @@ class ReviewLauncherFixture(LauncherFixture):
                 "",
             ), AGENTS_REGISTRY,
         )
+        _ = write_config_fixture(self.config_file, self.config_file.read_text(encoding="utf-8"))
+        _ = config_environment(self.root)
         reviewed = self.working_dir / "reviewed.txt"
         _ = reviewed.write_text("original\n", encoding="utf-8")
         _ = subprocess.run(
@@ -273,6 +280,8 @@ class ReviewLauncherFixture(LauncherFixture):
         environment["LINT_CONFIG_FILE"] = str(self.root / "lint.conf")
         environment["UNIT_EARLY_POLL_SECS"] = "0.01"
         environment["TEST_WAIT_HELPER_DIR"] = str(DIRECT_DIR.resolve())
+        environment["CONF_DIR"] = str(self.root)
+        environment["UNIT_CONFIG"] = str(self.config_file)
         # Early mode starts a detached Stage 2 run; the stub records its arguments instead.
         mesh_runs = self.root / "mesh_runs_stub.py"
         if not mesh_runs.exists():

@@ -31,6 +31,7 @@ BASH = "/bin/bash"
 PYTHON_RELATIVE = "build_hold/build_hold.py"
 SHELL_RELATIVE = "direct/verify.sh"
 EXPECTED_VARIABLES = (
+    "CONF_DIR",
     "BUILD_HOLD_DIR",
     "BUILD_HOLD_RELEASE_DIR",
     "MAC_TEST_STATE_DIR",

@@ -1,5 +1,20 @@
 # Config Files
 
+## Live values
+
+Python callers read key=value settings through `scripts/lib/conf.py`; bash callers
+can source `scripts/lib/conf.sh` and call `conf_value <file> <key>`. The file name
+is its stem. Reads use `~/.claude/config` on every call; `CONF_DIR` selects a test
+fixture folder and installed scripts refuse it. The first key wins, with a
+`key.<short-host>` value taking precedence over `key`. A `# range: A..B` or
+`# one of: a, b, c` comment directly above the key sets its limits. On a missing
+or invalid value, the reader warns and uses the newest valid committed value
+under that revision's limits; with no usable history it raises `conf.Unusable`.
+Only the user approves a value change. A session asks the user and runs `/tune`
+on the user's go, with the user's words; `/tune` publishes the one config file
+and pulls the Mac without a test or release cycle. Moving an unchanged value
+from code to config needs no approval and does not use `/tune`.
+
 ## bake_textures_example.json
 
 Example configuration for the `/blender:bake_textures` command. Copy and modify this template to specify blend files, objects, texture maps, and export settings for texture baking.
@@ -73,9 +88,7 @@ limits, the unreachable retry delay, the free-space and load limits, default
 and repository size limits for each Mac mirror's build folder,
 Linux-only packages, and Mac nextest exclusions. A repository needs a
 `linux_only.<repo>` key, even when its value is empty, before tests can run on
-the Mac. An empty `ci_repo` disables CI calls. `MAC_TEST_CONFIG` selects a
-different file for a checkout's scripts in tests. Installed scripts refuse to
-run with `MAC_TEST_CONFIG` set.
+the Mac. An empty `ci_repo` disables CI calls. `CONF_DIR` selects the fixture folder in tests.
 
 ## direct.conf
 
@@ -100,13 +113,11 @@ made from what gets reported.
 integer. It is 3600, one hour (user, 2026-10-10). Unit reports come only when
 someone asks (2026-10-19): no notifier instance or timer sends them.
 
-`scripts/direct/findings.py` reads the file at startup, so an edit applies to
-the next `findings.py gate` with nothing to restart. The file is authoritative:
-no limit has a compiled default, so a missing key, a non-numeric value, or a
-value below its minimum makes `findings.py` list every problem it found and
-exit 2 before running the command. `UNIT_CONFIG` overrides the path,
-which is how `test_findings.py` supplies its own limits rather than this
-machine's.
+`scripts/direct/findings.py` reads values at use, so an edit applies to the
+next read with nothing to restart. No limit has a compiled default. A missing
+or invalid value warns and uses the newest valid committed value; without a
+usable revision, `findings.py` lists the problems and exits 2 before running
+the command. `CONF_DIR` selects the fixture folder in tests.
 
 ## dailies.conf
 

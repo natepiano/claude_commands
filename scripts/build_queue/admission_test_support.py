@@ -1,6 +1,8 @@
 """One private admission server, fake clock and fault boundary for service tests."""
 from __future__ import annotations
 
+from scripts.lint.memory_test_support import write_config_fixture
+
 from collections import Counter
 from collections.abc import Callable, Generator
 from contextlib import ExitStack, contextmanager
@@ -242,7 +244,7 @@ class AdmissionFixture(ExitStack):
         environment = {**gate_isolation_environment(self.root), **fake_memory_readings(
             self.root, available_kib=60 * GIB // 1024, total_kib=60 * GIB // 1024),
             "ADMISSION_SOCKET": str(self.socket_path), "BUILDLOG_DIR": str(self.root / "log"),
-            "BUILDLOG_PROC": str(self.proc.path), "LINT_CONFIG_FILE": str(self.root / "lint.conf"),
+            "BUILDLOG_PROC": str(self.proc.path), "LINT_CONFIG_FILE": str(self.root / "lint.conf"), "CONF_DIR": str(Path(self.root / "lint.conf").parent),
             "BUILDLOG_BUILD_BUDGET_GIB": "21", "NOTIFY_SOCKET": "", "LISTEN_FDS": "",
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"), "USER_ZONE": "UTC"}
         self.enter_context(mock.patch.dict(os.environ, environment))
@@ -266,8 +268,7 @@ class AdmissionFixture(ExitStack):
         self.server = self.new_server()
 
     def configure(self, **seconds: float) -> None:
-        _ = (self.root / "lint.conf").write_text("[memory]\n" +
-            "".join(f"{name}={value}\n" for name, value in seconds.items()))
+        _ = write_config_fixture(self.root / "lint.conf", "".join(f"{name}={value}\n" for name, value in seconds.items()))
 
     def scope_events(self) -> ScopeEvents:
         events = ScopeEvents(self.server.epoll)

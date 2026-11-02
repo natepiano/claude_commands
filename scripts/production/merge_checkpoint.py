@@ -41,7 +41,7 @@ from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
 from scripts.lib.atomic_file import write_text_atomic  # noqa: E402
 import sessions  # noqa: E402
 from scripts.lib.process_failure import failure_detail  # noqa: E402
-from scripts.lib import tunables  # noqa: E402
+from scripts.lib import conf  # noqa: E402
 
 # /zone queues a change for the Mac while it is offline; a promotion's Mac pull sends it.
 ZONE_SCRIPT = Path(__file__).resolve().parents[1] / "lib/zone.py"
@@ -964,13 +964,9 @@ def remote_path(path: PurePosixPath) -> str:
 
 
 def pull_mac_checkout(mac: PurePosixPath, source: Path) -> None:
-    path = Path(os.environ.get("MERGE_CHECKPOINT_CONFIG", Path(__file__).resolve().parents[2] / "config/merge_checkpoint.conf"))
     try:
-        configured_tries = tunables.number(path, "MAC_PULL_TRIES", minimum=1, maximum=float("inf"))
-        if not configured_tries.is_integer():
-            raise ValueError("MAC_PULL_TRIES must be a positive integer")
-        tries = int(configured_tries)
-        retry_seconds = tunables.number(path, "MAC_PULL_RETRY_SECONDS", minimum=0, maximum=float("inf"))
+        tries = conf.whole("merge_checkpoint", "MAC_PULL_TRIES")
+        retry_seconds = conf.number("merge_checkpoint", "MAC_PULL_RETRY_SECONDS")
     except ValueError as error:
         raise Stop("promote", "failed", str(error), "repair the Mac pull configuration and rerun this checkpoint") from error
     remote = (f"cd {remote_path(mac)} && git pull --ff-only "

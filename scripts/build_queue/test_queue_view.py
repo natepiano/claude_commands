@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from statistics import median
+from pathlib import Path
 import time
 import unittest
 from unittest import mock
@@ -78,7 +79,7 @@ class QueueViewTests(QueueFixtureTests):
             for stale in (False, True):
                 with self.subTest(source=source, stale=stale), mock.patch.dict("os.environ", {
                     "BUILDLOG_BUILD_BUDGET_GIB": "21" if source == "environment" else "",
-                    "LINT_CONFIG_FILE": str(config),
+                    "LINT_CONFIG_FILE": str(config), "CONF_DIR": str(Path(config).parent),
                 }):
                     _ = config.write_text("[memory]\nbuild_budget_gib=21\n")
                     inputs = fixture.inputs()

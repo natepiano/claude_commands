@@ -17,6 +17,7 @@ import tempfile
 import unittest
 from unittest import mock
 
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lint import memory_admit as gate
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.build_queue import admission_protocol as wire, admission_service as service
@@ -633,7 +634,7 @@ class ServiceTests(unittest.TestCase):
     def test_running_steps_refresh_without_waiters_and_idle_service_does_not_poll(self) -> None:
         with AdmissionFixture() as fixture:
             config = fixture.root / "lint.conf"
-            _ = config.write_text("[memory]\nrunning_pass_seconds=3\n")
+            _ = write_config_fixture(config, "running_pass_seconds=3\n")
             request = fixture.request()
             request = replace(request, sidecar=str(fixture.scope(request.owner)))
             granted = only_admitted(fixture.server.handle_request(request))

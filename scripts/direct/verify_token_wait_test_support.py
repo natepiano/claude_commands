@@ -1,6 +1,8 @@
 """Independent tools, state and process cleanup for verify token tests."""
 from __future__ import annotations
 
+from scripts.lint.memory_test_support import config_environment
+
 import json
 import os
 import signal
@@ -229,7 +231,7 @@ esac
             "MAC_IDLE_STATE_DIR": str(self.root / "mac-idle"),
             "VERIFY_MAC_RUNNER": str(self.root / "no-mac-runner"),
             "LINT_CONFIG_READER": str(reader),
-            "LINT_CONFIG_FILE": str(reader),
+            "LINT_CONFIG_FILE": str(reader), **config_environment(self.root),
             "UNIT_SESSION_DIR": str(self.root / "session"),
             "TEST_RUNNING": str(self.root / "running"),
             "TEST_RELEASE": str(self.root / "release"),

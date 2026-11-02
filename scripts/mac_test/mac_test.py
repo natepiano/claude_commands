@@ -30,7 +30,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 import override_guard
 import build_hold
 import offload
-import sweep
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+import conf
 from user_zone import user_zone
 
 
@@ -452,34 +453,33 @@ def state_paths() -> StatePaths:
 
 
 def config_path() -> Path:
-    configured = os.environ.get("MAC_TEST_CONFIG", "~/.claude/config/mac_test.conf")
-    return Path(configured).expanduser()
-
-
-def configured_number(values: dict[str, str], key: str, default: float) -> float:
-    try:
-        value = float(values.get(key, str(default)))
-    except ValueError:
-        return default
-    return value if math.isfinite(value) and value > 0 else default
+    return conf.path("mac_test")
 
 
 def read_config() -> MacTestConfig:
-    values = sweep.config_values(str(config_path()))
+    # An explicit empty repository disables CI; a missing key still takes the fault path.
+    try:
+        ci_repo = conf.effective_line("mac_test", "ci_repo")[1]
+    except conf.Unusable:
+        ci_repo = conf.text("mac_test", "ci_repo")
+    else:
+        if ci_repo:
+            ci_repo = conf.text("mac_test", "ci_repo")
     return MacTestConfig(
-        ci_repo=values.get("ci_repo", ""),
-        ci_variable=values.get("ci_variable", "MACOS_CI"),
-        ci_workflow=values.get("ci_workflow", "ci.yml"),
-        ci_job=values.get("ci_job", "macOS: Compile and Test"),
-        gh_timeout_s=configured_number(values, "gh_timeout_s", 30.0),
-        block_hours=configured_number(values, "block_hours", 4.0),
-        block_max_hours=configured_number(values, "block_max_hours", 48.0),
-        block_warn_minutes=configured_number(values, "block_warn_minutes", 15.0),
-        host=values.get("host", "mac"),
-        connect_timeout_s=configured_number(values, "connect_timeout_s", 6.0),
-        claim_idle_minutes=configured_number(values, "claim_idle_minutes", 15.0),
-        claim_poll_seconds=configured_number(values, "claim_poll_seconds", 60.0),
+        ci_repo=ci_repo,
+        ci_variable=conf.text("mac_test", "ci_variable"),
+        ci_workflow=conf.text("mac_test", "ci_workflow"),
+        ci_job=conf.text("mac_test", "ci_job"),
+        gh_timeout_s=conf.number("mac_test", "gh_timeout_s"),
+        block_hours=conf.number("mac_test", "block_hours"),
+        block_max_hours=conf.number("mac_test", "block_max_hours"),
+        block_warn_minutes=conf.number("mac_test", "block_warn_minutes"),
+        host=conf.text("mac_test", "host"),
+        connect_timeout_s=conf.number("mac_test", "connect_timeout_s"),
+        claim_idle_minutes=conf.number("mac_test", "claim_idle_minutes"),
+        claim_poll_seconds=conf.number("mac_test", "claim_poll_seconds"),
     )
+
 
 
 @contextmanager

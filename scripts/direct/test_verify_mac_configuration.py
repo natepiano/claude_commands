@@ -4,13 +4,14 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 from typing import final
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture
 
 
 @final
 class VerifyMacConfigurationTests(VerifyMacOffloadFixture):
     def test_local_first_target_runs_without_trying_free_mac(self) -> None:
-        config = Path(self.environment["BUILD_TARGETS_CONFIG"])
+        config = Path(self.environment["CONF_DIR"]) / "build_targets.conf"
         _ = config.write_text(config.read_text().replace("targets=mac,natedev", "targets=natedev,mac"))
         result = self.verify("test", "sample", "--no-cache")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -21,8 +22,8 @@ class VerifyMacConfigurationTests(VerifyMacOffloadFixture):
 
     def test_alternate_target_settings_are_passed_to_runner(self) -> None:
         alternate = self.root / "alternate Mac.conf"
-        _ = alternate.write_text(f"offload=on\nlinux_only.{self.root.name}=\n")
-        config = Path(self.environment["BUILD_TARGETS_CONFIG"])
+        _ = write_config_fixture(alternate, f"offload=on\nlinux_only.{self.root.name}=\n", template="mac_test")
+        config = Path(self.environment["CONF_DIR"]) / "build_targets.conf"
         _ = config.write_text(config.read_text().replace("mac settings.conf", alternate.name))
         result = self.verify("test", "sample", "--filter", "alpha", "--no-cache",
                              extra={"TEST_RUNNER_MAC": "passed", "TEST_RUNNER_STATUS": "0"})

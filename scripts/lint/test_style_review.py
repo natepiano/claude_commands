@@ -54,7 +54,7 @@ class PreparationTests(unittest.TestCase):
         _ = self.commit("baseline")
         config = self.root / "lint.conf"
         _ = config.write_text("style_review=on\n")
-        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"LINT_CONFIG_FILE": str(config)})))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"LINT_CONFIG_FILE": str(config), "CONF_DIR": str(Path(config).parent)})))
 
     def commit(self, message: str) -> str:
         return commit_repository(self.repo, message)
