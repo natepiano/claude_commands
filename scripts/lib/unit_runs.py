@@ -200,8 +200,9 @@ def held(session_id: str, root_override: str | Path | None = None,
                       if any(Path(path).resolve() == resolved for path in paths)), None)
         if owner is None:
             owner = director(Path(target))
-            # Cache marker targets outside the roots for other units in this pass.
-            folders.setdefault(owner, []).append(target)
+            if owner == session_id:
+                # Cache an outside target only after its marker owner matches its director.
+                folders.setdefault(owner, []).append(target)
         if owner == session_id:
             runs.append(target)
     seen = {Path(run).resolve() for run in runs}

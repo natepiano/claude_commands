@@ -195,6 +195,21 @@ class UnitRunsTest(unittest.TestCase):
             self.assertEqual(unit_runs.held("original", root, active), [])
             self.assertEqual(unit_runs.held("replacement", root, active, scanned=scanned), [str(run)])
 
+    def test_a_foreign_outside_marker_does_not_change_another_directors_shared_list(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root, active, outside = Path(folder) / "runs", Path(folder) / "active", Path(folder) / "outside"
+            root.mkdir()
+            active.mkdir()
+            outside.mkdir()
+            unit_runs.record_director(outside, "director-b")
+            _ = (active / "director-a").write_text(str(outside) + "\n")
+            scanned = unit_runs.held_by_session(root)
+            self.assertEqual(unit_runs.held("director-a", root, active, scanned=scanned), [])
+            self.assertEqual(unit_runs.held("director-a", root, active), [])
+            independent = unit_runs.held("director-b", root, active)
+            self.assertEqual(independent, [])
+            self.assertEqual(unit_runs.held("director-b", root, active, scanned=scanned), independent)
+
     def test_held_without_a_marker_lists_only_the_directed_runs(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             runs, active = Path(folder) / "runs", Path(folder) / "active"
