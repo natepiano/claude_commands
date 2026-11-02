@@ -1,5 +1,5 @@
 ---
-description: Show or edit which lint checks run — across /unit:direct phases and the lint CLI
+description: Set which lint checks run.
 ---
 
 # lint_config

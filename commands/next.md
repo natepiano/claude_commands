@@ -1,5 +1,5 @@
 ---
-description: Show the user the one most urgent item waiting for them, or the most urgent of one kind, or the oldest or newest; settle that one item, then stop.
+description: Review one pending item with the user.
 argument-hint: "[change | proposal | efficiency | question] [oldest | newest] [all-below]"
 ---
 

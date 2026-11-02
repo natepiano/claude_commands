@@ -1,5 +1,5 @@
 ---
-description: Rename one unit of this production. It stops the unit, moves every place that names it, relaunches it and verifies the result.
+description: Rename a unit and its records.
 argument-hint: "<old> <new>"
 ---
 

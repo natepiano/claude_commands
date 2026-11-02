@@ -1,5 +1,5 @@
 ---
-description: Show Claude and Codex accounts, plans, and weekly quota reset times
+description: Show accounts, plans, and quota resets.
 ---
 
 Run `python3 ~/.claude/scripts/whoami/whoami.py` and relay its output. Times use the machine's local timezone. Weekly reset means quota renewal, not login expiry. Report unavailable information as unavailable; never inspect or print raw credentials.

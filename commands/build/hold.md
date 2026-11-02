@@ -1,5 +1,5 @@
 ---
-description: Hold natedev or a configured SSH target. Args - `hold <why> [eta HH:MM] [target <name>]`, `quiet`, `status`, or `release [target <name>]`.
+description: Hold or release a build target.
 ---
 
 `$ARGUMENTS` is `hold <why> [eta HH:MM] [target <name>]`, `quiet`, `status`, or `release [target <name>]`.

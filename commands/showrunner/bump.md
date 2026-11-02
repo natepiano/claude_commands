@@ -1,5 +1,5 @@
 ---
-description: Bump urgent work so it is delivered now and validated later - top priority, a short checkpoint, first in the merge queue, a demo build, then the full suite on the pushed tip.
+description: Prioritize urgent work for delivery.
 argument-hint: "<unit> <what the user wants now>"
 ---
 
