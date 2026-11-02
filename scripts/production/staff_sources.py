@@ -180,7 +180,7 @@ def seed(*, dry_run: bool = False) -> None:
 
 
 # The source scan is shared by seed and the live handler. It never writes source records.
-LiveRole = Literal["showrunner", "unit", "impl", "test", "review", "fix", "astra-designer", "astra-reviewer"]
+LiveRole = Literal["showrunner", "unit", "worker", "impl", "test", "review", "fix", "astra-designer", "astra-reviewer"]
 
 
 @dataclass(frozen=True)
@@ -505,7 +505,11 @@ class _WorkerSources:
 
     def ledger_owner(self, path: Path, worker: workers.UnitWorker, fields: Mapping[str, object],
                      owner: WorkerOwner | None) -> tuple[str, WorkerOwner]:
-        current = self.record.by_id(staff.StaffId(_text(fields.get("staff_id")) or worker.name))
+        current = self.record.by_member_reference(_text(fields.get("staff_id")) or worker.name)
+        if current is None:
+            backend = worker.backend
+            session = backend.thread_id if isinstance(backend, workers.CodexThread) else backend.session_id
+            current = self.record.by_current_session(session)
         if current is not None and current.kind == "worker" and current.parent is not None:
             row = self.record.by_id(current.parent)
             if row is not None:
@@ -777,7 +781,11 @@ class _WorkerSources:
         roster = run / workers.ROSTER
         if roster.exists():
             for value in self.checked(roster).values():
-                entry = _object(value)
+                try:
+                    entry = _object(value)
+                except ValueError:
+                    # The roster reader reports this entry and continues with its siblings.
+                    continue
                 if entry.get("status") in ("starting", "running", "paused", "waiting_capacity"):
                     observe(entry)
         for path in sorted(run.glob("impl_worker_*.json")):
@@ -824,7 +832,16 @@ class _WorkerSources:
                 identity = self.backend(parent, name, entry)
                 if isinstance(identity, BackendUnavailable):
                     _problem(f"{path} worker {name}", "worker backend is unavailable")
-                self.add(WorkerObservation(name, parent, _role(_text(entry.get("role"))), identity))
+                role = _text(entry.get("role"))
+                if not role and entry.get("role") in (None, "") and isinstance(parent.match, staff.StaffRow) and isinstance(identity, dict):
+                    current = next((row for row in self.record.find(kind="worker", parent=parent.match.id)
+                                    if row.name == name and len(identity) == 1
+                                    and row.current_session in identity.values()), None)
+                    if current is not None:
+                        # Membership proves the worker kind, but not its opening role.
+                        self.add(WorkerObservation(name, parent, "worker", identity))
+                        continue
+                self.add(WorkerObservation(name, parent, _role(role), identity))
             except (ValueError, OSError, staff.StaffRefused, staff.StaffUnreadable) as error:
                 _problem(f"{path} worker {name}", error)
 

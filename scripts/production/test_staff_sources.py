@@ -2263,5 +2263,130 @@ class NonLocalMemberReferenceTests(unittest.TestCase):
                 self.assertEqual(found, expected)
 
 
+class LegacyWorkerSourceTests(StaffTestCase):
+    run_dir: Path = Path()
+
+    @property
+    def parent(self) -> staff.StaffRow:
+        row = staff.by_path("sdlc/models")
+        assert row is not None
+        return row
+
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        _ = self.production("sdlc", "models-unit")
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            staff_sources.seed()
+        parent = staff.by_path("sdlc/models")
+        owner = staff.by_path("sdlc")
+        assert parent is not None and owner is not None
+        _ = self.session_record(owner.current_session, owner.name)
+        _ = self.session_record(parent.current_session, "models-unit")
+        self.run_dir = self.worker_run("sdlc", "models-unit", parent.current_session)
+
+    def read_live(self) -> tuple[list[dict[str, object]], str]:
+        with redirect_stderr(io.StringIO()) as errors:
+            value = staff_sources.live()
+        return cast(list[dict[str, object]], value["members"]), errors.getvalue()
+
+    def test_roleless_roster_uses_exact_worker_membership_without_inventing_a_role(self) -> None:
+        worker = fixture_member("worker", name="review", parent=self.parent.id)
+        worker = staff.update_current_session(worker.id, staff.native_id(fixture_runtime_id("legacy-review-current")))
+        path = self.roster_worker(self.run_dir, worker.name, "", worker.current_session)
+        for omitted in (True, False):
+            with self.subTest(omitted=omitted):
+                data = cast(dict[str, dict[str, object]], json.loads(path.read_text()))
+                if omitted:
+                    _ = data[worker.name].pop("role", None)
+                else:
+                    data[worker.name]["role"] = ""
+                self.write_json(path, data)
+                before = self.staff_file.read_bytes(), path.read_bytes()
+                members, errors = self.read_live()
+                self.assertEqual(errors, "")
+                found = next(member for member in members if member["id"] == worker.id)
+                self.assertEqual(found["kind"], "worker")
+                self.assertEqual(found["role"], "worker")
+                self.assertEqual(found["name"], worker.name)
+                self.assertEqual(found["parent"], self.parent.id)
+                self.assertEqual(found["identity"], {"codex": worker.current_session})
+                self.assertEqual((self.staff_file.read_bytes(), path.read_bytes()), before)
+
+    def test_roleless_roster_rejects_missing_or_conflicting_membership_and_invalid_roles(self) -> None:
+        worker = fixture_member("worker", name="review", parent=self.parent.id)
+        other = fixture_member("unit", name="other", parent=self.parent.parent)
+        elsewhere = fixture_member("worker", name="elsewhere", parent=other.id)
+        cases = (
+            ("missing", "", fixture_runtime_id("missing-worker")),
+            (worker.name, "invalid-role", worker.current_session),
+            (worker.name, "", fixture_runtime_id("conflicting-worker")),
+            ("wrong-name", "", worker.current_session),
+            ("elsewhere", "", elsewhere.current_session),
+        )
+        for name, role, identity in cases:
+            with self.subTest(name=name, role=role, identity=identity):
+                self.write_json(self.run_dir / "mesh_roster.json", {})
+                path = self.roster_worker(self.run_dir, name, role, identity)
+                before = self.staff_file.read_bytes(), path.read_bytes()
+                members, errors = self.read_live()
+                self.assertFalse(any(member["kind"] == "worker" for member in members), members)
+                self.assertEqual(len(errors.splitlines()), 1, errors)
+                self.assertIn(f"{path} worker {name}:", errors)
+                self.assertIn("missing or invalid recorded worker role", errors)
+                self.assertEqual((self.staff_file.read_bytes(), path.read_bytes()), before)
+
+    def test_malformed_roster_entry_preserves_its_valid_sibling(self) -> None:
+        worker = fixture_member("worker", name="review", parent=self.parent.id)
+        path = self.roster_worker(self.run_dir, worker.name, "review", worker.current_session)
+        data = cast(dict[str, object], json.loads(path.read_text()))
+        write_text_atomic(path, json.dumps({"broken": [], **data}) + "\n")
+        before = self.staff_file.read_bytes(), path.read_bytes()
+        members, errors = self.read_live()
+        self.assertEqual(len(errors.splitlines()), 1, errors)
+        self.assertIn(f"{path} worker broken: expected a JSON object", errors)
+        found = next(member for member in members if member["id"] == worker.id)
+        self.assertEqual(found["role"], "review")
+        self.assertEqual(found["identity"], {"codex": worker.current_session})
+        self.assertEqual((self.staff_file.read_bytes(), path.read_bytes()), before)
+
+    def paused_legacy_ledger(self, identity: str) -> Path:
+        path = self.ledger_worker(self.run_dir, "sdlc", "former-models-unit", "review", "review",
+                                  identity, family="claude")
+        data = cast(dict[str, object], json.loads(path.read_text()))
+        entries = cast(dict[str, dict[str, object]], data["workers"])
+        entries["review"]["ownership"] = {"kind": "Paused"}
+        self.write_json(path, data)
+        self.write_json(self.run_dir / "mesh_roster.json", {})
+        return path
+
+    def test_paused_legacy_ledger_finds_renamed_parent_through_backend_current_session(self) -> None:
+        worker = fixture_member("worker", name="review", parent=self.parent.id)
+        worker = staff.update_current_session(worker.id, staff.native_id(fixture_runtime_id("legacy-ledger-current")))
+        path = self.paused_legacy_ledger(worker.current_session)
+        parent = staff.rename(self.parent.id, "renamed-models")
+        _ = self.session_record(worker.current_session, "review")
+        before = self.staff_file.read_bytes(), path.read_bytes()
+        members, errors = self.read_live()
+        self.assertEqual(errors, "")
+        found = next(member for member in members if member["id"] == worker.id)
+        self.assertEqual(found["parent"], parent.id)
+        self.assertEqual(found["identity"], {"claude": worker.current_session})
+        self.assertEqual(found["role"], "review")
+        self.assertEqual(next(member["name"] for member in members if member["id"] == parent.id), parent.name)
+        self.assertNotIn("staff_id", path.read_text())
+        self.assertEqual((self.staff_file.read_bytes(), path.read_bytes()), before)
+
+    def test_paused_legacy_ledger_without_native_membership_has_no_current_staff_parent(self) -> None:
+        identity = fixture_runtime_id("unregistered-legacy-ledger")
+        path = self.paused_legacy_ledger(identity)
+        _ = self.session_record(identity, "review")
+        before = self.staff_file.read_bytes(), path.read_bytes()
+        members, errors = self.read_live()
+        self.assertFalse(any(member["kind"] == "worker" for member in members), members)
+        self.assertIn(f"{path} worker review: worker ledger has no current staff parent", errors)
+        self.assertEqual((self.staff_file.read_bytes(), path.read_bytes()), before)
+
+
 if __name__ == "__main__":
     _ = unittest.main()
