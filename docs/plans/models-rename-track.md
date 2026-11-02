@@ -22,28 +22,24 @@
 
 **Depends on:** herdr Phase 3q (landed). Lands before the configuration-completeness audits (herdr 4c, 4d). Live repair (sdlc, 2026-10-31): the 16:24 fill wrote `.unit.toml` in a format that `taplo fmt --check` rejects under each repository's own `taplo.toml` (`align_entries`, `reorder_keys`).
 
-#### Work Order
+#### As-built
 
-**Goal:** `unit_config.write` and `write_parked` emit the text that `taplo fmt` gives under the target repository's own config, and a fill rerun rewrites each existing file that differs; a second rerun changes nothing.
-
-**Spec:**
-1. `unit_config._publish` (`unit_config.py:239`) compares formatted bytes, not parsed values, so a file with the right values in the wrong format is rewritten.
-2. The report says `changed` or `unchanged` from that byte comparison.
-3. The format comes from the repository's own `taplo.toml`; a parked file whose worktree is gone uses the repository config recorded for it, else the default.
+- `unit_config.write`, `write_parked` and `park` emit the text that `taplo fmt --no-auto-config [--config <file>] --stdin-filepath <path> -` gives, and return `Published | AlreadyCurrent`.
+- `_publish` compares formatted bytes, so a file with the right values in the wrong format is rewritten. `_formatted` checks that the formatted text decodes to the same values.
+- `repository_formatting(worktree)` reads the repository's `.taplo.toml` or `taplo.toml` into `RepositoryTaploConfig(text)`, else `DefaultTaploConfig`. `UnitConfig.formatting` holds it (`compare=False`); parked files save it under the `taplo_config` key.
+- A parked file takes its format from the live recorded start folder's repository config, else its saved `RepositoryTaploConfig`, else the caller's config.
+- The staff fill prints `changed` or `unchanged` from the `Published` result, and rewrites existing live configs through `write`. `retirement_plan(..., check_format=...)` checks format only on dry runs.
+- A taplo failure raises to the caller; unformatted text is never written.
 
 **Files:**
-- `scripts/production/unit_config.py`, `scripts/production/staff_sources.py` — formatting and publication.
-- `scripts/production/test_unit_config.py`, `scripts/production/test_staff_sources.py` — tests and aligning-config fixtures.
+- `scripts/production/unit_config.py` — formatting, `RepositoryTaploConfig`, `DefaultTaploConfig`, `Published | AlreadyCurrent`.
+- `scripts/production/staff_sources.py` — fill report and rewrite.
+- `scripts/production/unit_config_format_test_support.py` — aligning-config fixtures and a counting taplo wrapper.
+- `scripts/production/test_unit_config.py`, `scripts/production/test_staff_sources.py` — tests that run real taplo on writer output.
 
-**Workers:** `1 writer + 1 tester`
-- `impl` — `unit_config.py` and `staff_sources.py`.
-- `test` — the tests and fixtures.
+**Binds later work:** parked files carry `taplo_config`; a reader older than this change rejects that key.
 
-**State:** `.unit.toml` files in each unit worktree and parked files under `~/.local/state/staff/units/`; the rewrite is rerun-safe.
-
-**Constraints from prior phases:** herdr Phase 3h review (2026-11-01): Phase 3q `UnitConfig`; isolation gate.
-
-**Acceptance gate:** basedpyright 0/0 on changed files and callers; `test_unit_config*` and `test_staff_sources*` pass, with a test that runs taplo on the writer's output under an aligning config; the live rerun rewrites the files, `taplo fmt --check .unit.toml` passes in each filled worktree, and a second rerun prints `unchanged` with no byte changed.
+**Gotchas:** `unit_config` calls taplo through its own `run_taplo` alias of `subprocess.run`. `add_unit_test_support` fakes `subprocess.run` for every command that is not git, and the alias keeps that fake away from taplo.
 
 ### Phase 4 — Member names come from the staff row  · status: todo
 
