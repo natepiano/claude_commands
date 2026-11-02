@@ -93,8 +93,18 @@ When the user asks to review changes, open the prepared page:
 2. Give the link to the user.
 
 The page contains every waiting change, with staff-based showrunner tabs.
-The user selects Next in the browser.
 Answers save in the background.
+Each successful save opens the next waiting change in the same tab.
+Navigation during a save prevents this automatic change.
+Next skips a change without saving an answer.
+A failed save keeps the answer, failure text, resend control, and waiting count.
+Validate yourself advances the page when the request saves.
+On a page load, only a sent validation message removes the row from the count and Next order.
+Pending and failed validation messages keep the row waiting, with a note and a resend control.
+This state survives a reload and a server restart.
+A direct link shows **The showrunner will validate this** without answer buttons.
+The showrunner still receives the validation message and retains the row in its own `/next` queue.
+Send feedback removes the row from the page count only when its verdict saves.
 Do not ask for a batch size or take page answers in chat.
 
 The diagnostic command `show <production>` still prints the current row and count.
@@ -141,6 +151,19 @@ to the session that added it. The fix comes back as a new row.
 Rerunning the same verdict prints `already has this verdict`, the first run's
 line and the scratch removal lines. A different verdict for a Reviewed row is
 refused; it still ends the row's scratch folders.
+
+## Validate
+
+A message `Change review C<n>: the user asks you to validate this` asks the
+showrunner of the row's tab to check the change in place of the user:
+
+1. Check the change with evidence: run it, read its output, or look at the screen.
+2. If it works, save the verdict
+   `works (validated by the showrunner: <evidence>; not seen live: <what>)`.
+3. If it does not work, save a verdict that names the fault. The row returns to
+   its unit, and the fix comes back as a new row for the user.
+
+Use the `verdict` command above for both. The row stays out of the user's count until the verdict saves.
 
 ## Never a question
 

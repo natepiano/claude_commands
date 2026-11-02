@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import json
 import itertools
 import os
 import re
 import signal
+import shlex
 import socket
 import subprocess
 import sys
@@ -62,6 +64,7 @@ class Arguments(argparse.Namespace):
     prompt: str = ""
     cwd: str = ""
     lens: str = ""
+    diff: str = ""
     pass_number: int = 1
     image: list[str] = []
 
@@ -111,6 +114,7 @@ def parse_arguments() -> Arguments:
     _ = parser.add_argument("--prompt", required=True)
     _ = parser.add_argument("--cwd", default=str(Path.cwd()))
     _ = parser.add_argument("--lens", choices=LENSES, default="")
+    _ = parser.add_argument("--diff", default="", help="saved phase diff for the simplify lens")
     _ = parser.add_argument("--pass", dest="pass_number", type=int, default=1)
     _ = parser.add_argument("--image", action="append", default=[])
     args = parser.parse_args(namespace=Arguments())
@@ -127,6 +131,12 @@ def parse_arguments() -> Arguments:
         parser.error("--style-since requires a final-diff review")
     if args.style_until and not args.style_since:
         parser.error("--style-until requires --style-since")
+    if args.lens == "simplify" and (args.role != "review" or args.early_ready or args.style_since):
+        parser.error("simplify requires a broad review of the completed phase diff")
+    if args.lens == "simplify" and not args.diff:
+        parser.error("--diff is required with --lens simplify")
+    if args.diff and args.lens != "simplify":
+        parser.error("--diff requires --lens simplify")
     return args
 
 
@@ -626,6 +636,78 @@ def execute(dispatch: Dispatch, paths: list[str]) -> int:
     return settle_dispatch(dispatch, code, completed, shown, status, summary, reply)
 
 
+def execute_simplify(args: Arguments, run: Path, phase: str, cwd: Path, source_prompt: Path,
+                     env: dict[str, str]) -> int:
+    directory = phase_reservation.phase_directory(run, phase)
+    directory.mkdir(parents=True, exist_ok=True)
+    summary = directory / "review_findings_1_simplify.txt"
+    status = directory / "review_status_simplify"
+
+    def report_error(message: str) -> int:
+        _ = status.write_text("error\n")
+        print(f"simplify: error: {message}; summary {summary}", file=sys.stderr)
+        return 0
+
+    try:
+        if conf.text("direct", "SIMPLIFY_LENS") == "off":
+            print("simplify: off")
+            return 0
+        if args.pass_number != 1:
+            print("simplify: skipped; broad review only")
+            return 0
+        diff = (cwd / Path(args.diff).expanduser()).resolve()
+        digest = hashlib.sha256(diff.read_bytes()).hexdigest()
+        cache = directory / "simplify"
+        cache.mkdir(exist_ok=True)
+        with (cache / "launch.lock").open("a+") as lock:
+            try:
+                worker_lifecycle.acquire_flock(lock, mode=fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return report_error("the Claude lens is busy")
+            record_path = cache / f"{digest}.json"
+            if record_path.exists():
+                record = read_object(record_path)
+                outcome, output = text(record.get("status")), text(record.get("summary"))
+                action = "reused"
+            else:
+                prompt = cache / "prompt.md"
+                standing = (conf.directory() / "review/simplify.md").read_text()
+                _ = prompt.write_text(f"/simplify {shlex.quote(str(diff))}\n\n"
+                                      + standing + "\n\n" + source_prompt.read_text() + "\n")
+                env["UNIT_REVIEW_CACHE_FILE"] = str(record_path)
+                command = ["bash", str(SCRIPTS / "review.sh"), "--phase", phase, str(run), str(cwd),
+                           str(prompt), "simplify", "simplify review", "reviewing the completed phase diff", "1", "simplify"]
+                # The child retains the lock if this launcher stops before it can send a signal.
+                with subprocess.Popen(command, env=env, start_new_session=True,
+                                      pass_fds=(lock.fileno(),)) as reviewer:
+                    def interrupt(signum: int, frame: FrameType | None) -> NoReturn:
+                        del frame
+                        reviewer.send_signal(signum)
+                        raise SystemExit(128 + signum)
+
+                    previous = {number: signal.signal(number, interrupt)
+                                for number in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)}
+                    try:
+                        _ = reviewer.wait()
+                    finally:
+                        if reviewer.poll() is None:
+                            reviewer.terminate()
+                            _ = reviewer.wait()
+                        for number, handler in previous.items():
+                            _ = signal.signal(number, handler)
+                outcome = status.read_text().strip() if status.exists() else "error"
+                output = summary.read_text() if summary.exists() else ""
+                action = outcome
+            _ = status.write_text(outcome + "\n")
+            _ = summary.write_text(output)
+            if args.summary:
+                _ = Path(args.summary).write_text(output)
+            print(f"simplify: {action}; summary {summary}")
+            return 0
+    except (OSError, ValueError) as error:
+        return report_error(str(error))
+
+
 def main() -> int:
     args = parse_arguments()
     cwd, prompt = Path(args.cwd).expanduser().resolve(), Path(args.prompt).expanduser().resolve()
@@ -634,6 +716,8 @@ def main() -> int:
     paths = authorized_paths(args, cwd)
     env = dict(os.environ)
     run, phase = prepare_run(args, cwd, prompt, env)
+    if args.lens == "simplify":
+        return execute_simplify(args, run, phase, cwd, prompt, env)
     role = "impl" if args.role == "implement" else args.role
     check = [PYTHON, PROGRESS, "check-launch", "--session-dir", str(run), "--pass-kind", role,
              "--phase-id", phase, "--prompt-file", str(prompt), "--fix-cause", args.fix_cause]

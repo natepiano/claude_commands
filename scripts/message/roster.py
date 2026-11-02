@@ -1337,7 +1337,7 @@ def _herdr_codex_panes(machine: str) -> Roster:
             process = codex_processes.get(herdr.HerdrPlace(name, pane))
             entries.append(RosterEntry(
                 machine=machine, kind="codex", role="freestanding",
-                name=f"herdr {name}:{pane}", status=agent["agent_status"],
+                name=f"herdr {name}:{pane}", status=str(agent["agent_status"]),
                 reach=CannotReceiveMessages("interactive Codex in a herdr pane"),
                 cwd=cwds.get(herdr.HerdrPlace(name, pane), ""),
                 showrunner=NoShowrunner(), director=NoDirector(), assignment=NotAWorker(),

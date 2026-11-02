@@ -99,6 +99,8 @@ STATE_IN_FLIGHT = "repair_in_flight"
 STATE_PENDING = "fixed_pending_review"
 STATE_ACCEPTED = "accepted"
 STATE_ROUTED = "routed"
+STATE_HELD = "held_for_decision"
+STATE_DECIDED = "decided"
 KEEP_CATEGORIES = ("regression", "broken", "gate", "ruling")
 
 
@@ -258,12 +260,28 @@ def _newest_open_instance(session_dir: Path) -> str:
     return _string(phases[-1].get("instance_id")) if phases else ""
 
 
-def _phase_identity(session_dir: Path, phase_id: str = "") -> tuple[str, str]:
-    """The phase this ledger call is for, so two open phases keep separate ledgers.
+def _newest_ledger_instance(session_dir: Path, phase_id: str) -> str:
+    """Return the newest ledger instance for the named phase."""
+    ledgers: list[dict[str, object]] = []
+    for path in [_state_path(session_dir), *sorted(session_dir.glob(_parked_path(session_dir, "*").name))]:
+        if path.is_file():
+            ledger = _json_object(path.read_text(encoding="utf-8"))
+            if ledger is not None and _string(ledger.get("phase_id")) == phase_id:
+                ledgers.append(ledger)
+    if not ledgers:
+        return ""
+    newest = max(ledgers, key=lambda ledger: _number(ledger.get("started_at")))
+    return _string(newest.get("phase_instance_id"))
 
-    A named phase must be open. With none named, the one open phase is meant;
-    with several open the call is refused, since picking one would act on the
-    newest phase's ledger whatever the caller meant.
+
+def _phase_identity(
+    session_dir: Path, phase_id: str = "", *, closed_phase_ok: bool = False,
+) -> tuple[str, str]:
+    """Resolve the phase for this ledger command.
+
+    A named phase must be open unless the caller permits a closed phase.
+    An unnamed command selects the only open phase.
+    Several open phases require an explicit name.
     """
     progress = _progress_state(session_dir)
     if progress is None:
@@ -273,6 +291,10 @@ def _phase_identity(session_dir: Path, phase_id: str = "") -> tuple[str, str]:
         for phase in phases:
             if _string(phase.get("id")) == phase_id:
                 return _string(phase.get("instance_id")), phase_id
+        if closed_phase_ok:
+            instance_id = _newest_ledger_instance(session_dir, phase_id)
+            if instance_id:
+                return instance_id, phase_id
         open_ids = ", ".join(_string(phase.get("id")) for phase in phases) or "none"
         raise SystemExit(f"Phase {phase_id} is not open (open phases: {open_ids})")
     if len(phases) > 1:
@@ -281,6 +303,8 @@ def _phase_identity(session_dir: Path, phase_id: str = "") -> tuple[str, str]:
     phase = phases[0] if phases else _object_dict(progress.get("phase"))
     if phase is None:
         return "", ""
+    if not closed_phase_ok and _string(phase.get("status")) not in ("", "active"):
+        raise SystemExit(f"Phase {_string(phase.get('id'))} is not open (open phases: none)")
     return _string(phase.get("instance_id")), _string(phase.get("id"))
 
 
@@ -335,10 +359,12 @@ def _fresh_state(instance_id: str, phase_id: str, now: float) -> dict[str, objec
     }
 
 
-def _read_state(session_dir: Path, now: float, phase: str = "") -> dict[str, object]:
+def _read_state(
+    session_dir: Path, now: float, phase: str = "", *, closed_phase_ok: bool = False,
+) -> dict[str, object]:
     """Load the phase's ledger: the live file, a parked one, or a fresh one."""
     path = _state_path(session_dir)
-    instance_id, phase_id = _phase_identity(session_dir, phase)
+    instance_id, phase_id = _phase_identity(session_dir, phase, closed_phase_ok=closed_phase_ok)
     if not path.exists():
         return _fresh_state(instance_id, phase_id, now)
     try:
@@ -596,7 +622,7 @@ def _summarize(entry: dict[str, object]) -> dict[str, object]:
     detail = _string(entry.get("detail"))
     if detail:
         summary["detail"] = detail
-    for key in ("route", "astra_reviews"):
+    for key in ("route", "astra_reviews", "decision"):
         if key in entry:
             summary[key] = entry[key]
     return summary
@@ -703,6 +729,12 @@ def _open(args: argparse.Namespace) -> None:
     now = _now_epoch()
     state = _read_state(session_dir, now, _arg_string(args, "phase"))
     severity = _arg_string(args, "severity")
+    held = bool(getattr(args, "held_for_decision", False))
+    lenses = _arg_string(args, "lens").split(",")
+    if held and "simplify" not in lenses:
+        raise SystemExit("--held-for-decision requires --lens simplify")
+    if "simplify" in lenses and severity != "minor":
+        raise SystemExit("simplify findings require --severity minor")
     ordinal = _integer(state.get("next_ordinal"), 1)
     finding_id = f"F{ordinal:03d}"
     entry: dict[str, object] = {
@@ -714,7 +746,7 @@ def _open(args: argparse.Namespace) -> None:
         "detail": _arg_string(args, "detail"),
         "caught_by": _caught_by(args),
         "lens": _arg_string(args, "lens"),
-        "state": STATE_OPEN,
+        "state": STATE_HELD if held else STATE_OPEN,
         "opened_at": now,
         "opened_round": len(_rounds(state)),
         "fix_attempts": 0,
@@ -737,6 +769,7 @@ def _open(args: argparse.Namespace) -> None:
             "title": _arg_string(args, "title"),
             "caught_by": _caught_by(args),
             "lens": _arg_string(args, "lens"),
+            "state": entry["state"],
             "round": len(_rounds(state)),
         },
     )
@@ -751,6 +784,8 @@ def _verdict(args: argparse.Namespace) -> None:
     entry = _finding(state, finding_id)
     outcome = _arg_string(args, "state")
     current = _string(entry.get("state"))
+    if current in (STATE_HELD, STATE_DECIDED):
+        raise SystemExit(f"{finding_id} requires the user's decision; no closure verdict can change it")
     # A verdict judges a repair that exists. While one is in flight nothing has
     # confirmed any edit landed, so there is nothing a reviewer could have read.
     if current == STATE_IN_FLIGHT:
@@ -1181,10 +1216,33 @@ def _abandon(args: argparse.Namespace) -> None:
     )
 
 
+def _decision(args: argparse.Namespace) -> None:
+    """Record the user's answer without applying the proposed change."""
+    session_dir = _session_dir(args)
+    now = _now_epoch()
+    state = _read_state(session_dir, now, _arg_string(args, "phase"), closed_phase_ok=True)
+    entry = _finding(state, _arg_string(args, "id"))
+    if _string(entry.get("state")) != STATE_HELD:
+        raise SystemExit("Only a finding held for a decision can receive an answer")
+    decision: dict[str, object] = {
+        "answer": _arg_string(args, "answer"),
+        "user_words": _required_text(args, "user_words"),
+        "timestamp_epoch": now,
+    }
+    entry["state"] = STATE_DECIDED
+    entry["decision"] = decision
+    _write_state(session_dir, state)
+    _append_event(session_dir, state, {
+        "event_type": "finding_decision", "finding_id": entry["id"],
+        "timestamp": _iso_time(now), **decision,
+    })
+    print(f"{entry['id']} decided: {decision['answer']}")
+
+
 def _status(args: argparse.Namespace) -> None:
     session_dir = _session_dir(args)
     now = _now_epoch()
-    state = _read_state(session_dir, now, _arg_string(args, "phase"))
+    state = _read_state(session_dir, now, _arg_string(args, "phase"), closed_phase_ok=True)
     findings = [_summarize(_finding(state, key)) for key in sorted(_findings(state))]
     payload: dict[str, object] = {
         "phase_id": _string(state.get("phase_id")),
@@ -1193,6 +1251,7 @@ def _status(args: argparse.Namespace) -> None:
         "in_flight": _in_flight_ids(state),
         "repair_round": _repair_round(state, session_dir),
         "routed": [_summarize(_finding(state, key)) for key in _ids_in_state(state, STATE_ROUTED)],
+        "held_for_decision": [_summarize(_finding(state, key)) for key in _ids_in_state(state, STATE_HELD)],
         "gating_severities": list(_gating_severities(state)),
         "open_counts": _open_counts(state),
         "findings": findings,
@@ -1245,7 +1304,16 @@ def _build_parser() -> argparse.ArgumentParser:
     # quality, and `ux` is the UX screenshot reviewer's. Empty for a closure
     # review or the main review alone.
     _ = opened.add_argument("--lens", type=_lens_list, default="")
+    _ = opened.add_argument("--held-for-decision", action="store_true")
     opened.set_defaults(handler=_open)
+
+    decision = subparsers.add_parser("decision", help="record the user's answer to a held finding")
+    _ = decision.add_argument("--session-dir", required=True)
+    _ = decision.add_argument("--phase", default="", help=PHASE_HELP)
+    _ = decision.add_argument("--id", required=True)
+    _ = decision.add_argument("--answer", choices=("approved", "declined"), required=True)
+    _ = decision.add_argument("--user-words", required=True)
+    decision.set_defaults(handler=_decision)
 
     verdict = subparsers.add_parser("verdict", help="record a closure review's outcome")
     _ = verdict.add_argument("--session-dir", required=True)
