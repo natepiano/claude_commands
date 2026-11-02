@@ -54,9 +54,8 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 send_role_map_command = role_map.ssh_role_map
 start_session_counts_fetch = cast(Callable[[], bool], getattr(accounts, "_start_session_counts_fetch"))
 session_counts_cache = cast(Callable[[], Path], getattr(accounts, "_session_counts_cache"))
-session_counts_file = cast(Callable[[], Path], getattr(accounts, "_session_counts_file"))
-publish_session_counts = cast(Callable[[dict[tuple[Path, str], dict[str, str]]], accounts.MachineSessionCounts],
-    getattr(accounts, "_publish_session_counts"))
+session_counts_document = cast(Callable[[dict[tuple[Path, str], dict[str, str]]], accounts.MachineSessionCounts],
+    getattr(accounts, "_session_counts_document"))
 decode_session_counts = cast(Callable[[str, str], accounts.MachineSessionCounts], getattr(accounts, "_decode_session_counts"))
 machine_role_counts = cast(Callable[[tuple[accounts.StatusRow, ...], datetime],
     tuple[tuple[accounts.StatusRow, ...], tuple[str, ...]]], getattr(accounts, "_machine_role_counts"))
@@ -544,6 +543,16 @@ class AccountsTests(unittest.TestCase):
             self.assertIn(str(records / "fixture.json"), document["session_inputs"])
             self.assertEqual((records / "fixture.json").read_bytes(), retained_bytes)
 
+    def test_stored_status_starts_no_counts_fetch_and_writes_nothing(self) -> None:
+        before = {path: path.read_bytes() for path in self.home.rglob("*") if path.is_file()}
+        paths = set(self.home.rglob("*"))
+        with patch.object(accounts, "_start_session_counts_fetch") as fetch:
+            code, _text, error = self.run_cli("status", "--stored", "--json")
+        self.assertEqual((code, error), (0, ""))
+        fetch.assert_not_called()
+        self.assertEqual(set(self.home.rglob("*")), paths)
+        self.assertEqual({path: path.read_bytes() for path in self.home.rglob("*") if path.is_file()}, before)
+
     def test_machine_counts_publish_and_merge_on_either_machine_without_waiting_for_ssh(self) -> None:
         from scripts.message import sessions
         local = accounts.RoleSessionCounts(1, 1, 2)
@@ -556,9 +565,9 @@ class AccountsTests(unittest.TestCase):
                   patch.object(remote, "other_machine", return_value=peer),
                   patch.object(sessions, "live_sessions", return_value=[]),
                   patch.object(role_map, "ssh_role_map", side_effect=AssertionError("status waited on ssh"))):
-                _ = publish_session_counts({(self.home / ".claude1", "units"):
+                published = session_counts_document({(self.home / ".claude1", "units"):
                     {"one": "busy", "two": "shell", "three": "idle", "four": "idle"}})
-                published = decode_session_counts(session_counts_file().read_text(), here)
+                published = decode_session_counts(json.dumps(published), here)
                 self.assertEqual(published["accounts"]["claude1"]["units"]["total"], 4)
                 atomic_file.write_text_atomic(session_counts_cache(), json.dumps({
                     "machine": peer, "at": now.isoformat(), "accounts": {"claude1": {"units": count}}}))
@@ -580,9 +589,9 @@ class AccountsTests(unittest.TestCase):
             with (self.subTest(hostname=hostname),
                   patch.object(remote, "local_machine", return_value=hostname),
                   patch.object(remote, "other_machine", return_value=peer)):
-                published = publish_session_counts({(self.home / ".claude1", "units"): {"unit": "busy"}})
+                published = session_counts_document({(self.home / ".claude1", "units"): {"unit": "busy"}})
                 self.assertEqual(published["machine"], here)
-                self.assertEqual(decode_session_counts(session_counts_file().read_text(), here), published)
+                self.assertEqual(decode_session_counts(json.dumps(published), here), published)
                 atomic_file.write_text_atomic(session_counts_cache(), json.dumps({
                     "machine": peer, "at": now.isoformat(), "accounts": {}}))
                 rows, problems = machine_role_counts((row,), now)
@@ -597,20 +606,20 @@ class AccountsTests(unittest.TestCase):
         self.write_note("codex1", "fixture-worker")
         self.codex_login("fixture-worker")
         self.codex_login("fixture-worker", self.home / ".codex1")
-        published = publish_session_counts({
+        published = session_counts_document({
             (self.home / ".codex", "workers"): {"legacy-worker": "busy"},
             (self.home / ".codex1", "workers"): {"numbered-worker": "idle"},
         })
         self.assertEqual(published["accounts"], {
             "codex1": {"workers": {"busy": 1, "shell": None, "idle": 1, "total": 2}}})
-        self.assertEqual(decode_session_counts(session_counts_file().read_text(), published["machine"]), published)
+        self.assertEqual(decode_session_counts(json.dumps(published), published["machine"]), published)
 
     def test_published_worker_counts_resolve_accounts_in_numbered_codex_homes(self) -> None:
         self.write_note("codex1", "fixture-first")
         self.write_note("codex2", "fixture-second")
         self.codex_login("fixture-second", self.home / ".codex1")
         self.codex_login("fixture-first", self.home / ".codex2")
-        published = publish_session_counts({
+        published = session_counts_document({
             (self.home / ".codex1", "workers"): {"first-worker": "busy"},
             (self.home / ".codex2", "workers"): {"second-worker": "idle"},
         })
@@ -618,7 +627,7 @@ class AccountsTests(unittest.TestCase):
             "codex1": {"workers": {"busy": 0, "shell": None, "idle": 1, "total": 1}},
             "codex2": {"workers": {"busy": 1, "shell": None, "idle": 0, "total": 1}},
         })
-        self.assertEqual(decode_session_counts(session_counts_file().read_text(), published["machine"]), published)
+        self.assertEqual(decode_session_counts(json.dumps(published), published["machine"]), published)
 
     def test_peer_counts_age_failure_and_recovery_use_only_the_local_counts(self) -> None:
         row = SharedStatusDocumentTests().row()
@@ -671,6 +680,7 @@ class AccountsTests(unittest.TestCase):
     def test_counts_read_uses_only_local_registries_and_shared_transport_selects_the_peer(self) -> None:
         from scripts.message import sessions
         peer = remote.other_machine()
+        before = {path: path.read_bytes() for path in self.home.rglob("*") if path.is_file()}
         with (patch.object(sessions, "live_sessions", return_value=[]),
               patch.object(accounts, "group_accounts", side_effect=AssertionError("role fetch")),
               patch.object(accounts, "account_statuses", side_effect=AssertionError("account read")),
@@ -679,6 +689,7 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual((result, error), (0, ""))
         local = "mac" if peer == "natedev" else "natedev"
         self.assertEqual(decode_session_counts(text, local)["accounts"], {})
+        self.assertEqual({path: path.read_bytes() for path in self.home.rglob("*") if path.is_file()}, before)
         with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, stdout=text, stderr="")) as fetch:
             self.assertEqual(role_map.ssh_role_map(("session-counts-read",), machine=peer), text)
         fetch.assert_called_once_with(("ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", peer,

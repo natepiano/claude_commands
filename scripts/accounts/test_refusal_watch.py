@@ -53,6 +53,10 @@ else:
     pane_record = import_module("pane_record")
 
 
+def setUpModule() -> None:
+    _ = unittest.enterModuleContext(patch.object(accounts, "_start_session_counts_fetch", return_value=True))
+
+
 NOW = datetime(2026, 10, 14, 12, tzinfo=timezone.utc)
 SOURCE_LOGIN = "source@example.invalid"
 TARGET_LOGIN = "target@example.invalid"
