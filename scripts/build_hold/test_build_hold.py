@@ -519,7 +519,7 @@ class TargetCommandTests(PrivateReleaseBroadcastTest):
         status, output, errors, calls = self.run_with_mac_stand_in(
             ["hold", "--target", "mac", "--holder", "alice", "--for", "renderer checks"])
         self.assertEqual(status, 0, errors)
-        self.assertEqual(calls, [["block", "--holder", "alice", "--for", "renderer checks"]])
+        self.assertEqual(calls, [["block", "--holder", "alice", "--for", "renderer checks", "--target", "mac"]])
         self.assertEqual(output, "Mac stand-in result\n")
         self.assertEqual(errors, "Mac stand-in detail\n")
         self.assert_no_natedev_record()
@@ -530,7 +530,7 @@ class TargetCommandTests(PrivateReleaseBroadcastTest):
                 status, output, errors, calls = self.run_with_mac_stand_in(
                     ["release", "--target", "mac", "--holder", "alice"], exit_code=exit_code)
                 self.assertEqual(status, exit_code, errors)
-                self.assertEqual(calls, [["unblock", "--holder", "alice"]])
+                self.assertEqual(calls, [["unblock", "--holder", "alice", "--target", "mac"]])
                 self.assertEqual(output, "Mac stand-in result\n")
                 self.assertEqual(errors, "Mac stand-in detail\n")
                 self.assert_no_natedev_record()
@@ -539,7 +539,7 @@ class TargetCommandTests(PrivateReleaseBroadcastTest):
         status, output, errors, calls = self.run_with_mac_stand_in(
             ["hold", "--target", "mac", "--holder", "alice", "--for", "renderer checks"], exit_code=9)
         self.assertEqual(status, 9, errors)
-        self.assertEqual(calls, [["block", "--holder", "alice", "--for", "renderer checks"]])
+        self.assertEqual(calls, [["block", "--holder", "alice", "--for", "renderer checks", "--target", "mac"]])
         self.assertEqual(output, "Mac stand-in result\n")
         self.assertEqual(errors, "Mac stand-in detail\n")
         self.assert_no_natedev_record()
@@ -567,13 +567,13 @@ class TargetCommandTests(PrivateReleaseBroadcastTest):
                     status, _, errors, calls = self.run_with_mac_stand_in(
                         ["hold", "--target", "mac", "--for", "renderer checks"], check_block_holder=True)
                     self.assertEqual(status, 0, errors)
-                    self.assertEqual(calls, [["block", "--holder", "first-name", "--for", "renderer checks"]])
+                    self.assertEqual(calls, [["block", "--holder", "first-name", "--for", "renderer checks", "--target", "mac"]])
                     self.session("current-name", "first-name", "middle-name")
                     status, output, errors, calls = self.run_with_mac_stand_in(
                         ["release", "--target", "mac", *given], check_block_holder=True)
                     self.assertEqual(status, 0, errors)
-                    self.assertEqual(calls, [["unblock", "--holder", "current-name"],
-                                             ["unblock", "--holder", "first-name"]])
+                    self.assertEqual(calls, [["unblock", "--holder", "current-name", "--target", "mac"],
+                                             ["unblock", "--holder", "first-name", "--target", "mac"]])
                     self.assertEqual(output, "Mac stand-in result\n")
                     self.assertEqual(errors, "Mac stand-in detail\n")
                     self.assertFalse((self.scratch / "stand-in-block-holder").exists())
@@ -585,7 +585,7 @@ class TargetCommandTests(PrivateReleaseBroadcastTest):
                     status, output, errors, calls = self.run_with_mac_stand_in(
                         ["release", "--target", "mac", *given], check_block_holder=True)
                     self.assertEqual(status, 1)
-                    self.assertEqual(calls, [["unblock", "--holder", "current-name"]])
+                    self.assertEqual(calls, [["unblock", "--holder", "current-name", "--target", "mac"]])
                     self.assertEqual(output, "blocked by someone-else\n")
                     self.assertEqual(errors, "")
                     self.assertEqual((self.scratch / "stand-in-block-holder").read_text(), "someone-else")
