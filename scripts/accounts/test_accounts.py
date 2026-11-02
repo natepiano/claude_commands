@@ -5201,6 +5201,9 @@ finally:
               patch.object(subprocess, "Popen", side_effect=AssertionError("stored Popen"))):
             code, output, error = self.run_cli("status", "--json", "--stored")
             self.assertEqual((code, error), (0, ""))
+            document = cast(accounts.StatusDocument, json.loads(output))
+            self.assertEqual(sum("usage reading is old" in problem for problem in document["problems"]), 2)
+            self.assertEqual(sum("credits reading is old" in problem for problem in document["problems"]), 1)
             rows = cast(list[dict[str, object]], json.loads(output)["accounts"])
             self.assertEqual([row["weekly_left_percent"] for row in rows], [65, 25])
             self.assertEqual([row["read_at"] for row in rows], [read.isoformat(), read.isoformat()])
@@ -5585,7 +5588,10 @@ finally:
         _ = usage_store.store_file().write_text(json.dumps(stored))
         code, output, error = self.run_cli("status", "--stored", "--json")
         self.assertEqual((code, error), (0, ""))
-        row = cast(accounts.StatusDocument, json.loads(output))["accounts"][0]
+        document = cast(accounts.StatusDocument, json.loads(output))
+        self.assertTrue(any("credits reading is old" in problem for problem in document["problems"]))
+        row = document["accounts"][0]
+        self.assertIs(row["read_ok"], False)
         self.assertIsNone(row["credits"])
         self.assertFalse(row["credits_in_use"])
         code, table, error = self.run_cli("status", "--stored")
@@ -5659,7 +5665,7 @@ finally:
 
     # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
-    def test_a_refresh_without_session_credentials_keeps_a_good_reading_unstarred(self) -> None:
+    def test_a_refresh_without_session_credentials_keeps_a_good_reading_but_marks_its_age(self) -> None:
         self.login_directory("claude2", "desktop@example.invalid")
         at = datetime.now(timezone.utc) - timedelta(minutes=20)
         usage_store.save([agent_accounts.Report("Claude", email="desktop@example.invalid",
@@ -5682,10 +5688,43 @@ finally:
         self.assertEqual((code, error), (0, ""))
         rows = cast(list[dict[str, object]], json.loads(document)["accounts"])
         held = next(item for item in rows if item["label"] == "claude2")
-        self.assertIs(held["read_ok"], True)
+        self.assertIs(held["read_ok"], False)
         self.assertEqual(held["weekly_left_percent"], 75)
         self.assertEqual(usage_store.store_file().read_bytes(), before)
         self.assertEqual(self.live_reads.call_count, 2)
+
+    @patch.object(accounts, "is_test_login", new=provider_fixture_login)
+    def test_stored_status_read_failures_and_old_readings_reach_board_problems(self) -> None:
+        self.login_directory("claude2", "idle@example.invalid")
+        now = datetime.now(timezone.utc)
+        old = now - timedelta(days=15)
+        cases = (
+            (agent_accounts.UsageReadOutcome.STALE_TOKEN, "login token expired"),
+            (agent_accounts.UsageReadOutcome.NO_LOGIN_TOKEN, "no login token"),
+            (agent_accounts.UsageReadOutcome.REFUSED_401, "the usage service did not accept this login"),
+            (agent_accounts.UsageReadOutcome.RATE_LIMITED_429, "the usage service is busy"),
+            (agent_accounts.UsageReadOutcome.CREDENTIALS_UNAVAILABLE, "login credentials unavailable in this session"),
+            (agent_accounts.UsageReadOutcome.ERROR, "the usage read failed"),
+            (agent_accounts.UsageReadOutcome.OK, "usage reading is old"),
+            (agent_accounts.UsageReadOutcome.HELD, "usage reading is old"),
+        )
+        for outcome, cause in cases:
+            with self.subTest(outcome=outcome):
+                usage = usage_store.StoredUsage(read_outcome=outcome, attempt_outcome=outcome,
+                    attempted_at=now.isoformat(), weekly=usage_store.StoredWindow(left=75,
+                        at=old.isoformat(), resets=(now + timedelta(days=1)).isoformat()))
+                with usage_store.read_lock():
+                    usage_store.write({"idle@example.invalid": usage})
+                code, output, error = self.run_cli("status", "--stored", "--json")
+                self.assertEqual((code, error), (0, ""))
+                document = cast(accounts.StatusDocument, json.loads(output))
+                self.assertTrue(any(cause in problem for problem in document["problems"]))
+                self.assertIs(document["accounts"][0]["read_ok"], False)
+                self.assertEqual(document["accounts"][0]["read_at"], old.isoformat())
+                code, table, error = self.run_cli("status", "--stored")
+                self.assertEqual((code, error), (0, ""))
+                self.assertIn(cause, table)
+        self.live_reads.assert_not_called()
 
     def test_login_renewal_uses_a_quiet_probe_and_keeps_the_new_reading(self) -> None:
         self.login_directory("claude2", "idle@example.invalid")
@@ -7966,6 +8005,35 @@ class SharedStatusDocumentTests(unittest.TestCase):
                     self.assertIs(document.get("read_ok"), expected)
                     self.assertIs(document.get("credits_in_use"), False)
                     self.assertEqual(document["read_at"], self.at.isoformat() if has_reading else None)
+
+    def test_old_reading_dot_uses_the_existing_refresh_age_limit(self) -> None:
+        for outcome in (agent_accounts.UsageReadOutcome.OK, agent_accounts.UsageReadOutcome.HELD):
+            for age, expected in ((timedelta(minutes=10), True), (timedelta(minutes=10, microseconds=1), False)):
+                with self.subTest(outcome=outcome, age=age):
+                    row = replace(self.row(), read_outcome=outcome, read_at=self.at - age)
+                    self.assertIs(self.document(row)["read_ok"], expected)
+
+    def test_usage_and_credit_readings_just_after_status_time_are_fresh(self) -> None:
+        read_at = self.at + timedelta(seconds=0.1)
+        credit_reading = cast(Callable[[usage_store.StoredUsage, datetime],
+                                      tuple[str, float | Literal["unlimited"] | accounts.StatusUnavailable]],
+                              getattr(accounts, "_credit_reading"))
+        read_problem = cast(Callable[..., list[accounts.StatusProblem]], getattr(accounts, "_read_failure_problem"))
+        usage = usage_store.StoredUsage(credits={"at": read_at.isoformat(), "balance": "13446"})
+        on_credits, credits = credit_reading(usage, self.at)
+        self.assertEqual(credits, 13446)
+        self.assertNotEqual(on_credits, "stale")
+        for outcome in (agent_accounts.UsageReadOutcome.OK, agent_accounts.UsageReadOutcome.HELD):
+            with self.subTest(outcome=outcome):
+                row = replace(self.row(), read_outcome=outcome, read_at=read_at, on_credits=on_credits, credits=credits)
+                problems = read_problem(row, timezone.utc, now=self.at)
+                self.assertEqual(problems, [])
+                reading = replace(self.reading(row), notes=tuple(accounts.render_status_problem(problem) for problem in problems))
+                document = cast(accounts.StatusDocument, json.loads(accounts.render_status_json(reading)))
+                self.assertEqual(document["problems"], [])
+                self.assertIs(document["accounts"][0]["read_ok"], True)
+                self.assertEqual(document["accounts"][0]["read_at"], read_at.isoformat())
+                self.assertEqual(document["accounts"][0]["credits"], 13446)
 
     def test_credit_spending_is_independent_of_enabled_balance_and_access(self) -> None:
         for enabled in (True, False):

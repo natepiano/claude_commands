@@ -53,7 +53,20 @@ Times are in the user's zone setting (`config/user_zone.conf`). The numbers are 
 
 The JSON has no login or folder fields. `--json` cannot be combined with `--detail`.
 
-The accounts board orders its columns as account, left, role, busy, shell, idle, total, resets, credits, enabled, read. Each count cell joins its role values in role order, such as `units, showrunners` with busy counts `3, 2`. Spare counts are blank. Claude session records supply `busy`, `shell`, or `idle`; missing or unknown activity counts as idle. Codex workers count as busy for `running` or `starting`, and idle otherwise. Codex shell counts are unknown and stay blank. The last row sums known counts across all accounts and roles. Narrow panes preserve the order and the total row. JSON retains `credits_in_use` for cargo-handler, but the board has no `in use` column or fact.
+The accounts board orders its columns as account, left, role, busy, shell, idle, total, resets, credits, enabled.
+Each count cell joins its role values in role order.
+For example, `units, showrunners` can have busy counts `3, 2`.
+Spare counts are blank.
+Claude session records supply `busy`, `shell`, or `idle`.
+Missing or unknown activity counts as idle.
+Codex workers count as busy for `running` or `starting`, and idle otherwise.
+Codex shell counts are unknown and stay blank.
+The last row sums known counts across all accounts and roles.
+Narrow panes preserve the order and the total row.
+JSON retains `credits_in_use`, `read_at`, and `read_ok` for other consumers.
+The board has no `in use` or `read` column or fact.
+Failed reads and old readings appear in Problems.
+The dot stays red until the account has a current reading without a read failure.
 
 Counts use the local session registry, validated retained launches, the shared staff membership classifier, notifier registrations, and mesh records. Each status refresh scans these local records once and checks owner liveness. JSON `session_inputs` names the files and directories that the board watches. With session inputs present, each existing ten-second tick runs `status --json --stored` once. This costs one local Python process, file reads, and liveness checks, without ssh, herdr discovery, or a usage request. A killed process disappears from the counts even when its registry files do not change. The reader skips damaged launch entries individually and retains valid siblings. A failed refresh retains its watches and retries on the next tick. An unavailable local staff record supplies no unit membership.
 

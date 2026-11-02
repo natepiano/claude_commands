@@ -3087,7 +3087,7 @@ User 2026-11-02: "i want accounts renewal on the mac for sure". natedev renewed 
 
 **As-built:** `agent_notes.py usage-only` (Mac launchd job, nixos `modules/darwin/account-usage.nix`) runs `refusal_watch.renew_expired_logins` as a dry run after it saves usage. When an account is due, it starts `agent_notes.py renew-logins` as a detached child (`start_new_session`) and returns: launchd runs one job instance, so the usage job never waits on a 120 s probe. `renew-logins` holds the `login-renewal` schedule lock and calls the same function, which keeps the hourly limit and `~/.local/state/accounts/login_renewals.json`. Two repair rounds (F001: the probe held the usage job, first by its lock, then by launchd's one instance). Style review PASS. Live proof: the Mac after promotion.
 
-### Phase 101s — The accounts board has no read column  · status: todo
+### Phase 101s — The accounts board has no read column  · status: done
 
 User 2026-11-02: remove the `read` column from the accounts board; an account that cannot be read shows in the problems, not in a permanent column. Start after 101r. Keep handler-unit (cargo-handler shows accounts) told of each change.
 
