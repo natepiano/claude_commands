@@ -867,6 +867,10 @@ compose_nextest_args() {
     take_test_targets
     NEXTEST_ARGS=(--no-fail-fast --workspace "${TEST_SELECTION[@]}" \
         -E "$TEST_FILTER" "${FEATURE_FLAGS[@]}")
+    # Allow an empty package run; named filters must still match tests.
+    if [[ ${#FILTERS[@]} -eq 0 ]]; then
+        NEXTEST_ARGS+=(--no-tests=warn)
+    fi
 }
 
 VERIFY_ORIGINAL_ARGS=("$@")
