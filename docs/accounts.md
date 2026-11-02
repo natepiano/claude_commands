@@ -69,11 +69,14 @@ Failed reads and old readings appear in Problems.
 The dot stays red until the account has a current reading without a read failure.
 
 Counts use local session records, saved launches, staff membership, notifier registrations, and mesh records.
-Each status pass publishes its local counts to `~/.local/state/accounts/session_counts.json`.
+`session-counts-read` prints live local counts without a file write.
+Status reads compute local counts without a file write.
 A detached process fetches the other machine's local counts through the shared role-map transport.
 The fetch has a 20-second limit and a five-second connection limit.
 One file lock prevents concurrent fetches.
 The board read never waits for the fetch.
+`status --stored` starts no counts fetch and opens no fetch lock.
+It reads only the saved peer counts with the same ten-minute age limit.
 The board uses `peer_session_counts.json` only within the existing ten-minute age limit.
 A failed fetch replaces that copy with an unavailable marker.
 A missing, damaged, or old copy also makes the peer unavailable.
