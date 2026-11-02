@@ -9,13 +9,6 @@ from push_texts import ActionTemplate, NoActionNeeded, PushExample, PushText, Se
 
 
 ENTRIES = (
-    PushText("message.repeat_flood", "send-repeat-guard", "note", "Repeated messages held",
-        NoActionNeeded(),
-        "The {sender} sender on {host} sent {copies} messages to {receivers} sessions. "
-        + "Further repeats are held. Other messages still arrive. "
-        + "The sender's owner is being told to fix the cause.",
-        (PushExample("watchdog", {"sender": "unit-watchdog", "host": "natedev", "copies": "48", "receivers": "16"}),),
-        purpose="Repeated machine messages are held before they consume more context."),
     PushText("vault.stopped", "buildlog", "note", "Mac vault copy is not updating",
         ActionTemplate("{action}"),
         "The hourly job that updates the hanadocs vault on the Mac skipped it. {reason} It tries again each hour and sends no more alerts until an update works. Until then, the Mac copy stays out of date.",
