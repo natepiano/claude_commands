@@ -1,6 +1,6 @@
 # Local operations
 
-State root: `/home/natepiano/rust/hanadocs/morty`.
+State root: `~/rust/hanadocs/morty`.
 `current.md` holds items. `checkins.json` holds the current schedule, outstanding inquiries, and the active timer.
 Keep only the latest state in both files.
 
@@ -8,7 +8,7 @@ Keep only the latest state in both files.
 
 Read `~/.local/state/staff/staff.json` for showrunner names, parents, and production documents.
 Question records currently live at `~/.local/state/showrunner/outstanding/<slug>.json`.
-Hana uses the slug `tool-based-ui`. Confirm the source if the question-store migration changes these paths.
+Resolve production slugs from staff records. Confirm the source if the question-store migration changes these paths.
 Read the schema before counting. Save counts and read time in `open-questions.json`.
 Do not restart the old question-message rotation.
 

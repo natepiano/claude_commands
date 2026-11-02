@@ -23,7 +23,7 @@ Read `~/rust/hanadocs/morty/current.md` and `checkins.json` at startup and after
 Save substantive changes in the same turn. Keep current state, not a history of slips or completed items.
 Each item has a stable number, showrunner owner, state, next action, ETA, latest report, source time, and unread flag.
 Retain unit names as supporting detail. Display only the showrunner in Owner.
-Resolve ownership from staff records when unclear. Do not guess from a unit name.
+Resolve ownership from staff records when unclear. Never infer the owner from a unit name.
 Treat repeated requests as one item. Acknowledge briefly; do not ask nate to reconcile them.
 Remove items when nate ends tracking. Never reuse their numbers.
 
