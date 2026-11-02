@@ -26,6 +26,7 @@ import proposal_issue
 
 import berth_board
 import fake_fmt
+from style_child_test_support import style_cli_command, unqueued_style_children
 import mechanical_classes
 import rules
 import style_ledger
@@ -100,11 +101,10 @@ class StylePlanFixture(unittest.TestCase):
         _ = shutil.copytree(self.snapshot, self.fixture_root, symlinks=True)
         self.addCleanup(shutil.rmtree, self.fixture_root)
         self.configure_fixture()
-        # Keep one gate case on the executable path; the others retain the real parser and handlers in-process.
-        if self._testMethodName != "test_structure_file_cells_gate_and_checkpoint_require_the_last_file_verdict":
-            _ = self.enterContext(mock.patch.object(subprocess, "run", side_effect=self.run_command))
+        _ = self.enterContext(mock.patch.object(subprocess, "run", side_effect=self.run_command))
 
     def configure_fixture(self) -> None:
+        _ = self.enterContext(unqueued_style_children())
         listed = mechanical_classes.classes()
         _ = self.enterContext(mock.patch.object(mechanical_classes, "classes", return_value=listed))
         self.root = self.fixture_root
@@ -140,6 +140,10 @@ class StylePlanFixture(unittest.TestCase):
         if command[0] == sys.executable and len(command) > 1:
             module = next((item for item in (style_plan, style_ledger, style_footprint, proposal_issue)
                            if Path(command[1]) == Path(item.__file__ or "")), None)
+        # Keep one gate case in a child interpreter with the shared queue fake.
+        if module is style_plan and self._testMethodName == "test_structure_file_cells_gate_and_checkpoint_require_the_last_file_verdict":
+            command = style_cli_command(Path(command[1]), *arguments)
+            module = None
         executable = Path(shutil.which(command[0], path=environment.get("PATH")) or command[0])
         if executable.parent == self.root / "bin" and executable.name in fake_fmt.NAMES:
             module = ModuleType("style_plan_formatter_fixture")

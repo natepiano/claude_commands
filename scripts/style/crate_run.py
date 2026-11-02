@@ -15,6 +15,7 @@ import subprocess
 from collections import defaultdict
 from collections.abc import Callable, Generator, Sequence
 from contextlib import contextmanager
+from copy import deepcopy
 from dataclasses import asdict, dataclass, replace
 from enum import StrEnum
 from pathlib import Path
@@ -1037,12 +1038,28 @@ class CrateRun:
                     self.save(manifest)
                     stage = CrateStage.CLAIMED
                 if stage in {CrateStage.CLAIMED, CrateStage.WAITING_FOR_RESERVATIONS}:
+                    # Reject unresolved recovery before any execution or abandonment transition.
+                    if intent.retry_eligible():
+                        _ = intent.recover()
+                        intent.clear_admission()
                     refused: dict[str, str] = dict(record.get("terminal_refusals", {}))
                     if stage == CrateStage.WAITING_FOR_RESERVATIONS:
                         with ledger_api.refill_lock(self.repo):
                             self.publish_refusals(manifest, record, refused)
+                    resume_record = deepcopy(record)
                     try:
-                        self.execute(manifest, record, intent, definition, planner, runner, available, executor, refused)
+                        with bulk.admission_attempt(intent.stop_admission, intent.clear_admission):
+                            self.execute(manifest, record, intent, definition, planner, runner, available, executor, refused)
+                    except (KeyboardInterrupt, SystemExit) as stopped:
+                        if not intent.retry_eligible():
+                            raise
+                        try:
+                            if not isinstance(stopped, bulk.StyleAdmissionStopped):
+                                intent.restore_admission(stopped)
+                        finally:
+                            manifest["crates"][package] = resume_record
+                            self.save(manifest)
+                        raise
                     except bulk.ReservationBlocked as blocked:
                         # A writer may appear after planning. Undo journaled private edits,
                         # retain all claims, and retry normal proof on the next invocation.
