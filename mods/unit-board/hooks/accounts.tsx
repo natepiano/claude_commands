@@ -26,10 +26,19 @@ function reading<Value>(value: Value | null | undefined): AccountReading<Value> 
   return value === null || value === undefined ? { kind: 'unavailable' } : { kind: 'available', value };
 }
 
+function machineRoleCounts(account: StoredAccount, role: string, index: number): AccountReading<RoleSessionCounts> {
+  if (!account.role_counts_by_machine) return reading(account.role_counts?.[index]);
+  if (role === 'spare') return { kind: 'unavailable' };
+  const counts = Object.values(account.role_counts_by_machine).flatMap(machine => machine[role] ? [machine[role]!] : []);
+  const sum = (key: 'busy' | 'idle' | 'total') => counts.reduce((total, count) => total + count[key], 0);
+  return reading({ busy: sum('busy'), idle: sum('idle'), total: sum('total'),
+    shell: account.tool === 'codex' ? null : counts.reduce((total, count) => total + (count.shell ?? 0), 0) });
+}
+
 export function accountDisplay(account: StoredAccount): AccountDisplay {
   return {
     label: account.label, roles: account.roles,
-    roleCounts: account.roles.map((_, index) => reading(account.role_counts?.[index])),
+    roleCounts: account.roles.map((role, index) => machineRoleCounts(account, role, index)),
     weekly: reading(account.weekly_left_percent), resets: reading(account.resets_at),
     credits: account.credits === null ? { kind: 'unavailable' }
       : account.credits === 'unlimited' ? { kind: 'unlimited' } : { kind: 'finite', amount: account.credits },

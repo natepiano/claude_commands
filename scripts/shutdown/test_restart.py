@@ -2523,10 +2523,10 @@ class RestartTests(ShutdownTestCase):
         before = record_path.read_bytes()
         launches: list[list[str]] = []
 
-        def launch(name: str, space: str, title: str, prepared: herdr.PreparedAgentEnvironment,
+        def launch(name: str, destination: herdr.NewTab, prepared: herdr.PreparedAgentEnvironment,
                    kind: str, agent_arguments: list[str], opening: herdr.OpeningPrompt | herdr.NoOpeningPrompt,
                    timeout_ms: int, *, agent: str) -> herdr.AgentLaunched:
-            del name, space, title, kind, timeout_ms, agent
+            del name, destination, kind, timeout_ms, agent
             launches.append(agent_arguments)
             self.assertNotIn("--session-id", agent_arguments)
             self.assertNotIn("--resume", agent_arguments)
@@ -2573,10 +2573,10 @@ class RestartTests(ShutdownTestCase):
         before = Path(os.environ["STAFF_FILE"]).read_bytes(), dict(owner)
         starts: list[list[str]] = []
 
-        def launch(name: str, space: str, title: str, prepared: herdr.PreparedAgentEnvironment,
+        def launch(name: str, destination: herdr.NewTab, prepared: herdr.PreparedAgentEnvironment,
                    kind: str, agent_arguments: list[str], opening: herdr.OpeningPrompt | herdr.NoOpeningPrompt,
                    timeout_ms: int, *, agent: str) -> herdr.AgentLaunched:
-            del name, space, title, prepared, kind, timeout_ms, agent
+            del name, destination, prepared, kind, timeout_ms, agent
             starts.append(agent_arguments)
             self.assertEqual(agent_arguments[agent_arguments.index("--resume") + 1], current)
             assert isinstance(opening, herdr.OpeningPrompt)
@@ -2639,7 +2639,7 @@ class RestartTests(ShutdownTestCase):
     def test_herdr_restart_refuses_a_pane_with_a_live_agent(self) -> None:
         owner, responses, log = self.herdr_restart_fixture()
         self.write_herdr_responses(responses, [{
-            "pane_id": "w1:p1", "agent": "claude", "agent_status": "idle",
+            "pane_id": "w1:p1", "agent": "claude", "agent_status": herdr.AgentStatus.IDLE,
         }], pane_present=True)
         with (patch.object(restart, "AGENT_EXIT_SECONDS", 0.0),
               self.assertRaisesRegex(OSError, "pane still holds a live agent")):
@@ -2651,8 +2651,8 @@ class RestartTests(ShutdownTestCase):
     def test_herdr_restart_waits_for_herdr_to_see_its_stopped_agent_exit(self) -> None:
         owner, responses, log = self.herdr_restart_fixture()
         self.write_herdr_responses(responses, [], pane_present=True)
-        stale: list[herdr.AgentOccupant] = [{"pane_id": "w1:p1", "agent": "claude", "agent_status": "idle"}]
-        exited: list[herdr.AgentOccupant] = [{"pane_id": "w1:p1", "agent": "claude", "agent_status": "exited"}]
+        stale: list[herdr.AgentOccupant] = [{"pane_id": "w1:p1", "agent": "claude", "agent_status": herdr.AgentStatus.IDLE}]
+        exited: list[herdr.AgentOccupant] = [{"pane_id": "w1:p1", "agent": "claude", "agent_status": herdr.AgentStatus.EXITED}]
         with (patch.object(herdr.Herdr, "agents", side_effect=[stale, stale, exited]) as agents,
               patch.object(restart, "SESSION_POLL_SECONDS", 0.0)):
             _ = restart._herdr_launch(restart._resume_parts(owner, "restart"), restart.RecordedHerdrPane("writing", "w1:p1"), owner, dry_run=False)  # pyright: ignore[reportPrivateUsage]
@@ -2664,9 +2664,9 @@ class RestartTests(ShutdownTestCase):
     def test_herdr_restart_replaces_a_pane_at_its_shell_with_no_live_agent(self) -> None:
         owner, responses, log = self.herdr_restart_fixture()
         occupants: list[list[herdr.AgentOccupant]] = [[], [
-            {"pane_id": "w1:p1", "agent": None, "agent_status": "none"},
+            {"pane_id": "w1:p1", "agent": None, "agent_status": herdr.AgentStatus.NONE},
         ], *[[{"pane_id": "w1:p1", "agent": "claude", "agent_status": state}]
-             for state in ("exited", "stopped", "dead")]]
+             for state in (herdr.AgentStatus.EXITED, herdr.AgentStatus.STOPPED, herdr.AgentStatus.DEAD)]]
         for agents in occupants:
             with self.subTest(agents=agents):
                 log.unlink(missing_ok=True)

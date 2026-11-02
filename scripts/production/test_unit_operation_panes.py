@@ -146,16 +146,27 @@ class UnitOperationPaneTests(unittest.TestCase):
     def test_a_pane_already_gone_counts_as_closed(self) -> None:
         pane = unit_move.unit_pane(self.pane.found, 'demo')
         gone = herdr.HerdrFailure('herdr pane close: pane_not_found: pane w1:p1 not found', 'pane_not_found')
-        with mock.patch.object(herdr.Herdr, 'run', side_effect=[
-                gone, json.dumps({'result': {'panes': []}})]) as close:
+        with (mock.patch.object(herdr.Herdr, 'pane_activity', return_value=herdr.PaneAtShell()),
+              mock.patch.object(herdr.Herdr, 'panes', side_effect=[
+                  [{'pane_id': 'w1:p1', 'terminal_id': 'unit-terminal', 'workspace_id': 'w1', 'session_id': None}], []]),
+              mock.patch.object(herdr.Herdr, 'run', side_effect=[
+                json.dumps({"result": {"panes": [
+                    {"pane_id": "w1:p1", "terminal_id": "unit-terminal", "tab_id": "w1:t1", "workspace_id": "w1"}]}}),
+                gone]) as close):
             unit_move.close_unit_pane(pane)
         self.assertEqual(close.call_args_list, [
-            mock.call('pane', 'close', 'w1:p1'), mock.call('pane', 'list')])
+            mock.call('pane', 'list'), mock.call('pane', 'close', 'w1:p1')])
 
     def test_herdr_close_error_is_reported_for_the_units_exact_place(self) -> None:
         pane = unit_move.unit_pane(self.pane.found, 'demo')
         failure = herdr.HerdrFailure('fixture close failed')
-        with mock.patch.object(herdr.Herdr, 'run', side_effect=failure) as close:
+        run = herdr.Herdr.run
+        def fail_close(client: herdr.Herdr, *arguments: str, deadline: float = math.inf) -> str:
+            if arguments == ('pane', 'close', 'w1:p1'):
+                raise failure
+            return run(client, *arguments, deadline=deadline)
+        with mock.patch.object(herdr.Herdr, 'run', autospec=True, side_effect=fail_close) as close:
             with self.assertRaisesRegex(RenameRefused, 'alpha-unit: pane close failed: fixture close failed'):
                 unit_move.close_unit_pane(pane)
-        close.assert_called_once_with('pane', 'close', 'w1:p1')
+        close.assert_called_with(mock.ANY, 'pane', 'close', 'w1:p1')
+        self.assertEqual(close.call_args_list.count(mock.call(mock.ANY, 'pane', 'close', 'w1:p1')), 1)
