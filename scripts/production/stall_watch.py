@@ -55,7 +55,7 @@ import sessions  # noqa: E402
 import herdr  # noqa: E402  session_pane puts scripts/herdr on the path
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Iterator
+    from collections.abc import Callable, Iterable, Iterator
 
 STATE_DIR = Path(os.environ.get("STALL_WATCH_STATE_DIR") or Path.home() / ".local/state/stall-watch")
 SESSIONS_DIR = Path(os.environ.get("NOTIFIER_SESSIONS_DIR") or Path.home() / ".claude/sessions")
@@ -549,7 +549,24 @@ def watch_config(*, status_defaults: bool = False, packaged_only: bool = False) 
     return fields
 
 
-def status_defers_bump(status: str, peers: Iterable[str]) -> bool:
+def name_spans(text: str, name: str) -> list[tuple[int, int]]:
+    """Names exclude word and hyphen neighbors; sentence periods remain boundaries."""
+    pattern = r"(?<![\w-])(?<!\w\.)" + re.escape(name) + r"(?![\w-]|\.\w)"
+    return [match.span() for match in re.finditer(pattern, text, re.IGNORECASE)] if name else []
+
+
+def names_outside(text: str, pattern: str, peers: Iterable[str], own_names: tuple[str, ...],
+                  *, at_start: bool = False) -> bool:
+    """An outside occurrence must extend beyond every complete own-name span."""
+    own_spans = [span for own in own_names for span in name_spans(text, own)]
+    candidates = [match.span() for match in re.finditer(pattern, text, re.IGNORECASE)]
+    candidates.extend(span for peer in peers for span in name_spans(text, peer))
+    return any((not at_start or start == 0) and not any(
+        own_start <= start and end <= own_end for own_start, own_end in own_spans)
+        for start, end in candidates)
+
+
+def status_defers_bump(status: str, peers: Iterable[str], own_names: tuple[str, ...]) -> bool:
     """Explicit pauses and waits on another owner outrank a context-compaction wake."""
     fields = watch_config(status_defaults=True)
     if re.search(fields["paused_status_pattern"].strip(), status, re.IGNORECASE):
@@ -561,8 +578,13 @@ def status_defers_bump(status: str, peers: Iterable[str]) -> bool:
     if owner is None or not owner.strip():
         raise ValueError("external_wait_pattern must capture a nonempty owner")
     owner = owner.strip()
-    return (re.search(fields["external_owner_pattern"].strip(), owner, re.IGNORECASE) is not None
-            or any(re.match(re.escape(peer) + r"\b", owner, re.IGNORECASE) for peer in peers if peer))
+    return names_outside(owner, fields["external_owner_pattern"].strip(), peers, own_names, at_start=True)
+
+
+def holding_names_outside(status: str, peers: Iterable[str], own_names: tuple[str, ...]) -> bool:
+    """A holding line must name an outside party, anywhere in the line."""
+    pattern = watch_config(status_defaults=True)["holding_party_pattern"].strip()
+    return names_outside(status, pattern, peers, own_names)
 
 
 def prompt_grace_seconds() -> float:
@@ -1160,6 +1182,11 @@ def pane_budget_left(name: str, deadline: float) -> bool:
 
 
 def tick(now: float, *, deadline: float = math.inf) -> int:
+    with herdr.pane_snapshot() as read_panes:
+        return watch_pass(now, deadline=deadline, read_panes=read_panes)
+
+
+def watch_pass(now: float, *, deadline: float, read_panes: Callable[[str], list[herdr.PaneIdentity]]) -> int:
     deadline = min(deadline, time.monotonic() + 110)
     PROMPT_WARNINGS.clear()
     pending = reconcile_prompts()
@@ -1208,6 +1235,7 @@ def tick(now: float, *, deadline: float = math.inf) -> int:
             continue
         work.extend(PaneInspection(slug, configured, zone, live, name, unit) for name, unit in marked.items())
     inspection_started = False
+    labels_by_session: dict[str, dict[str, str]] = {}
     for slug, configured, zone, live, name, unit in inspection_order(work):
         if isinstance(rows, ProcessSnapshotFailure):
             continue
@@ -1238,6 +1266,13 @@ def tick(now: float, *, deadline: float = math.inf) -> int:
             # Progress belongs to the attempted read, independent of its alert state or outcome.
             write_text_atomic(STATE_DIR / "inspection.cursor", json.dumps({"slug": slug, "unit": name}) + "\n")
             inspection_started = True
+        if unit.place.session not in labels_by_session:
+            # Discovery already read these panes. A missing label must not prevent prompt checks.
+            panes = read_panes(unit.place.session)
+            labels_by_session[unit.place.session] = {pane["pane_id"]: pane.get("label") or "" for pane in panes}
+            if not panes:
+                print(f"stall-watch: {unit.place.session}: pane labels unavailable", file=sys.stderr)
+        labels = labels_by_session[unit.place.session]
         try:
             pane = read_place(unit.place, 400, joined=True, deadline=inspection_deadline).strip()
         except (OSError, HerdrFailure) as error:
@@ -1287,8 +1322,11 @@ def tick(now: float, *, deadline: float = math.inf) -> int:
         # assistant text is authoritative when it supplies a turn-end status.
         turn = transcript_turn_end(session_id) or (turns[-1] if turns else None)
         last = turn.group("status").strip() if turn else "none on screen"
+        peers = (*(live.keys() - {name}), configured["session"], slug)
+        own_names = (name, unit.unit, claude.name, labels.get(unit.place.pane, ""), f"session:{session_id}")
         try:
-            deferred = bool(turn) and status_defers_bump(last, (*(live.keys() - {name}), configured["session"], slug))
+            deferred = bool(turn) and status_defers_bump(last, peers, own_names)
+            holding = turn is not None and turn.group("kind") == HOLDING_KIND and holding_names_outside(last, peers, own_names)
         except (OSError, UnicodeError, KeyError, ValueError, re.error, IndexError) as error:
             print(f"stall-watch: {name}: no bump: invalid status rule: {error}", file=sys.stderr)
             continue
@@ -1316,7 +1354,6 @@ def tick(now: float, *, deadline: float = math.inf) -> int:
         if not stretch["reported_status"]:
             stretch["reported_status"] = last
             save_stretch(path, stretch)
-        holding = turn is not None and turn.group("kind") == HOLDING_KIND
         if not holding and not stretch["bump_sent"]:
             text = (f"stall-watch: you have been idle since {since_text} with nothing running. "
                     "Continue your run; if you are waiting on someone, say on whom in one line.")
