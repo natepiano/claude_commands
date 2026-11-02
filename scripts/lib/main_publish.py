@@ -62,6 +62,7 @@ class NoTimeLimit:
 
 UNLIMITED_GIT = NoTimeLimit()
 ZONE_SSH_LIMIT = CommandTimeLimit(120)
+PUBLICATION_PREFIXES = ("tune(", "zone(", "user zone: ")
 
 
 def _timeout_detail(error: subprocess.TimeoutExpired) -> str:
@@ -93,16 +94,38 @@ def checkout_of(conf: Path) -> Path:
 
 
 def ready(checkout: Path, *, fetch_limit: CommandTimeLimit | NoTimeLimit = UNLIMITED_GIT) -> None:
-    """Refuse unless the checkout is on main and holds origin/main."""
+    """Update main from origin and rebase pending publisher commits when main diverges."""
     branch = git(checkout, "branch", "--show-current").stdout.strip()
     if branch != "main":
         raise Refusal(f"{checkout} is on {branch or 'no branch'}, not main")
     fetched = git(checkout, "fetch", "-q", "origin", "main", time_limit=fetch_limit)
     if fetched.returncode:
         raise Refusal(f"git fetch origin main: {first_line(fetched)}")
+    listed = git(checkout, "log", "--format=%h %s", "origin/main..main")
+    if listed.returncode:
+        raise Refusal(f"cannot inspect unpublished commits: {first_line(listed)}")
+    commits = listed.stdout.splitlines()
+    for commit_line in commits:
+        if not commit_line.partition(" ")[2].startswith(PUBLICATION_PREFIXES):
+            raise Refusal(f"main holds other commit {commit_line} that origin does not have; main is unchanged")
     merged = git(checkout, "merge", "-q", "--ff-only", "origin/main")
-    if merged.returncode:
+    if not merged.returncode:
+        return
+    if not commits:
         raise Refusal(f"{checkout} main does not take origin/main as a fast-forward: {first_line(merged)}")
+    rebased = git(checkout, "rebase", "--no-autostash", "--no-update-refs", "--empty=drop", "origin/main")
+    if not rebased.returncode:
+        return
+    conflicted = git(checkout, "diff", "--name-only", "--diff-filter=U")
+    if conflicted.stdout:
+        stopped = git(checkout, "show", "-s", "--format=%h %s", "REBASE_HEAD")
+        cause = f"rebase conflict in {stopped.stdout.strip()}: {', '.join(conflicted.stdout.splitlines())}"
+    else:
+        cause = f"rebase refused: {first_line(rebased)}"
+    aborted = git(checkout, "rebase", "--abort")
+    if aborted.returncode and conflicted.stdout:
+        raise Refusal(f"{cause}; cannot restore main: {first_line(aborted)}")
+    raise Refusal(" ".join(cause.split()))
 
 
 def commit(checkout: Path, conf: Path, message: str, before: ExistingFile | MissingFile,
@@ -128,7 +151,7 @@ def push(checkout: Path, *, time_limit: CommandTimeLimit | NoTimeLimit = UNLIMIT
     unpushed = listed.stdout.splitlines()
     if not unpushed:
         return True, "origin has it"
-    others = [subject for subject in unpushed if not subject.startswith(("tune(", "zone(", "user zone: "))]
+    others = [subject for subject in unpushed if not subject.startswith(PUBLICATION_PREFIXES)]
     if others:
         return False, f"not pushed: main holds {len(others)} other commit(s) origin does not have"
     pushed = git(checkout, "push", "-q", "origin", "main", time_limit=time_limit)
