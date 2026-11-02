@@ -483,7 +483,7 @@ Source: Phase 7e closure review (F002), moved here under the landing rule (model
 
 **Ruled out:** a second reader for any one file's settings; code defaults beside the config; a persistent status for `conf.Unusable`.
 
-### Phase 8b — A rejected config publish recovers after main moves  · status: todo
+### Phase 8b — A rejected config publish recovers after main moves  · status: done
 **Depends on:** Phase 8 (the publish path it repairs)
 
 Source: Phase 8 architect review, 2026-11-02 (finding 2). After a rejected `/tune` or `/zone` push, the publish commit stays on local main. When another writer then advances origin/main, `main_publish.ready()` refuses the next run: `merge --ff-only origin/main` cannot take a diverged main (`scripts/lib/main_publish.py:95-105`). The approved change then needs a hand repair. This is a defect in what Phase 8 shipped, so it runs next.
