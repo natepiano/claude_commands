@@ -27,7 +27,9 @@ import proposals_folder
 from scripts.production import showrunners
 import showrunner_tree
 from scripts.production import staff
-from scripts.production.staff_test_support import isolated_staff_file, unit_membership
+from scripts.production.staff_test_support import (
+    fixture_member, isolated_source_readers, isolated_staff_file, source_environment, unit_membership,
+)
 from change_review import Visible
 from next_item import NextError, Queue
 
@@ -82,6 +84,10 @@ class NextItemTests(unittest.TestCase):
         folder = tempfile.TemporaryDirectory()
         self.addCleanup(folder.cleanup)
         self.root = Path(folder.name)
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, source_environment(self.root / "sources"))))
+        _ = self.enterContext(isolated_source_readers())
+        _ = fixture_member("showrunner", name="fixture")
         with contextlib.ExitStack() as stack:
             _ = cast(object, stack.enter_context(mock.patch.dict(
                 os.environ, {"NEXT_STATE_DIR": str(self.root / "next"), "NIGHTLY_REVIEW_NOTE": str(self.root / "note.md")})))
@@ -227,6 +233,12 @@ class NextItemTests(unittest.TestCase):
             _ = (self.root / f"{slug}.md").write_text(f"- 2026-10-12 rust/{slug}: {slug}-item gain — proposed\n")
             _ = doc.write_text(f"# {slug}\n\n- **Efficiency ledger:** {self.root / f'{slug}.md'}\n"
                                + f"- **Proposals:** {issues_folder}\n")
+            parent_name = {"kid": "top", "grand": "kid"}.get(slug)
+            parent = next((row.id for row in staff.find(kind="showrunner") if row.name == parent_name), None)
+            owner = fixture_member("showrunner", name=slug, parent=parent, doc=staff.LiveDoc("natedev", doc))
+            timer = Path(os.environ["NOTIFIER_STATE_DIR"]) / f"showrunner-{slug}"
+            timer.mkdir(parents=True)
+            _ = (timer / "conf").write_text(f"TARGET=session:{owner.id}\nCHECK=zsh /x/production_check.sh {doc}\n")
             _ = (issues_folder / f"{slug}-item.md").write_text(
                 f"---\nstatus: open\ntags: [issue, proposal]\nproposed_by: {slug}\ndate_created: 2026-10-01\n---\n")
             _ = (outstanding / f"{slug}.json").write_text(f'[{{"since": "2026-10-06T09:00", "text": "{slug}-item"}}]')
