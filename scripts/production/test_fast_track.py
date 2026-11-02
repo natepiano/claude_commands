@@ -209,6 +209,8 @@ class FastTrackTests(MergeCheckpointFixture):
                             if isinstance(value, list) else
                             str(value) if key.strip() == "refused_paths" else json.dumps(value))
                 lines.append(f"{key.strip()} = {rendered}")
+            elif lines and lines[-1].lstrip().startswith(("# whole:", "# range:", "# one of:")):
+                _ = lines.pop()
         _ = self.config.write_text("\n".join(lines) + "\n")
 
     def command(self, *arguments: str) -> subprocess.CompletedProcess[str]:
