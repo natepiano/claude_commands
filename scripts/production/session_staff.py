@@ -106,9 +106,13 @@ class MemberSources:
                 if isinstance(found, MemberFound):
                     return found
             identities: dict[staff.StaffId, MemberFound] = {}
+            resolved = False
             for launch in launches:
                 identity = record.by_member_reference(launch["session_id"])
-                if identity is None or identity.kind != "unit":
+                if identity is None:
+                    continue
+                resolved = True
+                if identity.kind != "unit":
                     continue
                 found = unit_match(selector, record, identity.current_session, parent=parent.row)
                 if isinstance(found, MemberFound):
@@ -117,7 +121,7 @@ class MemberSources:
                 raise staff.StaffUnreadable(f"{selector.slug}/{selector.unit}: conflicting staff identities")
             if identities:
                 return next(iter(identities.values()))
-            if launches:
+            if resolved:
                 return NoSuchMember(selector)
             return unit_match(selector, record, parent=parent.row)
         if source is None:

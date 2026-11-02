@@ -2067,5 +2067,40 @@ class StaffSourcesTests(StaffTestCase):
         self.assertEqual([row.name for row in staff.snapshot().rows], ["sdlc"])
 
 
+class NonLocalMemberReferenceTests(unittest.TestCase):
+    def test_unresolved_nonlocal_launch_allows_name_lookup_but_resolved_evidence_does_not(self) -> None:
+        from scripts.production import session_staff
+
+        parent_id = staff.StaffId(fixture_runtime_id("nonlocal-parent"))
+        unit_id = staff.StaffId(fixture_runtime_id("nonlocal-unit"))
+        worker_id = staff.StaffId(fixture_runtime_id("nonlocal-worker"))
+        other_id = staff.StaffId(fixture_runtime_id("nonlocal-other-parent"))
+        moved_id = staff.StaffId(fixture_runtime_id("nonlocal-moved-unit"))
+        parent = staff.StaffRow(parent_id, "showrunner", "demo", None, current_session=parent_id)
+        unit = staff.StaffRow(unit_id, "unit", "alpha", parent_id, current_session=unit_id)
+        worker = staff.StaffRow(worker_id, "worker", "impl", unit_id, current_session=worker_id)
+        other = staff.StaffRow(other_id, "showrunner", "other", None, current_session=other_id)
+        moved = staff.StaffRow(moved_id, "unit", "alpha", other_id, current_session=moved_id)
+        record = staff.StaffSnapshot((parent, unit, worker, other, moved))
+        selector = session_staff.UnitMember("demo", "alpha-unit")
+        missing = fixture_runtime_id("nonlocal-unregistered-session")
+        for reference in (missing, worker.id, parent.id, moved.id):
+            with self.subTest(reference=reference):
+                # No production mark: this must reach the non-local launch loop.
+                launch: pane_record.PaneLaunch = {
+                    "pane_id": "w1:p1", "session_id": reference,
+                    "config_dir": "/fixture/claude", "cwd": "/fixture/unit",
+                    "name": "alpha-unit", "model": "", "remote_control": False,
+                    "environment": {"SHOWRUNNER_UNIT_ID": "alpha-unit"},
+                    "flags_read": True, "written_at": "2026-11-01T12:00:00Z",
+                }
+                sources = session_staff.MemberSources({}, (launch,))
+                with mock.patch.object(staff, "snapshot", side_effect=AssertionError("unexpected staff read")):
+                    found = sources.member(selector, record)
+                expected = (session_staff.MemberFound(unit) if reference == missing
+                            else session_staff.NoSuchMember(selector))
+                self.assertEqual(found, expected)
+
+
 if __name__ == "__main__":
     _ = unittest.main()
