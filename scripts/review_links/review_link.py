@@ -43,22 +43,35 @@ def link_host() -> str:
 
 def render_markdown(source: str, title: str) -> str:
     """Keep an escaped, readable copy visible until Markdown rendering succeeds."""
+    metadata = ""
+    front = re.match(r"\A\ufeff?---[ \t]*\r?\n(.*?)\r?\n(?:---|\.\.\.)[ \t]*(?:\r?\n|$)", source, re.DOTALL)
+    if front and re.search(r"(?m)^[A-Za-z_][\w-]*:", front.group(1)):
+        metadata = '<details><summary>Document metadata</summary><pre>' + html.escape(front.group(1)) + '</pre></details>'
+        source = source[front.end():]
     return Template("""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light dark">
 <title>$title</title>
 <style>
-:root { color-scheme: light dark; font-family: system-ui, sans-serif; line-height: 1.6; }
+:root { color-scheme: light dark; font-family: system-ui, sans-serif; font-size: 14px; line-height: 1.5; }
+h1 { font-size: 1.7rem; }
+h2 { font-size: 1.35rem; }
+h3 { font-size: 1.15rem; }
+summary { cursor: pointer; color: #888; }
 body { margin: auto; padding: 1rem; overflow-wrap: anywhere; }
 main > :not(table):not(:has(table)), #markdown-source { max-width: 48rem; margin-left: auto; margin-right: auto; }
+details { max-width: 48rem; margin: 0 auto 1rem; }
 pre { white-space: pre; overflow-x: auto; overflow-wrap: normal; padding: 1rem; background: light-dark(#f0f2f5, #202329); border-radius: .5rem; }
 code { font-family: ui-monospace, monospace; }
 img { max-width: 100%; height: auto; }
-table { display: block; width: max-content; max-width: 100%; margin-left: auto; margin-right: auto; overflow-x: auto; border-collapse: collapse; }
-td, th { border: 1px solid #888; padding: .4rem .6rem; overflow-wrap: normal; word-break: normal; }
+table { display: table; table-layout: auto; width: 60%; max-width: 100%; margin-left: auto; margin-right: auto; border-collapse: collapse; }
+td, th { min-width: 9ch; border: 1px solid #888; padding: .4rem .6rem; overflow-wrap: anywhere; word-break: normal; vertical-align: top; }
+th { overflow-wrap: normal; }
+td:first-child, th:first-child { min-width: 14ch; }
 a { color: light-dark(#145ac2, #91bdff); }
 </style></head><body>
+$metadata
 <main id="rendered" hidden></main>
 <pre id="markdown-source">$source</pre>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
@@ -76,7 +89,7 @@ try {
   }
 } catch (_) { /* The source remains readable without the renderer. */ }
 </script></body></html>
-""").substitute(title=html.escape(title), source=html.escape(source))
+""").substitute(title=html.escape(title), source=html.escape(source), metadata=metadata)
 
 
 def read_snapshot_index(root: Path) -> dict[str, str]:

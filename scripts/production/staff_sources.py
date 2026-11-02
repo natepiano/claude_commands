@@ -35,7 +35,7 @@ from scripts.production.showrunners import (  # noqa: E402
 import unit_names  # noqa: E402
 from scripts.production import staff, unit_config  # noqa: E402
 from scripts.production.session_labels import showrunner_owner  # noqa: E402
-from scripts.production.worker_admission import parent as worker_parent, showrunner_member  # noqa: E402
+from scripts.production.worker_admission import UnpublishedWorker, parent as worker_parent, showrunner_member  # noqa: E402
 from scripts.direct import workers  # noqa: E402
 from scripts.astra import astra_roles, design_roles  # noqa: E402
 from scripts.lib import unit_runs, git_exclude  # noqa: E402
@@ -255,6 +255,70 @@ def codex_thread_host(arguments: list[str]) -> bool:
 
 
 
+def pane_holds_staff_member(record: staff.StaffSnapshot, sources: _MemberSources, pane: str) -> bool:
+    """Join the pane's retained identity or unit labels to the supplied staff snapshot."""
+    for launch in sources.launches:
+        if launch.get("pane_id") != pane or launch.get("ended"):
+            continue
+        if record.by_member_reference(launch["session_id"]) is not None:
+            return True
+        environment = launch["environment"]
+        production = environment.get("SHOWRUNNER_UNIT", "")
+        unit = environment.get("SHOWRUNNER_UNIT_ID", "")
+        if production and unit:
+            found = sources.member(UnitMember(production, unit), record)
+            if isinstance(found, MemberFound):
+                return True
+    return False
+
+
+def codex_non_staff_reason(record: staff.StaffSnapshot, sources: _MemberSources,
+                           environment: Mapping[str, str]) -> str:
+    """Exclude a process without a thread only when its pane has no staff owner."""
+    if environment.get("CODEX_THREAD_ID", ""):
+        return ""
+    pane = environment.get("HERDR_PANE_ID", "")
+    if not pane:
+        return "not in a herdr pane; not staff"
+    if not pane_holds_staff_member(record, sources, pane):
+        return "pane holds no staff member; not staff"
+    return ""
+
+
+@dataclass(frozen=True)
+class PendingPublicationEvidence:
+    """Read-only backend publications and every damaged inbox, in pathname order."""
+
+    workers: tuple[UnpublishedWorker, ...]
+    diagnostics: tuple[str, ...]
+
+
+def pending_publication_evidence(run: Path) -> PendingPublicationEvidence:
+    """Read all inboxes without invoking the writer's empty-file recovery."""
+    from scripts.agents import worker_lifecycle
+
+    pending: list[UnpublishedWorker] = []
+    diagnostics: list[str] = []
+    for path in sorted(run.glob("*.pending.json")):
+        try:
+            text = path.read_text(encoding="utf-8")
+            value: object = cast(object, json.loads(text)) if text else dict[str, object]()
+            fields = worker_lifecycle.validate_worker_state(path, value)
+            raw = fields.get("unpublished_thread")
+            if raw is None:
+                continue
+            if not isinstance(raw, dict):
+                raise staff.StaffUnreadable(f"{path}: invalid unfinished backend evidence")
+            backend = cast(dict[str, object], raw)
+            native, parent = backend.get("id"), backend.get("parent")
+            if not isinstance(native, str) or not isinstance(parent, str):
+                raise staff.StaffUnreadable(f"{path}: unfinished backend needs native identity and parent")
+            pending.append(UnpublishedWorker(path, staff.native_id(native), staff.native_id(parent)))
+        except (OSError, UnicodeError, ValueError) as error:
+            diagnostics.append(str(error))
+    return PendingPublicationEvidence(tuple(pending), tuple(diagnostics))
+
+
 class _WorkerSources:
     """One command's read evidence, shared by the importer and live projection."""
 
@@ -311,8 +375,8 @@ class _WorkerSources:
                 environment = herdr.process_environment(process.pid)
                 if native := environment.get("CODEX_THREAD_ID", ""):
                     self.native_running[native] = {"codex": native}
-                elif not environment.get("HERDR_PANE_ID", ""):
-                    _problem(f"Codex process {process.pid}", "not in a herdr pane; not staff")
+                elif reason := codex_non_staff_reason(record, sources, environment):
+                    _problem(f"Codex process {process.pid}", reason)
                 else:
                     self.codex_scan_incomplete = True
                     _problem(f"Codex process {process.pid}", "native thread identity is unavailable")
@@ -962,10 +1026,13 @@ def live() -> dict[str, object]:
     for identity in unregistered:
         _problem(identity, "current native session has no staff row; identity publication is incomplete")
     incomplete = bool(unregistered) or scan.claude_registry_incomplete or scan.codex_scan_incomplete
-    from scripts.production.worker_admission import pending_publications
     for run in sorted(scan.runs):
         try:
-            for pending in pending_publications(run):
+            publications = pending_publication_evidence(run)
+            for diagnostic in publications.diagnostics:
+                incomplete = True
+                _problem(str(run), diagnostic)
+            for pending in publications.workers:
                 if record.by_current_session(pending.identity) is None:
                     unregistered.append(pending.identity)
                     incomplete = True
