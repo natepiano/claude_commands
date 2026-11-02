@@ -26,6 +26,7 @@ from typing import Protocol, cast, override
 
 import bulk_constants as constants
 import bulk_rename as bulk
+import approved_renames
 import coverage_report
 import rules
 import style_ledger as ledger_api
@@ -263,7 +264,11 @@ def current_rename(ledger: ledger_api.Ledger, finding: ledger_api.HeldFinding, h
         return bulk.Refusal(finding.finding_id, scope.reason)
     if source.count("\n", 0, scope.offset) + 1 != current.line:
         return bulk.Refusal(finding.finding_id, "changed since judged: the declaration is not on the current line")
-    return bulk.RenameFinding(finding.finding_id, current.path, pair)
+    authority = ledger.rename_authority(finding)
+    if finding.finding_id in sources.judgments:
+        judgment = sources.judgments[finding.finding_id]
+        authority = approved_renames.AnchoredRenameSource(judgment.anchor.commit, current.path, current.line, source)
+    return bulk.RenameFinding(finding.finding_id, current.path, pair, authority, finding.finding_id + ":" + ledger.finding_input_identity(finding))
 
 
 AppliedFinding = bulk.KeptRename | constants.KeptConstant
@@ -595,7 +600,7 @@ def fresh_machine_judgment(ledger: ledger_api.Ledger, finding: ledger_api.HeldFi
         # rename_file owns syntax, references, capture, docs, visibility and module-instance
         # proof. It updates analyzer overlays only; no checkout or ledger row is written.
         file = bulk.rename_file(server, target, path, source,
-                                (bulk.RenameFinding(finding.finding_id, path, pair),),
+                                (bulk.RenameFinding(finding.finding_id, path, pair, approved_renames.AnchoredRenameSource(candidate.anchor.commit, path, pair.line, source), finding.finding_id + ":" + ledger.finding_input_identity(finding)),),
                                 bulk.repository_docs(checkout), check_files=availability.require)
         if not file.kept:
             return next(iter(file.refusals), bulk.Refusal(finding.finding_id, "fresh judgment has no complete rename proof"))
@@ -614,7 +619,7 @@ def plan_renames(repo: Path, ledger: ledger_api.Ledger, base: str, selected: Sel
                  server: bulk.RenameServer | RenameService, availability: PlanningFileAvailability) -> PlannedEdits:
     sources = RenameSources()
     sources.judgments = {item.finding_id: item for item in selected.judgments}
-    refused: dict[str, str] = {}
+    refused: dict[str, bulk.Refusal] = {}
     pending: list[bulk.PendingFinding] = []
     groups: dict[str, list[bulk.RenameFinding]] = defaultdict(list)
     not_checked: list[NotCheckedFinding] = []
@@ -632,7 +637,7 @@ def plan_renames(repo: Path, ledger: ledger_api.Ledger, base: str, selected: Sel
                     if isinstance(server, RenameService):
                         prerequisites = machine_rename_candidate(ledger, finding, base, repo)
                         if isinstance(prerequisites, bulk.Refusal):
-                            refused[finding.finding_id] = prerequisites.reason
+                            refused[finding.finding_id] = prerequisites
                         else:
                             not_checked.append(NotCheckedFinding(finding.finding_id, server.value))
                         continue
@@ -643,13 +648,13 @@ def plan_renames(repo: Path, ledger: ledger_api.Ledger, base: str, selected: Sel
                         sources.judgments[finding.finding_id] = judgment
                         rename = current_rename(ledger, finding, base, sources, repo)
             if isinstance(rename, bulk.Refusal):
-                refused[finding.finding_id] = rename.reason
+                refused[finding.finding_id] = rename
             else:
                 groups[rename.path].append(rename)
         except bulk.ReservationBlocked as blocked:
             pending.append(bulk.PendingFinding(finding.finding_id, blocked.path, blocked.holders))
         except (bulk.BulkRenameError, OSError, UnicodeError) as error:
-            refused[finding.finding_id] = str(error)
+            refused[finding.finding_id] = bulk.Refusal(finding.finding_id, str(error))
     docs = bulk.repository_docs(repo)
     files: list[bulk.FileRenames] = []
     for path, findings in groups.items():
@@ -663,11 +668,11 @@ def plan_renames(repo: Path, ledger: ledger_api.Ledger, base: str, selected: Sel
             pending.extend(bulk.PendingFinding(item.finding_id, blocked.path, blocked.holders) for item in findings)
             continue
         files.append(file)
-        refused.update((item.finding_id, item.reason) for item in file.refusals)
+        refused.update((item.finding_id, item) for item in file.refusals)
         for document in file.related:
             sources.current[document.path] = document.edited
     return PlannedEdits(tuple(file for file in bulk.combine_file_renames(files) if file.edited != file.original),
-                        tuple(bulk.Refusal(identity, reason) for identity, reason in refused.items()),
+                        tuple(refused.values()),
                         judgments=tuple(sources.judgments.values()), pending=tuple(pending),
                         not_checked=tuple(not_checked))
 

@@ -40,14 +40,15 @@ import coverage_report
 import finding_sites
 import mechanical_classes
 import merge_gate
-from approved_renames import (AppliedCheck, ApprovedRename, BindingRename, Declarations, FileRename, Folder, InlineModule,
-                              MissingFile, NoAppliedCheck, RenameNotApplied, UncertainScan, applied_check,
-                              approved_rename, binding_rename, binding_rename_check, declaration_sites, enclosing,
+from approved_renames import (BindingProof, AppliedInCode, AppliedCheck, ApprovedRename, BindingRename, Declarations, FileRename, Folder, InlineModule,
+                              MissingFile, NoAppliedCheck, OuterBindingBlocked, OuterBindingUnproved, RenameNotApplied, UncertainScan, applied_check,
+                              approved_rename, binding_rename, binding_rename_check, binding_admission_check, declaration_sites, enclosing,
                               file_rename, inline_modules)
 from add_style import StandingStyleProduction, standing_style_production
 import rules
 from scripts.production import showrunners
 import style_ledger
+import approved_renames
 import style_footprint
 import style_proposals
 from issues import Issue, frontmatter
@@ -1049,9 +1050,13 @@ def binding_worktree_checks(repo: Path, renames: Mapping[str, tuple[BindingRenam
     for path, pairs in renames.items():
         edited = worktree_file(repo, path)
         if path not in original.paths or not isinstance(edited, bytes):
-            checks[path] = {pair: NoAppliedCheck("rename") for pair in pairs}
+            unchecked = BindingProof({pair: NoAppliedCheck("rename") for pair in pairs}, {}, False, {})
+            before = original.text(path) if path in original.paths else ""
+            checks[path] = binding_admission_check(before, pairs, unchecked, current=edited.decode(errors="replace") if isinstance(edited, bytes) else "").checks
             continue
-        checks[path] = binding_rename_check(path, original.text(path), edited.decode(errors="replace"), pairs).checks
+        before = original.text(path)
+        proof = binding_rename_check(path, before, edited.decode(errors="replace"), pairs)
+        checks[path] = binding_admission_check(before, pairs, proof, current=edited.decode(errors="replace")).checks
     return checks
 
 
@@ -1243,6 +1248,21 @@ def gate(repo: Path, ticket_id: str) -> int:
                 raise style_ledger.LedgerError("renamed files with other changes: " + ", ".join(
                     f"{moved.new} (renamed from {moved.old}: change is not only the rename)" for moved in changed))
             binding_checks = binding_worktree_checks(repo, bindings, origin.base)
+            admission_failures: list[tuple[style_ledger.HeldFinding, OuterBindingBlocked | OuterBindingUnproved]] = []
+            for finding in findings:
+                current = worktree_file(repo, finding.path)
+                source = current.decode(errors="replace") if isinstance(current, bytes) else approved_renames.CurrentRenameSourceUnavailable()
+                admission = ledger.local_rename_admission(finding, finding.path, source,
+                                                          companions=tuple(pair for pair in bindings.get(finding.path, ())
+                                                                           if isinstance(binding_checks[finding.path][pair], AppliedInCode)))
+                if isinstance(admission, OuterBindingBlocked | OuterBindingUnproved):
+                    admission_failures.append((finding, admission))
+            blocked = tuple(admission_failures)
+            if blocked:
+                for finding, check in blocked:
+                    ledger.record_rename_block(finding.finding_id, check)
+                    print(f"review: {finding.finding_id}: {check.reason} in {finding.path}")
+                return 1
             unapplied = tuple(finding for finding in findings if isinstance(
                 binding_checks[finding.path][rename] if isinstance(rename := binding_rename(
                     finding.kind, finding.before, finding.after, finding.line, finding.text), BindingRename)
@@ -1822,6 +1842,8 @@ def phase_text(ticket: style_ledger.TicketRecord, texts: tuple[style_ledger.Pinn
                    + [f"- `{rule}` · `{path}`" for rule, path in ticket["cells"]]) if per_file_structure else []
     held_lines = (["Already-held findings: do not hold these again; record held for a file whose finding still stands."]
                   + [f"- {finding.finding_id} · {finding.rule} · {finding.path}:{finding.line} · {finding.text}"
+                     + (f" · {finding.rename_disposition.reason}" if isinstance(
+                         finding.rename_disposition, OuterBindingBlocked | OuterBindingUnproved) else "")
                      for finding in held_findings]) if per_file_structure and held_findings else []
     waived_lines = (["Waived by the user: do not hold these again. Record waived for a cell whose only findings are these."]
                     + [f"- {finding.finding_id} · {finding.rule} · {finding.path}:{finding.line} · {finding.text}"
@@ -1980,6 +2002,9 @@ def phase_text(ticket: style_ledger.TicketRecord, texts: tuple[style_ledger.Pinn
         "Use `--input-scope file` when the verdict rests on that file alone. It stays current when other files change.",
         "Use `--input-scope rule --reads <files>` when the verdict rests on other files; name each file you read for it. "
         + "Without `--reads`, the cell comes back after any change in its crate or module.",
+        *[f"Blocked finding {finding.finding_id}: {finding.rename_disposition.reason} in {finding.path}. "
+          + "Choose another name or decline the finding; a skipped rename is never built."
+          for finding in held_findings if isinstance(finding.rename_disposition, OuterBindingBlocked | OuterBindingUnproved)],
         "", "**Files:**", *files, "", "**Workers:**", workers, "",
         "**Acceptance gate:**", "Run check, lint and the crate tests once through this ticket's verification runner:",
         f"`~/.claude/scripts/lib/py ~/.claude/scripts/style/style_plan.py verify --repo . --ticket {ticket_id}`",

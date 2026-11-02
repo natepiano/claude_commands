@@ -52,7 +52,7 @@ def renamed(checkout: Path, _ledger: ledger_api.Ledger, _base: str,
         source = (checkout / finding.path).read_text()
         pair = BindingRename(finding.line, finding.text, finding.before, finding.after)
         files.append(bulk.FileRenames(finding.path, source, source.replace(finding.before, finding.after),
-                                     (bulk.KeptRename(bulk.RenameFinding(finding.finding_id, finding.path, pair),
+                                     (bulk.KeptRename(bulk.RenameFinding(finding.finding_id, finding.path, pair, _ledger.rename_authority(finding), _ledger.finding_input_identity(finding)),
                                                       "let", 0),), ()))
     return run.PlannedEdits(tuple(files), ())
 
