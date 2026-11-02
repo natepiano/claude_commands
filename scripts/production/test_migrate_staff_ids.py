@@ -11,13 +11,14 @@ import json
 import os
 from pathlib import Path
 import subprocess
-from typing import override
+from typing import cast, override
+import unittest
 from unittest import mock
 from types import SimpleNamespace
 
 from scripts.production import completion_receipt, migrate_staff_ids, rename_state, showrunners, staff, staff_sources, unit_config
 from scripts.production.staff_test_support import StaffTestCase, fixture_runtime_id
-from scripts.message import roster
+from scripts.message import roster, sessions
 
 
 @dataclass
@@ -700,6 +701,82 @@ class NativeMigrationTests(StaffTestCase):
         migration = migrate_staff_ids.plan(record)
         self.assertEqual(migration.identities, {owner.id: native_owner, unit.id: native_unit, worker.id: native_worker})
         self.assertEqual(self.staff_file.read_bytes(), before)
+
+
+class LiveMigrationEvidenceTests(unittest.TestCase):
+    @cached_property
+    def state(self) -> NativeMigrationTests:
+        state = NativeMigrationTests("test_one_valid_transcript_in_the_exact_worktree_proves_the_missing_unit_id")
+        self.addCleanup(state.doCleanups)
+        state.setUp()
+        return state
+
+    @property
+    def fixture(self) -> MigrationFixture:
+        return self.state.fixture
+
+    @property
+    def other(self) -> str:
+        return fixture_runtime_id("older-worktree-conversation")
+
+    @property
+    def launch_file(self) -> Path:
+        return Path(os.environ["HERDR_PANE_RECORD_DIR"]) / "agents.json"
+
+    @override
+    def setUp(self) -> None:
+        transcript = self.state.session_transcript(self.other, self.state.root / "gone")
+        _ = transcript.write_text(json.dumps({"sessionId": self.other}) + "\n")
+        registry = self.state.session_record(self.fixture.native_unit, "models")
+        _ = registry.rename(registry.with_name(str(os.getpid()) + ".json"))
+        self.state.pane("live:unit", session_id=self.fixture.native_unit,
+                        environment={"STAFF_ID": self.fixture.old_unit})
+        launches = cast(dict[str, dict[str, object]], json.loads(self.launch_file.read_text()))
+        launches["live:unit"].update(pid=os.getpid(), proc_start=sessions.process_start(os.getpid()))
+        self.state.write_json(self.launch_file, launches)
+
+    def change_launch(self, **fields: object) -> None:
+        launches = cast(dict[str, dict[str, object]], json.loads(self.launch_file.read_text()))
+        launches["live:unit"].update(fields)
+        self.state.write_json(self.launch_file, launches)
+
+    def test_live_registry_and_launch_prove_parent_and_child(self) -> None:
+        old = staff.StaffId("s00000000003")
+        child = staff.StaffRow(old, "worker", "impl", self.fixture.old_unit, current_session=old)
+        native = staff.native_id(fixture_runtime_id("accounts-child-thread"))
+        _ = self.state.write_document({"schema": 2, "rows": [
+            self.fixture.owner.to_json(), self.fixture.unit.to_json(), child.to_json()]})
+        run = self.state.worker_run("demo", "models", self.fixture.native_unit)
+        _ = self.state.roster_worker(run, "impl", "impl", native, status="done")
+        before = self.state.staff_file.read_bytes(), self.launch_file.read_bytes()
+        result = migrate_staff_ids.plan(staff.snapshot())
+        self.assertEqual(result.identities[self.fixture.old_unit], self.fixture.native_unit)
+        self.assertEqual(result.identities[old], native)
+        self.assertEqual(before, (self.state.staff_file.read_bytes(), self.launch_file.read_bytes()))
+
+    def test_reused_pid_does_not_confirm_old_launch(self) -> None:
+        self.change_launch(proc_start="old-process-start")
+        result = migrate_staff_ids.plan(staff.snapshot())
+        self.assertNotIn(self.fixture.old_unit, result.identities)
+        self.assertTrue(any("conflicting native session evidence" in line for line in result.missing), result.missing)
+
+    def test_missing_registry_does_not_confirm_launch(self) -> None:
+        (Path(os.environ["NOTIFIER_SESSIONS_DIR"]) / f"{os.getpid()}.json").unlink()
+        result = migrate_staff_ids.plan(staff.snapshot())
+        self.assertNotIn(self.fixture.old_unit, result.identities)
+
+    def test_ended_launch_does_not_confirm_session(self) -> None:
+        self.change_launch(ended=True)
+        result = migrate_staff_ids.plan(staff.snapshot())
+        self.assertNotIn(self.fixture.old_unit, result.identities)
+
+    def test_independent_launch_conflict_still_refuses(self) -> None:
+        self.state.pane("other:unit", session_id=self.other, environment={"STAFF_ID": self.fixture.old_unit})
+        result = migrate_staff_ids.plan(staff.snapshot())
+        self.assertNotIn(self.fixture.old_unit, result.identities)
+        detail = "\n".join(result.missing)
+        self.assertIn(self.fixture.native_unit, detail)
+        self.assertIn(self.other, detail)
 
 
 class RetiredNativeMigrationTests(StaffTestCase):
