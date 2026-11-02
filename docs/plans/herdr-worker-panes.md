@@ -767,7 +767,7 @@ Split from 3l on 2026-10-31; the same user ask and the same sdlc acceptance as 3
 
 **Ruled out:** rekeying the row id on `/clear`; an alias table or `STAFF_ID` copy; a persisted clear handoff journal.
 
-### Phase 3a — `unit <id>` tells the user about one member  · status: todo
+### Phase 3a — `unit <id>` tells the user about one member  · status: done
 
 **Depends on:** 3h on main and its live move (Phases → Rename track). User ask, relayed by the sdlc showrunner (2026-11-01): "make sure there's a simple tool i can use to do a reverse lookup - command line tool - short like \"unit\" and if i do unit followe dby an ID it telle ms what i need to know about the unit."
 
