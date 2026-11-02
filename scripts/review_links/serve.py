@@ -11,13 +11,16 @@ import subprocess
 import sys
 import time
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from io import BytesIO
 from pathlib import Path
 from typing import TYPE_CHECKING, BinaryIO, TypeVar, cast
 from urllib.parse import unquote, urlsplit
 
 if __package__:
+    from . import change_page
     from .review_link import private_name
 else:
+    import change_page  # pyright: ignore[reportImplicitRelativeImport]
     from review_link import private_name  # pyright: ignore[reportImplicitRelativeImport]
 
 if TYPE_CHECKING:
@@ -89,6 +92,26 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
     def send_head(self) -> BinaryIO | None:
         root = cast(ReviewLinksServer, self.server).root
         try:
+            page = change_page.page_at(root, self.path)
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError) as error:
+            self.send_error(503, str(error))
+            return None
+        else:
+            try:
+                content = change_page.render(page)
+            except (OSError, ValueError, change_page.change_review.ChangeReviewError) as error:
+                self.send_error(503, str(error))
+                return None
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(content)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            return BytesIO(content)
+        try:
             decoded = unquote(urlsplit(self.path).path)
             if ".." in decoded.split("/"):
                 raise FileNotFoundError("parent traversal")
@@ -115,6 +138,40 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             stream.close()
             raise
         return stream
+
+    def do_POST(self) -> None:
+        server = cast(ReviewLinksServer, self.server)
+        try:
+            if server.bound_address != tailscale_ip():
+                self.send_error(403, "Answers require the local Tailscale bind address")
+                return
+        except (OSError, ValueError, subprocess.SubprocessError):
+            self.send_error(403, "Tailscale address unavailable")
+            return
+        if urlsplit(self.path).query or self.headers.get_content_type() != "application/x-www-form-urlencoded":
+            self.send_error(400, "Use the page form")
+            return
+        try:
+            page = change_page.page_at(server.root, self.path)
+        except (OSError, ValueError):
+            self.send_error(404, "Change page not found")
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if length <= 0:
+                raise ValueError("Empty answer")
+            body = self.rfile.read(length).decode("utf-8")
+            change_page.submit(page, body)
+        except (ValueError, change_page.change_review.ChangeReviewError) as error:
+            self.send_error(400, str(error))
+            return
+        except (OSError, RuntimeError, subprocess.SubprocessError, change_page.Refusal) as error:
+            self.send_error(503, str(error))
+            return
+        self.send_response(303)
+        self.send_header("Location", urlsplit(self.path).path)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     @override
     def guess_type(self, path: str | os.PathLike[str]) -> str:
