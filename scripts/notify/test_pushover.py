@@ -925,6 +925,30 @@ class PushoverTests(unittest.TestCase):
         self.assertEqual(form["title"], ["Third"])
 
 
+    def test_silence_release_discards_saved_repeat_flood_pushes_and_posts_other_pushes(self) -> None:
+        self.silence_on()
+        with redirect_stdout(io.StringIO()):
+            kept = silence.keep({"source": "send-repeat-guard", "priority": "0",
+                "title": "Repeated messages held", "message": "No action needed.",
+                "detail": "", "key": "old-flood", "text_id": "message.repeat_flood"})
+            self.assertIsInstance(kept, silence.Kept)
+            code, form = self.run_send(["--no-action", "Build done", "The build passed."])
+        self.assertEqual((code, form), (0, {}))
+        posted: list[str] = []
+
+        def post(_url: str, data: bytes) -> tuple[int, bytes]:
+            posted.append(urllib.parse.parse_qs(data.decode())["title"][0])
+            return 200, b'{"status":1}'
+
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(silence.off(lambda _argv: 0,
+                lambda push: pushover.post_kept(push, self.keys, post)), 0)
+        self.assertEqual(posted, ["Build done"])
+        self.assertEqual(silence.read_kept(), [])
+        self.assertEqual([line["outcome"] for line in self.log_lines()
+                          if line["source"] == "send-repeat-guard"],
+                         ["dropped: retired template message.repeat_flood"])
+
     def test_a_push_after_a_missed_end_posts_the_kept_pushes_first(self) -> None:
         self.silence_on()
         with redirect_stdout(io.StringIO()):

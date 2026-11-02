@@ -15,6 +15,11 @@ from scripts.direct.test_verify_tree_cancel import CANCEL_LINE, VerifyTreeCancel
 from scripts.direct.verify_token_wait_test_support import VERIFY
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.message.repeat_guard_test_support import install_guard_test_budget
+
+
+def setUpModule() -> None:
+    install_guard_test_budget()
 
 
 class MeshTreeCancelTests(VerifyTreeCancelFixture):
