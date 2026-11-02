@@ -3080,3 +3080,25 @@ natedev showrunner 2026-11-01 (C35, cef58b5c): prove each started-hold form that
 natedev showrunner 2026-11-02: the user ran /theme at 09:06 EST; Claude Code wrote `theme` into live `~/.claude/settings.json`, and merge_gate refused every promotion because the tracked file differed from HEAD.
 
 **As-built:** `theme` joins the per-machine keys in `scripts/settings/settings_local_keys.sh` (with `model`, `effortLevel`, `modelSettings`, `extraKnownMarketplaces`). The clean filter strips it, the sidecar keeps it, and the smudge restores it. The committed `settings.json` has no `theme`. `test_settings_local_keys.py` fixtures give each machine a different theme and still clean to one blob.
+
+### Phase 101r — The Mac renews an expired Claude login by itself  · status: done
+
+User 2026-11-02: "i want accounts renewal on the mac for sure". On natedev the notes job's refusals part calls `refusal_watch.renew_expired_logins` each pass: for a noted Claude account whose stored usage read shows a stale or missing token, it runs a quiet probe session (`accounts.py exec --probe claudeN -p hello`), at most once an hour per account, and records it in `login_renewals.json`. The Mac runs only `agent_notes.py usage-only` (nixos `modules/darwin/account-usage.nix`), which never reaches that call, so idle Mac accounts stay expired ("login token expired; start a session on it").
+
+**Goal:** the Mac's usage-only pass renews an expired local Claude login the same way natedev does.
+**Spec:** after `usage_only` in `scripts/whoami/agent_notes.py` saves its readings, and still under its schedule lock, call the same renewal (`refusal_watch.renew_expired_logins`) and print its lines. One renewal path for both machines; no copy. A busy schedule skips renewal too. Keep the 60-minute attempt limit and the record file. A probe failure never stops the usage read. Update the module docstring and `docs/accounts.md` where they say usage-only runs no consumers or that only a session renews a login.
+**Files:**
+- scripts/whoami/agent_notes.py
+- scripts/whoami/test_agent_notes.py (or the test module that covers usage_only)
+- docs/accounts.md
+
+### Phase 101s — The accounts board has no read column  · status: todo
+
+User 2026-11-02: remove the `read` column from the accounts board; an account that cannot be read shows in the problems, not in a permanent column. Start after 101r. Keep handler-unit (cargo-handler shows accounts) told of each change.
+
+**Goal:** the board shows account, left, role, busy, shell, idle, total, resets, credits, enabled; a failed or old reading shows only as a problem line and the red dot.
+**Spec:** drop the `read` column and the narrow-layout `read … ago` fact in `mods/unit-board/hooks/accounts.tsx`. Keep `read_at` and `read_ok` in the JSON (the dot and cargo-handler read them). Check that every read failure the status computes reaches the problems list; add any that does not. Update `docs/accounts.md` where it lists the board columns.
+**Files:**
+- mods/unit-board/hooks/accounts.tsx
+- mods/unit-board/tests/accounts.test.ts
+- docs/accounts.md
