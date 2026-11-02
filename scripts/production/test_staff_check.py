@@ -104,11 +104,11 @@ class StaffCheckTests(StaffTestCase):
     def test_damaged_pending_files_have_identical_sorted_reports_without_file_changes(self) -> None:
         run = Path(os.environ["ROSTER_RUN_ROOT"]) / "damaged-inboxes"
         run.mkdir(parents=True)
-        for name, text in (("z.pending.json", ""), ("a.pending.json", "{}")):
+        for name, text in (("z.pending.json", '{"messages": []}'), ("a.pending.json", '{"messages": []}')):
             _ = (run / name).write_text(text)
         other = run.with_name("other-damaged-inboxes")
         other.mkdir()
-        _ = (other / "bad.pending.json").write_text("{}")
+        _ = (other / "bad.pending.json").write_text('{"messages": []}')
         def disk() -> dict[Path, tuple[bytes, int]]:
             return {path: (path.read_bytes(), path.stat().st_mtime_ns)
                     for folder in (run, other) for path in folder.iterdir()}
