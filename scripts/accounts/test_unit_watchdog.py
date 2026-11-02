@@ -29,6 +29,7 @@ from scripts.production import showrunners, staff
 from scripts.shutdown.remote import local_machine
 from scripts.production.staff_test_support import isolated_staff_file, showrunner_relationship, unit_membership
 from scripts.shutdown import folder_trust, stop_resume
+from scripts.shutdown import pane_record as hook_pane_record
 from scripts.notify.push_texts import RenderedPush
 
 if TYPE_CHECKING:
@@ -104,6 +105,7 @@ class UnitWatchdogTests(unittest.TestCase):
         self.pending = []
         self.finish_jobs = True
         _ = self.enterContext(patch.object(pane_record, "RECORD_DIR", self.home / "panes"))
+        _ = self.enterContext(patch.object(hook_pane_record, "RECORD_DIR", self.home / "panes"))
         _ = self.enterContext(patch.object(stop_resume, "resume", side_effect=self.resume))
         _ = self.enterContext(patch.object(sessions, "session_liveness", side_effect=self.session_liveness))
         _ = self.enterContext(patch.object(unit_lookup, "runs_dir", return_value=self.runs))
@@ -335,19 +337,22 @@ class UnitWatchdogTests(unittest.TestCase):
     def test_explicit_resume_after_public_stop_allows_recovery_of_a_later_crash(self) -> None:
         owner = self.add_unit("alpha")
 
-        def start(tab: herdr.TabSession, entry: pane_record.PaneLaunch, label: str, message: str) -> None:
+        def start(tab: herdr.TabSession, entry: pane_record.PaneLaunch, label: str, message: str) -> sessions.LiveSessionProcess:
             self.assertIn("maintenance", message)
             self.assertEqual((tab.pane_id, entry["session_id"], label), ("alpha", "alpha", "claude4"))
             environment = {**entry["environment"], "HERDR_ENV": "1", "HERDR_SESSION": "shared",
                            "HERDR_PANE_ID": tab.pane_id, "CLAUDE_CONFIG_DIR": entry["config_dir"]}
             payload = json.dumps({"session_id": "alpha", "cwd": owner["cwd"]})
-            with (patch.dict(os.environ, environment, clear=True),
+            with (patch.dict(os.environ, environment),
+                  patch.object(os, "getppid", return_value=owner["pid"]),
+                  patch.object(staff, "runtime_id", return_value=owner["session_id"]),
                   patch.object(sys, "stdin", io.StringIO(payload)),
-                  patch.object(pane_record, "claude_arguments", return_value=stop_resume.resume_arguments(entry))):
+                  patch.object(hook_pane_record, "claude_arguments", return_value=stop_resume.resume_arguments(entry))):
                 with self.assertRaises(SystemExit) as exited:
                     _ = runpy.run_path(str(stop_resume.SCRIPTS / "hooks/session-start-pane-record.py"), run_name="__main__")
                 self.assertEqual(exited.exception.code, 0)
             self.revive("alpha", label)
+            return sessions.LiveSessionProcess(owner["pid"])
 
         config = accounts.account_dir("claude4")
         with self.stop_process_leaves():

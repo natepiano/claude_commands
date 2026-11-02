@@ -68,7 +68,11 @@ class StopResumeTests(unittest.TestCase):
         _ = self.enterContext(patch.object(account, "process_config_dir", side_effect=self.process_account))
         _ = self.enterContext(patch.object(herdr, "repository_root", return_value=self.root))
         _ = self.enterContext(patch.object(herdr, "repository_trust_key", return_value=self.root))
-        _ = cast(object, self.enterContext(patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "", "SHUTDOWN_STATE_DIR": str(self.root / "shutdown")})))
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {
+            "HOME": str(self.root), "STAFF_FILE": str(self.root / "staff.json"),
+            "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
+            "CLAUDE_CODE_SESSION_ID": "", "SHUTDOWN_STATE_DIR": str(self.root / "shutdown"),
+        })))
         _ = self.enterContext(patch.object(herdr, "shared_session", return_value="agents"))
         _ = self.enterContext(patch.object(herdr, "Herdr", return_value=self.client))
         _ = self.enterContext(patch.object(pane_record, "RECORD_DIR", self.root / "panes"))
@@ -595,7 +599,12 @@ class StopResumeTests(unittest.TestCase):
         popen.assert_not_called()
 
     def test_failed_handoff_reports_failure_without_signalling(self) -> None:
-        with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "019b3a40-4250-7000-8000-000000000102"}), patch.object(stop_resume, "_detach", wraps=self.real_detach), patch.object(sys, "platform", "linux"), patch.object(subprocess, "run", side_effect=OSError("service manager unavailable")):
+        with (patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": self.entry["session_id"]}),
+              patch.object(staff, "runtime_id", return_value=self.entry["session_id"]),
+              patch.object(showrunners, "own_slug", return_value="alpha"),
+              patch.object(stop_resume, "_detach", wraps=self.real_detach),
+              patch.object(sys, "platform", "linux"),
+              patch.object(subprocess, "run", side_effect=OSError("service manager unavailable"))):
             result = stop_resume.move_sessions(["alpha"], "claude4", why="limit")
         self.assertEqual(result, [stop_resume.StopFailed("alpha", "cannot hand off move: service manager unavailable")])
         self.kill.assert_not_called()
