@@ -349,7 +349,7 @@ def resume(unit: RetiredUnit, record: staff.StaffSnapshot) -> int:
     if isinstance(member, staff_sources.NoSuchMember):
         raise Refused(f"{unit.name}: no retained staff row")
     if isinstance(unit.recovery, unit_config.UnitConfig):
-        unit_config.write_parked(member.row.id, unit.recovery)
+        _ = unit_config.write_parked(member.row.id, unit.recovery)
     make_worktree(unit)
     unit_config.restore(member.row.id, unit.worktree)
     row = staff.restore_unit(member.row.id, staff.PresentWorktree(remote.local_machine(), unit.worktree))
