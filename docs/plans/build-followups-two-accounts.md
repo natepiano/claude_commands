@@ -3092,3 +3092,9 @@ User 2026-11-02: "i want accounts renewal on the mac for sure". natedev renewed 
 User 2026-11-02: remove the `read` column; a reading that fails or is old shows in the problems, not in a permanent column.
 
 **As-built:** `mods/unit-board/hooks/accounts.tsx` drops the `read` column and the narrow `read … ago` fact. `accounts.py` status adds a problem line for a usage or credits reading older than the existing ten-minute limit and sets `read_ok` false for it; a reading saved after status starts counts as fresh (F001). `read_at` and `read_ok` stay in the JSON; cargo-handler colours its dot from `read_ok` (handler-unit Phase 61 drops its own read column). One repair round; style review PASS.
+
+### Phase 101t — `codex update` works through the codex alias on both machines  · status: done · 2f0877b2
+
+User 2026-11-02 "go", via natedev: the `codex` alias set a numbered `CODEX_HOME`, so `codex update` failed with "Could not detect the Codex installation method".
+
+**As-built:** `_exec_codex_account` in `scripts/accounts/accounts.py` sends a first argument of `update` to `_update_codex`, with no account check. It runs the local program with `CODEX_HOME=~/.codex`, attached to the terminal, then reads its version. Then it runs `CODEX_HOME="$HOME/.codex" "$HOME/.local/bin/codex" update >&2 && … --version` on `remote.other_machine()` over ssh (600 s limit; stderr discarded, so stdout holds only the version). It prints one version or failure line per machine; ssh 255 or a timeout prints `unreachable; run codex update there`. Exit 0 only when both machines updated. Two repair rounds (F001: update text could print as the version; F002: invalid stderr bytes raised a traceback). Style review PASS.

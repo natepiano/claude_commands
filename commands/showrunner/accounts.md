@@ -17,7 +17,8 @@ and print its output exactly as it comes, with nothing added.
   `/account_moves` sets ordered one-shot moves on natedev, with an optional hold. A recorded group choice removes its entry; retries keep `auto: <id>`. Covered groups suppress the Claude low-quota phone reminder. Claude session alerts and `/quota_ack` are removed. See `docs/accounts.md`.
   The shutdown progress line keeps their target and reason visible until safe to stop.
 - `setup claudeN`: builds the folder and prints how to log in.
-- `exec claudeN|codexN|units|showrunners|workers [args…]`: starts Claude or Codex on that account or group's selection, passing arguments unchanged; `--probe` before the label is Claude-only.
+- `exec claudeN|codexN|units|showrunners|workers [args…]`: start the selected account or group with unchanged arguments. `--probe` before the label applies only to Claude.
+- `codex update` and `codexN update` update both machines' shared installs through the aliases. The local update uses the terminal. Each machine gets one version or failure summary line. An unreachable machine shows `unreachable; run codex update there`. Zero status requires success on both machines.
 - `setup codexN`: links the home, finishes its first startup (up to 20 minutes: run it in the background), then prints the login command.
   Keep `CODEX_HOME` on the login command; never sign in to shared `~/.codex`.
 - `cutover-home codexN [--undo]`: journal and rename `~/.codex/auth.json` into its numbered home, or back. If the numbered home already has the same login, archive the legacy identity beside the journal instead; undo restores that archive and keeps the numbered identity. Refuses while a process uses the home losing the login, naming its pid; stop it, then rerun. Rerun interruptions to finish. After cutover on both machines, `~/.codex` holds no login: the executable without `CODEX_HOME` is signed out, while the `codex` alias uses `exec workers`. Bare `--undo` remains Claude-only.
