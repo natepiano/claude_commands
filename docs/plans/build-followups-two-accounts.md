@@ -3080,3 +3080,15 @@ natedev showrunner 2026-11-01 (C35, cef58b5c): prove each started-hold form that
 natedev showrunner 2026-11-02: the user ran /theme at 09:06 EST; Claude Code wrote `theme` into live `~/.claude/settings.json`, and merge_gate refused every promotion because the tracked file differed from HEAD.
 
 **As-built:** `theme` joins the per-machine keys in `scripts/settings/settings_local_keys.sh` (with `model`, `effortLevel`, `modelSettings`, `extraKnownMarketplaces`). The clean filter strips it, the sidecar keeps it, and the smudge restores it. The committed `settings.json` has no `theme`. `test_settings_local_keys.py` fixtures give each machine a different theme and still clean to one blob.
+
+### Phase 101r — The Mac renews an expired Claude login by itself  · status: done · ef9480b6
+
+User 2026-11-02: "i want accounts renewal on the mac for sure". natedev renewed idle logins in its notes job's refusal-watch pass; the Mac ran only `agent_notes.py usage-only`, which never renewed.
+
+**As-built:** `agent_notes.py usage-only` (Mac launchd job, nixos `modules/darwin/account-usage.nix`) runs `refusal_watch.renew_expired_logins` as a dry run after it saves usage. When an account is due, it starts `agent_notes.py renew-logins` as a detached child (`start_new_session`) and returns: launchd runs one job instance, so the usage job never waits on a 120 s probe. `renew-logins` holds the `login-renewal` schedule lock and calls the same function, which keeps the hourly limit and `~/.local/state/accounts/login_renewals.json`. Two repair rounds (F001: the probe held the usage job, first by its lock, then by launchd's one instance). Style review PASS. Live proof: the Mac after promotion.
+
+### Phase 101s — The accounts board has no read column  · status: done · 9b161976
+
+User 2026-11-02: remove the `read` column; a reading that fails or is old shows in the problems, not in a permanent column.
+
+**As-built:** `mods/unit-board/hooks/accounts.tsx` drops the `read` column and the narrow `read … ago` fact. `accounts.py` status adds a problem line for a usage or credits reading older than the existing ten-minute limit and sets `read_ok` false for it; a reading saved after status starts counts as fresh (F001). `read_at` and `read_ok` stay in the JSON; cargo-handler colours its dot from `read_ok` (handler-unit Phase 61 drops its own read column). One repair round; style review PASS.

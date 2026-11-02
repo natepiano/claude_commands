@@ -259,7 +259,7 @@ class AddUnitLaunchTests(AddUnitTestCase):
     def test_add_unit_rerun(self) -> None:
         original = add_unit.ensure_staff_unit
         process = self.root / "proc" / str(os.getpid())
-        process.mkdir(parents=True)
+        process.mkdir(parents=True, exist_ok=True)
         fields = Path(f"/proc/{os.getpid()}/stat").read_text().rsplit(")", 1)[1].split()
         fields[1] = "102"
         _ = (process / "stat").write_text(f"{os.getpid()} (claude) " + " ".join(fields))

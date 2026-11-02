@@ -415,6 +415,12 @@ def _file() -> Path:
     return Path(os.environ.get("STAFF_FILE") or Path.home() / ".local/state/staff/staff.json").expanduser()
 
 
+def folder_move_path(unit: StaffId) -> Path:
+    """Keep move progress beside the selected staff record."""
+    _ = native_id(unit)
+    return _file().parent / "folder_moves" / f"{unit}.json"
+
+
 def _is_owner() -> bool:
     """An explicit STAFF_FILE is local state owned by this process."""
     return bool(os.environ.get("STAFF_FILE")) or remote.other_machine() != OWNER_MACHINE

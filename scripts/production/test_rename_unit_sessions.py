@@ -221,7 +221,8 @@ with staff.operation():
     def test_verify_names_the_live_holder_of_a_former_mark(self) -> None:
         self.moved_unit_with_leftover_marks()
         pid = fake_unit_host.live_pid(self)
-        old = fake_showrunner.write_session(self.root / "state/sessions", "old", "sid-old", pid)
+        old = fake_showrunner.write_session(self.root / "state/sessions", "old",
+                                           "d01f29c0-228f-4d37-b886-f7b752cc4118", pid)
         self.addCleanup(old.close)
         fake_unit_host.place_process(self.env, pid, "w3:p3Y")
         self.assert_refused(self.rename("verify"),

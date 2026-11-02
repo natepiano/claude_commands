@@ -108,6 +108,18 @@ class StopResumeTests(unittest.TestCase):
         identity = command[command.index("--resume") + 1]
         self.launched.add(identity)
         self.client.native_ids[arguments[2]] = identity
+        pane = arguments[2]
+        if pane not in pane_record.read("agents"):
+            original = pane_record.launch_for_session(identity)
+            assert original is not None
+            environment = dict(original["environment"])
+            for item in command[:command.index("exec")]:
+                if "=" in item:
+                    key, value = item.split("=", 1)
+                    environment[key] = value
+            replacement = pane_record.launch(pane, identity, original["cwd"], environment,
+                ["claude", *command[command.index("exec") + 2:]])
+            pane_record.write("agents", replacement)
         return result
 
     @staticmethod

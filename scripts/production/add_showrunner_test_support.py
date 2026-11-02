@@ -24,6 +24,7 @@ from scripts.production import showrunners
 from scripts.herdr import herdr
 from scripts.message import sessions
 from scripts.herdr.fake_herdr import CommandResponse
+from scripts.production.fake_unit_host import confirm_tab_close, native_claude
 
 SCRIPT = Path(__file__).with_name("add_showrunner.py")
 SHARED = herdr.SHARED_SESSION
@@ -246,6 +247,7 @@ class AddShowrunnerFixture(unittest.TestCase):
         process = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.buffer.read()"],
                                    stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.processes.append(process)
+        native_claude(self.env, process.pid)
         return (str(self.root / "sessions" / f"{process.pid}.json"),
                 json.dumps({"pid": process.pid, "procStart": sessions.process_start(process.pid),
                             "name": name or f"{session}-name", "sessionId": session, "updatedAt": 1,
@@ -339,6 +341,7 @@ class AddShowrunnerFixture(unittest.TestCase):
         a boot unit; the agent prompt brings the session up. While the shared session is live, it holds
         a tab named `slug`."""
         _ = self.env.setdefault("FAKE_CLAUDE_PID", str(os.getpid()))
+        native_claude(self.env, int(self.env["FAKE_CLAUDE_PID"]))
         _ = self.env.setdefault("FAKE_CLAUDE_SESSION_ID", fixture_runtime_id("showrunner::" + slug))
         self.env["FIXTURE_CHECKOUT"] = str(SCRIPT.parents[2])
         sessions = [herdr.SessionEntry(name=path.name.removeprefix("live-"), running=True, default=False,
@@ -369,6 +372,7 @@ class AddShowrunnerFixture(unittest.TestCase):
             responses[f"--session {SHARED} agent prompt w1:p1 {prompt}"] = CommandResponse(
                 code=0, stdout="", write_files={**self.on_start, str(self.state / f"live-{SHARED}"): ""})
         responses.update(self.herdr_overrides)
+        confirm_tab_close(responses, SHARED, "w1:t1", Path(self.env["FAKE_HERDR_RESPONSES"]))
         _ = Path(self.env["FAKE_HERDR_RESPONSES"]).write_text(json.dumps(responses))
 
     def events(self, command: str) -> list[dict[str, object]]:

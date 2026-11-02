@@ -44,6 +44,7 @@ from scripts.accounts import accounts
 from scripts.whoami.note_file import NumberedAccountLabel, note_name, parse_account_label
 import herdr
 from scripts.herdr.fake_herdr import CommandResponse
+from scripts.production.fake_unit_host import confirm_tab_close, native_claude
 from scripts.whoami import usage_store
 from test_support import registry_confirmation, ShutdownTestCase
 
@@ -422,6 +423,7 @@ class AddUnitTestCase(ShutdownTestCase):
         if isinstance(request, add_unit.UnitLaunch):
             self.env["FIXTURE_CHECKOUT"] = str(SCRIPT.parents[2])
             self.env["FAKE_CLAUDE_PID"] = str(os.getpid())
+            native_claude(self.env, int(self.env["FAKE_CLAUDE_PID"]))
             parent = fixture_runtime_id("showrunner::" + fixture_showrunner_name(request.production.slug, request.production.doc))
             self.env["FAKE_CLAUDE_SESSION_ID"] = fixture_runtime_id("unit:" + parent + ":" + request.identity.session)
             name = SHARED
@@ -469,6 +471,8 @@ class AddUnitTestCase(ShutdownTestCase):
                     str(self.state / f"herdr-live-{name}"): "",
                     self.env["FAKE_HERDR_RESPONSES"]: json.dumps(after)})
         responses.update(self.herdr_overrides)
+        if isinstance(request, add_unit.UnitLaunch):
+            confirm_tab_close(responses, SHARED, "w1:t1", Path(self.env["FAKE_HERDR_RESPONSES"]))
         if isinstance(request, add_unit.UnitLaunch) and (self.root / "proc/202").exists():
             after_stop = {**responses, "--session default session list --json": CommandResponse(code=0, stdout='{"sessions": []}')}
             stopped_name = (self.root / "proc/201/cmdline").read_text().split("\0")[2]
