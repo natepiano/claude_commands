@@ -483,31 +483,17 @@ Source: Phase 7e closure review (F002), moved here under the landing rule (model
 
 **Ruled out:** a second reader for any one file's settings; code defaults beside the config; a persistent status for `conf.Unusable`.
 
-### Phase 8b — A rejected config publish recovers after main moves  · status: todo
-**Depends on:** Phase 8 (the publish path it repairs)
+### Phase 8b — A rejected config publish recovers after main moves  · status: done
 
-Source: Phase 8 architect review, 2026-11-02 (finding 2). After a rejected `/tune` or `/zone` push, the publish commit stays on local main. When another writer then advances origin/main, `main_publish.ready()` refuses the next run: `merge --ff-only origin/main` cannot take a diverged main (`scripts/lib/main_publish.py:95-105`). The approved change then needs a hand repair. This is a defect in what Phase 8 shipped, so it runs next.
+#### As-built
 
-#### Work Order
-
-**Goal:** a rerun of an approved `/tune` or `/zone` change after a rejected push publishes it with no new approval and no duplicate commit, also when origin/main moved in between.
-
-**Spec:**
-1. `ready()` accepts a local main whose only commits beyond origin/main are publisher commits (subjects `tune(`, `zone(`, `user zone: `, the same set `push()` accepts). It rebases those commits onto the fetched origin/main. Any other unpushed commit, or a rebase conflict, refuses by name and leaves main as it was.
-2. A rebased commit whose change origin/main already holds drops out, so a same-value retry makes no duplicate commit.
-3. The Mac pull queue and the `already` rerun keep their Phase 8 behavior.
+- `main_publish.ready()` fetches origin, lists `origin/main..main`, and refuses any commit whose subject does not start with `tune(`, `zone(` or `user zone: ` with `main holds other commit <id> <subject> that origin does not have; main is unchanged` (exit 2, stderr). The refusal runs before the edit, so `/tune` and `/zone` leave the config and HEAD unchanged.
+- It then takes origin/main as a fast-forward. When that fails and publish commits exist, it rebases them onto origin/main (`--no-autostash --no-update-refs --empty=drop`). A conflict names the commit and its files, runs `rebase --abort`, and refuses with main unchanged.
+- After a rejected push and another writer's push, a same-value rerun publishes one commit on top of origin/main and exits 0 with one line; a further rerun makes no new commit.
 
 **Files:**
-- `scripts/lib/main_publish.py` — `ready()` recovery
-- `scripts/lib/test_main_publish.py` — regression tests in a temporary repository
+- `scripts/lib/main_publish.py` — `ready()` recovery and refusals
+- `scripts/lib/test_main_publish.py` — temporary-repository recovery, refusal and conflict tests
+- `scripts/lib/test_tune.py`, `scripts/lib/test_zone.py` — caller refusals read stderr and check HEAD unchanged
 
-**Workers:** 1 writer + 1 tester
-- `impl` — `main_publish.py`
-- `test` — `test_main_publish.py`, from this Spec alone
-
-**State:** none (tests use temporary repositories and `CONF_DIR` fixtures).
-
-**Constraints from prior phases:** tests set `CONF_DIR`; never read the installed config.
-
-**Acceptance gate:** `python3 -m unittest discover -s scripts/lib -p test_main_publish.py`, `-p test_tune.py` and `-p test_zone.py` green, covering: a rejected push, then another writer's push to origin, then a same-value retry that publishes with one commit and no approval; a non-publisher unpushed commit refused; a rebase conflict refused with main unchanged. `basedpyright` on each slot's files `0 errors, 0 warnings, 0 notes`. Live, by the director: the real `/tune` command and a real rerun. Showrunner limits 2026-11-02: the smallest fix, no new lock or design; a refused or conflicting commit gives one clear error. Runs in parallel with 7d (disjoint files).
-
+**Ruled out:** a new lock or a wider publish design (showrunner limit 2026-11-02).
