@@ -90,6 +90,12 @@ else:
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
 import memory_admit
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "build_targets"))
+if TYPE_CHECKING:
+    from ..build_targets.target_config import SshTarget, read_targets
+else:
+    from target_config import SshTarget, read_targets
+
 if TYPE_CHECKING:
     import sample
 
@@ -946,8 +952,11 @@ class HoldEventRecord(TypedDict):
 
 def hold_event(args: list[str]) -> None:
     event, target, key, holder, reason, at = args[:6]
-    if event not in ("began", "ended") or target not in ("mac", "natedev") or len(args) not in (6, 7):
+    if event not in ("began", "ended") or len(args) not in (6, 7):
         raise ValueError("invalid hold-event arguments")
+    if target not in ("mac", "natedev"):
+        if not any(item.name == target and isinstance(item, SshTarget) for item in read_targets()):
+            raise ValueError(f"unknown SSH hold target: {target}")
     instant = datetime.fromisoformat(at)
     if instant.utcoffset() is None:
         raise ValueError("hold-event at needs an offset")
