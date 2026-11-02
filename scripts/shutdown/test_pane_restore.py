@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import math
 import os
 import subprocess
 import sys
@@ -35,7 +36,8 @@ class FakeClient(herdr.Herdr):
         self.start_error: herdr.HerdrFailure | None = None
 
     @override
-    def result(self, *arguments: str) -> dict[str, object]:
+    def result(self, *arguments: str, deadline: float = math.inf) -> dict[str, object]:
+        del deadline
         if arguments[:2] == ("workspace", "list"):
             return {"workspaces": [{"workspace_id": "w1", "label": "demo"}]}
         if arguments[:2] == ("pane", "list"):

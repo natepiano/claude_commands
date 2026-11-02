@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 import json
@@ -16,6 +17,22 @@ from scripts.direct.wait_for_test_state import wait_until
 
 
 class ImplementLauncherWorkerTests(CompletedWorkerFixture):
+    def test_phase_launch_records_its_baseline_before_the_worker_opens(self) -> None:
+        session = self.start_phase("first-baseline")
+        head = subprocess.run(["git", "-C", str(self.working_dir), "rev-parse", "HEAD"], check=True,
+                              capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS).stdout
+        status = subprocess.run(["git", "-C", str(self.working_dir), "status", "--short"], check=True,
+                                capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS).stdout
+        stub = self.root / "scripts/agents/agent_exec.sh"
+        with stub.open("a") as stream:
+            _ = stream.write('cat "$UNIT_RUN_DIR/phases/3/phase_baseline" > "$UNIT_RUN_DIR/baseline-at-worker-open"\n')
+        result = self.checked_launch(session, "--phase", "3")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue((session / "phases/3/phase_baseline").is_file())
+        self.assertEqual((session / "phases/3/phase_baseline").read_text(), head)
+        self.assertEqual((session / "phases/3/progress_baseline_status").read_text(), status)
+        self.assertEqual((session / "baseline-at-worker-open").read_text(), head)
+
     def test_follow_recovers_missing_claim_unless_the_roster_launcher_is_alive(self) -> None:
         for launcher_pid in (None, 99999999, os.getpid()):
             live = launcher_pid == os.getpid()
@@ -86,7 +103,7 @@ class ImplementLauncherWorkerTests(CompletedWorkerFixture):
 
                     wait_until(held_claim, session_dir)
                 finally:
-                    os.killpg(process.pid, signal.SIGKILL)
+                    send_process_group(process.pid, signal.SIGKILL)
                     _ = process.wait(timeout=TEST_HANG_GUARD_SECS)
 
                 result = self.mesh_launch(session_dir, to=name)

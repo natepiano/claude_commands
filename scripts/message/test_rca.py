@@ -213,7 +213,7 @@ with socket.socket(socket.AF_UNIX) as client:
 pathlib.Path(os.environ['OWNER_TEST_RECEIPT']).write_text('delivered')
 print('SENT: fake owner socket')
 """)
-        caller = """import json, math, os, pathlib, signal, sys
+        caller = """import json, math, os, pathlib, subprocess, sys
 from scripts.production import stall_watch
 rca = stall_watch.rca
 rca.STATE = pathlib.Path(os.environ['OWNER_TEST_CASE_DIR'])
@@ -233,8 +233,13 @@ else:
     failure = ''
 pathlib.Path(os.environ['OWNER_TEST_RETURN']).write_text(json.dumps({
     'failure': failure, 'delivered': pathlib.Path(os.environ['OWNER_TEST_RECEIPT']).exists()}))
-# Model a service manager ending the caller's process group as soon as the one-shot returns.
-os.killpg(os.getpgrp(), signal.SIGTERM)
+# A separate service manager can end the test's caller group without signalling its own group.
+subprocess.run([sys.executable, '-c',
+    "import pathlib, signal, sys; "
+    "sys.path.insert(0, str(pathlib.Path.cwd() / 'scripts' / 'lib')); "
+    "import process_group; "
+    "process_group.send_process_group(int(sys.argv[1]), signal.SIGTERM)",
+    str(os.getpgrp())], start_new_session=True, check=True)
 """
         for mode in ("rca", "stall-watch"):
             with self.subTest(sender=mode), socket.socket(socket.AF_UNIX) as receiver:

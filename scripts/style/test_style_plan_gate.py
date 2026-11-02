@@ -33,6 +33,129 @@ from style_plan_test_support import StylePlanFixture
 
 @final
 class StylePlanTests(StylePlanFixture):
+    def approved_documentation_ticket(
+        self, source: str = "//! The old module name.\n\n//! Other documentation.\nfn value() {}\n", line: int = 1,
+    ) -> tuple[str, Path]:
+        """A structure ticket reading an approved, filed documentation finding at its source line."""
+        path = self.sources[0]
+        self.write(path, source)
+        self.commit_to_every_checkout()
+        rule = self.rule("documented-module", "tier: D\nfamily: modules\ninput_scope: file\n")
+        issue = self.approved_decision(rule, (), "restructure")
+        ledger = self.ledger()
+        ticket = "modules-unit-1"
+        ledger.ticket_add(ticket, "modules-unit", "structure", "modules", "crates/alpha", [path], [rule],
+                          cells=((rule, path),))
+        ledger.ticket_assign(ticket, "main")
+        _ = ledger.ticket_base(ticket)
+        blob = next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == rule)
+        finding = ledger.hold(rule, path, line, "The documentation names a removed module", "restructure",
+                              "The old module name", "The current module name", blob, ticket)
+        ledger.file_held(finding.finding_id, issue)
+        ledger.record(rule=rule, path=path, commit=self.tip, verdict="held", detail="", ticket=ticket, worker="test",
+                      rule_blob=blob, input_scope=style_ledger.DeclaredInputScope.RULE)
+        return ticket, issue
+
+    def test_approved_finding_doc_comment_edit_passes_and_repeated_gate_agrees(self) -> None:
+        ticket, issue = self.approved_documentation_ticket()
+        path = self.sources[0]
+        _ = (self.repo / path).write_text((self.repo / path).read_text().replace("old module", "current module"))
+        approval = issue.read_text()
+        for actor in ("user", "rule global:rust/documented-module.md"):
+            with self.subTest(approved_by=actor):
+                _ = issue.write_text(approval.replace("plan: approved", f'plan: approved\napproved_by: "{actor}"'))
+                first = self.reference_gate(ticket)
+                self.assertEqual(first, (0, "mechanical\n"))
+                self.assertEqual(self.reference_gate(ticket), first)
+
+    def test_approved_doc_site_does_not_exempt_another_comment_in_the_same_file(self) -> None:
+        ticket, _ = self.approved_documentation_ticket()
+        target = self.repo / self.sources[0]
+        _ = target.write_text(target.read_text().replace("old module", "current module"))
+        self.assertEqual(self.reference_gate(ticket), (0, "mechanical\n"))
+        _ = target.write_text(target.read_text().replace("Other documentation", "Changed unrelated documentation"))
+        code, output = self.reference_gate(ticket)
+        self.assertEqual(code, 1, output)
+        self.assertIn("check 6: serialized, reflected, configured or documented name flagged", output)
+
+    def test_doc_site_loses_its_exemption_when_approval_is_removed(self) -> None:
+        ticket, issue = self.approved_documentation_ticket()
+        target = self.repo / self.sources[0]
+        _ = target.write_text(target.read_text().replace("old module", "current module"))
+        self.assertEqual(self.reference_gate(ticket), (0, "mechanical\n"))
+        _ = issue.write_text(issue.read_text().replace("plan: approved", 'plan: ""'))
+        code, output = self.reference_gate(ticket)
+        self.assertEqual(code, 1, output)
+        self.assertIn("check 6: serialized, reflected, configured or documented name flagged", output)
+
+    def test_approved_doc_site_does_not_exempt_a_serialized_name_change(self) -> None:
+        ticket, _ = self.approved_documentation_ticket(
+            '//! The old module name.\n\n#[serde(rename = "old")]\nstruct Value;\n')
+        target = self.repo / self.sources[0]
+        _ = target.write_text(target.read_text().replace("old module", "current module"))
+        self.assertEqual(self.reference_gate(ticket), (0, "mechanical\n"))
+        _ = target.write_text(target.read_text().replace('rename = "old"', 'rename = "new"'))
+        code, output = self.reference_gate(ticket)
+        self.assertEqual(code, 1, output)
+        self.assertIn("check 6: serialized, reflected, configured or documented name flagged", output)
+
+    def test_approved_doc_replacement_does_not_exempt_new_documentation_in_the_same_hunk(self) -> None:
+        ticket, _ = self.approved_documentation_ticket("//! The old module name.\nfn value() {}\n")
+        target = self.repo / self.sources[0]
+        _ = target.write_text("//! The current module name.\n/// New documentation for the function.\nfn value() {}\n")
+        code, output = self.reference_gate(ticket)
+        self.assertEqual(code, 1, output)
+        self.assertIn("check 6: serialized, reflected, configured or documented name flagged", output)
+
+    def test_approved_doc_replacement_allows_an_adjacent_ordinary_comment_edit(self) -> None:
+        ticket, _ = self.approved_documentation_ticket(
+            "//! The old module name.\n// Old ordinary comment.\nfn value() {}\n")
+        target = self.repo / self.sources[0]
+        _ = target.write_text("//! The current module name.\n// Updated ordinary comment.\nfn value() {}\n")
+        self.assertEqual(self.reference_gate(ticket), (0, "mechanical\n"))
+
+    def test_approval_does_not_move_from_module_comment_to_function_documentation(self) -> None:
+        ticket, _ = self.approved_documentation_ticket(
+            "//! The old module name.\n// Old ordinary comment.\nfn value() {}\n")
+        target = self.repo / self.sources[0]
+        _ = target.write_text("// Updated ordinary comment.\n/// New function contract.\nfn value() {}\n")
+        code, output = self.reference_gate(ticket)
+        self.assertEqual(code, 1, output)
+        self.assertIn("check 6: serialized, reflected, configured or documented name flagged", output)
+
+    def test_approved_doc_edit_uses_its_position_among_duplicate_comments(self) -> None:
+        ticket, _ = self.approved_documentation_ticket(
+            "/// Same description.\nfn value() {}\n\n/// Same description.\nfn other() {}\n")
+        target = self.repo / self.sources[0]
+        _ = target.write_text(target.read_text().replace("/// Same description.", "/// Updated description.", 1))
+        self.assertEqual(self.reference_gate(ticket), (0, "mechanical\n"))
+
+    def test_approved_doc_edit_allows_an_ordinary_line_added_above_its_site(self) -> None:
+        ticket, _ = self.approved_documentation_ticket(
+            "// Old ordinary.\n//! Old module.\nfn value() {}\n", line=2)
+        target = self.repo / self.sources[0]
+        _ = target.write_text("// New ordinary.\n// Extra ordinary.\n//! New module.\nfn value() {}\n")
+        self.assertEqual(self.reference_gate(ticket), (0, "mechanical\n"))
+
+    def test_approved_doc_edit_allows_an_ordinary_line_removed_above_its_site(self) -> None:
+        ticket, _ = self.approved_documentation_ticket(
+            "// Old ordinary.\n//! Old module.\nfn value() {}\n", line=2)
+        target = self.repo / self.sources[0]
+        _ = target.write_text("//! New module.\nfn value() {}\n")
+        self.assertEqual(self.reference_gate(ticket), (0, "mechanical\n"))
+
+    def test_approved_block_doc_edit_ignores_ordinary_lines_but_not_an_extra_outer_doc(self) -> None:
+        ticket, _ = self.approved_documentation_ticket(
+            "// Old ordinary.\n/** Old module. */\nfn value() {}\n", line=2)
+        target = self.repo / self.sources[0]
+        replacement = "// New ordinary.\n// Extra ordinary.\n/** New module. */\n"
+        _ = target.write_text(replacement + "fn value() {}\n")
+        self.assertEqual(self.reference_gate(ticket), (0, "mechanical\n"))
+        _ = target.write_text(replacement + "/// New function contract.\nfn value() {}\n")
+        code, output = self.reference_gate(ticket)
+        self.assertEqual(code, 1, output)
+        self.assertIn("check 6: serialized, reflected, configured or documented name flagged", output)
+
     def test_structure_file_cells_gate_and_checkpoint_require_the_last_file_verdict(self) -> None:
         rule = self.rule("structure", "tier: D\nfamily: modules\n")
         second = self.rule("structure-other", "tier: D\nfamily: modules\n")
@@ -223,7 +346,7 @@ class StylePlanTests(StylePlanFixture):
         ])
         held_batches = [ticket for ticket in self.candidates("modules", ("crates/alpha/Cargo.toml",))
                         if ticket.crate == "crates/alpha"]
-        self.assertEqual(held_batches, batches)
+        self.assertEqual(held_batches, [])
         self.record(manifest, "crates/alpha", self.tip)
         self.write(self.sources[0], "pub fn changed() {}\n")
         self.tip = self.commit()

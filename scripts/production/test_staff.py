@@ -16,11 +16,13 @@ from dataclasses import FrozenInstanceError, replace
 from multiprocessing.connection import Connection
 from multiprocessing.process import BaseProcess
 from multiprocessing.synchronize import Barrier
+from pathlib import Path
 from typing import cast
 from unittest import mock
 
 from scripts.production import staff
-from scripts.production.staff_test_support import CHECKOUT, PROCESS_TIMEOUT, STAFF_SCRIPT, StaffTestCase
+from scripts.production.staff_test_support import CHECKOUT, STAFF_SCRIPT, StaffTestCase
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 MISSING_ID = staff.StaffId("s00000000000")
@@ -44,7 +46,7 @@ def concurrent_ensure(
     """Release both real writer processes together and return an id or failure."""
     with result:
         try:
-            _ = ready.wait(timeout=PROCESS_TIMEOUT)
+            _ = ready.wait(timeout=TEST_HANG_GUARD_SECS)
             row = staff.ensure(kind, name=name, parent=parent)
             result.send((True, str(row.id)))
         except Exception as error:
@@ -52,6 +54,194 @@ def concurrent_ensure(
 
 
 class StaffTests(StaffTestCase):
+    def test_restored_unit_survives_its_previous_pending_retirement(self) -> None:
+        parent = staff.ensure("showrunner", name="sdlc")
+        location = staff.PresentWorktree("natedev", self.root / "models")
+        unit = staff.ensure("unit", name="models", parent=parent.id, worktree=location)
+        staff.defer_retire((unit.id,))
+        self.assertEqual(staff.retire_pending(), ())
+        self.assertEqual(staff.by_id(unit.id), replace(unit, worktree=staff.RemovedWorktree(location.machine, location.path)))
+        staff.defer_retire((unit.id,))
+        self.assertEqual(staff.snapshot().pending_retire, (unit.id,))
+
+        restored = staff.restore_unit(unit.id, location)
+        self.assertEqual(staff.snapshot().pending_retire, ())
+        self.assertEqual(staff.retire_pending(), ())
+        self.assertEqual(staff.by_id(unit.id), restored)
+        self.assertEqual((restored.id, restored.kind, restored.name, restored.parent),
+                         (unit.id, "unit", unit.name, parent.id))
+        self.assertEqual(restored.worktree, location)
+
+    def test_restore_unit_keeps_the_retained_id_and_parent_and_rerun_writes_nothing(self) -> None:
+        parent = staff.ensure("showrunner", name="sdlc")
+        location = staff.PresentWorktree("natedev", self.root / "models")
+        removed = staff.ensure("unit", name="models", parent=parent.id,
+                               worktree=staff.RemovedWorktree(location.machine, location.path))
+        unit = staff.restore_unit(removed.id, location)
+        self.assertEqual((unit.id, unit.kind, unit.name, unit.parent), (removed.id, "unit", "models", parent.id))
+        self.assertEqual(unit.worktree, location)
+        self.assertEqual(staff.by_id(removed.id), unit)
+        before = self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns
+        self.assertEqual(staff.restore_unit(removed.id, location), unit)
+        self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), before)
+
+    def test_restore_unit_refuses_missing_identity_or_another_member_without_writing(self) -> None:
+        parent, unit, worker = self.tree()
+        location = staff.PresentWorktree("natedev", self.root / "models")
+        before = self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns
+        for held_id in (parent.id, worker.id, unit.id):
+            with self.subTest(held_id=held_id):
+                self.assert_refused(lambda: staff.restore_unit(held_id, location))
+        with self.assertRaises(staff.StaffNotFound):
+            _ = staff.restore_unit(MISSING_ID, location)
+        self.assertEqual(staff.by_id(unit.id), unit)
+        self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), before)
+
+    def test_restore_unit_refuses_a_different_retained_location_without_writing(self) -> None:
+        parent = staff.ensure("showrunner", name="sdlc")
+        removed = staff.ensure("unit", name="models", parent=parent.id,
+                               worktree=staff.RemovedWorktree("natedev", self.root / "models"))
+        before = self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns
+        for proposed in (staff.PresentWorktree("mac", self.root / "models"),
+                         staff.PresentWorktree("natedev", self.root / "elsewhere")):
+            with self.subTest(proposed=proposed):
+                self.assert_refused(lambda: staff.restore_unit(removed.id, proposed))
+        self.assertEqual(staff.by_id(removed.id), removed)
+        self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), before)
+
+    def test_restore_unit_from_mac_uses_the_owner_and_is_idempotent_through_the_cli(self) -> None:
+        parent = staff.ensure("showrunner", name="sdlc")
+        location = staff.PresentWorktree("mac", self.root / "models")
+        removed = staff.ensure("unit", name="models", parent=parent.id,
+                               worktree=staff.RemovedWorktree(location.machine, location.path))
+        with self.machine("mac"):
+            restored = staff.restore_unit(removed.id, location)
+            before = self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns
+            self.assertEqual(staff.restore_unit(removed.id, location), restored)
+        self.assertEqual((restored.id, restored.kind, restored.name, restored.parent),
+                         (removed.id, "unit", "models", parent.id))
+        self.assertEqual(restored.worktree, location)
+        self.assertEqual(staff.by_id(removed.id), restored)
+        self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), before)
+        self.assertEqual(self.ssh_commands(), [
+            ["restore-unit", removed.id,
+             "--machine", location.machine, "--path", str(location.path), "--json"],
+            ["restore-unit", removed.id,
+             "--machine", location.machine, "--path", str(location.path), "--json"],
+        ])
+        self.assertFalse(self.mac_file.exists())
+        _ = self.assert_rerun("restore-unit", removed.id,
+                              "--machine", location.machine, "--path", str(location.path))
+        self.assertEqual(staff.by_id(removed.id), restored)
+
+    def test_admission_publishes_identity_and_location_once_without_a_setter_window(self) -> None:
+        runner = staff.ensure("showrunner", name="sdlc")
+        location = staff.PresentWorktree("natedev", self.root / "models")
+        original = os.replace
+        publications: list[dict[str, object]] = []
+
+        def observe(temporary: Path, destination: Path) -> None:
+            original(temporary, destination)
+            if destination == self.staff_file:
+                publications.append(cast(dict[str, object], json.loads(self.staff_file.read_text())))
+
+        with (mock.patch.object(os, "replace", side_effect=observe),
+              mock.patch.object(staff, "set_worktree", side_effect=AssertionError("second write"))):
+            unit = staff.ensure("unit", name="models", parent=runner.id, worktree=location)
+        self.assertEqual(len(publications), 1)
+        published = cast(list[dict[str, object]], publications[0]["rows"])
+        self.assertEqual(next(row for row in published if row["id"] == unit.id), unit.to_json())
+        self.assertEqual(unit.worktree, location)
+        before = self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns
+        self.assertEqual(staff.ensure("unit", name="models", parent=runner.id, worktree=location), unit)
+        self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), before)
+
+    def test_admission_fills_unfilled_locations_but_refuses_wrong_kind_duplicates_and_resurrection(self) -> None:
+        runner = staff.ensure("showrunner", name="sdlc", doc=staff.LiveDoc("natedev", self.root / "doc.md"))
+        blank = staff.ensure("unit", name="models", parent=runner.id)
+        location = staff.PresentWorktree("natedev", self.root / "models")
+        filled = staff.ensure("unit", name="models", parent=runner.id, worktree=location)
+        self.assertEqual(filled, replace(blank, worktree=location))
+        self.assert_refused(lambda: staff.ensure("showrunner", name="wrong", worktree=location))
+        self.assert_refused(lambda: staff.ensure("unit", name="wrong", parent=runner.id, doc=runner.doc))
+        self.assert_refused(lambda: staff.ensure("unit", name="duplicate", parent=runner.id, worktree=location))
+        self.assert_refused(lambda: staff.ensure("unit", name="models", parent=runner.id,
+                                               worktree=staff.PresentWorktree("natedev", self.root / "other")))
+        removed = staff.set_worktree(filled.id, staff.RemovedWorktree(location.machine, location.path))
+        self.assert_refused(lambda: staff.ensure("unit", name="models", parent=runner.id, worktree=location))
+        self.assertEqual(staff.by_id(removed.id), removed)
+
+    def test_remote_admission_sends_the_location_in_the_owner_transaction(self) -> None:
+        runner = staff.ensure("showrunner", name="sdlc")
+        with self.machine("mac"):
+            location = staff.PresentWorktree("mac", self.root / "mac-models")
+            unit = staff.ensure("unit", name="models", parent=runner.id, worktree=location)
+            self.assertEqual(unit.worktree, location)
+            self.assertEqual(staff.by_id(unit.id), unit)
+            self.assertFalse(self.mac_file.exists())
+        self.assertEqual(staff.by_id(unit.id), unit)
+
+    def test_active_filters_removed_and_wrapped_rows_but_raw_identity_keeps_every_state(self) -> None:
+        runners = [staff.ensure("showrunner", name=name, doc=doc) for name, doc in (
+            ("unfilled", staff.DocUnfilled()),
+            ("live", staff.LiveDoc("natedev", self.root / "live.md")),
+            ("wrapped", staff.WrappedDoc("natedev", self.root / "archive.md")))]
+        units = [staff.ensure("unit", name=name, parent=runners[0].id, worktree=worktree)
+                 for name, worktree in (("unfilled", staff.WorktreeUnfilled()),
+                     ("present", staff.PresentWorktree("natedev", self.root / "present")),
+                     ("removed", staff.RemovedWorktree("natedev", self.root / "removed")))]
+        record = staff.snapshot()
+        self.assertCountEqual(staff.active(record, "unit"), units[:2])
+        self.assertCountEqual(staff.active(record, "showrunner"), runners[:2])
+        for row in (*runners, *units):
+            self.assertEqual(record.by_id(row.id), row)
+        self.assertEqual(record.by_path("unfilled/removed"), units[2])
+        self.assertCountEqual(record.find(), [*runners, *units])
+
+    def test_local_and_remote_retire_refuse_owners_and_remove_only_the_selected_worker(self) -> None:
+        runner, unit, worker = self.tree()
+        for machine in ("natedev", "mac"):
+            with self.subTest(machine=machine), self.machine(machine):
+                for row in (runner, unit):
+                    self.assert_refused(lambda: staff.retire(row.id))
+        self.assertEqual(staff.retire(worker.id), worker)
+        self.assertEqual(staff.by_id(unit.id), unit)
+        self.assertEqual(staff.by_id(runner.id), runner)
+
+    def test_pending_retirement_keeps_ids_and_edges_and_waits_for_workers_and_known_locations(self) -> None:
+        runner = staff.ensure("showrunner", name="sdlc", doc=staff.LiveDoc("natedev", self.root / "doc.md"))
+        child = staff.ensure("showrunner", name="child", parent=runner.id)
+        unit = staff.ensure("unit", name="models", parent=runner.id,
+                            worktree=staff.PresentWorktree("natedev", self.root / "models"))
+        worker = staff.ensure_worker("impl1", unit.id)
+        staff.defer_retire((runner.id, unit.id, child.id))
+        self.assertCountEqual(staff.retire_pending(), (runner.id, unit.id, child.id))
+        self.assertEqual(staff.by_id(worker.id), worker)
+        _ = staff.retire(worker.id)
+        self.assertEqual(staff.retire_pending(), (child.id,))
+        self.assertEqual(staff.by_id(unit.id), replace(unit, worktree=staff.RemovedWorktree("natedev", self.root / "models")))
+        self.assertEqual(staff.by_id(runner.id), replace(runner, doc=staff.WrappedDoc("natedev", self.root / "doc.md")))
+        self.assertEqual(staff.by_id(child.id), child)
+        before = self.staff_file.read_bytes()
+        self.assertEqual(staff.retire_pending(), (child.id,))
+        self.assertEqual(self.staff_file.read_bytes(), before)
+
+    def test_seed_retirement_retains_the_removed_row_and_cannot_reactivate_it_from_stale_membership(self) -> None:
+        runner = staff.ensure("showrunner", name="sdlc")
+        unit = staff.ensure("unit", name="models", parent=runner.id,
+                            worktree=staff.PresentWorktree("natedev", self.root / "models"))
+        retirement = staff.SeedInput((), (staff.SeedRetirement(unit.id, runner.id),))
+        record = staff.apply_seed(retirement)
+        removed = replace(unit, worktree=staff.RemovedWorktree("natedev", self.root / "models"))
+        self.assertEqual(record.by_id(unit.id), removed)
+        self.assertEqual(record.by_id(runner.id), runner)
+        before = self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns
+        self.assertEqual(staff.apply_seed(retirement).by_id(unit.id), removed)
+        self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), before)
+        stale = staff.SeedInput((staff.SeedMember("unit", "unit", unit.name, unit.id, staff.KeepSeedParent()),))
+        self.assertEqual(staff.apply_seed(stale).by_id(unit.id), removed)
+        self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), before)
+
     def test_schema_one_rewrites_as_two_without_inventing_worktrees_or_docs(self) -> None:
         runner, unit, worker = self.tree()
         _ = self.write_document({"schema": 1, "rows": [row.to_json() for row in (runner, unit, worker)]})
@@ -159,7 +349,7 @@ class StaffTests(StaffTestCase):
             with self.subTest(prefix=prefix, slot=slot):
                 result = subprocess.run(["bash", str(CHECKOUT / "scripts/direct/worker_name.sh"),
                                          str(self.root), slot, "impl", prefix],
-                                        capture_output=True, text=True, check=True, timeout=PROCESS_TIMEOUT)
+                                        capture_output=True, text=True, check=True, timeout=TEST_HANG_GUARD_SECS)
                 name = result.stdout.strip()
                 _ = staff.WorkerName.parse(name)
                 row = staff.ensure_worker(name, unit.id)
@@ -167,17 +357,17 @@ class StaffTests(StaffTestCase):
                 self.assertEqual(staff.by_id(row.id), row)
 
     def test_pending_showrunner_retirement_waits_for_direct_workers_without_rolling_back_other_rows(self) -> None:
-        runner = staff.ensure("showrunner", name="sdlc")
+        runner = staff.ensure("showrunner", name="sdlc", doc=staff.LiveDoc("natedev", self.root / "sdlc.md"))
         worker = staff.ensure_worker("sdlc-handler-astra-reviewer", runner.id)
-        other = staff.ensure("showrunner", name="unheld")
+        other = staff.ensure("showrunner", name="unheld", doc=staff.LiveDoc("natedev", self.root / "unheld.md"))
         staff.defer_retire((runner.id, other.id))
         self.assertEqual(staff.retire_pending(), (runner.id,))
-        self.assertIsNone(staff.by_id(other.id))
+        self.assertEqual(staff.by_id(other.id), replace(other, doc=staff.WrappedDoc("natedev", self.root / "unheld.md")))
         self.assertEqual(staff.by_id(worker.id), worker)
         self.assert_refused(lambda: staff.retire(runner.id))
         _ = staff.retire(worker.id)
         self.assertEqual(staff.retire_pending(), ())
-        self.assertIsNone(staff.by_id(runner.id))
+        self.assertEqual(staff.by_id(runner.id), replace(runner, doc=staff.WrappedDoc("natedev", self.root / "sdlc.md")))
 
     def test_row_write_transport_refuses_unit_and_showrunner_retirement(self) -> None:
         runner = staff.ensure("showrunner", name="sdlc")
@@ -236,9 +426,9 @@ class StaffTests(StaffTestCase):
                 processes.append(process)
                 process.start()
                 send.close()
-            _ = ready.wait(timeout=PROCESS_TIMEOUT)
+            _ = ready.wait(timeout=TEST_HANG_GUARD_SECS)
             for process in processes:
-                process.join(timeout=PROCESS_TIMEOUT)
+                process.join(timeout=TEST_HANG_GUARD_SECS)
                 self.assertFalse(process.is_alive(), "concurrent staff writer did not finish")
                 self.assertEqual(process.exitcode, 0)
             ids: list[str] = []
@@ -251,7 +441,7 @@ class StaffTests(StaffTestCase):
             for process in processes:
                 if process.is_alive():
                     process.terminate()
-                process.join(timeout=PROCESS_TIMEOUT)
+                process.join(timeout=TEST_HANG_GUARD_SECS)
                 process.close()
             for result in results:
                 result.close()
@@ -334,10 +524,11 @@ class StaffTests(StaffTestCase):
         _ = self.assert_rerun("move", unit.id, f"--parent={other.id}")
         _ = self.assert_rerun("move", other.id, f"--parent={showrunner.id}")
         _ = self.assert_rerun("move", other.id, "--parent=none")
-        _ = self.assert_rerun("retire", unit.id)
+        worker = staff.find(kind="worker", parent=unit.id)[0]
+        _ = self.assert_rerun("retire", worker.id)
         before = self.staff_file.read_bytes()
         with redirect_stderr(io.StringIO()) as errors:
-            self.assertIsNone(staff.retire(unit.id))
+            self.assertIsNone(staff.retire(worker.id))
         self.assertIn("unchanged", errors.getvalue())
         self.assertEqual(self.staff_file.read_bytes(), before)
 
@@ -443,8 +634,14 @@ class StaffTests(StaffTestCase):
         self.assertEqual(staff.find(kind="showrunner", parent=unit.id), [])
         self.assertIsNone(staff.by_id(MISSING_ID))
         self.assertIsNone(staff.by_path("sdlc/missing/impl1"))
-        self.assertEqual(staff.retire(unit.id), unit)
-        self.assertIsNone(staff.by_id(unit.id))
+        self.assert_refused(lambda: staff.retire(unit.id))
+        location = staff.PresentWorktree("natedev", self.root / "models")
+        _ = staff.set_worktree(unit.id, location)
+        staff.defer_retire((unit.id,))
+        self.assertEqual(staff.retire_pending(), (unit.id,))
+        self.assertEqual(staff.retire(worker.id), worker)
+        self.assertEqual(staff.retire_pending(), ())
+        self.assertEqual(staff.by_id(unit.id), replace(unit, worktree=staff.RemovedWorktree(location.machine, location.path)))
         self.assertIsNone(staff.by_id(worker.id))
         self.assertIsNone(staff.by_path("sdlc/models/impl1"))
         self.assertEqual(staff.by_id(other_worker.id), other_worker)
@@ -471,12 +668,14 @@ class StaffTests(StaffTestCase):
         self.assertEqual(staff.by_path("natedev/registry/impl1"), worker)
 
     def test_retire_showrunner_detaches_child_showrunners(self) -> None:
-        parent = staff.ensure("showrunner", name="parent")
+        parent = staff.ensure("showrunner", name="parent", doc=staff.LiveDoc("natedev", self.root / "parent.md"))
         child = staff.ensure("showrunner", name="child", parent=parent.id)
         unit = staff.ensure("unit", name="models", parent=child.id)
-        self.assertEqual(staff.retire(parent.id), parent)
-        self.assertIsNone(staff.by_id(parent.id))
-        self.assertEqual(staff.by_id(child.id), replace(child, parent=None))
+        self.assert_refused(lambda: staff.retire(parent.id))
+        staff.defer_retire((parent.id,))
+        self.assertEqual(staff.retire_pending(), ())
+        self.assertEqual(staff.by_id(parent.id), replace(parent, doc=staff.WrappedDoc("natedev", self.root / "parent.md")))
+        self.assertEqual(staff.by_id(child.id), child)
         self.assertEqual(staff.by_path("child/models"), unit)
 
     def test_retired_ids_are_not_reused_and_all_ids_fit_herdr(self) -> None:
@@ -608,7 +807,7 @@ class StaffTests(StaffTestCase):
         before = self.staff_file.read_bytes()
         killed = subprocess.run(
             [sys.executable, "-c", KILLED_WRITER], cwd=CHECKOUT,
-            capture_output=True, text=True, check=False, timeout=PROCESS_TIMEOUT,
+            capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
         )
         self.assertEqual(killed.returncode, 73, killed.stderr)
         self.assertEqual(self.staff_file.read_bytes(), before)
@@ -728,8 +927,9 @@ class StaffTests(StaffTestCase):
             row = staff.ensure("showrunner", name="private")
             self.assertEqual(staff.snapshot().rows, (row,))
             self.assertTrue(self.mac_file.is_file())
-            self.assertEqual(staff.retire(row.id), row)
-            self.assertEqual(staff.snapshot().rows, ())
+            worker = staff.ensure_worker("review", row.id)
+            self.assertEqual(staff.retire(worker.id), worker)
+            self.assertEqual(staff.snapshot().rows, (row,))
         self.assertFalse(self.staff_file.exists())
         self.assertEqual(self.ssh_log.read_text() if self.ssh_log.exists() else "", "")
 
@@ -792,6 +992,20 @@ class StaffTests(StaffTestCase):
         with self.assertRaises(FrozenInstanceError):
             setattr(record, "rows", ())
 
+    def test_local_snapshot_reads_retained_membership_without_contacting_the_owner(self) -> None:
+        _, unit, _ = self.tree()
+        retained = self.staff_file.read_bytes()
+        _ = staff.rename(unit.id, "renamed-on-owner")
+        with self.machine("mac"):
+            self.mac_file.parent.mkdir(parents=True, exist_ok=True)
+            _ = self.mac_file.write_bytes(retained)
+            _ = self.ssh_log.write_text("")
+            with mock.patch.object(subprocess, "run", side_effect=AssertionError("no remote owner read")):
+                record = staff.local_snapshot()
+            self.assertEqual(record.by_id(unit.id), unit)
+            self.assertEqual(record.inputs, (str(self.mac_file),))
+            self.assertEqual(self.ssh_commands(), [])
+
     def test_mac_snapshot_refuses_an_unreachable_owner(self) -> None:
         _ = self.tree()
         before = self.staff_file.read_bytes()
@@ -821,7 +1035,7 @@ class StaffTests(StaffTestCase):
                     pending = self.start_script(STAFF_SCRIPT, "move", unit.id, f"--parent={destination.id}", "--json")
                     self.assert_operation_blocks(pending, listener)
                 self.assertEqual(staff.by_id(unit.id), unit)
-            output, errors = pending.communicate(timeout=PROCESS_TIMEOUT)
+            output, errors = pending.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(pending.returncode, 0, errors)
         self.assertEqual(cast(object, json.loads(output)), replace(unit, parent=destination.id).to_json())
         self.assertEqual(staff.by_id(unit.id), replace(unit, parent=destination.id))
@@ -860,12 +1074,12 @@ class StaffTests(StaffTestCase):
                 "from scripts.production import staff; " +
                 "exec(\"with staff.operation():\\n staff.ensure('showrunner', name='child')\")"],
                 cwd=CHECKOUT, pass_fds=staff.operation_fds(), capture_output=True,
-                text=True, timeout=PROCESS_TIMEOUT, check=False)
+                text=True, timeout=TEST_HANG_GUARD_SECS, check=False)
             self.assertEqual(child.returncode, 0, child.stderr)
             with self.lock_notice(self.staff_file.parent / "operation.lock") as listener:
                 seed = self.start_script(STAFF_SCRIPT, "ensure", "showrunner", "--name=after")
                 self.assert_operation_blocks(seed, listener)
-        output, errors = seed.communicate(timeout=PROCESS_TIMEOUT)
+        output, errors = seed.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(seed.returncode, 0, output + errors)
         self.assertEqual({row.name for row in staff.snapshot().rows}, {"outer", "child", "after"})
 
@@ -876,13 +1090,13 @@ class StaffTests(StaffTestCase):
             exited = subprocess.Popen([sys.executable, "-c",
                 "import fcntl, sys; fcntl.flock(int(sys.argv[1]), fcntl.LOCK_EX)", str(inherited.fileno())],
                 pass_fds=(inherited.fileno(),))
-            self.assertEqual(exited.wait(timeout=PROCESS_TIMEOUT), 0)
+            self.assertEqual(exited.wait(timeout=TEST_HANG_GUARD_SECS), 0)
             environment = {**os.environ, "STAFF_OPERATION_FD": str(inherited.fileno())}
             child = subprocess.run([sys.executable, "-c",
                 "from scripts.production import staff; " +
                 "exec(\"with staff.operation():\\n staff.ensure('showrunner', name='orphan')\")"],
                 cwd=CHECKOUT, env=environment, pass_fds=(inherited.fileno(),), capture_output=True,
-                text=True, timeout=3, check=False)
+                text=True, timeout=TEST_HANG_GUARD_SECS, check=False)
         self.assertEqual(child.returncode, 0, child.stderr)
         self.assertEqual([row.name for row in staff.find()], ["orphan"])
 
@@ -910,7 +1124,7 @@ class StaffTests(StaffTestCase):
                     env=environment, pass_fds=(unlocked.fileno(),), stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE, text=True)
                 self.assert_operation_blocks(child, listener)
-        output, errors = child.communicate(timeout=PROCESS_TIMEOUT)
+        output, errors = child.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(child.returncode, 0, output + errors)
         self.assertEqual(len(staff.find(kind="showrunner")), 1)
 
@@ -922,6 +1136,8 @@ class StaffTests(StaffTestCase):
 
     def test_pending_retirement_waits_for_workers_then_retires_units_before_showrunners(self) -> None:
         runner, unit, worker = self.tree()
+        runner = staff.set_doc(runner.id, staff.LiveDoc("natedev", self.root / "sdlc.md"))
+        unit = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", self.root / "models"))
         child = staff.ensure("showrunner", name="child", parent=runner.id)
         staff.defer_retire((runner.id, unit.id))
         original = self.staff_file.read_bytes()
@@ -929,19 +1145,21 @@ class StaffTests(StaffTestCase):
         self.assertEqual(self.staff_file.read_bytes(), original)
         self.assertEqual(staff.retire_pending(), tuple(sorted((runner.id, unit.id))))
         self.assertEqual(self.staff_file.read_bytes(), original)
-        _ = staff.rename(unit.id, "panes")
+        unit = staff.rename(unit.id, "panes")
         self.assertEqual(staff.snapshot().pending_retire, tuple(sorted((runner.id, unit.id))))
         _ = staff.retire(worker.id)
         self.assertEqual(staff.retire_pending(), ())
-        self.assertIsNone(staff.by_id(unit.id))
-        self.assertIsNone(staff.by_id(runner.id))
-        self.assertEqual(staff.by_id(child.id), replace(child, parent=None))
+        self.assertEqual(staff.by_id(unit.id), replace(unit, worktree=staff.RemovedWorktree("natedev", self.root / "models")))
+        self.assertEqual(staff.by_id(runner.id), replace(runner, doc=staff.WrappedDoc("natedev", self.root / "sdlc.md")))
+        self.assertEqual(staff.by_id(child.id), child)
         completed = self.staff_file.read_bytes()
         self.assertEqual(staff.retire_pending(), ())
         self.assertEqual(self.staff_file.read_bytes(), completed)
 
     def test_pending_retirement_round_trips_over_mac_transport(self) -> None:
         runner, unit, worker = self.tree()
+        runner = staff.set_doc(runner.id, staff.LiveDoc("natedev", self.root / "sdlc.md"))
+        unit = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", self.root / "models"))
         with self.machine("mac"):
             staff.defer_retire((runner.id, unit.id))
             self.assertEqual(staff.snapshot().pending_retire, tuple(sorted((runner.id, unit.id))))
@@ -949,14 +1167,29 @@ class StaffTests(StaffTestCase):
             _ = staff.retire(worker.id)
             self.assertEqual(staff.retire_pending(), ())
         self.assertFalse(self.mac_file.exists())
-        self.assertEqual(staff.snapshot().rows, ())
+        self.assertCountEqual(staff.snapshot().rows, (
+            replace(runner, doc=staff.WrappedDoc("natedev", self.root / "sdlc.md")),
+            replace(unit, worktree=staff.RemovedWorktree("natedev", self.root / "models")),
+        ))
 
     def test_pending_retirement_drops_ids_already_retired(self) -> None:
-        runner = staff.ensure("showrunner", name="gone")
+        runner = staff.ensure("showrunner", name="gone", doc=staff.WrappedDoc("natedev", self.root / "gone.md"))
         staff.defer_retire((runner.id,))
-        _ = staff.retire(runner.id)
         self.assertEqual(staff.retire_pending(), ())
         self.assertEqual(staff.snapshot().pending_retire, ())
+        self.assertEqual(staff.by_id(runner.id), runner)
+
+    def test_pending_retirement_keeps_unfilled_locations_until_their_facts_are_known(self) -> None:
+        runner, unit, worker = self.tree()
+        _ = staff.retire(worker.id)
+        staff.defer_retire((runner.id, unit.id))
+        before = self.staff_file.read_bytes()
+        with redirect_stderr(io.StringIO()) as errors:
+            self.assertEqual(staff.retire_pending(), tuple(sorted((runner.id, unit.id))))
+        self.assertIn(f"keeping {unit.id}: worktree is unfilled", errors.getvalue())
+        self.assertEqual(self.staff_file.read_bytes(), before)
+        self.assertEqual(staff.by_id(unit.id), unit)
+        self.assertEqual(staff.by_id(runner.id), runner)
 
 
 if __name__ == "__main__":

@@ -50,6 +50,20 @@ class NoticeRetryTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(codex_winddown, "instances", return_value=["production"]))
         _ = self.enterContext(mock.patch.object(broadcast, "SEND", self.state / "fake-send.py"))
 
+    def test_status_reports_partial_discovery_after_rendering_healthy_work(self) -> None:
+        runner = Showrunner(session="healthy", socket="/fixture.sock", slug="healthy", zone="UTC", doc="fixture.md")
+        partial = showrunners.ShowrunnerDiscovery([runner], (
+            showrunners.ShowrunnerLookupFailure("missing", "fixture lookup failed"),))
+        output = io.StringIO()
+        with (mock.patch.object(showrunners, "registered_showrunners", return_value=partial),
+              mock.patch.object(codex_winddown, "current_counts", return_value={"healthy-unit": 1}),
+              mock.patch.object(codex_winddown, "live_unit_names", return_value=["healthy-unit"]) as units,
+              mock.patch.object(codex_winddown, "read_projections", return_value={}),
+              redirect_stdout(output)):
+            self.assertEqual(codex_winddown.main(["status"]), 1)
+        units.assert_called_once_with(runner)
+        self.assertIn("healthy-unit", output.getvalue())
+
     def test_quiet_claim_is_retried_after_a_stop_before_delivery(self) -> None:
         class Killed(BaseException):
             pass
@@ -334,7 +348,7 @@ class CountTests(unittest.TestCase):
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         with (
             mock.patch.dict(os.environ, {"HOME": str(root)}, clear=True),
-            mock.patch.object(showrunners, "registered_showrunners", return_value=[]),
+            mock.patch.object(showrunners, "registered_showrunners", return_value=showrunners.ShowrunnerDiscovery()),
             mock.patch.object(codex_winddown, "clock", return_value="fixture time"),
             mock.patch.object(broadcast, "broadcast", return_value=[]) as send_groups,
             mock.patch.object(broadcast, "report", return_value=True) as report,
@@ -373,7 +387,7 @@ class CountTests(unittest.TestCase):
             mock.patch.object(roster, "machine_name", return_value="fixture"),
             mock.patch.object(roster.remote, "other_machine", return_value="mac"),
             mock.patch.object(broadcast, "SEND", root / "record-send.py"),
-            mock.patch.object(showrunners, "registered_showrunners", return_value=[]),
+            mock.patch.object(showrunners, "registered_showrunners", return_value=showrunners.ShowrunnerDiscovery()),
             mock.patch.object(codex_winddown, "clock", return_value="fixture time"),
             mock.patch.object(subprocess, "run", new=run), redirect_stdout(output),
         ):
@@ -426,7 +440,7 @@ class CountTests(unittest.TestCase):
             mock.patch.object(codex_winddown, "STATE", state),
             mock.patch.object(codex_winddown, "announce", return_value=True),
             mock.patch.object(codex_winddown, "live_sessions", return_value=[newer, older, unnamed]),
-            mock.patch.object(showrunners, "registered_showrunners", return_value=[runner]),
+            mock.patch.object(showrunners, "registered_showrunners", return_value=showrunners.ShowrunnerDiscovery([runner])),
             mock.patch.object(codex_winddown, "start_count", return_value=True) as start_count,
             mock.patch.object(
                 broadcast,

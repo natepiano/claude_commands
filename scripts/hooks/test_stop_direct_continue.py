@@ -15,6 +15,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 HOOK = Path(__file__).with_name("stop-direct-continue.py")
@@ -45,7 +46,7 @@ class DirectorStopFixture:
         }
         result = subprocess.run(
             [sys.executable, str(HOOK)], input=json.dumps(payload), text=True,
-            capture_output=True, check=True, timeout=10,
+            capture_output=True, check=True, timeout=TEST_HANG_GUARD_SECS,
             env=self.environment, cwd=self.root,
         )
         if result.stderr:

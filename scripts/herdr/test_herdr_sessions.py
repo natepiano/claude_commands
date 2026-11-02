@@ -26,12 +26,10 @@ from sessions import SessionRecord, UnreadableSessionRecord, read_session
 from scripts.production import showrunners
 from scripts.shutdown import launch_permission
 from scripts.accounts import accounts
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff
 from scripts.production.staff_test_support import isolated_staff_file, showrunner_relationship, unit_membership
 
-
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
 
 class SessionListReply(TypedDict):
     ok: bool
@@ -212,6 +210,17 @@ class HerdrSessionsTests(unittest.TestCase):
         self.assertEqual(self.commands(), [["--session", "default", "session", "list", "--json"],
                                            ["--session", "agents", "pane", "list"],
                                            ["--session", "other", "pane", "list"]])
+
+    def test_partial_discovery_does_not_mislabel_an_unknown_showrunner_standalone(self) -> None:
+        self.respond(["agents"], tabs=("unknown",))
+        self.server(100, "agents")
+        self.claude(101, 100, "director", pane="w1:p1")
+        partial = showrunners.ShowrunnerDiscovery([], (
+            showrunners.ShowrunnerLookupFailure("director", "fixture lookup failed"),))
+        with patch.object(herdr_sessions, "registered_showrunners", return_value=partial):
+            code, output, errors = self.call("list")
+        self.assertEqual((code, output), (3, ""))
+        self.assertIn("fixture lookup failed", errors)
 
     def test_unit_role_takes_precedence_over_showrunner(self) -> None:
         self.respond(["agents"], tabs=("unit",))

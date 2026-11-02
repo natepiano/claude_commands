@@ -52,7 +52,7 @@ class ReleasedHold:
     label: str
     then: str
     requested_at: str
-    # The requesting session's id; None for a terminal or a recovery snapshot.
+    # The requesting session's id; None for a terminal request.
     session_id: str | None
 
 

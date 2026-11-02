@@ -58,6 +58,7 @@ from scripts.production.session_staff import (
     lookup_slug as _lookup_slug,
     production_members as production_members,
     group_marked_units as group_marked_units,
+    retained_unit_marks,
     session_staff_and_directors as session_staff_and_directors,
 )
 
@@ -69,6 +70,7 @@ class ProductionMembers:
         self._slug: str = slug
         self._record: staff.StaffSnapshot | None = record
         self._units: set[str] | None = None
+        self._retired: set[str] = set()
 
     def has(self, unit: str) -> bool:
         """Whether the unit is a current staff child, including an offline child."""
@@ -77,13 +79,23 @@ class ProductionMembers:
             sources = member_sources()
             members = production_members(record, sources)
             self._units = {row.name for row in members.get(showrunners.canonical_slug(self._slug), ())}
+            parent = sources.member(ShowrunnerMember(self._slug), record)
+            if isinstance(parent, MemberFound):
+                self._retired = {row.name for row in record.find(kind="unit", parent=parent.row.id)
+                                 if isinstance(row.worktree, staff.RemovedWorktree)}
         return unit_names.name(unit) in self._units
 
 
+    def is_retired(self, unit: str) -> bool:
+        """Only a retained row's removed worktree marks retirement."""
+        _ = self.has(unit)
+        return unit_names.name(unit) in self._retired
+
+
 def unit_is_retired(cells: dict[str, str], marks: ProductionMembers) -> bool:
-    """A unit is retired when it has no current row under this showrunner."""
+    """Read retirement from the retained row, never from a missing membership."""
     unit = cell_value(cells.get("Unit", ""))
-    return not unit or not marks.has(unit)
+    return bool(unit) and marks.is_retired(unit)
 
 
 def unit_metadata(record: staff.StaffSnapshot, sources: MemberSources, *,
@@ -109,7 +121,7 @@ def unit_metadata(record: staff.StaffSnapshot, sources: MemberSources, *,
                 direct[local[name].id] = cells
             else:
                 orphans.setdefault(name, []).append((slug, cells))
-    units = record.find(kind="unit")
+    units = tuple(row for rows in members.values() for row in rows)
     for row in units:
         if row.id in direct:
             continue
@@ -138,7 +150,7 @@ def live_unit_table(lines: list[str], slug: str, *, record: staff.StaffSnapshot 
 
 
 def retired_units(lines: list[str], slug: str, *, record: staff.StaffSnapshot | None = None) -> set[str]:
-    """Document unit names that are no longer recorded under this showrunner."""
+    """Document unit names whose retained row has a removed worktree."""
     marks = ProductionMembers(slug, record=record)
     return {cell_value(cells.get("Unit", "")) for cells in unit_table(lines) if unit_is_retired(cells, marks)} - {""}
 
@@ -439,7 +451,15 @@ def marked_unit(slug: str, name: str, *, record: staff.StaffSnapshot | None = No
                 running: Sequence[SessionRecord] | None = None) -> MarkedUnit | None:
     """One unit of the production. Unreadable herdr, or this unit's mark on two sessions, raises OSError."""
     slug = _lookup_slug(slug)
-    found = group_marked_units(observed_staff_marks(running=running), record=record, sources=sources)
+    record = record if record is not None else staff.snapshot()
+    sources = sources if sources is not None else member_sources()
+    selected = sources.member(UnitMember(slug, name), record)
+    marked = observed_staff_marks(running=running)
+    if isinstance(selected, MemberFound):
+        # A retained row still needs pane liveness checks when cleanup is retried.
+        found = retained_unit_marks(marked, selected.row, slug, record=record, sources=sources)
+    else:
+        found = group_marked_units(marked, record=record, sources=sources)
     if fault := found.faults.get(slug, {}).get(name):
         raise OSError(fault)
     return found.units.get(slug, {}).get(name)

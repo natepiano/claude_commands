@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from typing import final
 from scripts.direct.verify_mac_memory_retry_test_support import VerifyMacMemoryRetryFixture
-from scripts.direct.verify_mac_offload_test_support import HANG_GUARD_S
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 @final
@@ -19,7 +19,7 @@ class VerifyMacMemoryExcludedTests(VerifyMacMemoryRetryFixture):
         self.addCleanup(self.stop_verify, process)
         self.wait_for_path(self.runner_state / "sleep-events", (process,))
         self.release_memory(meminfo)
-        output, errors = process.communicate(timeout=HANG_GUARD_S)
+        output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(process.returncode, 0, output + errors)
         self.assertEqual(self.runner_events(), [])
         self.assertEqual(self.free_now_settings(), [])

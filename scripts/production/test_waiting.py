@@ -29,6 +29,7 @@ import production_units
 import dailies_render
 import merge_checkpoint
 from scripts.production import production_doc, staff
+from scripts.shutdown.remote import local_machine
 from scripts.production.staff_test_support import isolated_staff_file, unit_membership
 from fake_showrunner import write_timer
 import update_registration
@@ -36,6 +37,7 @@ import waiting
 from cli_fixture import invoke_cli, production_paths
 from fake_herdr import CommandResponse
 import fake_unit_host
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 # Script completion deadlines only bound hangs; startup can be slow under load.
@@ -305,7 +307,8 @@ class WaitingTests(unittest.TestCase):
 
 
     def test_named_unit_refuses_retired_row(self) -> None:
-        _ = staff.retire(unit_membership("showrunner-example", ALPHA).id)
+        _ = staff.set_worktree(unit_membership("showrunner-example", ALPHA).id,
+                               staff.RemovedWorktree(local_machine(), self.alpha))
         content = self.doc.read_text(encoding="utf-8")
         self.write(self.doc, content.replace("`docs/alpha.md`", "(retired by the user)", 1))
         production = production_units.read_production(self.doc)
@@ -645,7 +648,7 @@ os.execv(os.environ["WAITING_TEST_REAL_GIT"], [os.environ["WAITING_TEST_REAL_GIT
     def test_parallel_eta_requests_for_different_phases_keep_every_record(self) -> None:
         phases = [f"Phase {number}: parallel record" for number in range(1, 13)]
         processes = [self.eta_request_process(phase) for phase in phases]
-        outputs = [process.communicate(timeout=300) for process in processes]
+        outputs = [process.communicate(timeout=TEST_HANG_GUARD_SECS) for process in processes]
         for process, (stdout, stderr) in zip(processes, outputs):
             self.assertEqual(process.returncode, 0, stdout + stderr)
         seen = cast(dict[str, object], json.loads((self.state / "eta_seen.json").read_text()))
@@ -654,7 +657,7 @@ os.execv(os.environ["WAITING_TEST_REAL_GIT"], [os.environ["WAITING_TEST_REAL_GIT
 
     def test_parallel_eta_requests_for_one_phase_print_once(self) -> None:
         processes = [self.eta_request_process(PHASE) for _ in range(12)]
-        outputs = [process.communicate(timeout=300) for process in processes]
+        outputs = [process.communicate(timeout=TEST_HANG_GUARD_SECS) for process in processes]
         for process, (stdout, stderr) in zip(processes, outputs):
             self.assertEqual(process.returncode, 0, stdout + stderr)
         self.assertEqual(sum(stdout.count(f"request /unit:eta: {ALPHA}")
@@ -700,15 +703,15 @@ runpy.run_path(sys.argv[0], run_name='__main__')
                     readable, _, _ = select.select([read_ready], [], [], 300)
                     self.assertEqual(readable, [read_ready], "child never reached the held lock")
                     if os.read(read_ready, 7) != b"blocked":
-                        stdout, stderr = process.communicate(timeout=300)
+                        stdout, stderr = process.communicate(timeout=TEST_HANG_GUARD_SECS)
                         self.fail("child exited before observing the state lock: " + stdout + stderr)
                     self.assertIsNone(process.poll())
                     fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
-                    stdout, stderr = process.communicate(timeout=300)
+                    stdout, stderr = process.communicate(timeout=TEST_HANG_GUARD_SECS)
                 finally:
                     if process.poll() is None:
                         process.kill()
-                    _ = process.communicate(timeout=300)
+                    _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         finally:
             os.close(read_ready)
             if write_ready != -1:
@@ -741,7 +744,8 @@ runpy.run_path(sys.argv[0], run_name='__main__')
         self.assertNotIn(f"{BETA} on {ALPHA}: open", output.getvalue())
 
     def test_waits_hide_retired_waiting_unit_but_keep_live_wait_on_it(self) -> None:
-        _ = staff.retire(unit_membership("showrunner-example", ALPHA).id)
+        _ = staff.set_worktree(unit_membership("showrunner-example", ALPHA).id,
+                               staff.RemovedWorktree(local_machine(), self.alpha))
         content = self.doc.read_text(encoding="utf-8")
         self.write(self.doc, content.replace("`docs/alpha.md`", "retired after completion", 1))
         now = datetime.now(ZoneInfo("America/Los_Angeles"))
