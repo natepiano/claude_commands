@@ -19,7 +19,7 @@ import tempfile
 import time
 import traceback
 from types import FrameType
-from typing import Literal, TextIO, cast, final
+from typing import TYPE_CHECKING, Literal, TextIO, cast, final
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lint"))
@@ -29,6 +29,11 @@ import cargo_manifest
 import override_guard
 import sweep
 import treekey
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_targets"))
+if TYPE_CHECKING:
+    from ..build_targets import target_config
+else:
+    import target_config
 
 
 # Version the mirrored repository's development shell exports on the Mac.
@@ -686,7 +691,20 @@ def config_path() -> Path:
     return Path(configured).expanduser()
 
 
-def state_directory() -> Path:
+def configured_ssh_target(target: str) -> target_config.SshTarget:
+    """Resolve an SSH target before access to its coordination state."""
+    for configured in target_config.read_targets():
+        if configured.name == target and isinstance(configured, target_config.SshTarget):
+            if target in (".", "..") or Path(target).name != target:
+                raise target_config.ConfigError(f"invalid target name: {target}")
+            return configured
+    raise target_config.ConfigError(f"unknown SSH target: {target}")
+
+
+def state_directory(target: str = "mac") -> Path:
+    if target != "mac":
+        _ = configured_ssh_target(target)
+        return Path.home() / ".local/state/build-targets" / target
     configured = os.environ.get("MAC_TEST_STATE_DIR", "~/.local/state/mac-test")
     return Path(configured).expanduser()
 
@@ -786,12 +804,12 @@ def write_result(
     return status
 
 
-def backoff_path() -> Path:
-    return state_directory() / "unreachable_until"
+def backoff_path(target: str = "mac") -> Path:
+    return state_directory(target) / "unreachable_until"
 
 
-def read_backoff(now: float) -> BackoffState:
-    path = backoff_path()
+def read_backoff(now: float, target: str = "mac") -> BackoffState:
+    path = backoff_path(target)
     try:
         until = float(path.read_text(encoding="utf-8").strip())
     except FileNotFoundError:
@@ -803,8 +821,8 @@ def read_backoff(now: float) -> BackoffState:
     return ACTIVE_BACKOFF if until > now else NO_BACKOFF
 
 
-def write_backoff(until: float) -> None:
-    path = backoff_path()
+def write_backoff(until: float, target: str = "mac") -> None:
+    path = backoff_path(target)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.NamedTemporaryFile(

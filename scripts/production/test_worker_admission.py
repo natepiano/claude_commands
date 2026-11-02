@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import os
 import json
+import io
+from contextlib import redirect_stderr
 from dataclasses import replace
 from unittest import mock
 
@@ -86,6 +88,22 @@ class RecordedDirectorAdmissionTests(StaffTestCase):
 
 
 class WorkerAdmissionTests(StaffTestCase):
+    def test_empty_pending_files_have_no_unpublished_workers(self) -> None:
+        run = self.root / "pending-run"
+        run.mkdir()
+        empty = run / "empty.pending.json"
+        empty_object = run / "object.pending.json"
+        _ = empty.write_bytes(b"")
+        _ = empty_object.write_text("{}")
+        with redirect_stderr(io.StringIO()) as errors:
+            self.assertEqual(worker_admission.pending_publications(run), ())
+            self.assertEqual(worker_admission.pending_publications(run), ())
+        self.assertFalse(empty.exists())
+        archived, = run.glob(empty.name + ".empty-legacy-*")
+        self.assertEqual(archived.read_bytes(), b"")
+        self.assertEqual(empty_object.read_text(), "{}")
+        self.assertEqual(len(errors.getvalue().splitlines()), 1)
+
     def test_invalid_worker_roles_refuse_before_membership_or_backend_publication(self) -> None:
         _, unit, _ = self.tree()
         before = self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns
