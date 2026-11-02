@@ -28,6 +28,7 @@ from scripts.production.staff_test_support import (
 from scripts.shutdown import pane_record, remote
 import herdr
 from scripts.production import showrunners
+from scripts.production.session_staff import MemberSources
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 import showrunner_tree
 import production_units
@@ -1212,6 +1213,94 @@ class StaffSourcesTests(StaffTestCase):
                 self.assertIn(str(path), errors.getvalue())
                 self.assertTrue(errors.getvalue().strip())
                 write_text_atomic(path, original)
+
+    def test_codex_scan_continues_after_unparsable_process_arguments(self) -> None:
+        from scripts.message import process_table
+
+        _ = self.fill_production("scan-demo")
+        owner = staff.by_path("scan-demo")
+        assert owner is not None
+        table = {
+            42401: process_table.Process(42401, 1, "codex", 'codex --config "unfinished'),
+            42402: process_table.Process(42402, 1, "codex", "codex --model gpt-6"),
+        }
+        with (mock.patch.object(process_table, "snapshot", return_value=table),
+              mock.patch.object(herdr, "process_environment", return_value={"CODEX_THREAD_ID": owner.current_session}) as environment,
+              redirect_stderr(io.StringIO()) as errors):
+            document = staff_sources.live()
+        environment.assert_called_once_with(42402)
+        members = cast(list[dict[str, object]], document["members"])
+        found = next(member for member in members if member["id"] == owner.id)
+        self.assertEqual(found["identity"], {"codex": owner.current_session})
+        self.assertFalse(document["complete"])
+        self.assertEqual(errors.getvalue().splitlines(), [
+            "staff sources: Codex process scan: pid 42401: No closing quotation"])
+
+    def test_missing_codex_thread_reports_one_codex_problem(self) -> None:
+        from scripts.message import process_table
+
+        table = {42401: process_table.Process(42401, 1, "codex", "codex resume")}
+        record = staff.StaffSnapshot(())
+        sources = MemberSources({}, ())
+        with (mock.patch.object(process_table, "snapshot", return_value=table),
+              mock.patch.object(herdr, "process_environment", return_value={"HERDR_PANE_ID": "test:pane"})):
+            evidence = staff_sources.observe_workers(
+                record, sources, unavailable=staff_sources.UnavailableWorkerPolicy.LIST)
+            with self.assertRaises(staff.StaffUnreadable) as refused:
+                _ = staff_sources.observe_workers(record, sources)
+        expected = "staff sources: Codex process 42401: native thread identity is unavailable"
+        self.assertEqual(evidence.diagnostics, (expected,))
+        self.assertEqual(str(refused.exception), expected)
+        self.assertNotIn("Claude", str(refused.exception))
+
+    def test_unparsable_claude_settings_do_not_make_the_codex_scan_incomplete(self) -> None:
+        from scripts.message import process_table
+
+        _ = self.fill_production("claude-scan-demo")
+        table = {
+            42401: process_table.Process(42401, 1, "python3",
+                                        'relaunch.py run -- claude --resume session --settings {"name":"unfinished}'),
+            42402: process_table.Process(42402, 1, "claude",
+                                        'claude --resume session --settings {"name":"unfinished}'),
+        }
+        with (mock.patch.object(process_table, "snapshot", return_value=table),
+              mock.patch.object(herdr, "process_environment") as environment,
+              redirect_stderr(io.StringIO()) as errors):
+            document = staff_sources.live()
+        environment.assert_not_called()
+        self.assertTrue(document["complete"])
+        self.assertEqual(errors.getvalue(), "")
+
+    def test_codex_without_a_thread_or_pane_reports_a_diagnostic_without_refusal(self) -> None:
+        from scripts.message import process_table
+
+        table = {42401: process_table.Process(42401, 1, "codex", "/local/bin/codex resume")}
+        with (mock.patch.object(process_table, "snapshot", return_value=table),
+              mock.patch.object(herdr, "process_environment", return_value={})):
+            evidence = staff_sources.observe_workers(staff.StaffSnapshot(()), MemberSources({}, ()))
+        self.assertEqual(evidence.diagnostics, (
+            "staff sources: Codex process 42401: not in a herdr pane; not staff",))
+
+    def test_unparsable_node_codex_arguments_keep_the_scan_incomplete(self) -> None:
+        from scripts.message import process_table
+
+        table = {42401: process_table.Process(
+            42401, 1, "node", 'node /modules/@openai/codex/bin/codex.js --config "unfinished')}
+        with (mock.patch.object(process_table, "snapshot", return_value=table),
+              mock.patch.object(herdr, "process_environment") as environment):
+            with self.assertRaises(staff.StaffUnreadable) as refused:
+                _ = staff_sources.observe_workers(staff.StaffSnapshot(()), MemberSources({}, ()))
+        environment.assert_not_called()
+        self.assertEqual(str(refused.exception),
+                         "staff sources: Codex process scan: pid 42401: No closing quotation")
+
+    def test_failed_codex_process_snapshot_does_not_report_a_claude_registry_failure(self) -> None:
+        from scripts.message import process_table
+
+        with mock.patch.object(process_table, "snapshot", side_effect=OSError("process table unavailable")):
+            with self.assertRaisesRegex(staff.StaffUnreadable, "Codex processes: process table unavailable") as refused:
+                _ = staff_sources.observe_workers(staff.StaffSnapshot(()), MemberSources({}, ()))
+        self.assertNotIn("Claude", str(refused.exception))
 
     def test_live_staff_includes_codex_showrunner_and_unit_by_current_thread_without_role_inference(self) -> None:
         from scripts.message import process_table

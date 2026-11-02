@@ -941,6 +941,37 @@ class StaffTests(StaffTestCase):
         missing = self.cli("get", "sdlc/missing", "--json", code=1)
         self.assertTrue(missing.stderr.strip())
 
+    def test_get_finds_a_member_by_its_worktree_root(self) -> None:
+        _, unit, _ = self.tree()
+        path = self.root / "checkout"
+        unit = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", path))
+        found = self.cli("get", str(path), "--json")
+        self.assertEqual(json.loads(found.stdout), unit.to_json())
+
+    def test_get_finds_the_longest_worktree_for_an_inside_folder(self) -> None:
+        runner, unit, _ = self.tree()
+        path = self.root / "checkout"
+        _ = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", path))
+        nested = fixture_member("unit", name="nested", parent=runner.id)
+        nested = staff.set_worktree(nested.id, staff.PresentWorktree("natedev", path / "nested"))
+        found = self.cli("get", str(path / "nested/src"), "--json")
+        self.assertEqual(json.loads(found.stdout), nested.to_json())
+
+    def test_get_reports_an_unknown_worktree_path_as_not_found(self) -> None:
+        _, unit, _ = self.tree()
+        path = self.root / "checkout"
+        _ = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", path))
+        missing = self.cli("get", str(self.root / "checkout-other"), code=1)
+        self.assertIn("staff member not found", missing.stderr)
+        self.assertEqual(missing.stdout, "")
+
+    def test_get_finds_a_member_by_its_current_session(self) -> None:
+        _, unit, _ = self.tree()
+        current = staff.native_id(fixture_runtime_id("get-after-clear"))
+        unit = staff.update_current_session(unit.id, current)
+        found = self.cli("get", current, "--json")
+        self.assertEqual(json.loads(found.stdout), unit.to_json())
+
     def test_cli_maps_refused_unreadable_and_missing_mutations(self) -> None:
         _, unit, worker = self.tree()
         before = self.staff_file.read_bytes()

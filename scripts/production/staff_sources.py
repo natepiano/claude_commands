@@ -284,7 +284,8 @@ class _WorkerSources:
         self.blocked_threads: set[str] = set()
         self.ledger_names: set[tuple[str, str]] = set()
         registry = sessions.read_registry(dependencies=self.dependencies)
-        self.registry_incomplete: bool = bool(registry.unreadable)
+        self.claude_registry_incomplete: bool = bool(registry.unreadable)
+        self.codex_scan_incomplete: bool = False
         for path in registry.unreadable:
             if path.exists():
                 _problem(path, "session registry is unreadable")
@@ -297,17 +298,26 @@ class _WorkerSources:
         import herdr
         try:
             for process in process_table.snapshot().values():
-                arguments = shlex.split(process.arguments)
+                try:
+                    arguments = shlex.split(process.arguments)
+                except ValueError as error:
+                    if not herdr.is_codex_process(process.arguments.split()):
+                        continue
+                    self.codex_scan_incomplete = True
+                    _problem(f"Codex process scan: pid {process.pid}", error)
+                    continue
                 if not herdr.is_codex_process(arguments) or codex_thread_host(arguments):
                     continue
                 environment = herdr.process_environment(process.pid)
                 if native := environment.get("CODEX_THREAD_ID", ""):
                     self.native_running[native] = {"codex": native}
+                elif not environment.get("HERDR_PANE_ID", ""):
+                    _problem(f"Codex process {process.pid}", "not in a herdr pane; not staff")
                 else:
-                    self.registry_incomplete = True
+                    self.codex_scan_incomplete = True
                     _problem(f"Codex process {process.pid}", "native thread identity is unavailable")
         except (OSError, ValueError, subprocess.SubprocessError) as error:
-            self.registry_incomplete = True
+            self.codex_scan_incomplete = True
             _problem("Codex processes", error)
         self._owners()
 
@@ -456,8 +466,10 @@ class _WorkerSources:
                 slug = unit_lookup.row_production(row, self.record, self.sources).slug
                 unit = unit_names.unit_id(row.name)
             elif row.kind == "showrunner":
-                if self.registry_incomplete:
+                if self.claude_registry_incomplete:
                     raise ValueError("director registry is incomplete")
+                if self.codex_scan_incomplete:
+                    raise ValueError("Codex director process scan is incomplete")
                 if any(owner.match == row for owner in self.sessions.values()):
                     return False
                 raise ValueError("showrunner director identity is unavailable")
@@ -473,8 +485,10 @@ class _WorkerSources:
             return True
         if marked is not None and isinstance(marked.claude, unit_lookup.ClaudeUnknown):
             raise ValueError(marked.claude.reason)
-        if self.registry_incomplete:
+        if self.claude_registry_incomplete:
             raise ValueError("director registry is incomplete")
+        if self.codex_scan_incomplete:
+            raise ValueError("Codex director process scan is incomplete")
         return False
 
     def paused_current(self, path: Path, worker: workers.UnitWorker, parent: WorkerOwner | None) -> bool:
@@ -491,7 +505,7 @@ class _WorkerSources:
             if backend.session_id in self.running:
                 self.live_worker_runs.update(runs)
                 return True
-            if self.registry_incomplete:
+            if self.claude_registry_incomplete:
                 failures.append(ValueError("Claude registry is incomplete"))
         else:
             if not runs:
@@ -601,8 +615,10 @@ class _WorkerSources:
             self.directors[run] = workers.resolve_live_unit_director(
                 run, self.record, self.sources, tuple(self.running.values()), self.dependencies)
         live = isinstance(self.directors[run], workers.LiveUnitDirector)
-        if not live and self.registry_incomplete:
+        if not live and self.claude_registry_incomplete:
             raise ValueError(f"{run}: director registry is incomplete")
+        if not live and self.codex_scan_incomplete:
+            raise ValueError(f"{run}: Codex director process scan is incomplete")
         return live
 
     def worker_live(self, run: Path, fields: Mapping[str, object]) -> bool:
@@ -614,7 +630,7 @@ class _WorkerSources:
                 raise ValueError("Claude worker session is unavailable")
             if session in self.running:
                 return True
-            if self.registry_incomplete:
+            if self.claude_registry_incomplete:
                 raise ValueError(f"{session}: Claude registry is incomplete")
             return False
         if _alive(fields.get("launcher_pid")):
@@ -709,7 +725,7 @@ class _WorkerSources:
                 matches = [session for session in self.running if session.startswith(short)]
                 if len(matches) > 1:
                     raise ValueError(f"{ledger}: ambiguous Claude session prefix {short}")
-                if not matches and self.registry_incomplete:
+                if not matches and self.claude_registry_incomplete:
                     failures.append(ValueError(f"{ledger}: Claude registry is incomplete"))
                 live = bool(matches) or live
         if not live and failures:
@@ -924,10 +940,12 @@ def observe_workers(record: staff.StaffSnapshot, sources: _MemberSources, *,
         observed = scan.collect()
     if scan.unreadable and unavailable is UnavailableWorkerPolicy.REFUSE:
         raise staff.StaffUnreadable("worker sources: " + ", ".join(map(str, sorted(scan.unreadable))))
-    if scan.registry_incomplete:
+    if scan.claude_registry_incomplete:
         if unavailable is UnavailableWorkerPolicy.REFUSE:
             raise staff.StaffUnreadable("Claude session registry is incomplete")
         _ = errors.write("Claude session registry is incomplete\n")
+    if scan.codex_scan_incomplete and unavailable is UnavailableWorkerPolicy.REFUSE:
+        raise staff.StaffUnreadable(errors.getvalue().strip())
     diagnostics = tuple(errors.getvalue().splitlines())
     return WorkerEvidence(observed, scan.identities, diagnostics)
 
@@ -943,7 +961,7 @@ def live() -> dict[str, object]:
     unregistered = sorted(identity for identity in scan.native_running if record.by_current_session(identity) is None)
     for identity in unregistered:
         _problem(identity, "current native session has no staff row; identity publication is incomplete")
-    incomplete = bool(unregistered) or scan.registry_incomplete
+    incomplete = bool(unregistered) or scan.claude_registry_incomplete or scan.codex_scan_incomplete
     from scripts.production.worker_admission import pending_publications
     for run in sorted(scan.runs):
         try:

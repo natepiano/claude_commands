@@ -18,7 +18,8 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import atomic_file, unit_runs
 from scripts.production import staff, staff_sources, unit_config, showrunners, rename_state, unit_names, unit_move
-from scripts.shutdown import remote
+from scripts.shutdown import pane_record, remote
+from scripts.message import sessions
 
 
 @dataclass(frozen=True)
@@ -128,11 +129,31 @@ def worktree_transcript(row: staff.StaffRow, evidence: set[str], missing: list[s
         missing.append(f"{row.id} {row.name}: worktree transcript unavailable: {error}")
 
 
+def live_launch_sessions(record: staff.StaffSnapshot, launches: Sequence[pane_record.PaneLaunch]) -> set[str]:
+    """Confirm a launch through its exact registry process and start time."""
+    confirmed: set[str] = set()
+    for launch in launches:
+        pid, started = launch.get("pid"), launch.get("proc_start")
+        if launch.get("ended") or not isinstance(pid, int) or not started:
+            continue
+        try:
+            native = staff.runtime_id(pid)
+        except staff.StaffRefused:
+            continue
+        if not native or sessions.process_start(pid) != started:
+            continue
+        reference = launch["session_id"]
+        if reference == native or record.by_member_reference(reference) is not None:
+            confirmed.add(native)
+    return confirmed
+
+
 def plan(record: staff.StaffSnapshot) -> MigrationPlan:
     """Prove identities from recorded owners; missing history stays unproved."""
     missing: list[str] = []
     sources, source_problems = staff_sources.migration_sources(record)
     missing.extend(source_problems)
+    live_sessions = live_launch_sessions(record, sources.launches)
     evidence: dict[staff.StaffId, set[str]] = {row.id: set() for row in record.rows}
     peer_identities, peer_problems = staff_sources.migration_peer_identities(record)
     missing.extend(peer_problems)
@@ -185,7 +206,9 @@ def plan(record: staff.StaffSnapshot) -> MigrationPlan:
                     evidence[row.id].add(saved.retired.session_id)
             elif unit_config.parked_path(row.id).exists():
                 missing.append(f"{row.id} {row.name}: unreadable parked configuration: {saved.reason}")
-            worktree_transcript(row, evidence[row.id], missing)
+            # Folder history cannot replace an identity proved by its live process.
+            if not evidence[row.id].intersection(live_sessions):
+                worktree_transcript(row, evidence[row.id], missing)
         if row.kind == "showrunner" and isinstance(row.doc, (staff.LiveDoc, staff.WrappedDoc)):
             # A timer binds this stored doc, not another discovered copy.
             for source in sources.productions.values():
@@ -210,7 +233,8 @@ def plan(record: staff.StaffSnapshot) -> MigrationPlan:
         try:
             candidates = {staff.native_id(value) for value in evidence[row.id]}
             if len(candidates) != 1:
-                raise staff.StaffRefused("missing native session evidence" if not candidates else "conflicting native session evidence")
+                raise staff.StaffRefused("missing native session evidence" if not candidates
+                                        else "conflicting native session evidence: " + ", ".join(sorted(candidates)))
             native = next(iter(candidates))
             other = destinations.get(native)
             if other is not None and other != row.id:
