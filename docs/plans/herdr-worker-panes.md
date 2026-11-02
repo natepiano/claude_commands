@@ -791,42 +791,16 @@ Split from 3l on 2026-10-31; the same user ask and the same sdlc acceptance as 3
 
 ### Phase 4n — Reconcile a pane's current Codex thread  · status: done
 
-**Owner:** herdr-unit.
+**Owner:** herdr-unit. Landed in ecbad8b15 (2026-11-02).
 
-**Depends on:** 3a.
+**As built:** `Herdr.native_pane_process(pane, kind, timeout)` in `scripts/herdr/herdr.py` returns the one proved foreground `NativeAgentProcess` (identity, start time, launch environment). `native_session` reads through it. Five tests in `scripts/herdr/test_herdr.py` cover pid selection, the open rollout, the launch fallback, a changed process and failed evidence.
 
-#### Work Order
-
-**Goal:** an explicit lifecycle reconciliation updates `current_session` after a proved Codex thread replacement.
-
-**As landed (scope cut by sdlc, 2026-11-02):** only `Herdr.native_pane_process` landed; `native_session` reads through it. Restart keeps the stored thread of a Codex pane row, as before. The reconcile step was removed because no source proves an idle Codex window's thread:
+**Scope cut (sdlc, 2026-11-02):** the restart reconcile step was removed. Restart keeps the stored thread of a Codex pane row. No source proves an idle Codex window's thread:
 1. A Codex window attached to the managed app-server daemon holds no rollout file, even during a turn; the daemon holds it.
 2. An idle in-process window closes its rollout between writes.
 3. The Codex v0.166 state and history databases, session_meta, writer locks, logs and the daemon's `thread/loaded/list` have no client pid.
 
 **Known gap:** a Codex pane's thread change (`/resume`, `/new`) is not seen until Codex offers a read-only thread query. The upstream ask is a proposal in `herdr-worker-panes-next.md`.
-
-**Spec:**
-1. Prove a real thread replacement in a throwaway Codex pane on `codex2`.
-2. Reuse `herdr.native_process` and its open-rollout proof, including the process pid and start time.
-3. Reconcile through the restart lifecycle before restore selection; call `staff.update_current_session(old, new)` only after this proof.
-4. Keep the fixed row id, child links, store keys, and held messages unchanged.
-5. Keep mesh replacement through `worker_admission.publish(previous_id=...)` and Claude replacement through its clear hook.
-6. Keep `unit` and `staff_check` read-only; failed evidence changes nothing.
-
-**Files:**
-- `scripts/shutdown/restart.py`, `scripts/herdr/herdr.py`, `scripts/production/staff.py` — lifecycle integration and shared identity readers.
-- `scripts/shutdown/test_restart.py`, `scripts/herdr/test_herdr.py`, `scripts/production/test_staff.py` — reconciliation tests.
-- `scripts/production/staff_check.py`, `scripts/production/test_staff_check.py` — read-only checker regression.
-
-**Workers:** `1 writer + 1 tester`
-- `impl` — lifecycle integration; hub: `scripts/shutdown/restart.py`.
-- `test` — replacement, repeated reconciliation, failed evidence, and checker tests.
-
-**Acceptance gate:** test a replacement, repeated reconciliation, and failed or changed process evidence.
-Prove unchanged checker bytes on natedev and the Mac.
-A second reconciliation changes nothing; the real replacement preserves the fixed row id and child links.
-Run types and the affected suites.
 
 ### Phase 3s — The one join answers from the row  · status: todo
 
@@ -1688,6 +1662,25 @@ Phases 7 and 10-12 consume this operation instead of adding close logic.
 **Acceptance gate (close contract):** test failed starts, worker closure, restore, and account moves.
 Each test preserves the director and sibling panes and leaves one retained replacement launch.
 Test failed close and interrupted retirement, then rerun without another launch.
+
+### Phase 6a — A darwin reader behind `startup_processes`  · status: todo
+
+**Owner:** pane track rule: herdr-unit or models-unit, whichever is free first (sdlc, 2026-11-02).
+
+**Depends on:** Phase 6. Land before Phase 15's Mac probe of Phases 6-7.
+
+#### Work Order
+
+**Goal:** `Herdr.startup_processes` gives the correct result on the Mac. Today it reads `/proc`, which the Mac does not have (shutdown-unit Phase 6 probes).
+
+**Spec:**
+1. Add a darwin reader behind the same function, with the same result type. Linux behavior stays the same.
+2. Read only process facts (pid, parent, command, start time); print no environment values.
+3. Add a test that forces the darwin path.
+
+**Files:** `scripts/herdr/herdr.py`, `scripts/herdr/test_herdr.py`.
+
+**Acceptance gate:** the herdr suite on natedev and on the Mac; types for both files.
 
 ### Phase 7 — worker_panes.py: start-or-resume, close, observe  · status: todo
 
