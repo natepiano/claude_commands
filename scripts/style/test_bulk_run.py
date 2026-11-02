@@ -1185,7 +1185,7 @@ class WorkspaceRunTests(CargoProjectTests):
 
     def test_diagnostic_reader_reverts_the_edits_it_reads_transitively(self) -> None:
         files = tuple(bulk.rename_file(self.server, self.repo / path, path, (self.repo / path).read_text(),
-                                      (bulk.RenameFinding(path, path, self.finding((self.repo / path).read_text()).rename),))
+                                      (bulk.RenameFinding(path, path, self.finding((self.repo / path).read_text()).rename, self.finding((self.repo / path).read_text(), path=path).authority, path),))
                       for path in ("src/lib.rs", "beta/src/lib.rs"))
         workspace = run.WorkspaceEdits(self.repo, self.base, files)
         for file in files:
