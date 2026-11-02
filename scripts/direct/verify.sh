@@ -664,7 +664,12 @@ workspace_taplo() (
     rm -f "$listing"
     # No paths means a repository scan to Taplo, so skip the empty set.
     (( ${#files[@]} )) || return 0
-    run taplo fmt "$@" -- "${files[@]}"
+    local status=0
+    run taplo fmt "$@" -- "${files[@]}" || status=$?
+    if [[ "$status" != 0 && "${1:-}" == --check ]]; then
+        echo 'verify.sh: TOML check failed; files can be invalid or not properly formatted.' >&2
+    fi
+    return "$status"
 )
 
 example_features() {
