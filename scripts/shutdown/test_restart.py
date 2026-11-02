@@ -56,7 +56,7 @@ import shutdown
 from scripts.whoami import account as account_reader
 from scripts.accounts import accounts, outage_alerts
 import quota_alert
-from scripts.production import showrunners
+from scripts.production import showrunners, staff
 from scripts.production.staff_test_support import fixture_runtime_id
 from scripts.whoami.account import Account, UnknownAccountName, UnreadableAccount
 from shutdown_record import SessionShutdown, SessionProgress, TimerRestore, Where
@@ -327,6 +327,67 @@ class RestartTests(ShutdownTestCase):
     desktop_state: restart.DesktopLaunchState = restart.DesktopLaunchState()
     account = Account("claude", LOGIN, LABEL)
     conversation_lookup = staticmethod(restart._conversation_launch)  # pyright: ignore[reportPrivateUsage]
+
+    def test_showrunner_workspace_comes_from_its_production_document(self) -> None:
+        doc = self.root / "slug-production.md"
+        _ = doc.write_text("- **Showrunner session:** `production-space`\n")
+        owner = showrunner(fixture_runtime_id("workspace-showrunner"))
+        owner["name"] = "different-name"
+        owner["doc"] = str(doc)
+        self.assertEqual(restart.herdr_space(owner, staff.snapshot()), "production-space")
+
+    def test_unit_workspace_uses_fixed_parent_despite_other_names_and_folders(self) -> None:
+        from scripts.production import staff
+        from scripts.production.staff_test_support import fixture_member
+
+        doc = self.root / "actual-production.md"
+        _ = doc.write_text("- **Showrunner session:** `parent-space`\n")
+        parent = fixture_member("showrunner", name="parent", doc=staff.LiveDoc("natedev", doc))
+        parent = staff.update_current_session(parent.current_session,
+            staff.native_id(fixture_runtime_id("workspace-parent-current")))
+        child = fixture_member("unit", name="renamed", parent=parent.id,
+            worktree=staff.PresentWorktree("natedev", self.root / "other-production" / "other-unit"))
+        child = staff.update_current_session(child.current_session,
+            staff.native_id(fixture_runtime_id("workspace-unit-current")))
+        other_doc = self.root / "other-production.md"
+        _ = other_doc.write_text("- **Showrunner session:** `wrong-space`\n")
+        other = fixture_member("showrunner", name="other", doc=staff.LiveDoc("natedev", other_doc))
+        _ = fixture_member("unit", name="misleading", parent=other.id)
+        before = Path(os.environ["STAFF_FILE"]).read_bytes()
+        record = staff.snapshot()
+        for reference in (child.id, child.current_session):
+            with self.subTest(reference=reference):
+                owner = unit(reference, doc=str(other_doc))
+                owner["name"] = "misleading"
+                owner["cwd"] = str(self.root / "other-production" / "other-unit")
+                with patch.object(staff, "snapshot", side_effect=AssertionError("Use the supplied snapshot")):
+                    self.assertEqual(restart.herdr_space(owner, record), "parent-space")
+        self.assertEqual(Path(os.environ["STAFF_FILE"]).read_bytes(), before)
+
+    def test_other_sessions_use_their_own_workspace_names(self) -> None:
+        record = staff.snapshot()
+        for owner in (top_level("standalone-id", name="standalone"),
+                      worker_session("worker-id", owner="director-id")):
+            with self.subTest(kind=owner["kind"]):
+                self.assertEqual(restart.herdr_space(owner, record), owner["name"])
+
+    def test_restore_workspace_names_reads_one_snapshot_for_multiple_units(self) -> None:
+        from scripts.production.staff_test_support import fixture_member
+
+        records: list[SessionShutdown] = []
+        for name in ("first", "second"):
+            doc = self.root / (name + "-production.md")
+            _ = doc.write_text(f"- **Showrunner session:** `{name}-space`\n")
+            parent = fixture_member("showrunner", name=name, doc=staff.LiveDoc("natedev", doc))
+            child = fixture_member("unit", name=name + "-unit", parent=parent.id)
+            records.append(entry(unit(child.current_session)))
+        record = staff.snapshot()
+        before = Path(os.environ["STAFF_FILE"]).read_bytes()
+        with patch.object(staff, "snapshot", return_value=record) as read:
+            spaces = restart._restore_workspace_names(records)  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(spaces, frozenset({"first-space", "second-space"}))
+        read.assert_called_once_with()
+        self.assertEqual(Path(os.environ["STAFF_FILE"]).read_bytes(), before)
 
     def test_record_restart_restores_recorded_marks_and_the_staff_owners_id(self) -> None:
         from scripts.production import staff, session_staff
@@ -1146,7 +1207,7 @@ class RestartTests(ShutdownTestCase):
         with (patch.object(restart, "_run", commands), patch.object(restart, "_live_session_ids", return_value=frozenset()),
               redirect_stdout(io.StringIO()) as preview):
             self.assertEqual(restart.up(LOGIN, dry_run=True), 0)
-        self.assertIn("herdr writing: resume dashboard in a new tab in ad-hoc", preview.getvalue())
+        self.assertIn("herdr writing: resume dashboard in a new tab in dashboard", preview.getvalue())
         self.assertNotIn("manual restart", preview.getvalue())
         self.assertFalse(any("ghostty" in argv or argv[:1] == ["open"] for argv in commands.calls))
 
@@ -1831,7 +1892,7 @@ class RestartTests(ShutdownTestCase):
         server.assert_not_called()
         pane.assert_not_called()
         agent.assert_not_called()
-        self.assertIn("herdr writing: resume mac-preview in a new tab in ad-hoc", output.getvalue())
+        self.assertIn("herdr writing: resume mac-preview in a new tab in mac-preview", output.getvalue())
         self.assertEqual(commands.calls, [["open", "-na", "/Applications/Nix Apps/Ghostty.app",
             "--args", "-e", "/test tools/herdr", "session", "attach", "writing"]])
         self.assertEqual(self.files(), before)
@@ -2068,10 +2129,10 @@ class RestartTests(ShutdownTestCase):
         owner = self.herdr_restart_fixture()[0]
         _ = self.enterContext(patch.object(herdr, "herdr_processes", return_value=[]))
         old = TitledLayoutHerdr()
-        _ = old.open_tab("ad-hoc", owner["name"], owner["cwd"], {})
-        _ = old.open_tab("ad-hoc", "other-key", owner["cwd"], {})
+        _ = old.open_tab(owner["name"], owner["name"], owner["cwd"], {})
+        _ = old.open_tab(owner["name"], "other-key", owner["cwd"], {})
         fresh = TitledLayoutHerdr()
-        _ = fresh.open_tab("ad-hoc", "other-key", owner["cwd"], {})
+        _ = fresh.open_tab(owner["name"], "other-key", owner["cwd"], {})
 
         def open_tab(host: str, space: str, title: str, cwd: str, environment: dict[str, str]) -> str:
             self.assertEqual(host, "fixture")
@@ -2092,7 +2153,24 @@ class RestartTests(ShutdownTestCase):
         self.assertIsInstance(found, herdr.PaneFound)
         self.assertEqual(fresh.tabs[0]["label"], owner["name"])
         self.assertEqual(fresh.lookup(fresh.tabs[0]["label"]), found)
-        self.assertTrue(herdr.attach_hint("ad-hoc", owner["name"]).endswith("tab " + owner["name"]))
+        self.assertTrue(herdr.attach_hint(owner["name"], owner["name"]).endswith("tab " + owner["name"]))
+
+    def test_restart_rerun_keeps_one_tab_and_one_backend(self) -> None:
+        owner, _, log = self.herdr_restart_fixture()
+        saved = entry(owner)
+        self.create([saved])
+        with (patch.object(herdr, "herdr_processes", return_value=[]),
+              patch.object(restart, "_retire"), redirect_stdout(io.StringIO())):
+            first = restart.relaunch_session(saved, dry_run=False, desktop_state=self.desktop_state)
+            self.assertEqual(first["progress"]["kind"], "restarting")
+            before = self.herdr_calls(log)
+            self.assertEqual(len([command for command in before if command[2:4] == ["agent", "start"]]), 1)
+            self.assertEqual(len([command for command in before if command[2:4] == ["workspace", "create"]]), 1)
+            stored_before = self.files()
+            second = restart.relaunch_session(self.stored_record(), dry_run=False, desktop_state=self.desktop_state)
+        self.assertEqual(second, first)
+        self.assertEqual(self.herdr_calls(log), before)
+        self.assertEqual(self.files(), stored_before)
 
     def test_shared_tab_restart_carries_its_destination_transcript_and_failed_submit_outcome(self) -> None:
         owner, _responses, _log = self.herdr_restart_fixture()
@@ -2108,7 +2186,7 @@ class RestartTests(ShutdownTestCase):
                 restart.SharedHerdrTab("agents"), owner, dry_run=False)
         self.assertEqual(result.prompt_outcome, failed)
         opened.assert_called_once()
-        self.assertEqual(opened.call_args.args[1:3], ("ad-hoc", "kept name"))
+        self.assertEqual(opened.call_args.args[1:3], ("kept name", "kept name"))
         self.assertEqual(start.call_args.args[1], "destination:p1")
         opening = cast(herdr.OpeningPrompt, start.call_args.kwargs["opening"])
         assert "config_dir" in owner
@@ -3560,7 +3638,7 @@ class RestartTests(ShutdownTestCase):
         else:
             terminal = next(argv for argv in argvs if argv[:1] == ['open'])
             self.assertEqual(terminal[:4], ['open', '-na', '/Applications/Nix Apps/Ghostty.app', '--args'])
-        self.assertIn("herdr writing: resume native in a new tab in ad-hoc", lines)
+        self.assertIn("herdr writing: resume native in a new tab in native", lines)
         self.assertTrue(any((line.startswith('manual restart unknown:') for line in lines)))
         self.assertCountEqual(shutdown_record.session_records(LOGIN), original)
         self.assertEqual(list(self.state_root.rglob('restart-note-*.txt')), [])
@@ -3652,7 +3730,7 @@ class RestartTests(ShutdownTestCase):
         resume_commands = [argv[-1] for argv in commands.calls if '-ic' in argv]
         self.assertEqual(len(resume_commands), 1 if sys.platform == "linux" else 2)
         self.assertIn("herdr writing: resume named-showrunner in a new tab in demo", output.getvalue())
-        self.assertIn("herdr writing: resume named-herdr in a new tab in ad-hoc", output.getvalue())
+        self.assertIn("herdr writing: resume named-herdr in a new tab in named-herdr", output.getvalue())
         for command in resume_commands:
             if "--resume named-showrunner " in command:
                 self.assertIn("accounts.py exec claude2", command)

@@ -2237,8 +2237,8 @@ class HerdrTests(unittest.TestCase):
         self.assertEqual(herdr.attach_hint("build-followups", "alpha"),
                          "herdr session attach agents, workspace build-followups, tab alpha")
         self.share()
-        self.assertEqual(herdr.attach_hint("ad-hoc", "solo"),
-                         "herdr session attach fixture, workspace ad-hoc, tab solo")
+        self.assertEqual(herdr.attach_hint("solo", "solo"),
+                         "herdr session attach fixture, workspace solo, tab solo")
 
     def test_focus_tab_of_shows_the_workspace_then_the_tab_and_refuses_a_missing_pane(self) -> None:
         self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": [
@@ -4068,7 +4068,7 @@ class SavedLayoutTests(unittest.TestCase):
     """A restart puts every session back in its saved workspace and tab, in the saved order (user, 2026-10-21)."""
 
     BEFORE: list[tuple[str, list[str]]] = [
-        ("ad-hoc", ["postmaster", "ups"]),
+        ("mail", ["postmaster", "ups"]),
         ("cargo-liner", ["cargo-liner", "berth", "tile"]),
         ("hana", ["hana", "assembly", "widget"]),
         ("fps", ["performance", "benchmark", "frame-cost", "metrics-gathering"]),
@@ -4134,7 +4134,7 @@ class SavedLayoutTests(unittest.TestCase):
         cases: tuple[tuple[str, str, dict[str, str]], ...] = (
             ("control", "control", {}),
             ("control", "roles", {"SHOWRUNNER_UNIT": "sdlc", "SHOWRUNNER_UNIT_ID": "roles-unit"}),
-            ("ad-hoc", "scratch", {}))
+            ("scratch", "scratch", {}))
         for space, name, environment in cases:
             with self.subTest(session=name):
                 pane = client.open_tab(space, name, "/repo", environment)
