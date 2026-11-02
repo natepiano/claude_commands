@@ -54,7 +54,19 @@ This lens alone permits Claude subagents.
 `assign.py` reads `SIMPLIFY_LENS=on|off` from `config/direct.conf` at each launch.
 It reads `config/review/simplify.md` at each new run.
 That file defines the report rules and the standing instructions.
-An error or busy Claude run reports `error`; the phase continues under <DualReview/> step 6.
+The launcher disables background tasks for `direct.simplify`.
+At each launch, the shared account picker selects a Claude account with room.
+The launcher prints its label on stderr and in the review log.
+No available quota, a Claude error, an empty report, or a busy run produces `error`; the phase continues under <DualReview/> step 6.
+`assign.py` replaces itself with `review.sh` after it prepares the prompt and diff digest.
+`review.sh` owns the launch lock, result files, and cache.
+Only `reviewed` results enter the cache; failed reviews run again on the same diff.
+Each failure sends an urgent message to `SIMPLIFY_FAILURE_TARGET` from `config/direct.conf`.
+The message names the unit, phase, and reason.
+`UNIT_REVIEW_PROOF=1` adds `PROOF, no action: ` before the failure message text and summary.
+`send.py` suppresses repeated messages for the same recipient, diff, and reason during `SIMPLIFY_FAILURE_REPEAT_MINUTES`.
+`SIMPLIFY_AGENT_COUNT` sets the required number of completed agents.
+A send failure prints its reason and preserves the review status.
 
 The worker is the address and the lens is the judgment. Pass the lens to
 `assign.sh`; its returned handle names the selected worker and summary. Each
