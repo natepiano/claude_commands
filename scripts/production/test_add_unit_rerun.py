@@ -152,7 +152,7 @@ class AddUnitRerunTests(AddUnitTestCase):
         publish = unit_config.write
 
         def interrupted(worktree: Path, config: unit_config.UnitConfig) -> None:
-            publish(worktree, config)
+            _ = publish(worktree, config)
             raise OSError("stopped after config publication")
 
         arguments = ("alpha", "--plan", "docs/plans/given.md", "--port", "8123",

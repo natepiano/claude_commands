@@ -4,19 +4,168 @@ from __future__ import annotations
 from dataclasses import replace
 import os
 from pathlib import Path
+import subprocess
 import tomllib
 from typing import cast
+from unittest import mock
 from unittest.mock import patch
 
 from scripts.lib import atomic_file
 from scripts.lib.git_exclude import ExcludeRefused
 from scripts.production import unit_config as config
 from scripts.production.unit_config_test_support import UnitConfigFixture
+from scripts.production.unit_config_format_test_support import (
+    check_format, count_taplo, remove_assignment_spacing, require_taplo, write_aligning_config,
+)
 
 
 class UnitConfigTests(UnitConfigFixture):
+    def test_launcher_subprocess_fake_does_not_replace_taplo_for_live_or_parked_writes(self) -> None:
+        binary = require_taplo(self)
+        _ = write_aligning_config(self.worktree)
+
+        def launcher_run(command: list[str], **_keywords: object) -> object:
+            if command[0] == "taplo":
+                return subprocess.CompletedProcess(command, 0, "", "")
+            return cast(object, mock.DEFAULT)
+
+        with count_taplo(self, self.root) as calls, patch(
+            "subprocess.run", wraps=subprocess.run, side_effect=launcher_run,
+        ):
+            self.assertIsInstance(config.write(self.worktree, self.config()), config.Published)
+            self.assertIsInstance(config.park(self.unit, self.worktree, self.retirement()), config.Published)
+            self.assertEqual(calls.count(), 2)
+
+        for path in (self.source, self.parked):
+            result = check_format(binary, path, self.worktree)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(config.read(self.worktree), self.config())
+        self.assertEqual(config.read_parked(self.unit), replace(self.config(), retired=self.retirement()))
+
+    def test_parked_write_uses_live_config_before_saved_formatting(self) -> None:
+        binary = require_taplo(self)
+        _ = write_aligning_config(self.worktree)
+        self.park_config()
+        saved = config.read_parked(self.unit)
+        assert isinstance(saved, config.UnitConfig)
+        before = self.parked.read_bytes()
+        atomic_file.write_text_atomic(self.worktree / "taplo.toml",
+                                      "[formatting]\nalign_entries = false\nreorder_keys = false\n")
+        self.assertIsInstance(config.write_parked(self.unit, saved), config.Published)
+        self.assertNotEqual(self.parked.read_bytes(), before)
+        result = check_format(binary, self.parked, self.worktree)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        current = config.read_parked(self.unit)
+        assert isinstance(current, config.UnitConfig)
+        self.assertEqual(current, saved)
+        self.assertEqual(current.formatting, config.repository_formatting(self.worktree))
+        self.assertIsInstance(config.write_parked(self.unit, current), config.AlreadyCurrent)
+
+    def test_removed_worktree_uses_saved_formatting_from_read_parked(self) -> None:
+        binary = require_taplo(self)
+        removed = self.root / "removed-worktree"
+        _ = self.git("worktree", "add", "-b", "retired", str(removed))
+        _ = write_aligning_config(removed)
+        retired = replace(self.retirement(), start_folder=config.RecordedStartFolder(removed))
+        _ = config.write(removed, self.config())
+        _ = config.park(self.unit, removed, retired)
+        saved = config.read_parked(self.unit)
+        assert isinstance(saved, config.UnitConfig)
+        before = self.parked.read_bytes()
+        _ = self.git("worktree", "remove", "--force", str(removed))
+        _ = write_aligning_config(self.worktree)
+        remove_assignment_spacing(self.parked)
+        self.assertIsInstance(config.write_parked(self.unit, saved), config.Published)
+        self.assertEqual(self.parked.read_bytes(), before)
+        result = check_format(binary, self.parked, self.worktree)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIsInstance(config.write_parked(self.unit, saved), config.AlreadyCurrent)
+
+    def test_write_applies_a_rule_scoped_to_the_unit_file(self) -> None:
+        binary = require_taplo(self)
+        settings = self.worktree / "taplo.toml"
+        atomic_file.write_text_atomic(settings, '[formatting]\nalign_entries = false\nreorder_keys = false\n'
+                                     + '\n[[rule]]\ninclude = [".unit.toml"]\n'
+                                     + '[rule.formatting]\nalign_entries = true\nreorder_keys = true\n')
+        self.assertTrue(config.needs_write(self.worktree, self.config()))
+        _ = config.write(self.worktree, self.config())
+        result = check_format(binary, self.source, self.worktree)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        default_result = check_format(binary, self.source, self.worktree, defaults=True)
+        self.assertNotEqual(default_result.returncode, 0, "The file rule must change the writer's output.")
+        self.assertEqual(config.read(self.worktree), self.config())
+
+    def test_write_uses_the_repository_aligning_config(self) -> None:
+        binary = require_taplo(self)
+        _ = write_aligning_config(self.worktree)
+        _ = config.write(self.worktree, self.config())
+        result = check_format(binary, self.source, self.worktree)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(config.read(self.worktree), self.config())
+        default_result = check_format(binary, self.source, self.worktree, defaults=True)
+        self.assertNotEqual(default_result.returncode, 0, "The fixture must distinguish repository formatting from defaults.")
+
+    def test_write_repairs_equal_values_with_wrong_format_and_then_preserves_bytes_and_mtime(self) -> None:
+        binary = require_taplo(self)
+        _ = write_aligning_config(self.worktree)
+        _ = config.write(self.worktree, self.config())
+        remove_assignment_spacing(self.source)
+        self.assertEqual(config.read(self.worktree), self.config())
+        before = self.source.read_bytes()
+        self.assertTrue(config.needs_write(self.worktree, self.config()))
+        _ = config.write(self.worktree, self.config())
+        self.assertNotEqual(self.source.read_bytes(), before)
+        self.assertEqual(config.read(self.worktree), self.config())
+        result = check_format(binary, self.source, self.worktree)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        repaired = self.file_versions()
+        self.assertFalse(config.needs_write(self.worktree, self.config()))
+        _ = config.write(self.worktree, self.config())
+        self.assertEqual(self.file_versions(), repaired)
+
+    def test_parked_write_uses_the_recorded_repository_after_worktree_removal(self) -> None:
+        binary = require_taplo(self)
+        removed = self.root / "removed-worktree"
+        _ = self.git("worktree", "add", "-b", "retired", str(removed))
+        _ = write_aligning_config(removed)
+        retired = replace(self.retirement(), start_folder=config.RecordedStartFolder(removed))
+        _ = config.write(removed, self.config())
+        _ = config.park(self.unit, removed, retired)
+        _ = self.git("worktree", "remove", "--force", str(removed))
+        self.assertFalse(removed.exists())
+        _ = write_aligning_config(self.worktree)
+        value = replace(self.config(), retired=retired)
+        result = check_format(binary, self.parked, self.worktree)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(config.read_parked(self.unit), value)
+        remove_assignment_spacing(self.parked)
+        before = self.parked.read_bytes()
+        self.assertTrue(config.parked_needs_write(self.unit, value))
+        _ = config.write_parked(self.unit, value)
+        self.assertNotEqual(self.parked.read_bytes(), before)
+        result = check_format(binary, self.parked, self.worktree)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        repaired = self.file_versions()
+        self.assertFalse(config.parked_needs_write(self.unit, value))
+        _ = config.write_parked(self.unit, value)
+        self.assertEqual(self.file_versions(), repaired)
+
+    def test_parked_write_uses_defaults_without_a_repository_or_worktree(self) -> None:
+        binary = require_taplo(self)
+        _ = write_aligning_config(self.worktree)
+        removed = self.root / "removed-worktree"
+        self.assertFalse(removed.exists())
+        value = replace(self.config(), retired=replace(
+            self.retirement(), start_folder=config.RecordedStartFolder(removed)))
+        _ = config.write_parked(self.unit, value)
+        result = check_format(binary, self.parked, self.worktree, defaults=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(config.read_parked(self.unit), value)
+        aligned = check_format(binary, self.parked, self.worktree)
+        self.assertNotEqual(aligned.returncode, 0, "The fixture must distinguish repository formatting from defaults.")
+
     def test_preview_read_keeps_abandoned_files_until_a_recovery_read(self) -> None:
-        config.write(self.worktree, self.config())
+        _ = config.write(self.worktree, self.config())
         dead = self.source.with_name(f".{self.source.name}.999999999.abandoned.tmp")
         _ = dead.write_text('plan="unfinished')
         before = self.file_versions(), dead.read_bytes(), dead.stat().st_mtime_ns
@@ -31,14 +180,14 @@ class UnitConfigTests(UnitConfigFixture):
             for port in (config.NoAppPort(), config.AppPort(8124)):
                 with self.subTest(plan=plan, port=port):
                     value = config.UnitConfig(plan, port, ("nightly-review",))
-                    config.write(self.worktree, value)
+                    _ = config.write(self.worktree, value)
                     self.assertEqual(config.read(self.worktree), value)
                     fields = tomllib.loads(self.source.read_text())
                     self.assertEqual(fields["responsibilities"], ["nightly-review"])
                     self.assertEqual("port" in fields, isinstance(port, config.AppPort))
                     self.assertNotIn("retired", fields)
                     before = self.file_versions()
-                    config.write(self.worktree, value)
+                    _ = config.write(self.worktree, value)
                     self.assertEqual(self.file_versions(), before)
         self.assertEqual(self.git("status", "--porcelain", "--untracked-files=all"), "")
         self.assertEqual(self.git("ls-files", ".unit.toml"), "")
@@ -65,10 +214,10 @@ class UnitConfigTests(UnitConfigFixture):
 
     def test_park_restore_and_discard_keep_retirement_facts_until_the_last_step(self) -> None:
         self.assertIsInstance(config.place(self.unit, self.worktree), config.Nowhere)
-        config.write(self.worktree, self.config())
+        _ = config.write(self.worktree, self.config())
         source = self.source.read_bytes()
         self.assertEqual(config.place(self.unit, self.worktree), config.InWorktree(self.source))
-        config.park(self.unit, self.worktree, self.retirement())
+        _ = config.park(self.unit, self.worktree, self.retirement())
         self.assertEqual(self.source.read_bytes(), source)
         facts = cast(dict[str, object], tomllib.loads(self.parked.read_text())["retired"])
         self.assertEqual(facts, {"date": "2026-10-31", "session": "session-before-retire",
@@ -89,29 +238,29 @@ class UnitConfigTests(UnitConfigFixture):
         self.assertEqual(self.file_versions(), before)
 
     def test_unrecorded_start_folder_is_retained_without_inventing_a_path(self) -> None:
-        config.write(self.worktree, self.config())
+        _ = config.write(self.worktree, self.config())
         retired = replace(self.retirement(), start_folder=config.UnrecordedStartFolder())
-        config.park(self.unit, self.worktree, retired)
+        _ = config.park(self.unit, self.worktree, retired)
         self.assertEqual(tomllib.loads(self.parked.read_text())["retired"]["folder"], "")
         before = self.file_versions()
-        config.park(self.unit, self.worktree, retired)
+        _ = config.park(self.unit, self.worktree, retired)
         self.assertEqual(self.file_versions(), before)
 
     def test_park_after_worktree_removal_uses_verified_retirement_and_changes_nothing(self) -> None:
         self.park_config()
         self.source.unlink()
         before = self.file_versions()
-        config.park(self.unit, self.worktree, self.retirement())
+        _ = config.park(self.unit, self.worktree, self.retirement())
         self.assertEqual(self.file_versions(), before)
         with self.assertRaises(config.ConfigRefused):
-            config.park(self.unit, self.worktree, replace(self.retirement(), session_id="another-session"))
+            _ = config.park(self.unit, self.worktree, replace(self.retirement(), session_id="another-session"))
         self.assertEqual(self.file_versions(), before)
 
     def test_missing_copies_refuse_park_and_restore_without_creating_evidence(self) -> None:
         for operation in (lambda: config.park(self.unit, self.worktree, self.retirement()),
                           lambda: config.restore(self.unit, self.worktree)):
             with self.assertRaises(config.ConfigRefused):
-                operation()
+                _ = operation()
             self.assertFalse(self.source.exists())
             self.assertFalse(self.parked.exists())
 
@@ -122,18 +271,18 @@ class UnitConfigTests(UnitConfigFixture):
         for operation in (lambda: config.park(self.unit, self.worktree, self.retirement()),
                           lambda: config.restore(self.unit, self.worktree)):
             with self.assertRaises(config.ConfigRefused) as caught:
-                operation()
+                _ = operation()
             self.assertIn(str(self.parked), str(caught.exception))
             self.assertEqual(self.file_versions(), before)
 
     def test_publication_is_read_back_before_park_or_restore_reports_success(self) -> None:
-        config.write(self.worktree, self.config())
+        _ = config.write(self.worktree, self.config())
         real_replace = os.replace
         for destination in (self.parked, self.source):
             with self.subTest(destination=destination):
                 if destination == self.source:
                     self.parked.unlink(missing_ok=True)
-                    config.park(self.unit, self.worktree, self.retirement())
+                    _ = config.park(self.unit, self.worktree, self.retirement())
                     self.source.unlink()
 
                 def corrupt_publication(temporary: Path, path: Path) -> None:
@@ -144,7 +293,7 @@ class UnitConfigTests(UnitConfigFixture):
                 with patch.object(os, "replace", side_effect=corrupt_publication):
                     with self.assertRaises(config.ConfigRefused) as caught:
                         if destination == self.parked:
-                            config.park(self.unit, self.worktree, self.retirement())
+                            _ = config.park(self.unit, self.worktree, self.retirement())
                         else:
                             config.restore(self.unit, self.worktree)
                 self.assertIn(str(destination), str(caught.exception))
@@ -158,13 +307,13 @@ class UnitConfigTests(UnitConfigFixture):
             ("port", replace(self.config(), port=config.NoAppPort(), responsibilities=())),
             ("responsibilities", replace(self.config(), responsibilities=())),
         ):
-            config.write(self.worktree, different)
+            _ = config.write(self.worktree, different)
             self.assertEqual(config.place(self.unit, self.worktree), config.Both(self.source, self.parked, False))
             before = self.file_versions()
             for operation in (lambda: config.park(self.unit, self.worktree, self.retirement()),
                               lambda: config.restore(self.unit, self.worktree)):
                 with self.subTest(key=key), self.assertRaises(config.ConfigRefused) as caught:
-                    operation()
+                    _ = operation()
                 message = str(caught.exception)
                 self.assertIn(str(self.source), message)
                 self.assertIn(str(self.parked), message)
@@ -176,18 +325,18 @@ class UnitConfigTests(UnitConfigFixture):
         self.park_config()
         before = self.file_versions()
         with self.assertRaisesRegex(config.ConfigRefused, "retired"):
-            config.park(self.unit, self.worktree, replace(self.retirement(), branch=config.Branch("other")))
+            _ = config.park(self.unit, self.worktree, replace(self.retirement(), branch=config.Branch("other")))
         self.assertEqual(self.file_versions(), before)
 
     def test_matching_copies_make_park_and_restore_reruns_noops(self) -> None:
         self.park_config()
         before = self.file_versions()
-        config.park(self.unit, self.worktree, self.retirement())
+        _ = config.park(self.unit, self.worktree, self.retirement())
         config.restore(self.unit, self.worktree)
         self.assertEqual(self.file_versions(), before)
 
     def test_park_interrupted_before_or_after_publication_recovers_without_removing_the_source(self) -> None:
-        config.write(self.worktree, self.config())
+        _ = config.write(self.worktree, self.config())
         source = self.source.read_bytes()
         real_replace = os.replace
         for published in (False, True):
@@ -203,15 +352,15 @@ class UnitConfigTests(UnitConfigFixture):
 
                 with patch.object(os, "replace", side_effect=interrupt):
                     with self.assertRaisesRegex(OSError, "stopped at parked publication"):
-                        config.park(self.unit, self.worktree, self.retirement())
+                        _ = config.park(self.unit, self.worktree, self.retirement())
                 self.assertEqual(self.source.read_bytes(), source)
                 self.assertEqual(self.parked.exists(), published)
                 if published:
                     self.assertEqual(tomllib.loads(self.parked.read_text())["retired"]["session"],
                                      "session-before-retire")
-                config.park(self.unit, self.worktree, self.retirement())
+                _ = config.park(self.unit, self.worktree, self.retirement())
                 complete = self.file_versions()
-                config.park(self.unit, self.worktree, self.retirement())
+                _ = config.park(self.unit, self.worktree, self.retirement())
                 self.assertEqual(self.file_versions(), complete)
                 self.assertEqual(list(self.parked.parent.glob(f".{self.parked.name}.*")), [])
 
@@ -275,19 +424,19 @@ class UnitConfigTests(UnitConfigFixture):
         self.assertEqual((self.source.read_bytes(), self.source.stat().st_mtime_ns), source)
 
     def test_interrupted_replacement_keeps_the_old_whole_config_until_retry(self) -> None:
-        config.write(self.worktree, self.config())
+        _ = config.write(self.worktree, self.config())
         before = self.file_versions()
         updated = replace(self.config(), port=config.AppPort(8125))
         with patch.object(os, "replace", side_effect=OSError("stopped before replace")):
             with self.assertRaisesRegex(OSError, "stopped before replace"):
-                config.write(self.worktree, updated)
+                _ = config.write(self.worktree, updated)
         self.assertEqual(self.file_versions(), before)
-        config.write(self.worktree, updated)
+        _ = config.write(self.worktree, updated)
         self.assertEqual(config.read(self.worktree), updated)
         self.assertEqual(list(self.worktree.glob("..unit.toml.*")), [])
 
     def test_read_removes_an_abandoned_temporary_file_and_keeps_the_last_complete_config(self) -> None:
-        config.write(self.worktree, self.config())
+        _ = config.write(self.worktree, self.config())
         dead = self.source.with_name(f".{self.source.name}.999999999.abandoned.tmp")
         _ = dead.write_text('plan="unfinished')
         self.assertEqual(config.read(self.worktree), self.config())
@@ -305,7 +454,7 @@ class UnitConfigTests(UnitConfigFixture):
                 for operation in (lambda: config.write(self.worktree, self.config()),
                                   lambda: config.restore(self.unit, self.worktree)):
                     with self.assertRaises((ExcludeRefused, config.ConfigRefused)):
-                        operation()
+                        _ = operation()
                     self.assertEqual(self.file_versions(), before)
 
     def test_restore_refuses_unsafe_git_rules_before_publishing_a_missing_worktree_copy(self) -> None:

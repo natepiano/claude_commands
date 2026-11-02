@@ -53,7 +53,7 @@ class AddUnitResumeTests(AddUnitTestCase):
         row = staff.set_worktree(row.id, staff.PresentWorktree("natedev", worktree))
         saved = unit_config.UnitConfig(unit_config.PlanFile(Path("docs/plans/given.md")),
                                       unit_config.AppPort(8123), ("nightly-review", "build-check"))
-        unit_config.write(worktree, saved)
+        _ = unit_config.write(worktree, saved)
         path = worktree / ".unit.toml"
         before = path.read_bytes(), path.stat().st_mtime_ns
         _ = self.successful("alpha", "--resume", "3001165e-ca76-59c2-9490-878224585fad", "--cwd", str(worktree))
