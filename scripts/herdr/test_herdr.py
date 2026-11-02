@@ -32,6 +32,7 @@ import pane_launch
 import fake_herdr
 import trust_survey
 from fake_herdr import CommandResponse
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff
 from scripts.message import sessions
@@ -84,6 +85,80 @@ def startup_shell(workspace_id: str) -> tuple[dict[str, object], dict[str, objec
 
 
 class NativePaneSessionTests(StaffTestCase):
+    def test_native_pane_process_returns_the_proved_account_and_launch_identity_for_the_exact_codex_pid(self) -> None:
+        current = fixture_runtime_id("pane-current-thread")
+        launch = fixture_runtime_id("pane-launch-thread")
+        observation = herdr.NativeAgentProcess(current, "same-start", {
+            "CODEX_THREAD_ID": launch, "CODEX_HOME": str(self.root / ".codex2")})
+        payload = {"result": {"process_info": {"foreground_processes": [
+            {"pid": 998074, "argv": ["zsh"]}, {"pid": 998075, "argv": ["codex", "resume", launch]}]}}}
+        completed = subprocess.CompletedProcess[str]([], 0, json.dumps(payload), "")
+        with (patch.object(herdr, "run_program", return_value=completed),
+              patch.object(herdr, "native_process", return_value=observation) as native):
+            observed = herdr.Herdr("agents").native_pane_process("w1:p1", "codex", 1)
+        self.assertEqual(observed, observation)
+        native.assert_called_once_with(998075, "codex")
+
+    def test_codex_native_process_proves_the_open_thread_instead_of_the_launch_thread(self) -> None:
+        launch = fixture_runtime_id("native-launch-thread")
+        current = fixture_runtime_id("native-replaced-thread")
+        proc = self.root / "native-proc"
+        descriptors = proc / "998072" / "fd"
+        descriptors.mkdir(parents=True)
+        rollout = self.root / "rollout-current.jsonl"
+        write_text_atomic(rollout, json.dumps({"type": "session_meta", "payload": {"id": current}}) + "\n")
+        (descriptors / "7").symlink_to(rollout)
+        environment = {"CODEX_THREAD_ID": launch, "CODEX_HOME": str(self.root / ".codex2")}
+        with (patch.dict(os.environ, {"HERDR_PROC": str(proc)}),
+              patch.object(herdr, "_PLATFORM", "linux"),
+              patch.object(sessions, "process_start", return_value="same-process"),
+              patch.object(herdr, "process_environment", return_value=environment)):
+            observed = herdr.native_process(998072, "codex")
+        self.assertEqual(observed, herdr.NativeAgentProcess(current, "same-process", environment))
+        self.assertEqual(observed.environment["CODEX_THREAD_ID"], launch)
+
+    def test_no_open_rollout_reports_launch_fallback_and_keeps_native_session_behavior(self) -> None:
+        launch = fixture_runtime_id("native-fallback-launch")
+        proc = self.root / "fallback-proc"
+        (proc / "998076" / "fd").mkdir(parents=True)
+        environment = {"CODEX_THREAD_ID": launch, "CODEX_HOME": str(self.root / ".codex2")}
+        payload = {"result": {"process_info": {"foreground_processes": [
+            {"pid": 998076, "argv": ["codex", "resume", launch]}]}}}
+        completed = subprocess.CompletedProcess[str]([], 0, json.dumps(payload), "")
+        with (patch.dict(os.environ, {"HERDR_PROC": str(proc)}),
+              patch.object(herdr, "_PLATFORM", "linux"),
+              patch.object(sessions, "process_start", return_value="same-process"),
+              patch.object(herdr, "process_environment", return_value=environment),
+              patch.object(herdr, "run_program", return_value=completed)):
+            observed = herdr.native_process(998076, "codex")
+            identity = herdr.Herdr("agents").native_session("w1:p1", "codex", 1)
+        self.assertEqual(observed.identity, launch)
+        self.assertEqual(observed.started, "same-process")
+        self.assertEqual(observed.environment, environment)
+        self.assertEqual(identity, launch)
+
+    def test_codex_native_process_refuses_a_changed_process_after_proving_its_thread(self) -> None:
+        launch = fixture_runtime_id("changed-process-launch")
+        current = fixture_runtime_id("changed-process-thread")
+        with (patch.object(herdr, "_PLATFORM", "linux"),
+              patch.object(sessions, "process_start", side_effect=["first-process", "reused-pid"]),
+              patch.object(herdr, "process_environment", return_value={"CODEX_THREAD_ID": launch}),
+              patch.object(herdr, "codex_rollout_thread", return_value=current)):
+            with self.assertRaisesRegex(ValueError, "native process start changed"):
+                _ = herdr.native_process(998073, "codex")
+
+    def test_codex_native_process_does_not_replace_failed_rollout_proof_with_the_launch_identity(self) -> None:
+        launch = fixture_runtime_id("failed-rollout-launch")
+        for reason in ("current Codex rollout changed", "current Codex rollout is ambiguous",
+                       "current Codex rollout is unreadable"):
+            with (self.subTest(reason=reason),
+                  patch.object(herdr, "_PLATFORM", "linux"),
+                  patch.object(sessions, "process_start", return_value="same-process"),
+                  patch.object(herdr, "process_environment", return_value={"CODEX_THREAD_ID": launch}),
+                  patch.object(herdr, "codex_rollout_thread", side_effect=ValueError(reason))):
+                with self.assertRaisesRegex(ValueError, reason):
+                    _ = herdr.native_process(998073, "codex")
+
     def test_native_pane_identity_uses_its_exact_claude_pid_registry_without_an_exported_id(self) -> None:
         identity = fixture_runtime_id("herdr-native-Claude")
         registry = Path(os.environ["NOTIFIER_SESSIONS_DIR"]) / f"{os.getpid()}.json"
