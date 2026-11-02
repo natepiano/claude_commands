@@ -6,8 +6,10 @@ import json
 import os
 from pathlib import Path
 from contextlib import redirect_stdout
+from decimal import Decimal
 import io
-from typing import TypedDict, cast, override
+import time
+from typing import TYPE_CHECKING, TypedDict, cast, override
 import unittest
 from unittest import mock
 
@@ -15,6 +17,11 @@ from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixtu
 from scripts.direct import verify_doc_test_support as doc_support
 from scripts.build_targets import test_ssh_eligibility as eligibility_support
 from scripts.lint.memory_test_support import fake_memory_readings, write_config_fixture
+
+if TYPE_CHECKING:
+    from ..aws_target import ledger
+else:
+    from scripts.aws_target import ledger
 
 
 REPOSITORY = Path(__file__).resolve().parents[2]
@@ -201,6 +208,12 @@ class VerifySshTargetsTests(VerifyMacOffloadFixture):
                 "offload=on\nhost=fake-aws\nkinds=test,check,doc\nslots=1\nslots.hana=1\n"
                 + "parity.rustc=rustc fixture\nparity.nextest=nextest fixture\n"
                 + "parity.mend=mend fixture\nparity.scripts_commit=fixture-commit\n", template="aws_target")
+        observed_at = int(time.time())
+        for target in ("aws", "spare"):
+            book = ledger.CostLedger(Path(self.environment["HOME"]) / ".local/state/build-targets" / target)
+            book.record_inventory(ledger.ResourceInventory(observed_at, (
+                ledger.PricedResource("retained-storage", Decimal("1")),), "private priced inventory"))
+            book.observe(ledger.InstanceObservation(observed_at, "stopped", "fake DescribeInstances"))
 
     def ssh_events(self) -> list[SshRunnerEvent]:
         path = self.runner_state / "ssh-events.jsonl"
