@@ -150,9 +150,12 @@ it. A failed compaction leaves the thread available for its own compaction.
 </LongLivedWorkers>
 
 <CoreContract>
-- Never create a worktree or modify unrelated files. The only branch the run may
-  create is the remote branch <PushCheckpoint/> pushes; never switch to an
-  existing branch.
+- Never modify unrelated files. The unit director may make a worktree, and its
+  branch, for its own workers. The unit's staff row keeps its one home worktree;
+  where a worker works stays in its run record, not in staff. The director
+  removes each worktree it made when that work ends. In the home worktree, the
+  only branch the run may create is the remote branch <PushCheckpoint/> pushes;
+  never switch to an existing branch.
 - The unit director does not write implementation code unless the user explicitly
   asks, except <FastTrack/>. Exceptions: agreed doc-only/trivial post-review fixes.
 - `single` never commits. Loop and verbose modes create one
