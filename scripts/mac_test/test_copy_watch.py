@@ -22,9 +22,11 @@ import copy_watch
 import mac_test
 import offload
 if TYPE_CHECKING:
+    from ..lint.memory_test_support import config_environment, write_config_fixture
     from ..lib import test_hang_guard
     from ..lib.process_group import send_process_group
 else:
+    from scripts.lint.memory_test_support import config_environment, write_config_fixture
     from scripts.lib import test_hang_guard
     from scripts.lib.process_group import send_process_group
 
@@ -332,7 +334,7 @@ class CopyWatchProcessTests(unittest.TestCase):
         self.runner = self.root / "runner.py"
         _ = self.runner.write_text(RUNNER_STUB)
         _ = (self.root / "step.py").write_text(STEP_STUB)
-        _ = (self.root / "mac.conf").write_text("offload=on\nlinux_only.repo=\n")
+        _ = write_config_fixture(self.root / "mac_test.conf", "offload=on\nlinux_only.repo=\n")
         busy: ClaimRecord = {
             "pid": os.getpid(),
             "proc_start": mac_test.process_start_time(os.getpid()) or "",
@@ -344,7 +346,7 @@ class CopyWatchProcessTests(unittest.TestCase):
             **os.environ,
             "TEST_ROOT": str(self.root),
             "MAC_TEST_STATE_DIR": str(self.state),
-            "MAC_TEST_CONFIG": str(self.root / "mac.conf"),
+            "MAC_TEST_CONFIG": str(self.root / "mac_test.conf"), **config_environment(self.root),
             "BUILD_TARGETS_POLL_S": "0.05",
             "TEST_BUSY_CLAIM": json.dumps(busy),
             "TEST_COPY_MODES": "failed",
@@ -376,7 +378,7 @@ class CopyWatchProcessTests(unittest.TestCase):
         arguments = [
             sys.executable, str(SCRIPT),
             "--info", str(self.info), "--result", str(self.result), "--runner", str(self.runner),
-            "--settings", str(self.root / "mac.conf"), "--repo-root", str(self.repository),
+            "--settings", str(self.root / "mac_test.conf"), "--repo-root", str(self.repository),
             "--package", "sample", "--call-id", "v-call", "--call-started", call_started,
         ]
         if filter_run:

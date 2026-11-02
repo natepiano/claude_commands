@@ -1970,13 +1970,13 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 - `submit_opening_prompt` captures the recipient after input readiness, before typing. A recipient that changed by the time the turn appears gives `PromptNotSubmitted("prompt recipient changed during submission")`; each Enter retry first rechecks it (`"prompt recipient changed before Enter retry"`).
 - `restart._prompt_outcome` accepts a `PromptSubmitted` receipt only when its process equals the session's current registry process, under every progress kind; the attempt check while `restarting` stays, and a timer-only retry of the same process still reads its proof. Receipt saving stores the recipient the launcher captured and never samples the registry.
 - `prompt_in_input` takes the composer between the last two rule lines; every nonblank row after the closing rule must be wholly one enumerated footer phrase, else the bordered region is scrollback. The composer match allows a screen newline without a space only inside a word. The enumerated rows reject real Claude screens (labelled top rule; status-line, mode and agent rows), so Enter-only retries do not fire live; "Enter retries reach a real session's composer" replaces the phrase list with layout rules.
-- `restart_push(label, names, *, machine) -> tuple[RenderedPush, ...]` groups names greedily so each push keeps `stopped` ≤ 400 characters, message < 500 and title < 45, and every session is named; a name that alone exceeds the limits gets its own push, shortened to the longest fitting prefix plus a visible `…`; no names gives one `shutdown.restart_incomplete`. `restart.restart` and `settle.report_stop` send every push, and nothing raises through either.
-- `shutdown.restart_failed` catalog examples name one session each (`typical` "One session (organon-unit)", `many_long_names` "One session (build-followups-two-accounts-unit-director)"), approved under the user spec.
+- `restart_push(label, failures, *, machine)` returns one push with the failed session count. It never splits the list. Without known failures, it returns one `shutdown.restart_incomplete` push.
+- `shutdown.restart_failed` shows a retryable failure count, the machine and one retry command. Trust failures keep separate commands. Manual failures share one count push per machine. All changed examples require the normal text review.
 
 **Files:**
 - `scripts/herdr/herdr.py` — recipient identity and lookup, process-bound outcome, Enter-retry recheck, composer footer and wrap-aware match.
-- `scripts/shutdown/restart.py` — receipt read bound to the recipient process; `restart_push` splitting; `restart` sends each push.
-- `scripts/shutdown/settle.py` — `report_stop` sends each push.
+- `scripts/shutdown/restart.py` — process-bound receipts and one phone push per kind of fix in a restart problem.
+- `scripts/shutdown/restart_support.py` — `report_stop` uses the same fix groups and retains delivery marks.
 - `scripts/notify/push_catalog.py`, `scripts/notify/push_texts_reviewed.json` — named `shutdown.restart_failed` examples and their approvals.
 - `scripts/herdr/test_herdr.py`, `scripts/shutdown/test_restart.py`, `scripts/shutdown/test_settle.py`, `scripts/shutdown/test_shutdown_cli.py`, `scripts/notify/test_push_texts.py` — regressions through real receipt files, fake registry identities and fake panes.
 

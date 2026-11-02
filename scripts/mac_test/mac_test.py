@@ -30,7 +30,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 import override_guard
 import build_hold
 import offload
-import sweep
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+import conf
 from user_zone import user_zone
 
 if TYPE_CHECKING:
@@ -474,62 +475,38 @@ def state_paths(target: str = "") -> StatePaths:
 
 
 def config_path(target: str = "") -> Path:
-    if target:
-        return offload.configured_ssh_target(target).settings
-    configured = os.environ.get("MAC_TEST_CONFIG", "~/.claude/config/mac_test.conf")
-    return Path(configured).expanduser()
-
-
-def configured_number(values: dict[str, str], key: str, default: float) -> float:
-    try:
-        value = float(values.get(key, str(default)))
-    except ValueError:
-        return default
-    return value if math.isfinite(value) and value > 0 else default
+    return offload.configured_ssh_target(target).settings if target else conf.path("mac_test")
 
 
 def read_config(target: str = "") -> MacTestConfig:
     settings = config_path(target)
-    values = sweep.config_values(str(settings))
+    values = conf.values(settings)
+    if "ci_repo" not in values:
+        ci_repo = conf.text(settings, "ci_repo")
+    else:
+        ci_repo = values["ci_repo"]
     if target:
         configured = offload.configured_ssh_target(target)
-        def number(key: str) -> float:
-            try:
-                value = float(values[key])
-            except (KeyError, ValueError) as error:
-                raise StateReadError(f"{settings}: {key} needs a positive number") from error
-            if not math.isfinite(value) or value <= 0:
-                raise StateReadError(f"{settings}: {key} needs a positive number")
-            return value
-
-        if not values.get("host") or "ci_repo" not in values:
-            raise StateReadError(f"{settings}: host and ci_repo are required")
-        if configured.platform == "linux" and values["ci_repo"]:
+        if configured.platform == "linux" and ci_repo:
             raise StateReadError(f"{settings}: ci_repo must be empty for a Linux target")
-        if values["ci_repo"] and any(not values.get(key) for key in ("ci_variable", "ci_workflow", "ci_job")):
-            raise StateReadError(f"{settings}: ci_variable, ci_workflow and ci_job are required for CI")
-        return MacTestConfig(
-            ci_repo=values["ci_repo"], ci_variable=values.get("ci_variable", ""),
-            ci_workflow=values.get("ci_workflow", ""), ci_job=values.get("ci_job", ""),
-            gh_timeout_s=number("gh_timeout_s"), block_hours=number("block_hours"),
-            block_max_hours=number("block_max_hours"), block_warn_minutes=number("block_warn_minutes"),
-            host=values["host"], connect_timeout_s=number("connect_timeout_s"),
-            claim_idle_minutes=number("claim_idle_minutes"), claim_poll_seconds=number("claim_poll_seconds"),
-        )
+    ci_fields = {key: conf.text(settings, key) if ci_repo else values.get(key, "")
+                 for key in ("ci_variable", "ci_workflow", "ci_job")}
+
     return MacTestConfig(
-        ci_repo=values.get("ci_repo", ""),
-        ci_variable=values.get("ci_variable", "MACOS_CI"),
-        ci_workflow=values.get("ci_workflow", "ci.yml"),
-        ci_job=values.get("ci_job", "macOS: Compile and Test"),
-        gh_timeout_s=configured_number(values, "gh_timeout_s", 30.0),
-        block_hours=configured_number(values, "block_hours", 4.0),
-        block_max_hours=configured_number(values, "block_max_hours", 48.0),
-        block_warn_minutes=configured_number(values, "block_warn_minutes", 15.0),
-        host=values.get("host", "mac"),
-        connect_timeout_s=configured_number(values, "connect_timeout_s", 6.0),
-        claim_idle_minutes=configured_number(values, "claim_idle_minutes", 15.0),
-        claim_poll_seconds=configured_number(values, "claim_poll_seconds", 60.0),
+        ci_repo=ci_repo,
+        ci_variable=ci_fields["ci_variable"],
+        ci_workflow=ci_fields["ci_workflow"],
+        ci_job=ci_fields["ci_job"],
+        gh_timeout_s=conf.number(settings, "gh_timeout_s"),
+        block_hours=conf.number(settings, "block_hours"),
+        block_max_hours=conf.number(settings, "block_max_hours"),
+        block_warn_minutes=conf.number(settings, "block_warn_minutes"),
+        host=conf.text(settings, "host"),
+        connect_timeout_s=conf.number(settings, "connect_timeout_s"),
+        claim_idle_minutes=conf.number(settings, "claim_idle_minutes"),
+        claim_poll_seconds=conf.number(settings, "claim_poll_seconds"),
     )
+
 
 
 @contextmanager

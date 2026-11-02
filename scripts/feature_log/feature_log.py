@@ -1652,11 +1652,14 @@ def _run_propose(arguments: argparse.Namespace) -> int:
     return 0
 
 
-def _run_review_land(verb: Literal["add", "supersede"], row_value: str) -> int:
+def _run_review_land(verb: Literal["add", "supersede"], row_value: str, if_proposed: bool) -> int:
     row = _review_row(row_value)
     with locked():
         proposal = _read_proposal(row)
         if proposal is None:
+            if if_proposed:
+                print(f"skipped: no proposal for {row}")
+                return 0
             raise FeatureLogError(f"no proposal for {row}; run propose first")
         if proposal["verb"] != verb:
             raise FeatureLogError(
@@ -1697,6 +1700,9 @@ def _run_drop(arguments: argparse.Namespace) -> int:
     with locked():
         proposal = _read_proposal(row)
         if proposal is None:
+            if cast(bool, arguments.if_proposed):
+                print(f"skipped: no proposal for {row}")
+                return 0
             raise FeatureLogError(f"no proposal for {row}; run propose first")
         if proposal["status"] == "dropped":
             print(f"unchanged: {row}")
@@ -2341,10 +2347,12 @@ def _parser() -> FeatureLogArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     add = subparsers.add_parser("add")
+    _ = add.add_argument("--if-proposed", action="store_true")
     _ = add.add_argument("--review")
     _add_new_note_arguments(add, required=False)
 
     supersede = subparsers.add_parser("supersede")
+    _ = supersede.add_argument("--if-proposed", action="store_true")
     _ = supersede.add_argument("--review")
     _ = supersede.add_argument("--old", action="append")
     _ = supersede.add_argument(
@@ -2359,6 +2367,7 @@ def _parser() -> FeatureLogArgumentParser:
     _add_new_note_arguments(propose, required=True)
 
     drop = subparsers.add_parser("drop")
+    _ = drop.add_argument("--if-proposed", action="store_true")
     _ = drop.add_argument("--review", required=True)
     _ = drop.add_argument("--verdict", required=True)
 
@@ -2439,7 +2448,9 @@ def main(
         if command == "add":
             review = cast(str | None, arguments.review)
             if review is not None:
-                return _run_review_land("add", review)
+                return _run_review_land("add", review, cast(bool, arguments.if_proposed))
+            if cast(bool, arguments.if_proposed):
+                raise FeatureLogError("--if-proposed requires --review")
             _require_new_note_arguments(arguments)
             return _run_add(arguments)
         if command == "supersede":
@@ -2448,7 +2459,9 @@ def main(
             if review is not None:
                 if isinstance(policy, ExtendReplacementSet):
                     raise FeatureLogError("--split cannot be combined with --review")
-                return _run_review_land("supersede", review)
+                return _run_review_land("supersede", review, cast(bool, arguments.if_proposed))
+            if cast(bool, arguments.if_proposed):
+                raise FeatureLogError("--if-proposed requires --review")
             _require_new_note_arguments(arguments)
             if cast(list[str] | None, arguments.old) is None:
                 raise FeatureLogError("the following arguments are required: --old")

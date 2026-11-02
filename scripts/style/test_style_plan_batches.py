@@ -116,7 +116,7 @@ class StylePlanTests(StylePlanFixture):
         runner = mock.Mock(return_value=subprocess.CompletedProcess([], 0))
         with mock.patch.object(style_plan, "run_verification_step", runner):
             for profile in ("default", "default", "changed-policy"):
-                with mock.patch.dict("os.environ", {"NEXTEST_PROFILE": profile, "LINT_CONFIG_FILE": profile}):
+                with mock.patch.dict("os.environ", {"NEXTEST_PROFILE": profile, "LINT_CONFIG_FILE": profile, "CONF_DIR": str(Path(profile).parent)}):
                     self.assertEqual(style_plan.verify_ticket(self.unit, ticket_id), 0)
             self.assertEqual(runner.call_args_list, [mock.call(self.unit, stage, "alpha")
                              for _ in range(3) for stage in ("check", "lint", "test")])

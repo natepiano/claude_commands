@@ -685,8 +685,9 @@ returns it to its unit.
    review id is the row: bare `C<n>` on hana's list, `<showrunner>/C<n>` on any
    other, where `<showrunner>` is the name the list `change-review - <showrunner>.md`
    is named for (`natedev/C3`).
+   A row with no proposal skips this step.
    - A landing row runs `add --review <id>`, or `supersede --review <id>` when
-     its proposal has `--old`. Propose a missing row first; correct wrong
+     its proposal has `--old`. Correct wrong
      meaning by rerunning `propose` while it is open.
    - A returning row runs `drop --review <id> --verdict "<verdict>"`.
 

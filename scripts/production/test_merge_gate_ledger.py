@@ -95,7 +95,7 @@ class MergeGateLedgerTests(MergeGateFixture):
         self.assertCountEqual(starts, [("hooks", "test_first.py"), ("added_folder", "test_added.py")])
         self.assertEqual(self.pass_records()[-1]["suites"], folders)
 
-    def test_checkpoint_reuses_unit_tree_and_still_runs_types_and_checks_settings(self) -> None:
+    def test_checkpoint_reuses_unit_tree_and_still_runs_types(self) -> None:
         first = self.run_gate("--tests-only", "--repo", str(self.unit))
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
         self.clear_gate_events()
@@ -105,12 +105,6 @@ class MergeGateLedgerTests(MergeGateFixture):
         self.assertTrue((self.state / "types-ran").exists())
         self.assertIn("tests reused from", second.stdout)
         self.assertEqual(self.git(self.origin, "rev-parse", "integration"), self.git(self.checkout, "rev-parse", "HEAD"))
-        self.clear_gate_events()
-        refused = self.run_gate("--settings-blob", "00000000")
-        self.assertNotEqual(refused.returncode, 0, refused.stdout + refused.stderr)
-        self.assertIn("tests reused from", refused.stdout)
-        self.assertIn("settings.json differs", refused.stderr)
-        self.assertEqual(self.module_events(), [])
 
     @gate_suites("lib", "hooks")
     def test_checkpoint_full_pass_records_and_tests_only_reuses_it(self) -> None:

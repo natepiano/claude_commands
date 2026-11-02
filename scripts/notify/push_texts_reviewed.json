@@ -118,19 +118,6 @@
       "time": "2026-11-01T12:00:00-05:00"
     }
   },
-  "message.repeat_flood": {
-    "watchdog": {
-      "objections": [
-        {
-          "quote": "Further repeats are held. Other messages still arrive. The sender's owner is being told to fix the cause.",
-          "rule": "push-only-what-the-user-must-do"
-        }
-      ],
-      "reviewer": "user-spec: User order via natedev 2026-10-31: at least alert about repeated machine messages; one phone notice per flood even when the owner fixes it; reviewer: opus",
-      "sha256": "56fd421e276ce3434ccdbf6cbaaa78d11aff2befd1f14eb4e54c11c2bc08e81a",
-      "time": "2026-10-31T15:05:07.264319-04:00"
-    }
-  },
   "nate.adhoc": {
     "long_sender": {
       "objections": [
@@ -751,15 +738,15 @@
     }
   },
   "shutdown.manual_restart": {
-    "long_session": {
+    "one_session": {
       "reviewer": "opus",
-      "sha256": "9603dec07aeab9f9f235d21747a4caae3769a6b7430cda177b035bb9fb960b52",
-      "time": "2026-10-14T04:30:28.978102-04:00"
+      "sha256": "3c4cbdb225b283a3e2a18271acc1940d8e874db61cb7d331330603093c237760",
+      "time": "2026-11-01T22:43:40.334596-05:00"
     },
     "typical": {
       "reviewer": "opus",
-      "sha256": "9603dec07aeab9f9f235d21747a4caae3769a6b7430cda177b035bb9fb960b52",
-      "time": "2026-10-14T04:30:22.346233-04:00"
+      "sha256": "3c4cbdb225b283a3e2a18271acc1940d8e874db61cb7d331330603093c237760",
+      "time": "2026-11-01T22:43:31.298215-05:00"
     }
   },
   "shutdown.move_failed": {
@@ -789,13 +776,13 @@
   "shutdown.restart_failed": {
     "one_long_name": {
       "reviewer": "opus",
-      "sha256": "1c5bdd7ba6330bd03c3c3abaecea9c104a6fa2effc0a6ad652bcda66b8e22ddf",
-      "time": "2026-10-26T20:03:23.034661-04:00"
+      "sha256": "da53582edd216e5d1e0758383368fd76a554d8bd088e6b11ab8e05efa00a3188",
+      "time": "2026-11-01T22:39:12.544136-05:00"
     },
     "typical": {
       "reviewer": "opus",
-      "sha256": "1c5bdd7ba6330bd03c3c3abaecea9c104a6fa2effc0a6ad652bcda66b8e22ddf",
-      "time": "2026-10-26T20:03:15.200466-04:00"
+      "sha256": "da53582edd216e5d1e0758383368fd76a554d8bd088e6b11ab8e05efa00a3188",
+      "time": "2026-11-01T22:39:06.696247-05:00"
     }
   },
   "shutdown.restart_incomplete": {
@@ -811,15 +798,22 @@
     }
   },
   "shutdown.restart_untrusted": {
-    "long_folder": {
-      "reviewer": "opus",
-      "sha256": "3b93542505b329db050aa3ae4e95cf4561d4ebf613678c8ddcc91cd5277be6eb",
-      "time": "2026-10-26T20:04:34.245746-04:00"
-    },
     "typical": {
       "reviewer": "opus",
-      "sha256": "3b93542505b329db050aa3ae4e95cf4561d4ebf613678c8ddcc91cd5277be6eb",
-      "time": "2026-10-26T20:04:20.684453-04:00"
+      "sha256": "f57b6487a5078fa11193be0ca11dfc0b3c14d83684cc0d4d77e22cec98a3a7a6",
+      "time": "2026-11-01T23:38:17.230240-05:00"
+    }
+  },
+  "shutdown.restart_untrusted_unlisted": {
+    "one_session": {
+      "reviewer": "opus",
+      "sha256": "9e6720e2a7760893f5c4b0e8069adca367392a4366f8d21682df33f65ebd97bb",
+      "time": "2026-11-01T23:41:12.323161-05:00"
+    },
+    "several_sessions": {
+      "reviewer": "opus",
+      "sha256": "9e6720e2a7760893f5c4b0e8069adca367392a4366f8d21682df33f65ebd97bb",
+      "time": "2026-11-01T23:41:18.957713-05:00"
     }
   },
   "silence.auto_off": {

@@ -9,6 +9,33 @@ import json
 
 
 class ImplementLauncherWorkerTests(support.ImplementLauncherFixture):
+    def test_worker_compaction_uses_the_private_config_instead_of_the_home_config(self) -> None:
+        _ = self.config_file.write_text(
+            self.config_file.read_text(encoding="utf-8").replace(
+                "UNIT_COMPACT_ABOVE_TOKENS=100000", "UNIT_COMPACT_ABOVE_TOKENS=20000"
+            ), encoding="utf-8",
+        )
+        home_config = self.root / ".claude/config/direct.conf"
+        _ = home_config.write_text("UNIT_COMPACT_ABOVE_TOKENS=999999\n", encoding="utf-8")
+        session_dir = self.start_phase("private-compaction-config")
+
+        first = self.mesh_launch(session_dir)
+
+        self.assertEqual(first.returncode, 0, first.stderr)
+        roster = cast(dict[str, object], json.loads(
+            (session_dir / "mesh_roster.json").read_text(encoding="utf-8")
+        ))
+        name = next(iter(roster))
+        self.set_mesh_context(session_dir, name, 20001)
+
+        result = self.mesh_launch(session_dir, to=name)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            (session_dir / "mesh_events.txt").read_text(encoding="utf-8").splitlines(),
+            ["compact", "can-follow", "follow"],
+        )
+
     def test_a_worker_left_with_a_live_turn_by_compaction_gets_no_follow_up(self) -> None:
         session_dir = self.start_phase("compact-still-live")
         first = self.mesh_launch(session_dir)
