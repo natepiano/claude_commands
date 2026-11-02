@@ -24,7 +24,7 @@ class TargetReportTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())) / "buildlog"
-        self.registry = self.root.parent / "targets.conf"
+        self.registry = self.root.parent / "build_targets.conf"
         _ = self.registry.write_text(
             "targets=mac,natedev\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac.conf\n"
             + "kind.natedev=local\nplatform.natedev=linux\n"
@@ -35,6 +35,7 @@ class TargetReportTests(unittest.TestCase):
         point_root_at(self, self.root)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "USER_ZONE": "UTC", "BUILD_TARGETS_CONFIG": str(self.registry),
+            "CONF_DIR": str(self.root.parent),
         })))
         _ = self.enterContext(mock.patch.object(subprocess, "run", side_effect=AssertionError("Unexpected external command")))
 

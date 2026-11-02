@@ -27,11 +27,13 @@ if TYPE_CHECKING:
     from . import mac_test, offload
     from ..build_hold import build_hold
     from ..build_targets import targets
+    from ..lint.memory_test_support import config_environment, write_config_fixture
 else:
     import mac_test
     import offload
     import build_hold
     import targets
+    from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 
 class RepositorySlotTests(unittest.TestCase):
@@ -54,14 +56,17 @@ class RepositorySlotTests(unittest.TestCase):
             "build_budget_gib=32\ntarget_budget_gib=24\n"
         )
         for name in ("mac", "aws"):
-            _ = (self.root / f"{name}.conf").write_text(f"host=fake-{name}\n" + settings)
-        registry = self.root / "targets.conf"
+            _ = write_config_fixture(self.root / f"{name}.conf", f"host=fake-{name}\n" + settings,
+                                     template="mac_test")
+        _ = write_config_fixture(self.root / "mac_test.conf", "ci_repo=", template="mac_test")
+        registry = self.root / "build_targets.conf"
         _ = registry.write_text(
             "targets=mac,aws,natedev\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac.conf\n"
             + "kind.aws=ssh\nplatform.aws=linux\nsettings.aws=aws.conf\n"
             + "kind.natedev=local\nplatform.natedev=linux\n"
         )
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            **config_environment(self.root),
             "HOME": str(self.root), "BUILD_TARGETS_CONFIG": str(registry),
             "MAC_TEST_CONFIG": str(self.root / "mac.conf"),
             "MAC_TEST_STATE_DIR": str(self.root / "mac-state"),
@@ -442,7 +447,7 @@ class RepositorySlotTests(unittest.TestCase):
         self.assertIn(str(source), affinity)
 
     def test_target_platform_selects_the_mirror_and_claim_layout(self) -> None:
-        registry = self.root / "targets.conf"
+        registry = self.root / "build_targets.conf"
         _ = registry.write_text(registry.read_text().replace(
             "targets=mac,aws,natedev", "targets=mac,aws,darwin,natedev")
             + "kind.darwin=ssh\nplatform.darwin=macos\nsettings.darwin=mac.conf\n")
@@ -490,7 +495,8 @@ class RepositorySlotTests(unittest.TestCase):
     def test_mac_skip_keeps_legacy_filters_when_linux_filter_support_expands(self) -> None:
         identity = offload.KnownRepository("hana", "https://github.com/nate/hana")
         settings = self.root / "mac.conf"
-        _ = settings.write_text(settings.read_text() + "mac_skip.hana=test(gpu)\n")
+        _ = write_config_fixture(settings, settings.read_text() + "mac_skip.hana=test(gpu)\n",
+                                 template="mac_test")
         cases = (
             (("-E", "test(a)"), ("-E", "(test(a)) & not (test(gpu))")),
             (("--workspace",), ("--workspace",)),

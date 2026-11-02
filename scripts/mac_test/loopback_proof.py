@@ -13,13 +13,14 @@ import tempfile
 from typing import TYPE_CHECKING
 import uuid
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'lib'))
 import linux_runner
-import offload
-import sweep
+import conf
 
 if TYPE_CHECKING:
     from ..lint import memory_admit
 else:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'lint'))
     import memory_admit
 
 
@@ -92,7 +93,7 @@ print('loopback: test, check and staged doc passed; the slot retained its warm b
 def main() -> int:
     root = Path(__file__).resolve().parents[2]
     registry = Path(os.environ.get('BUILD_TARGETS_CONFIG', str(root / 'config/build_targets.conf'))).expanduser()
-    values = sweep.config_values(str(registry))
+    values = conf.values(registry)
     memory = int(linux_runner.positive_setting(values, 'loopback.memory_gib') * memory_admit.GIB)
     budget = int(linux_runner.positive_setting(values, 'loopback.build_budget_gib') * memory_admit.GIB)
     # The isolated fixture has no history for nextest, check or doc.
@@ -104,8 +105,8 @@ def main() -> int:
               + f'loopback.build_budget_gib must be at least {need / memory_admit.GIB:g} GiB', file=sys.stderr)
         return 2
     host = values['loopback.host']
-    connect = offload.positive_number(values, 'loopback.connect_timeout_s', 0)
-    deadline = offload.positive_number(values, 'loopback.command_timeout_s', 0)
+    connect = conf.number(registry, 'loopback.connect_timeout_s')
+    deadline = conf.number(registry, 'loopback.command_timeout_s')
     if not host or connect <= 0 or deadline <= 0:
         raise ValueError('loopback host and time limits must be configured')
     ssh = ['ssh', '-o', 'BatchMode=yes', '-o', f'ConnectTimeout={connect:g}']

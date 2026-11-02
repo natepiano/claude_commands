@@ -416,15 +416,14 @@ def run(mirror: Path, values: dict[str, str], repository: str, verb: str,
 def trim_build_folder(target: Path, environment: dict[str, str]) -> int:
     """Use the existing budget sweep without the machine-wide disk sweep."""
     code = '\n'.join((
-        'import os, sys',
+        'import sys',
         'from pathlib import Path',
         "sys.path.insert(0, str(Path.home() / '.claude/scripts/lint'))",
         'import sweep',
-        'config = os.path.expanduser(os.environ.get(sweep.CONFIG_ENV) or sweep.DEFAULT_CONFIG)',
-        'values = sweep.config_values(config)',
-        'recent = sweep.size_bytes(values.get(sweep.RECENT_KEY, str(sweep.DEFAULT_RECENT_MINUTES)), 60)',
-        "if recent is None: raise ValueError('invalid sweep recent window')",
-        'sys.exit(sweep.sweep_workspace(sys.argv[1], config, False, recent / 60))',
+        'import conf',
+        'config = conf.path("lint")',
+        'recent_seconds = int(conf.number(config, sweep.RECENT_KEY) * 60)',
+        'sys.exit(sweep.sweep_workspace(sys.argv[1], str(config), False, recent_seconds / 60))',
     ))
     return subprocess.run([sys.executable, '-c', code, str(target)],
                           env={**os.environ, **environment}, check=False).returncode

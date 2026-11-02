@@ -933,7 +933,7 @@ def scopes_overlap(first: ClaimScope, second: ClaimScope) -> bool:
 def slot_capacity(paths: StatePaths, scope: ClaimScope) -> int:
     if target_config.uses_legacy_mac_layout(paths.platform) or isinstance(scope, WholeMacScope):
         return 1
-    values = sweep.config_values(str(config_path(paths.target)))
+    values = conf.values(config_path(paths.target))
     value = values.get(f"slots.{scope.name}", values.get("slots", ""))
     if not value and not scope.key:
         return 1  # Preserve the legacy claim protocol for records without an origin.

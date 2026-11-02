@@ -23,12 +23,14 @@ from unittest import mock
 if TYPE_CHECKING:
     from . import linux_runner, mac_test, offload, test_target_slots
     from ..lint import sweep
+    from ..lint.memory_test_support import write_config_fixture
 else:
     import linux_runner
     import mac_test
     import offload
     import test_target_slots
     import sweep
+    from scripts.lint.memory_test_support import write_config_fixture
 
 
 class DiskReading(NamedTuple):
@@ -132,21 +134,23 @@ class LinuxShellTests(unittest.TestCase):
         self.source = self.root / "rust/phase-copy"
         self.source.mkdir(parents=True)
         self.settings = self.root / "aws.conf"
-        _ = self.settings.write_text(
+        _ = write_config_fixture(self.settings,
             "offload=on\nhost=fake-linux\nkinds=test,check,doc\nslots=2\n"
             + "free_floor_gib=10\nbuild_budget_gib=32\ntarget_budget_gib=24\n"
             + "target_budget_gib.hana=31\ntarget_budget_gib.phase-copy=2\n"
             + "devshell.hana=ci\ndevshell.phase-copy=wrong\nskip.hana=test(gpu)\n"
-            + "devshell=default\nshell_cache=.local/state/build-target/shells\nshell_timeout_s=2\n"
+            + "devshell=default\nshell_cache=.local/state/build-target/shells\nshell_timeout_s=2\n",
+            template="mac_test",
         )
-        registry = self.root / "targets.conf"
+        registry = self.root / "build_targets.conf"
         _ = registry.write_text(
             "targets=aws,mac\nkind.aws=ssh\nplatform.aws=linux\nsettings.aws=aws.conf\n"
             + "kind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac.conf\n"
         )
         _ = (self.root / "mac.conf").write_text("offload=on\nhost=fake-mac\nlinux_only.phase-copy=\n")
+        _ = (self.root / "lint.conf").write_text("# range: 0..\nrecent_minutes=60\n")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
-            "HOME": str(self.root), "BUILD_TARGETS_CONFIG": str(registry),
+            "HOME": str(self.root), "BUILD_TARGETS_CONFIG": str(registry), "CONF_DIR": str(self.root),
         })))
         _ = self.enterContext(mock.patch.object(Path, "home", return_value=self.root))
         self.mirror = self.root / offload.remote_mirror(self.identity, "aws", 2)
@@ -166,6 +170,7 @@ class LinuxShellTests(unittest.TestCase):
         self.environment = {
             "HOME": str(self.root), "PATH": f"{tools}:/run/current-system/sw/bin:/usr/bin:/bin",
             "TOOL_EVENTS": str(self.event_path), "BUILD_TARGETS_CONFIG": str(registry),
+            "CONF_DIR": str(self.root),
             "BUILDLOG_DIR": str(self.root / "buildlog"),
             "LINT_SWEEP_STATE_DIR": str(self.root / "sweep-state"),
         }
@@ -1133,10 +1138,12 @@ class LinuxCopyTests(unittest.TestCase):
         _ = self.git("init", "-q")
         _ = self.git("config", "user.name", "Fixture")
         _ = self.git("config", "user.email", "fixture@example.invalid")
-        registry = self.root / "targets.conf"
+        registry = self.root / "build_targets.conf"
         _ = registry.write_text("targets=aws\nkind.aws=ssh\nplatform.aws=linux\nsettings.aws=aws.conf\n")
-        _ = (self.root / "aws.conf").write_text("host=fake-linux\n")
-        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"BUILD_TARGETS_CONFIG": str(registry)})))
+        _ = write_config_fixture(self.root / "aws.conf", "host=fake-linux\noffload=on\n", template="mac_test")
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            "BUILD_TARGETS_CONFIG": str(registry), "CONF_DIR": str(self.root),
+        })))
 
     def git(self, *words: str) -> str:
         result = subprocess.run(

@@ -89,7 +89,7 @@ else:
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
 import memory_admit
-from config_values import config_values
+import conf
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "build_targets"))
 if TYPE_CHECKING:
@@ -111,7 +111,7 @@ def sync_config() -> dict[str, str]:
     """Read peer settings when a sync or report needs them."""
     path = Path(os.environ.get("BUILD_TARGETS_CONFIG", str(Path(__file__).resolve().parents[2]
                                                          / "config/build_targets.conf"))).expanduser()
-    return config_values(str(path))
+    return conf.values(path)
 
 
 def target_hosts(target: str) -> tuple[str, ...]:

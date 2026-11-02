@@ -33,7 +33,7 @@ class TargetSyncTests(unittest.TestCase):
     def setUp(self) -> None:
         temporary = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.root = temporary / "buildlog"
-        self.registry = temporary / "targets.conf"
+        self.registry = temporary / "build_targets.conf"
         self.commands = []
         self.unavailable = set()
         self.failed_pushes = set()
@@ -50,6 +50,7 @@ class TargetSyncTests(unittest.TestCase):
         point_root_at(self, self.root)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "HOME": str(temporary), "BUILD_TARGETS_CONFIG": str(self.registry), "BUILDLOG_PEER": "",
+            "CONF_DIR": str(temporary),
         })))
         _ = self.enterContext(mock.patch.object(store, "host_name", return_value="natedev"))
         _ = self.enterContext(mock.patch.object(health, "write_snapshot"))

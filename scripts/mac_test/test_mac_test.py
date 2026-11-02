@@ -27,9 +27,9 @@ from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
 if TYPE_CHECKING:
-    from ..lint.memory_test_support import write_config_fixture, commit_config_fixture
+    from ..lint.memory_test_support import write_config_fixture, commit_config_fixture, config_environment
 else:
-    from memory_test_support import write_config_fixture, commit_config_fixture
+    from memory_test_support import write_config_fixture, commit_config_fixture, config_environment
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import mac_test
@@ -372,6 +372,7 @@ class MacTestCommandTests(unittest.TestCase):
                 for name, value in os.environ.items()
                 if name != "CLAUDE_CODE_SESSION_ID"
             },
+            **config_environment(self.root),
             "HOME": str(self.root),
             "PATH": f"{self.bin_directory}{os.pathsep}{os.environ['PATH']}",
             "MAC_TEST_STATE_DIR": str(self.state_directory),
@@ -2838,6 +2839,7 @@ class ClaimWatchTests(unittest.TestCase):
         _ = write_config_fixture(config, "host=config-mac\nclaim_idle_minutes=15\nclaim_poll_seconds=60\n")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "HOME": str(self.root), "MAC_TEST_STATE_DIR": str(self.paths.directory),
+            **config_environment(self.root),
             "MAC_TEST_CONFIG": str(config), "CONF_DIR": str(Path(config).parent), "USER_ZONE": "America/New_York",
             "BUILD_HOLD_DIR": str(self.root / "holders"), "BUILDLOG_DIR": str(self.root / "buildlog"),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),

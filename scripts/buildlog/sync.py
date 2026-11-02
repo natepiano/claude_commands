@@ -32,7 +32,7 @@ from user_zone import user_zone  # noqa: E402
 from atomic_file import write_text_atomic
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "build_targets"))
 from target_config import SshTarget, read_targets
-from config_values import config_values
+import conf
 
 REMOTE_ROOT = ".local/state/buildlog/"
 LOCK_NAME = "sync.lock"
@@ -94,7 +94,7 @@ def configured_peers() -> tuple[SyncPeer, ...]:
     peers: list[SyncPeer] = []
     for target in read_targets():
         if isinstance(target, SshTarget):
-            host = config_values(str(target.settings)).get("host", "")
+            host = conf.values(target.settings).get("host", "")
             if not host or host.startswith("-") or any(character.isspace() for character in host):
                 raise ValueError(f"invalid sync host for {target.name}")
             peers.append(SyncPeer(target.name, host))
