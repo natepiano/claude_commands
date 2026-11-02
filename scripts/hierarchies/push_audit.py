@@ -480,7 +480,7 @@ def pair_reviews(pushes: Sequence[PushRecord], reviews: Sequence[ReviewRecord],
 
 
 def recorded_text_identity(push: PushRecord, review: ReviewMatch) -> TextIdentity:
-    found = re.search(r"(?:^|\n)Template: ([^\n]+)\s*$", push.message)
+    found = re.search(r"(?:^|\n| · )Template: ([^\n]+)\s*$", push.message)
     if found and found[1].strip() != "none (free text)":
         return TextId(found[1].strip())
     if isinstance(review, ReviewRecord) and isinstance(review.text_identity, TextId):

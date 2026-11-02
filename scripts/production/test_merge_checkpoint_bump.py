@@ -48,7 +48,7 @@ class CheckpointBumpTests(MergeCheckpointFixture):
             row = cast(dict[str, object], json.loads(path.read_text()))
             session_id, socket = cast(str, row["sessionId"]), cast(str, row["messagingSocketPath"])
             if address in ("session:" + session_id, "uds:" + socket):
-                return session_id.removeprefix("bump-")
+                return cast(str, row["name"])
         self.fail(f"notification did not address a fixture recipient: {address}")
 
     def notice_log(self, text: str) -> Path:

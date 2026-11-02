@@ -533,10 +533,10 @@ class DailiesInputFixture(unittest.TestCase):
         """A production with a complete update timer, so the tree counts it."""
         instance = self.root / "notifier-state" / f"showrunner-{slug}"
         instance.mkdir(parents=True, exist_ok=True)
-        _ = (instance / "conf").write_text(
-            f"TARGET=session:{slug}-session\nCHECK=zsh /x/production_check.sh {self.doc}\n", encoding="utf-8")
         row = showrunner_relationship(fixture_showrunner_name(slug, self.doc))
-        showrunner_launch(row, f"{slug}-session", self.env)
+        _ = (instance / "conf").write_text(
+            f"TARGET=session:{row.id}\nCHECK=zsh /x/production_check.sh {self.doc}\n", encoding="utf-8")
+        showrunner_launch(row, row.id, self.env)
 
     def attach(self, child: str, parent: str) -> None:
         for slug in (child, parent):

@@ -109,13 +109,12 @@ PushNotification (built-in) ── PreToolUse gate ── allowed only with that
 ### `scripts/notify/pushover.py`
 
 - Usage: `pushover.py [--priority 0|1|2] [--source NAME] [--key KEY] [--answerable] (--action TEXT | --no-action) TITLE MESSAGE`, or `--text-id ID --value k=v…`, which takes no positional arguments and no action flags.
-- Footer (user ask, 2026-10-27: an emergency push from the hana session did not say who sent it). `post_message()` is the one place a push goes out, also a push kept during silence (`post_kept()`) and a held push sent at hold expiry. It adds two last lines after the review and the length checks, so a reviewed text and its approval do not change:
+- Footer (user ask, 2026-10-27: an emergency push from the hana session did not say who sent it). `post_message()` is the one place a push goes out, also a push kept during silence (`post_kept()`) and a held push sent at hold expiry. It adds one last line after the review and the length checks, so a reviewed text and its approval do not change:
 
   ```
   <message>
 
-  Sent by: hana
-  Template: auto_mode.refused
+  Sent by: hana · Template: auto_mode.refused
   ```
 
   - `Sent by` is `sender_name(source)`: the source on one line, at most 80 characters. A `send.py in <session>` source (`send.py`'s `default_sender()`) shows only the session; any other source (`stall-watch`, `rca`, `natedev`, `build-followups`, `send.py`, or the parent command line when there is no `--source`) shows as it is.
@@ -144,7 +143,7 @@ PushNotification (built-in) ── PreToolUse gate ── allowed only with that
 - Failed or Withheld:
   - When the priority is 2 or the push has a registered id that is not agent-written (one with no current approval), it is still sent. Such a registered id sends its rendered text and requests a template fix. The log detail is `sent despite failed review: <rules>`.
   - Otherwise, including `nate.adhoc`, nothing is posted. The command prints `pushover: not sent: <why>` and exits 6. Agent-written ids request no template fix, including at priority 2.
-- `Rewritten` sends the rewrite and prints `pushover: sent as rewritten:`, followed by the title, the header line(s) and the body. This includes agent-written ids (`nate.adhoc`). Other registered ids always send their rendered text; review is only a logged check, with detail `registered text sent as rendered, rewrite not applied`. Agent-written ids keep their `Template:` footer, reviewed JSON `text_id` and review.jsonl `text_id`.
+- `Rewritten` sends the rewrite and prints `pushover: sent as rewritten:`, followed by the title, the header line(s) and the body. This includes agent-written ids (`nate.adhoc`, `alert.blocked`, `alert.decision`). Other registered ids always send their rendered text; review is only a logged check, with detail `registered text sent as rendered, rewrite not applied`. Agent-written ids keep their `Template:` footer, reviewed JSON `text_id` and review.jsonl `text_id`.
 - `deliver(draft, keys_file, post, *, detail, header)` posts a draft that has already been reviewed. `trimmed_body()` is the only body trim. Keys are read from `~/.config/pushover/env` and are never printed. `post: Post` is injectable, so tests never reach Pushover.
 
 | pushover exit | Meaning |
@@ -233,7 +232,7 @@ The gate is a PreToolUse hook. Its `settings.json` entry has matcher `PushNotifi
 ### Script push texts
 
 - `scripts/notify/push_texts.py`:
-  - `PushText(id, sender, need, title, action: ActionTemplate | NoActionNeeded, body, examples: tuple[PushExample, ...], purpose, session: SessionTemplate | NoSessionLine, header: bool = True, agent_written: bool = False)` and `PushExample(name, values)`. `purpose` is one line (72 characters at most) that says when the push goes out. It is not part of the fingerprint, so a change to it moves no approval. With `header=False` the phone shows only the title and the body, with no `No action needed.` line. `catalog()` refuses `header=False` on an entry that has an action or a session. `nate.adhoc` uses it, and `fingerprint` includes it only when it is False. Only `nate.adhoc` has `agent_written=True`; this field is excluded from the fingerprint. `agent_written(text_id: str) -> bool` returns False for unknown ids.
+  - `PushText(id, sender, need, title, action: ActionTemplate | NoActionNeeded, body, examples: tuple[PushExample, ...], purpose, session: SessionTemplate | NoSessionLine, header: bool = True, agent_written: bool = False)` and `PushExample(name, values)`. `purpose` is one line (72 characters at most) that says when the push goes out. It is not part of the fingerprint, so a change to it moves no approval. With `header=False` the phone shows only the title and the body, with no `No action needed.` line. `catalog()` refuses `header=False` on an entry that has an action or a session. `nate.adhoc` uses it, and `fingerprint` includes it only when it is False. `nate.adhoc`, `alert.blocked` and `alert.decision` have `agent_written=True`; this field is excluded from the fingerprint. `agent_written(text_id: str) -> bool` returns False for unknown ids.
   - `render(id, **values)` and `render_entry(entry, values) -> RenderedPush`. An unknown id, a missing value or an extra value raises `ValueError`.
   - `user_send_argv(rendered, *, sender, machine, priority, timeout)` builds the `send.py --to user --from … --need … --text-id … --value …` argv. User-send wrappers take a rendered push, never a string.
   - `fingerprint(entry)` is the sha256 over the templates and every example's values and filled text.
@@ -446,3 +445,12 @@ The user asked for this on 2026-10-23: each permission alert starts a root cause
 - **No recipient filter in the nightly count:** one day's measurement found 29 of 578 showrunner replies with an unregistered ask. Only one (3.4%) was addressed to a peer only, well under the one-in-four bar, so peer asks are too small a share to matter.
 - **No Stop hook for unregistered asks** (user, 2026-10-19: "i have already asked you to get rid of the stop hook that does this"). It once blocked 28 unregistered asks in one day; the nightly count still measures them.
 - **One loader for the UX and message guides:** one way to do a thing.
+
+
+Registered alerts and delivery footer (2026-11-01):
+- Every posted push ends in `Sent by: <sender> · Template: <id>` on one line. Free text keeps `none (free text)`. The audit reads both this and historical two-line footers.
+- `mac.locked`, `github.keys_cold`, `build_hold.blocking` and `nixos.ups_power_back` carry the approved fixed wording. GitHub cold keys need no body. UPS battery and shutdown alerts also use their existing ids. UPS events without an approved template (including REPLBATT and NOCOMM) keep their existing free-text alerts.
+- `/alert_user` selects a fixed template first, else `alert.blocked` or `alert.decision`. These two use agent-written title, action and body: short and to the point, with live review like `nate.adhoc`.
+- For agent-written and free-text pushes, the push review receives every fixed template's id and purpose. When one fits, it withholds the draft under `use-registered-template:<id>`, including emergency drafts; it names the required id instead of rewriting around it. Fixed registered live reviews and catalog example reviews do not get this instruction; fixed registered texts still send as rendered and report review failures.
+- `send.py` gives `github.keys_cold` a shared `github.keys_cold:<machine>` key in its existing locked claim store. Every sender uses it. Under the claim lock, the warm-check record is saved before the key, so a sender crash before delivery cannot strand a claim without its check; a failed send releases the claim. A delivered event suppresses later sessions until the existing `github-warm-status` clear check retires it. The check survives phone expiry so a continuing cold spell cannot start a second event. Run the template on the machine with cold keys, forwarding delivery with `--machine natedev` on the Mac. No extra ledger or time window.
+- Free text is still accepted pending the nixos rebuild; this phase adds no missing-id refusal.

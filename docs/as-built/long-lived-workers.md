@@ -542,10 +542,15 @@ worker evidence. Operational readers refuse it; server cleanup retains the serve
 and reports the doubt. Board narration omits unavailable enrichment. Missing files
 remain distinct: `resolve` checks ledger-owned names and exact thread identities
 before any new allocation, so a missing roster does not establish a new run.
-A missing inbox has no persisted messages. An existing zero-byte inbox is ambiguous
-(it could be a legacy deliberate clear or a failed write), so it refuses. A newly
-cleared inbox contains `{"thread_id":"","messages":[],"accepting_messages":true}`;
-thread-specific queues carry the same fields with their exact identity and close flag.
+A missing inbox has no persisted messages. Before `1a8adf46`, the pending writer
+truncated the live file before writing JSON. Thus, a zero-byte inbox can indicate lost messages.
+An exclusive reader locks and rereads that file. It renames the file beside the original as
+`<worker>.pending.json.empty-legacy-<UTC timestamp>`. It logs one line with the file and reason.
+It then returns `{}`, which represents a valid empty queue. A shared reader also returns `{}`
+but leaves the file for an exclusive reader to quarantine. Readers also accept `{}` in a pending
+file as an empty queue. Non-empty records must pass all queue field checks.
+A newly cleared inbox contains `{"thread_id":"","messages":[],"accepting_messages":true}`.
+Queues for specific threads carry the same fields with their exact identity and close flag.
 
 `workers.py repair-roster --session-dir RUN` explicitly reconstructs missing rows
 from the current run's unit ledger. It preserves surviving rows, writes damaged
@@ -565,7 +570,7 @@ Landing requires a point with **no live launcher or old writer** in the affected
 runs. All old entry points must be stopped and restarted before the first atomic
 replacement: an old process locks the data inode, which does not exclude a new
 sidecar-lock writer. Never run old and new writers together on a run. Real-run
-repair is an explicit director action after the checkpoint, not an automatic resolve.
+roster repair is an explicit director action after the checkpoint, not an automatic resolve.
 
 Atomic worker-state snapshots are strict but lock-free for previews and progress
 presentation: each read sees one complete publication and creates no lock file.

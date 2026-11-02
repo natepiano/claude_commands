@@ -20,7 +20,11 @@ class ProtocolTests(unittest.TestCase):
         with AdmissionFixture() as fixture:
             request = fixture.request()
             requests: list[wire.Request] = [request, fixture.launch(),
-                replace(request, profile=gate.GateProfile("repo", "tree", GIB, gate.NoGateHistory(GIB))),
+                replace(request, profile=gate.ProgramProfile("merge-gate", "repo", "tree", gate.FixedCapSizing(3 * GIB))),
+                replace(request, profile=gate.ProgramProfile("rust-analyzer", "repo", "tree",
+                    gate.HistoryPeakSizing(18 * GIB, gate.FirstProgramPeak(18 * GIB), NOW))),
+                replace(request, profile=gate.ProgramProfile("rust-analyzer", "repo", "tree",
+                    gate.HistoryPeakSizing(18 * GIB, gate.MeasuredProgramPeak(7 * GIB, 5), NOW))),
                 wire.ReleaseRequest("release", "/tmp/stem", 137),
                 wire.WidthRequest("width", "/tmp/stem", 4), wire.ViewRequest(),
                 wire.ExplainRequest(), wire.MineRequest("session"),
@@ -43,9 +47,9 @@ class ProtocolTests(unittest.TestCase):
             inputs, limits = fixture.server.last_inputs, fixture.server.last_limits
             assert isinstance(inputs, gate.QueueInputs)
             assert isinstance(limits, gate.AdmissionLimits)
-            reading = gate.queue_read_from(inputs, limits)
+            reading = gate.queue_read_from(inputs, limits, policy=gate.DEFAULT_ADMISSION_POLICY)
             replies: tuple[wire.Reply, ...] = (
-                wire.Wait(gate.EstimateExpired(NOW - gate.HEAD_SECONDS), 1, "head", "estimate expired"),
+                wire.Wait(gate.EstimateExpired(NOW - gate.DEFAULT_ADMISSION_POLICY.timing.head_seconds), 1, "head", "estimate expired"),
                 wire.Admitted("stem", GIB, "future-source", "stem.max", "stem.wave"),
                 wire.LaunchAdmitted(GIB, "future-source"), wire.Refused("no"), wire.Ok(),
                 wire.ViewReply(reading), wire.ExplainReply(reading.explanation), wire.MineReply(reading))
@@ -96,12 +100,12 @@ class ProtocolTests(unittest.TestCase):
     def test_expired_explanation_keeps_release_advice_and_decided_from_over_wire(self) -> None:
         with AdmissionFixture() as fixture:
             fixture.free(0)
-            _ = fixture.server.handle_request(fixture.request(age=gate.HEAD_SECONDS))
+            _ = fixture.server.handle_request(fixture.request(age=gate.DEFAULT_ADMISSION_POLICY.timing.head_seconds))
             inputs, limits = fixture.server.last_inputs, fixture.server.last_limits
             assert isinstance(inputs, gate.QueueInputs)
             assert isinstance(limits, gate.AdmissionLimits)
             inputs = replace(inputs, recovery=gate.RecoveryStarts(NOW + 120, NOW + 30))
-            local = gate.queue_read_from(inputs, limits).explanation
+            local = gate.queue_read_from(inputs, limits, policy=gate.DEFAULT_ADMISSION_POLICY).explanation
             parsed = wire.parse_reply(wire.encode_reply(wire.ExplainReply(local)))
             assert isinstance(parsed, wire.ExplainReply)
             self.assertEqual(parsed.explanation, local)

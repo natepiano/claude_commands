@@ -12,6 +12,7 @@ import tomllib
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from enum import Enum
+from importlib import import_module
 from pathlib import Path
 from typing import Literal, NotRequired, TypedDict, cast
 
@@ -44,6 +45,8 @@ class SessionRecord(TypedDict):
     entrypoint: NotRequired[str]
     # The conversation's folder, for the exact staff-worktree join. Older records may omit it.
     cwd: NotRequired[str]
+    # Older records omit status. The reader converts absence to an empty string.
+    status: NotRequired[str]
 
 
 @dataclass(frozen=True)
@@ -159,6 +162,7 @@ def parse_session(parsed: object) -> RegistryEntry:
     former = data.get("formerNames")
     entrypoint = data.get("entrypoint")
     cwd = data.get("cwd")
+    status = data.get("status")
     if (
         not isinstance(pid, int)
         or isinstance(pid, bool)
@@ -182,6 +186,7 @@ def parse_session(parsed: object) -> RegistryEntry:
         if isinstance(former, list) else [],
         entrypoint=entrypoint if isinstance(entrypoint, str) else "",
         cwd=cwd if isinstance(cwd, str) else "",
+        status=status if isinstance(status, str) else "",
     )
 
 
@@ -384,8 +389,17 @@ def latest_transcript(session_id: str, projects: Path) -> Path | None:
     return transcripts[-1] if transcripts else None
 
 
+def member_target(target: str) -> str:
+    """Resolve a retained staff reference to its current conversation at delivery."""
+    if not target.startswith("session:"):
+        return target
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    resolve = cast(Callable[[str], str], import_module("scripts.production.staff").current_session_target)
+    return resolve(target)
+
+
 def main(argv: list[str]) -> int:
-    if len(argv) != 3 or argv[1] not in {"socket", "address", "id"} or not argv[2]:
+    if len(argv) != 3 or argv[1] not in {"socket", "member-socket", "address", "id"} or not argv[2]:
         print(
             "usage: sessions.py socket <session:id|name> | address <session:id|name> | id <pid|name>",
             file=sys.stderr,
@@ -393,6 +407,14 @@ def main(argv: list[str]) -> int:
         return 2
 
     command, target = argv[1:]
+    if command == "member-socket":
+        sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+        try:
+            target = member_target(target)
+        except (OSError, ValueError) as error:
+            print(f"sessions: staff target unavailable: {error}", file=sys.stderr)
+            return 3
+        command = "socket"
     registry = read_registry()
     unreadable = bool(registry.unreadable)
     records = (observation.record for observation in registry.entries)

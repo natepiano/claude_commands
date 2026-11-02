@@ -90,6 +90,33 @@ Linux-only packages, and Mac nextest exclusions. A repository needs a
 `linux_only.<repo>` key, even when its value is empty, before tests can run on
 the Mac. An empty `ci_repo` disables CI calls. `CONF_DIR` selects the fixture folder in tests.
 
+## aws_target.conf
+
+This file defines the disabled AWS SSH target. `offload=off` prevents work.
+The active target list remains `targets=mac,natedev` in `build_targets.conf`.
+Phase 8 requires the user's deployment steps before target activation.
+
+`host=aws-build` names the Tailscale SSH host. `instance_id` and `region` remain empty before deployment.
+`credentials_profile=build-scaler` names the user's AWS CLI profile. This file contains no credential.
+`kinds=test,check,doc` excludes lint. An empty `ci_repo` disables GitHub calls.
+
+`monthly_limit_usd=400` and `daily_limit_usd=20` contain the user's spending limits.
+The AWS Budget must read `monthly_limit_usd`. Code must never raise either limit.
+The spending reserve is $3. The maximum drain time is 60 minutes.
+Each repository budget stays within the 32 GiB build budget.
+The fixed and hourly costs are estimates from the design's queue replay.
+
+The SSH, retry, storage, slot, hold and claim settings apply when each command reads this file.
+Block and claim settings use the same units as `mac_test.conf`.
+`build_budget_gib`, `target_budget_gib` and `free_floor_gib` use GiB.
+`slots.<repo>` and `target_budget_gib.<repo>` replace the corresponding target values for that repository.
+
+Configured SSH targets use `~/.local/state/build-targets/<target>/` for claims, locks, blocks and retry records.
+The Mac retains `~/.local/state/mac-test/` and its existing fixture overrides.
+Checkout tests use a temporary `HOME` for other targets and `BUILD_TARGETS_CONFIG` for their settings paths.
+`mac_test.py <command> --target <name>` selects a configured SSH target.
+Explicit target status reads local records without probes or cleanup.
+
 ## direct.conf
 
 The `/unit:direct` tuning file: the convergence limits — how many automatic

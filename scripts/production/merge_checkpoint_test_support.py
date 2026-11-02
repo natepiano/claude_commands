@@ -28,14 +28,13 @@ import merge_checkpoint
 import change_review
 from scripts.direct import progress_history
 from scripts.direct.recorder_fixture import invoke_recorder
-from scripts.production import staff
 from scripts.production.cli_fixture import invoke_cli
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.socket_test_support import short_socket_directory
-from scripts.production import fake_unit_host
+from scripts.production import fake_unit_host, staff
 from scripts.message import sessions
-from scripts.production.staff_test_support import isolated_staff_file, production_membership
+from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file, production_membership, unit_membership
 
 
 def invoke_checkpoint(arguments: list[str], environment: dict[str, str], cwd: Path,
@@ -347,7 +346,7 @@ class MergeCheckpointFixture(unittest.TestCase):
             directory.mkdir(parents=True)
             self.executable(directory / name, STUB)
         with isolated_staff_file(Path(self.env["STAFF_FILE"]), self.env):
-            _ = staff.ensure("showrunner", name="example")
+            _ = fixture_member("showrunner", name="example")
         self.production_doc()
 
     def git(self, *args: str, cwd: Path | None = None) -> str:
@@ -465,6 +464,8 @@ class MergeCheckpointFixture(unittest.TestCase):
         self.env.update(fake_unit_host.environment(self.state))
         with isolated_staff_file(Path(self.env["STAFF_FILE"]), self.env):
             production_membership("example", "alpha-unit")
+            runner = fixture_member("showrunner", name="example")
+            director = unit_membership("example", "alpha-unit")
         fake_unit_host.write(self.env, [fake_unit_host.HostedUnit(
             "fixture-unit", "w1:p1", {"SHOWRUNNER_UNIT": "example", "SHOWRUNNER_UNIT_ID": "alpha-unit"},
         )])
@@ -480,14 +481,14 @@ class MergeCheckpointFixture(unittest.TestCase):
             if name == "alpha":
                 fake_unit_host.place_process(self.env, pid, "w1:p1")
             _ = (records / (str(pid) + ".json")).write_text(json.dumps({
-                "pid": pid, "sessionId": "bump-" + name, "name": name,
+                "pid": pid, "sessionId": director.id if name == "alpha" else runner.id, "name": name,
                 "messagingSocketPath": str(address), "updatedAt": 1,
                 "procStart": sessions.process_start(pid), "tmux": "",
             }))
         timer = self.root / "notifier/showrunner-example"
         timer.mkdir(parents=True)
         _ = (timer / "conf").write_text(
-            f"TARGET=session:bump-showrunner\nCHECK=zsh /fixture/production_check.sh {self.doc}\n"
+            f"TARGET=session:{runner.id}\nCHECK=zsh /fixture/production_check.sh {self.doc}\n"
         )
         self.addCleanup(self.stop_bump_gates)
 
@@ -502,12 +503,18 @@ class MergeCheckpointFixture(unittest.TestCase):
                         + f"os.execv({git!r}, [{git!r}, *sys.argv[1:]])\n")
 
     def move_bump_recipients(self) -> None:
-        for path in (self.root / "sessions").glob("*.json"):
-            row = cast(dict[str, object], json.loads(path.read_text()))
-            row["sessionId"] = cast(str, row["sessionId"]) + "-moved"
-            _ = path.write_text(json.dumps(row))
         timer = self.root / "notifier/showrunner-example/conf"
-        _ = timer.write_text(timer.read_text().replace("session:bump-showrunner", "session:bump-showrunner-moved"))
+        timer_text = timer.read_text()
+        with isolated_staff_file(Path(self.env["STAFF_FILE"]), self.env):
+            for path in (self.root / "sessions").glob("*.json"):
+                row = cast(dict[str, object], json.loads(path.read_text()))
+                old_id = staff.native_id(cast(str, row["sessionId"]))
+                new_id = staff.native_id(fixture_runtime_id("moved-recipient:" + old_id))
+                _ = staff.update_current_session(old_id, new_id)
+                row["sessionId"] = new_id
+                row["name"] = cast(str, row["name"]) + "-moved"
+                _ = path.write_text(json.dumps(row))
+        _ = timer.write_text(timer_text)
 
     def launch_competing_bump_gate(self, tip: str) -> subprocess.Popen[bytes]:
         path = merge_checkpoint.checkpoint_step_record(self.checkout, tip, "bump-gate")

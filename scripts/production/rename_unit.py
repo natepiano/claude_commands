@@ -299,6 +299,30 @@ def _check_stopped(rename: UnitRename, *, relaunch: bool = False) -> None:
     relaunch may accept its recorded session already live under the new id."""
     try:
         marked = unit_lookup.marked_units(rename.slug)
+        # Membership omits unregistered runtimes. They still prevent reuse of
+        # a retained pane, so inspect occupancy before any relaunch or write.
+        places = {found.place: unit for unit in (rename.old, rename.new)
+                  if (found := marked.get(unit)) is not None}
+        if rename.pane_session and rename.pane_id:
+            places[herdr.HerdrPlace(rename.pane_session, rename.pane_id)] = rename.new
+        observations = unit_lookup.observed_staff_marks()
+        # An initially stopped unit has no journaled live pane. Its launch
+        # labels still identify an occupied destination to refuse, even when
+        # the replacement conversation has no staff row. This grants no row
+        # ownership to that conversation.
+        for slug, observed in observations:
+            if slug == rename.slug and observed.unit in (rename.old, rename.new):
+                _ = places.setdefault(observed.place, observed.unit)
+        for _, observed in observations:
+            if observed.place not in places:
+                continue
+            unit = places[observed.place]
+            if isinstance(observed.claude, unit_lookup.ClaudeUnknown):
+                raise RenameRefused(f"{unit}: cannot tell whether Claude is running: {observed.claude.reason}")
+            if (isinstance(observed.claude, unit_lookup.LiveClaude)
+                    and not (relaunch and unit == rename.new
+                             and observed.claude.session_id == rename.session_id)):
+                raise RenameRefused(f"{unit} has a live Claude; stop it first")
     except OSError as error:
         raise RenameRefused(f"{rename.old}: cannot tell whether Claude is running: {error}") from error
     relaunched = False

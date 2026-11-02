@@ -183,8 +183,10 @@ if sys.argv[1] == '--bg':
     import uuid
     registry = pathlib.Path(os.environ.get('NOTIFIER_SESSIONS_DIR', str(root / 'sessions')))
     registry.mkdir(parents=True, exist_ok=True)
-    (registry / f'{name}.json').write_text(json.dumps({
-        'id': 'abc12345', 'sessionId': str(uuid.uuid5(uuid.NAMESPACE_URL, name)), 'name': name}))
+    (registry / f"{os.environ['FIXTURE_BACKEND_PID']}.json").write_text(json.dumps({
+        'id': 'abc12345', 'sessionId': 'abc12345-' + str(uuid.uuid5(uuid.NAMESPACE_URL, name))[9:],
+        'name': name, 'pid': int(os.environ['FIXTURE_BACKEND_PID']),
+        'procStart': os.environ['FIXTURE_BACKEND_START'], 'updatedAt': 1, 'messagingSocketPath': ''}))
     print(f'backgrounded · abc12345 · {name}')
 elif sys.argv[1:3] == ['agents', '--json']:
     unreadable = root / 'unreadable_listing_once'
@@ -308,6 +310,14 @@ class ImplementLauncherFixture(LauncherFixture):
         mesh = agents / "codex_mesh.py"
         _ = mesh.write_text(STUB_MESH, encoding="utf-8")
         mesh.chmod(0o755)
+        _ = shutil.copy2(DIRECT_DIR.parent / "production/worker_fill.py", self.root / "scripts/production/worker_fill.py")
+        opening_sender = self.root / "opening-send.py"
+        _ = opening_sender.write_text("import json, os, pathlib, sys\n"
+            + "root = pathlib.Path(os.environ['STUB_CLAUDE_ROOT'])\n"
+            + "rows = json.loads(pathlib.Path(os.environ['STAFF_FILE']).read_text())['rows']\n"
+            + "(root / 'staff-at-work.json').write_text(json.dumps(rows))\n"
+            + "(root / 'opening-message.txt').write_text(pathlib.Path(sys.argv[sys.argv.index('--file') + 1]).read_text())\n"
+            + "print('SENT: fixture')\n")
         agent_bg = agents / "agent_bg.sh"
         _ = shutil.copy2(AGENTS_DIR / "agent_bg.sh", agent_bg)
         _ = agent_bg.write_text(
@@ -323,7 +333,12 @@ class ImplementLauncherFixture(LauncherFixture):
         environment["CONF_DIR"] = str(self.root)
         environment["UNIT_CONFIG"] = str(self.config_file)
         environment["STAFF_FILE"] = str(self.root / "staff.json")
-        environment["STAFF_ID"] = self.staff_parent
+        environment["CODEX_THREAD_ID"] = self.staff_parent
+        _ = environment.pop("STAFF_ID", None)
+        from scripts.message import sessions
+        environment["FIXTURE_BACKEND_PID"] = str(os.getpid())
+        environment["FIXTURE_BACKEND_START"] = sessions.process_start(os.getpid()) or ""
+        environment["AGENT_BG_SEND_SCRIPT"] = str(self.root / "opening-send.py")
         environment["AGENT_NOTES_DIR"] = str(self.root / "notes")
         # The copied shell helper uses the real account policy, while identity
         # and configuration stay in this fixture's home.
@@ -507,9 +522,11 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
         sessions.mkdir()
         projects = self.root / "projects" / "fixture"
         projects.mkdir(parents=True)
-        session_id = "11111111-2222-3333-4444-555555555555"
-        _ = (sessions / "12345.json").write_text(json.dumps({
+        session_id = "abc12345-2222-4333-8444-555555555555"
+        _ = (sessions / f"{os.getpid()}.json").write_text(json.dumps({
             "id": "abc12345", "sessionId": session_id, "name": "fixture-impl",
+            "pid": os.getpid(), "procStart": self.environment()["FIXTURE_BACKEND_START"], "updatedAt": 1,
+            "messagingSocketPath": "",
         }), encoding="utf-8")
         transcript = projects / f"{session_id}.jsonl"
         _ = transcript.write_text(

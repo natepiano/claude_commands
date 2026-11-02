@@ -151,7 +151,7 @@ def find_unit(slug: str, given: str, *, record: staff.StaffSnapshot | None = Non
     config_plan = (saved.plan.path.as_posix() if isinstance(saved.plan, unit_config.PlanFile) else
                    "permanent" if isinstance(saved.plan, unit_config.PermanentPlan) else "standby")
     folder = RecordedStartFolder(facts.start_folder.path)
-    return RetiredUnit(production, name, worktree, facts.branch.value, config_plan, facts.session_id, True, folder, retire_unit.saved_branch_in_note(plan), saved)
+    return RetiredUnit(production, name, worktree, facts.branch.value, config_plan, member.row.current_session, True, folder, retire_unit.saved_branch_in_note(plan), saved)
 
 
 def resume_record(production: Production, name: str) -> Path:
@@ -337,7 +337,7 @@ def resumed_session_proven(slug: str, name: str, session_id: str, row: staff.Sta
         return False
     entry = pane_record.read(marked.place.session).get(marked.place.pane)
     return (marked.claude.session_id == session_id and entry is not None
-            and entry["session_id"] == session_id and entry["environment"].get("STAFF_ID") == row.id)
+            and entry["session_id"] == row.id and session_id == row.current_session)
 
 
 def resume(unit: RetiredUnit, record: staff.StaffSnapshot) -> int:
@@ -355,7 +355,7 @@ def resume(unit: RetiredUnit, record: staff.StaffSnapshot) -> int:
     row = staff.restore_unit(member.row.id, staff.PresentWorktree(remote.local_machine(), unit.worktree))
     launch(unit)
     if not resumed_session_proven(unit.production.slug, unit.name, unit.session_id, row):
-        raise Refused(f"{unit.name}: resumed session and pane STAFF_ID are not proven; parked facts kept")
+        raise Refused(f"{unit.name}: resumed native session identity is not proven; parked facts kept")
     unmark(unit)
     print(f"{unit.name} resumed")
     completed = resume_record(unit.production, unit.name).with_suffix(".done")

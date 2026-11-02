@@ -202,7 +202,7 @@ def target_state(target: Target) -> TargetState:
                 else UntilReleased()
             )
             return Held(holder.name, holder.purpose, holder.since, end, HolderSession(holder.key))
-        paths = mac_test.state_paths()
+        paths = mac_test.state_paths(target.name)
         claims = mac_test.read_claims(paths)
         block = mac_test.read_claim_block(paths)
         if not isinstance(block, mac_test.NoMacBlock):
@@ -215,8 +215,12 @@ def target_state(target: Target) -> TargetState:
                        if isinstance(block.delivery, mac_test.RecordedSession) else NO_HOLDER_SESSION)
             return Held(block.holder, block.reason, block.since, block_end, session)
         jobs = tuple(running_job(claim) for claim in claims if mac_test.run_is_live(claim.record))
-        return Running(jobs) if jobs else Free()
+        if jobs:
+            return Running(jobs)
+        if isinstance(offload.read_backoff(utc_now().timestamp(), target.name), offload.ActiveBackoff):
+            return Unreachable("retry backoff")
+        return Free()
     except build_hold.ReleaseRecordReadError as error:
         return StateUnreadable(build_hold.release_record_error_line(error))
-    except (OSError, UnicodeError, mac_test.StateReadError) as error:
+    except (OSError, UnicodeError, mac_test.StateReadError, ConfigError) as error:
         return StateUnreadable(str(error))

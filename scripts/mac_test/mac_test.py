@@ -431,12 +431,17 @@ class CliArguments(argparse.Namespace):
         self.settings: str = ""
         self.repo_root: str = ""
         self.copy: bool = False
+        self.target: str = ""
 
 
 class StatePaths:
     """Files used by mac-test coordination."""
 
-    def __init__(self, directory: Path) -> None:
+    def __init__(self, directory: Path, target: str = "mac", *,
+                 registry_selected: bool = False, platform: Literal["linux", "macos"] = "macos") -> None:
+        self.target: str = target
+        self.registry_selected: bool = registry_selected
+        self.platform: Literal["linux", "macos"] = platform
         self.directory: Path = directory
         self.lock: Path = directory / "state.lock"
         self.control_lock: Path = directory / "control.lock"
@@ -447,37 +452,45 @@ class StatePaths:
         self.block: Path = directory / "block.json"
 
 
-def state_paths() -> StatePaths:
-    configured = os.environ.get("MAC_TEST_STATE_DIR", "~/.local/state/mac-test")
-    return StatePaths(Path(configured).expanduser())
+def state_paths(target: str = "") -> StatePaths:
+    if not target:
+        return StatePaths(offload.state_directory())
+    configured = offload.configured_ssh_target(target)
+    return StatePaths(offload.state_directory(target), target,
+                      registry_selected=True, platform=configured.platform)
 
 
-def config_path() -> Path:
-    return conf.path("mac_test")
+def config_path(target: str = "") -> Path:
+    return offload.configured_ssh_target(target).settings if target else conf.path("mac_test")
 
 
-def read_config() -> MacTestConfig:
-    # An explicit empty repository disables CI; a missing key still takes the fault path.
-    try:
-        ci_repo = conf.effective_line("mac_test", "ci_repo")[1]
-    except conf.Unusable:
-        ci_repo = conf.text("mac_test", "ci_repo")
+def read_config(target: str = "") -> MacTestConfig:
+    settings = config_path(target)
+    values = conf.values(settings)
+    if "ci_repo" not in values:
+        ci_repo = conf.text(settings, "ci_repo")
     else:
-        if ci_repo:
-            ci_repo = conf.text("mac_test", "ci_repo")
+        ci_repo = values["ci_repo"]
+    if target:
+        configured = offload.configured_ssh_target(target)
+        if configured.platform == "linux" and ci_repo:
+            raise StateReadError(f"{settings}: ci_repo must be empty for a Linux target")
+    ci_fields = {key: conf.text(settings, key) if ci_repo else values.get(key, "")
+                 for key in ("ci_variable", "ci_workflow", "ci_job")}
+
     return MacTestConfig(
         ci_repo=ci_repo,
-        ci_variable=conf.text("mac_test", "ci_variable"),
-        ci_workflow=conf.text("mac_test", "ci_workflow"),
-        ci_job=conf.text("mac_test", "ci_job"),
-        gh_timeout_s=conf.number("mac_test", "gh_timeout_s"),
-        block_hours=conf.number("mac_test", "block_hours"),
-        block_max_hours=conf.number("mac_test", "block_max_hours"),
-        block_warn_minutes=conf.number("mac_test", "block_warn_minutes"),
-        host=conf.text("mac_test", "host"),
-        connect_timeout_s=conf.number("mac_test", "connect_timeout_s"),
-        claim_idle_minutes=conf.number("mac_test", "claim_idle_minutes"),
-        claim_poll_seconds=conf.number("mac_test", "claim_poll_seconds"),
+        ci_variable=ci_fields["ci_variable"],
+        ci_workflow=ci_fields["ci_workflow"],
+        ci_job=ci_fields["ci_job"],
+        gh_timeout_s=conf.number(settings, "gh_timeout_s"),
+        block_hours=conf.number(settings, "block_hours"),
+        block_max_hours=conf.number(settings, "block_max_hours"),
+        block_warn_minutes=conf.number(settings, "block_warn_minutes"),
+        host=conf.text(settings, "host"),
+        connect_timeout_s=conf.number(settings, "connect_timeout_s"),
+        claim_idle_minutes=conf.number(settings, "claim_idle_minutes"),
+        claim_poll_seconds=conf.number(settings, "claim_poll_seconds"),
     )
 
 
@@ -773,6 +786,7 @@ class MacBlockEvent:
     kind: Literal["began", "ended"]
     block: PendingMacBlock | ActiveMacBlock
     at: datetime
+    target: str = "mac"
 
 
 pending_hold_events: ContextVar[tuple[MacBlockEvent, ...]] = ContextVar("pending_hold_events", default=())
@@ -796,7 +810,7 @@ def record_after_unlock() -> Generator[None, None, None]:
 
 def start_hold_recorder(event: MacBlockEvent) -> None:
     command = [sys.executable, str(Path(__file__).resolve().parent.parent / "buildlog" / "record.py"),
-               "hold-event", event.kind, "mac", timestamp(event.block.since), event.block.holder, event.block.reason,
+               "hold-event", event.kind, event.target, timestamp(event.block.since), event.block.holder, event.block.reason,
                timestamp(event.at.astimezone(timezone.utc)), timestamp(event.block.expires)]
     try:
         process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
@@ -806,8 +820,11 @@ def start_hold_recorder(event: MacBlockEvent) -> None:
     threading.Thread(target=process.wait, name="hold-event-recorder", daemon=True).start()
 
 
-def record_hold_event(event: Literal["began", "ended"], block: PendingMacBlock | ActiveMacBlock, at: datetime) -> None:
-    record = MacBlockEvent(event, block, at)
+def record_hold_event(
+    event: Literal["began", "ended"], block: PendingMacBlock | ActiveMacBlock,
+    at: datetime, target: str = "mac",
+) -> None:
+    record = MacBlockEvent(event, block, at, target)
     if coordination_depth.get():
         _ = pending_hold_events.set((*pending_hold_events.get(), record))
     else:
@@ -1187,16 +1204,17 @@ def replace_ci(
     )
 
 
-def send_mac_free(block: ActiveMacBlock, owed: FreeMessageOwed) -> bool:
+def send_target_free(block: ActiveMacBlock, owed: FreeMessageOwed, target: str) -> bool:
+    label = "the Mac" if target == "mac" else target
     text = (
-        f"Message from mac-test: the Mac is free. {owed.what} ended at "
+        f"Message from mac-test: {label} is free. {owed.what} ended at "
         + f"{message_time(owed.ended)}; your block ({block.reason}) is active, and "
         + "nothing is built or tested there until you run unblock."
     )
     return send_message(
         delivery_target(block.delivery),
-        "Mac is free",
-        f"mac-free-{timestamp(block.since)}",
+        f"{'Mac' if target == 'mac' else target} is free",
+        f"{target}-free-{timestamp(block.since)}",
         1440,
         text,
     )
@@ -1335,13 +1353,14 @@ def skipped_ci_runs(config: MacTestConfig, since: datetime) -> str:
     return "\n".join(lines)
 
 
-def expiry_text(block: PendingMacBlock | ActiveMacBlock, skipped: str) -> str:
+def expiry_text(block: PendingMacBlock | ActiveMacBlock, skipped: str, target: str) -> str:
+    label = "the Mac" if target == "mac" else target
     text = (
-        f"Message from mac-test: the Mac block by {block.holder} ({block.reason}) "
+        f"Message from mac-test: {label} block by {block.holder} ({block.reason}) "
         + f"reached its time limit at {block_time(block.expires)} and lifted by itself."
     )
     if ci_needs_restore(block.ci):
-        text += " CI may use the Mac again."
+        text += f" CI may use {label} again."
     if skipped:
         text += f"\n{skipped}"
     return text
@@ -1369,20 +1388,21 @@ def expire_block(
     claims: tuple[HeldClaim, ...],
     block: PendingMacBlock | ActiveMacBlock,
 ) -> SettleOutcome:
+    label = "Mac" if paths.target == "mac" else paths.target
     if not config.ci_repo:
         block = replace_ci(block, "not_configured")
     elif ci_needs_restore(block.ci):
         restored = switch_ci_back(config)
         if isinstance(restored, GhFailure):
             text = (
-                f"Message from mac-test: the Mac block by {block.holder} is past "
-                + "its time limit but still in place: CI's Mac switch could not be "
+                f"Message from mac-test: {label} block by {block.holder} is past "
+                + f"its time limit but still in place: CI's {label} switch could not be "
                 + f"turned back on ({restored.line}). Run github-warmup, then unblock."
             )
             send_to_block_recipients(
                 block,
-                "Mac block could not lift",
-                f"mac-block-stuck-{timestamp(block.since)}",
+                f"{label} block could not lift",
+                f"{paths.target}-block-stuck-{timestamp(block.since)}",
                 60,
                 text,
             )
@@ -1400,7 +1420,7 @@ def expire_block(
         except FileNotFoundError:
             pass
         else:
-            record_hold_event("ended", block, at)
+            record_hold_event("ended", block, at, paths.target)
     skipped = (
         skipped_ci_runs(config, block.since)
         if block.ci != "not_configured"
@@ -1408,10 +1428,10 @@ def expire_block(
     )
     send_to_block_recipients(
         block,
-        "Mac block lifted",
-        f"mac-block-expired-{timestamp(block.since)}",
+        f"{label} block lifted",
+        f"{paths.target}-block-expired-{timestamp(block.since)}",
         1440,
-        expiry_text(block, skipped),
+        expiry_text(block, skipped, paths.target),
     )
     return SettleOutcome(
         claims,
@@ -1422,9 +1442,10 @@ def expire_block(
     )
 
 
-def warning_text(block: PendingMacBlock | ActiveMacBlock) -> str:
+def warning_text(block: PendingMacBlock | ActiveMacBlock, target: str) -> str:
+    label = "Mac" if target == "mac" else target
     return (
-        f"Message from mac-test: your Mac block ({block.reason}) lifts by itself at "
+        f"Message from mac-test: your {label} block ({block.reason}) lifts by itself at "
         + f"{block_time(block.expires)}. Run block again to keep it."
     )
 
@@ -1440,7 +1461,7 @@ def start_watcher(paths: StatePaths) -> None:
     environment = [
         f"{name}={value}"
         for name, value in sorted(os.environ.items())
-        if name.startswith("MAC_TEST_")
+        if name.startswith("MAC_TEST_") or name == "BUILD_TARGETS_CONFIG"
     ]
     command = [
         "systemd-run",
@@ -1458,6 +1479,7 @@ def start_watcher(paths: StatePaths) -> None:
         sys.executable,
         str(Path(__file__).resolve()),
         "watch",
+        *(["--target", paths.target] if paths.registry_selected or paths.target != "mac" else []),
     ]
     try:
         result = subprocess.run(
@@ -1471,7 +1493,7 @@ def start_watcher(paths: StatePaths) -> None:
         failed = True
     if failed:
         print(
-            "warning: the Mac block watcher could not be started",
+            f"warning: the {'Mac' if paths.target == 'mac' else paths.target} block watcher could not be started",
             file=sys.stderr,
         )
 
@@ -1483,7 +1505,7 @@ def start_claim_watcher(paths: StatePaths) -> None:
     environment = [
         f"{name}={value}"
         for name, value in sorted(os.environ.items())
-        if name.startswith("MAC_TEST_")
+        if name.startswith("MAC_TEST_") or name == "BUILD_TARGETS_CONFIG"
     ]
     command = [
         "systemd-run", "--user", "--collect", "--quiet", "--no-block",
@@ -1491,6 +1513,7 @@ def start_claim_watcher(paths: StatePaths) -> None:
         f"HOME={os.environ.get('HOME', '')}",
         f"PATH={os.environ.get('PATH', '')}",
         *environment, sys.executable, str(Path(__file__).resolve()), "watch-claim",
+        *(["--target", paths.target] if paths.registry_selected or paths.target != "mac" else []),
     ]
     try:
         result = subprocess.run(
@@ -1500,7 +1523,8 @@ def start_claim_watcher(paths: StatePaths) -> None:
     except OSError:
         failed = True
     if failed:
-        print("warning: the Mac claim watcher could not be started", file=sys.stderr)
+        print(f"warning: the {'Mac' if paths.target == 'mac' else paths.target} claim watcher could not be started",
+              file=sys.stderr)
 
 
 def mac_activity_script() -> str:
@@ -1574,6 +1598,9 @@ def claim_watch_pass(paths: StatePaths, config: MacTestConfig) -> bool:
         claims = tuple(claim for claim in read_claims(paths) if run_is_live(claim.record))
     if not claims:
         return False
+    if paths.platform == "linux":
+        # The Linux controller must confirm remote cleanup before claim removal.
+        return True
     activity: dict[str, MacActivity] = {}
     for claim in claims:
         host = claim_host(claim.record, config)
@@ -1807,7 +1834,7 @@ def full_settle(
     if (
         isinstance(block, ActiveMacBlock)
         and isinstance(block.free_message, FreeMessageOwed)
-        and send_mac_free(block, block.free_message)
+        and send_target_free(block, block.free_message, paths.target)
     ):
         block = mark_free_message_sent(block)
         with locked(paths.lock):
@@ -1816,10 +1843,10 @@ def full_settle(
     if block.expires - now <= timedelta(minutes=config.block_warn_minutes):
         _ = send_message(
             delivery_target(block.delivery),
-            "Mac block nearing its time limit",
-            f"mac-block-warn-{timestamp(block.expires)}",
+            f"{'Mac' if paths.target == 'mac' else paths.target} block nearing its time limit",
+            f"{paths.target}-block-warn-{timestamp(block.expires)}",
             1440,
-            warning_text(block),
+            warning_text(block, paths.target),
         )
     if not watcher_holds_lock:
         start_watcher(paths)
@@ -1907,16 +1934,16 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope) -> Clai
         print(f"state unreadable: {error.path}")
         return ClaimFinished(12)
     overlapping = tuple(claim for claim in claims if scopes_overlap(claim.scope, scope))
-    if isinstance(args.remote, str):
-        for claim in overlapping:
-            record = claim.record
-            if claim.scope == scope and run_is_kept(record):
-                return take_over_kept_claim(args, claim, record)
     try:
         block = read_claim_block(paths)
     except (OSError, StateReadError):
         print(f"state unreadable: {paths.block}")
         return ClaimFinished(12)
+    if isinstance(args.remote, str):
+        for claim in overlapping:
+            record = claim.record
+            if claim.scope == scope and run_is_kept(record):
+                return take_over_kept_claim(args, claim, record)
     owner = build_hold.owning_session()
     if not isinstance(block, NoMacBlock) and not block_belongs_to(block, owner):
         print(f"blocked by {block.holder}: {block.reason}")
@@ -2042,7 +2069,9 @@ def free_now(
     """
     if not offload.read_config(settings).enabled:
         return "off"
-    if isinstance(offload.read_backoff(time.time()), offload.ActiveBackoff):
+    backoff = (offload.read_backoff(time.time()) if paths.target == "mac"
+               else offload.read_backoff(time.time(), paths.target))
+    if isinstance(backoff, offload.ActiveBackoff):
         return "backoff"
     scope = claim_scope(str(repo_root))
     try:
@@ -2063,6 +2092,8 @@ def free_now(
 
 def command_free_now(args: CliArguments, paths: StatePaths) -> int:
     settings = Path(args.settings) if args.settings else offload.DEFAULT_MAC_SETTINGS
+    if not args.settings and args.target:
+        settings = config_path(args.target)
     answer = free_now(paths, settings, Path(args.repo_root), args.copy)
     print(answer)
     return 0 if answer == "free" else 1
@@ -2071,16 +2102,18 @@ def command_free_now(args: CliArguments, paths: StatePaths) -> int:
 def block_state_line(
     block: PendingMacBlock | ActiveMacBlock,
     waiting_problem: Problem,
+    target: str = "mac",
 ) -> str:
+    host = "the Mac" if target == "mac" else target
     if isinstance(block, ActiveMacBlock):
         return (
-            f"Mac blocked for {block.holder}: nothing is running there, "
+            f"{'Mac' if target == 'mac' else target} blocked for {block.holder}: nothing is running there, "
             + "it is free now."
         )
     waiting = block.waiting_on
     if isinstance(waiting, WaitingOnLocalRun):
         return (
-            f"Block pending for {block.holder}: {waiting.what} is running on the Mac. "
+            f"Block pending for {block.holder}: {waiting.what} is running on {host}. "
             + "Nothing new starts there, and you get a message when it ends."
         )
     if isinstance(waiting, WaitingOnCiJob):
@@ -2169,7 +2202,7 @@ def command_block(
                 new_block = False
             write_block(paths.block, block)
             if new_block:
-                record_hold_event("began", block, now)
+                record_hold_event("began", block, now, paths.target)
         outcome = full_settle(
             paths,
             config,
@@ -2177,7 +2210,7 @@ def command_block(
         )
         if isinstance(outcome.block, NoMacBlock):
             return 0
-        print(block_state_line(outcome.block, outcome.waiting_problem))
+        print(block_state_line(outcome.block, outcome.waiting_problem, paths.target))
         if ci_may_still_be_on(outcome.block.ci):
             lift_failure = outcome.expired_block_lift_failure
             line = (
@@ -2230,13 +2263,13 @@ def command_unblock(
             except FileNotFoundError:
                 pass
             else:
-                record_hold_event("ended", block, at)
+                record_hold_event("ended", block, at, paths.target)
         if ci_needs_restore(block.ci):
             print("Mac unblocked; CI may use the Mac again.")
         elif block.ci == "off_before":
             print("Mac unblocked; CI's Mac switch was already off and stays off.")
         else:
-            print("Mac unblocked.")
+            print(f"{'Mac' if paths.target == 'mac' else paths.target} unblocked.")
         if block.ci != "not_configured":
             print(skipped_ci_runs(config, block.since))
         return 0
@@ -2327,7 +2360,8 @@ def command_status(paths: StatePaths, config: MacTestConfig) -> int:
             )
             if isinstance(block.free_message, FreeMessageOwed):
                 print(
-                    f'The "Mac is free" message has not reached {block.holder} yet.'
+                    f'The "{"Mac" if paths.target == "mac" else paths.target} is free" message '
+                    + f'has not reached {block.holder} yet.'
                 )
             print_switch_with_block(block, switch_problem)
         if isinstance(lift_failure, ExpiredBlockLiftFailed):
@@ -2336,6 +2370,26 @@ def command_status(paths: StatePaths, config: MacTestConfig) -> int:
                 + "switch could not be turned back on "
                 + f"({lift_failure.gh_error_line}). Run github-warmup, then unblock."
             )
+    return 0
+
+
+def command_target_status(paths: StatePaths) -> int:
+    """Show recorded target state without locks, probes or cleanup."""
+    try:
+        block = read_claim_block(paths)
+        claims = tuple(claim for claim in read_claims(paths) if run_is_live(claim.record))
+    except (OSError, StateReadError) as error:
+        print(f"state unreadable: {error}")
+        return 12
+    if not isinstance(block, NoMacBlock):
+        print(f"blocked by {block.holder} since {block_time(block.since)}: {block.reason}")
+    for claim in claims:
+        print(f"running: {claim.record['what']} ({claim.record['worktree']})")
+    if isinstance(block, NoMacBlock) and not claims:
+        if isinstance(offload.read_backoff(time.time(), paths.target), offload.ActiveBackoff):
+            print("unreachable: retry backoff")
+        else:
+            print("free")
     return 0
 
 
@@ -2362,7 +2416,7 @@ def command_watch(paths: StatePaths, config: MacTestConfig) -> int:
                 )
             if isinstance(outcome.block, NoMacBlock):
                 return 0
-            time.sleep(watch_interval())
+            time.sleep(watch_interval() if paths.target == "mac" else config.claim_poll_seconds)
 
 
 def remote_host_argument(value: str) -> str:
@@ -2373,6 +2427,7 @@ def remote_host_argument(value: str) -> str:
 
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(description=__doc__)
+    _ = root.add_argument("--target", default="")
     commands = root.add_subparsers(dest="command", required=True)
 
     claim = commands.add_parser("claim")
@@ -2403,20 +2458,35 @@ def parser() -> argparse.ArgumentParser:
     _ = commands.add_parser("status")
     _ = commands.add_parser("watch")
     _ = commands.add_parser("watch-claim")
+    for command in commands.choices.values():
+        _ = command.add_argument("--target", default=argparse.SUPPRESS)
     return root
 
 
 def main() -> int:
     override_guard.refuse_overrides(Path(__file__), "mac_test/mac_test.py")
     args = parser().parse_args(namespace=CliArguments())
-    paths = state_paths()
+    try:
+        paths = state_paths(args.target)
+        return dispatch_command(args, paths)
+    except (OSError, UnicodeError, StateReadError) as error:
+        print(f"state unreadable: {error}", file=sys.stderr)
+        return 12
+    except ValueError as error:
+        print(str(error), file=sys.stderr)
+        return 2
+
+
+def dispatch_command(args: CliArguments, paths: StatePaths) -> int:
     if args.command == "claim":
         return command_claim(args, paths)
     if args.command == "release":
         return command_release(args, paths)
     if args.command == "free-now":
         return command_free_now(args, paths)
-    config = read_config()
+    if args.command == "status" and args.target:
+        return command_target_status(paths)
+    config = read_config(args.target)
     if args.command == "block":
         return command_block(args, paths, config)
     if args.command == "unblock":

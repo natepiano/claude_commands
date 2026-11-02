@@ -111,11 +111,12 @@ class ServiceTests(unittest.TestCase):
                 admission_pass = gate.admission_pass
 
                 def pass_crossing_deadline(inputs: gate.QueueInputs, now: float,
-                                           limits: gate.AdmissionLimits) -> gate.PassResult:
+                                           limits: gate.AdmissionLimits,
+                                           policy: gate.AdmissionPolicy) -> gate.PassResult:
                     self.assertEqual(inputs.override, override)
                     self.assertEqual(len(inputs.ordered), 1)
                     fixture.clock.advance(1)
-                    return admission_pass(inputs, now, limits)
+                    return admission_pass(inputs, now, limits, policy)
 
                 with mock.patch.object(gate, "admission_pass", side_effect=pass_crossing_deadline) as passed:
                     self.assertIsInstance(fixture.server.handle_request(request)[0], wire.Wait)
@@ -566,7 +567,7 @@ class ServiceTests(unittest.TestCase):
                 inputs, limits = fixture.server.last_inputs, fixture.server.last_limits
                 assert isinstance(inputs, gate.QueueInputs)
                 assert isinstance(limits, gate.AdmissionLimits)
-                self.assertEqual(result, gate.admission_pass(inputs, inputs.now, limits))
+                self.assertEqual(result, gate.admission_pass(inputs, inputs.now, limits, policy=gate.DEFAULT_ADMISSION_POLICY))
                 starts = sorted((row for row in result.rows if isinstance(row.admission, gate.ProposedAdmission)),
                     key=lambda row: row.admission.rank if isinstance(row.admission, gate.ProposedAdmission) else -1)
                 committed = list(fixture.server.reservations.values())
@@ -581,8 +582,8 @@ class ServiceTests(unittest.TestCase):
                         assert isinstance(waiting, wire.Wait)
                         self.assertEqual(waiting.reason, row.reason)
                         self.assertEqual(waiting.text, queue_view.reason_phrase(row.reason,
-                            gate.queue_read_from(inputs, limits).view.waiting))
-                expected = gate.queue_read_from(inputs, limits)
+                            gate.queue_read_from(inputs, limits, policy=gate.DEFAULT_ADMISSION_POLICY).view.waiting))
+                expected = gate.queue_read_from(inputs, limits, policy=gate.DEFAULT_ADMISSION_POLICY)
                 with mock.patch.dict(os.environ, {"BUILDLOG_BUILD_BUDGET_GIB": "1"}):
                     self.assertEqual(fixture.server.handle_request(wire.ViewRequest()), [wire.ViewReply(expected)])
                     explained = fixture.server.handle_request(wire.ExplainRequest())[0]
@@ -641,7 +642,7 @@ class ServiceTests(unittest.TestCase):
             record = fixture.server.reservations[request.episode]
             need = gate.TestPhaseNeed(2 * GIB, 5, 8, 8, "same_width")
             fixture.server.reservations[request.episode] = replace(record, test_phase_need=need)
-            fixture.clock.advance(gate.RAMP_SECONDS)
+            fixture.clock.advance(gate.DEFAULT_ADMISSION_POLICY.timing.ramp_seconds)
             row = service.reservation_row(fixture.server.reservations[request.episode])
             phase = gate.test_phase_path(row)
             assert isinstance(phase, Path)
@@ -814,7 +815,8 @@ class ServiceTests(unittest.TestCase):
                 if path != scope / "cgroup.procs":
                     guard(path)
             def supplied_scope_memory(_path: Path, row: gate.Reservation, _now: object,
-                                      _processes: object, _proc: Path) -> gate.StepMemory:
+                                      _processes: object, _proc: Path, policy: gate.AdmissionPolicy) -> gate.StepMemory:
+                _ = policy
                 lifetime = fixture.proc.lifetime(row, fixture.proc.owner_start(owner.pid) == owner.start_time)
                 return gate.GoneMemory() if isinstance(lifetime, gate.EndedStep) else gate.MeasuredMemory(GIB)
             with mock.patch.object(gate, "check_memory_reading", side_effect=membership_only), \
@@ -859,7 +861,7 @@ class ServiceTests(unittest.TestCase):
         with AdmissionFixture() as fixture:
             fixture.free(4 * GIB)
             fixture.compiler(8 * GIB)
-            request = fixture.launch(since=fixture.clock.now() - gate.HEAD_SECONDS - 1)
+            request = fixture.launch(since=fixture.clock.now() - gate.DEFAULT_ADMISSION_POLICY.timing.head_seconds - 1)
             replies = fixture.server.handle_request(request)
             self.assertIsInstance(replies[0], wire.Wait)
             expected = gate.decide(4 * GIB, 60 * GIB, 8 * GIB, [gate.CompilerServiceMemory(8 * GIB)])
@@ -883,7 +885,7 @@ class ServiceTests(unittest.TestCase):
     def test_expiry_and_refresh_keep_episode_place_and_order_fields(self) -> None:
         with AdmissionFixture() as fixture:
             fixture.free(0)
-            request = fixture.request(age=gate.HEAD_SECONDS - 1)
+            request = fixture.request(age=gate.DEFAULT_ADMISSION_POLICY.timing.head_seconds - 1)
             young = fixture.server.handle_request(request)[0]
             assert isinstance(young, wire.Wait)
             self.assertNotIsInstance(young.reason, gate.EstimateExpired)

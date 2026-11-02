@@ -1,6 +1,7 @@
 """Merge gate suites contracts."""
 
 from __future__ import annotations
+from scripts.build_queue import queue_place
 
 import unittest
 import io
@@ -49,7 +50,7 @@ class MergeGateRerunsTests(GateSuitesFixture):
             return result
 
         with mock.patch.dict(os.environ, self.environment), \
-                mock.patch.object(merge_gate, "in_builds_slice", return_value=False), \
+                mock.patch.object(queue_place, "in_builds_slice", return_value=False), \
                 mock.patch.object(merge_gate, "finish_gate_job", side_effect=record_finish), redirect_stdout(output):
             run = merge_gate.run_suites(self.checkout, type_dirs=("scripts/production",))
         report = output.getvalue()
@@ -94,7 +95,7 @@ class MergeGateRerunsTests(GateSuitesFixture):
                 (self.state / "tools.jsonl").unlink(missing_ok=True)
                 output = io.StringIO()
                 with mock.patch.dict(os.environ, self.environment), \
-                        mock.patch.object(merge_gate, "in_builds_slice", return_value=reason == "existing"), \
+                        mock.patch.object(queue_place, "in_builds_slice", return_value=reason == "existing"), \
                         redirect_stdout(output):
                     run = merge_gate.run_suites(self.checkout)
                 self.assertTrue(run.passed, output.getvalue())

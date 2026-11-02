@@ -29,6 +29,7 @@ class ProjectSpec(NamedTuple):
     crates: frozenset[str]
     published: frozenset[str]
     checkouts: tuple[Path, ...]
+    closes_by_change_review: bool = False
 
 
 PROJECTS: dict[str, ProjectSpec] = {
@@ -76,9 +77,10 @@ PROJECTS: dict[str, ProjectSpec] = {
             }
         ),
         (Path.home() / "rust/hana", Path.home() / "rust/hana_catalyst"),
+        closes_by_change_review=True,
     ),
     "natedev": ProjectSpec(
-        "natepiano/nixos", frozenset(), frozenset(), (Path("/etc/nixos"),)
+        "natepiano/nixos", frozenset(), frozenset(), (Path("/etc/nixos"),), closes_by_change_review=False,
     ),
     "cargo-liner": ProjectSpec(
         "natepiano/cargo-liner",
@@ -95,6 +97,7 @@ PROJECTS: dict[str, ProjectSpec] = {
         ),
         frozenset({"cargo-mend", "cargo-port", "cargo-tile", "tui_pane"}),
         (Path.home() / "rust/cargo-liner",),
+        closes_by_change_review=False,
     ),
     "bevy_brp": ProjectSpec(
         "natepiano/bevy_brp",
@@ -110,21 +113,24 @@ PROJECTS: dict[str, ProjectSpec] = {
         ),
         frozenset({"bevy_brp_extras", "bevy_brp_mcp", "bevy_brp_mcp_macros"}),
         (Path.home() / "rust/bevy_brp",),
+        closes_by_change_review=False,
     ),
     "obsidian_knife": ProjectSpec(
         "natepiano/obsidian_knife",
         frozenset({"obsidian_knife"}),
         frozenset(),
         (Path.home() / "rust/obsidian_knife",),
+        closes_by_change_review=False,
     ),
     "nateroids": ProjectSpec(
         "natepiano/nateroids",
         frozenset({"nateroids"}),
         frozenset(),
         (Path.home() / "rust/nateroids",),
+        closes_by_change_review=False,
     ),
     "claude": ProjectSpec(
-        "natepiano/claude_commands", frozenset(), frozenset(), (Path.home() / ".claude",)
+        "natepiano/claude_commands", frozenset(), frozenset(), (Path.home() / ".claude",), closes_by_change_review=True,
     ),
 }
 

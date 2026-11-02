@@ -29,7 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from typing import BinaryIO, Callable, Literal, NoReturn, NotRequired, Protocol, TypedDict, cast, get_args, get_origin, get_type_hints, is_typeddict
 from functools import lru_cache
 from itertools import chain
-from types import UnionType
+from types import UnionType, MappingProxyType
 from urllib.parse import urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
@@ -113,24 +113,54 @@ RELEASE_HEADROOM = 1.314
 # covers all 81 dev steps with prior shape history. The limiting cargo-berth
 # build used 1.412826538 GiB after a 0.336112976 GiB same-shape peak.
 DEV_HEADROOM = 4.2034275337646125
-RAMP_SECONDS = 120
-# Hana nextest: the longest measured gap between waves at >=50% of peak
-# was 954 s (2026-10-29); 1500 s adds margin for sparse slice samples.
-PEAK_DECAY_SECONDS = 1500
-# 2026-10-29 freeze: full avg10 stayed below 10 during about 30 s of thrash.
-FULL_PRESSURE_LIMIT = 5.0
-# The same freeze had swap 80-87% used with some avg10 29-37%.
-SWAP_USED_LIMIT = 85.0
-SOME_PRESSURE_LIMIT = 25.0
-# Four starts promised 10.3 GiB in 42 s before that 30 s thrash.
-RECOVERY_START_SECONDS = 30
-# Bound recovery after the freeze: one ramp window after pressure clears.
-RECOVERY_WINDOW_SECONDS = 120
+
+
+@dataclass(frozen=True)
+class AdmissionTiming:
+    ramp_seconds: int = 120
+    head_seconds: int = 600
+    strict_seconds: int = 600
+    backfill_seconds: int = 120
+    recovery_start_seconds: int = 30
+    recovery_window_seconds: int = 120
+
+
+@dataclass(frozen=True)
+class PressurePolicy:
+    full_avg10_limit: float = 5.0
+    swap_used_limit: float = 85.0
+    some_avg10_limit: float = 25.0
+
+
+@dataclass(frozen=True)
+class PeakHold:
+    default_seconds: int = 1500
+    by_kind: Mapping[str, int] = field(default_factory=dict[str, int])
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "by_kind", MappingProxyType(dict(self.by_kind)))
+
+    def seconds_for(self, kind: str) -> int:
+        return self.by_kind.get(kind, self.default_seconds)
+
+
+@dataclass(frozen=True)
+class AdmissionPolicy:
+    timing: AdmissionTiming = AdmissionTiming()
+    pressure: PressurePolicy = PressurePolicy()
+    peak_hold: PeakHold = field(default_factory=PeakHold)
+
+
+DEFAULT_ADMISSION_POLICY = AdmissionPolicy()
 PROC = Path("/proc")
-# A step held this long gets room first when it can start.
-HEAD_SECONDS = 600
-STRICT_SECONDS = 600
-BACKFILL_SECONDS = 120
+# These cargo subcommands compile; arbitrary programs and merge gates run.
+CARGO_COMPILE_KINDS = frozenset({"build", "test", "nextest", "clippy", "check", "lint", "doc", "mend", "final"})
+
+
+def peak_activity(kind: str) -> str:
+    return "compiling" if kind in CARGO_COMPILE_KINDS else "running"
+
+
 QUEUE_LOCK_TIMEOUT_SECONDS = 10.0
 QUEUE_READ_LOCK_SECONDS = 0.5
 SNAPSHOT_MAX_AGE_SECONDS = 10
@@ -620,11 +650,12 @@ def read_queue_priority(directory: Path, *, finish: bool = False) -> QueuePriori
 
 
 def priority_set(unit: str, why: str) -> str:
+    policy = memory_config().policy
     actor = require_showrunner()
     if not unit.strip():
         raise PriorityRefused("unit is required")
     directory = admission_dir(store.root())
-    with exclusive_queue(directory) as readings:
+    with exclusive_queue(directory, policy=policy) as readings:
         previous = read_queue_priority(directory, finish=True)
         if (isinstance(previous, NoQueuePriority)
                 or (previous["unit"], previous["why"], previous["set_by"]) != (unit, why, actor)):
@@ -633,7 +664,7 @@ def priority_set(unit: str, why: str) -> str:
             begin_priority_transition(directory, priority, "set", now)
         processes = process_table(Path(os.environ.get("BUILDLOG_PROC", "/proc")))
         readings.processes = processes
-        snapshot = gather_queue_inputs(directory, processes, time.time(), readings=readings)
+        snapshot = gather_queue_inputs(directory, processes, time.time(), readings=readings, policy=policy)
         place = next((place for place, (_, row) in enumerate(snapshot.ordered, 1)
                       if row.get("priority_rank") == 0), 0)
     result = f"first step now #{place}" if place else "no waiting step yet"
@@ -641,9 +672,10 @@ def priority_set(unit: str, why: str) -> str:
 
 
 def priority_clear() -> str:
+    policy = memory_config().policy
     _ = require_showrunner()
     directory = admission_dir(store.root())
-    with exclusive_queue(directory):
+    with exclusive_queue(directory, policy=policy):
         priority = read_queue_priority(directory, finish=True)
         if not isinstance(priority, NoQueuePriority):
             begin_priority_transition(directory, priority, "clear", time.time())
@@ -968,27 +1000,27 @@ class EstimateExpired:
     estimated_at: float
 
 
-def estimate_expired(waiter: Waiter, now: float) -> bool:
-    return now - waiter.get("estimated_at", now) >= HEAD_SECONDS
+def estimate_expired(waiter: Waiter, now: float, policy: AdmissionPolicy) -> bool:
+    return now - waiter.get("estimated_at", now) >= policy.timing.head_seconds
 
 
 WaitReason = EstimateExpired | NeedsBuildBudget | NeedsMemory | BehindHead | BehindOlderFit | HeadAdmissionStatus | ReadyForAdmission | ReadingUnavailable | MemoryPressure
 
 
 def head_wait_reason(decision: AdmissionDecision, need: int, available: int,
-                     waiter: Waiter, now: float) -> HeadAdmissionStatus:
-    return HeadAdmissionStatus(decision, need, available, head_window(waiter, now))
+                     waiter: Waiter, now: float, policy: AdmissionPolicy) -> HeadAdmissionStatus:
+    return HeadAdmissionStatus(decision, need, available, head_window(waiter, now, policy))
 
 
-def head_window(waiter: Waiter, now: float) -> BackfillUntil | StrictUntil:
-    if "priority_since" not in waiter and now - waiter["since"] < HEAD_SECONDS:
-        return BackfillUntil(waiter["since"] + HEAD_SECONDS)
+def head_window(waiter: Waiter, now: float, policy: AdmissionPolicy) -> BackfillUntil | StrictUntil:
+    if "priority_since" not in waiter and now - waiter["since"] < policy.timing.head_seconds:
+        return BackfillUntil(waiter["since"] + policy.timing.head_seconds)
     start = waiter.get("priority_since", now)
-    cycle = STRICT_SECONDS + BACKFILL_SECONDS
+    cycle = policy.timing.strict_seconds + policy.timing.backfill_seconds
     elapsed = max(0.0, now - start)
     cycle_start = start + (elapsed // cycle) * cycle
-    if elapsed % cycle < STRICT_SECONDS:
-        return StrictUntil(cycle_start + STRICT_SECONDS)
+    if elapsed % cycle < policy.timing.strict_seconds:
+        return StrictUntil(cycle_start + policy.timing.strict_seconds)
     return BackfillUntil(cycle_start + cycle)
 
 
@@ -1007,11 +1039,12 @@ def window_clause(window: BackfillUntil | StrictUntil, budget: int, head_need: i
     return f"younger steps may use {room / GIB:.1f} GiB of the budget until {until}"
 
 
-def head_wait_text(reason: HeadAdmissionStatus, zone: ZoneInfo) -> str:
+def head_wait_text(reason: HeadAdmissionStatus, zone: ZoneInfo,
+                   policy: AdmissionPolicy) -> str:
     decision = reason.decision
     parts: list[str] = []
     if isinstance(decision.pressure, MemoryPressure):
-        parts.append(pressure_text(decision.pressure))
+        parts.append(pressure_text(decision.pressure, policy))
     elif decision.state == "admit":
         parts.append("ready for the next admission check")
     else:
@@ -1193,6 +1226,7 @@ class QueueExplanation:
     line: WaitingLine
     decided_from: QueueInputs
     limits: AdmissionLimits
+    policy: AdmissionPolicy = field(kw_only=True)
     ordered: tuple[Waiter, ...] = ()
     reservations: tuple[Reservation, ...] = ()
     override: HeadAdmissionOverride | NoHeadAdmissionOverride = NoHeadAdmissionOverride()
@@ -1360,36 +1394,50 @@ INFER_FROM_ARGV = InferFromArgv()
 
 
 @dataclass(frozen=True)
-class MeasuredGatePeak:
+class MeasuredProgramPeak:
     bytes: int
     runs: int
 
 
 @dataclass(frozen=True)
-class NoGateHistory:
-    cap_bytes: int
-
-
-GateEstimate = MeasuredGatePeak | NoGateHistory
+class FirstProgramPeak:
+    bytes: int
 
 
 @dataclass(frozen=True)
-class GateProfile:
+class FixedCapSizing:
+    cap_bytes: int
+
+
+@dataclass(frozen=True)
+class HistoryPeakSizing:
+    first_peak_bytes: int
+    estimate: MeasuredProgramPeak | FirstProgramPeak
+    estimated_at: float
+
+
+@dataclass(frozen=True)
+class ProgramProfile:
+    program: str
     repo: str
     worktree: str
-    cap_bytes: int
-    estimate: GateEstimate
-    estimated_at: float = 0.0
+    sizing: FixedCapSizing | HistoryPeakSizing
 
     @property
-    def step(self) -> Literal["merge-gate"]:
-        return "merge-gate"
+    def step(self) -> str:
+        return self.program
+
+    @property
+    def estimated_at(self) -> float:
+        return self.sizing.estimated_at if isinstance(self.sizing, HistoryPeakSizing) else 0.0
 
     @property
     def peak(self) -> ExpectedPeak:
-        estimate = self.estimate
+        if isinstance(self.sizing, FixedCapSizing):
+            return ExpectedPeak(self.sizing.cap_bytes, "fallback", 0)
+        estimate = self.sizing.estimate
         return (ExpectedPeak(estimate.bytes, "measured", estimate.runs)
-                if isinstance(estimate, MeasuredGatePeak) else ExpectedPeak(estimate.cap_bytes, "fallback", 0))
+                if isinstance(estimate, MeasuredProgramPeak) else ExpectedPeak(estimate.bytes, "fallback", 0))
 
     @property
     def repository(self) -> UnknownRepository:
@@ -1410,14 +1458,15 @@ def anonymous_history_rows(source: Path | BinaryIO) -> Iterator[dict[str, object
     yield from store.whole_rows(source, 0)
 
 
-def gate_estimate(cap_bytes: int, host: str, now: datetime, root: Path) -> GateEstimate:
-    """Read the gate's one peak history, without using cargo estimates."""
+def program_peak_estimate(program: str, host: str, now: datetime, root: Path,
+                          first_peak_bytes: int) -> MeasuredProgramPeak | FirstProgramPeak:
+    """Read one program's peak history, without using cargo estimates."""
     cutoff = now - timedelta(days=HISTORY_DAYS)
     peaks: list[int] = []
     try:
         for row in anonymous_history_rows(root / "admission/anon_peaks.jsonl"):
             try:
-                if row.get("host") != host or row.get("step") != "merge-gate":
+                if row.get("host") != host or row.get("step") != program:
                     continue
                 peak, ended = row.get("anon_peak_bytes"), row.get("ended_at")
                 if not isinstance(peak, int) or peak <= 0 or not isinstance(ended, str):
@@ -1428,7 +1477,7 @@ def gate_estimate(cap_bytes: int, host: str, now: datetime, root: Path) -> GateE
                 continue
     except FileNotFoundError:
         pass
-    return MeasuredGatePeak(percentile(peaks), len(peaks)) if peaks else NoGateHistory(cap_bytes)
+    return MeasuredProgramPeak(percentile(peaks), len(peaks)) if peaks else FirstProgramPeak(first_peak_bytes)
 
 
 @dataclass(frozen=True)
@@ -1472,11 +1521,12 @@ class CheckResult:
     repo: str
     step: str
     available: int
-    profile: StepProfile | GateProfile
+    profile: StepProfile | ProgramProfile
     head_need: int = 0
     head_label: str = ""
     head_reason: WaitReason = ReadyForAdmission()
     blocker: Blocker = NoSingleBlocker()
+    policy: AdmissionPolicy = field(kw_only=True)
 
 
 def _positive_gib_bytes(raw: str) -> int | None:
@@ -1489,16 +1539,30 @@ def _positive_gib_bytes(raw: str) -> int | None:
     return None
 
 
-def build_budget_bytes() -> int:
-    """Read the environment override or the live configured build budget."""
-    environment_budget = _positive_gib_bytes(os.environ.get("BUILDLOG_BUILD_BUDGET_GIB", ""))
-    if environment_budget is not None:
-        return environment_budget
-    return max(1, int(conf.number("lint", "build_budget_gib") * GIB))
+@dataclass(frozen=True)
+class MemoryConfig:
+    policy: AdmissionPolicy
+    test_phase_margin: float
+    build_budget_bytes: int
+    running_pass_seconds: float
+    waiting_pass_seconds: float
+    wait_reply_seconds: float
+    replay_retention_seconds: float
+    reconnect_seconds: float
+    silence_seconds: float
+    outage_notice_seconds: float
+    source_check_seconds: float
+    source_settle_seconds: float
+    override_reconnect_seconds: float
+    request_max_bytes: int
+    program_first_peaks: Mapping[str, int]
+    program_sample_seconds: float
+    program_stop_seconds: float
+    peak_wave_seconds: float
 
 
 def _test_phase_margin_value(raw: object) -> float:
-    """Read old stored margins through the live policy when not recorded."""
+    """Use the live margin when an old record has no valid margin."""
     if isinstance(raw, bool) or not isinstance(raw, (str, int, float)):
         return test_phase_margin()
     try:
@@ -1510,6 +1574,14 @@ def _test_phase_margin_value(raw: object) -> float:
 
 def test_phase_margin() -> float:
     return conf.number("lint", "test_phase_margin")
+
+
+def build_budget_bytes() -> int:
+    """Read the environment override or the live configured build budget."""
+    environment_budget = _positive_gib_bytes(os.environ.get("BUILDLOG_BUILD_BUDGET_GIB", ""))
+    if environment_budget is not None:
+        return environment_budget
+    return max(1, int(conf.number("lint", "build_budget_gib") * GIB))
 
 
 def request_max_bytes() -> int:
@@ -1546,8 +1618,55 @@ def override_reconnect_seconds() -> float:
     return conf.number("lint", "override_reconnect_seconds")
 
 
-def resolve_admission_limits(total: int | UnknownHostTotal) -> AdmissionLimits:
-    return AdmissionLimits(build_budget_bytes(), total * 5 // 100 if isinstance(total, int) else 0)
+def read_memory_config() -> MemoryConfig:
+    """Resolve the live configuration for one admission decision."""
+    values = conf.values("lint")
+    timing = AdmissionTiming(*(conf.whole("lint", key) for key in (
+        "ramp_seconds", "head_seconds", "strict_seconds", "backfill_seconds",
+        "recovery_start_seconds", "recovery_window_seconds")))
+    pressure = PressurePolicy(*(conf.number("lint", key) for key in (
+        "full_pressure_limit", "swap_used_limit", "some_pressure_limit")))
+    kinds = {key.removeprefix("peak_hold_seconds."): conf.whole("lint", key)
+             for key in values if key.startswith("peak_hold_seconds.")}
+    first_peaks = {key.removeprefix("program_first_peak_gib."):
+                   max(1, int(conf.number("lint", key) * GIB))
+                   for key in values if key.startswith("program_first_peak_gib.")}
+    return MemoryConfig(
+        policy=AdmissionPolicy(timing, pressure, PeakHold(conf.whole("lint", "peak_hold_seconds"), kinds)),
+        test_phase_margin=test_phase_margin(),
+        build_budget_bytes=max(1, int(conf.number("lint", "build_budget_gib") * GIB)),
+        running_pass_seconds=running_pass_seconds(), waiting_pass_seconds=waiting_pass_seconds(),
+        wait_reply_seconds=wait_reply_seconds(), replay_retention_seconds=replay_retention_seconds(),
+        reconnect_seconds=reconnect_seconds(), silence_seconds=silence_seconds(),
+        outage_notice_seconds=outage_notice_seconds(), source_check_seconds=source_check_seconds(),
+        source_settle_seconds=source_settle_seconds(), override_reconnect_seconds=override_reconnect_seconds(),
+        request_max_bytes=request_max_bytes(), program_first_peaks=first_peaks,
+        program_sample_seconds=conf.number("lint", "program_sample_seconds"),
+        program_stop_seconds=conf.number("lint", "program_stop_seconds"),
+        peak_wave_seconds=conf.number("lint", "peak_wave_seconds"))
+
+
+def memory_config() -> MemoryConfig:
+    return read_memory_config()
+
+
+def _configured_budget(config: MemoryConfig) -> int:
+    environment_budget = _positive_gib_bytes(os.environ.get("BUILDLOG_BUILD_BUDGET_GIB", ""))
+    return environment_budget if environment_budget is not None else config.build_budget_bytes
+
+
+@dataclass(frozen=True)
+class ReadMemoryConfiguration:
+    pass
+
+
+READ_MEMORY_CONFIGURATION = ReadMemoryConfiguration()
+
+
+def resolve_admission_limits(total: int | UnknownHostTotal,
+                             config: MemoryConfig | ReadMemoryConfiguration = READ_MEMORY_CONFIGURATION) -> AdmissionLimits:
+    resolved = read_memory_config() if isinstance(config, ReadMemoryConfiguration) else config
+    return AdmissionLimits(_configured_budget(resolved), total * 5 // 100 if isinstance(total, int) else 0)
 
 
 def decide(available: int, total: int | UnknownHostTotal, need: int, running: list[StepMemory],
@@ -1980,11 +2099,16 @@ def test_phase_need_from_rows(rows: Iterable[Mapping[str, object]],
 
 
 def test_phase_need(row: Mapping[str, object], host: str, now: datetime, root: Path, *,
-                    history_path: Path | None = None) -> TestPhaseNeed | NoTestPhaseNeed:
+                    history_path: Path | None = None,
+                    config: MemoryConfig | ReadMemoryConfiguration = READ_MEMORY_CONFIGURATION
+                    ) -> TestPhaseNeed | NoTestPhaseNeed:
     try:
         path = history_path if history_path is not None else root / "admission/anon_peaks.jsonl"
         need = test_phase_need_from_rows(anonymous_history_rows(path), row, host, now)
-        return replace(need, margin=test_phase_margin()) if isinstance(need, TestPhaseNeed) else need
+        if isinstance(need, TestPhaseNeed):
+            resolved = read_memory_config() if isinstance(config, ReadMemoryConfiguration) else config
+            return replace(need, margin=resolved.test_phase_margin)
+        return need
     except OSError:
         return NoTestPhaseNeed("no_history")
 
@@ -2323,22 +2447,26 @@ def process_table(proc: Path = PROC) -> dict[int, ProcessIdentity]:
     return processes
 
 
-def tree_memory(pid: int, start: str, processes: dict[int, ProcessIdentity],
-                proc: Path = PROC) -> MeasuredMemory | GoneMemory:
-    """Sum resident and swapped bytes from one process table reading."""
-    identity = processes.get(pid)
-    if identity is None or identity.start != start:
-        return GoneMemory()
+def process_tree(roots: Mapping[int, str], processes: dict[int, ProcessIdentity]) -> set[int]:
+    """Find live roots and their descendants from one process table reading."""
     children: dict[int, list[int]] = {}
     for child, identity in processes.items():
         children.setdefault(identity.parent, []).append(child)
-    pending, seen, used, swapped = [pid], set[int](), 0, 0
+    pending = [pid for pid, start in roots.items() if pid in processes and processes[pid].start == start]
+    seen: set[int] = set()
     while pending:
         child = pending.pop()
         if child in seen:
             continue
         seen.add(child)
         pending.extend(children.get(child, []))
+    return seen
+
+
+def process_memory(pids: set[int], proc: Path = PROC) -> MeasuredMemory:
+    """Sum resident and swapped bytes for a set of processes."""
+    used, swapped = 0, 0
+    for child in pids:
         try:
             for line in (proc / str(child) / "status").read_text().splitlines():
                 parts = line.split()
@@ -2350,6 +2478,13 @@ def tree_memory(pid: int, start: str, processes: dict[int, ProcessIdentity],
         except (OSError, ValueError, IndexError):
             continue
     return MeasuredMemory(used, swap_bytes=swapped)
+
+
+def tree_memory(pid: int, start: str, processes: dict[int, ProcessIdentity],
+                proc: Path = PROC) -> MeasuredMemory | GoneMemory:
+    """Sum resident and swapped bytes from one process table reading."""
+    members = process_tree({pid: start}, processes)
+    return process_memory(members, proc) if members else GoneMemory()
 
 
 @dataclass(frozen=True)
@@ -2388,7 +2523,7 @@ def reservation_lifetime(row: Reservation, owner_live: bool) -> PopulatedStepSco
 
 
 def step_memory(row: Reservation, now: datetime, processes: dict[int, ProcessIdentity],
-                proc: Path = PROC) -> StepMemory:
+                proc: Path = PROC, *, policy: AdmissionPolicy) -> StepMemory:
     identity = processes.get(row["pid"])
     owner_live = identity is not None and identity.start == row["start_time"]
     lifetime = reservation_lifetime(row, owner_live)
@@ -2408,14 +2543,14 @@ def step_memory(row: Reservation, now: datetime, processes: dict[int, ProcessIde
             reading = tree_memory(row["pid"], row["start_time"], processes, proc)
     else:
         reading = tree_memory(row["pid"], row["start_time"], processes, proc)
-    return step_promise(row, now, reading)
+    return step_promise(row, now, reading, policy)
 
 
-def step_promise(row: Reservation, now: datetime, reading: StepMemory) -> StepMemory:
+def step_promise(row: Reservation, now: datetime, reading: StepMemory, policy: AdmissionPolicy) -> StepMemory:
     """Apply the reservation lifetime promise at this instant."""
     if isinstance(reading, MeasuredMemory) and release_build(row):
         return replace(reading, promise=LifetimePromise(row["need"]))
-    if isinstance(reading, MeasuredMemory) and now.timestamp() - _epoch(row["admitted_at"]) < RAMP_SECONDS:
+    if isinstance(reading, MeasuredMemory) and now.timestamp() - _epoch(row["admitted_at"]) < policy.timing.ramp_seconds:
         if reading.bytes == 0:
             return PromisedMemory(row["need"])
         return replace(reading, promise=RampPromise(row["need"]))
@@ -2439,8 +2574,8 @@ def test_phase_history(row: Reservation, reading: StepMemory,
 
 
 def reservation_memory(path: Path, row: Reservation, now: datetime,
-                       processes: dict[int, ProcessIdentity], proc: Path) -> StepMemory:
-    reading = step_memory(row, now, processes, proc)
+                       processes: dict[int, ProcessIdentity], proc: Path, policy: AdmissionPolicy) -> StepMemory:
+    reading = step_memory(row, now, processes, proc, policy=policy)
     try:
         peak = int(path.with_suffix(".max").read_text())
         if peak < 0:
@@ -2478,8 +2613,8 @@ def reservation_memory(path: Path, row: Reservation, now: datetime,
     except (OSError, ValueError):
         pass
     history: PeakHistory = PeakSoFar(peak, peak_at, peak_time, old_sampler) if peak > 0 else NoPeakRecorded()
-    if not release_build(row) and now.timestamp() - last_near_peak_at >= PEAK_DECAY_SECONDS:
-        history = PeakDecayed(0, peak, last_near_peak_at, last_near_peak_at + PEAK_DECAY_SECONDS, old_sampler)
+    if not release_build(row) and now.timestamp() - last_near_peak_at >= policy.peak_hold.seconds_for(row.get("step", "")):
+        history = PeakDecayed(0, peak, last_near_peak_at, last_near_peak_at + policy.peak_hold.seconds_for(row.get("step", "")), old_sampler)
         peak = 0
     if isinstance(reading, MeasuredMemory):
         return replace(reading, observed_peak=peak, peak_history=history)
@@ -2548,7 +2683,7 @@ def read_meminfo(path: Path) -> HostMemory:
 NO_HOST_SWAP = HostMemory(0, UnknownHostTotal())
 
 
-def read_pressure(host: HostMemory = NO_HOST_SWAP) -> Pressure:
+def read_pressure(host: HostMemory = NO_HOST_SWAP, *, policy: AdmissionPolicy) -> Pressure:
     """An unreadable pressure file does not block; the memory rule still applies."""
     readings: dict[str, float] = {}
     path = Path(os.environ.get("BUILDLOG_MEMORY_PRESSURE", "/proc/pressure/memory"))
@@ -2564,9 +2699,9 @@ def read_pressure(host: HostMemory = NO_HOST_SWAP) -> Pressure:
         pass
     full, some = readings.get("full", 0.0), readings.get("some", 0.0)
     swap = 100 * max(0, host.swap_total - host.swap_free) / host.swap_total if host.swap_total else 0.0
-    if swap > SWAP_USED_LIMIT and some > SOME_PRESSURE_LIMIT:
+    if swap > policy.pressure.swap_used_limit and some > policy.pressure.some_avg10_limit:
         return MemoryPressure(full, some, swap)
-    return MemoryPressure(full) if full > FULL_PRESSURE_LIMIT else NO_PRESSURE_HOLD
+    return MemoryPressure(full) if full > policy.pressure.full_avg10_limit else NO_PRESSURE_HOLD
 
 
 def read_recovery(directory: Path) -> RecoverySpacing:
@@ -2604,12 +2739,12 @@ def write_recovery(directory: Path, recovery: PressureHoldRecorded | RecoverySta
         temporary.unlink(missing_ok=True)
 
 
-def next_recovery(recovery: RecoverySpacing, pressure: Pressure, now: float) -> RecoverySpacing:
+def next_recovery(recovery: RecoverySpacing, pressure: Pressure, now: float, policy: AdmissionPolicy) -> RecoverySpacing:
     """Advance pressure recovery without consuming a proposed admission's start slot."""
     if isinstance(pressure, MemoryPressure):
         return PressureHoldRecorded()
     if isinstance(recovery, PressureHoldRecorded):
-        return RecoveryStarts(now + RECOVERY_WINDOW_SECONDS, now)
+        return RecoveryStarts(now + policy.timing.recovery_window_seconds, now)
     if isinstance(recovery, RecoveryStarts) and now >= recovery.ends_at:
         return NoRecoverySpacing()
     return recovery
@@ -2623,10 +2758,10 @@ def pressure_with_recovery(recovery: RecoverySpacing, pressure: Pressure, now: f
     return pressure
 
 
-def pressure_text(pressure: MemoryPressure) -> str:
+def pressure_text(pressure: MemoryPressure, policy: AdmissionPolicy) -> str:
     if pressure.next_start_at:
-        return "memory pressure recovery: starts at least 30 s apart"
-    if pressure.swap_used_percent > SWAP_USED_LIMIT:
+        return f"memory pressure recovery: starts at least {policy.timing.recovery_start_seconds:g} s apart"
+    if pressure.swap_used_percent > policy.pressure.swap_used_limit:
         return f"memory pressure: swap {pressure.swap_used_percent:.1f}% used; some avg10 {pressure.some_avg10:.1f}"
     return f"memory pressure: full avg10 {pressure.full_avg10:.1f}"
 
@@ -2731,17 +2866,17 @@ def waiter_order(row: Waiter) -> tuple[int, float, int]:
 
 
 def head_priority(waiters: list[Waiter], available: int, total: int | UnknownHostTotal,
-                  running: list[StepMemory], now: float, *,
+                  running: list[StepMemory], now: float, policy: AdmissionPolicy, *,
                   limits: AdmissionLimits | ReadHostAdmissionLimits = READ_HOST_ADMISSION_LIMITS) -> HeadPriority | NoHeadPriority:
     ordered = waiters
     if not ordered:
         return NoHeadPriority()
     head = ordered[0]
-    if "priority_since" in head or now - head["since"] >= HEAD_SECONDS:
+    if "priority_since" in head or now - head["since"] >= policy.timing.head_seconds:
         decision = decide(available, total, head["need"], running, limits=limits)
         if ("priority_since" in head or decision.state == "admit"
                 or available + decision.measured >= head["need"] + decision.reserve):
-            return HeadPriority(head, head_window(head, now))
+            return HeadPriority(head, head_window(head, now, policy))
     return NoHeadPriority()
 
 
@@ -2774,7 +2909,7 @@ def admission_for_waiter(available: int, total: int | UnknownHostTotal, row: Wai
                          running: list[StepMemory], head: HeadPriority | NoHeadPriority,
                          pressure: Pressure, room_used: int,
                          override: HeadAdmissionOverride | NoHeadAdmissionOverride, first: bool,
-                         now: float, limits: AdmissionLimits | ReadHostAdmissionLimits) -> AdmissionDecision:
+                         now: float, limits: AdmissionLimits | ReadHostAdmissionLimits, policy: AdmissionPolicy) -> AdmissionDecision:
     decision = decide(available, total, row["need"], running, pressure=pressure, limits=limits)
     if (isinstance(head, HeadPriority) and isinstance(head.window, StrictUntil)
             and waiter_order(head.waiter) < waiter_order(row)):
@@ -2790,7 +2925,7 @@ def admission_for_waiter(available: int, total: int | UnknownHostTotal, row: Wai
             and row["pid"] == override["pid"] and row["start_time"] == override["start_time"]):
         threshold = row["need"] + decision.reserve
         fits_free = available >= threshold
-        fresh = not estimate_expired(row, now)
+        fresh = not estimate_expired(row, now, policy)
         decision = replace(decision, state="admit" if fits_free and fresh and isinstance(pressure, NoPressureHold) else "hold",
                            threshold=threshold, promised=0, free_passes=fits_free)
     return decision
@@ -2801,7 +2936,8 @@ def admission_walk(available: int, total: int | UnknownHostTotal, ordered: list[
                    pressure: Pressure, *, recovery: RecoverySpacing, now: float,
                    room_used: int = 0,
                    override: HeadAdmissionOverride | NoHeadAdmissionOverride = NO_HEAD_ADMISSION_OVERRIDE,
-                   limits: AdmissionLimits | ReadHostAdmissionLimits = READ_HOST_ADMISSION_LIMITS) -> list[WaiterAdmission]:
+                   limits: AdmissionLimits | ReadHostAdmissionLimits = READ_HOST_ADMISSION_LIMITS,
+                   policy: AdmissionPolicy) -> list[WaiterAdmission]:
     """Keep memory, the head's budget room and the recovery slot in queue order."""
     promised = list(running)
     marked: list[Waiter] = []
@@ -2810,16 +2946,16 @@ def admission_walk(available: int, total: int | UnknownHostTotal, ordered: list[
     marked_room = 0
     for index, row in enumerate(ordered):
         decision = admission_for_waiter(available, total, row, promised, head, pressure,
-                                        room_used + marked_room, override, index == 0, now, limits)
+                                        room_used + marked_room, override, index == 0, now, limits, policy)
         if marked and ((decision.state == "admit" and (recovering or decide(
                            available, total, row["need"],
                            [*running, *(PromisedMemory(waiter["need"]) for waiter in marked)],
                            pressure=pressure, limits=limits).state == "hold"))
                        or (decision.state == "hold" and admission_for_waiter(
                            available, total, row, running, head, pressure, room_used,
-                           override, index == 0, now, limits).state == "admit")):
+                           override, index == 0, now, limits, policy).state == "admit")):
             decision = replace(decision, state="hold", order_hold=HeldBehindOlderFit(marked[0]))
-        expired = estimate_expired(row, now)
+        expired = estimate_expired(row, now, policy)
         if expired:
             decision = replace(decision, state="hold")
         admissions.append(WaiterAdmission(row, decision))
@@ -3061,18 +3197,24 @@ def token_wait(path: Path, root: Path | None = None) -> None:
 
 def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float = 0.0,
           root: Path | None = None, now: datetime | None = None,
-          profile: InferFromArgv | StepProfile | GateProfile = INFER_FROM_ARGV) -> CheckResult:
+          profile: InferFromArgv | StepProfile | ProgramProfile = INFER_FROM_ARGV) -> CheckResult:
     """Admit or hold one step. A held step is a waiter from `since` (epoch seconds; 0 means now), so a
     step that gave its reservation back for the cargo token keeps its place."""
     root = root if root is not None else store.root()
     estimate_time = now if now is not None else datetime.now(UTC)
+    config = read_memory_config()
+    policy = config.policy
     fresh = False
     width = test_threads(argv)
     package, filters = test_package(argv), test_filters(argv)
-    if isinstance(profile, GateProfile) and (not profile.estimated_at or estimate_time.timestamp() - profile.estimated_at >= HEAD_SECONDS):
-        profile = replace(profile, estimate=gate_estimate(profile.cap_bytes, store.host_name(), estimate_time, root),
-                          estimated_at=estimate_time.timestamp())
-    elif isinstance(profile, StepProfile) and profile.estimated_at and estimate_time.timestamp() - profile.estimated_at >= HEAD_SECONDS:
+    if isinstance(profile, ProgramProfile) and isinstance(profile.sizing, HistoryPeakSizing):
+        sizing = profile.sizing
+        if not sizing.estimated_at or estimate_time.timestamp() - sizing.estimated_at >= policy.timing.head_seconds:
+            profile = replace(profile, sizing=replace(sizing,
+                estimate=program_peak_estimate(profile.program, store.host_name(), estimate_time, root,
+                                               sizing.first_peak_bytes),
+                estimated_at=estimate_time.timestamp()))
+    elif isinstance(profile, StepProfile) and profile.estimated_at and estimate_time.timestamp() - profile.estimated_at >= policy.timing.head_seconds:
         profile = InferFromArgv()
     if isinstance(profile, InferFromArgv):
         repository, worktree = git_identity(argv, os.getcwd())
@@ -3092,20 +3234,20 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
                              package=package, filters=filters, fresh=fresh,
                              shape=build_shape(argv) if step == "build" else NoBuildShape())
         profile = StepProfile(repo, step, worktree, peak, repository, scope, estimate_time.timestamp())
-    elif not profile.estimated_at:
+    elif isinstance(profile, StepProfile) and not profile.estimated_at:
         profile = replace(profile, estimated_at=estimate_time.timestamp())
     repo, step, worktree, peak = profile.repo, profile.step, profile.worktree, profile.peak
     if not argv and not (root / "admission").exists():
         host = read_meminfo(meminfo)
         available = host.available
-        pressure = read_pressure(host)
+        pressure = read_pressure(host, policy=policy)
         if isinstance(pressure, NoPressureHold):
-            decision = decide(available, host.total, peak.bytes, sccache_memory(), pressure)
-            return CheckResult(decision, peak, [], NotReserved("launch"), repo, step, available, profile)
+            decision = decide(available, host.total, peak.bytes, sccache_memory(), pressure, limits=resolve_admission_limits(host.total, config))
+            return CheckResult(decision, peak, [], NotReserved("launch"), repo, step, available, profile, policy=policy)
         # A launch can be the first caller to observe a pressure hold. Record
         # it under the lock so launches after it share the recovery window.
     directory = admission_dir(root)
-    with exclusive_queue(directory) as snapshot:
+    with exclusive_queue(directory, policy=policy) as snapshot:
         # Lock contention must not consume the recovery spacing or ramp window.
         # Use one time for every decision and ledger write in this transaction.
         now = now if now is not None else datetime.now(UTC)
@@ -3116,7 +3258,7 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
         for intent_path in directory.glob("*.token-wait"):
             finish_token_wait(intent_path)
         for path, row in reservation_rows(directory):
-            memory = reservation_memory(path, row, now, processes, proc)
+            memory = reservation_memory(path, row, now, processes, proc, policy)
             snapshot.memory[path] = memory
             if isinstance(memory, GoneMemory):
                 finalized = finalize_reservation(path, row, OwnerGone(), now)
@@ -3125,7 +3267,7 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
                         and ("shape" not in row or recorded_build_shape(row["shape"]) == build_shape(argv))):
                     # Use the existing expiry path; the next poll estimates outside the lock.
                     # An old row may get its shape from the index outside this lock.
-                    profile = replace(profile, estimated_at=now.timestamp() - HEAD_SECONDS)
+                    profile = replace(profile, estimated_at=now.timestamp() - policy.timing.head_seconds) if isinstance(profile, StepProfile) else profile
                 continue
             live.append((path, row))
         compilers = sccache_memory()
@@ -3143,7 +3285,7 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
         waiter["test_scope"] = profile.scope
         waiter["package"] = package
         waiter["filters"] = list(filters)
-        waiter["estimated_at"] = profile.estimated_at
+        waiter["estimated_at"] = profile.estimated_at or estimate_time.timestamp()
         waiter["fresh_test"] = fresh
         waiter["need_source"] = peak.source
         waiter["need_runs"] = peak.count
@@ -3161,11 +3303,11 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
                 waiter["token_left_at"] = previous["token_left_at"]
         identity = waiter_identity(step, worktree)
         waiter["session_id"], waiter["session_name"] = identity["session_id"], identity["session_name"]
-        waiter["step"], waiter["folder"] = identity["step"], profile.worktree if isinstance(profile, GateProfile) else identity["folder"]
+        waiter["step"], waiter["folder"] = identity["step"], profile.worktree if isinstance(profile, ProgramProfile) else identity["folder"]
         host = read_meminfo(meminfo)
         snapshot.host = host
         available = host.available
-        pressure = read_pressure(host)
+        pressure = read_pressure(host, policy=policy)
         snapshot.pressure = pressure
         recovery = read_recovery(directory)
         snapshot.recovery = recovery
@@ -3180,10 +3322,10 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
         ordered, priority = resolve_queue_order(directory,
             [(path, row) for path, row in waiting if path != mine] + [(mine, waiter)],
             finish=True, readings=snapshot)
-        inputs = gather_queue_inputs(directory, processes, now.timestamp(), snapshot.memory, readings=snapshot)
+        inputs = gather_queue_inputs(directory, processes, now.timestamp(), snapshot.memory, readings=snapshot, policy=policy)
         inputs = replace(inputs, ordered=ordered, priority=priority,
                          blockers_for=frozenset((waiter_owner(waiter),)))
-        result = admission_pass(inputs, now.timestamp(), _queue_limits(inputs))
+        result = admission_pass(inputs, now.timestamp(), resolve_admission_limits(host.total, config), policy)
         own = next(row for row in result.rows if row.owner == waiter_owner(waiter))
         decision = own.decision
         # Persist actual selected bases after the pure pass. Failure to record
@@ -3246,12 +3388,12 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
             mine.unlink(missing_ok=True)
         head_reason = own.reason
         result_check = CheckResult(decision, peak, [row for _, row in live], reservation, repo, step, available, profile,
-                                   head_need, head_label, head_reason, blocker)
+                                   head_need, head_label, head_reason, blocker, policy=policy)
     if step == "nextest" and isinstance(reservation, Reserved):
         try:
             admitted = read_reservation(reservation.path)
             if "test_phase_need" not in admitted:
-                need = test_phase_need(admitted, store.host_name(), now, root)
+                need = test_phase_need(admitted, store.host_name(), now, root, config=config)
                 update_reservation(reservation.path, {"test_phase_need": test_phase_need_record(need)}, root,
                                    readings=snapshot)
         except Exception:
@@ -3389,15 +3531,15 @@ def waiter_owner(row: Waiter) -> str:
     return f"{row['pid']}-{row['start_time']}"
 
 
-def admission_pass(inputs: QueueInputs, now: float, limits: AdmissionLimits) -> PassResult:
+def admission_pass(inputs: QueueInputs, now: float, limits: AdmissionLimits, policy: AdmissionPolicy) -> PassResult:
     """Decide one frozen scenario, proposing ledger changes without committing any."""
     ordered = sorted(((path, row.copy()) for path, row in inputs.ordered), key=lambda item: waiter_order(item[1]))
     memory = [step.measured for step in inputs.running]
     host = inputs.host if isinstance(inputs.host, HostMemory) else HostMemory(0, UnknownHostTotal())
     available, total = host.available, host.total
-    recovery = next_recovery(inputs.recovery, inputs.pressure, now)
+    recovery = next_recovery(inputs.recovery, inputs.pressure, now, policy)
     pressure = pressure_with_recovery(recovery, inputs.pressure, now)
-    head = head_priority([row for _, row in ordered], available, total, memory, now, limits=limits)
+    head = head_priority([row for _, row in ordered], available, total, memory, now, policy, limits=limits)
     marks: tuple[HeadMark, ...] = ()
     if isinstance(head, HeadPriority) and "priority_since" not in head.waiter:
         marked = head.waiter.copy()
@@ -3414,7 +3556,7 @@ def admission_pass(inputs: QueueInputs, now: float, limits: AdmissionLimits) -> 
     totals = decide(available, total, 0, memory, pressure=pressure, limits=limits)
     admissions = admission_walk(available, total, [row for _, row in ordered], memory, head, pressure,
         recovery=recovery, now=now, room_used=head_room_used(list(inputs.reservations), memory, head),
-        override=override, limits=limits)
+        override=override, limits=limits, policy=policy)
     rows: list[PassRow] = []
     endings: tuple[PassResult, ...] = ()
     rank = 0
@@ -3423,16 +3565,16 @@ def admission_pass(inputs: QueueInputs, now: float, limits: AdmissionLimits) -> 
         if isinstance(inputs.host, ReadingUnavailable):
             decision = replace(decision, state="hold")
             reason: WaitReason = ReadingUnavailable()
-        elif estimate_expired(row, now):
+        elif estimate_expired(row, now, policy):
             reason = EstimateExpired(row.get("estimated_at", now))
         elif index == 0:
-            reason = head_wait_reason(decision, row["need"], available, row, now)
+            reason = head_wait_reason(decision, row["need"], available, row, now, policy)
         else:
             reason = queue_wait_reason(decision, row["need"], available, RecordedQueueIdentities())
         proposal: ProposedAdmission | NotAdmitted = NotAdmitted()
         if decision.state == "admit":
             rank += 1
-            admitted_recovery = (replace(recovery, next_start_at=now + RECOVERY_START_SECONDS)
+            admitted_recovery = (replace(recovery, next_start_at=now + policy.timing.recovery_start_seconds)
                                  if isinstance(recovery, RecoveryStarts) else recovery)
             admitted_override = (OverrideEnded(override, "admitted") if index == 0
                                  and not isinstance(override, NoHeadAdmissionOverride) else outcome)
@@ -3442,7 +3584,7 @@ def admission_pass(inputs: QueueInputs, now: float, limits: AdmissionLimits) -> 
         if owner in inputs.blockers_for:
             if decision.state == "hold" and not isinstance(inputs.host, ReadingUnavailable):
                 if not endings:
-                    endings = tuple(admission_pass(inputs_after_steps_end(inputs, frozenset((ended,))), now, limits)
+                    endings = tuple(admission_pass(inputs_after_steps_end(inputs, frozenset((ended,))), now, limits, policy)
                                     for ended in range(len(inputs.running)))
                 blocker = blocking_index(owner, endings)
             else:
@@ -3510,14 +3652,15 @@ def blocker_snapshot(waiter_path: Path) -> Blocker:
     directory = waiter_path.parent
     proc = Path(os.environ.get("BUILDLOG_PROC", "/proc"))
     processes = process_table(proc)
-    inputs = gather_queue_inputs(directory, processes, time.time())
+    policy = read_memory_config().policy
+    inputs = gather_queue_inputs(directory, processes, time.time(), policy=policy)
     matching = [row for path, row in inputs.ordered if path == waiter_path]
     if not matching:
         if not waiter_path.exists():
             raise WaiterGone(f"waiter file is gone: {waiter_path}")
         return NoSingleBlocker()
     owner = waiter_owner(matching[0])
-    result = admission_pass(replace(inputs, blockers_for=frozenset((owner,))), inputs.now, _queue_limits(inputs))
+    result = admission_pass(replace(inputs, blockers_for=frozenset((owner,))), inputs.now, _queue_limits(inputs), policy)
     row = next((row for row in result.rows if row.owner == owner), None)
     return (blocker_identity(row.blocker, list(inputs.reservations), processes, proc)
             if row is not None else NoSingleBlocker())
@@ -3547,10 +3690,11 @@ READING_NOT_TAKEN = ReadingNotTaken()
 
 def gather_queue_inputs(directory: Path, processes: dict[int, ProcessIdentity], now: float,
                         memory: Mapping[Path, StepMemory] = NO_MEMORY_READINGS, *,
-                        readings: QueueSnapshotReadings | ReadingNotTaken = READING_NOT_TAKEN) -> QueueInputs:
+                        readings: QueueSnapshotReadings | ReadingNotTaken = READING_NOT_TAKEN,
+                        policy: AdmissionPolicy) -> QueueInputs:
     """Resolve every file, process and environment input before the pure decision walk."""
     if isinstance(readings, ReadingNotTaken):
-        readings = QueueSnapshotReadings(ProcessesNotRead(), {})
+        readings = QueueSnapshotReadings(ProcessesNotRead(), {}, policy=policy)
     proc = Path(os.environ.get("BUILDLOG_PROC", "/proc"))
     identities = QueueIdentityReader(processes, proc)
     running: list[RunningStep] = []
@@ -3559,7 +3703,7 @@ def gather_queue_inputs(directory: Path, processes: dict[int, ProcessIdentity], 
         reservation = cast(Reservation, cast(object, row))
         pid = reservation["pid"]
         reading = memory[path] if path in memory else reservation_memory(
-            path, reservation, datetime.fromtimestamp(now, UTC), processes, proc)
+            path, reservation, datetime.fromtimestamp(now, UTC), processes, proc, policy)
         if isinstance(reading, GoneMemory):
             continue
         identity = identities.identity(pid, row)
@@ -3586,7 +3730,7 @@ def gather_queue_inputs(directory: Path, processes: dict[int, ProcessIdentity], 
         readings.recovery = recovery
     pressure = readings.pressure
     if isinstance(pressure, ReadingNotTaken):
-        pressure = read_pressure(host if isinstance(host, HostMemory) else HostMemory(0, UnknownHostTotal()))
+        pressure = read_pressure(host if isinstance(host, HostMemory) else HostMemory(0, UnknownHostTotal()), policy=policy)
         readings.pressure = pressure
     rows = [(path, cast(Waiter, cast(object, row))) for path, row in queue_rows(directory, "waiting", processes)]
     for _, row in rows:
@@ -3615,7 +3759,7 @@ def decision_checks(decision: AdmissionDecision, need: int, available: int) -> t
             FreeCheck(available, need, decision.reserve, decision.promised, decision.threshold, decision.free_passes))
 
 
-def queue_read_from(inputs: QueueInputs, limits: AdmissionLimits) -> QueueRead:
+def queue_read_from(inputs: QueueInputs, limits: AdmissionLimits, policy: AdmissionPolicy) -> QueueRead:
     """Apply admission to resolved evidence, with no file, process or environment reads."""
     ordered = sorted(inputs.ordered, key=lambda item: waiter_order(item[1]))
     running, reservations, now = inputs.running, inputs.reservations, inputs.now
@@ -3624,7 +3768,7 @@ def queue_read_from(inputs: QueueInputs, limits: AdmissionLimits) -> QueueRead:
     unavailable = isinstance(inputs.host, ReadingUnavailable)
     host = inputs.host if isinstance(inputs.host, HostMemory) else HostMemory(0, UnknownHostTotal())
     available, total = host.available, host.total
-    result = admission_pass(inputs, now, limits)
+    result = admission_pass(inputs, now, limits, policy)
     recovery = result.recovery
     override = result.override.record if isinstance(result.override, OverrideKept) else NoHeadAdmissionOverride()
     pressure = result.totals.pressure
@@ -3662,8 +3806,8 @@ def queue_read_from(inputs: QueueInputs, limits: AdmissionLimits) -> QueueRead:
             has_priority = isinstance(head, HeadPriority)
             order: StrictUntil | BackfillUntil | WindowNotStarted = WindowNotStarted()
             if (has_priority and "priority_since" in row
-                    or not has_priority and now - row["since"] < HEAD_SECONDS):
-                window = head_window(row, now)
+                    or not has_priority and now - row["since"] < policy.timing.head_seconds):
+                window = head_window(row, now, policy)
                 if has_priority or isinstance(window, BackfillUntil):
                     order = window
             first = HeadExplanation(step, source, own,
@@ -3685,7 +3829,7 @@ def queue_read_from(inputs: QueueInputs, limits: AdmissionLimits) -> QueueRead:
                     min((item.waiter.need for item in line), default=0),
                     max((item.waiter.need for item in line), default=0),
                     min((item.waiter.since for item in line), default=now)),
-        inputs, limits, tuple(row for _, row in ordered), tuple(reservations), override, recovery, inputs.priority)
+        inputs, limits, tuple(row for _, row in ordered), tuple(reservations), override, recovery, inputs.priority, policy=policy)
     return QueueRead(view, explanation, ordered)
 
 
@@ -3694,12 +3838,16 @@ def _queue_limits(inputs: QueueInputs) -> AdmissionLimits:
     return resolve_admission_limits(inputs.host.total if isinstance(inputs.host, HostMemory) else UnknownHostTotal())
 
 
-def _queue_read_live(inputs: QueueInputs) -> QueueRead:
-    return queue_read_from(inputs, _queue_limits(inputs))
+def _queue_read_live(inputs: QueueInputs, config: MemoryConfig) -> QueueRead:
+    total = inputs.host.total if isinstance(inputs.host, HostMemory) else UnknownHostTotal()
+    return queue_read_from(inputs, resolve_admission_limits(total, config), config.policy)
 
 
 def read_queue_pass(directory: Path, processes: dict[int, ProcessIdentity], now: float) -> QueueRead:
-    return _queue_read_live(gather_queue_inputs(directory, processes, now))
+    config = memory_config()
+    inputs = gather_queue_inputs(directory, processes, now, policy=config.policy)
+    total = inputs.host.total if isinstance(inputs.host, HostMemory) else UnknownHostTotal()
+    return queue_read_from(inputs, resolve_admission_limits(total, config), config.policy)
 
 
 def read_queue(directory: Path, processes: dict[int, ProcessIdentity], now: float) -> tuple[QueueView, list[tuple[Path, Waiter]]]:
@@ -3711,6 +3859,7 @@ def read_queue(directory: Path, processes: dict[int, ProcessIdentity], now: floa
 class QueueSnapshot:
     written_at: float
     inputs: QueueInputs
+    policy: AdmissionPolicy
 
 
 @dataclass(frozen=True)
@@ -3730,8 +3879,8 @@ def snapshot_value(value: object) -> object:
     if is_dataclass(value) and not isinstance(value, type):
         return {"kind": type(value).__name__, **{field.name: snapshot_value(cast(object, getattr(value, field.name)))
                                                 for field in fields(value)}}
-    if isinstance(value, dict):
-        return {key: snapshot_value(item) for key, item in cast(dict[str, object], value).items()}
+    if isinstance(value, Mapping):
+        return {key: snapshot_value(item) for key, item in cast(Mapping[str, object], value).items()}
     if isinstance(value, frozenset):
         return [snapshot_value(item) for item in sorted(cast(frozenset[str], value))]
     if isinstance(value, (tuple, list)):
@@ -3780,7 +3929,7 @@ def parse_snapshot_value(value: object, schema: object) -> object:
                 raise ValueError("invalid snapshot tuple")
             parsed = [parse_snapshot_value(item, kind) for item, kind in zip(items, args, strict=True)]
         return parsed if origin is list else frozenset(parsed) if origin is frozenset else tuple(parsed)
-    if origin is dict:
+    if origin in (dict, Mapping):
         if not isinstance(value, dict):
             raise ValueError("invalid snapshot mapping")
         return {parse_snapshot_value(key, args[0]): parse_snapshot_value(item, args[1])
@@ -3802,9 +3951,10 @@ def parse_snapshot_value(value: object, schema: object) -> object:
                                                 for name, kind in annotations.items()})
 
 
-def write_queue_snapshot(directory: Path, inputs: QueueInputs) -> None:
+def write_queue_snapshot(directory: Path, inputs: QueueInputs, policy: AdmissionPolicy) -> None:
     """Publish a cache atomically under LOCK_EX; durability is deliberately unnecessary."""
-    encoded = json.dumps({"v": 3, "written_at": time.time(), "inputs": snapshot_value(inputs)},
+    encoded = json.dumps({"v": 4, "written_at": time.time(), "inputs": snapshot_value(inputs),
+                          "policy": snapshot_value(policy)},
                          separators=(",", ":"), ensure_ascii=False, allow_nan=False)
     temporary = directory / "queue.json.tmp"
     try:
@@ -3820,7 +3970,7 @@ def read_queue_snapshot(directory: Path) -> QueueSnapshot | NoQueueSnapshot:
         if not isinstance(raw, dict):
             return NoQueueSnapshot()
         envelope = cast(dict[str, object], raw)
-        if type(envelope.get("v")) is not int or envelope["v"] != 3:
+        if type(envelope.get("v")) is not int or envelope["v"] != 4:
             return NoQueueSnapshot()
         written_at = cast(float, parse_snapshot_value(envelope["written_at"], float))
         evidence = envelope["inputs"]
@@ -3832,20 +3982,23 @@ def read_queue_snapshot(directory: Path) -> QueueSnapshot | NoQueueSnapshot:
         inputs = cast(QueueInputs, parse_snapshot_value(fields, QueueInputs))
         if sum(not isinstance(step.measured, CompilerServiceMemory) for step in inputs.running) != len(inputs.reservations):
             return NoQueueSnapshot()
-        return QueueSnapshot(written_at, inputs)
+        policy = cast(AdmissionPolicy, parse_snapshot_value(envelope["policy"], AdmissionPolicy))
+        return QueueSnapshot(written_at, inputs, policy)
     except (OSError, ValueError, TypeError, KeyError, RecursionError, OverflowError):
         return NoQueueSnapshot()
 
 
 def queue_read() -> QueueRead | QueueBusy:
+    config = memory_config()
     snapshot = read_queue_snapshot(store.root() / "admission")
-    if isinstance(snapshot, QueueSnapshot) and 0 <= time.time() - snapshot.written_at <= SNAPSHOT_MAX_AGE_SECONDS:
-        return _queue_read_live(snapshot.inputs)
+    compatible = isinstance(snapshot, QueueSnapshot) and snapshot.policy == config.policy
+    if isinstance(snapshot, QueueSnapshot) and compatible and 0 <= time.time() - snapshot.written_at <= SNAPSHOT_MAX_AGE_SECONDS:
+        return _queue_read_live(snapshot.inputs, config)
     try:
         return locked_queue_read(timeout=QUEUE_READ_LOCK_SECONDS)
     except TimeoutError:
-        if isinstance(snapshot, QueueSnapshot):
-            return replace(_queue_read_live(snapshot.inputs), freshness=StaleReading(snapshot.written_at))
+        if isinstance(snapshot, QueueSnapshot) and compatible:
+            return replace(_queue_read_live(snapshot.inputs, config), freshness=StaleReading(snapshot.written_at))
         return QueueBusy()
 
 
@@ -3856,6 +4009,7 @@ class ProcessesNotRead:
 
 @dataclass
 class QueueSnapshotReadings:
+    policy: AdmissionPolicy = field(kw_only=True)
     processes: dict[int, ProcessIdentity] | ProcessesNotRead
     memory: dict[Path, StepMemory]
     host: HostMemory | ReadingUnavailable | ReadingNotTaken = ReadingNotTaken()
@@ -3867,12 +4021,15 @@ class QueueSnapshotReadings:
 
 @contextmanager
 def exclusive_queue(directory: Path, *,
+                    policy: AdmissionPolicy | ReadMemoryConfiguration = READ_MEMORY_CONFIGURATION,
                     readings: QueueSnapshotReadings | ReadingNotTaken = READING_NOT_TAKEN) -> Generator[QueueSnapshotReadings]:
     """Every exclusive exit publishes the resulting ledger, including exceptional exits."""
+    resolved_policy = (readings.policy if isinstance(readings, QueueSnapshotReadings) else
+                       read_memory_config().policy if isinstance(policy, ReadMemoryConfiguration) else policy)
     with (directory / "lock").open("a+") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         if isinstance(readings, ReadingNotTaken):
-            readings = QueueSnapshotReadings(ProcessesNotRead(), {})
+            readings = QueueSnapshotReadings(ProcessesNotRead(), {}, policy=resolved_policy)
         try:
             yield readings
         finally:
@@ -3880,7 +4037,7 @@ def exclusive_queue(directory: Path, *,
                 processes = (process_table(Path(os.environ.get("BUILDLOG_PROC", "/proc")))
                              if isinstance(readings.processes, ProcessesNotRead) else readings.processes)
                 write_queue_snapshot(directory, gather_queue_inputs(
-                    directory, processes, time.time(), readings.memory, readings=readings))
+                    directory, processes, time.time(), readings.memory, readings=readings, policy=readings.policy), readings.policy)
             except Exception:
                 # A cache failure cannot change admission or mask the section's exception.
                 pass
@@ -3937,7 +4094,7 @@ def head_after_steps_end(explanation: QueueExplanation, ended: tuple[int, ...]) 
     indices = frozenset(ended)
     released = [row for index, row in enumerate(explanation.running) if index in indices]
     inputs = inputs_after_steps_end(explanation.decided_from, indices)
-    row = admission_pass(inputs, explanation.now, explanation.limits).rows[0]
+    row = admission_pass(inputs, explanation.now, explanation.limits, explanation.policy).rows[0]
     if isinstance(row.reason, EstimateExpired):
         return row.reason
     decision = row.decision
@@ -4150,14 +4307,15 @@ def release(path: Path, status: int, root: Path | None = None) -> None:
 
 
 def update_reservation(path: Path, changes: dict[str, object], root: Path, *,
-                       readings: QueueSnapshotReadings | ReadingNotTaken = READING_NOT_TAKEN) -> None:
+                       readings: QueueSnapshotReadings | ReadingNotTaken = READING_NOT_TAKEN,
+                       policy: AdmissionPolicy | ReadMemoryConfiguration = READ_MEMORY_CONFIGURATION) -> None:
     """Apply fields to the current reservation under the lock, or skip an ended step."""
     if isinstance(readings, QueueSnapshotReadings):
         # Reuse this check's host samples; refresh ledger and process state after
         # reacquiring the lock, since another check may have changed them.
         readings = replace(readings, processes=ProcessesNotRead(), memory={},
                            recovery=READING_NOT_TAKEN, order=QUEUE_ORDER_NOT_RESOLVED)
-    with exclusive_queue(admission_dir(root), readings=readings):
+    with exclusive_queue(admission_dir(root), readings=readings, policy=policy):
         try:
             row = read_reservation(path)
         except (OSError, ValueError, TypeError):
@@ -4173,12 +4331,13 @@ def set_width(path: Path, width: int, root: Path | None = None) -> None:
         row = read_reservation(path)
     except (OSError, ValueError, TypeError):
         return
+    config = read_memory_config()
     changes: dict[str, object] = {"test_threads": width}
     if row["step"] == "nextest":
         row["test_threads"] = width
-        need = test_phase_need(row, store.host_name(), datetime.now(UTC), root)
+        need = test_phase_need(row, store.host_name(), datetime.now(UTC), root, config=config)
         changes["test_phase_need"] = test_phase_need_record(need)
-    update_reservation(path, changes, root)
+    update_reservation(path, changes, root, policy=config.policy)
 
 
 def _epoch(instant: str) -> float:
@@ -4238,7 +4397,7 @@ def run_action() -> None:
                     and (row["test_scope"] == "full"
                          or (row.get("package") == test_package(argv)
                              and row.get("filters") == list(test_filters(argv))))
-                    and 0 <= time.time() - row["estimated_at"] < HEAD_SECONDS):
+                    and 0 <= time.time() - row["estimated_at"] < read_memory_config().policy.timing.head_seconds):
                 key = row["repo_identity"]
                 repository: Repository = (RepositoryIdentity(key, row.get("repository_name", cached_repo), row.get("legacy_name", ""))
                                           if key else UnknownRepository())
@@ -4256,11 +4415,11 @@ def run_action() -> None:
     decision, peak, live = result.decision, result.peak, result.live
     summary = ", ".join(f"{row['repo']} {row['step']} in {row['worktree']}" for row in live)
     if isinstance(result.head_reason, HeadAdmissionStatus):
-        summary = f"{head_wait_text(result.head_reason, user_zone())}; {summary}".rstrip("; ")
+        summary = f"{head_wait_text(result.head_reason, user_zone(), result.policy)}; {summary}".rstrip("; ")
     elif isinstance(result.head_reason, BehindOlderFit):
         summary = f"{older_fit_text(result.head_reason)}; {summary}".rstrip("; ")
     elif isinstance(decision.pressure, MemoryPressure):
-        summary = f"{pressure_text(decision.pressure)}; {summary}".rstrip("; ")
+        summary = f"{pressure_text(decision.pressure, result.policy)}; {summary}".rstrip("; ")
     if diagnostics.getvalue():
         summary = "; ".join(filter(None, [summary, *diagnostics.getvalue().splitlines()]))
     reservation = result.reservation

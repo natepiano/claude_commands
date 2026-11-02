@@ -44,7 +44,7 @@ class FileOnlyLabelTests(unittest.TestCase):
 
     def test_a_known_session_resolves_without_loading_herdr(self) -> None:
         record: SessionRecord = {
-            "pid": 123, "sessionId": "queue-reader", "name": "queue-reader-test",
+            "pid": 123, "sessionId": "51e7edcb-739e-4f5c-a614-c06f4945a3dd", "name": "queue-reader-test",
             "messagingSocketPath": "", "updatedAt": 1, "tmux": "", "formerNames": [],
         }
         program = """
@@ -78,6 +78,6 @@ print(json.dumps({
         self.assertEqual(result.returncode, 0, result.stderr)
         observed = cast(dict[str, object], json.loads(result.stdout))
         self.assertEqual(observed["labels"], {
-            "queue-reader": {"session": "queue-reader-test", "showrunner": "—", "unit": "—"},
+            "51e7edcb-739e-4f5c-a614-c06f4945a3dd": {"session": "queue-reader-test", "showrunner": "—", "unit": "—"},
         })
         self.assertEqual(observed["herdr_modules"], [])

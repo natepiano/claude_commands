@@ -31,13 +31,12 @@ from __future__ import annotations
 import argparse
 from collections import deque
 from collections.abc import Generator, Sequence
-from contextlib import contextmanager, redirect_stderr
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import Enum, auto
 import fcntl
 import hashlib
-import io
 import json
 import os
 from pathlib import Path
@@ -70,6 +69,9 @@ from scripts.lib.user_zone import user_zone  # noqa: E402
 from scripts.lib.process_failure import failure_detail  # noqa: E402
 from scripts.lib import scratch  # noqa: E402
 from scripts.lint import memory_admit  # noqa: E402
+from scripts.build_queue.queue_place import (  # noqa: E402
+    QueuePlace, QueuePlaceRefused, defer_cleanup_signals, queue_place, suite_scope_prefix,
+)
 
 # Full-tree basedpyright peaked at 4065 MiB on 2026-10-30: its 4878 MiB reservation
 # leaves room for modules beside it under this cap.
@@ -279,16 +281,6 @@ class SharedCPUSlot:
                 self.returned = True
 
 
-@contextmanager
-def defer_cleanup_signals() -> Generator[None]:
-    """Keep ownership changes atomic with respect to runner cancellation."""
-    previous = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM, signal.SIGHUP, signal.SIGINT})
-    try:
-        yield
-    finally:
-        _ = signal.pthread_sigmask(signal.SIG_SETMASK, previous)
-
-
 @dataclass
 class SharedCPUPool:
     descriptor: int
@@ -335,105 +327,18 @@ def shared_cpu_pool() -> Generator[SharedCPUPool | NoSharedCPU]:
                 os.close(descriptor)
 
 
-def atomic_sample(path: Path, value: str) -> None:
-    temporary = path.with_name(path.name + ".tmp")
-    try:
-        _ = temporary.write_text(value)
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
-@dataclass
-class GateReservation:
-    path: Path
-    peak_bytes: int = 0
-    wave_at: float = 0.0
-    status: int = 1
-
-    def observe(self, peak_mib: float, current_mib: float) -> None:
-        peak = int(peak_mib * (1 << 20))
-        now = datetime.now(UTC).timestamp()
-        if peak > self.peak_bytes:
-            atomic_sample(self.path.with_suffix(".max"), f"{peak}\n")
-            self.peak_bytes = peak
-            atomic_sample(self.path.with_suffix(".wave"), f"{peak} {int(now)}\n")
-            self.wave_at = now
-        elif self.peak_bytes and current_mib * (1 << 20) >= self.peak_bytes / 2 and now - self.wave_at >= 60:
-            atomic_sample(self.path.with_suffix(".wave"), f"{self.peak_bytes} {int(now)}\n")
-            self.wave_at = now
-
-
-def gate_wait_reasons(result: memory_admit.CheckResult) -> tuple[str, ...]:
-    """Describe why admission holds, without treating changing samples as a new reason."""
-    decision = result.decision
-    if isinstance(decision.pressure, memory_admit.MemoryPressure):
-        if decision.pressure.next_start_at:
-            return ("memory pressure recovery",)
-        if decision.pressure.swap_used_percent > memory_admit.SWAP_USED_LIMIT:
-            return ("swap memory pressure",)
-        return ("memory pressure",)
-    if isinstance(result.head_reason, memory_admit.BehindOlderFit):
-        return (memory_admit.older_fit_text(result.head_reason),)
-    reasons: list[str] = []
-    if result.head_need:
-        reasons.append(f"queue head {result.head_label}")
-    if decision.charged + result.peak.bytes > decision.budget:
-        reasons.append("build memory budget")
-    if result.available < decision.threshold:
-        reasons.append("free memory")
-    return tuple(reasons) or ("admission refresh",)
-
-
 @contextmanager
-def gate_reservation(repo: Path, cap_mib: int, temporary: Path, hold: BuildHoldWait) -> Generator[GateReservation]:
-    root = memory_admit.store.root()
-    pid = os.getpid()
-    sidecar = temporary / "gate.scope"
-    _ = sidecar.write_text("")
-    profile: memory_admit.GateProfile | memory_admit.StepProfile = memory_admit.GateProfile(
-        str(Path.home() / ".claude"), str(repo.resolve()), cap_mib * (1 << 20),
-        memory_admit.NoGateHistory(cap_mib * (1 << 20)))
-    previous_need = 0
-    previous_reasons: tuple[str, ...] = ()
-    reported_at = 0.0
+def gate_reservation(repo: Path, cap_mib: int, temporary: Path, hold: BuildHoldWait) -> Generator[QueuePlace]:
+    if not temporary.is_dir():
+        raise GateRefused(f"gate temporary directory is missing: {temporary}")
+    cap = cap_mib * (1 << 20)
     try:
-        while True:
-            hold.wait_until_free()
-            diagnostics = io.StringIO()
-            try:
-                with redirect_stderr(diagnostics):
-                    result = memory_admit.check(
-                        Path(os.environ.get("BUILDLOG_MEMINFO", "/proc/meminfo")), pid, str(sidecar),
-                        ["merge-gate"], root=root, profile=profile)
-            except Exception as error:
-                lines = diagnostics.getvalue().splitlines()
-                raise GateRefused(lines[-1] if lines else str(error)) from error
-            profile = result.profile
-            if result.decision.state == "admit":
-                if not isinstance(result.reservation, memory_admit.Reserved):
-                    raise GateRefused("memory admission did not return a gate reservation")
-                reservation = GateReservation(result.reservation.path)
-                try:
-                    yield reservation
-                finally:
-                    memory_admit.release(reservation.path, reservation.status, root=root)
-                return
-            now = time.monotonic()
-            reasons = gate_wait_reasons(result)
-            if (result.peak.bytes != previous_need or reasons != previous_reasons or now - reported_at >= 60):
-                print(f"Gate memory wait: {result.peak.bytes / memory_admit.GIB:.3f} GiB needed; "
-                      + "; ".join(reasons), flush=True)
-                previous_need, previous_reasons, reported_at = result.peak.bytes, reasons, now
-            time.sleep(1.0)
-    finally:
-        memory_admit.cancel_waiter(pid, root=root)
-        # Also cover a stop after the checker publishes a reservation but before
-        # it returns it to this context. The sidecar identifies this gate alone.
-        for path, row in memory_admit.live_reservations(memory_admit.admission_dir(root)):
-            if row["pid"] == pid and row["sidecar"] == str(sidecar):
-                memory_admit.release(path, 1, root=root)
-        sidecar.unlink(missing_ok=True)
+        with queue_place("merge-gate", repo,
+                         sizing=memory_admit.HistoryPeakSizing(cap, memory_admit.FirstProgramPeak(cap), 0.0),
+                         before_check=hold.wait_until_free) as place:
+            yield place
+    except QueuePlaceRefused as error:
+        raise GateRefused(str(error)) from error
 
 
 @dataclass
@@ -705,35 +610,6 @@ def module_order(modules: Sequence[tuple[str, Path]], timings: dict[str, float],
     """`modules` in start order: modules with no recorded time first, then the slowest recorded first."""
     return sorted(modules, key=lambda item: (f"{item[0]}/{test_module_name(repo, *item)}" in timings,
                                              -timings.get(f"{item[0]}/{test_module_name(repo, *item)}", 0)))
-
-
-def in_builds_slice() -> bool:
-    try:
-        return "/builds.slice/" in Path("/proc/self/cgroup").read_text()
-    except OSError:
-        return False
-
-
-def suite_scope_prefix() -> list[str]:
-    if os.environ.get("BUILDLOG_SCOPE") == "0":
-        print("Module scope skipped: BUILDLOG_SCOPE=0", flush=True)
-        return []
-    if in_builds_slice():
-        print("Module scope skipped: gate already runs in builds.slice", flush=True)
-        return []
-    prefix = ["systemd-run", "--user", "--scope", "--quiet", "--collect",
-              "--expand-environment=no", "--slice=builds.slice", "--"]
-    try:
-        probe = subprocess.run([*prefix, "true"], stdin=subprocess.DEVNULL,
-                               capture_output=True, timeout=10, check=False)
-    except (OSError, subprocess.TimeoutExpired) as error:
-        print(f"Module scope skipped: probe failed ({error})", flush=True)
-        return []
-    if probe.returncode:
-        print(f"Module scope skipped: probe failed (exit {probe.returncode})", flush=True)
-        return []
-    print("Module scope: builds.slice", flush=True)
-    return prefix
 
 
 def start_gate_job(suite: str, path: Path, argv: Sequence[str], repo: Path,
@@ -1064,7 +940,7 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
                     sample = process_memory_mib({os.getpid(), *(job.process.pid for job in running)})
                     admission.observe(time.monotonic(), sample.get(os.getpid(), 0.0),
                                       {job.process.pid: sample.get(job.process.pid, 0.0) for job in running})
-                    reservation.observe(admission.peak_mib, admission.latest_mib)
+                    reservation.observe(int(admission.peak_mib * (1 << 20)), int(admission.latest_mib * (1 << 20)))
                     for job in running:
                         measured = sample.get(job.process.pid, 0.0)
                         job.peak_memory_mib = max(job.peak_memory_mib, measured)
@@ -1266,7 +1142,6 @@ def require_clean_promotion(repo: Path) -> None:
     result = command([sys.executable, "-c", PROMOTION_TRACKED_CHECK], repo)
     if result.returncode:
         raise GateRefused("promotion refused: " + failure_detail(result))
-
 
 
 @dataclass(frozen=True)

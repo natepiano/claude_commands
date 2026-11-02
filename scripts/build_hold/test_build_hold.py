@@ -482,8 +482,11 @@ class TargetCommandTests(PrivateReleaseBroadcastTest):
     ) -> tuple[int, str, str, list[list[str]]]:
         calls: list[list[str]] = []
         expected_script = SCRIPT.resolve().parent.parent / "mac_test/mac_test.py"
+        run = subprocess.run
 
         def command(argv: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+            if argv[:1] == ["git"]:
+                return run(argv, capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
             self.assertEqual(argv[:2], [sys.executable, str(expected_script)])
             self.assertTrue(options.get("capture_output"))
             self.assertTrue(options.get("text"))
@@ -519,7 +522,7 @@ class TargetCommandTests(PrivateReleaseBroadcastTest):
         status, output, errors, calls = self.run_with_mac_stand_in(
             ["hold", "--target", "mac", "--holder", "alice", "--for", "renderer checks"])
         self.assertEqual(status, 0, errors)
-        self.assertEqual(calls, [["block", "--holder", "alice", "--for", "renderer checks"]])
+        self.assertEqual(calls, [["block", "--holder", "alice", "--for", "renderer checks", "--target", "mac"]])
         self.assertEqual(output, "Mac stand-in result\n")
         self.assertEqual(errors, "Mac stand-in detail\n")
         self.assert_no_natedev_record()
@@ -530,7 +533,7 @@ class TargetCommandTests(PrivateReleaseBroadcastTest):
                 status, output, errors, calls = self.run_with_mac_stand_in(
                     ["release", "--target", "mac", "--holder", "alice"], exit_code=exit_code)
                 self.assertEqual(status, exit_code, errors)
-                self.assertEqual(calls, [["unblock", "--holder", "alice"]])
+                self.assertEqual(calls, [["unblock", "--holder", "alice", "--target", "mac"]])
                 self.assertEqual(output, "Mac stand-in result\n")
                 self.assertEqual(errors, "Mac stand-in detail\n")
                 self.assert_no_natedev_record()
@@ -539,7 +542,7 @@ class TargetCommandTests(PrivateReleaseBroadcastTest):
         status, output, errors, calls = self.run_with_mac_stand_in(
             ["hold", "--target", "mac", "--holder", "alice", "--for", "renderer checks"], exit_code=9)
         self.assertEqual(status, 9, errors)
-        self.assertEqual(calls, [["block", "--holder", "alice", "--for", "renderer checks"]])
+        self.assertEqual(calls, [["block", "--holder", "alice", "--for", "renderer checks", "--target", "mac"]])
         self.assertEqual(output, "Mac stand-in result\n")
         self.assertEqual(errors, "Mac stand-in detail\n")
         self.assert_no_natedev_record()
@@ -567,13 +570,13 @@ class TargetCommandTests(PrivateReleaseBroadcastTest):
                     status, _, errors, calls = self.run_with_mac_stand_in(
                         ["hold", "--target", "mac", "--for", "renderer checks"], check_block_holder=True)
                     self.assertEqual(status, 0, errors)
-                    self.assertEqual(calls, [["block", "--holder", "first-name", "--for", "renderer checks"]])
+                    self.assertEqual(calls, [["block", "--holder", "first-name", "--for", "renderer checks", "--target", "mac"]])
                     self.session("current-name", "first-name", "middle-name")
                     status, output, errors, calls = self.run_with_mac_stand_in(
                         ["release", "--target", "mac", *given], check_block_holder=True)
                     self.assertEqual(status, 0, errors)
-                    self.assertEqual(calls, [["unblock", "--holder", "current-name"],
-                                             ["unblock", "--holder", "first-name"]])
+                    self.assertEqual(calls, [["unblock", "--holder", "current-name", "--target", "mac"],
+                                             ["unblock", "--holder", "first-name", "--target", "mac"]])
                     self.assertEqual(output, "Mac stand-in result\n")
                     self.assertEqual(errors, "Mac stand-in detail\n")
                     self.assertFalse((self.scratch / "stand-in-block-holder").exists())
@@ -585,7 +588,7 @@ class TargetCommandTests(PrivateReleaseBroadcastTest):
                     status, output, errors, calls = self.run_with_mac_stand_in(
                         ["release", "--target", "mac", *given], check_block_holder=True)
                     self.assertEqual(status, 1)
-                    self.assertEqual(calls, [["unblock", "--holder", "current-name"]])
+                    self.assertEqual(calls, [["unblock", "--holder", "current-name", "--target", "mac"]])
                     self.assertEqual(output, "blocked by someone-else\n")
                     self.assertEqual(errors, "")
                     self.assertEqual((self.scratch / "stand-in-block-holder").read_text(), "someone-else")
@@ -640,8 +643,10 @@ class TargetCommandTests(PrivateReleaseBroadcastTest):
                     status, output, errors, calls = self.run_with_mac_stand_in(
                         [*arguments, "--target", "missing", "--holder", "alice"])
                     self.assertEqual(status, 2)
-                    self.assertEqual(output, f"unknown target missing; the target config cannot be read: {reason}\n")
-                    self.assertEqual(errors, "")
+                    history_fault = config in (missing, invalid_utf8)
+                    suffix = "; no usable committed file" if history_fault else ""
+                    self.assertEqual(output, f"unknown target missing; the target config cannot be read: {reason}{suffix}\n")
+                    self.assertEqual(errors, f"warning: {reason}\n" if history_fault else "")
                     holder_lookup.assert_not_called()
                     self.assertEqual(calls, [])
                     self.assert_no_natedev_record()

@@ -66,6 +66,13 @@ def _resume(session: str, client: herdr.Herdr, pane: herdr.TabSession, entry: pa
         resume_arguments(entry), herdr.NoOpeningPrompt(), START_TIMEOUT_MS, agent=title)
     if isinstance(launched, herdr.nix_env.Refused):
         raise herdr.HerdrFailure(launched.reason)
+    try:
+        identity = client.native_session(launched.pane, "claude", START_TIMEOUT_MS / 1000)
+        if identity != entry["session_id"]:
+            raise herdr.HerdrFailure(f"{entry['session_id']}: resumed registry identity differs: {identity}")
+    except (herdr.HerdrFailure, OSError):
+        client.close_tab_of(launched.pane)
+        raise
     # Ordering the tabs keeps each pane's id (herdr review, 2026-10-19).
     client.close_tab_of(pane.pane_id)
 
@@ -76,7 +83,8 @@ def restore(session: str, *, dry_run: bool) -> int:
     live = {item["sessionId"] for item in [*sessions.live_sessions(), *sessions.running_sessions()]}
     failures = 0
     for pane in client.tab_sessions():
-        entry = entries.get(pane.pane_id)
+        saved = entries.get(pane.pane_id)
+        entry = pane_record.resume_launch(saved) if saved is not None else None
         reason = skip_reason(pane, entry, live)
         if entry is None or reason:
             if reason:

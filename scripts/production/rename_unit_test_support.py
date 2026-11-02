@@ -25,7 +25,7 @@ from scripts.herdr import fake_herdr
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.production.cli_fixture import invoke_cli
 from scripts.production.rename_test_support import bind_staff_fixture
-from scripts.production.staff_test_support import StaffTestCase, unit_membership
+from scripts.production.staff_test_support import fixture_member, StaffTestCase, unit_membership
 from scripts.shutdown import stop_resume
 from scripts.production import staff
 from scripts.lib.atomic_file import write_text_atomic
@@ -366,7 +366,7 @@ class UnitRenameFixture(StaffTestCase):
             f"| names-unit | `{plan}` | `{worktree}` | demo-names |")
         self.write(self.doc, text)
         parent = next(row for row in staff.snapshot().find(kind="showrunner") if row.name == SLUG)
-        _ = staff.ensure("unit", name="names", parent=parent.id)
+        _ = fixture_member("unit", name="names", parent=parent.id)
         for directory in (self.checkout, worktree):
             self.write(directory / plan, "# Names\n\n> **Production:** demo (names-unit)\n"
                        + "> **Standing:** style_plan.py\n\nnames-unit history stays.\n")
@@ -394,7 +394,8 @@ class UnitRenameFixture(StaffTestCase):
         old = self.rust / "claude-demo-alpha"
         saved = fake_unit_host.stopped_record(self.home / ".claude", old,
             name=name, cwd=old / "sub", production=slug, unit=unit, doc=self.doc,
-            host_session=host_session, branch="demo-alpha", plan=old / "docs/plans/alpha.md", progress=progress)
+            host_session=host_session, branch="demo-alpha", plan=old / "docs/plans/alpha.md", progress=progress,
+            runtime_id=unit_membership(slug, unit).id)
         saved["codex_seats"] = [{"run_dir": str(self.root / "runs/r1"), "seat": "impl", "role": "impl",
                                  "thread_id": "thread-impl", "turn_live": True, "launcher_command": [
                                      "bash", "/scripts/direct/implement.sh", "--to", "impl", str(self.root / "runs/r1"),
@@ -413,11 +414,11 @@ class UnitRenameFixture(StaffTestCase):
 
     def record(self) -> dict[str, object]:
         directory = self.home / ".local/state/shutdown/owner@example.com/sessions"
-        return cast(dict[str, object], json.loads((directory / "sid-alpha.json").read_text()))
+        return cast(dict[str, object], json.loads((directory / "5ad615f2-4e04-5121-a102-9d6b2e2a6eb3.json").read_text()))
 
     def record_live_launch(self) -> None:
         pane_record.write("demo-alpha-unit", pane_record.PaneLaunch(
-            pane_id="w1:p1", session_id="sid-alpha", config_dir=str(self.home / ".claude4"),
+            pane_id="w1:p1", session_id="5ad615f2-4e04-5121-a102-9d6b2e2a6eb3", config_dir=str(self.home / ".claude4"),
             cwd=str(self.rust / "claude-demo-alpha"), name="alpha", model="sonnet",
             remote_control=True, environment={"SHOWRUNNER_UNIT": "demo", "SHOWRUNNER_UNIT_ID": "alpha-unit"},
             flags_read=True, ended=False, written_at="2026-10-30T22:00:00+00:00"))

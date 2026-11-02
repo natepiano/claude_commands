@@ -4385,6 +4385,31 @@ class NoRoleCount:
 
 
 @dataclass(frozen=True)
+class UnknownShellCount:
+    """The worker roster does not report shell activity."""
+
+
+@dataclass(frozen=True)
+class RoleSessionCounts:
+    """Distinct live members of one role, grouped by activity."""
+
+    busy: int
+    shell: int | UnknownShellCount
+    idle: int
+
+    @property
+    def total(self) -> int:
+        return self.busy + (self.shell if isinstance(self.shell, int) else 0) + self.idle
+
+
+class RoleSessionCountsDocument(TypedDict):
+    busy: int
+    shell: int | None
+    idle: int
+    total: int
+
+
+@dataclass(frozen=True)
 class StatusRow:
     """One account's values, shared by the table and JSON renderers."""
     label: str
@@ -4400,7 +4425,7 @@ class StatusRow:
     read_at: datetime | StatusUnavailable
     read_outcome: agent_accounts.UsageReadOutcome
     attempted_at: datetime | StatusUnavailable
-    role_counts: tuple[int | NoRoleCount, ...] = ()
+    role_counts: tuple[RoleSessionCounts | NoRoleCount, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -4418,7 +4443,7 @@ class StatusAccountDocument(TypedDict):
     label: str
     tool: Literal["claude", "codex"]
     roles: list[str]
-    role_counts: list[int | None]
+    role_counts: list[RoleSessionCountsDocument | None]
     weekly_left_percent: float | None
     resets_at: str | None
     credits: float | Literal["unlimited"] | None
@@ -4530,7 +4555,9 @@ def render_status_json(reading: StatusReading) -> str:
     accounts: list[StatusAccountDocument] = []
     for row in reading.rows:
         item = StatusAccountDocument(label=row.label, tool=row.tool, roles=list(row.roles),
-            role_counts=[count if isinstance(count, int) else None for count in
+            role_counts=[RoleSessionCountsDocument(busy=count.busy,
+                shell=count.shell if isinstance(count.shell, int) else None, idle=count.idle, total=count.total)
+                if isinstance(count, RoleSessionCounts) else None for count in
                 (row.role_counts or tuple(NoRoleCount() for _role in row.roles))],
             weekly_left_percent=None if isinstance(row.weekly_left_percent, (StatusUnavailable, WeeklyNotReadSince)) else row.weekly_left_percent,
             resets_at=None if isinstance(row.resets_at, StatusUnavailable) else row.resets_at.astimezone(timezone.utc).isoformat(),
@@ -5334,7 +5361,7 @@ def _count_role_sessions(rows: tuple[StatusRow, ...]) -> tuple[tuple[StatusRow, 
     from scripts.production import showrunners, session_staff, staff
 
     inputs = {sessions.sessions_dir(), pane_launch.record_directory(), showrunners.NOTIFIER_STATE_DIR}
-    counts: dict[tuple[Path, str], set[str]] = {}
+    counts: dict[tuple[Path, str], dict[str, str]] = {}
     launches: dict[str, pane_launch.PaneLaunch] = {}
     for path in pane_launch.record_directory().glob("*.json"):
         inputs.add(path)
@@ -5359,18 +5386,22 @@ def _count_role_sessions(rows: tuple[StatusRow, ...]) -> tuple[tuple[StatusRow, 
         inputs.add(path)
     for session in sessions.live_sessions():
         identity = session["sessionId"]
-        launch = launches.get(identity)
+        owner = membership.by_current_session(identity)
+        candidates = [launch for reference, launch in launches.items()
+                      if owner is not None and reference in (owner.id, owner.current_session)]
+        launch = max(candidates, key=lambda launch: launch["written_at"]) if candidates else launches.get(identity)
         role = "showrunners" if identity in runner_ids else ""
         if not role and launch is not None:
-            marks = launch["environment"]
-            unit, staff_id = marks.get("SHOWRUNNER_UNIT_ID", ""), marks.get("STAFF_ID", "")
-            if unit or staff_id:
-                try:
-                    member = session_staff.unit_match(session_staff.ObservedUnit(unit), membership, staff_id)
-                except (staff.StaffUnreadable, ValueError):
-                    continue
-                if isinstance(member, session_staff.MemberFound):
-                    role = "units"
+            unit = launch["environment"].get("SHOWRUNNER_UNIT_ID", "")
+            try:
+                # The live session id joins first; an older launch keeps its unit mark.
+                member = session_staff.unit_match(session_staff.ObservedUnit(unit), membership, identity)
+                if isinstance(member, session_staff.NoSuchMember) and unit:
+                    member = session_staff.unit_match(session_staff.ObservedUnit(unit), membership)
+            except (staff.StaffUnreadable, ValueError):
+                continue
+            if isinstance(member, session_staff.MemberFound):
+                role = "units"
         if not role:
             continue
         if launch is not None and launch.get("ended", False):
@@ -5385,16 +5416,25 @@ def _count_role_sessions(rows: tuple[StatusRow, ...]) -> tuple[tuple[StatusRow, 
             if not isinstance(setting, account.ConfiguredClaudeFolder):
                 continue
             directory = setting.path
-        counts.setdefault((directory, role), set()).add(identity)
+        counts.setdefault((directory, role), {})[identity] = session.get("status", "")
     from scripts.message.unit_labels import MeshWorker, listed_mesh_worker
 
     for run, name, entry, home in _worker_status_records(inputs):
         if home and listed_mesh_worker(cast(MeshWorker, cast(object, entry))):
-            counts.setdefault((Path(home), "workers"), set()).add(str(run / name))
+            counts.setdefault((Path(home), "workers"), {})[str(run / name)] = (
+                "busy" if entry.get("status") in ("running", "starting") else "idle")
     counted = tuple(replace(row, role_counts=tuple(
-        NoRoleCount() if role == "spare" else len(counts.get((Path(row.folder).expanduser(), role), set()))
+        NoRoleCount() if role == "spare" else _role_session_counts(
+            tuple(counts.get((Path(row.folder).expanduser(), role), {}).values()), row.tool)
         for role in row.roles)) for row in rows)
     return counted, tuple(str(path) for path in sorted(inputs))
+
+
+def _role_session_counts(states: tuple[str, ...], tool: Literal["claude", "codex"]) -> RoleSessionCounts:
+    """Treat unknown activity as idle without changing role membership."""
+    busy = states.count("busy")
+    shell = states.count("shell") if tool == "claude" else 0
+    return RoleSessionCounts(busy, shell if tool == "claude" else UnknownShellCount(), len(states) - busy - shell)
 
 
 def _worker_status_records(inputs: set[Path]) -> list[tuple[Path, str, dict[str, object], str]]:

@@ -300,7 +300,7 @@ instance_tick() {
     fi
   fi
 
-  socket=$(NOTIFIER_SESSIONS_DIR="$SESSIONS_DIR" "$PY" "$SESSIONS" socket "${conf[TARGET]}" 2>/dev/null)
+  socket=$(NOTIFIER_SESSIONS_DIR="$SESSIONS_DIR" "$PY" "$SESSIONS" member-socket "${conf[TARGET]}" 2>/dev/null)
   rc=$?
   if [[ -z $socket ]]; then
     # Exit 1 is no such live session. Any other failure is the lookup itself failing.

@@ -1,7 +1,7 @@
 """One private admission server, fake clock and fault boundary for service tests."""
 from __future__ import annotations
 
-from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lint.test_memory_admit import write_memory_config
 
 from collections import Counter
 from collections.abc import Callable, Generator
@@ -184,18 +184,19 @@ class PrivateReadings:
         self.counts["host"] += 1
         return gate.read_meminfo(self.root / "meminfo")
 
-    def pressure(self, host: gate.HostMemory) -> gate.Pressure:
+    def pressure(self, host: gate.HostMemory, policy: gate.AdmissionPolicy) -> gate.Pressure:
         self.counts["pressure"] += 1
-        return gate.read_pressure(host)
+        return gate.read_pressure(host, policy=policy)
 
     def compilers(self) -> list[gate.StepMemory]:
         self.counts["compilers"] += 1
         return gate.sccache_memory()
 
     def reservation(self, path: Path, row: gate.Reservation, now: datetime,
-                    processes: dict[int, gate.ProcessIdentity], proc: Path) -> gate.StepMemory:
+                    processes: dict[int, gate.ProcessIdentity], proc: Path,
+                    policy: gate.AdmissionPolicy) -> gate.StepMemory:
         self.counts[f"reservation:{row['pid']}"] += 1
-        return gate.reservation_memory(path, row, now, processes, proc)
+        return gate.reservation_memory(path, row, now, processes, proc, policy)
 
 
 class SocketPeer:
@@ -248,6 +249,7 @@ class AdmissionFixture(ExitStack):
             "BUILDLOG_BUILD_BUDGET_GIB": "21", "NOTIFY_SOCKET": "", "LISTEN_FDS": "",
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"), "USER_ZONE": "UTC"}
         self.enter_context(mock.patch.dict(os.environ, environment))
+        write_memory_config(self.root / "lint.conf")
         self.readings: PrivateReadings = PrivateReadings(self.root)
         try:
             self.server: ObservedAdmissionServer = self.new_server()
@@ -268,7 +270,7 @@ class AdmissionFixture(ExitStack):
         self.server = self.new_server()
 
     def configure(self, **seconds: float) -> None:
-        _ = write_config_fixture(self.root / "lint.conf", "".join(f"{name}={value}\n" for name, value in seconds.items()))
+        write_memory_config(self.root / "lint.conf", **{name: str(value) for name, value in seconds.items()})
 
     def scope_events(self) -> ScopeEvents:
         events = ScopeEvents(self.server.epoll)
@@ -342,7 +344,7 @@ class AdmissionFixture(ExitStack):
             capture_output=True, timeout=3, check=False)
         if probe.returncode:
             raise unittest.SkipTest("real transient scope needs a user systemd manager")
-        child: subprocess.Popen[bytes] = subprocess.Popen(["systemd-run", "--user", "--scope", "--quiet", f"--unit={unit}",
+        child: subprocess.Popen[bytes] = subprocess.Popen(["systemd-run", "--user", "--scope", "--quiet", "--expand-environment=no", f"--unit={unit}",
             "sh", "-c", "echo $$; sleep 300 & wait"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         def stop() -> None:
             _ = subprocess.run(["systemctl", "--user", "stop", unit], capture_output=True,

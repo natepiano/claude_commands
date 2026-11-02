@@ -30,7 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.astra import astra_work
 from scripts.agents import worker_lifecycle
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.production import worker_admission
+from scripts.production import staff, worker_admission
 
 ROOT = Path(__file__).resolve().parents[2]
 Role = Literal['designer', 'reviewer']
@@ -573,7 +573,7 @@ def _authorize(design: HeldDesign) -> HolderReach:
     reach = resolve_holder(design.holder)
     if isinstance(reach, HolderUnavailable):
         raise RoleRefused(reach.reason)
-    if os.environ.get('CLAUDE_CODE_SESSION_ID') != reach.session_id:
+    if staff.runtime_id() != reach.session_id:
         raise RoleRefused('only the current holder may dispatch or change this design')
     return reach
 
@@ -691,11 +691,11 @@ def _mesh_context_fields(design: HeldDesign, reach: HolderReach) -> dict[str, ob
 
 
 def launch_thread(design: HeldDesign, role: Role, prompt: Path, model: str, effort: str, *,
-                  admitted: worker_admission.WorkerAdmitted) -> str:
+                  admitted: worker_admission.WorkerStartAllowed) -> str:
     """Start the reserved thread and keep its creation claim if the result is uncertain."""
     mesh = mesh_directory(design.placement.design_id)
     mesh.mkdir(parents=True, exist_ok=True)
-    name = admitted.row.name
+    name = admitted.name
     if name != _instance(design, role).name:
         raise RoleRefused("staff admission names another worker")
     policy = access_policy(design, role)
@@ -793,7 +793,7 @@ def open_role(repository: str, document: str, role: Role, holder: Holder, area: 
     model, effort = resolve_model(role)
     prompt, _ = _prompt(design, role, '')
     admitted = worker_admission.admit(
-        instance.name, mesh_directory(design_id), production=holder.production_slug,
+        instance.name, mesh_directory(design_id), role="astra-" + role, production=holder.production_slug,
         unit=holder.unit_name if isinstance(holder, UnitHolder) else '')
     with _lock(directory):
         current = read_design(design_id)
@@ -1503,7 +1503,7 @@ def end_holder(production: str, unit: str) -> None:
     for design in _read_designs(lambda fields: _held_by(fields, holder), refuse_matching_damage=True):
         if design.holder == holder:
             reach = resolve_holder(ShowrunnerHolder(production))
-            if not isinstance(reach, HolderReach) or reach.session_id != os.environ.get('CLAUDE_CODE_SESSION_ID'):
+            if not isinstance(reach, HolderReach) or reach.session_id != staff.runtime_id():
                 raise RoleRefused('only the production showrunner may retire held roles')
             for instance in design.roles:
                 if not isinstance(instance.lifecycle, (RoleNotOpened, RoleEnded)):

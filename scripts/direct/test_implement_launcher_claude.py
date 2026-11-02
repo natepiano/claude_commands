@@ -63,8 +63,14 @@ class ImplementLauncherWorkerTests(ClaudeLauncherFixture):
         result = self.claude_launch(run, "sonnet:low")
         self.assertEqual(result.returncode, 0, result.stderr)
         rows = cast(list[dict[str, object]], json.loads((self.root / "staff-at-process.json").read_text()))
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["parent"], self.environment()["STAFF_ID"])
+        self.assertEqual(rows, [])
+        at_work = cast(list[dict[str, object]], json.loads((self.root / "staff-at-work.json").read_text()))
+        workers = [row for row in at_work if row["kind"] == "worker"]
+        self.assertEqual(len(workers), 1)
+        self.assertEqual(workers[0]["parent"], self.environment()["CODEX_THREAD_ID"])
+        identity = cast(dict[str, object], json.loads((run / "impl_worker_impl.json").read_text()))
+        self.assertEqual(workers[0]["id"], identity["worker_id"])
+        self.assertEqual((self.root / "opening-message.txt").read_bytes(), self.prompt_file.read_bytes())
 
 
 if __name__ == "__main__":

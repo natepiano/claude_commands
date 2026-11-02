@@ -1,8 +1,14 @@
 ---
-description: Hold natedev or the Mac for your work, check quiet, show holds, or release them. Args - `hold <why> [eta HH:MM] [target mac]`, `quiet`, `status`, or `release [target mac]`.
+description: Hold natedev or a configured SSH target. Args - `hold <why> [eta HH:MM] [target <name>]`, `quiet`, `status`, or `release [target <name>]`.
 ---
 
-`$ARGUMENTS` is `hold <why> [eta HH:MM in the IANA zone you state times in] [target mac]`, `quiet`, `status`, or `release [target mac]`. The default target is natedev.
+`$ARGUMENTS` is `hold <why> [eta HH:MM] [target <name>]`, `quiet`, `status`, or `release [target <name>]`.
+The default target is natedev. Use the IANA zone for the stated ETA.
+
+For a configured SSH target, use `build_hold.py hold --for '<why>' --target <name>`.
+Release it with `build_hold.py release --target <name>`. The CLI also accepts the trailing form `target <name>`.
+SSH targets refuse `--keep`, `--release-eta`, `--zone` and `release --resume`.
+Holds affect only the selected target. Do not send a natedev hold notice for an SSH target.
 
 1. On `hold`, run `python3 ~/.claude/scripts/build_hold/build_hold.py hold --for '<why>'`. Your session id owns the hold. Add `--keep <pid>` for each run that must continue; repeated holds add to this list, with each PID checked against its start time. The sole holder, kept runs and their children, the user’s own terminal or desktop runs, and shared sccache work may continue. Every other test and build stops at once with the holder and reason, including work already running. Its session gets one release notice; run stopped work again then. `verify.sh` itself continues so eligible tests can go to the Mac; its natedev test children must obey the hold. No run is paused: paused cargo keeps steve slots and cargo locks while wall-clock limits keep running. Pass `--release-eta HH:MM --zone <IANA zone>` only for a measured time later today. Send the printed notice with `/notify_top_level --here`; showrunners forward it. `No release after 2 h: ask me` is an escalation. For `target mac`, add `--target mac`; it runs `mac_test.py block`. Do not send the natedev notice for a Mac block. Mac refuses `--keep`, `--release-eta` and `--zone`.
 2. Before a held natedev test, run `python3 ~/.claude/scripts/build_hold/build_hold.py quiet`. It waits up to 10 minutes for remaining builds, including every user's `cargo`, `rustc` and `cargo-nextest` processes to end. Load does not delay it; success prints the 1-minute load and five heaviest processes by current CPU over about one second as the baseline. Run it in the background or under Monitor, never in a sleep loop. Exit 1 lists build counts by user: let those builds end, then retry. CI runners are not asked to stop. For the Mac, wait for the block's free message if its answer says work is still running; see `/build:mac`.
