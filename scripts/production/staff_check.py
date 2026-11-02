@@ -15,7 +15,7 @@ import sys
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.production import staff, staff_sources, unit_lookup, showrunners
-from scripts.production import production_units, worker_admission
+from scripts.production import production_units
 from scripts.lib import unit_runs
 from scripts.message import process_table
 from scripts.shutdown import remote
@@ -39,6 +39,7 @@ class CheckEvidence:
     sessions: tuple[LiveStaffSession, ...]
     workers: staff_sources.WorkerEvidence
     uncertainties: tuple[str, ...] = ()
+    notes: tuple[str, ...] = ()
 
 
 def _codex_thread_host(arguments: list[str]) -> bool:
@@ -63,6 +64,7 @@ def read_evidence(record: staff.StaffSnapshot) -> CheckEvidence:
     records = {entry.record["pid"]: entry.record for entry in registry.entries}
     observed: list[LiveStaffSession] = []
     uncertainties: list[str] = []
+    notes: list[str] = []
     for process in sorted(table.values(), key=lambda entry: entry.pid):
         try:
             arguments = shlex.split(process.arguments)
@@ -95,6 +97,9 @@ def read_evidence(record: staff.StaffSnapshot) -> CheckEvidence:
         else:
             key = "codex:" + environment.get("CODEX_THREAD_ID", f"pid:{process.pid}")
         if not identity:
+            if reason := staff_sources.codex_non_staff_reason(record, sources, environment):
+                notes.append(f"staff sources: Codex process {process.pid}: {reason}")
+                continue
             uncertainties.append(f"pid {process.pid} uncertain: Codex runtime identity is unavailable")
             continue
         observed.append(LiveStaffSession(process.pid, key, staff.StaffId(identity),
@@ -117,7 +122,9 @@ def read_evidence(record: staff.StaffSnapshot) -> CheckEvidence:
     for root in unit_runs.run_roots(os.environ.get("ROSTER_RUN_ROOT")):
         for run in sorted(root.glob("*")):
             try:
-                pending = worker_admission.pending_publications(run)
+                publications = staff_sources.pending_publication_evidence(run)
+                uncertainties.extend(f"{run} uncertain: {message}" for message in publications.diagnostics)
+                pending = publications.workers
                 if not pending:
                     continue
                 from scripts.agents import codex_mesh
@@ -129,7 +136,7 @@ def read_evidence(record: staff.StaffSnapshot) -> CheckEvidence:
             except (OSError, ValueError, staff.StaffRefused) as error:
                 uncertainties.append(f"{run} uncertain: {error}")
     workers = staff_sources.observe_workers(record, sources)
-    return CheckEvidence(sources, tuple(observed), workers, tuple(uncertainties))
+    return CheckEvidence(sources, tuple(observed), workers, tuple(uncertainties), tuple(notes))
 
 
 def wrong_rows(record: staff.StaffSnapshot, evidence: CheckEvidence) -> list[str]:
@@ -252,6 +259,8 @@ def wrong_rows(record: staff.StaffSnapshot, evidence: CheckEvidence) -> list[str
         row = record.by_current_session(identity)
         wrong(row.id if row is not None else identity, row.name if row is not None else "session", reason)
     for message in evidence.workers.diagnostics:
+        if message.endswith("; not staff"):
+            continue
         wrong("?", "sources", "uncertain: " + message)
     return [f"{identity} {name}: {'; '.join(reasons)}" for (identity, name), reasons in sorted(problems.items())]
 
@@ -267,6 +276,9 @@ def main() -> int:
     except (OSError, ValueError, KeyError, herdr.HerdrFailure, subprocess.SubprocessError) as error:
         print("staff check: cannot read source: " + str(error).replace("\n", " "))
         return 2
+    notes = {*evidence.notes, *(message for message in evidence.workers.diagnostics if message.endswith("; not staff"))}
+    for note in sorted(notes):
+        print("note: " + note.replace("\n", " ").replace("\r", " "))
     for line in lines:
         print(line.replace("\n", " ").replace("\r", " "))
     print(f"checked {len(record.rows)} rows; {len(lines)} wrong")
