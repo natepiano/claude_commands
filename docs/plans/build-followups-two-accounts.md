@@ -3105,19 +3105,8 @@ User 2026-11-02 (via the Mac session): "the accounts board should show the count
 
 **As-built:** each status pass in `scripts/accounts/accounts.py` publishes this machine's per-account busy, shell, idle and total counts to `~/.local/state/accounts/session_counts.json` (`_publish_session_counts`), keyed by the machine alias. `_start_session_counts_fetch` starts a detached fetch of the other machine's file under a nonblocking lock, through `role_map.ssh_role_map(..., machine=)`, into `peer_session_counts.json`; the board read never waits on ssh. `_machine_role_counts` sums both machines into each count column and keeps them apart in the JSON field `role_counts_by_machine`. A missing, damaged, failed or older-than-ten-minutes copy adds one problem line, `<machine> unavailable: counts are <this machine> only`, and the board shows local counts. Legacy `~/.codex` sessions count, and numbered Codex homes count under `codex_home_label()`. The unit-board hook and types read the new field. Three findings closed in two repair rounds (F001 machine alias; F002 legacy `~/.codex` counts; F003 numbered-home label).
 
-### Phase 101v — Status reads stay read-only and test runs start no ssh  · status: done
+### Phase 101v — Status reads stay read-only and test runs start no ssh  · status: done · cc347b39
 
-natedev 2026-11-02 (urgent): main is red from 101u (069010236). `test_role_map` and `test_refusal_watch` fail: 4 failures, 1 error. Causes: `status --stored` now writes `session_counts.json`, writes a lock and starts the detached ssh fetch, against its documented rule (no ssh, no cache write). Every status pass writes `session_counts.json`. Test modules other than `test_accounts.py` start a real detached fetch.
+natedev 2026-11-02 (urgent): main was red from 101u (069010236): `test_role_map` and `test_refusal_watch`, 4 failures and 1 error.
 
-**Goal:** status writes nothing and `--stored` starts no process; tests start no real fetch.
-**Spec:**
-1. Status computes local counts and does not write `session_counts.json`. `session-counts-read` prints the document from live counts; remove the file and `_session_counts_file` if nothing else reads it.
-2. With `--stored`, `_machine_role_counts` reads only `peer_session_counts.json` (age limit unchanged) and starts no fetch; no lock file.
-3. `test_role_map.py` and `test_refusal_watch.py` stub `_start_session_counts_fetch` for the whole module, as `test_accounts.py` does. Keep the failing assertions as they are.
-4. docs/accounts.md: correct the publish sentence and say `--stored` starts no counts fetch.
-**Files:**
-- scripts/accounts/accounts.py
-- scripts/accounts/test_accounts.py
-- scripts/accounts/test_role_map.py
-- scripts/accounts/test_refusal_watch.py
-- docs/accounts.md
+**As-built:** `_count_role_sessions` counts in memory and writes no file; `_session_counts_document` (was `_publish_session_counts`) builds the document that `session-counts-read` prints, and `_session_counts_file` is gone. `_machine_role_counts` takes the status `UsageSource` and starts the detached fetch only for `RefreshStaleUsage`, so `status --stored` reads only `peer_session_counts.json` and opens no lock. `test_role_map.py`, `test_refusal_watch.py` and `test_cutover_home.py` stub `_start_session_counts_fetch` for the whole module. New test `test_stored_status_starts_no_counts_fetch_and_writes_nothing`. 3251 tests in the accounts modules and their importers pass. No code review ran (urgent red-main repair; the director read the diff).
