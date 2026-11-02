@@ -222,7 +222,7 @@ class RestartSupportTests(ShutdownTestCase):
 
 
     def test_session_count_text_names_one_and_many_sessions(self) -> None:
-        self.assertEqual(settle.stopped_sessions_text(1), "One session")
+        self.assertEqual(settle.stopped_sessions_text(1), "1 session")
         self.assertEqual(settle.stopped_sessions_text(14), "14 sessions")
 
 
@@ -330,7 +330,7 @@ class RestartSupportTests(ShutdownTestCase):
                                             "account": '"claude2"', "command": command})
             retry = pushes["shutdown.restart_failed"]
             self.assertEqual((retry.values["stopped"], retry.values["cause"]),
-                             ("One session (Broken owner)", "window failed to open"))
+                             ("1 session (Broken owner)", "window failed to open"))
             self.assertNotIn("Untrusted owner", retry.message)
 
 
@@ -393,7 +393,7 @@ class RestartSupportTests(ShutdownTestCase):
                     self.assertEqual(current.get("restore_alerted"), settle.not_back_text(failed))
 
 
-    def test_automatic_restart_sends_all_split_pushes_and_marks_every_named_failure(self) -> None:
+    def test_automatic_restart_sends_one_push_and_marks_every_failure(self) -> None:
         batches = [[f"Owner{index}-" + "x" * suffix_length for index in range(6)]
                    for suffix_length in (80, 40)]
         batches.append(["Short owner", "Oversize-" + "x" * 201, "Another owner"])
@@ -410,27 +410,11 @@ class RestartSupportTests(ShutdownTestCase):
                       redirect_stdout(io.StringIO())):
                     settle.report_stop(records)
                     pushes = [cast(RenderedPush, call.args[0]) for call in alert.call_args_list]
-                    self.assertGreater(len(pushes), 1)
-                    for push in pushes:
-                        self.assertEqual(push.id, "shutdown.restart_failed")
-                        self.assertLessEqual(len(push.values["stopped"]), 400)
-                        self.assertLess(len(push.message), 500)
-                        self.assertLess(len(push.title), 45)
-                        self.assertTrue(any(name in push.message for name in names)
-                                        or "…" in push.values["stopped"])
-                    for name in names:
-                        if len(name) == 210:
-                            shortened, = [push for push in pushes if "…" in push.values["stopped"]]
-                            displayed = shortened.values["stopped"].removeprefix("One session (").removesuffix(")")
-                            self.assertTrue(displayed.endswith("…"))
-                            self.assertGreater(len(displayed), 1)
-                            self.assertTrue(name.startswith(displayed[:-1]))
-                            self.assertLess(len(displayed[:-1]), len(name))
-                            self.assertTrue(len(shortened.message) == 499
-                                            or len(shortened.values["stopped"]) == 400)
-                            self.assertFalse(any(other in shortened.message for other in names if other != name))
-                        else:
-                            self.assertEqual(sum(push.message.count(name) for push in pushes), 1)
+                    push, = pushes
+                    self.assertEqual(push.id, "shutdown.restart_failed")
+                    self.assertEqual(push.values["stopped"], f"{len(names)} sessions")
+                    self.assertLess(len(push.message), 500)
+                    self.assertLess(len(push.title), 45)
                     for saved in records:
                         current = shutdown_record.find_session(LOGIN, saved["session"]["session_id"])
                         assert current is not None
@@ -455,9 +439,9 @@ class RestartSupportTests(ShutdownTestCase):
         push = cast(RenderedPush, alert.call_args.args[0])
         self.assertEqual(push.id, "shutdown.manual_restart")
         self.assertNotIn("private resume command", push.body)
-        self.assertIn('send: "Resume the stopped Claude session named Owner on natedev from its shutdown record."', cast(ActionRequired, push.action).text)
+        self.assertIn('send: "Resume the stopped Claude sessions on natedev from their shutdown records."', cast(ActionRequired, push.action).text)
         self.assertIn("on the natedev computer", cast(ActionRequired, push.action).text)
-        self.assertIn("Its terminal cannot restart on its own", push.body)
+        self.assertIn("1 session on natedev cannot restart without help", push.body)
         self.assertIn("manual restart", cast(str, sender.call_args.args[2]))
 
 

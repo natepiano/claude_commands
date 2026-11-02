@@ -50,18 +50,18 @@ ENTRIES = (
             "request": "edit send.py"})),
         purpose="A session waits for you to answer its permission prompt.",
         session=SessionTemplate("{unit}")),
-    PushText("shutdown.restart_failed", "shutdown", "decision", "Claude coding work is still stopped",
+    PushText("shutdown.restart_failed", "shutdown", "decision", "Claude coding work remains stopped",
         ActionTemplate('In the Claude session named natedev on the natedev computer, run /shutdown restart {account}.'),
-        "After your restart request, Claude coding work for account {account} is still stopped on {machine}. "
-        + "{stopped} did not restart, so that work stays paused.\n\n"
-        + "The restart gave this error: {cause}\n\n"
-        + "The command above retries the restart on natedev and the Mac.",
-        (PushExample("typical", {"account": 'claude2', "machine": "natedev", "stopped": "One session (organon-unit)",
+        "After your restart request, {stopped} on Claude account {account} did not restart on {machine}. "
+        + "Coding work stays stopped until the restart succeeds.\n\n"
+        + "The restart gave this error: {cause}.\n\n"
+        + "The command retries only stopped sessions. Running sessions keep their work.",
+        (PushExample("typical", {"account": 'claude2', "machine": "natedev", "stopped": "5 sessions",
              "cause": "window failed to open"}),
-         PushExample("one_long_name", {"account": '"claude-team-build-followups-12"', "machine": "Mac",
-             "stopped": "One session (build-followups-two-accounts-unit-director)",
+         PushExample("one_long_name", {"account": 'claude3', "machine": "Mac",
+             "stopped": "1 session",
              "cause": "restart prompt not submitted"})),
-        purpose="A restart did not start all stopped sessions again."),
+        purpose="One restart problem sends one push with the failed session count."),
     # A retry of an untrusted folder fails the same way, so this push never asks for one first.
     # The command is accounts.trust_command for the folder and the session's account.
     PushText("shutdown.restart_untrusted", "shutdown", "decision", "Stopped Claude work needs your folder trust",
@@ -107,12 +107,12 @@ ENTRIES = (
          PushExample("long_account", {"account": '"claude-team-build-followups-12"', "machine": "natedev"})),
         purpose="A restart ended, but its result could not be confirmed."),
     PushText("shutdown.manual_restart", "shutdown", "decision", "Stopped Claude coding work needs you",
-        ActionTemplate('In the Claude session named natedev on the natedev computer, send: "Resume the stopped Claude session named {session} on {machine} from its shutdown record."'),
-        "A Claude coding session on {machine} stopped during your shutdown. Its work is paused. "
-        + "Its terminal cannot restart on its own. Its shutdown record holds the command to resume it.",
-        (PushExample("typical", {"machine": "natedev", "session": "Owner"}),
-         PushExample("long_session", {"machine": "Mac", "session": "build-followups-message-clarity-unit-director-session-12"})),
-        purpose="A session stopped in a shutdown cannot restart on its own."),
+        ActionTemplate('In the Claude session named natedev on the natedev computer, send: "Resume the stopped Claude sessions on {machine} from their shutdown records."'),
+        "After your shutdown, {stopped} on {machine} cannot restart without help. "
+        + "Coding work stays stopped. The shutdown records hold the commands to resume the stopped sessions.",
+        (PushExample("typical", {"machine": "natedev", "stopped": "3 sessions"}),
+         PushExample("one_session", {"machine": "Mac", "stopped": "1 session"})),
+        purpose="Stopped Claude sessions need their saved commands to resume."),
     PushText("quota.claude_next_move", "quota_alert", "note", "Claude work on {account} may stop",
         ActionTemplate("In the natedev session, type /account_moves and the move you want, for example: when units reach 1% switch to claude2."),
         "{account} has {remaining} of its weekly usage left, and no move is set up for the units or showrunners on it. When it runs out, they move to a Claude account with room, or stop if none has any.",

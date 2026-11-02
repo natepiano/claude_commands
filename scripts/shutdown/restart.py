@@ -3183,9 +3183,9 @@ def _not_back_records(login: str, ids: tuple[str, ...]) -> list[SessionShutdown]
 
 
 def _pushed_not_back(login: str, ids: tuple[str, ...]) -> set[str]:
-    """Names of this machine's sessions whose unchanged not-back state was already pushed."""
+    """Return names whose current outage already sent a push."""
     return {saved["session"]["name"] for saved in _not_back_records(login, ids)
-            if saved.get("restore_alerted") == restart_support.not_back_text(saved)}
+            if saved.get("restore_alerted")}
 
 
 def _mark_pushed_not_back(login: str, ids: tuple[str, ...], names: set[str]) -> None:
@@ -3209,55 +3209,32 @@ def restart_cause(reason: str) -> str:
     return line if len(line) <= RESTART_CAUSE_LIMIT else line[:RESTART_CAUSE_LIMIT - 1] + "…"
 
 
-@dataclass(frozen=True)
-class SessionOutagePush:
-    push: RenderedPush
-    sessions: tuple[str, ...]
-
-
 def restart_push(label: str, failures: Sequence[FailedSessionRestart], *, machine: str) -> tuple[RenderedPush, ...]:
     """Render known failed sessions or the unconfirmed machine when names are unavailable."""
     if not failures:
         return (render("shutdown.restart_incomplete", account=json.dumps(label), machine=machine),)
-    return tuple(batch.push for batch in restart_outage_pushes(label, failures, machine=machine))
+    return restart_outage_pushes(label, failures, machine=machine)
 
 
-def restart_outage_pushes(label: str, failures: Sequence[FailedSessionRestart], *, machine: str) -> list[SessionOutagePush]:
-    """Keep each split push with the exact sessions it covers, including shortened names."""
-    by_cause: dict[str, list[str]] = {}
-    for item in failures:
-        by_cause.setdefault(restart_cause(item.reason), []).append(item.name)
-    return [batch for cause, names in by_cause.items()
-            for batch in _cause_pushes(label, cause, names, machine=machine)]
+def restart_outage_pushes(label: str, failures: Sequence[FailedSessionRestart], *, machine: str) -> tuple[RenderedPush, ...]:
+    """Render one push for the failures in this restart problem."""
+    if not failures:
+        return ()
+    stopped = restart_support.stopped_sessions_text(len(failures))
+    cause = "not all sessions restarted"
+    if len(failures) == 1:
+        item = failures[0]
+        cause = restart_cause(item.reason)
 
+        def named_push(name: str) -> RenderedPush:
+            return render("shutdown.restart_failed", account=json.dumps(label),
+                          stopped=f"{stopped} ({name})", machine=machine, cause=cause)
 
-def _cause_pushes(label: str, cause: str, names: list[str], *, machine: str) -> list[SessionOutagePush]:
-    """Split one cause's sessions across pushes that each fit the phone limits."""
-    def named_push(group: list[str]) -> RenderedPush:
-        stopped = restart_support.stopped_sessions_text(len(group)) + " (" + ", ".join(group) + ")"
-        return render("shutdown.restart_failed", account=json.dumps(label), stopped=stopped, machine=machine,
-                      cause=cause)
-
-    def fits(push: RenderedPush) -> bool:
-        return len(push.values["stopped"]) <= 400 and len(push.message) < 500 and len(push.title) < 45
-
-    pushes: list[SessionOutagePush] = []
-    group: list[str] = []
-    for name in names:
-        candidate = named_push([*group, name])
-        if group and not fits(candidate):
-            pushes.append(SessionOutagePush(named_push(group), tuple(group)))
-            group = []
-            candidate = named_push([name])
-        if not fits(candidate):
-            excess = max(len(candidate.values["stopped"]) - 400, len(candidate.message) - 499)
-            shortened = name[:max(0, len(name) - excess - 1)] + "…"
-            pushes.append(SessionOutagePush(named_push([shortened]), (name,)))
-            continue
-        group.append(name)
-    if group:
-        pushes.append(SessionOutagePush(named_push(group), tuple(group)))
-    return pushes
+        push = _session_shortened_to_fit(named_push, item.name)
+    else:
+        push = render("shutdown.restart_failed", account=json.dumps(label), stopped=stopped,
+                      machine=machine, cause=cause)
+    return (push,)
 
 
 def untrusted_push(label: str, item: FailedSessionRestart, *, machine: str) -> RenderedPush:
@@ -3290,38 +3267,33 @@ def _session_shortened_to_fit(named_push: Callable[[str], RenderedPush], name: s
 def send_failure_pushes(
     label: str, failures: Sequence[FailedSessionRestart], *, machine: str,
     identities: dict[str, str], moved: dict[str, SessionShutdown],
-    send: Callable[[RenderedPush], bool],
+    send: Callable[[RenderedPush], bool], manual: frozenset[str],
 ) -> set[str]:
-    """Claim only one push at a time, and render only the sessions it owns."""
+    """Claim failed sessions and send one push for each required fix."""
     sent: set[str] = set()
-    retried: list[FailedSessionRestart] = []
-    for item in failures:
-        move = moved.get(item.name)
-        if not item.trust_command and move is None:
-            retried.append(item)
-            continue
-        identity = identities.get(item.name, "")
-        with outage_alerts.reserve((identity,) if identity else ()) as claims:
-            if not claims:
-                continue
+    with outage_alerts.reserve(identities[item.name] for item in failures if item.name in identities) as claims:
+        held = [item for item in failures if identities.get(item.name, "") in claims]
+
+        def deliver(push: RenderedPush, items: Sequence[FailedSessionRestart]) -> None:
+            if send(push):
+                for item in items:
+                    outage_alerts.delivered(claims[identities[item.name]])
+                    sent.add(item.name)
+
+        for item in held:
             if item.trust_command:
+                move = moved.get(item.name)
                 push = (move_untrusted_push(move, item, machine=machine) if move is not None
                         else untrusted_push(label, item, machine=machine))
-            elif move is not None:
-                push = move_failed_push(move)
-            else:
-                continue
-            if send(push):
-                outage_alerts.delivered(claims[identity])
-                sent.add(item.name)
-    for candidate in restart_outage_pushes(label, retried, machine=machine):
-        with outage_alerts.reserve(identities[name] for name in candidate.sessions if name in identities) as claims:
-            held = [item for item in retried if item.name in candidate.sessions and identities.get(item.name, "") in claims]
-            for batch in restart_outage_pushes(label, held, machine=machine):
-                if send(batch.push):
-                    for name in batch.sessions:
-                        outage_alerts.delivered(claims[identities[name]])
-                        sent.add(name)
+                deliver(push, [item])
+        manual_failures = [item for item in held if not item.trust_command and item.name in manual]
+        if manual_failures:
+            deliver(render("shutdown.manual_restart", machine=machine,
+                           stopped=restart_support.stopped_sessions_text(len(manual_failures))), manual_failures)
+        retryable = [item for item in held if not item.trust_command and item.name not in manual]
+        if retryable:
+            for push in restart_outage_pushes(label, retryable, machine=machine):
+                deliver(push, retryable)
     return sent
 
 
@@ -3345,18 +3317,13 @@ def _notify_local_restart(login: str, result: MachineRestartResult, ids: tuple[s
     failed = [item for item in result.failed_sessions if item.name not in pushed and item.name not in running]
     manual = [item.name for item in result.manual_sessions if item.name not in pushed]
     moved = {saved["session"]["name"]: saved for saved in observed if saved.get("target")}
-    sent = send_failure_pushes(result.label, failed, machine=result.machine, identities=identities,
-                               moved=moved, send=restart_support.alert_user)
-    for name in manual:
-        identity = identities.get(name, "")
-        with outage_alerts.reserve((identity,) if identity else ()) as claims:
-            if claims and restart_support.alert_user(render("shutdown.manual_restart", session=name, machine=result.machine)):
-                outage_alerts.delivered(claims[identity])
-                sent.add(name)
+    failures = [*failed, *(FailedSessionRestart(name, "manual restart required") for name in manual)]
+    sent = send_failure_pushes(result.label, failures, machine=result.machine, identities=identities,
+                               moved=moved, send=restart_support.alert_user, manual=frozenset(manual))
     _mark_pushed_not_back(login, ids, sent)
     unknown = any(item.name not in identities for item in failed) or any(name not in identities for name in manual)
-    if unreached or unknown or (result.status == "partial" and not result.failed_sessions
-                               and not result.manual_sessions and not result.timers_not_started):
+    if not sent and (unreached or unknown or (result.status == "partial" and not result.failed_sessions
+                                            and not result.manual_sessions and not result.timers_not_started)):
         machines = ([result.machine] if unknown or (result.status == "partial" and not failed and not manual) else [])
         if unreached:
             machines.append(unreached)

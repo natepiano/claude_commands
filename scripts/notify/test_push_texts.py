@@ -143,15 +143,32 @@ class PushTextTests(unittest.TestCase):
                 self.assertEqual(result.stdout, "")
                 self.assertEqual(result.stderr, f"gpu_xid: unknown Xid code: {shown}\n")
 
-    def test_failed_restart_catalog_examples_show_named_sessions(self) -> None:
+    def test_failed_restart_catalog_examples_show_the_count_and_one_command(self) -> None:
         entry = next(entry for entry in push_texts.catalog() if entry.id == "shutdown.restart_failed")
         self.assertEqual({example.name for example in entry.examples}, {"typical", "one_long_name"})
         for example in entry.examples:
             with self.subTest(example=example.name):
                 push = push_texts.render_entry(entry, example.values)
                 stopped = push.values["stopped"]
-                self.assertRegex(stopped, r"\([^()]+\)")
+                self.assertRegex(stopped, r"^(?:1 session|[1-9][0-9]* sessions)")
                 self.assertIn(stopped, push.message)
+                self.assertIn("Coding work stays stopped until the restart succeeds.", push.body)
+                self.assertEqual(cast(ActionRequired, push.action).text.count("/shutdown restart"), 1)
+                self.assertIn("natedev", cast(ActionRequired, push.action).text)
+                self.assertLess(len(push.message), 500)
+        self.assertEqual(entry.examples[0].values["stopped"], "5 sessions")
+
+    def test_manual_restart_catalog_groups_sessions_by_machine(self) -> None:
+        entry = next(entry for entry in push_texts.catalog() if entry.id == "shutdown.manual_restart")
+        self.assertEqual({example.values["stopped"] for example in entry.examples}, {"1 session", "3 sessions"})
+        for example in entry.examples:
+            with self.subTest(example=example.name):
+                push = push_texts.render_entry(entry, example.values)
+                self.assertIn(example.values["stopped"], push.body)
+                self.assertIn(f'Resume the stopped Claude sessions on {example.values["machine"]} from their shutdown records.',
+                              cast(ActionRequired, push.action).text)
+                self.assertNotIn("/shutdown restart", push.message)
+                self.assertLess(len(push.message), 500)
 
     def test_every_catalog_example_keeps_email_addresses_out_of_pushes(self) -> None:
         for entry in push_texts.catalog():

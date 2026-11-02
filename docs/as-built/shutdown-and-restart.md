@@ -45,3 +45,12 @@ checks identity and idle state before input. Tests use disposable state and
 fake host commands.
 
 `herdr-upkeep` runs `scripts/maintenance/herdr_upkeep.py`. It saves the running shared session’s layout and refreshes detection rules. `config/herdr_upkeep.toml` supplies its interval and process deadline at each invocation. A successful run saves its completion time; a not-due rerun changes nothing. The worker and its descendants are killed at the configured deadline, and a failed run stays due. Inventory no longer runs a desktop updater or reads the deleted `agent sessions.md`; production identity comes from `staff.json`. No reboot is part of the removal proof.
+
+A restart problem sends one phone push per kind of fix.
+Retryable failures share one count push with a retry command and its machine.
+Different retryable causes and long session names do not create more pushes.
+Each untrusted folder keeps its own trust push because the command differs per folder.
+Manual failures share one count push per machine. Its action requests a resume from the shutdown records.
+The same failed sessions, a subset, or a changed failure reason sends no second push.
+A confirmed recovery clears the outage claims. A later failure can send a new push.
+Failed push delivery releases the claims for a retry.
