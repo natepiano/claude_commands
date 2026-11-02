@@ -3074,3 +3074,9 @@ User 2026-11-01: the role count of 68 workers counted idle workers too; asked fo
 natedev showrunner 2026-11-01 (C35, cef58b5c): prove each started-hold form that `next list` prints.
 
 **As-built:** `test_started_fixed_expired_and_no_pace_holds_list_exact_rows_without_state_changes` runs the real `next list` path on scratch state for a fixed hold with time left, a fixed hold that is over, and the 40-minute default with no pace history. Each case asserts the full line and unchanged hold state. The half-point line with a pace stays in `test_started_hold_row_is_shared_by_list_add_hold_reply_and_the_mac`. Tests only.
+
+### Phase 101q — /theme never blocks a promotion  · status: done
+
+natedev showrunner 2026-11-02: the user ran /theme at 09:06 EST; Claude Code wrote `theme` into live `~/.claude/settings.json`, and merge_gate refused every promotion because the tracked file differed from HEAD.
+
+**As-built:** `theme` joins the per-machine keys in `scripts/settings/settings_local_keys.sh` (with `model`, `effortLevel`, `modelSettings`, `extraKnownMarketplaces`). The clean filter strips it, the sidecar keeps it, and the smudge restores it. The committed `settings.json` has no `theme`. `test_settings_local_keys.py` fixtures give each machine a different theme and still clean to one blob.

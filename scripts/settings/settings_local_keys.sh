@@ -11,7 +11,8 @@
 # file is repo-relative and falls under .gitignore's catch-all.
 
 # extraKnownMarketplaces names folders on one machine (natedev's nate-local plugins).
-SETTINGS_LOCAL_KEYS_JSON='["model","effortLevel","modelSettings","extraKnownMarketplaces"]'
+# theme is what /theme picks on each machine.
+SETTINGS_LOCAL_KEYS_JSON='["model","effortLevel","modelSettings","extraKnownMarketplaces","theme"]'
 SETTINGS_LOCAL_KEYS_SIDECAR="settings.local-keys.json"
 
 # Hook groups that belong to one machine, matched by a substring of any of
