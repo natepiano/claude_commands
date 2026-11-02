@@ -10,12 +10,15 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from typing import cast
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS / "production"))
 
-import showrunners
+from scripts.production import showrunners
+from scripts.lib.git_exclude import ensure_excluded
 import showrunner_tree
 from add_showrunner import NoEndingTab, herdr_tab_open
 import herdr
@@ -307,13 +310,9 @@ def _pilot_steps(steps: tuple[str, ...], pilot: AllStyleUnits | PilotUnits, slug
 
 
 def _exclude(style: StyleProduction) -> None:
-    path = Path(_git(style.repository, "rev-parse", "--path-format=absolute", "--git-path", "info/exclude"))
-    previous = path.read_text() if path.exists() else ""
     patterns = ("/docs/style-production/", f"/docs/{style.doc.name}", f"/{style.log.as_posix()}")
-    missing = [pattern for pattern in patterns if pattern not in previous.splitlines()]
-    if missing:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        write_text_atomic(path, previous + ("\n" if previous and not previous.endswith("\n") else "") + "\n".join(missing) + "\n")
+    for pattern in patterns:
+        ensure_excluded(style.repository, pattern)
 
 
 def _run_script(script: Path, *arguments: str) -> None:

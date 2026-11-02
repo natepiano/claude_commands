@@ -16,16 +16,19 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from typing import cast, override
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 from scripts.lib.socket_test_support import short_socket_directory
 import broadcast
 import codex_winddown
 import fake_unit_host
 import fake_showrunner
-import showrunners
+from scripts.production import showrunners, staff
+from scripts.production.staff_test_support import fixture_member, fixture_runtime_id
 import roster
 from process_table import Process
 from sessions import SessionRecord
-from showrunners import Showrunner
+from scripts.production.showrunners import Showrunner
 
 SCRIPT = Path(__file__).with_name("codex_winddown.py")
 MESH = "/run/current-system/sw/bin/python3 /home/u/.claude/scripts/direct/../agents/codex_mesh.py"
@@ -47,6 +50,20 @@ class NoticeRetryTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(codex_winddown, "STATE", self.state))
         _ = self.enterContext(mock.patch.object(codex_winddown, "instances", return_value=["production"]))
         _ = self.enterContext(mock.patch.object(broadcast, "SEND", self.state / "fake-send.py"))
+
+    def test_status_reports_partial_discovery_after_rendering_healthy_work(self) -> None:
+        runner = Showrunner(session="healthy", socket="/fixture.sock", slug="healthy", zone="UTC", doc="fixture.md")
+        partial = showrunners.ShowrunnerDiscovery([runner], (
+            showrunners.ShowrunnerLookupFailure("missing", "fixture lookup failed"),))
+        output = io.StringIO()
+        with (mock.patch.object(showrunners, "registered_showrunners", return_value=partial),
+              mock.patch.object(codex_winddown, "current_counts", return_value={"healthy-unit": 1}),
+              mock.patch.object(codex_winddown, "live_unit_names", return_value=["healthy-unit"]) as units,
+              mock.patch.object(codex_winddown, "read_projections", return_value={}),
+              redirect_stdout(output)):
+            self.assertEqual(codex_winddown.main(["status"]), 1)
+        units.assert_called_once_with(runner)
+        self.assertIn("healthy-unit", output.getvalue())
 
     def test_quiet_claim_is_retried_after_a_stop_before_delivery(self) -> None:
         class Killed(BaseException):
@@ -332,7 +349,7 @@ class CountTests(unittest.TestCase):
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         with (
             mock.patch.dict(os.environ, {"HOME": str(root)}, clear=True),
-            mock.patch.object(showrunners, "registered_showrunners", return_value=[]),
+            mock.patch.object(showrunners, "registered_showrunners", return_value=showrunners.ShowrunnerDiscovery()),
             mock.patch.object(codex_winddown, "clock", return_value="fixture time"),
             mock.patch.object(broadcast, "broadcast", return_value=[]) as send_groups,
             mock.patch.object(broadcast, "report", return_value=True) as report,
@@ -371,7 +388,7 @@ class CountTests(unittest.TestCase):
             mock.patch.object(roster, "machine_name", return_value="fixture"),
             mock.patch.object(roster.remote, "other_machine", return_value="mac"),
             mock.patch.object(broadcast, "SEND", root / "record-send.py"),
-            mock.patch.object(showrunners, "registered_showrunners", return_value=[]),
+            mock.patch.object(showrunners, "registered_showrunners", return_value=showrunners.ShowrunnerDiscovery()),
             mock.patch.object(codex_winddown, "clock", return_value="fixture time"),
             mock.patch.object(subprocess, "run", new=run), redirect_stdout(output),
         ):
@@ -424,7 +441,7 @@ class CountTests(unittest.TestCase):
             mock.patch.object(codex_winddown, "STATE", state),
             mock.patch.object(codex_winddown, "announce", return_value=True),
             mock.patch.object(codex_winddown, "live_sessions", return_value=[newer, older, unnamed]),
-            mock.patch.object(showrunners, "registered_showrunners", return_value=[runner]),
+            mock.patch.object(showrunners, "registered_showrunners", return_value=showrunners.ShowrunnerDiscovery([runner])),
             mock.patch.object(codex_winddown, "start_count", return_value=True) as start_count,
             mock.patch.object(
                 broadcast,
@@ -522,7 +539,7 @@ class MessageTests(unittest.TestCase):
         _ = other.write_text("\n".join(("## Units", "| Unit | Plan | Worktree | Branch | Port | Owns |",
                                         "| --- | --- | --- | --- | --- | --- |")), encoding="utf-8")
         # A showrunner is recorded by its update timer; the one of `zz-gone` has no running session.
-        _ = fake_showrunner.write_timer(self.root / "notifier", "show", "id-hana", "America/Los_Angeles", doc)
+        _ = fake_showrunner.write_timer(self.root / "notifier", "show", "b861068b-66ee-573d-b3be-ec6d4a321e71", "America/Los_Angeles", doc)
         _ = fake_showrunner.write_timer(self.root / "notifier", "zz-gone", "id-gone", "America/Los_Angeles", other)
         socket_dir = Path(self.enterContext(short_socket_directory()))
         for name, pid in (("hana", os.getpid()), ("trunk", os.getppid())):
@@ -530,7 +547,8 @@ class MessageTests(unittest.TestCase):
             self.addCleanup(listener.close)
             listener.bind(str(socket_dir / f"{name}.sock"))
             _ = (self.root / f"sessions/{pid}.json").write_text(json.dumps({
-                "pid": pid, "sessionId": f"id-{name}", "name": name, "updatedAt": 1,
+                "pid": pid, "sessionId": fixture_runtime_id("showrunner::show") if name == "hana" else
+                    fixture_runtime_id("unit:" + fixture_runtime_id("showrunner::show") + ":trunk"), "name": name, "updatedAt": 1,
                 "tmux": "",
                 "messagingSocketPath": str(socket_dir / f"{name}.sock"),
             }), encoding="utf-8")
@@ -558,6 +576,12 @@ class MessageTests(unittest.TestCase):
             "UNIT_HISTORY_DIR": str(self.root / "history"),
         }
         self.environment.update(fake_unit_host.environment(self.root))
+        from scripts.production.staff_test_support import isolated_staff_file, unit_membership
+
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", self.environment))
+        runner = fixture_member("showrunner", name="show", runtime_id=fixture_runtime_id("showrunner::show"))
+        _ = unit_membership("show", "trunk-unit")
+        _ = staff.set_doc(runner.id, staff.LiveDoc("natedev", doc))
         fake_unit_host.write({**os.environ, **self.environment}, [
             fake_unit_host.HostedUnit("trunk", "w1:p1", {"SHOWRUNNER_UNIT": "show", "SHOWRUNNER_UNIT_ID": "trunk-unit"})])
         fake_unit_host.place_process(self.environment, os.getppid(), "w1:p1")
@@ -576,16 +600,18 @@ class MessageTests(unittest.TestCase):
         lines = done.stdout.splitlines()
         self.assertEqual(lines[-1], "hana: counting every 2 minutes")
         self.assertCountEqual(lines[:-1], [
-            "show · showrunner [session:id-hana] - sent",
-            "show · trunk · unit director [session:id-trunk] - sent",
+            "show · showrunner [session:b861068b-66ee-573d-b3be-ec6d4a321e71] - sent",
+            "show · trunk · unit director [session:379d7b65-4078-589d-aa5b-b7df1d7a2d37] - sent",
         ])
         log = (self.root / "log").read_text(encoding="utf-8")
         for session in ("hana", "trunk"):
-            self.assertIn(f"send --to session:id-{session} --from natedev --here --text Codex wind-down, from the user", log)
+            identity = (fixture_runtime_id("showrunner::show") if session == "hana" else
+                        fixture_runtime_id("unit:" + fixture_runtime_id("showrunner::show") + ":trunk"))
+            self.assertIn(f"send --to session:{identity} --from natedev --here --text Codex wind-down, from the user", log)
         self.assertEqual(log.count('a "Codex count" message arrives'), 1)
         self.assertEqual(log.count("You are encouraged to continue work on your own"), 1)
         self.assertEqual(log.count("Sent directly to showrunners and unit directors on fixture and mac; do not pass it on."), 2)
-        self.assertIn("notifier new codex-count-hana --every 2 --to session:id-hana", log)
+        self.assertIn("notifier new codex-count-hana --every 2 --to session:b861068b-66ee-573d-b3be-ec6d4a321e71", log)
         prompt = (self.root / "prompts/codex-count-hana.txt").read_text(encoding="utf-8")
         self.assertIn(f"{SCRIPT} count hana`", prompt)
 
@@ -596,14 +622,14 @@ class MessageTests(unittest.TestCase):
         lines = done.stdout.splitlines()
         self.assertEqual(lines[0], "hana: count stopped")
         self.assertCountEqual(lines[1:], [
-            "show · showrunner [session:id-hana] - sent",
-            "show · trunk · unit director [session:id-trunk] - sent",
+            "show · showrunner [session:b861068b-66ee-573d-b3be-ec6d4a321e71] - sent",
+            "show · trunk · unit director [session:379d7b65-4078-589d-aa5b-b7df1d7a2d37] - sent",
         ])
         # Only the showrunners' own update timers are left: every count is gone.
         self.assertEqual(sorted(path.name for path in (self.root / "notifier").iterdir()),
                          ["showrunner-show", "showrunner-zz-gone"])
         log = (self.root / "log").read_text(encoding="utf-8")
-        self.assertIn("send --to session:id-hana --from natedev --here --text All clear, from the user", log)
+        self.assertIn("send --to session:b861068b-66ee-573d-b3be-ec6d4a321e71 --from natedev --here --text All clear, from the user", log)
         self.assertIn("Start using Codex again", log)
 
     def test_triage_needs_a_wind_down_and_carries_the_users_words(self) -> None:
@@ -611,8 +637,8 @@ class MessageTests(unittest.TestCase):
         _ = self.run_script("start", "--from", "natedev")
         done = self.run_script("triage", "--from", "natedev")
         self.assertCountEqual(done.stdout.splitlines(), [
-            "show · showrunner [session:id-hana] - sent",
-            "show · trunk · unit director [session:id-trunk] - sent",
+            "show · showrunner [session:b861068b-66ee-573d-b3be-ec6d4a321e71] - sent",
+            "show · trunk · unit director [session:379d7b65-4078-589d-aa5b-b7df1d7a2d37] - sent",
         ])
         self.assertIn("which ones can be stopped now and added to a resume list",
                       (self.root / "log").read_text(encoding="utf-8"))

@@ -14,14 +14,22 @@ from zoneinfo import ZoneInfo
 from typing import TYPE_CHECKING, cast, final, override
 from unittest import mock
 
+
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 import change_review
 import footer_counts
 import next_item
 from production_units import Production
 import proposals_folder
-import showrunners
+from scripts.production import showrunners
 import showrunner_tree
 from scripts.production import staff
+from scripts.production.staff_test_support import (
+    fixture_member, isolated_source_readers, isolated_staff_file, source_environment, unit_membership,
+)
 from change_review import Visible
 from next_item import NextError, Queue
 
@@ -76,6 +84,10 @@ class NextItemTests(unittest.TestCase):
         folder = tempfile.TemporaryDirectory()
         self.addCleanup(folder.cleanup)
         self.root = Path(folder.name)
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, source_environment(self.root / "sources"))))
+        _ = self.enterContext(isolated_source_readers())
+        _ = fixture_member("showrunner", name="fixture")
         with contextlib.ExitStack() as stack:
             _ = cast(object, stack.enter_context(mock.patch.dict(
                 os.environ, {"NEXT_STATE_DIR": str(self.root / "next"), "NIGHTLY_REVIEW_NOTE": str(self.root / "note.md")})))
@@ -147,7 +159,41 @@ class NextItemTests(unittest.TestCase):
             self.assertEqual(run("show", "--kind", "question")[1], "question\ndemo: Newest question\n")
             self.assertEqual(run("show", "--kind", "question", "--order", "oldest")[1], "question\ndemo: Newest question\n")
 
+    def test_move_to_end_uses_the_given_key_instead_of_the_pinned_item(self) -> None:
+        queue = self.queues["change"]
+        urgency.pin(queue.name, "C2")
+        with self.patched():
+            self.assertEqual(next_item.move_to_end("change", PRODUCTION, key="C1"),
+                             "change: moved C1 to the end")
+            self.assertEqual([entry.key for entry in urgency.queue_order(queue.entries, queue.name)], ["C2", "C1"])
+            self.assertEqual(set(urgency.ended(queue.name)), {"C1"})
+            self.assertEqual(urgency.pinned(queue.name), "C2")
+
+    def test_move_to_end_refuses_a_key_outside_the_queue_without_moving_the_pin(self) -> None:
+        queue = self.queues["change"]
+        urgency.pin(queue.name, "C1")
+        with self.patched(), self.assertRaisesRegex(NextError, "C999"):
+            _ = next_item.move_to_end("change", PRODUCTION, key="C999")
+        self.assertEqual(urgency.pinned(queue.name), "C1")
+        self.assertEqual(urgency.ended(queue.name), {})
+
+    def test_prepared_changes_keep_the_queue_order_and_move_without_reading_the_lists_again(self) -> None:
+        prepared = change_review.ChangeQueue("change-demo", change_review.row_entries([
+            {"#": "C1", "Change": "First", "Merged": "2026-10-01"},
+            {"#": "C2", "Change": "Second", "Merged": "2026-10-02"},
+        ]))
+        with mock.patch.object(change_review, "change_queue", side_effect=AssertionError("list read")), \
+                mock.patch.object(next_item, "read_queue", side_effect=AssertionError("queue read")):
+            queue = next_item.change_queue(PRODUCTION, prepared=prepared)
+            self.assertEqual([entry.item for entry in queue.entries], [
+                "C1 First\n  How to check: \n  Merged: 2026-10-01", "C2 Second\n  How to check: \n  Merged: 2026-10-02"])
+            self.assertEqual(next_item.move_to_end("change", PRODUCTION, key="C1", prepared=prepared),
+                             "change: moved C1 to the end")
+        self.assertEqual([entry.key for entry in urgency.queue_order(queue.entries, queue.name)], ["C2", "C1"])
+
     def test_the_efficiency_and_change_lists_read_their_real_files(self) -> None:
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        _ = unit_membership("demo", "fixture-unit")
         _ = (self.root / "ledger.md").write_text(LEDGER, encoding="utf-8")
         doc = self.root / "docs" / "plans" / "demo-production.md"
         doc.parent.mkdir(parents=True)
@@ -187,6 +233,12 @@ class NextItemTests(unittest.TestCase):
             _ = (self.root / f"{slug}.md").write_text(f"- 2026-10-12 rust/{slug}: {slug}-item gain — proposed\n")
             _ = doc.write_text(f"# {slug}\n\n- **Efficiency ledger:** {self.root / f'{slug}.md'}\n"
                                + f"- **Proposals:** {issues_folder}\n")
+            parent_name = {"kid": "top", "grand": "kid"}.get(slug)
+            parent = next((row.id for row in staff.find(kind="showrunner") if row.name == parent_name), None)
+            owner = fixture_member("showrunner", name=slug, parent=parent, doc=staff.LiveDoc("natedev", doc))
+            timer = Path(os.environ["NOTIFIER_STATE_DIR"]) / f"showrunner-{slug}"
+            timer.mkdir(parents=True)
+            _ = (timer / "conf").write_text(f"TARGET=session:{owner.id}\nCHECK=zsh /x/production_check.sh {doc}\n")
             _ = (issues_folder / f"{slug}-item.md").write_text(
                 f"---\nstatus: open\ntags: [issue, proposal]\nproposed_by: {slug}\ndate_created: 2026-10-01\n---\n")
             _ = (outstanding / f"{slug}.json").write_text(f'[{{"since": "2026-10-06T09:00", "text": "{slug}-item"}}]')

@@ -2,34 +2,95 @@
 
 from __future__ import annotations
 
+from scripts.production.staff_test_support import fixture_member
+
 import json
+import os
 import subprocess
 import sys
 import unittest
 from pathlib import Path
 from typing import cast, final
-from scripts.production import staff
+from unittest import mock
+from scripts.astra import design_roles
+from scripts.astra.design_role_test_support import write_empty_binding_record
+from scripts.production import staff, unit_config
+from scripts.production.rename_rerun_test_support import final_files
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 
 
-from scripts.production.rename_unit_test_support import UnitRenameFixture, SCRIPT, SLUG, TEST_HANG_GUARD_SECS
+from scripts.production.rename_unit_test_support import UnitRenameFixture, SCRIPT, SLUG
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 @final
 class UnitRenameTests(UnitRenameFixture):
+    def test_worktree_rename_updates_a_removed_location_without_reactivating_its_row(self) -> None:
+        row = next(row for row in staff.find(kind="unit") if row.name == "alpha")
+        source, destination = self.rust / "claude-demo-alpha", self.rust / "claude-demo-gamma"
+        _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", source))
+        self.assert_ok(self.rename("apply"))
+        retained = staff.by_id(row.id)
+        assert retained is not None
+        self.assertEqual((retained.id, retained.name, retained.parent, retained.worktree),
+                         (row.id, "gamma", row.parent, staff.RemovedWorktree("natedev", destination)))
+        before = final_files(self.root)
+        self.assert_ok(self.rename("apply"))
+        self.assertEqual(final_files(self.root), before)
+
+    def test_a_retry_after_git_move_sets_the_new_staff_path_and_keeps_config_bytes_and_identity(self) -> None:
+        row = next(row for row in staff.find(kind="unit") if row.name == "alpha")
+        source = self.rust / "claude-demo-alpha"
+        destination = self.rust / "claude-demo-gamma"
+        _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", source))
+        config = unit_config.UnitConfig(unit_config.PlanFile(Path("docs/plans/alpha.md")),
+                                        unit_config.AppPort(8123), ("nightly",))
+        _ = unit_config.write(source, config)
+        data = (source / ".unit.toml").read_bytes()
+        with mock.patch.object(staff, "set_worktree", side_effect=OSError("stopped after folder move")):
+            interrupted = self.rename("apply")
+        self.assertNotEqual(interrupted.returncode, 0, interrupted.stdout + interrupted.stderr)
+        self.assertFalse(source.exists())
+        self.assertTrue(destination.is_dir())
+        retained = staff.by_id(row.id)
+        assert retained is not None
+        self.assertEqual(retained.worktree, staff.PresentWorktree("natedev", source))
+        self.assert_ok(self.rename("apply"))
+        renamed = staff.by_id(row.id)
+        assert renamed is not None
+        self.assertEqual((renamed.name, renamed.parent, renamed.worktree),
+                         ("gamma", row.parent, staff.PresentWorktree("natedev", destination)))
+        self.assertEqual((destination / ".unit.toml").read_bytes(), data)
+        self.assertEqual(self.git("check-ignore", ".unit.toml", cwd=destination), ".unit.toml")
+        before = final_files(self.root)
+        self.assert_ok(self.rename("apply"))
+        self.assertEqual(final_files(self.root), before)
+
+    def test_bad_unrelated_record_warns_once_across_move_and_verification(self) -> None:
+        with mock.patch.dict(os.environ, self.env):
+            bad = write_empty_binding_record(self.checkout, design_roles.UnitHolder('unrelated', 'other-unit'),
+                                             lifecycle=design_roles.RoleOpen('unrelated-thread'))
+        completed = self.rename('apply')
+        self.assert_ok(completed)
+        self.assertEqual(completed.stderr.splitlines(), [f'warning: {bad}: missing or invalid repository'])
+        self.assertTrue(bad.is_file())
+        verified = self.rename('verify')
+        self.assert_ok(verified)
+        self.assertEqual(verified.stderr.splitlines(), [f'warning: {bad}: missing or invalid repository'])
+
     def test_rename_unit_preserves_staff_and_worker_identity(self) -> None:
         row = next(row for row in staff.snapshot().find(kind="unit") if row.name == "alpha")
-        worker = staff.ensure("worker", name="impl1", parent=row.id)
+        worker = fixture_member("worker", name="impl1", parent=row.id)
         self.assert_ok(self.rename("apply"))
-        self.assertEqual(staff.snapshot().by_id(row.id), staff.StaffRow(row.id, "unit", "gamma", row.parent))
+        self.assertEqual(staff.snapshot().by_id(row.id), staff.StaffRow(row.id, "unit", "gamma", row.parent, current_session=row.id))
         self.assertEqual(staff.snapshot().by_id(worker.id), worker)
         self.assertEqual(self.journal()["staff_id"], row.id)
 
     def test_taken_staff_name_refuses_before_sources_change(self) -> None:
         row = staff.snapshot().find(kind="showrunner")[0]
-        _ = staff.ensure("unit", name="gamma", parent=row.id)
+        _ = fixture_member("unit", name="gamma", parent=row.id)
         before = self.snapshot()
         failed = self.rename("apply")
         self.assertEqual(failed.returncode, 2, failed.stderr)
@@ -38,7 +99,7 @@ class UnitRenameTests(UnitRenameFixture):
 
     def test_missing_staff_member_refuses_before_sources_change(self) -> None:
         row = next(row for row in staff.snapshot().find(kind="unit") if row.name == "alpha")
-        _ = staff.retire(row.id)
+        self.forget_rows(row.id)
         before = self.snapshot()
         failed = self.rename("apply")
         self.assertEqual(failed.returncode, 2, failed.stderr)
@@ -98,11 +159,6 @@ class UnitRenameTests(UnitRenameFixture):
         self.assertIn("alpha-unit history stays in prose.", plan)
         self.assertFalse(self.stall_path("alpha-unit").exists())
         self.assertTrue(self.stall_path("gamma-unit").exists())
-        pool = cast(dict[str, dict[str, dict[str, object]]],
-                    json.loads((self.root / "state/review-pool/demo/pool.json").read_text()))
-        self.assertEqual(pool["reviewers"]["r1"]["lease"], {"unit": "gamma-unit", "ordinal": 3})
-        self.assertEqual(pool["reviewers"]["r1"]["thread_id"], "thread-r1")
-        self.assertEqual(cast(dict[str, object], pool["reviewers"]["r2"]["lease"])["unit"], "mul_add-unit")
         started = cast(dict[str, object], json.loads((self.root / "history/runs/run-1.jsonl").read_text().splitlines()[0]))
         self.assertEqual((started["working_dir"], started["branch"], started["plan_doc"]),
                          (str(new), "demo-gamma", f"{new}/docs/plans/alpha.md"))

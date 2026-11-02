@@ -54,9 +54,6 @@ class RefusalTest(unittest.TestCase):
                         "herdr pane send --pane 3 '/exit'"):
             self.assertEqual(self.refused(command), guard.EXIT_REFUSAL, command)
 
-    def test_shutdown_now_is_refused(self) -> None:
-        self.assertEqual(self.refused('~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py now "claude 3" --only abc'),
-                         guard.NOW_REFUSAL)
 
     def test_killing_a_claude_process_is_refused(self) -> None:
         for command in ("kill 4242", "kill -TERM 4242", "kill -9 5151 4242", "pkill claude", "kill $(pgrep -f claude)"):
@@ -72,8 +69,8 @@ class RefusalTest(unittest.TestCase):
         for command in (MOVE,
                         "tmux send-keys -t merge-gate 'run the gate' Enter",
                         "kill 5151",
-                        "~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py down \"claude 3\" --why now",
-                        "~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py ready --where 'stopped now'",
+                        "~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py stop sid",
+                        "~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py resume sid --why 'continue now'",
                         "claude --resume abc",
                         "CLAUDE_CONFIG_DIR=~/.claude1 claude --version"):
             self.assertEqual(self.refused(command), "", command)

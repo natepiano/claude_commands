@@ -13,20 +13,26 @@ import sys
 import tempfile
 import time
 import unittest
-from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
 from typing import NamedTuple, cast, override
 from unittest.mock import MagicMock, patch
 
+from scripts.lib.signal_test_support import install_signal_pid_guard
 from scripts.agents import codex_mesh, mesh_runs
 from scripts.buildlog import treekey
 from scripts.astra import design_roles
 from scripts.lib.test_hang_guard import LauncherHangGuard
 from scripts.lib.socket_test_support import short_socket_directory
+from scripts.message.repeat_guard_test_support import install_guard_test_budget
 
 WORKER = "unit-impl"
 DEAD_PID = 2 ** 22 + 12345
+
+
+def setUpModule() -> None:
+    install_signal_pid_guard()
+    install_guard_test_budget()
 
 
 class DirectorNotice(NamedTuple):
@@ -48,7 +54,9 @@ class MeshRunsTests(unittest.TestCase):
         self.session = self.root / "unit" / "run-1"
         self.session.mkdir(parents=True)
         _ = self.stack.enter_context(patch.object(mesh_runs, "RUN_ROOTS", (self.root / "unit",)))
-        self.stack.enter_context(patch.dict(os.environ, {"REVIEW_POOL_STATE": str(self.root / "pool"),
+        self.stack.enter_context(patch.dict(os.environ, {
+                                                        "HOME": str(self.root),
+                                                        "XDG_STATE_HOME": str(self.root / "state"),
                                                         "DESIGN_ROLES_STATE": str(self.root / "astra/design-roles"),
                                                         "BUILDLOG_SCOPE": "0"}))
         self.sent = []
@@ -88,22 +96,12 @@ class MeshRunsTests(unittest.TestCase):
         self.assertIn("durable result", str(pending))
         self.assertEqual(self.sent, [])
 
-    def test_an_adopted_unit_reviewer_starts_detached_runs_without_opening_the_archive(self) -> None:
-        archive = self.root / "pool"
+    def test_an_adopted_unit_reviewer_starts_detached_runs_from_its_current_owner(self) -> None:
         _ = (self.session / codex_mesh.ROSTER_FILE).write_text(json.dumps({"unit-review": {
             "thread_id": "adopted-thread", "status": "running", "role": "review",
             "launcher_pid": os.getpid(), "unit_ledger": str(self.root / "unit-workers/ledger.json"),
         }}))
-        original_glob = Path.glob
-
-        def refuse_archive(path: Path, pattern: str, *, case_sensitive: bool | None = None,
-                           recurse_symlinks: bool = False) -> Iterator[Path]:
-            if path.is_relative_to(archive):
-                raise AssertionError(f"detached run inspected the archive: {path}")
-            return original_glob(path, pattern, case_sensitive=case_sensitive, recurse_symlinks=recurse_symlinks)
-
-        with patch.object(Path, "glob", refuse_archive):
-            caller = mesh_runs.caller_from_environment({"CODEX_THREAD_ID": "adopted-thread"})
+        caller = mesh_runs.caller_from_environment({"CODEX_THREAD_ID": "adopted-thread"})
         self.assertEqual(caller, mesh_runs.MeshCaller(str(self.session), "unit-review", "adopted-thread"))
 
     def test_detached_run_caller_uses_the_current_owner_instead_of_an_earlier_adopted_entry(self) -> None:
@@ -148,6 +146,32 @@ class MeshRunsTests(unittest.TestCase):
         self.assertEqual(self.sent, [])
         self.assertEqual(cast(object, json.loads((self.session / codex_mesh.ROSTER_FILE).read_text())), roster)
         self.assertFalse((self.session / (WORKER + ".pending.json")).exists())
+
+    def test_repeated_run_results_are_guarded_once_before_any_worker_delivery(self) -> None:
+        record = cast(mesh_runs.RunRecord, json.loads(self.record(["true"]).read_text()))
+        outcomes: list[str] = []
+        for index in range(4):
+            with self.subTest(copy=index + 1):
+                outcomes.append(mesh_runs.deliver(record, 0))
+        self.assertTrue(all("held for" in outcome for outcome in outcomes[:2]))
+        self.assertTrue(all("held repeated run result" in outcome for outcome in outcomes[2:]))
+        self.assertEqual(len(cast(list[str], self.pending()["messages"])), 2)
+        self.assertEqual(self.sent, [])
+
+    def test_run_and_direct_delivery_count_the_same_thread_and_do_not_count_director_fallback_as_worker(self) -> None:
+        record = cast(mesh_runs.RunRecord, json.loads(self.record(["true"]).read_text()))
+        text = mesh_runs.result_text(record, 0)
+        self.assertIn("held for", mesh_runs.deliver(record, 0))
+        outcome = codex_mesh.hold_message(str(self.session), WORKER, text, without_launcher=True, sender="mesh-runs")
+        self.assertIsInstance(outcome, codex_mesh.HeldForLauncher)
+        self.assertIn("held repeated run result", mesh_runs.deliver(record, 0))
+        self.write_roster("thread-1", "done", DEAD_PID, port=4100)
+        active = self.root / "unit/active"
+        active.mkdir()
+        _ = (active / "director-session").write_text(str(self.session))
+        self.assertIn("sent to director", mesh_runs.deliver(record, 0))
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(self.sent[0].session_id, "director-session")
 
     def write_roster(self, thread_id: str, status: str, launcher_pid: int, port: int) -> None:
         roster = {WORKER: {"thread_id": thread_id, "status": status, "launcher_pid": launcher_pid,
@@ -331,7 +355,7 @@ class MeshRunsTests(unittest.TestCase):
         self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["status"], "running")
 
     def test_start_exits_3_for_a_caller_that_is_not_a_mesh_worker(self) -> None:
-        popen = MagicMock()
+        popen = MagicMock(return_value=SimpleNamespace(pid=4321))
         for environment in ({"CODEX_THREAD_ID": "thread-unknown"}, {"CODEX_THREAD_ID": ""}):
             with patch.dict(os.environ, environment), patch.object(subprocess, "Popen", popen):
                 self.assertEqual(mesh_runs.main(["start", "--", "true"]), mesh_runs.NOT_A_MESH_WORKER)
@@ -346,10 +370,10 @@ class MeshRunsTests(unittest.TestCase):
         hold = codex_mesh.hold_message
         statuses: list[object] = []
 
-        def watched(session_dir: str, name: str, text: str, *, without_launcher: bool) -> codex_mesh.HoldOutcome:
+        def watched(session_dir: str, name: str, text: str, *, without_launcher: bool, sender: str) -> codex_mesh.HoldOutcome:
             stored = cast(dict[str, object], json.loads(path.read_text(encoding="utf-8")))
             statuses.append(stored["status"])
-            return hold(session_dir, name, text, without_launcher=without_launcher)
+            return hold(session_dir, name, text, without_launcher=without_launcher, sender=sender)
 
         with patch.object(codex_mesh, "hold_message", watched):
             record = self.supervise(path)

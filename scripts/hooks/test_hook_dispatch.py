@@ -15,10 +15,8 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import NamedTuple, cast, override
 from unittest.mock import patch
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
-
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
 
 HOOKS = Path(__file__).resolve().parent
 DISPATCH = HOOKS / "hook_dispatch.py"
@@ -573,6 +571,7 @@ class SettingsRegistrationTests(IsolatedHookTests):
             event: [list(row) for row in rows] for event, rows in LEGACY.items()
         }
         expected["post_tool_use"].append(["post-tool-use-push-delivered.py", "PushNotification", 600])
+        expected["post_tool_use"].append(["post-tool-use-sendmessage-miss.py", "SendMessage", 600])
         self.assertEqual(parsed_output(result.stdout), expected)
 
     def test_each_event_registers_dispatch_once_and_removes_old_python_commands(self) -> None:

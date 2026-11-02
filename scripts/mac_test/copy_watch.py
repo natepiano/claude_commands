@@ -29,15 +29,20 @@ import sys
 import tempfile
 import time
 from types import FrameType
-from typing import Literal, TypedDict, cast
+from typing import TYPE_CHECKING, Literal, TypedDict, cast
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lint"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_hold"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+import process_group
 import override_guard
 import mac_test
 import offload
+if TYPE_CHECKING:
+    from ..direct import step_record
+else:
+    from scripts.direct import step_record
 
 
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
@@ -385,20 +390,28 @@ def poll_seconds() -> float:
 
 
 class Wakeup:
-    """A stop flag set by TERM, HUP or INT, and a sleep any signal ends at once."""
+    """Stop on TERM, HUP, INT or parent loss; signals end sleep at once."""
 
     def __init__(self, read_fd: int) -> None:
         self.read_fd: int = read_fd
-        self.stop_requested: bool = False
+        self.parent_pid: int = os.getppid()
+        self.stopped: bool = False
+
+    @property
+    def stop_requested(self) -> bool:
+        if os.getppid() != self.parent_pid:
+            self.stopped = True
+        return self.stopped
 
     def request_stop(self, signal_number: int, frame: FrameType | None) -> None:
         _ = (signal_number, frame)
-        self.stop_requested = True
+        self.stopped = True
 
     def sleep(self, seconds: float) -> None:
         if self.stop_requested:
             return
-        readable, _, _ = select.select([self.read_fd], [], [], seconds)
+        # Parent loss sends no signal; neither watch loop may sleep past it.
+        readable, _, _ = select.select([self.read_fd], [], [], min(seconds, 1.0))
         if readable:
             try:
                 while os.read(self.read_fd, 512):
@@ -488,7 +501,7 @@ class Watch:
             stopped = Path(f"{self.request.info}.stopped")
             stopped.touch()
             try:
-                os.killpg(self.step.info.pgid, signal.SIGTERM)
+                process_group.send_process_group(self.step.info.pgid, signal.SIGTERM)
             except OSError:
                 stopped.unlink(missing_ok=True)
             else:
@@ -500,6 +513,12 @@ class Watch:
     def update_candidate(self) -> bool:
         """Keep the candidate file in step with the call; true while it is a candidate."""
         wanted = not self.final and isinstance(self.copy, NoCopy) and self.step.compiling
+        live_step = step_record.read(self.request.call_id)
+        if isinstance(live_step, step_record.StepRecord):
+            wanted = wanted and step_record.mac_eligible(live_step) and live_step.state not in (
+                step_record.StepState.ON_SSH, step_record.StepState.ON_MAC)
+        elif not isinstance(live_step, step_record.MissingRecord):
+            wanted = False
         if not wanted:
             self.candidate.unlink(missing_ok=True)
         elif not self.candidate.exists():
@@ -542,7 +561,7 @@ class Watch:
         return self.stop()
 
     def stop(self) -> WatchReport:
-        """verify.sh's TERM: natedev finished, so a running copy stops.
+        """verify.sh ended or sent TERM, so a running copy stops.
 
         A copy that ended before the TERM keeps its outcome, except a win,
         which stopped nothing.
@@ -565,7 +584,7 @@ class Watch:
 
 
 def wait_for_stop(wakeup: Wakeup) -> WatchReport:
-    """A repository the Mac cannot name is never a candidate: wait for verify's TERM."""
+    """An unknown repository is never a candidate: wait for verify to end."""
     while not wakeup.stop_requested:
         wakeup.sleep(60.0)
     return WatchReport("", 0.0, 0, "")

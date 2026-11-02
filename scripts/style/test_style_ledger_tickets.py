@@ -14,6 +14,7 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 from contextlib import closing
 from datetime import datetime, timezone
+from dataclasses import replace
 from typing import cast, final
 from unittest import mock
 import rules
@@ -24,16 +25,422 @@ import coverage_report
 import unit_files
 
 
-from ledger_test_support import (LedgerTestCase, LedgerStatus)
+from ledger_test_support import (remove_finding_anchor_schema, remove_generation_schema, LedgerTestCase, LedgerStatus)
 
 
 @final
 class StyleLedgerTicketsTests(LedgerTestCase):
+    def refusal_ticket(self, *, secondary: bool = False) -> tuple[style_ledger.Ledger, Path, tuple[str, ...]]:
+        """An assigned approved ticket with three findings, optionally from two decisions."""
+        ledger, issue = self.widen_ticket()
+        ledger.ticket_drop("names-1")
+        ledger.set_tip(self.initial_tip, "main")
+        first = ledger.proposal_findings(issue)[0]
+        extra = ledger.hold(first.rule, first.path, 22, "another binding", "rename", "another", "fresh_name",
+                            first.rule_blob, "outside")
+        ledger.file_held(extra.finding_id, issue)
+        findings = ledger.proposal_findings(issue)
+        ids = tuple(finding.finding_id for finding in findings)
+        decisions: tuple[Path, ...] = ()
+        if secondary:
+            other = self.root / "secondary.md"
+            _ = other.write_text(issue.read_text())
+            with closing(sqlite3.connect(ledger.database)) as connection, connection:
+                _ = connection.execute("UPDATE held_findings SET proposal=? WHERE finding_id=?", (str(other), ids[1]))
+            decisions = (other,)
+        ledger.ticket_add("names-2", "names", "proposal", "names", "crates/alpha", list(self.sources[:2]),
+                          [findings[0].rule], proposal=str(issue), proposals=decisions, finding_ids=ids)
+        ledger.ticket_assign("names-2", "main")
+        return ledger, issue, ids
+
+    def test_ticket_refuse_keeps_other_findings_and_the_approved_gate_in_both_active_states(self) -> None:
+        ledger, issue, ids = self.refusal_ticket()
+        with closing(sqlite3.connect(ledger.database)) as connection, closing(sqlite3.connect(":memory:")) as pristine:
+            connection.backup(pristine)
+            for state in ("assigned", "checkpointed"):
+                with self.subTest(state=state):
+                    if state == "checkpointed":
+                        ledger.ticket_checkpoint("names-2", self.initial_tip)
+                    before = ledger.ticket_open("names")[0]
+                    # All membership/ownership writes remain in the existing release operation.
+                    with mock.patch.object(style_ledger.Ledger, "bulk_release", autospec=True,
+                                           side_effect=style_ledger.Ledger.bulk_release) as release:
+                        result = self.cli("ticket", "refuse", "--id", "names-2", "--finding", ids[0],
+                                          "--by", "Nate", "--reason", "would shadow an enclosing binding")
+                    release.assert_called_once()
+                    self.assertEqual(len(result.stdout.splitlines()), 1)
+                    origin = ledger.ticket_origin("names-2")
+                    self.assertIsInstance(origin, style_ledger.ApprovedProposal)
+                    assert isinstance(origin, style_ledger.ApprovedProposal)
+                    approved = style_plan.approved_ticket(ledger, "names-2", origin)
+                    self.assertEqual({finding.finding_id for finding in approved.findings}, set(ids[1:]))
+                    released, = ledger.named_held((ids[0],))
+                    self.assertEqual((released.state, released.build_ticket),
+                                     (style_ledger.Filed(issue), style_ledger.NoBuildTicket()))
+                    row, = ledger.bulk_refusals("names-2")
+                    self.assertEqual((row.finding_id, row.reason), (ids[0], "would shadow an enclosing binding"))
+                    after = ledger.ticket_open("names")[0]
+                    self.assertEqual((after["state"], after["checkpoint"], after["base"], after["files"], after["rules"]),
+                                     (before["state"], before["checkpoint"], before["base"], before["files"], before["rules"]))
+                    pristine.backup(connection)
+
+    def test_ticket_refuse_removes_an_already_waived_finding_and_the_gate_passes(self) -> None:
+        ledger, _, ids = self.refusal_ticket()
+        ledger.waive_held(ids[0], style_ledger.WaiveByPerson("Nate"))
+        waived, = ledger.named_held((ids[0],))
+        _ = self.cli("ticket", "refuse", "--id", "names-2", "--finding", ids[0],
+                     "--by", "Nate", "--reason", "would shadow")
+        released, = ledger.named_held((ids[0],))
+        self.assertEqual(released, replace(waived, build_ticket=style_ledger.NoBuildTicket()))
+        origin = ledger.ticket_origin("names-2")
+        assert isinstance(origin, style_ledger.ApprovedProposal)
+        self.assertEqual({finding.finding_id for finding in style_plan.approved_ticket(ledger, "names-2", origin).findings},
+                         set(ids[1:]))
+
+    def test_ticket_refuse_releases_multiple_named_findings_in_one_request(self) -> None:
+        ledger, _, ids = self.refusal_ticket()
+        _ = self.cli("ticket", "refuse", "--id", "names-2", "--finding", ids[0], "--finding", ids[1],
+                     "--by", "Nate", "--reason", "would shadow")
+        origin = ledger.ticket_origin("names-2")
+        assert isinstance(origin, style_ledger.ApprovedProposal)
+        self.assertEqual(origin.finding_ids, (ids[2],))
+        self.assertEqual({row.finding_id for row in ledger.bulk_refusals("names-2")}, set(ids[:2]))
+        self.assertEqual(len(style_plan.approved_ticket(ledger, "names-2", origin).findings), 1)
+
+    def test_ticket_refuse_rejects_unknown_and_foreign_ids_before_any_write(self) -> None:
+        ledger, _, ids = self.refusal_ticket()
+        finding, = ledger.named_held(ids[:1])
+        foreign = ledger.hold(finding.rule, self.sources[2], 1, "other finding", "rename", "old", "new",
+                              finding.rule_blob, "outside")
+        for identity, message in (("unknown", "unknown held finding"), (foreign.finding_id, "does not belong to ticket")):
+            with self.subTest(finding=identity):
+                before = self.ledger_contents(ledger)
+                result = self.cli("ticket", "refuse", "--id", "names-2", "--finding", ids[0], "--finding", identity,
+                                  "--by", "Nate", "--reason", "would shadow", success=False)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn(message, result.stderr)
+                self.assertEqual(self.ledger_contents(ledger), before)
+
+    def test_ticket_refuse_preserves_every_contributing_issue_rule(self) -> None:
+        ledger, _, ids = self.refusal_ticket(secondary=True)
+        # Either primary or secondary losing its last finding must refuse the whole request.
+        for removing in ((ids[0], ids[2]), (ids[1],)):
+            with self.subTest(findings=removing):
+                finding, = ledger.named_held(removing[:1])
+                assert isinstance(finding.state, style_ledger.Filed)
+                before = self.ledger_contents(ledger)
+                arguments = [part for identity in removing for part in ("--finding", identity)]
+                result = self.cli("ticket", "refuse", "--id", "names-2", *arguments,
+                                  "--by", "Nate", "--reason", "would shadow", success=False)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn(f"issue {finding.state.proposal} without a finding of its rule", result.stderr)
+                self.assertEqual(self.ledger_contents(ledger), before)
+
+    def test_ticket_refuse_requires_a_kept_finding_of_the_issue_rule(self) -> None:
+        ledger, issue, ids = self.refusal_ticket()
+        _ = issue.write_text(issue.read_text().replace("style_rule:", "style_rule: unrelated\nprevious_rule:"))
+        before = self.ledger_contents(ledger)
+        result = self.cli("ticket", "refuse", "--id", "names-2", "--finding", ids[0],
+                          "--by", "Nate", "--reason", "would shadow", success=False)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn(f"issue {issue} without a finding of its rule unrelated", result.stderr)
+        self.assertEqual(self.ledger_contents(ledger), before)
+
+    def test_ticket_refuse_requires_named_findings_a_person_and_a_nonempty_reason(self) -> None:
+        ledger, _, ids = self.refusal_ticket()
+        required = {"--finding": ids[0], "--by": "Nate", "--reason": "would shadow"}
+        for missing in required:
+            with self.subTest(missing=missing):
+                before = self.ledger_contents(ledger)
+                arguments = [part for flag, value in required.items() if flag != missing for part in (flag, value)]
+                result = self.cli("ticket", "refuse", "--id", "names-2", *arguments, success=False)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn(f"the following arguments are required: {missing}", result.stderr)
+                self.assertEqual(self.ledger_contents(ledger), before)
+        for flag in ("--by", "--reason"):
+            for value in ("", " \t "):
+                with self.subTest(flag=flag, value=value):
+                    before = self.ledger_contents(ledger)
+                    arguments = [part for key, text in required.items() for part in (key, value if key == flag else text)]
+                    result = self.cli("ticket", "refuse", "--id", "names-2", *arguments, success=False)
+                    self.assertEqual(result.returncode, 2)
+                    self.assertIn("requires a non-empty --by and --reason", result.stderr)
+                    self.assertEqual(self.ledger_contents(ledger), before)
+
+    def test_ticket_refuse_rerun_is_one_line_and_changes_no_records(self) -> None:
+        ledger, _, ids = self.refusal_ticket()
+        arguments = ("ticket", "refuse", "--id", "names-2", "--finding", ids[0], "--finding", ids[0],
+                     "--by", "Nate", "--reason", "would shadow")
+        first = self.cli(*arguments)
+        before = self.ledger_contents(ledger)
+        repeated = self.cli(*arguments)
+        self.assertEqual(repeated.stdout, first.stdout)
+        self.assertEqual(len(repeated.stdout.splitlines()), 1)
+        self.assertEqual(self.ledger_contents(ledger), before)
+
+    def test_ticket_refuse_rejects_tickets_that_cannot_hold_unmerged_edits(self) -> None:
+        ledger, _, ids = self.refusal_ticket()
+        with closing(sqlite3.connect(ledger.database)) as connection, closing(sqlite3.connect(":memory:")) as pristine:
+            connection.backup(pristine)
+            for state in ("queued", "merged", "dropped"):
+                with self.subTest(state=state):
+                    _ = connection.execute("UPDATE tickets SET state=? WHERE id='names-2'", (state,))
+                    connection.commit()
+                    before = self.ledger_contents(ledger)
+                    result = self.cli("ticket", "refuse", "--id", "names-2", "--finding", ids[0],
+                                      "--by", "Nate", "--reason", "would shadow", success=False)
+                    self.assertEqual(result.returncode, 2)
+                    self.assertIn("refusal requires an assigned or checkpointed proposal ticket", result.stderr)
+                    self.assertEqual(self.ledger_contents(ledger), before)
+                    pristine.backup(connection)
+
+    def test_restored_restructure_findings_keep_their_merged_owner_after_rule_changes(self) -> None:
+        ledger, _, issue, ids, checkpoint = self.withdrawn_checkpointed_ticket()
+        # The incident's durable records contain restructure findings with no automatic applied check.
+        with closing(sqlite3.connect(ledger.database)) as connection, connection:
+            _ = connection.executemany("UPDATE held_findings SET kind='restructure' WHERE finding_id=?",
+                                       [(identity,) for identity in ids])
+        ledger.ticket_restore_checkpoint("names-1")
+        self.assertEqual(len(ledger.ticket_merge("names-1")), len(ids))
+        self.assertEqual(self.ticket_row("names-1")[0], "merged")
+        rule_file = self.rule_dir / "decision.md"
+        _ = rule_file.write_text(rule_file.read_text() + "New requirement after merge.\n")
+        definitions = {item.rule_id: item for item in rules.load_rules(self.repo)}
+        withdrawal = ledger.withdraw_superseded(definitions)
+        self.assertEqual(withdrawal.withdrawn, ())
+        self.assertEqual({item.finding.finding_id for item in withdrawal.kept}, set(ids))
+        for finding in ledger.named_held(ids):
+            self.assertEqual((finding.state, finding.build_ticket),
+                             (style_ledger.Filed(issue), style_ledger.BuildTicket("names-1")))
+        completed = ledger.mark_built_at_merge(ids, checkpoint, style_ledger.ReadByPerson("reviewer"))
+        self.assertEqual(len(completed), len(ids))
+        self.assertTrue(all(isinstance(finding.state, style_ledger.Built) for finding in ledger.named_held(ids)))
+
+    def test_rule_change_keeps_checkpointed_findings_for_their_normal_merge(self) -> None:
+        ledger, _, issue, ids, checkpoint = self.checkpointed_decision_ticket()
+        rule_file = self.rule_dir / "decision.md"
+        _ = rule_file.write_text(rule_file.read_text() + "New requirement.\n")
+        definitions = {item.rule_id: item for item in rules.load_rules(self.repo)}
+        result = ledger.withdraw_superseded(definitions)
+        self.assertEqual(result.withdrawn, ())
+        self.assertEqual({item.finding.finding_id for item in result.kept}, set(ids))
+        self.assertEqual([(ticket["state"], ticket["checkpoint"]) for ticket in ledger.ticket_open("names")],
+                         [("checkpointed", checkpoint)])
+        for finding in ledger.named_held(ids):
+            self.assertEqual((finding.state, finding.build_ticket), (style_ledger.Filed(issue), style_ledger.BuildTicket("names-1")))
+        self.assertEqual(ledger.ticket_merge("names-1"), ())
+        self.assertTrue(all(isinstance(finding.state, style_ledger.Built) for finding in ledger.named_held(ids)))
+        self.assertEqual(ledger.withdraw_superseded(definitions).withdrawn, ())
+
+    def test_rule_change_still_drops_assigned_and_queued_tickets(self) -> None:
+        ledger, rule, finding = self.site_fixture()
+        issue = self.root / "decision.md"
+        ledger.ticket_add("build-1", "build", "proposal", "names", "crates/alpha", [finding.path], [rule],
+                          proposal=str(issue), finding_ids=(finding.finding_id,))
+        ledger.ticket_assign("build-1", "main")
+        ledger.ticket_add("queued-1", "queued", "read", "names", "crates/beta", [self.sources[2]], [rule])
+        rule_file = self.rule_dir / "site-rule.md"
+        _ = rule_file.write_text(rule_file.read_text() + "New requirement.\n")
+        _ = ledger.withdraw_superseded({item.rule_id: item for item in rules.load_rules(self.repo)})
+        self.assertEqual(ledger.ticket_open("build"), ())
+        self.assertEqual(self.ticket_row("queued-1")[0], "dropped")
+        self.assertIsInstance(ledger.named_held((finding.finding_id,))[0].state, style_ledger.Withdrawn)
+
+    def test_rule_change_cannot_drop_a_checkpointed_successor_or_cancel_through_it(self) -> None:
+        ledger, _, _, ids, checkpoint = self.checkpointed_decision_ticket()
+        rule = self.rule("ancestor")
+        ledger.ticket_add("ancestor-1", "ancestor", "read", "names", "crates/beta", [self.sources[2]], [rule])
+        ledger.ticket_assign("ancestor-1", "main")
+        ledger.ticket_add("later-1", "later", "read", "names", "crates/beta", [self.sources[3]], [rule])
+        # A persisted dependency must not turn a checkpoint into cancellable work.
+        with closing(sqlite3.connect(ledger.database)) as connection, connection:
+            _ = connection.executemany("INSERT INTO ticket_predecessors VALUES (?,?)",
+                                       [("names-1", "ancestor-1"), ("later-1", "names-1")])
+        rule_file = self.rule_dir / "ancestor.md"
+        _ = rule_file.write_text(rule_file.read_text() + "New requirement.\n")
+        # The later ticket pins the current body; only the dependency could cancel it.
+        with closing(sqlite3.connect(ledger.database)) as connection, connection:
+            _ = connection.execute("UPDATE tickets SET rule_blobs=? WHERE id='later-1'", (json.dumps({rule: self.blob(rule)}),))
+        _ = ledger.withdraw_superseded({item.rule_id: item for item in rules.load_rules(self.repo)})
+        self.assertEqual(ledger.ticket_open("ancestor"), ())
+        self.assertEqual(ledger.ticket_open("names")[0]["checkpoint"], checkpoint)
+        self.assertEqual(self.ticket_row("later-1")[0], "queued")
+        self.assertTrue(all(isinstance(finding.build_ticket, style_ledger.BuildTicket) for finding in ledger.named_held(ids)))
+
+    def test_restore_withdrawn_checkpoint_returns_its_findings_for_normal_merge(self) -> None:
+        ledger, _, issue, ids, checkpoint = self.withdrawn_checkpointed_ticket()
+        _ = self.cli("ticket", "restore-checkpoint", "--id", "names-1")
+        self.assertEqual((ledger.ticket_open("names")[0]["state"], ledger.ticket_open("names")[0]["checkpoint"]),
+                         ("checkpointed", checkpoint))
+        for finding in ledger.named_held(ids):
+            self.assertEqual((finding.state, finding.build_ticket), (style_ledger.Filed(issue), style_ledger.BuildTicket("names-1")))
+        self.assertEqual(ledger.ticket_merge("names-1"), ())
+        self.assertTrue(all(isinstance(finding.state, style_ledger.Built) for finding in ledger.named_held(ids)))
+
+    def test_restore_checkpoint_refuses_unproved_ticket_or_finding_without_writes(self) -> None:
+        ledger, _, _, ids, _ = self.withdrawn_checkpointed_ticket()
+        faults = (
+            ("UPDATE tickets SET checkpoint='' WHERE id='names-1'", (), "checkpoint"),
+            ("UPDATE tickets SET state='assigned' WHERE id='names-1'", (), "dropped"),
+            ("UPDATE tickets SET kind='read' WHERE id='names-1'", (), "proposal"),
+            ("UPDATE tickets SET finding_ids='[]' WHERE id='names-1'", (), "findings"),
+            ("DELETE FROM held_findings WHERE finding_id=?", (ids[1],), "finding"),
+            ("DELETE FROM rule_body_withdrawals WHERE finding_id=?", (ids[1],), "withdrawal"),
+            ("UPDATE held_findings SET updated_at='other-time' WHERE finding_id=?", (ids[1],), "withdrawal"),
+            ("UPDATE held_findings SET build_ticket='another-ticket' WHERE finding_id=?", (ids[1],), "withdrawal"),
+            ("UPDATE held_findings SET proposal='other-decision' WHERE finding_id=?", (ids[1],), "decision"),
+            ("UPDATE held_findings SET state='built' WHERE finding_id=?", (ids[1],), "withdrawal"),
+            ("UPDATE held_findings SET withdrawn_by=1 WHERE finding_id=?", (ids[1],), "withdrawal"),
+            ("UPDATE held_findings SET duplicate_of='duplicate' WHERE finding_id=?", (ids[1],), "withdrawal"),
+            ("UPDATE held_findings SET declaration_gone_at='gone' WHERE finding_id=?", (ids[1],), "withdrawal"),
+            ("UPDATE held_findings SET built_at='built-before' WHERE finding_id=?", (ids[1],), "withdrawal"),
+            ("UPDATE held_findings SET path='unrecorded.rs' WHERE finding_id=?", (ids[1],), "recorded files"),
+        )
+        with closing(sqlite3.connect(ledger.database)) as connection, closing(sqlite3.connect(":memory:")) as pristine:
+            connection.backup(pristine)
+            for sql, parameters, reason in faults:
+                with self.subTest(fault=sql):
+                    _ = connection.execute(sql, parameters)
+                    connection.commit()
+                    before = self.ledger_contents(ledger)
+                    result = self.cli("ticket", "restore-checkpoint", "--id", "names-1", success=False)
+                    self.assertEqual(result.returncode, 2)
+                    self.assertIn(reason, result.stderr)
+                    self.assertEqual(self.ledger_contents(ledger), before)
+                    # Restore the same historical fixture before testing the next independent refusal.
+                    pristine.backup(connection)
+
+    def test_restore_checkpoint_restores_unchanged_members_released_in_the_same_cancellation(self) -> None:
+        ledger, _, _, ids, _ = self.withdrawn_checkpointed_ticket()
+        with closing(sqlite3.connect(ledger.database)) as connection, connection:
+            _ = connection.execute("UPDATE held_findings SET state='filed' WHERE finding_id=?", (ids[1],))
+            _ = connection.execute("DELETE FROM rule_body_withdrawals WHERE finding_id=?", (ids[1],))
+        _ = self.cli("ticket", "restore-checkpoint", "--id", "names-1")
+        self.assertEqual(ledger.ticket_merge("names-1"), ())
+        self.assertTrue(all(isinstance(finding.state, style_ledger.Built) for finding in ledger.named_held(ids)))
+
+    def test_restore_checkpoint_refuses_a_drop_without_any_rule_withdrawal_evidence(self) -> None:
+        ledger, _, _, _, _ = self.withdrawn_checkpointed_ticket()
+        with closing(sqlite3.connect(ledger.database)) as connection, connection:
+            _ = connection.execute("UPDATE held_findings SET state='filed'")
+        before = self.ledger_contents(ledger)
+        result = self.cli("ticket", "restore-checkpoint", "--id", "names-1", success=False)
+        self.assertIn("no findings prove rule-body withdrawal", result.stderr)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(self.ledger_contents(ledger), before)
+
+    def test_restore_checkpoint_refuses_to_reopen_a_unit_with_new_work(self) -> None:
+        ledger, rule, _, _, _ = self.withdrawn_checkpointed_ticket()
+        ledger.ticket_add("names-2", "names", "read", "names", "crates/beta", [self.sources[2]], [rule])
+        before = self.ledger_contents(ledger)
+        result = self.cli("ticket", "restore-checkpoint", "--id", "names-1", success=False)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("unit has open tickets", result.stderr)
+        self.assertEqual(self.ledger_contents(ledger), before)
+
+    def test_restore_checkpoint_rolls_back_findings_if_the_ticket_write_fails(self) -> None:
+        ledger, _, _, _, _ = self.withdrawn_checkpointed_ticket()
+        with closing(sqlite3.connect(ledger.database)) as connection, connection:
+            _ = connection.execute("CREATE TRIGGER stop_restore BEFORE UPDATE OF state ON tickets "
+                                   + "BEGIN SELECT RAISE(ABORT,'stop restore'); END")
+        before = self.ledger_contents(ledger)
+        with self.assertRaisesRegex(sqlite3.IntegrityError, "stop restore"):
+            ledger.ticket_restore_checkpoint("names-1")
+        self.assertEqual(self.ledger_contents(ledger), before)
+
+    def test_proposal_migration_preserves_generations_and_backfills_legacy_decisions(self) -> None:
+        ledger, rule, finding = self.site_fixture()
+        issue = self.root / "decision.md"
+        ledger.ticket_add("legacy-1", "legacy", "proposal", "names", "crates/alpha", [finding.path], [rule],
+                          proposal=str(issue), finding_ids=(finding.finding_id,))
+        with closing(sqlite3.connect(ledger.database)) as connection, connection:
+            _ = connection.execute("DROP TABLE ticket_proposals")
+            remove_finding_anchor_schema(connection)
+            _ = connection.execute("UPDATE schema_version SET version=30")
+            generations = connection.execute("SELECT * FROM rule_generations").fetchall()
+            judgments = connection.execute("SELECT * FROM active_judgments").fetchall()
+        for _ in range(2):
+            with style_ledger.Ledger(self.repo, ledger.database) as upgraded:
+                self.assertEqual(upgraded.ticket_proposals("legacy-1"), (issue,))
+                self.assertEqual(upgraded.ticket_proposals("judge-1"), ())
+        with closing(sqlite3.connect(ledger.database)) as connection:
+            self.assertEqual(connection.execute("SELECT version FROM schema_version").fetchone(), (max(style_ledger.MIGRATIONS),))
+            self.assertEqual(connection.execute("SELECT * FROM ticket_proposals").fetchall(), [("legacy-1", str(issue))])
+            self.assertEqual(connection.execute("SELECT * FROM rule_generations").fetchall(), generations)
+            self.assertEqual(connection.execute("SELECT * FROM active_judgments").fetchall(), judgments)
+
+    def test_explicitly_cancelled_checkpoint_reservation_is_retried_after_reopening(self) -> None:
+        session = self.held_reservation("modules-unit-1")
+        self.checkpointed_structure_ticket("modules-unit-1", "--session-dir", str(session), "--phase", "7")
+        with self.ledger() as ledger:
+            ticket, = ledger.ticket_open("modules-unit")
+            definition = next(item for item in rules.load_rules(self.repo) if item.rule_id == ticket["rules"][0])
+            _ = definition.path.write_text(definition.path.read_text() + "Changed body.\n")
+            _ = ledger.withdraw_superseded({item.rule_id: item for item in rules.load_rules(self.repo)})
+            self.assertEqual(self.ticket_row("modules-unit-1"), ("checkpointed", str(session), "7"))
+            ledger.ticket_drop("modules-unit-1")
+        # A crash here leaves the committed dropped state and its pending release intact.
+        self.assertEqual(self.ticket_row("modules-unit-1"), ("dropped", str(session), "7"))
+        self.write("README.md", "Move off the held checkpoint.\n")
+        _ = self.commit("Reservation release must wait")
+        with self.ledger() as reopened:
+            changes = reopened.reconcile("main", "main")
+        self.assertTrue(any("reservation r1 stays held" in line for line in changes), changes)
+        self.assertEqual(self.ticket_row("modules-unit-1"), ("dropped", str(session), "7"))
+        _ = self.git("reset", "-q", "--hard", self.initial_tip)
+        with self.ledger() as reopened:
+            self.assertIn("ticket modules-unit-1: phase 7: released reservation r1", reopened.reconcile("main", "main"))
+            self.assertEqual(self.ticket_row("modules-unit-1"), ("dropped", "", ""))
+            calls = self.berth_calls()
+            _ = reopened.reconcile("main", "main")
+            self.assertEqual(self.berth_calls(), calls)
+        self.assertFalse((session / "phases/7/delegated_phase_reservation_state.json").exists())
+
+    def test_removed_judgment_rechecks_cancellation_after_its_git_proof(self) -> None:
+        ledger, rule, _ = self.removed_ticket()
+        path = self.sources[1]
+        (self.repo / path).unlink()
+        deleting = self.commit("Ticket deletes the file")
+        original = style_ledger._cell_scope  # pyright: ignore[reportPrivateUsage]
+
+        def cancel_then_scope(definition: rules.Rule, cell: str, tip: style_ledger.RepositoryTip) -> style_ledger.CellInputScope:
+            with self.ledger() as other:
+                other.ticket_drop("names-1")
+            return original(definition, cell, tip)
+
+        with (mock.patch.object(style_ledger, "_cell_scope", side_effect=cancel_then_scope),
+              self.assertRaisesRegex(style_ledger.LedgerError, "cannot judge from dropped")):
+            ledger.record(rule, path, deleting, self.blob(rule), "removed", ticket="names-1", worker="test")
+        self.assertEqual(self.cell_rows(ledger, path), [])
+
+    def test_old_body_ticket_cannot_add_or_record_before_or_after_cancellation(self) -> None:
+        rule = self.rule("changed")
+        with self.ledger() as ledger:
+            ledger.set_tip(self.initial_tip, "main")
+            ledger.ticket_add("reader-1", "reader", "read", "names", "crates/alpha", [self.sources[0]], [rule])
+            ledger.ticket_assign("reader-1", "main")
+            old_blob = self.blob(rule)
+            rule_file = self.rule_dir / "changed.md"
+            _ = rule_file.write_text(rule_file.read_text() + "New body.\n")
+            for cancelled in (False, True):
+                if cancelled:
+                    _ = ledger.withdraw_superseded({item.rule_id: item for item in rules.load_rules(self.repo)})
+                for blob in (old_blob, self.blob(rule)):
+                    with self.subTest(cancelled=cancelled, blob=blob):
+                        with self.assertRaises(style_ledger.LedgerError):
+                            _ = ledger.hold(rule, self.sources[0], 1, "change", "rename", "old", "new", blob, "reader-1")
+                        with self.assertRaises(style_ledger.LedgerError):
+                            ledger.record(rule, self.sources[0], self.initial_tip, blob, "clean", ticket="reader-1")
+            self.assertEqual(ledger.held_findings(style_ledger.AllHeldFindings()), ())
+            self.assertEqual(ledger.latest_ticket_judgments("reader-1"), ())
+            self.assertEqual(ledger.ticket_open("reader"), ())
+
     def test_batch_owner_migration_reruns_after_process_loss_before_version_write(self) -> None:
         ledger, rule, finding = self.site_fixture()
         ledger.ticket_add("legacy-1", "legacy", "read", "names", ".", [finding.path], [rule])
         with closing(sqlite3.connect(ledger.database)) as older_reader:
             _ = older_reader.execute("DROP TABLE ticket_batch_owners")
+            remove_generation_schema(older_reader)
             _ = older_reader.execute("UPDATE schema_version SET version=27")
             older_reader.commit()
             before = list(older_reader.iterdump())
@@ -238,16 +645,16 @@ class StyleLedgerTicketsTests(LedgerTestCase):
         ledger.ticket_add("read-2", "read", "read", "names", "crates/beta", [self.sources[2]], [rule])
         original = mock.Mock(wraps=subprocess.run)
 
-        def fail_diff(command: Sequence[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
-            if "diff" in command:
+        def fail_changed_paths(command: Sequence[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+            if "log" in command and "--name-only" in command:
                 return subprocess.CompletedProcess(command, 128, b"", b"fatal: PRIVATE GIT STDERR")
             return cast(subprocess.CompletedProcess[bytes], original(command, **kwargs))
 
-        with mock.patch.object(subprocess, "run", side_effect=fail_diff):
+        with mock.patch.object(subprocess, "run", side_effect=fail_changed_paths):
             self.assert_git_refusal(ledger, "ticket read-2 assign:", lambda: ledger.ticket_assign("read-2", "main"))
         ledger.ticket_assign("read-2", "main")
         self.record(rule, self.sources[2], self.initial_tip, ticket="read-2")
-        with mock.patch.object(subprocess, "run", side_effect=fail_diff):
+        with mock.patch.object(subprocess, "run", side_effect=fail_changed_paths):
             self.assert_git_refusal(ledger, "ticket read-2 resume check:", lambda: ledger.check_ticket_pipeline("read-2"))
             self.assert_git_refusal(ledger, "ticket read-2 checkpoint:",
                                     lambda: ledger.ticket_checkpoint("read-2", self.initial_tip, "held-run", "8"))
@@ -701,7 +1108,9 @@ class StyleLedgerTicketsTests(LedgerTestCase):
         _ = path.write_text(path.read_text() + "Additional rule requirement\n")
 
         self.assertEqual(self.states(rule_id), dict.fromkeys(self.sources, "stale"))
-        self.record(rule_id, self.sources[0], self.initial_tip, rule_blob=old_blob)
+        refused = self.cli("record", "--rule", rule_id, "--path", self.sources[0], "--commit", self.initial_tip,
+                           "--rule-blob", old_blob, "--verdict", "clean", "--ticket", "unit-1", "--worker", "test", success=False)
+        self.assertIn("rule body changed", refused.stderr)
         self.assertEqual(self.states(rule_id)[self.sources[0]], "stale")
         self.record(rule_id, self.sources[0], self.initial_tip)
         self.assertEqual(self.states(rule_id)[self.sources[0]], "current")
@@ -810,7 +1219,7 @@ class StyleLedgerTicketsTests(LedgerTestCase):
         self.set_tip(self.initial_tip)
         _ = self.hold_finding(rule_id, 1, ticket="A")
         self.record(rule_id, self.sources[0], self.initial_tip, "held", ticket="A")
-        self.record(rule_id, self.sources[0], self.initial_tip, "clean", ticket="B")
+        self.record(rule_id, self.sources[0], self.initial_tip, "exception", ticket="B", detail="Reviewed exception")
         self.record(rule_id, self.sources[0], self.initial_tip, "held", ticket="A")
 
         row = next(line.split("\t") for line in self.cli("status").stdout.splitlines() if line.startswith(rule_id + "\t"))
@@ -1956,6 +2365,55 @@ class StyleLedgerTicketsTests(LedgerTestCase):
         ledger.ticket_checkpoint("read-1", self.initial_tip)
         return ledger
 
+    def successor_after_style_fast_forward(self, *, import_docs: bool = True,
+                                           merge_predecessor: bool = True) -> tuple[style_ledger.Ledger, str]:
+        """An assigned beta successor inherits its alpha predecessor and optional imported style work."""
+        ledger = self.checkpointed_read_transition()
+        _ = self.git("branch", "style/main", self.initial_tip)
+        ledger.set_tip(self.initial_tip, "style/main")
+        if not merge_predecessor:
+            self.write(self.sources[0], "pub fn predecessor_work() {}\n")
+            checkpoint = self.commit("Checkpoint predecessor before its merge")
+            ledger.ticket_checkpoint("read-1", checkpoint)
+        rule = ledger.ticket_open("read")[0]["rules"][0]
+        ledger.ticket_add("read-2", "read", "read", "names", "crates/beta", [self.sources[2]], [rule])
+        ledger.ticket_assign("read-2", "main")
+        _ = ledger.ticket_base("read-2")
+        if merge_predecessor:
+            _ = ledger.ticket_merge("read-1")
+        style_tip = self.initial_tip
+        if import_docs:
+            self.write("docs/another-unit.md", "Another unit's merged notes.\n")
+            style_tip = self.commit("Other unit's style work arrives by fast-forward")
+            _ = self.git("branch", "-f", "style/main", style_tip)
+        return ledger, style_tip
+
+    def test_successor_gate_ignores_docs_imported_by_a_style_fast_forward(self) -> None:
+        ledger, _ = self.successor_after_style_fast_forward()
+        self.write(self.sources[2], "pub fn successor_work() {}\n")
+        _ = self.commit("Successor changes only its reserved source")
+        ledger.check_ticket_pipeline("read-2")
+        self.assertEqual(ledger.ticket_open("read")[0]["id"], "read-2")
+
+    def test_successor_own_commit_on_a_predecessor_path_is_refused(self) -> None:
+        ledger, _ = self.successor_after_style_fast_forward(import_docs=False, merge_predecessor=False)
+        self.write(self.sources[0], "pub fn overlapping_work() {}\n")
+        _ = self.commit("Successor changes a path its predecessor protects")
+        with self.assertRaisesRegex(style_ledger.LedgerError, "overlap:.*" + self.sources[0]):
+            ledger.check_ticket_pipeline("read-2")
+
+    def test_successor_disjoint_commit_excludes_its_unmerged_predecessors_commits(self) -> None:
+        ledger, _ = self.successor_after_style_fast_forward(import_docs=False, merge_predecessor=False)
+        self.write(self.sources[2], "pub fn successor_work() {}\n")
+        _ = self.commit("Successor builds on an unmerged predecessor with disjoint work")
+        ledger.check_ticket_pipeline("read-2")
+        self.assertEqual({ticket["state"] for ticket in ledger.ticket_open("read")}, {"checkpointed", "assigned"})
+
+    def test_set_tip_accepts_a_successor_that_imported_another_units_docs(self) -> None:
+        ledger, style_tip = self.successor_after_style_fast_forward()
+        ledger.set_tip(style_tip, "style/main")
+        self.assertEqual(ledger.synced_commit(), style_tip)
+
     def test_transition_audit_checkpoint_missing_commit_names_ticket_and_verb(self) -> None:
         ledger = self.checkpointed_read_transition()
         refused = self.cli("ticket", "checkpoint", "--id", "read-1", "--commit", "missing-commit", success=False)
@@ -2424,14 +2882,16 @@ class StyleLedgerTicketsTests(LedgerTestCase):
         new_blob = self.blob(rule_id)
         self.add_ticket("read-1", [rule_id])
 
-        self.record(rule_id, self.sources[0], self.initial_tip, rule_blob=old_blob, ticket="read-1")
+        refused_old = self.cli("record", "--rule", rule_id, "--path", self.sources[0], "--commit", self.initial_tip,
+                               "--rule-blob", old_blob, "--verdict", "clean", "--ticket", "read-1", "--worker", "test", success=False)
+        self.assertIn("rule body changed", refused_old.stderr)
         _ = self.cli(
             "record", "--rule", rule_id, "--path", self.sources[1], "--commit", self.initial_tip,
-            "--verdict", "clean", "--ticket", "read-1", "--worker", "test",
+            "--verdict", "clean", "--ticket", "read-1", "--worker", "test", success=False,
         )
 
-        self.assertEqual(self.states(rule_id)[self.sources[0]], "stale")
-        self.assertEqual(self.states(rule_id)[self.sources[1]], "stale")
+        self.assertEqual(self.states(rule_id)[self.sources[0]], "open")
+        self.assertEqual(self.states(rule_id)[self.sources[1]], "open")
         refused = self.cli(
             "record", "--rule", rule_id, "--path", self.sources[0], "--commit", self.initial_tip,
             "--rule-blob", new_blob, "--verdict", "clean", "--ticket", "read-1", "--worker", "test",
@@ -2439,7 +2899,7 @@ class StyleLedgerTicketsTests(LedgerTestCase):
         )
         self.assertEqual(refused.returncode, 2)
         self.assertIn(rule_id, refused.stderr)
-        self.assertEqual(self.states(rule_id)[self.sources[0]], "stale")
+        self.assertEqual(self.states(rule_id)[self.sources[0]], "open")
         unpinned = self.cli(
             "record", "--rule", rule_id, "--path", self.sources[2], "--commit", self.initial_tip,
             "--verdict", "clean", "--ticket", "external", "--worker", "test", success=False,
@@ -3070,6 +3530,7 @@ class StyleLedgerTicketsTests(LedgerTestCase):
             _ = connection.execute("ALTER TABLE processed_tips DROP COLUMN reason")
             _ = connection.execute("DROP TABLE refill_results")
             _ = connection.execute("ALTER TABLE held_findings DROP COLUMN built_at")
+            remove_generation_schema(connection)
             _ = connection.execute("UPDATE schema_version SET version=6")
             connection.commit()
         with style_ledger.open_ledger(self.repo) as migrated:

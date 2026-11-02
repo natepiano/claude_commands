@@ -19,6 +19,10 @@ from types import FrameType
 TEST_HANG_GUARD_SECS = 600
 
 
+class FixtureHang(BaseException):
+    """Escape product recovery handlers when synchronous fixture work hangs."""
+
+
 @dataclass
 class LauncherHangGuard:
     """Bound a launcher handshake without letting machine load advance test time."""
@@ -56,11 +60,11 @@ class LauncherHangGuard:
             raise RuntimeError("synchronous hang protection requires the main test thread")
 
         def expired(_signum: int, _frame: FrameType | None) -> None:
-            # Product code catches OSError/TimeoutError to recover RPCs. A fixture
-            # hang must escape those recovery loops instead of losing its alarm.
+            # Product recovery also catches Exception. The one-shot alarm must
+            # escape that boundary so recovery cannot silently consume it.
             site = (f" at {_frame.f_code.co_filename}:{_frame.f_lineno} ({_frame.f_code.co_name})"
                     if _frame is not None else "")
-            raise AssertionError(f"{self.name}: synchronous fixture hang guard expired{site}")
+            raise FixtureHang(f"{self.name}: synchronous fixture hang guard expired{site}")
 
         handler = signal.signal(signal.SIGALRM, expired)
         previous = signal.setitimer(signal.ITIMER_REAL, self.remaining())

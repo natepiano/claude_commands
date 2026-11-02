@@ -1,5 +1,5 @@
 ---
-description: Give the showrunner a measured ETA for this unit's current phase, built from the durations this run has already recorded, when the unit director has not stated one.
+description: Estimate a phase ETA from run records.
 ---
 
 # ETA

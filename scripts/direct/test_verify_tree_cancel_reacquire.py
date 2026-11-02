@@ -9,6 +9,7 @@ from pathlib import Path
 from scripts.direct.verify_tree_cancel_test_support import CANCEL_LINE, VerifyTreeCancelFixture
 from scripts.direct.verify_token_wait_test_support import BOARD
 from scripts.direct.wait_for_test_state import wait_until
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 class VerifyTreeCancelTests(VerifyTreeCancelFixture):
@@ -20,7 +21,7 @@ class VerifyTreeCancelTests(VerifyTreeCancelFixture):
         process = self.start_verify("test", BUILDLOG_MEM_POLL_S="1", TEST_MEMORY_CHANGE_EVENT="1")
         lock = self.board / "locks/cargo.d"
         wait_until(lambda: (bool(list(admission.glob("*.waiting"))) and not lock.exists())
-                   or process.poll() is not None, admission, timeout=60, processes=(process,))
+                   or process.poll() is not None, admission, timeout=TEST_HANG_GUARD_SECS, processes=(process,))
         self.assertIsNone(process.poll(), "verify never entered memory admission")
         # The queue prunes live PIDs whose argv does not identify a verifier.
         # Advertise this fake peer before publishing its entry, so the count
@@ -32,20 +33,20 @@ class VerifyTreeCancelTests(VerifyTreeCancelFixture):
         self.addCleanup(self.finish_process, holder)
         taken = subprocess.run(["bash", str(BOARD), "acquire", str(self.board), "peer", "cargo",
                                 "--pid", str(holder.pid), "--hold", "3600", "--wait", "0"],
-                               capture_output=True, text=True, check=False, timeout=10)
+                               capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(taken.returncode, 0, taken.stdout + taken.stderr)
         waiters = self.board / "token_waiters"
         waiters.mkdir(exist_ok=True)
         _ = memory.write_text("MemAvailable: 50331648 kB\n")
         wait_until(lambda: bool(list(waiters.glob(f"*.{process.pid}.again")))
-                   or process.poll() is not None, waiters, timeout=60, processes=(process,))
+                   or process.poll() is not None, waiters, timeout=TEST_HANG_GUARD_SECS, processes=(process,))
         own_entries = list(waiters.glob(f"*.{process.pid}.again"))
         self.assertEqual(len(own_entries), 1, "fixture never reached subshell reacquisition")
         # Keep a peer's entry present too: cancellation must remove only its own files.
         peer_entry = waiters / f"peer.0123456789abcdef.9999999999.{holder.pid}.again"
         peer_entry.touch()
         self.edit_source()
-        output, errors = process.communicate(timeout=30)
+        output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(process.returncode, 77, output + errors)
         self.assertEqual((output + errors).splitlines().count(CANCEL_LINE.format(cmd="test")), 1)
         self.assertEqual(sorted(waiters.iterdir()), [peer_entry], "cancel left its reacquisition entry")
@@ -60,7 +61,7 @@ class VerifyTreeCancelTests(VerifyTreeCancelFixture):
         self.assertEqual([(row.get("outcome"), row.get("status")) for row in records], [("cancelled", 77)])
         released = subprocess.run(["bash", str(BOARD), "release", str(self.board), "peer", "cargo",
                                    "--pid", str(holder.pid)], capture_output=True, text=True,
-                                  check=False, timeout=10)
+                                  check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(released.returncode, 0, released.stdout + released.stderr)
 
 

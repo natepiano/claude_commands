@@ -10,9 +10,6 @@ ids; a Codex worker member is its thread id, since a Codex worker has no Claude 
 - a unit director to each Codex worker of its run, with the worker's role from `mesh_roster.json`;
 - a unit director to each Claude worker of its run, its member that worker's Claude session id and
   its role the one `board.sh roles` reports for its slot;
-- a unit director to each pool reviewer it leases, role `review`, its member the reviewer's thread
-  id, from the review pool's `pool.json`. It also carries `unit` (the lease's unit), `thread_id`,
-  `state` (`busy` while its `busy_pid` runs, else `idle`) and `type`. Templates are left out.
 - a Claude manager to each local Astra thread it holds, role `astra-designer` or
   `astra-reviewer`, from the Astra role records. Each adds `codex_home` and `state`
   (`busy` while its mesh worker runs or waits for capacity, or its exec pid runs; else `idle`).
@@ -39,12 +36,13 @@ import sys
 from pathlib import Path
 from typing import Literal, TypedDict, cast
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "message"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.astra import astra_roles  # noqa: E402
 from scripts.production import staff, staff_sources
-import showrunners  # noqa: E402
+from scripts.production import showrunners  # noqa: E402
 import showrunner_tree
 import unit_lookup  # noqa: E402
 import unit_runs  # noqa: E402
@@ -68,20 +66,9 @@ class Edge(TypedDict):
     role: Role
 
 
-class ReviewerEdge(Edge):
-    unit: str
-    thread_id: str
-    state: Literal["busy", "idle"]
-    type: str
-
-
 class AstraEdge(Edge):
     codex_home: str
     state: Literal["busy", "idle"]
-
-
-def pool_root() -> Path:
-    return Path(os.environ.get("REVIEW_POOL_STATE", "~/.local/state/review-pool")).expanduser()
 
 
 def _warn(text: str) -> None:
@@ -96,9 +83,12 @@ def _json_object(path: Path) -> dict[str, object]:
     return cast(dict[str, object], raw) if isinstance(raw, dict) else {}
 
 
-def showrunner_sessions() -> dict[str, str]:
+def showrunner_sessions(*,
+                        membership: staff.StaffSnapshot | showrunners.DiscoverMembership = showrunners.DISCOVER_MEMBERSHIP,
+                        ) -> dict[str, str]:
     """Each production slug to its showrunner's session id, from its update timer, wherever it runs."""
     found: dict[str, str] = {}
+    record = staff.initial_snapshot() if isinstance(membership, showrunners.DiscoverMembership) else membership
     for instance in sorted(showrunners.NOTIFIER_STATE_DIR.glob("showrunner-*")):
         try:
             lines = (instance / "conf").read_text(encoding="utf-8").splitlines()
@@ -107,7 +97,8 @@ def showrunner_sessions() -> dict[str, str]:
         target = next((line.removeprefix("TARGET=") for line in lines if line.startswith("TARGET=")), "")
         session_id = target.removeprefix("session:") if target.startswith("session:") else ""
         if session_id:
-            found[instance.name.removeprefix("showrunner-")] = session_id
+            owner = record.by_id(staff.StaffId(session_id))
+            found[instance.name.removeprefix("showrunner-")] = owner.current_session if owner is not None else session_id
     return found
 
 
@@ -119,9 +110,9 @@ def showrunner_edges(sessions: dict[str, str], running: set[str], record: staff.
     ]
 
 
-def marked_units() -> unit_lookup.MarkedProductions | None:
+def marked_units(*, record: staff.StaffSnapshot | None = None) -> unit_lookup.MarkedProductions | None:
     try:
-        return unit_lookup.every_marked_unit()
+        return unit_lookup.every_marked_unit(record=record)
     except OSError as error:
         _warn(f"unit marks unreadable: {error}")
         return None
@@ -139,7 +130,7 @@ def unit_edges(sessions: dict[str, str], running: set[str], marked: unit_lookup.
             claude = units[unit].claude
             if not isinstance(claude, unit_lookup.LiveClaude) or claude.session_id not in running:
                 continue
-            found = staff_sources.member(staff_sources.UnitMember(slug, unit), record)
+            found = staff_sources.member(staff_sources.ObservedUnit(unit, units[unit].staff_id), record)
             if isinstance(found, staff_sources.NoSuchMember) or found.row.parent is None:
                 continue
             manager = managers.get(found.row.parent, "")
@@ -229,43 +220,6 @@ def _claude_edges(director: str, run: Path, workers: dict[str, str]) -> list[Edg
     return edges
 
 
-def _pid_running(pid: object) -> bool:
-    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-    except PermissionError:
-        return True
-    except OSError:
-        return False
-    return True
-
-
-def reviewer_edges(running: set[str], marked: unit_lookup.MarkedProductions) -> list[ReviewerEdge]:
-    """Each leased pool reviewer under the running unit director that holds its lease."""
-    edges: list[ReviewerEdge] = []
-    for slug, units in sorted(marked.units.items()):
-        reviewers = _json_object(pool_root() / slug / "pool.json").get("reviewers")
-        if not isinstance(reviewers, dict):
-            continue
-        for _name, raw in sorted(cast(dict[str, object], reviewers).items()):
-            if not isinstance(raw, dict):
-                continue
-            reviewer = cast(dict[str, object], raw)
-            lease = reviewer.get("lease")
-            leased = cast(dict[str, object], lease).get("unit") if isinstance(lease, dict) else None
-            thread, kind = reviewer.get("thread_id"), reviewer.get("type")
-            director = units.get(leased) if isinstance(leased, str) else None
-            claude = director.claude if director is not None else None
-            if (isinstance(leased, str) and isinstance(thread, str) and thread and isinstance(kind, str)
-                    and isinstance(claude, unit_lookup.LiveClaude) and claude.session_id in running):
-                edges.append(ReviewerEdge(manager=claude.session_id, member=thread, role="review", unit=leased,
-                                          thread_id=thread,
-                                          state="busy" if _pid_running(reviewer.get("busy_pid")) else "idle",
-                                          type=kind))
-    return edges
-
-
 def astra_edges() -> list[AstraEdge]:
     """Each live Astra thread under its Claude manager, wherever that manager runs."""
     return [AstraEdge(manager=record["manager"], member=record["thread_id"],
@@ -299,20 +253,19 @@ def worker_edges(running: set[str], astra_threads: set[str] | None = None) -> li
 
 def tree() -> list[Edge]:
     running = {record["sessionId"] for record in running_sessions()}
-    sessions = showrunner_sessions()
-    marked = marked_units()
     astra = astra_edges()
     showrunner: list[Edge] = []
     directors: list[Edge] = []
     try:
         record = staff.snapshot()
+        sessions = showrunner_sessions(membership=record)
+        marked = marked_units(record=record)
         showrunner = showrunner_edges(sessions, running, record)
         if marked is not None:
             directors = unit_edges(sessions, running, marked, record)
     except staff.StaffUnreadable as error:
         _warn(f"staff unreadable: {error}")
-    reviewers = reviewer_edges(running, marked) if marked is not None else []
-    return [*showrunner, *directors, *reviewers,
+    return [*showrunner, *directors,
             *worker_edges(running, {edge["member"] for edge in astra}), *astra]
 
 

@@ -12,10 +12,15 @@ from pathlib import Path
 from typing import final, override
 from unittest import mock
 
+
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 import issues
 import proposals_folder
 import proposals_table
-import showrunners
+from scripts.production import showrunners
 import showrunner_tree
 from proposals_table import ADD_ON_STATE, IN_PROGRESS_STATE, REVIEW_STATE, Row
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import io
 import json
 import os
@@ -11,16 +12,19 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
+from threading import Event, current_thread
 from typing import cast, final, override
 from unittest import mock
 
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.direct import phase_reservation, plan_history  # noqa: E402
+from scripts.agents import worker_lifecycle
+from scripts.lib import atomic_file
+from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 
 ACTIVE: dict[str, object] = {"kind": "active", "active_phase_reservation": {
     "reservation_id": "r1", "coordination_run_id": "c1", "phase": "34h", "phase_start_head": "a" * 40}}
@@ -69,6 +73,204 @@ class WorktreeAttributionTests(unittest.TestCase):
             code = phase_reservation.main(["claim", "--session-dir", str(self.session),
                                            "--phase", phase, "--repo", str(root)])
         return code, errors.getvalue()
+
+    def test_claim_records_the_first_commit_and_dirty_status(self) -> None:
+        directory = phase_reservation.phase_directory(self.session, "1")
+        _ = phase_reservation.enroll(directory, "1", "board_ready")
+        _ = (self.first / "untracked.txt").write_text("already here\n")
+        head = phase_reservation.commit_id(self.first, "HEAD")
+        status = subprocess.run(["git", "-C", str(self.first), "status", "--short"], check=True,
+                                capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS).stdout
+        self.assertEqual(self.claim("1", self.first), (0, ""))
+        self.assertTrue((directory / phase_reservation.BASELINE_FILE).is_file())
+        self.assertEqual((directory / phase_reservation.BASELINE_FILE).read_text(), head + "\n")
+        self.assertEqual((directory / phase_reservation.BASELINE_STATUS_FILE).read_text(), status)
+
+    def test_later_claim_keeps_both_first_launch_baselines_after_a_commit(self) -> None:
+        directory = phase_reservation.phase_directory(self.session, "1")
+        head = phase_reservation.commit_id(self.first, "HEAD")
+        _ = (self.first / "untracked.txt").write_text("already here\n")
+        self.assertEqual(self.claim("1", self.first), (0, ""))
+        _ = subprocess.run(["git", "-C", str(self.first), "add", "untracked.txt"], check=True,
+                           capture_output=True, timeout=TEST_HANG_GUARD_SECS)
+        _ = subprocess.run(["git", "-C", str(self.first), "-c", "user.name=Test",
+                            "-c", "user.email=test@example.invalid", "commit", "-q", "-m", "later"],
+                           check=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS)
+        self.assertNotEqual(phase_reservation.commit_id(self.first, "HEAD"), head)
+        self.assertEqual(self.claim("1", self.first), (0, ""))
+        self.assertTrue((directory / phase_reservation.BASELINE_FILE).is_file())
+        self.assertEqual((directory / phase_reservation.BASELINE_FILE).read_text(), head + "\n")
+        self.assertEqual((directory / phase_reservation.BASELINE_STATUS_FILE).read_text(), "?? untracked.txt\n")
+
+    def test_claim_without_reservation_state_still_records_both_baselines(self) -> None:
+        directory = phase_reservation.phase_directory(self.session, "ad hoc")
+        self.assertEqual(self.claim("ad hoc", self.first), (0, ""))
+        self.assertFalse((directory / phase_reservation.STATE_FILE).exists())
+        self.assertTrue((directory / phase_reservation.BASELINE_FILE).is_file())
+        self.assertEqual((directory / phase_reservation.BASELINE_FILE).read_text(),
+                         phase_reservation.commit_id(self.first, "HEAD") + "\n")
+        self.assertEqual((directory / phase_reservation.BASELINE_STATUS_FILE).read_text(), "")
+
+    def test_claim_supplies_the_baseline_for_record_active_after_first_touch(self) -> None:
+        directory = phase_reservation.phase_directory(self.session, "1")
+        _ = phase_reservation.enroll(directory, "1", "board_ready")
+        self.assertEqual(self.claim("1", self.first), (0, ""))
+        _ = (self.first / "changed.txt").write_text("first touch\n")
+        answer = phase_reservation.CheckAnswer(phase_reservation.CLEAR, "",
+                                              phase_reservation.Acquisition("r1", "c1",
+                                                                           phase_reservation.commit_id(self.first, "HEAD")))
+        with mock.patch.object(phase_reservation, "check", return_value=answer) as check, \
+                contextlib.redirect_stdout(io.StringIO()):
+            try:
+                code = phase_reservation.main(["record-active", "--session-dir", str(self.session),
+                                               "--phase", "1", "--repo", str(self.first)])
+            except SystemExit as error:
+                self.fail(f"record-active refused after a successful claim: {error}")
+        self.assertEqual(code, 0)
+        check.assert_called_once_with(self.first, ["changed.txt"], mock.ANY)
+        self.assertEqual(phase_reservation.read_state(directory)["kind"], phase_reservation.ACTIVE)
+
+    def test_claim_refuses_a_missing_head_without_publishing_a_baseline(self) -> None:
+        _ = subprocess.run(["git", "-C", str(self.first), "checkout", "-q", "--orphan", "unborn"],
+                           check=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS)
+        code, errors = self.claim("1", self.first)
+        self.assertEqual(code, 2)
+        self.assertIn("phase_reservation:", errors)
+        directory = phase_reservation.phase_directory(self.session, "1")
+        self.assertFalse((directory / phase_reservation.BASELINE_FILE).exists())
+        self.assertFalse((directory / phase_reservation.BASELINE_STATUS_FILE).exists())
+
+    def test_claim_refuses_a_failed_status_without_publishing_a_baseline(self) -> None:
+        head = phase_reservation.commit_id(self.first, "HEAD")
+        with mock.patch.object(phase_reservation, "repository_root", return_value=self.first), \
+                mock.patch.object(phase_reservation, "commit_id", return_value=head), \
+                mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess(
+                    ["git", "status", "--short"], 128, "", "status unavailable")):
+            code, errors = self.claim("1", self.first)
+        self.assertEqual(code, 2)
+        self.assertIn("phase_reservation: git status --short failed", errors)
+        directory = phase_reservation.phase_directory(self.session, "1")
+        self.assertFalse((directory / phase_reservation.BASELINE_FILE).exists())
+        self.assertFalse((directory / phase_reservation.BASELINE_STATUS_FILE).exists())
+
+    def test_interleaved_claims_keep_the_first_launch_commit_and_status(self) -> None:
+        directory = phase_reservation.phase_directory(self.session, "1")
+        original = phase_reservation.commit_id(self.first, "HEAD")
+        _ = (self.first / "first.txt").write_text("first launch\n")
+        first_thread = current_thread()
+        second_observed = Event()
+        first_finished = Event()
+        guard = LauncherHangGuard("interleaved phase claims")
+        commit = phase_reservation.commit_id
+        publish = atomic_file.write_text_atomic
+        acquire = worker_lifecycle.acquire_flock
+        claims: list[Future[int]] = []
+
+        def second_claim() -> int:
+            try:
+                return phase_reservation.main(["claim", "--session-dir", str(self.session),
+                                               "--phase", "1", "--repo", str(self.first)])
+            finally:
+                second_observed.set()
+
+        def read_commit(root: Path, name: str) -> str:
+            if current_thread() is not first_thread and name == "HEAD":
+                # Without serialization the second claim has also observed an absent baseline.
+                second_observed.set()
+                guard.event(first_finished)
+            return commit(root, name)
+
+        def contend(handle: int | worker_lifecycle.LockFileDescriptor, *, mode: int = fcntl.LOCK_EX,
+                    deadline: float = worker_lifecycle.NO_LOCK_DEADLINE) -> None:
+            if current_thread() is not first_thread:
+                try:
+                    acquire(handle, mode=mode | fcntl.LOCK_NB, deadline=deadline)
+                    return
+                except BlockingIOError:
+                    second_observed.set()
+            acquire(handle, mode=mode, deadline=deadline)
+
+        with ThreadPoolExecutor(max_workers=1) as worker:
+            def interleave(path: Path, content: str) -> None:
+                if current_thread() is first_thread and path.name == phase_reservation.BASELINE_STATUS_FILE:
+                    claims.append(worker.submit(second_claim))
+                    guard.event(second_observed)
+                publish(path, content)
+
+            with guard.protect(), mock.patch.object(phase_reservation, "commit_id", read_commit), \
+                    mock.patch.object(phase_reservation, "write_text_atomic", interleave), \
+                    mock.patch.object(worker_lifecycle, "acquire_flock", contend):
+                try:
+                    self.assertEqual(self.claim("1", self.first), (0, ""))
+                    (self.first / "first.txt").unlink()
+                    _ = (self.first / "second.txt").write_text("worker has edited\n")
+                    _ = subprocess.run(["git", "-C", str(self.first), "-c", "user.name=Test",
+                                        "-c", "user.email=test@example.invalid", "commit", "-q",
+                                        "--allow-empty", "-m", "second launch"], check=True,
+                                       capture_output=True, timeout=TEST_HANG_GUARD_SECS)
+                finally:
+                    first_finished.set()
+                self.assertEqual(guard.result(claims[0]), 0)
+        self.assertEqual((directory / phase_reservation.BASELINE_FILE).read_text(), original + "\n")
+        self.assertEqual((directory / phase_reservation.BASELINE_STATUS_FILE).read_text(), "?? first.txt\n")
+
+    def test_claim_refuses_a_kept_baseline_missing_from_a_replacement_checkout(self) -> None:
+        directory = phase_reservation.phase_directory(self.session, "1")
+        self.assertEqual(self.claim("1", self.second), (0, ""))
+        before = {name: (directory / name).read_bytes() for name in
+                  (phase_reservation.BASELINE_FILE, phase_reservation.BASELINE_STATUS_FILE)}
+        _ = subprocess.run(["git", "-C", str(self.first), "worktree", "remove", str(self.second)],
+                           check=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS)
+        _ = subprocess.run(["git", "-C", str(self.first), "checkout", "-q", "--orphan", "replacement"],
+                           check=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS)
+        _ = subprocess.run(["git", "-C", str(self.first), "-c", "user.name=Test",
+                            "-c", "user.email=test@example.invalid", "commit", "-q", "--allow-empty",
+                            "-m", "replacement"], check=True, capture_output=True,
+                           timeout=TEST_HANG_GUARD_SECS)
+        # The old root is gone. The new root contains only the unrelated replacement branch.
+        replacement = self.first.parent / "replacement"
+        _ = subprocess.run(["git", "clone", "-q", "--single-branch", "--no-local", str(self.first),
+                            str(replacement)], check=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS)
+        with self.assertRaises(phase_reservation.StateRefused):
+            _ = phase_reservation.commit_id(replacement, before[phase_reservation.BASELINE_FILE].decode().strip())
+        code, errors = self.claim("1", replacement)
+        self.assertEqual(code, 2)
+        self.assertIn("phase_reservation:", errors)
+        self.assertIn(str(directory / phase_reservation.BASELINE_FILE), errors)
+        self.assertIn(str(replacement), errors)
+        self.assertEqual({name: (directory / name).read_bytes() for name in before}, before)
+
+    def test_claim_keeps_a_baseline_present_in_a_replacement_checkout(self) -> None:
+        directory = phase_reservation.phase_directory(self.session, "1")
+        self.assertEqual(self.claim("1", self.second), (0, ""))
+        before = {name: (directory / name).read_bytes() for name in
+                  (phase_reservation.BASELINE_FILE, phase_reservation.BASELINE_STATUS_FILE)}
+        _ = subprocess.run(["git", "-C", str(self.first), "worktree", "remove", str(self.second)],
+                           check=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(self.claim("1", self.first), (0, ""))
+        self.assertEqual((directory / phase_reservation.WORKTREE_FILE).read_text(), str(self.first) + "\n")
+        self.assertEqual({name: (directory / name).read_bytes() for name in before}, before)
+
+    def test_claim_retries_after_interruption_between_baseline_writes(self) -> None:
+        directory = phase_reservation.phase_directory(self.session, "1")
+        publish = atomic_file.write_text_atomic
+
+        def interrupt(path: Path, content: str) -> None:
+            if path.name == phase_reservation.BASELINE_FILE:
+                raise OSError("interrupted before commit publication")
+            publish(path, content)
+
+        _ = (self.first / "before.txt").write_text("interrupted launch\n")
+        with mock.patch.object(phase_reservation, "write_text_atomic", interrupt):
+            code, errors = self.claim("1", self.first)
+        self.assertEqual(code, 2)
+        self.assertIn("interrupted", errors)
+        self.assertFalse((directory / phase_reservation.BASELINE_FILE).exists())
+        (self.first / "before.txt").unlink()
+        self.assertEqual(self.claim("1", self.first), (0, ""))
+        self.assertEqual((directory / phase_reservation.BASELINE_FILE).read_text(),
+                         phase_reservation.commit_id(self.first, "HEAD") + "\n")
+        self.assertEqual((directory / phase_reservation.BASELINE_STATUS_FILE).read_text(), "")
 
     def test_same_file_in_linked_worktrees_belongs_to_each_worktrees_phase(self) -> None:
         for root in (self.first, self.second):

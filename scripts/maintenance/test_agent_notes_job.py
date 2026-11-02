@@ -1,0 +1,140 @@
+"""Deadlines isolate maintenance failures; completed parts survive an interrupted pass."""
+from __future__ import annotations
+
+import json
+import os
+import sys
+import tempfile
+import time
+import unittest
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from threading import Event
+from typing import cast, override
+from unittest.mock import patch
+
+from scripts.maintenance import agent_notes_job as job
+from scripts.maintenance.settings import Part, Schedule, settings
+
+
+class JobTests(unittest.TestCase):
+    root: Path = Path()
+    config: Path = Path()
+
+    @override
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.config = self.root / "job.toml"
+        _ = self.config.write_text((job.ROOT / "config/agent_notes.toml").read_text())
+        self.enterContext(patch.dict(os.environ, {
+            "XDG_STATE_HOME": str(self.root), "AGENT_NOTES_JOB_CONFIG": str(self.config)}))
+
+    def test_successful_parts_are_saved_and_a_rerun_retries_only_the_failure(self) -> None:
+        def part(name: Part, _cadence: Schedule, _deadline: float) -> job.PartResult:
+            return job.PartResult(name, job.Outcome.FAILED if name is Part.PACER else job.Outcome.SUCCESS,
+                                  0, 1 if name is Part.PACER else 0)
+        with patch.object(job, "run_part", side_effect=part):
+            first = job.run_job()
+        self.assertEqual([item.part for item in first if item.exit_code], [Part.PACER])
+        saved = cast(dict[str, object], json.loads((self.root / "agent-notes/job/completed.json").read_text()))
+        self.assertEqual(set(saved), {part.value for part in Part if part is not Part.PACER})
+        with patch.object(job, "run_part", return_value=job.PartResult(Part.PACER, job.Outcome.SUCCESS, 0, 0)) as run:
+            _ = job.run_job()
+            self.assertEqual(run.call_args.args[0], Part.PACER)
+            run.assert_called_once()
+        path = self.root / "agent-notes/job/completed.json"
+        before = path.read_bytes(), path.stat().st_mtime_ns
+        with patch.object(job, "run_part") as run:
+            self.assertTrue(all(item.outcome is job.Outcome.NOT_DUE for item in job.run_job()))
+        run.assert_not_called()
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+
+    def test_quota_follows_notes_and_vault_follows_all_writers(self) -> None:
+        notes_done = Event()
+        finished: set[Part] = set()
+        def part(name: Part, _cadence: Schedule, _deadline: float) -> job.PartResult:
+            if name in (Part.QUOTA, Part.PACER):
+                self.assertTrue(notes_done.is_set())
+            if name is Part.VAULT:
+                self.assertEqual(finished, set(Part) - {Part.VAULT})
+            finished.add(name)
+            if name is Part.NOTES:
+                notes_done.set()
+            return job.PartResult(name, job.Outcome.SUCCESS, 0, 0)
+        with patch.object(job, "run_part", side_effect=part):
+            self.assertTrue(all(item.exit_code == 0 for item in job.run_job()))
+
+    def test_a_hung_part_times_out_without_costing_a_parallel_part(self) -> None:
+        script = self.root / "part.py"
+        _ = script.write_text("import signal,sys\nif sys.argv[-1] == 'notes': signal.pause()\nprint('completed')\n")
+        cadence = Schedule(1, 0.2)
+        with patch.object(job, "__file__", str(script)), ThreadPoolExecutor() as pool:
+            blocked = pool.submit(job.run_part, Part.NOTES, cadence, time.monotonic() + 2)
+            healthy = pool.submit(job.run_part, Part.PACER, cadence, time.monotonic() + 2)
+            good, bad = healthy.result(), blocked.result()
+        self.assertEqual((good.outcome, good.exit_code, good.output.strip()), (job.Outcome.SUCCESS, 0, "completed"))
+        self.assertEqual((bad.outcome, bad.exit_code), (job.Outcome.TIMED_OUT, 124))
+        self.assertLess(bad.seconds, 2)
+
+    def test_preserved_note_is_a_logged_skip_and_does_not_fail_or_repeat_the_job(self) -> None:
+        script = self.root / "part.py"
+        _ = script.write_text(
+            "import os,sys\n"
+            + "if sys.argv[-1] == 'hierarchy':\n"
+            + " print('hana hierarchy: left as it stands: no unit director')\n"
+            + " sys.exit(os.EX_TEMPFAIL)\n")
+        with patch.object(job, "__file__", str(script)), patch("sys.argv", ["agent-notes"]):
+            with patch("builtins.print") as output:
+                self.assertEqual(job.main(), 0)
+            lines = [str(cast(object, call.args[0])) for call in output.call_args_list]
+            self.assertTrue(any(line.startswith("hierarchy: skipped;") for line in lines))
+            self.assertIn("hana hierarchy: left as it stands: no unit director", lines)
+            with patch.object(job, "run_part") as run:
+                self.assertTrue(all(item.outcome is job.Outcome.NOT_DUE for item in job.run_job()))
+            run.assert_not_called()
+
+    def test_hierarchy_refusal_uses_the_skip_protocol_without_changing_the_note(self) -> None:
+        from scripts.maintenance import hana_hierarchy
+
+        with patch.object(hana_hierarchy, "gather", side_effect=hana_hierarchy.Refused("no directors")), \
+                patch("builtins.print") as output:
+            self.assertEqual(job._perform(Part.HIERARCHY), os.EX_TEMPFAIL)  # pyright: ignore[reportPrivateUsage]
+        output.assert_called_once_with("hana hierarchy: left as it stands: no directors", file=sys.stderr)
+
+    def test_hierarchy_source_command_failure_is_not_a_skip(self) -> None:
+        from dataclasses import replace
+        from scripts.maintenance import hana_hierarchy
+
+        script = self.root / "source.py"
+        for source in ("raise SystemExit(2)\n", "import signal; signal.pause()\n"):
+            with self.subTest(source=source):
+                _ = script.write_text(source)
+                with patch.object(hana_hierarchy, "ROSTER", str(script)), \
+                        patch.object(hana_hierarchy, "settings", return_value=replace(settings(), hierarchy_read_seconds=0.1)), \
+                        patch("builtins.print"):
+                    self.assertEqual(job._perform(Part.HIERARCHY), 1)  # pyright: ignore[reportPrivateUsage]
+
+    def test_unexpected_part_exits_still_fail_the_job(self) -> None:
+        script = self.root / "part.py"
+        _ = script.write_text("raise SystemExit(2)\n")
+        with patch.object(job, "__file__", str(script)), patch("sys.argv", ["agent-notes"]), patch("builtins.print"):
+            self.assertEqual(job.main(), 1)
+
+    def test_runtime_configuration_controls_each_parts_interval_and_deadline(self) -> None:
+        original = self.config.read_text()
+        _ = self.config.write_text(original.replace("timeout_seconds = 60", "timeout_seconds = 0.5"))
+        self.assertEqual(settings().parts[Part.NOTES].timeout_seconds, 0.5)
+        def result(part: Part, _cadence: Schedule, _deadline: float) -> job.PartResult:
+            return job.PartResult(part, job.Outcome.SUCCESS, 0, 0)
+        with patch.object(job, "run_part", side_effect=result):
+            _ = job.run_job()
+        _ = self.config.write_text(original.replace("interval_seconds = 120", "interval_seconds = 0.000000001"))
+        with patch.object(job, "run_part", side_effect=result) as run:
+            _ = job.run_job()
+        self.assertEqual(run.call_count, len(Part))
+
+
+if __name__ == "__main__":
+    _ = unittest.main()

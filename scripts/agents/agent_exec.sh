@@ -59,7 +59,7 @@ agents_exec_main() {
     local output_file="$5"
     local log_file="$6"
     local script_dir prompt family_args_line claude_code workers_home
-    local -a family_args extra_args command
+    local -a family_args extra_args command task_args=()
 
     if [[ ! -f "$prompt_file" ]]; then
         printf 'Prompt not found: %s\n' "$prompt_file" > "$log_file"
@@ -77,6 +77,10 @@ agents_exec_main() {
     script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     source "$script_dir/agents_config.sh"
     agents_resolve "$task"
+    if [[ "$task" == direct.simplify ]]; then
+        [[ "$mode" == readonly ]] || return 2
+        task_args=(--disallowedTools Edit,Write,NotebookEdit)
+    fi
 
     prompt="$(cat "$prompt_file")"
     if [[ -n "${AGENT_EXEC_EXTRA_ARGS:-}" ]]; then
@@ -86,16 +90,7 @@ agents_exec_main() {
 
     case "$AGENT_FAMILY" in
         codex)
-            workers_home="$("$PY" - "$script_dir/../.." <<'PY'
-import sys
-sys.path.insert(0, sys.argv[1])
-from scripts.whoami.agent_accounts import workers_home
-try:
-    print(workers_home())
-except (OSError, ValueError) as error:
-    sys.exit(str(error))
-PY
-            )"
+            workers_home="$(agents_workers_home)" || return 1
             family_args_line="$(agents_codex_args)"
             read -r -a family_args <<< "$family_args_line"
             command=(env "CODEX_HOME=$workers_home" codex exec "${family_args[@]}")
@@ -136,6 +131,7 @@ PY
             else
                 command+=(--permission-mode plan)
             fi
+            command+=("${task_args[@]}")
             command+=(--settings '{"sandbox":{"enabled":false}}')
             command+=(--verbose --output-format stream-json)
             command+=("${family_args[@]}")

@@ -65,7 +65,7 @@ from pathlib import Path
 from typing import TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.lib import unit_runs  # noqa: E402
+from scripts.lib import conf, unit_runs  # noqa: E402
 from scripts.history.rounds import phase_rounds  # noqa: E402
 from scripts.usage.agents_log import LENSES as REVIEW_LENSES  # noqa: E402
 
@@ -99,115 +99,9 @@ STATE_IN_FLIGHT = "repair_in_flight"
 STATE_PENDING = "fixed_pending_review"
 STATE_ACCEPTED = "accepted"
 STATE_ROUTED = "routed"
+STATE_HELD = "held_for_decision"
+STATE_DECIDED = "decided"
 KEEP_CATEGORIES = ("regression", "broken", "gate", "ruling")
-
-# Every convergence limit is set in `~/.claude/config/direct.conf` and nowhere
-# else -- there are no compiled defaults, so a missing key or an unusable value
-# stops the run instead of quietly substituting a limit nobody chose. Problems
-# accumulate and are reported together, so one run fixes the whole file rather
-# than one key per attempt. `UNIT_CONFIG` overrides the path so the
-# tests read a fixture rather than the machine's live settings.
-DEFAULT_CONFIG_PATH = Path("~/.claude/config/direct.conf").expanduser()
-
-_CONFIG_PROBLEMS: list[str] = []
-
-
-def _config_path() -> Path:
-    configured = os.environ.get("UNIT_CONFIG") or os.environ.get("PLAN_DELEGATE_CONFIG")
-    return Path(configured) if configured else DEFAULT_CONFIG_PATH
-
-
-def _config_values() -> dict[str, str]:
-    path = _config_path()
-    try:
-        text = path.read_text(encoding="utf-8")
-    except OSError as error:
-        # Stop here: a file nobody can read would otherwise report every key as
-        # unset, burying the one problem that matters.
-        _CONFIG_PROBLEMS.append(f"the file cannot be read ({error.strerror})")
-        _require_usable_config()
-        return {}
-    values: dict[str, str] = {}
-    for line in text.splitlines():
-        statement = line.split("#", 1)[0].strip()
-        key, separator, value = statement.partition("=")
-        if separator:
-            values[key.strip()] = value.strip()
-    return values
-
-
-def _configured_int(values: dict[str, str], key: str, minimum: int = 1) -> int:
-    """Read one integer limit. Records a problem and returns a placeholder when unusable."""
-    raw = values.get(key)
-    if raw is None:
-        _CONFIG_PROBLEMS.append(f"{key} is not set")
-        return minimum
-    try:
-        parsed = int(raw)
-    except ValueError:
-        _CONFIG_PROBLEMS.append(f"{key}={raw} is not a whole number")
-        return minimum
-    if parsed < minimum:
-        _CONFIG_PROBLEMS.append(f"{key}={raw} is below the minimum of {minimum}")
-        return minimum
-    return parsed
-
-
-def _configured_float(values: dict[str, str], key: str) -> float:
-    """Read one rate. Records a problem and returns a placeholder when unusable."""
-    raw = values.get(key)
-    if raw is None:
-        _CONFIG_PROBLEMS.append(f"{key} is not set")
-        return 1.0
-    try:
-        parsed = float(raw)
-    except ValueError:
-        _CONFIG_PROBLEMS.append(f"{key}={raw} is not a number")
-        return 1.0
-    if parsed <= 0:
-        _CONFIG_PROBLEMS.append(f"{key}={raw} is not greater than 0")
-        return 1.0
-    return parsed
-
-
-def _require_usable_config() -> None:
-    """Exit before any command runs when the configuration cannot be trusted."""
-    if not _CONFIG_PROBLEMS:
-        return
-    print(f"direct.conf ({_config_path()}) is not usable:", file=sys.stderr)
-    for problem in _CONFIG_PROBLEMS:
-        print(f"  - {problem}", file=sys.stderr)
-    print("Every convergence limit must be set; there are no defaults.", file=sys.stderr)
-    raise SystemExit(2)
-
-
-_CONFIG = _config_values()
-
-MAX_FIX_ATTEMPTS = _configured_int(_CONFIG, "MAX_FIX_ATTEMPTS")
-MAX_REOPENS = _configured_int(_CONFIG, "MAX_REOPENS")
-STALLED_ROUNDS = _configured_int(_CONFIG, "STALLED_ROUNDS")
-RUNAWAY_ROUNDS = _configured_int(_CONFIG, "RUNAWAY_ROUNDS")
-ROUTING_FROM_ROUND = _configured_int(_CONFIG, "ROUTING_FROM_ROUND")
-ASTRA_AFTER_FAILED_FIXES = _configured_int(_CONFIG, "ASTRA_AFTER_FAILED_FIXES")
-
-# Repairs are dispatched one batch per round, so N confirmed findings should
-# close in about N/2 rounds. A phase that needs materially more than that is
-# bleeding slowly rather than converging -- the stalled-count test never trips
-# on 8 -> 7 -> 6 -> 5, and that pattern is what used to run to the backstop.
-# The floor is what a phase gets regardless of its first-round count.
-REPAIR_ROUNDS_PER_FINDING = _configured_float(_CONFIG, "REPAIR_ROUNDS_PER_FINDING")
-MIN_REPAIR_BUDGET = _configured_int(_CONFIG, "MIN_REPAIR_BUDGET")
-
-# Re-dispatching the same pass kind over and over inside one phase is itself a
-# convergence failure: observed as six consecutive implementation passes and as
-# back-to-back failed fix passes, neither of which the ledger could see.
-MAX_CONSECUTIVE_SAME_KIND_PASSES = _configured_int(_CONFIG, "MAX_CONSECUTIVE_SAME_KIND_PASSES")
-
-# <DualReview/> may preempt one obsolete blind review per phase. A second
-# cancellation means the broad review is never completing.
-MAX_REVIEW_CANCELLATIONS = _configured_int(_CONFIG, "MAX_REVIEW_CANCELLATIONS", minimum=0)
-
-_require_usable_config()
 
 
 def _now_epoch() -> float:
@@ -366,12 +260,28 @@ def _newest_open_instance(session_dir: Path) -> str:
     return _string(phases[-1].get("instance_id")) if phases else ""
 
 
-def _phase_identity(session_dir: Path, phase_id: str = "") -> tuple[str, str]:
-    """The phase this ledger call is for, so two open phases keep separate ledgers.
+def _newest_ledger_instance(session_dir: Path, phase_id: str) -> str:
+    """Return the newest ledger instance for the named phase."""
+    ledgers: list[dict[str, object]] = []
+    for path in [_state_path(session_dir), *sorted(session_dir.glob(_parked_path(session_dir, "*").name))]:
+        if path.is_file():
+            ledger = _json_object(path.read_text(encoding="utf-8"))
+            if ledger is not None and _string(ledger.get("phase_id")) == phase_id:
+                ledgers.append(ledger)
+    if not ledgers:
+        return ""
+    newest = max(ledgers, key=lambda ledger: _number(ledger.get("started_at")))
+    return _string(newest.get("phase_instance_id"))
 
-    A named phase must be open. With none named, the one open phase is meant;
-    with several open the call is refused, since picking one would act on the
-    newest phase's ledger whatever the caller meant.
+
+def _phase_identity(
+    session_dir: Path, phase_id: str = "", *, closed_phase_ok: bool = False,
+) -> tuple[str, str]:
+    """Resolve the phase for this ledger command.
+
+    A named phase must be open unless the caller permits a closed phase.
+    An unnamed command selects the only open phase.
+    Several open phases require an explicit name.
     """
     progress = _progress_state(session_dir)
     if progress is None:
@@ -381,6 +291,10 @@ def _phase_identity(session_dir: Path, phase_id: str = "") -> tuple[str, str]:
         for phase in phases:
             if _string(phase.get("id")) == phase_id:
                 return _string(phase.get("instance_id")), phase_id
+        if closed_phase_ok:
+            instance_id = _newest_ledger_instance(session_dir, phase_id)
+            if instance_id:
+                return instance_id, phase_id
         open_ids = ", ".join(_string(phase.get("id")) for phase in phases) or "none"
         raise SystemExit(f"Phase {phase_id} is not open (open phases: {open_ids})")
     if len(phases) > 1:
@@ -389,6 +303,8 @@ def _phase_identity(session_dir: Path, phase_id: str = "") -> tuple[str, str]:
     phase = phases[0] if phases else _object_dict(progress.get("phase"))
     if phase is None:
         return "", ""
+    if not closed_phase_ok and _string(phase.get("status")) not in ("", "active"):
+        raise SystemExit(f"Phase {_string(phase.get('id'))} is not open (open phases: none)")
     return _string(phase.get("instance_id")), _string(phase.get("id"))
 
 
@@ -443,10 +359,12 @@ def _fresh_state(instance_id: str, phase_id: str, now: float) -> dict[str, objec
     }
 
 
-def _read_state(session_dir: Path, now: float, phase: str = "") -> dict[str, object]:
+def _read_state(
+    session_dir: Path, now: float, phase: str = "", *, closed_phase_ok: bool = False,
+) -> dict[str, object]:
     """Load the phase's ledger: the live file, a parked one, or a fresh one."""
     path = _state_path(session_dir)
-    instance_id, phase_id = _phase_identity(session_dir, phase)
+    instance_id, phase_id = _phase_identity(session_dir, phase, closed_phase_ok=closed_phase_ok)
     if not path.exists():
         return _fresh_state(instance_id, phase_id, now)
     try:
@@ -530,7 +448,7 @@ def _astra_due(entry: dict[str, object], repair_round: int) -> bool:
     if _string(entry.get("state")) != STATE_OPEN:
         return False
     attempts = _integer(entry.get("fix_attempts"))
-    triggered = repair_round >= ROUTING_FROM_ROUND or attempts >= ASTRA_AFTER_FAILED_FIXES
+    triggered = repair_round >= conf.whole("direct", "ROUTING_FROM_ROUND") or attempts >= conf.whole("direct", "ASTRA_AFTER_FAILED_FIXES")
     return triggered and not any(
         _integer(record.get("fix_attempts"), -1) == attempts
         for record in _object_list(entry.get("astra_reviews"))
@@ -677,7 +595,7 @@ def _repair_budget(state: dict[str, object]) -> int:
     if not rounds:
         return 0
     initial = _integer(rounds[0].get("gating_open_before"), 0)
-    return max(MIN_REPAIR_BUDGET, math.ceil(initial * REPAIR_ROUNDS_PER_FINDING))
+    return max(conf.whole("direct", "MIN_REPAIR_BUDGET"), math.ceil(initial * conf.number("direct", "REPAIR_ROUNDS_PER_FINDING")))
 
 
 def _gating_severities(state: dict[str, object]) -> tuple[str, ...]:
@@ -704,7 +622,7 @@ def _summarize(entry: dict[str, object]) -> dict[str, object]:
     detail = _string(entry.get("detail"))
     if detail:
         summary["detail"] = detail
-    for key in ("route", "astra_reviews"):
+    for key in ("route", "astra_reviews", "decision"):
         if key in entry:
             summary[key] = entry[key]
     return summary
@@ -768,30 +686,30 @@ def _advisory_reason(
         entry = _finding(state, finding_id)
         if _string(entry.get("state")) != STATE_OPEN:
             continue
-        if _integer(entry.get("reopen_count")) >= MAX_REOPENS:
+        if _integer(entry.get("reopen_count")) >= conf.whole("direct", "MAX_REOPENS"):
             return f"{finding_id} reopened {_integer(entry.get('reopen_count'))} times after being accepted"
     for finding_id in sorted(_findings(state)):
         entry = _finding(state, finding_id)
         if _string(entry.get("state")) != STATE_OPEN:
             continue
-        if _integer(entry.get("fix_attempts")) >= MAX_FIX_ATTEMPTS:
+        if _integer(entry.get("fix_attempts")) >= conf.whole("direct", "MAX_FIX_ATTEMPTS"):
             attempts = _integer(entry.get("fix_attempts"))
             return f"{finding_id} failed to close after {attempts} repair attempts"
     kind, run = _consecutive_same_kind(passes)
-    if run >= MAX_CONSECUTIVE_SAME_KIND_PASSES:
+    if run >= conf.whole("direct", "MAX_CONSECUTIVE_SAME_KIND_PASSES"):
         return f"{run} consecutive {kind} passes ran without the phase advancing"
     cancellations = _review_cancellations(passes)
-    if cancellations > MAX_REVIEW_CANCELLATIONS:
+    if cancellations > conf.whole("direct", "MAX_REVIEW_CANCELLATIONS"):
         return f"the blind review was canceled {cancellations} times, so it is never completing"
     # Stall and budget read live rounds: an abandoned round repaired nothing, so
     # counting it would stop the phase for a repair that never ran.
     rounds = _live_rounds(state)
-    if len(rounds) >= STALLED_ROUNDS:
+    if len(rounds) >= conf.whole("direct", "STALLED_ROUNDS"):
         previous = _integer(rounds[-1].get("gating_open_before"), -1)
         earlier = _integer(rounds[-2].get("gating_open_before"), -1)
         if previous >= 0 and earlier >= 0 and gating_open >= previous >= earlier:
             trend = f"({earlier} -> {previous} -> {gating_open})"
-            return f"the gating open count has not decreased for {STALLED_ROUNDS} rounds {trend}"
+            return f"the gating open count has not decreased for {conf.whole("direct", "STALLED_ROUNDS")} rounds {trend}"
     budget = _repair_budget(state)
     if budget and len(rounds) >= budget:
         initial = _integer(rounds[0].get("gating_open_before"), 0)
@@ -801,8 +719,8 @@ def _advisory_reason(
         )
     # The backstop counts every dispatch, abandoned ones included: a loop that
     # keeps launching repairs that keep dying is exactly the runaway it guards.
-    if len(_rounds(state)) >= RUNAWAY_ROUNDS:
-        return f"the runaway backstop of {RUNAWAY_ROUNDS} fix rounds was reached"
+    if len(_rounds(state)) >= conf.whole("direct", "RUNAWAY_ROUNDS"):
+        return f"the runaway backstop of {conf.whole("direct", "RUNAWAY_ROUNDS")} fix rounds was reached"
     return ""
 
 
@@ -811,6 +729,12 @@ def _open(args: argparse.Namespace) -> None:
     now = _now_epoch()
     state = _read_state(session_dir, now, _arg_string(args, "phase"))
     severity = _arg_string(args, "severity")
+    held = bool(getattr(args, "held_for_decision", False))
+    lenses = _arg_string(args, "lens").split(",")
+    if held and "simplify" not in lenses:
+        raise SystemExit("--held-for-decision requires --lens simplify")
+    if "simplify" in lenses and severity != "minor":
+        raise SystemExit("simplify findings require --severity minor")
     ordinal = _integer(state.get("next_ordinal"), 1)
     finding_id = f"F{ordinal:03d}"
     entry: dict[str, object] = {
@@ -822,7 +746,7 @@ def _open(args: argparse.Namespace) -> None:
         "detail": _arg_string(args, "detail"),
         "caught_by": _caught_by(args),
         "lens": _arg_string(args, "lens"),
-        "state": STATE_OPEN,
+        "state": STATE_HELD if held else STATE_OPEN,
         "opened_at": now,
         "opened_round": len(_rounds(state)),
         "fix_attempts": 0,
@@ -845,6 +769,7 @@ def _open(args: argparse.Namespace) -> None:
             "title": _arg_string(args, "title"),
             "caught_by": _caught_by(args),
             "lens": _arg_string(args, "lens"),
+            "state": entry["state"],
             "round": len(_rounds(state)),
         },
     )
@@ -859,6 +784,8 @@ def _verdict(args: argparse.Namespace) -> None:
     entry = _finding(state, finding_id)
     outcome = _arg_string(args, "state")
     current = _string(entry.get("state"))
+    if current in (STATE_HELD, STATE_DECIDED):
+        raise SystemExit(f"{finding_id} requires the user's decision; no closure verdict can change it")
     # A verdict judges a repair that exists. While one is in flight nothing has
     # confirmed any edit landed, so there is nothing a reviewer could have read.
     if current == STATE_IN_FLIGHT:
@@ -981,7 +908,7 @@ def _gate(args: argparse.Namespace) -> None:
             "open_counts": payload.get("open_counts"),
         },
     )
-    if _integer(payload.get("repair_round")) >= ROUTING_FROM_ROUND and any(
+    if _integer(payload.get("repair_round")) >= conf.whole("direct", "ROUTING_FROM_ROUND") and any(
         _integer(entry.get("fix_attempts")) >= 1
         for entry in _open_entries(state, _gating_severities(state))
     ):
@@ -1134,7 +1061,7 @@ def _dispatch(args: argparse.Namespace) -> None:
     if due:
         raise SystemExit("Astra review due for " + ", ".join(due) + "; record it with findings.py astra")
     kept = _kept_evidence(args, covered)
-    if repair_round >= ROUTING_FROM_ROUND:
+    if repair_round >= conf.whole("direct", "ROUTING_FROM_ROUND"):
         missing_kept = sorted(covered - set(kept))
         if missing_kept:
             raise SystemExit(
@@ -1289,10 +1216,33 @@ def _abandon(args: argparse.Namespace) -> None:
     )
 
 
+def _decision(args: argparse.Namespace) -> None:
+    """Record the user's answer without applying the proposed change."""
+    session_dir = _session_dir(args)
+    now = _now_epoch()
+    state = _read_state(session_dir, now, _arg_string(args, "phase"), closed_phase_ok=True)
+    entry = _finding(state, _arg_string(args, "id"))
+    if _string(entry.get("state")) != STATE_HELD:
+        raise SystemExit("Only a finding held for a decision can receive an answer")
+    decision: dict[str, object] = {
+        "answer": _arg_string(args, "answer"),
+        "user_words": _required_text(args, "user_words"),
+        "timestamp_epoch": now,
+    }
+    entry["state"] = STATE_DECIDED
+    entry["decision"] = decision
+    _write_state(session_dir, state)
+    _append_event(session_dir, state, {
+        "event_type": "finding_decision", "finding_id": entry["id"],
+        "timestamp": _iso_time(now), **decision,
+    })
+    print(f"{entry['id']} decided: {decision['answer']}")
+
+
 def _status(args: argparse.Namespace) -> None:
     session_dir = _session_dir(args)
     now = _now_epoch()
-    state = _read_state(session_dir, now, _arg_string(args, "phase"))
+    state = _read_state(session_dir, now, _arg_string(args, "phase"), closed_phase_ok=True)
     findings = [_summarize(_finding(state, key)) for key in sorted(_findings(state))]
     payload: dict[str, object] = {
         "phase_id": _string(state.get("phase_id")),
@@ -1301,6 +1251,7 @@ def _status(args: argparse.Namespace) -> None:
         "in_flight": _in_flight_ids(state),
         "repair_round": _repair_round(state, session_dir),
         "routed": [_summarize(_finding(state, key)) for key in _ids_in_state(state, STATE_ROUTED)],
+        "held_for_decision": [_summarize(_finding(state, key)) for key in _ids_in_state(state, STATE_HELD)],
         "gating_severities": list(_gating_severities(state)),
         "open_counts": _open_counts(state),
         "findings": findings,
@@ -1353,7 +1304,16 @@ def _build_parser() -> argparse.ArgumentParser:
     # quality, and `ux` is the UX screenshot reviewer's. Empty for a closure
     # review or the main review alone.
     _ = opened.add_argument("--lens", type=_lens_list, default="")
+    _ = opened.add_argument("--held-for-decision", action="store_true")
     opened.set_defaults(handler=_open)
+
+    decision = subparsers.add_parser("decision", help="record the user's answer to a held finding")
+    _ = decision.add_argument("--session-dir", required=True)
+    _ = decision.add_argument("--phase", default="", help=PHASE_HELP)
+    _ = decision.add_argument("--id", required=True)
+    _ = decision.add_argument("--answer", choices=("approved", "declined"), required=True)
+    _ = decision.add_argument("--user-words", required=True)
+    decision.set_defaults(handler=_decision)
 
     verdict = subparsers.add_parser("verdict", help="record a closure review's outcome")
     _ = verdict.add_argument("--session-dir", required=True)
@@ -1438,8 +1398,33 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def require_configuration() -> None:
+    problems: list[str] = []
+    for key in ("MAX_FIX_ATTEMPTS", "MAX_REOPENS", "STALLED_ROUNDS", "RUNAWAY_ROUNDS",
+                "ROUTING_FROM_ROUND", "ASTRA_AFTER_FAILED_FIXES", "MIN_REPAIR_BUDGET",
+                "MAX_CONSECUTIVE_SAME_KIND_PASSES", "MAX_REVIEW_CANCELLATIONS", "REPAIR_ROUNDS_PER_FINDING"):
+        try:
+            if key == "REPAIR_ROUNDS_PER_FINDING":
+                _ = conf.number("direct", key)
+            else:
+                _ = conf.whole("direct", key)
+        except conf.Unusable as error:
+            message = str(error)
+            if "key is missing" in message:
+                message = f"{key} is not set: {message}"
+            elif "expected a whole number" in message or "could not convert string to float" in message:
+                raw = conf.effective_line("direct", key)[1]
+                message = f"{key}={raw} is not a whole number: {message}"
+            elif not conf.path("direct").is_file():
+                message = f"cannot be read: {message}"
+            problems.append(message)
+    if problems:
+        raise conf.Unusable("\n".join(problems))
+
+
 def main() -> None:
     args = _build_parser().parse_args()
+    require_configuration()
     handler_value: object = getattr(args, "handler")  # pyright: ignore[reportAny]
     if not callable(handler_value):
         raise SystemExit("No command handler selected")
@@ -1455,4 +1440,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except conf.Unusable as error:
+        print(str(error), file=sys.stderr)
+        raise SystemExit(2) from error

@@ -1,5 +1,5 @@
 ---
-description: Wind Codex agents down on every showrunner and count the ones still running, sort them into stop-now and finish, or give the all clear. Args - `start`, `triage`, `clear`, `help`, or none for the count now.
+description: Stop Codex work or report active agents.
 argument-hint: "[start|triage|clear|help]"
 ---
 

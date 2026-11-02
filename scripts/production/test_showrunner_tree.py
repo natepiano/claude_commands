@@ -1,6 +1,7 @@
 """Staff-backed reporting trees, legacy edge writes and their command-line behavior."""
 from __future__ import annotations
 
+from pathlib import Path
 import io
 import os
 import subprocess
@@ -9,15 +10,42 @@ import unittest
 from contextlib import redirect_stdout
 from unittest import mock
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 import showrunner_parent
 import showrunner_tree
-import showrunners
+from scripts.production import showrunners
 import test_showrunners
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import staff
 
 
 class ShowrunnerTreeTests(test_showrunners.ShowrunnerFixture):
+    def test_attach_refuses_unknown_liveness_instead_of_accepting_a_partial_inventory(self) -> None:
+        self.showrunner("top")
+        self.showrunner("kid")
+        partial = showrunners.ShowrunnerDiscovery([], (
+            showrunners.ShowrunnerLookupFailure("kid", "kid lookup failed"),))
+        with (mock.patch.object(showrunners, "registered_showrunners", return_value=partial),
+              mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", self.notifier)):
+            with self.assertRaisesRegex(OSError, "kid lookup failed"):
+                showrunner_tree.check_attach("kid", "top")
+        self.assertFalse((self.state / "kid/parent").exists())
+
+    def test_wrapped_showrunner_keeps_its_raw_parent_but_leaves_the_active_tree_despite_a_stale_timer(self) -> None:
+        self.showrunner("top", running=False)
+        self.showrunner("wrapped", running=False)
+        self.recorded_parent("wrapped", "top")
+        old = staff.snapshot().by_path("wrapped")
+        assert old is not None
+        _ = staff.set_doc(old.id, staff.WrappedDoc("natedev", self.root / "wrapped-production.md"))
+        record = staff.snapshot()
+        self.assertEqual(showrunner_tree.children_of("top", record=record), [])
+        self.assertEqual(showrunner_tree.parent_edges(record=record), {})
+        retained = record.by_id(old.id)
+        assert retained is not None
+        self.assertEqual(retained.parent, old.parent)
+
     def test_attach_retries_routing_notices_after_the_parent_was_saved(self) -> None:
         self.showrunner("top")
         self.showrunner("mid")
@@ -125,7 +153,9 @@ class ShowrunnerTreeTests(test_showrunners.ShowrunnerFixture):
     def test_attach_with_no_parent_named_takes_the_callers_production_and_sends_the_caller_nothing(self) -> None:
         self.showrunner("top")
         self.showrunner("mid")
-        attached = self.successful("attach", "mid", caller="top-id")
+        caller = staff.by_path("top")
+        assert caller is not None
+        attached = self.successful("attach", "mid", caller=caller.id)
         self.assertEqual(attached.splitlines(), ["mid now reports to top", "told mid"])
         self.assertEqual([socket for socket, _ in self.messages()], [f"uds:{self.root / 'mid-id.sock'}"])
         self.assertIn("name the parent: this session runs no production", self.refused("attach", "top"))

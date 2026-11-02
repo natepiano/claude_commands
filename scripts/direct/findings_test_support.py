@@ -15,16 +15,15 @@ import unittest
 from unittest.mock import patch
 
 from scripts.production.cli_fixture import invoke_cli
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 # Only the fsync test calls a function directly; never initialize it from live config.
-with patch.dict(os.environ, {"UNIT_CONFIG": str(Path(__file__).resolve().parents[2] / "config/direct.conf")}):
+with patch.dict(os.environ, {"CONF_DIR": str(Path(Path(__file__).resolve().parents[2] / "config/direct.conf").parent)}):
     from scripts.direct import findings as findings
 
 SCRIPT = Path(__file__).with_name("findings.py")
 FINDINGS_CODE = compile(SCRIPT.read_text(encoding="utf-8"), str(SCRIPT), "exec")
 
-# load 136 on natedev, 2026-10-29
-TEST_HANG_GUARD_SECS = 300
 
 
 def invoke_findings(arguments: list[str], environment: dict[str, str], cwd: Path) -> subprocess.CompletedProcess[str]:
@@ -42,18 +41,7 @@ def invoke_findings(arguments: list[str], environment: dict[str, str], cwd: Path
 # findings.py has no compiled limits, so every run needs a complete config.
 # These are the machine's shipped values; a test that cares about one limit
 # overrides just that key on top of them.
-STANDARD_CONFIG = """\
-MIN_REPAIR_BUDGET=3
-REPAIR_ROUNDS_PER_FINDING=0.5
-RUNAWAY_ROUNDS=5
-MAX_FIX_ATTEMPTS=2
-MAX_REOPENS=2
-STALLED_ROUNDS=2
-MAX_CONSECUTIVE_SAME_KIND_PASSES=3
-MAX_REVIEW_CANCELLATIONS=1
-ROUTING_FROM_ROUND=4
-ASTRA_AFTER_FAILED_FIXES=2
-"""
+STANDARD_CONFIG = (SCRIPT.parents[2] / "config/direct.conf").read_text(encoding="utf-8")
 
 
 class FindingsLedgerFixture(unittest.TestCase):
@@ -118,7 +106,7 @@ class FindingsLedgerFixture(unittest.TestCase):
         """Pin the clock and the config so a machine's own direct.conf cannot move a limit."""
         environment = os.environ.copy()
         environment["UNIT_NOW_EPOCH"] = str(at)
-        environment["UNIT_CONFIG"] = str(self.config_file)
+        environment["CONF_DIR"] = str(Path(self.config_file).parent)
         # The gate reads pass events from the durable stream under this root.
         # Left unset it resolves to the machine's own history, where a phase id
         # this fixture invented would be answered by whatever happens to live
@@ -128,7 +116,12 @@ class FindingsLedgerFixture(unittest.TestCase):
 
     def write_config(self, text: str) -> None:
         """Write the standard limits with `text` appended; a repeated key there wins."""
-        _ = self.config_file.write_text(STANDARD_CONFIG + text, encoding="utf-8")
+        changes = dict(line.split("=", 1) for line in text.splitlines() if "=" in line)
+        lines = [line.split("=", 1)[0] + "=" + changes.pop(line.split("=", 1)[0])
+                 if "=" in line and line.split("=", 1)[0] in changes else line
+                 for line in STANDARD_CONFIG.splitlines()]
+        _ = self.config_file.write_text("\n".join(lines) + "\n" + "\n".join(
+            key + "=" + value for key, value in changes.items()), encoding="utf-8")
 
     def write_partial_config(self, text: str) -> None:
         """Write `text` as the whole file, standard limits omitted."""

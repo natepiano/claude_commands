@@ -280,7 +280,7 @@ A call is off host when the verb is not `project-of`, the short host name is not
 
 | Project | Step | Runs when | Outcome |
 | --- | --- | --- | --- |
-| hana | `<ChangeReviewFeatureLog/>`, then `<CloseChangeReview/>` | `merge_checkpoint.py` accepts a merge in `~/rust/hana` or `~/rust/hana_catalyst`; later, the user's change-review verdict | `propose` at merge; `add`/`supersede --review` on `works` or `fine`; `drop` on any other verdict |
+| hana | `<ChangeReviewFeatureLog/>`, then `<CloseChangeReview/>` | `merge_checkpoint.py` accepts a merge in `~/rust/hana` or `~/rust/hana_catalyst`; later, the user's change-review verdict | `propose` at merge; `add`/`supersede --review` when the verdict begins `works` or `fine` after optional `okay`/`ok` and a row id (`c17`), ignoring case and later words; `drop` on any other start |
 | claude | the same two steps | `merge_checkpoint.py` accepts a merge in a `~/.claude` worktree (build-followups); later, the user's change-review verdict | the same, with rows qualified by the production's list: `propose --review build-followups/C<n> --project claude`, then `add --review build-followups/C<n>` or `drop --review build-followups/C<n> --verdict …` |
 | cargo-liner, bevy_brp, obsidian_knife, nateroids | `<FeatureLogCloseOut/>` in `/validate_and_push` | the commit is on the default branch and all watched CI is green; also after `push_pr_branch_and_merge.sh` | `add`, `supersede`, or `none — <reason>` in the summary's `Feature log:` line |
 | natedev | `/etc/nixos/README.md` step 6 | `rebuild` succeeded and the activated revision (last line of `~/.local/state/rebuild/generations.log`, without `-dirty`) is on `origin/main` | `add --project natedev`, `supersede`, or `feature log: none — <reason>` |
@@ -425,7 +425,7 @@ Ledgers and evidence:
 - `git log -S` on a bullet's current wording finds the last commit that rewrapped it. cargo-liner's changelog rewrap `a5f4bf0b` (2026-09-16) is the known case: 48 notes link the pre-rewrap match, one links the rewrap, which added that bullet, and seven cargo-port notes link `d9558a79`, a summary rewrite later than the behavior.
 - `git log --first-parent --merges --ancestry-path <c>..<audit>` alone returns nothing for work that entered on a merge's second parent (a subtree import, a workspace consolidation). An introducing commit can also sit off the first-parent line outside any import.
 - A docs-move or docs checkpoint commit can hold a link by mistake; the link is the commit that made the behavior true. A note stating specific values links the first-parent commit that reached them.
-- A `See it` command resolves with `command -v`: natedev installs `plasma-review`, not `plasma-diff`. Read a command's source before running it: `agent-sessions-snapshot --help` ignores the flag and regenerates the vault's agent-session pages.
+- A `See it` command resolves with `command -v`: natedev installs `plasma-review`, not `plasma-diff`. Read a command's source before running it: the now-removed `agent-sessions-snapshot --help` ignored the flag and regenerated the vault's agent-session pages.
 - An app check at an audit ref runs from a detached worktree with `BRP_EXTRAS_PORT=15798 cargo run` and JSON-RPC over curl to `http://127.0.0.1:15798`; one app holds the port at a time.
 
 ## Why

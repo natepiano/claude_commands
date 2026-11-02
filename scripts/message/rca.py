@@ -31,8 +31,9 @@ retires the case's alert by its sender and key: a kept alert never goes out at s
 emergency alert stops repeating. `remind`, which stall_watch.py runs on each pass, sends the owner one
 reminder for a case still open 30 minutes after it opened.
 
-The owner message and the reminder start send.py detached and do not wait for it, as a relay can take
-minutes; its output goes to STATE/owner.log. The start and fixed pushes wait for send.py and print its outcome.
+Owner sends wait for send.py and write its outcome to STATE/owner.log. The watcher defers new owner
+sends until its concurrent reminder batch, under the time remaining before its outer watchdog. Cases
+retain undelivered notices for the next pass. The start and fixed pushes also wait for send.py.
 
 Each case is one JSON file in STATE, which is $XDG_STATE_HOME/message/rca or ~/.local/state/message/rca.
 `open` never fails its caller: the alert already went out, so an error prints to stderr and it exits 0.
@@ -42,15 +43,20 @@ from __future__ import annotations
 import argparse
 import fcntl
 import json
+import math
 import os
 import re
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
+from time import monotonic, sleep
 from collections.abc import Generator
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Literal, NamedTuple, TypedDict, cast
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from typing import Literal, NamedTuple, NotRequired, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "production"))
@@ -59,17 +65,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "notify"))
 import push_texts  # noqa: E402
 import review  # noqa: E402
 import sessions  # noqa: E402
-import showrunners  # noqa: E402
+from scripts.production import showrunners  # noqa: E402
 import silence  # noqa: E402
 from user_zone import user_zone  # noqa: E402
+from session_staff import PRODUCTION_MARK  # noqa: E402
 
 STATE = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state") / "message" / "rca"
 SEND = Path(os.environ.get("RCA_SEND") or Path(__file__).resolve().parent / "send.py")
 CALL = "~/.claude/scripts/lib/py ~/.claude/scripts/message/rca.py"
 PROJECTS = Path.home() / ".claude" / "projects"
-# unit_lookup.PRODUCTION_MARK: the production slug every process of a unit's session inherits.
-# unit_lookup itself is not imported here, as its herdr import costs 160 ms.
-PRODUCTION_MARK = "SHOWRUNNER_UNIT"
 # The owner when the session has no production, or its showrunner does not run.
 NATEDEV = "natedev"
 SENDER = "rca"
@@ -82,7 +86,7 @@ REWRITTEN_TEXT = "permission.rca_fixed_rewritten"
 REMIND_AFTER = timedelta(minutes=30)
 # A user push waits for its review; a Claude recipient falls back to a relay.
 SEND_SECONDS = 300
-# The output of each detached owner message and reminder, after a line with its time and key.
+# The completed outcome of each owner message and reminder, after a line with its time and key.
 OWNER_LOG = "owner.log"
 # The first word of a command that changes a file: auto_mode.refused's "write …" and "edit …", and the
 # tool names stall_watch.py records for a pending edit or write call.
@@ -110,6 +114,7 @@ class Case(TypedDict):
     fix: str
     commit: str
     reminded: bool
+    owner_told: NotRequired[bool]
     alerts: int
     # When the session stopped (UTC ISO time); a case from before 2026-10-23 reads its opened time.
     stopped: str
@@ -143,10 +148,18 @@ def now() -> datetime:
 
 
 @contextmanager
-def locked() -> Generator[None]:
+def locked(*, deadline: float = math.inf) -> Generator[None]:
     STATE.mkdir(parents=True, exist_ok=True)
     with open(STATE / ".lock", "w", encoding="utf-8") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    raise OSError("case lock deadline exhausted; retained for the next pass") from None
+                sleep(min(0.01, remaining))
         yield
 
 
@@ -202,13 +215,13 @@ def production_of(report: Report) -> str:
     return showrunners.canonical_slug(slug) if slug else ""
 
 
-def owner_address(production: str) -> str:
+def owner_address(production: str, *, deadline: float = math.inf) -> str:
     """Where the case's owner gets messages: the production's showrunner, else the natedev session."""
     if not production:
         return NATEDEV
     try:
-        return showrunners.current_address(production) or NATEDEV
-    except (OSError, ValueError):
+        return showrunners.current_address(production, deadline=deadline) or NATEDEV
+    except ValueError:
         return NATEDEV
 
 
@@ -262,31 +275,42 @@ def owner_message(case: Case, *, reminder: bool = False) -> str:
     return "\n".join(lines)
 
 
-def send(argv: list[str]) -> tuple[bool, str]:
+def send(argv: list[str], *, seconds: float = SEND_SECONDS) -> tuple[bool, str]:
     """Run send.py; whether it exited 0, and what it printed."""
+    if seconds <= 0:
+        return False, "owner delivery budget exhausted; retained for the next pass"
     try:
         result = subprocess.run([sys.executable, str(SEND), *argv], capture_output=True, text=True,
-                                timeout=SEND_SECONDS, check=False)
+                                timeout=seconds, check=False)
     except (OSError, subprocess.TimeoutExpired) as error:
         return False, str(error)
     return result.returncode == 0, (result.stdout + result.stderr).strip()
 
 
-def tell_owner(case: Case, *, reminder: bool = False) -> str:
-    """Start the owner message detached, so the caller does not wait for its relay: "" once it started, else why
-    it did not start. A message that fails after it starts goes to OWNER_LOG; the reminder covers a first message."""
+def tell_owner(case: Case, *, reminder: bool = False, deadline: float = math.inf) -> str:
+    """Wait for the owner delivery before a one-shot caller exits; return its failure, or empty on success."""
     key = f"rca-{case['id']}" + ("-remind" if reminder else "")
-    argv = [sys.executable, str(SEND), "--to", owner_address(case["production"]), "--from", SENDER, "--key", key,
-            "--text", owner_message(case, reminder=reminder)]
     try:
+        argv = ["--to", owner_address(case["production"], deadline=deadline), "--from", SENDER, "--key", key,
+                "--text", owner_message(case, reminder=reminder)]
         STATE.mkdir(parents=True, exist_ok=True)
         with open(STATE / OWNER_LOG, "a", encoding="utf-8") as log:
             _ = log.write(f"{now().isoformat()} {key}\n")
             log.flush()
-            _ = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
+            sent, outcome = send(argv, seconds=min(SEND_SECONDS, max(0, deadline - monotonic())))
+            _ = log.write(outcome + "\n")
+        if sent:
+            with locked(deadline=deadline):
+                current = read_case(case_path(case["id"]))
+                if current is not None:
+                    if reminder:
+                        current["reminded"] = True
+                    else:
+                        current["owner_told"] = True
+                    save(current)
     except OSError as error:
         return str(error)
-    return ""
+    return "" if sent else outcome or "send.py failed"
 
 
 def sender_of(case: Case) -> str:
@@ -333,13 +357,14 @@ def refusal(outcome: review.Rewritten | review.Failed | review.Withheld, rendere
     return "\n".join(lines)
 
 
-def open_case(report: Report, at: datetime | None = None) -> str:
+def open_case(report: Report, at: datetime | None = None, *, defer_owner: bool = False,
+              deadline: float = math.inf) -> str:
     """Open a case for the alert, or join the open one for the same session and commands.
 
     It never raises: the alert already went out, so an error is only printed."""
     try:
         commands = list(dict.fromkeys(line for command in report.commands if (line := one_line(command))))
-        with locked():
+        with locked(deadline=deadline):
             for case in cases():
                 if (case["status"] != "fixed" and case["session"] == report.session
                         and set(case["commands"]) == set(commands)):
@@ -350,11 +375,11 @@ def open_case(report: Report, at: datetime | None = None) -> str:
             case = Case(id=new_id(opened), session=report.session, machine=report.machine,
                         production=production_of(report), commands=commands, kind=report.kind,
                         transcript=transcript_of(report), opened=opened.isoformat(), status="open", owner="",
-                        cause="", fix="", commit="", reminded=False, alerts=1,
+                        cause="", fix="", commit="", reminded=False, owner_told=False, alerts=1,
                         stopped=report.stopped or opened.isoformat(), waits=one_line(report.waits),
                         alert_source=report.source, alert_key=report.key, refusals=0)
             save(case)
-        failure = tell_owner(case)
+        failure = "" if defer_owner else tell_owner(case, deadline=deadline)
         if failure:
             print(f"rca: {case['id']}: the owner message did not start, a reminder follows: {failure}", file=sys.stderr)
         return f"rca: opened {case['id']}"
@@ -410,22 +435,23 @@ def fixed(case_id: str, cause: str, fix: str, commit: str) -> tuple[bool, str]:
     return sent, "\n".join(part for part in (retired, detail) if part)
 
 
-def remind(at: datetime | None = None) -> None:
-    """Tell the owner once of each case still open 30 minutes after it opened. It never raises."""
+def remind(at: datetime | None = None, *, deadline: float = math.inf) -> None:
+    """Retry first notices and due reminders concurrently within one caller-owned deadline."""
     try:
-        late = [case for case in cases() if case["status"] == "open" and not case["reminded"]
-                and (at or now()) - datetime.fromisoformat(case["opened"]) >= REMIND_AFTER]
-        for case in late:
-            failure = tell_owner(case, reminder=True)
-            if failure:
-                print(f"rca: {case['id']}: the reminder did not start: {failure}", file=sys.stderr)
-                continue
-            with locked():
-                current = read_case(case_path(case["id"]))
-                if current is not None:
-                    current["reminded"] = True
-                    save(current)
-            print(f"rca: reminded {case['id']}")
+        due = [(case, case.get("owner_told", True)) for case in cases()
+               if case["status"] != "fixed" and (not case.get("owner_told", True)
+                   or case["status"] == "open" and not case["reminded"]
+                   and (at or now()) - datetime.fromisoformat(case["opened"]) >= REMIND_AFTER)]
+        if not due:
+            return
+        with ThreadPoolExecutor(max_workers=len(due)) as pool:
+            sends = [pool.submit(tell_owner, case, reminder=reminder, deadline=deadline) for case, reminder in due]
+            for (case, reminder), future in zip(due, sends):
+                failure = future.result()
+                if failure:
+                    print(f"rca: {case['id']}: owner delivery retained for retry: {failure}", file=sys.stderr)
+                else:
+                    print(f"rca: {'reminded' if reminder else 'told owner of'} {case['id']}")
     except Exception as error:  # noqa: BLE001  a pass of the caller must not end here
         print(f"rca: no reminders sent: {type(error).__name__}: {error}", file=sys.stderr)
 

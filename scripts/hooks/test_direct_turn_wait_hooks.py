@@ -15,6 +15,7 @@ from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 HOOKS = Path(__file__).resolve().parent
@@ -34,7 +35,7 @@ class DirectorWaitFixture:
         result = subprocess.run(
             [sys.executable, str(HOOKS / hook)],
             input=json.dumps({"session_id": SESSION, **fields}), text=True,
-            capture_output=True, check=True, timeout=30,
+            capture_output=True, check=True, timeout=TEST_HANG_GUARD_SECS,
             env={**self.environment, "UNIT_NOW_EPOCH": str(at)}, cwd=self.root,
         )
         if result.stderr or result.stdout:

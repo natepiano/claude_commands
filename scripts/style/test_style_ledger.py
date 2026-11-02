@@ -23,15 +23,77 @@ import style_ledger
 from approved_renames import AppliedInCode
 
 
-from ledger_test_support import (LedgerTestCase, LedgerStatus, PARENT_FILE)
-
-
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
+from ledger_test_support import (remove_generation_schema, LedgerTestCase, LedgerStatus, PARENT_FILE)
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 @final
 class StyleLedgerRecordsTests(LedgerTestCase):
+    def test_path_attributes_classify_meta_roles_and_nested_cfg_attr_payloads(self) -> None:
+        from style_ledger import _path_attributes  # pyright: ignore[reportPrivateUsage]
+        data = ('#[cfg(path = "predicate.rs")] fn f() {} '
+                '#[cfg_attr(path = "predicate.rs", allow(dead_code))] fn g() {} '
+                '#[custom(path = "argument.rs")] fn h() {} '
+                '#[path::metadata(path = "argument.rs")] fn j() {}')
+        self.assertEqual(_path_attributes("src/lib.rs", data.encode()), ())
+        source = ('#[cfg_attr(path = "predicate.rs", '
+                  'cfg_attr(all(), path = "child.rs"))] mod child; '
+                  '#[path="direct.rs"] mod direct; '
+                  '#[r#path="raw.rs"] mod raw;')
+        mounts = _path_attributes("src/lib.rs", source.encode())
+        self.assertEqual(mounts, (style_ledger.MountedFile("src/lib.rs", ("src/child.rs",)),
+                                 style_ledger.MountedFile("src/lib.rs", ("src/direct.rs",)),
+                                 style_ledger.MountedFile("src/lib.rs", ("src/raw.rs",))))
+
+    def test_private_rule_scope_nests_and_restores_after_interruption(self) -> None:
+        rule_id = self.rule("private-rules")
+        private, nested = self.root / "private", self.root / "nested"
+        private.mkdir()
+        nested.mkdir()
+        roots: list[Path] = []
+        load = rules.load_rules
+
+        def observed(repo: Path) -> tuple[rules.Rule, ...]:
+            roots.append(repo)
+            return load(repo)
+
+        with self.ledger() as initial:
+            initial.set_tip(self.initial_tip)
+        invalid = self.repo / "docs/style/invalid.md"
+        invalid.parent.mkdir(parents=True)
+        _ = invalid.write_text("---\ninvalid: [\n")
+        with self.ledger() as ledger:
+            with mock.patch.object(rules, "load_rules", side_effect=observed):
+                with self.assertRaisesRegex(RuntimeError, "interrupted"):
+                    with ledger.rules_from_checkout(private):
+                        ledger.ticket_add("scope-1", "scope", "read", "names", "crates/alpha",
+                                          [self.sources[0]], [rule_id])
+                        with ledger.rules_from_checkout(nested):
+                            ledger.ticket_add("scope-2", "scope", "read", "names", "crates/alpha",
+                                              [self.sources[0]], [rule_id])
+                        ledger.ticket_add("scope-3", "scope", "read", "names", "crates/alpha",
+                                          [self.sources[0]], [rule_id])
+                        raise RuntimeError("interrupted")
+                invalid.unlink()
+                ledger.ticket_add("scope-4", "scope", "read", "names", "crates/alpha",
+                                  [self.sources[0]], [rule_id])
+            self.assertEqual(roots, [private, nested, private, self.repo])
+            self.assertEqual(ledger.repo, self.repo)
+
+    def test_tree_entries_share_commit_and_bare_tree_inventory(self) -> None:
+        path = self.sources[0]
+        _ = self.git("update-index", "--chmod=+x", path)
+        tree = self.git("write-tree")
+        commit = self.git("commit-tree", tree, "-p", self.initial_tip, "-m", "inventory")
+        inventory = style_ledger.tree_entries(self.repo, tree)
+        self.assertEqual(inventory, style_ledger.tree_entries(self.repo, commit))
+        self.assertEqual(inventory[path].mode, "100755")
+        self.assertEqual(inventory[path].kind, "blob")
+        cache = style_ledger.GitReadCache(self.repo)
+        self.assertEqual(inventory, cache.tip(commit).entries)
+        contents = dict(style_ledger.blob_contents(self.repo, {path: inventory[path].object}))
+        self.assertEqual(contents[path], (self.repo / path).read_bytes())
+
     def test_metadata_only_rule_edit_accepts_pin_and_keeps_cell_current_but_body_edit_does_not(self) -> None:
         rule_id = self.rule("metadata")
         path = self.rule_dir / "metadata.md"
@@ -92,6 +154,113 @@ class StyleLedgerRecordsTests(LedgerTestCase):
             contender.result(timeout=TEST_HANG_GUARD_SECS)
         self.assertTrue(acquired.is_set(), "refill lock was not released on context exit")
 
+    def assert_generation_backfill(
+        self, rows: tuple[tuple[str, str, str, str], ...], expected: dict[str, str],
+        invalidations: tuple[tuple[int, str], ...] = (),
+    ) -> None:
+        """Upgrade distinct historical evidence through the real constructor transaction."""
+        with self.ledger() as ledger:
+            database = ledger.database
+        with closing(sqlite3.connect(database)) as connection, connection:
+            remove_generation_schema(connection)
+            for id, (rule, blob, at, verdict) in enumerate(rows, 1):
+                _ = connection.execute(
+                    'INSERT INTO judgments(id,rule,rule_blob,input_scope,input_fingerprint,path,"commit",'
+                    + "verdict,verdict_detail,ticket,worker,recorded_at) VALUES (?,?,?,'file','input','path','tip',?,'','outside',?,?)",
+                    (id, rule, blob, verdict, str(id), at))
+            _ = connection.executemany("INSERT INTO invalidated_held_judgments VALUES (?,?)", invalidations)
+            _ = connection.execute("UPDATE schema_version SET version=29")
+        with style_ledger.Ledger(self.repo, database):
+            pass
+        with closing(sqlite3.connect(database)) as connection:
+            self.assertEqual(dict(cast(list[tuple[str, str]], connection.execute("SELECT rule,rule_blob FROM rule_generations").fetchall())), expected)
+            self.assertEqual(connection.execute("SELECT DISTINCT generation FROM rule_generations").fetchall(), [(0,)])
+            invalidated = {style_ledger.base_rule(rows[id - 1][0]) for id, at in invalidations
+                           if rows[id - 1][2] == at}
+            self.assertEqual(connection.execute("SELECT id,generation FROM judgments ORDER BY id").fetchall(),
+                             [(id, -1 if style_ledger.base_rule(rule) in invalidated and verdict != "removed" else 0)
+                              for id, (rule, _, _, verdict) in enumerate(rows, 1)])
+            self.assertEqual(connection.execute("SELECT id FROM active_judgments ORDER BY id").fetchall(),
+                             [(id,) for id, (rule, _, _, verdict) in enumerate(rows, 1)
+                              if style_ledger.base_rule(rule) not in invalidated or verdict == "removed"])
+
+    def test_generation_backfill_ranks_once_without_correlated_scan(self) -> None:
+        with closing(sqlite3.connect(":memory:")) as connection:
+            _ = connection.execute("CREATE TABLE judgments(rule TEXT,rule_blob TEXT,recorded_at TEXT,id INTEGER)")
+            _ = connection.execute("CREATE TABLE rule_generations(rule TEXT,rule_blob TEXT,generation INTEGER)")
+            insert = next(statement for statement in style_ledger.MIGRATIONS[30].split(";")
+                          if statement.strip().startswith("INSERT INTO rule_generations"))
+            plan = cast(list[tuple[int, int, int, str]], connection.execute("EXPLAIN QUERY PLAN " + insert).fetchall())
+            self.assertFalse(any("CORRELATED" in detail for _, _, _, detail in plan), plan)
+
+    def test_generation_backfill_timestamp_tie_uses_higher_id_blob(self) -> None:
+        self.assert_generation_backfill((("rule", "first", "2", "clean"), ("rule", "second", "2", "held")),
+                                        {"rule": "second"})
+
+    def test_generation_backfill_newer_timestamp_wins_over_higher_id(self) -> None:
+        self.assert_generation_backfill((("rule", "newer", "3", "clean"), ("rule", "older", "2", "held")),
+                                        {"rule": "newer"})
+
+    def test_generation_backfill_partitions_uncovered_component_with_its_base_rule(self) -> None:
+        self.assert_generation_backfill((("rule", "base", "1", "clean"),
+                                         ("rule#uncovered", "component", "2", "held")), {"rule": "component"})
+
+    def test_generation_backfill_ranks_removed_and_invalidated_rows_and_keeps_barriers(self) -> None:
+        self.assert_generation_backfill((("rule", "clean", "1", "clean"),
+                                         ("rule#uncovered", "held", "2", "held"),
+                                         ("rule", "removed", "3", "removed")), {"rule": "removed"}, ((2, "2"),))
+
+    def test_generation_backfill_invalidation_requires_matching_timestamp(self) -> None:
+        self.assert_generation_backfill((("rule", "clean", "1", "clean"),
+                                         ("rule#uncovered", "held", "2", "held")), {"rule": "held"}, ((2, "old"),))
+
+    def test_generation_backfill_preserves_embedded_marker_and_removes_one_suffix(self) -> None:
+        self.assert_generation_backfill((("rule#uncovered.md", "embedded", "1", "clean"),
+                                         ("rule.md", "other", "2", "held"),
+                                         ("rule#uncovered#uncovered", "once", "3", "held")),
+                                        {"rule#uncovered.md": "embedded", "rule.md": "other", "rule#uncovered": "once"},
+                                        ((1, "1"),))
+
+    def test_live_generation_writer_and_reconciliation_preserve_embedded_marker(self) -> None:
+        rule = self.rule("embedded#uncovered-marker")
+        rule_file = self.rule_dir / "embedded#uncovered-marker.md"
+        with self.ledger() as ledger:
+            ledger.set_tip(self.initial_tip, "main")
+            ledger.record(rule, self.sources[0], self.initial_tip, self.blob(rule), "clean", ticket="outside", worker="old")
+            _ = rule_file.write_text(rule_file.read_text() + "Changed body.\n")
+            ledger.record(rule, self.sources[0], self.initial_tip, self.blob(rule), "clean", ticket="outside", worker="fresh")
+            _ = ledger.withdraw_superseded({item.rule_id: item for item in rules.load_rules(self.repo)})
+            self.assertEqual(next(ledger.cells(rule)).state, "current")
+            self.assertEqual(tuple(judgment.rule_blob for judgment in ledger._judgments(rule, self.sources[0])), (self.blob(rule),))  # pyright: ignore[reportPrivateUsage]
+        with closing(sqlite3.connect(ledger.database)) as connection:
+            self.assertEqual(connection.execute("SELECT rule,generation FROM rule_generations").fetchall(), [(rule, 1)])
+
+    def test_generation_migration_preserves_prior_withdrawals_and_invalidations(self) -> None:
+        rule = self.rule("legacy-generation")
+        path = self.sources[0]
+        rule_file = self.rule_dir / "legacy-generation.md"
+        original = rule_file.read_text()
+        with self.ledger() as ledger:
+            ledger.set_tip(self.initial_tip, "main")
+            blob = self.blob(rule)
+            ledger.record(rule, path, self.initial_tip, blob, "clean", ticket="outside", worker="clean")
+            finding = ledger.hold(rule, path, 1, "violation", "rename", "old", "new", blob, "outside")
+            ledger.record(rule, path, self.initial_tip, blob, "held", ticket="outside", worker="held")
+            _ = rule_file.write_text(original + "Body B.\n")
+            _ = ledger.withdraw_superseded({item.rule_id: item for item in rules.load_rules(self.repo)})
+            database = ledger.database
+        with closing(sqlite3.connect(database)) as connection, connection:
+            remove_generation_schema(connection)
+            _ = connection.execute("INSERT INTO invalidated_held_judgments SELECT id,recorded_at FROM judgments WHERE verdict='held'")
+            _ = connection.execute("UPDATE schema_version SET version=29")
+        _ = rule_file.write_text(original)
+        with self.ledger() as ledger:
+            _ = ledger.withdraw_superseded({item.rule_id: item for item in rules.load_rules(self.repo)})
+            self.assertNotEqual(next(ledger.cells(rule)).state, "current")
+            self.assertIsInstance(ledger.named_held((finding.finding_id,))[0].state, style_ledger.Withdrawn)
+            ledger.record(rule, path, self.initial_tip, blob, "clean", ticket="outside", worker="clean")
+            self.assertEqual(next(ledger.cells(rule)).state, "current")
+
     def test_migration_27_upgrades_copies_at_25_and_26_and_is_repeatable(self) -> None:
         rule = self.rule("pipeline")
         ledger = self.ledger()
@@ -111,6 +280,7 @@ class StyleLedgerRecordsTests(LedgerTestCase):
                 database = self.root / f"existing-copy-{version}.sqlite"
                 with closing(sqlite3.connect(ledger.database)) as source, closing(sqlite3.connect(database)) as copy:
                     source.backup(copy)
+                    remove_generation_schema(copy)
                     _ = copy.executescript("""
                         DROP INDEX tickets_one_assigned;
                         DROP TABLE ticket_predecessors;
@@ -123,7 +293,8 @@ class StyleLedgerRecordsTests(LedgerTestCase):
                     _ = copy.execute("UPDATE schema_version SET version=?", (version,))
                     copy.commit()
                     rows = copy.execute("SELECT * FROM tickets").fetchall()
-                    judgments = copy.execute("SELECT * FROM judgments").fetchall()
+                    # Migration 30 appends the initial generation to each preserved historical row.
+                    judgments = copy.execute("SELECT *,0 FROM judgments").fetchall()
                 for _ in range(2):
                     with style_ledger.Ledger(self.repo, database):
                         pass
@@ -1245,6 +1416,7 @@ class StyleLedgerRecordsTests(LedgerTestCase):
             _ = connection.execute("ALTER TABLE processed_tips DROP COLUMN reason")
             _ = connection.execute("DROP TABLE refill_results")
             _ = connection.execute("ALTER TABLE held_findings DROP COLUMN built_at")
+            remove_generation_schema(connection)
             _ = connection.execute("UPDATE schema_version SET version=8")
             connection.commit()
         migrated = self.ledger()
@@ -1859,9 +2031,11 @@ class StyleLedgerRecordsTests(LedgerTestCase):
         ledger, issue, base = self.binding_ticket(source, ((2, "old", "fresh"),))
         path = self.sources[0]
         rule = self.rule("prefer-type-named-fields-and-bindings")
-        second = ledger.hold(rule, path, 4, source.splitlines()[3], "rename", "second", "next", self.blob(rule), "outside")
+        judging = self.judging_ticket(ledger, rule, path)
+        second = ledger.hold(rule, path, 4, source.splitlines()[3], "rename", "second", "next", self.blob(rule), judging)
         other_issue = self.root / "second.md"
         ledger.file_held(second.finding_id, other_issue)
+        ledger.ticket_drop(judging)
         # Workspace tickets retain separate decisions and finding ownership.
         with closing(sqlite3.connect(ledger.database)) as connection, connection:
             _ = connection.execute("UPDATE tickets SET crate='.' WHERE id='names-1'")

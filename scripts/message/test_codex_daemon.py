@@ -15,6 +15,7 @@ from unittest import mock
 
 from scripts.lib.socket_test_support import short_socket_directory
 import codex_daemon
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 from codex_test_support import FakeDaemon, receive_frame, reply, send_frame, write_codex_account
@@ -251,7 +252,7 @@ class CodexDaemonTests(unittest.TestCase):
                         reply(connection, initialize, {})
                         self.assertEqual(receive_frame(connection)["method"], "initialized")
                         self.assertEqual(receive_frame(connection)["method"], "thread/queue/add")
-                    connection.settimeout(2)
+                    connection.settimeout(TEST_HANG_GUARD_SECS)
                     self.assertEqual(connection.recv(1), b"")
 
                 with FakeDaemon(chosen, conversation), mock.patch.dict(os.environ, {

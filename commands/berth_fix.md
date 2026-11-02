@@ -1,5 +1,5 @@
 ---
-description: Report a cargo-berth failure to the berth-fix session, or act as that fixer — reproduce, fix cargo-berth, install, and answer the reporter
+description: Report or fix a cargo-berth failure.
 ---
 
 # Berth Fix

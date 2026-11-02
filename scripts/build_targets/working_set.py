@@ -77,13 +77,35 @@ except ValueError as error:
     sys.exit(1)
 
 
-# Node options whose value can be the next argument. Equals forms need no skip.
+# Separate-value options from Node v24.19.0 --help, plus the existing V8 options.
+# Equals forms need no skip.
 NODE_VALUE_OPTIONS = frozenset((
-    "-r", "--require", "--import", "--loader", "--experimental-loader",
-    "--inspect-port", "--max-old-space-size", "--max-semi-space-size",
-    "--stack-size", "--stack_size", "--conditions", "-C", "--input-type",
-    "--title", "--env-file", "--env-file-if-exists",
+    "-C", "-e", "-p", "-r",
+    "--allow-fs-read", "--allow-fs-write", "--build-snapshot-config",
+    "--conditions", "--cpu-prof-dir", "--cpu-prof-interval", "--cpu-prof-name",
+    "--debug-port", "--diagnostic-dir", "--disable-proto", "--disable-warning",
+    "--dns-result-order", "--env-file", "--env-file-if-exists", "--eval",
+    "--experimental-config-file", "--experimental-loader", "--experimental-sea-config",
+    "--experimental-test-isolation", "--experimental-test-tag-filter",
+    "--heap-prof-dir", "--heap-prof-interval", "--heap-prof-name",
+    "--heapsnapshot-near-heap-limit", "--heapsnapshot-signal", "--icu-data-dir",
+    "--import", "--input-type", "--inspect-port", "--inspect-publish-uid",
+    "--loader", "--localstorage-file", "--max-http-header-size",
+    "--max-old-space-size", "--max-old-space-size-percentage", "--max-semi-space-size",
+    "--network-family-autoselection-attempt-timeout", "--openssl-config", "--print",
+    "--redirect-warnings", "--report-dir", "--report-directory", "--report-filename",
+    "--report-signal", "--require", "--run", "--secure-heap", "--secure-heap-min",
+    "--snapshot-blob", "--stack-size", "--stack_size", "--test-concurrency",
+    "--test-coverage-branches", "--test-coverage-exclude", "--test-coverage-functions",
+    "--test-coverage-include", "--test-coverage-lines", "--test-global-setup",
+    "--test-isolation", "--test-name-pattern", "--test-random-seed", "--test-reporter",
+    "--test-reporter-destination", "--test-rerun-failures", "--test-shard",
+    "--test-skip-pattern", "--test-timeout", "--title", "--tls-cipher-list", "--tls-keylog",
+    "--trace-event-categories", "--trace-event-file-pattern", "--trace-require-module",
+    "--unhandled-rejections", "--use-largepages", "--v8-pool-size",
+    "--watch-kill-signal", "--watch-path",
 ))
+NO_NODE_ENTRY = ""
 
 
 def node_entry(arguments: tuple[str, ...]) -> str:
@@ -97,25 +119,39 @@ def node_entry(arguments: tuple[str, ...]) -> str:
         if argument == "-" or not argument.startswith("-"):
             break
         option = argument.split("=", 1)[0]
-        if option in ("--eval", "--print") or argument.startswith(("-e", "-p")) and not argument.startswith("--"):
-            return ""
+        if option in ("--eval", "--print", "--run") or argument.startswith(("-e", "-p")) and not argument.startswith("--"):
+            return NO_NODE_ENTRY
         index += 2 if argument in NODE_VALUE_OPTIONS else 1
-    return arguments[index] if index < len(arguments) else ""
+    return arguments[index] if index < len(arguments) else NO_NODE_ENTRY
 
 
+@dataclass(frozen=True)
+class ProcessClassification:
+    category: str
+    node_script: str
 
-def classify(arguments: tuple[str, ...]) -> str:
+
+def classify_process(arguments: tuple[str, ...]) -> ProcessClassification:
     program = os.path.basename(arguments[0]) if arguments else ""
+    node_script = node_entry(arguments) if program in ("node", "nodejs") else NO_NODE_ENTRY
     if program in ("node", "nodejs", "bun") and len(arguments) > 1:
-        entry = node_entry(arguments) if program in ("node", "nodejs") else arguments[1]
+        entry = arguments[1] if program == "bun" else node_script
         if "/@anthropic-ai/claude-code/" in entry:
             program = "claude"
         elif "/@openai/codex/" in entry:
             program = "codex"
     for category in CATEGORIES:
         if any(fnmatch.fnmatchcase(program, pattern) for pattern in category.programs):
-            return category.name
-    return "other"
+            return ProcessClassification(category.name, node_script)
+    return ProcessClassification("other", node_script)
+
+
+def classify(arguments: tuple[str, ...]) -> str:
+    return classify_process(arguments).category
+
+
+def script_path(script: str, cwd: str) -> str:
+    return os.path.normpath(script if os.path.isabs(script) else os.path.join(cwd, script))
 
 
 def python_script(arguments: tuple[str, ...], cwd: str) -> str:
@@ -151,7 +187,7 @@ def python_script(arguments: tuple[str, ...], cwd: str) -> str:
     script = arguments[index]
     if script == "-":
         return "<stdin>"
-    return os.path.normpath(script if os.path.isabs(script) else os.path.join(cwd, script))
+    return script_path(script, cwd)
 
 
 def owner_for(script: str) -> str:
@@ -224,7 +260,7 @@ def collect(proc: Path = PROC) -> WorkingSet:
     machine = MachineMemory(memory["MemTotal"], memory["MemAvailable"], memory["SwapTotal"],
                             memory["SwapTotal"] - memory["SwapFree"])
     categories = {category.name: MemoryGroup(category.name) for category in CATEGORIES}
-    helpers: dict[str, MemoryGroup] = {}
+    helpers: dict[tuple[str, str], MemoryGroup] = {}
     unreadable = 0
     with os.scandir(proc) as entries:
         for entry in entries:
@@ -245,23 +281,25 @@ def collect(proc: Path = PROC) -> WorkingSet:
             except (OSError, KeyError, ValueError):
                 unreadable += 1
                 continue
-            category = classify(arguments)
+            classification = classify_process(arguments)
+            category = classification.category
             command = os.path.basename(arguments[0])
             sample = ProcessMemory(int(entry.name), command, pss, swap)
             categories[category].add(sample)
-            if category == "Python helpers":
+            if category == "Python helpers" or classification.node_script:
                 try:
                     cwd = os.readlink(process / "cwd")
                 except OSError:
                     cwd = "<cwd unreadable>"
-                script = python_script(arguments, cwd)
-                group = helpers.setdefault(script, MemoryGroup(category, script, owner_for(script)))
+                script = (python_script(arguments, cwd) if category == "Python helpers"
+                          else script_path(classification.node_script, cwd))
+                group = helpers.setdefault((category, script), MemoryGroup(category, script, owner_for(script)))
                 group.add(sample)
     groups: list[MemoryGroup] = []
     for category in CATEGORIES:
         groups.append(categories[category.name])
-        if category.name == "Python helpers":
-            groups.extend(sorted(helpers.values(), key=lambda group: group.pss_kib, reverse=True))
+        groups.extend(sorted((group for group in helpers.values() if group.category == category.name),
+                             key=lambda group: group.pss_kib, reverse=True))
     return WorkingSet(tuple(groups), machine, unreadable)
 
 
@@ -280,7 +318,7 @@ def render(report: WorkingSet) -> str:
     machine = report.machine
     lines.append(f"Machine: {machine.total_kib / 1024:.1f} MiB total; {machine.available_kib / 1024:.1f} MiB available; "
                  + f"swap {machine.swap_used_kib / 1024:.1f} / {machine.swap_total_kib / 1024:.1f} MiB used.")
-    lines.append(f"Unreadable or exited processes: {report.unreadable}. Python detail rows are part of the Python total.")
+    lines.append(f"Unreadable or exited processes: {report.unreadable}. Script detail rows are part of their category totals.")
     return "\n".join(lines)
 
 

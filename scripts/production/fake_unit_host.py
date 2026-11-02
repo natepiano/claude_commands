@@ -12,6 +12,7 @@ import unittest
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Literal, cast, final
 from unittest import mock
 
@@ -23,9 +24,33 @@ if TYPE_CHECKING:
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "herdr"))
 import herdr
 from fake_herdr import CommandResponse, herdr_listener
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 PANE_RESULT = herdr.Herdr.result
-TEST_HANG_GUARD_SECS = 300  # load 136 on natedev, 2026-10-29
+
+
+def native_claude(environment: Mapping[str, str], pid: int) -> None:
+    """Publish the private process files needed for registry and liveness reads."""
+    directory = Path(environment["HERDR_PROC"]) / str(pid)
+    directory.mkdir(parents=True, exist_ok=True)
+    for name, content in (("environ", b""), ("cmdline", b"claude\0")):
+        if not (directory / name).exists():
+            _ = (directory / name).write_bytes(content)
+
+
+def confirm_tab_close(responses: dict[str, CommandResponse | list[CommandResponse]],
+                      session: str, tab: str, path: Path) -> None:
+    """Remove the closed tab's panes from subsequent inventory responses."""
+    command = f"--session {session} pane list"
+    response = responses[command]
+    assert not isinstance(response, list)
+    result = herdr.json_object(cast(object, json.loads(response["stdout"])), "fixture response")
+    inventory = herdr.json_object(result["result"], "fixture inventory")
+    inventory["panes"] = [pane for pane in herdr.json_items(inventory["panes"], "fixture panes")
+                          if herdr.json_object(pane, "fixture pane").get("tab_id") != tab]
+    after = {**responses, command: CommandResponse(code=0, stdout=json.dumps(result))}
+    _ = responses.setdefault(f"--session {session} tab close {tab}", CommandResponse(
+        code=0, stdout="", write_files={str(path): json.dumps(after)}))
 
 
 @dataclass(frozen=True)
@@ -93,7 +118,9 @@ def write(env: Mapping[str, str], units: Sequence[HostedUnit]) -> None:
             shell = shells[(name, unit.pane)]
             process(env, shell, server, ["zsh"], {**unit.marks, "HERDR_PANE_ID": unit.pane, "HERDR_SESSION": name})
             responses[f"--session {name} pane process-info --pane {unit.pane}"] = {
-                "code": 0, "stdout": json.dumps({"result": {"process_info": {"shell_pid": shell}}})}
+                "code": 0, "stdout": json.dumps({"result": {"process_info": {
+                    "shell_pid": shell, "foreground_process_group_id": shell,
+                    "foreground_processes": [{"name": "zsh"}]}}})}
             responses[f"--session {name} pane close {unit.pane}"] = {
                 "code": 0, "stdout": "", "remove_paths": [str(Path(env["HERDR_PROC"]) / str(shell))]}
             for source in ("recent", "recent-unwrapped"):
@@ -102,6 +129,14 @@ def write(env: Mapping[str, str], units: Sequence[HostedUnit]) -> None:
                         responses[f"--session {name} pane read {unit.pane} --source {source} --lines {lines}{ansi}"] = {
                             "code": 0, "stdout": unit.screen}
     responses["--session default session list --json"] = {"code": 0, "stdout": json.dumps({"sessions": sessions})}
+    before_close = {command: dict(response) for command, response in responses.items()}
+    for unit in units:
+        after_close = {**before_close, f"--session {unit.session} pane list": {
+            "code": 0, "stdout": json.dumps({"result": {"panes": [
+                {"pane_id": pane.pane, "label": pane.label or None}
+                for pane in by_session[unit.session] if pane.pane != unit.pane]}})}}
+        responses[f"--session {unit.session} pane close {unit.pane}"]["write_files"] = {
+            str(responses_file): json.dumps(after_close)}
     _ = responses_file.write_text(json.dumps(responses))
 
 
@@ -143,7 +178,7 @@ def live_pid(test: unittest.TestCase) -> int:
 
     def close() -> None:
         child.terminate()
-        _ = child.wait(timeout=30)
+        _ = child.wait(timeout=TEST_HANG_GUARD_SECS)
 
     test.addCleanup(close)
     return child.pid
@@ -170,10 +205,14 @@ class PaneShellFixture:
         self.place: herdr.HerdrPlace = herdr.HerdrPlace("agents", "w1:p1")
         self.shell: int = 991001
         self.director: int = 4242
+        from scripts.production import staff
+        owner = staff.by_path(f"{slug}/{unit.removesuffix('-unit')}")
+        assert owner is not None
+        self.native_id: str = owner.current_session
         self.stop_calls: list[str] = []
         self.lifecycle: list[str] = []
         self._found: unit_lookup.MarkedUnit | None = unit_lookup.MarkedUnit(unit,
-            unit_lookup.LiveClaude("alpha", "sid-alpha", "/fixture/socket", self.director)
+            unit_lookup.LiveClaude("alpha", self.native_id, "/fixture/socket", self.director)
             if live else unit_lookup.ClaudeNotRunning(), self.place)
         write(self.environment, [HostedUnit(self.place.session, self.place.pane,
               {unit_lookup.PRODUCTION_MARK: slug, unit_lookup.UNIT_MARK: unit})])
@@ -236,6 +275,10 @@ class PaneShellFixture:
             server = pid + 1
             process(self.environment, server, 0, ["herdr", "--session", session, "server"], {})
             herdr_listener(Path(self.environment["HERDR_PROC"]), server, session, self.environment)
+            responses_file = Path(self.environment["FAKE_HERDR_RESPONSES"])
+            responses = cast(dict[str, CommandResponse], json.loads(responses_file.read_text()))
+            responses[f"--session {session} pane list"] = responses[f"--session {self.place.session} pane list"]
+            _ = responses_file.write_text(json.dumps(responses))
             parent, os_session = server, pid
         process(self.environment, pid, parent, ["visitor"], marks,
                 session=os_session, cwd=self.worktree)
@@ -244,7 +287,8 @@ class PaneShellFixture:
 def stopped_record(root: Path, worktree: Path, *, name: str = "alpha", cwd: Path | None = None,
                    production: str = "demo", unit: str = "alpha-unit", doc: Path | None = None,
                    host_session: str = "agents", branch: str = "", plan: Path | None = None,
-                   progress: Literal["waiting", "ready", "stopped"] = "stopped") -> shutdown_record.SessionShutdown:
+                   progress: Literal["waiting", "ready", "stopped"] = "stopped",
+                   runtime_id: str = "5ad615f2-4e04-5121-a102-9d6b2e2a6eb3") -> shutdown_record.SessionShutdown:
     """One typed unit record builder; callers override only their scenario's values."""
     del production, doc  # Parentage is supplied by staff, never persisted here.
     saved: shutdown_record.SessionShutdown = {
@@ -253,7 +297,7 @@ def stopped_record(root: Path, worktree: Path, *, name: str = "alpha", cwd: Path
         "requested_by": {"kind": "terminal"}, "hold": "session", "then": "stop", "force": "wait for ready",
         "alerts": "none", "probe": False,
         "session": {
-            "session_id": "sid-alpha", "config_dir": str(root), "pid": 4242, "proc_start": "1",
+            "session_id": runtime_id, "config_dir": str(root), "pid": 4242, "proc_start": "1",
             "name": name, "cwd": str(cwd or worktree), "status": "idle", "updated_at": 0, "probe": False,
             "model": {"kind": "no reply yet"},
             "checkout": {"kind": "git", "path": str(worktree), "head": {"kind": "branch", "name": branch},
@@ -304,13 +348,13 @@ def record_shutdown(case: unittest.TestCase, pane: PaneShellFixture, path: Path,
 
     def shutdown(*arguments: str) -> None:
         pane.stop_calls.append(' '.join(arguments))
-        if arguments[0] in {'now', 'down'}:
+        if arguments[0] == 'stop':
             pane.stopped()
             fields = cast(dict[str, str], json.loads(path.read_text()))
             def stopped(saved: shutdown_record.SessionShutdown) -> None:
                 saved['progress'] = {'kind':'stopped','at':'2026-10-09T21:50:00+00:00'}
                 saved['stop_issues'] = []
-            _ = shutdown_record.update_session(fields['login'], 'sid-alpha', stopped)
+            _ = shutdown_record.update_session(fields['login'], pane.native_id, stopped)
             stopped_event.set()
         elif arguments[0] == 'restart':
             pane.slug, pane.unit, name = destination
@@ -319,11 +363,17 @@ def record_shutdown(case: unittest.TestCase, pane: PaneShellFixture, path: Path,
                   {'SHOWRUNNER_UNIT':pane.slug, 'SHOWRUNNER_UNIT_ID':pane.unit})])
             pane.shell = 991001
             pane.found = unit_lookup.MarkedUnit(pane.unit,
-                unit_lookup.LiveClaude(name, 'sid-alpha', '/fixture/socket', pane.shell), pane.place)
+                unit_lookup.LiveClaude(name, pane.native_id, '/fixture/socket', pane.shell), pane.place)
         else:
             raise AssertionError(f'unexpected shutdown: {arguments}')
 
+    from scripts.shutdown import stop_resume
+    def stop(identity: str) -> stop_resume.Stopped:
+        shutdown("stop", identity)
+        return stop_resume.Stopped(identity, pane.director)
+    _ = case.enterContext(mock.patch.object(stop_resume, 'stop', side_effect=stop))
     _ = case.enterContext(mock.patch.object(rename_unit, 'run_shutdown', side_effect=shutdown))
     def wait_for_stop(_seconds: float) -> None:
         case.assertTrue(stopped_event.wait(TEST_HANG_GUARD_SECS), 'fake shutdown did not publish its stop')
-    _ = case.enterContext(mock.patch.object(time, 'sleep', side_effect=wait_for_stop))
+    _ = case.enterContext(mock.patch.object(rename_unit, 'time',
+        SimpleNamespace(monotonic=time.monotonic, sleep=wait_for_stop)))

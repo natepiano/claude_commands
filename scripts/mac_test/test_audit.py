@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import os
 from pathlib import Path
 import subprocess
@@ -11,6 +13,12 @@ import tempfile
 import unittest
 from typing import final, override
 
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
+if TYPE_CHECKING:
+    from ..lint.memory_test_support import write_config_fixture
+else:
+    from memory_test_support import write_config_fixture
 
 SCRIPT = Path(__file__).with_name("audit.py")
 
@@ -44,7 +52,7 @@ class AuditCommandTests(unittest.TestCase):
         self.write_command_stands()
         self.environment = {
             **os.environ,
-            "MAC_TEST_CONFIG": str(self.config_path),
+            "MAC_TEST_CONFIG": str(self.config_path), "CONF_DIR": str(Path(self.config_path).parent),
             "MAC_TEST_STATE_DIR": str(self.state_directory),
             "MAC_TEST_COMMAND_LOG": str(self.command_log),
             "PATH": str(self.bin_directory),
@@ -133,9 +141,7 @@ edition = "2021"
         self.write_file(member / "src/lib.rs", "pub fn member() {}\n")
 
     def write_config(self, packages: str) -> None:
-        _ = self.config_path.write_text(
-            f"linux_only.{self.workspace.name}={packages}\n", encoding="utf-8"
-        )
+        _ = write_config_fixture(self.config_path, f"linux_only.{self.workspace.name}={packages}\n", template="mac_test")
 
     def write_command_stands(self) -> None:
         stand = self.bin_directory / "command-stand"

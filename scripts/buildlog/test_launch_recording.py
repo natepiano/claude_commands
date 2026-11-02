@@ -26,6 +26,10 @@ import report
 import store
 from test_index import Record, encode, point_root_at, step
 from test_launches import CLI, result_line
+if TYPE_CHECKING:
+    from ..lib import test_hang_guard
+else:
+    from scripts.lib import test_hang_guard
 
 if TYPE_CHECKING:
     from ..hana_shot import hana_shot
@@ -277,7 +281,7 @@ class LaunchRecordingTests(unittest.TestCase):
             ))],
             cwd=Path(__file__).resolve().parents[2],
             env={name: value for name, value in os.environ.items() if name != "PYTHONPATH"},
-            capture_output=True, text=True, check=False, timeout=300,
+            capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         imports = cast(Record, json.loads(result.stdout))
@@ -508,7 +512,7 @@ class LaunchRecordingTests(unittest.TestCase):
 
         first = subprocess.run(
             [sys.executable, str(CLI), "report", "2026-10-17"], env=environment,
-            capture_output=True, text=True, check=False, timeout=300,
+            capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
 
         self.assertEqual(first.returncode, 0, first.stderr)
@@ -524,7 +528,7 @@ class LaunchRecordingTests(unittest.TestCase):
 
         repeated = subprocess.run(
             [sys.executable, str(CLI), "report", "2026-10-17"], env=environment,
-            capture_output=True, text=True, check=False, timeout=300,
+            capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
         self.assertEqual(repeated.returncode, 0, repeated.stderr)
         self.assertIn("(0 new", repeated.stderr)

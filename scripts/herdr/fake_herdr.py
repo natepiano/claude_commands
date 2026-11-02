@@ -9,6 +9,7 @@ the final response for subsequent calls.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
@@ -29,10 +30,11 @@ class CommandResponse(TypedDict):
     remove_paths: NotRequired[list[str]]
 
 
-class AgentStartOutcome(TypedDict):
+class PaneCommandOutcome(TypedDict):
     arguments: list[str]
     command_index: int
     exit_code: int
+    moved_pane: NotRequired[str]
 
 
 def command_refusal(argv: list[str]) -> CommandResponse | None:
@@ -61,8 +63,26 @@ def option(arguments: list[str], name: str) -> str | None:
     return arguments[arguments.index(name) + 1] if name in arguments[:-1] else None
 
 
-def pane_list(stdout: str, session: list[str], starts: list[AgentStartOutcome]) -> str:
-    """Supply real pane fields, keeping the latest successful launch's conversation after exit.
+def pane_agents(session: str) -> dict[str, bool]:
+    """Read the fixture's surviving shells and agents, without consulting the real host."""
+    root = os.environ.get("HERDR_PROC")
+    if sys.platform == "darwin" or os.environ.get("HERDR_PLATFORM") == "darwin" or not root or not Path(root).is_dir():
+        return {}
+    running: dict[str, bool] = {}
+    for directory in Path(root).glob("[0-9]*"):
+        try:
+            environment = dict(item.split("=", 1) for item in (directory / "environ").read_text().split("\0") if "=" in item)
+            command = (directory / "cmdline").read_text().split("\0")[0]
+        except OSError:
+            continue
+        pane = environment.get("HERDR_PANE_ID", "")
+        if pane and environment.get("HERDR_SESSION") == session:
+            running[pane] = running.get(pane, False) or Path(command).name in {"claude", "codex"}
+    return running
+
+
+def pane_list(stdout: str, session: list[str], outcomes: list[PaneCommandOutcome]) -> str:
+    """Supply stable terminals and live conversations, including pane moves and agent exits.
 
     Explicit response fields win, including malformed values used to test the reader.
     Launch outcomes are recorded when commands finish, including lifecycle check failures.
@@ -80,9 +100,20 @@ def pane_list(stdout: str, session: list[str], starts: list[AgentStartOutcome]) 
     if not isinstance(result.get("panes"), list):
         return stdout
     sessions: dict[str, dict[str, str]] = {}
-    for start in starts:
-        command = start["arguments"]
-        if command[:4] != [*session, "agent", "start"] or start["exit_code"] != 0:
+    terminals: dict[str, str] = {}
+    moves: list[tuple[str, str]] = []
+    for outcome in outcomes:
+        command = outcome["arguments"]
+        if command[:2] != session or outcome["exit_code"] != 0:
+            continue
+        if command[2:4] == ["pane", "move"] and (moved := outcome.get("moved_pane")):
+            original = command[4]
+            moves.append((original, moved))
+            terminals[moved] = terminals.get(original, original)
+            if original in sessions:
+                sessions[moved] = sessions.pop(original)
+            continue
+        if command[2:4] != ["agent", "start"]:
             continue
         pane = option(command, "--pane")
         if pane is None:
@@ -90,7 +121,12 @@ def pane_list(stdout: str, session: list[str], starts: list[AgentStartOutcome]) 
         kind = option(command, "--kind") or "claude"
         value = option(command, "--session-id") or option(command, "--resume")
         sessions[pane] = {"agent": kind, "kind": "id", "source": f"herdr:{kind}",
-                          "value": value or str(uuid5(NAMESPACE_URL, json.dumps([command, start["command_index"]])))}
+                          "value": value or str(uuid5(NAMESPACE_URL, json.dumps([command, outcome["command_index"]])))}
+    running = pane_agents(session[1]) if sessions else {}
+    # Processes keep their inherited pane id when herdr moves the terminal.
+    for original, moved in moves:
+        if original in running:
+            running[moved] = running.pop(original) or running.get(moved, False)
     for item in cast(list[object], result["panes"]):
         if not isinstance(item, dict):
             continue
@@ -98,7 +134,8 @@ def pane_list(stdout: str, session: list[str], starts: list[AgentStartOutcome]) 
         ident = pane.get("pane_id")
         if isinstance(ident, str):
             _ = pane.setdefault("workspace_id", ident.split(":", 1)[0])
-            _ = pane.setdefault("agent_session", sessions.get(ident))
+            _ = pane.setdefault("terminal_id", "term_" + uuid5(NAMESPACE_URL, json.dumps([session, terminals.get(ident, ident)])).hex)
+            _ = pane.setdefault("agent_session", sessions.get(ident) if running.get(ident, True) else None)
     return json.dumps(reply)
 
 
@@ -144,8 +181,12 @@ def execute(argv: list[str], previous: list[list[str]], outcomes: Path) -> int:
         _ = Path(file).write_text(text)
     stdout = response["stdout"]
     if argv[2:4] == ["pane", "list"] and response["code"] == 0:
-        starts = [cast(AgentStartOutcome, json.loads(line)) for line in outcomes.read_text().splitlines()] if outcomes.exists() else []
-        stdout = pane_list(stdout, argv[:2], starts)
+        history: list[PaneCommandOutcome] = []
+        if outcomes.exists():
+            with outcomes.open() as recorded:
+                fcntl.flock(recorded, fcntl.LOCK_SH)
+                history = [cast(PaneCommandOutcome, json.loads(line)) for line in recorded]
+        stdout = pane_list(stdout, argv[:2], history)
     _ = sys.stdout.write(stdout)
     _ = sys.stderr.write(response.get("stderr", ""))
     return response["code"]
@@ -153,14 +194,30 @@ def execute(argv: list[str], previous: list[list[str]], outcomes: Path) -> int:
 
 def main(argv: list[str]) -> int:
     log = Path(os.environ["FAKE_HERDR_LOG"])
-    previous = [cast(list[str], json.loads(line)) for line in log.read_text().splitlines()] if log.exists() else []
-    with log.open("a") as output:
+    # One transaction reserves the command's history index and publishes a whole line.
+    with log.open("a+") as output:
+        fcntl.flock(output, fcntl.LOCK_EX)
+        _ = output.seek(0)
+        previous = [cast(list[str], json.loads(line)) for line in output]
         _ = output.write(json.dumps(argv) + "\n")
     outcomes = log.with_name(log.name + ".agent-starts")
     code = execute(argv, previous, outcomes)
-    if argv[2:4] == ["agent", "start"]:
-        outcome = AgentStartOutcome(arguments=argv, command_index=len(previous), exit_code=code)
+    if argv[2:4] in (["agent", "start"], ["pane", "move"]):
+        outcome = PaneCommandOutcome(arguments=argv, command_index=len(previous), exit_code=code)
+        if argv[2:4] == ["pane", "move"] and code == 0:
+            responses = cast(dict[str, CommandResponse | list[CommandResponse]],
+                             json.loads(Path(os.environ["FAKE_HERDR_RESPONSES"]).read_text()))
+            try:
+                reply = cast(dict[str, object], json.loads(command_response(argv, responses, previous)["stdout"]))
+                result = cast(dict[str, object], reply["result"])
+                move = cast(dict[str, object], result["move_result"])
+                moved_pane = cast(dict[str, object], move["pane"])["pane_id"]
+                if isinstance(moved_pane, str):
+                    outcome["moved_pane"] = moved_pane
+            except (ValueError, KeyError, TypeError):
+                pass
         with outcomes.open("a") as output:
+            fcntl.flock(output, fcntl.LOCK_EX)
             _ = output.write(json.dumps(outcome) + "\n")
     return code
 

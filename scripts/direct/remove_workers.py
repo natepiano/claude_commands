@@ -49,7 +49,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, TypedDict, cast
+from typing import TYPE_CHECKING, TypedDict, cast
 
 if TYPE_CHECKING:
     from ..lib import unit_runs
@@ -64,8 +64,6 @@ else:
 DEFAULT_ROOTS = unit_runs.run_roots()
 LEDGER = "workers"
 CLAUDE_TIMEOUT_SECS = 30
-SHUTDOWN_TIMEOUT_SECS = 30
-SHUTDOWN = Path(__file__).resolve().parents[1] / "shutdown" / "shutdown.py"
 
 # Workers launched before the ledger were named `<session dir basename>-<slot>`,
 # and the basename was a uuid, so the name alone says which run owns them.
@@ -80,16 +78,6 @@ class AgentRow(TypedDict, total=False):
     sessionId: str
     kind: str
     name: str
-
-
-class HeldSessions(TypedDict):
-    kind: Literal["held sessions"]
-    session_ids: set[str]
-
-
-class ShutdownStateUnreadable(TypedDict):
-    kind: Literal["shutdown state unreadable"]
-    reason: str
 
 
 def claude_bin() -> str:
@@ -127,56 +115,14 @@ def list_sessions(claude: str) -> list[AgentRow] | None:
     return [cast("AgentRow", cast("object", row)) for row in rows if isinstance(row, dict)]
 
 
-def shutdown_held_sessions() -> HeldSessions | ShutdownStateUnreadable:
-    """Read validated shutdown holds; failure means callers must retain everything."""
-    try:
-        result = subprocess.run(
-            [*shutdown_command(), "held-sessions"],
-            capture_output=True,
-            text=True,
-            timeout=SHUTDOWN_TIMEOUT_SECS,
-            check=False,
-        )
-    except (OSError, ValueError, subprocess.TimeoutExpired) as error:
-        reason = str(error) or type(error).__name__
-        return {"kind": "shutdown state unreadable", "reason": reason}
-    if result.returncode != 0:
-        detail = (result.stderr or result.stdout).strip()
-        reason = f"held-sessions exited {result.returncode}"
-        if detail:
-            reason = f"{reason}: {detail}"
-        return {"kind": "shutdown state unreadable", "reason": reason}
-    return {
-        "kind": "held sessions",
-        "session_ids": {
-            line.strip() for line in result.stdout.splitlines() if line.strip()
-        },
-    }
-
-
-def shutdown_command() -> list[str]:
-    """Return the command prefix used to query shutdown-held sessions."""
-    return [sys.executable, str(SHUTDOWN)]
-
-
 def live_runs(roots: tuple[Path, ...], listed_sessions: set[str]) -> set[Path]:
     live: set[Path] = set()
-    shutdown_state = shutdown_held_sessions()
-    if shutdown_state["kind"] == "shutdown state unreadable":
-        print(
-            "remove_workers: shutdown state could not be read; keeping every active run.",
-            file=sys.stderr,
-        )
     now = time.time()
     for root in roots:
         active = root / "active"
         if active.is_dir():
             for marker in active.iterdir():
-                if (
-                    shutdown_state["kind"] == "held sessions"
-                    and marker.name not in listed_sessions
-                    and marker.name not in shutdown_state["session_ids"]
-                ):
+                if marker.name not in listed_sessions:
                     continue
                 lines = marker.read_text(encoding="utf-8").splitlines()
                 if lines and lines[0].strip():

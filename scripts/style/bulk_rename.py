@@ -12,6 +12,7 @@ import json
 import os
 import queue
 import random
+import re
 import shutil
 import shlex
 import subprocess
@@ -23,22 +24,68 @@ import tomllib
 import uuid
 from urllib.parse import unquote, urlparse
 from collections import defaultdict
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Generator, Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
+from contextlib import ExitStack, contextmanager
+from contextvars import ContextVar
+from enum import StrEnum
 from functools import cache
 from pathlib import Path
 from types import MappingProxyType, TracebackType
 from typing import BinaryIO, Protocol, TypedDict, cast
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.build_queue import queue_place
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 
 import berth_board
 import style_footprint
 import style_ledger
-from approved_renames import (BindingComments, BindingRename, BindingScope, NoBindingScope,
-                              RenameDeclaration, rename_declaration, refactor_rename, refactor_comments,
+import approved_renames
+from approved_renames import (BindingComments, BindingRename, BindingScope, NoBindingScope, OuterBindingBlocked, OuterBindingUnproved,
+                              RenameDeclaration, rename_declaration, refactor_rename, refactor_comments, binding_comments,
                               PatternBindingCollision, pattern_binding_check,
-                              backtick_mentions, identifier_mentions)
+                              backtick_mentions, identifier_mentions, field_sites)
+
+
+class StyleAdmissionStopped(SystemExit):
+    """A queue refusal stops the command with its finding claims intact."""
+
+    def __init__(self) -> None:
+        super().__init__(2)
+
+
+def no_admission_change() -> None:
+    pass
+
+
+_admission_changes: ContextVar[tuple[Callable[[], None], Callable[[], None]]] = ContextVar(
+    "style_admission_changes", default=(no_admission_change, no_admission_change))
+
+
+@contextmanager
+def admission_attempt(begin: Callable[[], None], started: Callable[[], None]) -> Generator[None]:
+    """Bind the journal transitions for every child in one source edit attempt."""
+    token = _admission_changes.set((begin, started))
+    try:
+        yield
+    finally:
+        _admission_changes.reset(token)
+
+
+@contextmanager
+def style_program_place(program: str, repo: Path) -> Generator[queue_place.QueuePlace]:
+    """Stop the command before a queue refusal can change finding state."""
+    begin, started = _admission_changes.get()
+    begin()
+    try:
+        with queue_place.queue_place(program, repo) as place:
+            place.on_started = started
+            yield place
+    except queue_place.QueuePlaceRefused as error:
+        print(f"style admission: {error}", file=sys.stderr)
+        raise StyleAdmissionStopped() from error
 
 
 class BulkRenameError(Exception):
@@ -64,10 +111,47 @@ class Refusal:
 
 
 @dataclass(frozen=True)
+class BlockedRename(Refusal):
+    """A non-executable rename whose enclosing binding must be resolved by a person."""
+
+    blocker: OuterBindingBlocked | OuterBindingUnproved
+
+
+class ReservationBlocked(BulkRenameError):
+    """A transient writer conflict, retaining cargo-berth's authority and holder."""
+
+    def __init__(self, path: str, holders: tuple[berth_board.Reservation, ...]) -> None:
+        super().__init__(f"{path}: another worktree holds the file")
+        self.path: str = path
+        self.holders: tuple[berth_board.Reservation, ...] = holders
+
+
+@dataclass(frozen=True)
+class PendingFinding:
+    finding_id: str
+    path: str
+    holders: tuple[berth_board.Reservation, ...]
+
+
+class PendingReservation(TypedDict):
+    finding_id: str
+    path: str
+    holders: list[dict[str, str]]
+
+
+def freeze_pending(item: PendingFinding) -> PendingReservation:
+    return {"finding_id": item.finding_id, "path": item.path,
+            "holders": [{"worktree": str(holder.holder_worktree_root), "branch": holder.holder_branch,
+                         "reservation_id": holder.reservation_id} for holder in item.holders]}
+
+
+@dataclass(frozen=True)
 class RenameFinding:
     finding_id: str
     path: str
     rename: BindingRename
+    authority: approved_renames.AnchoredRenameSource | approved_renames.RenameAnchorUnavailable
+    finding_version: str
 
 
 @dataclass(frozen=True)
@@ -86,6 +170,7 @@ class FileRenames:
     refusals: tuple[Refusal, ...]
     related: tuple[RenamedDocument, ...] = ()
     dependencies: frozenset[str] = frozenset()
+    proof_dependencies: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -294,11 +379,14 @@ def workspace_edits(value: object, path: Path, text: str, version: int,
 
 def apply_edits(text: str, edits: Sequence[SourceEdit]) -> str:
     end = len(text) + 1
+    previous_was_insertion = False
     for edit in sorted(edits, key=lambda edit: (edit.start, edit.end), reverse=True):
-        if not 0 <= edit.start <= edit.end <= len(text) or edit.end > end or edit.start == end:
+        if (not 0 <= edit.start <= edit.end <= len(text) or edit.end > end
+                or edit.start == end and previous_was_insertion):
             raise BulkRenameError("overlapping or invalid edits")
         text = text[:edit.start] + edit.text + text[edit.end:]
         end = edit.start
+        previous_was_insertion = edit.start == edit.end
     return text
 
 
@@ -308,8 +396,14 @@ class RustAnalyzer:
     def __init__(self, repo: Path, timeout: float = 180) -> None:
         self.repo: Path = repo
         self.timeout: float = timeout
-        self.process: subprocess.Popen[bytes] = subprocess.Popen(
-            ["rust-analyzer"], cwd=repo, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        self.lifetime: ExitStack = ExitStack()
+        try:
+            place = self.lifetime.enter_context(style_program_place("rust-analyzer", repo))
+            self.process: subprocess.Popen[bytes] = place.popen(
+                ["rust-analyzer"], cwd=repo, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        except BaseException:
+            _ = self.lifetime.__exit__(*sys.exc_info())
+            raise
         self.inbox: queue.Queue[dict[str, object] | Exception] = queue.Queue()
         self.sequence: int = 0
         self.versions: dict[Path, int] = {}
@@ -320,7 +414,11 @@ class RustAnalyzer:
             "cargo": {"buildScripts": {"enable": True}}, "procMacro": {"enable": True}, "checkOnSave": False,
         }
         self.reader: threading.Thread = threading.Thread(target=self._read, daemon=True)
-        self.reader.start()
+        try:
+            self.reader.start()
+        except BaseException:
+            self.lifetime.close()
+            raise
 
     def _read(self) -> None:
         try:
@@ -419,17 +517,20 @@ class RustAnalyzer:
             raise
 
     def close(self) -> None:
-        if self.process.poll() is None:
-            self.process.terminate()
-            try:
-                _ = self.process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                _ = self.process.wait()
-        for stream in (self.process.stdin, self.process.stdout):
-            if stream is not None:
-                stream.close()
-        self.reader.join(timeout=1)
+        try:
+            if self.process.poll() is None:
+                self.process.terminate()
+                try:
+                    _ = self.process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self.process.kill()
+                    _ = self.process.wait()
+            for stream in (self.process.stdin, self.process.stdout):
+                if stream is not None:
+                    stream.close()
+            self.reader.join(timeout=1)
+        finally:
+            self.lifetime.close()
 
     def __exit__(self, exc_type: type[BaseException] | None, exc: BaseException | None, traceback: TracebackType | None) -> None:
         self.close()
@@ -456,8 +557,15 @@ class RustAnalyzer:
         if self.request("textDocument/prepareRename", params) is None:
             raise BulkRenameError("rust-analyzer refused prepareRename")
         value = self.request("textDocument/rename", {**params, "newName": new})
-        return workspace_edits(value, path, text, self.versions[path], self.documents, self.versions,
-                               lambda target: self.sources.read(target).source)
+        workspace = workspace_edits(value, path, text, self.versions[path], self.documents, self.versions,
+                                    lambda target: self.sources.read(target).source)
+        token = next(span for span in self.sources.tokens(text).spans if span.start == offset)
+        line = text.count("\n", 0, offset) + 1
+        rename = BindingRename(line, text.splitlines()[line - 1], token.token.value, new)
+        declaration = rename_declaration(text, rename)
+        if isinstance(declaration, RenameDeclaration) and declaration.scope.kind not in {"field", "variant", "item"}:
+            return preserve_shorthand_field_labels(self.sources, workspace, rename)
+        return workspace
 
     def definitions(self, path: Path, text: str, offsets: tuple[int, ...]) -> tuple[DefinitionResolution, ...]:
         """Pipeline one file's definition requests; one deadline bounds the entire round."""
@@ -515,26 +623,6 @@ class BindingText:
     def contains(ranges: tuple[tuple[int, int], ...], index: int) -> bool:
         return any(start <= index < end for start, end in ranges)
 
-    def derive_field(self, rename: BindingRename) -> bool:
-        for index, word in enumerate(self.words):
-            if word not in {"struct", "enum"}:
-                continue
-            body = next((i for i in range(index + 1, len(self.words)) if self.words[i] in {"{", "(", ";"}), -1)
-            if body not in self.ends:
-                continue
-            finish = self.ends[body]
-            start_line = self.source[:self.spans[body].start].count("\n") + 1
-            end_line = self.source[:self.spans[finish].end].count("\n") + 1
-            if not start_line <= rename.line <= end_line:
-                continue
-            start = index - 1
-            while start >= 0 and self.words[start] not in {";", "}"}:
-                start -= 1
-            attributes = set(self.words[start + 1:index])
-            if "derive" in attributes and attributes & {"Serialize", "Deserialize", "Parser", "Args", "Subcommand", "ValueEnum", "Config"}:
-                return True
-        return False
-
     def format_literals(self) -> frozenset[int]:
         """Literal format arguments, excluding ordinary strings in the same standard macro."""
         positions: set[int] = set()
@@ -567,6 +655,110 @@ def repository_docs(repo: Path) -> tuple[str, ...]:
 def docs_name_binding(docs: tuple[str, ...], comments: BindingComments, old: str) -> bool:
     return any(identifier_mentions(document, function) and backtick_mentions(document, old)
                for document in docs for function in comments.functions)
+
+
+@dataclass(frozen=True)
+class PreservedFieldNames:
+    """Attributes proved safe together with edits that freeze the original external names."""
+
+    attributes: frozenset[int] = frozenset()
+    edits: tuple[SourceEdit, ...] = ()
+
+
+def preserved_field_names(server: RenameServer, path: Path, parsed: BindingText, declaration: RenameDeclaration,
+                          rename: BindingRename) -> PreservedFieldNames:
+    if declaration.scope.kind != "field":
+        return PreservedFieldNames()
+    words = parsed.words
+    owner = declaration.scope.ranges[0][0]
+    spans = style_footprint.attribute_spans(words)
+    owners = style_footprint.attribute_owners(words)
+    owner_attributes = [(a, b) for a, b in spans if owners.get(a) == owner]
+    derives: set[str] = set()
+    for a, b in owner_attributes:
+        if words[a + 2:a + 4] == ("derive", "("):
+            derives.update(''.join(words[a + 4:b - 2]).split(','))
+    supported = {"Serialize", "Deserialize", "serde::Serialize", "serde::Deserialize",
+                 "Parser", "Args", "clap::Parser", "clap::Args"}
+    if not derives & supported:
+        return PreservedFieldNames()
+    if words[owner] != "struct" or derives - supported - style_footprint.STD_DERIVES - {""}:
+        raise BulkRenameError("derive field has an unproved derive or owner")
+    body = next(i for i in range(owner + 1, len(words)) if words[i] == "{")
+    field = declaration.scope.declaration
+    # Field metadata belongs to the next field at the struct body's own depth.
+    previous = max((i for i in range(body + 1, field) if words[i] == "," and parsed.parents.get(i) == body), default=body)
+    field_attributes = [(a, b) for a, b in spans if previous < a < field]
+    handled: set[int] = set()
+    for a, b in owner_attributes:
+        if words[a + 2] not in {"derive", "cfg", "doc"}:
+            raise BulkRenameError("derive field has unproved struct metadata (including rename_all)")
+        handled.add(a)
+    # Flattening anywhere in this record can merge keys with the renamed field.
+    for a, b in spans:
+        if body < a < parsed.ends[body] and set(words[a:b]) & {"flatten", "cfg_attr"}:
+            raise BulkRenameError("derive field has flatten or conditional metadata")
+    serde = bool(derives & {"Serialize", "Deserialize", "serde::Serialize", "serde::Deserialize"})
+    clap = bool(derives & {"Parser", "Args", "clap::Parser", "clap::Args"})
+    long_attributes: list[tuple[int, int]] = []
+    for a, b in field_attributes:
+        attribute = words[a + 2:b - 1]
+        if attribute[0] in {"cfg", "doc"}:
+            handled.add(a)
+        elif serde and attribute == ("serde", "(", "default", ")"):
+            handled.add(a)
+        elif clap and attribute in {("arg", "(", "long", ")"), ("clap", "(", "long", ")")}:
+            long_attributes.append((a, b))
+            handled.add(a)
+        else:
+            raise BulkRenameError("derive field CLI id, name or help metadata is unproved" if clap else
+                                  "derive field already sets its name or has unproved field metadata")
+    if clap and len(long_attributes) != 1:
+        raise BulkRenameError("derive field CLI name requires exactly one implicit long flag")
+    value_names: tuple[str, ...] = ()
+    if clap:
+        kind = words[field + 2:field + 3]
+        if (words[field + 1:field + 2] != (":",) or kind not in {("bool",), ("usize",)}
+                or words[field + 3:field + 4] not in {(",",), ("}",)}):
+            raise BulkRenameError("derive field CLI type and generated help name are unproved")
+        gaps = style_footprint.comment_gaps(parsed.source, parsed.spans, lambda text: text)
+        if any(style_footprint.outer_doc(line) for gap in gaps[previous + 1:field + 1] for line in gap):
+            raise BulkRenameError("derive field CLI doc help is unproved")
+        if kind == ("usize",):
+            value_names = (rename.old.removeprefix("r#").upper(),)
+    old = rename.old.removeprefix("r#")
+    if clap and (old != old.lower() or any(not part for part in old.split("_"))):
+        raise BulkRenameError("derive field CLI case conversion is unproved")
+    # A familiar spelling can be imported from an unrelated procedural macro.
+    for a, b in owner_attributes:
+        if words[a + 2:a + 4] != ("derive", "("):
+            continue
+        for index in range(a + 4, b - 2):
+            name = words[index]
+            if name not in {"Serialize", "Deserialize", "Parser", "Args"}:
+                continue
+            answers = server.definitions(path, parsed.source, (parsed.spans[index].start,))
+            if len(answers) != 1 or not isinstance(answers[0], DefinitionTarget):
+                raise BulkRenameError("derive field origin unproved: " + name)
+            origin = Path(unquote(urlparse(answers[0].uri).path)).resolve()
+            package_root = crate_directory(origin)
+            package = object_fields(tomllib.loads((package_root / "Cargo.toml").read_text()).get("package"))
+            expected = "serde_derive" if name in {"Serialize", "Deserialize"} else "clap_derive"
+            if package.get("name") != expected or package_root.is_relative_to(crate_directory(path)):
+                raise BulkRenameError("derive field origin unproved: " + name)
+    edits: list[SourceEdit] = []
+    if serde:
+        # Insert before this field's metadata and visibility, using the field boundary.
+        anchor = parsed.spans[previous + 1].start
+        edits.append(SourceEdit(anchor, anchor, '#[serde(rename = "' + old + '")] '))
+    for a, b in long_attributes:
+        # Freeze the generated id, flag and value placeholder together. These two
+        # supported field types are checked against real clap help and parsing.
+        flag = old.replace("_", "-")
+        value_name = ''.join(', value_name = "' + name + '"' for name in value_names)
+        edits.append(SourceEdit(parsed.spans[a].start, parsed.spans[b - 1].end,
+                                '#[arg(id = "' + old + '", long = "' + flag + '"' + value_name + ')]'))
+    return PreservedFieldNames(frozenset(handled), tuple(edits))
 
 
 def mapped_offset(offset: int, edits: Sequence[SourceEdit]) -> int:
@@ -698,17 +890,94 @@ def module_exports(server: RenameServer, path: Path, source: str, module: int, n
     return False
 
 
+def cfg_field_reference_guard(server: RenameServer, path: Path, parsed: BindingText,
+                              declaration: RenameDeclaration, rename: BindingRename,
+                              workspace: WorkspaceRename) -> WorkspaceRename:
+    """Complete proven cfg field uses in the analyzer edit set; refuse missing proof."""
+    if declaration.scope.kind != "field":
+        return workspace
+    span = parsed.spans[declaration.scope.declaration]
+    begin, end = lsp_position(parsed.source, span.start), lsp_position(parsed.source, span.end)
+    target = DefinitionTarget(path.as_uri(), (begin["line"], begin["character"]),
+                              (end["line"], end["character"]))
+    documents = {document.path: document for document in workspace.documents}
+    for source in crate_source_documents(server, path):
+        tokens = server.sources.tokens(source.source)
+        if rename.old not in tokens.words:
+            continue
+        owners = style_footprint.attribute_owners(tokens.words)
+        gated: set[int] = set()
+        for start, finish in style_footprint.attribute_spans(tokens.words):
+            if not set(tokens.words[start:finish]) & {"cfg", "cfg_attr"}:
+                continue
+            item = owners.get(start, finish)
+            finish = item
+            while finish < len(tokens.words) and tokens.words[finish] not in {"{", ";", ","}:
+                finish = tokens.ends.get(finish, finish) + 1
+            finish = tokens.ends.get(finish, finish) + 1
+            gated.update(range(item, finish))
+        document = documents.get(source.path, DocumentEdits(source.path, source.source, ()))
+        missing: list[int] = []
+        for i in sorted(gated):
+            if i >= len(tokens.spans) or tokens.words[i] != rename.old:
+                continue
+            token = tokens.spans[i]
+            owner = tokens.parents.get(i, -1)
+            field_use = (tokens.words[max(0, i - 1):i] == (".",)
+                         and tokens.words[i + 1:i + 2] != ("(",)
+                         or isinstance(rename_edit_site(tokens, SourceEdit(token.start, token.end, rename.new)),
+                                       ShorthandFieldLabel)
+                         or owner >= 0 and tokens.words[owner] == "{"
+                         and i in field_sites(tokens.words, owner, tokens.ends[owner]))
+            if not field_use or source.path == path and token.start == span.start:
+                continue
+            if any(edit.start <= token.start and token.end <= edit.end and edit.text != rename.old
+                   for edit in document.edits):
+                continue
+            missing.append(token.start)
+        if not missing:
+            continue
+        server.open(source.path, source.source)
+        answers = server.definitions(source.path, source.source, tuple(missing))
+        if len(answers) != len(missing):
+            raise BulkRenameError("cfg field reference coverage unavailable: incomplete definition response")
+        edits = list(document.edits)
+        for point, answer in zip(missing, answers, strict=True):
+            if isinstance(answer, DefinitionUnavailable):
+                line = source.source.count("\n", 0, point) + 1
+                raise BulkRenameError(f"field rename has cfg-dependent references: {source.path}:{line}; "
+                                      + "field definition is unproved: " + answer.reason)
+            if answer == target or isinstance(answer, FieldShorthandTargets) and answer.field == target:
+                edit = SourceEdit(point, point + len(rename.old), rename.new)
+                site = rename_edit_site(tokens, edit)
+                edits.extend(site.field_edits(rename.new) if isinstance(site, ShorthandFieldLabel) else (edit,))
+        if tuple(edits) != document.edits:
+            documents[source.path] = replace(document, edits=tuple(edits))
+    return WorkspaceRename(tuple(documents.values()))
+
+
+def shorthand_edit_guard(document: DocumentEdits, rename: BindingRename) -> None:
+    """A local binding edit must keep the record field label intact."""
+    before = BindingText(document.source)
+    for edit in document.edits:
+        site = rename_edit_site(before, edit)
+        if (isinstance(site, ShorthandFieldLabel) and site.span.token.value == rename.old
+                and site.binding_edits(rename.new)[0] not in document.edits):
+            raise BulkRenameError("record shorthand edit was not normalized to preserve its field label")
+
+
 def rename_guard(server: RenameServer, path: Path, source: str, declaration: RenameDeclaration,
-                 rename: BindingRename) -> None:
+                 rename: BindingRename) -> PreservedFieldNames:
     parsed = server.sources.tokens(source)
+    preservation = preserved_field_names(server, path, parsed, declaration, rename)
     collision = pattern_binding_check(source, declaration, rename)
     if isinstance(collision, PatternBindingCollision):
         raise BulkRenameError(collision.reason)
-    if parsed.derive_field(rename):
-        raise BulkRenameError("serde/clap/confique derive field or variant")
     if declaration.scope.kind in {"field", "variant", "item"}:
         owners = style_footprint.attribute_owners(parsed.words)
         for start, owner in owners.items():
+            if start in preservation.attributes:
+                continue
             applies = (owner == declaration.scope.ranges[0][0]
                        or owner <= declaration.scope.declaration
                        and not set(parsed.words[owner:declaration.scope.declaration]) & {";", ",", "{", "}"})
@@ -743,6 +1012,7 @@ def rename_guard(server: RenameServer, path: Path, source: str, declaration: Ren
             if parsed.contains(declaration.scope.ranges, i) and parsed.words[max(0, i - 1):i] not in {(".",), ("::",)}:
                 line = source.count("\n", 0, parsed.spans[i].start) + 1
                 raise BulkRenameError(f"rename could capture {rename.new!r} at line {line}")
+    return preservation
 
 
 @cache
@@ -785,6 +1055,59 @@ def text_name_guard(server: RenameServer, document: DocumentEdits, rename: Bindi
             raise BulkRenameError("rename changes serialized or externally visible literal text")
 
 
+@dataclass(frozen=True)
+class ShorthandFieldLabel:
+    """One token that names both a record field and its local value or pattern binding."""
+
+    span: style_footprint.TokenSpan
+
+    def field_edits(self, new: str) -> tuple[SourceEdit, ...]:
+        return (SourceEdit(self.span.start, self.span.end, new + ": " + self.span.token.value),)
+
+    def binding_edits(self, new: str) -> tuple[SourceEdit, SourceEdit]:
+        # Keeping the insertion separate maps the old binding boundary to the value,
+        # including when this shorthand is the renamed pattern's declaration.
+        return (SourceEdit(self.span.start, self.span.start, self.span.token.value + ": "),
+                SourceEdit(self.span.start, self.span.end, new))
+
+
+def rename_edit_site(parsed: BindingText, edit: SourceEdit) -> ShorthandFieldLabel | SourceEdit:
+    """Classify only an entire existing shorthand token, using the shared token spans."""
+    for i, span in enumerate(parsed.spans):
+        if (span.start == edit.start and span.end == edit.end
+                and parsed.words[parsed.parents.get(i, i)] == "{"
+                and style_footprint.shorthand_field(parsed.words, i)):
+            return ShorthandFieldLabel(span)
+    return edit
+
+
+def preserve_shorthand_field_labels(sources: RunSourceIndex, workspace: WorkspaceRename,
+                                    rename: BindingRename) -> WorkspaceRename:
+    """A local rename changes the value side, never the record's field label.
+
+    Some analyzer edits (notably inside macro arguments) replace the bare token.
+    Split both bare replacements and already expanded fields into the same edit
+    pair so the existing offset and reference proof also handles pattern bindings.
+    """
+    documents: list[DocumentEdits] = []
+    for document in workspace.documents:
+        parsed = sources.tokens(document.source)
+        edits: list[SourceEdit] = []
+        for edit in document.edits:
+            site = rename_edit_site(parsed, edit)
+            if (isinstance(site, ShorthandFieldLabel) and site.span.token.value == rename.old
+                    and site.binding_edits(rename.new)[0] not in document.edits):
+                words = tuple(span.token.value for span in sources.tokens(edit.text).spans)
+                if (words == (rename.new,) and edit.text == rename.new
+                        or words == (rename.old, ":", rename.new)
+                        and re.fullmatch(re.escape(rename.old) + r"\s*:\s*" + re.escape(rename.new), edit.text)):
+                    edits.extend(site.binding_edits(rename.new))
+                    continue
+            edits.append(edit)
+        documents.append(replace(document, edits=tuple(edits)))
+    return WorkspaceRename(tuple(documents))
+
+
 def public_edit_guard(document: DocumentEdits, rename: BindingRename) -> None:
     if not published_crate(crate_directory(document.path)):
         return
@@ -792,6 +1115,9 @@ def public_edit_guard(document: DocumentEdits, rename: BindingRename) -> None:
     for i, span in enumerate(parsed.spans):
         if span.token.kind != "identifier" or not any(edit.start <= span.start < edit.end for edit in document.edits):
             continue
+        site = rename_edit_site(parsed, SourceEdit(span.start, span.end, rename.new))
+        if isinstance(site, ShorthandFieldLabel) and site.binding_edits(rename.new)[0] in document.edits:
+            continue  # The label is preserved; the edited value is still resolution-checked.
         line = document.source.count("\n", 0, span.start) + 1
         scope = BindingScope("item", i, ((i, i + 1),))
         if not public_declaration(parsed, scope):
@@ -968,6 +1294,13 @@ class RunSourceIndex:
             self.names[source] = source_name_index(self.tokens(source))
         return self.names[source].get(name.removeprefix("r#"), ())
 
+    def originally_named(self, path: Path, name: str) -> frozenset[Path]:
+        """Restoring an earlier overlay can reintroduce a destination-name reference."""
+        _ = self.coverage(path)
+        original = self.packages[crate_directory(path)]
+        assert isinstance(original, CrateSourceCoverage)
+        return frozenset(document.path for document in original.documents if self.named(document.source, name))
+
     def module_layout(self, path: Path, parsed: BindingText) -> tuple[ModuleLoadingSite, ...]:
         key = (path, parsed.source)
         if key in self.layouts:
@@ -1024,25 +1357,47 @@ class RunSourceIndex:
         return coverage
 
 
-def cargo_target_roots(crate: Path) -> tuple[CargoSourceTarget, ...]:
-    """Read configured targets and Cargo's conventional target locations, without building."""
-    manifest = object_fields(tomllib.loads((crate / "Cargo.toml").read_text()))
+@dataclass(frozen=True)
+class FrozenCargoTargetInventory:
+    """A manifest and source paths from the same immutable repository tree."""
+
+    manifest: str
+    paths: frozenset[Path]
+
+
+def cargo_target_roots(crate: Path, *, frozen: FrozenCargoTargetInventory | None = None
+                       ) -> tuple[CargoSourceTarget, ...]:
+    """Read Cargo targets from disk or an explicit frozen manifest/source inventory."""
+    manifest = object_fields(tomllib.loads(
+        (crate / "Cargo.toml").read_text() if frozen is None else frozen.manifest))
+    def exists(path: Path) -> bool:
+        return path.exists() if frozen is None else Path(os.path.normpath(path)) in frozen.paths
+
     package = object_fields(manifest.get("package"))
     roots: list[CargoSourceTarget] = []
     library = object_fields(manifest.get("lib", {}))
-    if "lib" in manifest or package.get("autolib", True) and (crate / "src/lib.rs").exists():
+    if "lib" in manifest or package.get("autolib", True) and exists(crate / "src/lib.rs"):
         roots.append(CargoSourceTarget("lib", str(package.get("name")), crate / str(library.get("path", "src/lib.rs"))))
     for kind, folder, auto in (("bin", "src/bin", "autobins"), ("example", "examples", "autoexamples"),
                                ("test", "tests", "autotests"), ("bench", "benches", "autobenches")):
         discovered: dict[str, Path] = {}
         directory = crate / folder
-        if directory.exists():
-            for entry in sorted(directory.iterdir()):
-                if entry.suffix == ".rs" and entry.is_file():
-                    discovered[entry.stem] = entry
-                elif entry.is_dir() and (entry / "main.rs").exists():
-                    discovered[entry.name] = entry / "main.rs"
-        if kind == "bin" and (crate / "src/main.rs").exists():
+        if frozen is None:
+            entries = tuple(directory.iterdir()) if directory.exists() else ()
+        else:
+            # Recursive Git inventories contain leaf entries, never directories.
+            # A leaf at the folder itself (including a gitlink) cannot be searched.
+            if directory in frozen.paths:
+                raise BulkRenameError(
+                    f"source coverage unavailable: Cargo {kind} target folder {directory} is not a directory")
+            entries = tuple({directory / path.relative_to(directory).parts[0]
+                             for path in frozen.paths if path.is_relative_to(directory)})
+        for entry in sorted(entries):
+            if entry.suffix == ".rs" and (entry.is_file() if frozen is None else exists(entry)):
+                discovered[entry.stem] = entry
+            elif exists(entry / "main.rs"):
+                discovered[entry.name] = entry / "main.rs"
+        if kind == "bin" and exists(crate / "src/main.rs"):
             discovered[str(package.get("name"))] = crate / "src/main.rs"
         configured = object_list(manifest.get(kind, []))
         for value in configured:
@@ -1058,7 +1413,7 @@ def cargo_target_roots(crate: Path) -> tuple[CargoSourceTarget, ...]:
         if package.get(auto, True):
             roots.extend(CargoSourceTarget(kind, name, path) for name, path in sorted(discovered.items()))
     build = package.get("build", "build.rs")
-    if isinstance(build, str) and ("build" in package or (crate / build).exists()):
+    if isinstance(build, str) and ("build" in package or exists(crate / build)):
         roots.append(CargoSourceTarget("build", "build", crate / build))
     if not roots:
         raise BulkRenameError("source coverage unavailable: no Cargo target roots")
@@ -1066,55 +1421,167 @@ def cargo_target_roots(crate: Path) -> tuple[CargoSourceTarget, ...]:
 
 
 def module_path_attributes(path: Path, parsed: BindingText) -> dict[int, str]:
-    """Associate supported literal outer paths with their out-of-line mod owners."""
-    paths: dict[int, str] = {}
-    owners = style_footprint.attribute_owners(parsed.words)
-    macros = parsed.macros
-
-    def refuse(start: int, cause: str) -> None:
-        line = parsed.source.count("\n", 0, parsed.spans[start].start) + 1
-        raise BulkRenameError(f"unsupported source loader: {cause} in {path} at line {line}")
-
-    for start, end in style_footprint.attribute_spans(parsed.words):
-        if any(begin <= start < finish for begin, finish in macros):
-            continue  # Expansion-generated modules remain the phase 102 limitation.
-        inner = parsed.words[start + 1] == "!"
-        opening = start + (2 if inner else 1)
-        attribute = parsed.words[opening + 1:end - 1]
-        words = tuple(word.removeprefix("r#") for word in attribute)
-        if words[:1] == ("cfg_attr",) and any(words[i:i + 2] == ("path", "=") for i in range(len(words) - 1)):
-            refuse(start, "conditional path attribute")
-        if words[:1] != ("path",):
-            continue
-        if inner:
-            refuse(start, "inner path attribute")
-        owner = owners.get(start, -1)
-        if owner < 0 or parsed.words[owner] != "mod" or parsed.words[owner + 2:owner + 3] != (";",):
-            refuse(start, "path attribute requires an out-of-line module")
-        if owner in paths:
-            refuse(start, "duplicate path attributes")
-        if len(attribute) != 3 or attribute[1] != "=":
-            refuse(start, "nonliteral path attribute")
-        literal = attribute[2]
-        if literal.startswith('"') and literal.endswith('"'):
-            if "\\" in literal:
-                refuse(start, "escaped path string")
-            filename = literal[1:-1]
-        elif literal.startswith('r') and '"' in literal:
-            opening_quote = literal.index('"')
-            hashes = literal[1:opening_quote]
-            if hashes.strip('#') or not literal.endswith('"' + hashes):
-                refuse(start, "nonliteral path attribute")
-            filename = literal[opening_quote + 1:len(literal) - len(hashes) - 1]
-        else:
-            refuse(start, "nonliteral path attribute")
-            raise AssertionError("refuse always raises")
-        paths[owner] = filename
+    """Read paths and retain the rename source graph's refusal of include expansion."""
+    paths = module_file_paths(path, parsed)
     for i, word in enumerate(parsed.words):
         if (word.removeprefix("r#") == "include" and parsed.words[i + 1:i + 2] == ("!",)
-                and not any(begin <= i < finish for begin, finish in macros)):
-            refuse(i, "include!")
+                and not any(begin <= i < finish for begin, finish in parsed.macros)):
+            line = parsed.source.count("\n", 0, parsed.spans[i].start) + 1
+            raise BulkRenameError(f"unsupported source loader: include! in {path} at line {line}")
     return paths
+
+
+@dataclass(frozen=True)
+class UnprovedModuleSource:
+    """One declaration whose loading route cannot be proved; siblings retain their evidence."""
+    declaration: int
+    reason: str
+
+
+@dataclass(frozen=True)
+class ModulePathEvidence:
+    paths: dict[int, str]
+    failures: tuple[UnprovedModuleSource, ...]
+
+
+class ModulePathUse(StrEnum):
+    OUT_OF_LINE = "out-of-line rename layout"
+    INCLUDING_INLINE = "source ownership including inline modules"
+
+
+def module_file_path_evidence(path: Path, parsed: BindingText,
+                              use: ModulePathUse = ModulePathUse.OUT_OF_LINE) -> ModulePathEvidence:
+    """Associate literal outer paths and per-declaration failures with module owners."""
+    paths: dict[int, str] = {}
+    failures: list[UnprovedModuleSource] = []
+    match use:
+        case ModulePathUse.OUT_OF_LINE:
+            bodies = {(";",)}
+        case ModulePathUse.INCLUDING_INLINE:
+            bodies = {(";",), ("{",)}
+    owners = style_footprint.attribute_owners(parsed.words)
+    for attribute in style_ledger.path_attribute_metas(parsed.words):
+        start = attribute.begin
+        if any(begin <= start < finish for begin, finish in parsed.macros):
+            continue  # Expansion-generated modules remain the phase 102 limitation.
+        owner = owners.get(start, -1)
+        words = parsed.words[attribute.index:attribute.end]
+        cause = ""
+        match attribute.mode:
+            case style_ledger.PathAttributeMode.CONDITIONAL:
+                cause = "conditional path attribute"
+            case style_ledger.PathAttributeMode.DIRECT:
+                if parsed.words[start + 1] == "!":
+                    cause = "inner path attribute"
+                elif (owner < 0 or parsed.words[owner] != "mod"
+                      or parsed.words[owner + 2:owner + 3] not in bodies):
+                    cause = "path attribute requires an out-of-line module"
+                elif owner in paths:
+                    cause = "duplicate path attributes"
+                elif len(words) != 3 or words[1] != "=":
+                    cause = "nonliteral path attribute"
+                else:
+                    literal = words[2]
+                    if literal.startswith('"') and literal.endswith('"'):
+                        if "\\" in literal:
+                            cause = "escaped path string"
+                        else:
+                            paths[owner] = literal[1:-1]
+                    elif literal.startswith('r') and '"' in literal:
+                        opening = literal.index('"')
+                        hashes = literal[1:opening]
+                        if hashes.strip('#') or not literal.endswith('"' + hashes):
+                            cause = "nonliteral path attribute"
+                        else:
+                            paths[owner] = literal[opening + 1:len(literal) - len(hashes) - 1]
+                    else:
+                        cause = "nonliteral path attribute"
+        if cause:
+            line = parsed.source.count("\n", 0, parsed.spans[start].start) + 1
+            failures.append(UnprovedModuleSource(owner,
+                f"unsupported source loader: {cause} in {path} at line {line}"))
+    return ModulePathEvidence(paths, tuple(failures))
+
+
+def module_file_paths(path: Path, parsed: BindingText) -> dict[int, str]:
+    evidence = module_file_path_evidence(path, parsed)
+    if evidence.failures:
+        raise BulkRenameError(evidence.failures[0].reason)
+    return evidence.paths
+
+
+@dataclass(frozen=True)
+class ExternalModuleSource:
+    """A file module and the lexical directory used to resolve its own children."""
+    path: Path
+    loading: ModuleLoadingDirectory
+    ancestry: tuple[str, ...]
+    declaration_offset: int
+
+
+@dataclass(frozen=True)
+class InlineModuleSource:
+    """An inline module body within the declaring source file."""
+    declaration_offset: int
+    begin: int
+    end: int
+
+
+def module_source_routes(candidate: Path, parsed: BindingText, loading: ModuleLoadingDirectory,
+                         explicit_paths: dict[int, str], exists: Callable[[Path], bool],
+                         failures: tuple[UnprovedModuleSource, ...] = ()
+                         ) -> tuple[ExternalModuleSource | InlineModuleSource | UnprovedModuleSource, ...]:
+    """Resolve one file's module declarations; the caller owns traversal and its source snapshot."""
+    excluded = dict((*style_footprint.attribute_spans(parsed.words), *parsed.macros))
+    routes: list[ExternalModuleSource | InlineModuleSource | UnprovedModuleSource] = list(failures)
+    unproved = {failure.declaration for failure in failures}
+
+    def modules(start: int, finish: int, directory: ModuleLoadingDirectory, route: tuple[str, ...]) -> None:
+        i = start
+        while i < finish:
+            if i in excluded:
+                i = excluded[i]
+                continue
+            if (parsed.words[i] == "mod" and i + 2 < finish
+                    and parsed.spans[i + 1].token.kind == "identifier"):
+                name = parsed.words[i + 1].removeprefix("r#")
+                body = i + 2
+                if i in unproved:
+                    i = parsed.ends.get(body, body) + 1
+                    continue
+                if parsed.words[body] == ";":
+                    child_loading: ModuleLoadingDirectory
+                    if i in explicit_paths:
+                        selected = directory.directory / explicit_paths[i]
+                        child_loading = OwnedModuleDirectory(selected.parent)
+                    else:
+                        folder = directory.children()
+                        choices = (folder / (name + ".rs"), folder / name / "mod.rs")
+                        found = [choice for choice in choices if exists(choice)]
+                        if len(found) != 1:
+                            routes.append(UnprovedModuleSource(i,
+                                f"source coverage unavailable: module {name!r} in {candidate}: "
+                                + ("missing source" if not found else "ambiguous source")))
+                            i = body + 1
+                            continue
+                        selected = found[0]
+                        child_loading = (OwnedModuleDirectory(selected.parent) if selected.name == "mod.rs"
+                                         else FlatModuleDirectory(selected.parent, name))
+                    routes.append(ExternalModuleSource(selected, child_loading, (*route, name),
+                                                       parsed.spans[i + 1].start))
+                elif parsed.words[body] == "{" and body in parsed.ends:
+                    end = parsed.ends[body]
+                    routes.append(InlineModuleSource(parsed.spans[i + 1].start,
+                                                      parsed.spans[body].end, parsed.spans[end].start))
+                    folder = (directory.directory / explicit_paths[i] if i in explicit_paths
+                              else directory.children() / name)
+                    modules(body + 1, end, OwnedModuleDirectory(folder), (*route, name))
+                    i = end + 1
+                    continue
+            i += 1
+
+    modules(0, len(parsed.words), loading, ())
+    return tuple(routes)
 
 
 def crate_source_coverage(server: RenameServer, path: Path) -> CrateSourceCoverage:
@@ -1140,46 +1607,17 @@ def crate_source_coverage(server: RenameServer, path: Path) -> CrateSourceCovera
         instance = ModuleInstance(target, ancestry, candidate, canonical)
         instances.append(instance)
         active.add(canonical)
-        excluded = dict((*style_footprint.attribute_spans(parsed.words), *parsed.macros))
-
-        def modules(start: int, finish: int, directory: ModuleLoadingDirectory, route: tuple[str, ...]) -> None:
-            i = start
-            while i < finish:
-                if i in excluded:
-                    i = excluded[i]
-                    continue
-                if (parsed.words[i] == "mod" and i + 2 < finish
-                        and parsed.spans[i + 1].token.kind == "identifier"):
-                    name = parsed.words[i + 1].removeprefix("r#")
-                    body = i + 2
-                    if parsed.words[body] == ";":
-                        child_loading: ModuleLoadingDirectory
-                        if i in explicit_paths:
-                            selected = directory.directory / explicit_paths[i]
-                            child_loading = OwnedModuleDirectory(selected.parent)
-                        else:
-                            folder = directory.children()
-                            choices = (folder / (name + ".rs"), folder / name / "mod.rs")
-                            found = [choice for choice in choices if choice.exists()]
-                            if len(found) != 1:
-                                raise BulkRenameError(f"source coverage unavailable: module {name!r} in {candidate}: "
-                                                      + ("missing source" if not found else "ambiguous source"))
-                            selected = found[0]
-                            child_loading = (OwnedModuleDirectory(selected.parent) if selected.name == "mod.rs"
-                                             else FlatModuleDirectory(selected.parent, name))
-                        child = visit(selected, child_loading, target, (*route, name))
-                        declarations.append(ModuleDeclarationSource(instance, parsed.spans[i + 1].start,
-                                                                    child.path, 0, len(child.source)))
-                    elif parsed.words[body] == "{" and body in parsed.ends:
-                        end = parsed.ends[body]
-                        declarations.append(ModuleDeclarationSource(instance, parsed.spans[i + 1].start,
-                                                                    canonical, parsed.spans[body].end, parsed.spans[end].start))
-                        modules(body + 1, end, OwnedModuleDirectory(directory.children() / name), (*route, name))
-                        i = end + 1
-                        continue
-                i += 1
-
-        modules(0, len(parsed.words), loading, ancestry)
+        for route in module_source_routes(candidate, parsed, loading, explicit_paths, Path.exists):
+            match route:
+                case UnprovedModuleSource():
+                    raise BulkRenameError(route.reason)
+                case ExternalModuleSource():
+                    child = visit(route.path, route.loading, target, (*ancestry, *route.ancestry))
+                    declarations.append(ModuleDeclarationSource(instance, route.declaration_offset,
+                                                                child.path, 0, len(child.source)))
+                case InlineModuleSource():
+                    declarations.append(ModuleDeclarationSource(instance, route.declaration_offset,
+                                                                canonical, route.begin, route.end))
         active.remove(canonical)
         return document
 
@@ -1238,7 +1676,7 @@ def collapsed_field_shorthands(sources: RunSourceIndex, document: DocumentEdits,
 
 
 def verify_rename_references(server: RenameServer, path: Path, offset: int, rename: BindingRename,
-                             replacements: Sequence[tuple[DocumentEdits, str]]) -> None:
+                             replacements: Sequence[tuple[DocumentEdits, str]]) -> frozenset[Path]:
     """Accept only preserved definitions; restore all server overlays on every failed proof."""
     declaration_document, declaration_text = next((document, edited) for document, edited in replacements
                                                   if document.path == path)
@@ -1253,6 +1691,8 @@ def verify_rename_references(server: RenameServer, path: Path, offset: int, rena
     inspected = [*replacements, *((document, document.source)
                                  for document in crate_name_documents(server, path, rename.new, tuple(changed_paths))
                                  if document.path not in changed_paths)]
+    proof_dependencies = set(server.sources.originally_named(path, rename.new))
+    proof_dependencies.update(document.path for document, _ in inspected)
     for document, edited in inspected:
         checks: list[ReferenceMustResolve] = []
         collapsed = collapsed_field_shorthands(server.sources, document, edited, rename) if document.edits else ()
@@ -1270,6 +1710,8 @@ def verify_rename_references(server: RenameServer, path: Path, offset: int, rena
             line = document.source.count("\n", 0, point) + 1
             if isinstance(answer, DefinitionUnavailable):
                 raise BulkRenameError(f"rename resolution unavailable for {rename.new!r} at line {line} in {document.path.name}: {answer.reason}")
+            targets = (answer.field, answer.binding) if isinstance(answer, FieldShorthandTargets) else (answer,)
+            proof_dependencies.update(Path(unquote(urlparse(target.uri).path)) for target in targets)
         for point, answer in zip(untouched, answers[:len(untouched)], strict=True):
             if isinstance(answer, DefinitionUnavailable):
                 raise AssertionError("unavailable definitions were refused above")
@@ -1308,17 +1750,82 @@ def verify_rename_references(server: RenameServer, path: Path, offset: int, rena
         for document, _ in replacements:
             server.open(document.path, document.source)
         raise
+    return frozenset(proof_dependencies)
 
 
 def file_edits_preserved(file: FileRenames, after: str) -> bool:
-    """Formatting may change whitespace only, never RA's tokens or the approved comments."""
+    """Keep significant tokens and attached comment paragraphs across rustfmt.
+
+    Only commas/braces and line wrapping of a plain comment paragraph may
+    differ. Markdown structure, hard breaks and block comments remain exact.
+    """
+    def formatted_evidence(source: str) -> tuple[tuple[style_footprint.Token, ...], tuple[tuple[int, str], ...]]:
+        spans = style_footprint.token_spans(source)
+        tokens: list[style_footprint.Token] = []
+        comments: list[tuple[int, str]] = []
+        previous_end = 0
+        paragraph = ""
+        marker = ""
+        for index, end in enumerate((*(span.start for span in spans), len(source))):
+            lines = [(raw, re.fullmatch(r"(///(?!/)|//!|//(?![/!])) ?(.*)", raw.lstrip()))
+                     for raw in source[previous_end:end].splitlines() if raw.strip()]
+            structured = any(not match or raw.endswith(("  ", "\\")) or (match and re.match(
+                r"(?:[ \t]|[#>*|]|`{3}|~{3}|[-+] |[0-9]+[.)] |\[.*\]:|<)", match[2]))
+                             for raw, match in lines)
+            for raw, match in lines:
+                line = raw.strip()
+                body = match[2] if match else ""
+                plain = bool(not structured and match and body)
+                if plain and match:
+                    if paragraph and marker != match[1]:
+                        comments.append((len(tokens), marker + " " + paragraph))
+                        paragraph = ""
+                    marker = match[1]
+                    paragraph = (paragraph + " " + body) if paragraph else body
+                else:
+                    if paragraph:
+                        comments.append((len(tokens), marker + " " + paragraph))
+                        paragraph = ""
+                    comments.append((len(tokens), line))
+            if paragraph:
+                comments.append((len(tokens), marker + " " + paragraph))
+                paragraph = ""
+            if index < len(spans):
+                span = spans[index]
+                if span.token.value not in {",", "{", "}"}:
+                    tokens.append(span.token)
+                previous_end = span.end
+        return tuple(tokens), tuple(comments)
+
     try:
-        before_spans, after_spans = style_footprint.token_spans(file.edited), style_footprint.token_spans(after)
+        return formatted_evidence(file.edited) == formatted_evidence(after)
     except style_footprint.UnreadableTokenSpans:
         return False
-    return (tuple(span.token for span in before_spans) == tuple(span.token for span in after_spans)
-            and style_footprint.comment_gaps(file.edited, before_spans, lambda text: text)
-            == style_footprint.comment_gaps(after, after_spans, lambda text: text))
+
+
+def parameter_comments(source: str, declaration: RenameDeclaration, rename: BindingRename) -> BindingComments | NoBindingScope:
+    """Use the shared mention proof, excluding docs owned by nested items and all Markdown links."""
+    parsed = BindingText(source)
+    gaps = tuple(zip((0, *(span.end for span in parsed.spans)),
+                     (*(span.start for span in parsed.spans), len(source)), strict=True))
+    comments = style_footprint.comment_gaps(source, parsed.spans, lambda text: text)
+    masked = source
+    for index, (start, end) in reversed(tuple(enumerate(gaps))):
+        if index > declaration.scope.declaration and any(style_footprint.outer_doc(line) for line in comments[index]):
+            # Outer docs are attributes of their following item, never of the
+            # surrounding function. Preserve coordinates for the shared checker.
+            masked = masked[:start] + ''.join('\n' if char == '\n' else ' ' for char in source[start:end]) + masked[end:]
+    plan = binding_comments(masked, rename)
+    if isinstance(plan, NoBindingScope):
+        return plan
+    for edit in plan.edits:
+        for start, end in gaps:
+            if not start <= edit.start < edit.end <= end:
+                continue
+            for link in re.finditer(r"\[[^\]\n]*\](?:\([^\)\n]*\)|\s*:[^\n]*)?", source[start:end]):
+                if start + link.start() < edit.end and edit.start < start + link.end():
+                    return NoBindingScope("intra-doc link is not a parameter mention")
+    return plan
 
 
 def unreserved_files(_paths: tuple[str, ...]) -> None:
@@ -1333,6 +1840,36 @@ def rename_file(server: RenameServer, path: Path, relative: str, source: str,
     for finding in findings:
         try:
             declaration = rename_declaration(source, finding.rename)
+            admission = approved_renames.admit_anchored_rename(finding.authority, finding.finding_version, finding.rename, relative, source,
+                purpose=approved_renames.RenameAdmissionPurpose.EXECUTE_PENDING_EDIT)
+            if isinstance(admission, OuterBindingBlocked | OuterBindingUnproved):
+                reason = ("outer binding visibility unproved: " if isinstance(admission, OuterBindingUnproved) else "") + admission.reason
+                # Keep the existing collision and external-text diagnostics. Policy
+                # refusal remains typed even when an earlier guard also refuses.
+                if isinstance(declaration, RenameDeclaration):
+                    try:
+                        _ = rename_guard(server, path, source, declaration, finding.rename)
+                        parsed = server.sources.tokens(source)
+                        mentions = tuple(SourceEdit(span.start, span.end, finding.rename.new) for span in parsed.spans
+                                         if span.token.value == finding.rename.old)
+                        text_name_guard(server, DocumentEdits(path, source, mentions), finding.rename)
+                    except BulkRenameError as error:
+                        reason = str(error) + "; " + reason
+                refused.append(BlockedRename(finding.finding_id, reason, admission))
+                continue
+            if isinstance(admission, approved_renames.AdmittedLocalRename):
+                if not admission.covers(finding.finding_version, finding.rename, relative, source):
+                    refused.append(BlockedRename(finding.finding_id, "local admission snapshot changed",
+                                                  OuterBindingUnproved("local admission snapshot changed", finding.rename.line, finding.rename.text)))
+                    continue
+                offset = dict(admission.edit_mapping)[admission.declaration_position]
+                token = next((span.token.value for span in server.sources.tokens(source).spans if span.start == offset), "")
+                if token.removeprefix("r#") != finding.rename.old.removeprefix("r#"):
+                    refused.append(BlockedRename(finding.finding_id, "recorded declaration no longer has the old name",
+                                                  OuterBindingUnproved("recorded declaration no longer has the old name", finding.rename.line, finding.rename.text)))
+                    continue
+                line = source.count("\n", 0, offset) + 1
+                declaration = rename_declaration(source, BindingRename(line, source.splitlines()[line - 1], finding.rename.old, finding.rename.new))
             if isinstance(declaration, NoBindingScope):
                 raise BulkRenameError(declaration.reason)
             located.append((finding, declaration))
@@ -1343,6 +1880,7 @@ def rename_file(server: RenameServer, path: Path, relative: str, source: str,
     kept: list[KeptRename] = []
     offsets = {finding.finding_id: declaration.offset for finding, declaration in located}
     changed: dict[Path, RenamedDocument] = {}
+    proof_dependencies: set[str] = set()
     occupied: dict[Path, list[tuple[int, int]]] = defaultdict(list)
     root = path
     for _ in Path(relative).parts:
@@ -1355,21 +1893,38 @@ def rename_file(server: RenameServer, path: Path, relative: str, source: str,
             declaration = rename_declaration(current, rename)
             if isinstance(declaration, NoBindingScope) or declaration.offset != offset:
                 raise BulkRenameError("earlier rename changed this finding's declaration")
-            rename_guard(server, path, current, declaration, rename)
-            comments = refactor_comments(current, declaration, rename)
-            if docs_name_binding(docs, comments, rename.old):
+            preservation = rename_guard(server, path, current, declaration, rename)
+            comments = (parameter_comments(current, declaration, rename) if declaration.scope.kind == "fn parameter"
+                        else refactor_comments(current, declaration, rename))
+            if isinstance(comments, NoBindingScope):
+                raise BulkRenameError("parameter doc word is ambiguous: " + comments.reason)
+            companion = tuple(SourceEdit(edit.start, edit.end, edit.replacement) for edit in comments.edits)
+            own_doc = declaration.scope.kind == "fn parameter" and any(edit.end <= offset for edit in companion)
+            if not own_doc and docs_name_binding(docs, comments, rename.old):
                 raise BulkRenameError("repository Markdown names the parameter; requires a coordinated documentation edit")
             workspace = server.rename(path, current, offset, rename.new)
+            workspace = cfg_field_reference_guard(server, path, server.sources.tokens(current), declaration, rename, workspace)
             documents: list[DocumentEdits] = []
             for document in workspace.documents:
                 if not document.path.is_relative_to(root) or crate_directory(document.path) != crate_directory(path):
                     raise BulkRenameError("WorkspaceEdit leaves the finding's crate: " + str(document.path))
+                if declaration.scope.kind == "fn parameter":
+                    spans = server.sources.tokens(document.source).spans
+                    if any(not any(span.start <= edit.start and edit.end <= span.end for span in spans)
+                           and (document.path != path or edit not in companion) for edit in document.edits):
+                        raise BulkRenameError("parameter refactor changes text outside its proved comment mentions")
+                if declaration.scope.kind not in {"field", "variant", "item"}:
+                    shorthand_edit_guard(document, rename)
                 text_name_guard(server, document, rename)
                 public_edit_guard(document, rename)
                 edits = list(document.edits)
                 if document.path == path:
-                    edits.extend(SourceEdit(edit.start, edit.end, edit.replacement) for edit in comments.edits
+                    edits.extend(edit for edit in companion
                                  if not any(other.start < edit.end and edit.start < other.end for other in edits))
+                    for edit in preservation.edits:
+                        if any(other.start < edit.end and edit.start < other.end for other in edits):
+                            raise BulkRenameError("WorkspaceEdit overlaps the preserved external name")
+                        edits.append(edit)
                 if any(edit.start < end and start < edit.end for edit in edits for start, end in occupied[document.path]):
                     raise BulkRenameError("WorkspaceEdit overlaps an earlier finding's edit")
                 documents.append(replace(document, edits=tuple(edits)))
@@ -1381,7 +1936,9 @@ def rename_file(server: RenameServer, path: Path, relative: str, source: str,
             check_files(tuple(document.path.relative_to(root).as_posix() for document in documents))
             # Validate every document before changing any server document.
             replacements = [(document, apply_edits(document.source, document.edits)) for document in documents]
-            verify_rename_references(server, path, offset, rename, replacements)
+            reads = verify_rename_references(server, path, offset, rename, replacements)
+        except ReservationBlocked:
+            raise
         except (BulkRenameError, OSError, UnicodeError, ValueError) as error:
             refused.append(Refusal(finding.finding_id, str(error)))
             continue
@@ -1403,9 +1960,10 @@ def rename_file(server: RenameServer, path: Path, relative: str, source: str,
                     except BulkRenameError:
                         offsets[identity] = -1
         kept.append(KeptRename(finding, declaration.scope.kind, 0))
+        proof_dependencies.update(target.relative_to(root).as_posix() for target in reads if target.is_relative_to(root))
     return FileRenames(relative, source, current, tuple(kept), tuple(refused),
                        tuple(document for target, document in changed.items() if target != path),
-                       frozenset(document.path for document in changed.values()))
+                       frozenset(document.path for document in changed.values()), frozenset(proof_dependencies))
 
 
 def combine_file_renames(files: Sequence[FileRenames]) -> tuple[FileRenames, ...]:
@@ -1419,20 +1977,38 @@ def combine_file_renames(files: Sequence[FileRenames]) -> tuple[FileRenames, ...
                                                 document.edited,
                                                 (*(previous.kept if previous else ()), *(file.kept if own else ())),
                                                 (*(previous.refusals if previous else ()), *(file.refusals if own else ())),
-                                                dependencies=(previous.dependencies if previous else frozenset[str]()) | file.dependencies)
+                                                dependencies=(previous.dependencies if previous else frozenset[str]()) | file.dependencies,
+                                                proof_dependencies=(previous.proof_dependencies if previous else frozenset[str]())
+                                                                   | file.proof_dependencies)
     return tuple(merged.values())
+
+
+def cargo_output(repo: Path, arguments: Sequence[str]) -> subprocess.CompletedProcess[str]:
+    """Capture Cargo output while the shared queue owns the program lifetime."""
+    with style_program_place("cargo", repo) as place:
+        process = place.popen(arguments, cwd=repo, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            output, errors = process.communicate()
+            return subprocess.CompletedProcess(arguments, process.wait(), output.decode(), errors.decode())
+        finally:
+            for stream in (process.stdout, process.stderr):
+                if stream is not None:
+                    stream.close()
 
 
 def command(repo: Path, arguments: Sequence[str]) -> None:
     print("bulk rename: " + " ".join(arguments), flush=True)
-    result = subprocess.run(arguments, cwd=repo, check=False)
-    if result.returncode:
-        raise BulkRenameError(f"{' '.join(arguments)} exited {result.returncode}")
+    if arguments and Path(arguments[0]).name == "cargo":
+        with style_program_place("cargo", repo) as place:
+            code = place.popen(arguments, cwd=repo).wait()
+    else:
+        code = subprocess.run(arguments, cwd=repo, check=False).returncode
+    if code:
+        raise BulkRenameError(f"{' '.join(arguments)} exited {code}")
 
 
 def verification_packages(repo: Path, crate: str) -> tuple[str, ...]:
-    result = subprocess.run(["cargo", "metadata", "--no-deps", "--format-version", "1"], cwd=repo,
-                            capture_output=True, text=True, check=False)
+    result = cargo_output(repo, ["cargo", "metadata", "--no-deps", "--format-version", "1"])
     if result.returncode:
         raise BulkRenameError(result.stderr.strip())
     metadata = object_fields(cast(object, json.loads(result.stdout)))
@@ -1543,6 +2119,9 @@ class BatchIntent:
                 raise ValueError("invalid batch owner")
             self.batch_id = batch_id
             files = object_fields(value["files"])
+            formatted = object_list(value.get("formatter_restored_paths", []))
+            if not all(isinstance(name, str) and name in files for name in formatted):
+                raise ValueError("invalid formatter restoration paths")
             tickets = object_list(value["tickets"])
             if not all(isinstance(ticket, str) for ticket in tickets):
                 raise ValueError("invalid tickets")
@@ -1566,7 +2145,12 @@ class BatchIntent:
                 if not isinstance(before, str) or not isinstance(after, str):
                     raise ValueError("invalid source bytes")
                 data = bytes.fromhex(before)
-                if hashlib.sha256(data).hexdigest() != digest or target.read_bytes() not in (data, bytes.fromhex(after)):
+                current = target.read_bytes()
+                preserved = current in (data, bytes.fromhex(after))
+                if not preserved and name in formatted:
+                    original = data.decode("utf-8")
+                    preserved = file_edits_preserved(FileRenames(name, original, original, (), ()), current.decode("utf-8"))
+                if hashlib.sha256(data).hexdigest() != digest or not preserved:
                     raise self.refuse(f"{name}: bytes do not match the recorded edit")
                 originals[target] = data
             # Check the whole set before restoring any file. Repeated recovery accepts before bytes too.
@@ -1680,8 +2264,10 @@ def check_available(repo: Path, path: str) -> None:
     board = berth_board.read_board(repo)
     if isinstance(board, berth_board.BoardUnavailable):
         raise BulkRenameError(f"cannot check reservation availability: {board.reason}")
-    if any(entry.blocks(path) and entry.holder_worktree_root.resolve() != repo for entry in board.reservations()):
-        raise BulkRenameError(f"{path}: another worktree holds the file")
+    holders = tuple(entry for entry in board.reservations()
+                    if entry.blocks(path) and entry.holder_worktree_root.resolve() != repo.resolve())
+    if holders:
+        raise ReservationBlocked(path, holders)
 
 
 def run_batch(repo: Path, ticket_id: str) -> Path:
@@ -1713,7 +2299,7 @@ def run_batch(repo: Path, ticket_id: str) -> Path:
             elif path.resolve() != path or not path.is_file() or not finding.path.endswith(".rs"):
                 refused.append(Refusal(finding.finding_id, "finding path is not a regular Rust file"))
             else:
-                groups[finding.path].append(RenameFinding(finding.finding_id, finding.path, rename))
+                groups[finding.path].append(RenameFinding(finding.finding_id, finding.path, rename, ledger.rename_authority(finding), finding.finding_id + ":" + ledger.finding_input_identity(finding)))
         packages = verification_packages(repo, ticket["crate"])
         files: list[FileRenames] = []
         with RustAnalyzer(repo) as server:
@@ -1756,7 +2342,7 @@ def run_batch(repo: Path, ticket_id: str) -> Path:
                 "sample": [asdict(item) for item in sample],
                 "files": {path: {"before": workspace.files[path].original, "after": (repo / path).read_text()} for path in good},
             })
-            _ = ledger.bulk_release(ticket_id, {refusal.finding_id: refusal.reason for refusal in refused})
+            _ = ledger.bulk_release(ticket_id, {refusal.finding_id: refusal.blocker if isinstance(refusal, BlockedRename) else refusal.reason for refusal in refused})
         except BaseException:
             workspace.restore()
             intent.finish()

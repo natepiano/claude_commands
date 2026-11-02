@@ -10,7 +10,12 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-import showrunners
+
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from scripts.production import showrunners
 import showrunner_tree
 from issues import Issue, open_issues
 # Callers such as rename_unit read the tag here.
@@ -93,4 +98,5 @@ def open_proposals(doc: Path, names: frozenset[str] | None = None) -> list[Issue
     if folder is None or not folder.is_dir():
         return []
     names = owners(doc) if names is None else names
-    return [issue for issue in open_issues(folder, PROPOSAL_TAG) if proposer(issue) in names]
+    return [issue for issue in open_issues(folder, PROPOSAL_TAG)
+            if issue.value("record_type") != "question" and proposer(issue) in names]

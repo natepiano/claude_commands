@@ -29,14 +29,16 @@ from pathlib import Path
 from typing import NamedTuple, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 from scripts.production import completion_receipt, staff, staff_sources
+from scripts.shutdown import remote
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "whoami"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from atomic_file import write_text_atomic
 
 import add_showrunner
-import showrunners
+from scripts.production import showrunners
 import unit_effort
 import unit_lookup
 import sessions
@@ -81,12 +83,10 @@ def _unit_row(lines: list[str], unit: str) -> dict[str, str]:
 
 def _session_status(pid: int) -> str:
     """The session record's `status`: `busy` while a turn runs."""
-    try:
-        record = cast(object, json.loads((unit_lookup.sessions_dir() / f"{pid}.json").read_text(encoding="utf-8")))
-    except (OSError, ValueError) as error:
-        raise Refusal(f"cannot read the unit's session record: {error}") from error
-    status = cast(dict[str, object], record).get("status") if isinstance(record, dict) else None
-    return status if isinstance(status, str) else ""
+    record = sessions.read_session(unit_lookup.sessions_dir() / f"{pid}.json")
+    if isinstance(record, sessions.UnreadableSessionRecord):
+        raise Refusal("cannot read the unit's session record")
+    return record.get("status", "")
 
 
 def _quiet(unit: str, marked: unit_lookup.MarkedUnit, claude: unit_lookup.LiveClaude) -> None:
@@ -121,7 +121,7 @@ def _committed(doc: Path) -> None:
 
 def checked(name: str, child_doc: Path) -> Promotion:
     """Everything the promotion needs. Raises Refusal naming what is in the way."""
-    parent_doc = showrunners.production_of(os.environ.get("CLAUDE_CODE_SESSION_ID", ""))
+    parent_doc = showrunners.production_of(staff.runtime_id())
     if parent_doc is None:
         raise Refusal("this session runs no production, so it has no unit to promote")
     parent = read_production(parent_doc)
@@ -265,7 +265,7 @@ def retire(promotion: Promotion) -> None:
         lines[index] = "|".join(parts)
         break
     write_text_atomic(doc, "\n".join(lines))
-    commit_paths(promotion.parent, [doc], f"production({promotion.parent.slug}): retire {promotion.unit}, "
+    _ = commit_paths(promotion.parent, [doc], f"production({promotion.parent.slug}): retire {promotion.unit}, "
                  + f"promoted to showrunner of {promotion.child.slug}")
 
 
@@ -286,7 +286,7 @@ def _main(argv: list[str]) -> int:
     args = parser.parse_args(argv)
     record = staff.initial_snapshot()
     try:
-        parent_doc = showrunners.production_of(os.environ.get("CLAUDE_CODE_SESSION_ID", ""))
+        parent_doc = showrunners.production_of(staff.runtime_id())
         if parent_doc is not None:
             parent = read_production(parent_doc)
             unit_name = cast(str, args.unit)
@@ -294,11 +294,14 @@ def _main(argv: list[str]) -> int:
             completed = promotion_record(parent, unit_name).with_suffix(".done.json")
             receipt = completion_receipt.read_receipt(completed, record)
             if isinstance(receipt, completion_receipt.OwnedReceipt):
+                if isinstance(receipt.owner.doc, staff.WrappedDoc):
+                    raise Refusal(f"{receipt.owner.name}: showrunner is wrapped; cannot complete this promotion")
+                old = staff_sources.member(staff_sources.UnitMember(parent.slug, unit_name), record)
                 child_doc = receipt.fields.get("child_doc")
                 if (receipt.owner.kind == "showrunner" and isinstance(child_doc, str)
                         and Path(child_doc).resolve() == cast(Path, args.production).expanduser().resolve()
-                        and isinstance(staff_sources.member(staff_sources.UnitMember(parent.slug, unit_name), record),
-                                       staff_sources.NoSuchMember)):
+                        and (isinstance(old, staff_sources.NoSuchMember)
+                             or isinstance(old.row.worktree, staff.RemovedWorktree))):
                     print(f"{unit_name} already promoted")
                     return 0
         promotion = checked(cast(str, args.unit), cast(Path, args.production))
@@ -312,15 +315,15 @@ def _main(argv: list[str]) -> int:
     unit, slug = promotion.unit, promotion.child.slug
     if cast(bool, args.check):
         print(f"check: ok — would stop {unit} (herdr {promotion.marked.place.session}), resume it as the showrunner of "
-              + f"{slug} in {promotion.worktree} under {promotion.parent.slug}, and retire its row; {moved}")
+              + f"{slug} in {promotion.worktree} under {promotion.parent.slug}, and preserve its native row; {moved}")
         return 0
     old_member = staff_sources.member(staff_sources.UnitMember(promotion.parent.slug, promotion.unit), record)
-    new_member = staff_sources.member(staff_sources.ShowrunnerMember(slug), record)
     parent_member = staff_sources.member(staff_sources.ShowrunnerMember(promotion.parent.slug), record)
-    if isinstance(parent_member, staff_sources.NoSuchMember):
-        _ = staff.ensure("showrunner", name=showrunners.herdr_space(promotion.parent.slug, str(promotion.parent.doc)))
-    if isinstance(new_member, staff_sources.NoSuchMember):
-        new_member = staff_sources.MemberFound(staff.ensure("showrunner", name=showrunners.herdr_space(slug, str(promotion.child.doc))))
+    parent_row = parent_member.row if isinstance(parent_member, staff_sources.MemberFound) else None
+    if parent_row is None:
+        print(f"promote_showrunner: {promotion.parent.slug}: native showrunner identity is missing", file=sys.stderr)
+        return 2
+    _ = staff_sources.ensure_staff_showrunner(promotion.parent, runtime_id=parent_row.current_session)
     was_pending = pending.exists()
     if not was_pending:
         save_promotion(promotion, target_directory)
@@ -344,6 +347,16 @@ def _main(argv: list[str]) -> int:
               + f"was restarted. Its pane is {where_place(promotion.marked.place)}; read it with "
               + f"`~/.claude/scripts/lib/py ~/.claude/scripts/production/session_pane.py read session {promotion.claude.session_id}`.")
         return 1
+    native = staff.native_id(promotion.claude.session_id)
+    name = showrunners.herdr_space(slug, str(promotion.child.doc))
+    document = staff.LiveDoc(remote.local_machine(), promotion.child.doc.resolve())
+    retained = record.by_current_session(native)
+    if (retained is not None and retained.kind == "showrunner"
+            and (retained.name, retained.parent, retained.doc) == (name, parent_row.id, document)):
+        new_member = staff_sources.MemberFound(retained)
+    else:
+        new_member = staff_sources.MemberFound(staff.promote_unit(
+            retained.id if retained is not None else native, name=name, parent=parent_row.id, doc=document))
     try:
         if was_pending and showrunners.current_name(slug):
             started = showrunners.main(["attach", slug, promotion.parent.slug])
@@ -373,8 +386,6 @@ def _main(argv: list[str]) -> int:
             print(f"kept worker {worker.id} {worker.name} under {old_member.row.name}")
         if workers:
             return 1
-        if result.unit_retired:
-            _ = staff.retire(old_member.row.id)
     if result.exit_code == 0:
         fields = cast(dict[str, object], json.loads(pending.read_text(encoding="utf-8")))
         completion_receipt.write_receipt(pending.with_suffix(".done.json"), new_member.row.id, fields)

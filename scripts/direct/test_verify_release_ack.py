@@ -17,10 +17,9 @@ from scripts.build_hold import build_hold
 from scripts.direct import test_verify_untested_examples
 from scripts.direct.test_verify_hold_wait import read_cycle_file, release_registered_call
 from scripts.lint.memory_test_support import fake_memory_readings
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
 
 INVOKE = Path(__file__).resolve().parent.parent / "lint" / "invoke.sh"
 CYCLE_ID = "b" * 32

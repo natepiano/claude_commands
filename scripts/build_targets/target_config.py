@@ -3,15 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import os
 from pathlib import Path
 import sys
+import os
 from typing import Literal
 
 
 SCRIPTS = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(SCRIPTS / "lint"))
-from config_values import config_values
+sys.path.insert(0, str(SCRIPTS / "lib"))
+import conf
 
 
 Platform = Literal["linux", "macos"]
@@ -33,14 +33,17 @@ class SshTarget:
 Target = LocalTarget | SshTarget
 
 
-class ConfigError(ValueError):
-    """A build-target key is missing or has an unsupported value."""
+ConfigError = conf.Unusable
+
+
+def uses_legacy_mac_layout(platform: Platform) -> bool:
+    """Mac targets retain one mirror and claim per source repository name."""
+    return platform == "macos"
 
 
 def read_targets(path: Path | None = None) -> tuple[Target, ...]:
-    default = path if path is not None else SCRIPTS.parent / "config/build_targets.conf"
-    config = Path(os.environ.get("BUILD_TARGETS_CONFIG", str(default))).expanduser().resolve()
-    values = config_values(str(config))
+    config = conf.path("build_targets") if path is None or os.environ.get("CONF_DIR") else path
+    values = conf.values(config)
     names = tuple(name.strip() for name in values.get("targets", "").split(","))
     if not all(names) or len(set(names)) != len(names):
         raise ConfigError(f"targets: expected distinct target names in {config}")

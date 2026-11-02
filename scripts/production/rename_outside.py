@@ -20,9 +20,11 @@ import sys
 from pathlib import Path
 from typing import cast
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import change_review  # noqa: E402
-import showrunners  # noqa: E402
+from scripts.production import showrunners  # noqa: E402
 import showrunner_tree
 import unit_move  # noqa: E402
 from rename_state import RenameRefused, read_json, write_json, write_text  # noqa: E402

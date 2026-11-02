@@ -3,6 +3,8 @@
 lookups and add_showrunner's start: nothing real stops or starts. Git runs in temporary repositories."""
 from __future__ import annotations
 
+from scripts.production.staff_test_support import fixture_member
+
 import io
 import json
 import os
@@ -13,14 +15,16 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import cast, final, override
+from typing import Callable, cast, final, override
 from unittest import mock
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import add_showrunner
 import promote_showrunner
-import showrunners
+from scripts.production import showrunners
 import showrunner_tree
 import unit_effort
 import unit_lookup
@@ -33,7 +37,7 @@ from scripts.herdr import herdr as trust_reader
 from scripts.whoami import account
 
 from scripts.production.staff_test_support import StaffTestCase
-from scripts.production import staff
+from scripts.production import staff, staff_sources
 
 CHILD_PREFLIGHT = add_showrunner.checked
 
@@ -125,9 +129,14 @@ class PromoteShowrunnerTests(unittest.TestCase):
         self.child_doc = self.worktree / "child-production.md"
         _ = self.child_doc.write_text(doc_text(self.worktree))
         commit_all(self.worktree)
+        self.staff.register_production("parent", self.parent_doc)
+        self.staff.register_production("child", self.child_doc)
+        parent_row = fixture_member("showrunner", name="parent", doc=staff.LiveDoc("natedev", self.parent_doc))
+        _ = fixture_member("unit", name="demo", parent=parent_row.id, runtime_id=SESSION)
         session_records = self.root / "sessions"
         session_records.mkdir()
-        _ = (session_records / f"{PID}.json").write_text(json.dumps({"status": "idle"}))
+        _ = (session_records / f"{PID}.json").write_text(json.dumps({"pid": PID, "sessionId": SESSION, "name": "demo",
+            "messagingSocketPath": "", "updatedAt": 1, "status": "idle"}))
         self.events, self.alive, self.started = [], [True, True, False], 0
         _ = (self.root / "herdr-responses.json").write_text(json.dumps({"default": {"code": 0, "stdout": ""}}))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
@@ -219,46 +228,83 @@ class PromoteShowrunnerTests(unittest.TestCase):
         self.assertFalse(plan_cell_is_retired(self.demo_row()["Plan"]))
 
     def staff_unit(self) -> staff.StaffRow:
-        parent = staff.ensure("showrunner", name="parent")
-        unit = staff.ensure("unit", name="demo", parent=parent.id)
+        parent = fixture_member("showrunner", name="parent")
+        unit = fixture_member("unit", name="demo", parent=parent.id, runtime_id=SESSION)
         self.staff.pane("w7:p1", session_id=SESSION, environment={
-            "STAFF_ID": unit.id, "SHOWRUNNER_UNIT": "parent", "SHOWRUNNER_UNIT_ID": "demo-unit"})
+            "CLAUDE_CODE_SESSION_ID": unit.id, "SHOWRUNNER_UNIT": "parent", "SHOWRUNNER_UNIT_ID": "demo-unit"})
         return unit
+
+    def assert_native_promotion(self, unit: staff.StaffRow) -> None:
+        retained = staff.by_id(unit.id)
+        assert retained is not None
+        self.assertEqual((retained.id, retained.parent, retained.kind, retained.name, retained.doc, retained.worktree),
+                         (unit.id, unit.parent, "showrunner", "child", staff.LiveDoc("natedev", self.child_doc),
+                          staff.WORKTREE_UNFILLED))
+        self.assertEqual([row for row in staff.snapshot().rows if row.id == unit.id], [retained])
+        self.assertEqual([row for row in staff.find(kind="showrunner") if row.name == "child"], [retained])
 
     def test_promote_keeps_worker_rows_and_reports_each_one(self) -> None:
         unit = self.staff_unit()
-        worker = staff.ensure("worker", name="impl1", parent=unit.id)
+        worker = fixture_member("worker", name="impl1", parent=unit.id)
         code, output, errors = self.run_main()
         self.assertEqual(code, 1, output + errors)
         self.assertIn(worker.id, output)
         self.assertIn(worker.name, output)
-        self.assertEqual(staff.by_id(unit.id), unit)
+        self.assert_native_promotion(unit)
         self.assertEqual(staff.by_id(worker.id), worker)
         self.assertTrue(any(row.name == "child" for row in staff.find(kind="showrunner")))
 
     def test_promote_showrunner_rerun(self) -> None:
         unit = self.staff_unit()
-        original_ensure = staff.ensure
-        for after in (False, True):
-            def interrupted_add(kind: staff.Kind, *, name: str, parent: staff.StaffId | None = None) -> staff.StaffRow:
-                if after:
-                    _ = original_ensure(kind, name=name, parent=parent)
+        original_ensure = staff_sources.ensure_staff_showrunner
+        for after_ensure in (False, True):
+            def interrupted_ensure(production: Production, caller: str = "", *,
+                                   runtime_id: str = "") -> staff.StaffRow:
+                self.assertEqual(production.doc, self.parent_doc)
+                if after_ensure:
+                    _ = original_ensure(production, caller, runtime_id=runtime_id)
                 raise RuntimeError("stopped at staff ensure")
-            with mock.patch.object(staff, "ensure", side_effect=interrupted_add):
+
+            with mock.patch.object(staff_sources, "ensure_staff_showrunner",
+                                   side_effect=interrupted_ensure):
                 with self.assertRaisesRegex(RuntimeError, "stopped at staff ensure"):
                     _ = self.run_main()
             self.assert_nothing_stopped()
-        original = staff.retire
-        def interrupted(staff_id: staff.StaffId) -> staff.StaffRow | None:
-            _ = original(staff_id)
+        original = staff.promote_unit
+        for after in (False, True):
+            before = self.staff.staff_file.read_bytes()
+
+            def interrupted(identity: staff.StaffId, *, name: str, parent: staff.StaffId,
+                            doc: staff.LiveDoc) -> staff.StaffRow:
+                self.assertEqual(identity, unit.id)
+                if after:
+                    _ = original(identity, name=name, parent=parent, doc=doc)
+                raise RuntimeError("stopped at native promotion")
+
+            with mock.patch.object(staff, "promote_unit", side_effect=interrupted):
+                with self.assertRaisesRegex(RuntimeError, "stopped at native promotion"):
+                    _ = self.run_main()
+            if not after:
+                self.assertEqual(self.staff.staff_file.read_bytes(), before)
+                self.assertEqual(staff.by_id(unit.id), unit)
+            else:
+                self.assert_native_promotion(unit)
+            self.assertFalse(any(event.startswith("start") for event in self.events))
+            self.marked.clear()
+        retire = promote_showrunner.retire
+
+        def interrupted_retirement(promotion: promote_showrunner.Promotion) -> None:
+            retire(promotion)
             raise RuntimeError("stopped after staff retirement")
-        with mock.patch.object(staff, "retire", side_effect=interrupted):
+
+        with mock.patch.object(promote_showrunner, "retire", side_effect=interrupted_retirement):
             with self.assertRaisesRegex(RuntimeError, "stopped after staff retirement"):
                 _ = self.run_main()
-        self.marked.clear()
+        self.assertTrue(plan_cell_is_retired(self.demo_row()["Plan"]))
+        self.assert_native_promotion(unit)
         code, output, errors = self.run_main()
         self.assertEqual(code, 0, output + errors)
-        self.assertIsNone(staff.by_id(unit.id))
+        self.assert_native_promotion(unit)
         self.assertTrue(any(row.name == "child" for row in staff.find(kind="showrunner")))
         data, document = self.staff.staff_file.read_bytes(), self.parent_doc.read_bytes()
         code, output, errors = self.run_main()
@@ -290,7 +336,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
         self.assertEqual(code, 0, output + errors)
         child = staff.by_path("child")
         assert child is not None
-        _ = staff.retire(child.id)
+        _ = staff.set_doc(child.id, staff.WrappedDoc("natedev", self.child_doc))
         code, output, errors = self.run_main()
         self.assertEqual(code, 2, output + errors)
         self.assertNotIn("already promoted", output)
@@ -300,9 +346,14 @@ class PromoteShowrunnerTests(unittest.TestCase):
 
         def start_child(_child: Production, _model: str, _effort: str, resume: str | None,
                         cwd: Path, _selected: accounts.ClaudeLaunchAccount,
-                        *, identity: add_showrunner.ShowrunnerLaunch) -> herdr.PromptSubmitted:
+                        *, identity: add_showrunner.ShowrunnerLaunch,
+                        before_prompt: Callable[[herdr.SessionTranscript], object]) -> herdr.PromptSubmitted:
             self.assertEqual((resume, cwd), (SESSION, self.worktree))
             self.assertEqual(identity.session_id, SESSION)
+            _ = before_prompt(herdr.SessionTranscript(_selected.dir, SESSION))
+            row = staff.by_id(staff.native_id(SESSION))
+            assert row is not None
+            self.assertEqual((row.kind, row.name), ("showrunner", "child"))
             self.marked.clear()
             return submitted
 
@@ -379,7 +430,10 @@ class PromoteShowrunnerTests(unittest.TestCase):
             self.child_refusal = "child already has a running showrunner"
 
         def mid_turn() -> None:
-            _ = (self.root / "sessions" / f"{PID}.json").write_text(json.dumps({"status": "busy"}))
+            path = self.root / "sessions" / f"{PID}.json"
+            data = cast(dict[str, object], json.loads(path.read_text()))
+            data["status"] = "busy"
+            _ = path.write_text(json.dumps(data))
 
         def form() -> None:
             self.pane = unit_effort.Skipped("a form, prompt or menu is open")
@@ -475,7 +529,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
         code, out, err = self.run_main()
         self.assertEqual((code, err), (1, ""), out)
         self.assertTrue(plan_cell_is_retired(self.demo_row()["Plan"]))
-        self.assertIsNone(staff.by_id(unit.id))
+        self.assert_native_promotion(unit)
         self.assertIsNotNone(staff.by_path("child"))
 
     def test_promoted_unit_staff_retires_while_attachment_is_still_owed(self) -> None:
@@ -484,7 +538,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
         code, out, err = self.run_main()
         self.assertEqual((code, err), (1, ""), out)
         self.assertTrue(plan_cell_is_retired(self.demo_row()["Plan"]))
-        self.assertIsNone(staff.by_id(unit.id))
+        self.assert_native_promotion(unit)
 
     def test_unready_showrunner_whose_retire_fails_reports_the_row_as_owed(self) -> None:
         self.started = add_showrunner.SESSION_NOT_READY

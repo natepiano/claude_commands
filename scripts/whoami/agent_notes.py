@@ -8,8 +8,11 @@ UTC so a saved reading is distinguishable from live usage. No credentials are
 saved. Other frontmatter and note bodies are preserved. Run as a script, it then
 hands the notes to quota_alert.py, which records routing when an account runs
 low, and to codex_pacer.py, which decides the `pace` tier from them; `refresh`
-(/quota_refresh) is the run after the user reports a usage reset. `blocked` is
-codex_mesh.py reporting that Codex refused a launch for quota: it reads the notes
+(/quota_refresh) is the run after the user reports a usage reset.
+`usage-only` reads and saves usage, then starts `renew-logins` when renewal is due.
+`renew-logins` renews expired local Claude logins under its own schedule lock.
+It sends no quota alerts and runs neither account moves nor the Codex pacer.
+`blocked` is codex_mesh.py reporting that Codex refused a launch for quota: it reads the notes
 as the timer left them and hands them to quota_alert.blocked().
 """
 
@@ -42,6 +45,7 @@ from scripts.accounts import next_moves, refusals, role_map
 from scripts.accounts.role_map import role_map_command
 from scripts.whoami.agent_accounts import KnownCodexAccount, UnknownCodexAccount, codex_account
 from scripts.whoami.agent_accounts import (ClaudeAccountsInUse, CodexHomeSource, EASTERN, Report, UsageReadOutcome,
+                            ScheduledUsageReads, UnscheduledUsageReads, UNSCHEDULED_USAGE_READS,
                             claude_on_disk, codex_email_on_disk, codex_home_display, codex_homes,
                             codex_report_in_use, live_reports, observe_workers_home as resolve_workers_home, NoWorkersHome)
 from quota_alert import (AgentNote, alert, blocked, current_session, refresh, CodexAlertPassReadings,
@@ -49,6 +53,8 @@ from quota_alert import (AgentNote, alert, blocked, current_session, refresh, Co
                          StoppedWorkerCommand, StoppedCommandUnknown)
 from scripts.whoami.run_out import READINGS_LOG
 from scripts.whoami import usage_store
+from scripts.maintenance.schedule import ScheduleBusy, locked_history, schedule_directory
+from scripts.maintenance.settings import positive, usage_only_interval
 from user_zone import user_zone
 
 
@@ -266,7 +272,7 @@ def apply(
     *, multiple_codex_homes: bool = False,
 ) -> QuotaUpdates:
     """Compute quota updates without writing any note."""
-    if account.usage_read_outcome == UsageReadOutcome.HELD:
+    if account.usage_read_outcome in (UsageReadOutcome.HELD, UsageReadOutcome.CREDENTIALS_UNAVAILABLE):
         return QuotaUpdates({}, (), ())
     messages: list[str] = []
     by_label: dict[str, dict[str, str]] = {}
@@ -336,12 +342,12 @@ def apply(
 
 
 @role_map_command
-def update() -> list[str]:
+def update(*, include_warnings: bool = True) -> list[str]:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from scripts.accounts import accounts
 
     workers_home = resolve_workers_home()
-    return update_for_selection(accounts.claude_account_selection(), workers_home)
+    return list(update_alert_pass(accounts.claude_account_selection(), workers_home, include_warnings=include_warnings).messages)
 
 
 def update_for_selection(selection: ClaudeAccountsInUse, workers_home: Path | NoWorkersHome) -> list[str]:
@@ -354,6 +360,35 @@ class UpdatedAgentNotes:
     messages: tuple[str, ...]
     codex_readings: CodexAlertPassReadings
     usage_reused: bool = False
+
+
+@dataclass(frozen=True)
+class RefreshedUsage:
+    """Reports and store diagnostics from a usage-only read-and-save attempt."""
+    reports: list[Report]
+    observed_at: datetime
+    messages: tuple[str, ...]
+
+
+def refresh_usage(selection: ClaudeAccountsInUse, workers_home: Path | NoWorkersHome,
+                  logins: dict[str, str], *,
+                  schedule: ScheduledUsageReads | UnscheduledUsageReads = UNSCHEDULED_USAGE_READS) -> RefreshedUsage:
+    """Read and save usage for both the notes timer and the Mac refresher."""
+    reading = (live_reports(selection, workers_home, schedule=schedule)
+               if isinstance(schedule, ScheduledUsageReads) else live_reports(selection, workers_home))
+    reports = asyncio.run(reading)
+    observed_at = datetime.now(timezone.utc)
+    messages: list[str] = []
+    if reports or isinstance(schedule, UnscheduledUsageReads):
+        try:
+            usage_store.save(reports, observed_at, logins)
+        except (OSError, ValueError) as error:
+            messages.append(f"usage store: {error}")
+    unavailable = sum(report.usage_read_outcome == UsageReadOutcome.CREDENTIALS_UNAVAILABLE
+                      for report in reports)
+    if unavailable:
+        messages.append(f"usage refresh: {unavailable} account(s) have login credentials unavailable in this session")
+    return RefreshedUsage(reports, observed_at, tuple(messages))
 
 
 def timer_usage_signature(selection: ClaudeAccountsInUse, workers_home: Path | NoWorkersHome) -> str:
@@ -406,7 +441,7 @@ def claude_note_logins(notes: Iterable[AgentNote]) -> dict[str, str]:
 
 @role_map_command
 def update_alert_pass(selection: ClaudeAccountsInUse, workers_home: Path | NoWorkersHome, *,
-                      force_usage: bool = False) -> UpdatedAgentNotes:
+                      force_usage: bool = False, include_warnings: bool = True) -> UpdatedAgentNotes:
     """Build the alert readings before writing any note."""
     from scripts.accounts import accounts
 
@@ -434,17 +469,15 @@ def update_alert_pass(selection: ClaudeAccountsInUse, workers_home: Path | NoWor
         reports = recent.reports
         observed_at = recent.observed_at
     else:
-        reports = asyncio.run(live_reports(selection, workers_home))
-        checked_at = datetime.now(timezone.utc)
-        observed_at = checked_at
+        refreshed = refresh_usage(selection, workers_home, claude_note_logins(notes))
+        reports, observed_at = refreshed.reports, refreshed.observed_at
+        checked_at = observed_at
+        messages.extend(refreshed.messages)
     codex_readings = codex_alert_pass(workers_home, reports, observed_at)
     if not notes:
         messages.append(f"no agent notes in {note_file.notes_dir()}")
     try:
-        # Usage history and process labels use the stable account label.
-        logins = claude_note_logins(notes)
         if fresh:
-            usage_store.save(reports, checked_at, logins)
             usage_store.save_timer_usage(signature, reports, observed_at)
     except (OSError, ValueError) as error:
         # The saved readings must never cost the notes or the alerts.
@@ -504,15 +537,21 @@ def update_alert_pass(selection: ClaudeAccountsInUse, workers_home: Path | NoWor
             append_readings(readings, checked_at)
         except (OSError, UnicodeError) as error:
             messages.append(f"readings log: {error}")
+    if include_warnings:
+        messages += watch_usage(reports, selection, workers_home, codex_readings)
+    return UpdatedAgentNotes(tuple(messages), codex_readings, usage_reused=not fresh)
+
+
+def watch_usage(reports: list[Report], selection: ClaudeAccountsInUse, workers_home: Path | NoWorkersHome,
+                codex_readings: CodexAlertPassReadings) -> list[str]:
+    """Warn only for accounts in use, sharing the pass's existing usage readings."""
     try:
         watch_reports = [report for report in reports
                          if (report.tool.lower() != "codex" or codex_report_in_use(report, workers_home))
                          and (report.tool.lower() != "claude" or selection.is_in_use(report.email or ""))]
-        messages += five_hour.watch(watch_reports, codex_readings=codex_readings)
+        return five_hour.watch(watch_reports, codex_readings=codex_readings)
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
-        # The 5-hour watch must never cost the notes or the weekly alerts.
-        messages.append(f"5-hour watch did not run: {error!r}")
-    return UpdatedAgentNotes(tuple(messages), codex_readings, usage_reused=not fresh)
+        return [f"5-hour watch did not run: {error!r}"]
 
 
 def mark_tier(plan: codex_pacer.Plan) -> None:
@@ -532,8 +571,62 @@ class RefusalCommandLine(argparse.Namespace):
     stopped: list[str] | None = None
 
 
+class UsageOnlyCommandLine(argparse.Namespace):
+    poll_seconds: float = 0
+
+
+def positive_poll_seconds(value: str) -> float:
+    return positive({"poll_seconds": float(value)}, "poll_seconds")
+
+
+def usage_only(*, poll_seconds: float = 0) -> None:
+    """Read each due account, then start renewal without waiting for a probe."""
+    from scripts.accounts import accounts, refusal_watch
+
+    interval = usage_only_interval() - poll_seconds / 2
+    with locked_history(schedule_directory("usage-only")) as history:
+        if isinstance(history, ScheduleBusy):
+            return
+        with role_map.stored_role_map():
+            selection = accounts.claude_account_selection(usage_only=True)
+            workers_home = resolve_workers_home()
+            logins = claude_note_logins(note_file.read_notes())
+            with usage_store.read_cadence(interval):
+                refreshed = refresh_usage(selection, workers_home, logins,
+                    schedule=ScheduledUsageReads(history, interval))
+    for line in refreshed.messages:
+        print(line)
+    try:
+        if refusal_watch.renew_expired_logins(refreshed.observed_at, True):
+            _ = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "renew-logins"],
+                                 start_new_session=True, stdin=subprocess.DEVNULL)
+    except Exception as error:
+        reason = str(error).splitlines()[0] if str(error) else type(error).__name__
+        print(f"login renewal: {reason}", file=sys.stderr)
+
+
+def renew_logins() -> None:
+    """Renew expired logins while holding only the renewal schedule lock."""
+    from scripts.accounts import refusal_watch
+
+    try:
+        with locked_history(schedule_directory("login-renewal")) as renewal_history:
+            if isinstance(renewal_history, ScheduleBusy):
+                return
+            for line in refusal_watch.renew_expired_logins(datetime.now(timezone.utc), False):
+                print(line)
+    except Exception as error:
+        reason = str(error).splitlines()[0] if str(error) else type(error).__name__
+        print(f"login renewal: {reason}", file=sys.stderr)
+
+
 @role_map_command
 def main() -> None:
+    if sys.argv[1:2] == ["renew-logins"]:
+        parser = argparse.ArgumentParser(prog="agent_notes.py renew-logins")
+        _ = parser.parse_args(sys.argv[2:])
+        renew_logins()
+        return
     if sys.argv[1:2] == ["blocked"]:
         parser = argparse.ArgumentParser(prog="agent_notes.py blocked")
         _ = parser.add_argument("identity", nargs="+", metavar="HOME LOGIN LABEL | HOME REASON")
@@ -567,8 +660,17 @@ def main() -> None:
         for line in blocked(list(note_file.read_notes()), identity, window=window, refused_at=refused_at, stopped=stopped):
             print(line)
         return
+    if sys.argv[1:2] == ["usage-only"]:
+        parser = argparse.ArgumentParser(prog="agent_notes.py usage-only")
+        _ = parser.add_argument("--poll-seconds", type=positive_poll_seconds, default=0)
+        parsed = parser.parse_args(sys.argv[2:], namespace=UsageOnlyCommandLine())
+        try:
+            usage_only(poll_seconds=parsed.poll_seconds)
+        except (OSError, ValueError) as error:
+            sys.exit(str(error))
+        return
     if sys.argv[1:] not in ([], ["refresh"]):
-        sys.exit("usage: agent_notes.py [refresh|blocked]")
+        sys.exit("usage: agent_notes.py [refresh|usage-only|renew-logins|blocked]")
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from scripts.accounts import accounts
 

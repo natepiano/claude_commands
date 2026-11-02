@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """The nightly review: one read-only unit, one improvement proposal per mode, queued for the user.
 
-`launch` runs from the nightly-review timer on natedev (/etc/nixos/modules/linux/nightly-review.nix).
-The review is the permanent nightly-review-unit of one production: wrap never retires it, so it
-keeps one conversation across nights. Each night the timer sends that unit the night's job,
-`/nightly_review config rust messages` for NIGHT=<date>. When the unit is gone, the timer first
-starts it through add_unit.py --permanent, which uses the configured units account, checks shutdown holds and trust,
+`launch` runs on demand on natedev; the 01:00 nightly-review timer that ran it was retired by
+/etc/nixos cc9a0e9 (2026-10-19). The review is the permanent nightly-review-unit of one production:
+wrap never retires it, so it keeps one conversation across nights. Each launch sends that unit the
+night's job, `/nightly_review config rust messages` for NIGHT=<date>. When the unit is gone, launch
+first starts it through add_unit.py --permanent, which uses the configured units account, checks shutdown holds and trust,
 and keeps the unit's launch flags (its own settings, ~/rust, /etc/nixos and ~/.claude).
 The unit does the modes in order; for each it writes NIGHT/<mode>.md and messages natedev, which
 distills the proposals into NIGHT/digest.md and the ledger (/watcher). The night is skipped when no
@@ -33,6 +33,7 @@ sys.path.insert(0, str(SCRIPTS.parent))
 sys.path.insert(0, str(SCRIPTS / "whoami"))
 sys.path.insert(0, str(SCRIPTS / "shutdown"))
 sys.path.insert(0, str(SCRIPTS / "production"))
+from scripts.lib.process_failure import failure_detail
 from scripts.whoami import account  # noqa: E402
 
 if TYPE_CHECKING:
@@ -119,7 +120,7 @@ def showrunner_transcripts(since: datetime) -> list[Path]:
     """Find dated replies in each showrunner's own account, including natedev."""
     from scripts.production import showrunners
 
-    names = {runner["session"] for runner in showrunners.registered_showrunners() if runner["session"]}
+    names = {runner["session"] for runner in showrunners.require_complete(showrunners.registered_showrunners()) if runner["session"]}
     found: set[Path] = set()
     for path in sorted(SESSIONS_DIR.glob("*.json")):
         try:
@@ -249,7 +250,7 @@ def nightly_production() -> NightlyProduction | str:
         import production_units
 
     found: list[NightlyProduction] = []
-    for runner in showrunners.registered_showrunners():
+    for runner in showrunners.require_complete(showrunners.registered_showrunners()):
         try:
             rows = production_units.unit_table(Path(runner["doc"]).read_text(encoding="utf-8").splitlines())
         except (OSError, UnicodeError, production_units.Refusal):
@@ -287,7 +288,7 @@ def tonight(day: date) -> list[str]:
             started = subprocess.run([sys.executable, str(SCRIPTS / "production" / "add_unit.py"), "--production",
                                       str(production.doc), SESSION, "--permanent"], capture_output=True, text=True, check=False)
             if started.returncode != 0:
-                return [f"{SESSION}: not started: {started.stderr.strip() or started.stdout.strip()}"]
+                return [f"{SESSION}: not started: {failure_detail(started)}"]
             lines.append(f"{SESSION}: started")
             claude = live_unit(production.slug)
     except OSError as error:

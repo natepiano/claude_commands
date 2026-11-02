@@ -8,6 +8,7 @@
     change_review.py edit [--production DOC] [--list L] --row ID --change "<what changed for you>" --check "<how to try it>" --see "<what you see>"
     change_review.py show [--production DOC] [--list L]
     change_review.py verdict [--production DOC] [--list L] --row ID --verdict "<the user's words>"
+    change_review.py set-kind [--production DOC] [--list L] --row ID --kind "See in action|Read only"
     change_review.py mark-important [--production DOC] [--list L] --row ID
     change_review.py list-path [--production DOC]
     change_review.py showrunner [--production DOC]
@@ -74,6 +75,8 @@ from enum import Enum
 from pathlib import Path
 from typing import TypeVar, cast
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 from atomic_file import write_text_atomic  # noqa: E402
 import scratch  # noqa: E402
@@ -94,6 +97,8 @@ CHECK = "How to check"
 URGENCY = "Urgency"
 # The production a row's change is from: its slug. A row from before the column is the root's.
 PRODUCTION = "Production"
+KIND = "Kind"
+REVIEW_KINDS = ("See in action", "Read only")
 NOT_YET = "not yet"
 FORM = "<what changed for you> | <how to try it: where and what to type> | <what you see>"
 SEPARATOR = " | "
@@ -106,8 +111,7 @@ _LINE = re.compile(rf"^{TRAILER}:\s*(?P<value>.*)$", re.MULTILINE)
 _COVERS = re.compile(rf"^{TRAILER}-Covers:\s*(?P<sha>[0-9a-f]{{7,40}})\s*$", re.MULTILINE)
 _NUMBER = re.compile(r"^\| C(\d+) \|", re.MULTILINE)
 _ROW = re.compile(r"^[A-Z]\d+$")
-_LANDS = re.compile(r"\b(works|fine)\b", re.IGNORECASE)
-_FAILS = re.compile(r"\b(not|no|never|still|fails?|failed|broken|wrong|doesn't|don't|isn't)\b", re.IGNORECASE)
+_LANDS = re.compile(r"^\s*(?:(?:okay|ok)\s+)?(?:c\d+\s+)?(?:works|fine)\b", re.IGNORECASE)
 # A cell boundary is a `|` that _cell did not escape.
 _BOUNDARY = re.compile(r"(?<!\\)\|")
 _CHECKPOINT = re.compile(r"^checkpoint\((?P<branch>[^)]+)\):")
@@ -215,7 +219,7 @@ def _git(repo: Path, *arguments: str) -> str:
 
 def registered_productions() -> Iterable[Path]:
     """Production docs named by the registered update timers."""
-    import showrunners
+    from scripts.production import showrunners
 
     return showrunners.timer_docs().values()
 
@@ -587,6 +591,7 @@ def append_rows(path: Path, changes: list[Visible], day: date, merged: str, prod
         when = f"{day.isoformat()} · {_cell(merged)}" if merged else day.isoformat()
         rows = [_row(path, columns, {"#": f"C{number + offset}", "Change": _cell(item.change), "Merged": when,
                                      "On the Mac build": NOT_YET, CHECK: _cell(item.how()), URGENCY: _cell(rank),
+                                     KIND: "",
                                      PRODUCTION: _cell(row_production(owners[offset] if owners else production))})
                 for offset, item in enumerate(changes)]
         _insert(lines, end, rows)
@@ -619,13 +624,12 @@ def _held(columns: list[str], rows: list[str], changes: list[Visible], merged: s
 def pending(path: Path) -> list[dict[str, str]]:
     """Each row still to review, as its cells by column name. Reads only."""
     lines = read(path).splitlines(keepends=True)
-    columns, first, end = _table(path, lines, SECTION)
-    return [dict(zip(columns, (_plain(cell) for cell in _cells(line)))) for line in lines[first:end]]
+    return _review_table(path, lines, SECTION)
 
 
 def scope_list(doc: Path) -> Path:
     """The list that takes the production's rows: the one its Change review line names, else its root's."""
-    import showrunners
+    from scripts.production import showrunners
     import showrunner_tree
 
     slug = slug_of(doc)
@@ -789,9 +793,25 @@ def visible_owners(commits: list[Commit], production: Path) -> list[Path]:
             for item in entries(commit.message) if isinstance(item, Visible)]
 
 
+def read_commit_parents(repo: Path, revisions: Iterable[str]) -> dict[str, tuple[str, ...]]:
+    """Read the parents of the requested commits in one Git command."""
+    requested = tuple(dict.fromkeys(revisions))
+    if not requested:
+        return {}
+    result = subprocess.run(["git", "-C", str(repo), "rev-list", "--no-walk", "--parents", "--stdin"],
+                            input="\n".join(requested) + "\n", capture_output=True, text=True, check=False)
+    if result.returncode:
+        raise ChangeReviewError(f"git rev-list --parents: {result.stderr.strip()}")
+    parents: dict[str, tuple[str, ...]] = {}
+    for line in result.stdout.splitlines():
+        sha, *ancestors = line.split()
+        parents[sha] = tuple(ancestors)
+    return parents
+
+
 def merge_commits(repo: Path, merge: str) -> list[Commit]:
     """The commits a merge brought in, without merges; none for a commit that is no merge."""
-    parents = _git(repo, "rev-list", "--parents", "-n", "1", merge).split()[1:]
+    parents = next(iter(read_commit_parents(repo, (merge,)).values()), ())
     if len(parents) < 2:
         return []
     records = _git(repo, "log", "--no-merges", "--format=%x1e%H%x1f%B", parents[1], f"^{parents[0]}", "--")
@@ -959,9 +979,9 @@ def describe(row: dict[str, str]) -> str:
 
 
 def lands(verdict: str) -> bool:
-    """A verdict that says `works` or `fine` and no word of failure (`not`, `still`, `broken` ...) lands
-    the row ("okay c17 works"); any other returns it to its unit."""
-    return _LANDS.search(verdict) is not None and _FAILS.search(verdict) is None
+    """Land on an opening `works` or `fine`, after optional `okay`/`ok` and row id.
+    Case and later words do not affect the result; any other start returns the row."""
+    return _LANDS.match(verdict) is not None
 
 
 def _to_review(path: Path, lines: list[str], row: str) -> tuple[list[str], int]:
@@ -1055,13 +1075,68 @@ def record_verdict(path: Path, row: str, verdict: str, day: date,
             return VerdictConflict(_plain(cells.get("Verdict", "")), _plain(cells.get("Date", "")))
         cells = dict(zip(columns, _cells(lines.pop(index))))
         _add_column(path, lines, REVIEWED, "Merged")
+        # Page rows retain their description and proof in the same record after
+        # answering. Older lists keep their existing Reviewed table shape.
+        if cells.get(KIND):
+            for column in (KIND, CHECK, PRODUCTION):
+                _add_column(path, lines, REVIEWED, column)
         reviewed, top, _ = _table(path, lines, REVIEWED)
-        _insert(lines, top, [_row(path, reviewed, {"#": row, "Change": cells.get("Change", ""),
+        _insert(lines, top, [_row(path, reviewed, {**dict.fromkeys(reviewed, ""), **cells, "#": row,
                                                    "Verdict": _cell(verdict), "Date": day.isoformat(),
                                                    "Merged": cells.get("Merged", "")})])
         return VerdictRecorded(row_merge(cells))
 
     return _edit(path, production, day, write, lambda _: f"verdict {row}")
+
+
+def review_rows(path: Path) -> list[dict[str, str]]:
+    """Read pending and saved page answers from the authoritative list."""
+    snapshot = review_snapshot(path)
+    return [*snapshot.pending, *snapshot.reviewed]
+
+
+def _review_table(path: Path, lines: list[str], section: str) -> list[dict[str, str]]:
+    """Decode one review table and refuse rows with missing or extra cells."""
+    columns, first, end = _table(path, lines, section)
+    result: list[dict[str, str]] = []
+    for line in lines[first:end]:
+        cells = _cells(line)
+        if len(cells) != len(columns):
+            raise ChangeReviewError(f"{path}: {cells[0]} has the wrong number of cells")
+        result.append(dict(zip(columns, map(_plain, cells))))
+    return result
+
+
+@dataclass(frozen=True)
+class ReviewListSnapshot:
+    """One list read, with its metadata and both review tables."""
+
+    text: str
+    pending: list[dict[str, str]]
+    reviewed: list[dict[str, str]]
+
+
+def review_snapshot(path: Path) -> ReviewListSnapshot:
+    text = read(path)
+    lines = text.splitlines(keepends=True)
+
+    return ReviewListSnapshot(text, _review_table(path, lines, SECTION), _review_table(path, lines, REVIEWED))
+
+
+def set_row_kind(path: Path, row: str, kind: str, production: Path) -> str:
+    """Classify by whether the change alters something the user runs or sees."""
+    if kind not in REVIEW_KINDS:
+        raise ChangeReviewError("--kind must be 'See in action' or 'Read only'")
+
+    def write(lines: list[str]) -> str:
+        _add_column(path, lines, SECTION, KIND)
+        columns, index = _to_review(path, lines, row)
+        cells = dict(zip(columns, _cells(lines[index])))
+        written = _row(path, columns, {**cells, KIND: kind})
+        lines[index] = written + "\n"
+        return written
+
+    return _edit(path, production, today(), write, lambda _: f"kind {row}")
 
 
 def end_row_scratch(path: Path, row: str) -> list[str]:
@@ -1092,7 +1167,7 @@ def production_doc(production: str) -> Path:
     """The production doc given; without one, the calling showrunner's."""
     if production:
         return Path(production).expanduser()
-    import showrunners  # only the actions that name a production read the update timers
+    from scripts.production import showrunners  # only the actions that name a production read the update timers
 
     found = showrunners.production_of(os.environ.get("CLAUDE_CODE_SESSION_ID", ""))
     if found is None:
@@ -1106,7 +1181,7 @@ def showrunner_of(doc: Path) -> str:
     A child production's rows go to its root's list. The name is the root showrunner's session
     name as it is now, never the production slug, so it is read only while that showrunner runs.
     """
-    import showrunners
+    from scripts.production import showrunners
     import showrunner_tree
 
     try:
@@ -1166,7 +1241,7 @@ def foreign_units(production: Path) -> set[str]:
 
     Empty when the productions cannot be read: drift then counts every checkpoint.
     """
-    import showrunners
+    from scripts.production import showrunners
     import showrunner_tree
 
     try:
@@ -1211,6 +1286,7 @@ class CommandLine(argparse.Namespace):
     see: str = ""
     row: str = ""
     verdict: str = ""
+    kind: str = ""
     production: str = ""
     urgency: str = ""
     due: str = ""
@@ -1295,6 +1371,9 @@ def _run(options: CommandLine) -> int:
             target = _row_option(options)
             now = datetime.now(user_zone()).replace(tzinfo=None)
             print(mark_row(target.path, target.row, now, production_doc(options.production)))
+        case "set-kind":
+            target = _row_option(options)
+            print(set_row_kind(target.path, target.row, options.kind, production_doc(options.production)))
         case "verdict":
             target = _row_option(options)
             verdict = _words("verdict", options.verdict)
@@ -1317,7 +1396,7 @@ def _run(options: CommandLine) -> int:
         case "showrunner":
             print(showrunner_of(production_doc(options.production)))
         case "backfill-production":
-            import showrunners
+            from scripts.production import showrunners
 
             docs = list(showrunners.timer_docs().values())
             lists = [Path(options.list).expanduser()] if options.list else sorted(LISTS.glob(f"{PREFIX}*.md"))
@@ -1354,11 +1433,11 @@ def _run(options: CommandLine) -> int:
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     _ = parser.add_argument("action", choices=("check", "append", "drift", "add", "edit", "show", "verdict",
-                                                   "mark-important", "list-path", "showrunner",
+                                                   "mark-important", "set-kind", "list-path", "showrunner",
                                                    "backfill-production"))
     _ = parser.add_argument("--repo", default=".")
     for name in ("checkpoint", "previous", "merge-branch", "list", "merged", "since", "change", "check", "see",
-                 "row", "verdict", "production", "urgency", "due", "after"):
+                 "row", "verdict", "production", "urgency", "due", "after", "kind"):
         _ = parser.add_argument(f"--{name}", default="")
     _ = parser.add_argument("--write", action="store_true")
     _ = parser.add_argument("--hold", action="append")

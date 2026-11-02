@@ -102,7 +102,7 @@ def allowed(top: Path) -> bool:
     """A folder directly in a root that may be made: a scratchpad, the run folders, a scratch root."""
     if top.parent == real("/tmp") and (top.name == "claude" or SESSION_SCRATCHPAD.fullmatch(top.name)):
         return True
-    if top.parent == real("/tmp/claude") and top.name in ("unit", "delegate", "scratch", "session"):
+    if top.parent == real("/tmp/claude") and top.name in ("unit", "delegate", "scratch", "session", "copies"):
         return True
     return top == real("~/rust/repro")
 

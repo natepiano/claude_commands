@@ -7,9 +7,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-import showrunners
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from scripts.production import showrunners
 import showrunner_tree
 from scripts.production import staff, staff_sources
 from scripts.lib.atomic_file import write_text_atomic
@@ -100,7 +101,13 @@ def attach_parent(child: str, parent: str = "") -> None:
         if isinstance(pending, PendingParentNotice) and pending != PendingParentNotice("attach", parent):
             raise staff.StaffRefused(f"{child}: finish its pending {pending.action} to {pending.parent} first")
         child_row, parent_row = _row(child, record), _row(parent, record)
-        finished = child_row.parent == parent_row.id and isinstance(pending, NoPendingParentNotice)
+        path = showrunners.SHOWRUNNER_STATE_DIR / child / showrunners.PARENT_FILE
+        try:
+            recorded_parent = path.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            recorded_parent = ""
+        finished = (child_row.parent == parent_row.id and recorded_parent == parent
+                    and isinstance(pending, NoPendingParentNotice))
         if finished:
             print(f"{child} already reports to {parent}; done")
             return

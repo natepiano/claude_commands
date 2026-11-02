@@ -13,14 +13,20 @@ from scripts.lib import test_hang_guard
 
 from scripts.lib.test_agents_registry import registry_text, write_registry
 
+from functools import cached_property
 import json
 import os
 import shutil
 import subprocess
 from pathlib import Path
-from typing import TypedDict, cast, override
+from typing import TYPE_CHECKING, TypedDict, cast, override
 
 from scripts.direct.recorder_fixture import LauncherFixture, STUB_ATOMIC_JSON_WRITER, communicate_launcher, configure_launcher_fixture, launcher_environment, launcher_registry, prepare_launcher_runtime
+
+if TYPE_CHECKING:
+    from ..lint.memory_test_support import config_environment, write_config_fixture
+else:
+    from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 
 DIRECT_DIR = Path(__file__).parent
@@ -177,8 +183,10 @@ if sys.argv[1] == '--bg':
     import uuid
     registry = pathlib.Path(os.environ.get('NOTIFIER_SESSIONS_DIR', str(root / 'sessions')))
     registry.mkdir(parents=True, exist_ok=True)
-    (registry / f'{name}.json').write_text(json.dumps({
-        'id': 'abc12345', 'sessionId': str(uuid.uuid5(uuid.NAMESPACE_URL, name)), 'name': name}))
+    (registry / f"{os.environ['FIXTURE_BACKEND_PID']}.json").write_text(json.dumps({
+        'id': 'abc12345', 'sessionId': 'abc12345-' + str(uuid.uuid5(uuid.NAMESPACE_URL, name))[9:],
+        'name': name, 'pid': int(os.environ['FIXTURE_BACKEND_PID']),
+        'procStart': os.environ['FIXTURE_BACKEND_START'], 'updatedAt': 1, 'messagingSocketPath': ''}))
     print(f'backgrounded · abc12345 · {name}')
 elif sys.argv[1:3] == ['agents', '--json']:
     unreadable = root / 'unreadable_listing_once'
@@ -250,21 +258,35 @@ class ImplementLauncherFixture(LauncherFixture):
         super().setUp()
         self.prompt_file: Path = self.root / "implementation_prompt.md"
         self.implement_script = self.root / "scripts" / "direct" / "implement.sh"
+        _ = self.staff_parent
+
+    @cached_property
+    def staff_parent(self) -> str:
+        from scripts.production.staff_test_support import isolated_staff_file, unit_membership
+        with isolated_staff_file(self.root / "staff.json", {}):
+            parent = unit_membership("fixture", "fixture-unit")
+        return parent.id
 
     @override
     def prepare_fixture(self) -> None:
         self.prepare_project(
             "feature/workers", "implementation_prompt.md", "Write the retry path.\n",
             (
-                "UNIT_PROGRESS_INTERVAL_SECONDS=180",
-                "UNIT_COMPACT_ABOVE_TOKENS=100000",
-                "MAX_FIX_ATTEMPTS=3", "MAX_REOPENS=3", "STALLED_ROUNDS=3",
-                "RUNAWAY_ROUNDS=10", "REPAIR_ROUNDS_PER_FINDING=2",
-                "MIN_REPAIR_BUDGET=2", "MAX_CONSECUTIVE_SAME_KIND_PASSES=6",
-                "MAX_REVIEW_CANCELLATIONS=1", "ROUTING_FROM_ROUND=4",
-                "ASTRA_AFTER_FAILED_FIXES=2", "",
+                "# whole: 1..", "UNIT_PROGRESS_INTERVAL_SECONDS=180",
+                "# whole: 1..", "UNIT_COMPACT_ABOVE_TOKENS=100000",
+                "# whole: 1..", "MAX_FIX_ATTEMPTS=3", "# whole: 1..", "MAX_REOPENS=3", "# whole: 1..", "STALLED_ROUNDS=3",
+                "# whole: 1..", "RUNAWAY_ROUNDS=10", "# range: 5e-324..", "REPAIR_ROUNDS_PER_FINDING=2",
+                "# whole: 1..", "MIN_REPAIR_BUDGET=2", "# whole: 1..", "MAX_CONSECUTIVE_SAME_KIND_PASSES=6",
+                "# whole: 0..", "MAX_REVIEW_CANCELLATIONS=1", "# whole: 1..", "ROUTING_FROM_ROUND=4",
+                "# whole: 1..", "ASTRA_AFTER_FAILED_FIXES=2", "",
             ), AGENTS_REGISTRY,
         )
+        _ = write_config_fixture(self.config_file, self.config_file.read_text(encoding="utf-8"))
+        _ = config_environment(self.root)
+        # A phase launch captures HEAD before opening its worker, as a real checked-out phase does.
+        _ = subprocess.run(["git", "-C", str(self.working_dir), "-c", "user.name=Test",
+                            "-c", "user.email=test@example.invalid", "commit", "-q", "--allow-empty",
+                            "-m", "base"], check=True, capture_output=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
         notes = self.root / "notes"
         notes.mkdir()
         _ = (notes / "claude2.md").write_text("---\nlogin: worker@example.invalid\n---\n")
@@ -276,6 +298,8 @@ class ImplementLauncherFixture(LauncherFixture):
     def build_script_tree(self) -> Path:
         """Copy the real wrapper beside a stub agent, so nothing calls a model."""
         direct_dir, agents, lib = prepare_launcher_runtime(self.root)
+        for name in ("conf.py", "conf.sh"):
+            _ = shutil.copy2(DIRECT_DIR.parent / "lib" / name, lib / name)
         _ = shutil.copy2(DIRECT_DIR.parent / "lib/nix_env.py", lib / "nix_env.py")
         home_lib = self.root / ".claude/scripts/lib"
         home_lib.mkdir(parents=True, exist_ok=True)
@@ -288,6 +312,14 @@ class ImplementLauncherFixture(LauncherFixture):
         mesh = agents / "codex_mesh.py"
         _ = mesh.write_text(STUB_MESH, encoding="utf-8")
         mesh.chmod(0o755)
+        _ = shutil.copy2(DIRECT_DIR.parent / "production/worker_fill.py", self.root / "scripts/production/worker_fill.py")
+        opening_sender = self.root / "opening-send.py"
+        _ = opening_sender.write_text("import json, os, pathlib, sys\n"
+            + "root = pathlib.Path(os.environ['STUB_CLAUDE_ROOT'])\n"
+            + "rows = json.loads(pathlib.Path(os.environ['STAFF_FILE']).read_text())['rows']\n"
+            + "(root / 'staff-at-work.json').write_text(json.dumps(rows))\n"
+            + "(root / 'opening-message.txt').write_text(pathlib.Path(sys.argv[sys.argv.index('--file') + 1]).read_text())\n"
+            + "print('SENT: fixture')\n")
         agent_bg = agents / "agent_bg.sh"
         _ = shutil.copy2(AGENTS_DIR / "agent_bg.sh", agent_bg)
         _ = agent_bg.write_text(
@@ -300,6 +332,14 @@ class ImplementLauncherFixture(LauncherFixture):
     @override
     def environment(self) -> dict[str, str]:
         environment = launcher_environment(self.root)
+        environment["CONF_DIR"] = str(self.root)
+        environment["STAFF_FILE"] = str(self.root / "staff.json")
+        environment["CODEX_THREAD_ID"] = self.staff_parent
+        _ = environment.pop("STAFF_ID", None)
+        from scripts.message import sessions
+        environment["FIXTURE_BACKEND_PID"] = str(os.getpid())
+        environment["FIXTURE_BACKEND_START"] = sessions.process_start(os.getpid()) or ""
+        environment["AGENT_BG_SEND_SCRIPT"] = str(self.root / "opening-send.py")
         environment["AGENT_NOTES_DIR"] = str(self.root / "notes")
         # The copied shell helper uses the real account policy, while identity
         # and configuration stay in this fixture's home.
@@ -435,6 +475,7 @@ printf '%s\\n' '{answer}'
                 ["python3", str(findings), arguments[0], "--session-dir", str(session_dir),
                  *arguments[1:]],
                 check=False, capture_output=True, text=True, env=self.environment(),
+                timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
 
@@ -483,9 +524,11 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
         sessions.mkdir()
         projects = self.root / "projects" / "fixture"
         projects.mkdir(parents=True)
-        session_id = "11111111-2222-3333-4444-555555555555"
-        _ = (sessions / "12345.json").write_text(json.dumps({
+        session_id = "abc12345-2222-4333-8444-555555555555"
+        _ = (sessions / f"{os.getpid()}.json").write_text(json.dumps({
             "id": "abc12345", "sessionId": session_id, "name": "fixture-impl",
+            "pid": os.getpid(), "procStart": self.environment()["FIXTURE_BACKEND_START"], "updatedAt": 1,
+            "messagingSocketPath": "",
         }), encoding="utf-8")
         transcript = projects / f"{session_id}.jsonl"
         _ = transcript.write_text(

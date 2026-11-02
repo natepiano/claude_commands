@@ -20,11 +20,11 @@ import mmap
 import os
 import socket
 import traceback
-from collections.abc import Generator
+from collections.abc import Generator, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import BinaryIO
+from typing import BinaryIO, cast
 
 INDEX_NAME = "index.sqlite"
 UNKNOWN_IDENTITY = "unknown"
@@ -35,11 +35,13 @@ SYNC_STATUS_NAME = "sync.json"
 SYNC_PAUSED_NAME = "sync_paused.json"
 CI_POLLED_NAME = "polled.json"
 DISK_NAME = "disk.json"
+DEFAULT_ROOT_DISPLAY = "~/.local/state/buildlog"
+ERRORS_DISPLAY_PATH = f"{DEFAULT_ROOT_DISPLAY}/{ERRORS_NAME}"
 
 
 def root() -> Path:
     override = os.environ.get("BUILDLOG_DIR")
-    return Path(override) if override else Path.home() / ".local/state/buildlog"
+    return Path(override) if override else Path(DEFAULT_ROOT_DISPLAY).expanduser()
 
 
 def host_name() -> str:
@@ -89,6 +91,33 @@ def last_whole_row_end(handle: BinaryIO) -> int:
         return end
     with mmap.mmap(fd, end, access=mmap.ACCESS_READ) as contents:
         return contents.rfind(b"\n") + 1
+
+
+def whole_rows(handle: BinaryIO, start: int) -> Iterator[dict[str, object]]:
+    """Read complete object rows from an already locked binary file.
+
+    A start inside a row skips that row. Invalid rows and the unfinished tail
+    do not count as records. The caller keeps its shared or exclusive flock.
+    """
+    end = last_whole_row_end(handle)
+    if start >= end:
+        return
+    if start > 0:
+        _ = handle.seek(start - 1)
+        if handle.read(1) != b"\n":
+            _ = handle.readline(end - start)
+    else:
+        _ = handle.seek(0)
+    while handle.tell() < end:
+        line = handle.readline(end - handle.tell())
+        if not line:
+            break
+        try:
+            decoded = cast(object, json.loads(line.decode("utf-8")))
+        except (UnicodeDecodeError, ValueError):
+            continue
+        if isinstance(decoded, dict):
+            yield cast(dict[str, object], decoded)
 
 
 def read_last_whole_row_end(path: Path) -> int:

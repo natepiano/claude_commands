@@ -6,12 +6,12 @@ from __future__ import annotations
 import json
 import sys
 import signal
-import dailies_render
-from cli_fixture import invoke_cli
 import os
 import subprocess
 import tempfile
 import unittest
+from contextlib import contextmanager
+from collections.abc import Generator
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -19,8 +19,17 @@ from typing import ClassVar, TypedDict, cast, final, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+import dailies_render
+from cli_fixture import invoke_cli
 from dailies_render import (NoLastReportedEta, StateClear, StateRefused,
                             check_render_state, last_report, load_state)
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.production import staff
+from scripts.production.cli_fixture import production_paths
+from scripts.production.staff_test_support import (
+    fixture_member, isolated_source_readers, isolated_staff_file, source_environment,
+)
 
 SCRIPT = Path(__file__).with_name("dailies_render.py")
 AT = "2026-10-04T11:00"
@@ -34,6 +43,12 @@ AGENT_LINES = ["* none active"]
 def setUpModule() -> None:
     # The state check reads the build hold and mac_test state; no test sees the machine's own.
     scratch = tempfile.TemporaryDirectory()
+    staff_scope = isolated_staff_file(Path(scratch.name) / "staff.json", {})
+    _ = staff_scope.__enter__()
+    unittest.addModuleCleanup(staff_scope.__exit__, None, None, None)
+    _ = cast(object, unittest.enterModuleContext(mock.patch.dict(os.environ, source_environment(Path(scratch.name) / "sources"))))
+    _ = unittest.enterModuleContext(isolated_source_readers())
+    _ = fixture_member("showrunner", name="fixture")
     previous = {name: os.environ.get(name) for name in ("BUILD_HOLD_DIR", "MAC_TEST_STATE_DIR")}
     os.environ["BUILD_HOLD_DIR"] = str(Path(scratch.name) / "build-hold")
     os.environ["MAC_TEST_STATE_DIR"] = str(Path(scratch.name) / "mac-test")
@@ -115,7 +130,7 @@ def run(arguments: list[str], scratch: str, holders: list[dict[str, str]] | None
                    "MAC_TEST_STATE_DIR": str(Path(scratch) / "mac-test")}
     if subprocess_cli:
         result = subprocess.run([sys.executable, str(SCRIPT), *arguments], env=environment,
-                                capture_output=True, text=True, check=False, timeout=300)
+                                capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
     else:
         result = invoke_cli(dailies_render, lambda: dailies_render.main(arguments), arguments,
                             environment, Path(scratch), production_state=True)
@@ -146,18 +161,46 @@ def timeline(lines: list[str]) -> list[str]:
     return lines[opening + 1 : closing]
 
 
+@contextmanager
+def canonical_outstanding(root: Path, entries: list[dict[str, object]]) -> Generator[Path]:
+    environment = source_environment(root / "sources")
+    with (isolated_staff_file(root / "staff.json", environment),
+          mock.patch.dict(os.environ, environment), production_paths(environment)):
+        folder = root / "issues"
+        folder.mkdir(exist_ok=True)
+        doc = root / "reader-production.md"
+        _ = doc.write_text(f"# Production — reader\n- **Proposals:** {folder}\n")
+        owner = fixture_member("showrunner", name="reader", doc=staff.LiveDoc("natedev", doc))
+        timer = Path(environment["NOTIFIER_STATE_DIR"]) / "showrunner-reader"
+        timer.mkdir(parents=True, exist_ok=True)
+        _ = (timer / "conf").write_text(f"TARGET=session:{owner.current_session}\nCHECK=zsh /x/check {doc}\n")
+        path = root / "reader.json"
+        reminders: list[dict[str, object]] = []
+        for index, item in enumerate(entries):
+            if "question" not in item and "reviewed" not in item:
+                reminders.append(item)
+                continue
+            fields = {**item, "asked_by": str(owner.id)}
+            _ = (folder / f"question-{index}.md").write_text(
+                "---\nrecord_type: question\nstatus: open\n"
+                + f"production_id: {owner.id}\nasked_by: {owner.id}\n"
+                + f"registration: {json.dumps(fields)}\n---\n")
+        _ = path.write_text(json.dumps(reminders))
+        yield path
+
+
 class ReportFooterTests(unittest.TestCase):
     def test_outstanding_reader_preserves_full_questions_and_distinguishes_review_results(self) -> None:
         question = "Session: demo\nAction: choose a route\n" + "Which route? " * 120
-        with tempfile.TemporaryDirectory() as scratch:
-            path = Path(scratch) / "outstanding.json"
-            _ = path.write_text(json.dumps([
-                {"since": AT, "text": "reminder"},
-                {"since": AT, "text": "facts needed", "question": question},
-                {"since": AT, "text": "route", "question": question, "reviewed": "Use the short route?"},
-                {"since": AT, "text": "review failed", "question": question,
-                 "review_unavailable": "reviewer unavailable", "after": "2026-10-04T12:00"},
-            ]))
+        entries: list[dict[str, object]] = [
+            {"since": AT, "text": "reminder"},
+            {"since": AT, "text": "facts needed", "question": question},
+            {"since": AT, "text": "route", "question": question, "reviewed": "Use the short route?"},
+            {"since": AT, "text": "review failed", "question": question,
+             "review_unavailable": "reviewer unavailable", "after": "2026-10-04T12:00"},
+        ]
+        with (tempfile.TemporaryDirectory() as scratch,
+              canonical_outstanding(Path(scratch), entries) as path):
             items = dailies_render.read_outstanding(path)
             self.assertIsInstance(items[0], dailies_render.OutstandingReminder)
             awaiting = items[1]
@@ -190,11 +233,9 @@ class ReportFooterTests(unittest.TestCase):
             {"question": "Choose now?", "reviewed": None},
             {"question": "Choose now?", "review_unavailable": None},
         ]
-        with tempfile.TemporaryDirectory() as scratch:
-            path = Path(scratch) / "outstanding.json"
-            for fields in cases:
-                with self.subTest(fields=fields):
-                    _ = path.write_text(json.dumps([{"since": AT, "text": "route", **fields}]))
+        for fields in cases:
+            with self.subTest(fields=fields), tempfile.TemporaryDirectory() as scratch:
+                with canonical_outstanding(Path(scratch), [{"since": AT, "text": "route", **fields}]) as path:
                     with self.assertRaises(dailies_render.InputError):
                         _ = dailies_render.read_outstanding(path)
 
@@ -243,14 +284,15 @@ from pathlib import Path
 from types import ModuleType
 sys.path.insert(0, str(Path.cwd()))
 from cli_fixture import invoke_cli
-assert "showrunners" not in sys.modules
+assert "scripts.production.showrunners" not in sys.modules
 assert "dailies_render" not in sys.modules
 caller = Path.home()
 caller_path = sys.path.copy()
 command = ModuleType("fixture_command")
 command.__file__ = "fixture_command.py"
 def paths(home):
-    import dailies_render, showrunners
+    import dailies_render
+    from scripts.production import showrunners
     from scripts.whoami import note_file
     assert dailies_render.CHART_CONF == home / ".local/state/showrunner/dailies.conf"
     assert note_file.notes_dir() == home / "rust/hanadocs/agents"
@@ -272,7 +314,7 @@ for name in ("first", "second"):
     paths(caller)
 '''
             result = subprocess.run([sys.executable, "-c", program], env=environment,
-                                    cwd=SCRIPT.parent, capture_output=True, text=True, timeout=300)
+                                    cwd=SCRIPT.parent, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_counts_print_on_one_line_above_the_chart_in_every_length(self) -> None:

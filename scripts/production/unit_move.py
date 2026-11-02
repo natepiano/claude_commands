@@ -1,22 +1,27 @@
-"""Move one stopped unit's branch, worktree and records: shared by a production rename and a unit rename.
+"""Move a unit folder, or share stopped-unit move steps with rename commands.
 
-Every function takes the showrunner checkout and the old and new values it moves, so the caller's
-journal decides the order and records progress. Each one is safe to run again after a refusal.
+Folder moves record paths and step states before they change the folder.
+Rename callers control their own step order and progress records.
 """
 from __future__ import annotations
 
 import fcntl
+import argparse
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
-from collections.abc import Generator
+from collections.abc import Generator, Sequence
 from contextlib import contextmanager
+from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, NamedTuple, cast
+from typing import Literal, NamedTuple, cast
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "direct"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "shutdown"))
@@ -25,9 +30,14 @@ import tidy_wrapped  # noqa: E402
 import unit_lookup  # noqa: E402
 import herdr  # noqa: E402
 import pane_record  # noqa: E402
-if TYPE_CHECKING:
-    from scripts.shutdown import shutdown_record
+import pane_launch  # noqa: E402
+from scripts.lib.process_failure import failure_detail  # noqa: E402
 from rename_state import RenameRefused, read_json, write_json  # noqa: E402
+from scripts.lib import atomic_file, conf, relaunch  # noqa: E402
+from scripts.production import staff, staff_sources  # noqa: E402
+from scripts.message import sessions  # noqa: E402
+from scripts.shutdown import remote  # noqa: E402
+from scripts.agents import worker_lifecycle  # noqa: E402
 
 BERTH_KEY = "cargoBerthTarget"
 
@@ -50,7 +60,7 @@ def git(checkout: Path, *arguments: str) -> str:
     result = subprocess.run(["git", "-C", str(checkout), *arguments], capture_output=True,
                             text=True, check=False)
     if result.returncode:
-        raise RenameRefused(f"git {' '.join(arguments)}: {result.stderr.strip() or result.stdout.strip()}")
+        raise RenameRefused(f"git {' '.join(arguments)}: {failure_detail(result)}")
     return result.stdout.rstrip("\n")
 
 
@@ -292,6 +302,37 @@ def processes_inside(worktree: Path) -> list[int]:
     return sorted(found)
 
 
+class UnitConversation(NamedTuple):
+    """The conversation and account saved at the unit's Claude launch."""
+    session_id: str
+    account: str
+
+
+class NoUnitConversation(NamedTuple):
+    """No launch entry identifies this unit's conversation."""
+
+
+def unit_conversation(found: unit_lookup.MarkedUnit | None, *, session_id: str = "") -> UnitConversation | NoUnitConversation:
+    """Use the live director's id, then its pane launch; retained launches survive a stop."""
+    from scripts.accounts import accounts
+
+    if found is not None and isinstance(found.claude, unit_lookup.LiveClaude):
+        session_id = found.claude.session_id
+    if not session_id:
+        return NoUnitConversation()
+    if found is not None:
+        entry = pane_record.read(found.place.session).get(found.place.pane)
+        if entry is not None and entry["session_id"] == session_id and entry["config_dir"]:
+            return UnitConversation(session_id, accounts.claude_config_label(Path(entry["config_dir"])))
+    try:
+        entry = pane_record.launch_for_session(session_id)
+    except ValueError as error:
+        raise RenameRefused(str(error)) from error
+    return (UnitConversation(session_id, accounts.claude_config_label(Path(entry["config_dir"])))
+            if entry is not None and entry["config_dir"] else NoUnitConversation())
+
+
+
 class UnitPane(NamedTuple):
     unit: str
     place: herdr.HerdrPlace
@@ -311,12 +352,12 @@ def unit_pane(found: unit_lookup.MarkedUnit | None, _production: str) -> UnitPan
     return UnitPane(found.unit, found.place, shell)
 
 
-def close_unit_pane(pane: UnitPane | None, _saved: shutdown_record.SessionShutdown) -> None:
+def close_unit_pane(pane: UnitPane | None) -> None:
     """Close the unit's exact session-qualified pane after the caller stops the unit."""
     if pane is None:
         return
     try:
-        _ = herdr.Herdr(pane.place.session).run("pane", "close", pane.place.pane)
+        herdr.Herdr(pane.place.session).close_retained_pane(pane.place.pane)
     except (herdr.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
         raise RenameRefused(f"{pane.unit}: pane close failed: {error}") from error
 
@@ -335,3 +376,474 @@ def _darwin_processes_inside(worktree: Path) -> list[int]:
         elif field.startswith("n") and (field[1:] == root or field[1:].startswith(f"{root}/")):
             found.add(pid)
     return sorted(found)
+
+
+class FolderStepState(str, Enum):
+    PENDING = "pending"
+    DONE = "done"
+    SKIPPED = "skipped"
+
+
+FolderMoveStep = Literal["stop", "worktree", "staff", "launch", "run", "resume"]
+FOLDER_MOVE_STEPS: tuple[FolderMoveStep, ...] = ("stop", "worktree", "staff", "launch", "run", "resume")
+
+
+@dataclass
+class FolderMove:
+    """Paths and durable progress for one folder move."""
+
+    old: Path
+    new: Path
+    steps: dict[FolderMoveStep, FolderStepState]
+
+    @property
+    def finished(self) -> bool:
+        return all(state is not FolderStepState.PENDING for state in self.steps.values())
+
+
+@dataclass(frozen=True)
+class FolderLaunch:
+    """The unique retained launch of the selected member."""
+
+    session: str
+    entry: pane_record.PaneLaunch
+
+
+@dataclass(frozen=True)
+class NoFolderLaunch:
+    """The stopped member has no retained launch."""
+
+
+@dataclass(frozen=True)
+class RunningFolderSession:
+    """An exact foreground process proves the member's current backend and account."""
+
+    pid: int
+    started: str
+    kind: Literal["claude", "codex"]
+
+
+@dataclass(frozen=True)
+class StoppedFolderSession:
+    """No member process is live; its retained pane is closed or at its shell."""
+
+
+@dataclass(frozen=True)
+class PendingFolderStartup:
+    """The submitted launch has not yet proved one foreground member process."""
+
+    reason: str
+
+
+@dataclass(frozen=True)
+class ClosedFolderPane:
+    """The retained pane no longer exists."""
+
+
+def folder_launch(row: staff.StaffRow) -> FolderLaunch | NoFolderLaunch:
+    matches = [FolderLaunch(path.stem, entry)
+               for path in sorted(pane_record.record_directory().glob("*.json"))
+               for entry in pane_record.read_strict(path.stem).values()
+               if entry["session_id"] in (row.id, row.current_session)]
+    if len(matches) > 1:
+        raise RenameRefused(f"{row.id}: several retained launches match")
+    return matches[0] if matches else NoFolderLaunch()
+
+
+def folder_pane(row: staff.StaffRow, launch: FolderLaunch) -> herdr.PaneIdentity | ClosedFolderPane:
+    client = herdr.Herdr(launch.session)
+    panes = client.panes()
+    matches = [pane for pane in panes if pane["pane_id"] == launch.entry["pane_id"]]
+    if not matches:
+        if any(pane["session_id"] == row.current_session for pane in panes):
+            raise RenameRefused(f"{row.id}: conversation is on another pane")
+        return ClosedFolderPane()
+    if len(matches) != 1 or not matches[0].get("terminal_id"):
+        raise RenameRefused(f"{row.id}: retained pane has no unique terminal")
+    selected = matches[0]
+    if sum(pane.get("terminal_id") == selected.get("terminal_id") for pane in panes) != 1:
+        raise RenameRefused(f"{row.id}: retained terminal is ambiguous")
+    if selected["session_id"] not in (None, row.current_session):
+        raise RenameRefused(f"{row.id}: retained pane holds another conversation")
+    if any(pane["session_id"] == row.current_session and pane["pane_id"] != selected["pane_id"] for pane in panes):
+        raise RenameRefused(f"{row.id}: conversation is on another pane")
+    return selected
+
+
+def _folder_pane(row: staff.StaffRow, launch: FolderLaunch) -> herdr.PaneIdentity:
+    pane = folder_pane(row, launch)
+    if isinstance(pane, ClosedFolderPane):
+        raise RenameRefused(f"{row.id}: retained pane is closed")
+    return pane
+
+
+def _session_without_foreground_agent(
+        row: staff.StaffRow, *, claude_live_reason: str = "live session has no retained pane launch",
+) -> StoppedFolderSession:
+    """Refuse a live target and report unknown liveness without blocking."""
+    live = sessions.session_liveness(row.current_session)
+    if isinstance(live, sessions.SessionLivenessUnknown):
+        print(f"anomaly: {live.reason}; not blocking", file=sys.stderr)
+    if isinstance(live, sessions.LiveSessionProcess):
+        raise RenameRefused(f"{row.id}: {claude_live_reason}")
+    try:
+        threads = herdr.running_codex_threads(thread_host=staff_sources.codex_thread_host)
+    except (herdr.HerdrFailure, OSError, ValueError) as error:
+        print(f"anomaly: Codex liveness is unknown: {error}; not blocking", file=sys.stderr)
+        threads = set[str]()
+    if row.current_session in threads:
+        raise RenameRefused(f"{row.id}: live Codex thread has no retained pane launch")
+    return StoppedFolderSession()
+
+
+def folder_session(row: staff.StaffRow, launch: FolderLaunch | NoFolderLaunch) -> RunningFolderSession | StoppedFolderSession:
+    """Prove the runtime identity before a process can be stopped or resumed."""
+    if isinstance(launch, NoFolderLaunch):
+        return _session_without_foreground_agent(row)
+    pane = folder_pane(row, launch)
+    if isinstance(pane, ClosedFolderPane):
+        return _session_without_foreground_agent(row)
+    client = herdr.Herdr(launch.session)
+    if isinstance(client.pane_activity(pane["pane_id"]), herdr.PaneAtShell):
+        return _session_without_foreground_agent(row, claude_live_reason="live session is outside its retained pane")
+    observed = _foreground_folder_session(row, launch, pane)
+    if isinstance(observed, PendingFolderStartup):
+        raise RenameRefused(observed.reason)
+    return observed
+
+
+def _foreground_folder_session(
+        row: staff.StaffRow, launch: FolderLaunch, pane: herdr.PaneIdentity,
+) -> RunningFolderSession | PendingFolderStartup:
+    """Read startup progress while refusing a proved foreign conversation or account."""
+    client = herdr.Herdr(launch.session)
+    info = herdr.json_object(client.result("pane", "process-info", "--pane", pane["pane_id"]).get("process_info"),
+                             "folder move process info")
+    matches: list[RunningFolderSession] = []
+    pending: list[PendingFolderStartup] = []
+    for value in herdr.json_items(info.get("foreground_processes"), "folder move foreground processes"):
+        process = herdr.json_object(value, "folder move process")
+        try:
+            arguments = [herdr.json_text(value, "folder move argument")
+                         for value in herdr.json_items(process.get("argv"), "folder move arguments")]
+        except herdr.HerdrFailure as error:
+            pending.append(PendingFolderStartup(f"{row.id}: foreground arguments are unreadable: {error}"))
+            continue
+        kind = "codex" if herdr.is_codex_process(arguments) else "claude" if herdr.is_claude_process(arguments) else ""
+        if not kind:
+            continue
+        pid = process.get("pid")
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+            raise RenameRefused("folder move process has no pid")
+        try:
+            observed = herdr.native_process(pid, kind)
+        except (herdr.HerdrFailure, OSError, ValueError) as error:
+            pending.append(PendingFolderStartup(f"{row.id}: foreground runtime identity is unproved: {error}"))
+            continue
+        config = observed.environment.get("CODEX_HOME" if kind == "codex" else "CLAUDE_CONFIG_DIR",
+                                 str(Path.home() / (".codex" if kind == "codex" else ".claude")))
+        if observed.identity != row.current_session:
+            raise RenameRefused(f"{row.id}: foreground runtime identity is unproved")
+        if Path(config).resolve() != Path(launch.entry["config_dir"]).resolve():
+            raise RenameRefused(f"{row.id}: retained pane account changed")
+        matches.append(RunningFolderSession(pid, observed.started, kind))
+    if len(matches) > 1:
+        raise RenameRefused(f"{row.id}: retained pane has no unique member process")
+    if pending:
+        return pending[0]
+    if not matches:
+        return PendingFolderStartup(f"{row.id}: retained pane has no unique member process")
+    return matches[0]
+
+
+def _folder_move_config() -> Path:
+    """Select the configuration file for folder moves."""
+    return Path(os.environ.get("PRODUCTION_CONFIG", Path(__file__).resolve().parents[2] / "config/production.conf"))
+
+
+def folder_move_deadline(key: str) -> float:
+    """The operation deadline can shorten the configured wait."""
+    deadline = min(time.monotonic() + conf.number(_folder_move_config(), key), worker_lifecycle.effective_deadline())
+    if deadline <= time.monotonic():
+        raise worker_lifecycle.OperationDeadlineExpired("folder move operation deadline expired")
+    return deadline
+
+
+def stop_folder_session(row: staff.StaffRow, launch: FolderLaunch) -> None:
+    """Stop only the proved member and retain its pane at the shell."""
+    observed = folder_session(row, launch)
+    if isinstance(observed, StoppedFolderSession):
+        return
+    pane = _folder_pane(row, launch)
+    deadline = folder_move_deadline("FOLDER_MOVE_STOP_SECONDS")
+    poll = conf.number(_folder_move_config(), "FOLDER_MOVE_POLL_SECONDS")
+    live = sessions.process_liveness(observed.pid, observed.started)
+    if not isinstance(live, sessions.LiveSessionProcess):
+        raise RenameRefused(f"{row.id}: process identity changed before stop")
+    pane_record.end(launch.session, pane["pane_id"], row.current_session, record=staff.StaffSnapshot((row,)))
+    os.kill(observed.pid, signal.SIGTERM)
+    client = herdr.Herdr(launch.session)
+    while True:
+        current = _folder_pane(row, launch)
+        if current.get("terminal_id") != pane.get("terminal_id"):
+            raise RenameRefused(f"{row.id}: retained terminal changed during stop")
+        live = sessions.process_liveness(observed.pid, observed.started)
+        if isinstance(live, sessions.SessionLivenessUnknown):
+            raise RenameRefused(live.reason)
+        if isinstance(live, sessions.SessionNotLive) and isinstance(client.pane_activity(current["pane_id"]), herdr.PaneAtShell):
+            return
+        if time.monotonic() >= deadline:
+            raise RenameRefused(f"{row.id}: session did not leave its retained pane at the shell")
+        time.sleep(min(poll, max(0, deadline - time.monotonic())))
+
+
+def resume_folder_session(row: staff.StaffRow, launch: FolderLaunch) -> None:
+    """Resume the same conversation and account in the retained terminal."""
+    pane = _folder_pane(row, launch)
+    entry = pane_record.read_strict(launch.session).get(launch.entry["pane_id"])
+    if entry is None or entry["session_id"] not in (row.id, row.current_session):
+        raise RenameRefused(f"{row.id}: retained launch changed before resume")
+    if not entry["flags_read"]:
+        raise RenameRefused(f"{row.id}: retained launch flags are unknown")
+    path = pane_record.record_path(launch.session)
+    attempt = pane_launch.ResumeAttempt(pane["pane_id"], entry.copy())
+    client = herdr.Herdr(launch.session)
+    projected = entry.copy()
+    projected["session_id"] = row.current_session
+    observed = folder_session(row, launch)
+    if isinstance(observed, RunningFolderSession):
+        if observed.pid not in processes_inside(Path(entry["cwd"])):
+            pane_launch.finish_restore(path, entry, attempt, pane_launch.FailedResume(), close=client.close_tab_confirmed)
+            raise RenameRefused(f"{row.id}: resumed session is outside the moved folder")
+        projected["kind"] = observed.kind
+        proof = pane_launch.VerifiedResume(projected, frozenset({row.id, row.current_session}))
+        pane_launch.finish_restore(path, entry, attempt, proof, close=client.close_tab_confirmed)
+        return
+    config = Path(entry["config_dir"])
+    arguments = pane_record.resume_arguments(projected)
+    environment = {key: value for key, value in entry["environment"].items()
+                   if key not in {"STAFF_ID", "CODEX_THREAD_ID", "CLAUDE_CODE_SESSION_ID", "HERDR_TAB_ID"}}
+    environment.update({"HERDR_PANE_ID": pane["pane_id"], "HERDR_WORKSPACE_ID": pane["workspace_id"]})
+    command = ["env", "-u", "STAFF_ID", "-u", "CODEX_THREAD_ID", "-u", "CLAUDE_CODE_SESSION_ID", "-u", "HERDR_TAB_ID",
+               *(f"{key}={value}" for key, value in environment.items()),
+               "sh", "-c", 'cd -- "$1" && shift && exec "$@"', "resume", entry["cwd"],
+               sys.executable, str(Path(__file__).resolve().parents[1] / "accounts/accounts.py"),
+               "exec", config.name.removeprefix("."), *arguments]
+    deadline = folder_move_deadline("FOLDER_MOVE_RESUME_SECONDS")
+    poll = conf.number(_folder_move_config(), "FOLDER_MOVE_POLL_SECONDS")
+    try:
+        client.run_in_pane(pane["pane_id"], command)
+        while True:
+            current = _folder_pane(row, launch)
+            if current.get("terminal_id") != pane.get("terminal_id"):
+                raise RenameRefused(f"{row.id}: retained terminal changed during resume")
+            startup = _foreground_folder_session(row, launch, current)
+            if isinstance(startup, RunningFolderSession):
+                if startup.pid not in processes_inside(Path(entry["cwd"])):
+                    raise RenameRefused(f"{row.id}: resumed session is outside the moved folder")
+                proof = pane_launch.VerifiedResume(projected, frozenset({row.id, row.current_session}))
+                pane_launch.finish_restore(path, entry, attempt, proof, close=client.close_tab_confirmed)
+                return
+            if time.monotonic() >= deadline:
+                raise RenameRefused(f"{row.id}: resumed session is not yet proved; rerun move-folder")
+            time.sleep(min(poll, max(0, deadline - time.monotonic())))
+    except (RenameRefused, herdr.HerdrFailure, OSError, ValueError):
+        pane_launch.finish_restore(path, entry, attempt, pane_launch.FailedResume(), close=client.close_tab_confirmed)
+        raise
+
+
+def read_folder_move(path: Path) -> FolderMove:
+    fields = json_object(read_json(path))
+    if set(fields) != {"old", "new", "steps"}:
+        raise RenameRefused(f"{path}: invalid folder move fields")
+    old, new = fields["old"], fields["new"]
+    if not isinstance(old, str) or not isinstance(new, str) or not Path(old).is_absolute() or not Path(new).is_absolute():
+        raise RenameRefused(f"{path}: folder move paths must be absolute")
+    if old == new or Path(new).is_relative_to(Path(old)):
+        raise RenameRefused(f"{path}: folder move paths overlap")
+    steps = json_object(fields["steps"])
+    if set(steps) != set(FOLDER_MOVE_STEPS):
+        raise RenameRefused(f"{path}: invalid folder move steps")
+    try:
+        if any(not isinstance(value, str) for value in steps.values()):
+            raise ValueError("step state must be text")
+        progress: dict[FolderMoveStep, FolderStepState] = {
+            step: FolderStepState(cast(str, steps[step])) for step in FOLDER_MOVE_STEPS}
+    except ValueError as error:
+        raise RenameRefused(f"{path}: invalid folder move step state") from error
+    pending = False
+    for step in FOLDER_MOVE_STEPS:
+        state = progress[step]
+        if state is FolderStepState.SKIPPED and step not in ("stop", "resume"):
+            raise RenameRefused(f"{path}: required folder move step was skipped")
+        if state is FolderStepState.PENDING:
+            pending = True
+        elif pending and state is FolderStepState.DONE:
+            raise RenameRefused(f"{path}: folder move steps are out of order")
+    if (progress["stop"] is FolderStepState.SKIPPED) != (progress["resume"] is FolderStepState.SKIPPED):
+        raise RenameRefused(f"{path}: stop and resume states disagree")
+    return FolderMove(Path(old), Path(new), progress)
+
+
+def save_folder_move(path: Path, move: FolderMove) -> None:
+    atomic_file.write_text_atomic(path, json.dumps({"old": str(move.old), "new": str(move.new),
+        "steps": {step: move.steps[step].value for step in FOLDER_MOVE_STEPS}}, indent=2, sort_keys=True) + "\n")
+
+
+def _folder_boundary(folder: Path, allowed: set[int]) -> None:
+    run = newest_run(folder)
+    if run is not None and (phase := open_phase(run)):
+        raise RenameRefused(f"phase {phase} is open; move the folder at a phase boundary")
+    pids = set(processes_inside(folder)) - allowed
+    if pids:
+        raise RenameRefused(f"processes inside {folder}: {', '.join(str(pid) for pid in sorted(pids))}")
+
+
+def folder_shell(row: staff.StaffRow, launch: FolderLaunch | NoFolderLaunch) -> set[int]:
+    """The retained shell belongs to the unit session and remains open during the move."""
+    if isinstance(launch, NoFolderLaunch):
+        return set()
+    pane = folder_pane(row, launch)
+    if isinstance(pane, ClosedFolderPane):
+        return set()
+    return {pane_record.pane_shell_pid(herdr.HerdrPlace(launch.session, pane["pane_id"]))}
+
+
+def folder_supervisor(observed: RunningFolderSession) -> set[int]:
+    """Allow only the live supervisor whose exact command starts this Claude child."""
+    if observed.kind != "claude":
+        return set()
+    try:
+        parent = pane_record.process_parent(observed.pid)
+        arguments = pane_record.process_arguments(parent)
+        program = Path(__file__).resolve().parents[1] / "lib/relaunch.py"
+        if (len(arguments) < 5 or Path(arguments[1]).resolve() != program
+                or arguments[2:4] != ["run", "--"]):
+            return set()
+        child = pane_record.process_arguments(observed.pid)
+        started = sessions.process_start(parent)
+        expected, _ = relaunch.child_launch(arguments[4:], herdr.process_environment(parent))
+        if (expected != child or not herdr.is_claude_process(child) or not started
+                or not isinstance(sessions.process_liveness(parent, started), sessions.LiveSessionProcess)
+                or not isinstance(sessions.process_liveness(observed.pid, observed.started), sessions.LiveSessionProcess)
+                or pane_record.process_parent(observed.pid) != parent
+                or sessions.process_start(parent) != started):
+            return set()
+        return {parent}
+    except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+        return set()
+
+
+def move_folder(unit: staff.StaffId, destination: Path) -> None:
+    """Finish one folder move without changing the member's name or branch."""
+    destination = destination.expanduser().resolve()
+    with staff.operation(), herdr.process_action():
+        record = staff.snapshot()
+        row = record.by_id(unit)
+        if row is None or row.kind != "unit" or not isinstance(row.worktree, staff.PresentWorktree):
+            raise RenameRefused(f"{unit}: move-folder requires a unit with a present worktree")
+        if row.worktree.machine != remote.local_machine():
+            raise RenameRefused(f"{unit}: run move-folder on {row.worktree.machine}")
+        for note in herdr.repair_retained_launches(record, pane_record.record_directory(), member=row.id):
+            print(note)
+        path = staff.folder_move_path(unit)
+        previous = read_folder_move(path) if path.exists() else None
+        if previous is not None and not previous.finished and previous.new != destination:
+            raise RenameRefused(f"{unit}: finish the recorded move to {previous.new} first")
+        if previous is not None and previous.new == destination:
+            if previous.finished:
+                if row.worktree.path != destination:
+                    raise RenameRefused(f"{unit}: completed move differs from the staff worktree")
+                if previous.steps["resume"] is FolderStepState.DONE:
+                    launch = folder_launch(row)
+                    if isinstance(launch, FolderLaunch) and launch.entry.get("ended", False):
+                        observed = folder_session(row, launch)
+                        if isinstance(observed, RunningFolderSession):
+                            resume_folder_session(row, launch)
+                print("unchanged")
+                return
+            move = previous
+        else:
+            if row.worktree.path == destination:
+                print("unchanged")
+                return
+            if exists(destination):
+                raise RenameRefused(f"destination already exists: {destination}")
+            if destination.is_relative_to(row.worktree.path):
+                raise RenameRefused("destination is inside the unit worktree")
+            move = FolderMove(row.worktree.path, destination,
+                              {step: FolderStepState.PENDING for step in FOLDER_MOVE_STEPS})
+        if row.worktree.path not in (move.old, move.new):
+            raise RenameRefused(f"{unit}: staff worktree differs from the recorded move")
+        launch = folder_launch(row)
+        observed = folder_session(row, launch)
+        if previous is None or previous.finished:
+            if not (move.old / ".git").is_file() or git(move.old, "rev-parse", "--show-toplevel") != str(move.old):
+                raise RenameRefused(f"{move.old}: move-folder requires a linked worktree root")
+            allowed = folder_shell(row, launch)
+            if isinstance(observed, RunningFolderSession):
+                allowed.add(observed.pid)
+                allowed.update(folder_supervisor(observed))
+            _folder_boundary(move.old, allowed)
+            if isinstance(observed, StoppedFolderSession):
+                move.steps["stop"] = move.steps["resume"] = FolderStepState.SKIPPED
+            elif isinstance(launch, FolderLaunch) and (not launch.entry["flags_read"] or not launch.entry["config_dir"]):
+                raise RenameRefused(f"{unit}: retained launch cannot resume the session")
+            if isinstance(observed, RunningFolderSession):
+                for key in ("FOLDER_MOVE_STOP_SECONDS", "FOLDER_MOVE_RESUME_SECONDS", "FOLDER_MOVE_POLL_SECONDS"):
+                    _ = conf.number(_folder_move_config(), key)
+            save_folder_move(path, move)
+        for step in FOLDER_MOVE_STEPS:
+            if move.steps[step] is not FolderStepState.PENDING:
+                continue
+            if step == "stop":
+                if not isinstance(launch, FolderLaunch):
+                    raise RenameRefused(f"{unit}: retained launch is missing")
+                stop_folder_session(row, launch)
+            elif step == "worktree":
+                if isinstance(folder_session(row, launch), RunningFolderSession):
+                    raise RenameRefused(f"{unit}: session resumed before the folder move")
+                _folder_boundary(move.old if move.old.exists() else move.new, folder_shell(row, launch))
+                if move.old.exists():
+                    if exists(move.new):
+                        raise RenameRefused(f"destination already exists: {move.new}")
+                    move.new.parent.mkdir(parents=True, exist_ok=True)
+                    _ = git(move.old, "worktree", "move", str(move.old), str(move.new))
+                if git(move.new, "rev-parse", "--show-toplevel") != str(move.new):
+                    raise RenameRefused(f"{move.new}: moved worktree is not registered")
+                atomic_file.sync_folder(move.old.parent)
+                atomic_file.sync_folder(move.new.parent)
+            elif step == "staff":
+                _ = staff.set_worktree(unit, staff.PresentWorktree(row.worktree.machine, move.new))
+            elif step == "launch":
+                pane_record.move_cwd(unit, move.old, move.new, record)
+            elif step == "run":
+                run = newest_run(move.old) or newest_run(move.new)
+                if run is not None:
+                    move_run(run, move.old, move.new, git(move.new, "branch", "--show-current"))
+            else:
+                if not isinstance(launch, FolderLaunch):
+                    raise RenameRefused(f"{unit}: retained launch is missing")
+                resume_folder_session(row, launch)
+            move.steps[step] = FolderStepState.DONE
+            save_folder_move(path, move)
+        print(f"moved {unit}: {move.old} -> {move.new}")
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Move a unit folder without a rename.")
+    commands = parser.add_subparsers(dest="command", required=True)
+    command = commands.add_parser("move-folder")
+    _ = command.add_argument("--unit", required=True)
+    _ = command.add_argument("--to", required=True, type=Path)
+    arguments = parser.parse_args(argv)
+    try:
+        move_folder(staff.native_id(cast(str, arguments.unit)), cast(Path, arguments.to))
+        return 0
+    except (RenameRefused, staff.StaffRefused, staff.StaffNotFound, OSError, ValueError, herdr.HerdrFailure) as error:
+        print(f"unit_move: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

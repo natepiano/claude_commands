@@ -3,9 +3,8 @@
 from __future__ import annotations
 
 import json
-import dailies_input
-import dailies_render
 import os
+import sqlite3
 import subprocess
 import sys
 import unittest
@@ -15,11 +14,16 @@ from typing import TextIO, cast
 from unittest import mock
 from zoneinfo import ZoneInfo
 
+import dailies_input
+import dailies_render
 from production_units import read_production
 from dailies_render import LENGTHS
 from dailies_input import (BevyUpgradeUnavailable, Block, ClaudeNotRunning, Decision, FormWaiting,
                            Running, SessionGone, StillWaiting, TicksFailing, bevy_upgrade_watch)
 import unit_lookup
+from scripts.production import staff
+from scripts.shutdown.remote import local_machine
+from scripts.production.staff_test_support import fixture_showrunner_name, unit_membership
 from unit_lookup import UnitState
 from dailies_input_test_support import (DailiesInputFixture, SCRIPT, RENDERER, WAITING, STAMP, AT,
                                         ALPHA, BETA, RACE_WATCH_STUB)
@@ -44,7 +48,7 @@ class DailiesInputTests(DailiesInputFixture):
         with (mock.patch.dict(os.environ, self.env),
               mock.patch.object(unit_lookup, "marked_units", return_value={}),
               mock.patch.object(unit_lookup, "read_run_states", wraps=unit_lookup.read_run_states) as reads):
-            units = dailies_input.units_from_doc(self.doc.read_text(encoding="utf-8").splitlines(), "fixture")
+            units = dailies_input.units_from_doc(self.doc.read_text(encoding="utf-8").splitlines(), "example")
             reads.assert_called_once_with()
         self.assertEqual([(unit.name, unit.run) for unit in units],
                          [(ALPHA, UnitState.STANDING_BY), (BETA, UnitState.RUN_FINISHED)])
@@ -554,7 +558,7 @@ class DailiesInputTests(DailiesInputFixture):
         self.env["DAILIES_PHASE_TABLE_FAIL"] = "show"
         built = self.run_builder()
         self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
-        self.assertIn("phase tables: unavailable — show could not read records", built.stdout)
+        self.assertIn("phase tables: unavailable — stderr: show could not read records", built.stdout)
         self.assertEqual(cast(dict[str, object], self.unit()["eta"])["time"], "23:40")
 
         self.open_phase_record()
@@ -579,6 +583,9 @@ class DailiesInputTests(DailiesInputFixture):
         self.assertEqual(cast(dict[str, object], self.unit()["eta"])["time"], "23:40")
 
     def test_a_dailies_leaves_a_retired_units_note_for_the_timer_to_prune(self) -> None:
+        _ = staff.set_worktree(
+            unit_membership(fixture_showrunner_name("example", self.doc), ALPHA).id,
+            staff.RemovedWorktree(local_machine(), self.root / "alpha"))
         note = self.root / "vault/old-showrunner/alpha-unit.md"
         note.parent.mkdir(parents=True)
         _ = note.write_text(
@@ -662,6 +669,9 @@ class DailiesInputTests(DailiesInputFixture):
         self.assertEqual([unit["unit"] for unit in units], [ALPHA])
 
     def test_all_retired_units_report_no_live_units(self) -> None:
+        _ = staff.set_worktree(
+            unit_membership(fixture_showrunner_name("example", self.doc), ALPHA).id,
+            staff.RemovedWorktree(local_machine(), self.root / "alpha"))
         content = self.doc.read_text(encoding="utf-8")
         _ = self.doc.write_text(content.replace("`docs/alpha.md`", "retired after completion", 1),
                                 encoding="utf-8")
@@ -1637,7 +1647,8 @@ class DailiesInputTests(DailiesInputFixture):
         self.assertEqual(parsed.waiting.count, 1)
         created = datetime.fromisoformat(cast(str, summary["oldest_waiting"]))
         local_created = created.astimezone(ZoneInfo("America/Los_Angeles"))
-        self.assertEqual(parsed.waiting.oldest_pending_since, local_created)
+        self.assertEqual(parsed.waiting.oldest_pending_since.astimezone(ZoneInfo("UTC")),
+                         local_created.astimezone(ZoneInfo("UTC")))
         _ = self.output.write_text(json.dumps({
             "length": "simple", "zone": "America/Los_Angeles", "units": [],
             "children": [{"name": "hana-style", "open": 0, "report": saved}],
@@ -1646,6 +1657,28 @@ class DailiesInputTests(DailiesInputFixture):
         rendered = self.run_renderer(render_at.strftime("%Y-%m-%dT%H:%M"))
         self.assertEqual(rendered.returncode, 0, rendered.stderr)
         self.assertIn(" · hand-off waiting 5h", rendered.stdout)
+
+    def assert_handoff_age_at(self, created_at: str) -> None:
+        ledger_cli = self.style_ledger_cli
+
+        def with_fixed_creation_time(*arguments: str) -> subprocess.CompletedProcess[str]:
+            result = ledger_cli(*arguments)
+            if arguments[:2] == ("handoff", "add"):
+                # The ledger runs in a child: fix its saved clock in the disposable database.
+                database, = Path(self.env["STYLE_LEDGER_STATE_DIR"]).rglob("ledger.sqlite")
+                with sqlite3.connect(database) as connection:
+                    _ = connection.execute("UPDATE handoffs SET created_at=?, updated_at=?",
+                                           (created_at, created_at))
+            return result
+
+        with mock.patch.object(self, "style_ledger_cli", side_effect=with_fixed_creation_time):
+            self.test_unsent_handoff_age_from_the_ledger_flags_the_saved_style_report()
+
+    def test_unsent_handoff_age_in_the_first_fold_of_the_repeated_hour(self) -> None:
+        self.assert_handoff_age_at("2026-11-01T08:01:42.340892+00:00")
+
+    def test_unsent_handoff_age_in_the_second_fold_of_the_repeated_hour(self) -> None:
+        self.assert_handoff_age_at("2026-11-01T09:01:42.340892+00:00")
 
     def test_failed_or_invalid_summary_saves_unavailable_and_the_report_still_succeeds(self) -> None:
         self.mark_style_production()
@@ -1670,9 +1703,20 @@ class DailiesInputTests(DailiesInputFixture):
                 self.assertIsInstance(unavailable["unavailable"], str)
                 self.assertTrue(unavailable["unavailable"])
                 if error:
-                    self.assertEqual(unavailable, {"unavailable": error})
+                    self.assertEqual(unavailable, {"unavailable": f"summary: stderr: {error}"})
                 parsed = dailies_render.parse_child_report(saved, "saved", ZoneInfo("America/Los_Angeles"))
                 self.assertIsInstance(parsed.style, dailies_render.StyleSummaryUnavailable)
+
+    def test_complete_dailies_with_child_productions_reads_one_staff_snapshot(self) -> None:
+        self.attach("kid", "example")
+        self.attach("leaf", "kid")
+        self.write_saved_report("kid")
+        self.write_open_for("leaf", json.dumps([{"since": "2026-10-06T10:00", "text": "name the release"}]))
+        with mock.patch.object(staff, "snapshot", wraps=staff.snapshot) as reads:
+            result = self.run_builder()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual([(child["name"], child["open"]) for child in self.children()], [("kid", 1)])
+        self.assertEqual(reads.call_count, 1)
 
     def test_a_production_below_is_read_into_the_input_with_what_waits_on_the_user(self) -> None:
         self.attach("kid", "example")

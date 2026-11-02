@@ -1,5 +1,5 @@
 ---
-description: Show style coverage, held changes and pending hand-offs
+description: Report style coverage and pending work.
 argument-hint: "[rule|crate]"
 ---
 

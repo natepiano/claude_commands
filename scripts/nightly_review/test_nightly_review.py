@@ -16,13 +16,14 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 import nightly_review
 from scripts.whoami import account
 from scripts.accounts import accounts
 from scripts.production import showrunners
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 # `messages` reads the message review from its own folder, as the timer does.
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
 
 sys.path.insert(0, str(Path(nightly_review.__file__).resolve().parents[1] / "notify"))
 if TYPE_CHECKING:
@@ -76,6 +77,10 @@ class NightlyReviewTests(unittest.TestCase):
         copied = self.root / "copy/scripts/nightly_review/nightly_review.py"
         copied.parent.mkdir(parents=True)
         _ = shutil.copyfile(nightly_review.__file__, copied)
+        library = copied.parents[1] / "lib"
+        library.mkdir()
+        _ = shutil.copyfile(Path(nightly_review.__file__).resolve().parents[1] / "lib/process_failure.py",
+                            library / "process_failure.py")
         whoami = copied.parents[1] / "whoami"
         whoami.mkdir()
         _ = (whoami / "account.py").write_text("def process_config_dir(pid): pass\n")
@@ -225,7 +230,7 @@ class TonightTests(NightlyReviewTests):
 
     def test_a_refused_start_names_add_units_reason_and_sends_nothing(self) -> None:
         lines, calls = self.tonight([None], [done(code=1, stderr="claude3 is shut down")])
-        self.assertEqual(lines, [f"{SESSION}: not started: claude3 is shut down"])
+        self.assertEqual(lines, [f"{SESSION}: not started: stderr: claude3 is shut down"])
         self.assertEqual(len(calls), 1)
 
     def test_a_night_with_no_production_holding_the_unit_is_skipped(self) -> None:
@@ -248,6 +253,14 @@ class NightlyProductionTests(NightlyReviewTests):
 
     def runners(self, *docs: tuple[str, str]) -> list[showrunners.Showrunner]:
         return [showrunners.Showrunner(session="", socket="", slug=slug, zone="", doc=doc) for slug, doc in docs]
+
+    def test_unknown_production_cannot_make_the_nightly_owner_appear_unique(self) -> None:
+        healthy = self.runners(("one", self.doc("one", "permanent")))
+        partial = showrunners.ShowrunnerDiscovery(healthy, (
+            showrunners.ShowrunnerLookupFailure("missing", "fixture lookup failed"),))
+        with mock.patch.object(showrunners, "registered_showrunners", return_value=partial):
+            with self.assertRaisesRegex(OSError, "fixture lookup failed"):
+                _ = nightly_review.nightly_production()
 
     def test_the_production_with_the_permanent_row_is_found(self) -> None:
         listed = self.runners(("one", self.doc("one", "standby")), ("two", self.doc("two", "permanent")))

@@ -1,9 +1,18 @@
 ---
-description: Rename one unit of this production. It stops the unit, moves every place that names it, relaunches it and verifies the result.
+description: Rename a unit and its records.
 argument-hint: "<old> <new>"
 ---
 
 # Rename unit
+
+Move a folder without a rename only at a phase boundary:
+
+```sh
+python3 ~/.claude/scripts/production/unit_move.py move-folder --unit <staff id> --to <path>
+```
+
+The command keeps the branch, account, conversation and pane.
+A stopped unit stays down. Rerun the command after an interruption.
 
 Run from the showrunner session, at any time, also in the middle of a phase. `<old>` is the unit's id, its stem, or its Claude session's name. When the id already is `<new>`, only the session takes the new name: the plan shows the other steps as already matching.
 `<new>` can be an id or a stem, and it becomes `<stem>-unit`. A stem starting with `<slug>-`

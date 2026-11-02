@@ -19,18 +19,21 @@ from unittest import mock
 sys.path[:0] = [str(Path(__file__).resolve().parents[1] / name)
                 for name in ("production", "message", "herdr")]
 from scripts.lib.socket_test_support import short_socket_directory
+from scripts.message.sessions_test_support import copy_session_modules
+from scripts.production import staff
+from scripts.production.staff_test_support import (
+    fixture_member, isolated_staff_file, showrunner_relationship, unit_membership,
+)
 from dailies_input import StatusBlock, UnitRow, status_blocks
 from unit_lookup import UnitState
 import fake_unit_host
 from fake_unit_host import HostedUnit
 from sessions import SessionRecord
-from fake_herdr import CommandResponse
+from fake_herdr import CommandResponse, pane_list
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 SCRIPT = Path(__file__).with_name("unit_status.sh")
-SESSION_ID = "test-session"
 # Only bound fixture hangs; no tested wait uses a clock.
-# load 136 on natedev, 2026-10-29
-TEST_HANG_GUARD_SECS = 300
 
 
 def setUpModule() -> None:
@@ -58,9 +61,11 @@ def publish_host(environment: dict[str, str], units: list[HostedUnit]) -> None:
         if command == "default":
             continue
         arguments = command.split()
+        stdout = (pane_list(response["stdout"], arguments[:2], [])
+                  if arguments[2:4] == ["pane", "list"] else response["stdout"])
         lines.extend((f"{shlex.quote(command)})",
                       f"print -r -- {shlex.quote(json.dumps(arguments))} >> \"$FAKE_HERDR_LOG\"",
-                      f"print -rn -- {shlex.quote(response['stdout'])}",
+                      f"print -rn -- {shlex.quote(stdout)}",
                       f"exit {response['code']};;"))
     lines.extend(('*) print -u2 -r -- "unexpected unit-status host command: $*"; exit 98;;', "esac"))
     _write_executable(Path(environment["HERDR_BIN"]), "\n".join(lines) + "\n")
@@ -83,17 +88,22 @@ class UnitStatusFixture(unittest.TestCase):
         _ = shutil.copy2(SCRIPT, script)
         _write_executable(root / "scripts/lib/py", f'#!/bin/sh\nexec {shlex.quote(sys.executable)} "$@"\n')
         message = root / "scripts/message"
-        message.mkdir()
-        _ = shutil.copy2(SCRIPT.parents[1] / "message/sessions.py", message / "sessions.py")
+        copy_session_modules(message)
+        (root / "config").mkdir()
+        _ = shutil.copy2(SCRIPT.parents[2] / "config/session_retries.toml", root / "config/session_retries.toml")
         _write_executable(message / "notifier.sh", 'print -r -- "$*" >> "$NOTIFIER_CALL_LOG"\nprint -r -- "$NOTIFIER_HEALTH_TEXT"\nexit "$NOTIFIER_HEALTH_EXIT"\n')
         hooks = root / "scripts/hooks"
         hooks.mkdir()
         _ = (hooks / "direct_run.py").write_text("raise SystemExit(1)\n", encoding="utf-8")
-        for name in ("add_unit.py", "production_units.py", "live_units.py", "showrunners.py", "unit_lookup.py", "session_pane.py"):
+        for name in ("production_units.py", "unit_table.py", "live_units.py", "showrunners.py", "unit_lookup.py", "session_staff.py", "session_labels.py", "unit_names.py", "staff.py", "session_pane.py"):
             _ = shutil.copy2(SCRIPT.with_name(name), script.with_name(name))
         (root / "scripts/herdr").mkdir()
-        _ = shutil.copy2(SCRIPT.parents[1] / "herdr/herdr.py", root / "scripts/herdr/herdr.py")
-        for name in ("atomic_file.py", "user_zone.py", "probe_session.py", "unit_runs.py", "nix_env.py"):
+        for name in ("herdr.py", "place.py", "pane_launch.py"):
+            _ = shutil.copy2(SCRIPT.parents[1] / "herdr" / name, root / "scripts/herdr" / name)
+        (root / "scripts/shutdown").mkdir()
+        for name in ("pane_record.py", "remote.py"):
+            _ = shutil.copy2(SCRIPT.parents[1] / "shutdown" / name, root / "scripts/shutdown" / name)
+        for name in ("atomic_file.py", "user_zone.py", "probe_session.py", "unit_runs.py", "nix_env.py", "process_failure.py"):
             _ = shutil.copy2(SCRIPT.parents[1] / "lib" / name, root / "scripts/lib" / name)
         for name in ("active", "sessions"):
             (root / name).mkdir()
@@ -126,14 +136,13 @@ class UnitStatusFixture(unittest.TestCase):
         missing_units: tuple[str, ...] = (),
         unreadable_units: tuple[str, ...] = (),
     ) -> tuple[tuple[str, ...], str | None, str]:
-        with self.case_directory() as root:
+        with self.case_directory() as root, isolated_staff_file(root / "staff.json", environment := dict(os.environ)):
             script = root / "scripts/production/unit_status.sh"
             active_dir = root / "active"
             call_log = root / "notifier_calls"
             records = root / "sessions"
             responses_file = root / "herdr-responses.json"
-            environment = {
-                **os.environ,
+            environment.update({
                 "HOME": str(root),
                 "UNIT_ACTIVE_DIR": str(active_dir),
                 "UNIT_HISTORY_DIR": str(root / "history"),
@@ -148,7 +157,11 @@ class UnitStatusFixture(unittest.TestCase):
                 "HERDR_PLATFORM": "linux",
                 "FAKE_HERDR_LOG": str(root / "herdr.jsonl"),
                 "FAKE_HERDR_RESPONSES": str(responses_file),
-            }
+            })
+            _ = showrunner_relationship("example")
+            for unit in units:
+                if unit not in retired_units:
+                    _ = unit_membership("example", unit)
             pids: dict[str, int] = {}
             _ = responses_file.write_text(json.dumps({"default": {"code": 0, "stdout": ""}}))
             rows: list[str] = []
@@ -165,7 +178,13 @@ class UnitStatusFixture(unittest.TestCase):
                     held = socket.socket(socket.AF_UNIX)
                     held.bind(str(address))
                     self.addCleanup(held.close)
-                    session_id = f"{SESSION_ID}-{unit}"
+                    if unit in retired_units:
+                        owner = showrunner_relationship("example")
+                        member = fixture_member("unit", name=unit, parent=owner.id,
+                                                worktree=staff.RemovedWorktree("natedev", worktree))
+                    else:
+                        member = unit_membership("example", unit)
+                    session_id = member.id
                     if marker is not None:
                         _ = (active_dir / session_id).write_text(marker, encoding="utf-8")
                     pids[unit] = self.live_pid()
