@@ -66,7 +66,9 @@ pre { white-space: pre; overflow-x: auto; overflow-wrap: normal; padding: 1rem; 
 code { font-family: ui-monospace, monospace; }
 img { max-width: 100%; height: auto; }
 table { display: table; table-layout: auto; width: 60%; max-width: 100%; margin-left: auto; margin-right: auto; border-collapse: collapse; }
-td, th { border: 1px solid #888; padding: .4rem .6rem; overflow-wrap: anywhere; word-break: normal; vertical-align: top; }
+td, th { min-width: 9ch; border: 1px solid #888; padding: .4rem .6rem; overflow-wrap: anywhere; word-break: normal; vertical-align: top; }
+th { overflow-wrap: normal; }
+td:first-child, th:first-child { min-width: 14ch; }
 a { color: light-dark(#145ac2, #91bdff); }
 </style></head><body>
 $metadata
