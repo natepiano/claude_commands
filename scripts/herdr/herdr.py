@@ -1950,11 +1950,17 @@ def claude_trust(folder: Path, claude_json: Path) -> Trusted | Untrusted | Unrea
         }}
     except (OSError, UnicodeError, ValueError) as error:
         return UnreadableTrustFile(folder, claude_json, type(error).__name__)
-    keys = tuple(dict.fromkeys((folder, repository_root(folder), repository_trust_key(folder))))
+    keys = claude_trust_keys(folder)
     for key in keys:
         if configuration["projects"].get(str(key), {"hasTrustDialogAccepted": False})["hasTrustDialogAccepted"]:
             return Trusted(folder, claude_json, key)
     return Untrusted(folder, claude_json, keys)
+
+
+def claude_trust_keys(folder: Path) -> tuple[Path, ...]:
+    """The exact folder, repository root, and main checkout that can grant trust."""
+    folder = folder.resolve()
+    return tuple(dict.fromkeys((folder, repository_root(folder), repository_trust_key(folder))))
 
 
 def copy_claude_trust(folder: Path, source: Path, target: Path) -> Trusted | Untrusted | UnreadableTrustFile:
