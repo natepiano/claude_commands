@@ -413,9 +413,12 @@ class AccountsTests(unittest.TestCase):
     def test_stored_role_counts_keep_a_unit_without_legacy_launch_flags(self) -> None:
         self.assert_stored_role_counts("legacy flags")
 
+    def test_stored_role_counts_treat_unknown_claude_activity_as_idle(self) -> None:
+        self.assert_stored_role_counts("unknown status")
+
     def assert_stored_role_counts(self, evidence: Literal[
         "unit marks", "staff identity", "damaged history", "damaged sibling", "damaged folder", "legacy flags",
-        "cleared unit marks", "cleared staff identity",
+        "cleared unit marks", "cleared staff identity", "unknown status",
     ]) -> None:
         from scripts.message import sessions
         from scripts.shutdown import inventory
@@ -462,6 +465,11 @@ class AccountsTests(unittest.TestCase):
             if pane != "stopped":
                 owners.append(sessions.SessionRecord(pid=12345, sessionId=identity, name=identity,
                     messagingSocketPath="/fake.sock", updatedAt=1, tmux="", formerNames=[]))
+                state = {"unit-a": "busy", "unit-b": "shell", "runner-a": "idle"}.get(pane)
+                if state is not None:
+                    owners[-1]["status"] = state
+                elif evidence == "unknown status":
+                    owners[-1]["status"] = "unrecognized"
         # A repeated registry identity is still one session.
         owners.append(owners[0])
         history: dict[str, object] = dict(launches)
@@ -484,15 +492,19 @@ class AccountsTests(unittest.TestCase):
         _ = (run / "mesh_roster.json").write_text(json.dumps({
             "first": {"status": "running", "thread_id": "one", "port": 123},
             "second": {"status": "done", "thread_id": "two", "port": 123},
+            "third": {"status": "starting", "thread_id": "three", "port": 123},
+            "fourth": {"status": "paused", "thread_id": "four", "port": 123},
             "ended": {"status": "ended", "thread_id": "ended", "port": 123},
         }))
         runners = inventory.ShowrunnerRegistrations((
             inventory.ShowrunnerRegistration("runner-a", "runner-a", ""),
             inventory.ShowrunnerRegistration("runner-b", "runner-b", ""),
         ))
-        cases: tuple[tuple[str, dict[str, tuple[list[str], list[int]]]], ...] = (
-            ("claude2", {"claude1": (["units"], [2]), "claude2": (["showrunners"], [1])}),
-            ("claude1", {"claude1": (["units", "showrunners"], [2, 1]), "claude2": ([], [])}),
+        units = accounts.RoleSessionCountsDocument(busy=1, shell=1, idle=0, total=2)
+        runners_count = accounts.RoleSessionCountsDocument(busy=0, shell=0, idle=1, total=1)
+        cases: tuple[tuple[str, dict[str, tuple[list[str], list[accounts.RoleSessionCountsDocument]]]], ...] = (
+            ("claude2", {"claude1": (["units"], [units]), "claude2": (["showrunners"], [runners_count])}),
+            ("claude1", {"claude1": (["units", "showrunners"], [units, runners_count]), "claude2": ([], [])}),
         )
         retained_bytes = (records / "fixture.json").read_bytes()
         for runner_label, expected in cases:
@@ -512,7 +524,7 @@ class AccountsTests(unittest.TestCase):
             self.assertEqual((code, error), (0, ""))
             document = cast(accounts.StatusDocument, json.loads(text))
             values = {row["label"]: (row["roles"], row["role_counts"]) for row in document["accounts"]}
-            self.assertEqual(values, {**expected, "codex1": (["workers"], [2]), "codex2": (["spare"], [None])})
+            self.assertEqual(values, {**expected, "codex1": (["workers"], [{"busy": 2, "shell": None, "idle": 2, "total": 4}]), "codex2": (["spare"], [None])})
             self.assertIn(str(run / "mesh_roster.json"), document["session_inputs"])
             self.assertIn(str(records / "fixture.json"), document["session_inputs"])
             self.assertEqual((records / "fixture.json").read_bytes(), retained_bytes)
@@ -7867,7 +7879,7 @@ class SharedStatusDocumentTests(unittest.TestCase):
     def row(self) -> accounts.StatusRow:
         return accounts.StatusRow(
             label="fixture", tool="codex", folder="~/.codex1", login="fixture@example.invalid",
-            roles=("workers",), role_counts=(0,), weekly_left_percent=60, resets_at=self.at + timedelta(days=1),
+            roles=("workers",), role_counts=(accounts.RoleSessionCounts(0, accounts.UnknownShellCount(), 0),), weekly_left_percent=60, resets_at=self.at + timedelta(days=1),
             credits=13446, on_credits="no", use_credits=True, read_at=self.at,
             read_outcome=agent_accounts.UsageReadOutcome.OK, attempted_at=self.at)
 
@@ -7945,7 +7957,7 @@ class SharedStatusDocumentTests(unittest.TestCase):
             '* Fixture problem.'
         ))
         self.assertEqual(self.document(self.row()), {
-            "label": "fixture", "tool": "codex", "roles": ["workers"], "role_counts": [0],
+            "label": "fixture", "tool": "codex", "roles": ["workers"], "role_counts": [{"busy": 0, "shell": None, "idle": 0, "total": 0}],
             "weekly_left_percent": 60, "resets_at": "2026-10-17T18:00:00+00:00",
             "credits": 13446, "use_credits": True, "read_at": "2026-10-16T18:00:00+00:00",
             "read_ok": True, "credits_in_use": False,
