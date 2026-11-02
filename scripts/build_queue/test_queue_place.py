@@ -591,13 +591,14 @@ class QueuePlaceTests(unittest.TestCase):
             fixture.seed([2 * GIB] * 10)
             with queue.queue_place("rust-analyzer", fixture.root, sizing=gate.FixedCapSizing(12 * GIB)):
                 path, row = fixture.reservation()
-                self.assertEqual((row["need"], row.get("queue_waiter", {}).get("need_source")), (12 * GIB, "fallback"))
+                self.assertEqual((row["need"], row.get("queue_waiter", {}).get("need_source")), (12 * GIB, "cap"))
                 profile = gate.ProgramProfile("rust-analyzer", "repo", str(fixture.root), gate.FixedCapSizing(12 * GIB))
                 later = datetime.now(UTC) + timedelta(seconds=gate.read_memory_config().policy.timing.head_seconds + 1)
                 with mock.patch.object(gate, "program_peak_estimate", side_effect=AssertionError("cap estimated history")):
                     result = gate.check(Path(os.environ["BUILDLOG_MEMINFO"]), os.getpid(), row["sidecar"],
                                         ["rust-analyzer"], root=fixture.log, profile=profile, now=later)
-                self.assertEqual(result.peak, gate.ExpectedPeak(12 * GIB, "fallback", 0))
+                self.assertEqual(result.peak, gate.ExpectedPeak(12 * GIB, "cap", 0,
+                                 gate.ProgramMemoryCap("rust-analyzer")))
                 self.assertEqual(gate.read_reservation(path)["need"], 12 * GIB)
 
     def test_invalid_config_warns_once_and_does_not_corrupt_child_protocol(self) -> None:

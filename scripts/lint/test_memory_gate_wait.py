@@ -111,6 +111,21 @@ class MemoryGateWaitTests(unittest.TestCase):
         return [cast(CheckerCall, json.loads(line))
                 for line in (self.root / "calls.jsonl").read_text().splitlines()]
 
+    def test_cap_wait_line_names_the_program_cap_without_a_history_fallback(self) -> None:
+        for program, words in (("merge-gate", "the merge gate's memory cap"),
+                               ("rust-analyzer", "rust-analyzer's memory cap")):
+            with self.subTest(program=program):
+                result = subprocess.run([
+                    "bash", "-c", 'source "$1"; BUILDLOG_MEM_WAIT_S=0; '
+                    + 'buildlog_memory_line_inner first 0 0 "$2" cap 0 0 0 0 "" repo "$3"',
+                    "test", str(Path(__file__).with_name("memory_gate.sh")), str(6 * gate.GIB), program,
+                ], env=self.environment, cwd=self.root, text=True, capture_output=True, check=False, timeout=30)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(words, result.stderr)
+                self.assertIn("6.0 GiB", result.stderr)
+                self.assertNotIn("no history", result.stderr)
+                self.assertNotIn("fallback", result.stderr)
+
     def test_unknown_source_and_failed_poll_preserve_the_real_waiting_row(self) -> None:
         result = self.run_wait("unknown,fail,hold,admit")
         self.assertEqual(result.returncode, 0, result.stderr)
