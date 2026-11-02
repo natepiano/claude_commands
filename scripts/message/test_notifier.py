@@ -69,6 +69,28 @@ class NotifierTests(unittest.TestCase):
         self.live_socket.bind(str(self.socket_path))
         self.record("sid-1")
 
+    def test_fixed_timer_delivers_to_current_session_after_clear_without_rewriting_its_target(self) -> None:
+        from scripts.production import staff
+        from scripts.production.staff_test_support import fixture_runtime_id
+
+        with mock.patch.dict(os.environ, {"STAFF_FILE": str(self.root / "staff.json")}):
+            owner = staff.ensure("showrunner", name="demo", runtime_id=fixture_runtime_id("timer-first"))
+            current = staff.native_id(fixture_runtime_id("timer-after-clear"))
+            _ = staff.update_current_session(owner.current_session, current)
+            self.record(current)
+            _ = self.successful("new", "example", "--to", "session:" + owner.id,
+                                "--every", "2", "--command", "the scheduled prompt")
+            configuration = self.state_dir / "example" / "conf"
+            before = configuration.read_bytes(), configuration.stat().st_mtime_ns
+            _ = self.successful("fire", "example")
+            arguments = self.send_args.read_text().splitlines()
+            self.assertEqual(arguments[arguments.index("--to") + 1], "uds:" + str(self.socket_path))
+            self.assertEqual(self.conf()["TARGET"], "session:" + owner.id)
+            self.assertEqual((configuration.read_bytes(), configuration.stat().st_mtime_ns), before)
+            retained = staff.by_id(owner.id)
+            assert retained is not None
+            self.assertEqual(retained.current_session, current)
+
     def test_tick_drains_repeat_notices_only_from_the_configured_local_state(self) -> None:
         pending = self.root / "repeat-outbox"
         pending.mkdir()

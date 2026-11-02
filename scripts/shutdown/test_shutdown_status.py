@@ -524,7 +524,7 @@ else:
                 status = shutdown.main([verb, LOGIN, '--here', '--only', 'old session-id'])
                 self.assertEqual(status, 0)
                 self.assertIn('tmux kill-session -t =old:name', output.getvalue())
-                self.assertIn("--session-id 'old session-id'", output.getvalue())
+                self.assertNotIn("--session-id", output.getvalue())
         remaining = record_store.find_session(LOGIN, 'old session-id')
         assert remaining is not None
         self.assertEqual(remaining['session'], saved['session'])
@@ -572,7 +572,7 @@ else:
         report["sessions"] = [owner]
         with patch.object(shutdown, "inventory", return_value=report), redirect_stdout(io.StringIO()) as output:
             self.assertEqual(shutdown.main(["status", LOGIN, "--here"]), 0)
-        self.assertIn("--session-id 'live old-id'", output.getvalue())
+        self.assertNotIn("--session-id", output.getvalue())
         self.assertNotIn("--session old-destination", output.getvalue())
 
     def test_status_lists_progress_details_and_message_delivery_per_session(self) -> None:

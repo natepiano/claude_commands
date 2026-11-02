@@ -6,7 +6,7 @@ import unittest
 from unittest.mock import patch
 
 from scripts.production import staff
-from scripts.production.staff_test_support import unit_membership
+from scripts.production.staff_test_support import unit_membership, fixture_runtime_id
 from scripts.production.add_unit_test_support import AddUnitTestCase, configure_test_zone
 import add_unit
 import production_units
@@ -54,7 +54,8 @@ class AddUnitStaffRowTests(AddUnitTestCase):
             worktree = self.root / "project-alpha"
             _ = self.git("worktree", "add", "-b", "build-followups-alpha", str(worktree), "build-followups")
             row = add_unit.ensure_staff_unit(production, "alpha-unit",
-                                             worktree=staff.PresentWorktree("natedev", worktree))
+                                             worktree=staff.PresentWorktree("natedev", worktree),
+                                             runtime_id=fixture_runtime_id("new-alpha-unit-backend"))
             parent = before.by_path("director")
             self.assertIsNotNone(parent)
             assert parent is not None

@@ -203,6 +203,7 @@ def newest_sessions() -> list[SessionRecord]:
 def registered_showrunners(
     environment: Mapping[str, str], problems: list[str],
     *, known_sessions: Mapping[str, SessionRecord] | showrunners.DiscoverSessions = showrunners.DISCOVER_SESSIONS,
+    membership: staff.StaffSnapshot | showrunners.DiscoverMembership = showrunners.DISCOVER_MEMBERSHIP,
 ) -> list[showrunners.Showrunner]:
     state = Path(
         environment.get(
@@ -217,7 +218,7 @@ def registered_showrunners(
     registered: list[showrunners.Showrunner] = []
     try:
         with contextlib.redirect_stderr(errors):
-            discovery = showrunners.registered_showrunners(state, known_sessions=known_sessions)
+            discovery = showrunners.registered_showrunners(state, known_sessions=known_sessions, membership=membership)
         registered = list(discovery)
         for failure in discovery.lookup_failures:
             problem(problems, "showrunners", failure.diagnostic)
@@ -339,7 +340,8 @@ def unit_labels_for(session_ids: Iterable[str], environment: Mapping[str, str]) 
         records = newest_sessions()
         problems: list[str] = []
         registered = registered_showrunners(environment, problems,
-                                            known_sessions={record["sessionId"]: record for record in records})
+                                            known_sessions={record["sessionId"]: record for record in records},
+                                            membership=record)
         runners = showrunner_ids(records, registered)
         marks, directors = session_staff.session_staff_and_directors(records, environment, record=record)
         places = production_places(records, {}, registered, runners, set(directors), problems, record=record, marks=marks)

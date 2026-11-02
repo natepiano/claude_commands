@@ -23,6 +23,7 @@ import broadcast
 import codex_daemon
 import process_table
 import roster
+from scripts.production import staff
 
 NO_SHOWRUNNER = roster.NoShowrunner()
 NO_DIRECTOR = roster.NoDirector()
@@ -161,6 +162,8 @@ class BroadcastTests(unittest.TestCase):
         output, errors = io.StringIO(), io.StringIO()
         os.environ["SSH_SNAPSHOT"] = roster.RosterSnapshot(roster.Roster(self.peer_rows, self.peer_problems)).encode()
         with (patch.dict(os.environ, environment),
+              patch.object(staff, "runtime_id", return_value=environment.get(
+                  "CLAUDE_CODE_SESSION_ID", self.environment["CLAUDE_CODE_SESSION_ID"])),
               patch.object(roster, "roster", side_effect=self.fixture_roster) as read_roster,
               patch.object(roster, "sender_identity", wraps=roster.sender_identity) as read_identity,
               redirect_stdout(output), redirect_stderr(errors)):

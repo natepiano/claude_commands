@@ -13,9 +13,11 @@ import unittest
 from collections.abc import Generator
 from contextlib import AbstractContextManager, ExitStack, contextmanager
 from io import IOBase
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, cast, override
 from unittest import mock
+from uuid import NAMESPACE_URL, uuid5
 
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import staff
@@ -26,6 +28,74 @@ CHECKOUT = Path(__file__).resolve().parents[2]
 STAFF_SCRIPT = Path(__file__).with_name("staff.py")
 SOURCES_SCRIPT = Path(__file__).with_name("staff_sources.py")
 FixtureMachine = Literal["natedev", "mac"]
+UNFILLED_WORKTREE = staff.WorktreeUnfilled()
+UNFILLED_DOC = staff.DocUnfilled()
+
+
+def fixture_runtime_id(label: str) -> str:
+    """A fake backend returns one repeatable native id for this fixture label."""
+    return str(uuid5(NAMESPACE_URL, "staff-test-backend:" + label))
+
+
+def fixture_member(kind: staff.Kind, *, name: str, parent: staff.StaffId | None = None,
+                   worktree: staff.PresentWorktree | staff.RemovedWorktree | staff.WorktreeUnfilled = UNFILLED_WORKTREE,
+                   doc: staff.LiveDoc | staff.WrappedDoc | staff.DocUnfilled = UNFILLED_DOC,
+                   runtime_id: str = "") -> staff.StaffRow:
+    """Publish the identity returned by the private fixture backend, never live evidence."""
+    existing = [row for row in staff.initial_snapshot().find(kind=kind, parent=parent)
+                if row.name == name and row.parent == parent]
+    identity = runtime_id or (existing[0].current_session if len(existing) == 1 else
+                              fixture_runtime_id(f"{kind}:{parent or ''}:{name}"))
+    return staff.ensure(kind, name=name, parent=parent, worktree=worktree, doc=doc, runtime_id=identity)
+
+
+def fixture_worker(name: str, parent: staff.StaffId, *, runtime_id: str = "") -> staff.StaffRow:
+    """Publish the fake worker backend's native identity through the real writer."""
+    existing = [row for row in staff.initial_snapshot().find(kind="worker", parent=parent)
+                if row.name == name and row.parent == parent]
+    identity = runtime_id or (existing[0].current_session if len(existing) == 1 else fixture_runtime_id(f"worker:{parent}:{name}"))
+    return staff.ensure_worker(name, parent, runtime_id=identity)
+
+
+def record_fixture_claude_start(arguments: list[str]) -> None:
+    """The private backend records its own native identity before opening work."""
+    from scripts.message import sessions
+
+    identity = (arguments[arguments.index("--resume") + 1] if "--resume" in arguments
+                else os.environ["FAKE_CLAUDE_SESSION_ID"])
+    pid = int(os.environ["FAKE_CLAUDE_PID"])
+    path = Path(os.environ["NOTIFIER_SESSIONS_DIR"]) / f"{pid}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_text_atomic(path, json.dumps({
+        "pid": pid, "procStart": sessions.process_start(pid), "sessionId": identity,
+        "name": "fixture Claude", "updatedAt": 1, "formerNames": [], "tmux": "",
+        "entrypoint": "cli", "messagingSocketPath": "",
+    }) + "\n")
+
+
+class ClaudeBackendFixture:
+    """Observe launcher inputs and supply a native id before its opening callback."""
+
+    def __init__(self, identity: str, configuration: Path) -> None:
+        self.identity: str = identity
+        self.configuration: Path = configuration
+        self.arguments: list[str] = []
+        self.environment: dict[str, str] = {}
+        self.before_opening: staff.StaffSnapshot = staff.StaffSnapshot(())
+
+    def launch(self, name: str, space: str, title: str, cwd: str, environment: dict[str, str],
+               kind: str, agent_arguments: list[str], opening: object, timeout_ms: int, *,
+               agent: str) -> object:
+        import herdr
+
+        del name, space, title, cwd, kind, timeout_ms, agent
+        if not isinstance(opening, herdr.OpeningPrompt):
+            raise AssertionError("new Claude admission needs an opening prompt")
+        self.arguments = list(agent_arguments)
+        self.environment = dict(environment)
+        _ = opening.before_prompt(herdr.SessionTranscript(self.configuration, self.identity))
+        self.before_opening = staff.snapshot()
+        return herdr.AgentLaunched("w1:p1", herdr.PromptSubmitted(datetime.fromtimestamp(0, UTC)))
 
 
 @contextmanager
@@ -48,7 +118,7 @@ def showrunner_relationship(name: str, parent: str = "") -> staff.StaffRow:
 
         def intended_row(short_name: str) -> staff.StaffRow:
             if short_name not in rows:
-                rows[short_name] = staff.ensure("showrunner", name=short_name)
+                rows[short_name] = fixture_member("showrunner", name=short_name)
             return rows[short_name]
 
         child = intended_row(name)
@@ -59,7 +129,6 @@ def showrunner_relationship(name: str, parent: str = "") -> staff.StaffRow:
 def showrunner_launch(row: staff.StaffRow, session_id: str, environment: dict[str, str]) -> None:
     """Pin timer identities when several fixture timers share one production doc."""
     launch = pane_record.launch(f"fixture:{session_id}", session_id, str(CHECKOUT), {}, ["claude", "-n", row.name])
-    launch["environment"]["STAFF_ID"] = row.id
     with mock.patch.object(pane_record, "RECORD_DIR", Path(environment["HERDR_PANE_RECORD_DIR"])):
         pane_record.write("agents", launch)
 
@@ -69,8 +138,8 @@ def unit_membership(showrunner: str, unit: str) -> staff.StaffRow:
     from scripts.production import unit_names
 
     parents = [row for row in staff.initial_snapshot().find(kind="showrunner") if row.name == showrunner]
-    parent = parents[0] if parents else staff.ensure("showrunner", name=showrunner)
-    return staff.ensure("unit", name=unit_names.name(unit), parent=parent.id)
+    parent = parents[0] if parents else fixture_member("showrunner", name=showrunner)
+    return fixture_member("unit", name=unit_names.name(unit), parent=parent.id)
 
 
 def production_membership(showrunner: str, *units: str) -> None:
@@ -102,14 +171,13 @@ OWNER_CLI = """import os, runpy, sys
 sys.path.insert(0, os.environ['STAFF_TEST_CHECKOUT'])
 from scripts.production.staff_test_support import isolated_source_readers, observe_operation_lock
 observe_operation_lock()
+# Import platform-dependent Python support before selecting fake Mac transport.
+from scripts.production import staff_sources
 sys.platform = os.environ.get('STAFF_TEST_PLATFORM', 'linux')
 script = sys.argv.pop(1)
 sys.argv[0] = script
-if script.endswith('staff_sources.py') or '--live' in sys.argv:
-    from scripts.production import staff_sources
-    with isolated_source_readers():
-        runpy.run_path(script, run_name='__main__')
-else:
+# Retire/check verbs discover processes too, even without --live.
+with isolated_source_readers():
     runpy.run_path(script, run_name='__main__')
 """
 
@@ -141,7 +209,11 @@ def observe_operation_lock() -> None:
 @contextmanager
 def isolated_source_readers() -> Generator[None]:
     """Redirect import-bound source paths and prevent live session discovery."""
+    from scripts.message import process_table
+
     with ExitStack() as contexts:
+        # Process-evidence cases install their own private snapshot inside this boundary.
+        _ = contexts.enter_context(mock.patch.object(process_table, "snapshot", return_value={}))
         for module_name, attributes in (
             ("showrunners", {
                 "NOTIFIER_STATE_DIR": Path(os.environ["NOTIFIER_STATE_DIR"]),
@@ -196,9 +268,11 @@ os.environ.update(source_environment(source))
 sys.platform = 'linux'
 sys.path.insert(0, os.environ['STAFF_TEST_CHECKOUT'])
 sys.argv = [os.environ['STAFF_TEST_SCRIPT'], *command[2:]]
-from scripts.production.staff_test_support import observe_operation_lock
+from scripts.production.staff_test_support import isolated_source_readers, observe_operation_lock
+from scripts.production import staff_sources
 observe_operation_lock()
-runpy.run_path(sys.argv[0], run_name='__main__')
+with isolated_source_readers():
+    runpy.run_path(sys.argv[0], run_name='__main__')
 """
 
 
@@ -268,9 +342,9 @@ class StaffTestCase(unittest.TestCase):
             yield
 
     def tree(self) -> tuple[staff.StaffRow, staff.StaffRow, staff.StaffRow]:
-        showrunner = staff.ensure("showrunner", name="sdlc")
-        unit = staff.ensure("unit", name="models", parent=showrunner.id)
-        worker = staff.ensure("worker", name="impl1", parent=unit.id)
+        showrunner = fixture_member("showrunner", name="sdlc")
+        unit = fixture_member("unit", name="models", parent=showrunner.id)
+        worker = fixture_member("worker", name="impl1", parent=unit.id)
         return showrunner, unit, worker
 
     def cli(self, *arguments: str, code: int = 0) -> subprocess.CompletedProcess[str]:
@@ -307,6 +381,13 @@ class StaffTestCase(unittest.TestCase):
         self.register_production(slug, doc)
         for unit in units:
             _ = self.worktree(unit)
+            owner = fixture_runtime_id("showrunner::" + (workspace or slug))
+            from scripts.production import unit_names
+
+            identity = fixture_runtime_id("unit:" + owner + ":" + unit_names.name(unit))
+            self.pane(f"fixture:{slug}/{unit}", session_id=identity,
+                      environment={"SHOWRUNNER_UNIT": slug, "SHOWRUNNER_UNIT_ID": unit},
+                      written_at="2026-10-01T00:00:00+00:00")
         if parent:
             parent_file = Path(os.environ["SHOWRUNNER_STATE_DIR"]) / slug / "parent"
             parent_file.parent.mkdir(parents=True, exist_ok=True)
@@ -317,7 +398,11 @@ class StaffTestCase(unittest.TestCase):
         """Register an existing fixture document without making a second production."""
         timer = Path(os.environ["NOTIFIER_STATE_DIR"]) / f"showrunner-{slug}" / "conf"
         timer.parent.mkdir(parents=True, exist_ok=True)
-        write_text_atomic(timer, f"TARGET=session:session-{slug}\nCHECK=zsh /fixture/production_check.sh {shlex.quote(str(doc))}\n")
+        from scripts.production import showrunners
+
+        name = showrunners.herdr_space(slug, str(doc))
+        identity = fixture_runtime_id("showrunner::" + name)
+        write_text_atomic(timer, f"TARGET=session:{identity}\nCHECK=zsh /fixture/production_check.sh {shlex.quote(str(doc))}\n")
 
     def units_doc(self, doc: Path, units: tuple[str, ...], *, workspace: str, retired: tuple[str, ...] = ()) -> None:
         rows = [f"| `{unit}` | `{self.source_root / 'worktrees' / unit}` | {'retired' if unit in retired else 'active'} |" for unit in units]

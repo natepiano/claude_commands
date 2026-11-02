@@ -2031,9 +2031,11 @@ class StyleLedgerRecordsTests(LedgerTestCase):
         ledger, issue, base = self.binding_ticket(source, ((2, "old", "fresh"),))
         path = self.sources[0]
         rule = self.rule("prefer-type-named-fields-and-bindings")
-        second = ledger.hold(rule, path, 4, source.splitlines()[3], "rename", "second", "next", self.blob(rule), "outside")
+        judging = self.judging_ticket(ledger, rule, path)
+        second = ledger.hold(rule, path, 4, source.splitlines()[3], "rename", "second", "next", self.blob(rule), judging)
         other_issue = self.root / "second.md"
         ledger.file_held(second.finding_id, other_issue)
+        ledger.ticket_drop(judging)
         # Workspace tickets retain separate decisions and finding ownership.
         with closing(sqlite3.connect(ledger.database)) as connection, connection:
             _ = connection.execute("UPDATE tickets SET crate='.' WHERE id='names-1'")

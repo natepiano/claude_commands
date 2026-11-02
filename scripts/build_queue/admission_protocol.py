@@ -1,0 +1,258 @@
+"""Versioned admission envelopes; domain values use memory_admit's one codec."""
+from __future__ import annotations
+
+from dataclasses import dataclass
+import json
+import os
+from pathlib import Path
+from typing import TypeVar, cast
+
+from scripts.lint import memory_admit as gate
+
+VERSION = 1
+
+
+class AdmissionUnavailable(RuntimeError):
+    """A bounded queue query has no answer."""
+
+    def __init__(self, reason: str) -> None:
+        self.reason: str = reason
+        super().__init__(reason)
+
+
+class UnsupportedVersion(ValueError):
+    def __init__(self, version: object) -> None:
+        super().__init__(f"client version {version}, service supports 1..{VERSION}")
+
+
+@dataclass(frozen=True)
+class Owner:
+    pid: int
+    start_time: str
+
+
+@dataclass(frozen=True)
+class Identity:
+    session_id: str
+    name: str
+    step: str
+    folder: str
+
+
+@dataclass(frozen=True)
+class RequestedTestWidth:
+    threads: int
+
+    def __post_init__(self) -> None:
+        if self.threads <= 0:
+            raise ValueError("test width must be positive")
+
+
+@dataclass(frozen=True)
+class UnspecifiedTestWidth:
+    pass
+
+
+@dataclass(frozen=True)
+class NoTestWidth:
+    pass
+
+
+TestWidth = RequestedTestWidth | UnspecifiedTestWidth | NoTestWidth
+
+
+@dataclass(frozen=True)
+class CallRecord:
+    call_id: str
+
+
+@dataclass(frozen=True)
+class NoCallRecord:
+    pass
+
+
+Call = CallRecord | NoCallRecord
+Profile = gate.StepProfile | gate.GateProfile
+
+
+@dataclass(frozen=True)
+class AdmitRequest:
+    episode: str
+    owner: Owner
+    argv: tuple[str, ...]
+    cwd: str
+    since: float
+    sidecar: str
+    identity: Identity
+    call: Call
+    test_width: TestWidth
+    profile: Profile
+    fresh_test: bool
+
+
+@dataclass(frozen=True)
+class LaunchRequest:
+    episode: str
+    owner: Owner
+    since: float
+    identity: Identity
+    profile: Profile
+
+
+@dataclass(frozen=True)
+class ReleaseRequest:
+    request_id: str
+    reservation: str
+    status: int
+
+
+@dataclass(frozen=True)
+class WidthRequest:
+    request_id: str
+    reservation: str
+    width: int
+
+
+@dataclass(frozen=True)
+class ViewRequest:
+    pass
+
+
+@dataclass(frozen=True)
+class ExplainRequest:
+    pass
+
+
+@dataclass(frozen=True)
+class MineRequest:
+    session_id: str
+
+
+@dataclass(frozen=True)
+class AdmitHeadRequest:
+    request_id: str
+    why: str
+    actor: str
+
+
+Request = (AdmitRequest | LaunchRequest | ReleaseRequest | WidthRequest | ViewRequest
+           | ExplainRequest | MineRequest | AdmitHeadRequest)
+
+
+@dataclass(frozen=True)
+class Wait:
+    reason: gate.WaitReason
+    position: int
+    head: str
+    text: str
+
+
+@dataclass(frozen=True)
+class Admitted:
+    reservation: str
+    need: int
+    source: str
+    max_path: str
+    wave_path: str
+
+
+@dataclass(frozen=True)
+class LaunchAdmitted:
+    need: int
+    source: str
+
+
+@dataclass(frozen=True)
+class Refused:
+    reason: str
+
+
+@dataclass(frozen=True)
+class Ok:
+    pass
+
+
+@dataclass(frozen=True)
+class ViewReply:
+    reading: gate.QueueRead
+
+
+@dataclass(frozen=True)
+class ExplainReply:
+    explanation: gate.QueueExplanation
+
+
+@dataclass(frozen=True)
+class MineReply:
+    reading: gate.QueueRead
+
+
+Reply = Wait | Admitted | LaunchAdmitted | Refused | Ok | ViewReply | ExplainReply | MineReply
+
+_REQUESTS: dict[str, type] = {
+    "admit": AdmitRequest, "launch": LaunchRequest, "release": ReleaseRequest,
+    "width": WidthRequest, "view": ViewRequest, "explain": ExplainRequest,
+    "mine": MineRequest, "admit_head": AdmitHeadRequest,
+}
+_REPLIES: dict[str, type] = {
+    "wait": Wait, "admitted": Admitted, "launch_admitted": LaunchAdmitted,
+    "refused": Refused, "ok": Ok, "view": ViewReply, "explain": ExplainReply, "mine": MineReply,
+}
+T = TypeVar("T")
+
+
+def admission_socket_path() -> Path:
+    return Path(os.environ.get("ADMISSION_SOCKET") or "/run/build-admission/build-admission.sock")
+
+
+def encode_record(value: object) -> str:
+    """State and message payloads have exactly the domain codec's representation."""
+    return json.dumps(gate.snapshot_value(value), separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+
+
+def parse_record(text: str, schema: type[T]) -> T:
+    value = cast(object, json.loads(text))
+    return cast(T, gate.parse_snapshot_value(value, schema))
+
+
+def _encode(value: object, variants: dict[str, type]) -> str:
+    name = next((name for name, schema in variants.items() if type(value) is schema), None)
+    if name is None:
+        raise ValueError("unknown admission message")
+    return encode_record({"v": VERSION, "type": name, "data": value}) + "\n"
+
+
+def _parse(line: str | bytes, variants: dict[str, type]) -> object:
+    try:
+        value = cast(object, json.loads(line))
+        if not isinstance(value, dict):
+            raise ValueError("invalid admission envelope")
+        envelope = cast(dict[str, object], value)
+        if type(envelope.get("v")) is not int or envelope["v"] != VERSION:
+            raise UnsupportedVersion(envelope.get("v"))
+        name = envelope.get("type")
+        if not isinstance(name, str) or name not in variants or set(envelope) != {"v", "type", "data"}:
+            raise ValueError("invalid admission envelope")
+        return gate.parse_snapshot_value(envelope["data"], variants[name])
+    except (KeyError, TypeError, UnicodeError) as error:
+        raise ValueError("invalid admission message") from error
+
+
+def encode_request(request: Request) -> str:
+    return _encode(request, _REQUESTS)
+
+
+def parse_request(line: str | bytes) -> Request:
+    return cast(Request, _parse(line, _REQUESTS))
+
+
+def encode_reply(reply: Reply) -> str:
+    return _encode(reply, _REPLIES)
+
+
+def parse_reply(line: str | bytes, request: Request | None = None) -> Reply:
+    reply = cast(Reply, _parse(line, _REPLIES))
+    if (isinstance(request, LaunchRequest) and isinstance(reply, Admitted)
+            or isinstance(request, AdmitRequest) and isinstance(reply, LaunchAdmitted)):
+        raise ValueError("admission outcome does not match request")
+    return reply

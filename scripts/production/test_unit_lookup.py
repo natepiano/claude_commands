@@ -30,7 +30,7 @@ from sessions import SessionRecord
 from unit_lookup import ClaudeNotRunning, ClaudeUnknown, LiveClaude, UnitState
 from scripts.production import staff
 from scripts.shutdown import remote
-from scripts.production.staff_test_support import isolated_staff_file, unit_membership, showrunner_relationship, StaffTestCase
+from scripts.production.staff_test_support import isolated_staff_file, unit_membership, showrunner_relationship, fixture_runtime_id, StaffTestCase
 
 SCRIPT = Path(__file__).with_name("unit_lookup.py")
 
@@ -80,8 +80,8 @@ class UnitLookupTests(unittest.TestCase):
         for durable_id in (retired.id, ""):
             with self.subTest(durable_id=bool(durable_id)):
                 fake_unit_host.write(self.environment, [
-                    marked("retired", "w1:p1", "retired-unit", STAFF_ID=durable_id),
-                    marked("live", "w2:p1", "live-unit", STAFF_ID=live.id),
+                    marked("retired", "w1:p1", "retired-unit", CODEX_THREAD_ID=durable_id),
+                    marked("live", "w2:p1", "live-unit", CODEX_THREAD_ID=live.id),
                 ])
                 found = unit_lookup.marked_units("show", record=record)
                 self.assertEqual(list(found), ["live-unit"])
@@ -98,8 +98,8 @@ class UnitLookupTests(unittest.TestCase):
         assert historical.parent is not None
         _ = staff.set_doc(historical.parent, staff.WrappedDoc("natedev", self.root / "wrapped.md"))
         fake_unit_host.write(self.environment, [
-            marked("historical", "w1:p1", "historical-unit", slug="wrapped", STAFF_ID=historical.id),
-            marked("live", "w2:p1", "live-unit", STAFF_ID=live.id),
+            marked("historical", "w1:p1", "historical-unit", slug="wrapped", CODEX_THREAD_ID=historical.id),
+            marked("live", "w2:p1", "live-unit", CODEX_THREAD_ID=live.id),
         ])
         found = unit_lookup.every_marked_unit(record=staff.snapshot())
         self.assertEqual({slug: list(units) for slug, units in found.units.items()}, {"show": ["live-unit"]})
@@ -128,22 +128,22 @@ class UnitLookupTests(unittest.TestCase):
     def test_retained_unit_cleanup_lookup_keeps_a_live_director_after_active_membership_excludes_it(self) -> None:
         row = unit_membership("show", "retired-unit")
         _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.root / "removed"))
-        fake_unit_host.write(self.environment, [marked("director", "w1:p1", "retired-unit", STAFF_ID=row.id)])
-        self.claude("director", "w1:p1")
+        fake_unit_host.write(self.environment, [marked("director", "w1:p1", "retired-unit", CODEX_THREAD_ID=row.id)])
+        self.claude("director", "w1:p1", session_id=row.id)
         record = staff.snapshot()
         found = unit_lookup.marked_unit("show", "retired-unit", record=record)
         self.assertIsNotNone(found)
         assert found is not None
         self.assertIsInstance(found.claude, LiveClaude)
         assert isinstance(found.claude, LiveClaude)
-        self.assertEqual((found.claude.session_id, found.claude.pid), ("id-director", os.getpid()))
+        self.assertEqual((found.claude.session_id, found.claude.pid), (row.id, os.getpid()))
         self.assertEqual(unit_lookup.marked_units("show", record=record), {})
 
     def test_retained_unit_cleanup_lookup_keeps_unknown_session_evidence(self) -> None:
         row = unit_membership("show", "retired-unit")
         _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.root / "removed"))
-        fake_unit_host.write(self.environment, [marked("director", "w1:p1", "retired-unit", STAFF_ID=row.id)])
-        self.claude("director", "w1:p1")
+        fake_unit_host.write(self.environment, [marked("director", "w1:p1", "retired-unit", CODEX_THREAD_ID=row.id)])
+        self.claude("director", "w1:p1", session_id=row.id)
         _ = (self.records / "broken.json").write_text("{")
         (self.records / "director-1.json").unlink()
         found = unit_lookup.marked_unit("show", "retired-unit", record=staff.snapshot())
@@ -155,8 +155,8 @@ class UnitLookupTests(unittest.TestCase):
         row = unit_membership("show", "retired-unit")
         _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.root / "removed"))
         fake_unit_host.write(self.environment, [
-            marked("first", "w1:p1", "retired-unit", STAFF_ID=row.id),
-            marked("second", "w2:p1", "retired-unit", STAFF_ID=row.id),
+            marked("first", "w1:p1", "retired-unit", CODEX_THREAD_ID=row.id),
+            marked("second", "w2:p1", "retired-unit", CODEX_THREAD_ID=row.id),
         ])
         self.live_hosts("w1:p1", "w2:p1")
         with self.assertRaisesRegex(OSError, "retired-unit: its mark is on herdr sessions") as caught:
@@ -214,7 +214,7 @@ class UnitLookupTests(unittest.TestCase):
             if environment.get("SHOWRUNNER_UNIT_ID"):
                 row = unit_membership(showrunners.canonical_slug(environment["SHOWRUNNER_UNIT"]),
                                       environment["SHOWRUNNER_UNIT_ID"])
-                _ = environment.setdefault("STAFF_ID", row.id)
+                _ = environment.setdefault("CODEX_THREAD_ID", row.id)
             hosted.append(replace(item, marks=environment))
         fake_unit_host.write(self.environment, hosted)
 
@@ -232,12 +232,12 @@ class UnitLookupTests(unittest.TestCase):
         observed = [(slug, pane.unit, pane.staff_id, pane.claude.session_id)
                     for slug, pane in unit_lookup.observed_staff_marks()
                     if isinstance(pane.claude, LiveClaude)]
-        self.assertEqual(observed, [("show", "alpha-unit", row.id, "id-director")])
+        self.assertEqual(observed, [("show", "alpha-unit", row.id, row.id)])
 
     def test_legacy_pane_uses_the_unique_unit_name_after_a_transfer(self) -> None:
         row = unit_membership("receiving", "alpha-unit")
         fake_unit_host.write(self.environment, [marked("director", "w4:p1", "alpha-unit", slug="former")])
-        self.claude("director", "w4:p1")
+        self.claude("director", "w4:p1", session_id=row.id)
         self.assertEqual(list(unit_lookup.marked_units("receiving")), [row.name + "-unit"])
         self.assertEqual(unit_lookup.marked_units("former"), {})
 
@@ -314,7 +314,7 @@ print(observed.row.id)
 
     def test_staff_identity_alone_joins_a_pane_without_legacy_staff_marks(self) -> None:
         row = unit_membership("receiving", "alpha-unit")
-        fake_unit_host.write(self.environment, [HostedUnit("director", "w4:p1", {"STAFF_ID": row.id})])
+        fake_unit_host.write(self.environment, [HostedUnit("director", "w4:p1", {"CODEX_THREAD_ID": row.id})])
         self.claude("director", "w4:p1")
         found = unit_lookup.marked_units("receiving")
         self.assertEqual(list(found), ["alpha-unit"])
@@ -327,19 +327,19 @@ print(observed.row.id)
 
         owner = unit_membership("show", "alpha-unit")
         fake_unit_host.write(self.environment, [HostedUnit("agents", "w4:p1", {})])
-        self.claude("alpha", "w4:p1", session_id="same-conversation")
+        self.claude("alpha", "w4:p1", session_id=owner.id)
         pid = os.getpid()
         registry = self.records / f"{pid}.json"
         _ = registry.write_bytes((self.records / "alpha-1.json").read_bytes())
         record = sessions.read_session(registry)
         assert not isinstance(record, sessions.UnreadableSessionRecord)
-        marks = {"SHOWRUNNER_UNIT": "show", "SHOWRUNNER_UNIT_ID": "alpha-unit", "STAFF_ID": owner.id}
-        pane_record.write("agents", pane_record.launch("w4:p1", "same-conversation", str(self.root), marks, ["claude"]))
+        marks = {"SHOWRUNNER_UNIT": "show", "SHOWRUNNER_UNIT_ID": "alpha-unit", "CODEX_THREAD_ID": owner.id}
+        pane_record.write("agents", pane_record.launch("w4:p1", owner.id, str(self.root), marks, ["claude"]))
         found = unit_lookup.marked_units("show")
         self.assertIsInstance(found["alpha-unit"].claude, LiveClaude)
         self.assertEqual(found["alpha-unit"].staff_id, owner.id)
         self.assertEqual(session_pane.record_place(record), herdr.HerdrPlace("agents", "w4:p1"))
-        self.assertEqual(session_pane.session_place("same-conversation"), herdr.HerdrPlace("agents", "w4:p1"))
+        self.assertEqual(session_pane.session_place(owner.id), herdr.HerdrPlace("agents", "w4:p1"))
         grouped, _ = session_staff.session_staff_and_directors([record], self.environment)
         self.assertIsInstance(grouped.units["show"]["alpha-unit"].claude, LiveClaude)
 
@@ -350,7 +350,7 @@ print(observed.row.id)
 
         owner = unit_membership("show", "alpha-unit")
         fake_unit_host.write(self.environment, [HostedUnit("agents", "w4:p1", {})])
-        self.claude("alpha", "w4:p1", session_id="staffed-conversation")
+        self.claude("alpha", "w4:p1", session_id=owner.id)
         registry = self.records / f"{os.getpid()}.json"
         _ = registry.write_bytes((self.records / "alpha-1.json").read_bytes())
         session = sessions.read_session(registry)
@@ -359,21 +359,21 @@ print(observed.row.id)
         found = unit_lookup.marked_units("show")
         self.assertIsInstance(found["alpha-unit"].claude, LiveClaude)
         self.assertEqual(found["alpha-unit"].staff_id, owner.id)
-        self.assertEqual(session_pane.session_place("staffed-conversation"), herdr.HerdrPlace("agents", "w4:p1"))
+        self.assertEqual(session_pane.session_place(owner.id), herdr.HerdrPlace("agents", "w4:p1"))
         grouped, _ = session_staff.session_staff_and_directors([session], self.environment)
         self.assertEqual(grouped.units["show"]["alpha-unit"].staff_id, owner.id)
         run_root = self.root / "runs"
         run = run_root / "older-run"
         run.mkdir(parents=True)
-        _ = (run / "director").write_text("staffed-conversation")
+        _ = (run / "director").write_text(owner.id)
         _ = (run / "mesh_roster.json").write_text(json.dumps({"fix": {"thread_id": "worker-thread", "status": "running"}}))
         registered = [{"slug": "show", "session": "runner", "socket": "", "zone": "UTC", "doc": "/unused"}]
         with (mock.patch.object(unit_labels, "newest_sessions", return_value=[session]),
               mock.patch.object(unit_labels, "registered_showrunners", return_value=registered),
               mock.patch.object(herdr, "herdr_processes", side_effect=AssertionError("queue must read files only"))):
-            labels = unit_labels.unit_labels_for(["staffed-conversation", "worker-thread"],
+            labels = unit_labels.unit_labels_for([owner.id, "worker-thread"],
                 {**self.environment, "ROSTER_RUN_ROOT": str(run_root)})
-        self.assertEqual(labels["staffed-conversation"], unit_labels.UnitLabels("alpha", "show", "alpha"))
+        self.assertEqual(labels[owner.id], unit_labels.UnitLabels("alpha", "show", "alpha"))
         self.assertEqual(labels["worker-thread"], unit_labels.UnitLabels("fix", "show", "alpha"))
 
     def test_repair_creates_the_missing_live_launch_from_staff_and_rerun_writes_nothing(self) -> None:
@@ -382,14 +382,14 @@ print(observed.row.id)
 
         owner = unit_membership("show", "alpha-unit")
         fake_unit_host.write(self.environment, [HostedUnit("agents", "w4:p1", {})])
-        self.claude("alpha", "w4:p1", session_id="staffed-conversation")
+        self.claude("alpha", "w4:p1", session_id=owner.id)
         _ = (self.records / f"{os.getpid()}.json").write_bytes((self.records / "alpha-1.json").read_bytes())
         with mock.patch.object(pane_record, "PROC", self.root / "proc"):
             changes = session_staff.repair_marks()
             self.assertEqual(len(changes), 1)
             entry = pane_record.read("agents")["w4:p1"]
-            self.assertEqual(entry["session_id"], "staffed-conversation")
-            self.assertEqual(entry["environment"], {"STAFF_ID": owner.id,
+            self.assertEqual(entry["session_id"], owner.id)
+            self.assertEqual(entry["environment"], {"CLAUDE_CODE_SESSION_ID": owner.id,
                 "SHOWRUNNER_UNIT": "show", "SHOWRUNNER_UNIT_ID": "alpha-unit"})
             path = pane_record.record_path("agents")
             before = path.read_bytes(), path.stat().st_mtime_ns
@@ -404,7 +404,7 @@ print(observed.row.id)
         owner = unit_membership("show", "alpha-unit")
         _ = staff.set_worktree(owner.id, staff.PresentWorktree(remote.local_machine(), self.root))
         fake_unit_host.write(self.environment, [HostedUnit("agents", "w4:p1", {})])
-        self.claude("organon", "w4:p1", session_id="folder-conversation")
+        self.claude("organon", "w4:p1", session_id=owner.id)
         raw = cast(dict[str, object], json.loads((self.records / "organon-1.json").read_text()))
         raw["cwd"] = str(self.root)
         _ = (self.records / f"{os.getpid()}.json").write_text(json.dumps(raw))
@@ -423,14 +423,14 @@ print(observed.row.id)
         with (mock.patch.object(unit_labels, "newest_sessions", return_value=[session]),
               mock.patch.object(unit_labels, "registered_showrunners", return_value=registered),
               mock.patch.object(herdr, "herdr_processes", side_effect=AssertionError("queue must read files only"))):
-            labels = unit_labels.unit_labels_for(["folder-conversation"], self.environment)
-        self.assertEqual(labels["folder-conversation"], unit_labels.UnitLabels("organon", "show", "alpha"))
+            labels = unit_labels.unit_labels_for([owner.id], self.environment)
+        self.assertEqual(labels[owner.id], unit_labels.UnitLabels("organon", "show", "alpha"))
 
         with mock.patch.object(pane_record, "PROC", self.root / "proc"):
             changes = session_staff.repair_marks()
             self.assertEqual(len(changes), 1)
             entry = pane_record.read("agents")["w4:p1"]
-            self.assertEqual(entry["environment"], {"STAFF_ID": owner.id,
+            self.assertEqual(entry["environment"], {"CLAUDE_CODE_SESSION_ID": owner.id,
                 "SHOWRUNNER_UNIT": "show", "SHOWRUNNER_UNIT_ID": "alpha-unit"})
             path = pane_record.record_path("agents")
             before = path.read_bytes(), path.stat().st_mtime_ns
@@ -445,28 +445,31 @@ print(observed.row.id)
         instance = self.root / "notifier/showrunner-new"
         instance.mkdir(parents=True)
         _ = (instance / "conf").write_text(
-            f"TARGET=session:showrunner\nCHECK=zsh /scripts/production_check.sh {doc}\n")
+            f"TARGET=session:{showrunner_relationship('new').id}\nCHECK=zsh /scripts/production_check.sh {doc}\n")
 
     def process(self, pid: int, parent: int, argv: list[str], **environment: str) -> None:
         fake_unit_host.process(self.environment, pid, parent, argv, environment, cwd=self.root)
 
     def herdr_session(self, name: str = "native", pane: str = "w1:p1", unit: str = "trunk-unit") -> None:
-        _ = unit_membership("new" if (self.root / "new-production.md").exists() else "show", unit)
-        fake_unit_host.write(self.environment, [marked(name, pane, unit)])
+        row = unit_membership("new" if (self.root / "new-production.md").exists() else "show", unit)
+        fake_unit_host.write(self.environment, [marked(name, pane, unit, CODEX_THREAD_ID=row.id)])
         self.process(os.getpid(), 991000, ["claude"], HERDR_PANE_ID=pane,
-                     SHOWRUNNER_UNIT="show", SHOWRUNNER_UNIT_ID=unit)
+                     SHOWRUNNER_UNIT="show", SHOWRUNNER_UNIT_ID=unit, CODEX_THREAD_ID=row.id)
 
     def claude(self, name: str, pane: str, *, updated: int = 1, session_id: str = "", pid: int | None = None) -> None:
         """Record a live Claude in `pane`: this test process stands in for it."""
         pid = os.getpid() if pid is None else pid
         if pane:
             fake_unit_host.place_process(self.environment, pid, pane)
+        raw = (self.root / "proc" / str(pid) / "environ").read_bytes().decode().split("\0")
+        marks = dict(item.split("=", 1) for item in raw if "=" in item)
+        identity = session_id or marks.get("CODEX_THREAD_ID") or fixture_runtime_id("lookup-backend:" + name)
         path = Path(self.enterContext(short_socket_directory())) / f"{name}-{updated}.sock"
         held = socket.socket(socket.AF_UNIX)
         held.bind(str(path))
         self.addCleanup(held.close)
         _ = (self.records / f"{name}-{updated}.json").write_text(json.dumps({
-            "pid": pid, "sessionId": session_id or f"id-{name}", "name": name,
+            "pid": pid, "sessionId": identity, "name": name,
             "messagingSocketPath": str(path), "updatedAt": updated, "tmux": f"label-at-start:@1.{pane}" if pane else ""}))
 
     def live_hosts(self, *panes: str) -> None:
@@ -483,13 +486,13 @@ print(observed.row.id)
         self.hosts({"$1": marked("renamed-since-launch", "w4:p1", "trunk-unit"),
                                      "$2": marked("another-show", "w5:p1", "trunk-unit", slug="other"),
                                      "$3": HostedUnit("unmarked", "w6:p1", {})})
-        self.claude("renamed-since-launch", "w4:p1")
+        self.claude("renamed-since-launch", "w4:p1", session_id=unit_membership("show", "trunk-unit").id)
         found = unit_lookup.marked_units("show")
         self.assertEqual(list(found), ["trunk-unit"])
         unit = found["trunk-unit"]
         self.assertEqual((unit.place, unit.place.session), (herdr.HerdrPlace("renamed-since-launch", "w4:p1"), "renamed-since-launch"))
         assert isinstance(unit.claude, LiveClaude)
-        self.assertEqual((unit.claude.name, unit.claude.session_id), ("renamed-since-launch", "id-renamed-since-launch"))
+        self.assertEqual((unit.claude.name, unit.claude.session_id), ("renamed-since-launch", unit_membership("show", "trunk-unit").id))
 
     def test_old_marked_sessions_are_found_under_both_production_names(self) -> None:
         self.renamed_production()
@@ -505,7 +508,7 @@ print(observed.row.id)
                 listed = self.run_script("list", slug)
                 self.assertEqual(listed.returncode, 0, listed.stderr)
                 self.assertEqual(listed.stdout.split("\t")[:6],
-                                 ["trunk-unit", "herdr:still-old:w4:p1", "still-old", "live", "still-old", "id-still-old"])
+                                 ["trunk-unit", "herdr:still-old:w4:p1", "still-old", "live", "still-old", unit_membership("new", "trunk-unit").id])
 
     def test_grouping_resolves_former_slugs_without_discovering_processes(self) -> None:
         self.renamed_production()
@@ -622,11 +625,19 @@ print(observed.row.id)
 
     def test_a_relaunch_in_the_same_pane_is_found_from_its_newest_record(self) -> None:
         self.hosts({"$1": marked("trunk", "w4:p1", "trunk-unit")})
-        self.claude("before", "w4:p1", updated=1, session_id="old-id")
-        self.claude("after", "w4:p1", updated=2, session_id="new-id")
+        old_id = unit_membership("show", "trunk-unit").id
+        new_id = fixture_runtime_id("lookup-relaunched-backend")
+        self.claude("before", "w4:p1", updated=1, session_id=old_id)
+        _ = staff.update_current_session(old_id, staff.native_id(new_id))
+        self.claude("after", "w4:p1", updated=2, session_id=new_id)
         claude = unit_lookup.marked_units("show")["trunk-unit"].claude
         assert isinstance(claude, LiveClaude)
-        self.assertEqual((claude.name, claude.session_id), ("after", "new-id"))
+        self.assertEqual((claude.name, claude.session_id), ("after", new_id))
+        row = staff.by_id(old_id)
+        assert row is not None
+        self.assertEqual(row.current_session, new_id)
+        self.assertEqual(staff.by_current_session(new_id), row)
+        self.assertIsNone(staff.by_current_session(old_id))
 
     def test_a_marked_session_with_no_claude_is_still_the_units_pane(self) -> None:
         self.hosts({"$1": marked("trunk", "w4:p1", "trunk-unit")})
@@ -745,12 +756,12 @@ print(observed.row.id)
         server = self.root / "proc/991000"
         _ = (server / "cmdline").write_bytes(b"herdr\0server\0")
         _ = (server / "environ").write_bytes(b"HERDR_SESSION=writing\0")
-        self.claude("writer", "", session_id="writer-id")
+        self.claude("writer", "", session_id=unit_membership("show", "trunk-unit").id)
         found = unit_lookup.marked_units("show")["trunk-unit"]
         self.assertEqual(found.place, herdr.HerdrPlace("writing", "w1:p1"))
         self.assertIsInstance(found.claude, LiveClaude)
         assert isinstance(found.claude, LiveClaude)
-        self.assertEqual((found.claude.name, found.claude.session_id), ("writer", "writer-id"))
+        self.assertEqual((found.claude.name, found.claude.session_id), ("writer", unit_membership("show", "trunk-unit").id))
         self.assertEqual(self.run_script("list", "show").stdout.split("\t")[:4],
                          ["trunk-unit", "herdr:writing:w1:p1", "writing", "live"])
 
@@ -761,12 +772,12 @@ print(observed.row.id)
         claude_cwd = self.root / "proc" / str(os.getpid()) / "cwd"
         claude_cwd.unlink()
         claude_cwd.symlink_to(self.root / "deleted-directory")
-        self.claude("writer", "", session_id="writer-id")
+        self.claude("writer", "", session_id=unit_membership("show", "trunk-unit").id)
         found = unit_lookup.marked_units("show")["trunk-unit"]
         self.assertEqual(found.place, herdr.HerdrPlace("writing", "w1:p1"))
         self.assertIsInstance(found.claude, LiveClaude)
         assert isinstance(found.claude, LiveClaude)
-        self.assertEqual((found.claude.pid, found.claude.session_id), (os.getpid(), "writer-id"))
+        self.assertEqual((found.claude.pid, found.claude.session_id), (os.getpid(), unit_membership("show", "trunk-unit").id))
         self.assertEqual(self.run_script("list", "show").stdout.split("\t")[:4],
                          ["trunk-unit", "herdr:writing:w1:p1", "writing", "live"])
 
@@ -820,7 +831,7 @@ print(observed.row.id)
 
     def test_shell_marks_cannot_borrow_an_unmarked_claude_in_the_same_pane(self) -> None:
         self.hosts({"old": marked("old", "w4:p1", "old-unit")})
-        self.claude("unmarked", "w4:p1")
+        self.claude("unmarked", "w4:p1", session_id=fixture_runtime_id("unregistered-unmarked-Claude"))
         _ = (self.root / "proc" / str(os.getpid()) / "environ").write_bytes(b"HERDR_PANE_ID=w4:p1")
         found = unit_lookup.marked_units("show")["old-unit"]
         self.assertIsInstance(found.claude, ClaudeNotRunning)

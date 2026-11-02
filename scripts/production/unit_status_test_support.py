@@ -20,7 +20,10 @@ sys.path[:0] = [str(Path(__file__).resolve().parents[1] / name)
                 for name in ("production", "message", "herdr")]
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.message.sessions_test_support import copy_session_modules
-from scripts.production.staff_test_support import isolated_staff_file, showrunner_relationship, unit_membership
+from scripts.production import staff
+from scripts.production.staff_test_support import (
+    fixture_member, isolated_staff_file, showrunner_relationship, unit_membership,
+)
 from dailies_input import StatusBlock, UnitRow, status_blocks
 from unit_lookup import UnitState
 import fake_unit_host
@@ -30,7 +33,6 @@ from fake_herdr import CommandResponse, pane_list
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 SCRIPT = Path(__file__).with_name("unit_status.sh")
-SESSION_ID = "test-session"
 # Only bound fixture hangs; no tested wait uses a clock.
 
 
@@ -176,7 +178,13 @@ class UnitStatusFixture(unittest.TestCase):
                     held = socket.socket(socket.AF_UNIX)
                     held.bind(str(address))
                     self.addCleanup(held.close)
-                    session_id = f"{SESSION_ID}-{unit}"
+                    if unit in retired_units:
+                        owner = showrunner_relationship("example")
+                        member = fixture_member("unit", name=unit, parent=owner.id,
+                                                worktree=staff.RemovedWorktree("natedev", worktree))
+                    else:
+                        member = unit_membership("example", unit)
+                    session_id = member.id
                     if marker is not None:
                         _ = (active_dir / session_id).write_text(marker, encoding="utf-8")
                     pids[unit] = self.live_pid()

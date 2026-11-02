@@ -13,7 +13,7 @@ from typing import cast, final
 from unittest import mock
 import style_ledger
 import rules
-from approved_renames import AppliedInCode, Folder, NoAppliedCheck, RenameNotApplied
+from approved_renames import AppliedInCode, Folder, NoAppliedCheck, NoOuterBindingBlock, RenameNotApplied
 import declarations
 
 from ledger_test_support import (remove_generation_schema, LedgerTestCase, PARENT_FILE, MOVED_FILE, TWIN_FILE, PARENT)
@@ -21,6 +21,625 @@ from ledger_test_support import (remove_generation_schema, LedgerTestCase, PAREN
 
 @final
 class StyleLedgerFindingsTests(LedgerTestCase):
+    def test_current_parameters_control_every_ledger_built_boundary(self) -> None:
+        from test_approved_renames import PARAMETER_CHANGES
+        for label, source, current, blocked in PARAMETER_CHANGES:
+            for boundary in ("ticket_merge", "mark_built", "mark_built_at_merge"):
+                for clear_base in (False, True):
+                    if boundary == "ticket_merge" and clear_base:
+                        continue
+                    with self.subTest(parameter=label, boundary=boundary, clear_base=clear_base):
+                        case = StyleLedgerFindingsTests()
+                        case.setUp()
+                        try:
+                            ledger, issue, _ = case.binding_ticket(source, ((2, "g", "checkout_info"),))
+                            finding, = ledger.proposal_findings(issue)
+                            case.write(case.sources[0], current)
+                            build_base = case.commit("Change the outer parameter before the build")
+                            with closing(sqlite3.connect(ledger.database)) as connection, connection:
+                                _ = connection.execute("UPDATE tickets SET base=? WHERE id='names-1'", (build_base,))
+                            case.write(case.sources[0], current.replace("|g| g", "|checkout_info| checkout_info"))
+                            checkpoint = case.commit("Rename after changing the outer parameter")
+                            ledger.set_tip(checkpoint, "main")
+                            ledger.ticket_checkpoint("names-1", checkpoint)
+                            with closing(sqlite3.connect(ledger.database)) as connection, connection:
+                                if clear_base:
+                                    _ = connection.execute("UPDATE tickets SET base='' WHERE id='names-1'")
+                                if boundary != "ticket_merge":
+                                    _ = connection.execute("UPDATE tickets SET state='merged' WHERE id='names-1'")
+                            ledger = case.ledger()
+                            def build() -> None:
+                                if boundary == "ticket_merge":
+                                    refused = ledger.ticket_merge("names-1")
+                                    if blocked:
+                                        self.assertEqual(len(refused), 1)
+                                        self.assertIsInstance(refused[0].cause, style_ledger.OuterBindingBlocked)
+                                    else:
+                                        self.assertEqual(refused, ())
+                                elif boundary == "mark_built":
+                                    ledger.mark_built(finding.finding_id)
+                                else:
+                                    _ = ledger.mark_built_at_merge((finding.finding_id,), checkpoint,
+                                                                  style_ledger.ReadByPerson("reader"))
+                            if blocked and boundary != "ticket_merge":
+                                with self.assertRaisesRegex(style_ledger.LedgerError, "blocked by outer binding"):
+                                    build()
+                            else:
+                                try:
+                                    build()
+                                except style_ledger.LedgerError as error:
+                                    self.fail(f"the current item must permit this build: {error}")
+                            reopened, = case.ledger().proposal_findings(issue)
+                            if blocked:
+                                self.assertEqual(reopened.state, style_ledger.Filed(issue))
+                                self.assertIsInstance(reopened.rename_disposition, style_ledger.OuterBindingBlocked)
+                                assert isinstance(reopened.rename_disposition, style_ledger.OuterBindingBlocked)
+                                self.assertEqual(reopened.rename_disposition.text, current.splitlines()[0])
+                                before = ledger.database.read_bytes()
+                                if boundary != "ticket_merge":
+                                    with self.assertRaises(style_ledger.LedgerError):
+                                        build()
+                                    self.assertEqual(ledger.database.read_bytes(), before)
+                            else:
+                                self.assertIsInstance(reopened.state, style_ledger.Built)
+                                self.assertIsInstance(reopened.rename_disposition, NoOuterBindingBlock)
+                        finally:
+                            case.tearDown()
+                            case.doCleanups()
+
+    def test_bulk_release_records_only_current_parameter_blockers(self) -> None:
+        from test_approved_renames import PARAMETER_CHANGES
+        for label, source, current, blocked in PARAMETER_CHANGES:
+            with self.subTest(parameter=label):
+                case = StyleLedgerFindingsTests()
+                case.setUp()
+                try:
+                    ledger, issue, _ = case.binding_ticket(source, ((2, "g", "checkout_info"),))
+                    finding, = ledger.proposal_findings(issue)
+                    case.write(case.sources[0], current)
+                    _ = case.commit("Change the current outer parameter before release")
+                    reasons = {finding.finding_id: "release for a separate execution failure"}
+                    released = ledger.bulk_release("names-1", reasons)
+                    self.assertEqual(len(released), 1)
+                    reopened, = case.ledger().proposal_findings(issue)
+                    self.assertEqual(reopened.state, style_ledger.Filed(issue))
+                    self.assertIsInstance(reopened.build_ticket, style_ledger.NoBuildTicket)
+                    if blocked:
+                        self.assertIsInstance(reopened.rename_disposition, style_ledger.OuterBindingBlocked)
+                        assert isinstance(reopened.rename_disposition, style_ledger.OuterBindingBlocked)
+                        self.assertEqual(reopened.rename_disposition.text, current.splitlines()[0])
+                    else:
+                        self.assertIsInstance(reopened.rename_disposition, NoOuterBindingBlock)
+                    before = ledger.database.read_bytes()
+                    self.assertEqual(ledger.bulk_release("names-1", reasons), released)
+                    self.assertEqual(ledger.database.read_bytes(), before)
+                finally:
+                    case.tearDown()
+                    case.doCleanups()
+
+    def test_unread_local_body_refuses_every_built_boundary_after_a_signature_change(self) -> None:
+        from test_approved_renames import UNREAD_LOCAL_BODIES
+        for label, source in UNREAD_LOCAL_BODIES:
+            for clear_base in (False, True):
+                with self.subTest(body=label, clear_base=clear_base):
+                    case = StyleLedgerFindingsTests()
+                    case.setUp()
+                    try:
+                        current = source.replace("label()", "label(extra: usize)").replace("|g| g", "|checkout_info| checkout_info")
+                        case.assert_outer_scope_refuses_built(source, 2, "containing item body unread",
+                                                             edited=current, clear_base=clear_base, unproved=True)
+                    finally:
+                        case.tearDown()
+                        case.doCleanups()
+
+    def test_proved_item_with_unread_body_passes_every_built_boundary(self) -> None:
+        from test_approved_renames import UNREAD_ITEM_BODIES
+        for label, source in UNREAD_ITEM_BODIES:
+            with self.subTest(body=label):
+                case = StyleLedgerFindingsTests()
+                case.setUp()
+                try:
+                    ledger, issue, _ = case.binding_ticket(source, ((2, "g", "checkout_info"),))
+                    finding, = ledger.proposal_findings(issue)
+                    case.write(case.sources[0], source.replace("fn g(", "fn checkout_info("))
+                    checkpoint = case.commit("Rename the item with an unread body")
+                    ledger.set_tip(checkpoint, "main")
+                    ledger.ticket_checkpoint("names-1", checkpoint)
+                    refused = ledger.ticket_merge("names-1")
+                    self.assertFalse(any(isinstance(row.cause, style_ledger.OuterBindingBlocked | style_ledger.OuterBindingUnproved)
+                                         for row in refused), refused)
+                    # Exercise each person-marked boundary even if merge's applied
+                    # proof already built the item. Keep its merged ticket evidence.
+                    for boundary in ("mark_built", "mark_built_at_merge"):
+                        with self.subTest(boundary=boundary):
+                            with closing(sqlite3.connect(ledger.database)) as connection, connection:
+                                _ = connection.execute("UPDATE held_findings SET state='filed',build_ticket='names-1' WHERE finding_id=?",
+                                                       (finding.finding_id,))
+                            ledger = case.ledger()
+                            if boundary == "mark_built":
+                                ledger.mark_built(finding.finding_id)
+                            else:
+                                built = ledger.mark_built_at_merge((finding.finding_id,), checkpoint, style_ledger.ReadByPerson("reader"))
+                                self.assertEqual(tuple(row.finding_id for row in built), (finding.finding_id,))
+                            self.assertIsInstance(case.ledger().proposal_findings(issue)[0].state, style_ledger.Built)
+                finally:
+                    case.tearDown()
+                    case.doCleanups()
+
+    def test_generic_parameters_refuse_every_built_boundary(self) -> None:
+        from test_approved_renames import GENERIC_PARAMETER_BINDINGS
+        self.assert_local_declarations_refuse_every_built_boundary(GENERIC_PARAMETER_BINDINGS)
+        case = StyleLedgerFindingsTests()
+        case.setUp()
+        try:
+            case.assert_nonlocal_declaration_builds("pub const g: usize = 1;\n", 1)
+        finally:
+            case.tearDown()
+            case.doCleanups()
+
+    def assert_local_declarations_refuse_every_built_boundary(self, forms: tuple[tuple[str, str], ...]) -> None:
+        self.assert_a_true_field_keeps_its_nonlocal_build_path()
+        for label, source in forms:
+            with self.subTest(form=label):
+                case = StyleLedgerFindingsTests()
+                case.setUp()
+                try:
+                    ledger, issue, base = case.binding_ticket(source, ((2, "g", "checkout_info"),))
+                    finding, = ledger.proposal_findings(issue)
+                    with closing(sqlite3.connect(ledger.database)) as connection, connection:
+                        _ = connection.execute("UPDATE tickets SET base='' WHERE id='names-1'")
+                    ledger = case.ledger()
+                    ledger.set_tip(base, "main")
+                    ledger.ticket_checkpoint("names-1", base)
+                    refused = ledger.ticket_merge("names-1")
+                    self.assertEqual(len(refused), 1)
+                    self.assertIsInstance(refused[0].cause, style_ledger.OuterBindingBlocked | style_ledger.OuterBindingUnproved)
+                    assert isinstance(refused[0].cause, style_ledger.OuterBindingBlocked | style_ledger.OuterBindingUnproved)
+                    reason = re.escape(refused[0].cause.reason)
+                    with closing(sqlite3.connect(ledger.database)) as connection, connection:
+                        _ = connection.execute("UPDATE held_findings SET build_ticket='names-1' WHERE finding_id=?",
+                                               (finding.finding_id,))
+                    for _ in range(2):
+                        with self.assertRaisesRegex(style_ledger.LedgerError, reason):
+                            _ = ledger.mark_built_at_merge((finding.finding_id,), base, style_ledger.ReadByPerson("reader"))
+                        with self.assertRaisesRegex(style_ledger.LedgerError, reason):
+                            ledger.mark_built(finding.finding_id)
+                    reopened, = case.ledger().proposal_findings(issue)
+                    self.assertEqual(reopened.state, style_ledger.Filed(issue))
+                    self.assertIsInstance(reopened.rename_disposition, style_ledger.OuterBindingBlocked | style_ledger.OuterBindingUnproved)
+                    before = ledger.database.read_bytes()
+                    with self.assertRaises(style_ledger.LedgerError):
+                        ledger.mark_built(finding.finding_id)
+                    self.assertEqual(ledger.database.read_bytes(), before)
+                finally:
+                    case.tearDown()
+                    case.doCleanups()
+
+    def test_nested_field_expression_bindings_refuse_every_built_boundary(self) -> None:
+        from test_approved_renames import FIELD_EXPRESSION_BINDINGS
+        self.assert_local_declarations_refuse_every_built_boundary(FIELD_EXPRESSION_BINDINGS)
+
+    def assert_a_true_field_keeps_its_nonlocal_build_path(self) -> None:
+        from test_approved_renames import TRUE_FIELD_BINDING
+        self.assert_nonlocal_declaration_builds(TRUE_FIELD_BINDING, 2)
+
+    def assert_nonlocal_declaration_builds(self, source: str, line: int) -> None:
+        ledger, issue, _ = self.binding_ticket(source, ((line, "g", "checkout_info"),))
+        self.write(self.sources[0], source.replace("g:", "checkout_info:"))
+        checkpoint = self.commit("Rename a direct field")
+        ledger.set_tip(checkpoint, "main")
+        ledger.ticket_checkpoint("names-1", checkpoint)
+        _ = ledger.ticket_merge("names-1")
+        finding, = ledger.proposal_findings(issue)
+        built = ledger.mark_built_at_merge((finding.finding_id,), checkpoint, style_ledger.ReadByPerson("reader"))
+        self.assertEqual(tuple(item.finding_id for item in built), (finding.finding_id,))
+        self.assertIsInstance(ledger.proposal_findings(issue)[0].state, style_ledger.Built)
+
+    def test_bulk_release_persists_terminal_admission_without_a_saved_build_base(self) -> None:
+        source = "fn label(checkout_info: usize) {\n    map(|g| g + 1)\n}\n"
+        ledger, issue, _ = self.binding_ticket(source, ((2, "g", "checkout_info"),))
+        finding, = ledger.proposal_findings(issue)
+        with closing(sqlite3.connect(ledger.database)) as connection, connection:
+            _ = connection.execute("UPDATE tickets SET base='' WHERE id='names-1'")
+        ledger = self.ledger()
+        reasons = {finding.finding_id: "outer binding admission refused"}
+        _ = ledger.bulk_release("names-1", reasons)
+        current, = self.ledger().proposal_findings(issue)
+        self.assertEqual(current.state, style_ledger.Filed(issue))
+        self.assertIsInstance(current.rename_disposition, style_ledger.OuterBindingBlocked)
+        self.assertIsInstance(current.build_ticket, style_ledger.NoBuildTicket)
+        before = ledger.database.read_bytes()
+        _ = ledger.bulk_release("names-1", reasons)
+        self.assertEqual(ledger.database.read_bytes(), before)
+
+    def test_authoritative_anchor_matrix_at_every_built_boundary(self) -> None:
+        from test_approved_renames import IDENTICAL_BINDING_ITEMS
+        original = IDENTICAL_BINDING_ITEMS
+        changed = original.replace("first()", "first(checkout_info: usize)").replace("|g| g", "|checkout_info| checkout_info", 1)
+        reordered = changed[changed.index("fn second"):]+changed[:changed.index("fn second")]
+        for probe in ("missing_anchor", "later_field", "later_item", "later_local", "removed", "raw_pair"):
+            for boundary in ("ticket_merge", "mark_built", "mark_built_at_merge"):
+                with self.subTest(probe=probe, boundary=boundary):
+                    case = StyleLedgerFindingsTests()
+                    case.setUp()
+                    try:
+                        source = original.replace("|g| g", "|r#g| r#g", 1) if probe == "raw_pair" else original
+                        ledger, issue, _ = case.binding_ticket(source, ((2, "g", "checkout_info"),))
+                        finding, = ledger.proposal_findings(issue)
+                        edited = reordered if probe == "missing_anchor" else changed
+                        if probe == "removed":
+                            edited = original.replace("map(|g| g + 1)", "consume(42)", 1)
+                        if probe == "raw_pair":
+                            edited = source.replace("first()", "first(checkout_info: usize)")
+                        case.write(case.sources[0], edited)
+                        checkpoint = case.commit("Current snapshot must retain anchored local identity")
+                        ledger.set_tip(checkpoint, "main")
+                        # Comparison bases intentionally name another declaration at line two.
+                        comparison = ""
+                        if probe.startswith("later_"):
+                            forms = {"later_field": "struct Other {\n    g: usize,\n}\n",
+                                     "later_item": "mod other {\n    fn g() {}\n}\n",
+                                     "later_local": "fn other() {\n    let g = 1;\n}\n"}
+                            case.write(case.sources[0], forms[probe])
+                            comparison = case.commit("Later build comparison coordinate is unrelated")
+                            case.write(case.sources[0], edited)
+                            checkpoint = case.commit("Restore current source after unrelated comparison")
+                            ledger.set_tip(checkpoint, "main")
+                        with closing(sqlite3.connect(ledger.database)) as connection, connection:
+                            if probe == "missing_anchor":
+                                _ = connection.execute("UPDATE held_findings SET anchor_commit='',ticket='unreadable-judgment' WHERE finding_id=?", (finding.finding_id,))
+                            if probe == "raw_pair":
+                                _ = connection.execute("UPDATE held_findings SET before='r#g' WHERE finding_id=?", (finding.finding_id,))
+                            _ = connection.execute("UPDATE tickets SET base=? WHERE id='names-1'", (comparison,))
+                        ledger = case.ledger()
+                        ledger.ticket_checkpoint("names-1", checkpoint)
+                        if boundary == "ticket_merge":
+                            refused = ledger.ticket_merge("names-1")
+                            self.assertEqual(len(refused), 1)
+                            self.assertIsInstance(refused[0].cause, style_ledger.OuterBindingBlocked | style_ledger.OuterBindingUnproved)
+                        else:
+                            with closing(sqlite3.connect(ledger.database)) as connection, connection:
+                                _ = connection.execute("UPDATE tickets SET state='merged' WHERE id='names-1'")
+                            ledger = case.ledger()
+                            def build() -> None:
+                                if boundary == "mark_built":
+                                    ledger.mark_built(finding.finding_id)
+                                else:
+                                    _ = ledger.mark_built_at_merge((finding.finding_id,), checkpoint, style_ledger.ReadByPerson("reader"))
+                            with self.assertRaises(style_ledger.LedgerError):
+                                build()
+                            before = ledger.database.read_bytes()
+                            with self.assertRaises(style_ledger.LedgerError):
+                                build()
+                            self.assertEqual(ledger.database.read_bytes(), before)
+                        current, = case.ledger().proposal_findings(issue)
+                        self.assertEqual(current.state, style_ledger.Filed(issue))
+                        self.assertIsInstance(current.rename_disposition, style_ledger.OuterBindingBlocked | style_ledger.OuterBindingUnproved)
+                    finally:
+                        case.tearDown()
+                        case.doCleanups()
+
+        self.assert_safe_anchored_person_build_needs_no_saved_build_base()
+
+    def assert_safe_anchored_person_build_needs_no_saved_build_base(self) -> None:
+        source = "fn label() {\n    map(|g| g + 1)\n}\n"
+        ledger, issue, _ = self.binding_ticket(source, ((2, "g", "checkout_info"),))
+        finding, = ledger.proposal_findings(issue)
+        self.write(self.sources[0], source.replace("|g| g", "|checkout_info| checkout_info"))
+        checkpoint = self.commit("Precisely applied rename with an independent judgment anchor")
+        ledger.set_tip(checkpoint, "main")
+        ledger.ticket_checkpoint("names-1", checkpoint)
+        with closing(sqlite3.connect(ledger.database)) as connection, connection:
+            _ = connection.execute("UPDATE tickets SET base='',state='merged' WHERE id='names-1'")
+        ledger = self.ledger()
+        self.assertEqual(ledger.applied_check(finding, checkpoint), NoAppliedCheck("rename"))
+        _ = ledger.mark_built_at_merge((finding.finding_id,), checkpoint, style_ledger.ReadByPerson("reader"))
+        self.assertIsInstance(ledger.proposal_findings(issue)[0].state, style_ledger.Built)
+
+    def test_identical_sibling_cannot_satisfy_current_admission_with_a_saved_base(self) -> None:
+        from test_approved_renames import IDENTICAL_BINDING_ITEMS
+        self.assert_outer_scope_refuses_built(
+            IDENTICAL_BINDING_ITEMS, 2, "rename blocked by outer binding 'checkout_info' at line 1",
+            edited=IDENTICAL_BINDING_ITEMS.replace("first()", "first(checkout_info: usize)").replace("|g| g", "|checkout_info| checkout_info", 1))
+
+    def test_identical_sibling_cannot_satisfy_current_admission_without_a_saved_base(self) -> None:
+        from test_approved_renames import IDENTICAL_BINDING_ITEMS
+        self.assert_outer_scope_refuses_built(
+            IDENTICAL_BINDING_ITEMS, 2, "rename blocked by outer binding 'checkout_info' at line 1", clear_base=True,
+            edited=IDENTICAL_BINDING_ITEMS.replace("first()", "first(checkout_info: usize)").replace("|g| g", "|checkout_info| checkout_info", 1))
+
+    def test_duplicate_item_path_refuses_every_built_boundary(self) -> None:
+        from test_approved_renames import DUPLICATE_BINDING_ITEM_PATH
+        self.assert_outer_scope_refuses_built(
+            DUPLICATE_BINDING_ITEM_PATH, 2, "recorded item path is not unique in current source", unproved=True,
+            edited=DUPLICATE_BINDING_ITEM_PATH.replace("|g| g", "|checkout_info| checkout_info", 1))
+
+    def test_proven_capture_edits_build_at_each_built_boundary(self) -> None:
+        from test_approved_renames import CAPTURE_BINDING_ITEM
+        for boundary in ("ticket_merge", "mark_built", "mark_built_at_merge"):
+            with self.subTest(boundary=boundary):
+                case = StyleLedgerFindingsTests()
+                case.setUp()
+                try:
+                    ledger, issue, _ = case.binding_ticket(CAPTURE_BINDING_ITEM, ((2, "g", "checkout_info"),))
+                    finding, = ledger.proposal_findings(issue)
+                    case.write(case.sources[0], CAPTURE_BINDING_ITEM.replace("g =", "checkout_info =").replace("{g}", "{checkout_info}"))
+                    checkpoint = case.commit("Apply precisely proved format capture rename")
+                    ledger.set_tip(checkpoint, "main")
+                    ledger.ticket_checkpoint("names-1", checkpoint)
+                    self.assertEqual(ledger.applied_check(finding, checkpoint), AppliedInCode())
+                    if boundary == "ticket_merge":
+                        self.assertEqual(ledger.ticket_merge("names-1"), ())
+                    else:
+                        with closing(sqlite3.connect(ledger.database)) as connection, connection:
+                            _ = connection.execute("UPDATE tickets SET state='merged' WHERE id='names-1'")
+                        ledger = case.ledger()
+                        if boundary == "mark_built":
+                            ledger.mark_built(finding.finding_id)
+                        else:
+                            built = ledger.mark_built_at_merge((finding.finding_id,), checkpoint, style_ledger.NotReadByPerson())
+                            self.assertEqual(tuple(item.finding_id for item in built), (finding.finding_id,))
+                    self.assertIsInstance(ledger.proposal_findings(issue)[0].state, style_ledger.Built)
+                finally:
+                    case.tearDown()
+                    case.doCleanups()
+
+    def test_a_later_outer_binding_cannot_build_using_an_anchor_without_a_saved_base(self) -> None:
+        self.assert_outer_scope_refuses_built(
+            "fn label() {\n    map(|g| g + 1)\n}\n", 2,
+            "rename blocked by outer binding 'checkout_info' at line 1", clear_base=True,
+            edited="fn label(checkout_info: usize) {\n    map(|g| g + 1)\n}\n")
+
+    def test_an_applied_rename_without_a_saved_base_keeps_later_current_bindings_visible(self) -> None:
+        self.assert_outer_scope_refuses_built(
+            "fn label() {\n    map(|g| g + 1)\n}\n", 2,
+            "rename blocked by outer binding 'checkout_info' at line 1", clear_base=True,
+            edited="fn label(checkout_info: usize) {\n    map(|checkout_info| checkout_info + 1)\n}\n")
+
+    def test_unidentified_current_rename_edits_never_build_using_the_historical_item(self) -> None:
+        self.assert_outer_scope_refuses_built(
+            "fn label() {\n    map(|g| g + 1)\n}\n", 2,
+            "finding text is absent", unproved=True, clear_base=True,
+            edited="fn label() {\n    map(|checkout_info| checkout_info + 2)\n}\n")
+
+    def test_a_later_outer_binding_survives_undoing_an_applied_rename_at_every_built_boundary(self) -> None:
+        self.assert_outer_scope_refuses_built(
+            "fn label() {\n    map(|g| g + 1)\n}\n", 2,
+            "rename blocked by outer binding 'checkout_info' at line 1",
+            edited="fn label(checkout_info: usize) {\n    map(|checkout_info| checkout_info + 1)\n}\n")
+
+    def test_impl_and_trait_inner_attributes_refuse_every_built_boundary(self) -> None:
+        from test_approved_renames import INHERITED_INNER_ATTRIBUTES
+        for label, source in INHERITED_INNER_ATTRIBUTES:
+            with self.subTest(scope=label):
+                case = StyleLedgerFindingsTests()
+                case.setUp()
+                try:
+                    case.assert_outer_scope_refuses_built(
+                        source, 2, "unresolved attribute macro 'inject' at line 1", unproved=True,
+                        edited=source.replace("|g| g", "|checkout_info| checkout_info"))
+                finally:
+                    case.tearDown()
+                    case.doCleanups()
+
+    def test_absent_local_text_cannot_build_through_merge_or_either_person_entry_point(self) -> None:
+        self.assert_outer_scope_refuses_built(
+            "fn label(checkout_info: usize) {\n    map(|g| g + 1)\n}\n", 2,
+            "rename blocked by outer binding 'checkout_info' at line 1", stale=True)
+
+    def test_stale_local_admission_without_a_saved_ticket_base_stays_terminal(self) -> None:
+        self.assert_outer_scope_refuses_built(
+            "fn label(checkout_info: usize) {\n    map(|g| g + 1)\n}\n", 2,
+            "rename blocked by outer binding 'checkout_info' at line 1", stale=True, clear_base=True)
+
+    def test_no_saved_base_cannot_make_an_unproved_local_target_built(self) -> None:
+        self.assert_outer_scope_refuses_built(
+            "fn label() {\n    map(|g| g + 1)\n}\n", 2,
+            "finding text is absent", unproved=True, stale=True, clear_base=True)
+
+    def test_absent_local_text_without_a_blocker_still_cannot_be_read_as_built(self) -> None:
+        self.assert_outer_scope_refuses_built(
+            "fn label() {\n    map(|g| g + 1)\n}\n", 2,
+            "finding text is absent", unproved=True, stale=True)
+
+    def test_an_inherited_inner_attribute_never_allows_a_finding_to_build(self) -> None:
+        self.assert_outer_scope_refuses_built(
+            "mod outer { #![inject] fn label() {\n    map(|g| g + 1)\n} }\n", 2,
+            "unresolved attribute macro 'inject' at line 1", unproved=True)
+
+    def test_presence_refusals_persist_reopen_and_cannot_be_marked_built(self) -> None:
+        from test_approved_renames import PRESENCE_REFUSALS
+        for label, source, line, expected in PRESENCE_REFUSALS:
+            with self.subTest(form=label):
+                # Each row uses a separate test fixture, with the existing ticket setup.
+                case = StyleLedgerFindingsTests()
+                case.setUp()
+                try:
+                    ledger, issue, base = case.binding_ticket(source, ((line, "g", "checkout_info"),))
+                    finding, = ledger.proposal_findings(issue)
+                    ledger.set_tip(base, "main")
+                    ledger.ticket_checkpoint("names-1", base)
+                    _ = ledger.ticket_merge("names-1")
+                    current, = ledger.proposal_findings(issue)
+                    self.assertIsInstance(current.rename_disposition, expected)
+                    self.assertEqual(current.state, style_ledger.Filed(issue))
+                    self.assertIsInstance(current.build_ticket, style_ledger.NoBuildTicket)
+                    assert isinstance(current.rename_disposition, style_ledger.OuterBindingBlocked | style_ledger.OuterBindingUnproved)
+                    reason = current.rename_disposition.reason
+                    ledger = case.ledger()
+                    self.assertEqual(ledger.named_held((finding.finding_id,))[0].rename_disposition,
+                                     current.rename_disposition)
+                    with closing(sqlite3.connect(ledger.database)) as connection, connection:
+                        _ = connection.execute("UPDATE held_findings SET build_ticket='names-1' WHERE finding_id=?",
+                                               (finding.finding_id,))
+                    for _ in range(2):
+                        before = ledger.database.read_bytes()
+                        with self.assertRaisesRegex(style_ledger.LedgerError, re.escape(reason)):
+                            ledger.mark_built(finding.finding_id)
+                        self.assertEqual(ledger.database.read_bytes(), before)
+                    with self.assertRaisesRegex(style_ledger.LedgerError, re.escape(reason)):
+                        _ = ledger.mark_built_at_merge((finding.finding_id,), base, style_ledger.ReadByPerson("reader"))
+                finally:
+                    case.tearDown()
+                    case.doCleanups()
+
+    def test_comparison_before_an_unread_binding_cannot_be_marked_built(self) -> None:
+        self.assert_outer_scope_refuses_built(
+            "fn label() { let flag = left < right; introduce!(checkout_info);\n    map(|g| g + 1)\n}\n", 2,
+            "unresolved bang macro 'introduce' at line 1", unproved=True)
+
+    def test_unparsed_enclosing_condition_cannot_be_marked_built(self) -> None:
+        self.assert_outer_scope_refuses_built(
+            "fn label() {\n    if let Some(checkout_info) = if flag { value } else { other } {\n"
+            + "        map(|g| g + 1);\n    }\n}\n", 3,
+            "wanted name already used in this item: 'checkout_info' at line 2", unproved=True)
+
+    def test_preceding_enclosing_macro_cannot_be_marked_built(self) -> None:
+        self.assert_outer_scope_refuses_built(
+            "fn label() { introduce!(checkout_info);\n    map(|g| g + 1)\n}\n", 2,
+            "unresolved bang macro 'introduce' at line 1", unproved=True)
+
+    def test_unread_binding_in_another_function_does_not_stop_an_applied_rename_building(self) -> None:
+        source = ("fn earlier() { if let Some(checkout_info) = value::<{ 1 }>() { consume(checkout_info); } }\n"
+                  "fn label() {\n    map(|g| g + 1)\n}\n")
+        ledger, issue, _ = self.binding_ticket(source, ((3, "g", "checkout_info"),))
+        self.write(self.sources[0], source.replace("|g| g", "|checkout_info| checkout_info"))
+        checkpoint = self.commit("Apply a rename outside the unread sibling function")
+        ledger.set_tip(checkpoint, "main")
+        ledger.ticket_checkpoint("names-1", checkpoint)
+        _ = ledger.ticket_merge("names-1")
+        finding, = ledger.proposal_findings(issue)
+        # The existing file-wide duplicate-name guard still requires a person's
+        # read; unrelated scope uncertainty must not override that read as a block.
+        try:
+            built = ledger.mark_built_at_merge((finding.finding_id,), checkpoint, style_ledger.ReadByPerson("reader"))
+        except style_ledger.LedgerError as error:
+            self.fail(f"unrelated scope refused the applied rename: {error}")
+        self.assertEqual(tuple(item.finding_id for item in built), (finding.finding_id,))
+        finding, = ledger.proposal_findings(issue)
+        self.assertIsInstance(finding.state, style_ledger.Built)
+
+    def assert_outer_scope_refuses_built(self, source: str, line: int, reason: str, *,
+                                       unproved: bool = False, stale: bool = False, clear_base: bool = False,
+                                       edited: str = "") -> None:
+        ledger, issue, base = self.binding_ticket(source, ((line, "g", "checkout_info"),))
+        finding, = ledger.proposal_findings(issue)
+        if stale:
+            with closing(sqlite3.connect(ledger.database)) as connection, connection:
+                _ = connection.execute("UPDATE held_findings SET text=? WHERE finding_id=?",
+                                       (finding.text + " // stale judgment", finding.finding_id))
+            ledger = self.ledger()
+            finding, = ledger.proposal_findings(issue)
+        if clear_base:
+            with closing(sqlite3.connect(ledger.database)) as connection, connection:
+                _ = connection.execute("UPDATE tickets SET base='' WHERE id='names-1'")
+            ledger = self.ledger()
+            finding, = ledger.proposal_findings(issue)
+        if edited:
+            self.write(self.sources[0], edited)
+            base = self.commit("Current item after the finding was recorded")
+        ledger.set_tip(base, "main")
+        ledger.ticket_checkpoint("names-1", base)
+        if clear_base:
+            self.assertEqual(ledger.applied_check(finding, base), NoAppliedCheck("rename"))
+        elif stale:
+            self.assertIsInstance(ledger.applied_check(finding, base),
+                                  style_ledger.OuterBindingBlocked | style_ledger.OuterBindingUnproved)
+        not_built = ledger.ticket_merge("names-1")
+        self.assertEqual(len(not_built), 1)
+        current, = ledger.proposal_findings(issue)
+        self.assertEqual(current.state, style_ledger.Filed(issue))
+        if unproved:
+            self.assertNotIsInstance(not_built[0].cause, NoAppliedCheck)
+            self.assertIsInstance(not_built[0].cause, style_ledger.OuterBindingUnproved)
+        else:
+            self.assertIsInstance(current.rename_disposition, style_ledger.OuterBindingBlocked)
+            assert isinstance(current.rename_disposition, style_ledger.OuterBindingBlocked)
+            self.assertEqual(current.rename_disposition.reason, reason)
+        ledger = self.ledger()
+        with self.assertRaisesRegex(style_ledger.LedgerError, re.escape(reason)):
+            _ = ledger.mark_built_at_merge((finding.finding_id,), base, style_ledger.ReadByPerson("reader"))
+        # A legacy skipped finding can still name its merged build ticket.
+        with closing(sqlite3.connect(ledger.database)) as connection, connection:
+            _ = connection.execute("UPDATE held_findings SET build_ticket='names-1' WHERE finding_id=?",
+                                   (finding.finding_id,))
+        with self.assertRaisesRegex(style_ledger.LedgerError, re.escape(reason)):
+            ledger.mark_built(finding.finding_id)
+        self.assertEqual(ledger.named_held((finding.finding_id,))[0].state, style_ledger.Filed(issue))
+        rows = self.held_rows(ledger.database)
+        with self.assertRaisesRegex(style_ledger.LedgerError, re.escape(reason)):
+            ledger.mark_built(finding.finding_id)
+        self.assertEqual(self.held_rows(ledger.database), rows)
+
+    def test_same_line_outer_bindings_cannot_be_marked_built(self) -> None:
+        self.assert_outer_scope_refuses_built(
+            "fn label(checkout_info: usize) { let checkout_info = 1;\n    map(|g| g + 1)\n}\n", 2,
+            "rename blocked by outer binding 'checkout_info' at line 1")
+
+    def test_raw_outer_binding_cannot_be_marked_built(self) -> None:
+        self.assert_outer_scope_refuses_built(
+            "fn label(r#checkout_info: usize) {\n    map(|g| g + 1)\n}\n", 2,
+            "rename blocked by outer binding 'checkout_info' at line 1")
+
+    def test_undecidable_outer_binding_visibility_cannot_be_overridden_as_built(self) -> None:
+        self.assert_outer_scope_refuses_built(
+            "fn label() {\n    if let Some(checkout_info) = value::<{ 1 }>() {\n        map(|g| g + 1);\n    }\n}\n", 3,
+            "wanted name already used in this item: 'checkout_info' at line 2", unproved=True)
+
+    def test_a_blocked_closure_stays_filed_with_an_idempotent_disposition_while_another_rename_builds(self) -> None:
+        source = ("fn label(checkout_info: usize) -> usize {\n"
+                  "    let other = 1;\n    map(|g| g + other)\n}\n")
+        ledger, issue, _ = self.binding_ticket(source, ((3, "g", "checkout_info"), (2, "other", "count")))
+        self.write(self.sources[0], source.replace("other", "count"))
+        checkpoint = self.commit("Apply only the unblocked binding")
+        ledger.set_tip(checkpoint, "main")
+        ledger.ticket_checkpoint("names-1", checkpoint)
+        not_built = ledger.ticket_merge("names-1")
+        blocked = next(f for f in ledger.proposal_findings(issue) if f.before == "g")
+        built = next(f for f in ledger.proposal_findings(issue) if f.before == "other")
+        self.assertIsInstance(blocked.rename_disposition, style_ledger.OuterBindingBlocked)
+        assert isinstance(blocked.rename_disposition, style_ledger.OuterBindingBlocked)
+        self.assertEqual((blocked.rename_disposition.name, blocked.rename_disposition.line), ("checkout_info", 1))
+        self.assertEqual(blocked.state, style_ledger.Filed(issue))
+        self.assertIsInstance(blocked.build_ticket, style_ledger.NoBuildTicket)
+        self.assertIsInstance(built.state, style_ledger.Built)
+        self.assertEqual(not_built, (style_ledger.FindingNotBuilt(blocked.finding_id, blocked.rename_disposition),))
+        rows = self.held_rows(ledger.database)
+        with closing(sqlite3.connect(ledger.database)) as connection:
+            dispositions = connection.execute("SELECT * FROM rename_outer_binding_blocks").fetchall()
+        self.assertEqual(ledger.ticket_merge("names-1"), ())
+        ledger.record_rename_block(blocked.finding_id, blocked.rename_disposition)
+        self.assertEqual(self.held_rows(ledger.database), rows)
+        with closing(sqlite3.connect(ledger.database)) as connection:
+            self.assertEqual(connection.execute("SELECT * FROM rename_outer_binding_blocks").fetchall(), dispositions)
+        # A reopened ledger must retain the ticket proof after the claim was cleared.
+        ledger = self.ledger()
+        # Even a person's explicit built operation cannot override a proven scope block.
+        with self.assertRaisesRegex(style_ledger.LedgerError, "blocked by outer binding 'checkout_info'"):
+            _ = ledger.mark_built_at_merge((blocked.finding_id,), checkpoint, style_ledger.ReadByPerson("reader"))
+        self.assertEqual(ledger.named_held((blocked.finding_id,))[0].state, style_ledger.Filed(issue))
+        # Old skipped rows can still name their merged ticket, as the live incident did.
+        with closing(sqlite3.connect(ledger.database)) as connection, connection:
+            _ = connection.execute("UPDATE held_findings SET build_ticket='names-1' WHERE finding_id=?",
+                                   (blocked.finding_id,))
+        with self.assertRaisesRegex(style_ledger.LedgerError, "blocked by outer binding 'checkout_info'"):
+            ledger.mark_built(blocked.finding_id)
+        self.assertEqual(ledger.named_held((blocked.finding_id,))[0].state, style_ledger.Filed(issue))
+
+    def test_bulk_release_records_a_blocked_binding_and_keeps_it_visible_to_refill(self) -> None:
+        source = "fn label(checkout_info: usize) -> usize {\n    map(|g| g + 1)\n}\n"
+        ledger, issue, _ = self.binding_ticket(source, ((2, "g", "checkout_info"),))
+        finding, = ledger.proposal_findings(issue)
+        reason = "rename blocked by outer binding 'checkout_info' at line 1"
+        released = ledger.bulk_release("names-1", {finding.finding_id: reason})
+        current, = ledger.proposal_findings(issue)
+        self.assertIsInstance(current.rename_disposition, style_ledger.OuterBindingBlocked)
+        self.assertEqual(current.state, style_ledger.Filed(issue))
+        self.assertIsInstance(current.build_ticket, style_ledger.NoBuildTicket)
+        rows = self.held_rows(ledger.database)
+        self.assertEqual(ledger.bulk_release("names-1", {finding.finding_id: reason}), released)
+        self.assertEqual(self.held_rows(ledger.database), rows)
+
     def test_restored_body_cannot_fall_back_to_an_older_clean_judgment(self) -> None:
         rule = self.rule("restored-clean")
         path = self.sources[0]
@@ -285,7 +904,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
             _ = ledger.ticket_merge("names-1")
         self.assertEqual(self.built_time(ledger, ids[0]), "2026-10-27T10:00:00+00:00")
 
-
     def test_declaration_follow_sets_built_at_once(self) -> None:
         ledger = self.ledger()
         finding_id = self.renamed_parent(ledger)
@@ -298,7 +916,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
             _ = self.follow_approved(ledger, [finding_id])
         self.assertEqual(self.built_time(ledger, finding_id), "2026-10-27T10:00:00+00:00")
 
-
     def test_held_built_sets_built_at_once_and_reopening_clears_it(self) -> None:
         ledger, finding_id, _, _ = self.checkpointed_type_findings()
         with mock.patch.object(style_ledger, "_now", return_value="2026-10-27T10:00:00+00:00"):
@@ -309,7 +926,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
         self.assertEqual(self.built_time(ledger, finding_id), "2026-10-27T10:00:00+00:00")
         ledger.return_to_filed({finding_id: style_ledger.ReadByPerson("reader")})
         self.assertEqual(self.built_time(ledger, finding_id), "")
-
 
     def test_mark_built_at_merge_sets_built_at_once(self) -> None:
         _, _, ids = self.decision_findings()
@@ -325,7 +941,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
                 _ = ledger.mark_built_at_merge(ids[:1], tip, style_ledger.ReadByPerson("other"))
         self.assertEqual(self.built_time(ledger, ids[0]), "2026-10-27T10:00:00+00:00")
 
-
     def test_withdrawing_a_built_duplicate_clears_its_built_at(self) -> None:
         _, issue, ids = self.decision_findings()
         self.write(self.sources[0], "pub enum Outcome { New }\n")
@@ -340,7 +955,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
         states = {finding.finding_id: finding.state for finding in ledger.proposal_findings(issue)}
         self.assertEqual(states[ids[0]], style_ledger.Withdrawn(issue, style_ledger.DuplicateOf(ids[1])))
 
-
     def test_record_held_refuses_a_cell_with_no_findings(self) -> None:
         rule = self.rule("read")
         self.set_tip(self.initial_tip)
@@ -351,7 +965,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
         self.assertIn(self.sources[0], result.stderr)
         self.assertIn("held add", result.stderr)
         self.assertEqual(self.states(rule)[self.sources[0]], "open")
-
 
     def test_record_held_names_inactive_findings_and_keeps_the_users_waiver(self) -> None:
         rule = self.rule("read")
@@ -365,7 +978,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
             self.assertIn(words, result.stderr)
         self.assertIsInstance(self.ledger().named_held((finding,))[0].state, style_ledger.Waived)
         self.assertEqual(self.states(rule)[self.sources[0]], "open")
-
 
     def test_record_held_accepts_unfiled_and_filed_findings_only_on_the_matching_cell(self) -> None:
         rule = self.rule("read")
@@ -381,7 +993,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
             with self.subTest(rule=wrong_rule, path=wrong_path):
                 with self.assertRaises(style_ledger.LedgerError):
                     ledger.record(wrong_rule, wrong_path, self.initial_tip, self.blob(wrong_rule), "held")
-
 
     def test_record_held_reports_built_and_withdrawn_findings_without_counting_them_as_live(self) -> None:
         rule = self.rule("read")
@@ -402,7 +1013,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
             self.assertIn(words, str(refused.exception))
         self.assertEqual(ledger.latest_held_judgments(), {})
 
-
     def test_record_held_maps_manifest_findings_to_their_crate_cell(self) -> None:
         rule = self.rule("manifest", "tier: D\nfamily: modules\ninput_scope: manifest\n")
         self.set_tip(self.initial_tip)
@@ -412,7 +1022,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
         self.assertEqual(self.states(rule)["crates/alpha"], "current")
         with self.assertRaises(style_ledger.LedgerError):
             ledger.record(rule, "crates/beta", self.initial_tip, self.blob(rule), "held")
-
 
     def test_unwaiving_a_finding_restores_a_worker_recorded_waived_verdict_to_held(self) -> None:
         rule = self.rule("read")
@@ -425,7 +1034,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
         self.assertEqual(ledger.unwaive_held((finding,), style_ledger.WaiveUndoneBy("ana")), (finding,))
         self.assertIsInstance(ledger.named_held((finding,))[0].state, style_ledger.Unfiled)
         self.assertEqual(ledger.latest_held_judgments(), {(rule, self.sources[0]): self.initial_tip})
-
 
     def test_preview_ledger_migrates_and_changes_only_a_temporary_copy(self) -> None:
         rule = self.rule("preview")
@@ -458,7 +1066,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
         self.assertEqual(version, (10,))
         self.assertEqual(state, ("filed",))
 
-
     def test_preview_ledger_does_not_create_missing_state(self) -> None:
         state = self.root / "state"
         with style_ledger.preview_ledger(self.repo) as ledger:
@@ -466,7 +1073,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
             preview_database = ledger.database
         self.assertFalse(state.exists())
         self.assertFalse(preview_database.exists())
-
 
     def test_decision_merge_builds_only_its_ticket_findings(self) -> None:
         rule, issue, ids = self.decision_findings()
@@ -486,7 +1092,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
         self.assertEqual(findings[1].state, style_ledger.Filed(issue))
         self.assertIsInstance(findings[1].build_ticket, style_ledger.NoBuildTicket)
 
-
     def test_decision_merge_builds_an_applied_rename_and_files_an_unapplied_one_again(self) -> None:
         rule, issue, ids = self.decision_findings()
         ledger = self.ledger()
@@ -505,7 +1110,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
         self.assertEqual(unbuilt.state, style_ledger.Filed(issue))
         self.assertIsInstance(unbuilt.build_ticket, style_ledger.NoBuildTicket)
 
-
     def test_binding_merge_keeps_unapplied_and_unproved_findings_filed(self) -> None:
         source = "fn f() {\n    let old = input;\n    consume(old);\n    let second = input;\n    consume(second);\n}\n"
         ledger, issue, _ = self.binding_ticket(source, ((2, "old", "fresh"), (4, "second", "next")))
@@ -520,7 +1124,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
         _ = ledger.ticket_merge("names-1")
         self.assertTrue(all(isinstance(f.state, style_ledger.Filed) for f in ledger.proposal_findings(issue)))
 
-
     def test_binding_check_needs_a_build_ticket_with_a_saved_base(self) -> None:
         source = "fn f() {\n    let old = input;\n    consume(old);\n}\n"
         ledger, issue, _ = self.binding_ticket(source, ((2, "old", "fresh"),))
@@ -534,7 +1137,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
         finding, = ledger.proposal_findings(issue)
         self.assertIsInstance(finding.build_ticket, style_ledger.NoBuildTicket)
         self.assertEqual(ledger.applied_check(finding, checkpoint), NoAppliedCheck("rename"))
-
 
     def test_a_file_rename_check_reads_which_file_is_at_the_commit(self) -> None:
         finding, _ = self.file_rename_finding()
@@ -555,12 +1157,10 @@ class StyleLedgerFindingsTests(LedgerTestCase):
         with self.assertRaises(style_ledger.CheckCouldNotRun):
             _ = ledger.applied_check(finding, "0" * 40)
 
-
     def test_a_folder_at_the_commit_reads_as_a_folder(self) -> None:
         self.write("ledger/lock/guard.rs", "pub struct Guard;\n")
         commit = self.commit("Add the guard module")
         self.assertEqual(self.ledger()._file_at(commit, "ledger/lock"), Folder())  # pyright: ignore[reportPrivateUsage]
-
 
     def test_decision_merge_builds_a_file_rename_only_when_it_is_applied(self) -> None:
         finding, issue = self.file_rename_finding()
@@ -585,7 +1185,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
                 self.assertEqual(output, "")
                 self.assertIsInstance(held.state, style_ledger.Built)
 
-
     def test_decision_merge_leaves_a_type_finding_filed_until_a_person_marks_it_built(self) -> None:
         rule, issue, _ = self.decision_findings()
         ledger = self.ledger()
@@ -607,7 +1206,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
         held = next(item for item in self.ledger().proposal_findings(issue) if item.finding_id == finding.finding_id)
         self.assertIsInstance(held.state, style_ledger.Built)
 
-
     def test_a_rerun_of_ticket_merge_prints_the_findings_that_wait_for_a_person_again(self) -> None:
         rule, issue, _ = self.decision_findings()
         ledger = self.ledger()
@@ -624,7 +1222,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
         self.assertEqual(self.cli("ticket", "merge", "--id", "names-1").stdout, line)
         _ = self.cli("held", "built", "--id", finding.finding_id)
         self.assertEqual(self.cli("ticket", "merge", "--id", "names-1").stdout, "")
-
 
     def test_held_replace_reopens_the_same_finding_and_restores_its_waived_cell(self) -> None:
         rule = self.rule("replace")
@@ -649,7 +1246,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
         self.assertEqual(ledger.latest_held_judgments(), {(rule, self.sources[0]): self.initial_tip})
         self.record(rule, self.sources[0], self.initial_tip, "held", ticket="read-1")
 
-
     def test_held_add_keeps_a_waive_until_explicit_replace(self) -> None:
         rule = self.rule("replace")
         self.set_tip(self.initial_tip)
@@ -661,7 +1257,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
         self.assertEqual(self.held_rows(ledger.database), before)
         _ = self.cli("held", "replace", "--id", finding_id, "--after", "corrected")
         self.assertEqual(ledger.named_held((finding_id,))[0].after, "corrected")
-
 
     def test_hold_of_a_different_change_at_a_held_site_gets_its_own_row(self) -> None:
         rule = self.rule("change-ids")
@@ -697,7 +1292,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
                 self.assertEqual(len(self.held_rows(ledger.database)), count)
                 kept, = ledger.named_held((today,))
                 self.assertEqual((kept.kind, kept.before, kept.after), change)
-
 
     def test_hold_returns_its_change_when_another_writer_changes_the_row_after_the_commit(self) -> None:
         rule = self.rule("change-race")
@@ -735,12 +1329,10 @@ class StyleLedgerFindingsTests(LedgerTestCase):
         self.assertEqual(len(self.held_rows(ledger.database)), 2)
         self.assertEqual(ledger.named_held((first.finding_id,))[0].after, "other")
 
-
     def test_held_replace_refuses_an_unknown_id(self) -> None:
         result = self.cli("held", "replace", "--id", "missing", "--after", "new", success=False)
         self.assertEqual(result.returncode, 2)
         self.assertEqual(result.stderr.strip(), "style_ledger: unknown held finding missing")
-
 
     def test_decline_keeps_a_nonempty_actor_when_it_overrides_a_unit_waive(self) -> None:
         rule = self.rule("decline-actor")
@@ -754,7 +1346,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
             self.assertEqual(connection.execute("SELECT waive_provenance,waived_by FROM held_findings WHERE finding_id=?",
                                                 (finding_id,)).fetchone(), ("person", "user"))
         self.assertEqual(ledger.named_held((finding_id,))[0].waive_actor, style_ledger.WaiveByPerson("user"))
-
 
     def test_decline_rejects_a_unit_and_keeps_person_and_ledger_waives_protected(self) -> None:
         rule = self.rule("decline-protection")
@@ -778,7 +1369,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
                     _ = ledger.replace_held(finding_id, "corrected")
                 self.assertEqual(ledger.database.read_bytes(), before)
 
-
     def test_held_replace_refuses_a_ledger_waive_without_writing(self) -> None:
         rule = self.rule("ledger-waive")
         self.set_tip(self.initial_tip)
@@ -795,7 +1385,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
                 self.assertIn(finding_id, result.stderr)
                 self.assertIn("ledger", result.stderr)
                 self.assertEqual(ledger.database.read_bytes(), before)
-
 
     def test_held_replace_preserves_person_waives_and_replaces_only_a_unit_waive(self) -> None:
         rule = self.rule("waive-origin")
@@ -826,7 +1415,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
         unit, = ledger.named_held((unit_id,))
         self.assertEqual((unit.after, unit.state), ("corrected", style_ledger.Unfiled()))
 
-
     def test_held_waive_records_the_caller_and_replace_protects_a_person(self) -> None:
         rule = self.rule("explicit-waive")
         self.set_tip(self.initial_tip)
@@ -854,7 +1442,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
         self.assertEqual((replaced.finding_id, replaced.after, replaced.state),
                          (unit_id, "corrected", style_ledger.Unfiled()))
 
-
     def test_held_waive_requires_exactly_one_nonblank_actor(self) -> None:
         rule = self.rule("waive-actor")
         finding_id = self.hold_finding(rule, 1)
@@ -875,7 +1462,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
                     self.assertIn("requires a", result.stderr)
                 self.assertEqual(ledger.database.read_bytes(), before)
 
-
     def test_a_persons_explicit_waive_protects_an_existing_unit_waive(self) -> None:
         rule = self.rule("repeat-waive")
         finding_id = self.hold_finding(rule, 1)
@@ -890,7 +1476,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
         with self.assertRaisesRegex(style_ledger.LedgerError, finding_id + ".*person"):
             _ = ledger.replace_held(finding_id, "corrected")
         self.assertEqual(ledger.database.read_bytes(), before)
-
 
     def test_held_replace_requires_and_records_a_person_for_an_unrecorded_waive(self) -> None:
         rule = self.rule("legacy-replace")
@@ -914,7 +1499,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
                          (finding_id, "corrected", style_ledger.Unfiled(), style_ledger.WaiveUndoneBy("ana")))
         self.assertEqual(ledger.latest_held_judgments(), {(rule, self.sources[0]): self.initial_tip})
 
-
     def test_held_replace_refuses_each_non_waived_state_without_writes(self) -> None:
         _, _, ids = self.decision_findings()
         self.set_tip(self.initial_tip)
@@ -928,7 +1512,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
                 self.assertEqual(result.returncode, 2)
                 self.assertEqual(result.stderr.strip(), f"style_ledger: {ids[0]}: cannot replace a {state} finding")
                 self.assertEqual(self.held_rows(ledger.database), before)
-
 
     def test_held_replace_refuses_legacy_waives_without_unit_provenance(self) -> None:
         rule = self.rule("legacy-waive")
@@ -959,7 +1542,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
         migrated.waive_held(finding_id, style_ledger.WaiveByUnit("external-1"))
         self.assertEqual(migrated.named_held((finding_id,))[0].waive_provenance, style_ledger.WaiveProvenance.UNRECORDED)
 
-
     def test_held_replace_does_not_create_or_overwrite_other_cell_verdicts(self) -> None:
         rule = self.rule("replace")
         self.set_tip(self.initial_tip)
@@ -973,7 +1555,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
                 _ = self.cli("held", "replace", "--id", finding_id, "--after", "Outcome::Correct")
                 self.assertEqual(ledger.latest_held_judgments(), {})
                 self.assertEqual(self.states(rule)[self.sources[0]], "open" if verdict == "missing" else "current")
-
 
     def test_held_add_of_a_built_row_names_reopen_only_when_its_rename_is_not_in_the_code(self) -> None:
         rule, issue, ids = self.decision_findings()
@@ -998,7 +1579,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
         self.assertEqual([finding.state for finding in self.ledger().proposal_findings(issue)],
                          [style_ledger.Built(issue), style_ledger.Built(issue)])
 
-
     def test_held_add_of_a_built_row_that_a_person_read_names_no_reopen(self) -> None:
         rule, issue, ids = self.decision_findings()
         self.write(self.sources[1], "pub enum Outcome { Old }\n")
@@ -1015,7 +1595,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
         )
         self.assertEqual((result.stdout, result.stderr), (ids[1] + "\n", ""))
         self.assertEqual(self.ledger().proposal_findings(issue)[1].reading, style_ledger.ReadByPerson("nate"))
-
 
     def test_a_ticket_merge_that_finds_the_rename_applied_clears_a_person_reading(self) -> None:
         rule, issue, ids = self.decision_findings()
@@ -1036,13 +1615,11 @@ class StyleLedgerFindingsTests(LedgerTestCase):
         self.assertEqual((held.finding_id, held.state, held.reading),
                          (ids[0], style_ledger.Built(issue), style_ledger.NotReadByPerson()))
 
-
     def test_held_built_refuses_a_finding_with_no_merged_build_ticket(self) -> None:
         _, issue, ids = self.decision_findings()
         result = self.cli("held", "built", "--id", ids[0], success=False)
         self.assertEqual((result.returncode, result.stderr.strip()), (2, f"style_ledger: {ids[0]}: no merged build ticket"))
         self.assertEqual(self.ledger().proposal_findings(issue)[0].state, style_ledger.Filed(issue))
-
 
     def test_held_built_refuses_a_rename_not_applied_at_its_build_ticket_checkpoint(self) -> None:
         rule, issue, ids = self.decision_findings()
@@ -1065,7 +1642,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
             ledger.mark_built(ids[1])
         self.assertEqual(ledger.proposal_findings(issue)[1].state, style_ledger.Filed(issue))
 
-
     def test_held_built_at_a_merge_refuses_a_commit_off_the_synced_branch(self) -> None:
         _, issue, ids = self.decision_findings()
         self.write(self.sources[0], "pub enum Outcome { New }\n")
@@ -1076,7 +1652,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
                 result = self.cli("held", "built", "--id", ids[0], "--commit", merge, success=False)
                 self.assertEqual((result.returncode, result.stderr.strip()), (2, f"style_ledger: {error}"))
         self.assertEqual(self.ledger().proposal_findings(issue)[0].state, style_ledger.Filed(issue))
-
 
     def test_held_built_at_a_merge_refuses_a_merge_older_than_the_commit_the_finding_was_judged_at(self) -> None:
         rule, _, ids = self.decision_findings()
@@ -1093,7 +1668,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
         self.assertEqual((result.returncode, result.stderr.strip()),
                          (2, f"style_ledger: {ids[0]}: {self.initial_tip} is older than {judged[:7]}, where the finding was judged"))
         self.assertEqual(self.held_rows(ledger.database), before)
-
 
     def test_held_built_at_a_merge_refuses_every_id_when_one_is_refused(self) -> None:
         rule, issue, ids = self.decision_findings()
@@ -1116,7 +1690,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
                 self.assertEqual((result.returncode, result.stderr.strip()), (2, f"style_ledger: {error}"))
                 self.assertEqual(self.held_rows(ledger.database), before)
 
-
     def test_held_built_at_a_merge_marks_an_applied_rename_built_and_clears_a_reading(self) -> None:
         _, issue, ids = self.decision_findings()
         self.write(self.sources[0], "pub enum Outcome { New }\n")
@@ -1131,7 +1704,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
         held = {finding.finding_id: (finding.state, finding.reading) for finding in self.ledger().proposal_findings(issue)}
         self.assertEqual(held, {ids[0]: (style_ledger.Built(issue), style_ledger.NotReadByPerson()),
                                 ids[1]: (style_ledger.Filed(issue), style_ledger.NotReadByPerson())})
-
 
     def test_held_built_at_a_merge_needs_a_person_for_a_type_finding_and_records_who_read_it(self) -> None:
         rule, issue, _ = self.decision_findings()
@@ -1156,7 +1728,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
         held = next(item for item in self.ledger().proposal_findings(issue) if item.finding_id == finding.finding_id)
         self.assertEqual((held.state, held.reading), (style_ledger.Built(issue), style_ledger.ReadByPerson("nate")))
 
-
     def test_held_built_at_a_merge_refuses_a_merge_without_the_build_ticket_checkpoint(self) -> None:
         ledger, finding_id, _, checkpoint = self.checkpointed_type_findings()
         with closing(sqlite3.connect(ledger.database)) as connection, connection:
@@ -1171,7 +1742,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
         result = self.cli("held", "built", "--id", finding_id, "--commit", checkpoint, "--by", "nate")
         self.assertEqual(result.stdout, f"built {finding_id} at {checkpoint[:7]}, read by nate\n")
 
-
     def test_held_built_at_a_merge_refuses_a_merge_without_a_listing_ticket_checkpoint(self) -> None:
         ledger, finding_id, _, checkpoint = self.checkpointed_type_findings()
         with closing(sqlite3.connect(ledger.database)) as connection, connection:
@@ -1184,7 +1754,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
                           + checkpoint[:7]))
         self.assertEqual(self.held_rows(ledger.database), before)
 
-
     def test_held_built_at_a_merge_rereads_the_linked_tickets_under_the_write_lock(self) -> None:
         ledger, finding_id, _, checkpoint = self.checkpointed_type_findings()
         with closing(sqlite3.connect(ledger.database)) as connection, connection:
@@ -1196,7 +1765,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
             f"{finding_id}: {self.initial_tip} does not contain names-1's checkpoint {checkpoint[:7]}",
         )
 
-
     def test_held_built_at_a_merge_rereads_the_judging_ticket_under_the_write_lock(self) -> None:
         ledger, finding_id, judged = self.judged_type_finding()
         # The judging ticket checkpoints at a later commit after the judged-commit check read its start.
@@ -1204,7 +1772,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
             ledger, finding_id, "UPDATE tickets SET checkpoint=? WHERE id='names-1'", (judged,),
             f"{finding_id}: {self.initial_tip} is older than {judged[:7]}, where the finding was judged",
         )
-
 
     def test_held_built_at_a_merge_decides_from_the_rows_it_read(self) -> None:
         ledger, finding_id, judged = self.judged_type_finding()
@@ -1230,14 +1797,12 @@ class StyleLedgerFindingsTests(LedgerTestCase):
             _ = ledger.mark_built_at_merge((finding_id,), self.initial_tip, style_ledger.ReadByPerson("nate"))
         self.assertEqual(self.held_rows(ledger.database), before)
 
-
     def test_held_built_at_a_merge_ignores_the_checkpoint_of_a_dropped_ticket(self) -> None:
         ledger, finding_id, _, _ = self.checkpointed_type_findings()
         with closing(sqlite3.connect(ledger.database)) as connection, connection:
             _ = connection.execute("UPDATE tickets SET state='dropped' WHERE id='names-1'")
         result = self.cli("held", "built", "--id", finding_id, "--commit", self.initial_tip, "--by", "nate")
         self.assertEqual(result.stdout, f"built {finding_id} at {self.initial_tip[:7]}, read by nate\n")
-
 
     def test_held_built_at_a_merge_writes_no_id_when_one_lacks_a_checkpoint(self) -> None:
         ledger, finding_id, other_id, checkpoint = self.checkpointed_type_findings()
@@ -1248,7 +1813,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
                          (2, f"style_ledger: {finding_id}: {self.initial_tip} does not contain names-1's checkpoint "
                           + checkpoint[:7]))
         self.assertEqual(self.held_rows(ledger.database), before)
-
 
     def test_unwaive_moves_waived_findings_to_unfiled_with_no_move_and_the_held_list_shows_who(self) -> None:
         _, issue, ids = self.decision_findings()
@@ -1274,7 +1838,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
         ledger.waive_held(ids[0], style_ledger.WaiveByPerson("nate"))
         self.assertEqual(ledger.held_findings(style_ledger.HeldFindingsInState("waived"))[0].waive_undo, person)
 
-
     def test_unwaive_holds_the_cell_that_a_decline_waived_so_a_second_decline_waives_it_again(self) -> None:
         rule, _, ids = self.decision_findings()
         self.set_tip(self.initial_tip)
@@ -1291,7 +1854,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
         waived, = ledger.held_findings(style_ledger.HeldFindingsInState("waived"))
         self.assertEqual((waived.finding_id, waived.waive_undo), (ids[0], style_ledger.WaiveUndoneBy("nate")))
 
-
     def test_unwaive_refuses_a_finding_judged_under_an_older_rule_text(self) -> None:
         rule, _, ids = self.decision_findings()
         self.set_tip(self.initial_tip)
@@ -1304,7 +1866,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
         with self.assertRaisesRegex(style_ledger.LedgerError, re.escape(f"{ids[0]}: rule changed since judged")):
             _ = ledger.unwaive_held(ids[:1], style_ledger.WaiveUndoneBy("nate"))
         self.assertEqual(self.held_rows(ledger.database), before)
-
 
     def test_unwaive_refuses_every_id_when_one_is_refused(self) -> None:
         rule, issue, ids = self.decision_findings()
@@ -1338,7 +1899,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
                 _ = ledger.unwaive_held((ids[0], name), style_ledger.WaiveUndoneBy("nate"))
             self.assertEqual(self.held_rows(ledger.database), before)
 
-
     def test_an_unwaived_finding_with_a_dropped_build_ticket_files_into_a_proposal_again(self) -> None:
         rule, issue, ids = self.decision_findings()
         self.set_tip(self.initial_tip)
@@ -1359,7 +1919,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
         self.assertEqual((filed.state, filed.build_ticket, filed.waive_undo),
                          (style_ledger.Filed(issue), style_ledger.BuildTicket("names-2"), style_ledger.WaiveUndoneBy("nate")))
 
-
     def test_decision_drop_releases_findings_for_another_ticket(self) -> None:
         rule, issue, ids = self.decision_findings()
         ledger = self.ledger()
@@ -1375,7 +1934,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
         self.assertEqual(ledger.proposal_findings(issue)[0].build_ticket, style_ledger.BuildTicket("names-2"))
         self.assertEqual(ledger.ticket_origin("names-1"), style_ledger.ApprovedProposal(issue, "names", ids[:1]))
 
-
     def test_decision_ticket_claim_is_atomic_and_refuses_other_issues_and_live_claims(self) -> None:
         rule, issue, ids = self.decision_findings()
         ledger = self.ledger()
@@ -1389,7 +1947,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
                                   proposal=proposal, finding_ids=ids)
             self.assertEqual(ledger.queued_tickets("other"), ())
             self.assertIsInstance(ledger.proposal_findings(issue)[1].build_ticket, style_ledger.NoBuildTicket)
-
 
     def test_decision_move_issue_findings_is_one_transaction_and_idempotent(self) -> None:
         rule, issue, ids = self.decision_findings()
@@ -1417,7 +1974,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
         with self.assertRaisesRegex(style_ledger.LedgerError, "not filed"):
             ledger.move_issue_findings(target, {ids[1]: issue})
 
-
     def test_drop_candidates_removes_every_candidate_with_the_exact_idea(self) -> None:
         rule = self.rule("read")
         self.add_ticket("names-1", [rule], unit="names")
@@ -1429,7 +1985,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
         self.assertEqual(tuple(candidate.idea for candidate in ledger.rule_candidates()), ("Consider a new rule.",))
         with self.assertRaisesRegex(style_ledger.LedgerError, "no rule candidate"):
             _ = ledger.drop_candidates("Consider a new rule")
-
 
     def test_decision_candidate_cli_stores_idea_without_a_held_finding(self) -> None:
         rule = self.rule("read")
@@ -1446,7 +2001,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
         self.assertEqual(refused.returncode, 2)
         self.assertIn("unknown ticket", refused.stderr)
         self.assertEqual(ledger.rule_candidates(), (candidate,))
-
 
     def test_withdrawal_migration_thirteen_keeps_version_twelve_findings_filed(self) -> None:
         rule = self.rule("read")
@@ -1470,7 +2024,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
             self.assertEqual(connection.execute("SELECT version FROM schema_version").fetchone(), (max(style_ledger.MIGRATIONS),))
             self.assertEqual(connection.execute("SELECT withdrawn_by FROM held_findings").fetchone(), (0,))
 
-
     def test_person_read_migration_fourteen_keeps_version_thirteen_findings_not_read_by_a_person(self) -> None:
         rule = self.rule("read")
         database = self.root / "version-thirteen.sqlite"
@@ -1492,7 +2045,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
             self.assertEqual(connection.execute("SELECT version FROM schema_version").fetchone(), (max(style_ledger.MIGRATIONS),))
             self.assertEqual(connection.execute("SELECT person_read_by FROM held_findings").fetchone(), ("",))
 
-
     def test_an_unfiled_finding_withdrawn_by_a_newer_judgment_reads_and_lists_as_judged_again(self) -> None:
         finding_id = self.hold_finding(self.rule("read"), 2)
         ledger = self.ledger()
@@ -1506,7 +2058,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
         self.assertEqual(finding.state, style_ledger.Withdrawn(style_ledger.NoDecision(), style_ledger.JudgedAgain(7)))
         listed = cast(list[dict[str, object]], json.loads(self.cli("held", "list", "--json").stdout))
         self.assertEqual(listed[0]["withdrawn_by"], 7)
-
 
     def test_duplicate_migration_fifteen_keeps_version_fourteen_withdrawals_by_their_exception(self) -> None:
         rule = self.rule("read")
@@ -1529,7 +2080,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
             self.assertEqual(connection.execute("SELECT version FROM schema_version").fetchone(), (max(style_ledger.MIGRATIONS),))
             self.assertEqual(connection.execute("SELECT withdrawn_by,duplicate_of FROM held_findings").fetchone(), (7, ""))
 
-
     def test_unwaive_migration_sixteen_keeps_version_fifteen_waived_findings_not_unwaived(self) -> None:
         rule = self.rule("read")
         database = self.root / "version-fifteen.sqlite"
@@ -1550,7 +2100,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
         with closing(sqlite3.connect(database)) as connection:
             self.assertEqual(connection.execute("SELECT version FROM schema_version").fetchone(), (max(style_ledger.MIGRATIONS),))
             self.assertEqual(connection.execute("SELECT unwaived_by FROM held_findings").fetchone(), ("",))
-
 
     def test_follow_migration_seventeen_keeps_version_sixteen_findings_not_followed(self) -> None:
         rule = self.rule("read")
@@ -1575,7 +2124,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
             self.assertEqual(connection.execute("SELECT followed_from,followed_from_line,followed_at,declaration_gone_at "
                                                 + "FROM held_findings").fetchone(), ("", 0, "", ""))
 
-
     def test_hold_of_a_followed_finding_site_returns_the_followed_finding(self) -> None:
         rule, issue, ids = self.decision_findings()
         ledger = self.ledger()
@@ -1587,7 +2135,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
                            self.blob(rule), "read-2")
         self.assertEqual((held.finding_id, held.state, held.line), (ids[0], style_ledger.Filed(issue), 7))
         self.assertEqual(len(ledger.held_findings(style_ledger.AllHeldFindings())), count)
-
 
     def test_held_findings_keep_two_sites_per_cell_and_preserve_idempotent_state(self) -> None:
         rule_id = self.rule("read")
@@ -1632,7 +2179,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
         filtered = cast(list[dict[str, object]], json.loads(self.cli("held", "list", "--state", "waived", "--json").stdout))
         self.assertEqual([finding["finding_id"] for finding in filtered], [first])
 
-
     def test_held_can_waive_unfiled_and_rejects_unknown_unclassified_or_wrong_pin(self) -> None:
         rule_id = self.rule("read")
         legacy = self.rule("legacy", "mechanism: llm\n")
@@ -1653,7 +2199,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
                 self.assertEqual(refused.returncode, 2)
                 self.assertIn(invalid, refused.stderr)
         self.assertEqual(len(self.ledger().held_findings(style_ledger.AllHeldFindings())), 1)
-
 
     def test_pinned_rule_bytes_survive_edits_reopen_and_pseudo_rules_share_the_parent(self) -> None:
         partial = self.rule(
@@ -1683,7 +2228,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
             stored = cast(list[tuple[str, bytes]], connection.execute("SELECT blob,text FROM rule_texts").fetchall())
         self.assertEqual(stored, [(blob, original)])
 
-
     def test_local_argument_attributes_only_block_conditional_identity(self) -> None:
         for attribute in ("#[derive(Clone)]", "#[derive(Clone)]\n", "#[cfg(test)]", "#[cfg_attr(test, derive(Clone))]"):
             with self.subTest(attribute=attribute):
@@ -1707,7 +2251,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
                         self.assertEqual((row.path, row.line, row.state),
                                          (PARENT_FILE, line, style_ledger.Filed(self.root / "decision.md")))
 
-
     def test_a_typed_closures_retained_parameter_follows_its_renamed_function_under_lock(self) -> None:
         ledger = self.ledger()
         source = ("fn original() {\n    common_one();\n    common_two();\n"
@@ -1726,7 +2269,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
         before = self.held_rows(ledger.database)
         _ = self.follow_approved(ledger, [finding_id])
         self.assertEqual(self.held_rows(ledger.database), before)
-
 
     def test_retained_children_follow_a_renamed_function_with_changed_closure_call_arguments(self) -> None:
         source = """    fn uncached_completed_rows_arrive_before_hierarchy_discovery_is_released() {
@@ -1869,7 +2411,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
         again = self.follow_approved(ledger, list(findings))
         self.assertTrue(all(isinstance(outcome, style_ledger.DeclarationInPlace) for outcome in again))
 
-
     def test_an_impl_member_inherits_only_a_proven_outside_trait_rename(self) -> None:
         for fails in (False, True):
             with self.subTest(body_fails=fails):
@@ -1894,7 +2435,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
                         self.assertEqual((row.line, row.state), (8, style_ledger.Filed(self.root / "decision.md")))
                         self.assertIsInstance(row.follow, style_ledger.FollowedDeclaration)
 
-
     def test_different_qualified_impl_types_do_not_share_an_outside_method_rename(self) -> None:
         ledger = self.ledger()
         source = ("mod one { pub struct Type; }\nmod two { pub struct Type; }\nimpl one::Type {\n"
@@ -1907,7 +2447,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
         self.assertIsInstance(outcome, style_ledger.OutsideRenameUnresolved)
         self.assertEqual(self.held_rows(ledger.database), before)
         self.assertIn(style_ledger.OutsideFailure.WRONG_OWNER, repr(outcome))
-
 
     def test_removed_parameters_and_fields_do_not_inherit_an_outside_owner_rename(self) -> None:
         cases = (
@@ -1928,7 +2467,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
                     self.assertEqual(self.held_rows(ledger.database), before)
                     self.assertIn(style_ledger.OutsideFailure.CHILD_UNPROVED, repr(outcome))
 
-
     def test_a_closure_parameter_does_not_follow_into_a_different_closure_under_lock(self) -> None:
         ledger = self.ledger()
         source = ("fn original() {\n    common_one();\n    common_two();\n    consume(move |answers| {\n"
@@ -1946,7 +2484,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
         self.assertEqual(self.held_rows(ledger.database), before)
         self.assertIn(style_ledger.OutsideFailure.CHILD_UNPROVED, repr(outcome))
 
-
     def test_a_deleted_closures_parameter_does_not_follow_into_the_surviving_call_under_lock(self) -> None:
         ledger = self.ledger()
         source = ("fn original() {\n    common_one();\n    common_two();\n    first(move |answers| {\n"
@@ -1962,7 +2499,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
         self.assertIsInstance(outcome, style_ledger.OutsideRenameUnresolved)
         self.assertIn(style_ledger.OutsideFailure.CHILD_UNPROVED, repr(outcome))
         self.assertEqual(self.held_rows(ledger.database), before)
-
 
     def test_a_filed_and_an_unfiled_finding_follow_a_proven_outside_rename(self) -> None:
         for index, (filed, destination) in enumerate((
@@ -1994,7 +2530,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
                     again, = self.follow_approved(reopened, [finding_id])
                     self.assertIsInstance(again, style_ledger.DeclarationInPlace)
                     self.assertEqual(self.held_rows(database), before)
-
 
     def test_an_outside_rename_needs_every_check_and_reports_its_mapped_declaration(self) -> None:
         source = "fn original() {\n    first();\n    second();\n    third();\n}\n"
@@ -2081,7 +2616,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
                     self.assertIn(MOVED_FILE, repr(outcome))
                     self.assertIn("declaration not gained", repr(outcome))
 
-
     def test_children_follow_only_when_their_renamed_owner_is_proven(self) -> None:
         cases = (
             ("let", "fn original() {\n    let rows = collect();\n    publish(rows);\n    finish();\n}\n", 2, "rows", True),
@@ -2119,7 +2653,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
                         else:
                             self.assertNotIsInstance(outcome, style_ledger.DeclarationMoved)
                             self.assertEqual(self.held_rows(ledger.database), before)
-
 
     def test_outside_follow_preserves_existing_follow_authority_and_write_rechecks(self) -> None:
         ledger = self.ledger()
@@ -2169,7 +2702,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
             self.assertIsInstance(outcome, style_ledger.DeclarationMoved)
             row, = other.held_findings(style_ledger.AllHeldFindings())
             self.assertEqual(row.text, "fresh request")
-
 
     def test_live_outside_rename_examples_follow_only_the_two_retained_children(self) -> None:
         ledger = self.ledger()
@@ -2248,7 +2780,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
                     self.assertNotIsInstance(outcome, style_ledger.DeclarationMoved)
                     self.assertEqual(self.held_rows(other.database), before)
 
-
     def test_a_test_module_glob_does_not_block_a_file_level_trait_impl(self) -> None:
         for index, destination in enumerate((PARENT_FILE, MOVED_FILE)):
             with self.subTest(destination=destination):
@@ -2279,7 +2810,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
                                      (finding_id, destination, 3, style_ledger.Filed(self.root / "decision.md"),
                                       style_ledger.FollowedDeclaration(PARENT_FILE, 3, tip)))
 
-
     def test_a_block_import_of_the_trait_name_does_not_block_the_file_level_impl(self) -> None:
         ledger = self.ledger()
         source = (
@@ -2293,7 +2823,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
         outcome, = self.follow_approved(ledger, [finding_id])
         self.assertIsInstance(outcome, style_ledger.DeclarationInPlace)
         self.assertEqual(self.held_rows(ledger.database), before)
-
 
     def test_a_relative_trait_import_resolves_from_the_file_module(self) -> None:
         cases = (
@@ -2346,7 +2875,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
                     self.assertIsInstance(outcome, style_ledger.DeclarationInPlace)
                     self.assertEqual(self.held_rows(ledger.database), before)
 
-
     def test_block_and_relative_import_limits_keep_the_finding(self) -> None:
         cases = (
             (PARENT_FILE, "#[cfg(test)]\nmod tests {\nuse super::*;\nimpl Trait for Type {\n    fn method(&self) { 7 }\n}\n}\n", 5),
@@ -2370,7 +2898,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
                 self.assertIsInstance(outcome, style_ledger.TraitIdentityUncertain)
                 self.assertEqual(self.held_rows(ledger.database), before)
 
-
     def test_same_line_built_qualifiers_keep_enclosing_aliases_uncertain(self) -> None:
         sites = (
             "mod imports { use crate::other::Other as Trait; pub fn caller() { Trait::old(); } }",
@@ -2391,7 +2918,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
                 outcome, = self.follow_approved(ledger, [finding_id])
                 self.assertIsInstance(outcome, style_ledger.TraitIdentityUncertain)
                 self.assertEqual(self.held_rows(ledger.database), before)
-
 
     def test_unproved_module_layouts_keep_relative_trait_findings_unchanged(self) -> None:
         root = "crates/alpha/src/"
@@ -2423,7 +2949,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
                 self.assertIsInstance(outcome, style_ledger.TraitIdentityUncertain)
                 self.assertEqual(self.held_rows(ledger.database), before)
 
-
     def test_a_nested_main_module_does_not_move_a_finding_to_its_parent_trait(self) -> None:
         ledger = self.ledger()
         root = "crates/alpha/src/"
@@ -2439,7 +2964,6 @@ class StyleLedgerFindingsTests(LedgerTestCase):
         outcome, = self.follow_approved(ledger, [finding_id])
         self.assertIsInstance(outcome, style_ledger.TraitIdentityUncertain)
         self.assertEqual(self.held_rows(ledger.database), before)
-
 
     def test_a_plain_main_module_chain_keeps_relative_shortcuts_identity(self) -> None:
         ledger = self.ledger()

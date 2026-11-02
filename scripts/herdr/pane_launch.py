@@ -15,7 +15,7 @@ import sessions
 from place import HerdrPlace
 
 UNIT_MARKS = ("SHOWRUNNER_UNIT", "SHOWRUNNER_UNIT_ID")
-MEMBER_MARKS = (*UNIT_MARKS, "STAFF_ID")
+MEMBER_MARKS = UNIT_MARKS
 
 
 class PaneLaunch(TypedDict):
@@ -31,6 +31,8 @@ class PaneLaunch(TypedDict):
     flags_read: bool
     ended: NotRequired[bool]
     written_at: str
+    pid: NotRequired[int]
+    proc_start: NotRequired[str]
 
 
 def record_directory() -> Path:
@@ -119,21 +121,14 @@ class RecordedLabels:
 
     def resolve(self, pid: int, environment: Mapping[str, str],
                 placement: Callable[[], object]) -> dict[str, str]:
-        if environment.get("STAFF_ID"):
-            return dict(environment)
+        # Raw discovery already has these process labels. Ownership projections
+        # pass their staff snapshot explicitly and still require native proof.
+        if isinstance(self.membership, StaffLabelsRead) and all(environment.get(key) for key in UNIT_MARKS):
+            return {key: value for key, value in environment.items() if key != "STAFF_ID"}
         record = sessions.read_session(sessions.sessions_dir() / f"{pid}.json")
         if (isinstance(record, sessions.UnreadableSessionRecord) or record["pid"] != pid
                 or not sessions.running_session(record)):
             return dict(environment)
-        values = dict(environment)
-        place = placement()
-        if isinstance(place, HerdrPlace):
-            if place.session not in self.entries:
-                self.entries[place.session] = read(record_directory() / f"{place.session}.json")
-            entry = matching_launch(self.entries[place.session], place, record["sessionId"])
-            if entry is not None:
-                values = {**{key: value for key, value in entry.get("environment", {}).items()
-                             if key in MEMBER_MARKS}, **values}
         if self.membership is StaffLabelsRead.PENDING:
             from scripts.production import staff
             from scripts.production.session_labels import StaffLabels
@@ -142,6 +137,20 @@ class RecordedLabels:
                 self.membership = StaffLabels.read()
             except (staff.StaffUnreadable, OSError, ValueError):
                 self.membership = StaffLabelsRead.UNAVAILABLE
+        values = dict(environment)
+        place = placement()
+        if isinstance(place, HerdrPlace):
+            if place.session not in self.entries:
+                self.entries[place.session] = read(record_directory() / f"{place.session}.json")
+            entries = self.entries[place.session]
+            entry = matching_launch(entries, place, record["sessionId"])
+            if entry is None and not isinstance(self.membership, StaffLabelsRead):
+                owner = self.membership.record.by_current_session(record["sessionId"])
+                if owner is not None:
+                    entry = matching_launch(entries, place, owner.id)
+            if entry is not None:
+                values = {**{key: value for key, value in entry.get("environment", {}).items()
+                             if key in MEMBER_MARKS}, **values}
         if not isinstance(self.membership, StaffLabelsRead):
             values = self.membership.environment(values, record["sessionId"], record["name"], record.get("cwd", ""))
         return values

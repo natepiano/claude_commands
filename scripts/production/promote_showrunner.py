@@ -123,7 +123,7 @@ def _committed(doc: Path) -> None:
 
 def checked(name: str, child_doc: Path) -> Promotion:
     """Everything the promotion needs. Raises Refusal naming what is in the way."""
-    parent_doc = showrunners.production_of(os.environ.get("CLAUDE_CODE_SESSION_ID", ""))
+    parent_doc = showrunners.production_of(staff.runtime_id())
     if parent_doc is None:
         raise Refusal("this session runs no production, so it has no unit to promote")
     parent = read_production(parent_doc)
@@ -288,7 +288,7 @@ def _main(argv: list[str]) -> int:
     args = parser.parse_args(argv)
     record = staff.initial_snapshot()
     try:
-        parent_doc = showrunners.production_of(os.environ.get("CLAUDE_CODE_SESSION_ID", ""))
+        parent_doc = showrunners.production_of(staff.runtime_id())
         if parent_doc is not None:
             parent = read_production(parent_doc)
             unit_name = cast(str, args.unit)
@@ -317,17 +317,15 @@ def _main(argv: list[str]) -> int:
     unit, slug = promotion.unit, promotion.child.slug
     if cast(bool, args.check):
         print(f"check: ok — would stop {unit} (herdr {promotion.marked.place.session}), resume it as the showrunner of "
-              + f"{slug} in {promotion.worktree} under {promotion.parent.slug}, and retire its row; {moved}")
+              + f"{slug} in {promotion.worktree} under {promotion.parent.slug}, and preserve its native row; {moved}")
         return 0
     old_member = staff_sources.member(staff_sources.UnitMember(promotion.parent.slug, promotion.unit), record)
     parent_member = staff_sources.member(staff_sources.ShowrunnerMember(promotion.parent.slug), record)
     parent_row = parent_member.row if isinstance(parent_member, staff_sources.MemberFound) else None
-    parent_location = staff.LiveDoc(remote.local_machine(), promotion.parent.doc.resolve())
-    if parent_row is None or parent_row.doc != parent_location:
-        _ = staff.ensure("showrunner", name=parent_row.name if parent_row else showrunners.herdr_space(
-            promotion.parent.slug, str(promotion.parent.doc)), parent=parent_row.parent if parent_row else None,
-            doc=parent_location)
-    new_member = staff_sources.MemberFound(add_showrunner.ensure_staff_showrunner(promotion.child, promotion.parent.slug))
+    if parent_row is None:
+        print(f"promote_showrunner: {promotion.parent.slug}: native showrunner identity is missing", file=sys.stderr)
+        return 2
+    _ = staff_sources.ensure_staff_showrunner(promotion.parent, runtime_id=parent_row.current_session)
     was_pending = pending.exists()
     if not was_pending:
         save_promotion(promotion, target_directory)
@@ -351,6 +349,16 @@ def _main(argv: list[str]) -> int:
               + f"was restarted. Its pane is {where_place(promotion.marked.place)}; read it with "
               + f"`~/.claude/scripts/lib/py ~/.claude/scripts/production/session_pane.py read session {promotion.claude.session_id}`.")
         return 1
+    native = staff.native_id(promotion.claude.session_id)
+    name = showrunners.herdr_space(slug, str(promotion.child.doc))
+    document = staff.LiveDoc(remote.local_machine(), promotion.child.doc.resolve())
+    retained = record.by_current_session(native)
+    if (retained is not None and retained.kind == "showrunner"
+            and (retained.name, retained.parent, retained.doc) == (name, parent_row.id, document)):
+        new_member = staff_sources.MemberFound(retained)
+    else:
+        new_member = staff_sources.MemberFound(staff.promote_unit(
+            retained.id if retained is not None else native, name=name, parent=parent_row.id, doc=document))
     try:
         if was_pending and showrunners.current_name(slug):
             started = showrunners.main(["attach", slug, promotion.parent.slug])
@@ -380,8 +388,6 @@ def _main(argv: list[str]) -> int:
             print(f"kept worker {worker.id} {worker.name} under {old_member.row.name}")
         if workers:
             return 1
-        if result.unit_retired:
-            _ = staff.set_worktree(old_member.row.id, staff.RemovedWorktree(remote.local_machine(), promotion.worktree))
     if result.exit_code == 0:
         fields = cast(dict[str, object], json.loads(pending.read_text(encoding="utf-8")))
         completion_receipt.write_receipt(pending.with_suffix(".done.json"), new_member.row.id, fields)

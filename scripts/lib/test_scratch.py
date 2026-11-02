@@ -29,6 +29,11 @@ else:
     import style_sync
 
 from scripts.lib import copy_record
+from scripts.message import sessions
+from scripts.production import staff
+from scripts.production.staff_test_support import StaffTestCase, fixture_runtime_id
+
+MAKER_ID = fixture_runtime_id("scratch-Claude-session")
 
 RUN = "run:2a858b68-0f9a-4af2-b3cf-a776e6b180cb"
 ROW = "row:cargo-liner-C54"
@@ -43,7 +48,8 @@ class ScratchTests(unittest.TestCase):
         self.enterContext(mock.patch.dict(os.environ, {
             copy_record.ROOT_ENV: str(self.base / "scratch"), scratch.VISIBLE_ROOT_ENV: str(self.base / "repro"),
             scratch.HOLDS_ENV: str(self.base / "holds.json"), copy_record.COPIES_ENV: str(self.base / "copies"),
-            "CLAUDE_CODE_SESSION_ID": "maker-session"}))
+            "CODEX_THREAD_ID": MAKER_ID, "STAFF_FILE": str(self.base / "staff.json")}))
+        _ = staff.ensure("showrunner", name="maker", runtime_id=MAKER_ID)
         def registered_plan(unit: str) -> Path:
             return self.base / "registered-plans" / f"{unit}.md"
 
@@ -728,7 +734,7 @@ class ScratchTests(unittest.TestCase):
         task = "row:natedev-C9"
         for folder in (saved, unsaved.parent):
             _ = scratch.hold(folder, task, "change review C9")
-        self.assertEqual(scratch.holds()[str(saved)]["maker"], "maker-session")
+        self.assertEqual(scratch.holds()[str(saved)]["maker"], MAKER_ID)
         self.assertEqual(scratch.unsaved_work(unsaved.parent), f"{unsaved}: it has commits and no remote")
         self.assertEqual(scratch.end(task), [saved])
         self.assertFalse(saved.exists())
@@ -742,7 +748,7 @@ class ScratchTests(unittest.TestCase):
         self.assertEqual(path.parent, self.base / "scratch")
         self.assertRegex(path.name, r"^run-2a858b68-0f9a-4af2-b3cf-a776e6b180cb-gate-[a-z0-9]{6}$")
         record = cast(dict[str, object], json.loads((path / copy_record.RECORD).read_text()))
-        self.assertEqual((record["task"], record["maker"]), (RUN, "maker-session"))
+        self.assertEqual((record["task"], record["maker"]), (RUN, MAKER_ID))
 
     def test_a_visible_repro_goes_where_cargo_port_lists_it(self) -> None:
         self.assertEqual(scratch.new(ROW, "demo", visible=True), self.base / "repro" / "cargo-liner-C54-demo")
@@ -891,3 +897,47 @@ class ScratchTests(unittest.TestCase):
 
 if __name__ == "__main__":
     _ = unittest.main()
+
+
+class NativeScratchMakerTests(StaffTestCase):
+    def test_scratch_owner_uses_the_exact_process_registry_when_claude_exports_no_session_id(self) -> None:
+        identity = fixture_runtime_id("scratch-exact-Claude-pid")
+        _ = staff.ensure("showrunner", name="maker", runtime_id=identity)
+        registry = Path(os.environ["NOTIFIER_SESSIONS_DIR"]) / f"{os.getpid()}.json"
+        self.write_json(registry, {"pid": os.getpid(), "procStart": sessions.process_start(os.getpid()),
+                                  "sessionId": identity, "name": "same-display-name",
+                                  "messagingSocketPath": str(self.root / "private.sock"), "updatedAt": 1})
+        with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": ""}):
+            self.assertEqual(scratch.maker(), identity)
+        self.write_json(registry, {"pid": os.getpid(), "procStart": "another-process-generation",
+                                  "sessionId": identity, "name": "same-display-name",
+                                  "messagingSocketPath": str(self.root / "private.sock"), "updatedAt": 1})
+        with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "", "CLAUDE_CODE_SESSION_ID": ""}):
+            self.assertEqual(scratch.maker(), "")
+
+    def test_scratch_and_hold_keep_the_fixed_maker_after_a_session_handoff(self) -> None:
+        owner = staff.ensure("showrunner", name="maker", runtime_id=MAKER_ID)
+        current = staff.native_id(fixture_runtime_id("scratch-replacement-thread"))
+        _ = staff.update_current_session(owner.current_session, current)
+        before = self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns
+        held = self.root / "held"
+        held.mkdir()
+        with mock.patch.dict(os.environ, {
+            "CODEX_THREAD_ID": current, copy_record.ROOT_ENV: str(self.root / "scratch"),
+            scratch.HOLDS_ENV: str(self.root / "holds.json"),
+        }):
+            path = scratch.new(RUN, "handoff")
+            record = scratch.task_of(path)
+            self.assertIsInstance(record, copy_record.Registered)
+            assert isinstance(record, copy_record.Registered)
+            self.assertEqual(record.fields["maker"], owner.id)
+            _ = scratch.hold(held, "gate:maker-handoff", "retain the fixed owner")
+            self.assertEqual(scratch.holds()[str(held)]["maker"], owner.id)
+        with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": owner.id}):
+            self.assertEqual(scratch.maker(), "")
+        self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), before)
+
+    def test_unpublished_runtime_has_no_scratch_owner_and_creates_no_staff_store(self) -> None:
+        with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": MAKER_ID}):
+            self.assertEqual(scratch.maker(), "")
+        self.assertFalse(self.staff_file.exists())

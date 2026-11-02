@@ -35,6 +35,7 @@ if TYPE_CHECKING:
     from scripts.lib.names import JobKey
 
 from scripts.agents import worker_lifecycle
+from scripts.production import worker_admission
 from scripts.lib.atomic_file import write_bytes_atomic, write_text_atomic
 
 ROSTER = "mesh_roster.json"
@@ -700,7 +701,7 @@ def recover_adoptions(run: Path) -> None:
 
 
 def _adopt(store: UnitWorkerLedger, ledger: UnitWorkers, source: Path, destination: Path, name: str,
-           *, owner_pid: int, reserve: bool = False) -> str:
+           *, permission: worker_admission.WorkerStartAllowed, owner_pid: int, reserve: bool = False) -> str:
     from scripts.agents import codex_mesh
     if not name or Path(name).name != name:
         raise WorkerUnavailable("invalid worker name")
@@ -710,6 +711,14 @@ def _adopt(store: UnitWorkerLedger, ledger: UnitWorkers, source: Path, destinati
     if source_present and _ledger_for_run(source).path != store.path:
         raise WorkerUnavailable("worker belongs to another unit")
     history = codex_mesh.worker_run_history(str(source), name) if source_present else ()
+    saved = ledger.workers.get(name)
+    native = (_text(_object(_read_roster(source).get(name)).get("thread_id")) if source_present
+              else saved.backend.thread_id if saved is not None and isinstance(saved.backend, CodexThread) else "")
+    if not native:
+        raise WorkerUnavailable(f"{name}: adoption has no native backend identity")
+    published = worker_admission.publish(permission, native)
+    if published.row.name != name:
+        raise WorkerUnavailable("published worker names another adoption")
     with worker_lifecycle.membership_operation(destination, *((source,) if source_present else ())):
         before: dict[str, object]
         with worker_lifecycle.lock_workers(
@@ -786,7 +795,15 @@ def adopt(source: Path, destination: Path, name: str) -> str:
     store = ledger_for_run(destination)
     with store.locked() as ledger:
         _recover(store, ledger)
-        return _adopt(store, ledger, source, destination, name, owner_pid=os.getpid())
+        source_entry = _object(_read_roster(source).get(name))
+        saved = ledger.workers.get(name)
+        if not source_entry and saved is None:
+            raise WorkerUnavailable(f"{name}: no worker to adopt")
+        role = _text(source_entry.get("role")) if source_entry else saved.role if saved is not None else ""
+    allowed = worker_admission.admit(name, destination, role=role)
+    with store.locked() as ledger:
+        _recover(store, ledger)
+        return _adopt(store, ledger, source, destination, name, permission=allowed, owner_pid=os.getpid())
 
 
 def note_backend(run: Path, name: str, thread_id: str, home: Path) -> None:
@@ -1158,6 +1175,12 @@ def _resolve(run: Path, role: str, owner_pid: int, *, model: str = "", effort: s
         except worker_lifecycle.WorkerStateUnreadable as error:
             name = next((name for name, worker in ledger.workers.items() if _owned_by_run(worker, run)), "worker")
             raise _roster_repair_hint(run, name, str(error)) from error
+    permissions = {name: worker_admission.admit(name, run, role=role)
+                   for name, worker in ledger.workers.items()
+                   if worker.role == role and not isinstance(worker.ownership, Retired)}
+    for name, value in _read_roster(run).items():
+        if _object(value).get("role") == role and name not in permissions:
+            permissions[name] = worker_admission.admit(name, run, role=role)
     with store.locked() as ledger:
         _recover(store, ledger)
         if codex_mesh.finished_run_status(str(run)):
@@ -1178,6 +1201,10 @@ def _resolve(run: Path, role: str, owner_pid: int, *, model: str = "", effort: s
                 if name not in ledger.workers:
                     ledger.workers[name] = _worker_from_record(name, run, record)
                 try:
+                    permission = permissions.get(name)
+                    if permission is None:
+                        raise WorkerUnavailable(f"{name}: worker changed during admission")
+                    _ = worker_admission.publish(permission, _text(record.get("thread_id")))
                     _reserve(run, name, store, owner_pid, paused=paused)
                 except WorkerUnavailable:
                     continue
@@ -1198,7 +1225,11 @@ def _resolve(run: Path, role: str, owner_pid: int, *, model: str = "", effort: s
                 if previous == str(run):
                     continue
                 try:
-                    return _adopt(store, ledger, Path(previous), run, name, reserve=True, owner_pid=owner_pid)
+                    permission = permissions.get(name)
+                    if permission is None:
+                        raise WorkerUnavailable(f"{name}: worker changed during admission")
+                    return _adopt(store, ledger, Path(previous), run, name, permission=permission,
+                                  reserve=True, owner_pid=owner_pid)
                 except WorkerUnavailable:
                     continue
         for name, value in sorted(roster.items(), key=lambda item: (role == "review" and item[0] != reviewer_base, item[0])):

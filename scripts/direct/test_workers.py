@@ -33,10 +33,12 @@ from scripts.direct import progress_history, workers
 from scripts.direct.recorder_fixture import invoke_recorder
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.message import sessions
-from scripts.production.staff_test_support import StaffTestCase, isolated_source_readers, showrunner_relationship
+from scripts.production import staff
+from scripts.production.staff_test_support import fixture_runtime_id, StaffTestCase, isolated_source_readers, showrunner_relationship
 
 
 SCRIPT = Path(__file__).with_name("workers.py")
+SECOND_THREAD_ID = fixture_runtime_id("second-worker-thread")
 
 
 class AdoptionWriteInterrupted(BaseException):
@@ -522,12 +524,12 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
         @mesh_fixture.bounded_fixture
         def open_second(request: dict[str, object]) -> list[dict[str, object]] | None:
             if request.get("method") == "thread/start":
-                return [{"id": request["id"], "result": {"thread": {"id": "second-thread"}}}]
+                return [{"id": request["id"], "result": {"thread": {"id": SECOND_THREAD_ID}}}]
             frames = original(request)
             params = cast(dict[str, object], request.get("params", {}))
-            if frames is not None and params.get("threadId") == "second-thread":
+            if frames is not None and params.get("threadId") == SECOND_THREAD_ID:
                 return cast(list[dict[str, object]], json.loads(
-                    json.dumps(frames).replace(mesh_fixture.THREAD_ID, "second-thread")))
+                    json.dumps(frames).replace(mesh_fixture.THREAD_ID, SECOND_THREAD_ID)))
             return frames
 
         self.server.respond = open_second
@@ -1069,7 +1071,7 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
         self.assertEqual(set(names), {"impl", "impl2"})
         roster = json_object(self.session_dir / codex_mesh.ROSTER_FILE)
         self.assertEqual({cast(dict[str, object], roster[name])["thread_id"] for name in names},
-                         {mesh_fixture.THREAD_ID, "second-thread"})
+                         {mesh_fixture.THREAD_ID, SECOND_THREAD_ID})
         self.assertTrue(all(cast(dict[str, object], roster[name]).get("allocation_pending") is True
                             for name in names))
         self.assertEqual(len(self.methods("thread/start")), 1)
@@ -1251,6 +1253,25 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
         with workers.ledger_for_run(self.session_dir).locked() as ledger:
             self.assertEqual(ledger.workers["reviewer-address"].access_policy.get("kind"), "ReadOnlyReviewer")
 
+    def test_worker_resolution_publishes_the_returned_thread_before_exposing_its_address(self) -> None:
+        self.configure_new_worker()
+        respond = self.server.respond
+        before_creation: list[tuple[staff.StaffRow, ...]] = []
+
+        def create(request: dict[str, object]) -> list[dict[str, object]] | None:
+            if request.get("method") == "thread/start":
+                before_creation.append(tuple(staff.find(kind="worker")))
+            return respond(request)
+
+        self.server.respond = create
+        name = self.resolve(self.session_dir, "impl")
+        row = staff.by_id(staff.StaffId(SECOND_THREAD_ID))
+        assert row is not None
+        self.assertEqual((row.name, row.parent), (name, staff.StaffId(os.environ["CODEX_THREAD_ID"])))
+        self.assertEqual(before_creation, [()])
+        self.assertEqual(self.methods("turn/start"), [])
+        self.assertEqual(cast(dict[str, object], self.roster()[name])["thread_id"], row.id)
+
     def test_concurrent_reviews_open_distinct_read_only_unit_workers(self) -> None:
         self.configure_new_worker()
         registry = self.session_dir.parent / "registry.conf"
@@ -1262,7 +1283,7 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
         @mesh_fixture.bounded_fixture
         def open_reviewer(request: dict[str, object]) -> list[dict[str, object]] | None:
             if request.get("method") == "thread/start":
-                identity = f"review-thread-{len(opened) + 1}"
+                identity = fixture_runtime_id(f"review-thread-{len(opened) + 1}")
                 opened.append(identity)
                 return [{"id": request["id"], "result": {"thread": {"id": identity}}}]
             return original(request)
@@ -1771,7 +1792,7 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
         with bounded_worker_change():
             workers.recover_adoptions(destination)
         roster = json_object(self.session_dir / codex_mesh.ROSTER_FILE)
-        roster["other-worker"] = {"thread_id": mesh_fixture.THREAD_ID, "status": "done", "role": "test",
+        roster["other-worker"] = {"thread_id": fixture_runtime_id("other-worker-recovery"), "status": "done", "role": "test",
                                   "codex_home": os.environ["CODEX_HOME"], "model": "gpt-kept-sol"}
         _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(json.dumps(roster))
         self.assertEqual(self.resolve(self.session_dir, "test"), "other-worker")
@@ -1900,7 +1921,7 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
         for run, name in zip(destinations, names):
             entry = cast(dict[str, object], json_object(run / codex_mesh.ROSTER_FILE)[name])
             threads.append(entry["thread_id"])
-        self.assertEqual(set(threads), {mesh_fixture.THREAD_ID, "second-thread"})
+        self.assertEqual(set(threads), {mesh_fixture.THREAD_ID, SECOND_THREAD_ID})
         self.assertEqual(len(self.methods("thread/start")), 1)
 
 

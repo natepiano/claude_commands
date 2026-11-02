@@ -20,7 +20,7 @@ from scripts.agents import codex_mesh
 
 
 from scripts.production.worker_admission import (
-    AdmissionRefused as AdmissionRefused, WorkerAdmitted as WorkerAdmitted, admit as admit,
+    AdmissionRefused as AdmissionRefused, WorkerStartAllowed as WorkerStartAllowed, PublishedWorker as PublishedWorker, admit as admit, publish as publish,
 )
 
 
@@ -108,11 +108,17 @@ def fill(*, dry_run: bool = False) -> int:
         if parent.id not in active:
             problems.append(f"{prefix}: parent {parent.id} is not live")
             continue
-        if any(row.name == observed.name for row in record.find(kind="worker", parent=parent.id)):
-            continue
         try:
+            if isinstance(observed.identity, staff_sources.BackendUnavailable) or len(observed.identity) != 1:
+                raise staff.StaffRefused("native runtime identity is unavailable or ambiguous")
+            identity = staff.native_id(next(iter(observed.identity.values())))
+            existing = next((row for row in record.find(kind="worker", parent=parent.id) if row.name == observed.name), None)
+            if existing is not None:
+                if existing.current_session != identity:
+                    raise staff.StaffRefused(f"{existing.id}: worker has a conflicting native identity: {identity}")
+                continue
             if not dry_run:
-                _ = staff.ensure_worker(observed.name, parent.id)
+                _ = staff.ensure_worker(observed.name, parent.id, runtime_id=identity)
             placed += 1
             print(f"{'would place' if dry_run else 'placed'} {observed.name} under {parent.id}")
         except (staff.StaffRefused, staff.StaffUnreadable, OSError) as error:
@@ -134,18 +140,24 @@ class _Arguments(argparse.Namespace):
     dry_run: bool = False
     name: str = ""
     run: Path = Path(".")
+    runtime_id: str = ""
+    role: str = ""
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    _ = parser.add_argument("command", choices=("fill", "admit"))
+    _ = parser.add_argument("command", choices=("fill", "admit", "publish"))
     _ = parser.add_argument("--dry-run", action="store_true")
     _ = parser.add_argument("--name", default="")
+    _ = parser.add_argument("--runtime-id", default="")
+    _ = parser.add_argument("--role")
     _ = parser.add_argument("--run", type=Path, default=Path("."))
     args = parser.parse_args(argv, namespace=_Arguments())
     try:
-        if args.command == "admit":
-            _ = admit(args.name, args.run)
+        if args.command in ("admit", "publish"):
+            allowed = admit(args.name, args.run, role=args.role or "")
+            if args.command == "publish":
+                _ = publish(allowed, args.runtime_id)
             return 0
         return fill(dry_run=args.dry_run)
     except (AdmissionRefused, staff.StaffUnreadable, staff.StaffRefused) as error:

@@ -155,7 +155,7 @@ The one style block in `render_markdown` keeps top-level text in a centered 48re
 
 #### As-built
 
-`scripts/hooks/session-start-ste.py` reads `config/simplified-technical-english.md` from its own checkout and returns it as `additionalContext` for `SessionStart` and `SubagentStart`; a bad payload, a missing file or a read error exits 0 with no output. `scripts/hooks/codex_hooks.py` has two rows, `ste` (SessionStart) and `ste-subagent` (SubagentStart), both with matcher `*`; `_select_hooks` picks a hook by command, event and matcher so two events share one script with separate trust. Checkpoint 69374ebc on branch natedev-efficiency. The `settings.json` hook lines for Claude Code and the live Codex install and trust wait for the user.
+`scripts/hooks/session-start-ste.py` reads `config/simplified-technical-english.md` from its own checkout and returns it as `additionalContext` for `SessionStart` and `SubagentStart`; a bad payload, a missing file or a read error exits 0 with no output. `scripts/hooks/codex_hooks.py` has two rows, `ste` (SessionStart) and `ste-subagent` (SubagentStart), both with matcher `*`; `_select_hooks` picks a hook by command, event and matcher so two events share one script with separate trust. Checkpoint 69374ebc on branch natedev-efficiency. Claude Code runs the hook from `settings.json` (user's go 2026-11-01): in the `SessionStart` group with matcher `startup|resume|clear|compact`, after `session-start-temp-root.py`, and in `SubagentStart`, after `session-start-agents-log.py`. The live Codex install and trust wait for the user.
 
 ### Phase 15 — nix_env trusts copies.py copies  · status: done
 
