@@ -1,5 +1,5 @@
 ---
-description: List the production's open proposals, plan backlog and add-ons in one table.
+description: List pending production proposals.
 ---
 
 # Proposals

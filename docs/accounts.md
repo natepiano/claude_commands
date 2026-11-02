@@ -53,7 +53,20 @@ Times are in the user's zone setting (`config/user_zone.conf`). The numbers are 
 
 The JSON has no login or folder fields. `--json` cannot be combined with `--detail`.
 
-The accounts board orders its columns as account, left, role, busy, shell, idle, total, resets, credits, enabled, read. Each count cell joins its role values in role order, such as `units, showrunners` with busy counts `3, 2`. Spare counts are blank. Claude session records supply `busy`, `shell`, or `idle`; missing or unknown activity counts as idle. Codex workers count as busy for `running` or `starting`, and idle otherwise. Codex shell counts are unknown and stay blank. The last row sums known counts across all accounts and roles. Narrow panes preserve the order and the total row. JSON retains `credits_in_use` for cargo-handler, but the board has no `in use` column or fact.
+The accounts board orders its columns as account, left, role, busy, shell, idle, total, resets, credits, enabled.
+Each count cell joins its role values in role order.
+For example, `units, showrunners` can have busy counts `3, 2`.
+Spare counts are blank.
+Claude session records supply `busy`, `shell`, or `idle`.
+Missing or unknown activity counts as idle.
+Codex workers count as busy for `running` or `starting`, and idle otherwise.
+Codex shell counts are unknown and stay blank.
+The last row sums known counts across all accounts and roles.
+Narrow panes preserve the order and the total row.
+JSON retains `credits_in_use`, `read_at`, and `read_ok` for other consumers.
+The board has no `in use` or `read` column or fact.
+Failed reads and old readings appear in Problems.
+The dot stays red until the account has a current reading without a read failure.
 
 Counts use the local session registry, validated retained launches, the shared staff membership classifier, notifier registrations, and mesh records. Each status refresh scans these local records once and checks owner liveness. JSON `session_inputs` names the files and directories that the board watches. With session inputs present, each existing ten-second tick runs `status --json --stored` once. This costs one local Python process, file reads, and liveness checks, without ssh, herdr discovery, or a usage request. A killed process disappears from the counts even when its registry files do not change. The reader skips damaged launch entries individually and retains valid siblings. A failed refresh retains its watches and retries on the next tick. An unavailable local staff record supplies no unit membership.
 
@@ -83,11 +96,20 @@ poll period, so jitter neither adds another poll nor causes adjacent polls to
 read. Without `--poll-seconds`, the full interval must elapse. The shared read
 guard uses the same cadence for this pass; natedev's cadence and the rate-limit
 backoff stay unchanged. The interval describes nominal attempts, not guaranteed
-successful readings. Polls with no due account exit silently without reading usage. The separate attempt
+successful readings. Polls with no due account skip usage reads. The attempt
 history and lock live in `~/.local/state/agent-notes/usage-only/`.
-It shares the agent-notes job's
-live read and save step. It writes no notes, sends no quota alerts and runs
-neither the Codex pacer nor account moves. Natedev still owns those actions.
+The Mac shares the agent-notes job's usage read and save step.
+After saving usage, it releases the usage schedule lock and checks whether an account needs renewal without starting a probe.
+When renewal is due, it starts a detached `agent_notes.py renew-logins` process.
+launchd runs one instance of the usage job at a time, so the usage job never waits for a renewal probe.
+The child inherits the job's output streams and calls the shared renewal function under a separate lock.
+A busy schedule skips both the usage read and renewal.
+A busy renewal lock skips renewal and permits usage reads.
+The renewal lock lives in `~/.local/state/agent-notes/login-renewal/`.
+Renewal tries each expired local Claude account at most once per hour.
+A renewal error prints one diagnostic and preserves the usage messages and saved readings.
+The refresher writes no notes, sends no quota alerts, and runs neither the Codex pacer nor account moves.
+Natedev owns those actions.
 Install the scripts before activating `modules/darwin/account-usage.nix`.
 
 A process that cannot reach login credentials reports `credentials unavailable
@@ -145,9 +167,9 @@ Run these in a terminal:
 | `claude2` | claude2 |
 | `claude3` | claude3 |
 | `claude4` | claude4 |
-| `codex` | The configured workers account, through `accounts.py exec workers` after the shell alias is updated. |
-| `codex1` | codex1 |
-| `codex2` | codex2 |
+| `codex` | Use the configured workers account through `accounts.py exec workers`. `codex update` updates the shared install on both machines. |
+| `codex1` | Use codex1. `codex1 update` updates the shared install on both machines. |
+| `codex2` | Use codex2. `codex2 update` updates the shared install on both machines. |
 
 The showrunner installs these aliases in the shell configuration on Linux and the Mac after this change merges. In a shell without them, run:
 
@@ -166,7 +188,9 @@ The executable is found on the loaded shell's PATH, then in `~/.local/bin`. The 
 
 `scripts/accounts/hello.sh <claudeN>` starts a throwaway probe session on that account, sends hello, prints the reply and exits. It needs no prompt; an allow rule covers it.
 
-For `codexN` or `workers`, arguments pass through to `codex` and the launch sets `CODEX_HOME` to the home holding that account's login. After the Codex cutover, codex2 uses `~/.codex2` and codex1 uses `~/.codex1`. The `codex1`, `codex2` and bare `codex` shell aliases follow these launchers; bare `codex` follows `exec workers`. `--probe` applies only to Claude accounts.
+For `codexN` or `workers`, normal launches pass arguments to `codex` and set `CODEX_HOME` to the account's home. After the Codex cutover, codex2 uses `~/.codex2` and codex1 uses `~/.codex1`. The shell aliases use these launchers. The `codex` alias uses `exec workers`. `--probe` applies only to Claude accounts.
+
+When the first argument is `update`, the launcher uses the shared `~/.codex` install without account checks. The local update uses the terminal and receives the remaining arguments. It then updates the other machine through SSH with a 600-second limit. Each machine gets one version or failure summary line. An unreachable machine shows `unreachable; run codex update there`. The command returns zero only when both updates and version reads succeed.
 
 Configuration decides the account every launch starts on: new, standby and resumed units and nightly reviews use the units account; new and resumed showrunners use the showrunners account. Set a group with `accounts.py move units|showrunners claudeN`. An unconfigured group refuses with that command; an `--account` or `--config-dir` override must name its configured account. New unit launches use herdr panes carrying the selected account variables; legacy tmux options remain available for observation and model recovery, and never choose a resume account. Every selected account runs in its own numbered folder, with the shared memory directory set to `~/.claude`. The launch removes any inherited OAuth token. Commands accept account numbers and the launch groups; `default` refuses.
 
@@ -404,7 +428,7 @@ An empty list does not read watch state. If that state cannot be read or parsed,
 
 `next hold GROUP N half-point|MINUTES [--expect PERCENT TARGET]` changes only that entry’s hold mode, preserving its identity and position. A different mode clears its started hold under the watch and log locks before writing the list; the same mode keeps it, so retrying after a lost Mac reply preserves elapsed time. Other entries keep their holds. With `--expect`, a shifted entry refuses without changing either the log or holds. Always run `next list` immediately before a guarded update and copy its percent and target: listed percentages read back exactly to their stored values on both machines. On refusal re-list, and never recreate an already-consumed entry. Do not undo a mode change with another `next hold`: its cleared elapsed hold cannot be restored. Install natedev and the Mac together before writing any half-point entry. Workers refuse both hold modes.
 
-Each refusal-watch pass first starts a quiet probe session on each local noted Claude account whose stored usage says its login expired. The probe has a 120 s limit. The pass reads usage again after a successful probe, then checks due moves. It tries each account at most once per hour and never starts a probe in a dry run. Probes run before the move log lock. If a probe fails, the blocked line says: "claude4's login expired, and a probe session on it failed (<detail>). Log in on claude4 by hand." Showrunners receive that line through the usual relay. An expired token or a credentials entry with no login token makes status ask you to start a session on that account. This step works on both machines; the Mac usage refresher does not start renewal probes. After a failed probe, status shows the probe time and asks for a manual login.
+Each refusal-watch pass starts a quiet probe session for each local noted Claude account with an expired or missing login token. The Mac usage refresher calls the same renewal function after it saves usage. The probe has a 120 s limit. A successful probe reads usage again. Refusal-watch then checks due moves. Renewal tries each account at most once per hour and never starts a probe in a dry run. Both callers store attempts in `~/.local/state/accounts/login_renewals.json`. Refusal-watch probes run before the move log lock. If a probe fails, the blocked line says: "claude4's login expired, and a probe session on it failed (<detail>). Log in on claude4 by hand." Showrunners receive that line through the usual relay. An expired or missing login token makes status ask you to start a session on that account. natedev renews in its notes job's refusal-watch pass; the Mac renews in its usage refresher. After a failed probe, status shows the probe time and asks for a manual login.
 
 Account launches and renewal probes find Claude on PATH, then in `~/.local/bin`, and start its full path, including terminal relaunches; Codex account launches use the same search.
 

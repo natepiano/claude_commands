@@ -1,5 +1,5 @@
 ---
-description: Exclude a branch from /merge_branch discovery in this repo only.
+description: Exclude a branch from merge discovery.
 ---
 
 Exclude a branch from `/merge_branch` discovery in this repo only.

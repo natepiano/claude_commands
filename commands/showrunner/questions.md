@@ -1,5 +1,5 @@
 ---
-description: List the production's open questions from the proposals store.
+description: List the production's open questions.
 argument-hint: "[<production doc>]"
 ---
 

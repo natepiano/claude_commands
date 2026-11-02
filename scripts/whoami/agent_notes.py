@@ -9,7 +9,9 @@ saved. Other frontmatter and note bodies are preserved. Run as a script, it then
 hands the notes to quota_alert.py, which records routing when an account runs
 low, and to codex_pacer.py, which decides the `pace` tier from them; `refresh`
 (/quota_refresh) is the run after the user reports a usage reset.
-`usage-only` reads and saves usage without running these consumers.
+`usage-only` reads and saves usage, then starts `renew-logins` when renewal is due.
+`renew-logins` renews expired local Claude logins under its own schedule lock.
+It sends no quota alerts and runs neither account moves nor the Codex pacer.
 `blocked` is codex_mesh.py reporting that Codex refused a launch for quota: it reads the notes
 as the timer left them and hands them to quota_alert.blocked().
 """
@@ -578,8 +580,8 @@ def positive_poll_seconds(value: str) -> float:
 
 
 def usage_only(*, poll_seconds: float = 0) -> None:
-    """Read each due account, without notes or routing consumers."""
-    from scripts.accounts import accounts
+    """Read each due account, then start renewal without waiting for a probe."""
+    from scripts.accounts import accounts, refusal_watch
 
     interval = usage_only_interval() - poll_seconds / 2
     with locked_history(schedule_directory("usage-only")) as history:
@@ -592,12 +594,39 @@ def usage_only(*, poll_seconds: float = 0) -> None:
             with usage_store.read_cadence(interval):
                 refreshed = refresh_usage(selection, workers_home, logins,
                     schedule=ScheduledUsageReads(history, interval))
-        for line in refreshed.messages:
-            print(line)
+    for line in refreshed.messages:
+        print(line)
+    try:
+        if refusal_watch.renew_expired_logins(refreshed.observed_at, True):
+            _ = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "renew-logins"],
+                                 start_new_session=True, stdin=subprocess.DEVNULL)
+    except Exception as error:
+        reason = str(error).splitlines()[0] if str(error) else type(error).__name__
+        print(f"login renewal: {reason}", file=sys.stderr)
+
+
+def renew_logins() -> None:
+    """Renew expired logins while holding only the renewal schedule lock."""
+    from scripts.accounts import refusal_watch
+
+    try:
+        with locked_history(schedule_directory("login-renewal")) as renewal_history:
+            if isinstance(renewal_history, ScheduleBusy):
+                return
+            for line in refusal_watch.renew_expired_logins(datetime.now(timezone.utc), False):
+                print(line)
+    except Exception as error:
+        reason = str(error).splitlines()[0] if str(error) else type(error).__name__
+        print(f"login renewal: {reason}", file=sys.stderr)
 
 
 @role_map_command
 def main() -> None:
+    if sys.argv[1:2] == ["renew-logins"]:
+        parser = argparse.ArgumentParser(prog="agent_notes.py renew-logins")
+        _ = parser.parse_args(sys.argv[2:])
+        renew_logins()
+        return
     if sys.argv[1:2] == ["blocked"]:
         parser = argparse.ArgumentParser(prog="agent_notes.py blocked")
         _ = parser.add_argument("identity", nargs="+", metavar="HOME LOGIN LABEL | HOME REASON")
@@ -641,7 +670,7 @@ def main() -> None:
             sys.exit(str(error))
         return
     if sys.argv[1:] not in ([], ["refresh"]):
-        sys.exit("usage: agent_notes.py [refresh|usage-only|blocked]")
+        sys.exit("usage: agent_notes.py [refresh|usage-only|renew-logins|blocked]")
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from scripts.accounts import accounts
 

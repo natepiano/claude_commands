@@ -1,5 +1,5 @@
 ---
-description: Start a lower production's showrunner in its own herdr session, on a picked account, already reporting to this one.
+description: Start a child production showrunner.
 argument-hint: "<production doc> [resume <session id> <dir> [account <label>|config-dir <dir>]] [check]"
 ---
 

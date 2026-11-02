@@ -1,5 +1,5 @@
 ---
-description: Multi-agent API review — ergonomics, performance, simplicity, duplication removal, module structure/naming, and judicious trait/generic use — across a crate or workspace member's public + internal API. Five review agents, an adversarial validation pass, then a worker-compatible phased implementation plan written to the docs directory.
+description: Review Rust APIs with agents.
 ---
 
 **IMPORTANT**: Do NOT modify any source code. This command produces a review doc with an implementation plan — implementation happens via `/plan:to_phased_plan` + `/unit:direct` or a follow-up turn.

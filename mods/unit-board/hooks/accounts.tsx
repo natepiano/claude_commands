@@ -15,7 +15,6 @@ export interface AccountDisplay {
   credits: CreditBalance;
   useCredits: boolean;
   readOk: boolean;
-  read: AccountReading<string>;
 }
 
 function leftTone(weekly: AccountReading<number>): Tone {
@@ -35,7 +34,6 @@ export function accountDisplay(account: StoredAccount): AccountDisplay {
     credits: account.credits === null ? { kind: 'unavailable' }
       : account.credits === 'unlimited' ? { kind: 'unlimited' } : { kind: 'finite', amount: account.credits },
     useCredits: account.use_credits, readOk: account.read_ok === true,
-    read: reading(account.read_at),
   };
 }
 
@@ -62,18 +60,7 @@ function dateText(value: AccountReading<string>, zone: string, now: number): str
   return days === 0 ? clock : `${new Intl.DateTimeFormat('en-US', { timeZone: zone, weekday: 'short' }).format(date)} ${clock}`;
 }
 
-function readAge(value: AccountReading<string>, now: number): string {
-  if (value.kind === 'unavailable') return '';
-  const readAt = new Date(value.value).getTime() / 1000;
-  if (!Number.isFinite(readAt)) return '';
-  const age = Math.max(0, now - readAt);
-  if (age < 60) return `${Math.floor(age)}s`;
-  if (age < 3600) return `${Math.floor(age / 60)}m`;
-  if (age < 86400) return `${Math.floor(age / 3600)}h`;
-  return `${Math.floor(age / 86400)}d`;
-}
-
-type AccountColumn = 'dot' | 'label' | 'roles' | 'busy' | 'shell' | 'idle' | 'total' | 'left' | 'resets' | 'credits' | 'enabled' | 'read';
+type AccountColumn = 'dot' | 'label' | 'roles' | 'busy' | 'shell' | 'idle' | 'total' | 'left' | 'resets' | 'credits' | 'enabled';
 interface AccountRow {
   cells: Record<AccountColumn, BoardLine>;
   facts: BoardLine[];
@@ -113,7 +100,7 @@ function totalRow(accounts: AccountDisplay[]): AccountRow {
   })]);
   return { cells: {
     dot: [], label: [span('total', 'default', 'bold')], left: [], roles: [], ...countSpans(cells),
-    resets: [], credits: [], enabled: [], read: [],
+    resets: [], credits: [], enabled: [],
   }, facts: COUNT_COLUMNS.flatMap(key => cells[key]
     ? [[span(key, 'inactive'), span(` ${cells[key]}`)]] : []) };
 }
@@ -123,7 +110,6 @@ function accountRow(account: AccountDisplay, zone: string, now: number): Account
   const dot = account.readOk ? 'success' : 'error';
   const left = account.weekly.kind === 'available' ? `${Math.round(account.weekly.value)}%` : '—';
   const reset = dateText(account.resets, zone, now);
-  const read = readAge(account.read, now);
   const balance = account.credits.kind === 'unavailable' ? '' : account.credits.kind === 'unlimited'
     ? 'unlimited' : new Intl.NumberFormat('en-US', { maximumFractionDigits: 0 }).format(account.credits.amount);
   const credits = [span(balance)];
@@ -136,12 +122,10 @@ function accountRow(account: AccountDisplay, zone: string, now: number): Account
   if (reset) facts.push([span('resets', 'inactive'), span(` ${reset}`)]);
   if (balance) facts.push([span('credits', 'inactive'), span(' '), ...credits]);
   if (account.useCredits) facts.push([span('enabled')]);
-  if (read) facts.push([span('read', 'inactive'), span(` ${read} ago`)]);
   return { cells: {
     dot: [span('●', dot)], label: [span(account.label, 'default', 'bold')],
     roles: [span(account.roles.join(', '))], ...countSpans(counts), left: [span(left, tone)],
     resets: [span(reset)], credits, enabled: [span(account.useCredits ? 'yes' : '')],
-    read: [span(read)],
   }, facts };
 }
 
@@ -187,7 +171,6 @@ function tableColumns(accounts: AccountRow[]): TableColumn[] {
     { key: 'resets', heading: 'resets', align: 'right', width: 0 },
     { key: 'credits', heading: 'credits', align: 'right', width: 0 },
     { key: 'enabled', heading: 'enabled', align: 'left', width: 0 },
-    { key: 'read', heading: 'read', align: 'right', width: 0 },
   ];
   return columns.map(column => ({ ...column, width: accounts.reduce(
     (width, row) => Math.max(width, lineWidth(row.cells[column.key])), cellWidth(column.heading)) }));

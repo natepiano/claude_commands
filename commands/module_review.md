@@ -1,5 +1,5 @@
 ---
-description: Three-pass module-structure evaluation. Three agents review a directory tree (cohesion / coupling / placement). The agent writes a restructure plan to a doc. If pass 1 surfaced over-large files (per the style guide), three more agents design split phases. Three final agents stress-test the complete plan. The agent refines and presents.
+description: Review module structure with agents.
 ---
 
 **IMPORTANT**: Do NOT modify any source code. This command produces a planning doc only — implementation lives in a separate command or follow-up turn.

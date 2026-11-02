@@ -1,5 +1,5 @@
 ---
-description: Publish a configuration value the user approved, on both machines.
+description: Publish an approved config value.
 ---
 
 **Usage:** `/tune <file> <key> <value>` (file is the config stem)

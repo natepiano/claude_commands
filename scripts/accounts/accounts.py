@@ -15,7 +15,6 @@ import os
 import random
 import re
 import shlex
-import shutil
 import socket
 import stat
 import subprocess
@@ -44,6 +43,7 @@ sys.path.insert(0, str(SCRIPTS / "whoami"))
 from scripts.whoami import account  # noqa: E402
 from scripts.whoami.account import ResolvedHistoryLabel as ResolvedHistoryLabel, HistoricalAccountUnresolved as HistoricalAccountUnresolved  # noqa: E402
 from scripts.lib import atomic_file, unit_runs  # noqa: E402
+from scripts.lib.agent_program import resolve_program as resolve_program
 from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
 from scripts.whoami import agent_accounts  # noqa: E402
 from scripts.whoami import note_file  # noqa: E402
@@ -57,7 +57,7 @@ from scripts.accounts.refusals import (  # noqa: E402
 )
 
 from scripts.accounts import next_moves
-from scripts.shutdown import stop_results
+from scripts.shutdown import remote, stop_results
 sys.path.insert(0, str(SCRIPTS / "shutdown"))
 from scripts.accounts.role_map import (  # noqa: E402
     RoleMap as RoleMap, RoleMapChange as RoleMapChange,
@@ -1558,31 +1558,53 @@ def launch_shell_environment(directory: Path) -> dict[str, str]:
     raise LaunchShellError("accounts: nix shell helper returned an unsupported result")
 
 
-def resolve_program(tool: Literal["claude", "codex"], *, environment: Mapping[str, str] = os.environ) -> str:
-    """Find the agent itself, without loading the launch shell a second time."""
-    installed = accounts_home() / ".local" / "bin" / tool
-    directories = environment.get("PATH", os.defpath).split(os.pathsep)
-    for directory in [*directories, str(installed.parent)]:
-        found = shutil.which(tool, path=directory or os.curdir)
-        if not found:
-            continue
-        program = Path(found)
-        # Shell launchers invoke the shared helper. Agent scripts must still work.
-        try:
-            with program.open("rb") as source:
-                if source.read(2) == b"#!":
-                    script = source.read()
-                    if b"nix_env.py" in script or b"lib.nix_env" in script:
-                        continue
-        except OSError:
-            # An executable does not need read permission to run.
-            pass
-        return str(program.absolute())
-    raise FileNotFoundError(f"{tool} program not found (looked in PATH and {installed})")
+def _update_codex(arguments: list[str]) -> int:
+    """Update both shared installs and report one result for each machine."""
+    environment = launch_shell_environment(Path.cwd())
+    environment["CODEX_HOME"] = str(accounts_home() / ".codex")
+    machine = remote.local_machine()
+    local_ok = False
+    try:
+        program = resolve_program("codex", environment=environment)
+        updated = subprocess.run([program, *arguments], env=environment, check=False)
+        if updated.returncode:
+            print(f"{machine}: update failed (exit {updated.returncode})", flush=True)
+        else:
+            version = subprocess.run([program, "--version"], env=environment,
+                capture_output=True, text=True, timeout=15, check=False)
+            local_ok = version.returncode == 0 and bool(version.stdout.strip())
+            detail = version.stdout.strip().splitlines()[-1] if local_ok else f"version read failed (exit {version.returncode})"
+            print(f"{machine}: {detail}", flush=True)
+    except subprocess.TimeoutExpired:
+        print(f"{machine}: version read timed out", flush=True)
+    except OSError:
+        print(f"{machine}: codex could not start", flush=True)
+
+    machine = remote.other_machine()
+    command = 'CODEX_HOME="$HOME/.codex" "$HOME/.local/bin/codex" update >&2 && "$HOME/.local/bin/codex" --version'
+    try:
+        updated = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", machine, command],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=600, check=False)
+    except (subprocess.TimeoutExpired, OSError):
+        print(f"{machine}: unreachable; run codex update there")
+        return 1
+    if updated.returncode == 255:
+        print(f"{machine}: unreachable; run codex update there")
+        return 1
+    if updated.returncode:
+        print(f"{machine}: update failed (exit {updated.returncode})")
+        return 1
+    if not updated.stdout.strip():
+        print(f"{machine}: version read failed")
+        return 1
+    print(f"{machine}: {updated.stdout.strip().splitlines()[-1]}")
+    return 0 if local_ok else 1
 
 
-def _exec_codex_account(label: str, arguments: list[str]) -> None:
+def _exec_codex_account(label: str, arguments: list[str]) -> int:
     """Launch Codex on a checked account, including the stored workers selection."""
+    if arguments[:1] == ["update"]:
+        return _update_codex(arguments)
     selected_label = role_account("workers").label if label == "workers" else label
     target = check_codex_target(selected_label, accounts_home() / ".codex")
     environment = launch_shell_environment(Path.cwd())
@@ -1671,14 +1693,13 @@ def renew_login(label: str) -> LoginRenewed | LoginRenewalFailed:
     return LoginRenewed()
 
 
-def exec_account(label: str, arguments: list[str], *, probe: bool = False) -> None:
+def exec_account(label: str, arguments: list[str], *, probe: bool = False) -> int:
     """Replace this process with the selected Claude or Codex account."""
     label = note_file.canonical_label(label)
     if label == "workers" or _label_is(label, "codex"):
         if probe:
             raise AccountsError("accounts: --probe is only supported for Claude accounts")
-        _exec_codex_account(label, arguments)
-        return
+        return _exec_codex_account(label, arguments)
     if label == "claude":
         prepared = PreparedAccount({}, frozenset({
             "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_REMOTE_MEMORY_DIR", "CLAUDE_CODE_OAUTH_TOKEN",
@@ -4459,6 +4480,11 @@ class StatusDocument(TypedDict):
     problems: list[str]
 
 
+def _reading_is_old(read_at: datetime, now: datetime) -> bool:
+    """Use one age limit for usage and credits; future readings are fresh."""
+    return now - read_at > STALE_AFTER
+
+
 def _credit_reading(
     usage: usage_store.StoredUsage, now: datetime,
 ) -> tuple[str, float | Literal["unlimited"] | StatusUnavailable]:
@@ -4468,7 +4494,7 @@ def _credit_reading(
     read_at = _stored_time(credits["at"])
     if read_at is None:
         return ("unavailable", StatusUnavailable("unavailable"))
-    if not timedelta(0) <= now - read_at <= STALE_AFTER:
+    if _reading_is_old(read_at, now):
         return ("stale", StatusUnavailable(f"stale since {read_at:%Y-%m-%d %H:%M %Z}"))
     balance = credits["balance"]
     try:
@@ -4564,14 +4590,15 @@ def render_status_json(reading: StatusReading) -> str:
             credits=None if isinstance(row.credits, StatusUnavailable) else row.credits,
             use_credits=row.use_credits,
             read_at=None if isinstance(row.read_at, StatusUnavailable) else row.read_at.astimezone(timezone.utc).isoformat(),
-            read_ok=isinstance(row.read_at, datetime) and row.read_outcome in (
+            read_ok=isinstance(row.read_at, datetime) and not _reading_is_old(row.read_at, reading.checked_at)
+            and row.on_credits != "stale" and row.read_outcome in (
                 agent_accounts.UsageReadOutcome.OK, agent_accounts.UsageReadOutcome.HELD),
             credits_in_use=row.on_credits == "yes")
         accounts.append(item)
     return json.dumps(StatusDocument(session_inputs=list(reading.session_inputs), accounts=accounts, problems=[note.removeprefix("* ") for note in reading.notes]))
 
 
-ProblemKind = Literal["warning", "usage claim", "usage save", "startup", "usage", "legacy", "unnoted", "test login", "access", "identity", "signed out", "wrong login", "unreadable note", "note", "state", "check", "role", "unclassified", "mcp servers"]
+ProblemKind = Literal["warning", "usage claim", "usage save", "startup", "usage", "credits", "legacy", "unnoted", "test login", "access", "identity", "signed out", "wrong login", "unreadable note", "note", "state", "check", "role", "unclassified", "mcp servers"]
 
 
 @dataclass(frozen=True)
@@ -4729,17 +4756,24 @@ def _read_failure_problem(row: StatusRow, zone: tzinfo,
         case agent_accounts.UsageReadOutcome.OK | agent_accounts.UsageReadOutcome.HELD:
             cause, step = "", ""
     subject = row.label if _label_is(row.label, "claude") or _label_is(row.label, "codex") else row.folder
-    startup_problems: list[StatusProblem] = []
+    reading_problems: list[StatusProblem] = []
+    if row.on_credits == "stale" and isinstance(row.credits, StatusUnavailable):
+        reading_problems.append(StatusProblem(subject, "credits reading is old",
+            ProblemCause("credits", row.credits.cell), ProblemStep("run accounts.py status to refresh usage"), True))
     if isinstance(startup, agent_accounts.CodexStartupFailure):
-        startup_problems.append(StatusProblem(subject, "usage unavailable",
+        reading_problems.append(StatusProblem(subject, "usage unavailable",
             ProblemCause("startup", f"Codex did not start at {agent_accounts.codex_home_display(startup.home)}; {previous}"),
             ProblemStep(f"run {startup.setup_command} and try again" + (f"; {step}" if step else "")), True))
         if row.read_outcome in (agent_accounts.UsageReadOutcome.ERROR, agent_accounts.UsageReadOutcome.OK,
                               agent_accounts.UsageReadOutcome.HELD):
-            return startup_problems
+            return reading_problems
     if row.read_outcome in (agent_accounts.UsageReadOutcome.OK, agent_accounts.UsageReadOutcome.HELD):
-        return []
-    return [*startup_problems, StatusProblem(subject, "usage unavailable", ProblemCause("usage", cause), ProblemStep(step), True)]
+        if isinstance(row.read_at, datetime) and _reading_is_old(row.read_at, now):
+            reading_problems.append(StatusProblem(subject, "usage reading is old",
+                ProblemCause("usage", f"last good read at {stamp(row.read_at)}"),
+                ProblemStep("run accounts.py status to refresh usage"), True))
+        return reading_problems
+    return [*reading_problems, StatusProblem(subject, "usage unavailable", ProblemCause("usage", cause), ProblemStep(step), True)]
 
 
 def render_status_table(reading: StatusReading) -> str:
@@ -5030,7 +5064,7 @@ def merge_status_problems(problems: list[StatusProblem]) -> list[StatusProblem]:
                 observation_order.append(key)
             groups[key].append(problem)
     priority: tuple[ProblemKind, ...] = ("warning", "usage claim", "usage save", "test login", "startup", "unreadable note", "wrong login",
-        "identity", "access", "signed out", "unnoted", "note", "legacy", "usage", "state", "check", "role", "unclassified", "mcp servers")
+        "identity", "access", "signed out", "unnoted", "note", "legacy", "usage", "credits", "state", "check", "role", "unclassified", "mcp servers")
     for observed in observation_order:
         if isinstance(observed, StatusProblem):
             result.append(observed)
@@ -5794,8 +5828,7 @@ def main(argv: list[str]) -> int:
             print(placement_report())
             return 0
         if options.action == "exec":
-            exec_account(options.label, options.claude_args, probe=options.probe)
-            return 0
+            return exec_account(options.label, options.claude_args, probe=options.probe) or 0
         if options.action == "move":
             if options.session in CLAUDE_GROUPS:
                 if not options.label or options.source or options.target:

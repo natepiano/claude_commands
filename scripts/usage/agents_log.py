@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import BinaryIO, Literal, cast, get_args
 
 Role = Literal["showrunner", "director", "impl", "test", "fix", "review", "worker", "interactive", "subagent"]
-Lens = Literal["adversary", "contract", "craft", "ux", "rerun"]
+Lens = Literal["adversary", "contract", "craft", "ux", "rerun", "simplify"]
 ROLES: tuple[Role, ...] = ("showrunner", "director", "impl", "test", "fix", "review", "worker", "interactive", "subagent")
 LENSES = cast(tuple[Lens, ...], get_args(Lens))
 

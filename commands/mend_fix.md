@@ -1,5 +1,5 @@
 ---
-description: Reproduce a cargo-mend failure on an external project in a throwaway /tmp copy, diagnose and fix cargo-mend, install after the fix is confirmed, and clean up only after the user verifies
+description: Reproduce and fix a cargo-mend failure.
 ---
 
 # Mend Fix

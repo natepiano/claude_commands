@@ -1,6 +1,6 @@
 ---
-description: File a question for the user without showing it in a reply.
-argument-hint: "[<unit staff id>] <the full question>"
+description: Queue a user question for later review.
+argument-hint: "[<unit staff id>] <the question in full>"
 ---
 
 # Question

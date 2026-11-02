@@ -604,7 +604,7 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
     for item in prepared:
         unit = item.unit
         assert isinstance(item.config.retired, unit_config.RetiredSession)
-        unit_config.park(item.member.id, unit.worktree, item.config.retired)
+        _ = unit_config.park(item.member.id, unit.worktree, item.config.retired)
         if unit.worktree.exists():
             retire_reservations(unit.worktree)
             _ = checked(production.checkout, "retire", "worktree", "remove", str(unit.worktree))

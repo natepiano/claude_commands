@@ -1169,7 +1169,7 @@ def _herdr_launch(
         ):
             activity = client.pane_activity(destination.pane_id)
             if isinstance(activity, herdr.PaneAtShell):
-                client.close_pane(destination.pane_id)
+                client.close_retained_pane(destination.pane_id)
             else:
                 # The session resumes in its own new tab, so a busy old pane is left as it is.
                 print(f"herdr {name}:{destination.pane_id}: pane runs {', '.join(activity.commands)}; left open")
@@ -1213,9 +1213,9 @@ def _leave_recorded_session(name: str, recorded: str, pane: str) -> None:
             print(f"{name} restart issue: herdr {recorded}:{pane} still runs a program; left open")
             return
         if all(isinstance(client.pane_activity(row["pane_id"]), herdr.PaneAtShell) for row in rows):
-            herdr.stop_session(recorded)
+            herdr.close_agent(recorded, pane)
         elif left:
-            client.close_pane(pane)
+            client.close_retained_pane(pane)
     except (herdr.HerdrFailure, OSError, subprocess.SubprocessError) as error:
         print(f"{name} restart issue: herdr session {recorded} left open: {error}")
 

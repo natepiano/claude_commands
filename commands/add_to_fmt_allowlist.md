@@ -1,5 +1,5 @@
 ---
-description: Add the current Rust crate to the rustfmt allowlist, detecting the package name from Cargo.toml.
+description: Add a Rust crate to the fmt allowlist.
 ---
 
 **IMPORTANT** don't commit any changes. Just do the following:

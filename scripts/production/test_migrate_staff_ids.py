@@ -62,7 +62,7 @@ class NativeMigrationTests(StaffTestCase):
         configuration = unit_config.UnitConfig(unit_config.StandbyPlan(), unit_config.AppPort(8123), ("nightly",),
             unit_config.RetiredSession("2026-10-31", native_unit,
                                       unit_config.RecordedStartFolder(self.root / "original"), unit_config.Branch("models")))
-        unit_config.write_parked(old_unit, configuration)
+        _ = unit_config.write_parked(old_unit, configuration)
         reference = Path(os.environ["SHOWRUNNER_STATE_DIR"]) / "demo" / "rename.json"
         self.write_json(reference, {"old": "former", "new": "demo", "owner": old_owner, "unit": old_unit})
         tip = self.fixture_git(repository, "rev-parse", "HEAD")
@@ -101,7 +101,7 @@ class NativeMigrationTests(StaffTestCase):
                 write_parked = unit_config.write_parked
 
                 def parked(identity: staff.StaffId, config: unit_config.UnitConfig) -> None:
-                    write_parked(identity, config)
+                    _ = write_parked(identity, config)
                     if identity == self.fixture.native_unit:
                         stop_once()
 
@@ -381,7 +381,7 @@ class NativeMigrationTests(StaffTestCase):
 
     def test_an_unequal_parked_destination_refuses_without_changing_staff(self) -> None:
         other = replace(self.fixture.configuration, responsibilities=("other",))
-        unit_config.write_parked(self.fixture.native_unit, other)
+        _ = unit_config.write_parked(self.fixture.native_unit, other)
         before = self.staff_file.read_bytes(), unit_config.parked_path(self.fixture.native_unit).read_bytes()
         with self.assertRaisesRegex(staff.StaffRefused, "unequal migration destination"):
             _ = self.result()

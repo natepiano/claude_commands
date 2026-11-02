@@ -165,28 +165,52 @@ def director(run: Path, *, dependencies: Callable[[Path], None] | None = None) -
     return recorded or _started_by(run, dependencies=dependencies)
 
 
-def held(session_id: str, root_override: str | Path | None = None,
-         active_override: str | Path | None = None) -> list[str]:
-    """Every run folder the session directs: its marker's run first, as the marker writes it, then
-    each folder under the run roots that names it as director. A plain scan, since reading the
-    director of every folder costs about 25 ms for the 224 live ones (2026-10-17)."""
-    if not session_id:
-        return []
-    try:
-        lines = marker(session_id, active_override).read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeError):
-        lines = []
-    runs = [lines[0].strip()] if lines and lines[0].strip() else []
-    seen = {Path(run).resolve() for run in runs}
+def held_by_session(root_override: str | Path | None = None) -> dict[str, list[str]]:
+    """Read each folder's director once, in root order and then name order."""
+    found: dict[str, list[str]] = {}
+    seen: set[Path] = set()
     for root in run_roots(root_override):
         try:
             folders = sorted(root.iterdir())
         except OSError:
             continue
         for folder in folders:
-            if folder.is_dir() and folder.resolve() not in seen and director(folder) == session_id:
-                seen.add(folder.resolve())
-                runs.append(str(folder))
+            resolved = folder.resolve()
+            if folder.is_dir() and resolved not in seen:
+                seen.add(resolved)
+                found.setdefault(director(folder), []).append(str(folder))
+    return found
+
+
+def held(session_id: str, root_override: str | Path | None = None,
+         active_override: str | Path | None = None, *,
+         scanned: dict[str, list[str]] | None = None) -> list[str]:
+    """List directed folders with the verified marker first, then the shared scan's order."""
+    if not session_id:
+        return []
+    folders = held_by_session(root_override) if scanned is None else scanned
+    try:
+        lines = marker(session_id, active_override).read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError):
+        lines = []
+    runs: list[str] = []
+    if lines and (target := lines[0].strip()):
+        resolved = Path(target).resolve()
+        owner = next((session for session, paths in folders.items()
+                      if any(Path(path).resolve() == resolved for path in paths)), None)
+        if owner is None:
+            owner = director(Path(target))
+            if owner == session_id:
+                # Cache an outside target only after its marker owner matches its director.
+                folders.setdefault(owner, []).append(target)
+        if owner == session_id:
+            runs.append(target)
+    seen = {Path(run).resolve() for run in runs}
+    for folder in folders.get(session_id, ()):
+        resolved = Path(folder).resolve()
+        if resolved not in seen:
+            seen.add(resolved)
+            runs.append(folder)
     return runs
 
 
