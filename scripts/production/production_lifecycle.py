@@ -30,6 +30,7 @@ from merge_checkpoint import (CodeCheckpoint, MergeEntry, NoMerge,
                               git, good, merge_branch_history, promote_local_checkout,
                               pull_mac_checkout, report)
 from scripts.production import production_doc
+from update_registration import QuestionStaff
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 from atomic_file import write_text_atomic
@@ -524,10 +525,10 @@ def retire_wrap_rows(rows: tuple[UnitRow, ...], record: staff.StaffSnapshot,
     return bool(pending)
 
 
-def tidy_state(slug: str) -> None:
-    """Delete the production's own footer, pause, open-question and state files; a failure keeps them for the sweep."""
+def tidy_state(slug: str, document: Path, *, identities: QuestionStaff) -> None:
+    """Close owned questions and delete state files. Keep the files when cleanup fails."""
     try:
-        removed = tidy_wrapped.tidy(slug)
+        removed = tidy_wrapped.tidy(slug, document, identities=identities)
     except (tidy_wrapped.TidyRefused, OSError) as error:
         report("tidy", "kept", f"{error}; tidy_wrapped.py removes them once the doc says wrapped")
         return
@@ -655,7 +656,8 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
     final_doc = archive if archive is not None else production.doc
     if not final_doc.is_file():
         raise LifecycleStop("staff", "held", f"wrapped production doc is missing: {final_doc}")
-    _ = staff.set_doc(runner.row.id, staff.WrappedDoc(local_machine(), final_doc))
+    wrapped_runner = staff.set_doc(runner.row.id, staff.WrappedDoc(local_machine(), final_doc))
+    record = replace(record, rows=tuple(wrapped_runner if row.id == wrapped_runner.id else row for row in record.rows))
     if record.pending_retire:
         _ = staff.retire_pending()
     if git(production.checkout, "diff", "--quiet", "HEAD", "--", *doc_paths).returncode == 1:
@@ -696,7 +698,7 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
     print(f"| Main | {main_result} |")
     print("| Next | close herdr sessions |")
     if not held:
-        tidy_state(production.slug)
+        tidy_state(production.slug, final_doc, identities=QuestionStaff.for_record(record, sources))
     return 1 if held else 0
 
 

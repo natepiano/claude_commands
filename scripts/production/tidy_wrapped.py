@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""Delete a wrapped production's own state files: its footer switch, review pause, open questions, footer counts,
-footer report and state folder.
+"""Delete a wrapped production's reminder state, counts, reports and state folder.
+
+Closed question records remain in the proposals store.
 
 Usage: tidy_wrapped.py <production doc>...
 
-The wrap calls `tidy` once the update timer is gone. Run by hand, this is the sweep for productions
-wrapped before the wrap tidied: a doc that does not say wrapped, or whose production still has an
-update timer, keeps every file.
+A production with an update timer or a status other than wrapped keeps its state.
 """
 from __future__ import annotations
 
@@ -15,6 +14,10 @@ import re
 import shutil
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from update_registration import QuestionStaff
 
 STATE_DIR = Path(os.environ.get("SHOWRUNNER_STATE_DIR") or Path.home() / ".local/state/showrunner")
 NOTIFIER_STATE_DIR = Path(os.environ.get("NOTIFIER_STATE_DIR") or Path.home() / ".local/state/notifier")
@@ -42,10 +45,17 @@ def owned_paths(slug: str) -> tuple[Path, ...]:
             STATE_DIR / "reports" / f"{slug}.json", STATE_DIR / slug)
 
 
-def tidy(slug: str) -> list[Path]:
-    """Delete the production's own state files and return those that existed."""
+def tidy(slug: str, document: Path | None = None, *, identities: QuestionStaff | None = None) -> list[Path]:
+    """Close the production's questions and delete its state files."""
+    from update_registration import QuestionStaff, close_questions
+    from proposals_folder import issues_folder
+
+    paths = owned_paths(slug)
+    if document is not None and issues_folder(document) is not None:
+        identities = identities if identities is not None else QuestionStaff.read()
+        close_questions(document, identities)
     removed: list[Path] = []
-    for path in owned_paths(slug):
+    for path in paths:
         if path.is_dir() and not path.is_symlink():
             shutil.rmtree(path)
         elif path.exists() or path.is_symlink():
@@ -74,12 +84,18 @@ def main(argv: list[str]) -> int:
     if not argv:
         print("usage: tidy_wrapped.py <production doc>...", file=sys.stderr)
         return 2
+    from update_registration import QuestionStaff, RegistrationFailure
+    from proposals_folder import issues_folder
+
+    identities: QuestionStaff | None = None
     failed = False
     for name in argv:
         try:
             slug = wrapped_slug(Path(name))
-            removed = tidy(slug)
-        except (TidyRefused, OSError, UnicodeError) as error:
+            if issues_folder(Path(name)) is not None:
+                identities = identities if identities is not None else QuestionStaff.read()
+            removed = tidy(slug, Path(name), identities=identities)
+        except (TidyRefused, RegistrationFailure, OSError, UnicodeError, ValueError) as error:
             print(f"kept: {error}", file=sys.stderr)
             failed = True
             continue
