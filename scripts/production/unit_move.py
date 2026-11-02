@@ -523,8 +523,12 @@ def _foreground_folder_session(
     pending: list[PendingFolderStartup] = []
     for value in herdr.json_items(info.get("foreground_processes"), "folder move foreground processes"):
         process = herdr.json_object(value, "folder move process")
-        arguments = [herdr.json_text(value, "folder move argument")
-                     for value in herdr.json_items(process.get("argv"), "folder move arguments")]
+        try:
+            arguments = [herdr.json_text(value, "folder move argument")
+                         for value in herdr.json_items(process.get("argv"), "folder move arguments")]
+        except herdr.HerdrFailure as error:
+            pending.append(PendingFolderStartup(f"{row.id}: foreground arguments are unreadable: {error}"))
+            continue
         kind = "codex" if herdr.is_codex_process(arguments) else "claude" if herdr.is_claude_process(arguments) else ""
         if not kind:
             continue

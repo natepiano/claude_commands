@@ -29,6 +29,11 @@ from scripts.shutdown import pane_record
 import herdr
 
 
+UNREADABLE_ARGUMENTS: tuple[dict[str, object], ...] = (
+    {}, {"argv": None}, {"argv": "starting"}, {"argv": ["starting", 17]},
+)
+
+
 @final
 class AddUnitResumeFolderTests(AddUnitTestCase):
     def test_resuming_a_stopped_unit_tab_retires_the_old_record_before_a_folder_move(self) -> None:
@@ -431,6 +436,130 @@ class UnitFolderMoveTests(FolderMoveFixture):
                     case.assert_finished_rerun(backend)
                 finally:
                     case.doCleanups()
+
+    def assert_unreadable_resume(self, kind: Literal["claude", "codex"], arguments: dict[str, object], *,
+                                 verified: bool = False, expires: bool = False) -> None:
+        backend = self.folder_backend(kind, live=True)
+        unreadable: dict[str, object] = {"pid": backend.pid + 1, "cwd": str(self.new_folder), **arguments}
+        foreground = [unreadable]
+        if verified:
+            foreground.insert(0, {"pid": backend.pid, "argv": [kind], "cwd": str(self.new_folder)})
+        polls = 32 if expires else 1 if verified else 2
+        backend.startup_foreground_polls = [foreground.copy() for _ in range(polls)]
+        clock = [0.0]
+        sleeps: list[float] = []
+        proved: list[int] = []
+        native_process = herdr.native_process
+
+        def observe(pid: int, runtime: str) -> herdr.NativeAgentProcess:
+            observed = native_process(pid, runtime)
+            if backend.starts:
+                proved.append(pid)
+            return observed
+
+        def sleep(seconds: float) -> None:
+            self.assertEqual(len(backend.starts), 1)
+            move = unit_move.read_folder_move(staff.folder_move_path(self.owner.id))
+            self.assertIs(move.steps["resume"], unit_move.FolderStepState.PENDING)
+            self.assertIs(pane_record.read("agents")["w1:p1"].get("ended"), True)
+            sleeps.append(seconds)
+            clock[0] += seconds
+
+        with (mock.patch.object(herdr, "native_process", side_effect=observe),
+              mock.patch.object(time, "monotonic", side_effect=lambda: clock[0]),
+              mock.patch.object(time, "sleep", side_effect=sleep),
+              mock.patch.object(unit_move, "folder_move_deadline", return_value=1.0)):
+            result = self.move_folder()
+        self.assert_moved(backend)
+        self.assertEqual((len(backend.starts), len(backend.stops)), (1, 1))
+        pane, command = backend.starts[0]
+        self.assertEqual(pane, "w1:p1")
+        self.assertEqual(backend.cwd, self.new_folder)
+        resume = command.index("--resume" if kind == "claude" else "resume", command.index("exec") + 1)
+        self.assertEqual(command[resume + 1], self.owner.current_session)
+        self.assertGreater(len(sleeps), 0)
+        move = unit_move.read_folder_move(staff.folder_move_path(self.owner.id))
+        if expires:
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn("resumed session is not yet proved; rerun move-folder", result.stderr)
+            self.assertGreaterEqual(clock[0], 1.0)
+            self.assertTrue(backend.startup_foreground_polls)
+            self.assertEqual(proved, [])
+            self.assertIs(move.steps["resume"], unit_move.FolderStepState.PENDING)
+            self.assertTrue(all(move.steps[step] is unit_move.FolderStepState.DONE
+                                for step in unit_move.FOLDER_MOVE_STEPS if step != "resume"))
+            self.assertIs(pane_record.read("agents")["w1:p1"].get("ended"), True)
+        else:
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(len(sleeps), polls)
+            self.assertEqual(backend.startup_foreground_polls, [])
+            self.assertEqual(proved, [backend.pid] * (polls + 1 if verified else 1))
+            self.assertIs(move.steps["resume"], unit_move.FolderStepState.DONE)
+            self.assertIs(pane_record.read("agents")["w1:p1"].get("ended"), False)
+            self.assert_finished_rerun(backend)
+
+    def test_resume_retries_unreadable_arguments_until_the_process_is_readable(self) -> None:
+        for kind in ("claude", "codex"):
+            for arguments in UNREADABLE_ARGUMENTS:
+                with self.subTest(kind=kind, arguments=arguments):
+                    case = UnitFolderMoveTests()
+                    case.setUp()
+                    try:
+                        case.assert_unreadable_resume(kind, arguments)
+                    finally:
+                        case.doCleanups()
+
+    def test_resume_keeps_a_verified_agent_pending_beside_unreadable_arguments(self) -> None:
+        for kind in ("claude", "codex"):
+            for arguments in UNREADABLE_ARGUMENTS:
+                with self.subTest(kind=kind, arguments=arguments):
+                    case = UnitFolderMoveTests()
+                    case.setUp()
+                    try:
+                        case.assert_unreadable_resume(kind, arguments, verified=True)
+                    finally:
+                        case.doCleanups()
+
+    def test_resume_keeps_its_step_pending_when_arguments_stay_unreadable_until_the_deadline(self) -> None:
+        for kind in ("claude", "codex"):
+            for arguments in UNREADABLE_ARGUMENTS:
+                with self.subTest(kind=kind, arguments=arguments):
+                    case = UnitFolderMoveTests()
+                    case.setUp()
+                    try:
+                        case.assert_unreadable_resume(kind, arguments, expires=True)
+                    finally:
+                        case.doCleanups()
+
+    def test_unreadable_arguments_before_resume_refuse_without_sending_a_command(self) -> None:
+        for kind in ("claude", "codex"):
+            for arguments in UNREADABLE_ARGUMENTS:
+                with self.subTest(kind=kind, arguments=arguments):
+                    case = UnitFolderMoveTests()
+                    case.setUp()
+                    try:
+                        backend = case.folder_backend(kind, live=True)
+                        backend.foreground_before_start = [
+                            {"pid": backend.pid, "argv": [kind], "cwd": str(case.old_folder)},
+                            {"pid": backend.pid + 1, "cwd": str(case.old_folder), **arguments},
+                        ]
+                        paths = (case.staff_file, case.records / "agents.json", case.history,
+                                 case.run_dir / "progress_history_state.json")
+                        before = [path.read_bytes() for path in paths]
+                        with mock.patch.object(time, "sleep") as sleep:
+                            result = case.move_folder()
+                        case.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                        case.assertIn("foreground arguments are unreadable", result.stderr)
+                        sleep.assert_not_called()
+                        case.assertEqual((backend.starts, backend.stops), ([], []))
+                        case.assertTrue(backend.live)
+                        case.assertEqual(backend.cwd, case.old_folder)
+                        case.assertTrue((case.old_folder / ".git").is_file())
+                        case.assertFalse(case.new_folder.exists())
+                        case.assertFalse(staff.folder_move_path(case.owner.id).exists())
+                        case.assertEqual([path.read_bytes() for path in paths], before)
+                    finally:
+                        case.doCleanups()
 
     def test_normal_codex_launch_moves_without_a_claude_launch_record(self) -> None:
         client_type = herdr.Herdr

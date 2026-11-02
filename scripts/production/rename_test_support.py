@@ -60,6 +60,8 @@ class FolderMoveBackend:
         self.startup_pending: bool = False
         self.startup_delay_polls: int = 0
         self.startup_observations: int = 0
+        self.startup_foreground_polls: list[list[dict[str, object]]] = []
+        self.foreground_before_start: list[dict[str, object]] = []
         self.pid: int = 998041
         self.shell_pid: int = 998040
         self.starts: list[tuple[str, list[str]]] = []
@@ -116,8 +118,13 @@ class FolderMoveBackend:
                 self.live = True
                 self.publish_process_state()
         argv = [self.kind] if self.live else [sys.executable, "/fixture/accounts.py", "exec", self.config.name]
+        foreground: list[dict[str, object]] = [{"pid": self.pid, "argv": argv, "cwd": str(self.cwd)}]
+        if self.starts and self.startup_foreground_polls:
+            foreground = self.startup_foreground_polls.pop(0)
+        elif not self.starts and self.foreground_before_start:
+            foreground = self.foreground_before_start
         return {"process_info": {"shell_pid": self.shell_pid, "cwd": str(self.cwd),
-                                 "foreground_processes": [{"pid": self.pid, "argv": argv, "cwd": str(self.cwd)}]}}
+                                 "foreground_processes": foreground}}
 
     def run_in_pane(self, pane: str, command: list[str]) -> None:
         self.fixture.assertEqual(pane, "w1:p1")
