@@ -874,6 +874,51 @@ class SendTests(ShutdownTestCase):
             self.assertEqual(send.send(options).outcome, "skipped")
         self.assertEqual([entry["outcome"] for entry in self.log()], ["sent", "failed", "skipped"])
 
+    def test_github_cold_keys_share_one_claim_until_warm_even_after_phone_expiry(self) -> None:
+        def options(sender: str, machine: str = "natedev") -> send.Options:
+            return send.parse(["--here", "--to", "user", "--text-id", "github.keys_cold",
+                               "--value", f"sender={sender}", "--value", f"machine={machine}"])
+        first = send.now()
+        with mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")) as channel:
+            self.assertEqual(send.send(options("hana")).outcome, "sent")
+            self.assertEqual(send.send(options("builds")).outcome, "skipped")
+            self.assertEqual(channel.call_count, 1)
+            with mock.patch.object(send, "now", return_value=first + send.emergency_lifetime() * 2):
+                with mock.patch.object(send, "check_exit", return_value=1):
+                    self.assertEqual(send.clear_check()[0], 0)
+                self.assertEqual(send.send(options("third")).outcome, "skipped")
+                with mock.patch.object(send, "check_exit", return_value=0):
+                    self.assertEqual(send.clear_check()[0], 0)
+                self.assertEqual(send.send(options("builds")).outcome, "sent")
+            self.assertEqual(send.send(options("hana", "mac")).outcome, "sent")
+
+    def test_cold_key_claim_survives_sender_death_with_a_warm_check(self) -> None:
+        options = send.parse(["--here", "--to", "user", "--text-id", "github.keys_cold",
+                              "--value", "sender=hana", "--value", "machine=natedev"])
+        with mock.patch.object(send, "run", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                _ = send.send(options)
+        with mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")) as channel:
+            self.assertEqual(send.send(options).outcome, "skipped")
+            channel.assert_not_called()
+            with mock.patch.object(send, "check_exit", return_value=0):
+                self.assertEqual(send.clear_check()[0], 0)
+            self.assertEqual(send.send(options).outcome, "sent")
+
+    def test_forwarded_cold_key_push_leaves_the_warm_check_on_its_origin_machine(self) -> None:
+        options = send.parse(["--here", "--to", "user", "--self-clearing", "--text-id", "github.keys_cold",
+                              "--value", "sender=hana", "--value", "machine=mac"])
+        self.assertEqual(options.key, "github.keys_cold:mac")
+        self.assertEqual(options.clears_when, "")
+
+    def test_failed_github_cold_key_push_releases_the_shared_claim(self) -> None:
+        options = send.parse(["--here", "--to", "user", "--text-id", "github.keys_cold",
+                              "--value", "sender=hana", "--value", "machine=natedev"])
+        with mock.patch.object(send, "run", return_value=(1, "", "offline")):
+            self.assertEqual(send.send(options).outcome, "failed")
+        with mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")):
+            self.assertEqual(send.send(options).outcome, "sent")
+
     @staticmethod
     def emergency(*extra: str) -> list[str]:
         return ["--here", "--to", "user", "--from", "hana", "--summary", "GitHub credentials are cold", "--need", "blocked",

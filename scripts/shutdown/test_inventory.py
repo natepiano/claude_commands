@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.production.staff_test_support import unit_membership
+from scripts.production import staff
 from test_support import ShutdownTestCase, linux_process_fixture
 from test_restart import entry, top_level, worker_session
 import shutdown_record
@@ -795,7 +796,12 @@ elif "comm=" in joined:
         self.write_session(UNKNOWN_PID, UNKNOWN_ID, "hidden-account", plain, updated_at=10)
 
     def make_production_state(self) -> None:
-        _ = unit_membership("build-followups", "shutdown-unit")
+        member = unit_membership("build-followups", "shutdown-unit")
+        assert member.parent is not None
+        parent = staff.by_id(member.parent)
+        assert parent is not None
+        _ = staff.update_current_session(parent.current_session, staff.StaffId(DIRECTOR_ID))
+        _ = staff.update_current_session(member.current_session, staff.StaffId(UNIT_ID))
         production_doc = self.root / "build-followups-production.md"
         _ = production_doc.write_text("- **User zone:** America/Los_Angeles\n", encoding="utf-8")
         showrunner = self.notifier / "showrunner-build-followups"

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.production.staff_test_support import ClaudeBackendFixture, StaffTestCase, fixture_member, fixture_runtime_id
+
 from scripts.lib import names
 from scripts.lib.test_names import fixture_names
 
@@ -44,8 +46,46 @@ def setUpModule() -> None:
 
 from scripts.production import staff, unit_config
 
+class NativeClaudeUnitTests(StaffTestCase):
+    def test_fresh_unit_uses_the_observed_claude_id_before_its_opening_prompt(self) -> None:
+        document = self.production("demo")
+        _ = document.write_text(document.read_text() + "\n- **Merge branch:** `main`\n"
+                                + f"- **Showrunner checkout:** `{self.root}`\n- **Log:** `demo-log.md`\n")
+        runner = fixture_member("showrunner", name="demo", doc=staff.LiveDoc("natedev", document))
+        production = production_units.read_production(document)
+        folder = self.root / "fresh-unit"
+        folder.mkdir()
+        identity = fixture_runtime_id("fresh-Claude-unit")
+        backend = ClaudeBackendFixture(identity, self.root / "claude-account")
+        request = add_unit.UnitLaunch(
+            production=production, branch="fresh", worktree=folder,
+            plan=add_unit.PlanGiven(Path("plan.md")), port=add_unit.OmittedCell(), owns=add_unit.OmittedCell(),
+            session=add_unit.NewSession(), launch_kind=add_unit.NewWorkLaunch(), timeout=5,
+            identity=add_unit.UnitIdentity("fresh-unit", "fresh"))
+        from scripts.accounts.accounts import NamedAccount
+
+        with (patch.object(herdr, "start_server"), patch.object(herdr, "launch_agent", side_effect=backend.launch)):
+            outcome = add_unit.launch_session(request, add_unit.DirectorAgent("fixture", add_unit.DefaultEffort()),
+                "/unit:direct plan.md", NamedAccount("claude1", backend.configuration))
+        self.assertIsInstance(outcome, herdr.PromptSubmitted)
+        row = backend.before_opening.by_id(staff.StaffId(identity))
+        assert row is not None
+        self.assertEqual((row.id, row.name, row.parent), (identity, "fresh", runner.id))
+        self.assertNotIn("--session-id", backend.arguments)
+        self.assertNotIn("--resume", backend.arguments)
+        self.assertNotIn("STAFF_ID", backend.environment)
+
+
 @final
 class AddUnitLaunchTests(AddUnitTestCase):
+    def assert_observed_identity(self, row: staff.StaffRow) -> None:
+        pid = int(self.env["FAKE_CLAUDE_PID"])
+        registry = sessions.read_session(Path(self.env["NOTIFIER_SESSIONS_DIR"]) / f"{pid}.json")
+        assert not isinstance(registry, sessions.UnreadableSessionRecord)
+        self.assertEqual(registry["sessionId"], self.env["FAKE_CLAUDE_SESSION_ID"])
+        self.assertEqual(registry.get("procStart"), sessions.process_start(pid))
+        self.assertEqual((row.id, row.current_session), (registry["sessionId"], registry["sessionId"]))
+
     def pin_launch_clock(self) -> None:
         def now(zone: tzinfo | None = None) -> datetime:
             return LAUNCHED_AT.astimezone(zone)
@@ -139,7 +179,8 @@ class AddUnitLaunchTests(AddUnitTestCase):
         tracked = subprocess.run(["git", "-C", str(worktree), "ls-files", "--error-unmatch", ".unit.toml"],
                                  capture_output=True, check=False)
         self.assertNotEqual(tracked.returncode, 0)
-        self.assertEqual(self.pane_environment()["STAFF_ID"], row.id)
+        self.assertNotIn("STAFF_ID", self.pane_environment())
+        self.assert_observed_identity(row)
 
     def test_standby_launch_writes_the_standby_plan_in_its_unit_config(self) -> None:
         _ = self.successful("alpha", "--standby")
@@ -162,8 +203,8 @@ class AddUnitLaunchTests(AddUnitTestCase):
 
     def test_existing_unit_name_under_another_production_requires_an_explicit_move(self) -> None:
         old_doc = self.staff.production("old", "alpha-unit", workspace="original")
-        original = staff.ensure("showrunner", name="original")
-        old = staff.ensure("unit", name="alpha", parent=original.id)
+        original = fixture_member("showrunner", name="original")
+        old = fixture_member("unit", name="alpha", parent=original.id)
         before = self.staff.staff_file.read_bytes()
         document = old_doc.read_bytes()
         for attempt in range(2):
@@ -182,31 +223,77 @@ class AddUnitLaunchTests(AddUnitTestCase):
         _ = self.successful("alpha", "--standby")
         rows = [row for row in staff.find(kind="unit") if row.name == "alpha"]
         self.assertEqual(len(rows), 1)
-        self.assertEqual(self.pane_environment().get("STAFF_ID"), rows[0].id)
+        self.assertNotIn("STAFF_ID", self.pane_environment())
+        self.assert_observed_identity(rows[0])
 
     def test_resumed_launch_carries_the_ensured_staff_identity(self) -> None:
-        _ = self.successful("alpha", "--standby", "--resume", "session-123", "--cwd", str(self.checkout))
+        _ = self.successful("alpha", "--standby", "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766", "--cwd", str(self.checkout))
         rows = [row for row in staff.find(kind="unit") if row.name == "alpha"]
         self.assertEqual(len(rows), 1)
-        self.assertEqual(self.pane_environment().get("STAFF_ID"), rows[0].id)
+        self.assertNotIn("STAFF_ID", self.pane_environment())
+        self.assert_observed_identity(rows[0])
+
+    def test_unit_admission_distinguishes_pending_backend_from_published_membership(self) -> None:
+        admit = add_unit.admit_unit
+        requests: list[add_unit.UnitLaunch] = []
+        pending: list[add_unit.UnitAdmissionPending | add_unit.UnitMembershipPublished] = []
+
+        def observe(request: add_unit.UnitLaunch) -> add_unit.UnitAdmissionPending | add_unit.UnitMembershipPublished:
+            result = admit(request)
+            requests.append(request)
+            pending.append(result)
+            self.assertEqual(staff.find(kind="unit"), [])
+            self.assertFalse(any(command[2:4] == ["agent", "start"] for command in self.herdr_calls()))
+            return result
+
+        with patch.object(add_unit, "admit_unit", side_effect=observe):
+            _ = self.successful("alpha", "--plan", "docs/plans/given.md")
+        self.assertEqual(len(pending), 1)
+        self.assertIsInstance(pending[0], add_unit.UnitAdmissionPending)
+        published = admit(requests[0])
+        self.assertIsInstance(published, add_unit.UnitMembershipPublished)
+        assert isinstance(published, add_unit.UnitMembershipPublished)
+        self.assertEqual(published.row, staff.by_current_session(self.env["FAKE_CLAUDE_SESSION_ID"]))
+        self.assertEqual(published.row.name, "alpha")
 
     def test_add_unit_rerun(self) -> None:
         original = add_unit.ensure_staff_unit
+        process = self.root / "proc" / str(os.getpid())
+        process.mkdir(parents=True)
+        fields = Path(f"/proc/{os.getpid()}/stat").read_text().rsplit(")", 1)[1].split()
+        fields[1] = "102"
+        _ = (process / "stat").write_text(f"{os.getpid()} (claude) " + " ".join(fields))
+        _ = (process / "cmdline").write_bytes(b"claude\0")
+        _ = (process / "environ").write_bytes(b"HERDR_PANE_ID=w1:p1\0")
+        _ = (process / "status").write_text(f"Uid:\t{os.getuid()}\t{os.getuid()}\t{os.getuid()}\t{os.getuid()}\n")
+
         for after in (False, True):
+            before = self.staff.staff_file.read_bytes()
+
             def interrupted(production: production_units.Production, unit: str, *,
-                            worktree: staff.PresentWorktree | staff.WorktreeUnfilled) -> staff.StaffRow:
+                            worktree: staff.PresentWorktree | staff.WorktreeUnfilled,
+                            runtime_id: str = "") -> staff.StaffRow:
+                self.assertEqual(runtime_id, self.env["FAKE_CLAUDE_SESSION_ID"])
+                self.assertEqual(self.staff.staff_file.read_bytes(), before)
                 if after:
-                    _ = original(production, unit, worktree=worktree)
+                    _ = original(production, unit, worktree=worktree, runtime_id=runtime_id)
                 raise RuntimeError("stopped at staff step")
+
             with patch.object(add_unit, "ensure_staff_unit", side_effect=interrupted):
                 stopped = self.cli("alpha", "--plan", "docs/plans/given.md")
             self.assertEqual(stopped.returncode, 1, stopped.stderr)
-            self.assertNotIn("| alpha-unit |", self.doc.read_text())
+            self.assertEqual(self.doc.read_text().count("| alpha-unit |"), 1)
+            if not after:
+                self.assertEqual(self.staff.staff_file.read_bytes(), before)
+                self.assertEqual(staff.find(kind="unit"), [])
+            self.assertNotIn("STAFF_ID", self.pane_environment())
+        starts = sum(command[2:4] == ["agent", "start"] for command in self.herdr_calls())
         _ = self.successful("alpha", "--plan", "docs/plans/given.md")
         record = staff.snapshot()
         units = record.find(kind="unit")
         self.assertEqual(len(units), 1)
-        self.assertEqual(units[0].name, "alpha")
+        self.assertEqual((units[0].name, units[0].id), ("alpha", self.env["FAKE_CLAUDE_SESSION_ID"]))
+        self.assertEqual(sum(command[2:4] == ["agent", "start"] for command in self.herdr_calls()), starts)
         document, data, head = self.doc.read_bytes(), self.staff.staff_file.read_bytes(), self.git("rev-parse", "HEAD")
         _ = self.successful("alpha", "--plan", "docs/plans/given.md")
         self.assertEqual((self.doc.read_bytes(), self.staff.staff_file.read_bytes(), self.git("rev-parse", "HEAD")),
@@ -226,7 +313,7 @@ class AddUnitLaunchTests(AddUnitTestCase):
                  ("--standby",), ("--permanent",))
         for mode in modes:
             launches = ((),) if mode[0] == "--brief" else (
-                (), ("--resume", "session-123", "--cwd", str(prior), "--autocompact", "200k"))
+                (), ("--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766", "--cwd", str(prior), "--autocompact", "200k"))
             for flags in launches:
                 with self.subTest(mode=mode, flags=flags):
                     arguments = ["--production", str(self.doc), "alpha", *mode, *flags]
@@ -263,7 +350,7 @@ class AddUnitLaunchTests(AddUnitTestCase):
         missing = self.checkout / "missing-production.md"
         with patch.dict(os.environ, self.env), redirect_stderr(errors):
             code = add_unit.main(["--production", str(missing), "alpha", "--permanent",
-                                  "--resume", "session-123", "--cwd", str(self.root)])
+                                  "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766", "--cwd", str(self.root)])
         self.assertEqual(code, 2, errors.getvalue())
         self.assertIn("cannot read production doc:", errors.getvalue())
         self.assertIn(str(missing), errors.getvalue())
@@ -479,9 +566,9 @@ class AddUnitLaunchTests(AddUnitTestCase):
             "CLAUDE_CONFIG_DIR": str(Path(self.env["HOME"]) / ".claude2"),
             "CLAUDE_CODE_REMOTE_MEMORY_DIR": str(Path(self.env["HOME"]) / ".claude")})
         arguments = self.agent_arguments()
-        session_index = arguments.index("--session-id")
-        self.assertTrue(arguments[session_index + 1])
-        self.assertEqual(arguments[:session_index] + arguments[session_index + 2:],
+        self.assertNotIn("--session-id", arguments)
+        self.assertNotIn("--resume", arguments)
+        self.assertEqual(arguments,
             ["--model", "opus", "--effort", "xhigh", "--remote-control", "alpha", "-n", "alpha", "--settings", '{"disableAgentView": true}'])
         self.assertEqual(self.opening_prompt(), "/unit:direct docs/plans/given.md")
         self.assertEqual(len([row for row in self.herdr_calls() if row[2:4] == ["agent", "prompt"]]), 1)
@@ -591,7 +678,7 @@ class AddUnitLaunchTests(AddUnitTestCase):
     def test_check_refuses_invalid_session_name_without_any_change(self) -> None:
         document = self.doc.read_text()
         head = self.git("rev-parse", "HEAD")
-        result = self.cli("new director", "--plan", "docs/plans/given.md", "--resume", "session-123",
+        result = self.cli("new director", "--plan", "docs/plans/given.md", "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766",
                           "--cwd", str(self.root / "prior-session"), "--check", "--config-dir", str(Path(self.env["HOME"]) / ".claude2"))
         self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
         self.assertEqual(len(result.stderr.strip().splitlines()), 1)
@@ -813,7 +900,7 @@ class AddUnitLaunchTests(AddUnitTestCase):
             unit_lookup.LiveClaude("alpha", "brief-session-id", "/fixture/socket", 4242),
             HerdrPlace("brief-host", "w1:p1"))
 
-        launches = ((), ("--resume", "session-123", "--cwd", str(worktree)))
+        launches = ((), ("--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766", "--cwd", str(worktree)))
         for plan in ("docs/plans/given.md", "docs/plans/build-followups-alpha.md"):
             for flags in launches:
                 with self.subTest(plan=plan, flags=flags):
@@ -852,7 +939,7 @@ class AddUnitLaunchTests(AddUnitTestCase):
 
         with patch.object(add_unit, "launched_unit", return_value=add_unit.NoMarkedUnit()), \
                 patch.object(sessions, "session_liveness", return_value=sessions.SessionNotLive()):
-            result = self.cli("alpha", "--plan", "docs/plans/missing.md", "--resume", "session-123",
+            result = self.cli("alpha", "--plan", "docs/plans/missing.md", "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766",
                               "--cwd", str(worktree))
 
         self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
@@ -999,7 +1086,7 @@ class AddUnitLaunchTests(AddUnitTestCase):
         registry = self.root / "registry"
         registry.mkdir()
         place = HerdrPlace("native", "w1:p1")
-        live = unit_lookup.LiveClaude("alpha", "session-123", "/socket", 4242)
+        live = unit_lookup.LiveClaude("alpha", "62ccbd64-f22e-5647-b20e-7899aa39d766", "/socket", 4242)
         starting = unit_lookup.MarkedUnit("alpha-unit", unit_lookup.ClaudeNotRunning(), place)
         marked = unit_lookup.MarkedUnit("alpha-unit", live, place)
         busy_pane = "⏺ Reading the plan\n  ⎿  Read 400 lines"
@@ -1011,7 +1098,7 @@ class AddUnitLaunchTests(AddUnitTestCase):
         for label, extra, active in cases:
             with self.subTest(label):
                 _ = (registry / "4242.json").write_text(json.dumps({
-                    "pid": 4242, "sessionId": "session-123", "name": "alpha", "messagingSocketPath": "/socket",
+                    "pid": 4242, "sessionId": "62ccbd64-f22e-5647-b20e-7899aa39d766", "name": "alpha", "messagingSocketPath": "/socket",
                     "updatedAt": 1, **extra}))
                 # The first lookup finds the mark before the record names the live Claude.
                 with patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(registry)}), \

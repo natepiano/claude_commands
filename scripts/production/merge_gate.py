@@ -372,7 +372,7 @@ def gate_wait_reasons(result: memory_admit.CheckResult) -> tuple[str, ...]:
     if isinstance(decision.pressure, memory_admit.MemoryPressure):
         if decision.pressure.next_start_at:
             return ("memory pressure recovery",)
-        if decision.pressure.swap_used_percent > memory_admit.SWAP_USED_LIMIT:
+        if decision.pressure.swap_used_percent > result.policy.pressure.swap_used_limit:
             return ("swap memory pressure",)
         return ("memory pressure",)
     if isinstance(result.head_reason, memory_admit.BehindOlderFit):
@@ -389,6 +389,7 @@ def gate_wait_reasons(result: memory_admit.CheckResult) -> tuple[str, ...]:
 
 @contextmanager
 def gate_reservation(repo: Path, cap_mib: int, temporary: Path, hold: BuildHoldWait) -> Generator[GateReservation]:
+    _ = memory_admit.memory_config()
     root = memory_admit.store.root()
     pid = os.getpid()
     sidecar = temporary / "gate.scope"

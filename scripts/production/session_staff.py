@@ -64,7 +64,7 @@ def unit_match(selector: UnitMember | ObservedUnit, record: staff.StaffSnapshot,
                 staff_id: str = "", *, parent: staff.StaffRow | None = None) -> MemberFound | NoSuchMember:
     """One id-first join; production requests also require their current parent."""
     if staff_id:
-        row = record.by_id(staff.StaffId(staff_id))
+        row = record.by_current_session(staff_id)
         matches = [row] if row is not None and row.kind == "unit" else []
     else:
         matches = [row for row in record.find(kind="unit") if row.name == unit_names.name(selector.unit)]
@@ -93,35 +93,49 @@ class MemberSources:
             # between identities from different productions.
             launches = [launch for launch in self.launches
                         if launch["environment"].get(UNIT_MARK) == selector.unit
-                        and launch["environment"].get("STAFF_ID")]
+                        and launch.get("session_id")]
             local = [launch for launch in launches
                      if launch["environment"].get(PRODUCTION_MARK) == selector.slug]
             if local:
                 latest = max(local, key=lambda launch: launch["written_at"])
-                found = unit_match(selector, record, latest["environment"]["STAFF_ID"], parent=parent.row)
+                # A missing durable id is not permission to reuse its old name.
+                identity = record.by_member_reference(latest["session_id"])
+                if identity is None or identity.kind != "unit":
+                    return NoSuchMember(selector)
+                found = unit_match(selector, record, identity.current_session, parent=parent.row)
                 if isinstance(found, MemberFound):
                     return found
-                # A missing durable id is not permission to reuse its old name.
-                if (identity := record.by_id(staff.StaffId(latest["environment"]["STAFF_ID"]))) is None or identity.kind != "unit":
-                    return NoSuchMember(selector)
             identities: dict[staff.StaffId, MemberFound] = {}
+            resolved = False
             for launch in launches:
-                found = unit_match(selector, record, launch["environment"]["STAFF_ID"], parent=parent.row)
+                identity = record.by_member_reference(launch["session_id"])
+                if identity is None:
+                    continue
+                resolved = True
+                if identity.kind != "unit":
+                    continue
+                found = unit_match(selector, record, identity.current_session, parent=parent.row)
                 if isinstance(found, MemberFound):
                     identities[found.row.id] = found
             if len(identities) > 1:
                 raise staff.StaffUnreadable(f"{selector.slug}/{selector.unit}: conflicting staff identities")
             if identities:
                 return next(iter(identities.values()))
+            if resolved:
+                return NoSuchMember(selector)
             return unit_match(selector, record, parent=parent.row)
         if source is None:
             row = record.by_path(selector.slug)
             return MemberFound(row) if row is not None and row.kind == "showrunner" else NoSuchMember(selector)
+        # A timer holds the member's fixed id, independent of its conversation.
+        owner = record.by_id(staff.StaffId(source.timer.target.removeprefix("session:")))
+        if owner is not None:
+            return MemberFound(owner) if owner.kind == "showrunner" else NoSuchMember(selector)
         launches = [launch for launch in self.launches
                     if f"session:{launch['session_id']}" == source.timer.target]
-        staff_id = max(launches, key=lambda launch: launch["written_at"])["environment"].get("STAFF_ID", "") if launches else ""
+        staff_id = max(launches, key=lambda launch: launch["written_at"])["session_id"] if launches else ""
         if staff_id:
-            row = record.by_id(staff.StaffId(staff_id))
+            row = record.by_current_session(staff_id)
             return MemberFound(row) if row is not None and row.kind == "showrunner" else NoSuchMember(selector)
         row = showrunner_owner(record, selector.slug, source.document)
         return MemberFound(row) if row is not None and row.kind == "showrunner" else NoSuchMember(selector)
@@ -252,7 +266,16 @@ def _group_marked_units(marked: Iterable[tuple[str, MarkedUnit]], record: staff.
     parents = {row.id: slug for slug, rows in membership.items() for row in rows}
     found: dict[str, dict[staff.StaffId, list[MarkedUnit]]] = {}
     faults: dict[str, dict[str, str]] = {}
+    marked = tuple(marked)
+    native_places = {unit.place for _, unit in marked
+                     if isinstance(unit.claude, LiveClaude) and unit.staff_id
+                     and (row := record.by_current_session(unit.staff_id)) is not None
+                     and row.kind == "unit"}
     for old_slug, unit in marked:
+        # The shell inherits launch labels; the proved conversation in this
+        # exact pane supplies identity before any ambiguous name-only join.
+        if not unit.staff_id and isinstance(unit.claude, ClaudeNotRunning) and unit.place in native_places:
+            continue
         try:
             selected = sources.member(ObservedUnit(unit.unit, unit.staff_id), record)
             if isinstance(selected, NoSuchMember):
@@ -320,7 +343,7 @@ def session_staff_and_directors(
             lambda: HerdrPlace(values.get("HERDR_SESSION", ""), values.get("HERDR_PANE_ID", "")))
         slug = values.get(PRODUCTION_MARK, "")
         unit = values.get(UNIT_MARK, "")
-        staff_id = values.get("STAFF_ID", "")
+        staff_id = session["sessionId"]
         if unit or staff_id:
             unit_mark = MarkedUnit(
                 unit, LiveClaude(session["name"], session["sessionId"],
@@ -357,7 +380,8 @@ def record_membership(launch: pane_record.PaneLaunch) -> pane_record.PaneLaunch:
     result = launch.copy()
     result["environment"] = pane_record.retained_environment(result, pane_record.launches())
     try:
-        result["environment"] = LaunchMembership.read().environment(result)
+        membership = LaunchMembership.read()
+        result["environment"] = membership.environment(result)
     except (staff.StaffUnreadable, OSError, ValueError):
         pass  # An unavailable owner cannot erase already recorded identity.
     return result
@@ -399,7 +423,7 @@ def repair_marks() -> list[RepairedSessionLabels]:
             except (OSError, ValueError):
                 continue
             entry["environment"] = membership.environment(entry, live_name=session["name"])
-            if not entry["environment"].get("STAFF_ID"):
+            if membership.record.by_current_session(entry["session_id"]) is None:
                 continue
             pane_record.write(process.place.session, entry)
             newest[entry["session_id"]] = entry["written_at"]

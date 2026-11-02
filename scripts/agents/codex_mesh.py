@@ -92,8 +92,8 @@ from scripts.agents import worker_lifecycle
 NO_LOCK_DEADLINE = worker_lifecycle.NO_LOCK_DEADLINE
 from scripts.lib import nix_env, process_group, unit_runs
 from scripts.lib.probe_session import PROBE_ENV
-from scripts.production import worker_admission
-from scripts.production.worker_admission import WorkerAdmitted
+from scripts.production import worker_admission, staff
+from scripts.production.worker_admission import WorkerStartAllowed
 from scripts.astra.design_roles import PhaseBoundDesigner, ReadOnlyReviewer, ThreadAccessPolicy
 from scripts.message import sessions, process_table
 from scripts.message import repeat_guard
@@ -1736,7 +1736,7 @@ def _validate_held_claim(name: str, entry: dict[str, object], thread_id: str) ->
     generation = design.placement.generation
     if (role is None or isinstance(role.lifecycle, (design_roles.RoleNotOpened, design_roles.RoleEnded, design_roles.RoleNeedsRecovery))
             or role.lifecycle.thread_id != thread_id or not isinstance(reach, design_roles.HolderReach)
-            or reach.session_id != os.environ.get("CLAUDE_CODE_SESSION_ID")
+            or reach.session_id != staff.runtime_id()
             or entry.get("authorized_generation") != generation
             or entry.get("authorized_holder") != reach.session_id
             or not entry.get("authorized_prompt")
@@ -2223,8 +2223,12 @@ def _write_pending(handle: worker_lifecycle.WorkerStateFile, thread_id: str, mes
     adoption_id = _as_str(previous.get("adoption_id"))
     if previous.get("thread_id") == thread_id and adoption_id:
         stored["adoption_id"] = adoption_id
-    if previous != stored:
-        handle.publish(json.dumps(stored))
+    publication = previous.get("unpublished_thread")
+    content: dict[str, object] = dict(stored)
+    if publication is not None:
+        content["unpublished_thread"] = publication
+    if previous != content:
+        handle.publish(json.dumps(content))
 
 
 @dataclass(frozen=True)
@@ -3043,7 +3047,8 @@ def _server_environment(session_dir: str, workers_home: Path) -> dict[str, str]:
     already have started this server. A run folder is known here, so the server names it itself.
     A mesh directory outside the run roots keeps the caller's environment unchanged.
     """
-    environment = {**os.environ, "CODEX_HOME": str(workers_home)}
+    environment = {key: value for key, value in os.environ.items() if key != "STAFF_ID"}
+    environment["CODEX_HOME"] = str(workers_home)
     context = _design_context(session_dir)
     if context:
         for key in tuple(environment):
@@ -3098,6 +3103,7 @@ def _start_server(
                     elif key in loaded_environment:
                         del loaded_environment[key]
                 environment = loaded_environment
+                _ = environment.pop("STAFF_ID", None)
             else:
                 if isinstance(loaded, nix_env.Refused):
                     _log_server(session_dir, loaded.reason)
@@ -3734,7 +3740,7 @@ def command_start(args: argparse.Namespace) -> int:
     name = _as_str(_attr(args, "name"))
     resident = getattr(args, "resident", False) is True
     try:
-        staff_admission = worker_admission.admit(name, Path(session_dir))
+        staff_admission = worker_admission.admit(name, Path(session_dir), role=_as_str(_attr(args, "role")) or "impl")
     except ValueError as error:
         print(str(error), file=sys.stderr)
         return 2
@@ -3883,7 +3889,7 @@ def _follow_worker(args: argparse.Namespace) -> int:
             # Held under the pending lock: a message held while the roster moves to a replacement
             # thread waits here, then lands on the replacement with the ones carried over.
             with _pending_file(session_dir, name) as handle:
-                resumed = _resume_worker_thread(args, session_dir, name, thread_id, client, home, staff_admission=staff_admission)
+                resumed = _resume_worker_thread(args, session_dir, name, thread_id, client, home, staff_admission=staff_admission, pending=handle)
                 if resumed.thread_replaced:
                     carried = _pending_for_thread(handle, thread_id)
                     if carried:
@@ -4123,6 +4129,9 @@ def command_compact(args: argparse.Namespace) -> int:
             else:
                 print(f"compacted {name}: {before.tokens} tokens, size not measured until its next turn")
             return 0
+        except worker_admission.AdmissionRefused as error:
+            print(str(error), file=sys.stderr)
+            return 2
         except (ConnectionError, OSError, SystemExit) as exc:
             print(f"codex_mesh: {name}: {exc}", file=sys.stderr)
             return 1
@@ -4213,12 +4222,13 @@ def command_release_follow(args: argparse.Namespace) -> int:
 
 def _run_worker(args: argparse.Namespace, port: int, *, started_here: bool = False,
                 admission: WorkerAdmission | IndependentWorkerAdmission = INDEPENDENT_WORKER_ADMISSION,
-                staff_admission: WorkerAdmitted | None = None) -> RunOutcome:
+                staff_admission: WorkerStartAllowed | None = None) -> RunOutcome:
     """Attach one worker to the app-server on `port` and run it to its end."""
     session_dir = _as_str(_attr(args, "session_dir"))
     if staff_admission is None:
         try:
-            staff_admission = worker_admission.admit(_as_str(_attr(args, "name")), Path(session_dir))
+            staff_admission = worker_admission.admit(_as_str(_attr(args, "name")), Path(session_dir),
+                role=_as_str(_attr(args, "role")) or "impl")
         except ValueError as error:
             print(str(error), file=sys.stderr)
             return WorkerLaunchRefused()
@@ -4227,6 +4237,9 @@ def _run_worker(args: argparse.Namespace, port: int, *, started_here: bool = Fal
     opened = time.time()
     try:
         return _attach_and_run(args, port, session_dir, name, timeout, opened, started_here=started_here, admission=admission, staff_admission=staff_admission)
+    except worker_admission.AdmissionRefused as error:
+        print(str(error), file=sys.stderr)
+        return WorkerLaunchRefused()
     except (ConnectionError, OSError, SystemExit) as exc:
         return FailedBeforeThread(str(exc) or exc.__class__.__name__, time.time() - opened,
             exc.serving if isinstance(exc, ServingRequestFailure) else NotBoundCodexServer(),
@@ -4259,6 +4272,98 @@ def _thread_start_params(args: argparse.Namespace) -> dict[str, object]:
     return params
 
 
+def _publish_created_worker(client: Client, session_dir: str, allowed: WorkerStartAllowed,
+                            thread_id: str, *, previous_id: str = "") -> worker_admission.PublishedWorker:
+    try:
+        return worker_admission.publish(allowed, thread_id, previous_id=previous_id)
+    except worker_admission.AdmissionRefused as error:
+        released = _release_worker_thread(client, thread_id, session_dir)
+        detail = (f"; cleanup unproved: {released.reason}" if isinstance(released, WorkerThreadStateUnknown)
+                  else "; created thread stopped")
+        raise worker_admission.AdmissionRefused(f"{error}{detail}") from error
+
+
+@dataclass(frozen=True)
+class UnlockedWorkerInbox:
+    """The caller has not acquired the worker inbox lock."""
+
+
+UNLOCKED_WORKER_INBOX = UnlockedWorkerInbox()
+
+
+def _create_published_worker(client: Client, session_dir: str, allowed: WorkerStartAllowed,
+                             method: str, params: dict[str, object], *, previous_id: str = "",
+                             submits_work: bool = False,
+                             stopped: RefusalCommandContext = REFUSAL_WITHOUT_COMMAND_EXIT,
+                             pending: worker_lifecycle.WorkerStateFile | UnlockedWorkerInbox = UNLOCKED_WORKER_INBOX,
+                             ) -> worker_admission.PublishedWorker:
+    """Retain a returned backend in its existing inbox until publication finishes."""
+    previous_owner = _read_json_object(_session_path(session_dir, ROSTER_FILE)).get(allowed.name)
+    with (contextlib.nullcontext(pending) if isinstance(pending, worker_lifecycle.WorkerStateFile)
+          else _pending_file(session_dir, allowed.name)) as inbox:
+        stored = inbox.read_object()
+        original_inbox = inbox.path.read_text(encoding="utf-8") if inbox.path.exists() else ""
+        raw = stored.get("unpublished_thread")
+        if raw is not None and not isinstance(raw, dict):
+            raise worker_admission.AdmissionRefused(f"staff: {allowed.name}: invalid unfinished backend evidence")
+        unfinished = _as_dict(cast(object, raw))
+    if raw is not None:
+        thread_id = _as_str(unfinished.get("id"))
+        try:
+            _ = staff.native_id(thread_id)
+        except staff.StaffRefused as error:
+            raise worker_admission.AdmissionRefused(f"staff: {allowed.name}: invalid unfinished backend identity") from error
+        retained_previous = _as_str(unfinished.get("previous_id"))
+        if (unfinished.get("parent") != allowed.parent or unfinished.get("method") != method
+                or previous_id not in (retained_previous, thread_id)):
+            raise worker_admission.AdmissionRefused(
+                f"staff: {allowed.name}: {thread_id}: unfinished backend belongs to another admission")
+        previous_id = retained_previous
+        resumed = _serving_request(client, "thread/resume", {**params, "threadId": thread_id})
+        if _as_str(_as_dict(resumed.get("thread")).get("id")) != thread_id:
+            raise worker_admission.AdmissionRefused(
+                f"staff: {allowed.name}: {thread_id}: unfinished backend identity was not proved")
+    else:
+        result = _serving_request(client, method, params, submits_work=submits_work, stopped=stopped)
+        thread_id = _as_str(_as_dict(result.get("thread")).get("id"))
+        if not thread_id:
+            raise worker_admission.AdmissionRefused(f"staff: {allowed.name}: {method} returned no native thread id")
+        try:
+            with (contextlib.nullcontext(pending) if isinstance(pending, worker_lifecycle.WorkerStateFile)
+                  else _pending_file(session_dir, allowed.name)) as inbox:
+                owner = _read_json_object(_session_path(session_dir, ROSTER_FILE)).get(allowed.name)
+                if (owner != previous_owner or previous_id
+                        and _as_dict(owner).get("thread_id") != previous_id):
+                    _refuse_taken_follow_up(client, thread_id, session_dir)
+                stored = inbox.read_object() or worker_lifecycle.empty_inbox()
+                stored["unpublished_thread"] = {"id": thread_id, "parent": allowed.parent,
+                                                "method": method, "previous_id": previous_id,
+                                                "original_inbox": original_inbox}
+                inbox.publish(json.dumps(stored))
+        except (OSError, ValueError) as error:
+            released = _release_worker_thread(client, thread_id, session_dir)
+            detail = (f"cleanup unproved: {released.reason}" if isinstance(released, WorkerThreadStateUnknown)
+                      else "created thread stopped")
+            raise worker_admission.AdmissionRefused(
+                f"staff: {allowed.name}: {thread_id}: could not retain returned backend: {error}; {detail}") from error
+    return _publish_created_worker(client, session_dir, allowed, thread_id, previous_id=previous_id)
+
+
+def _acknowledge_worker_publication(session_dir: str, name: str, thread_id: str, *,
+        pending: worker_lifecycle.WorkerStateFile | UnlockedWorkerInbox = UNLOCKED_WORKER_INBOX) -> None:
+    """Forget recovery evidence only after the matching roster is durable."""
+    with (contextlib.nullcontext(pending) if isinstance(pending, worker_lifecycle.WorkerStateFile)
+          else _pending_file(session_dir, name)) as inbox:
+        owner = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
+        stored = inbox.read_object()
+        unfinished = _as_dict(cast(object, stored.get("unpublished_thread")))
+        if owner.get("thread_id") != thread_id or unfinished.get("id") != thread_id:
+            return
+        del stored["unpublished_thread"]
+        original = _as_str(unfinished.get("original_inbox"))
+        inbox.publish(original if original and json.loads(original) == stored else json.dumps(stored))
+
+
 def _attach_and_run(
     args: argparse.Namespace,
     port: int,
@@ -4266,110 +4371,117 @@ def _attach_and_run(
     name: str,
     timeout: float,
     opened: float,
-    *, staff_admission: WorkerAdmitted, started_here: bool = False,
+    *, staff_admission: WorkerStartAllowed, started_here: bool = False,
     admission: WorkerAdmission | IndependentWorkerAdmission = INDEPENDENT_WORKER_ADMISSION,
 ) -> RunOutcome:
-    if staff_admission.row.name != name:
+    if staff_admission.name != name:
         raise ValueError("staff admission names another worker")
     prompt = Path(_as_str(_attr(args, "prompt_file"))).read_text(encoding="utf-8")
     log_path = Path(_as_str(_attr(args, "log_file")))
 
-    with worker_lifecycle.membership_operation(session_dir), worker_lifecycle.lock_worker(session_dir, name):
-        existing = _read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name)
-        if isinstance(existing, dict):
-            _role_fence(_as_dict(cast(object, existing)))
-            if _as_dict(cast(object, existing)).get("held_design_id"):
-                raise SystemExit("codex_mesh: held roles must resume through their holder")
-        availability = _server_availability(session_dir)
-        if isinstance(availability, ServerRestartRequired) and availability.doubt:
-            print(f"codex_mesh: {name}: server evidence unavailable: {availability.doubt}; launch refused", file=sys.stderr)
-            return WorkerLaunchRefused()
-        old_port = availability.port if isinstance(availability, LiveServer) else None
-        if isinstance(existing, dict):
-            old_entry = _as_dict(cast("object", existing))
-            reason = _relaunch_refusal(name, old_entry)
-            if reason:
-                print(f"codex_mesh: {name}: {reason}", file=sys.stderr)
+    client: Client | None = None
+    try:
+        with worker_lifecycle.membership_operation(session_dir), worker_lifecycle.lock_worker(session_dir, name):
+            existing = _read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name)
+            if isinstance(existing, dict):
+                _role_fence(_as_dict(cast(object, existing)))
+                if _as_dict(cast(object, existing)).get("held_design_id"):
+                    raise SystemExit("codex_mesh: held roles must resume through their holder")
+            availability = _server_availability(session_dir)
+            if isinstance(availability, ServerRestartRequired) and availability.doubt:
+                print(f"codex_mesh: {name}: server evidence unavailable: {availability.doubt}; launch refused", file=sys.stderr)
                 return WorkerLaunchRefused()
-            old_thread = _as_str(old_entry.get("thread_id"))
-            if old_thread:
-                if old_entry.get("status") == "failed":
-                    # A failed entry is always its launcher's last write.
-                    if old_port is not None:
-                        cleanup = _end_unwatched_turn(
-                            old_port, old_thread, Path(_as_str(_attr(args, "log_file")))
-                        )
-                        if isinstance(cleanup, RelaunchBlockedByLiveTurn):
-                            print(
-                                f"codex_mesh: {name}: thread {old_thread} still has a live turn that could not be interrupted; relaunch once it ends",
-                                file=sys.stderr,
+            old_port = availability.port if isinstance(availability, LiveServer) else None
+            if isinstance(existing, dict):
+                old_entry = _as_dict(cast("object", existing))
+                reason = _relaunch_refusal(name, old_entry)
+                if reason:
+                    print(f"codex_mesh: {name}: {reason}", file=sys.stderr)
+                    return WorkerLaunchRefused()
+                old_thread = _as_str(old_entry.get("thread_id"))
+                if old_thread:
+                    if old_entry.get("status") == "failed":
+                        # A failed entry is always its launcher's last write.
+                        if old_port is not None:
+                            cleanup = _end_unwatched_turn(
+                                old_port, old_thread, Path(_as_str(_attr(args, "log_file")))
                             )
-                            return WorkerLaunchRefused()
-                    old_thread = ""
-                elif old_entry.get("status") == WAITING_CAPACITY:
-                    # A dead waiting launcher cannot resume this thread.
-                    old_thread = ""
-            if old_thread and old_port is not None:
-                try:
-                    check = Client(old_port, f"relaunch-{os.getpid()}")
+                            if isinstance(cleanup, RelaunchBlockedByLiveTurn):
+                                print(
+                                    f"codex_mesh: {name}: thread {old_thread} still has a live turn that could not be interrupted; relaunch once it ends",
+                                    file=sys.stderr,
+                                )
+                                return WorkerLaunchRefused()
+                        old_thread = ""
+                    elif old_entry.get("status") == WAITING_CAPACITY:
+                        # A dead waiting launcher cannot resume this thread.
+                        old_thread = ""
+                if old_thread and old_port is not None:
                     try:
-                        live = _read_live_turn(check, old_thread)
-                    finally:
-                        check.close()
-                except (ConnectionError, OSError, SystemExit) as exc:
-                    live = ThreadStateUnknown(str(exc) or exc.__class__.__name__)
-                if isinstance(live, ThreadStateUnknown):
-                    print(
-                        f"codex_mesh: {name}: thread {old_thread}'s state could not be read ({live.reason}); use codex_mesh.py end --to {name} before relaunching",
-                        file=sys.stderr,
-                    )
-                    return WorkerLaunchRefused()
-                if not isinstance(live, ThreadIdle):
-                    print(
-                        f"codex_mesh: {name}: thread {old_thread} has a live turn; use codex_mesh.py end --to {name} before relaunching",
-                        file=sys.stderr,
-                    )
-                    return WorkerLaunchRefused()
-        client = Client(port, name)
-        _ = _bind_serving_server(client, session_dir, started_here=started_here)
-        started = _serving_request(client, "thread/start", _thread_start_params(args),
-                                   submits_work=True, stopped=CommandStoppedBeforeThread(session_dir))
-        thread_id = _as_str(_as_dict(started.get("thread")).get("id"))
-        if not thread_id:
-            raise SystemExit("codex_mesh: thread/start returned no thread id")
+                        check = Client(old_port, f"relaunch-{os.getpid()}")
+                        try:
+                            live = _read_live_turn(check, old_thread)
+                        finally:
+                            check.close()
+                    except (ConnectionError, OSError, SystemExit) as exc:
+                        live = ThreadStateUnknown(str(exc) or exc.__class__.__name__)
+                    if isinstance(live, ThreadStateUnknown):
+                        print(
+                            f"codex_mesh: {name}: thread {old_thread}'s state could not be read ({live.reason}); use codex_mesh.py end --to {name} before relaunching",
+                            file=sys.stderr,
+                        )
+                        return WorkerLaunchRefused()
+                    if not isinstance(live, ThreadIdle):
+                        print(
+                            f"codex_mesh: {name}: thread {old_thread} has a live turn; use codex_mesh.py end --to {name} before relaunching",
+                            file=sys.stderr,
+                        )
+                        return WorkerLaunchRefused()
+            client = Client(port, name)
+            _ = _bind_serving_server(client, session_dir, started_here=started_here)
+            published = _create_published_worker(client, session_dir, staff_admission, "thread/start",
+                _thread_start_params(args), previous_id=_as_str(_as_dict(cast(object, existing)).get("thread_id")),
+                submits_work=True, stopped=CommandStoppedBeforeThread(session_dir))
+            thread_id = published.row.current_session
+            name = published.row.name
+            with _pending_file(session_dir, name) as pending_file:
+                previous = _as_dict(cast(object, existing))
+                previous_thread = _as_str(previous.get("thread_id"))
+                if previous_thread and previous_thread != thread_id:
+                    dropped = len(_pending_for_thread(pending_file, previous_thread))
+                    _write_pending(pending_file, "", [])
+                    with log_path.open("a", encoding="utf-8") as log:
+                        stamp = datetime.now().astimezone().isoformat(timespec="seconds")
+                        _ = log.write(
+                            f"[{stamp}] mesh: dropped {dropped} held messages for thread {previous_thread} on relaunch\n"
+                        )
+                starting: StartingRecord = {
+                    "model": _as_str(_attr(args, "model")), "effort": _as_str(_attr(args, "effort")),
+                    "thread_id": thread_id,
+                    "status": "starting",
+                    "port": port,
+                    "launcher_pid": os.getpid(),
+                }
+                task = _as_str(_attr(args, "task"))
+                if task:
+                    starting["task"] = task
+                role = _roster_role(_attr(args, "role"))
+                if isinstance(role, AssignedWorkerRole):
+                    starting["role"] = role.role
+                expected: ExpectedRoster = (RosterUnchanged(previous_thread, _roster_revision(previous))
+                                            if previous else RosterAbsent())
+                if not _update_roster_if_expected(session_dir, name, starting, expected):
+                    raise SystemExit(f"codex_mesh: {name}: roster changed while opening the worker; launch refused")
+                _acknowledge_worker_publication(session_dir, name, thread_id, pending=pending_file)
+                if isinstance(role, AssignedWorkerRole):
+                    _record_assignment(thread_id, role.role, _dispatch_lens(args))
 
-        with _pending_file(session_dir, name) as pending_file:
-            previous = _as_dict(cast(object, existing))
-            previous_thread = _as_str(previous.get("thread_id"))
-            if previous_thread and previous_thread != thread_id:
-                dropped = len(_pending_for_thread(pending_file, previous_thread))
-                _write_pending(pending_file, "", [])
-                with log_path.open("a", encoding="utf-8") as log:
-                    stamp = datetime.now().astimezone().isoformat(timespec="seconds")
-                    _ = log.write(
-                        f"[{stamp}] mesh: dropped {dropped} held messages for thread {previous_thread} on relaunch\n"
-                    )
-            starting: StartingRecord = {
-                "model": _as_str(_attr(args, "model")), "effort": _as_str(_attr(args, "effort")),
-                "thread_id": thread_id,
-                "status": "starting",
-                "port": port,
-                "launcher_pid": os.getpid(),
-            }
-            task = _as_str(_attr(args, "task"))
-            if task:
-                starting["task"] = task
-            role = _roster_role(_attr(args, "role"))
-            if isinstance(role, AssignedWorkerRole):
-                starting["role"] = role.role
-            expected: ExpectedRoster = (RosterUnchanged(previous_thread, _roster_revision(previous))
-                                        if previous else RosterAbsent())
-            if not _update_roster_if_expected(session_dir, name, starting, expected):
-                raise SystemExit(f"codex_mesh: {name}: roster changed while opening the worker; launch refused")
-            if isinstance(role, AssignedWorkerRole):
-                _record_assignment(thread_id, role.role, _dispatch_lens(args))
-
-    admission.published()
+        admission.published()
+    except BaseException:
+        if client is not None:
+            client.close()
+        raise
+    assert client is not None
     return _stream_turn(args, client, port, session_dir, name, thread_id, prompt, timeout, opened)
 
 
@@ -5571,9 +5683,10 @@ def _refuse_taken_follow_up(client: Client, replacement: str, session_dir: str) 
 
 def _resume_worker_thread(
     args: argparse.Namespace, session_dir: str, name: str, thread_id: str, client: Client,
-    workers_home: Path, *, staff_admission: WorkerAdmitted,
+    workers_home: Path, *, staff_admission: WorkerStartAllowed,
+    pending: worker_lifecycle.WorkerStateFile | UnlockedWorkerInbox = UNLOCKED_WORKER_INBOX,
 ) -> _WorkerThreadForHome:
-    if staff_admission.row.name != name:
+    if staff_admission.name != name:
         raise ValueError("staff admission names another worker")
     params = _resume_params(session_dir, name, thread_id)
     previous_record = _lookup(session_dir, name)
@@ -5584,9 +5697,9 @@ def _resume_worker_thread(
     resumed = client.call("thread/resume", params)
     if not resumed.get("error"):
         result = _require(resumed, "thread/resume")
-        if (held or own_reviewer or previous_record.get("adopted_from")
-                or previous_record.get("dead_launcher_recovery")) and _as_str(_as_dict(result.get("thread")).get("id")) != thread_id:
+        if _as_str(_as_dict(result.get("thread")).get("id")) != thread_id:
             raise SystemExit("RoleNeedsRecovery: resumed thread identity differs; replacement refused")
+        _ = worker_admission.publish(staff_admission, thread_id)
         return _WorkerThreadForHome(thread_id, False)
     if isinstance(_read_account_move(session_dir, name, thread_id), AccountMoveMarker):
         _ = _require(resumed, "thread/resume")
@@ -5600,10 +5713,10 @@ def _resume_worker_thread(
         start_params.update({
             "developerInstructions": params["developerInstructions"], "approvalPolicy": "never",
         })
-    started = _serving_request(client, "thread/start", start_params, submits_work=True)
-    replacement = _as_str(_as_dict(started.get("thread")).get("id"))
-    if not replacement:
-        raise SystemExit("thread/start returned no replacement thread id")
+    published = _create_published_worker(client, session_dir, staff_admission, "thread/start", start_params,
+                                         submits_work=True, previous_id=thread_id, pending=pending)
+    replacement = published.row.current_session
+    name = published.row.name
     record: StartingRecord = {"thread_id": replacement, "status": "starting", "port": client.port,
                               "launcher_pid": _as_int(previous_record.get("launcher_pid")) or client.launcher_pid}
     if "access_policy" in previous_record:
@@ -5615,6 +5728,7 @@ def _resume_worker_thread(
     if not _update_roster_if_expected(session_dir, name, record,
                                      RosterUnchanged(thread_id, _roster_revision(previous_record))):
         _refuse_taken_follow_up(client, replacement, session_dir)
+    _acknowledge_worker_publication(session_dir, name, replacement, pending=pending)
     _ = client.call("thread/name/set", {"threadId": replacement, "name": unit_workers.shown_name(Path(session_dir), name)})
     _post_board_status(
         session_dir, name,
@@ -5843,7 +5957,7 @@ def _move_idle_worker(
                     moved.launcher_pid = client.launcher_pid
                     _ = _bind_serving_server(moved, session_dir, started_here=_fresh)
                     try:
-                        resumed = _resume_worker_thread(args, session_dir, name, thread_id, moved, worker_home_for_turn, staff_admission=staff_admission)
+                        resumed = _resume_worker_thread(args, session_dir, name, thread_id, moved, worker_home_for_turn, staff_admission=staff_admission, pending=handle)
                         thread_id, replaced = resumed.thread_id, resumed.thread_replaced
                         if replaced:
                             _write_pending(handle, thread_id, messages)
@@ -5855,7 +5969,7 @@ def _move_idle_worker(
                             role = _roster_role(previous.get("role"))
                             if isinstance(role, AssignedWorkerRole):
                                 _record_assignment(thread_id, role.role, _dispatch_lens(args))
-                    except (ConnectionError, OSError, SystemExit) as error:
+                    except (ConnectionError, OSError, SystemExit, worker_admission.AdmissionRefused) as error:
                         _record_worker_move_failure(request, str(error) or type(error).__name__)
                         moved.close()
                         current = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
@@ -6796,15 +6910,15 @@ def open_unit_worker(session_dir: str, name: str, role: str, *, model: str = "",
                      effort: str = "") -> dict[str, object]:
     """Open an idle thread; assignment starts its first turn later through follow."""
     try:
-        admitted = worker_admission.admit(name, Path(session_dir))
+        admitted = worker_admission.admit(name, Path(session_dir), role=role)
     except ValueError as error:
         raise unit_workers.WorkerUnavailable(str(error)) from error
     return _open_admitted_worker(session_dir, role, admitted, model=model, effort=effort)
 
 
-def _open_admitted_worker(session_dir: str, role: str, admitted: WorkerAdmitted, *,
+def _open_admitted_worker(session_dir: str, role: str, admitted: WorkerStartAllowed, *,
                           model: str, effort: str) -> dict[str, object]:
-    name = admitted.row.name
+    name = admitted.name
     with worker_lifecycle.membership_operation(session_dir):
         with worker_lifecycle.lock_worker(session_dir, name):
             command = ['bash', '-c',
@@ -6831,17 +6945,17 @@ def _open_admitted_worker(session_dir: str, role: str, admitted: WorkerAdmitted,
                 launch = argparse.Namespace(cwd=cwd, model=model,
                                             sandbox=READ_ONLY_SANDBOX if role == "review" else WORKER_SANDBOX,
                                             service_tier=service_tier)
-                result = _serving_request(client, "thread/start", _thread_start_params(launch))
-                thread_id = _as_str(_as_dict(result.get("thread")).get("id"))
-                if not thread_id:
-                    raise unit_workers.WorkerUnavailable("thread/start returned no thread id")
+                published = _create_published_worker(client, session_dir, admitted, "thread/start", _thread_start_params(launch))
+                thread_id = published.row.current_session
                 allocation = UnrecordedWorkerThread(thread_id)
+                name = published.row.name
                 display_name = unit_workers.shown_name(Path(session_dir), name, role=role)
                 _ = _require(client.call("thread/name/set", {"threadId": thread_id, "name": display_name}), "thread/name/set")
                 record: FollowableRecord = {"thread_id": thread_id, "status": "paused", "role": cast(WorkerRole, role),
                                             "model": model, "effort": effort, "access_policy": policy}
                 if not _update_roster_if_expected(session_dir, name, record, RosterAbsent()):
                     raise unit_workers.WorkerUnavailable(f"{name}: worker name was claimed")
+                _acknowledge_worker_publication(session_dir, name, thread_id)
                 allocation = NoThreadToRelease()
                 opened = {**record, "codex_home": str(home)}
             finally:
@@ -9061,16 +9175,17 @@ def _failure_account_detail(error: BaseException, serving: CodexServingState) ->
     return f"{name} ({codex_home_display(serving.home)}): {error}"
 
 
-def _admit_worker(name: str, session_dir: str, *, held_design: str = "") -> WorkerAdmitted:
+def _admit_worker(name: str, session_dir: str, *, held_design: str = "", role: str = "impl") -> WorkerStartAllowed:
     """Held roles belong to their recorded design holder, never the caller's session."""
     recorded = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
+    role = _as_str(recorded.get("held_role")) or _as_str(recorded.get("role")) or role
     held = held_design or _as_str(recorded.get("held_design_id"))
     if held:
         from scripts.astra import design_roles
         holder = design_roles.read_design(held).holder
-        return worker_admission.admit(name, Path(session_dir), production=holder.production_slug,
+        return worker_admission.admit(name, Path(session_dir), role=role, production=holder.production_slug,
                                         unit=holder.unit_name if isinstance(holder, design_roles.UnitHolder) else "")
-    return worker_admission.admit(name, Path(session_dir))
+    return worker_admission.admit(name, Path(session_dir), role=role)
 
 
 def command_prime(args: argparse.Namespace) -> int:
@@ -9078,16 +9193,16 @@ def command_prime(args: argparse.Namespace) -> int:
     session_dir = _as_str(_attr(args, "session_dir"))
     name = _as_str(_attr(args, "name"))
     try:
-        admitted = _admit_worker(name, session_dir, held_design=_as_str(_attr(args, "held_design")))
+        admitted = _admit_worker(name, session_dir, held_design=_as_str(_attr(args, "held_design")), role="review")
     except ValueError as error:
         print(str(error), file=sys.stderr)
         return 2
     return _prime_admitted_worker(args, admitted)
 
 
-def _prime_admitted_worker(args: argparse.Namespace, admitted: WorkerAdmitted) -> int:
+def _prime_admitted_worker(args: argparse.Namespace, admitted: WorkerStartAllowed) -> int:
     session_dir = _as_str(_attr(args, "session_dir"))
-    name = admitted.row.name
+    name = admitted.name
     with worker_lifecycle.membership_operation(session_dir), worker_lifecycle.lock_worker(session_dir, name):
         client: Client | None = None
         try:
@@ -9104,7 +9219,7 @@ def _prime_admitted_worker(args: argparse.Namespace, admitted: WorkerAdmitted) -
                 reach = design_roles.resolve_holder(design.holder)
                 if (instance is None or not isinstance(instance.lifecycle, design_roles.RoleNotOpened)
                         or not instance.lifecycle.claim or not isinstance(reach, design_roles.HolderReach)
-                        or reach.session_id != os.environ.get("CLAUDE_CODE_SESSION_ID")):
+                        or reach.session_id != staff.runtime_id()):
                     raise SystemExit("held thread creation lacks its holder's reserved claim")
                 claim = design_roles.design_directory(held_design) / f"{held_role}.creation-claimed"
                 with claim.open("x", encoding="utf-8") as handle:
@@ -9128,10 +9243,9 @@ def _prime_admitted_worker(args: argparse.Namespace, admitted: WorkerAdmitted) -
             port, _fresh = ensure_server(session_dir, cwd=_as_str(_attr(args, "cwd")) or None)
             client = Client(port, name)
             _ = _bind_serving_server(client, session_dir, started_here=_fresh)
-            result = _serving_request(client, "thread/start", params)
-            thread_id = _as_str(_as_dict(result.get("thread")).get("id"))
-            if not thread_id:
-                raise SystemExit("thread/start returned no thread id")
+            published = _create_published_worker(client, session_dir, admitted, "thread/start", params)
+            thread_id = published.row.current_session
+            name = published.row.name
             # The held design's holder names the thread before its mesh record exists.
             title = unit_workers.shown_name(Path(session_dir), name, role="review",
                                             held_design_id=held_design, held_role=held_role)
@@ -9156,8 +9270,12 @@ def _prime_admitted_worker(args: argparse.Namespace, admitted: WorkerAdmitted) -
                                         if existing else RosterAbsent())
             if not _update_roster_if_expected(session_dir, name, record, expected):
                 _refuse_taken_follow_up(client, thread_id, session_dir)
+            _acknowledge_worker_publication(session_dir, name, thread_id)
             print(thread_id)
             return 0
+        except worker_admission.AdmissionRefused as error:
+            print(str(error), file=sys.stderr)
+            return 2
         except (ConnectionError, OSError, UnicodeError, SystemExit) as exc:
             if isinstance(exc, ServingRequestFailure):
                 detail = _failure_account_detail(exc, exc.serving)
@@ -9175,16 +9293,16 @@ def command_fork(args: argparse.Namespace) -> int:
     session_dir = _as_str(_attr(args, "session_dir"))
     name = _as_str(_attr(args, "name"))
     try:
-        admitted = worker_admission.admit(name, Path(session_dir))
+        admitted = worker_admission.admit(name, Path(session_dir), role="review")
     except ValueError as error:
         print(str(error), file=sys.stderr)
         return 2
     return _fork_admitted_worker(args, admitted)
 
 
-def _fork_admitted_worker(args: argparse.Namespace, admitted: WorkerAdmitted) -> int:
+def _fork_admitted_worker(args: argparse.Namespace, admitted: WorkerStartAllowed) -> int:
     session_dir = _as_str(_attr(args, "session_dir"))
-    name = admitted.row.name
+    name = admitted.name
     with worker_lifecycle.membership_operation(session_dir), worker_lifecycle.lock_workers(
             worker_lifecycle.WorkerIdentity(Path(session_dir), name),
             worker_lifecycle.WorkerIdentity(Path(session_dir), _as_str(_attr(args, "from_name")))):
@@ -9214,10 +9332,9 @@ def _fork_admitted_worker(args: argparse.Namespace, admitted: WorkerAdmitted) ->
             _ = _serving_request(client, "thread/resume", params)
             fork_params = dict(params)
             fork_params.update({"sandbox": READ_ONLY_SANDBOX, "approvalPolicy": "never"})
-            result = _serving_request(client, "thread/fork", fork_params)
-            thread_id = _as_str(_as_dict(result.get("thread")).get("id"))
-            if not thread_id:
-                raise SystemExit("thread/fork returned no thread id")
+            published = _create_published_worker(client, session_dir, admitted, "thread/fork", fork_params)
+            thread_id = published.row.current_session
+            name = published.row.name
             _ = _require(client.call("thread/name/set", {"threadId": thread_id, "name": unit_workers.shown_name(Path(session_dir), name, role="review")}), "thread/name/set")
             record: FollowableRecord = {
                 "thread_id": thread_id, "status": "done", "role": "review", "context_tokens": 0,
@@ -9237,8 +9354,12 @@ def _fork_admitted_worker(args: argparse.Namespace, admitted: WorkerAdmitted) ->
                     return 1
                 print(f"codex_mesh: {name}: name was taken while the fork ran; fork refused", file=sys.stderr)
                 return 2
+            _acknowledge_worker_publication(session_dir, name, thread_id)
             print(thread_id)
             return 0
+        except worker_admission.AdmissionRefused as error:
+            print(str(error), file=sys.stderr)
+            return 2
         except (ConnectionError, OSError, SystemExit) as exc:
             if isinstance(exc, ServingRequestFailure):
                 detail = _failure_account_detail(exc, exc.serving)

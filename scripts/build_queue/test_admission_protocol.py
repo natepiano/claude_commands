@@ -43,9 +43,9 @@ class ProtocolTests(unittest.TestCase):
             inputs, limits = fixture.server.last_inputs, fixture.server.last_limits
             assert isinstance(inputs, gate.QueueInputs)
             assert isinstance(limits, gate.AdmissionLimits)
-            reading = gate.queue_read_from(inputs, limits)
+            reading = gate.queue_read_from(inputs, limits, policy=gate.DEFAULT_ADMISSION_POLICY)
             replies: tuple[wire.Reply, ...] = (
-                wire.Wait(gate.EstimateExpired(NOW - gate.HEAD_SECONDS), 1, "head", "estimate expired"),
+                wire.Wait(gate.EstimateExpired(NOW - gate.DEFAULT_ADMISSION_POLICY.timing.head_seconds), 1, "head", "estimate expired"),
                 wire.Admitted("stem", GIB, "future-source", "stem.max", "stem.wave"),
                 wire.LaunchAdmitted(GIB, "future-source"), wire.Refused("no"), wire.Ok(),
                 wire.ViewReply(reading), wire.ExplainReply(reading.explanation), wire.MineReply(reading))
@@ -96,12 +96,12 @@ class ProtocolTests(unittest.TestCase):
     def test_expired_explanation_keeps_release_advice_and_decided_from_over_wire(self) -> None:
         with AdmissionFixture() as fixture:
             fixture.free(0)
-            _ = fixture.server.handle_request(fixture.request(age=gate.HEAD_SECONDS))
+            _ = fixture.server.handle_request(fixture.request(age=gate.DEFAULT_ADMISSION_POLICY.timing.head_seconds))
             inputs, limits = fixture.server.last_inputs, fixture.server.last_limits
             assert isinstance(inputs, gate.QueueInputs)
             assert isinstance(limits, gate.AdmissionLimits)
             inputs = replace(inputs, recovery=gate.RecoveryStarts(NOW + 120, NOW + 30))
-            local = gate.queue_read_from(inputs, limits).explanation
+            local = gate.queue_read_from(inputs, limits, policy=gate.DEFAULT_ADMISSION_POLICY).explanation
             parsed = wire.parse_reply(wire.encode_reply(wire.ExplainReply(local)))
             assert isinstance(parsed, wire.ExplainReply)
             self.assertEqual(parsed.explanation, local)

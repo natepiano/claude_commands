@@ -16,9 +16,11 @@ import json
 import threading
 import time
 import select
+import sys
 from collections.abc import Callable, Generator, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Protocol, TypeGuard, final, cast
 
@@ -65,6 +67,7 @@ class _OperationState(threading.local):
     def __init__(self) -> None:
         self.deadline: float = NO_LOCK_DEADLINE
         self.sites: dict[tuple[int, LockIdentity], str] = {}
+        self.state_files: dict[Path, int] = {}
 
 
 _operation = _OperationState()
@@ -334,6 +337,22 @@ def _read_validated_json(path: Path, validate: Callable[[Path, object], object])
         raise
     except (OSError, UnicodeError) as error:
         raise WorkerStateUnreadable(path, str(error)) from error
+    if text == "" and path.name.endswith(".pending.json"):
+        # Shared readers leave recovery to the next exclusive reader. Otherwise
+        # reread under the exclusive lock before mutating a snapshot.
+        mode = _operation.state_files.get(path.resolve(), fcntl.LOCK_UN)
+        if mode & fcntl.LOCK_SH:
+            return {}
+        if not mode & fcntl.LOCK_EX:
+            with locked_state(path) as state:
+                return state.read_object()
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+        archived = path.with_name(f"{path.name}.empty-legacy-{stamp}")
+        _ = path.rename(archived)
+        print(f"worker_lifecycle: {path}: quarantined as {archived.name}: "
+              + "zero-byte legacy inbox may have lost messages during an in-place write; continuing empty",
+              file=sys.stderr)
+        return {}
     try:
         value = cast(object, json.loads(text))
     except (ValueError, UnicodeError) as error:
@@ -354,8 +373,9 @@ def read_worker_value(path: Path) -> object:
 def read_worker_state(path: Path) -> dict[str, object]:
     """Strict lock-free atomic snapshot; absence still requires ownership reconciliation.
 
-    Readers see one complete publication without creating lock files. Writers
-    must instead hold locked_state through their read and replacement.
+    Complete snapshots need no lock; zero-byte legacy inbox recovery takes the
+    exclusive sidecar lock. Shared readers defer recovery and return an empty
+    queue. Writers hold locked_state through their read and replacement.
     """
     return _state_object(path, read_worker_value(path))
 
@@ -391,9 +411,12 @@ def locked_state(path: Path, *, mode: int = fcntl.LOCK_EX,
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.with_name(path.name + ".lock").open("a", encoding="utf-8") as lock:
         acquire_flock(lock, mode=mode, deadline=deadline)
+        identity = path.resolve()
+        _operation.state_files[identity] = mode
         try:
             yield WorkerStateFile(path)
         finally:
+            del _operation.state_files[identity]
             acquire_flock(lock, mode=fcntl.LOCK_UN)
 
 

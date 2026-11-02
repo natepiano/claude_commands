@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.production.staff_test_support import fixture_member, fixture_runtime_id
+
 import json
 import os
 import re
@@ -148,18 +150,19 @@ class BoardJsonTests(unittest.TestCase):
         )), encoding="utf-8")
         fixture = ProductionFixture(slug, checkout, worktree, plan, document)
         self.plan(fixture)
-        _ = fake_showrunner.write_timer(self.notifier, slug, f"{slug}-id", "UTC", document)
+        production_membership(slug, unit_name)
+        row = next(row for row in staff.find(kind="showrunner") if row.name == slug)
+        _ = staff.set_doc(row.id, staff.LiveDoc("natedev", document))
+        _ = fake_showrunner.write_timer(self.notifier, slug, row.id, "UTC", document)
         if running:
             process_ids = (os.getpid(), os.getppid(), 1)
             held = fake_showrunner.write_session(
-                self.sessions, f"{slug}-showrunner", f"{slug}-id",
+                self.sessions, f"{slug}-showrunner", row.id,
                 pid=process_ids[self.production_count],
             )
             self.addCleanup(held.close)
         self.production_count += 1
-        production_membership(slug, unit_name)
-        row = next(row for row in staff.find(kind="showrunner") if row.name == slug)
-        showrunner_launch(row, f"{slug}-id", self.environment)
+        showrunner_launch(row, row.id, self.environment)
         return fixture
 
     def plan(self, fixture: ProductionFixture, *, gate: str = "", all_done: bool = False) -> None:
@@ -193,7 +196,7 @@ class BoardJsonTests(unittest.TestCase):
                      pane: str = "unit", at: str = "2026-10-31T10:00:00+00:00") -> None:
         launch = pane_record.launch(
             pane, session, str(self.root),
-            {"STAFF_ID": row.id, "CLAUDE_CONFIG_DIR": str(self.root / "account")},
+            {"CLAUDE_CONFIG_DIR": str(self.root / "account")},
             ["claude", "-n", row.name],
         )
         launch["written_at"] = at
@@ -366,9 +369,10 @@ class BoardJsonTests(unittest.TestCase):
         other = self.production("other")
         nested = fixture.worktree / "nested"
         nested.mkdir()
-        self.staff_launch(self.unit_member(fixture.slug), "unit-session")
+        unit = self.unit_member(fixture.slug)
+        self.staff_launch(unit, unit.id)
 
-        response, documents = self.generate("--session", "unit-session", cwd=nested)
+        response, documents = self.generate("--session", unit.id, cwd=nested)
 
         self.assertEqual(response["files"], [str(self.output / "show.json")])
         self.assertNotIn("focus", response)
@@ -383,7 +387,7 @@ class BoardJsonTests(unittest.TestCase):
         self.attach(child.slug, root.slug)
         self.attach(grandchild.slug, child.slug)
 
-        for arguments in (("--session", "z-root-id"), ("--production", root.slug)):
+        for arguments in (("--session", fixture_runtime_id("showrunner::z-root")), ("--production", root.slug)):
             with self.subTest(arguments=arguments):
                 response, documents = self.generate(*arguments)
 
@@ -402,7 +406,7 @@ class BoardJsonTests(unittest.TestCase):
                     self.assertEqual(unit["plan"], str(fixture.plan))
                 self.assertFalse((self.output / f"{other.slug}.json").exists())
 
-        response, documents = self.generate("--session", "m-child-id")
+        response, documents = self.generate("--session", fixture_runtime_id("showrunner::m-child"))
         self.assertEqual([doc["production"] for doc in documents], [child.slug, grandchild.slug])
         self.assertNotIn("focus", response)
 
@@ -411,7 +415,7 @@ class BoardJsonTests(unittest.TestCase):
         unrelated = self.root / "etc/nixos"
         unrelated.mkdir(parents=True)
 
-        response, documents = self.generate("--session", "show-id", cwd=unrelated)
+        response, documents = self.generate("--session", fixture_runtime_id("showrunner::show"), cwd=unrelated)
 
         self.assertEqual(response["files"], [str(self.output / "show.json")])
         self.assertEqual([document["production"] for document in documents], [fixture.slug])
@@ -424,7 +428,7 @@ class BoardJsonTests(unittest.TestCase):
 
         for cwd in (self.root, fixture.checkout, other.checkout):
             with self.subTest(cwd=cwd):
-                _, documents = self.generate("--session", "session-production-id", cwd=cwd)
+                _, documents = self.generate("--session", fixture_runtime_id("showrunner::session-production"), cwd=cwd)
                 self.assertEqual([document["production"] for document in documents], [fixture.slug])
                 self.assertFalse((self.output / f"{other.slug}.json").exists())
 
@@ -439,7 +443,7 @@ class BoardJsonTests(unittest.TestCase):
         self.attach(child.slug, root.slug)
         self.attach(grandchild.slug, child.slug)
 
-        response, documents = self.generate("--session", "z-root-id")
+        response, documents = self.generate("--session", fixture_runtime_id("showrunner::z-root"))
 
         self.assertEqual([document["production"] for document in documents],
                          [root.slug, child.slug, grandchild.slug])
@@ -468,11 +472,11 @@ class BoardJsonTests(unittest.TestCase):
         self.attach(child.slug, root.slug)
         self.attach(grandchild.slug, child.slug)
         unit = self.unit_member(root.slug)
-        worker = staff.ensure("worker", name="test1", parent=unit.id)
-        self.staff_launch(unit, "unit-session")
-        self.staff_launch(worker, "worker-session", pane="worker")
+        worker = fixture_member("worker", name="test1", parent=unit.id)
+        self.staff_launch(unit, unit.id)
+        self.staff_launch(worker, worker.id, pane="worker")
 
-        for session in ("unit-session", "worker-session"):
+        for session in (unit.id, worker.id):
             with self.subTest(session=session):
                 _, documents = self.generate("--session", session)
                 self.assertEqual([doc["production"] for doc in documents],
@@ -483,39 +487,41 @@ class BoardJsonTests(unittest.TestCase):
     def test_same_named_units_follow_the_newest_launch_staff_id(self) -> None:
         first = self.production("first", running=False)
         second = self.production("second", running=False)
-        self.staff_launch(self.unit_member(first.slug), "reused-session", pane="older",
-                          at="2026-10-31T09:00:00+00:00")
-        self.staff_launch(self.unit_member(second.slug), "reused-session", pane="newer")
+        unit = self.unit_member(first.slug)
+        self.staff_launch(unit, unit.id, pane="older", at="2026-10-31T09:00:00+00:00")
+        second_parent = next(row for row in staff.find(kind="showrunner") if row.name == second.slug)
+        other = self.unit_member(second.slug)
+        _ = staff.rename(other.id, "unrelated")
+        _ = staff.set_worktree(other.id, staff.RemovedWorktree("natedev", second.worktree))
+        moved = staff.move(unit.id, second_parent.id)
+        self.staff_launch(moved, moved.id, pane="newer")
 
-        _, documents = self.generate("--session", "reused-session")
+        _, documents = self.generate("--session", moved.id)
 
         self.assertEqual([doc["production"] for doc in documents], [second.slug])
         self.assertFalse((self.output / f"{first.slug}.json").exists())
 
     def test_timer_target_without_a_launch_staff_id_does_not_place_a_session(self) -> None:
         _ = self.production(running=False)
-        # This session has never had a staff identity. The normal writer keeps
-        # identities from earlier launches of the same conversation.
+        target = fixture_runtime_id("unregistered-board-timer")
         with pane_record.locked("agents"):
             pane_record.save("agents", {})
-        launch = pane_record.launch("unmarked", "show-id", str(self.root),
+        launch = pane_record.launch("unmarked", target, str(self.root),
                                     {"CLAUDE_CONFIG_DIR": str(self.root / "account")}, ["claude"])
         launch["written_at"] = "2099-01-01T00:00:00+00:00"
-        # Replace the fixture's earlier staff-bound launch; write() would
-        # correctly retain that conversation's STAFF_ID in the new launch.
         pane_record.save("agents", {launch["pane_id"]: launch})
 
-        response, documents = self.generate("--session", "show-id")
+        response, documents = self.generate("--session", target)
 
         self.assertEqual(response["files"], [])
         self.assertEqual(documents, [])
 
     def test_missing_staff_id_and_launch_records_have_no_showrunner_board(self) -> None:
         _ = self.production(running=False)
-        missing = staff.StaffRow(staff.StaffId("s00000000000"), "unit", "alpha", None)
-        self.staff_launch(missing, "missing-row-session", pane="missing")
+        missing = staff.StaffRow(staff.native_id(fixture_runtime_id("absent-board-unit")), "unit", "alpha", None, current_session=staff.native_id(fixture_runtime_id("absent-board-unit")))
+        self.staff_launch(missing, missing.id, pane="missing")
 
-        for session in ("no-launch-session", "missing-row-session"):
+        for session in ("no-launch-session", missing.id):
             with self.subTest(session=session):
                 response, documents = self.generate("--session", session)
                 self.assertEqual(response["files"], [])
@@ -523,13 +529,13 @@ class BoardJsonTests(unittest.TestCase):
 
     def test_unit_without_a_showrunner_ancestor_has_no_board(self) -> None:
         _ = self.production(running=False)
-        orphan = staff.StaffRow(staff.StaffId("s00000000001"), "unit", "orphan", None)
-        self.staff_launch(orphan, "orphan-session")
+        orphan = staff.StaffRow(staff.native_id(fixture_runtime_id("orphan-board-unit")), "unit", "orphan", None, current_session=staff.native_id(fixture_runtime_id("orphan-board-unit")))
+        self.staff_launch(orphan, orphan.id)
         # The writer forbids orphan units; pin the reader's defensive boundary
         # with the same snapshot shape should an incomplete ancestry reach it.
         record = staff.snapshot()
         with patch.object(staff, "snapshot", return_value=staff.StaffSnapshot((*record.rows, orphan))):
-            response, documents = self.generate("--session", "orphan-session")
+            response, documents = self.generate("--session", orphan.id)
 
         self.assertEqual(response["files"], [])
         self.assertEqual(documents, [])
@@ -543,7 +549,7 @@ class BoardJsonTests(unittest.TestCase):
         stale_child.mkdir(parents=True)
         _ = (stale_child / "parent").write_text(sibling.slug + "\n", encoding="utf-8")
 
-        _, documents = self.generate("--session", "root-id")
+        _, documents = self.generate("--session", fixture_runtime_id("showrunner::root"))
 
         self.assertEqual([doc["production"] for doc in documents], [root.slug, child.slug])
         self.assertFalse((self.output / f"{sibling.slug}.json").exists())
@@ -582,7 +588,7 @@ class BoardJsonTests(unittest.TestCase):
 
         with patch.object(staff, "snapshot", read_staff), patch.object(
                 board_json, "resolve", resolve_then_remove_staff):
-            _, documents = self.generate("--session", "root-id")
+            _, documents = self.generate("--session", fixture_runtime_id("showrunner::root"))
 
         self.assertEqual(reads, 1)
         self.assertEqual([document["production"] for document in documents], [root.slug, child.slug])
@@ -603,7 +609,7 @@ class BoardJsonTests(unittest.TestCase):
         for production, expected in ((fixture.slug, [fixture.slug]), ("unknown-production", [])):
             with self.subTest(production=production):
                 _, documents = self.generate("--production", production,
-                                             "--session", "session-production-id")
+                                             "--session", fixture_runtime_id("showrunner::session-production"))
 
                 self.assertEqual([document["production"] for document in documents], expected)
                 self.assertFalse((self.output / f"{other.slug}.json").exists())
@@ -624,7 +630,7 @@ class BoardJsonTests(unittest.TestCase):
                     # Give each actual filesystem operation room to advance mtime,
                     # without sleeping or relying on filesystem clock resolution.
                     os.utime(child_state, (NOW, NOW))
-                    response, documents = self.generate("--session", "root-id")
+                    response, documents = self.generate("--session", fixture_runtime_id("showrunner::root"))
                     self.assertEqual(response["watch"], expected_watch)
                     watched_mtime = child_state.stat().st_mtime_ns
                     self.assertEqual([doc["production"] for doc in documents],
@@ -640,7 +646,7 @@ class BoardJsonTests(unittest.TestCase):
                         self.assertEqual(showrunner_parent.detach(child.slug, record=record), root.slug)
                     self.assertGreater(child_state.stat().st_mtime_ns, watched_mtime)
 
-                    response, documents = self.generate("--session", "root-id")
+                    response, documents = self.generate("--session", fixture_runtime_id("showrunner::root"))
                     self.assertEqual(response["watch"], expected_watch)
                     self.assertEqual([doc["production"] for doc in documents],
                                      [root.slug, child.slug] if operation == "attach" else [root.slug])
@@ -678,7 +684,7 @@ class BoardJsonTests(unittest.TestCase):
         self.attach(child.slug, root.slug)
         self.attach(grandchild.slug, child.slug)
         child_row = next(row for row in staff.find(kind="showrunner") if row.name == child.slug)
-        _ = staff.ensure("showrunner", name="unregistered", parent=child_row.id)
+        _ = fixture_member("showrunner", name="unregistered", parent=child_row.id)
         response, documents = self.generate("--production", root.slug)
 
         self.assertEqual([doc["production"] for doc in documents],

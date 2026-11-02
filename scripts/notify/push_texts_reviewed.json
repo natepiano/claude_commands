@@ -1,4 +1,20 @@
 {
+  "alert.blocked": {
+    "typical": {
+      "objections": [],
+      "reviewer": "user-spec: User approved push_template_drafts.txt with the 2026-11-01 changes",
+      "sha256": "d3e03a4b890d8fea463239329391f5c74cb27071c6f4455df198c1687b6ed98e",
+      "time": "2026-11-01T12:00:00-05:00"
+    }
+  },
+  "alert.decision": {
+    "typical": {
+      "objections": [],
+      "reviewer": "user-spec: User approved push_template_drafts.txt with the 2026-11-01 changes",
+      "sha256": "4a780daecea5853ba4002afa0c2262436aec9a53a80837441a2fdd7f3646d5c3",
+      "time": "2026-11-01T12:00:00-05:00"
+    }
+  },
   "auto_mode.refused": {
     "file_change_no_waits": {
       "objections": [
@@ -66,6 +82,14 @@
       "time": "2026-10-23T19:45:00.398996-04:00"
     }
   },
+  "build_hold.blocking": {
+    "typical": {
+      "objections": [],
+      "reviewer": "user-spec: User approved push_template_drafts.txt with the 2026-11-01 changes",
+      "sha256": "4188fcea7946f96a281742a220e199083769041c69341162f93af046b4f35f21",
+      "time": "2026-11-01T12:00:00-05:00"
+    }
+  },
   "codex.reset_ready": {
     "long_machine": {
       "reviewer": "opus",
@@ -76,6 +100,22 @@
       "reviewer": "opus",
       "sha256": "1f065b1a5dcd7b40a7239274d3d8c502bfbcb27763417405c9b8168bea52fd46",
       "time": "2026-10-14T04:25:55.369515-04:00"
+    }
+  },
+  "github.keys_cold": {
+    "typical": {
+      "objections": [],
+      "reviewer": "user-spec: User approved push_template_drafts.txt with the 2026-11-01 changes",
+      "sha256": "f8044fe25f39b5647778f07a98609db9352b8c97c87404e559754757f62bde9b",
+      "time": "2026-11-01T12:00:00-05:00"
+    }
+  },
+  "mac.locked": {
+    "typical": {
+      "objections": [],
+      "reviewer": "user-spec: User approved push_template_drafts.txt with the 2026-11-01 changes",
+      "sha256": "df8eb63669515b2838b8a43037d38eb35187c7ec7363e57be686b74024087c3a",
+      "time": "2026-11-01T12:00:00-05:00"
     }
   },
   "message.repeat_flood": {
@@ -169,6 +209,14 @@
       "reviewer": "opus",
       "sha256": "0846956765230afe65d57d025036b245af20453c59348864ba08b614e449cc8d",
       "time": "2026-10-14T04:26:42.406180-04:00"
+    }
+  },
+  "nixos.ups_power_back": {
+    "typical": {
+      "objections": [],
+      "reviewer": "user-spec: User approved push_template_drafts.txt with the 2026-11-01 changes",
+      "sha256": "df438eaa62caf54aab780d668d527bb6db81e3a8a69e53e0bea4b9a05081f3ee",
+      "time": "2026-11-01T12:00:00-05:00"
     }
   },
   "nixos.ups_shutdown": {

@@ -22,12 +22,12 @@ from scripts.production.fake_unit_host import PaneShellFixture, record_shutdown,
 class RenamePaneShellTests(UnitRenameFixture):
     def test_seed_inherits_shared_stop_record_defaults(self) -> None:
         assert_shared_stop_record(self, self.seed_record,
-            self.home / '.local/state/shutdown/owner@example.com/sessions/sid-alpha.json')
+            self.home / '.local/state/shutdown/owner@example.com/sessions/5ad615f2-4e04-5121-a102-9d6b2e2a6eb3.json')
 
     def pane_shell(self, *, live: bool) -> None:
         _ = self.seed_record(progress='ready' if live else 'stopped')
         pane = PaneShellFixture(self, self.rust / 'claude-demo-alpha', Path(self.env['HERDR_PROC']), live=live, env=self.env)
-        record_shutdown(self, pane, self.home / '.local/state/shutdown/owner@example.com/sessions/sid-alpha.json',
+        record_shutdown(self, pane, self.home / '.local/state/shutdown/owner@example.com/sessions/5ad615f2-4e04-5121-a102-9d6b2e2a6eb3.json',
                         destination=('demo','gamma-unit','gamma'))
         self.assert_ok(self.rename('apply'))
         self.assert_ok(self.rename('verify'))
@@ -42,12 +42,12 @@ class RenamePaneShellTests(UnitRenameFixture):
         pane = PaneShellFixture(self, self.rust / "claude-demo-alpha", Path(self.env["HERDR_PROC"]),
                                 live=True, env=self.env)
         _ = herdr.Herdr("agents").run("agent", "start", "alpha", "--kind", "claude", "--pane", "w1:p1",
-                                    "--", "--session-id", "sid-alpha")
+                                    "--", "--session-id", "5ad615f2-4e04-5121-a102-9d6b2e2a6eb3")
         renamed = rename_unit.plan("demo", "alpha-unit", "gamma-unit", self.root / "scratch")
-        renamed.session_id = "sid-alpha"
+        renamed.session_id = "5ad615f2-4e04-5121-a102-9d6b2e2a6eb3"
         row = next(row for row in staff.find(kind="unit") if row.name == "alpha")
         _ = staff.rename(row.id, "gamma")
-        record_shutdown(self, pane, self.home / ".local/state/shutdown/owner@example.com/sessions/sid-alpha.json",
+        record_shutdown(self, pane, self.home / ".local/state/shutdown/owner@example.com/sessions/5ad615f2-4e04-5121-a102-9d6b2e2a6eb3.json",
                         destination=("demo", "gamma-unit", "gamma"))
         return pane, renamed
 
@@ -99,7 +99,7 @@ class RenamePaneShellTests(UnitRenameFixture):
                 _ = self.publish_stopped_panes(pane, renamed, (None, None), panes=[
                     {"pane_id": "w1:p1", "terminal_id": renamed.terminal_id, "agent_session": None},
                     {"pane_id": other, "terminal_id": "terminal-competitor",
-                     "agent_session": {"value": "sid-alpha"}},
+                     "agent_session": {"value": "5ad615f2-4e04-5121-a102-9d6b2e2a6eb3"}},
                 ])
                 with self.assertRaisesRegex(RenameRefused, "conversation.*another terminal"):
                     rename_unit.stop_unit(renamed, lambda: None)
@@ -198,7 +198,7 @@ class RenamePaneShellTests(UnitRenameFixture):
     def test_retry_after_director_exit_closes_only_the_journaled_conversation_pane(self) -> None:
         pane, renamed = self.recovery_panes()
         self.interrupt_before_close(renamed)
-        competitor = self.publish_stopped_panes(pane, renamed, ("sid-alpha", "sid-unrelated"))
+        competitor = self.publish_stopped_panes(pane, renamed, ("5ad615f2-4e04-5121-a102-9d6b2e2a6eb3", "sid-unrelated"))
         with (mock.patch.object(unit_lookup, "marked_unit", return_value=competitor),
               mock.patch.object(unit_lookup, "observed_staff_marks", return_value=(("demo", competitor),))):
             rename_unit.stop_unit(renamed, lambda: None)
@@ -213,7 +213,7 @@ class RenamePaneShellTests(UnitRenameFixture):
         _ = responses_path.write_text(json.dumps(responses))
         with self.assertRaisesRegex(RenameRefused, "close unavailable"):
             rename_unit.stop_unit(renamed, lambda: None)
-        competitor = self.publish_stopped_panes(pane, renamed, ("sid-alpha", "sid-unrelated"))
+        competitor = self.publish_stopped_panes(pane, renamed, ("5ad615f2-4e04-5121-a102-9d6b2e2a6eb3", "sid-unrelated"))
         with mock.patch.object(unit_lookup, "marked_unit", return_value=competitor):
             rename_unit.stop_unit(renamed, lambda: None)
         self.assertEqual(pane.close_calls(), [["--session", "agents", "pane", "close", "w1:p1"],
@@ -224,7 +224,7 @@ class RenamePaneShellTests(UnitRenameFixture):
         pane, renamed = self.recovery_panes()
         self.interrupt_before_close(renamed)
         terminal = renamed.terminal_id
-        for conversations in ((None, "sid-unrelated"), ("sid-alpha", "sid-alpha")):
+        for conversations in ((None, "sid-unrelated"), ("5ad615f2-4e04-5121-a102-9d6b2e2a6eb3", "5ad615f2-4e04-5121-a102-9d6b2e2a6eb3")):
             with self.subTest(conversations=conversations):
                 renamed.terminal_id = terminal if conversations[0] is not None else ""
                 competitor = self.publish_stopped_panes(pane, renamed, conversations)
@@ -236,7 +236,7 @@ class RenamePaneShellTests(UnitRenameFixture):
     def test_retry_closes_the_unlabelled_terminal_after_its_conversation_clears(self) -> None:
         pane, renamed = self.recovery_panes()
         live = herdr.Herdr("agents").panes()[0]
-        self.assertEqual(live["session_id"], "sid-alpha")
+        self.assertEqual(live["session_id"], "5ad615f2-4e04-5121-a102-9d6b2e2a6eb3")
         self.interrupt_before_close(renamed)
         competitor = self.publish_stopped_panes(pane, renamed, (None, None), panes=[
             {"pane_id": "w1:p1", "label": None},
@@ -258,7 +258,7 @@ class RenamePaneShellTests(UnitRenameFixture):
         self.interrupt_before_close(renamed)
         competitor = self.publish_stopped_panes(pane, renamed, (None, None), panes=[
             {"pane_id": "w2:p9", "workspace_id": "w2", "label": "alpha",
-             "terminal_id": "another-terminal", "agent_session": {"value": "sid-alpha"}},
+             "terminal_id": "another-terminal", "agent_session": {"value": "5ad615f2-4e04-5121-a102-9d6b2e2a6eb3"}},
         ])
         with (mock.patch.object(unit_lookup, "marked_unit", return_value=competitor),
               self.assertRaisesRegex(RenameRefused, "conversation.*another terminal")):
@@ -315,7 +315,7 @@ class RenamePaneShellTests(UnitRenameFixture):
         pane, renamed = self.recovery_panes()
         self.interrupt_before_close(renamed)
         renamed.terminal_id = ""
-        _ = self.publish_stopped_panes(pane, renamed, ("sid-alpha", "sid-unrelated"))
+        _ = self.publish_stopped_panes(pane, renamed, ("5ad615f2-4e04-5121-a102-9d6b2e2a6eb3", "sid-unrelated"))
         with self.assertRaisesRegex(RenameRefused, "no journaled terminal identity"):
             rename_unit.stop_unit(renamed, lambda: None)
         self.assertEqual(pane.close_calls(), [])

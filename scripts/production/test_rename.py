@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.production.staff_test_support import fixture_member
+
 import json
 import os
 import shlex
@@ -69,12 +71,12 @@ class ProductionRenameTests(support.ProductionRenameFixture):
         _ = self.git("add", str(self.doc))
         _ = self.git("commit", "-m", "Record workspace name")
         self.assert_success(self.run_rename("apply"))
-        self.assertEqual(staff.snapshot().by_id(row.id), staff.StaffRow(row.id, "showrunner", "new", None))
+        self.assertEqual(staff.snapshot().by_id(row.id), staff.StaffRow(row.id, "showrunner", "new", None, current_session=row.id))
         self.assertEqual(self.journal()["staff_id"], row.id)
         self.assertIn("- **Showrunner session:** `new`", self.new_doc.read_text())
 
     def test_taken_staff_name_refuses_before_sources_change(self) -> None:
-        _ = staff.ensure("showrunner", name=NEW)
+        _ = fixture_member("showrunner", name=NEW)
         before = self.snapshot()
         failed = self.run_rename("apply")
         self.assertEqual(failed.returncode, 2, failed.stderr)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+
 import json
 from collections.abc import Callable
 import os
@@ -39,7 +40,7 @@ class UnitRenameSessionsTests(UnitRenameFixture):
 
     def test_recordless_relaunch_real_add_unit_joins_parent_operation(self) -> None:
         rename = rename_unit.plan("demo", "alpha", "gamma", self.root / "scratch")
-        rename.session_id = "sid-alpha"
+        rename.session_id = "5ad615f2-4e04-5121-a102-9d6b2e2a6eb3"
         self.write(self.doc, self.doc.read_text().replace(
             "alpha-unit | docs/plans/alpha.md", "gamma-unit | standby"))
         run = cast(Callable[..., subprocess.CompletedProcess[str]], subprocess.run)
@@ -72,7 +73,7 @@ sys.path.insert(0, {str(checkout)!r})
 from scripts.production import staff
 assert 'CLAUDE_CODE_SESSION_ID' not in os.environ
 with staff.operation():
-    staff.ensure('showrunner', name='restart-child')
+    staff.ensure('showrunner', name='restart-child', runtime_id='9caee2d3-7095-5955-98a8-c402165f26d1')
 """)
         run = cast(Callable[..., subprocess.CompletedProcess[str]], subprocess.run)
 
@@ -89,7 +90,7 @@ with staff.operation():
 
     def test_recordless_rename_relaunch_is_a_valid_add_unit_request(self) -> None:
         rename = rename_unit.plan("demo", "alpha", "gamma", self.root / "scratch")
-        rename.session_id = "sid-alpha"
+        rename.session_id = "5ad615f2-4e04-5121-a102-9d6b2e2a6eb3"
         for mode in ("docs/plans/alpha.md", "standby", "permanent"):
             with self.subTest(mode=mode):
                 text = self.doc.read_text().replace("alpha-unit | docs/plans/alpha.md", "gamma-unit | " + mode)
@@ -117,16 +118,16 @@ with staff.operation():
                 parsed = parse_arguments(add_unit.main, command[2:])
                 self.assertIsNotNone(parsed)
                 assert parsed is not None
-                self.assertEqual((cast(str, parsed.account), cast(str, parsed.resume), cast(str, parsed.name)), ("claude4", "sid-alpha", "gamma-unit"))
+                self.assertEqual((cast(str, parsed.account), cast(str, parsed.resume), cast(str, parsed.name)), ("claude4", "5ad615f2-4e04-5121-a102-9d6b2e2a6eb3", "gamma-unit"))
                 request = add_unit.launch_request(parsed)
                 with (patch.object(accounts, "prepared_account", return_value=accounts.PreparedAccount({}, frozenset())),
                       patch.object(accounts, "claude_account_dir", return_value=self.home / ".claude4"),
                       patch.object(accounts, "account_for_group_launch", side_effect=AssertionError("must keep launch account"))):
                     self.assertEqual(add_unit.account_for_launch(request, cast(str, parsed.account)).label, "claude4")
                 # The journal must already contain the launch identity when a child starts.
-                self.assertEqual((self.journal()["account"], self.journal()["session_id"]), ("claude4", "sid-alpha"))
+                self.assertEqual((self.journal()["account"], self.journal()["session_id"]), ("claude4", "5ad615f2-4e04-5121-a102-9d6b2e2a6eb3"))
                 launches.append(command)
-                _ = self.mark_live("gamma-unit", "sid-alpha")
+                _ = self.mark_live("gamma-unit", "5ad615f2-4e04-5121-a102-9d6b2e2a6eb3")
                 return subprocess.CompletedProcess(command, 0, "", "")
             return run(command, **options)
         with patch.object(subprocess, "run", side_effect=launch):
@@ -136,10 +137,10 @@ with staff.operation():
         self.assertIs(self.journal()["done"], True)
 
     def recordless_stop(self) -> Callable[[str], stop_resume.Stopped]:
-        end = self.mark_live("alpha-unit", "sid-alpha")
+        end = self.mark_live("alpha-unit", "5ad615f2-4e04-5121-a102-9d6b2e2a6eb3")
         self.record_live_launch()
         def stop(identity: str) -> stop_resume.Stopped:
-            self.assertEqual(identity, "sid-alpha")
+            self.assertEqual(identity, "5ad615f2-4e04-5121-a102-9d6b2e2a6eb3")
             self.assertEqual(self.journal()["account"], "claude4")
             end()
             return stop_resume.Stopped(identity, 1)
@@ -172,7 +173,7 @@ with staff.operation():
     def finish_after_killed_save(self, step: int) -> None:
         with patch.object(self, "stop_session", side_effect=self.recordless_stop()):
             self.kill_apply_after_save(step)
-            self.assertEqual((self.journal()["account"], self.journal()["session_id"]), ("claude4", "sid-alpha"))
+            self.assertEqual((self.journal()["account"], self.journal()["session_id"]), ("claude4", "5ad615f2-4e04-5121-a102-9d6b2e2a6eb3"))
             self.finish_recordless_apply()
 
     def test_apply_killed_after_its_first_journal_save_resumes_the_same_account_and_conversation(self) -> None:
@@ -195,7 +196,7 @@ with staff.operation():
         with (patch.object(self, "stop_session") as stop,
               patch.object(os, "kill") as kill):
             self.assert_refused(self.rename("apply"),
-                                "alpha-unit: session sid-alpha has no pane launch account or shutdown record")
+                                "alpha-unit: session 5ad615f2-4e04-5121-a102-9d6b2e2a6eb3 has no pane launch account or shutdown record")
         stop.assert_not_called()
         self.assertTrue(all(call.args[1] == 0 for call in kill.call_args_list),
                         "refused apply must send no process-changing signal")
@@ -207,7 +208,7 @@ with staff.operation():
         fake_unit_host.write(self.env, [
             fake_unit_host.HostedUnit("old", "w3:p3Y", {"SHOWRUNNER_UNIT": "demo", "SHOWRUNNER_UNIT_ID": "alpha-unit"}),
             fake_unit_host.HostedUnit("moved", "w4:p1", {"SHOWRUNNER_UNIT": "demo", "SHOWRUNNER_UNIT_ID": "gamma-unit"}, label="gamma")])
-        held = fake_showrunner.write_session(self.root / "state/sessions", "gamma", "sid-alpha")
+        held = fake_showrunner.write_session(self.root / "state/sessions", "gamma", "5ad615f2-4e04-5121-a102-9d6b2e2a6eb3")
         self.addCleanup(held.close)
         fake_unit_host.place_process(self.env, os.getpid(), "w4:p1")
         fake_unit_host.process(self.env, 991030, 991000, ["python3", "-m", "unittest"],
@@ -233,7 +234,7 @@ with staff.operation():
         self.assert_refused(result, "gamma-unit is not running")
         self.assertEqual((self.journal()["step"], self.journal()["claimed"]), (10, False))
         self.assertEqual([json.loads(line) for line in log.read_text().splitlines()],
-                         [["restart", "--only", "sid-alpha", "--here"]])
+                         [["restart", "--only", "5ad615f2-4e04-5121-a102-9d6b2e2a6eb3", "--here"]])
         saved = self.record()
         session = cast(dict[str, object], saved["session"])
         host = cast(dict[str, object], session["host"])
@@ -272,14 +273,14 @@ with staff.operation():
                          ("alpha", "demo-alpha"))
         self.assertEqual((self.git("branch", "--list"), self.doc.read_text()), (branches, doc))
         # The relaunched unit keeps its mark alpha-unit, now under the new session name.
-        _ = self.mark_live("alpha-unit", "sid-alpha")
+        _ = self.mark_live("alpha-unit", "5ad615f2-4e04-5121-a102-9d6b2e2a6eb3")
         self.assert_ok(self.rename("apply", "builder-report", "alpha"))
         self.assertEqual(self.journal()["done"], True)
 
     def test_verify_fails_while_the_old_session_name_is_live(self) -> None:
         _ = self.seed_record(name="builder-report")
         self.assert_refused(self.rename("apply"), "gamma-unit is not running")
-        _ = self.mark_live("gamma-unit", "sid-alpha", name="builder-report")
+        _ = self.mark_live("gamma-unit", "5ad615f2-4e04-5121-a102-9d6b2e2a6eb3", name="builder-report")
         result = self.rename("apply")
         self.assert_refused(result, "gamma-unit's session is named builder-report, not gamma")
         self.assertIn("is still labelled builder-report", result.stderr)
@@ -287,11 +288,11 @@ with staff.operation():
     def test_a_verify_that_passes_closes_the_journal(self) -> None:
         _ = self.seed_record(name="builder-report")
         self.assert_refused(self.rename("apply"), "gamma-unit is not running")
-        end = self.mark_live("gamma-unit", "sid-alpha", name="builder-report")
+        end = self.mark_live("gamma-unit", "5ad615f2-4e04-5121-a102-9d6b2e2a6eb3", name="builder-report")
         self.assert_refused(self.rename("apply"), "gamma-unit's session is named builder-report, not gamma")
         self.assertEqual(self.journal()["done"], False)
         end()
-        _ = self.mark_live("gamma-unit", "sid-alpha")
+        _ = self.mark_live("gamma-unit", "5ad615f2-4e04-5121-a102-9d6b2e2a6eb3")
         self.assert_ok(self.rename("verify"))
         self.assertEqual(self.journal()["done"], True)
         self.assert_ok(self.rename("plan", "gamma", "delta"))

@@ -447,6 +447,14 @@ class LedgerTestCase(unittest.TestCase):
         ledger.file_held(finding.finding_id, issue)
         return finding, issue
 
+    def judging_ticket(self, ledger: style_ledger.Ledger, rule: str, path: str) -> str:
+        """Record the source revision before holding a fixture finding, independently of its build ticket."""
+        identity = ledger.next_ticket_id("judging")
+        ledger.ticket_add(identity, "judging", "read", "names", ".", [path], [rule])
+        ledger.ticket_assign(identity, "main")
+        _ = ledger.ticket_base(identity)
+        return identity
+
     def binding_ticket(self, source: str, pairs: tuple[tuple[int, str, str], ...]) -> tuple[style_ledger.Ledger, Path, str]:
         rule = self.rule("prefer-type-named-fields-and-bindings")
         path = self.sources[0]
@@ -454,11 +462,13 @@ class LedgerTestCase(unittest.TestCase):
         base = self.commit("Binding declarations before the ticket")
         ledger = self.ledger()
         issue = self.root / "bindings.md"
+        judging = self.judging_ticket(ledger, rule, path)
         ids: list[str] = []
         for line, old, new in pairs:
-            finding = ledger.hold(rule, path, line, source.splitlines()[line - 1], "rename", old, new, self.blob(rule), "outside")
+            finding = ledger.hold(rule, path, line, source.splitlines()[line - 1], "rename", old, new, self.blob(rule), judging)
             ledger.file_held(finding.finding_id, issue)
             ids.append(finding.finding_id)
+        ledger.ticket_drop(judging)
         ledger.ticket_add("names-1", "names", "proposal", "names", "crates/alpha", [path], [rule],
                           proposal=str(issue), finding_ids=tuple(ids))
         ledger.ticket_assign("names-1", "main")

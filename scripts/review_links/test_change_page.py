@@ -18,7 +18,8 @@ from unittest.mock import patch
 from urllib.parse import urlencode, urlsplit
 
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
-from scripts.production import change_review, showrunners, staff
+from scripts.production import change_review, showrunners
+from scripts.production.staff_test_support import fixture_member
 from scripts.feature_log import feature_log
 from scripts.review_links import change_page, serve
 
@@ -79,7 +80,7 @@ class ChangePageTests(unittest.TestCase):
             "XDG_STATE_HOME": str(self.temporary / "state"),
             "STAFF_FILE": str(self.temporary / "staff.json"),
         }))
-        _ = staff.ensure("showrunner", name="demo")
+        _ = fixture_member("showrunner", name="demo")
         _ = self.git("init", "-b", "main")
         _ = self.git("config", "user.name", "Review test")
         _ = self.git("config", "user.email", "review@example.invalid")
@@ -387,7 +388,7 @@ class ChangePageTests(unittest.TestCase):
     def test_a_child_page_routes_a_sibling_row_through_the_shared_root(self) -> None:
         notifier = self.temporary / "notifier"
         _ = self.enterContext(patch.object(showrunners, "NOTIFIER_STATE_DIR", notifier))
-        root = staff.ensure("showrunner", name="root")
+        root = fixture_member("showrunner", name="root")
         child = self.temporary / "child-production.md"
         sibling = self.temporary / "sibling-production.md"
         root_doc = self.temporary / "root-production.md"
@@ -400,7 +401,7 @@ class ChangePageTests(unittest.TestCase):
             _ = (timer / "conf").write_text(f"EVERY=15\nTARGET=session:test\nPROMPT_FILE={timer / 'prompt'}\n"
                                            + f"CHECK=zsh /unused/production_check.sh {doc}\n")
             if doc != root_doc:
-                _ = staff.ensure("showrunner", name=doc.stem.removesuffix("-production"), parent=root.id)
+                _ = fixture_member("showrunner", name=doc.stem.removesuffix("-production"), parent=root.id)
         _ = change_review.append_rows(self.review_list, [change_review.Visible("Sibling change", "Run", "Proof")],
                                       date(2026, 11, 1), self.git("rev-parse", "HEAD"), sibling)
         _ = change_review.set_row_kind(self.review_list, "C4", "Read only", child)

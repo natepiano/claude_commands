@@ -57,6 +57,7 @@ from scripts.whoami import account as account_reader
 from scripts.accounts import accounts, outage_alerts
 import quota_alert
 from scripts.production import showrunners
+from scripts.production.staff_test_support import fixture_runtime_id
 from scripts.whoami.account import Account, UnknownAccountName, UnreadableAccount
 from shutdown_record import SessionShutdown, SessionProgress, TimerRestore, Where
 
@@ -332,13 +333,17 @@ class RestartTests(ShutdownTestCase):
         from scripts.production.staff_test_support import unit_membership
 
         row = unit_membership("demo", "alpha-unit")
-        entry = pane_record.launch("old", "sid-alpha", str(self.root), {
+        row = staff.update_current_session(row.current_session, staff.StaffId("019b3a40-4250-7000-8000-000000000102"))
+        entry = pane_record.launch("old", "019b3a40-4250-7000-8000-000000000102", str(self.root), {
             "SHOWRUNNER_UNIT": "demo", "SHOWRUNNER_UNIT_ID": "alpha-unit"}, ["claude"])
         pane_record.write("writing", entry)
         membership = session_staff.LaunchMembership(staff.snapshot(), session_staff.MemberSources({}, (entry,)))
         with patch.object(session_staff.LaunchMembership, "read", return_value=membership):
-            parts = restart._resume_parts(top_level("sid-alpha"), "existing restart prompt")  # pyright: ignore[reportPrivateUsage]
-        self.assertEqual(parts.environment["STAFF_ID"], row.id)
+            parts = restart._resume_parts(top_level("019b3a40-4250-7000-8000-000000000102"), "existing restart prompt")  # pyright: ignore[reportPrivateUsage]
+        self.assertNotIn("STAFF_ID", parts.environment)
+        self.assertNotEqual(row.id, row.current_session)
+        self.assertEqual(staff.by_id(row.id), row)
+        self.assertEqual(parts.environment["CLAUDE_CODE_SESSION_ID"], row.current_session)
         self.assertEqual(parts.environment["SHOWRUNNER_UNIT_ID"], "alpha-unit")
         self.assertEqual(parts.opening_prompt, "existing restart prompt")
 
@@ -388,7 +393,11 @@ class RestartTests(ShutdownTestCase):
         _ = (self.root / ".claude2/.claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": LOGIN}}))
         self.configure_groups()
         # Existing restart fixtures represent sessions with saved conversations.
-        _ = self.enterContext(patch.object(restart, "_conversation_launch", return_value=restart.ResumeConversation()))
+        def saved_conversation(session_id: str, config_dir: Path) -> restart.ResumeConversation:
+            del config_dir
+            return restart.ResumeConversation(session_id)
+
+        _ = self.enterContext(patch.object(restart, "_conversation_launch", side_effect=saved_conversation))
         _ = self.enterContext(patch.object(restart_support, "record_time", return_value=RESTARTED))
         _ = self.enterContext(patch.object(restart_support, "inventory", return_value=inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL, sessions=[], unattributed=[])))
 
@@ -2002,6 +2011,19 @@ class RestartTests(ShutdownTestCase):
             return SUBMITTED_PROMPT
 
         _ = self.enterContext(patch.object(herdr.Herdr, "submit_opening_prompt", submitted))
+
+        def observed_native(client: herdr.Herdr, pane: str, kind: str, timeout: float) -> str:
+            self.assertEqual(kind, "claude")
+            self.assertGreater(timeout, 0)
+            starts = [argv for argv in self.herdr_calls(log)
+                      if argv[:4] == ["--session", client.session, "agent", "start"]
+                      and "--pane" in argv and argv[argv.index("--pane") + 1] == pane]
+            self.assertTrue(starts, "native observation requires a created backend in this pane")
+            arguments = starts[-1]
+            return (arguments[arguments.index("--resume") + 1] if "--resume" in arguments
+                    else fixture_runtime_id("fresh-restart-backend"))
+
+        _ = self.enterContext(patch.object(herdr.Herdr, "native_session", observed_native))
         _ = self.enterContext(patch.object(restart, "_heal_folder_trust", HEAL_FOLDER_TRUST))
         cwd = self.root / "trusted folder"
         cwd.mkdir()
@@ -2192,7 +2214,7 @@ class RestartTests(ShutdownTestCase):
         owner = top_level("missing-conversation")
         with patch.object(restart, "_conversation_launch", side_effect=self.conversation_lookup):
             command = restart.legacy_resume_command(entry(owner))
-        self.assertIn("--session-id missing-conversation", command)
+        self.assertNotIn("--session-id", command)
         self.assertNotIn("--resume", command)
 
     def test_live_manual_resume_keeps_every_legacy_cleanup_record(self) -> None:
@@ -2383,7 +2405,7 @@ class RestartTests(ShutdownTestCase):
                          [["--session", "writing", "agent", "prompt", "w2:p1", prompt]])
         self.assertEqual(conversation_pause.read_scheduled_prompts("resume-id"), (prompt,))
 
-    def test_missing_conversation_starts_with_the_same_id_and_reports_the_fresh_start(self) -> None:
+    def test_missing_conversation_lets_claude_choose_its_id_and_reports_the_fresh_start(self) -> None:
         owner, _, log = self.herdr_restart_fixture()
         with (patch.object(restart, "_conversation_launch", self.conversation_lookup),
               redirect_stdout(io.StringIO()) as output):
@@ -2392,11 +2414,98 @@ class RestartTests(ShutdownTestCase):
         calls = self.herdr_calls(log)
         start = next(row for row in calls if row[2:4] == ["agent", "start"])
         self.assertEqual(start[start.index("--") + 1:], [
-            "--session-id", "resume-id", "-n", "kept name", "--remote-control", "kept name",
+            "-n", "kept name", "--remote-control", "kept name",
             "--model", "opus", "--settings", '{"disableAgentView": true}'])
         self.assertEqual(output.getvalue().splitlines(), [
             "kept name: no conversation to resume; started a new one",
             "herdr session attach writing"])
+
+    def test_fresh_restart_updates_only_current_session_before_opening_work(self) -> None:
+        from scripts.production import staff
+        from scripts.production.staff_test_support import fixture_runtime_id, fixture_worker, unit_membership
+
+        owner, _, _ = self.herdr_restart_fixture()
+        stopped = unit_membership("demo", "alpha-unit")
+        child = fixture_worker("impl", stopped.id)
+        owner["session_id"] = stopped.id
+        observed = staff.StaffId(fixture_runtime_id("fresh-restart-Claude"))
+        record_path = Path(os.environ["STAFF_FILE"])
+        before = record_path.read_bytes()
+        launches: list[list[str]] = []
+
+        def launch(name: str, space: str, title: str, prepared: herdr.PreparedAgentEnvironment,
+                   kind: str, agent_arguments: list[str], opening: herdr.OpeningPrompt | herdr.NoOpeningPrompt,
+                   timeout_ms: int, *, agent: str) -> herdr.AgentLaunched:
+            del name, space, title, kind, timeout_ms, agent
+            launches.append(agent_arguments)
+            self.assertNotIn("--session-id", agent_arguments)
+            self.assertNotIn("--resume", agent_arguments)
+            self.assertNotIn("STAFF_ID", prepared.env)
+            self.assertEqual(staff.by_id(stopped.id), stopped)
+            self.assertIsNone(staff.by_id(observed))
+            assert isinstance(opening, herdr.OpeningPrompt)
+            assert "config_dir" in owner
+            _ = opening.before_prompt(herdr.SessionTranscript(Path(owner["config_dir"]), observed))
+            self.assertEqual(staff.by_id(stopped.id), replace(stopped, current_session=observed))
+            self.assertIsNone(staff.by_id(observed))
+            self.assertEqual(staff.by_current_session(observed), replace(stopped, current_session=observed))
+            self.assertEqual(staff.by_id(child.id), child)
+            self.assertEqual(record_path.read_bytes(), before.replace(
+                f'"current_session": "{stopped.current_session}"'.encode(),
+                f'"current_session": "{observed}"'.encode(), 1,
+            ))
+            self.assertEqual(opening.text, "Continue the saved task.")
+            return herdr.AgentLaunched("destination:p1", SUBMITTED_PROMPT)
+
+        with (patch.object(restart, "_conversation_launch", return_value=restart.StartFreshConversation()),
+              patch.object(herdr, "restore_server", return_value=herdr.ServerAdopted()),
+              patch.object(herdr.Herdr, "agents", return_value=[]),
+              patch.object(herdr, "launch_prepared_agent", side_effect=launch),
+              patch.object(restart, "_present_restored_pane"), redirect_stdout(io.StringIO())):
+            result = restart._herdr_launch(restart._resume_parts(owner, "Continue the saved task."),  # pyright: ignore[reportPrivateUsage]
+                restart.SharedHerdrTab("writing"), owner, dry_run=False)
+        self.assertEqual(result.prompt_outcome, SUBMITTED_PROMPT)
+        self.assertEqual(len(launches), 1)
+
+    def test_retained_fixed_owner_resumes_and_verifies_current_conversation_before_prompt(self) -> None:
+        from scripts.production import staff
+        from scripts.production.staff_test_support import fixture_runtime_id, unit_membership
+
+        owner, _, _ = self.herdr_restart_fixture()
+        stopped = unit_membership("demo", "alpha-unit")
+        owner["session_id"] = stopped.id
+        current = staff.native_id(fixture_runtime_id("restart-current-conversation"))
+        row = staff.update_current_session(stopped.current_session, current)
+        assert "config_dir" in owner
+        projects = Path(owner["config_dir"]) / "projects" / "encoded-folder"
+        projects.mkdir(parents=True)
+        _ = (projects / (current + ".jsonl")).write_text('{"type":"user"}\n')
+        before = Path(os.environ["STAFF_FILE"]).read_bytes(), dict(owner)
+        starts: list[list[str]] = []
+
+        def launch(name: str, space: str, title: str, prepared: herdr.PreparedAgentEnvironment,
+                   kind: str, agent_arguments: list[str], opening: herdr.OpeningPrompt | herdr.NoOpeningPrompt,
+                   timeout_ms: int, *, agent: str) -> herdr.AgentLaunched:
+            del name, space, title, prepared, kind, timeout_ms, agent
+            starts.append(agent_arguments)
+            self.assertEqual(agent_arguments[agent_arguments.index("--resume") + 1], current)
+            assert isinstance(opening, herdr.OpeningPrompt)
+            self.assertEqual(opening.transcript, herdr.SessionTranscript(Path(owner["config_dir"]), current))
+            _ = opening.before_prompt(herdr.SessionTranscript(Path(owner["config_dir"]), current))
+            self.assertEqual(staff.by_id(stopped.id), row)
+            self.assertEqual(opening.text, "Continue current work.")
+            return herdr.AgentLaunched("destination:p1", SUBMITTED_PROMPT)
+
+        with (patch.object(restart, "_conversation_launch", self.conversation_lookup),
+              patch.object(herdr, "restore_server", return_value=herdr.ServerAdopted()),
+              patch.object(herdr.Herdr, "agents", return_value=[]),
+              patch.object(herdr, "launch_prepared_agent", side_effect=launch),
+              patch.object(restart, "_present_restored_pane"), redirect_stdout(io.StringIO())):
+            result = restart._herdr_launch(restart._resume_parts(owner, "Continue current work."),  # pyright: ignore[reportPrivateUsage]
+                restart.SharedHerdrTab("writing"), owner, dry_run=False)
+        self.assertEqual(result.prompt_outcome, SUBMITTED_PROMPT)
+        self.assertEqual(len(starts), 1)
+        self.assertEqual((Path(os.environ["STAFF_FILE"]).read_bytes(), owner), before)
 
     def test_existing_conversation_in_the_launch_account_still_resumes(self) -> None:
         owner, _, log = self.herdr_restart_fixture()
@@ -2434,7 +2543,7 @@ class RestartTests(ShutdownTestCase):
             _ = restart._launch_session(saved, "Account move.", self.desktop_state, dry_run=False)  # pyright: ignore[reportPrivateUsage]
         starts = [row for row in self.herdr_calls(log) if row[2:4] == ["agent", "start"]]
         self.assertEqual([row[row.index("--") + 1:row.index("--") + 3] for row in starts],
-            [["--session-id", "resume-id"], ["--resume", "resume-id"]])
+            [["-n", "kept name"], ["--resume", "resume-id"]])
         self.assertEqual(output.getvalue().count("no conversation to resume; started a new one"), 1)
 
     def test_herdr_restart_refuses_a_pane_with_a_live_agent(self) -> None:

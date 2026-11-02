@@ -153,7 +153,9 @@ class ShowrunnerTreeTests(test_showrunners.ShowrunnerFixture):
     def test_attach_with_no_parent_named_takes_the_callers_production_and_sends_the_caller_nothing(self) -> None:
         self.showrunner("top")
         self.showrunner("mid")
-        attached = self.successful("attach", "mid", caller="top-id")
+        caller = staff.by_path("top")
+        assert caller is not None
+        attached = self.successful("attach", "mid", caller=caller.id)
         self.assertEqual(attached.splitlines(), ["mid now reports to top", "told mid"])
         self.assertEqual([socket for socket, _ in self.messages()], [f"uds:{self.root / 'mid-id.sock'}"])
         self.assertIn("name the parent: this session runs no production", self.refused("attach", "top"))

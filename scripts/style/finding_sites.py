@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from bisect import bisect_right
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import cached_property
 from enum import Enum, auto
 import re
@@ -63,13 +63,50 @@ SiteEvidence = UnchangedSite | NeedsJudgment | FilingEligibleWithoutHistory
 
 
 @dataclass(frozen=True)
+class ReadItemHeader:
+    """An item keyword at item position and its independently read header."""
+
+    keyword: int
+    end: int
+    tokens: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class UnreadItemHeader:
+    keyword: int
+    reason: str
+
+
+@dataclass(frozen=True)
+class ReadItemBody:
+    """The only body token range whose nested syntax has been read completely."""
+
+    tokens: range
+
+
+@dataclass(frozen=True)
+class UnreadItemBody:
+    lines: range
+
+
+@dataclass(frozen=True)
 class EnclosingItem:
     identity: tuple[str, ...]
     kind: str
     first: int
     last: int
-    unproved_lines: range = range(0)
-    header: tuple[str, ...] = ()
+    header_reading: ReadItemHeader | UnreadItemHeader
+    body_reading: ReadItemBody | UnreadItemBody
+    token_start: int
+    token_end: int
+
+    @property
+    def unproved_lines(self) -> range:
+        return self.body_reading.lines if isinstance(self.body_reading, UnreadItemBody) else range(0)
+
+    @property
+    def header(self) -> tuple[str, ...]:
+        return self.header_reading.tokens if isinstance(self.header_reading, ReadItemHeader) else ()
 
 
 class UnreadableSourceItems(ValueError):
@@ -141,6 +178,7 @@ class SourceSites:
             return UnreadableSourceItems("unreadable Rust tokens")
         words = tuple(span.token.value for span in spans)
         ends = style_footprint.delimiter_ends(words)
+        openers = {closing: opening for opening, closing in ends.items()}
         attributes = dict(style_footprint.attribute_spans(words))
         offsets = [0]
         for line in self.lines:
@@ -173,14 +211,17 @@ class SourceSites:
             last_line = bisect_right(offsets, spans[last - 1].end - 1)
             identity = (*owner, item.title)
             position = len(result)
-            result.append(EnclosingItem(identity, item.kind, first_line, last_line, header=words[first:last]))
+            result.append(EnclosingItem(identity, item.kind, first_line, last_line,
+                                        UnreadItemHeader(keyword, "item header not established"),
+                                        UnreadItemBody(range(first_line, last_line + 1)),
+                                        first, last))
 
             def refuse_body() -> bool:
-                # An unparsed body may conceal descendants. Retain its outer span
-                # as a refusal, and keep independent sibling owners readable.
+                # Body uncertainty cannot erase an already proved header. Discard
+                # hidden descendants while preserving independent sibling owners.
+                retained = replace(result[position], body_reading=UnreadItemBody(range(first_line, last_line + 1)))
                 del result[position:]
-                result.append(EnclosingItem(identity, item.kind, first_line, last_line,
-                                            range(first_line, last_line + 1)))
+                result.append(retained)
                 return True
 
             if not item_prefix_is_closed(first, keyword):
@@ -189,9 +230,10 @@ class SourceSites:
                 opening = keyword + (3 if item.kind == "macro_rules" else 2)
                 if opening not in ends:
                     return refuse_body()
-                result[position] = EnclosingItem(identity, item.kind, first_line, last_line,
-                    range(bisect_right(offsets, spans[opening].start),
-                          bisect_right(offsets, spans[ends[opening]].end - 1) + 1))
+                result[position] = replace(result[position],
+                    header_reading=ReadItemHeader(keyword, opening, words[first:opening]),
+                    body_reading=UnreadItemBody(range(bisect_right(offsets, spans[opening].start),
+                                                     bisect_right(offsets, spans[ends[opening]].end - 1) + 1)))
                 return True
             cursor = keyword + 1
             while cursor < last:
@@ -200,10 +242,13 @@ class SourceSites:
                     if close is None or close >= last:
                         return refuse_body()
                     if words[cursor] == "{" and close == last - 1:
-                        result[position] = EnclosingItem(identity, item.kind, first_line, last_line,
-                                                         header=words[first:cursor])
+                        result[position] = replace(result[position],
+                            header_reading=ReadItemHeader(keyword, cursor, words[first:cursor]))
                     if item.kind in {"mod", "impl", "trait", "extern"} and words[cursor] == "{" and close == last - 1:
-                        return visit(cursor + 1, close, identity) or refuse_body()
+                        if not visit(cursor + 1, close, identity):
+                            return refuse_body()
+                        result[position] = replace(result[position], body_reading=ReadItemBody(range(cursor, last)))
+                        return True
                     syntax = (NestedSyntax.PARAMETERS if item.kind == "fn" and words[cursor] == "("
                               else NestedSyntax.CONTINUATION)
                     if words[cursor] == "{":
@@ -214,6 +259,12 @@ class SourceSites:
                     cursor = close + 1
                 else:
                     cursor += 1
+            if isinstance(result[position].header_reading, UnreadItemHeader):
+                result[position] = replace(result[position],
+                    header_reading=ReadItemHeader(keyword, last, words[first:last]))
+            header = result[position].header_reading
+            assert isinstance(header, ReadItemHeader)
+            result[position] = replace(result[position], body_reading=ReadItemBody(range(header.end, last)))
             return True
 
         def qualified_path(start: int, end: int) -> bool:
@@ -359,6 +410,11 @@ class SourceSites:
                         elif continuation == "," and syntax in {NestedSyntax.ARMS, NestedSyntax.FIELDS, NestedSyntax.VARIANTS}:
                             at_item = False
                         elif continuation in {"?", "."}:
+                            at_item = False
+                        elif continuation == ">" and style_footprint.closes_named_generics(
+                                words, cursor, openers):
+                            # A const argument's block continues its proved turbofish;
+                            # its closing angle is not the start of a new statement.
                             at_item = False
                         elif continuation == "else":
                             at_item = True
