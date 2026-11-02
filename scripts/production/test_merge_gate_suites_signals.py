@@ -67,7 +67,7 @@ class MergeGateSignalsTests(GateSuitesFixture):
                        self.state, timeout=TEST_HANG_GUARD_SECS, processes=(process,))
             self.assertTrue((self.state / "module-held").exists())
             self.assertEqual(self.jobserver_tokens(), b"")
-            self.assertEqual(len(list(self.admission_directory.glob("*.reservation"))), 1)
+            self.assertEqual(len(self.admission.server.reservations), 1)
             process.send_signal(signal.SIGTERM)
             output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
             self.assertEqual(process.returncode, 1, output + errors)

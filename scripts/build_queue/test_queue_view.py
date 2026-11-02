@@ -27,6 +27,47 @@ class QueueViewTests(QueueFixtureTests):
         write_memory_config(config)
         _ = cast(object, self.enterContext(mock.patch.dict("os.environ", {"LINT_CONFIG_FILE": str(config)})))
 
+    def test_service_counts_unowned_scope_once_and_renders_the_held_heads_numbers(self) -> None:
+        import os
+        from pathlib import Path
+        from scripts.build_queue import admission_client as client
+        from scripts.build_queue.admission_test_support import AdmissionFixture, only_admitted
+        with AdmissionFixture() as server:
+            request = server.request(need=gate.GIB)
+            sidecar = server.scope(request.owner)
+            owned = Path(sidecar.read_text())
+            builds = Path(os.environ["BUILDLOG_BUILDS_CGROUP"])
+            builds.mkdir(parents=True, exist_ok=True)
+            _ = owned.rename(builds / "owned.scope")
+            _ = sidecar.write_text(str(builds / "owned.scope"))
+            _ = only_admitted(server.server.handle_request(replace(request, sidecar=str(sidecar))))
+            unowned = builds / "replay.scope"
+            unowned.mkdir()
+            amount = int(17.4 * gate.GIB)
+            _ = (unowned / "memory.current").write_text(str(amount))
+            _ = (unowned / "cgroup.procs").write_text("")
+            server.free(12 * gate.GIB)
+            _ = server.server.handle_request(server.request(need=8 * gate.GIB))
+            with server.serving():
+                reading = client.view()
+            measured = [step.measured for step in reading.view.running
+                        if isinstance(step.measured, gate.UnownedSliceMemory)]
+            self.assertEqual(len(measured), 1)
+            self.assertEqual(measured[0].bytes, amount)
+            head = reading.explanation.head
+            assert isinstance(head, gate.HeadExplanation)
+            self.assertEqual(head.budget.charged, amount + gate.GIB)
+            self.assertEqual(head.free.available, 12 * gate.GIB)
+            model = replace(self.fixture.model(), reading=reading, facts=head_facts.read_head_facts(reading))
+            view = plain(queue_view.render_view(model, 400))
+            card = plain(queue_card.render_card(model, [1], 400))
+            for text in (view, card):
+                self.assertIn("replay.scope: 17.4 GiB (unowned)", text)
+                self.assertIn(f"reserve {head.free.reserve / gate.GIB:.1f} GiB; need 8.0 GiB", text)
+                self.assertNotIn("owned.scope:", text)
+            self.assertIn("Head: free 12.0 GiB", view)
+            self.assertIn("Free 12.0 GiB", card)
+
     def test_expired_head_with_passing_checks_has_an_error_hold_at_sixty_cells(self) -> None:
         inputs = self.fixture.inputs(policy=gate.DEFAULT_ADMISSION_POLICY)
         path, row = inputs.ordered[0]
@@ -96,50 +137,7 @@ class QueueViewTests(QueueFixtureTests):
         assert isinstance(frozen, gate.HeadStillHeld)
         self.assertEqual(frozen.decision, head.decision)
 
-    def test_snapshot_view_and_explanation_resolve_the_readers_live_budget(self) -> None:
-        fixture = self.fixture
-        model = fixture.model()
-        config = fixture.root / "lint.conf"
-        for source in ("environment", "config"):
-            for stale in (False, True):
-                with self.subTest(source=source, stale=stale), mock.patch.dict("os.environ", {
-                    "BUILDLOG_BUILD_BUDGET_GIB": "21" if source == "environment" else "",
-                    "LINT_CONFIG_FILE": str(config),
-                }):
-                    _ = config.write_text("[memory]\nbuild_budget_gib=21\n")
-                    inputs = fixture.inputs(policy=gate.DEFAULT_ADMISSION_POLICY)
-                    with mock.patch.object(time, "time", return_value=NOW):
-                        gate.write_queue_snapshot(fixture.directory, inputs, policy=gate.DEFAULT_ADMISSION_POLICY)
-                    _ = config.write_text("[memory]\nbuild_budget_gib=24\n")
-                    with mock.patch.dict("os.environ", {
-                        "BUILDLOG_BUILD_BUDGET_GIB": "24" if source == "environment" else "",
-                    }), mock.patch.object(time, "time", return_value=NOW + (11 if stale else 0)), \
-                         mock.patch.object(gate, "locked_queue_read", side_effect=TimeoutError("held")) as locked, \
-                         mock.patch.object(gate, "resolve_admission_limits", wraps=gate.resolve_admission_limits) as resolve:
-                        reading = gate.queue_read()
-                    resolved_config = gate.read_memory_config()
-                    resolve.assert_called_once_with(60 * gate.GIB, resolved_config)
-                    self.assertEqual(locked.call_count, int(stale))
-                    assert isinstance(reading, gate.QueueRead)
-                    assert isinstance(reading.explanation.host, gate.HostAvailable)
-                    assert isinstance(reading.explanation.head, gate.HeadExplanation)
-                    self.assertEqual(reading.explanation.host.budget, 24 * gate.GIB)
-                    self.assertEqual(reading.explanation.head.decision.budget, 24 * gate.GIB)
-                    self.assertEqual(reading.view.reserve, reading.explanation.host.reserve)
-                    self.assertEqual(reading.freshness,
-                                     gate.StaleReading(NOW) if stale else gate.CurrentReading())
-                    self.assertIn("budget 24.0", plain(queue_view.render_view(replace(model, reading=reading), 100)))
 
-    def test_stale_snapshot_marks_only_the_original_header_time_as_warning(self) -> None:
-        model = self.fixture.budget_model()
-        current = queue_view.render_view(model, 100)
-        stale = replace(model, reading=replace(model.reading, freshness=gate.StaleReading(NOW - 11)))
-        lines = queue_view.render_view(stale, 100)
-        self.assertEqual(plain(lines), plain(current))
-        self.assertEqual(plain([lines[0]]), "Build queue · 10:46")
-        self.assertTrue(all(span.tone == "warning" for span in lines[0]))
-        self.assertTrue(all(span.tone == "inactive" for span in current[0]))
-        self.assertEqual(lines[1:], current[1:])
 
     def test_older_fit_phrase_requires_both_recorded_identity_and_join_time(self) -> None:
         waiting = self.fixture.model().reading.view.waiting
@@ -274,6 +272,8 @@ class BudgetViewTests(QueueFixtureTests):
                 lines = queue_view.render_view(self.fixture.budget_model(), columns, you=ASKING_SESSION)
                 self.assertEqual(plain(lines) + "\n", (GOLDEN / f"view_{columns}.txt").read_text())
                 self.assertTrue(all(terminal_width(plain([line])) <= columns for line in lines))
+                page = [*lines, (), *queue_card.render_selection(self.fixture.budget_model(), "1", columns)]
+                self.assertTrue(all(terminal_width(plain([line])) <= columns for line in page))
 
     def test_budget_scale_and_row_columns_match_the_sixty_column_page(self) -> None:
         model = self.fixture.budget_model()
@@ -315,7 +315,7 @@ class BudgetViewTests(QueueFixtureTests):
         _ = fake_memory_readings(self.fixture.root, full_avg10=0.0)
         model = self.fixture.budget_model()
         (self.fixture.root / "meminfo").unlink()
-        reading = gate.locked_queue_read()
+        reading = self.fixture.read()
         head = reading.explanation.head
         assert isinstance(head, gate.HeadExplanation)
         self.assertIsInstance(head.waiter.reason, gate.ReadingUnavailable)
@@ -342,7 +342,7 @@ class BudgetViewTests(QueueFixtureTests):
                 _ = fixture.write_waiter({"pid": 123, "start_time": "123", "need": 10 * gate.GIB,
                     "since": NOW - 900, "session_id": "head-session", "session_name": "head",
                     "step": "nextest", "folder": "/tmp/head"})
-                reading = gate.locked_queue_read()
+                reading = fixture.read()
                 head = reading.explanation.head
                 assert isinstance(head, gate.HeadExplanation)
                 reason = head.waiter.reason

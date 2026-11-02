@@ -9,6 +9,9 @@ from push_texts import ActionTemplate, NoActionNeeded, PushExample, PushText, Se
 
 
 ENTRIES = (
+    PushText("build_admission.down", "build-admission", "note", "Build admission service is down",
+        NoActionNeeded(), "build admission service is down; builds wait",
+        (PushExample("down", {}),), purpose="The service has not answered for two minutes."),
     PushText("message.repeat_flood", "send-repeat-guard", "note", "Repeated messages held",
         NoActionNeeded(),
         "The {sender} sender on {host} sent {copies} messages to {receivers} sessions. "

@@ -10,6 +10,7 @@ import sys
 
 
 OVERRIDE_VARIABLES: tuple[str, ...] = (
+    "ADMISSION_SOCKET",
     "BUILD_HOLD_DIR",
     "BUILD_HOLD_RELEASE_DIR",
     "MAC_TEST_STATE_DIR",

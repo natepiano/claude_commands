@@ -24,287 +24,158 @@ The two ceilings (44G + 18G) deliberately exceed physical RAM together; decision
 
 On 2026-10-06 06:54 PDT, two hung hana tests in one local `verify.sh test` step held 11.4 GB and 15.5 GB; earlyoom first sent SIGTERM to 26 other processes, including six CI compilers (four hana CI jobs failed), and killed the tests last. `builds.slice` peaked at 37.7 GiB, under its 44G, because zram (10 GiB), sessions (8 GiB) and CI (3.4 GiB) had already taken the machine to earlyoom's 5% line.
 
-### The memory gate (`scripts/lint/memory_gate.sh`, `scripts/lint/memory_admit.py`)
+### The admission service
 
-`config/lint.conf` `[memory]` supplies the admission policy at use. The timing keys are `ramp_seconds=120`, `head_seconds=600`, `strict_seconds=600`, `backfill_seconds=120`, `recovery_start_seconds=30` and `recovery_window_seconds=120`. Pressure uses `full_pressure_limit=5.0`, `swap_used_limit=85.0` and `some_pressure_limit=25.0`. These are the defaults in `DEFAULT_ADMISSION_POLICY`; seconds must be positive whole numbers and pressure limits must be positive finite numbers.
+`scripts/build_queue/admission_service.py` is the only live admitter. Its epoll loop owns the queue and reservations.
+`admission_protocol.py` defines every request and reply. `admission_client.py` handles connections, retries, wait output, and bounded queries.
+`memory_admit.py` owns the estimates, readers, pure admission rules, projection, and finalizer.
 
-`read_memory_config()` reads the file once and returns the frozen `AdmissionPolicy`, test-phase margin, budget, service intervals and named `ConfigFallback` records. The environment budget still wins. Missing and invalid values use their defaults. `memory_config()` also prints each fallback once per process as `memory admission: lint.conf [memory] <key> is missing|"<raw>" is not valid; using <value>`. Queue commands and the merge gate use that warning boundary; `check` uses the silent reader so its shell answer remains one line.
+Every pass reads one `MemoryConfig` from `[memory]` in `config/lint.conf`.
+The pass uses that policy for readings, decisions, and explanations. Its stored inputs preserve the evidence for counterfactual release advice.
+Queries project the stored `PassResult` through `queue_read_from_pass`. Queries perform no second admission walk.
+`queue_read()` is the one adapter for the view, cards, and build-why.
+A failed query raises `AdmissionUnavailable` within the query bound. Commands print `build queue: admission service unavailable: <reason>` and exit 2.
+The pane keeps the last successful page after a failed refresh.
+A failed first query shows `Build queue could not be read.`
 
-Every pass receives its policy and limits from its caller. `CheckResult.policy` and `QueueExplanation.policy` retain the values used by that answer; release counterfactuals and explanatory text use that frozen policy. The version 4 shared queue cache stores the exact capture policy as evidence for compatibility, and contains no admission limits. Its reader resolves configuration and limits live and uses cached evidence only when the complete policy matches. A policy mismatch takes a bounded live read; if the lock times out it returns busy, never stale incompatible evidence. Matching older evidence can still be returned as stale. Caches from earlier versions are rejected. The queue service reads the shared configuration at each pass and keeps that pass's policy for its query answers.
+| Request | Result |
+| --- | --- |
+| `admit` | Wait, refusal, or a durable grant with reservation id, `.max`, `.wave`, and sampling context |
+| `launch` | Wait, refusal, or launch permission without a reservation |
+| `release` | Finalize one reservation |
+| `width` | Change test width and queue a new test-phase estimate |
+| `token_wait` | Finalize a reservation and preserve its queue place |
+| `priority_set`, `priority_clear` | Change the one unit priority |
+| `admit_head` | Permit the current head to exceed the budget when free memory permits |
+| `view`, `explain`, `mine` | Read the stored pass |
 
-`peak_hold_seconds=1500` controls how long a non-release step retains its compile or whole-step peak after its last near-peak sample. Optional `peak_hold_seconds.<kind>` keys override it for individual step kinds through `PeakHold.seconds_for(kind)`. `peak_hold_seconds.merge-gate=180` is a director-set value, not a measured p95: module bursts recur within the gate's own roughly ten-minute run, and pressure limits stop new admissions if a re-peak meets a newly admitted step. Every other kind keeps the default. Missing override keys inherit the default without a fallback or warning; malformed overrides report a fallback to that configured default. Release-build lifetime promises and frozen test-phase charges retain their own rules.
+`/build:queue bump <position|session|folder>` uses the card's selector resolver to select a waiting step.
+It sets priority for that step's unit. An unmatched selector exits 3 without a priority change.
+The service refuses `priority_set` when no waiting step or current reservation belongs to the unit.
+The pane passes its session id to mutating commands. Read-only commands keep their existing environment.
 
-Evidence retained (natedev, 2026-10-17–31): build 187, check 2,123, clippy 6,083, doc 1,613, fmt 6,499, launch 1, mend 3,330, nextest 7,768, sweep 10,171 and taplo 3,037 step rows; slice aggregates and only the latest `.wave` pair.
-Within-step gap samples: 0 for every kind; no per-step near-peak timeline survives, so no p95 or measured override can be derived.
+Mutation requests have replay ids. The service persists each terminal reply before delivery.
+A replay returns the same reply. Live grants remain in the ledger until their reservation ends.
+Ended replies expire under `replay_retention_seconds`. Wait replies remain only on their connection.
+`Wait` carries the decision, readings, need, policy, and configuration fallbacks from the same pass.
+Client commands print each fallback once per process. The protocol carries data without warning text.
 
-Peak explanations say `compiling` for cargo compile kinds and `running` for other programs, including merge gates. `peak_activity` in memory_admit.py owns that classification. Old-sampler text renders the applicable kind's hold from the answer's policy.
+### Durable state and lifetime
 
-Sourced by `scripts/lint/invoke.sh` and by the BRP launch hook. A step starts when its expected memory fits beside current use and pending starts. The gate reads resident plus swap bytes from each running step's process tree. Historical peaks set the new step's need.
+`admission/state.json` holds reservations, waiter places, episodes, queue priority, head override, recovery spacing, and the replay ledger.
+The service replaces this file atomically. Reservation records include test-phase need, selected charge evidence, and finalization intent.
+Width and call absence use named variants. `RequestedTestWidth`, `UnspecifiedTestWidth`, and `NoTestWidth` describe the width.
+`CallRecord` and `NoCallRecord` describe the call.
 
-- **Rule** (`memory_admit.py` `decide`). Admit when running build charges plus `need` fit the configured build budget, `MemAvailable >= need + reserve + promised growth`, and memory PSI `full avg10 <= 5.0`, and no combined swap/partial-stall hold. `[memory] build_budget_gib` in `config/lint.conf` sets the budget (24 GiB, a one-day trial from 2026-10-31). A positive finite `BUILDLOG_BUILD_BUDGET_GIB` overrides it; an absent or invalid override uses the config, and an absent or invalid config value uses the 21 GiB fallback. The budget is read at each admission check. A running release-profile `build` charges the largest of its need, current resident and swap bytes, and observed `.max` peak until the step ends. Dev builds and other steps keep the `ramp_seconds` (default 120 s) start promise and the existing peak-decay rule. The compiler service adds its own anon memory once, outside the step process trees. Release builds and ramping steps add `max(0, promise - measured)` to the free-memory check. A release build can pass the budget check and still hold a new step because its unused promise needs free RAM. `reserve` is 5% of `MemTotal` (0 without a total). A step above the budget may run alone when no other build runs; in a strict window it must also fit the head's room; it must still meet the memory floor and pressure limit. A dead or reused caller counts nothing. The first waiter in the resolved queue order is the head candidate. Before 600 s (10 min), younger steps may start when the ordered admission walk marks them. At 600 s, the head takes priority when it fits now or `MemAvailable + measured >= head need + reserve`. Its next admission check records `priority_since` in its waiter row. A showrunner may use `priority set` to put one unit first until replacement or `priority clear`. No queue clock changes. In each `strict_seconds` (default 600 s) window, younger steps may start when they fit now and their total use of the head's room stays at or below budget minus head need (Rule A). Each live reservation admitted at or after `priority_since`, compared at millisecond precision, counts at the larger of its need and current charge. This includes starts in a backfill window and the same check that records priority. Ended reservations leave the sum. The walk adds the needs of younger rows it has already marked. Steps running before priority are blockers: after that set ends, the head passes the budget check, while free memory and pressure are still checked. In each `backfill_seconds` (default 120 s) window, younger steps use their normal budget and memory checks. The cycle ends when the head starts or leaves. When no build runs, this head starts below the memory floor too; PSI above 5, a swap hold or pressure recovery still holds it. The resolved priority order applies to every admission reader and frozen release calculation. Admission and queue display share `head_priority` and `admission_walk`; the head names the check that holds it through shared `head_wait_reason` and `head_wait_text`. Pressure takes precedence, then the build budget, then free memory; when both budget and free memory fail, it names both. The budget reason gives the build use at which the head can start. The oldest waiter also shows `younger steps may start until HH:MM` in the user's zone before 10 min, then `younger steps may use <budget minus head need> GiB of the budget until HH:MM` in a strict window, or `younger steps wait until HH:MM` when the head needs the whole budget or more. Backfill keeps `younger steps may start until HH:MM`. Queue, build-why and check wait lines call one window-clause writer. Younger steps name the strict head only when its room alone holds them. Pressure and available memory are read inside the check. `BUILDLOG_MEMORY_PRESSURE` changes the PSI path. An unreadable pressure file does not hold; the memory rule still applies.
-- **Waiters** (`live_waiters`). A held step keeps `<pid>-<start>.waiting` in `admission/`. It records the caller identity, need, wait start and step label. Dead, reused or zombie callers leave the queue when read. The first caller in the resolved queue order is the head candidate. Younger steps may backfill until it has waited `head_seconds` (default 600 s); a recorded `priority_since` keeps its head window. It takes priority when it fits now or when `MemAvailable + measured running bytes >= head need + reserve`; pending starts add no measured bytes to this test. From then on its row carries `priority_since`: younger steps may use budget minus head need in each 600 s strict window, subject to Rule A's room sum and their normal resource checks, then may start on their normal checks in a 120 s backfill window. This repeats until the head starts or leaves. A head that cannot fit even after the running steps end, and has not taken priority yet, holds nothing from smaller steps. Admission and queue display use the same head rule. The head never charges its own need twice. Its check uses current measured memory and pending starts, so old peak promises cannot keep it waiting. Records from older callers get a label from their process folder and command. Both first and periodic wait lines name the head and its need only when the head's room alone holds the step; with zero running steps and a nonempty checker summary, they print that reason in place of the running-step counts. The same admission walk marks fitting steps in queue order in every window. Each marked older step reserves its need in later budget and free-memory checks, and counts as running for the run-alone rule. A younger step that fits alone but loses room to a marked older step waits with `BehindOlderFit` (`behind older step <label>`). In strict windows, a younger row that fits now but exceeds the head's room gets `BehindHead`. A row that fails its normal checks gets its budget, free-memory or pressure reason instead. `AdmissionDecision.head_room` is `HeadRoom(head_need, used, room, passes)` behind a strict head and `NoHeadRoom` elsewhere.
-- **Other steps’ `need`** (`expected_peak`). For steps other than `build`, the first tier with at least 5 values in 14 days applies: this host and repository’s measured anon peaks (`admission/anon_peaks.jsonl`) of every test width, then build-log `peak_mem_bytes` x `ANON_SHARE` 0.65, then measured anon peaks of this step across repositories on the host, then the 12 GiB fallback. Repository identity is the normalized origin URL, or the oldest root commit when there is no origin; without either, only the fallback applies. `StepProfile` resolves identity for the estimate. A cached waiter must carry `repo_identity` (empty means unknown), `test_scope`, `estimated_at` and the tagged `need_basis`; older rows resolve again. The cached reader rebuilds the basis from the row, not from the shell source token. Waiting steps refresh identity and history every `head_seconds` (default 600 s). Admission rechecks estimate expiry after taking the lock; an expired estimate holds with its timestamp and queue position unchanged, uses no recovery start, and refreshes outside the lock on the next poll. Each answer updates the shell cache and waiter need. New anon rows carry `repo_identity` and `test_scope`; filtered tests and full runs use separate histories in every tier. Old anon rows mean full runs; build-log rows use their saved arguments. Package-only filter expressions and target selection count as full runs; test-name predicates, positional test names, skip and exact options count as filtered. Generic scratch names supply no old samples; old repository samples use the main checkout folder when it equals the origin repository name, including builds from its worktrees. Callers pass an explicit repository identity; the width report resolves hana from ~/rust/hana once per report. The pooled tier uses step and test scope across repositories, without a folder key. A missing index or history file skips that tier.
-The queue snapshot also keeps a matching `admit-head` record. The shared walk applies it only to that same first waiter. Check, queue view, build-why, blocker lookup and frozen release calculations use the same decision; free memory, pressure, recovery spacing and estimate expiry still apply. The record cannot admit a successor.
+`reservation_stem` gives each grant its `.max` and `.wave` paths. `invoke.sh` uses the grant's paths and sampling context.
+The sampler reads no reservation file. It marks the nextest test phase through `record.py test-phase-context`.
+The service watches owner pidfds and scope events. An ended owner retains its charge while its scope remains populated.
+An empty scope and ended owner permit finalization. A reused scope path gets a new watch.
 
-- **Ledger.** One `*.reservation` JSON file per admitted step under the build log's `admission/` directory (pid, pid start time, need, repo, step, worktree, admitted_at, sidecar path). Check, prune and write happen under one exclusive `flock` on `admission/lock`; the locked check finalizes a reservation whose owner and step scope have ended. `live_reservations` skips ended rows and writes nothing, including when the merge gate calls it outside the lock. `MemAvailable` is read inside the lock, after the process readings.
-- **`check` and `release`.** `check` returns a frozen `CheckResult` whose `reservation` is `Reserved(path)` or `NotReserved(held|launch|untracked)`. `StepProfile` (repo, step, worktree, peak) is resolved once per wait and passed back on later polls; each check reads one process table for all reservations while it holds the admission lock.
-- **Program queue places.** `scripts/build_queue/queue_place.py` exposes `queue_place(program, repo, *, sizing, before_check)`. It waits through the checker and yields a `QueuePlace`. `popen` starts one program in its own scope, nested when the holder already runs in `builds.slice`. Without a scope, it raises `QueuePlaceRefused` before the fork. Only `BUILDLOG_SCOPE=0` enables process-tree sampling for tests. Before release, `finish()` rereads the scope's `cgroup.procs` until it is empty. It sends TERM, then uses `cgroup.kill` at `program_stop_seconds`. The finalizer releases the place on normal, exceptional and signal exits. `observe` accepts peak and current bytes from holders. Scope setup and diagnostics stay off the program's stdout.
-- **Program sizing.** `ProgramProfile(program, repo, worktree, sizing)` supports history estimates and fixed caps. `HistoryPeakSizing(first_peak_bytes, estimate, estimated_at)` uses the host's p90 of that program's completed anonymous-history rows over `HISTORY_DAYS`. It refreshes after `head_seconds`. With no history, it uses `FirstProgramPeak` and the `fallback` source. `ConfiguredFirstPeak` reads `program_first_peak_gib.<program>` through the memory-config reader; rust-analyzer starts at 18 GiB. A missing first peak refuses. `FixedCapSizing(cap_bytes)` always asks for the cap, with no history read or refresh. Its source is `cap`, with a tagged `ProgramMemoryCap(program)` basis. The basis preserves the program name in queue explanations.
-- **`merge-gate` step.** The gate uses `FixedCapSizing` with its own `--memory-cap-mib`, whose default is `DEFAULT_MEMORY_CAP_MIB` (6144 MiB). It holds one queue row from start to end, after build holds clear. The row's `cap` source selects `LifetimePromise(need)`, as release builds do. The budget charge stays at least the cap. The free-memory check retains the unused cap as growth headroom. Neither the ramp deadline nor peak decay lowers that promise. Other fixed-cap programs use the same rule. Its aggregate samples feed the place's `.max`/`.wave` writer. Release records one anonymous-history row for reports and removes the reservation on every exit. Admission no longer reads gate history to size this row. Each module and type job also takes and returns one `/dev/steve` slot. `verify.sh test` keeps its existing admission.
-- **Queue API and cache.** `gather_queue_inputs(directory, processes, now, memory={})` resolves waiter file names and identities, running reservations and measurements, compiler-service memory, the host reading, raw pressure and recovery, and the matching head override into `QueueInputs`. `queue_read_from(inputs, limits)` reads no files, process state or environment: it applies recovery and the one ordered admission walk through `admission_pass(inputs, now, limits)` with explicitly supplied limits and the recorded override. Explanations retain those limits for pure release calculations. `read_queue_pass` composes those two functions, so locked reads and cached reads share decisions. `decision_checks(decision, need, available)` alone constructs budget and free checks for the head and every `LineWaiter`; each follower also carries its walk decision. Its independent `fits_now` still tests resource fit without earlier waiters' charges.
-- **Snapshot publication.** Every exclusive admission section (`check`, `release`, `set_width`, `admit_head` and waiter cancellation) uses `exclusive_queue` to publish `admission/queue.json` after its changes, including exceptional exits. `check` supplies its existing process table and reservation memory readings. `write_queue_snapshot` writes version 3, `written_at` and serialized `QueueInputs` through `queue.json.tmp` and `os.replace`, with no fsync. The serializer and validating parser live together in `memory_admit.py`; raw `recovery`, queue priority and `override` survive the round trip. No budget or reserve is stored; readers resolve both live once per reading. Versions 1 and 2 are ignored. Frozen per-step needs retain their own margins. A failed cache write leaves the previous snapshot and never changes admission's result. A bump from a session that is not a showrunner is refused before any lock or cache write.
-- **Bounded display read.** `queue_read()` uses a valid snapshot aged 0–10 seconds without a lock, retaining its `now` as the displayed reading time. Otherwise it calls `locked_queue_read(timeout=QUEUE_READ_LOCK_SECONDS)` with a 0.5-second bound; that function's default remains 10 seconds for existing callers. A timeout returns the parsed old or future snapshot with `StaleReading(written_at)`, or `QueueBusy` if no valid snapshot exists. Other readings carry `CurrentReading`. The compact view colours a stale header amber. The view, cards and build-why use `queue_read`; busy displays `queue busy; try again` and exits 0, including a one-line `QueueLines` response for the pane's JSON request. Labels still use one file-only lookup.
-- **Selection and checks.** `step_matches(selector, step)` is the single identity rule for session id, recorded name, folder and folder basename. `match_waiters(selector, view)` handles a decimal queue place or all identity matches; cards first try the shown name, then that matcher. Running cards use the same identity rule. Every waiting card prints its own pressure, budget and free checks through one renderer. A follower held behind a fitting older row says `behind #<k>, an older step that fits`, matched by session id and wait start, or `behind an older step that fits` if it has left. Check wait lines retain their recorded older-step name.
+`finalize_reservation` is the one finalizer. `StateIntents.save` persists its evidence before the history append.
+The finalizer matches `reservation_id` to prevent a duplicate history row after a crash.
+`StateIntents.clear` removes the reservation after the append. Startup completes any saved intent.
+The finalizer copies selected test-phase evidence. It never selects new evidence during release.
 
-- **Display windows and fit.** `HeadExplanation.order` is `StrictUntil | BackfillUntil | WindowNotStarted`. A first head without priority may have its fixed new-head backfill deadline; after that window, without recorded priority start, it is `WindowNotStarted`. Priority whose start has not been written also has no displayed deadline. `StrictUntil` is reported only with head priority. The view shows `↑ ≤N.N` in a strict window with positive room, `⊘` when that room is zero or less, `↑` in backfill, and a countdown only from recorded `priority_since`. The room has one formula, `strict_room(budget, head_need)`: budget minus head need. Admission’s `HeadRoom.room`, `window_clause` and the compact view call it. `head_window` and Phase 31 admission behavior stay unchanged. `LineWaiter.fits_now` requires the budget and free-memory checks to pass and pressure not to hold admission; queue order is separate.
-- **Queue order.** Only a registered showrunner may run `memory_admit.py priority set --unit <unit> --why "<what>"` or `priority clear`. One `queue_priority.json` selects a unit until replacement or clear. A second set replaces it at once; time never clears it. Set, replacement and clear keep a fixed transition id until the one `record.queue_priority` writer has published the row; retries finish that change once. These commands change no wait start or `priority_since`. The snapshot resolves unit membership once from the roster's unit labels, including current Codex workers and scratch-copy steps. It orders the unit first, then wait start and pid. Admission, queue views, cards, blocker lookup and frozen release calculations use that resolved order. The view and build-why share `head_facts.priority_text`: `queue priority: <unit> (the user's bump)`. Old `queue_bump` rows remain a separate history. `/build:queue bump <unit>` calls `priority set --unit <unit> --why "the user's bump"` through the same showrunner check. Success reports the unit's first place from the resolved snapshot, or `no waiting step yet` while keeping its priority set. Missing or extra unit words give `build queue: use /build:queue bump <unit>` without a process call. A non-showrunner receives `build queue: type /build:queue bump <unit> in a showrunner pane` on stdout with exit 3. The pane shows that refusal and hides diagnostics for other failures.
+At the first start without `state.json`, the service imports the old admission files through their existing readers.
+It imports live reservations, saved intents, waiter places, token handoffs, priority, head override, and recovery spacing.
+It writes state before it deletes imported files. Later starts import nothing.
+The old `.waiting`, `.reservation`, `.token-wait`, and `queue_priority.json` forms have no live writer.
+There is no admission lock or `queue.json` cache.
 
-- **Token wait.** When the CPU token is busy, `buildlog_token_wait` calls the locked `memory_admit.py token-wait <reservation>`. It saves a transaction intent, ends the reservation through `finalize_reservation`, and restores an ordinary waiter with the original `since`, any `priority_since`, and `token_left_at`. A retry or locked dead-owner cleanup finishes the same intent after a stop. The step holds no memory reservation during the token wait. Every reader applies the same windows, ordered walk and Rule A. After token acquisition, `BUILDLOG_MEM_TOKEN_BACK_AT` lets the next check append one `token_gap` to `admission/queue_times.jsonl` and remove `token_left_at` from the waiter. The one append stamps `at`, preserves write order, deduplicates by owner and gap, and trims a file above 8 MiB to the last 14 days. The step runs only after it holds both memory and the token. Every display uses total queue wait from `since`; old head-time fields are ignored.
+### Estimates and charges
 
+The client calls `step_estimate` before admission and after `EstimateExpired`.
+Before each new build estimate, it reads `build_history` from the service, then reads history.
+`StepProfile.build_history_generation` keeps that generation through reconnects and delayed replies.
+The service grants a build only when its estimate generation equals `ServiceState.build_history_generation`.
+A missing generation or a different generation gives `EstimateExpired`.
+A matching pending finalization also gives `EstimateExpired` until history publication finishes.
+`StateIntents.published` advances the durable generation after the history append and before intent removal.
+A publication retry also advances the generation. The service never prunes or resets the generation.
+A refresh uses the open admission connection. An unregistered client uses a read-only `build_history` query.
+A pass retries a retained finalization intent even while its owner remains alive.
+It preserves the first `since` and episode across refreshes and reconnects.
+A fresh nextest estimate expires after one running-pass interval. Other history estimates expire after `head_seconds`.
+A cap-source waiter never expires. A `FixedCapSizing` program holds its cap without a history estimate or refresh.
+The merge gate asks for its own `--memory-cap-mib`, default 6144 MiB.
+Its `ProgramMemoryCap("merge-gate")` evidence produces `the merge gate's memory cap` in explanations.
+`step_promise` gives fixed-cap rows and release builds `LifetimePromise` until they end.
+Both the budget charge and free-memory growth term use that promise.
 
-`buildlog_wait_for_memory [ARGV...]` polls every `BUILDLOG_MEM_POLL_S` (5 s). A step with argv never starts without memory: at `BUILDLOG_MEM_WAIT_LIMIT_S` (900 s) it prints one notice and keeps waiting as a head candidate. The wait start is `BUILDLOG_MEM_WAIT_SINCE` when set, else now; the gate exports it as `BUILDLOG_MEM_WAIT_FROM` and passes it to `check` as the waiter's `since`, so a later pass of the same step keeps its place. A call with no argv (the BRP launch hook) uses the fallback `need` and writes no reservation. If its wait limit arrives without admission, it refuses the launch with status 2. It sets, in the calling shell:
+Other programs retain `HistoryPeakSizing` and `program_peak_estimate`.
+Build estimates retain same-shape history, failed-build floors, and the configured budget cap.
+`peak_activity` labels cargo compilation as `compiling` and other work as `running`.
+The policy's ramp, pressure, recovery, head-window, and per-kind peak-hold values apply at each pass.
+The merge-gate peak hold is 180 seconds. Other kinds inherit `peak_hold_seconds`, currently 1500 seconds.
+No per-step near-peak timeline is retained; `.wave` holds only the latest pair.
+The 180-second merge-gate hold is a set value, not a measured p95. Fixed-cap lifetime promises supersede peak decay.
 
-- `BUILDLOG_MEM_OUTCOME`: `Granted` (explicit admission), `LeftQueue` (the call's leave hook selects another machine), or `CheckFailed` (the check cannot allow the step).
-- `BUILDLOG_MEM_WAIT_S`: seconds from the first hold; 0 when it never waited.
-- `BUILDLOG_MEM_RESERVATION`: the reservation path, empty when none was written. `buildlog_release_memory` deletes it.
+Nextest uses `TestPhaseCharge` after its sampler mark, ramp, and recorded test-phase need permit it.
+One estimate worker calls `test_phase_need` through `anonymous_history_rows`.
+Each job carries the reservation, width, revision, and event's resolved `MemoryConfig`.
+The loop accepts results only when the reservation and revision still match. Width changes increment the revision.
+A failed job stores nothing. A frozen need keeps its recorded margin; a later width request reads the margin again.
+The first selected charge evidence is persisted outside the pure pass. A failed optional evidence write does not undo admission.
 
-Admission and hold checks fail closed. Before the first wait line, a failed checker call stops the step at once. While a step waits, failed checker calls retry for up to `BUILDLOG_MEM_CHECK_RETRY_S` (60 s by default), printing `memory admission check failed (<last checker output line, or checker returned an error>); trying again, the step keeps its place` before each retry. A successful call clears the failure run; continued failures past the retry limit refuse the step with status 2. The caller pid and wait start stay unchanged across retries. The shell does not check the source field: an unknown source uses the fallback description. Invalid output, an unreadable memory reading or an untracked admission still stops the step with a non-zero status and one reason line. A reached launch wait limit also refuses the step. A check error cannot become a Mac retry or a Mac pass. Hold status 10 means wait or try an eligible Mac; status 75 from `wait-local` means its leave hook selected another machine. `wait-local` also returns 12 after it prints its refusal reason. Its statuses 10 and 12 stop the step with the same status and no added failure line when the check printed a reason. An absent reason or unreadable output adds the fail-closed reason, as do other check failures. Printed to stderr:
+Each pass counts `sccache.service` and unowned child scopes under `builds.slice`.
+`UnownedSliceMemory` names each unowned scope and its size. Process-tree charges are subtracted to prevent duplicate charges.
+The held head shows free memory, reserve, and need from `HeadExplanation`.
 
-```
-waiting for memory since HH:MM PDT: ...            (first hold: need, source, head, promised and measured GiB, running steps)
-still waiting for memory (N min): ...              (every 60 s)
-memory free after N min S s: starting
-still waiting for memory after N min: this step is now first in line, and no build starts without memory
-memory admission check failed (launch wait limit reached without admission); step refused
-memory admission check failed (<last line of the Python output>); step refused
-memory admission check failed (cannot read MemAvailable from <path>); step refused
-memory admission check failed (invalid admission answer admit:untracked); step refused
-build hold check register-local failed (exit 12); step refused
-```
+### Clients and program places
 
-In `invoke.sh`, `run_once` checks natedev holds before memory admission, runs the gate for every step that compiles, recorded or not (`BUILDLOG_SCOPE=0` too), and rechecks the hold after every memory gate return: a new hold sends the call back to the hold waiter before its step starts. The hold recheck skips Python when the holder directory is missing or when the shell confirms that it is readable, searchable and empty. An unreadable directory still needs the Python check. It restarts the step's clock, then calls `buildlog_exec`. `buildlog_step_compiles` exempts `*/sweep.py`, `cargo [+toolchain] fmt` and `taplo`, which also skip the build-hold wait. `buildlog_exec` runs a recorded step with `systemd-run --user --scope --slice=builds.slice`. The scope's shell, `BUILDLOG_SCOPE_SH`, writes its marker, then runs `{ echo 500 > /proc/self/oom_score_adj; } 2>/dev/null || true;` before `"$@"`, so every process the step starts in the scope (cargo, build scripts, test binaries, any rustc or linker the step runs itself) inherits oom_score_adj 500; an unprivileged process may raise its own. Builds outside `invoke.sh` keep 200, and the Mac runs no scope. A Codex worker's detached run (`scripts/agents/mesh_runs.py supervise`) runs its whole command in a `builds.slice` scope the same way, with its own marker (`<run>.scope` beside the run log); no marker after the scope exits means the scope never ran it, and the command runs plainly. Its cargo builds call cargo directly, so before this they ran in `herdr-agents.service` at the sessions' CPU weight. `mesh_runs.py start` stores the tree key of its folder (`scripts/buildlog/treekey.py`) in the run record, and starts nothing when the worker already has a running record of the same command, folder and tree key whose pid is that record's `supervise` process (`/proc/<pid>/cmdline`); it prints that run's id, start time and log. Before this, a worker started one lint run three times on one tree after an interrupt (hana_catalyst-inspectors, 2026-10-21), and each run took memory, the cargo token and build time. A running record whose `supervise` process is gone (killed or crashed) delivered nothing, so `mesh_runs.py start`, `mesh_runs.py reap` and the worker's launcher (`codex_mesh._end_dead_runs`, which runs `reap` before it closes the inbox) mark it finished with `ended: supervisor gone` and deliver `Result: FAIL (no exit status)`; a dead record that a newer run of the same command in the same folder answers is marked finished and delivers nothing. `scripts/lint/test_invoke_scope.py` runs the extracted string under `/bin/sh -c` with fd 3 set as `buildlog_exec` sets it: step and child read 500, exit 7 passes through, and a failed write stays silent under an exported `SHELLOPTS=errexit`; the 500 checks skip when the runner already runs at 500 or more.
+`memory_gate.sh` starts one foreground client for an admission wait. The client writes quoted grant assignments for the shell.
+Its stdout remains one protocol grant. Release, width, and token handoff use client commands.
+The Mac branch retains claim admission without a socket or `/proc` read.
+BRP launches use `launch`; launch permission creates no reservation.
 
-`BUILDLOG_SCOPE_SH` also writes the scope's cgroup directory to `"$BUILDLOG_PEAK.cgroup"`. `run_once` passes the step's argv to the gate and runs one `buildlog_sample_anon` sampler, which reads the scope's `anon` every second, keeps the maximum in the `.max` file beside the reservation, and exits when its parent is gone. `buildlog_finish_memory` stops the sampler, releases the reservation and removes the sidecar on every path; one `finalize_reservation` function saves an atomic finalization intent in the reservation before appending a positive maximum to `anon_peaks.jsonl`. The intent keeps a unique reservation id, peak, scope evidence, outcome, end time and status. Each history row carries that id; a retry skips an already appended id. New reservations record scope use with their sidecar path, and a retry no longer needs the sidecar. A peak read error other than a missing file leaves all evidence for the next cleanup. Cleanup removes `.max`, `.wave` and the sidecar first, and the reservation last, so every interrupted cleanup remains discoverable. Both locked `release` and locked `check` cleanup call it without taking the lock twice. The row keeps host, repo, repository identity, step, worktree, peak, UTC end time, test selection, width, call id, `shape`, `need`, and `outcome`. The outcome is `completed` for status 0, `failed` for 1–127, `killed` for 128 or above, and `owner_gone` for ended-owner cleanup; normal releases also keep their exit status. A killed owner whose shell never releases therefore leaves peak evidence. If locked cleanup adds history for the next build’s repository and shape, the current estimate expires through the normal expiry path. The waiter keeps its queue place and refreshes outside the lock on its next poll. Unscoped steps and missing or nonpositive peaks add no history. `scripts/lint/test_memory_admit.py` covers the rule, the ledger and the shell gate over a fake meminfo, index and cgroup tree; its shell tests run the gate under `set -e`, as `invoke.sh` does.
+Transport failures never permit a start and never select another admitter.
+The client reconnects with its first request identity. It reports unavailable transport periodically and waits.
+A valid wait resets checker-failure time. Checker failures after a wait retry until `BUILDLOG_MEM_CHECK_RETRY_S`.
+A first checker failure or explicit refusal stops at once. A launch deadline applies during transport and checker retries.
+A zero launch limit refuses its first hold and accepts an immediate grant.
+The leave hook runs during held waits and returns `LeftQueue` when another machine can start the step.
 
-### Build shape and promise
+`queue_place` uses the client in process. Its public call retains `before_check`.
+The hook runs before each attempt and after a grant. An exception after a grant returns the reservation before program startup.
+`popen` starts the program in its own scope, nested when the holder already runs in `builds.slice`.
+Without a scope, it raises `QueuePlaceRefused` before the fork.
+Only `BUILDLOG_SCOPE=0` enables process-tree sampling for tests.
+`finish()` rereads `cgroup.procs` until empty before release. It sends TERM, then uses `cgroup.kill` after `program_stop_seconds`.
+The scoped wrapper requires a published sidecar and a live holder before program execution.
 
-`build_shape.py` gives each Cargo build a frozen `BuildShape` and a stable JSON text key. The key contains profile (`release`, an explicit `--profile` name, or `dev`), sorted features (including the distinct `--all-features` and `--no-default-features` flags), and sorted targets (`--bin`, `--example`, `--lib`, or `all`). Repeated and comma-separated feature flags give the same key. Arguments after `--` do not change it.
+### Startup, cut-over, and rollback
 
-`check` writes that key as `shape` in each build reservation; the finalizer copies it into anonymous peak history. An older peak without `shape` uses the read-only `(call_id, step)` join from `steps.argv` in the SQLite index. The join does not compare repository names: history names the origin repository, while the index names the checkout folder. The peak row must still match the repository identity, host and history window. An unmatched row has `NoBuildShape` and supplies no shape history. Another repository or another shape never fills a shape tier. Index cgroup peaks do not substitute for anonymous peaks.
+The system socket starts the system service as the user. The service runs outside `builds.slice` with `OOMScoreAdjust=-900`.
+It clears the outage claim and sends `READY=1` after listener setup.
+Source changes stop the service after the settle interval. A missing source also counts as a change.
+A restored head override receives reconnect grace only after the listener is ready.
+`down-alert` waits two minutes, claims `build-admission`, and sends one outage push. A later start clears that claim.
 
-Over the last `HISTORY_DAYS` (14), the build tier is the same shape’s p90 with at least 10 rows, or its largest peak with 1–9 rows. With no rows, it uses the larger of 12 GiB (`FALLBACK`) and this repository’s heaviest build of the same profile. The newest same-shape row with `killed` or `owner_gone`, or a recorded outcome with peak above its recorded `need`, sets a `FailedPeakFloor`. The base is the larger of the tier and that floor. A later success below the floor leaves it in place; a newer failed row replaces it, and it expires when the row leaves the 14-day window. Old rows without an outcome are `OutcomeNotRecorded` and set no floor.
+The builds showrunner owns cut-over. Workers do not change live units or admission state.
 
-Only the same-shape tiers, `ShapeP90` and `ShapeLargest`, multiply that base by a profile factor: `RELEASE_HEADROOM` (1.314) for release, `DEV_HEADROOM` (4.2034275337646125) for dev, and no factor for other named profiles. `ShapeFallback` keeps its base, the larger of 12 GiB and the heaviest same-profile build; it has no failed-build floor and takes no headroom factor. Every tier is capped at the budget returned by `build_budget_bytes()` (environment override, then config, then fallback). The incident shape’s recorded 15.76 GiB failed peak gives about 20.7 GiB after headroom. A need above the cap remains a separate decision for the showrunner. Estimation and index reads stay outside the admission lock.
+1. Stop and disable the socket and service before the prerequisite rebuild.
+2. Remove the old `/var/lib/build-admission` state after its service drain succeeds.
+3. Hold natedev and require quiet builds plus `admission_service.py drain-check` reporting `drained`.
+4. Merge the cut-over alone.
+5. Enable only the socket and rebuild the system configuration.
+6. Check the service command, live view, cgroup, and OOM score.
+7. Release the hold.
 
-The repair replay below covers 126 natedev builds from 2026-10-16 to 2026-10-30, using the same fixed cohort as the options replay. It predates the no-factor fallback rule: it used the anonymous-history reader and both profile factors, including factors on fallback promises. Its cost figures and cold-history results have not been measured again for the corrected fallback. The same-shape tiers are unchanged. Old rows get only their shape from the index; index peaks do not enter history. All 126 captured anonymous history rows lack an outcome, so the replay does not create a failed floor for them. Tests cover the floor with recorded outcomes.
+`drain-check` counts live imported waiters, reservations, and processes that retain old admission functions.
+`drain-check --service` counts live service waiters, reservations, and clients through the same process list.
+Both commands only read state. A nonempty count refuses the drain.
 
-Steps with earlier same-shape history above their promise: **release 0 of 25; dev 0 of 81**. All 126 steps fit the rule used in that replay. In that replay the incident got 15.768 GiB, above its measured 15.762474 GiB anonymous peak and its 14,720 MiB rustc peak. A recorded failed peak of 15.76 GiB sets the later same-shape promise to about 20.7 GiB. No promise in that replay exceeds its pinned 21 GiB budget.
+1. Hold natedev before rollback.
+2. Require quiet builds and `drain-check --service` reporting `drained`.
+3. Stop and disable both units before the rollback rebuild.
+4. Run `export-priority` to preserve the active priority and remove the drained `admission/state.json`.
+5. Revert the cut-over only after the export succeeds.
+6. Release the hold.
 
-The smallest measured dev factor is 4.2034275337646125. One cargo-berth bin build sets it: step `natedev-20261029T220741-ab52bf` used 1.412826538 GiB after one earlier same-shape peak of 0.336112976 GiB. The release factor remains 1.314. Cached and full builds still share a shape; a later phase splits them.
-
-In the table, excess is count / p50 GiB / maximum GiB. A is the positive promise increase, `new need − previous need`, held for the whole step. B is the full-life upper bound: the positive increase for the first 120 seconds, then the full new promise for the rest of the step. It omits the previous post-ramp current and observed charge. These are conservative lifetime comparisons for every build; dev promises still end after 120 seconds, so their actual charge cost is lower. Maxima use actual overlap and cannot be added across shapes. The replay has no queue wait model.
-
-| Shape | Steps | Earlier shape | Previous excess | New excess | A GiB-h | A max GiB | B GiB-h | B max GiB |
-|---|---:|---:|---|---|---:|---:|---:|---:|
-| dev; hana/dynamic_linking; bin:hana | 1 | 0 | 0 / 0.000 / 0.000 | 0 / 0.000 / 0.000 | 1.173 | 10.259 | 2.042 | 21.000 |
-| dev; default; bin:cargo-berth | 4 | 2 | 1 / 0.840 / 0.840 | 0 / 0.000 / 0.000 | 1.360 | 20.073 | 1.611 | 20.073 |
-| dev; default; bin:cargo-handler | 29 | 28 | 3 / 0.039 / 0.079 | 0 / 0.000 / 0.000 | 0.887 | 9.000 | 0.936 | 9.000 |
-| dev; default; bin:cargo-port | 4 | 3 | 4 / 0.130 / 0.229 | 0 / 0.000 / 0.000 | 1.345 | 20.221 | 1.364 | 21.000 |
-| dev; default; bin:cargo-tile | 7 | 5 | 1 / 0.015 / 0.015 | 0 / 0.000 / 0.000 | 1.623 | 20.234 | 2.893 | 21.000 |
-| dev; default; bin:hana | 46 | 43 | 0 / 0.000 / 0.000 | 0 / 0.000 / 0.000 | 13.808 | 10.259 | 22.282 | 21.000 |
-| release; bevy/trace_chrome; bin:hana | 3 | 1 | 2 / 2.450 / 4.825 | 0 / 0.000 / 0.000 | 3.203 | 4.831 | 9.883 | 15.768 |
-| release; hana/hotpatching,hana_clerestory/default,hana_clerestory/monitor-probe,hana_clerestory/test,hana_clerestory/workaround-winit-3124,hana_clerestory/workaround-winit-4341,hana_clerestory/workaround-winit-4440,hana_clerestory/workaround-winit-4443,hana_clerestory/workaround-winit-4445,hana_diegetic/bench_support,hana_diegetic/default,hana_diegetic/typography_overlay,hana_kana/default,hana_kana/math,hana_kana/tween,hana_lagrange/default,hana_lagrange/fit_overlay,hana_mimesis_tools/test-support,hana_rigging/test-support,hana_valence/tween,hana_video/test; bin:hana | 2 | 1 | 2 / 0.805 / 1.493 | 0 / 0.000 / 0.000 | 5.208 | 5.027 | 17.028 | 15.768 |
-| release; default; bin:cargo-berth | 3 | 2 | 0 / 0.000 / 0.000 | 0 / 0.000 / 0.000 | 0.431 | 4.680 | 1.501 | 15.768 |
-| release; default; bin:cargo-handler | 10 | 9 | 7 / 0.087 / 0.215 | 0 / 0.000 / 0.000 | 4.700 | 14.917 | 4.963 | 15.768 |
-| release; default; bin:hana | 17 | 12 | 1 / 0.703 / 0.703 | 0 / 0.000 / 0.000 | 13.911 | 4.694 | 48.549 | 15.768 |
-| Total | 126 | 106 | 21 / 0.117 / 4.825 | 0 / 0.000 / 0.000 | 47.650 | 20.380 | 113.053 | 26.939 |
-
-The total promise increase is **47.650 GiB-hours**, with at most **20.380 GiB** extra held at once. The full-life upper bound is **113.053 GiB-hours**, with at most **26.939 GiB** extra at once. These room costs do not predict how much longer another step waits. The per-build audit and input hashes are in `phases/24/replay_report_2.md` in the unit run folder. The earlier options report used a different history model; the repair replay replaces its acceptance and cost figures. Replay inputs are read-only; no replay writes live build history.
-
-Check and clippy have sparse evidence of late growth, not per-step peak traces: one isolated check rose 1.500 GiB after 120 s, and four of five clippy samples rose (largest 6.324 GiB). Doc has no comparable early-and-late isolated sample. Their charge rules, and nextest’s charge rule, stay unchanged pending a later decision.
-
-### Admit the waiting head
-
-A registered showrunner session may run `python3 scripts/lint/memory_admit.py admit-head [--why "<text>"]`.
-Codex workers cannot use an inherited showrunner session id. The command replaces one atomic
-`admission/admit-head.json` record for the current first waiter. On its next locked check, that
-same head may exceed the build budget when `MemAvailable - reserve` covers its current need.
-Pressure and recovery holds still apply. If memory is short, the record stays. It never changes
-queue order or admits another step. The record is deleted when the head starts, or on the next
-locked check after that waiter leaves. Nothing waiting gives a refusal and writes no override.
-The build log gets a `head_admission` row when set and when admitted or lapsed, with the unit,
-step, need, free memory, reserve, reason and showrunner id.
-
-### Name the reservation that blocks a waiter
-
-`python3 scripts/lint/memory_admit.py blocker --waiter <waiter file>` reads the admission ledger under a shared lock. It does not create the lock, prune stale records, or change state files. It prints one JSON line and exits 0:
-
-- `{"session_id":"…","session_name":"…","pool":"memory"}` when one reservation blocks admission and its session is known.
-- `{"unit":"…"}` when that reservation's session is unknown but its cgroup sidecar names a systemd scope or service, or when `sccache.service` is the unique blocker.
-- `{}` when no single reservation can be named. This includes a ready step, a pressure hold, queue priority, several possible blocking reservations, and unknown ownership.
-
-A gone waiter file gives exit 2. A stale waiter that is still on disk gives `{}` and exit 0.
-
-The lookup uses the same queue and admission rules as `check`. It reports a reservation only when removing that reservation would admit the waiter and no other single reservation would do so. Releasing a measured reservation returns only its resident bytes to available memory. Swap bytes stay part of the build charge but do not count as freed RAM. The lookup removes the reservation's full build charge and growth promise, then applies the same admission rule. The lookup does not assign a pressure hold to a reservation.
-
-`CheckResult.blocker` carries the same typed result from the snapshot used for admission. New poll callers set `BUILDLOG_MEM_BLOCKER=1` to append one JSON blocker field to the existing pipe-separated `check` output. It is field 16 normally, or field 19 with `BUILDLOG_MEM_DETAIL=1`. JSON escapes any pipe in a name as `\u007c`. The prior fields keep their positions and values. Without the opt-in, the 15-field and 18-field forms stay unchanged so existing shell callers continue to work. A caller that accepts the new field can detect a holder change on its existing check poll, with no separate Python start.
-
-### Admission explanations: `build-why`
-
-`memory_admit.explain_queue() -> QueueExplanation` keeps its existing locked API and uses the same pure decision path as `queue_read`, `read_queue` and `queue_view`. It reads admission files and process memory without opening SQLite or estimating from history. Frozen variants describe host readings (or `ReadingUnavailable`), running identities and admission times, promises, current use, charges and their basis, totals, the head's admission decision and two checks, order window, priority and bump, and the size and needs of the remaining line. Byte counts and epoch times stay numeric until rendered. `queue_view()` keeps its existing `QueueView` result.
-
-`charge_basis` selects the same maximum that `build_charge` returns: current use, ramp or lifetime promise, retained peak or an unreadable peak's promise floor. The reservation reader attaches the peak's publication and near-peak times, including the old sampler's publication-time fallback and the exact decay deadline. An expired peak is explained as `PeakDecayed` when current use supplies the charge; it does not retain the original promise as a charge floor for dev builds or other steps. A release build uses `LifetimePromise`, which keeps its need charged and reserves unused growth until the step ends. `RampPromise` describes only the first two minutes; `NoPromise` describes a step past that window. Reservations are read through `reservation_memory`, leaving liveness decisions to admission's own reader.
-
-At estimate time `check` writes `need_source` (`measured`, `buildlog`, `pooled`, `fallback`, `shape`, `cap`), tagged `need_basis`, `need_runs` and `test_threads` into each waiter row, beside its existing estimate time, test scope, package and filters. `RecordedNeed` carries these values and `HISTORY_DAYS`; an older row is `NeedSourceNotRecorded`, rendered as `source not recorded`. A missing width is `WidthNotRecorded` in the explanation. An old row without a basis is `BasisNotRecorded`. `ShapeP90(runs)` and `ShapeLargest(runs)` carry a failed-peak floor or `NoFloor`, `ReleaseHeadroom`, `DevHeadroom` or `NoHeadroom`, and a budget cap or `UnderBudget`. `ShapeFallback` carries only its cap: it has no floor and takes no headroom factor. The shared basis reader rejects a saved fallback with a floor or factor field, so its cached estimate is refreshed. The four older source tokens can be a basis; a shape estimate requires a full shape basis and rejects a bare `shape` token. `build-why` names each term and says a fallback takes no headroom factor; the shell accepts `shape` as a same-shape promise and does not call it a p90.
-
-Run `~/.claude/scripts/lib/py ~/.claude/scripts/build_queue/build_why.py`. It shows free and total RAM, budget charges, pressure and recovery spacing, load, an aligned running table with both promise and charge, the first waiter's estimate source, the two checks' arithmetic, queue order and the line behind it. After the first waiter, three facts come from the shared `head_facts.py` reader: bumps since queue entry from the local monthly build-log `queue_bump` rows (grouped by recorded session, step and folder, with actors); the strict/backfill deadline and remaining time from admission's `order`, gated by `has_priority`; and cargo-token waits from admission’s optional `admission/queue_times.jsonl` records (`session_id`, `step`, `pid`, `start_time`, `token_left_at`, and `token_back_at`). Total wait comes from the first queue time. Missing token records show `unknown`. One backward scan reads complete lines in 1 MiB blocks, stops at the first bump before queue entry, and caps all months at 32 MiB. Missing month files contain no bumps; a read failure, malformed bump or exceeded cap makes the whole bump fact unknown without failing the command. The bump table shows at most eight groups, then counts the remaining steps and bumps. Numeric table cells include units and align right; text aligns left. The final line asks admission which endings admit the head, including its run-alone and order rules. `head_after_steps_end` evaluates the frozen snapshot without more reads; `smallest_head_release` chooses fewest endings, then least released charge, then running-table order. Branch bounds keep the subset search small. When only recovery spacing holds the head, `HeadStartsAt` names its start time: `no running step needs to end; recovery spacing starts it at HH:MM:SS zone`. If endings are needed first, the line names those steps and their memory drops, then the recovery start time, in the display's time zone. Pressure and other remaining holds are explicit. `/build:queue` uses the same bounded `queue_read()`; its compact view shows the budget, waiting steps and recorded head window. Detailed history stays in selector cards and build-why. Token-gap records are written after the token returns and count only complete left/back pairs for steps in view, matched by step, session id and recorded PID and process start. Each finished gap shows its recorded duration and local HH:MM-HH:MM span. A missing return or malformed line is skipped as unknown while valid matches remain visible; unreadable, absent or unmatched history shows `unknown`. No active token wait or extra Waiting-table row is inferred. Build-why’s tables and the compact queue rows align numeric cells right and text left. Labels use the queue's Showrunner, Unit and Session resolver; build-why resolves running, head, bumped-step and actor ids in one targeted label read. An admission read failure prints only `build-why: the admission state could not be read.` and exits 2.
-
-### Host pressure and recovery starts
-
-The gate reads `SwapTotal` and `SwapFree` with the memory totals. It holds a
-step when swap use is **over 85%** and memory PSI `some avg10` is **over 25%**.
-Either reading alone is not a swap hold. PSI `full avg10` **over 5%** holds a
-step on its own. The wait reason names swap and `some`, or `full`, as applicable.
-These limits come from the 2026-10-29 freeze: swap was 80–87% used, `some` was
-29–37%, and `full` remained below the former 10% trigger during about 30 s of
-thrash.
-
-Each running step keeps its observed `.max` peak in its build charge after
-its current use drops. The sampler writes a temporary file beside `.max`, then
-renames it over `.max`; a reader sees either complete value. An existing empty,
-invalid or unreadable peak file makes the peak unknown: the budget charge is
-at least the greater of current use and the step's promise. An absent file
-means that no peak has been recorded yet. The ramp promise and a release build’s lifetime promise reserve unused free RAM; the
-observed peak is a build-budget charge, not a second subtraction from
-`MemAvailable`. The gate also reads `anon` from
-`builds.slice/sccache.service/memory.stat` as a separate running entry. Missing
-or unreadable service stats add no charge. `BUILDLOG_BUILDS_CGROUP` selects the
-builds slice; the default is the current user's systemd builds slice. Tests
-use a private directory supplied by `memory_test_support.py`. A set live-memory
-tripwire records and refuses a real cgroup read before opening the file.
-The service charge stays in the queue view and can be a blocker unit. It is
-not a running build step, so it does not disable either run-alone exception.
-
-For dev builds and other steps, the peak charge expires after **1500 s (25 min)** without a recorded sample
-at or above half the current peak. This bound adds margin to the longest
-measured hana nextest wave gap, 954 s (2026-10-29, sparse slice samples).
-The sampler publishes `.max` first, then records the committed peak and its
-last near-peak time in `.wave` with an atomic rename, at most once per 60 s
-while use stays near the peak, and with every new peak. Decay requires the
-recorded peak to match `.max`; a failed time update cannot discard a new peak.
-After expiry, current memory and any ramp promise still count. Release builds keep the observed peak and lifetime promise until they end. A step with no
-`.wave` (a sampler from before the decay) decays 1500 s after its `.max` file
-last changed. An unreadable, malformed, old time-only or mismatched record,
-or a negative time, keeps the peak charge.
-Release and stale-reservation cleanup remove `.wave` with `.max`.
-
-For nextest, `test_phase_path` derives the sampler's `.test-phase.json` from the
-reservation's `.cgroup` sidecar. Admission reads it only through
-`record.read_test_phase` and never writes or removes it. Once its window is
-observed, its reading is measured past the ramp and the reservation has a
-`TestPhaseNeed`, the compile peak and its wave decay no longer count.
-`test_phase_history` is the one eligibility rule. The observed term becomes
-`TestPhaseCharge`: `ceil(max(test-phase peak so far, N) × need.margin)`.
-`read_memory_config()` reads `[memory] test_phase_margin` from `config/lint.conf`
-when a need is written after admission or a width change, currently **1.2**;
-a missing, nonnumeric, non-finite or below-1.0 value falls back to 1.2.
-The tagged need freezes that margin; old need records without it use the named
-fallback. Configuration changes apply to needs written afterward. Build-why
-prints the margin from the need that produced its charge. Neither the pure
-pass nor the charge calculation reads configuration. Snapshot version 4 stores the capture policy to validate evidence compatibility,
-but no live budget or reserve; readers resolve those limits live. A step's frozen
-need travels with its reservation reading. The test-phase charge does not
-decay. Current use and the unreadable-peak floor still compete for the charge.
-During the 120 s ramp the step keeps its existing promise and compile peak.
-An unreadable `.max` keeps the existing unreadable-peak rule. Without a mark
-or a recorded need, the old charge and its 1500 s decay stay in force.
-
-`test_phase_need_from_rows` is the pure rule for N. Its reader uses
-`anonymous_history_rows`, shared with the other estimate consumers. It takes
-positive `test_phase_peak_bytes` from this host's nextest runs in the last
-`HISTORY_DAYS`, matching repository identity, test scope, package and sorted
-filters exactly. It uses the p90 at the same width (`same_width`); otherwise
-the nearest wider width without scaling down (`wider_unscaled`); otherwise
-the widest narrower width, scaled up by the width ratio and rounded up
-(`scaled_up`). The existing `FILTERED_FLOOR` is its only floor. Missing width
-or history gives `NoTestPhaseNeed`; a reservation without the field is
-`not_recorded`. N is computed outside the admission lock after admission and
-before a width update. Both publish through one locked atomic reservation
-updater, which skips a reservation that has ended. If this optional need
-calculation or write fails after admission, the caller still receives its
-reservation and the step keeps the existing charge without a recorded N.
-A repeated check still counts every live reservation in the pass; if admitted,
-it reuses its matching nextest reservation instead of creating another.
-The admission need and N remain separate types, serialized through one tagged
-need codec.
-
-After `check`'s pure pass, the checker records the first running step charge
-whose selected basis is `TestPhaseCharge`. It writes a separate
-`.test-phase-charge.json` file beside that reservation, under the admission
-lock, with selected charge bytes, selection time, reservation id and tagged
-frozen need. It never modifies another step's reservation. A failed evidence
-write never changes admission. Queue views and counterfactual decisions do
-not record use.
-
-The finalizer saves `test_phase_peak_bytes`, `test_phase_started_at`, the
-stored tagged `test_phase_need` and any `test_phase_charge_use` decision
-evidence in its finalization intent before the first history append. It
-copies the evidence; it never reconstructs charge use from elapsed time or
-eligibility. No evidence means no decision use was recorded. Failed and
-interrupted appends reuse the saved evidence after the sampler and evidence
-files have gone. A stored need survives even when no window was observed;
-window fields are absent in that case. Finalization removes the separate
-evidence file. History coverage starts with this change, so families without
-earlier observed test phases keep the old charge.
-
-The narrow-key replay found **20 of 869 (2.3%)** no-compile runs above N × 1.2.
-Widening the key raised this to 60 of 1,399 (4.3%), so the rule never widens.
-A 1.314 margin removed only 2–13 more excesses and freed 15% less memory.
-The margin is configurable without a release. The 4c replay on 2026-10-31
-had hana 2/22 and tool-based-ui-trunk 1/2 above the charge, 3/194 overall;
-the builds showrunner accepted margin 1.2 on 2026-10-31. The 24 h check
-reports each repository again. If hana remains above 2.3% on at least 50
-rows with an N, its margin goes up through configuration.
-The historical replay used no-compile peaks as a stand-in for test-phase
-history; its queue model failed validation, so wait savings are sensitivity
-bounds, not predictions.
-
-| Replay day | GiB·min freed at 1.2 | Maximum freed at once | Wait-minutes sensitivity |
-| --- | ---: | ---: | ---: |
-| 2026-10-29 | 795 | 11.6–11.7 GiB | 0–140 |
-| 2026-10-30 | 320 | 11.6–11.7 GiB | 31–199 |
-
-The phase's replay script reports observed test phases by repository using N
-from earlier rows through the production rule. Its follow-up script compares
-the first 24 h after the merge with the preceding 24 h. Per repository and
-outcome it reports rows with decision evidence and rows without it. The measure
-is **peak above the frozen estimate plus margin**: final test-phase peak above
-`ceil(N × need.margin)`, using the frozen need in that evidence. This is not a
-breach of the actual changing charge. Missing evidence is unknown and may bias
-the observed subset; the report does not treat it as proof of an adequate
-margin. It also reports memory wait, earlyoom journal entries and recorded
-memory kills. The check is due 24 h after the merge reaches main; it does not
-run during implementation.
-
-A pressure hold enables start spacing, including a launch hold before the
-admission ledger exists. The first step can start as soon as pressure clears and the ordinary memory rules allow it. Each later start is
-at least **30 s** after the preceding start, until **120 s** after the first
-check that observes clear pressure. `RECOVERY_WINDOW_SECONDS` names that bound.
-After it ends, starts need no recovery spacing. The admission lock protects
-the `admission/pressure-recovery` end time and next-start time, so separate
-polling processes share the limit. Every admitted start advances the deadline,
-including a BRP launch without a reservation. Recovery state is written to a
-temporary file in the same folder and renamed into place. A damaged recovery
-record is ignored, with one reason line on stderr for in-process readers; the
-checker puts that reason in its summary field so its one-line shell protocol
-stays valid. A new pressure hold starts a new recovery window when it clears. The queue view and blocker lookup read these times without changing them;
-they do not assign a pressure or recovery wait to a reservation. Four starts
-promised 10.3 GiB in 42 s before the freeze. The recorded final peaks for the
-three steps already running total 21.58 GiB, before the 5.95 GiB compiler
-service charge. The regression holds those requests even at full=0, swap=80%
-and some=29%. These final peaks were logged after the freeze; no per-admission
-peak snapshots exist, so this proves the charge rule, not the exact historic
-admission decisions.
+A bare revert can hide live service charges from the restored checker. Never revert before the drain.
+An export retry preserves the exported priority when `state.json` is absent.
+The next cut-over imports the polling checker's current priority because the retired state file is absent.
 
 ### Cargo wrapper (natedev only)
 
@@ -416,9 +287,22 @@ The guard also refuses `merge_gate.py` in every mode, called directly, through P
 | `status` | One line per holder with since, reason and ETA, its keep list, cycle delivery rows, and the audit with `--keep <pid>` for each run that would stop; or `no build hold`. Then `release pending:` lines name unfinished releases and their unsent recipients, using the release drain's reader, and `/build:hold release` to finish them, even with no holder file. A damaged record or cycle is named with its path, error and the command that sets it aside. Status changes no file. Present files stay held despite cycle release fields. |
 | `audit` | Reads running build processes from `/proc`. Prints session-owned builds by class. Records other_session and no_session builds when a hold is in force. |
 
-**Build audit.** `audit_builds(proc_root, holders, buildlog_root)` reads `cargo-tile-real`, `cargo`, `cargo-nextest`, `rustc` and `rustdoc`. One top cargo or nextest process is one build. Nested cargo, nextest and compiler processes are its children, including through a shell. A compiler with no cargo ancestor is a separate build. The audit reads each process start time before and after its other files. It checks the process and its ancestors again before classification. A parent with a later start time cannot own an earlier child. An unreadable environment does not remove the build from the audit.
+**Build audit.** `audit_builds(proc_root, holders)` reads `cargo-tile-real`, `cargo`, `cargo-nextest`, `rustc` and `rustdoc`. One top cargo or nextest process is one build. Nested cargo, nextest and compiler processes are its children, including through a shell. A compiler with no cargo ancestor is a separate build. The audit reads each process start time before and after its other files. It checks the process and its ancestors again before classification. A parent with a later start time cannot own an earlier child. An unreadable environment does not remove the build from the audit.
 
-The owner comes from the process or an ancestor: `CLAUDE_CODE_SESSION_ID`, a unit run mapped through `owning_session(environment)`, or `CODEX_THREAD_ID`, else its nearest `claude` or `codex` ancestor. An agent without a session id is identified by its command, PID and start time. `holder` uses the same holder file key rule as `caller_holds_only_own`: that session's hold must be the only hold in force. `admitted` means the build is in the `builds.slice` cgroup used by `invoke.sh`, or the build or an ancestor has a matching PID and start time in the memory gate's `buildlog/admission/*.reservation` records. The audit reads these records without changing them. An inherited verify call id alone does not prove admission. The other classes are `other_session` and `no_session`. These audit classes describe ownership and memory records; the enforcer applies its allow rules separately. The printed audit omits `no_session` builds. The audit sends no messages and stops no processes. `hold`, `status` and `audit` accept `--proc-root` for a fake process tree in tests.
+The owner comes from `CLAUDE_CODE_SESSION_ID`, `owning_session(environment)`, or `CODEX_THREAD_ID` on the process or an ancestor.
+Otherwise, the nearest `claude` or `codex` ancestor supplies the owner.
+An agent without a session id has a command, PID, and start time as its identity.
+The `holder` class uses the file key rule from `caller_holds_only_own`.
+That session's hold must be the only hold in force.
+The `admitted` class requires membership in `builds.slice` or a matching reservation owner from the service's bounded `view` query.
+The audit compares both the PID and start time for the process and its ancestors.
+An unavailable service causes the same audit error as an unreadable admission folder did before the service.
+An inherited verify call id does not prove admission.
+The other classes are `other_session` and `no_session`.
+These classes describe ownership and admission; the enforcer applies its allow rules separately.
+The printed audit omits `no_session` builds.
+The audit sends no messages and stops no processes.
+The `hold`, `status`, and `audit` commands accept `--proc-root` for a fake process tree in tests.
 
 The audit calls `hold_enforcer.record_build(..., action="audit")` for each `other_session` or `no_session` build. The enforcer uses the same writer with `action="stopped"` for each stopped root. Both call `store.append_line` in the current process, after the audit read; no detached audit recorder runs. The kernel boot id, PID and process start time identify the build. The permanent file is `buildlog/<host>/hold-builds-<hold hash>.jsonl`. A separate `.lock` file covers the duplicate check and append, once per build, holder key, `since` and action. A new hold or a reused PID gets a new row. Index schema 21 adds `action` to `hold_builds`; old rows read as `audit`. Rows record hold identity, build identity, class, owner, command as shell text, working directory and observation time. Holder and admitted builds get no audit row.
 
@@ -533,8 +417,8 @@ Turns end as `TurnCompleted | TurnRefusedForCapacity | TurnFailed`; runs as `Run
 
 - **Unfaked memory pressure.** On 2026-10-29, `test_brp_launch_gate.py` took 169 s against a 6 s median because its pressure reading was unfaked.
 
-- **Memory gate sizes.** The fallback `need` is 12 GiB. Build steps use the shape tiers above; other steps keep their measured, build-log and pooled tiers. Reading `MemAvailable` before the process-memory reads, or outside the lock, admits on stale numbers.
-- **No stagger between release notices.** `memory_admit.check` runs the reservation read, the meminfo read, the decision and the reservation write under one exclusive `flock`. Release-profile builds keep their full need until they end; other steps keep the 120-second start promise and observed-peak rule. Builds released together cannot count the same free memory.
+- **Memory gate sizes.** The fallback need is 12 GiB. Build steps use shape tiers. Other steps retain measured, build-log, and pooled tiers. The service reads process memory before host memory during each pass.
+- **One admitter after a hold release.** The service reads memory, decides, and persists grants in its loop. Lifetime promises retain the full need until the step ends. Other steps use the configured ramp and peak rules. Simultaneous callers cannot reserve the same room.
 - **Release outcomes vanish with the last holder file**; set-aside `*.damaged-*` files are never cleaned up. A holder joining a no-cycle hold learns nothing until the final release line tells it to broadcast.
 - **earlyoom never logs "killed";** its line is `sending SIGTERM to process <pid> uid ... "<comm>": ...`.
 - **zram is invisible to slice limits.** earlyoom counts zram's virtual size as swap; `MemoryMax` counts RAM only, and compressed pages are charged to no slice.
@@ -600,10 +484,13 @@ A second promise rule is measured and declined (showrunner, 2026-10-28: simple w
 
 A scoped reservation stays charged and visible after its owner shell stops while its scope still holds a process; admission, queue and blocker reads use that same rule and keep `.max` and `.wave` until both the owner and scope have ended.
 
-A test-width update replaces the reservation atomically under the admission lock, so a stopped write leaves the previous row for the next run.
+A test-width update persists the reservation in `state.json` through `os.replace`. A stopped write leaves the previous state intact.
 
 A cleanup plan is written to a temporary file and linked into place only when no plan exists; a rerun over an incomplete older plan names the file and asks the caller to inspect and remove it before making a new plan.
 
 Python queue layouts, build-why tables and production dailies share `scripts/lib/terminal_cells.py::terminal_width`: combining marks occupy zero cells and wide characters two.
 
-**One decision pass.** `admission_pass(QueueInputs, now)` returns ordered `PassRow` decisions, reasons, requested blocker indices, proposed admissions and head marks, together with totals, recovery and override outcomes. It performs one `admission_walk` per scenario; each possible running-step ending is a separate scenario. Earlier admitted rows charge their needs against later rows; recovery allows one proposed start whose spacing is committed only when that row starts; expired estimates hold their place and charge until refreshed. `next_recovery` advances recovery without consuming a proposed start. The check commits only its own proposal and otherwise applies the pass's no-admission outcomes. `queue_read_from` and the release helpers use the same pass, with `QueueExplanation.decided_from` retaining the exact inputs for counterfactual endings. `blockers_for` selects owner keys for blocker computation; all other rows report `BlockerNotRequested`. The snapshot codec writes this set as a sorted list. The merged ledger still records priority with `bump_order`, `holds_younger` and `priority_since`; these remain inputs to the existing resources rules.
+**One decision pass.** `admission_pass(inputs, now, limits, policy)` returns decisions, blockers, proposals, head marks, and recovery outcomes.
+The service commits proposals and stores the pass. Queries project that pass through `queue_read_from_pass`.
+`QueueExplanation.decided_from` keeps the inputs for release calculations. Those calculations admit nothing and write nothing.
+`apply_queue_priority` supplies the priority order. The generic codec stores domain records for replies and service state.

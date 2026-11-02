@@ -182,11 +182,11 @@ buildlog_sample_anon() {
     local temporary="$maximum.tmp.${BASHPID:-$$}"
     local near_peak="${maximum%.max}.wave" last_near_peak_at=0 sampled_at peak_published
     local near_peak_temporary="$near_peak.tmp.${BASHPID:-$$}"
-    local phase_file=${4:-} reservation=${5:-} phase_context="" phase_started=null phase_peak=null
+    local phase_file=${4:-} sampling_context=${5:-} phase_context="" phase_started=null phase_peak=null
     local phase_temporary="$phase_file.tmp.${BASHPID:-$$}" membership pid executable
     local executables=()
-    if [[ -n "$phase_file" && -r "$reservation" ]]; then
-        phase_context=$(buildlog_memory_python "$BUILDLOG_RECORD" test-phase-context "$reservation" "${@:6}") || phase_context=""
+    if [[ -n "$phase_file" && -n "$sampling_context" ]]; then
+        phase_context=$(buildlog_memory_python "$BUILDLOG_RECORD" test-phase-context "$sampling_context" "${@:6}") || phase_context=""
         if [[ "$phase_context" == \{*\} ]]; then
             if printf '{"test_phase_peak_bytes":null,"test_phase_started_at":null,%s\n' "${phase_context#\{}" > "$phase_temporary"; then
                 mv -f "$phase_temporary" "$phase_file" || true
@@ -343,8 +343,8 @@ run_once() {
     fi
     if [[ -n "${BUILDLOG_MEM_RESERVATION:-}" && -n "${BUILDLOG_PEAK:-}" ]]; then
         BUILDLOG_TEST_PHASE_FILE="$BUILDLOG_PEAK.test-phase.json"
-        buildlog_sample_anon "$BUILDLOG_PEAK.cgroup" "${BUILDLOG_MEM_RESERVATION%.reservation}.max" "$parent_pid" \
-            "$BUILDLOG_TEST_PHASE_FILE" "$BUILDLOG_MEM_RESERVATION" "$@" &
+        buildlog_sample_anon "$BUILDLOG_PEAK.cgroup" "$BUILDLOG_MEM_MAX_PATH" "$parent_pid" \
+            "$BUILDLOG_TEST_PHASE_FILE" "$BUILDLOG_MEM_SAMPLING_CONTEXT" "$@" &
         sampler_pid=$!
     fi
     if [[ -n "${BUILDLOG_START:-}" ]]; then

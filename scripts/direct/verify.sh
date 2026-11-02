@@ -1190,17 +1190,6 @@ cancel_tree_run() {
     if [[ -n "${TOKEN_WAITER_FILE:-}" ]]; then
         rm -f "$TOKEN_WAITER_FILE" "${TOKEN_WAITER_FILE}.again"
     fi
-    # run_once owns admission in a pipeline subshell. Its exact ledger paths
-    # are shared with us before cargo starts, so killing it cannot leak them.
-    local memory_path
-    if [[ -f "$TREE_WATCH_DIR/reservations" ]]; then
-        while IFS= read -r memory_path; do
-            BUILDLOG_MEM_RESERVATION="$memory_path" buildlog_release_memory "$TREE_CHANGED_STATUS"
-        done < "$TREE_WATCH_DIR/reservations"
-    fi
-    if [[ -f "$TREE_WATCH_DIR/waiters" ]]; then
-        while IFS= read -r memory_path; do rm -f "$memory_path"; done < "$TREE_WATCH_DIR/waiters"
-    fi
     [[ -z "${MAC_LOG_FILE:-}" ]] || rm -f "$MAC_LOG_FILE"
     [[ -z "${MAC_RESULT_FILE:-}" ]] || rm -f "$MAC_RESULT_FILE"
     printf 'verify.sh: cancelled — the tree changed while %s ran, so this result would be stale. Resubmit the %s when your edits are done.\n' "$CMD" "$CMD" >&2
@@ -2641,28 +2630,13 @@ try_token_now() {
 # gate again with the token held. The step runs in run()'s subshell, so its
 # token wait reaches the call record through TOKEN_WAIT_FILE.
 eval "$(declare -f buildlog_wait_for_memory | sed '1s/buildlog_wait_for_memory/buildlog_wait_for_memory_only/')"
-# Share exact admission paths across run_once's subshell boundary. Releasing
-# a reservation twice is safe; keep earlier paths if the step re-enters admission.
-remember_tree_reservation() {
-    if [[ -n "${TREE_WATCH_DIR:-}" && -n "${BUILDLOG_MEM_RESERVATION:-}" ]]; then
-        printf '%s\n' "$BUILDLOG_MEM_RESERVATION" >> "$TREE_WATCH_DIR/reservations"
-    fi
-}
-
 buildlog_wait_for_memory() {
-    local memory_wait stat fields=()
-    if [[ -n "${TREE_WATCH_DIR:-}" && -r "/proc/${BASHPID:-$$}/stat" ]]; then
-        stat="$(< "/proc/${BASHPID:-$$}/stat")"
-        read -r -a fields <<< "${stat##*) }"
-        printf '%s/admission/%s-%s.waiting\n' "${BUILDLOG_DIR:-$HOME/.local/state/buildlog}" \
-            "${BASHPID:-$$}" "${fields[19]}" >> "$TREE_WATCH_DIR/waiters"
-    fi
+    local memory_wait
     step_state waiting_hold
     if release_token && [[ "${TOKEN_USED}" -eq 1 && -n "${TOKEN_WAIT_FILE:-}" ]]; then
         : > "${TOKEN_WAIT_FILE}.given_back"
     fi
     buildlog_wait_for_memory_only "$@" || return $?
-    remember_tree_reservation
     [[ "$BUILDLOG_MEM_OUTCOME" != LeftQueue ]] || return 0
     TOKEN_WAITED=0
     if ! try_token_now; then
@@ -2674,8 +2648,7 @@ buildlog_wait_for_memory() {
         # The second pass keeps the step's place in the memory queue from its first wait.
         BUILDLOG_MEM_TOKEN_BACK_AT=$token_back_at BUILDLOG_MEM_WAIT_SINCE=$BUILDLOG_MEM_WAIT_FROM buildlog_wait_for_memory_only "$@" || return $?
         BUILDLOG_MEM_WAIT_S=$(( memory_wait + BUILDLOG_MEM_WAIT_S ))
-        remember_tree_reservation
-        if [[ "$BUILDLOG_MEM_OUTCOME" == LeftQueue ]]; then
+            if [[ "$BUILDLOG_MEM_OUTCOME" == LeftQueue ]]; then
             if release_token && [[ "${TOKEN_USED}" -eq 1 && -n "${TOKEN_WAIT_FILE:-}" ]]; then
                 : > "${TOKEN_WAIT_FILE}.given_back"
             fi
