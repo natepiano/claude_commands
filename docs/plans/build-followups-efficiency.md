@@ -197,23 +197,19 @@ The one style block in `render_markdown` keeps top-level text in a centered 48re
 
 ### Phase 17 — The user answers a change review inside the review page  · status: done
 
-**Source:** the showrunner of natedev, 2026-11-01 20:20 EST, relaying the user: "can i provide the works or some other feedback in the page itself? that would be ideal". The answer goes in the Tailscale review link page, never in a claude.ai artifact.
+#### As-built
 
-**Requirements (showrunner's order):**
-1. Each change on the page has a works control and a text box for other feedback.
-2. An answer saves on submit, shows as saved, and survives a reload.
-3. The answer goes into the existing change review record through `change_review.py verdict`; no second copy of the state.
-4. A "not works" answer or free text goes back to the owning unit with the user's words, through the existing path.
-5. No agent polls for answers: the showrunner gets a message when one arrives.
-6. The write path listens on the tailnet address only, accepts only a row that the page shows, and takes no path or command from the request.
-7. One command makes the page from a list of row numbers, so one row and a batch use the same path.
-8. Each change on the page shows its kind at the top, in plain words: "See in action" or "Read only". The user (2026-11-01, via the showrunner): "i just want to have it show what kind i'm looking at - i do want to know about the ones that i don't need to look at also".
-9. A "Read only" change appears on the page too, with what changed and the proof; it is never hidden or left out.
-10. The kind test: does the change alter something the user runs or sees? Yes is "See in action"; no is "Read only".
-11. The change list has no kind field today. Choose one source for the kind (one place only, for example a field in the change review record set through change_review.py), and name it in your summary.
+`scripts/review_links/change_page.py --production <doc> C<n> [C<m> ...]` publishes one page for one or more change review rows. Each row shows its kind at the top ("See in action" or "Read only"; a "Read only" row is never hidden), what changed, its proof, Works and Not works controls, and a feedback box. `serve.py` serves change pages dynamically with `Cache-Control: no-store` and accepts the answer `POST` only when it binds to the Tailscale IP; it answers 4xx for a bad request, 503 when the send fails after the save, and 303 on success. `submit` saves `works`, `works: <text>` or `not works: <text>` through `change_review.py verdict`, then sends it by `send.py`: a not-works answer goes to the owning unit (`returning_unit`, which reads `git show` when the hash is a checkpoint and not a merge) and every answer goes to the showrunner. A saved row renders "Saved: <answer>" and a "Send saved answer again" control that resends from the saved Verdict. For a project with `ProjectSpec.closes_by_change_review` (hana, claude) the feature-log step runs before the save: `project-of`, then `add`, `supersede` or `drop --verdict=`. The kind has one source: the `Kind` column of the change review record, written by `change_review.py set-kind`; `record_verdict` keeps Kind, CHECK and PRODUCTION.
 
-Keep the plain layout of the trial page (`http://100.103.14.30:8765/2r5p9n/C27.html`; source copy `/tmp/claude/unit/1ce2e169-3129-4f89-b65d-25ead85f2048/C27.html`). Simple comes first: the smallest change to `scripts/review_links` that meets this. No hard-coded configuration values. A nixos change goes to the showrunner as a branch.
+**Files:**
+- `scripts/review_links/change_page.py` — page render, publish and submit.
+- `scripts/review_links/serve.py` — dynamic change-page GET and the tailnet-only POST.
+- `scripts/production/change_review.py` — `KIND`, `REVIEW_KINDS`, `set-kind`, `review_rows()`, `set_row_kind()`.
+- `scripts/feature_log/feature_log.py` — `ProjectSpec.closes_by_change_review`.
+- `commands/showrunner/produce.md` — CloseChangeReview step 1 takes its project list from that field.
+- `scripts/review_links/test_change_page.py`, `scripts/production/test_change_review.py`, `scripts/feature_log/test_feature_log.py` — real HTTP and record tests; fixtures admit staff through `staff_test_support.fixture_member`.
+- `docs/as-built/review-links.md` — page and POST behavior.
 
-**Code facts:** `scripts/review_links/serve.py` serves review snapshots only on this machine's Tailscale IPv4 address (`SimpleHTTPRequestHandler`, `ThreadingHTTPServer`). `scripts/review_links/review_link.py` publishes and refreshes files at short review links. `scripts/production/change_review.py` has the `verdict` action (line ~1299). Tests: `scripts/review_links/test_review_link.py`, `test_serve.py`, `scripts/production/test_change_review.py`.
+**Gotchas:** typed feedback that is exactly "works" counts as a pass and goes to the showrunner only, because the record cannot tell it from the Works button. The token compares as UTF-8 bytes. A deploy needs a review-links service restart.
 
-**State:** the change review record (written only through `change_review.py verdict`).
+**Ruled out:** a second copy of the answer state outside the change review record; a feature-log project list parsed from produce.md prose; retry recipients taken from the typed text and not from the saved Verdict.
