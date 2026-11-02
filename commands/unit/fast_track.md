@@ -45,5 +45,7 @@ Each push stays pending in `~/.local/state/fast-track/records.jsonl`. The unit's
 next broad blind review receives its diff automatically and marks it reviewed
 with that pass. Findings use the normal ledger and repair path. The next merge
 gate takes main and tests the fix through the standard process. Neither
-follow-up is optional.
+follow-up is optional. The nightly full suite also tests it: on natedev,
+`claude-nightly.timer` runs `claude-nightly.service` on origin/main at
+03:00, and a red run messages the sdlc showrunner.
 </FastTrack>
