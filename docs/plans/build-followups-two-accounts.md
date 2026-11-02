@@ -3092,3 +3092,21 @@ User 2026-11-02: "i want accounts renewal on the mac for sure". natedev renewed 
 User 2026-11-02: remove the `read` column; a reading that fails or is old shows in the problems, not in a permanent column.
 
 **As-built:** `mods/unit-board/hooks/accounts.tsx` drops the `read` column and the narrow `read … ago` fact. `accounts.py` status adds a problem line for a usage or credits reading older than the existing ten-minute limit and sets `read_ok` false for it; a reading saved after status starts counts as fresh (F001). `read_at` and `read_ok` stay in the JSON; cargo-handler colours its dot from `read_ok` (handler-unit Phase 61 drops its own read column). One repair round; style review PASS.
+
+### Phase 101t — `codex update` works through the codex alias on both machines  · status: todo
+
+User 2026-11-02 "go", via natedev: the `codex` alias (`accounts.py exec workers`) sets `CODEX_HOME` to a numbered home, so `codex update` fails with "Could not detect the Codex installation method". The install lives under `~/.codex/packages/standalone`; `CODEX_HOME=~/.codex codex update` works.
+
+**Goal:** `codex update` (and `codex1 update`, `codex2 update`) updates this machine's install, then the other machine's over ssh, and prints each machine's version.
+**Spec:**
+1. In `_exec_codex_account`, when the first argument is `update`, do not exec. Run the resolved `codex` program with `CODEX_HOME=<home>/.codex` and the rest of the arguments, attached to the terminal. Then print `<this machine>: <codex --version output>`.
+2. Then run on the other machine: `ssh -o BatchMode=yes -o ConnectTimeout=10 <other> 'CODEX_HOME="$HOME/.codex" "$HOME/.local/bin/codex" update && "$HOME/.local/bin/codex" --version'`, with a time limit. Print `<other machine>: <version>`.
+3. An unreachable machine (ssh exit 255 or timeout) prints one line: `<machine>: unreachable; run codex update there`. A failed remote update prints one line with its exit status.
+4. Exit 0 only when both machines updated. Reuse `scripts/shutdown/remote.py` `local_machine`/`other_machine`; no copy.
+5. Tests patch the program runs and ssh; they never run a real update or ssh.
+6. Docs: `docs/accounts.md` (the alias rows) and `commands/showrunner/accounts.md` say that `codex update` updates both machines' shared install.
+**Files:**
+- scripts/accounts/accounts.py
+- scripts/accounts/test_accounts.py
+- docs/accounts.md
+- commands/showrunner/accounts.md
