@@ -57,6 +57,9 @@ class FolderMoveBackend:
         self.fixture: FolderMoveFixture = fixture
         self.kind: Literal["claude", "codex"] = kind
         self.live: bool = live
+        self.startup_pending: bool = False
+        self.startup_delay_polls: int = 0
+        self.startup_observations: int = 0
         self.pid: int = 998041
         self.shell_pid: int = 998040
         self.starts: list[tuple[str, list[str]]] = []
@@ -80,8 +83,8 @@ class FolderMoveBackend:
         ]
 
     def agents(self) -> list[herdr.AgentOccupant]:
-        return [{"pane_id": "w1:p1", "agent": self.kind,
-                 "agent_status": "running" if self.live else "idle"}]
+        return ([{"pane_id": "w1:p1", "agent": self.kind, "agent_status": "running"}]
+                if self.live else [])
 
     def observed_processes(self, **_options: object) -> list[herdr.HerdrProcess]:
         if not self.live:
@@ -98,20 +101,32 @@ class FolderMoveBackend:
 
     def pane_activity(self, pane: str) -> herdr.PaneAtShell | herdr.PaneRunning:
         self.fixture.assertEqual(pane, "w1:p1")
+        if self.startup_pending:
+            return herdr.PaneRunning(("python accounts.py",))
         return herdr.PaneRunning((self.kind,)) if self.live else herdr.PaneAtShell()
 
     def result(self, *arguments: str) -> dict[str, object]:
         self.fixture.assertEqual(arguments, ("pane", "process-info", "--pane", "w1:p1"))
+        if self.startup_pending:
+            self.startup_observations += 1
+            if self.startup_delay_polls > 0:
+                self.startup_delay_polls -= 1
+            else:
+                self.startup_pending = False
+                self.live = True
+                self.publish_process_state()
+        argv = [self.kind] if self.live else [sys.executable, "/fixture/accounts.py", "exec", self.config.name]
         return {"process_info": {"shell_pid": self.shell_pid, "cwd": str(self.cwd),
-                                 "foreground_processes": [{"pid": self.pid, "argv": [self.kind], "cwd": str(self.cwd)}]}}
+                                 "foreground_processes": [{"pid": self.pid, "argv": argv, "cwd": str(self.cwd)}]}}
 
     def run_in_pane(self, pane: str, command: list[str]) -> None:
         self.fixture.assertEqual(pane, "w1:p1")
         self.fixture.assertFalse(self.live, "a live session must not start again")
+        self.fixture.assertEqual(self.agents(), [])
         self.cwd = Path(command[command.index("sh") + 4])
         self.fixture.assertTrue(self.cwd.is_dir())
         self.starts.append((pane, command.copy()))
-        self.live = True
+        self.startup_pending = True
         self.publish_process_state()
 
     def close_tab_confirmed(self, pane: str) -> None:

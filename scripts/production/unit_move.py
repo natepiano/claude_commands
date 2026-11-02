@@ -429,6 +429,13 @@ class StoppedFolderSession:
 
 
 @dataclass(frozen=True)
+class PendingFolderStartup:
+    """The submitted launch has not yet proved one foreground member process."""
+
+    reason: str
+
+
+@dataclass(frozen=True)
 class ClosedFolderPane:
     """The retained pane no longer exists."""
 
@@ -499,9 +506,21 @@ def folder_session(row: staff.StaffRow, launch: FolderLaunch | NoFolderLaunch) -
     client = herdr.Herdr(launch.session)
     if isinstance(client.pane_activity(pane["pane_id"]), herdr.PaneAtShell):
         return _session_without_foreground_agent(row, claude_live_reason="live session is outside its retained pane")
+    observed = _foreground_folder_session(row, launch, pane)
+    if isinstance(observed, PendingFolderStartup):
+        raise RenameRefused(observed.reason)
+    return observed
+
+
+def _foreground_folder_session(
+        row: staff.StaffRow, launch: FolderLaunch, pane: herdr.PaneIdentity,
+) -> RunningFolderSession | PendingFolderStartup:
+    """Read startup progress while refusing a proved foreign conversation or account."""
+    client = herdr.Herdr(launch.session)
     info = herdr.json_object(client.result("pane", "process-info", "--pane", pane["pane_id"]).get("process_info"),
                              "folder move process info")
     matches: list[RunningFolderSession] = []
+    pending: list[PendingFolderStartup] = []
     for value in herdr.json_items(info.get("foreground_processes"), "folder move foreground processes"):
         process = herdr.json_object(value, "folder move process")
         arguments = [herdr.json_text(value, "folder move argument")
@@ -515,7 +534,8 @@ def folder_session(row: staff.StaffRow, launch: FolderLaunch | NoFolderLaunch) -
         try:
             observed = herdr.native_process(pid, kind)
         except (herdr.HerdrFailure, OSError, ValueError) as error:
-            raise RenameRefused(f"{row.id}: foreground runtime identity is unproved: {error}") from error
+            pending.append(PendingFolderStartup(f"{row.id}: foreground runtime identity is unproved: {error}"))
+            continue
         config = observed.environment.get("CODEX_HOME" if kind == "codex" else "CLAUDE_CONFIG_DIR",
                                  str(Path.home() / (".codex" if kind == "codex" else ".claude")))
         if observed.identity != row.current_session:
@@ -523,8 +543,12 @@ def folder_session(row: staff.StaffRow, launch: FolderLaunch | NoFolderLaunch) -
         if Path(config).resolve() != Path(launch.entry["config_dir"]).resolve():
             raise RenameRefused(f"{row.id}: retained pane account changed")
         matches.append(RunningFolderSession(pid, observed.started, kind))
-    if len(matches) != 1:
+    if len(matches) > 1:
         raise RenameRefused(f"{row.id}: retained pane has no unique member process")
+    if pending:
+        return pending[0]
+    if not matches:
+        return PendingFolderStartup(f"{row.id}: retained pane has no unique member process")
     return matches[0]
 
 
@@ -592,11 +616,6 @@ def resume_folder_session(row: staff.StaffRow, launch: FolderLaunch) -> None:
         pane_launch.finish_restore(path, entry, attempt, proof, close=client.close_tab_confirmed)
         return
     config = Path(entry["config_dir"])
-    agents = [agent for agent in client.agents() if agent["pane_id"] == pane["pane_id"]]
-    if len(agents) != 1 or agents[0].get("agent") not in ("claude", "codex"):
-        raise RenameRefused(f"{row.id}: retained pane backend is unavailable")
-    kind = agents[0].get("agent")
-    projected["kind"] = cast(Literal["claude", "codex"], kind)
     arguments = pane_record.resume_arguments(projected)
     environment = {key: value for key, value in entry["environment"].items()
                    if key not in {"STAFF_ID", "CODEX_THREAD_ID", "CLAUDE_CODE_SESSION_ID", "HERDR_TAB_ID"}}
@@ -614,9 +633,9 @@ def resume_folder_session(row: staff.StaffRow, launch: FolderLaunch) -> None:
             current = _folder_pane(row, launch)
             if current.get("terminal_id") != pane.get("terminal_id"):
                 raise RenameRefused(f"{row.id}: retained terminal changed during resume")
-            observed = folder_session(row, launch)
-            if isinstance(observed, RunningFolderSession):
-                if observed.pid not in processes_inside(Path(entry["cwd"])):
+            startup = _foreground_folder_session(row, launch, current)
+            if isinstance(startup, RunningFolderSession):
+                if startup.pid not in processes_inside(Path(entry["cwd"])):
                     raise RenameRefused(f"{row.id}: resumed session is outside the moved folder")
                 proof = pane_launch.VerifiedResume(projected, frozenset({row.id, row.current_session}))
                 pane_launch.finish_restore(path, entry, attempt, proof, close=client.close_tab_confirmed)

@@ -295,10 +295,23 @@ class UnitFolderMoveTests(FolderMoveFixture):
         for kind in ("claude", "codex"):
             self.assert_move_with_unidentifiable_codex(kind, target_live=True)
 
-    def assert_live_move(self, kind: Literal["claude", "codex"]) -> None:
+    def assert_live_move(self, kind: Literal["claude", "codex"], *, legacy: bool = False,
+                         startup_delay_polls: int = 0) -> None:
         backend = self.folder_backend(kind, live=True)
+        backend.startup_delay_polls = startup_delay_polls
+        if legacy:
+            entries = pane_record.read("agents")
+            del entries["w1:p1"]["kind"]
+            pane_record.save("agents", entries)
         neighbour = pane_record.read("agents")["w1:p2"]
-        result = self.move_folder()
+        clock = [0.0]
+
+        def sleep(seconds: float) -> None:
+            clock[0] += seconds
+
+        with (mock.patch.object(time, "monotonic", side_effect=lambda: clock[0]),
+              mock.patch.object(time, "sleep", side_effect=sleep)):
+            result = self.move_folder()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assert_moved(backend)
         self.assertTrue(backend.live)
@@ -310,6 +323,13 @@ class UnitFolderMoveTests(FolderMoveFixture):
         self.assertEqual(command[resume + 1], self.owner.current_session)
         self.assertNotEqual(command[resume + 1], self.owner.id)
         self.assertEqual(command[command.index("exec") + 1], backend.config.name.removeprefix("."))
+        self.assertEqual(backend.cwd, self.new_folder)
+        self.assertEqual(backend.startup_observations, startup_delay_polls + 1)
+        self.assertFalse(backend.startup_pending)
+        self.assertEqual(backend.agents(), [{"pane_id": "w1:p1", "agent": kind, "agent_status": "running"}])
+        self.assertEqual(clock[0] > 0, startup_delay_polls > 0)
+        self.assertIs(unit_move.read_folder_move(staff.folder_move_path(self.owner.id)).steps["resume"],
+                      unit_move.FolderStepState.DONE)
         self.assertEqual(pane_record.read("agents")["w1:p2"], neighbour)
         self.assert_finished_rerun(backend)
 
@@ -318,6 +338,99 @@ class UnitFolderMoveTests(FolderMoveFixture):
 
     def test_live_codex_resumes_current_thread_in_the_same_terminal(self) -> None:
         self.assert_live_move("codex")
+
+    def test_live_claude_without_a_kind_field_resumes_from_its_retained_launch(self) -> None:
+        self.assert_live_move("claude", legacy=True)
+
+    def test_resume_waits_for_starting_processes_before_proving_the_session(self) -> None:
+        for kind in ("claude", "codex"):
+            with self.subTest(kind=kind):
+                case = UnitFolderMoveTests()
+                case.setUp()
+                try:
+                    case.assert_live_move(kind, startup_delay_polls=3)
+                finally:
+                    case.doCleanups()
+
+    def test_resume_refuses_a_proven_foreign_conversation_or_account_without_retrying(self) -> None:
+        for kind in ("claude", "codex"):
+            for changed in ("conversation", "account"):
+                with self.subTest(kind=kind, changed=changed):
+                    case = UnitFolderMoveTests()
+                    case.setUp()
+                    try:
+                        backend = case.folder_backend(kind, live=True)
+                        native_process = herdr.native_process
+
+                        def observe(pid: int, runtime: str) -> herdr.NativeAgentProcess:
+                            observed = native_process(pid, runtime)
+                            if not backend.starts:
+                                return observed
+                            if changed == "conversation":
+                                return replace(observed, identity=fixture_runtime_id("foreign-resumed-session"))
+                            key = "CODEX_HOME" if kind == "codex" else "CLAUDE_CONFIG_DIR"
+                            return replace(observed, environment={**observed.environment,
+                                key: str(case.root / "foreign-account")})
+
+                        with (mock.patch.object(herdr, "native_process", side_effect=observe),
+                              mock.patch.object(time, "sleep") as sleep):
+                            result = case.move_folder()
+                        case.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                        case.assertIn("foreground runtime identity is unproved" if changed == "conversation"
+                                      else "retained pane account changed", result.stderr)
+                        sleep.assert_not_called()
+                        case.assertEqual(backend.startup_observations, 1)
+                        case.assertEqual((len(backend.starts), len(backend.stops)), (1, 1))
+                        case.assertEqual(backend.starts[0][0], "w1:p1")
+                        case.assertEqual(backend.cwd, case.new_folder)
+                        move = unit_move.read_folder_move(staff.folder_move_path(case.owner.id))
+                        case.assertIs(move.steps["resume"], unit_move.FolderStepState.PENDING)
+                        case.assertIs(pane_record.read("agents")["w1:p1"].get("ended"), True)
+                    finally:
+                        case.doCleanups()
+
+    def test_resume_waits_for_the_native_identity_after_recognizing_the_process(self) -> None:
+        for kind in ("claude", "codex"):
+            with self.subTest(kind=kind):
+                case = UnitFolderMoveTests()
+                case.setUp()
+                try:
+                    backend = case.folder_backend(kind, live=True)
+                    native_process = herdr.native_process
+                    observations: list[int] = []
+                    clock = [0.0]
+
+                    def observe(pid: int, runtime: str) -> herdr.NativeAgentProcess:
+                        if backend.starts:
+                            case.assertEqual((pid, runtime), (backend.pid, kind))
+                            case.assertTrue(backend.live)
+                            observations.append(pid)
+                            if len(observations) <= 3:
+                                raise ValueError("native identity is not published yet")
+                        return native_process(pid, runtime)
+
+                    def sleep(seconds: float) -> None:
+                        clock[0] += seconds
+
+                    with (mock.patch.object(herdr, "native_process", side_effect=observe),
+                          mock.patch.object(time, "monotonic", side_effect=lambda: clock[0]),
+                          mock.patch.object(time, "sleep", side_effect=sleep)):
+                        moved = case.move_folder()
+                    case.assertEqual(moved.returncode, 0, moved.stderr)
+                    case.assert_moved(backend)
+                    case.assertEqual(observations, [backend.pid] * 4)
+                    case.assertGreater(clock[0], 0)
+                    case.assertEqual((len(backend.starts), len(backend.stops)), (1, 1))
+                    pane, command = backend.starts[0]
+                    case.assertEqual(pane, "w1:p1")
+                    resume = command.index("--resume" if kind == "claude" else "resume", command.index("exec") + 1)
+                    case.assertEqual(command[resume + 1], case.owner.current_session)
+                    case.assertEqual(backend.cwd, case.new_folder)
+                    case.assertIs(unit_move.read_folder_move(staff.folder_move_path(case.owner.id)).steps["resume"],
+                                  unit_move.FolderStepState.DONE)
+                    case.assert_finished_rerun(backend)
+                finally:
+                    case.doCleanups()
 
     def test_normal_codex_launch_moves_without_a_claude_launch_record(self) -> None:
         client_type = herdr.Herdr
