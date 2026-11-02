@@ -18,7 +18,7 @@ import unittest
 from unittest import mock
 
 SCRIPTS = Path(__file__).resolve().parents[1]
-for directory in ("mac_test", "build_targets", "build_hold", "buildlog"):
+for directory in ("mac_test", "build_targets", "build_hold", "buildlog", "lib", "lint"):
     sys.path.insert(0, str(SCRIPTS / directory))
 
 if TYPE_CHECKING:
@@ -26,7 +26,8 @@ if TYPE_CHECKING:
     from ..build_targets import targets
     from ..build_hold import build_hold
     from ..buildlog import record, store
-    from ..lint.config_values import config_values
+    from ..lib import conf
+    from ..lint.memory_test_support import write_config_fixture, config_environment
 else:
     import mac_test
     import offload
@@ -34,7 +35,8 @@ else:
     import build_hold
     import record
     import store
-    from config_values import config_values
+    import conf
+    from memory_test_support import write_config_fixture, config_environment
 
 NOW = datetime(2026, 11, 1, 12, tzinfo=timezone.utc)
 TARGET_NAMES = ("mac", "aws", "linux-two")
@@ -72,24 +74,26 @@ class IsolatedTargetState(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        self.config = self.root / "targets.conf"
+        self.config = self.root / "build_targets.conf"
         self.mac_state = self.root / "legacy-mac"
         lines = ["targets=mac,aws,linux-two,natedev"]
         for name, hours in zip(TARGET_NAMES, (4, 1, 2), strict=True):
             settings = self.root / f"{name}.conf"
-            _ = settings.write_text(
+            _ = write_config_fixture(settings,
                 f"host=fake-{name}\noffload=on\nci_repo=\nblock_hours={hours}\n"
                 + "block_max_hours=48\nblock_warn_minutes=15\n"
                 + "gh_timeout_s=1\nclaim_idle_minutes=15\nclaim_poll_seconds=60\n"
                 + "connect_timeout_s=1\nprobe_timeout_s=1\nunreachable_backoff_s=30\n",
-                encoding="utf-8",
+                template="mac_test",
             )
             platform = "macos" if name == "mac" else "linux"
             lines.extend((f"kind.{name}=ssh", f"platform.{name}={platform}",
                           f"settings.{name}={settings.name}"))
         lines.extend(("kind.natedev=local", "platform.natedev=linux"))
         _ = self.config.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        _ = write_config_fixture(self.root / "mac_test.conf", "ci_repo=", template="mac_test")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            **config_environment(self.root),
             "HOME": str(self.root),
             "BUILD_TARGETS_CONFIG": str(self.config),
             "MAC_TEST_CONFIG": str(self.root / "mac.conf"),
@@ -173,8 +177,8 @@ class TargetStateTests(IsolatedTargetState):
             self.assertEqual(self.snapshot(), before)
 
     def test_explicit_mac_reads_registry_settings_and_preserves_legacy_settings(self) -> None:
-        legacy = self.root / "legacy-settings.conf"
-        _ = legacy.write_text("block_hours=4\n", encoding="utf-8")
+        legacy = self.root / "mac_test.conf"
+        _ = write_config_fixture(legacy, "block_hours=4\nci_repo=", template="mac_test")
         settings = self.root / "mac.conf"
         _ = settings.write_text(settings.read_text().replace("block_hours=4", "block_hours=1"), encoding="utf-8")
         with mock.patch.dict(os.environ, {"MAC_TEST_CONFIG": str(legacy)}):
@@ -194,8 +198,8 @@ class TargetStateTests(IsolatedTargetState):
                 self.assertEqual(block.expires - block.since, timedelta(hours=4))
 
     def test_explicit_mac_free_now_reads_the_registry_offload_setting(self) -> None:
-        legacy = self.root / "legacy-settings.conf"
-        _ = legacy.write_text("offload=on\n", encoding="utf-8")
+        legacy = self.root / "mac_test.conf"
+        _ = write_config_fixture(legacy, "offload=on\nci_repo=", template="mac_test")
         settings = self.root / "mac.conf"
         _ = settings.write_text(settings.read_text().replace("offload=on", "offload=off"), encoding="utf-8")
         with mock.patch.dict(os.environ, {"MAC_TEST_CONFIG": str(legacy)}):
@@ -206,7 +210,7 @@ class TargetStateTests(IsolatedTargetState):
 
     def test_macos_peer_accepts_ci_settings_and_linux_peer_refuses_them(self) -> None:
         settings = self.root / "linux-two.conf"
-        _ = settings.write_text(settings.read_text().replace("ci_repo=", "ci_repo=owner/project")
+        _ = settings.write_text(settings.read_text().replace("ci_repo=\n", "ci_repo=owner/project\n")
                                 + "ci_variable=MACOS_CI\nci_workflow=ci.yml\nci_job=macOS tests\n",
                                 encoding="utf-8")
         before = self.snapshot()
@@ -244,7 +248,7 @@ class TargetStateTests(IsolatedTargetState):
                 _ = targets.target_state(target)
 
     def test_aws_drain_reserve_covers_its_configured_maximum_duration(self) -> None:
-        values = config_values(str(SCRIPTS.parent / "config/aws_target.conf"))
+        values = conf.values(SCRIPTS.parent / "config/aws_target.conf")
         reserve = float(values["limit_reserve_usd"])
         minutes = float(values["drain_max_minutes"])
         self.assertGreater(minutes, 0)
@@ -253,7 +257,7 @@ class TargetStateTests(IsolatedTargetState):
         self.assertLess(reserve, float(values["daily_limit_usd"]))
 
     def test_aws_repository_budgets_fit_the_build_budget(self) -> None:
-        values = config_values(str(SCRIPTS.parent / "config/aws_target.conf"))
+        values = conf.values(SCRIPTS.parent / "config/aws_target.conf")
         ceiling = float(values["build_budget_gib"])
         for key, value in values.items():
             if key == "target_budget_gib" or key.startswith("target_budget_gib."):

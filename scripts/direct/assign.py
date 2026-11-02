@@ -27,7 +27,7 @@ from scripts.direct import phase_reservation, workers
 from scripts.direct.worker_state import worker_claim_lock, worker_record_path
 from scripts.astra import design_roles
 from scripts.production import staff, worker_admission
-from scripts.lib import tunables, unit_runs
+from scripts.lib import conf, unit_runs
 from scripts.lint import style_review
 from scripts.usage.agents_log import LENSES
 
@@ -404,14 +404,10 @@ def claim_worker(dispatch: Dispatch) -> WorkerClaim:
             refuse(f"{dispatch.worker}: TransferringRole; use its destination holder")
         if record.get("held_design_id"):
             refuse(f"{dispatch.worker}: held roles resume through design_roles.py")
-        config = Path(os.environ.get("UNIT_CONFIG", str(Path.home() / ".claude/config/direct.conf")))
         try:
-            raw_threshold = tunables.values(config).get("UNIT_COMPACT_ABOVE_TOKENS", "")
-        except tunables.TunableUnusable as error:
+            threshold = conf.whole("direct", "UNIT_COMPACT_ABOVE_TOKENS")
+        except conf.Unusable as error:
             refuse(str(error))
-        threshold = int(raw_threshold) if re.fullmatch(r"\d+", raw_threshold) else 0
-        if threshold <= 0:
-            refuse(f"UNIT_COMPACT_ABOVE_TOKENS in {config} must be a positive integer")
         context_tokens = record.get("context_tokens")
         if isinstance(context_tokens, int) and context_tokens > threshold:
             compact = dispatch.mesh_call("compact", capture=True, check=False)

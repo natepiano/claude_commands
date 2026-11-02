@@ -112,6 +112,7 @@ class StyleLauncherTests(support.ReviewLauncherFixture):
                 _ = config.write_text(f"style_review={'off' if off else 'on'}\n")
                 environment = self.environment()
                 environment["LINT_CONFIG_FILE"] = str(config)
+                environment["CONF_DIR"] = str(Path(config).parent)
                 command = self.unit_review_command(session)
                 command[2:2] = ["--phase", "3", "--style-since", "HEAD"]
                 result = subprocess.run(command, env=environment, text=True, capture_output=True,

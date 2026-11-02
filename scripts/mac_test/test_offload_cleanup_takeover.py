@@ -9,8 +9,10 @@ import unittest
 from offload_cleanup_test_support import SeededCleanupFixture
 if TYPE_CHECKING:
     from ..lib import test_hang_guard
+    from ..lint.memory_test_support import write_config_fixture
 else:
     from scripts.lib import test_hang_guard
+    from memory_test_support import write_config_fixture
 
 
 class OffloadCommandTests(SeededCleanupFixture):
@@ -18,7 +20,8 @@ class OffloadCommandTests(SeededCleanupFixture):
         _ = self.write_kept_claim()
         alternate = self.root / "alternate-settings.conf"
         values = {**self.config, "host": "next-mac", "connect_timeout_s": "2"}
-        _ = alternate.write_text("".join(f"{key}={value}\n" for key, value in values.items()))
+        _ = write_config_fixture(alternate, "".join(f"{key}={value}\n" for key, value in values.items()),
+                                 template="mac_test")
         result = self.command("--no-fail-fast", settings=alternate)
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assert_wire("passed", "")

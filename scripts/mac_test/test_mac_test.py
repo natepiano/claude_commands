@@ -3,8 +3,9 @@
 
 from __future__ import annotations
 
+
 from datetime import datetime, timedelta, timezone
-from contextlib import redirect_stdout
+from contextlib import redirect_stdout, redirect_stderr
 import io
 import json
 import fcntl
@@ -24,8 +25,15 @@ from typing import TYPE_CHECKING, NotRequired, TypedDict, cast, final, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
+if TYPE_CHECKING:
+    from ..lint.memory_test_support import write_config_fixture, commit_config_fixture
+else:
+    from memory_test_support import write_config_fixture, commit_config_fixture
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import mac_test
+import conf
 if TYPE_CHECKING:
     from ..lib import test_hang_guard
 else:
@@ -366,7 +374,7 @@ class MacTestCommandTests(unittest.TestCase):
             "HOME": str(self.root),
             "PATH": f"{self.bin_directory}{os.pathsep}{os.environ['PATH']}",
             "MAC_TEST_STATE_DIR": str(self.state_directory),
-            "MAC_TEST_CONFIG": str(self.config_path),
+            "MAC_TEST_CONFIG": str(self.config_path), "CONF_DIR": str(Path(self.config_path).parent),
             "MAC_TEST_SEND": str(send_stub),
             "MAC_TEST_SESSIONS": str(sessions_stub),
             "MAC_TEST_STUB_DIR": str(self.stub_directory),
@@ -432,10 +440,11 @@ class MacTestCommandTests(unittest.TestCase):
                 _ = values.pop(name, None)
             else:
                 values[name] = value
-        _ = self.config_path.write_text(
-            "".join(f"{name}={value}\n" for name, value in values.items()),
-            encoding="utf-8",
-        )
+        _ = write_config_fixture(self.config_path, "".join(f"{name}={value}\n" for name, value in values.items()), template="mac_test")
+        removed = {key for key, value in changes.items() if value is None}
+        if removed:
+            _ = self.config_path.write_text("\n".join(line for line in self.config_path.read_text().splitlines()
+                if line.partition("=")[0].strip() not in removed) + "\n")
 
     def sync_gh(self) -> None:
         _ = (self.stub_directory / "gh-fixture.json").write_text(
@@ -720,27 +729,25 @@ class MacTestCommandTests(unittest.TestCase):
             "free\nno block\nCI's Mac switch: unknown (network unavailable)\n",
         )
 
-    def test_missing_repository_configuration_never_calls_gh(self) -> None:
+    def test_missing_configuration_recovers_history_and_refuses_without_it(self) -> None:
+        commit_config_fixture(self.config_path)
         for missing_file in (False, True):
             with self.subTest(missing_file=missing_file):
+                self.write_config()
                 if missing_file:
-                    self.config_path.unlink(missing_ok=True)
+                    self.config_path.unlink()
                 else:
                     self.write_config(ci_repo=None)
-                self.clear_log("gh")
-
-                blocked = self.command(
-                    "block", "--holder", "alice", "--for", "rendering"
-                )
-                self.assertEqual(
-                    blocked.returncode, 0, blocked.stdout + blocked.stderr
-                )
-                self.assertEqual(self.block_state()["ci"], "not_configured")
-                status = self.command("status")
-                self.assertIn("CI's Mac switch: not configured\n", status.stdout)
-                unblocked = self.command("unblock", "--holder", "alice")
-                self.assert_command(unblocked, 0, "Mac unblocked.\n")
-                self.assertEqual(self.logged_arguments("gh"), [])
+                errors = io.StringIO()
+                with mock.patch.dict(os.environ, self.environment), redirect_stderr(errors):
+                    config = mac_test.read_config()
+                self.assertEqual(config.ci_repo, "natepiano/hana")
+                self.assertIn("warning:", errors.getvalue())
+                self.assertIn(str(self.config_path), errors.getvalue())
+        empty = self.root / "no-history"
+        empty.mkdir()
+        with mock.patch.dict(os.environ, {"CONF_DIR": str(empty)}), redirect_stderr(io.StringIO()), self.assertRaises(conf.Unusable):
+            _ = mac_test.read_config()
 
     def test_claim_release_and_process_name_behavior_remain_local(self) -> None:
         first = self.start_child(b"mac \xff test")
@@ -1053,6 +1060,7 @@ class MacTestCommandTests(unittest.TestCase):
         self.assertEqual(path.read_bytes(), before)
 
     def test_free_now_answers_from_local_state_alone(self) -> None:
+        self.write_config(offload="off")
         self.assert_command(self.command("free-now"), 1, "off\n")
         self.write_config(offload="on")
         self.assert_command(self.command("free-now"), 0, "free\n")
@@ -1079,7 +1087,7 @@ class MacTestCommandTests(unittest.TestCase):
         (self.state_directory / "block.json").unlink()
 
         settings = self.root / "off.conf"
-        _ = settings.write_text("offload=off\n", encoding="utf-8")
+        _ = write_config_fixture(settings, "offload=off\n", template="mac_test")
         self.assert_command(self.command("free-now", "--settings", str(settings)), 1, "off\n")
         self.assert_command(self.command("free-now"), 0, "free\n")
         self.assertEqual(self.logged_arguments("gh"), [])
@@ -1510,7 +1518,7 @@ for arguments in (
         self.assertEqual(len(self.hold_events()), 1)
 
     def test_pending_block_with_only_own_claim_activates_without_free_message(self) -> None:
-        self.write_config(ci_repo=None)
+        self.write_config(ci_repo="")
         owner = self.start_child()
         environment = {**self.environment, "CLAUDE_CODE_SESSION_ID": "session-a"}
         self.assert_command(self.command("claim", "--pid", str(owner.pid), "--what", "own tests",
@@ -2823,10 +2831,10 @@ class ClaimWatchTests(unittest.TestCase):
         self.paths = mac_test.StatePaths(self.root / "state")
         self.paths.directory.mkdir()
         config = self.root / "mac_test.conf"
-        _ = config.write_text("host=config-mac\nclaim_idle_minutes=15\nclaim_poll_seconds=60\n")
+        _ = write_config_fixture(config, "host=config-mac\nclaim_idle_minutes=15\nclaim_poll_seconds=60\n")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "HOME": str(self.root), "MAC_TEST_STATE_DIR": str(self.paths.directory),
-            "MAC_TEST_CONFIG": str(config), "USER_ZONE": "America/New_York",
+            "MAC_TEST_CONFIG": str(config), "CONF_DIR": str(Path(config).parent), "USER_ZONE": "America/New_York",
             "BUILD_HOLD_DIR": str(self.root / "holders"), "BUILDLOG_DIR": str(self.root / "buildlog"),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
         })))
@@ -3127,12 +3135,12 @@ class ClaimWatchTests(unittest.TestCase):
         with mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 255, "active=0\nrc=0\n", "unreachable")):
             self.assertIsInstance(mac_test.check_mac_activity(config, "claim-host"), mac_test.ActivityCheckFailed)
 
-    def test_claim_idle_settings_have_defaults_and_accept_config_values(self) -> None:
+    def test_claim_idle_settings_read_configured_values(self) -> None:
         path = self.root / "mac_test.conf"
-        _ = path.write_text("")
+        _ = write_config_fixture(path)
         config = mac_test.read_config()
         self.assertEqual((config.claim_idle_minutes, config.claim_poll_seconds), (15, 60))
-        _ = path.write_text("host=other-mac\nclaim_idle_minutes=0.5\nclaim_poll_seconds=2\n")
+        _ = write_config_fixture(path, "host=other-mac\nclaim_idle_minutes=0.5\nclaim_poll_seconds=2\n")
         config = mac_test.read_config()
         self.assertEqual((config.claim_idle_minutes, config.claim_poll_seconds), (0.5, 2))
 

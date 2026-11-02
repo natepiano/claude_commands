@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from statistics import median
+from pathlib import Path
 import time
 import unittest
 from typing import cast, override
@@ -25,7 +26,7 @@ class QueueViewTests(QueueFixtureTests):
         super().setUp()
         config = self.fixture.root / "lint.conf"
         write_memory_config(config)
-        _ = cast(object, self.enterContext(mock.patch.dict("os.environ", {"LINT_CONFIG_FILE": str(config)})))
+        _ = cast(object, self.enterContext(mock.patch.dict("os.environ", {"CONF_DIR": str(config.parent)})))
 
     def test_expired_head_with_passing_checks_has_an_error_hold_at_sixty_cells(self) -> None:
         inputs = self.fixture.inputs(policy=gate.DEFAULT_ADMISSION_POLICY)
@@ -52,11 +53,11 @@ class QueueViewTests(QueueFixtureTests):
                             for line in lines for span in line))
 
     def test_pressure_threshold_text_uses_the_policy_in_the_reading(self) -> None:
-        config = self.fixture.root / "policy.conf"
-        _ = config.write_text("[memory]\nfull_pressure_limit=9\nswap_used_limit=70\nsome_pressure_limit=12\nrecovery_start_seconds=45\n")
-        with mock.patch.dict("os.environ", {"LINT_CONFIG_FILE": str(config)}):
+        config = self.fixture.root / "lint.conf"
+        write_memory_config(config, full_pressure_limit="9", swap_used_limit="70", some_pressure_limit="12", recovery_start_seconds="45")
+        with mock.patch.dict("os.environ", {"CONF_DIR": str(config.parent)}):
             policy = gate.read_memory_config().policy
-            _ = config.write_text("[memory]\nfull_pressure_limit=3\nswap_used_limit=90\nsome_pressure_limit=30\n")
+            write_memory_config(config, full_pressure_limit="3", swap_used_limit="90", some_pressure_limit="30")
             model = self.fixture.model()
         model = replace(model, reading=replace(model.reading,
             explanation=replace(model.reading.explanation, policy=policy)))
@@ -104,13 +105,13 @@ class QueueViewTests(QueueFixtureTests):
             for stale in (False, True):
                 with self.subTest(source=source, stale=stale), mock.patch.dict("os.environ", {
                     "BUILDLOG_BUILD_BUDGET_GIB": "21" if source == "environment" else "",
-                    "LINT_CONFIG_FILE": str(config),
+                    "LINT_CONFIG_FILE": str(config), "CONF_DIR": str(Path(config).parent),
                 }):
-                    _ = config.write_text("[memory]\nbuild_budget_gib=21\n")
+                    write_memory_config(config, build_budget_gib="21")
                     inputs = fixture.inputs(policy=gate.DEFAULT_ADMISSION_POLICY)
                     with mock.patch.object(time, "time", return_value=NOW):
                         gate.write_queue_snapshot(fixture.directory, inputs, policy=gate.DEFAULT_ADMISSION_POLICY)
-                    _ = config.write_text("[memory]\nbuild_budget_gib=24\n")
+                    write_memory_config(config, build_budget_gib="24")
                     with mock.patch.dict("os.environ", {
                         "BUILDLOG_BUILD_BUDGET_GIB": "24" if source == "environment" else "",
                     }), mock.patch.object(time, "time", return_value=NOW + (11 if stale else 0)), \

@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, TypedDict, cast
+from typing import Literal, TypedDict, cast
 
 import index
 import cgroup_capture
@@ -22,13 +22,8 @@ import store
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from user_zone import user_zone  # noqa: E402
 
-if TYPE_CHECKING:
-    from ..lint.config_values import build_oom_score_adj
-else:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
-    from config_values import build_oom_score_adj
+import conf
 
-BUILD_OOM_SCORE_ADJ = build_oom_score_adj()
 GIB = 2**30
 SNAPSHOT_DISTANCE_S = 120
 EARLYOOM = re.compile(
@@ -92,13 +87,13 @@ class EarlyoomKill:
 
     @property
     def outside_build_gate(self) -> bool:
-        if self.oom_score_adj == BUILD_OOM_SCORE_ADJ or not isinstance(self.cmdline, str):
+        if self.oom_score_adj == conf.whole("lint", "build_oom_score_adj") or not isinstance(self.cmdline, str):
             return False
         return "/target/" in cmdline_program(self.cmdline)
 
     @property
     def is_build(self) -> bool:
-        return self.oom_score_adj == BUILD_OOM_SCORE_ADJ or self.outside_build_gate
+        return self.oom_score_adj == conf.whole("lint", "build_oom_score_adj") or self.outside_build_gate
 
 
 def service_state(value: int | None) -> ServiceState:

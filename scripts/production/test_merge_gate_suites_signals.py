@@ -107,7 +107,7 @@ class MergeGateSignalsTests(GateSuitesFixture):
                 process = subprocess.Popen(
                     [*self.gate_command(), "--repo", str(self.checkout), "--merge-branch", "integration",
                      "--unit-branch", "unit-phase", "--checkpoint", self.checkpoint, "--previous-checkpoint", self.base,
-                     "--unit", "fixture", "--phase", "repair", "--settings-blob", self.settings_blob,
+                     "--unit", "fixture", "--phase", "repair",
                      "--production", str(self.quiet_production), "--type-dirs", "scripts"], env=self.environment, stdin=subprocess.DEVNULL,
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
                 try:
@@ -146,7 +146,7 @@ class MergeGateSignalsTests(GateSuitesFixture):
         process = subprocess.Popen(
             [*self.gate_command(), "--repo", str(self.checkout), "--merge-branch", "integration",
              "--unit-branch", "unit-phase", "--checkpoint", self.checkpoint, "--previous-checkpoint", self.base,
-             "--unit", "fixture", "--phase", "repair", "--settings-blob", self.settings_blob,
+             "--unit", "fixture", "--phase", "repair",
              "--production", str(self.quiet_production)],
             env=self.environment, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         hook_pid = 0

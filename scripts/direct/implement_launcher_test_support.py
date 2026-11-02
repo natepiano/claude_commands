@@ -19,9 +19,14 @@ import os
 import shutil
 import subprocess
 from pathlib import Path
-from typing import TypedDict, cast, override
+from typing import TYPE_CHECKING, TypedDict, cast, override
 
 from scripts.direct.recorder_fixture import LauncherFixture, STUB_ATOMIC_JSON_WRITER, communicate_launcher, configure_launcher_fixture, launcher_environment, launcher_registry, prepare_launcher_runtime
+
+if TYPE_CHECKING:
+    from ..lint.memory_test_support import config_environment, write_config_fixture
+else:
+    from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 
 DIRECT_DIR = Path(__file__).parent
@@ -267,15 +272,17 @@ class ImplementLauncherFixture(LauncherFixture):
         self.prepare_project(
             "feature/workers", "implementation_prompt.md", "Write the retry path.\n",
             (
-                "UNIT_PROGRESS_INTERVAL_SECONDS=180",
-                "UNIT_COMPACT_ABOVE_TOKENS=100000",
-                "MAX_FIX_ATTEMPTS=3", "MAX_REOPENS=3", "STALLED_ROUNDS=3",
-                "RUNAWAY_ROUNDS=10", "REPAIR_ROUNDS_PER_FINDING=2",
-                "MIN_REPAIR_BUDGET=2", "MAX_CONSECUTIVE_SAME_KIND_PASSES=6",
-                "MAX_REVIEW_CANCELLATIONS=1", "ROUTING_FROM_ROUND=4",
-                "ASTRA_AFTER_FAILED_FIXES=2", "",
+                "# whole: 1..", "UNIT_PROGRESS_INTERVAL_SECONDS=180",
+                "# whole: 1..", "UNIT_COMPACT_ABOVE_TOKENS=100000",
+                "# whole: 1..", "MAX_FIX_ATTEMPTS=3", "# whole: 1..", "MAX_REOPENS=3", "# whole: 1..", "STALLED_ROUNDS=3",
+                "# whole: 1..", "RUNAWAY_ROUNDS=10", "# range: 5e-324..", "REPAIR_ROUNDS_PER_FINDING=2",
+                "# whole: 1..", "MIN_REPAIR_BUDGET=2", "# whole: 1..", "MAX_CONSECUTIVE_SAME_KIND_PASSES=6",
+                "# whole: 0..", "MAX_REVIEW_CANCELLATIONS=1", "# whole: 1..", "ROUTING_FROM_ROUND=4",
+                "# whole: 1..", "ASTRA_AFTER_FAILED_FIXES=2", "",
             ), AGENTS_REGISTRY,
         )
+        _ = write_config_fixture(self.config_file, self.config_file.read_text(encoding="utf-8"))
+        _ = config_environment(self.root)
         # A phase launch captures HEAD before opening its worker, as a real checked-out phase does.
         _ = subprocess.run(["git", "-C", str(self.working_dir), "-c", "user.name=Test",
                             "-c", "user.email=test@example.invalid", "commit", "-q", "--allow-empty",
@@ -323,6 +330,8 @@ class ImplementLauncherFixture(LauncherFixture):
     @override
     def environment(self) -> dict[str, str]:
         environment = launcher_environment(self.root)
+        environment["CONF_DIR"] = str(self.root)
+        environment["UNIT_CONFIG"] = str(self.config_file)
         environment["STAFF_FILE"] = str(self.root / "staff.json")
         environment["CODEX_THREAD_ID"] = self.staff_parent
         _ = environment.pop("STAFF_ID", None)

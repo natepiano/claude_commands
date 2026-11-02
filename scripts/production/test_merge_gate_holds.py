@@ -42,9 +42,11 @@ class MergeGateHoldTests(TemporaryHoldTest):
         self.gate.setUp()
         self.gate.restore_fixture(suites_for_case(self))
         # Keep the hold helper's roots and owner, and the gate helper's tools and repos.
+        _ = (Path(self.gate.environment["CONF_DIR"]) / "build_targets.conf").write_bytes(
+            (self.root / "build_targets.conf").read_bytes())
         self.environment = {**self.gate.environment, **{
             name: os.environ[name] for name in (
-                "BUILD_HOLD_DIR", "BUILD_HOLD_RELEASE_DIR", "BUILD_TARGETS_CONFIG",
+                "BUILD_HOLD_DIR", "BUILD_HOLD_RELEASE_DIR",
                 "MAC_TEST_STATE_DIR", "NOTIFIER_SESSIONS_DIR", "CLAUDE_CODE_SESSION_ID",
                 "UNIT_ACTIVE_DIR", "UNIT_RUN_DIR", "UNIT_SESSION_DIR",
                 "PLAN_DELEGATE_BOARD_DIR", "PLAN_DELEGATE_SESSION_DIR",
@@ -65,8 +67,7 @@ class MergeGateHoldTests(TemporaryHoldTest):
                      "--previous-checkpoint", self.gate.base, "--unit", "fixture-unit",
                      "--phase", "hold", "--type-dirs", "scripts/production",
                      "--production", str(self.gate.quiet_production),
-                     "--settings-blob", self.gate.settings_blob,
-                     "--main-repo", str(self.gate.main), "--ssh", str(self.gate.bin / "ssh")]
+                          "--main-repo", str(self.gate.main), "--ssh", str(self.gate.bin / "ssh")]
         for mode in ([], ["--tests-only"], ["--promote-only"]):
             with self.subTest(mode=mode):
                 os.environ["MERGE_GATE_PASSED_DIR"] = str(self.gate.state / ("passes-" + "-".join(mode)))
@@ -159,22 +160,25 @@ class MergeGateHoldTests(TemporaryHoldTest):
         self.assertIn("Gate tests: 0.00s;", output.getvalue())
 
     def test_final_hold_read_error_undoes_the_merge_without_pushing(self) -> None:
-        check_settings = merge_gate.check_settings
+        wait_until_free = merge_gate.BuildHoldWait.wait_until_free
+        reads = 0
 
-        def fail_final_hold_read(repo: Path, revision: str, approved: str) -> None:
-            check_settings(repo, revision, approved)
-            self.assertNotEqual(self.gate.git(repo, "rev-parse", "HEAD"), self.gate.base)
-            self.unreadable()
+        def fail_final_hold_read(hold: merge_gate.BuildHoldWait) -> None:
+            nonlocal reads
+            reads += 1
+            if reads == 3:
+                self.assertNotEqual(self.gate.git(self.gate.checkout, "rev-parse", "HEAD"), self.gate.base)
+                self.unreadable()
+            wait_until_free(hold)
 
         output = io.StringIO()
-        with mock.patch.object(merge_gate, "check_settings", side_effect=fail_final_hold_read), \
+        with mock.patch.object(merge_gate.BuildHoldWait, "wait_until_free", fail_final_hold_read), \
                 contextlib.redirect_stderr(output), redirect_stdout(output):
             code = merge_gate.main([
                 "--repo", str(self.gate.checkout), "--merge-branch", "integration",
                 "--unit-branch", "unit-phase", "--checkpoint", self.gate.checkpoint,
                 "--previous-checkpoint", self.gate.base, "--unit", "fixture-unit", "--phase", "hold",
                 "--production", str(self.gate.quiet_production), "--type-dirs", "scripts/production",
-                "--settings-blob", self.gate.settings_blob,
             ])
         self.assertNotEqual(code, 0, output.getvalue())
         self.assertIn("natedev hold state cannot be read", output.getvalue())
