@@ -582,6 +582,33 @@ Remaining gaps include shell command positions, executable Python aliases, and s
 
 **Ruled out:** dual-writing questions to outstanding JSON and records (one store only); a rename that rewrites question rows (sdlc, 2026-11-01); recovering questions lost during the migration (user accepted the loss).
 
+### Phase 4j — A production with no Proposals folder keeps its questions  · status: done
+
+Source: sdlc 2026-11-02: on main 648186aaa, natedev's `update_registration.py questions --production natedev-production.md` fails with "no Proposals folder for questions". natedev's doc names no `Proposals:` line, and Phase 4i stores questions only in that folder.
+
+#### Work Order
+
+**Goal:** every production stores, lists and answers its questions, also when its doc names no Proposals folder and before `migrate-questions` has run.
+
+**Spec:**
+1. One function gives a production's question folder: the doc's Proposals folder when it names one, otherwise `<SHOWRUNNER_STATE_DIR or ~/.local/state/showrunner>/<showrunner staff id>/questions`. No other code works out the question folder.
+2. `store_questions` (`update_registration.py:872`), `question_records_for_document` (`:809`), the footer count (`footer_counts.py:98`) and wrap cleanup (`tidy_wrapped.py:55`, `:96`) use that function. A doc with no Proposals line never refuses for that reason.
+3. `migrate-questions` works for a production with no Proposals line.
+
+**Files:**
+- `scripts/production/update_registration.py`, `scripts/production/footer_counts.py`, `scripts/production/tidy_wrapped.py` — the folder function and its callers.
+- `scripts/production/test_update_registration_questions.py`, `scripts/production/test_footer_counts.py`, `scripts/production/test_tidy_wrapped.py` — regressions.
+
+**Workers:** `1 writer + 1 tester`
+- `impl` — the non-test files; hub: `scripts/production/update_registration.py`.
+- `test` — the tests.
+
+**State:** question records of a production with no Proposals line live in its state folder.
+
+**Constraints from prior phases:** Phase 4i one store, asker by fixed staff id, one staff context per command. No tests run before the natedev release (about 20:30 EST, 2026-11-02).
+
+**Acceptance gate:** with a doc that has no Proposals line, a test files a question, lists it with `questions-table`, answers it, and runs `migrate-questions` twice (the second run changes nothing); the footer counts it; wrap cleanup closes it; each changed test file green in its own `discover` run; full merged-tree gate green.
+
 ### Phase 7m — Showrunners take Morty's words as the user's  · status: done
 
 #### As-built

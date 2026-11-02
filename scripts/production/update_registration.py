@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Register updates, questions and answers for a production.
 
-Question records share the proposals folder. Fixed staff ids identify their askers.
+Question records use the proposals folder or the owner's question folder.
+Fixed staff ids identify their askers.
 The JSON list stores ordinary reminders only.
 """
 from __future__ import annotations
@@ -790,6 +791,33 @@ def outstanding_path(production: Production) -> Path:
 
 
 @dataclass(frozen=True)
+class QuestionFolder:
+    """The question folder and its fixed production owner."""
+
+    path: Path
+    owner: staff.StaffId
+
+
+@dataclass(frozen=True)
+class QuestionOwnerUnavailable:
+    """The document has no local showrunner row to own its questions."""
+
+    document: Path
+
+
+def question_folder(document: Path, identities: QuestionStaff) -> QuestionFolder | QuestionOwnerUnavailable:
+    """Select the production's question folder from its document and staff context."""
+    owner = identities.record.by_doc(local_machine(), document)
+    if owner is None or owner.kind != "showrunner":
+        return QuestionOwnerUnavailable(document)
+    folder = issues_folder(document)
+    if folder is None:
+        root = Path(os.environ.get("SHOWRUNNER_STATE_DIR") or Path.home() / ".local/state/showrunner")
+        folder = root / owner.id / "questions"
+    return QuestionFolder(folder, owner.id)
+
+
+@dataclass(frozen=True)
 class QuestionRecord:
     """A question issue with a fixed asker and its existing queue fields."""
 
@@ -806,19 +834,16 @@ def question_records(production: Production, identities: QuestionStaff) -> list[
 
 def question_records_for_document(doc: Path, identities: QuestionStaff) -> list[QuestionRecord]:
     """Read canonical question records without requiring unrelated checkpoint fields."""
-    folder = issues_folder(doc)
-    if folder is None:
+    folder = question_folder(doc, identities)
+    if isinstance(folder, QuestionOwnerUnavailable):
         return []
-    issues = [Issue(path, frontmatter(path)) for path in sorted(folder.glob("question-*.md"))]
+    issues = [Issue(path, frontmatter(path)) for path in sorted(folder.path.glob("question-*.md"))]
     questions = [issue for issue in issues if issue.value("record_type") == "question"]
     if not questions:
         return []
-    owner = identities.record.by_doc(local_machine(), doc)
-    if owner is None or owner.kind != "showrunner":
-        return []
     records: list[QuestionRecord] = []
     for issue in questions:
-        if issue.value("production_id") != owner.id:
+        if issue.value("production_id") != folder.owner:
             continue
         path = issue.path
         try:
@@ -836,7 +861,7 @@ def question_records_for_document(doc: Path, identities: QuestionStaff) -> list[
         status = issue.value("status")
         if status not in {"open", "closed"}:
             raise RegistrationFailure("questions", f"{path}: question status must be open or closed")
-        records.append(QuestionRecord(path, owner.id, staff.StaffId(asker), item, status))
+        records.append(QuestionRecord(path, folder.owner, staff.StaffId(asker), item, status))
     return records
 
 
@@ -869,11 +894,11 @@ def store_questions(production: Production, entries: list[OutstandingItem], iden
     existing = question_records(production, identities)
     if not questions and not existing:
         return
-    folder = issues_folder(production.doc)
-    if folder is None:
-        raise RegistrationFailure("questions", f"{production.doc}: no Proposals folder for questions")
-    owner = identities.owner(production.doc).id
-    folder.mkdir(parents=True, exist_ok=True)
+    folder = question_folder(production.doc, identities)
+    if isinstance(folder, QuestionOwnerUnavailable):
+        raise RegistrationFailure("questions", f"{folder.document}: no showrunner staff row")
+    owner = folder.owner
+    folder.path.mkdir(parents=True, exist_ok=True)
     open_paths: set[Path] = set()
     for item in questions:
         row = question_member(production, item, identities)
@@ -881,7 +906,7 @@ def store_questions(production: Production, entries: list[OutstandingItem], iden
         digest = hashlib.sha256(f"{owner}:{row.id}:{item['text']}".encode()).hexdigest()
         path = next((record.path for record in existing
                      if record.asker == row.id and record.item["text"] == item["text"]),
-                    folder / f"question-{row.id}-{digest[:16]}.md")
+                    folder.path / f"question-{row.id}-{digest[:16]}.md")
         open_paths.add(path)
         write_question_record(QuestionRecord(path, owner, row.id, item, "open"))
     for record in existing:
