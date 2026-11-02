@@ -41,9 +41,12 @@ the index, publication, promotion or pending review. Repeating it is safe.
 Review discovery recovers pushed commits even without a command retry; unpublished attempts
 whose base moved are closed.
 
-Each push stays pending in `~/.local/state/fast-track/records.jsonl`. The unit's
+Each push stays pending in `~/.local/state/fast-track/records.jsonl`;
+`fast_track.py --pending --unit <unit>` prints the pending diffs. The unit's
 next broad blind review receives its diff automatically and marks it reviewed
 with that pass. Findings use the normal ledger and repair path. The next merge
 gate takes main and tests the fix through the standard process. Neither
-follow-up is optional.
+follow-up is optional. The nightly full suite also tests it: on natedev,
+`claude-nightly.timer` runs `claude-nightly.service` on origin/main at
+03:00, and a red run messages the sdlc showrunner.
 </FastTrack>
