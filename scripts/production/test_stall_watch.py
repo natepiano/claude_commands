@@ -1062,6 +1062,16 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
         self.assertEqual(len(self.prompt_notices()), 1)
         self.assertEqual(len(self.prompt_followups()), 1)
 
+    def test_unknown_agent_state_does_not_retire_a_pending_permission_prompt(self) -> None:
+        self.panes["unit-one"].update(agent_status="blocked", pane=EDIT_PROMPT)
+        self.assertEqual(self.tick(START).returncode, 0)
+        saved = self.prompt_state().read_bytes()
+        self.panes["unit-one"]["agent_status"] = "future-state"
+        with mock.patch.object(stall_watch, "end_prompt", side_effect=AssertionError("unknown is not settled")):
+            self.assertEqual(self.tick(START + 10).returncode, 0)
+        self.assertEqual(self.prompt_state().read_bytes(), saved)
+        self.assertEqual(self.prompt_followups(), [])
+
     def test_a_prompt_answered_during_the_owner_grace_never_pushes(self) -> None:
         _ = (self.root / "stall_watch.conf").write_text("prompt_grace_seconds=120\n")
         self.panes["unit-one"]["agent_status"] = "blocked"

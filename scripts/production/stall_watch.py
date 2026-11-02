@@ -73,7 +73,7 @@ TURN_END = re.compile(rf"^\s*(?:[●⏺]\s+)?(?P<status>(?:— )?(?P<kind>{'|'.j
 HOLD_TIME = re.compile(r"\b(?:(?:(?P<year>\d{4})-)?(?P<month>\d{2})-(?P<day>\d{2})[ T])?"
                        + r"(?P<hour>\d{1,2}):(?P<minute>\d{2})\b(?:\s+(?P<utc>UTC|GMT)\b)?")
 WORK = {"zsh", "bash", "sh", "implement.sh", "review.sh", "verify.sh"}
-BLOCKED = "blocked"
+BLOCKED = herdr.AgentStatus.BLOCKED
 PROMPT_ALERT_SECONDS = 60
 PROMPT_TEXT_ID = "stall_watch.permission_prompt"
 # The prompt alert's sender, which its retire names too.
@@ -1317,7 +1317,8 @@ def watch_pass(now: float, *, deadline: float, read_panes: Callable[[str], list[
             if not pane_budget_left(name, inspection_deadline):
                 continue
             try:
-                blocked = agent_status(unit.place, deadline=inspection_deadline) == BLOCKED
+                state = agent_status(unit.place, deadline=inspection_deadline)
+                blocked = None if state == herdr.AgentStatus.UNKNOWN else state == BLOCKED
             except (OSError, HerdrFailure) as error:
                 print(f"stall-watch: {name}: its herdr state is unknown: {error}", file=sys.stderr)
                 if time.monotonic() >= inspection_deadline:
