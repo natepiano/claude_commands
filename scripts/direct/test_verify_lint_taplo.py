@@ -16,6 +16,12 @@ class VerifyLintScopeTests(support.VerifyLintScopeFixture):
         self.assertIn("not properly formatted", result.stdout + result.stderr)
         self.assertEqual((untracked.read_bytes(), untracked.stat().st_mtime_ns), before)
 
+    def test_silent_taplo_check_failure_has_a_diagnostic(self) -> None:
+        self.write_shell(self.root / "bin/taplo", "exit 1\n")
+        result = self.invoke_workspace_taplo("--check")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("not properly formatted", result.stdout + result.stderr)
+
     def test_fix_formats_tracked_toml_with_literal_brackets_and_preserves_untracked_neighbor(self) -> None:
         tracked, untracked = self.toml_glob_neighbors(untracked_text="value=2\n")
         before = untracked.read_bytes(), untracked.stat().st_mtime_ns
