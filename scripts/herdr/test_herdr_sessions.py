@@ -635,9 +635,9 @@ class StandaloneLaunchTests(unittest.TestCase):
         return [command for command in self.commands() if command[2:4] == ["agent", "start"]]
 
     def tab_opened(self, title: str) -> None:
-        """One tab named `title` opened in the shared session's ad-hoc workspace, and nothing started another session."""
+        """Open one tab in its named workspace within the shared session."""
         workspace, = [command for command in self.commands() if command[2:4] == ["workspace", "create"]]
-        self.assertEqual(workspace[:6], ["--session", "agents", "workspace", "create", "--label", "ad-hoc"])
+        self.assertEqual(workspace[:6], ["--session", "agents", "workspace", "create", "--label", title])
         self.assertIn(["--session", "agents", "tab", "rename", "w1:t1", title], self.commands())
         self.assertIn(["--session", "agents", "pane", "rename", "w1:p1", title], self.commands())
         self.assertEqual({command[1] for command in self.commands() if command[0] == "--session"}, {"agents"})
@@ -737,6 +737,35 @@ class StandaloneLaunchTests(unittest.TestCase):
         self.assertFalse(any(command[2:4] in (["agent", "prompt"], ["pane", "send-keys"]) for command in self.commands()))
         binary = os.environ["HERDR_BIN"]
         self.assertEqual(self.attachments, [(binary, [binary, "session", "attach", "agents"])])
+
+    def test_start_and_resume_reruns_open_no_second_tab(self) -> None:
+        self.destination()
+        for verb in ("start", "resume"):
+            with self.subTest(verb=verb):
+                title = "solo-" + verb
+                pane_reads = self.commands().count(["--session", "agents", "pane", "list"])
+                opened = {"pane_id": "w1:p1", "workspace_id": "w1", "tab_id": "w1:t1", "label": title}
+                pane_lists: list[list[dict[str, str]]] = [list[dict[str, str]]() for _ in range(pane_reads + 1)] + [[opened]]
+                self.responses["--session agents pane list"] = [
+                    CommandResponse(code=0, stdout=json.dumps({"result": {"panes": panes}}))
+                    for panes in pane_lists]
+                self.save()
+                arguments = (("start", "--name", title, "--cwd", str(self.root)) if verb == "start" else
+                             ("resume", title, "--session-id", "recorded", "--cwd", str(self.root)))
+                starts_before = len(self.agent_starts())
+                self.assertEqual(self.call(*arguments), (0, ""))
+                workspace = [command for command in self.commands() if command[2:4] == ["workspace", "create"]][-1]
+                self.assertEqual(workspace[5], title)
+                self.responses["--session agents pane list"] = CommandResponse(code=0, stdout=json.dumps({
+                    "result": {"panes": [{"pane_id": "w1:p1", "workspace_id": "w1", "label": title}]}}))
+                self.save()
+                before = self.commands()
+                self.assertEqual(self.call(*arguments),
+                    (1, f"herdr_sessions: a tab named {title} is already open in herdr session agents\n"))
+                added = self.commands()[len(before):]
+                self.assertFalse(any(command[2:4] in (["workspace", "create"], ["tab", "create"], ["agent", "start"])
+                                     for command in added))
+                self.assertEqual(len(self.agent_starts()), starts_before + 1)
 
     def test_start_inherits_named_account_for_pane_and_new_work_admission(self) -> None:
         directory = self.numbered_account()
