@@ -3111,19 +3111,11 @@ natedev 2026-11-02 (urgent): main was red from 101u (069010236): `test_role_map`
 
 **As-built:** `_count_role_sessions` counts in memory and writes no file; `_session_counts_document` (was `_publish_session_counts`) builds the document that `session-counts-read` prints, and `_session_counts_file` is gone. `_machine_role_counts` takes the status `UsageSource` and starts the detached fetch only for `RefreshStaleUsage`, so `status --stored` reads only `peer_session_counts.json` and opens no lock. `test_role_map.py`, `test_refusal_watch.py` and `test_cutover_home.py` stub `_start_session_counts_fetch` for the whole module. New test `test_stored_status_starts_no_counts_fetch_and_writes_nothing`. 3251 tests in the accounts modules and their importers pass. No code review ran (urgent red-main repair; the director read the diff).
 
-### Phase 101x — The Mac voice setting stays local  · status: done
+### Phase 101x — The Mac voice setting stays local  · status: done · 0dc14b47
 
-natedev 2026-11-02 (urgent): since about 16:00 EST the Mac takes no promotion. The user turned on voice on the Mac, so its `~/.claude/settings.json` has a new top-level `voice` key (`{enabled: true, mode: hold}`). Promotion and claude-sync refuse a tracked edit. Same class as `theme` in 101q.
+natedev 2026-11-02 (urgent): the user turned on voice on the Mac; its `settings.json` gained a top-level `voice` key, and promotion and claude-sync refused the tracked edit from about 16:00 EST.
 
-#### Work Order
-**Goal:** `voice` is a machine-local settings key, like `theme`; the Mac keeps its value and promotion and claude-sync accept the file.
-**Spec:**
-1. Add `voice` to `SETTINGS_LOCAL_KEYS_JSON` in `scripts/settings/settings_local_keys.sh`, with a comment line like the `theme` line.
-2. Add a test in `scripts/settings/test_settings_local_keys.py`, as for `theme`: a local `voice` object survives and a tracked copy gets no `voice` key.
-3. Do not touch the Mac or any live settings file.
-**Files:**
-- `scripts/settings/settings_local_keys.sh`
-- `scripts/settings/test_settings_local_keys.py`
+**As-built:** `voice` joins `SETTINGS_LOCAL_KEYS_JSON` in `scripts/settings/settings_local_keys.sh`, beside `theme`. The Mac fixture in `scripts/settings/test_settings_local_keys.py` has `voice: {enabled: true, mode: hold}`; the cleaned copy has no `voice` key and the sidecar merge puts the full object back. Tests were not run at the checkpoint (hana build hold); the merge gate runs them.
 
 ### Phase 101w — Account tunables live in config  · status: todo
 
