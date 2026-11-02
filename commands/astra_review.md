@@ -1,5 +1,5 @@
 ---
-description: Ask a gpt-6-astra Codex reviewer, on the current workers account, to review a document (a proposal, plan, issue or anything else) and bring its review back to you.
+description: Review a document with gpt-6-astra.
 ---
 
 # astra_review

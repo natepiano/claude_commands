@@ -1,5 +1,5 @@
 ---
-description: Ad hoc targeted style evaluation — check a directory scope against a specific subset of style guidelines (no budget or history writes)
+description: Review selected style rules in a scope.
 ---
 
 **IMPORTANT**: Do NOT modify any source code. This is a read-only evaluation.

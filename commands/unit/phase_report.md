@@ -1,5 +1,5 @@
 ---
-description: Write the report for a /unit:direct phase that finished without one, or whose report was thin.
+description: Write a missing or incomplete phase report.
 ---
 
 # Direct — phase report

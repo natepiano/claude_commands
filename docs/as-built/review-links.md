@@ -70,26 +70,58 @@ The lock file stays on disk. Closing it releases the lock, also on an error. If 
 
 ### Answering a change review
 
-`change_page.py` publishes one page for one or more change-review rows.
-The record's `Kind` column is the only source for each change's kind.
-Use these commands:
+`change_page.py` publishes one page with every waiting change from every configured showrunner list.
+Run this command without a row count or batch size:
 
 ```sh
-python3 scripts/production/change_review.py set-kind --production DOC --list LIST --row C27 --kind 'See in action'
-python3 scripts/production/change_review.py set-kind --production DOC --list LIST --row C28 --kind 'Read only'
-python3 scripts/review_links/change_page.py --production DOC --list LIST C27 C28
+python3 scripts/review_links/change_page.py
 ```
 
-Omit `--list` to use the production's configured list.
-Pass only `C27` to publish one change.
-A change that alters something the user runs or sees has the kind **See in action**.
-Other changes have the kind **Read only**.
-The publisher refuses rows without a valid kind, a change description, or proof in the How to check cell.
-It shows both kinds.
+The page finds list paths through `change_review.LISTS` and the existing filename prefix.
+Each GET reads each list once through `change_review.review_snapshot`.
+The snapshot, pending-row reader, and saved-answer reader use one table reader.
+This reader checks each table row against its header's cell count.
+It refuses a malformed row instead of silently losing cells.
+The browser receives every waiting row in that response.
+It shows one row at a time.
+The page resolves production documents from the update timers, staff records, and the list's production references.
+A list with no available production document retains its rows with a notice and no answer controls.
+The page never uses a review list as a production document.
+
+Tabs show each showrunner and its waiting count.
+The staff record supplies each unit's current showrunner.
+Checkpoint messages and production unit tables identify the unit that owns a row.
+The page reads each repository's commit graph once per request.
+The shared Git reader reads all commit parents in one command per repository through standard input.
+The graph tracks checkpoint ancestors without assigning bits to other commits.
+Production aliases share one document read per request.
+Rows from the same checkpoint share its selection within that request.
+It reads full checkpoint messages only when a merge contains changes from several known units.
+A row without a known staff unit stays with its source list.
+Empty lists and showrunners retain their zero-count tabs.
+Builds rows can remain in the natedev list while the builds tab shows them.
+
+Each tab orders its prepared change rows with `urgency.queue_order`, the same order that `/next change` uses.
+The page keeps row entries during ordering and does not format the text that `/next` prints.
+The existing urgency order, pin, dependencies, and moved rows determine its order.
+Rows from another list use qualified row IDs and qualified prerequisite IDs.
+Next selects the next prepared row in the browser without a server request.
+The URL fragment stores the showrunner and row key.
+A reload restores that place when the row still waits or needs message delivery.
+An empty tab shows **0 changes left** and hides Next.
+The page never advances without the user's action.
+
+The record's `Kind` column remains the only source for the kind.
+Set it with `change_review.py set-kind --production DOC --row C27 --kind 'See in action'`.
+Use **See in action** for a change to something the user runs or sees.
+Use **Read only** for other changes.
+Both kinds appear.
+An older row without Kind appears as **Kind not recorded**.
+The page shows every row with its recorded kind or the missing-kind notice.
 
 The short URL ends in `/changes.html`.
-The page uses the trial page's plain, narrow layout.
-Each section shows its kind, change description once, instructions or proof, and answer controls.
+The page retains the plain, narrow layout and fits a phone.
+Each row shows its kind, description once, proof, and answer controls.
 The user can select Works, Not works, Validate yourself, or Send feedback.
 The feedback field accepts one line, which matches the verdict command's table-cell format.
 Works with text saves `works: <text>`.
@@ -106,23 +138,31 @@ The CLI keeps its current form and still moves the pinned item.
 An unknown key raises `NextError` before the queue changes.
 Rows from an earlier list use their qualified keys.
 
-A successful submission redirects to the same page.
-After a verdict saves, the page shows `Saved: <answer>`.
-After a delivery failure, the page shows a **Send saved answer again** button.
-The button retries message delivery through the same POST path.
-The server reads the saved verdict from the record and refuses replacement text during a retry.
-Every GET reads the pending and Reviewed tables, with `Cache-Control: no-store`.
-No JavaScript is necessary.
+Each answer uses a background `fetch` POST.
+The row shows **Saving**, **Saved: <answer>**, or a short failure reason.
+Next stays available during a save.
+A failed save retains the feedback and selected outcome on that row.
+**Send answer again** retries that answer.
+A successful answer removes the row from its tab's waiting count.
+Validate yourself retains the row in the count and moves it to the tab's end.
 
-The publisher stores a private `.review-link-changes.json` beside a placeholder HTML file.
-The manifest contains local list and production paths, selected row IDs, and a random form token.
-It contains no answer or copied change content.
-The server never serves the manifest.
-The selected IDs form an immutable allowlist; each publication creates a new page.
-Each form must contain one row, token, outcome, and feedback field.
-The server returns 4xx for unknown rows, extra fields, wrong tokens, POST queries, invalid outcomes, and multiline feedback.
-This includes path fields, command fields, and non-ASCII tokens.
-The request cannot select a local file, command, or recipient.
+The all-list publisher stores a private `.review-link-browser.json` beside a placeholder HTML file.
+This manifest contains a random page secret and an optional initial row key.
+It stores no copied rows or answers.
+Each prepared row receives a token signed from that secret and its qualified list/row key.
+The server accepts only a row with that token and a row that remains in a configured list.
+The request cannot select a local path, command, or recipient.
+The server never serves private manifests.
+Each form contains only row, token, outcome, and feedback.
+Each browser form names its page as the save URL.
+Unknown rows, extra fields, wrong tokens, POST queries, invalid outcomes, and multiline feedback receive 4xx.
+Path fields, command fields, and non-ASCII tokens also receive 4xx.
+
+Older selected-row links still work with their existing plain HTML forms and 303 responses.
+Their `.review-link-changes.json` manifest keeps its immutable row allowlist.
+The selected-row publisher still accepts `--production DOC [--list LIST] C27`.
+It requires a valid kind, description, and proof for each selected row.
+The normal command uses the all-list page instead.
 
 The server accepts writes only when its bound address equals the current `tailscale ip -4` address.
 A different bind or a failed address lookup refuses the write.
@@ -150,7 +190,7 @@ A returning answer runs `feature_log.py drop --review` with the saved verdict.
 An operation failure keeps the row open and sends the showrunner the row ID and failure.
 The server does not repeat the feature-log operation for a saved answer.
 
-The server then runs `change_review.py verdict` with arguments from the private manifest.
+The server then runs `change_review.py verdict` with paths from the configured list and production records.
 It passes the user's words with `--verdict=<text>`, so text that starts with a dash remains valid.
 That command remains the only answer writer.
 It retains its lock, conflict checks, scratch cleanup, and list commit behavior.
@@ -158,11 +198,13 @@ Classified rows retain Kind, How to check, and Production in Reviewed.
 Older rows without Kind retain their existing Reviewed table behavior.
 An identical answer can retry delivery; a different saved answer is refused.
 
-The server returns 303 as soon as `change_review.py verdict` writes the answer.
+The all-list page returns JSON with status 200 after `change_review.py verdict` writes the answer.
+Older selected-row pages retain their 303 response.
 The feature-log operation still runs before the verdict.
 The request thread flushes the response before it runs the existing `scripts/message/send.py` sender.
 The server starts no detached shell for message delivery.
-The list's `showrunner:` frontmatter names the showrunner recipient.
+The all-list page sends to the row's current staff showrunner.
+Older selected-row pages use the list's `showrunner:` frontmatter.
 The saved verdict alone selects the recipients for the first send and each retry.
 An exact `works` verdict goes only to the showrunner, including text from Send feedback.
 Every other verdict also goes to the owning unit through the existing checkpoint route.
@@ -200,23 +242,20 @@ The server deletes the record only when both slots are empty.
 After successful verdict delivery, retained validation feedback does not restore the resend control.
 Existing single-intent records, `failed\n` records, and validation feedback records remain retryable.
 
-A failed POST keeps its 4xx or 503 status and uses the change page's layout and style.
-A known page shows **Not saved: &lt;reason&gt;** above the row and keeps its feedback and selected outcome.
-The reason uses short words; server stderr keeps the full error.
-The showrunner's feature-log failure message also keeps the full error.
-If the main page cannot render, a separate form retains the typed feedback and selected outcome.
-This form reads only the page manifest and notice, without row or queue reads.
+A failed POST keeps its 4xx or 503 status.
+The all-list page returns a short JSON reason and keeps the typed answer in the browser.
+The browser shows **Not saved: <reason>** on that row and provides a retry control.
+The server writes full errors only to stderr and the existing showrunner failure message.
+Older selected-row forms retain their styled failure page and typed answer.
+A fallback form needs only the page manifest and notice when row or queue reads fail.
 An unknown page, invalid content type, or refused bind shows one short sentence in the same style.
 
-After a save or a row move, each render reads `next_item.change_queue(production)` for the remaining count.
-Validate yourself keeps the row in that count.
-The page reads moved rows from the existing urgency state and stores no second queue.
-The Next form publishes the queue head through the existing change-page publisher and returns 303 to that page.
-It uses the same urgency order, pin, and moved rows as `/next change`.
+The browser uses its prepared queue for Next and stores no second queue on the server.
+Validate yourself calls the existing queue writer before the response.
 One stable lock in `urgency.py` protects pin, selection, and move operations across all queues.
 Each operation opens the lock separately and retains atomic file replacement.
 A GET never publishes or advances a page.
-An empty queue shows **0 changes left** without a Next control.
+Older selected-row pages retain their server Next form for compatibility.
 A retry can repeat a delivered message; the existing sender's repeat rules apply.
 The review record remains the only verdict store.
 
@@ -254,7 +293,7 @@ Both machines import `/etc/nixos/modules/common/review-links.nix`. It defines th
 
 ## Invariants
 
-- Ordinary snapshot content changes only when the same file set is published again without `--new`. Change pages read their selected rows live from the change review record. Their publisher writes only a private manifest and placeholder into the snapshot folder; the sweep deletes whole folders.
+- Ordinary snapshot content changes only when the same file set is published again without `--new`. Change pages read the change review records at request time. Their publisher writes only a private manifest and placeholder into the snapshot folder; the sweep deletes whole folders.
 - A new ID never takes an existing folder. The exclusive `mkdir` refuses a taken ID.
 - Each output and the index change by one `os.replace` of a complete temporary file in the same folder. A reader gets the old bytes or the new bytes, never part of a file.
 - Every index read, ID pick, snapshot write, cleanup and index write happens under the one `flock` on `<root>/.index.lock`.

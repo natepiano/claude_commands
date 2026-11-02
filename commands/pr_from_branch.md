@@ -1,5 +1,5 @@
 ---
-description: Create a pull request from the current branch, then manage the merge, switch back to main, and clean up.
+description: Create a PR and manage its merge.
 ---
 
 **Arguments**: None (uses current branch)

@@ -57,7 +57,7 @@ from scripts.accounts.refusals import (  # noqa: E402
 )
 
 from scripts.accounts import next_moves
-from scripts.shutdown import stop_results
+from scripts.shutdown import remote, stop_results
 sys.path.insert(0, str(SCRIPTS / "shutdown"))
 from scripts.accounts.role_map import (  # noqa: E402
     RoleMap as RoleMap, RoleMapChange as RoleMapChange,
@@ -1558,8 +1558,53 @@ def launch_shell_environment(directory: Path) -> dict[str, str]:
     raise LaunchShellError("accounts: nix shell helper returned an unsupported result")
 
 
-def _exec_codex_account(label: str, arguments: list[str]) -> None:
+def _update_codex(arguments: list[str]) -> int:
+    """Update both shared installs and report one result for each machine."""
+    environment = launch_shell_environment(Path.cwd())
+    environment["CODEX_HOME"] = str(accounts_home() / ".codex")
+    machine = remote.local_machine()
+    local_ok = False
+    try:
+        program = resolve_program("codex", environment=environment)
+        updated = subprocess.run([program, *arguments], env=environment, check=False)
+        if updated.returncode:
+            print(f"{machine}: update failed (exit {updated.returncode})", flush=True)
+        else:
+            version = subprocess.run([program, "--version"], env=environment,
+                capture_output=True, text=True, timeout=15, check=False)
+            local_ok = version.returncode == 0 and bool(version.stdout.strip())
+            detail = version.stdout.strip().splitlines()[-1] if local_ok else f"version read failed (exit {version.returncode})"
+            print(f"{machine}: {detail}", flush=True)
+    except subprocess.TimeoutExpired:
+        print(f"{machine}: version read timed out", flush=True)
+    except OSError:
+        print(f"{machine}: codex could not start", flush=True)
+
+    machine = remote.other_machine()
+    command = 'CODEX_HOME="$HOME/.codex" "$HOME/.local/bin/codex" update >&2 && "$HOME/.local/bin/codex" --version'
+    try:
+        updated = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", machine, command],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=600, check=False)
+    except (subprocess.TimeoutExpired, OSError):
+        print(f"{machine}: unreachable; run codex update there")
+        return 1
+    if updated.returncode == 255:
+        print(f"{machine}: unreachable; run codex update there")
+        return 1
+    if updated.returncode:
+        print(f"{machine}: update failed (exit {updated.returncode})")
+        return 1
+    if not updated.stdout.strip():
+        print(f"{machine}: version read failed")
+        return 1
+    print(f"{machine}: {updated.stdout.strip().splitlines()[-1]}")
+    return 0 if local_ok else 1
+
+
+def _exec_codex_account(label: str, arguments: list[str]) -> int:
     """Launch Codex on a checked account, including the stored workers selection."""
+    if arguments[:1] == ["update"]:
+        return _update_codex(arguments)
     selected_label = role_account("workers").label if label == "workers" else label
     target = check_codex_target(selected_label, accounts_home() / ".codex")
     environment = launch_shell_environment(Path.cwd())
@@ -1648,14 +1693,13 @@ def renew_login(label: str) -> LoginRenewed | LoginRenewalFailed:
     return LoginRenewed()
 
 
-def exec_account(label: str, arguments: list[str], *, probe: bool = False) -> None:
+def exec_account(label: str, arguments: list[str], *, probe: bool = False) -> int:
     """Replace this process with the selected Claude or Codex account."""
     label = note_file.canonical_label(label)
     if label == "workers" or _label_is(label, "codex"):
         if probe:
             raise AccountsError("accounts: --probe is only supported for Claude accounts")
-        _exec_codex_account(label, arguments)
-        return
+        return _exec_codex_account(label, arguments)
     if label == "claude":
         prepared = PreparedAccount({}, frozenset({
             "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_REMOTE_MEMORY_DIR", "CLAUDE_CODE_OAUTH_TOKEN",
@@ -5784,8 +5828,7 @@ def main(argv: list[str]) -> int:
             print(placement_report())
             return 0
         if options.action == "exec":
-            exec_account(options.label, options.claude_args, probe=options.probe)
-            return 0
+            return exec_account(options.label, options.claude_args, probe=options.probe) or 0
         if options.action == "move":
             if options.session in CLAUDE_GROUPS:
                 if not options.label or options.source or options.target:

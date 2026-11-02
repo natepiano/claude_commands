@@ -1,5 +1,5 @@
 ---
-description: Track a production's Bevy upgrade, current dependency pins, and the user's answers.
+description: Track a production Bevy upgrade.
 argument-hint: "[status | line | check | stop | start <version> | approve <crate> <words> | decline <crate> <words> | forget <crate> | note <crate> [<text>]]"
 ---
 

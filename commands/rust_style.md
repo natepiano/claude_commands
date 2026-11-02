@@ -1,5 +1,5 @@
 ---
-description: Load the Rust style guide before writing Rust code.
+description: Read the style guide before Rust edits.
 ---
 
 Load the Rust style guide before writing Rust code.

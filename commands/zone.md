@@ -1,5 +1,5 @@
 ---
-description: Show or change the user's time zone, everywhere, in one command.
+description: Show or set the user's time zone.
 ---
 
 **Usage:** `/zone [place, IANA zone or label]`

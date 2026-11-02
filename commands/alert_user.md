@@ -1,5 +1,5 @@
 ---
-description: Reach the user when work stopped on an action only they can take, or a choice only they can make.
+description: Notify the user when work needs them.
 ---
 
 Load `/message_style` before the first message to the user. Use the matching registered text below. Fill values with facts; keep agent-written title, action and body short and to the point.
