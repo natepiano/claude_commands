@@ -324,10 +324,12 @@ class RestartSupportTests(ShutdownTestCase):
             if attempt == "unchanged":
                 self.assertEqual(pushes, {})
                 continue
-            self.assertEqual(set(pushes), {"shutdown.restart_untrusted", "shutdown.restart_failed"})
-            trust = pushes["shutdown.restart_untrusted"]
-            self.assertEqual(trust.values, {"session": "Untrusted owner", "machine": "natedev",
-                                            "account": '"claude2"', "command": command})
+            self.assertEqual(set(pushes), {"shutdown.restart_untrusted_unlisted", "shutdown.restart_failed"})
+            trust = pushes["shutdown.restart_untrusted_unlisted"]
+            self.assertEqual(trust.values["stopped"], "1 session")
+            self.assertIn("Trust the folders of the stopped Claude sessions on natedev from their shutdown records.",
+                          cast(ActionRequired, trust.action).text)
+            self.assertNotIn(command, trust.message)
             retry = pushes["shutdown.restart_failed"]
             self.assertEqual((retry.values["stopped"], retry.values["cause"]),
                              ("1 session (Broken owner)", "window failed to open"))

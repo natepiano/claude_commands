@@ -3145,14 +3145,23 @@ class PeerRestartAvailability(Enum):
     REACHED_TO_BE_READ = "reached and to be read"
 
 
+def _restart_records(login: str) -> list[SessionShutdown]:
+    """Read one account's restart records, or all accounts for an all-account run."""
+    if login:
+        return session_records(login)
+    return [saved for saved in _read_all_restore_sources().records if saved["alerts"] == "user"]
+
+
 def _restart_alerts_enabled(login: str, only: Iterable[str] = (), *, peer: PeerRestartAvailability,
                             observed: list[SessionShutdown]) -> bool:
     ids = tuple(only)
     try:
-        records = [saved for saved in session_records(login)
+        records = [saved for saved in _restart_records(login)
                    if not ids or saved["session"]["session_id"] in ids]
     except (InvalidRecord, OSError, ValueError):
         return True
+    if not login and not records:
+        return False
     observed.extend(records)
     if peer is PeerRestartAvailability.NOT_ASKED:
         return (not records and not ids) or any(saved["alerts"] == "user" for saved in _eligible_records(records))
@@ -3173,7 +3182,7 @@ def restart_failed_session_running(saved: SessionShutdown) -> bool:
 
 def _not_back_records(login: str, ids: tuple[str, ...]) -> list[SessionShutdown]:
     try:
-        records = session_records(login)
+        records = _restart_records(login)
     except (InvalidRecord, OSError, ValueError):
         return []
     return [saved for saved in records
@@ -3237,22 +3246,17 @@ def restart_outage_pushes(label: str, failures: Sequence[FailedSessionRestart], 
     return (push,)
 
 
-def untrusted_push(label: str, item: FailedSessionRestart, *, machine: str) -> RenderedPush:
-    """Ask the user to accept folder trust first; a retry before that fails the same way."""
-    def named_push(name: str) -> RenderedPush:
-        return render("shutdown.restart_untrusted", session=name, machine=machine, account=json.dumps(label),
-                      command=item.trust_command)
+def untrusted_push(label: str, failures: Sequence[FailedSessionRestart], *, machine: str,
+                   folders: dict[str, Path]) -> RenderedPush:
+    """Count trust failures and select the action that covers every failed folder."""
+    from scripts.accounts import accounts
 
-    return _session_shortened_to_fit(named_push, item.name)
-
-
-def move_untrusted_push(saved: SessionShutdown, item: FailedSessionRestart, *, machine: str) -> RenderedPush:
-    """The trust step for a failed move: a restart of the record's own account finishes the move on its target."""
-    def named_push(name: str) -> RenderedPush:
-        return render("shutdown.move_untrusted", session=name, machine=machine, account=json.dumps(saved["label"]),
-                      target=saved.get("target", ""), command=item.trust_command)
-
-    return _session_shortened_to_fit(named_push, item.name)
+    configured = set(accounts.trust_configuration().folders)
+    covered = all(item.name in folders and configured.intersection(
+        str(key) for key in herdr.claude_trust_keys(folders[item.name])) for item in failures)
+    text_id = "shutdown.restart_untrusted" if covered else "shutdown.restart_untrusted_unlisted"
+    return render(text_id, machine=machine, account=json.dumps(label),
+                  stopped=restart_support.stopped_sessions_text(len(failures)))
 
 
 def _session_shortened_to_fit(named_push: Callable[[str], RenderedPush], name: str) -> RenderedPush:
@@ -3266,7 +3270,7 @@ def _session_shortened_to_fit(named_push: Callable[[str], RenderedPush], name: s
 
 def send_failure_pushes(
     label: str, failures: Sequence[FailedSessionRestart], *, machine: str,
-    identities: dict[str, str], moved: dict[str, SessionShutdown],
+    identities: dict[str, str], folders: dict[str, Path],
     send: Callable[[RenderedPush], bool], manual: frozenset[str],
 ) -> set[str]:
     """Claim failed sessions and send one push for each required fix."""
@@ -3280,12 +3284,9 @@ def send_failure_pushes(
                     outage_alerts.delivered(claims[identities[item.name]])
                     sent.add(item.name)
 
-        for item in held:
-            if item.trust_command:
-                move = moved.get(item.name)
-                push = (move_untrusted_push(move, item, machine=machine) if move is not None
-                        else untrusted_push(label, item, machine=machine))
-                deliver(push, [item])
+        untrusted = [item for item in held if item.trust_command]
+        if untrusted:
+            deliver(untrusted_push(label, untrusted, machine=machine, folders=folders), untrusted)
         manual_failures = [item for item in held if not item.trust_command and item.name in manual]
         if manual_failures:
             deliver(render("shutdown.manual_restart", machine=machine,
@@ -3298,7 +3299,7 @@ def send_failure_pushes(
 
 
 def _local_alert_sources(login: str) -> dict[str, str]:
-    identities = {saved["session"]["name"]: saved["session"]["session_id"] for saved in session_records(login)
+    identities = {saved["session"]["name"]: saved["session"]["session_id"] for saved in _restart_records(login)
                   if saved["machine"].casefold() == remote.local_machine().casefold()}
     return identities
 
@@ -3316,10 +3317,10 @@ def _notify_local_restart(login: str, result: MachineRestartResult, ids: tuple[s
     running = {saved["session"]["name"] for saved in observed if restart_failed_session_running(saved)}
     failed = [item for item in result.failed_sessions if item.name not in pushed and item.name not in running]
     manual = [item.name for item in result.manual_sessions if item.name not in pushed]
-    moved = {saved["session"]["name"]: saved for saved in observed if saved.get("target")}
+    folders = {saved["session"]["name"]: Path(saved["session"]["cwd"]) for saved in observed}
     failures = [*failed, *(FailedSessionRestart(name, "manual restart required") for name in manual)]
     sent = send_failure_pushes(result.label, failures, machine=result.machine, identities=identities,
-                               moved=moved, send=restart_support.alert_user, manual=frozenset(manual))
+                               folders=folders, send=restart_support.alert_user, manual=frozenset(manual))
     _mark_pushed_not_back(login, ids, sent)
     unknown = any(item.name not in identities for item in failed) or any(name not in identities for name in manual)
     if not sent and (unreached or unknown or (result.status == "partial" and not result.failed_sessions
@@ -3430,11 +3431,7 @@ def restart_all(*, dry_run: bool = False, alerts: AlertWhenNotBack | NeverAlert 
     try:
         result = _up("", dry_run, all_accounts=True)
         if isinstance(alerts, AlertWhenNotBack) and not dry_run and result.status == "partial":
-            for login in {saved["login"] for saved in _read_all_restore_sources().records}:
-                try:
-                    _notify_local_restart(login, result, (), _local_alert_sources(login))
-                except (OSError, RuntimeError, ValueError):
-                    pass
+            _notify_local_restart("", replace(result, label="--all"), (), _local_alert_sources(""))
         return result.exit_status
     except (InvalidRecord, OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
         print(f"restore failed: {_error_reason(error)}; elapsed {time.monotonic() - started:.1f} s", flush=True)

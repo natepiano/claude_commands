@@ -49,7 +49,12 @@ fake host commands.
 A restart problem sends one phone push per kind of fix.
 Retryable failures share one count push with a retry command and its machine.
 Different retryable causes and long session names do not create more pushes.
-Each untrusted folder keeps its own trust push because the command differs per folder.
+Trust failures share one count push per machine for plain restarts and failed moves.
+An all-account restart groups trust failures across accounts.
+If every folder has a configured trust key, the action runs `accounts.py trust`, then retries the restart.
+Otherwise, the action asks the natedev session to trust the stopped sessions’ folders from their shutdown records.
+The restart output keeps the trust command for each folder.
+Configured trust covers exact folder, repository-root, or main-checkout keys, not arbitrary descendants.
 Manual failures share one count push per machine. Its action requests a resume from the shutdown records.
 The same failed sessions, a subset, or a changed failure reason sends no second push.
 A confirmed recovery clears the outage claims. A later failure can send a new push.

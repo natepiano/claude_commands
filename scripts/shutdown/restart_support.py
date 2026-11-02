@@ -475,7 +475,7 @@ def report_stop(records: list[SessionShutdown]) -> None:
             restarted.extend(restart_work.FailedSessionRestart(name, "manual restart required") for name in manual)
             sent = restart_work.send_failure_pushes(first["label"], restarted, machine=machine,
                 identities={saved["session"]["name"]: saved["session"]["session_id"] for saved in items},
-                moved={saved["session"]["name"]: saved for saved in items if saved.get("target")},
+                folders={saved["session"]["name"]: Path(saved["session"]["cwd"]) for saved in items},
                 send=lambda push: alert_user(push, machine=route), manual=manual)
             for saved in items:
                 if saved["session"]["name"] in sent:

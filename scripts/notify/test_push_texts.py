@@ -158,6 +158,32 @@ class PushTextTests(unittest.TestCase):
                 self.assertLess(len(push.message), 500)
         self.assertEqual(entry.examples[0].values["stopped"], "5 sessions")
 
+    def test_trust_catalog_selects_commands_for_configured_folders_and_a_request_for_unlisted_folders(self) -> None:
+        entries = {entry.id: entry for entry in push_texts.catalog()}
+        covered = entries["shutdown.restart_untrusted"]
+        self.assertEqual({example.name for example in covered.examples}, {"typical"})
+        for example in covered.examples:
+            push = push_texts.render_entry(covered, example.values)
+            self.assertIn(example.values["stopped"], push.body)
+            action = cast(ActionRequired, push.action).text
+            self.assertEqual(action.count("accounts.py trust"), 1)
+            self.assertEqual(action.count("/shutdown restart"), 1)
+            self.assertNotIn("cd /", push.message)
+            self.assertLess(len(push.message), 500)
+        unlisted = entries["shutdown.restart_untrusted_unlisted"]
+        self.assertEqual({example.values["stopped"] for example in unlisted.examples}, {"1 session", "4 sessions"})
+        for example in unlisted.examples:
+            push = push_texts.render_entry(unlisted, example.values)
+            self.assertIn(example.values["stopped"], push.body)
+            self.assertIn(". Claude does not trust the folders. ", push.body)
+            self.assertIn(f'Trust the folders of the stopped Claude sessions on {example.values["machine"]} from their shutdown records.',
+                          cast(ActionRequired, push.action).text)
+            self.assertNotIn("accounts.py trust", push.message)
+            self.assertNotIn("/shutdown restart", push.message)
+            self.assertNotIn("cd /", push.message)
+            self.assertLess(len(push.message), 500)
+        self.assertNotIn("shutdown.move_untrusted", entries)
+
     def test_manual_restart_catalog_groups_sessions_by_machine(self) -> None:
         entry = next(entry for entry in push_texts.catalog() if entry.id == "shutdown.manual_restart")
         self.assertEqual({example.values["stopped"] for example in entry.examples}, {"1 session", "3 sessions"})

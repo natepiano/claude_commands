@@ -3923,11 +3923,12 @@ class RestartTests(ShutdownTestCase):
                                         alerts=restart.AlertWhenNotBack(), only=["stuck"], here=True)
                 if attempt == "first":
                     push, = pushes
-                    self.assertEqual(push.id, "shutdown.restart_untrusted")
-                    self.assertEqual(push.values, {"session": "stuck", "machine": "natedev",
-                                                   "account": '"claude2"', "command": command})
-                    self.assertIn(command, push.body)
-                    self.assertIn("/exit", cast(ActionRequired, push.action).text)
+                    self.assertEqual(push.id, "shutdown.restart_untrusted_unlisted")
+                    self.assertEqual(push.values["stopped"], "1 session")
+                    self.assertIn("Trust the folders of the stopped Claude sessions on natedev from their shutdown records.",
+                      cast(ActionRequired, push.action).text)
+                    self.assertNotIn("/shutdown restart", cast(ActionRequired, push.action).text)
+                    self.assertNotIn(command, push.message)
                 else:
                     self.assertEqual(pushes, [])
         self.assertEqual(self.stored_record().get("restore_alerted"), restart_support.not_back_text(self.stored_record()))
@@ -3949,12 +3950,14 @@ class RestartTests(ShutdownTestCase):
             _ = restart.restart(restart.AccountNamed(LABEL), dry_run=False,
                                 alerts=restart.AlertWhenNotBack(), only=["mover"], here=True)
         push, = [cast(RenderedPush, call.args[0]) for call in alert.call_args_list]
-        self.assertEqual(push.id, "shutdown.move_untrusted")
-        self.assertEqual(push.values["target"], "claude3")
-        self.assertIn("/shutdown restart \"claude2\" in the natedev session. That finishes the move to claude3.",
+        self.assertEqual(push.id, "shutdown.restart_untrusted_unlisted")
+        self.assertEqual(push.values["stopped"], "1 session")
+        self.assertIn("Coding work stays stopped until the folders are trusted and the sessions restart.", push.body)
+        self.assertNotIn("/shutdown restart", cast(ActionRequired, push.action).text)
+        self.assertIn("Trust the folders of the stopped Claude sessions on natedev from their shutdown records.",
                       cast(ActionRequired, push.action).text)
-        # The record lives under the source account; restarting it resumes the move on its target.
-        self.assertEqual((push.values["account"], push.values["command"]), ('"claude2"', command))
+        self.assertNotIn(command, push.message)
+        self.assertEqual(push.values["account"], '\"claude2\"')
         self.assertEqual(self.stored_record().get("restore_alerted"), restart_support.not_back_text(self.stored_record()))
 
     def test_untrusted_failure_reports_its_trust_command_to_the_other_machine(self) -> None:
@@ -4125,12 +4128,14 @@ class RestartTests(ShutdownTestCase):
 
     def test_restart_groups_launch_trust_and_manual_failures_by_the_required_fix(self) -> None:
         names = [f"Owner {index}" for index in range(6)]
-        self.create([entry(top_level(f"mixed-{index}", name=name)) for index, name in enumerate(names)])
+        records = [entry(top_level(f"mixed-{index}", name=name)) for index, name in enumerate(names)]
+        records[3]["target"], records[3]["source_label"] = "claude3", LABEL
+        self.create(records)
         command = "cd /tmp/project && CLAUDE_CONFIG_DIR=/home/natepiano/.claude2 claude"
-        result = restart.MachineRestartResult("natedev", LABEL, "partial", failed=4, manual=2,
-            failed_sessions=(*tuple(restart.FailedSessionRestart(name, "fixture failure") for name in names[:3]),
-                             restart.FailedSessionRestart(names[3], "folder not trusted", command)),
-            manual_sessions=tuple(restart.ManualSessionRestart(name, "private command") for name in names[4:]))
+        result = restart.MachineRestartResult("natedev", LABEL, "partial", failed=5, manual=1,
+            failed_sessions=(*tuple(restart.FailedSessionRestart(name, "fixture failure") for name in names[:2]),
+                             *tuple(restart.FailedSessionRestart(name, "folder not trusted", command) for name in names[2:5])),
+            manual_sessions=(restart.ManualSessionRestart(names[5], "private command"),))
         with (patch.object(restart, "named_claude_account", return_value=self.account),
               patch.object(restart, "_up", return_value=result),
               patch.object(restart, "_restart_alerts_enabled", return_value=True),
@@ -4142,13 +4147,100 @@ class RestartTests(ShutdownTestCase):
                 self.assertEqual(sender.call_count, 3)
         pushes = {cast(RenderedPush, call.args[0]).id: cast(RenderedPush, call.args[0])
                   for call in sender.call_args_list}
-        self.assertEqual(set(pushes), {"shutdown.restart_failed", "shutdown.restart_untrusted", "shutdown.manual_restart"})
-        self.assertEqual(pushes["shutdown.restart_failed"].values["stopped"], "3 sessions")
-        self.assertEqual(pushes["shutdown.restart_untrusted"].values["command"], command)
-        self.assertEqual(pushes["shutdown.manual_restart"].values["stopped"], "2 sessions")
+        self.assertEqual(set(pushes), {"shutdown.restart_failed", "shutdown.restart_untrusted_unlisted", "shutdown.manual_restart"})
+        self.assertEqual(pushes["shutdown.restart_failed"].values["stopped"], "2 sessions")
+        self.assertEqual(pushes["shutdown.restart_untrusted_unlisted"].values["stopped"], "3 sessions")
+        self.assertEqual(pushes["shutdown.manual_restart"].values["stopped"], "1 session")
         self.assertNotIn("private command", pushes["shutdown.manual_restart"].message)
         for index in range(6):
             self.assertIsInstance(outage_alerts.claim(f"mixed-{index}"), outage_alerts.AlertDelivered)
+
+    def test_trust_push_sends_once_for_same_subset_and_one_new_outage(self) -> None:
+        failures = [restart.FailedSessionRestart(f"Owner {index}", "folder not trusted", "cd /project && claude")
+                    for index in range(4)]
+        identities = {item.name: f"trust-{index}" for index, item in enumerate(failures)}
+        folders = {item.name: self.root / f"project-{index}" for index, item in enumerate(failures)}
+        pushes: list[RenderedPush] = []
+
+        def send(push: RenderedPush) -> bool:
+            pushes.append(push)
+            return True
+
+        for selected, count in ((failures[:3], 1), (failures[:3], 1), (failures[:2], 1), (failures, 2)):
+            _ = restart.send_failure_pushes(LABEL, selected, machine="natedev", identities=identities,
+                                            folders=folders, send=send, manual=frozenset())
+            self.assertEqual(len(pushes), count)
+        self.assertEqual([push.values["stopped"] for push in pushes], ["3 sessions", "1 session"])
+        self.assertTrue(all(push.id == "shutdown.restart_untrusted_unlisted" for push in pushes))
+
+    def test_restart_all_groups_trust_failures_across_accounts_on_one_machine(self) -> None:
+        records = [entry(top_level(f"all-trust-{index}", name=f"Owner {index}"),
+                         state=shutdown_record.SessionRestartFailed(kind="restart failed", at=STOPPED,
+                             reason="not trusted", trust_command="cd /project && claude")) for index in range(3)]
+        records[1]["login"], records[1]["label"] = "other@example.com", "claude3"
+        self.create(records)
+        result = restart.MachineRestartResult("natedev", LABEL, "partial", failed=3,
+            failed_sessions=tuple(restart.FailedSessionRestart(saved["session"]["name"], "not trusted", "cd /project && claude")
+                                  for saved in records))
+        with (patch.object(restart, "_up", return_value=result),
+              patch.object(restart, "_owner_liveness", return_value=restart.SessionNotLive()),
+              patch.object(restart_support, "alert_user", return_value=True) as sender,
+              redirect_stdout(io.StringIO())):
+            self.assertEqual(restart.restart_all(), 1)
+            self.assertEqual(restart.restart_all(), 1)
+        sender.assert_called_once()
+        push = cast(RenderedPush, sender.call_args.args[0])
+        self.assertEqual(push.id, "shutdown.restart_untrusted_unlisted")
+        self.assertEqual(push.values["stopped"], "3 sessions")
+        self.assertEqual(push.values["account"], '"--all"')
+        self.assertIn("Trust the folders of the stopped Claude sessions on natedev from their shutdown records.",
+                      cast(ActionRequired, push.action).text)
+
+    def test_restart_all_does_not_push_when_every_failed_record_disables_alerts(self) -> None:
+        saved = entry(top_level("quiet-trust"), state=shutdown_record.SessionRestartFailed(
+            kind="restart failed", at=STOPPED, reason="not trusted", trust_command="cd /project && claude"))
+        saved["alerts"] = "none"
+        self.create([saved])
+        result = restart.MachineRestartResult("natedev", LABEL, "partial", failed=1,
+            failed_sessions=(restart.FailedSessionRestart("quiet-trust", "not trusted", "cd /project && claude"),))
+        with (patch.object(restart, "_up", return_value=result),
+              patch.object(restart_support, "alert_user", return_value=True) as sender,
+              redirect_stdout(io.StringIO())):
+            self.assertEqual(restart.restart_all(), 1)
+        sender.assert_not_called()
+
+    def test_trust_push_selects_one_action_with_the_same_keys_as_the_trust_check(self) -> None:
+        repository = self.root / "trust-repository"
+        repository.mkdir()
+        _ = subprocess.run(["git", "init", "-q", str(repository)], check=True, capture_output=True)
+        child = repository / "child"
+        child.mkdir()
+        outside = self.root / "outside"
+        outside.mkdir()
+        failures = [restart.FailedSessionRestart(name, "not trusted", "cd /project && claude")
+                    for name in ("covered", "outside-a", "outside-b")]
+        configuration = accounts.trust_configuration()
+        folders = {"covered": child, "outside-a": outside, "outside-b": outside}
+        with patch.object(accounts, "trust_configuration", return_value=replace(configuration, folders=(str(repository),))):
+            push = restart.untrusted_push(LABEL, failures, machine="natedev", folders=folders)
+        self.assertEqual(push.id, "shutdown.restart_untrusted_unlisted")
+        self.assertEqual(push.values["stopped"], "3 sessions")
+        self.assertNotIn(str(outside), push.body)
+        with patch.object(accounts, "trust_configuration", return_value=replace(configuration, folders=(str(self.root),))):
+            push = restart.untrusted_push(LABEL, failures, machine="natedev", folders=folders)
+        self.assertEqual(push.id, "shutdown.restart_untrusted_unlisted")
+        with patch.object(accounts, "trust_configuration", return_value=replace(configuration, folders=(str(repository), str(outside)))):
+            push = restart.untrusted_push(LABEL, failures, machine="natedev", folders=folders)
+        self.assertEqual(push.id, "shutdown.restart_untrusted")
+        self.assertIn("accounts.py trust", cast(ActionRequired, push.action).text)
+        self.assertIn('/shutdown restart "claude2"', cast(ActionRequired, push.action).text)
+        self.assertNotIn("coverage", push.values)
+        with patch.object(accounts, "trust_configuration", return_value=replace(configuration, folders=(str(repository),))):
+            push = restart.untrusted_push(LABEL, failures[:1], machine="natedev", folders=folders)
+        self.assertEqual(push.id, "shutdown.restart_untrusted")
+        with patch.object(accounts, "trust_configuration", return_value=replace(configuration, folders=(str(repository),))):
+            push = restart.untrusted_push(LABEL, failures[:1], machine="natedev", folders={})
+        self.assertEqual(push.id, "shutdown.restart_untrusted_unlisted")
 
     def test_restart_failure_push_combines_different_causes_in_one_count(self) -> None:
         pushes = restart.restart_push("claude2", [
