@@ -51,6 +51,7 @@ def row(instance: Path) -> tuple[str, str, list[Path]]:
     import footer_counts
 
     sources.extend(footer_counts.sources(production.doc))
+    sources.extend(footer_counts.routing_sources())
     sources.append(showrunner_footer.outstanding_path(production.slug))
     questions = showrunner_footer.open_questions([production])
     line = showrunner_footer.counts_line([production], questions or 0) or ""

@@ -23,7 +23,7 @@ from urllib.parse import urlencode, urljoin, urlsplit
 
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib import urgency
-from scripts.production import change_review, next_item, showrunners, staff
+from scripts.production import change_routing, change_review, next_item, showrunners, staff
 from scripts.production.staff_test_support import fixture_member
 from scripts.feature_log import feature_log
 from scripts.review_links import change_browser, change_page, review_link, serve
@@ -118,8 +118,15 @@ class ChangePageTests(unittest.TestCase):
     page_path: str = ""
     page: change_page.ReviewPage = change_page.ReviewPage(Path(), Path(), (), "")
     port: int = 0
+    unit: staff.StaffRow
+    raw_messages: list[tuple[str, str, str]]
     messages: list[tuple[str, str, str]] = []
     delivery_done: threading.Event = threading.Event()
+
+    def __init__(self, methodName: str = "runTest") -> None:
+        super().__init__(methodName)
+        self.raw_messages = []
+        self.unit = staff.StaffRow(staff.StaffId(""), "unit", "", None, current_session=staff.StaffId(""))
 
     def git(self, *arguments: str) -> str:
         return subprocess.run(["git", "-C", str(self.repo), *arguments],
@@ -140,6 +147,7 @@ class ChangePageTests(unittest.TestCase):
             "FEATURE_LOG_VAULT": str(self.temporary / "vault"),
             "XDG_STATE_HOME": str(self.temporary / "state"),
             "STAFF_FILE": str(self.temporary / "staff.json"),
+            "XDG_CACHE_HOME": str(self.temporary / "cache"),
         }))
         _ = self.enterContext(patch.object(showrunners, "NOTIFIER_STATE_DIR", self.temporary / "notifier"))
         _ = self.enterContext(patch.object(change_review, "LISTS", self.temporary))
@@ -170,6 +178,9 @@ class ChangePageTests(unittest.TestCase):
 | --- | --- | --- | --- |
 | builder-unit | plan.md | /unused/feature | feature |
 """, encoding="utf-8")
+        runner = fixture_member("showrunner", name="page-owner", doc=staff.LiveDoc("natedev", self.production))
+        self.unit = fixture_member("unit", name="builder-unit", parent=runner.id,
+                                   worktree=staff.PresentWorktree("natedev", Path("/unused/feature")))
         _ = change_review.append_rows(self.review_list, [item, item, change_review.Visible(
             "Internal comments clarified", "Read the diff", "The old and new comments agree with the tests")],
             date(2026, 11, 1), merged, self.production)
@@ -177,7 +188,10 @@ class ChangePageTests(unittest.TestCase):
             _ = change_review.set_row_kind(self.review_list, row, kind, self.production)
         self.page_path = urlsplit(change_page.publish(self.production, self.review_list, ["C1", "C3"])).path
         self.page = change_page.page_at(self.root, self.page_path)
+        router = change_routing.StaffRouting(staff.snapshot(), {"page-owner": self.production}, change_review)
+        _ = router.graph(self.repo / ".git")
         self.messages = []
+        self.raw_messages = []
         self.delivery_done = threading.Event()
         deliver = change_page.deliver
 
@@ -198,8 +212,17 @@ class ChangePageTests(unittest.TestCase):
         self.addCleanup(thread.join, TEST_HANG_GUARD_SECS)
         self.addCleanup(server.shutdown)
 
+    def recipient_name(self, recipient: str) -> str:
+        if recipient.startswith("session:"):
+            member = staff.snapshot().by_current_session(recipient.removeprefix("session:"))
+            if member is None:
+                raise AssertionError("the recipient must name a current staff session")
+            return member.name
+        return recipient
+
     def capture_message(self, recipient: str, sender: str, message: str) -> None:
-        self.messages.append((recipient, sender, message))
+        self.raw_messages.append((recipient, sender, message))
+        self.messages.append((self.recipient_name(recipient), sender, message))
 
     def request(self, path: str, fields: dict[str, str]) -> Reply:
         self.delivery_done.clear()
@@ -264,7 +287,7 @@ class ChangePageTests(unittest.TestCase):
 
     def test_staff_moves_the_unit_changes_to_its_current_showrunner_tab(self) -> None:
         runner = fixture_member("showrunner", name="sdlc", doc=staff.LiveDoc("natedev", self.production))
-        _ = fixture_member("unit", name="builder-unit", parent=runner.id)
+        _ = staff.move(self.unit.id, runner.id)
         path, forms, body = self.browser()
         self.assertEqual(forms.tabs["page-owner/C1"], "sdlc")
         self.assertIn('sdlc (<span data-count>3</span>)', body)
@@ -277,6 +300,31 @@ class ChangePageTests(unittest.TestCase):
         refreshed = BrowserForms()
         refreshed.feed(self.request(path, {}).body)
         self.assertEqual(list(refreshed.rows), ["page-owner/C2", "page-owner/C3", "page-owner/C1"])
+
+    def test_a_units_table_name_does_not_replace_its_current_staff_session(self) -> None:
+        from scripts.production.staff_test_support import fixture_runtime_id
+
+        _ = staff.rename(self.unit.id, "x")
+        current = staff.update_current_session(self.unit.id, staff.native_id(fixture_runtime_id("session-x")))
+        self.assertEqual(self.request(self.page_path, self.answer(outcome="not works")).status, 303)
+        self.assertEqual(self.raw_messages[0][0], f"session:{current.current_session}")
+        self.assertIn("builder-unit", self.production.read_text())
+        self.assertEqual(self.messages[0][0], "x")
+
+    def test_a_delivery_resolves_the_staff_session_after_an_account_move(self) -> None:
+        from scripts.production.staff_test_support import fixture_runtime_id
+
+        status = change_page.DeliveryStatus(self.root)
+        delivery = change_page.submit(self.page, urlencode(self.answer(outcome="validate")), status)
+        owner = staff.snapshot().by_path("page-owner")
+        if owner is None:
+            self.fail("the showrunner must have a staff row")
+        moved = staff.update_current_session(owner.id, staff.native_id(fixture_runtime_id("moved-showrunner")))
+        record = cast(dict[str, object], json.loads(status.path(self.page, "C1").read_text()))
+        validation = cast(dict[str, object], record["validation"])
+        self.assertEqual(validation["recipients"], [owner.id])
+        change_page.deliver(delivery, status)
+        self.assertEqual(self.raw_messages[-1][0], f"session:{moved.current_session}")
 
     def test_tabs_with_waiting_changes_keep_their_order_before_empty_tabs(self) -> None:
         other = self.temporary / "change-review - zeta.md"
@@ -322,7 +370,7 @@ class ChangePageTests(unittest.TestCase):
 
     def test_production_aliases_share_one_document_read_per_page_request(self) -> None:
         runner = fixture_member("showrunner", name="sdlc", doc=staff.LiveDoc("natedev", self.production))
-        _ = fixture_member("unit", name="builder-unit", parent=runner.id)
+        _ = staff.move(self.unit.id, runner.id)
         reads: list[Path] = []
         read_text = Path.read_text
 
@@ -339,7 +387,7 @@ class ChangePageTests(unittest.TestCase):
 
     def test_a_page_reads_all_commit_parents_once_per_repository(self) -> None:
         runner = fixture_member("showrunner", name="sdlc", doc=staff.LiveDoc("natedev", self.production))
-        _ = fixture_member("unit", name="builder-unit", parent=runner.id)
+        _ = staff.move(self.unit.id, runner.id)
         other_repo = self.temporary / "other-repo"
         _ = subprocess.run(["git", "clone", "--quiet", str(self.repo), str(other_repo)], check=True)
         other_doc = self.temporary / "other-production.md"
@@ -348,6 +396,9 @@ class ChangePageTests(unittest.TestCase):
                                 .replace(str(self.review_list), str(other_list)))
         _ = change_review.append_rows(other_list, [change_review.Visible("Other change", "Read", "Proof")],
                                       date(2026, 11, 2), self.git("rev-parse", "HEAD"), other_doc)
+        router = change_routing.StaffRouting(staff.snapshot(), {}, change_review)
+        for repo in (self.repo, other_repo):
+            router.history_path(repo / ".git").unlink(missing_ok=True)
         path = urlsplit(change_browser.publish()).path
         with patch.object(subprocess, "run", wraps=subprocess.run) as commands:
             reply = self.request(path, {})
@@ -362,7 +413,76 @@ class ChangePageTests(unittest.TestCase):
         self.assertEqual(set(forms.rows), {"page-owner/C1", "page-owner/C2", "page-owner/C3", "other/C1"})
         self.assertEqual(set(forms.tabs.values()), {"sdlc"})
 
+    def test_an_unrouted_row_refuses_a_question_without_saving_and_still_accepts_a_verdict(self) -> None:
+        _ = self.git("checkout", "-b", "aws-unit")
+        _ = self.git("commit", "--allow-empty", "-m", "checkpoint(aws-unit): unknown owner")
+        _ = self.git("checkout", "main")
+        _ = self.git("merge", "--no-ff", "aws-unit", "-m", "Merge unknown unit")
+        _ = change_review.append_rows(self.review_list, [change_review.Visible("Unknown", "Read", "Proof")],
+                                      date(2026, 11, 2), self.git("rev-parse", "HEAD"), self.production)
+        path, forms, body = self.browser()
+        del body
+        self.assertEqual(forms.tabs["page-owner/C4"], "unrouted")
+        self.assertNotIn("question", forms.outcomes["page-owner/C4"])
+        before = self.review_list.read_bytes()
+        status = change_page.DeliveryStatus(self.root)
+        browser = change_browser.page_at(self.root, path)
+        fields = self.browser_fields(forms, "page-owner/C4", "question", "Who checks this?")
+        with self.assertRaisesRegex(change_page.AnswerRefused, "no showrunner to answer a question"):
+            _ = change_browser.submit(browser, urlencode(fields), status)
+        self.assertEqual(self.review_list.read_bytes(), before)
+        self.assertFalse(status.path(self.page, "C4").exists())
+        self.assertEqual(self.http_request(path, fields).status, 400)
+        self.assertEqual(self.http_request(path, self.browser_fields(forms, "page-owner/C4")).status, 200)
+        self.assertTrue(self.delivery_done.wait(TEST_HANG_GUARD_SECS))
+        self.assertEqual(self.messages, [])
+        saved = next(row for row in change_review.review_rows(self.review_list) if row["#"] == "C4")
+        self.assertEqual(saved["Verdict"], "works")
+
+    def test_a_question_delivery_without_recipients_fails_and_can_retry_after_staff_is_fixed(self) -> None:
+        status = change_page.DeliveryStatus(self.root)
+        question = status.ask(self.page, "C1", "Who checks this?")
+        assert isinstance(question, change_page.QuestionDelivery)
+        delivery = change_page.MessageDelivery(self.page, "C1", (), "Question", question.attempt)
+        with redirect_stderr(StringIO()) as error:
+            change_page.deliver(delivery, status)
+        self.assertIn("no showrunner to send to", error.getvalue())
+        self.assertNotIn(question.attempt, status.question_messages_in_flight)
+        failed = status.slots(self.page, "C1").question
+        assert isinstance(failed, change_page.OpenQuestion) and isinstance(failed.delivery, change_page.DeliveryIntent)
+        self.assertEqual(failed.delivery.state, "failed")
+        self.assertEqual(failed.delivery.failure_note, "no showrunner to send to")
+        runner = staff.snapshot().by_path("page-owner")
+        assert runner is not None
+        retried = status.retry_question(self.page, "C1", recipients=(runner.id,))
+        slots = status.slots(self.page, "C1").question
+        assert isinstance(slots, change_page.OpenQuestion) and isinstance(slots.delivery, change_page.DeliveryIntent)
+        change_page.deliver(change_page.MessageDelivery(self.page, "C1", slots.delivery.recipients,
+                                                       "Question", retried.attempt), status)
+        self.assertEqual([recipient for recipient, _, _ in self.messages], ["page-owner"])
+        sent = status.slots(self.page, "C1").question
+        assert isinstance(sent, change_page.OpenQuestion)
+        self.assertTrue(sent.awaiting_answer)
+        self.assertNotIn(retried.attempt, status.question_messages_in_flight)
+
+    def test_an_older_failed_verdict_without_recipients_retries_to_the_unit_and_showrunner(self) -> None:
+        self.assertEqual(self.request(self.page_path, self.answer(outcome="not works")).status, 303)
+        status = change_page.DeliveryStatus(self.root)
+        _ = status.path(self.page, "C1").write_text(json.dumps({"attempt": "old", "state": "failed", "kind": "verdict"}))
+        before = self.review_list.read_bytes()
+        self.messages.clear()
+        self.assertEqual(self.request(self.page_path, self.answer(outcome="retry")).status, 303)
+        self.assertEqual([recipient for recipient, _, _ in self.messages], ["builder-unit", "page-owner"])
+        self.assertEqual(self.review_list.read_bytes(), before)
+
     def test_unknown_staff_keeps_a_change_under_its_source_list(self) -> None:
+        path, forms, body = self.browser()
+        del path, body
+        self.assertEqual(forms.tabs["page-owner/C1"], "page-owner")
+
+    def test_a_showrunner_own_change_stays_under_its_source_list(self) -> None:
+        merged = self.git("rev-parse", "HEAD")
+        _ = self.review_list.write_text(self.review_list.read_text().replace(merged, ""))
         path, forms, body = self.browser()
         del path, body
         self.assertEqual(forms.tabs["page-owner/C1"], "page-owner")
@@ -371,11 +491,15 @@ class ChangePageTests(unittest.TestCase):
         foreign = self.temporary / "sdlc-production.md"
         _ = foreign.write_text(self.production.read_text())
         _ = fixture_member("showrunner", name="sdlc", doc=staff.LiveDoc("natedev", foreign))
+        _ = self.git("checkout", "-b", "aws-unit")
+        _ = self.git("commit", "--allow-empty", "-m", "checkpoint(aws-unit): unknown unit")
+        _ = self.git("checkout", "main")
+        _ = self.git("merge", "--no-ff", "aws-unit", "-m", "Merge aws-unit phase 1 into builds")
         _ = change_review.append_rows(self.review_list, [change_review.Visible("Unknown unit", "Read", "Proof")],
                                       date(2026, 11, 2), self.git("rev-parse", "HEAD"), foreign)
         path, forms, body = self.browser()
         del path, body
-        self.assertEqual(forms.tabs["page-owner/C4"], "page-owner")
+        self.assertEqual(forms.tabs["page-owner/C4"], "unrouted")
 
     def test_a_registered_production_saves_when_the_list_has_only_a_missing_document_reference(self) -> None:
         text = self.review_list.read_text().replace(str(self.production), str(self.temporary / "missing.md"))
@@ -407,7 +531,7 @@ class ChangePageTests(unittest.TestCase):
 
     def test_an_earlier_lists_prerequisites_keep_qualified_ids_in_the_embedded_tab_order(self) -> None:
         runner = fixture_member("showrunner", name="sdlc", doc=staff.LiveDoc("natedev", self.production))
-        _ = fixture_member("unit", name="builder-unit", parent=runner.id)
+        _ = staff.move(self.unit.id, runner.id)
         earlier = self.temporary / "change-review - earlier.md"
         _ = change_review.append_rows(earlier, [change_review.Visible("First", "Read", "Proof")],
                                       date(2026, 11, 2), self.git("rev-parse", "HEAD"), self.production,
@@ -434,7 +558,7 @@ class ChangePageTests(unittest.TestCase):
     def test_a_merge_with_two_units_uses_each_change_trailer_for_its_staff_tab(self) -> None:
         first = fixture_member("showrunner", name="sdlc", doc=staff.LiveDoc("natedev", self.production))
         second = fixture_member("showrunner", name="other", doc=staff.LiveDoc("natedev", self.production))
-        _ = fixture_member("unit", name="builder-unit", parent=first.id)
+        _ = staff.move(self.unit.id, first.id)
         _ = fixture_member("unit", name="second-unit", parent=second.id)
         _ = self.git("checkout", "-b", "mixed")
         _ = self.git("commit", "--allow-empty", "-m",
@@ -1123,7 +1247,7 @@ class ChangePageTests(unittest.TestCase):
         path = urlsplit(change_page.publish(self.production, self.review_list, ["C4"])).path
         page = change_page.page_at(self.root, path)
         self.assertEqual(self.request(path, dict(self.answer("C4", "feedback", words), token=page.token)).status, 303)
-        self.assertEqual([target for target, _, _ in self.messages], ["fallback-owner", "page-owner"])
+        self.assertEqual([target for target, _, _ in self.messages], ["page-owner"])
 
     def test_read_only_change_stays_visible_with_kind_change_proof_and_controls_after_reload(self) -> None:
         body = self.request(self.page_path, {}).body
@@ -1321,6 +1445,11 @@ class ChangePageTests(unittest.TestCase):
                                            + f"CHECK=zsh /unused/production_check.sh {doc}\n")
             if doc != root_doc:
                 _ = fixture_member("showrunner", name=doc.stem.removesuffix("-production"), parent=root.id)
+        owner = staff.snapshot().by_path("page-owner")
+        if owner is None:
+            self.fail("the list showrunner must have a staff record")
+        _ = fixture_member("unit", name="sibling-production-unit", parent=owner.id)
+        _ = self.git("commit", "--allow-empty", "-m", "checkpoint(sibling-production-unit): sibling change")
         _ = change_review.append_rows(self.review_list, [change_review.Visible("Sibling change", "Run", "Proof")],
                                       date(2026, 11, 1), self.git("rev-parse", "HEAD"), sibling)
         _ = change_review.set_row_kind(self.review_list, "C4", "Read only", child)
@@ -1384,6 +1513,7 @@ class ChangePageTests(unittest.TestCase):
         attempts: list[str] = []
 
         def fail_unit_delivery(recipient: str, sender: str, message: str) -> None:
+            recipient = self.recipient_name(recipient)
             attempts.append(recipient)
             if recipient == "builder-unit":
                 raise RuntimeError("unit socket unavailable")

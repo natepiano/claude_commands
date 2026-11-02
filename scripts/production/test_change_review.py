@@ -186,6 +186,10 @@ class ListTest(unittest.TestCase):
                               Path("/p/child-production.md"))
 
 
+from scripts.production.staff_test_support import isolated_staff_file
+from scripts.production.test_change_routing import checkpoint_rows
+
+
 class AttachedListTest(unittest.TestCase):
     root: Path = Path()
     doc: Path = Path()
@@ -211,6 +215,10 @@ class AttachedListTest(unittest.TestCase):
             "| C11 | Dependent child | Check dependent | 2026-10-03 | blocks, after C9 |\n")
         _ = self.enterContext(mock.patch.object(change_review, "LISTS", self.root))
         _ = self.enterContext(mock.patch.object(showrunner_tree, "root_of", return_value="parent"))
+
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        checkpoint_rows(self.root, {"parent": self.root / "parent-production.md", "child": self.doc},
+                        {self.current: "parent", self.earlier: "child"})
 
     def test_columnless_earlier_rows_belong_to_the_attached_production_without_list_edits(self) -> None:
         before = {path: path.read_bytes() for path in (self.current, self.earlier)}
@@ -256,6 +264,8 @@ class AttachedListTest(unittest.TestCase):
             "| --- | --- | --- | --- | --- | --- |\n" +
             "| C9 | Current child | child | Check current | 2026-10-20 | after C12 |\n" +
             "| C12 | Current prerequisite | child | Check prerequisite | 2026-10-21 | |\n")
+        checkpoint_rows(self.root, {"parent": self.root / "parent-production.md", "child": self.doc},
+                        {self.current: "parent"})
         entries = change_review.scope_entries(self.current, self.doc)
         self.assertEqual({entry.key: entry.after for entry in entries},
                          {"C9": "C12", "C12": "", "child/C9": "", "child/C11": "child/C9"})

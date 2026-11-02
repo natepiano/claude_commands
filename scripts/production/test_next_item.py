@@ -28,6 +28,8 @@ from scripts.production import showrunners
 import showrunner_tree
 from scripts.production import staff
 from scripts.production.staff_test_support import isolated_staff_file, unit_membership
+from scripts.production.test_change_routing import checkpoint_rows
+from scripts.production.staff_test_support import fixture_member
 from change_review import Visible
 from next_item import NextError, Queue
 
@@ -209,6 +211,7 @@ class NextItemTests(unittest.TestCase):
             del production
             return path
 
+        _ = fixture_member("showrunner", name="natedev", doc=staff.LiveDoc("natedev", PRODUCTION))
         with mock.patch.object(change_review, "production_list", the_list):
             self.assertEqual(run("show", "--kind", "change", "--production", str(PRODUCTION)), (0, "\n".join([
                 "change", "C1 Panels keep shields", "  How to check: Run `hana`. You see: Each panel has its shield",
@@ -238,6 +241,8 @@ class NextItemTests(unittest.TestCase):
                                           "", plans / f"{slug}-production.md")
         # A row written before the Production column belongs to the list's root.
         _ = path.write_text(path.read_text(encoding="utf-8").replace(" gone |", "  |"), encoding="utf-8")
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        checkpoint_rows(self.root, docs, {path: "top", side_list: "side"})
         tree = {"top": ["top", "kid", "grand"], "kid": ["kid", "grand"], "grand": ["grand"], "side": ["side"]}
 
         def owner_docs(doc: Path) -> list[Path]:
@@ -297,6 +302,8 @@ class NextItemTests(unittest.TestCase):
                 raise change_review.ChangeReviewError(f"{kid} has no line")
             return path
 
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        checkpoint_rows(self.root, {"top": top, "kid": kid}, {path: "top"})
         with mock.patch.object(change_review, "production_list", the_list), \
                 mock.patch.object(showrunner_tree, "root_of", return_value="top"), \
                 mock.patch.object(showrunners, "timer_docs", return_value={"top": top, "kid": kid}), \
@@ -332,6 +339,12 @@ class NextItemTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(showrunner_tree, "descendants_of", descendants))
         _ = self.enterContext(mock.patch.object(change_review, "production_list",
                                                return_value=folder / "change-review - top.md"))
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        listings = {folder / f"change-review - {slug}.md": slug for slug in docs}
+        selected_rows = {path: {row["#"] for row in change_review.pending(path)} for path in listings}
+        if self._testMethodName == "test_stopped_root_keeps_columnless_rows_when_own_list_becomes_current":
+            selected_rows[folder / "change-review - top.md"].difference_update({"C9", "C434"})
+        checkpoint_rows(self.root, docs, listings, selected_rows=selected_rows)
         return docs
 
     def test_attached_earlier_rows_keep_list_names_in_show_move_and_count(self) -> None:
