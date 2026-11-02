@@ -1,6 +1,6 @@
 import { span, wrapLine } from './board';
 import type { BoardLine, PaneElements } from './board';
-import type { StoredAccount, StoredAccountsStatus } from '../types/accounts';
+import type { RoleSessionCounts, StoredAccount, StoredAccountsStatus } from '../types/accounts';
 import { cellWidth } from './geometry';
 import type { Tone } from './geometry';
 
@@ -9,13 +9,12 @@ export type CreditBalance = { kind: 'finite'; amount: number } | { kind: 'unlimi
 export interface AccountDisplay {
   label: string;
   roles: string[];
-  roleCounts: AccountReading<number>[];
+  roleCounts: AccountReading<RoleSessionCounts>[];
   weekly: AccountReading<number>;
   resets: AccountReading<string>;
   credits: CreditBalance;
   useCredits: boolean;
   readOk: boolean;
-  creditsInUse: boolean;
   read: AccountReading<string>;
 }
 
@@ -36,7 +35,7 @@ export function accountDisplay(account: StoredAccount): AccountDisplay {
     credits: account.credits === null ? { kind: 'unavailable' }
       : account.credits === 'unlimited' ? { kind: 'unlimited' } : { kind: 'finite', amount: account.credits },
     useCredits: account.use_credits, readOk: account.read_ok === true,
-    creditsInUse: account.credits_in_use === true, read: reading(account.read_at),
+    read: reading(account.read_at),
   };
 }
 
@@ -74,7 +73,7 @@ function readAge(value: AccountReading<string>, now: number): string {
   return `${Math.floor(age / 86400)}d`;
 }
 
-type AccountColumn = 'dot' | 'label' | 'roles' | 'count' | 'left' | 'resets' | 'credits' | 'enabled' | 'inUse' | 'read';
+type AccountColumn = 'dot' | 'label' | 'roles' | 'busy' | 'shell' | 'idle' | 'total' | 'left' | 'resets' | 'credits' | 'enabled' | 'read';
 interface AccountRow {
   cells: Record<AccountColumn, BoardLine>;
   facts: BoardLine[];
@@ -86,6 +85,39 @@ interface TableColumn {
   width: number;
 }
 
+const COUNT_COLUMNS = ['busy', 'shell', 'idle', 'total'] as const;
+type CountColumn = typeof COUNT_COLUMNS[number];
+
+function countCells(counts: AccountReading<RoleSessionCounts>[]): Record<CountColumn, string> {
+  return Object.fromEntries(COUNT_COLUMNS.map(key => {
+    const values = counts.map(count => count.kind === 'available' ? count.value[key] : null);
+    return [key, values.some(value => value !== null)
+      ? values.map(value => value === null ? '' : String(value)).join(', ') : ''];
+  })) as Record<CountColumn, string>;
+}
+
+function countSpans(counts: Record<CountColumn, string>): Record<CountColumn, BoardLine> {
+  return { busy: [span(counts.busy)], shell: [span(counts.shell)],
+    idle: [span(counts.idle)], total: [span(counts.total)] };
+}
+
+function totalRow(accounts: AccountDisplay[]): AccountRow {
+  const counts = accounts.flatMap(account => account.roleCounts.flatMap(count =>
+    count.kind === 'available' ? [count.value] : []));
+  const knownShell = counts.flatMap(count => count.shell === null ? [] : [count.shell]);
+  const sum = (values: number[]) => values.reduce((total, value) => total + value, 0);
+  const cells = countCells([reading<RoleSessionCounts>({
+    busy: sum(counts.map(count => count.busy)),
+    shell: knownShell.length ? sum(knownShell) : null,
+    idle: sum(counts.map(count => count.idle)), total: sum(counts.map(count => count.total)),
+  })]);
+  return { cells: {
+    dot: [], label: [span('total', 'default', 'bold')], left: [], roles: [], ...countSpans(cells),
+    resets: [], credits: [], enabled: [], read: [],
+  }, facts: COUNT_COLUMNS.flatMap(key => cells[key]
+    ? [[span(key, 'inactive'), span(` ${cells[key]}`)]] : []) };
+}
+
 function accountRow(account: AccountDisplay, zone: string, now: number): AccountRow {
   const tone = leftTone(account.weekly);
   const dot = account.readOk ? 'success' : 'error';
@@ -95,21 +127,21 @@ function accountRow(account: AccountDisplay, zone: string, now: number): Account
   const balance = account.credits.kind === 'unavailable' ? '' : account.credits.kind === 'unlimited'
     ? 'unlimited' : new Intl.NumberFormat('en-US', { maximumFractionDigits: 0 }).format(account.credits.amount);
   const credits = [span(balance)];
-  const count = account.roleCounts.some(count => count.kind === 'available')
-    ? account.roleCounts.map(count => count.kind === 'available' ? String(count.value) : '').join(', ') : '';
+  const counts = countCells(account.roleCounts);
   const facts = [[span(`${left} left`, tone)]];
   if (account.roles.length) facts.push([span('role', 'inactive'), span(` ${account.roles.join(', ')}`)]);
-  if (count) facts.push([span('count', 'inactive'), span(` ${count}`)]);
+  for (const key of COUNT_COLUMNS) {
+    if (counts[key]) facts.push([span(key, 'inactive'), span(` ${counts[key]}`)]);
+  }
   if (reset) facts.push([span('resets', 'inactive'), span(` ${reset}`)]);
   if (balance) facts.push([span('credits', 'inactive'), span(' '), ...credits]);
   if (account.useCredits) facts.push([span('enabled')]);
-  if (account.creditsInUse) facts.push([span('in use', 'warning')]);
   if (read) facts.push([span('read', 'inactive'), span(` ${read} ago`)]);
   return { cells: {
     dot: [span('●', dot)], label: [span(account.label, 'default', 'bold')],
-    roles: [span(account.roles.join(', '))], count: [span(count)], left: [span(left, tone)],
+    roles: [span(account.roles.join(', '))], ...countSpans(counts), left: [span(left, tone)],
     resets: [span(reset)], credits, enabled: [span(account.useCredits ? 'yes' : '')],
-    inUse: [span(account.creditsInUse ? 'yes' : '', 'warning')], read: [span(read)],
+    read: [span(read)],
   }, facts };
 }
 
@@ -151,11 +183,10 @@ function tableColumns(accounts: AccountRow[]): TableColumn[] {
     { key: 'label', heading: 'account', align: 'left', width: 0 },
     { key: 'left', heading: 'left', align: 'right', width: 0 },
     { key: 'roles', heading: 'role', align: 'left', width: 0 },
-    { key: 'count', heading: 'count', align: 'right', width: 0 },
+    ...COUNT_COLUMNS.map(key => ({ key, heading: key, align: 'right' as const, width: 0 })),
     { key: 'resets', heading: 'resets', align: 'right', width: 0 },
     { key: 'credits', heading: 'credits', align: 'right', width: 0 },
     { key: 'enabled', heading: 'enabled', align: 'left', width: 0 },
-    { key: 'inUse', heading: 'in use', align: 'left', width: 0 },
     { key: 'read', heading: 'read', align: 'right', width: 0 },
   ];
   return columns.map(column => ({ ...column, width: accounts.reduce(
@@ -193,14 +224,14 @@ function accountLines(accounts: AccountRow[], width: number): BoardLine[] {
   if (tableWidth(columns) <= width) {
     return [tableLine(columns, header), ...accounts.map(row => tableLine(columns, row.cells))];
   }
-  const first = columns.slice(0, 5);
-  const second = columns.slice(5);
+  const first = columns.slice(0, 8);
+  const second = columns.slice(8);
   if (tableWidth(first) <= width && tableWidth(second, 2) <= width) {
     return [tableLine(first, header), tableLine(second, header, 2),
       ...accounts.flatMap(row => [tableLine(first, row.cells), tableLine(second, row.cells, 2)])];
   }
   return accounts.flatMap(row => {
-    const heading = [...row.cells.dot, span(' '), ...row.cells.label];
+    const heading = [...row.cells.dot, ...(row.cells.dot.length ? [span(' ')] : []), ...row.cells.label];
     return [...wrapLine(heading, width), ...wrapFacts(row.facts, width)];
   });
 }
@@ -209,9 +240,9 @@ export function AccountsView(elements: PaneElements, columns: number, status: St
   const { Box, Text } = elements;
   const width = Math.max(1, Math.floor(columns));
   const accounts = status.accounts.map(accountDisplay)
-    .sort((left, right) => left.label.localeCompare(right.label, undefined, { sensitivity: 'base' }))
-    .map(account => accountRow(account, zone, now));
-  const rows = accountLines(accounts, width);
+    .sort((left, right) => left.label.localeCompare(right.label, undefined, { sensitivity: 'base' }));
+  const rows = accountLines(accounts.length
+    ? [...accounts.map(account => accountRow(account, zone, now)), totalRow(accounts)] : [], width);
   const drawLine = (parts: BoardLine) => <Box flexDirection="row" flexShrink={0}>
     {(parts.some(part => part.text) ? parts.filter(part => part.text) : [span('')]).map(part => part.tone === 'default'
       ? <Text bold={part.kind === 'bold'}>{part.text}</Text>

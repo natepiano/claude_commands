@@ -2171,6 +2171,12 @@ class AtomicWorkerStateTests(MeshCommandFixture):
         self.assertEqual(type(caught.exception).__name__, "WorkerStateUnreadable")
         self.assertIn(str(path), str(caught.exception))
 
+    def test_empty_pending_object_validates_but_a_partial_queue_refuses(self) -> None:
+        path = self.session_dir / "worker.pending.json"
+        self.assertEqual(worker_lifecycle.validate_worker_state(path, {}), {})
+        with self.assertRaisesRegex(worker_lifecycle.WorkerStateUnreadable, "invalid queue fields"):
+            _ = worker_lifecycle.validate_worker_state(path, {"messages": []})
+
     def test_claim_lock_deadline_precedes_identity_migration(self) -> None:
         path = self.session_dir / "impl_worker_claim.lock"
         previous = self.session_dir / "impl_seat_impl.json"

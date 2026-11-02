@@ -1214,6 +1214,20 @@ class StaffSourcesTests(StaffTestCase):
                 self.assertTrue(errors.getvalue().strip())
                 write_text_atomic(path, original)
 
+    def test_empty_pending_files_have_no_publication_evidence_or_diagnostics(self) -> None:
+        from scripts.agents import worker_lifecycle
+
+        run = self.root / "pending-run"
+        run.mkdir()
+        _ = (run / "empty.pending.json").write_bytes(b"")
+        _ = (run / "object.pending.json").write_text("{}")
+        before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in run.iterdir()}
+        with mock.patch.object(worker_lifecycle, "locked_state", side_effect=AssertionError("reader took a lock")):
+            evidence = staff_sources.pending_publication_evidence(run)
+        self.assertEqual(evidence.workers, ())
+        self.assertEqual(evidence.diagnostics, ())
+        self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns) for path in run.iterdir()}, before)
+
     def test_pending_evidence_reads_every_damaged_file_without_recovery_or_locks(self) -> None:
         from scripts.agents import worker_lifecycle
 
@@ -1233,9 +1247,7 @@ class StaffSourcesTests(StaffTestCase):
             first = staff_sources.pending_publication_evidence(run)
             second = staff_sources.pending_publication_evidence(run)
         self.assertEqual(first, second)
-        self.assertEqual(first.diagnostics, (
-            f"{invalid}: worker state unreadable: invalid queue fields",
-            f"{empty}: worker state unreadable: invalid queue fields"))
+        self.assertEqual(first.diagnostics, (f"{invalid}: worker state unreadable: invalid queue fields",))
         self.assertEqual([(entry.inbox, entry.identity, entry.parent) for entry in first.workers],
                          [(valid, native, parent)])
         self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns) for path in run.iterdir()}, before)
