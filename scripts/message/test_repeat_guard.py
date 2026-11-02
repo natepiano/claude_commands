@@ -14,13 +14,23 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stderr
 from dataclasses import asdict, replace
 from pathlib import Path
-from typing import cast, override
+from typing import Literal, cast, override
 from unittest.mock import patch
+
+from scripts.lib import process_group
+from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import send
 import repeat_guard as guard
 import repeats
+from scripts.message.repeat_guard_test_support import (
+    NoticeAttemptTrace, NoticeDrainClock, install_guard_test_budget, run_ready_notice_attempt,
+)
+
+
+def setUpModule() -> None:
+    install_guard_test_budget()
 
 
 NOTICE_FIXTURE = r'''import sys,os,json,signal,io
@@ -42,10 +52,14 @@ else:
     source=request['state']['sender']
     kind=request['kind']
     def owner(sender):
-        if mode=='owner-block' and source=='watchdog': signal.pause()
+        if mode=='owner-block' and source=='watchdog':
+            os.write(int(os.environ['NOTICE_READY_FD']),b'owner-block\n')
+            signal.pause()
         return 'codex:owner'
     def accept(message,*args,**kwargs):
-        if source=='watchdog' and mode=='delivery-block': signal.pause()
+        if source=='watchdog' and mode=='delivery-block':
+            os.write(int(os.environ['NOTICE_READY_FD']),b'delivery-block\n')
+            signal.pause()
         if mode in ('before','after'):
             if mode=='after':
                 with Path(sink).open('a') as f: f.write(json.dumps({'kind':kind,'key':message.key,'source':source})+'\n')
@@ -99,6 +113,58 @@ class RepeatGuardTests(unittest.TestCase):
     def test_first_two_copies_pass_and_the_third_is_held_and_recorded(self) -> None:
         self.assertEqual([self.apply(at=index).held for index in range(1, 6)], [False, False, True, True, True])
         self.assertEqual(self.state.holds, [3, 4, 5])
+
+    def test_slow_worker_start_keeps_repeat_decisions_under_the_shared_test_budget(self) -> None:
+        launch = subprocess.Popen
+
+        def slow_start(command: list[str], *, stdin: int, stdout: int, stderr: int,
+                       text: Literal[True], start_new_session: bool) -> subprocess.Popen[str]:
+            time.sleep(1)
+            return launch(command, stdin=stdin, stdout=stdout, stderr=stderr,
+                          text=text, start_new_session=start_new_session)
+
+        errors = io.StringIO()
+        with (patch.dict(os.environ, {"HOME": str(self.home), "XDG_STATE_HOME": str(self.home / "state")}, clear=True),
+              patch.object(guard, "Popen", slow_start), redirect_stderr(errors)):
+            held = [guard.check(self.root, self.attempt(at=index)).held for index in range(3)]
+        self.assertEqual(held, [False, False, True])
+        self.assertEqual(errors.getvalue(), "")
+
+        program = """import json, sys, time
+from pathlib import Path
+from unittest.mock import patch
+import send
+guard = send.repeat_guard
+launch = guard.Popen
+def slow_start(*args, **kwargs):
+    time.sleep(1)
+    return launch(*args, **kwargs)
+with patch.object(guard, 'Popen', slow_start):
+    held = [guard.check(Path(sys.argv[1]), guard.Attempt(
+        'watchdog', 'session:morty', 'stopped', 'fixture-host', at)).held for at in range(3)]
+print(json.dumps(held))
+"""
+        child = subprocess.run([sys.executable, "-c", program, str(self.root / "child")],
+            capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS, check=False)
+        self.assertEqual(child.returncode, 0, child.stderr)
+        self.assertEqual(json.loads(child.stdout), [False, False, True])
+        self.assertEqual(child.stderr, "")
+
+    def test_child_test_budget_preserves_the_system_sitecustomize(self) -> None:
+        site = self.home / "nix-site"
+        site.mkdir()
+        _ = (site / "guard_site_probe.py").write_text("ready = True\n")
+        program = """import json, os
+import guard_site_probe, repeat_guard
+print(json.dumps([guard_site_probe.ready, 'NIX_PYTHONPATH' in os.environ,
+                  repeat_guard.GUARD_IO_CEILING_SECONDS]))
+"""
+        child = subprocess.run([sys.executable, "-c", program],
+            env={**os.environ, "NIX_PYTHONPATH": str(site)}, capture_output=True, text=True,
+            timeout=TEST_HANG_GUARD_SECS, check=False)
+        self.assertEqual(child.returncode, 0, child.stderr)
+        self.assertEqual(json.loads(child.stdout), [True, False, TEST_HANG_GUARD_SECS])
+        self.assertEqual(child.stderr, "")
 
     def test_unknown_prose_compares_exactly_even_when_values_look_volatile(self) -> None:
         for values in (("10:00", "11:00", "12:00"),
@@ -364,7 +430,6 @@ class RepeatGuardTests(unittest.TestCase):
                    + "print(g.check(Path(sys.argv[1]), g.Attempt('watchdog','morty','stopped','fixture-host',float(sys.argv[2]))).held)")
         def attempt(index: int) -> bool:
             result = subprocess.run([sys.executable, "-c", program, str(self.root), str(index)],
-                env={**os.environ, "PYTHONPATH": str(Path(guard.__file__).parent)},
                 capture_output=True, text=True, check=True)
             return result.stdout.strip() == "True"
         # Every competing process must fail open while this real shard lock is held.
@@ -438,8 +503,9 @@ class RepeatGuardTests(unittest.TestCase):
                 with guard.sender_record(self.root, "watchdog"):
                     self.fail("capacity reload selected a different lock")
             with patch.dict(os.environ, {"SEND_REPEAT_CONFIG": str(self.limits_file(replace(self.limits, max_senders=7)))}):
-                self.assertFalse(guard.check(self.root, self.attempt()).held)
-        self.assertLess(time.monotonic() - start, guard.GUARD_IO_CEILING_SECONDS + 0.2)
+                with patch.object(guard, "GUARD_IO_CEILING_SECONDS", 0.25):
+                    self.assertFalse(guard.check(self.root, self.attempt()).held)
+                    self.assertLess(time.monotonic() - start, guard.GUARD_IO_CEILING_SECONDS + 0.2)
 
     def test_stalled_reads_and_publication_release_the_send_at_its_deadline(self) -> None:
         self.prime_outbox()
@@ -448,8 +514,9 @@ class RepeatGuardTests(unittest.TestCase):
         path.unlink()
         os.mkfifo(path)
         start = time.monotonic()
-        self.assertFalse(guard.check(self.root, self.attempt(at=4)).held)
-        self.assertLess(time.monotonic() - start, guard.GUARD_IO_CEILING_SECONDS + 0.2)
+        with patch.object(guard, "GUARD_IO_CEILING_SECONDS", 0.25):
+            self.assertFalse(guard.check(self.root, self.attempt(at=4)).held)
+            self.assertLess(time.monotonic() - start, guard.GUARD_IO_CEILING_SECONDS + 0.2)
         path.unlink()
         _ = path.write_text(contents)
         # A fresh worker reaches the real publication boundary before it is stalled.
@@ -573,28 +640,39 @@ print(json.dumps(asdict(g._stored_check(Path(sys.argv[1]), g.Attempt('watchdog',
 
     def test_notice_supervisor_kills_real_delivery_child_and_grandchild(self) -> None:
         marker = self.home / "descendants"
+        ready = self.home / "ready"
+        os.mkfifo(ready)
         grandchild = "import os,signal; os.kill(os.getpid(), signal.SIGSTOP)"
-        child_program = """import subprocess,sys,os,signal
+        child_program = r"""import subprocess,sys,os,signal
 from pathlib import Path
 child = subprocess.Popen([sys.executable, '-c', sys.argv[2]])
 Path(sys.argv[1]).write_text(str(os.getpid()) + ' ' + str(child.pid))
+with open(sys.argv[3], 'w') as ready: ready.write('ready\n')
 os.kill(os.getpid(), signal.SIGSTOP)
 """
         runner = "import sys; import send; send.run(sys.argv[1:], '', 60)"
-        command = [sys.executable, "-c", runner, sys.executable, "-c", child_program, str(marker), grandchild]
-        started = time.monotonic()
-        with patch.dict(os.environ, {"PYTHONPATH": str(Path(guard.__file__).parent)}):
-            guard.notice_job(command, 1)
-        self.assertLess(time.monotonic() - started, 1.4)
-        for pid in marker.read_text().split():
+        command = [sys.executable, "-c", runner, sys.executable, "-c", child_program, str(marker), grandchild, str(ready)]
+        # Start the deadline check only after the delivery descendants exist.
+        with os.fdopen(os.open(ready, os.O_RDWR), "r") as readiness:
+            child = subprocess.Popen(command, start_new_session=True,
+                env={**os.environ, "PYTHONPATH": str(Path(guard.__file__).parent), "SEND_REPEAT_NOTICE_JOB": "1"})
             try:
-                status = subprocess.run(["ps", "-p", pid, "-o", "stat="], text=True, capture_output=True, check=False)
-                self.assertTrue(not status.stdout.strip() or status.stdout.strip().startswith("Z"), status.stdout)
+                with LauncherHangGuard("delivery descendants").protect():
+                    if readiness.readline() != "ready\n":
+                        raise AssertionError("delivery descendants did not become ready")
+                started = time.monotonic()
+                with patch.object(guard, "Popen", return_value=child):
+                    guard.notice_job(command, 1)
+                self.assertLess(time.monotonic() - started, 1.4)
+                for pid in marker.read_text().split():
+                    status = subprocess.run(["ps", "-p", pid, "-o", "stat="], text=True, capture_output=True, check=False)
+                    self.assertTrue(not status.stdout.strip() or status.stdout.strip().startswith("Z"), status.stdout)
             finally:
                 try:
-                    os.kill(int(pid), 9)
+                    process_group.send_process_group(child.pid, 9)
                 except ProcessLookupError:
                     pass
+                _ = child.wait(timeout=TEST_HANG_GUARD_SECS)
 
     def test_direct_events_report_observed_outcomes_and_replay_uses_independent_labels(self) -> None:
         receiver = guard.recipient_identity("", thread_id="thread-1")
@@ -637,12 +715,28 @@ Path.read_text = read
 import repeat_guard as g
 g.CONFIG=Path(sys.argv[1])
 assert not g.check(Path(sys.argv[2]), g.Attempt('user','session:a','same','fixture',0)).held
+print('ready', flush=True)
+sys.stdin.readline()
 assert not g.check(Path(sys.argv[2]), g.Attempt('watchdog','session:a','same','fixture',0)).held
 """
-        started = time.monotonic()
-        result = subprocess.run([sys.executable, "-c", program, str(fifo), str(self.root)],
-            env={**os.environ, "SEND_REPEAT_CONFIG": str(fifo), "PYTHONPATH": str(Path(guard.__file__).parent)},
-            capture_output=True, text=True, timeout=2, check=False)
+        command = [sys.executable, "-c", program, str(fifo), str(self.root)]
+        with subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, start_new_session=True,
+                env={**os.environ, "SEND_REPEAT_CONFIG": str(fifo),
+                     "PYTHONPATH": str(Path(guard.__file__).parent)}) as process:
+            try:
+                with LauncherHangGuard("guard import and protected call").protect():
+                    if process.stdout is None or process.stdout.readline() != "ready\n":
+                        raise AssertionError("guard import or protected call did not finish")
+                started = time.monotonic()
+                stdout, stderr = process.communicate("go\n", timeout=2)
+                result = subprocess.CompletedProcess(command, process.wait(timeout=TEST_HANG_GUARD_SECS), stdout, stderr)
+            finally:
+                try:
+                    process_group.send_process_group(process.pid, 9)
+                except ProcessLookupError:
+                    pass
+                _ = process.wait(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertLess(time.monotonic() - started, 1)
         self.assertIn("operation deadline exceeded", result.stderr)
@@ -677,14 +771,13 @@ assert not g.check(Path(sys.argv[2]), g.Attempt('watchdog','session:a','same','f
         self.assertEqual([n.kind for n in self.state.notices], ["owner", "owner"])
 
 
-    def run_notice_fixture(self, mode: str, *, short: bool = False) -> None:
+    def run_notice_fixture(self, mode: str) -> None:
         path = self.home / "notice_fixture.py"
         if not path.exists():
             _ = path.write_text(NOTICE_FIXTURE)
-        limits = replace(self.limits, notice_timeout_seconds=1, drain_timeout_seconds=3) if short else self.limits
         result = subprocess.run([sys.executable, str(path), "supervise", mode, str(self.root), str(self.home / "accepted")],
-            env={**os.environ, "SEND_REPEAT_CONFIG": str(self.limits_file(limits)),
-                 "PYTHONPATH": str(Path(guard.__file__).parent)}, capture_output=True, text=True, timeout=8 if short else 10, check=False)
+            env={**os.environ, "SEND_REPEAT_CONFIG": str(self.limits_file(self.limits))},
+            capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS, check=False)
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def fixture_accepts(self) -> list[dict[str, str]]:
@@ -796,14 +889,64 @@ assert not g.check(Path(sys.argv[2]), g.Attempt('watchdog','session:a','same','f
         b_after = guard.decode(b_path.read_text())
         self.assertEqual(next(notice.status for notice in b_after.notices if notice.text == "second flood"), "delivered")
 
+    def run_blocked_notice_fixture(self, mode: str) -> list[NoticeAttemptTrace]:
+        path = self.home / "notice_fixture.py"
+        _ = path.write_text(NOTICE_FIXTURE)
+        limits = replace(self.limits, notice_timeout_seconds=1, drain_timeout_seconds=1)
+        clock = NoticeDrainClock()
+        attempts: list[NoticeAttemptTrace] = []
+        real_run = send.run
+
+        def run(command: list[str], request: str, timeout: float) -> tuple[int | None, str, str]:
+            return run_ready_notice_attempt(real_run,
+                [command[0], str(path), "attempt", mode, str(self.root), str(self.home / "accepted")],
+                request, timeout, mode if attempts[-1].sender == "watchdog" else "")
+
+        def deliver(state: guard.SenderState, notice: guard.Notice, limits: guard.Limits) -> guard.NoticeOutcome:
+            attempt = NoticeAttemptTrace(state.sender, notice.id, mode if state.sender == "watchdog" else "")
+            attempts.append(attempt)
+            try:
+                outcome = send.attempt_repeat_notice(state, notice, limits)
+                attempt.outcome = outcome
+                return outcome
+            finally:
+                clock.elapsed += 1
+
+        with (patch.object(guard, "configuration", return_value=limits), patch.object(guard, "time", clock),
+              patch.object(send, "run", run), patch.dict(os.environ, {
+                  "SEND_REPEAT_NOTICE_DEADLINE": "inf", "SEND_REPEAT_NOTICE_JOB": "0"})):
+            guard.drain(self.root, deliver, 3)
+        return attempts
+
+    def notice_state(self, sender: str) -> guard.SenderState:
+        return next(state for path in self.root.glob("*.json")
+                    if (state := guard.decode(path.read_text())).sender == sender)
+
+    def start_notice_rotation_at_watchdog(self) -> None:
+        paths = sorted(self.root.glob("*.json"))
+        index = next(index for index, path in enumerate(paths)
+                     if guard.decode(path.read_text()).sender == "watchdog")
+        _ = (self.root / "cursor").write_text(paths[index - 1].name)
+
     def test_blocked_discovery_cannot_starve_later_owner_notices(self) -> None:
         self.prime_outbox()
         for text, sender in (("other flood", "watchdog"), ("third flood", "other")):
             for at in range(3):
                 _ = self.persist(guard.Attempt(sender, "session:Bea", text, "fixture-host", at))
-        self.run_notice_fixture("owner-block", short=True)
-        self.run_notice_fixture("owner-block", short=True)
-        self.assertTrue(any(entry["kind"] == "owner" and entry["source"] == "other" for entry in self.fixture_accepts()))
+        self.start_notice_rotation_at_watchdog()
+        first_id = self.notice_state("watchdog").notices[0].id
+        attempts = self.run_blocked_notice_fixture("owner-block")
+        self.assertEqual([(item.sender, item.notice_id, item.marker, item.outcome) for item in attempts],
+                         [("watchdog", first_id, "owner-block", "unknown")], str(attempts))
+        self.assertEqual(next(notice.status for notice in self.notice_state("watchdog").notices
+                              if notice.id == first_id), "unknown", str(attempts))
+        attempts += self.run_blocked_notice_fixture("owner-block")
+        self.assertEqual([(item.sender, item.outcome) for item in attempts],
+                         [("watchdog", "unknown"), ("other", "delivered")], str(attempts))
+        self.assertEqual([notice.status for notice in self.notice_state("other").notices],
+                         ["delivered"], str(attempts))
+        self.assertTrue(any(entry["kind"] == "owner" and entry["source"] == "other"
+                            for entry in self.fixture_accepts()), str(attempts))
 
     def test_blocked_owner_delivery_rotates_behind_other_floods_and_senders(self) -> None:
         self.prime_outbox()
@@ -812,11 +955,31 @@ assert not g.check(Path(sys.argv[2]), g.Attempt('watchdog','session:a','same','f
                 _ = self.persist(guard.Attempt(sender, "session:Bea", text, "fixture-host", at))
         for at in range(3):
             _ = self.persist(guard.Attempt("new", "session:Bea", "fourth flood", "fixture-host", at))
+        self.start_notice_rotation_at_watchdog()
+        notice_ids = [notice.id for notice in self.notice_state("watchdog").notices]
+        healthy_order = [guard.decode(path.read_text()).sender for path in sorted(self.root.glob("*.json"),
+                         key=lambda path: (path.name <= (self.root / "cursor").read_text(), path.name))]
+        attempts: list[NoticeAttemptTrace] = []
         for iteration in range(4):
             with self.subTest(iteration=iteration):
-                self.run_notice_fixture("delivery-block", short=True)
+                attempts += self.run_blocked_notice_fixture("delivery-block")
+                if iteration == 0:
+                    self.assertEqual([(item.sender, item.notice_id, item.marker, item.outcome) for item in attempts],
+                                     [("watchdog", notice_ids[0], "delivery-block", "unknown")], str(attempts))
+                    self.assertEqual(next(notice.status for notice in self.notice_state("watchdog").notices
+                                          if notice.id == notice_ids[0]), "unknown", str(attempts))
+        self.assertEqual([item.sender for item in attempts], healthy_order + ["watchdog"], str(attempts))
+        self.assertEqual([item.notice_id for item in attempts if item.sender == "watchdog"], notice_ids, str(attempts))
+        self.assertEqual([item.marker for item in attempts if item.sender == "watchdog"],
+                         ["delivery-block", "delivery-block"], str(attempts))
+        self.assertEqual([item.outcome for item in attempts],
+                         ["unknown", "delivered", "delivered", "unknown"], str(attempts))
+        for sender in ("other", "new"):
+            self.assertEqual([notice.status for notice in self.notice_state(sender).notices], ["delivered"], str(attempts))
+        self.assertEqual([notice.status for notice in self.notice_state("watchdog").notices],
+                         ["unknown", "unknown"], str(attempts))
         owners = {entry["source"] for entry in self.fixture_accepts() if entry["kind"] == "owner"}
-        self.assertTrue({"other", "new"}.issubset(owners))
+        self.assertTrue({"other", "new"}.issubset(owners), str(attempts))
 
 
 if __name__ == "__main__":
