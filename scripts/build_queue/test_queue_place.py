@@ -22,6 +22,7 @@ from unittest import mock
 from scripts.build_queue import queue_place as queue
 from scripts.build_queue.admission_test_support import AdmissionFixture
 from scripts.build_queue.queue_fixture import write_process
+from scripts.lib.process_group import send_process_group
 from scripts.lint import memory_admit as gate
 from scripts.lint.memory_test_support import fake_memory_readings, gate_isolation_environment
 from scripts.lint.test_memory_admit import write_memory_config
@@ -525,7 +526,7 @@ class QueuePlaceTests(unittest.TestCase):
                                     for _, saved in gate.live_reservations(fixture.directory)))
                 self.assertEqual(fixture.history(), [])
                 os.kill(program_pid, 0)  # The program still lives after its holder died.
-                os.killpg(program_pid, signal.SIGKILL)
+                send_process_group(program_pid, signal.SIGKILL)
                 _ = (scope / "cgroup.procs").write_text("")
                 check()
                 check()
@@ -619,7 +620,7 @@ class QueuePlaceTests(unittest.TestCase):
                                            capture_output=True, timeout=3, check=False)
                     if program_pid:
                         try:
-                            os.killpg(program_pid, signal.SIGKILL)
+                            send_process_group(program_pid, signal.SIGKILL)
                         except ProcessLookupError:
                             pass
 
@@ -725,7 +726,7 @@ class QueuePlaceTests(unittest.TestCase):
                                            capture_output=True, timeout=3, check=False)
                     if program_pid:
                         try:
-                            os.killpg(program_pid, signal.SIGKILL)
+                            send_process_group(program_pid, signal.SIGKILL)
                         except ProcessLookupError:
                             pass
 
