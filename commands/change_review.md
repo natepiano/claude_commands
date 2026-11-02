@@ -93,6 +93,8 @@ When the user asks to review changes, open the prepared page:
 2. Give the link to the user.
 
 The page contains every waiting change, with staff-based showrunner tabs.
+Tabs with waiting changes precede empty tabs in alphabetical order and keep their positions until the next page load.
+The selected tab draws its full outline inside its edges, including the first and last tabs.
 Answers save in the background.
 Each successful save opens the next waiting change in the same tab.
 Navigation during a save prevents this automatic change.
@@ -105,6 +107,9 @@ This state survives a reload and a server restart.
 A direct link shows **The showrunner will validate this** without answer buttons.
 The showrunner still receives the validation message and retains the row in its own `/next` queue.
 Send feedback removes the row from the page count only when its verdict saves.
+Ask a question uses the one-line feedback field.
+Only a sent question message removes the row from the count until the showrunner answers.
+Pending and failed question messages keep the row waiting after a page load, with a note and a resend control.
 Do not ask for a batch size or take page answers in chat.
 
 The diagnostic command `show <production>` still prints the current row and count.
@@ -164,6 +169,21 @@ showrunner of the row's tab to check the change in place of the user:
    its unit, and the fix comes back as a new row for the user.
 
 Use the `verdict` command above for both. The row stays out of the user's count until the verdict saves.
+
+## Question
+
+1. Read the question and its `Question id` in the change review message.
+2. Check the change or ask its unit.
+3. Save the answer with this command:
+
+```sh
+"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/review_links/change_page.py" answer-question --production <doc> --list <list> --row C<n> --question <id> --text "<answer>"
+```
+
+The row returns to the user's count with the question and answer below the change.
+The user can give a verdict or ask another question.
+The same question ID and answer text change nothing and exit 0 on a rerun.
+The command refuses an old or unknown ID, a different answer, or a row without an open question.
 
 ## Never a question
 
