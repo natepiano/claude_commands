@@ -4436,6 +4436,11 @@ class StatusDocument(TypedDict):
     problems: list[str]
 
 
+def _reading_is_old(read_at: datetime, now: datetime) -> bool:
+    """Use one age limit for usage and credits; future readings are fresh."""
+    return now - read_at > STALE_AFTER
+
+
 def _credit_reading(
     usage: usage_store.StoredUsage, now: datetime,
 ) -> tuple[str, float | Literal["unlimited"] | StatusUnavailable]:
@@ -4445,7 +4450,7 @@ def _credit_reading(
     read_at = _stored_time(credits["at"])
     if read_at is None:
         return ("unavailable", StatusUnavailable("unavailable"))
-    if not timedelta(0) <= now - read_at <= STALE_AFTER:
+    if _reading_is_old(read_at, now):
         return ("stale", StatusUnavailable(f"stale since {read_at:%Y-%m-%d %H:%M %Z}"))
     balance = credits["balance"]
     try:
@@ -4541,14 +4546,15 @@ def render_status_json(reading: StatusReading) -> str:
             credits=None if isinstance(row.credits, StatusUnavailable) else row.credits,
             use_credits=row.use_credits,
             read_at=None if isinstance(row.read_at, StatusUnavailable) else row.read_at.astimezone(timezone.utc).isoformat(),
-            read_ok=isinstance(row.read_at, datetime) and row.read_outcome in (
+            read_ok=isinstance(row.read_at, datetime) and not _reading_is_old(row.read_at, reading.checked_at)
+            and row.on_credits != "stale" and row.read_outcome in (
                 agent_accounts.UsageReadOutcome.OK, agent_accounts.UsageReadOutcome.HELD),
             credits_in_use=row.on_credits == "yes")
         accounts.append(item)
     return json.dumps(StatusDocument(session_inputs=list(reading.session_inputs), accounts=accounts, problems=[note.removeprefix("* ") for note in reading.notes]))
 
 
-ProblemKind = Literal["warning", "usage claim", "usage save", "startup", "usage", "legacy", "unnoted", "test login", "access", "identity", "signed out", "wrong login", "unreadable note", "note", "state", "check", "role", "unclassified", "mcp servers"]
+ProblemKind = Literal["warning", "usage claim", "usage save", "startup", "usage", "credits", "legacy", "unnoted", "test login", "access", "identity", "signed out", "wrong login", "unreadable note", "note", "state", "check", "role", "unclassified", "mcp servers"]
 
 
 @dataclass(frozen=True)
@@ -4706,17 +4712,24 @@ def _read_failure_problem(row: StatusRow, zone: tzinfo,
         case agent_accounts.UsageReadOutcome.OK | agent_accounts.UsageReadOutcome.HELD:
             cause, step = "", ""
     subject = row.label if _label_is(row.label, "claude") or _label_is(row.label, "codex") else row.folder
-    startup_problems: list[StatusProblem] = []
+    reading_problems: list[StatusProblem] = []
+    if row.on_credits == "stale" and isinstance(row.credits, StatusUnavailable):
+        reading_problems.append(StatusProblem(subject, "credits reading is old",
+            ProblemCause("credits", row.credits.cell), ProblemStep("run accounts.py status to refresh usage"), True))
     if isinstance(startup, agent_accounts.CodexStartupFailure):
-        startup_problems.append(StatusProblem(subject, "usage unavailable",
+        reading_problems.append(StatusProblem(subject, "usage unavailable",
             ProblemCause("startup", f"Codex did not start at {agent_accounts.codex_home_display(startup.home)}; {previous}"),
             ProblemStep(f"run {startup.setup_command} and try again" + (f"; {step}" if step else "")), True))
         if row.read_outcome in (agent_accounts.UsageReadOutcome.ERROR, agent_accounts.UsageReadOutcome.OK,
                               agent_accounts.UsageReadOutcome.HELD):
-            return startup_problems
+            return reading_problems
     if row.read_outcome in (agent_accounts.UsageReadOutcome.OK, agent_accounts.UsageReadOutcome.HELD):
-        return []
-    return [*startup_problems, StatusProblem(subject, "usage unavailable", ProblemCause("usage", cause), ProblemStep(step), True)]
+        if isinstance(row.read_at, datetime) and _reading_is_old(row.read_at, now):
+            reading_problems.append(StatusProblem(subject, "usage reading is old",
+                ProblemCause("usage", f"last good read at {stamp(row.read_at)}"),
+                ProblemStep("run accounts.py status to refresh usage"), True))
+        return reading_problems
+    return [*reading_problems, StatusProblem(subject, "usage unavailable", ProblemCause("usage", cause), ProblemStep(step), True)]
 
 
 def render_status_table(reading: StatusReading) -> str:
@@ -5007,7 +5020,7 @@ def merge_status_problems(problems: list[StatusProblem]) -> list[StatusProblem]:
                 observation_order.append(key)
             groups[key].append(problem)
     priority: tuple[ProblemKind, ...] = ("warning", "usage claim", "usage save", "test login", "startup", "unreadable note", "wrong login",
-        "identity", "access", "signed out", "unnoted", "note", "legacy", "usage", "state", "check", "role", "unclassified", "mcp servers")
+        "identity", "access", "signed out", "unnoted", "note", "legacy", "usage", "credits", "state", "check", "role", "unclassified", "mcp servers")
     for observed in observation_order:
         if isinstance(observed, StatusProblem):
             result.append(observed)
