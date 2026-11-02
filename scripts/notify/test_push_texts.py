@@ -113,6 +113,21 @@ class PushTextTests(unittest.TestCase):
                     self.assertLess(len(text), 500)
                     self.assertLess(len(push.title), 45)
 
+    def test_ups_maintenance_alerts_keep_the_approved_text_and_nonurgent_action(self) -> None:
+        cases = (
+            ("nixos.ups_replace_battery", "UPS battery needs replacing",
+             "Replace the battery in the natedev UPS.",
+             "The natedev UPS reports that its battery is worn out. During a power outage it may not keep natedev on long enough to shut down safely."),
+            ("nixos.ups_no_contact", "natedev lost contact with its UPS",
+             "Check the USB cable between the UPS and natedev.",
+             "natedev cannot read its UPS. During a power outage it gets no warning and cannot shut down safely."),
+        )
+        for text_id, title, action, body in cases:
+            with self.subTest(id=text_id):
+                push = push_texts.render(text_id)
+                self.assertEqual((push.sender, push.need, push.title, push.action, push.body),
+                                 ("ups", "note", title, ActionRequired(action), body))
+
     def test_every_gpu_xid_renders_its_meaning_and_restart_action(self) -> None:
         for code, meaning in gpu_xid.XID_MEANINGS.items():
             with self.subTest(xid=code):
