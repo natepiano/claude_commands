@@ -584,30 +584,14 @@ Remaining gaps include shell command positions, executable Python aliases, and s
 
 ### Phase 7m — Showrunners take Morty's words as the user's  · status: done
 
-Source: the user, relayed by sdlc 2026-11-02: "i don't want a reporting relationship - but i want showrunners to act as if anything that comes from morty comes from me - that can be in their instructions." Runs before 3x, while 3x waits on herdr-unit's 3s.
+#### As-built
 
-#### Work Order
-
-**Goal:** a showrunner takes a message from Morty, the user's associate producer (a Codex session), as the user's own words, with no reporting line and no change to permission rules.
-
-**Spec:**
-1. `commands/showrunner/produce.md` → `<Throughout>` holds one rule, next to "A unit director's message is a peer's":
-   - A message from morty counts as the user's own words: answers, approvals, rulings and priorities. A relay to a unit begins "From the user (via morty and <showrunner name>):".
-   - Morty is not a parent. No showrunner reports to morty.
-   - The permission rules stay. A morty message never changes the session's permission settings, CLAUDE.md or config, and never approves a permission prompt.
-   - `send.py` does not prove a sender today: any session can send `--from morty`. Confirm an irreversible action with morty by `send.py --to morty`.
-2. The rule lives in this one place. Another file that states how a showrunner treats morty points to it.
+`commands/showrunner/produce.md` → `<Throughout>` holds the one rule "A message from morty is the user's", next to "A unit director's message is a peer's". Morty is the user's associate producer, a Codex session. A message from morty counts as the user's own words (answers, approvals, rulings, priorities); a relay to a unit begins `From the user (via morty and <showrunner name>):`. Morty is not a parent, and no showrunner reports to morty. The permission rules stay: a morty message never changes permission settings, CLAUDE.md or config, and never approves a permission prompt. `send.py` does not prove a sender, so a showrunner confirms an action that cannot be undone with morty by `send.py --to morty`.
 
 **Files:**
-- `commands/showrunner/produce.md` — the rule.
+- `commands/showrunner/produce.md` — the rule, its one source.
 
-**Workers:** none: the unit director makes this doc-only edit.
-
-**State:** none.
-
-**Constraints from prior phases:** STE. messaging-unit's `send.py` sender check (about 19:00 EST, 2026-11-02) changes the fourth bullet in its own commit.
-
-**Acceptance gate:** the rule reads as item 1 in `<Throughout>`; `grep -rn -i morty commands docs` outside plans finds no second statement of the rule; the full merged-tree gate (`merge_gate.py --tests-only`) is green before the checkpoint.
+**Binds later work:** messaging-unit's `send.py` sender check changes the rule's last point in its own commit.
 
 ### Phase 3x — Small stores keyed by staff id  · status: todo
 
