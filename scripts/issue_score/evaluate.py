@@ -12,8 +12,11 @@ import stat
 import sys
 from typing import Literal, cast
 
+from scripts.lib import conf
+from .selection import UseConfiguredValue
+
 from . import client, decide, questions, vault
-from .records import ScoredIssue, STATE_DIR
+from .records import ScoredIssue, state_dir as configured_state_dir
 
 # renumber.py imports writer_lock by bare name, so its directory must be on sys.path.
 PRIORITIZE_DIR = str(Path(__file__).resolve().parents[1] / "prioritize")
@@ -54,6 +57,18 @@ class FieldObservation:
 class RunJudgments:
     scored: dict[str, ScoredIssue]
     failed: dict[str, str]
+
+
+def reliability_bucket_count() -> int:
+    return conf.whole("issue_score", "reliability_bucket_count")
+
+
+def title_only_character_limit() -> int:
+    return conf.whole("issue_score", "title_only_character_limit")
+
+
+def disagreement_count() -> int:
+    return conf.whole("issue_score", "disagreement_count")
 
 
 def split_for(filename: str | Path) -> Literal["tune", "holdout"]:
@@ -295,22 +310,23 @@ def _field_report(field: str, observations: list[FieldObservation]) -> list[str]
     lines += _table(["Label / Jev", *labels], [[label, *row] for label, row in zip(labels, matrix)])
     if not ordinal:
         rows: list[list[object]] = []
-        for bucket in range(5):
-            low, high = bucket / 5, (bucket + 1) / 5
+        bucket_count = reliability_bucket_count()
+        for bucket in range(bucket_count):
+            low, high = bucket / bucket_count, (bucket + 1) / bucket_count
             items = [item for item in probabilistic
                      if low <= cast(dict[str, float], item.probabilities).get(str(item.predicted), 0.0)
-                     and (cast(dict[str, float], item.probabilities).get(str(item.predicted), 0.0) < high or bucket == 4)]
+                     and (cast(dict[str, float], item.probabilities).get(str(item.predicted), 0.0) < high or bucket == bucket_count - 1)]
             # Confidence is read from the averaged API distribution, not from a
             # potentially incomplete synthetic decision distribution.
             confidences = [cast(dict[str, float], item.probabilities).get(str(item.predicted), 0.0) for item in items]
-            rows.append([f"{low:.2f}–{high:.2f}" + (" (inclusive)" if bucket == 4 else ""), len(items),
+            rows.append([f"{low:.2f}–{high:.2f}" + (" (inclusive)" if bucket == bucket_count - 1 else ""), len(items),
                          _metric(_mean(confidences)), _metric(_mean([float(item.actual == item.predicted) for item in items]))])
-        lines += ["Reliability (five confidence buckets):", "", *_table(["Confidence", "N", "Mean confidence", "Accuracy"], rows)]
+        lines += [f"Reliability ({bucket_count} confidence buckets):", "", *_table(["Confidence", "N", "Mean confidence", "Accuracy"], rows)]
     return lines
 
 
 def _covered(field: str, observations: list[FieldObservation], threshold: float) -> list[FieldObservation]:
-    thresholds = dict(questions.THRESHOLDS)
+    thresholds = dict(questions.thresholds())
     # Sweep this field even when production currently leaves it agent-only.
     thresholds[field] = (decide.MinimumGap(threshold) if isinstance(thresholds[field], decide.MinimumGap)
                          else decide.Supported(threshold))
@@ -318,7 +334,7 @@ def _covered(field: str, observations: list[FieldObservation], threshold: float)
 
 
 def _risk_thresholds(field: str) -> tuple[float, ...]:
-    return questions.RISK_GAPS if isinstance(questions.THRESHOLDS[field], decide.MinimumGap) else questions.RISK_THRESHOLDS
+    return questions.RISK_GAPS if isinstance(questions.thresholds()[field], decide.MinimumGap) else questions.RISK_THRESHOLDS
 
 
 def _threshold_outcome(field: str, observations: list[FieldObservation], *, complete: bool) -> decide.ThresholdOutcome:
@@ -346,7 +362,7 @@ def _outcome_text(outcome: decide.ThresholdOutcome) -> str:
 
 
 def _heldout_validation(field: str, observations: list[FieldObservation], *, complete: bool) -> str:
-    policy = questions.THRESHOLDS[field]
+    policy = questions.thresholds()[field]
     if not isinstance(policy, (decide.Supported, decide.MinimumGap)):
         return _outcome_text(policy)
     threshold = policy.gap if isinstance(policy, decide.MinimumGap) else policy.threshold
@@ -359,7 +375,7 @@ def _heldout_validation(field: str, observations: list[FieldObservation], *, com
         errors = [float(item.actual != item.predicted) for item in covered]
         measure = "exact error"
     error = _mean(errors)
-    target = questions.ERROR_TARGETS[field]
+    target = questions.error_targets()[field]
     passed = bool(covered) and isinstance(error, float) and error <= target + 1e-12
     status = "partial" if not complete else "pass" if passed else "fail"
     coverage = float(len(covered) / len(observations)) if observations else 0.0
@@ -375,7 +391,7 @@ def _judgment_text(field: str, observations: list[FieldObservation], *, split: S
 
 
 def _routing_summary(field: str, observations: list[FieldObservation]) -> str:
-    policy = questions.THRESHOLDS[field]
+    policy = questions.thresholds()[field]
     if isinstance(policy, decide.Supported):
         configured = f"at configured threshold {policy.threshold:.2f}"
     elif isinstance(policy, decide.MinimumGap):
@@ -402,7 +418,7 @@ def _risk_report(field: str, observations: list[FieldObservation], *, complete: 
             ordinal = [item for item in covered if isinstance(item.probabilities, dict)]
             row.append(_metric(_mean([float(abs(int(item.actual) - int(item.predicted)) > 1) for item in ordinal])))
         rows.append(row)
-    gap_policy = isinstance(questions.THRESHOLDS[field], decide.MinimumGap)
+    gap_policy = isinstance(questions.thresholds()[field], decide.MinimumGap)
     headers = ["Gap" if gap_policy else "Threshold", "Sure N", "Coverage", "Routed to user",
                "Taken-wrong" if gap_policy else "Exact error"]
     if field in ORDINAL_FIELDS:
@@ -492,11 +508,14 @@ def _recommendations(observations: Mapping[str, list[FieldObservation]], high: S
 
 
 def compare(run_id: str, *, split: Split = "all", repeat_run_id: str = "",
-            issues_dir: Path = vault.ISSUES_DIR, state_dir: Path = STATE_DIR,
-            goals_path: Path = vault.VAULT_ROOT / "prioritization goals.md", baseline_run_id: str = "") -> Path:
+            issues_dir: Path | UseConfiguredValue = UseConfiguredValue.CURRENT, state_dir: Path | UseConfiguredValue = UseConfiguredValue.CURRENT,
+            goals_path: Path | UseConfiguredValue = UseConfiguredValue.CURRENT, baseline_run_id: str = "") -> Path:
     """Write a report from saved answers; this function never contacts the API."""
+    issues_dir = vault.issue_directory() if isinstance(issues_dir, UseConfiguredValue) else issues_dir
+    state_dir = configured_state_dir() if isinstance(state_dir, UseConfiguredValue) else state_dir
+    goals_path = vault.vault_root() / "prioritization goals.md" if isinstance(goals_path, UseConfiguredValue) else goals_path
     state_dir = state_dir.expanduser().resolve()
-    if state_dir.is_relative_to(vault.VAULT_ROOT.resolve()) or state_dir.is_relative_to(issues_dir.resolve()):
+    if state_dir.is_relative_to(vault.vault_root().resolve()) or state_dir.is_relative_to(issues_dir.resolve()):
         raise ValueError("Reports must be outside the issue vault")
     run_path = _run_path(run_id, state_dir)
     run = load_run(run_path)
@@ -537,7 +556,7 @@ def compare(run_id: str, *, split: Split = "all", repeat_run_id: str = "",
                   f"Shared issues whose content/state hash changed between runs: {changed_content}. Interpret wording effects separately from state changes.", "",
                   f"Baseline scored: {sum(str(issue.path) in baseline.scored for issue in eligible)}; failed: {len(baseline_failed)}; unscored: {len(baseline_unscored)}.", "",
                   *(f"- Baseline missing: {_cell(issue.path)}" for issue in [*baseline_failed, *baseline_unscored]), ""]
-    groups = [("all", scored), ("title-only", [issue for issue in scored if len(vault.clean_body(issue.body)) < 200])]
+    groups = [("all", scored), ("title-only", [issue for issue in scored if len(vault.clean_body(issue.body)) < title_only_character_limit()])]
     high = _high_priority(scored)
     groups.append(("score ≥ 20", high))
     for name, issues in groups:
@@ -549,7 +568,7 @@ def compare(run_id: str, *, split: Split = "all", repeat_run_id: str = "",
     for field in FIELDS:
         lines += _risk_report(field, observations[field], complete=not partial, split=split)
     lines += _recommendations(observations, high, complete=not partial, split=split)
-    lines += ["## Largest disagreements (up to 20 per field)", ""]
+    lines += [f"## Largest disagreements (up to {disagreement_count()} per field)", ""]
     for field in FIELDS:
         def gap(item: FieldObservation) -> float:
             if field in ORDINAL_FIELDS:
@@ -559,7 +578,7 @@ def compare(run_id: str, *, split: Split = "all", repeat_run_id: str = "",
             return 1 - item.probabilities.get(str(item.actual), 0.0)
 
         mismatches = sorted((item for item in observations[field] if item.actual != item.predicted),
-                            key=lambda item: (-gap(item), str(item.issue.path)))[:20]
+                            key=lambda item: (-gap(item), str(item.issue.path)))[:disagreement_count()]
         lines += [f"### {field}", "", *_table(["Issue", "Current", "Jev", "Gap"],
                   [[item.issue.title, item.actual, item.predicted, f"{gap(item):.4f}"] for item in mismatches])]
     if baseline_run_id:

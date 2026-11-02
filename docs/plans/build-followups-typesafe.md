@@ -148,7 +148,7 @@ The governing rule, from the skill: **Jev makes the judgments, and code makes th
 - **Invariants:**
   - The scorer never writes inside `~/rust/hanadocs`.
   - A failed API call is an error, never an answer.
-  - All question text, criteria, option names and thresholds live in `questions.py`.
+  - Question text, criteria and option names live in `questions.py`; the numbers live in `config/issue_score.conf`.
   - Current field values are never sent in the state.
   - Live API calls only after the user's go (Questions for the user 1–2), only within the budget, and always as `with-typesafe <cmd>`.
   - The key is never read, printed, logged or stored. Code sees it only as `TYPESAFE_API_KEY` in its own environment.
@@ -401,3 +401,44 @@ The governing rule, from the skill: **Jev makes the judgments, and code makes th
 **Binds later work:** The guide names `THRESHOLDS` and `JEV_FIELDS` in `questions.py` and copies no values, so "area threshold from the user's answer; run the reassess" changes them with no guide edit. The area table has two columns, and the loader refuses a three-column header. Project shorthands come only from the vault base files (`vault.load_project_names()`); `commands/issue.md` holds no copy. A new canonical project also needs a `PROJECT_ABOUT` entry in `questions.py`.
 
 **Gotchas:** The Mac vault is far behind origin. Its `conf/issue-areas.md` is an untracked copy of the published table, not a pulled file; a later pull can conflict with it. The guide's sure rule has one exception: below `EVIDENCE_ABSENT`, area becomes `unfiled` with confidence `1 - fits`, sure only when that passes the area threshold.
+
+### Phase 8 — tunable values move to config  · status: done
+
+**Depends on:** Phase 7. Runs beside Phase 6c: 6c changes no repository code. Added 2026-11-02 from the showrunner's work order (the user approved the hard-coded values proposal, phase 3, on 2026-11-01).
+
+#### Work Order
+
+**Goal:** every tunable value in `scripts/issue_score/` lives in `config/issue_score.conf` and is read at use through `scripts/lib/conf.py`. Each value stays the same.
+
+**Spec:**
+- Merge `origin/natedev` first: `scripts/lib/conf.py` is not on this branch yet. Read `config/README.md` "Live values" for the key, limit and host rules.
+- Make `config/issue_score.conf`. Give each key a limit comment (`# range:`, `# whole:` or `# one of:`) and a one-line meaning. Keep every value byte-for-byte as the code has it now. A value change needs the user's go and is not part of this phase.
+- Move these values (current value in brackets):
+  - `score_issues.WORKERS` [8]
+  - `questions.MODEL` [jev-1.14.0], `BUDGET_USD` [20.0], `INPUT_USD_PER_MILLION` [0.042]
+  - the numbers in `questions.THRESHOLDS`: goal, alignment and impact [0.40], category [0.90], area gap [0.3]. The kind for each field (`Supported`, `MinimumGap`, `ReportOnly`) stays in code; only the numbers move.
+  - `questions.ERROR_TARGETS` [0.1 for each field], `EVIDENCE_PRESENT` [0.7], `EVIDENCE_ABSENT` [0.3], `SPLIT_PROBABILITY` [0.25], `BODY_CHARACTER_LIMIT` [24000]
+  - `client.ENDPOINT`, `client.MAX_ATTEMPTS` [5], the request timeout in `system_one` [120 s, an inline literal now], `client.SPEND_LEDGER` and `records.STATE_DIR` [paths under `~/.local/state/issue-score`]
+  - `vault.VAULT_ROOT` [`~/rust/hanadocs`] and the `~/rust/nate_style` entry of `vault.STYLE_RULES_DIRS`. Paths derived from the vault root stay derived in code.
+- Sweep the other files in `scripts/issue_score/` for any tunable this list does not name: a limit, a timeout, an interval, a size or a path. Move each one found. These stay in code, because they are design or formula, not tunables: question text, criteria, option names and levels; `QUESTION_SET_VERSION`; field lists; regular expressions; the evaluation sweep grids `RISK_THRESHOLDS` and `RISK_GAPS`; the token-bound pad and probability-sum tolerances; the tune/holdout split. Name each item you leave in code in the final report, with one reason.
+- Read at use: a caller reads the value when it needs it, not once at import. Replace each module constant with one small reader function in the module that owns the value. Do not add a second reader or a cache.
+- Tests never read `~/.claude/config`. Point `CONF_DIR` at the worktree's `config/` folder (or a fixture folder) the way `scripts/build_targets/test_ssh_eligibility.py` does. One test proves each key in `config/issue_score.conf` reads and passes its limit, and one test proves an unchanged default for each moved value.
+- Update `docs/typesafe.md` where it says a value lives in `questions.py`. Update this plan's Delegation Context invariant "All question text, criteria, option names and thresholds live in `questions.py`" to: question text, criteria and option names live in `questions.py`; the numbers live in `config/issue_score.conf`.
+
+**Files:**
+- `config/issue_score.conf` — new
+- `scripts/issue_score/{questions,client,records,vault,score_issues,decide,evaluate,blind,apply_labels,experiment}.py` — readers and callers
+- `scripts/issue_score/test_*.py` — `CONF_DIR` set; config tests
+- `docs/typesafe.md` — where the values live
+- `docs/plans/build-followups-typesafe.md` — the invariant line
+
+**Constraints from prior phases:**
+- No live TypeSafe call in this phase. Tests replay fixtures only.
+- `docs/typesafe.md` names `THRESHOLDS` and `JEV_FIELDS` and copies no values; keep it that way.
+- Phase 6c may run `apply_labels.py` while this phase edits the tree. That run uses a copy of the last commit, not the worktree.
+
+**Workers:** 1 writer + 1 tester
+- `impl` — `config/issue_score.conf`, the `scripts/issue_score/*.py` modules (not tests), `docs/typesafe.md`, the plan invariant line
+- `test` — `scripts/issue_score/test_*.py`: `CONF_DIR` in every test module, the config read and unchanged-default tests
+
+**Acceptance gate:** `config/issue_score.conf` holds each moved value, unchanged, with a limit; no module in `scripts/issue_score/` holds a tunable literal outside the stated exceptions; `basedpyright scripts/issue_score` reads `0 errors, 0 warnings, 0 notes`; the `scripts/issue_score` tests pass; the merge gate passes.
