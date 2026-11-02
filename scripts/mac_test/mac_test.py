@@ -20,7 +20,7 @@ import sys
 import tempfile
 import time
 import threading
-from typing import Literal, NotRequired, TypeGuard, TypedDict, cast
+from typing import TYPE_CHECKING, Literal, NotRequired, TypeGuard, TypedDict, cast
 from urllib.parse import quote
 
 
@@ -33,6 +33,13 @@ import offload
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 import conf
 from user_zone import user_zone
+
+if TYPE_CHECKING:
+    from ..build_targets import target_config
+    from ..build_targets.target_config import ConfigError
+else:
+    import target_config
+    from target_config import ConfigError
 
 
 MESSAGE_TIMEOUT_S = 30.0
@@ -61,6 +68,9 @@ class ClaimOwnerRecord(TypedDict):
     holder_session: NotRequired[str]
     idle_since: NotRequired[str]
     copy: NotRequired[bool]
+    repo_key: NotRequired[str]
+    repo_name: NotRequired[str]
+    slot: NotRequired[int]
 
 
 class ProcessBoundClaim(ClaimOwnerRecord):
@@ -71,6 +81,7 @@ class RemoteJobClaim(ClaimOwnerRecord):
     """Mac capacity held until the named host's job is known to have ended."""
 
     remote_host: str
+    cleanup_pending: NotRequired[bool]
 
 
 RunRecord = ProcessBoundClaim | RemoteJobClaim
@@ -81,6 +92,8 @@ class RepositoryScope:
     """A claim that excludes only other claims for the same repository."""
 
     name: str
+    key: str = ""
+    slot: int = 0
 
 
 @dataclass(frozen=True)
@@ -450,6 +463,7 @@ class StatePaths:
         self.run: Path = directory / "run.json"
         self.claims: Path = directory / "claims"
         self.block: Path = directory / "block.json"
+        self.affinity: Path = directory / "affinity"
 
 
 def state_paths(target: str = "") -> StatePaths:
@@ -571,12 +585,24 @@ def read_run(path: Path) -> RunState:
         if values["copy"] is not True:
             raise StateReadError(f"{path} has an invalid copy")
         record["copy"] = True
+    if "repo_key" in values or "repo_name" in values:
+        record["repo_key"] = required_string(values, "repo_key", path)
+        record["repo_name"] = required_string(values, "repo_name", path)
+    if "slot" in values:
+        slot = values["slot"]
+        if type(slot) is not int or slot < 1:
+            raise StateReadError(f"{path} has an invalid slot")
+        record["slot"] = slot
     if "remote_host" not in values:
         return record
     host = values["remote_host"]
     if not isinstance(host, str) or not host.strip():
         raise StateReadError(f"{path} has an invalid remote_host")
     remote: RemoteJobClaim = {**record, "remote_host": host}
+    if "cleanup_pending" in values:
+        if values["cleanup_pending"] is not True:
+            raise StateReadError(f"{path} has an invalid cleanup_pending")
+        remote["cleanup_pending"] = True
     return remote
 
 
@@ -876,18 +902,66 @@ def claim_scope(worktree: str) -> ClaimScope:
     """The repository a claim covers: the one its worktree is in, else the whole Mac."""
     repository = offload.repository_identity(Path(worktree))
     if isinstance(repository, offload.KnownRepository):
-        return RepositoryScope(repository.name)
+        return RepositoryScope(repository.name, repository.key)
     return WHOLE_MAC
+
+
+def target_claim_scope(paths: StatePaths, worktree: str) -> ClaimScope:
+    repository = offload.repository_identity(Path(worktree))
+    if not isinstance(repository, offload.KnownRepository):
+        return WHOLE_MAC
+    if target_config.uses_legacy_mac_layout(paths.platform):
+        return RepositoryScope(repository.legacy_mirror_name)
+    return RepositoryScope(repository.policy_name, repository.key)
 
 
 def claim_path(paths: StatePaths, scope: ClaimScope) -> Path:
     if isinstance(scope, RepositoryScope):
-        return paths.claims / f"{scope.name}.json"
+        key = offload.KnownRepository(scope.name, scope.key).path_key if scope.key else quote(scope.name, safe="")
+        suffix = f".slot-{scope.slot}" if scope.slot else ""
+        return paths.claims / f"{key}{suffix}.json"
     return paths.run
 
 
 def scopes_overlap(first: ClaimScope, second: ClaimScope) -> bool:
-    return isinstance(first, WholeMacScope) or isinstance(second, WholeMacScope) or first == second
+    if isinstance(first, WholeMacScope) or isinstance(second, WholeMacScope):
+        return True
+    same_repository = first.key == second.key if first.key and second.key else first.name == second.name
+    return same_repository and (not first.slot or not second.slot or first.slot == second.slot)
+
+
+def slot_capacity(paths: StatePaths, scope: ClaimScope) -> int:
+    if target_config.uses_legacy_mac_layout(paths.platform) or isinstance(scope, WholeMacScope):
+        return 1
+    values = conf.values(config_path(paths.target))
+    value = values.get(f"slots.{scope.name}", values.get("slots", ""))
+    if not value and not scope.key:
+        return 1  # Preserve the legacy claim protocol for records without an origin.
+    if not value.isascii() or not value.isdecimal() or int(value) < 1:
+        raise ConfigError(f"slots.{scope.name}: expected a positive integer")
+    return int(value)
+
+
+def affinity_path(paths: StatePaths, scope: RepositoryScope) -> Path:
+    return paths.affinity / f"{offload.KnownRepository(scope.name, scope.key).path_key}.json"
+
+
+def preferred_slots(paths: StatePaths, scope: RepositoryScope, worktree: str, capacity: int) -> tuple[int, ...]:
+    affinity = read_json_object(affinity_path(paths, scope)) or {}
+    if any(type(slot) is not int or slot < 1 for slot in affinity.values()):
+        raise StateReadError("invalid repository slot affinity")
+    preferred = affinity.get(str(Path(worktree).resolve()))
+    slots = tuple(range(1, capacity + 1))
+    return (cast(int, preferred), *(slot for slot in slots if slot != preferred)) if preferred in slots else slots
+
+
+def remember_slot(paths: StatePaths, scope: RepositoryScope, record: RunRecord) -> None:
+    path = affinity_path(paths, scope)
+    affinity = {worktree: slot for worktree, slot in (read_json_object(path) or {}).items()
+                if Path(worktree).exists()}
+    affinity[str(Path(record["worktree"]).resolve())] = scope.slot
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_json(path, affinity)
 
 
 def claim_files(paths: StatePaths) -> tuple[Path, ...]:
@@ -915,7 +989,10 @@ def read_claims(paths: StatePaths) -> tuple[HeldClaim, ...]:
             raise ClaimStateUnreadable(path, error) from error
         if isinstance(record, NoRun):
             continue
-        scope = claim_scope(record["worktree"]) if path == paths.run else RepositoryScope(path.stem)
+        if "repo_name" in record:
+            scope: ClaimScope = RepositoryScope(record["repo_name"], record.get("repo_key", ""), record.get("slot", 0))
+        else:
+            scope = target_claim_scope(paths, record["worktree"]) if path == paths.run else RepositoryScope(path.stem)
         held.append(HeldClaim(scope, path, record))
     return tuple(sorted(held, key=lambda claim: datetime.fromisoformat(claim.record["since"])))
 
@@ -1917,12 +1994,15 @@ def take_over_kept_claim(args: CliArguments, claim: HeldClaim, kept: RemoteJobCl
         return ClaimFinished(1)
     kept["pid"] = args.pid
     kept["proc_start"] = proc_start
+    kept["cleanup_pending"] = True
     if args.copy:
         kept["copy"] = True
     else:
         _ = kept.pop("copy", None)
     write_json(claim.path, kept)
     print(f"leftovers: {kept['remote_host']}")
+    if "slot" in kept:
+        print(f"slot: {kept['slot']}")
     return ClaimFinished(13)
 
 
@@ -1939,10 +2019,37 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope) -> Clai
     except (OSError, StateReadError):
         print(f"state unreadable: {paths.block}")
         return ClaimFinished(12)
+    for claim in overlapping:
+        record = claim.record
+        if ("remote_host" in record and record.get("cleanup_pending")
+                and record["pid"] == args.pid and not run_is_kept(record)):
+            print(f"leftovers: {record['remote_host']}")
+            if "slot" in record:
+                print(f"slot: {record['slot']}")
+            return ClaimFinished(13)
+    if not target_config.uses_legacy_mac_layout(paths.platform) and isinstance(scope, RepositoryScope):
+        try:
+            capacity = slot_capacity(paths, scope)
+            slots = preferred_slots(paths, scope, args.worktree, capacity)
+        except (OSError, StateReadError, ConfigError) as error:
+            print(f"state unreadable: {error}")
+            return ClaimFinished(12)
+        for claim in overlapping:
+            if (claim.record["pid"] == args.pid and claim.record["worktree"] == args.worktree
+                    and not run_is_kept(claim.record) and "slot" in claim.record
+                    and (isinstance(block, NoMacBlock) or block_belongs_to(block, build_hold.owning_session()))):
+                print(f"claimed\nslot: {claim.record['slot']}")
+                return ClaimFinished(0)
+        for slot in slots:
+            selected = RepositoryScope(scope.name, scope.key, slot)
+            if not any(scopes_overlap(claim.scope, selected) for claim in claims):
+                scope = selected
+                overlapping = ()
+                break
     if isinstance(args.remote, str):
         for claim in overlapping:
             record = claim.record
-            if claim.scope == scope and run_is_kept(record):
+            if scopes_overlap(claim.scope, scope) and run_is_kept(record):
                 return take_over_kept_claim(args, claim, record)
     owner = build_hold.owning_session()
     if not isinstance(block, NoMacBlock) and not block_belongs_to(block, owner):
@@ -1971,10 +2078,19 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope) -> Clai
         claimed = remote_claim
     if isinstance(owner, build_hold.OwningSession):
         claimed["holder_session"] = owner.session_id
+    if isinstance(scope, RepositoryScope):
+        claimed["repo_name"] = scope.name
+        claimed["repo_key"] = scope.key
+        if scope.slot:
+            claimed["slot"] = scope.slot
     path = claim_path(paths, scope)
     path.parent.mkdir(parents=True, exist_ok=True)
     write_json(path, claimed)
+    if isinstance(scope, RepositoryScope) and scope.slot:
+        remember_slot(paths, scope, claimed)
     print("claimed")
+    if isinstance(scope, RepositoryScope) and scope.slot:
+        print(f"slot: {scope.slot}")
     return ClaimFinished(0)
 
 
@@ -1997,7 +2113,7 @@ def stop_copy(holder: RunRecord) -> None:
 
 
 def command_claim(args: CliArguments, paths: StatePaths) -> int:
-    scope = claim_scope(args.worktree)
+    scope = target_claim_scope(paths, args.worktree)
     deadline = time.monotonic() + max(args.wait, 0.0)
     yield_deadline = 0.0
     stopped: set[tuple[int, str]] = set()
@@ -2073,7 +2189,7 @@ def free_now(
                else offload.read_backoff(time.time(), paths.target))
     if isinstance(backoff, offload.ActiveBackoff):
         return "backoff"
-    scope = claim_scope(str(repo_root))
+    scope = target_claim_scope(paths, str(repo_root))
     try:
         block = read_claim_block(paths)
         if not isinstance(block, NoMacBlock) and not block_belongs_to(block, build_hold.owning_session()):
@@ -2081,12 +2197,17 @@ def free_now(
         claims = read_claims(paths)
     except (OSError, StateReadError):
         return "state"
-    held = any(
-        scopes_overlap(claim.scope, scope)
-        and run_is_live(claim.record)
-        and (copy or not copy_gives_way(claim.record))
-        for claim in claims
-    )
+    scopes: tuple[ClaimScope, ...] = (scope,)
+    if not target_config.uses_legacy_mac_layout(paths.platform) and isinstance(scope, RepositoryScope):
+        try:
+            scopes = tuple(RepositoryScope(scope.name, scope.key, slot)
+                           for slot in range(1, slot_capacity(paths, scope) + 1))
+        except (OSError, ConfigError):
+            return "state"
+    held = all(any(
+        scopes_overlap(claim.scope, candidate) and run_is_live(claim.record)
+        and (copy or not copy_gives_way(claim.record)) for claim in claims
+    ) for candidate in scopes)
     return "busy" if held else "free"
 
 

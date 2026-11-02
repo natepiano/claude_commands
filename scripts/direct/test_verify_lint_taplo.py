@@ -43,8 +43,10 @@ class VerifyLintScopeTests(support.VerifyLintScopeFixture):
         for arguments in (("lint", "sample"), ("lint", "--workspace", "--check")):
             with self.subTest(arguments=arguments):
                 result = self.invoke_verify(*arguments, cwd=self.root / "src")
-                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertIn("not properly formatted", result.stdout + result.stderr)
+                diagnostics = (self.root / support.TAPLO_RESULTS_FILE).read_text(encoding="utf-8")
+                failure = result.stdout + result.stderr + "\nTaplo results:\n" + diagnostics
+                self.assertNotEqual(result.returncode, 0, failure)
+                self.assertIn("not properly formatted", result.stdout + result.stderr, failure)
 
     def test_fix_mode_formats_tracked_toml_and_preserves_untracked_unit_config(self) -> None:
         self.use_real_toml_tools()

@@ -89,12 +89,13 @@ else:
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
 import memory_admit
+import conf
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "build_targets"))
 if TYPE_CHECKING:
-    from ..build_targets.target_config import SshTarget, read_targets
+    from ..build_targets.target_config import LocalTarget, SshTarget, read_targets
 else:
-    from target_config import SshTarget, read_targets
+    from target_config import LocalTarget, SshTarget, read_targets
 
 if TYPE_CHECKING:
     import sample
@@ -106,8 +107,56 @@ RUSTC_TIMEOUT_S = 10
 LEDGER = Path.home() / ".local/state/verify/events.jsonl"
 LAUNCH_LOCK_NAME = "launches.lock"
 CPU_SIDECAR, IO_SIDECAR = ".cpu.stat", ".io.stat"
-# Adding or renaming a host requires updating the folders carried by sync.
-SYNC_HOSTS = ("natedev", "Mac", "Nates-MacBook-Pro-2023")
+def sync_config() -> dict[str, str]:
+    """Read peer settings when a sync or report needs them."""
+    path = Path(os.environ.get("BUILD_TARGETS_CONFIG", str(Path(__file__).resolve().parents[2]
+                                                         / "config/build_targets.conf"))).expanduser()
+    return conf.values(path)
+
+
+def target_hosts(target: str) -> tuple[str, ...]:
+    """Map a target to host names, including explicit legacy Mac aliases."""
+    values = sync_config()
+    configured = tuple(name.strip() for name in values.get(f"sync.hosts.{target}", "").split(",") if name.strip())
+    if any(name in (".", "..") or Path(name).name != name for name in configured):
+        raise ValueError("sync host names must be directory names")
+    return configured
+
+
+def mac_targets() -> tuple[str, ...]:
+    return tuple(target.name for target in read_targets()
+                 if isinstance(target, SshTarget) and target.platform == "macos")
+
+
+def configured_targets() -> tuple[str, ...]:
+    return tuple(target.name for target in read_targets())
+
+
+def local_targets() -> tuple[str, ...]:
+    return tuple(target.name for target in read_targets() if isinstance(target, LocalTarget))
+
+
+def synchronized_hosts() -> tuple[str, ...]:
+    values = sync_config()
+    names: list[str] = []
+    for key, value in values.items():
+        if key.startswith("sync.hosts."):
+            names.extend(name.strip() for name in value.split(",") if name.strip())
+    if any(name in (".", "..") or Path(name).name != name for name in names):
+        raise ValueError("sync host names must be directory names")
+    return tuple(dict.fromkeys(names))
+
+
+def recorded_target(host: str) -> str:
+    explicit = os.environ.get("BUILDLOG_TARGET", "")
+    if explicit:
+        return explicit
+    values = sync_config()
+    names = [key.removeprefix("sync.hosts.") for key in values if key.startswith("sync.hosts.")]
+    for name in names:
+        if host in target_hosts(name):
+            return name
+    return ""
 
 
 class GitFacts(TypedDict):
@@ -790,7 +839,7 @@ def step(args: list[str]) -> None:
         tree = tree_facts(os.environ.get("BUILDLOG_TREE_START"), treekey.tree_key(directory))
         step_caller = caller(tty)
         sent_key = sent_tree_key()
-        if step_caller == "verify-mac" and tree["tree_changed"] is None and isinstance(sent_key, SentTreeKey):
+        if step_caller in ("verify-mac", "verify-linux") and tree["tree_changed"] is None and isinstance(sent_key, SentTreeKey):
             tree["tree_key"] = sent_key.value
         name = parse.step_name(argv)
         record_id = new_id(host, start)
@@ -812,6 +861,7 @@ def step(args: list[str]) -> None:
             "v": RECORD_VERSION,
             "id": record_id,
             "host": host,
+            "target": recorded_target(host),
             "started_at": started_at,
             "ended_at": ended_at,
             "duration_s": round(end - start, 3),

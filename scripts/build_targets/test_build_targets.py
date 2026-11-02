@@ -556,6 +556,19 @@ class StepKindEligibilityTests(IsolatedBuildTargetTest):
         _ = write_config_fixture(self.settings, "offload=off\nlinux_only.hana=\n", template="mac_test")
         self.assertEqual(self.kind_answer("lint"), "natedev_only off\n")
 
+    def test_unresolved_probe_excludes_target_as_busy(self) -> None:
+        target = targets.SshTarget("mac", "macos", self.settings)
+        with mock.patch.object(offload, "probe_mac", return_value=offload.UnresolvedSlotStartup()) as probe:
+            result = build_targets.mac_target_eligibility(
+                target, self.root, "portable", "test", targets.AnyEligibleTarget(),
+            )
+        self.assertIsInstance(result, targets.ExcludedTarget)
+        assert isinstance(result, targets.ExcludedTarget)
+        self.assertEqual(result.target, target)
+        self.assertIn("busy", result.reason)
+        self.assertNotIn("unreachable", result.reason)
+        probe.assert_called_once()
+
     def test_unreadable_workspace_cannot_be_sent_to_the_mac(self) -> None:
         _ = (self.root / "Cargo.toml").write_text("[")
         self.assertEqual(self.kind_answer("doc"), "natedev_only repo\n")

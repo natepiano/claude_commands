@@ -296,7 +296,7 @@ class MacActivityShellTests(unittest.TestCase):
         with mock.patch.object(offload, "mirror_selector_script", return_value=marker) as selector:
             self.assertTrue(offload.leftover_check_script(HANA).startswith(marker))
             self.assertTrue(mac_test.mac_activity_script().startswith(marker))
-        self.assertEqual(selector.call_args_list, [mock.call(HANA), mock.call(offload.ALL_MIRRORS)])
+        self.assertEqual(selector.call_args_list, [mock.call(HANA, "mac", 1), mock.call(offload.ALL_MIRRORS)])
 
     def run_selector(
         self, shell: list[str], scope: offload.MirrorScope, responses: dict[str, tuple[int, str]],

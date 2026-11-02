@@ -36,6 +36,11 @@ Target = LocalTarget | SshTarget
 ConfigError = conf.Unusable
 
 
+def uses_legacy_mac_layout(platform: Platform) -> bool:
+    """Mac targets retain one mirror and claim per source repository name."""
+    return platform == "macos"
+
+
 def read_targets(path: Path | None = None) -> tuple[Target, ...]:
     config = conf.path("build_targets") if path is None or os.environ.get("CONF_DIR") else path
     values = conf.values(config)

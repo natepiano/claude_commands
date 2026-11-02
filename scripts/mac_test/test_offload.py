@@ -22,9 +22,9 @@ from typing import cast, final, override
 from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
 if TYPE_CHECKING:
-    from ..lint.memory_test_support import write_config_fixture, write_config_fault, commit_config_fixture
+    from ..lint.memory_test_support import config_environment, write_config_fixture, write_config_fault, commit_config_fixture
 else:
-    from memory_test_support import write_config_fixture, write_config_fault, commit_config_fixture
+    from memory_test_support import config_environment, write_config_fixture, write_config_fault, commit_config_fixture
 
 import offload
 import conf
@@ -64,6 +64,7 @@ class OffloadSettingsTests(unittest.TestCase):
         self.settings = self.root / "mac_test.conf"
         _ = write_config_fixture(self.settings, "", template="mac_test")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            **config_environment(self.root),
             "MAC_TEST_CONFIG": str(self.settings), "CONF_DIR": str(Path(self.settings).parent),
             "MAC_TEST_STATE_DIR": str(self.root / "state"),
         })))

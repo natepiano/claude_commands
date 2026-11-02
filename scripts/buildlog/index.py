@@ -32,7 +32,7 @@ from urllib.parse import quote
 import store
 import parse
 
-SCHEMA_VERSION = 26
+SCHEMA_VERSION = 27
 # Step and call fields under a former name, read as the current name.
 FORMER_FIELDS = (("seat", "worker"), ("delegate_session", "unit_session"))
 LOCK_NAME = "index.lock"
@@ -58,7 +58,7 @@ class JobRunState(StrEnum):
 STEP_COLUMNS: list[Column] = [
     ("id", "TEXT PRIMARY KEY", "host-UTC time-random"),
     ("src", "TEXT", "the JSON lines file the row came from, relative to the root"),
-    ("host", "TEXT", "natedev, or the Mac's short host name"),
+    ("host", "TEXT", "the host that ran the step"),
     ("started_at", "TEXT", "UTC ISO time; date(started_at,'localtime') gives the local day"),
     ("ended_at", "TEXT", "UTC ISO time"),
     ("duration_s", "REAL", "wall time of the step"),
@@ -115,6 +115,7 @@ STEP_COLUMNS: list[Column] = [
     ("started_at_us", "INTEGER", "UTC epoch microseconds; strict instant order for build history"),
     ("test_build_key", "TEXT", "verify test Cargo build-input key, excluding nextest run-only selection; NULL for older or changed builds"),
     ("scope_resources", "TEXT", "JSON own-scope CPU (excludes sccache.service compiles) and IO counters"),
+    ("target", "TEXT", "the configured build target; NULL for legacy records"),
 ]
 
 TEST_COLUMNS: list[Column] = [

@@ -20,9 +20,9 @@ from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, cast, overrid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
 if TYPE_CHECKING:
-    from ..lint.memory_test_support import write_config_fixture
+    from ..lint.memory_test_support import write_config_fixture, config_environment
 else:
-    from memory_test_support import write_config_fixture
+    from memory_test_support import write_config_fixture, config_environment
 
 import offload
 import mac_test
@@ -286,6 +286,7 @@ class OffloadCommandFixture(unittest.TestCase):
         self.sync_fixture()
         self.environment = {
             **os.environ,
+            **config_environment(self.root),
             "HOME": str(self.root / "home"),
             "PATH": f"{self.bin_directory}{os.pathsep}{os.environ['PATH']}",
             "MAC_TEST_STATE_DIR": str(self.state_directory),
