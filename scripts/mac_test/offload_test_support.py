@@ -17,6 +17,13 @@ import time
 import unittest
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, cast, override
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
+if TYPE_CHECKING:
+    from ..lint.memory_test_support import write_config_fixture
+else:
+    from memory_test_support import write_config_fixture
+
 import offload
 import mac_test
 import treekey
@@ -282,7 +289,7 @@ class OffloadCommandFixture(unittest.TestCase):
             "HOME": str(self.root / "home"),
             "PATH": f"{self.bin_directory}{os.pathsep}{os.environ['PATH']}",
             "MAC_TEST_STATE_DIR": str(self.state_directory),
-            "MAC_TEST_CONFIG": str(self.config_path),
+            "MAC_TEST_CONFIG": str(self.config_path), "CONF_DIR": str(Path(self.config_path).parent),
             "MAC_TEST_STUB_DIR": str(self.stub_directory),
             "MAC_TEST_REAL_STATE": str(STATE_SCRIPT),
             "BUILD_HOLD_DIR": str(self.root / "holders"),
@@ -300,10 +307,10 @@ class OffloadCommandFixture(unittest.TestCase):
         path.chmod(0o755)
 
     def sync_config(self) -> None:
-        _ = self.config_path.write_text(
-            "".join(f"{name}={value}\n" for name, value in self.config.items()),
-            encoding="utf-8",
-        )
+        _ = write_config_fixture(self.config_path, "".join(f"{name}={value}\n" for name, value in self.config.items()), template="mac_test")
+        lines = self.config_path.read_text().splitlines()
+        _ = self.config_path.write_text("\n".join(line for line in lines
+            if not line.startswith("linux_only.") or line.partition("=")[0] in self.config) + "\n")
 
     def sync_fixture(self) -> None:
         assignments = [f"TEST_HANG_GUARD_SECS={test_hang_guard.TEST_HANG_GUARD_SECS}"]

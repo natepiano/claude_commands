@@ -1,6 +1,8 @@
 """Judge real Git trees with fake Cargo, without changing the caller's index."""
 from __future__ import annotations
 
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
+
 import json
 import os
 from pathlib import Path
@@ -121,7 +123,7 @@ class VerifyDocFixture(unittest.TestCase):
         self.records = home / ".local/state/verify/doc_pass"
         self.events = self.root / "cargo-events.jsonl"
         self.config = self.root / "lint.conf"
-        _ = self.config.write_text("doc=on\nsweep=off\n", encoding="utf-8")
+        _ = write_config_fixture(self.config, "doc=on\nsweep=off\n")
         tools = self.root / "bin"
         tools.mkdir()
         self.executable(tools / "cargo", CARGO_STUB)
@@ -171,7 +173,7 @@ class VerifyDocFixture(unittest.TestCase):
             **memory_environment,
             "BUILD_HOLD_DIR": str(self.root / "build-hold"), "BUILD_TARGETS_SCRIPT": str(targets),
             "LINT_CONFIG_READER": str(SCRIPTS / "lint/lint_config.sh"),
-            "LINT_CONFIG_FILE": str(self.config),
+            "LINT_CONFIG_FILE": str(self.config), **config_environment(self.root),
             "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
         })
         # These are doc-policy tests, not interpreter-discovery tests. Exercise
@@ -212,6 +214,7 @@ class VerifyDocFixture(unittest.TestCase):
         settings = self.root / "mac.conf"
         _ = settings.write_text("offload=on\n")
         self.environment["MAC_TEST_CONFIG"] = str(settings)
+        self.environment["CONF_DIR"] = str(Path(settings).parent)
         self.environment["MAC_IDLE_STATE_DIR"] = str(self.root / "mac-idle")
         self.environment["MAC_TEST_STATE_DIR"] = str(self.root / "mac-state")
         targets = Path(self.environment["BUILD_TARGETS_SCRIPT"])

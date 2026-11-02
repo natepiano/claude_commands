@@ -20,12 +20,19 @@ import filesystem
 import store
 import sweep
 import test_index
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from ..lint.memory_test_support import config_environment
+else:
+    from scripts.lint.memory_test_support import config_environment
 
 
 class DiskTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
-        test_index.point_root_at(self, self.base() / "log")
+        root = self.base()
+        test_index.point_root_at(self, root / "log")
+        self.enterContext(mock.patch.dict(os.environ, config_environment(root)))
 
     def base(self) -> Path:
         return Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
@@ -169,7 +176,7 @@ class DiskTests(unittest.TestCase):
         config = self.base() / "lint.conf"
         _ = config.write_text("sweep_free_floor_gib.testhost=lots\n")
         with (
-            mock.patch.dict(os.environ, {sweep.CONFIG_ENV: str(config)}),
+            mock.patch.dict(os.environ, {"CONF_DIR": str(Path(config).parent)}),
             mock.patch.object(socket, "gethostname", return_value="testhost"),
         ):
             with self.assertRaises(disk.InvalidFloor) as caught:
@@ -190,7 +197,7 @@ class DiskTests(unittest.TestCase):
         errors = io.StringIO()
 
         with (
-            mock.patch.dict(os.environ, {sweep.CONFIG_ENV: str(config)}),
+            mock.patch.dict(os.environ, {"CONF_DIR": str(Path(config).parent)}),
             mock.patch.object(socket, "gethostname", return_value="testhost"),
             mock.patch.object(disk, "measure") as measure,
             redirect_stderr(errors),
@@ -206,7 +213,9 @@ class DiskTests(unittest.TestCase):
         measure.assert_not_called()
 
     def test_snapshot_round_trip_in_suite_log(self) -> None:
-        test_index.point_root_at(self, self.base() / "log")
+        root = self.base()
+        test_index.point_root_at(self, root / "log")
+        self.enterContext(mock.patch.dict(os.environ, config_environment(root)))
         expected: disk.DiskSnapshot = {
             "measured_at": "2026-10-04T12:00:00.000Z",
             "host": "natedev",

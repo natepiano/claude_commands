@@ -255,7 +255,6 @@ class GateFixtureSeed:
     snapshot: Path
     base: str
     checkpoint: str
-    settings_blob: str
 
 
 class MergeGateFixture(unittest.TestCase):
@@ -272,7 +271,6 @@ class MergeGateFixture(unittest.TestCase):
         self.environment: dict[str, str] = {}
         self.base: str = ""
         self.checkpoint: str = ""
-        self.settings_blob: str = ""
         self.suites: tuple[str, ...] = ()
 
     fixture_root: ClassVar[Path]
@@ -306,14 +304,14 @@ class MergeGateFixture(unittest.TestCase):
             self.build_fixture(self.fixture_root)
             snapshot = self.fixture_snapshot / str(len(self.fixture_seeds))
             _ = shutil.copytree(self.fixture_root, snapshot)
-            self.fixture_seeds[folders] = GateFixtureSeed(snapshot, self.base, self.checkpoint, self.settings_blob)
+            self.fixture_seeds[folders] = GateFixtureSeed(snapshot, self.base, self.checkpoint)
         else:
             # Git worktree metadata has absolute paths. Each copy must return
             # to the seed's original path, with its private origin and refs.
             _ = shutil.copytree(self.fixture_seeds[folders].snapshot, self.fixture_root)
         self.bind_fixture(self.fixture_root)
         seed = self.fixture_seeds[folders]
-        self.base, self.checkpoint, self.settings_blob = seed.base, seed.checkpoint, seed.settings_blob
+        self.base, self.checkpoint = seed.base, seed.checkpoint
 
     @property
     def module_count(self) -> int:
@@ -450,7 +448,6 @@ class MergeGateFixture(unittest.TestCase):
             self.write(self.checkout / "scripts" / "lib" / "test_second.py", SUITE_MODULE)
         self.write(self.checkout / ".gitignore", "__pycache__/\n")
         self.base = self.commit(self.checkout, "base")
-        self.settings_blob = self.git(self.checkout, "rev-parse", "HEAD:settings.json")
         _ = self.git(self.checkout, "push", "-u", "origin", "main")
         _ = self.git(self.checkout, "checkout", "-b", "integration")
         _ = self.git(self.checkout, "push", "-u", "origin", "integration")
@@ -503,7 +500,7 @@ class MergeGateFixture(unittest.TestCase):
              "--previous-checkpoint", previous or self.base,
              "--unit", "fixture-unit", "--phase", "phase-2",
              "--body", "Fixture checkpoint gate.", "--type-dirs", "scripts/production",
-             "--settings-blob", self.settings_blob, "--main-repo", str(self.main),
+             "--main-repo", str(self.main),
              "--ssh", str(self.bin / "ssh"),
              *([] if callers_production or "--production" in extra else ["--production", str(self.quiet_production)]),
              *extra]
@@ -540,7 +537,7 @@ class MergeGateFixture(unittest.TestCase):
     def run_promote_only(self) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             [sys.executable, str(SCRIPT), "--repo", str(self.checkout), "--merge-branch", "integration",
-             "--promote-only", "--settings-blob", self.settings_blob, "--main-repo", str(self.main),
+             "--promote-only", "--main-repo", str(self.main),
              "--ssh", str(self.bin / "ssh")], cwd=self.root, env=self.environment, stdin=subprocess.DEVNULL,
             capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
 
@@ -599,7 +596,7 @@ class MergeGateFixture(unittest.TestCase):
         _ = self.git(self.checkout, "merge", "--ff-only", "unit-phase")
         _ = self.git(self.checkout, "push", "origin", "integration")
         return merge_gate.GateArguments(
-            main_repo=str(self.main), merge_branch="integration", settings_blob=self.settings_blob,
+            main_repo=str(self.main), merge_branch="integration",
             ssh=str(self.bin / "ssh"), mac_repo="~/fixture", mac_host="fixture")
 
     @contextlib.contextmanager

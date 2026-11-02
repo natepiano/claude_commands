@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
+
 import json
 import os
 from pathlib import Path
@@ -288,7 +290,7 @@ class VerifyLintScopeFixture(unittest.TestCase):
             "BUILD_TARGETS_SCRIPT": str(targets),
             "VERIFY_ASSERTION_GUARD_SCRIPT": str(assertion_guard),
             "LINT_CONFIG_READER": str(SCRIPTS / "lint" / "lint_config.sh"),
-            "LINT_CONFIG_FILE": str(self.config),
+            "LINT_CONFIG_FILE": str(self.config), **config_environment(self.root),
         })
 
     def write_executable(self, path: Path, source: str) -> None:
@@ -347,10 +349,7 @@ class VerifyLintScopeFixture(unittest.TestCase):
         )
 
     def write_config(self, *, clippy: str) -> None:
-        _ = self.config.write_text(
-            f"mend=on\nfmt=on\nclippy={clippy}\ndoc=on\nsweep=off\n",
-            encoding="utf-8",
-        )
+        _ = write_config_fixture(self.config, f"mend=on\nfmt=on\nclippy={clippy}\ndoc=on\nsweep=off\n")
 
     def enable_cache(self) -> Path:
         session = self.root / "session"
