@@ -1660,11 +1660,15 @@ class Herdr:
 
     def native_session(self, pane: str, kind: str, timeout: float) -> str:
         """Prove the backend identity from the exact foreground process."""
+        return self.native_pane_process(pane, kind, timeout).identity
+
+    def native_pane_process(self, pane: str, kind: str, timeout: float) -> NativeAgentProcess:
+        """Read the identity and launch environment from one proved foreground process."""
         result = run_program(self.argv("pane", "process-info", "--pane", pane), timeout=timeout)
         require_success(result, "native pane processes")
         payload = json_object(decode_object(result.stdout, "native pane processes").get("result"), "native pane result")
         info = json_object(payload.get("process_info"), "native pane process info")
-        identities: list[str] = []
+        processes: list[NativeAgentProcess] = []
         for value in json_items(info.get("foreground_processes"), "native foreground processes"):
             process = json_object(value, "native foreground process")
             arguments = [json_text(arg, "native process argument")
@@ -1678,10 +1682,10 @@ class Herdr:
                 observed = native_process(pid, kind)
             except (OSError, ValueError) as error:
                 raise HerdrFailure(str(error)) from error
-            identities.append(observed.identity)
-        if len(identities) != 1:
+            processes.append(observed)
+        if len(processes) != 1:
             raise HerdrFailure("native registry identity is unavailable or ambiguous")
-        return next(iter(identities))
+        return processes[0]
 
     def readiness(self, pane: str) -> WorkerReadiness:
         agent = json_object(self.result("agent", "get", pane).get("agent"), "herdr agent get")

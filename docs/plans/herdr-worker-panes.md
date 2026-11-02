@@ -492,6 +492,8 @@ Acceptance gate: basedpyright 0/0 on changed files and every caller module; name
 
 ### Phase 3n — Workers on the staff record (call sites)  · status: todo
 
+**Owner:** models-unit, after its Phase 4 and 4m (sdlc, 2026-11-02). `staff.py` and `staff_sources.py` keep one writer at a time: herdr-unit and models-unit settle each window on the berth board.
+
 **Depends on:** 3h, 3l, 3p, 3q (staff storage schema changes with roles; live output remains schema 3), and the models unit's F024 checkpoint 3b67af71 on `origin/natedev-models` (the lock order, `worker_lifecycle.acquire_flock` and the `stop` path): merge it before any edit.
 
 Split from 3l on 2026-10-31; the same user ask and the same sdlc acceptance as 3l.
@@ -787,7 +789,7 @@ Split from 3l on 2026-10-31; the same user ask and the same sdlc acceptance as 3
 
 **Gotchas:** `.unit.toml` reads use `cleanup=False`, so a lookup never removes temporary files. Branch reads use `git --no-optional-locks`.
 
-### Phase 4n — Reconcile a pane's current Codex thread  · status: todo
+### Phase 4n — Reconcile a pane's current Codex thread  · status: done
 
 **Owner:** herdr-unit.
 
@@ -796,6 +798,13 @@ Split from 3l on 2026-10-31; the same user ask and the same sdlc acceptance as 3
 #### Work Order
 
 **Goal:** an explicit lifecycle reconciliation updates `current_session` after a proved Codex thread replacement.
+
+**As landed (scope cut by sdlc, 2026-11-02):** only `Herdr.native_pane_process` landed; `native_session` reads through it. Restart keeps the stored thread of a Codex pane row, as before. The reconcile step was removed because no source proves an idle Codex window's thread:
+1. A Codex window attached to the managed app-server daemon holds no rollout file, even during a turn; the daemon holds it.
+2. An idle in-process window closes its rollout between writes.
+3. The Codex v0.166 state and history databases, session_meta, writer locks, logs and the daemon's `thread/loaded/list` have no client pid.
+
+**Known gap:** a Codex pane's thread change (`/resume`, `/new`) is not seen until Codex offers a read-only thread query. The upstream ask is a proposal in `herdr-worker-panes-next.md`.
 
 **Spec:**
 1. Prove a real thread replacement in a throwaway Codex pane on `codex2`.
@@ -820,6 +829,8 @@ A second reconciliation changes nothing; the real replacement preserves the fixe
 Run types and the affected suites.
 
 ### Phase 3s — The one join answers from the row  · status: todo
+
+**Overlap (devtools-unit, via sdlc, 2026-11-02):** devtools 3x waits on 3s. devtools 3t switches every `issues_folder` caller in one commit, `rename_unit.py:1081` included, and sends the overlap at 3t start.
 
 **Depends on:** 3a (order); 3q, 3r for data. First reader phase on the rename track; lands before 3t/3u/3v.
 
@@ -1035,6 +1046,8 @@ Test a `/clear` during migration: resolve current ownership again, report unavai
 Make no unproved write and create no second row.
 
 ### Phase 3y — Middle stores keyed by staff id  · status: todo
+
+**Store landing (devtools-unit 4i, via sdlc, 2026-11-02):** devtools 3x lands stores 1, 2, 4 and 5 only. A store lands after 3y removes its rewriter, or after a test shows the old rewriter leaves the staff-id key alone and a real rename exits 0. Each store notice names its rewriter.
 
 **Depends on:** 3s for data, 3t, and the bevy part of 3v; records stage of the rename track. One owner handles `rename_outside.py`, `rename_unit.py` and `rename.py`. 3y does the rename-file part of 3x, 3z and 4a.
 
@@ -1287,6 +1300,8 @@ Test unchanged reruns and refusal when the recorded old value differs.
 ### Phase 4c — Units table deleted  · status: todo
 
 **Depends on:** 4b's Owns and Hub deletions; 4m (the Port audit); 3h's native-id and location completeness proof.
+
+**WRAPPED (devtools-unit 4i, via sdlc, 2026-11-02):** `production_units.py:27` holds `WRAPPED`, and `tidy_wrapped.py`, `staff_sources.py` and `staff_test_support.py` import it. When 4c rebuilds or deletes `production_units.py`, move `WRAPPED` to one leaf module and switch all three importers in the same commit. The leaf module must not import `update_registration` or `tidy_wrapped`, because that makes an import cycle.
 
 #### Work Order
 
@@ -1634,7 +1649,7 @@ Record live hashes; an unrelated hash change alone does not prove a probe write.
 
 **Acceptance gate:** `test_no_old_model_names.py` green; basedpyright 0/0 on changed files and callers; full gate green. No rerun test: the sweep is one commit, not a tool that changes shared state in steps (Invariants → Rerun-safe tools).
 
-### Phase 6 — herdr primitives for worker panes, and probes  · status: todo
+### Phase 6 — herdr primitives for worker panes, and probes  · status: done
 
 **Owner:** shutdown-unit (user approved through sdlc, 2026-11-02; it runs beside the rename).
 
@@ -1675,6 +1690,10 @@ Each test preserves the director and sibling panes and leaves one retained repla
 Test failed close and interrupted retirement, then rerun without another launch.
 
 ### Phase 7 — worker_panes.py: start-or-resume, close, observe  · status: todo
+
+**Owner:** models-unit, after 3n (sdlc, 2026-11-02). herdr-unit and models-unit settle each `herdr.py` window on the berth board.
+
+**Pane track rule (sdlc, 2026-11-02):** each next pane-track phase goes to herdr-unit or models-unit, whichever is free first, by the dependencies. A phase owned by another unit (10 shutdown, 11 accounts) stays with that unit. Each checkpoint notice gives the through-Phase-12 date.
 
 **Depends on:** Phase 1, Phase 3, Phase 3n, Phase 4, Phase 6
 
