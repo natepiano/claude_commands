@@ -3110,3 +3110,32 @@ User 2026-11-02 (via the Mac session): "the accounts board should show the count
 natedev 2026-11-02 (urgent): main was red from 101u (069010236): `test_role_map` and `test_refusal_watch`, 4 failures and 1 error.
 
 **As-built:** `_count_role_sessions` counts in memory and writes no file; `_session_counts_document` (was `_publish_session_counts`) builds the document that `session-counts-read` prints, and `_session_counts_file` is gone. `_machine_role_counts` takes the status `UsageSource` and starts the detached fetch only for `RefreshStaleUsage`, so `status --stored` reads only `peer_session_counts.json` and opens no lock. `test_role_map.py`, `test_refusal_watch.py` and `test_cutover_home.py` stub `_start_session_counts_fetch` for the whole module. New test `test_stored_status_starts_no_counts_fetch_and_writes_nothing`. 3251 tests in the accounts modules and their importers pass. No code review ran (urgent red-main repair; the director read the diff).
+
+### Phase 101x — The Mac voice setting stays local  · status: done · 0dc14b47
+
+natedev 2026-11-02 (urgent): the user turned on voice on the Mac; its `settings.json` gained a top-level `voice` key, and promotion and claude-sync refused the tracked edit from about 16:00 EST.
+
+**As-built:** `voice` joins `SETTINGS_LOCAL_KEYS_JSON` in `scripts/settings/settings_local_keys.sh`, beside `theme`. The Mac fixture in `scripts/settings/test_settings_local_keys.py` has `voice: {enabled: true, mode: hold}`; the cleaned copy has no `voice` key and the sidecar merge puts the full object back. Tests were not run at the checkpoint (hana build hold); the merge gate runs them.
+
+### Phase 101w — Account tunables live in config  · status: done · 5d9b3eec
+
+natedev 2026-11-02: the hard-coded values proposal, phase 3 (user approved 2026-11-01).
+
+**As-built:** `config/accounts.conf` holds one commented key per accounts tunable (timeouts, intervals, ages, counts, the nixos and notes path roots), each with its old value; the code reads each key at use through `scripts/lib/conf.py` with no fallback literal. Owner loops (refusal watch placement and pick) read the usage age once and pass it down. `scripts/whoami/note_file.py` resolves the notes folder as `AGENT_NOTES_DIR`, then the `AGENTS_DIR` override, then `notes_directory`, read once per process (`functools.cache`); `new_account.py` and the missing-note repair steps in `accounts.py` use that one helper. Tests run on a scratch `CONF_DIR` copy (`scratch_accounts_config` in `scripts/accounts/home_test_support.py`); caller test fixtures that clear `CONF_DIR` (herdr sessions, account move, send, codex mesh, profile notes pass) enter it too. `docs/accounts.md` names the file and says a change needs no build, and a new process for a notes-folder change.
+
+### Phase 101y — A new settings key on one machine never blocks promotion  · status: todo
+**Depends on:** Phase 101x (order only; both edit `scripts/settings/settings_local_keys.sh`).
+
+natedev 2026-11-02 accepted the general rule after 101x: a top-level key in the live `~/.claude/settings.json` that `HEAD`'s `settings.json` does not have is machine-local by default.
+
+#### Work Order
+**Goal:** a new top-level settings key added on one machine stays in that machine's live file, is stripped from the tracked copy, and never blocks promotion or claude-sync.
+**Spec:**
+1. Keep the listed keys local, including `theme` and `voice`. Also treat live top-level keys absent from committed `HEAD:settings.json` as local. Preserve their values in the sidecar before checkout removes the live file (`scripts/settings/settings_local_keys.sh:7`, `scripts/settings/refresh_filtered_index.sh:33`). Apply this rule through the shared clean, snapshot, restore and smudge definitions. Keep the existing hook-group and plugin-entry rules.
+2. An unlisted key supplied by an incoming committed settings blob becomes shared. Preserve that blob during checkout, including before HEAD advances (smudge gets it on stdin, `scripts/settings/smudge_settings_json.sh:21`). Stop treating the key as local after HEAD contains it. A listed key remains local even when a commit contains it. Preserve changes to existing shared keys as tracked edits. If the committed baseline cannot be read, report the error; never assume an empty baseline.
+3. Send a notice naming each newly detected local key and its machine, with `send.py`. Read the destination `local_key_notice_to` from `config/settings.conf` at use (`scripts/lib/conf.py`; `scripts/lib/conf.sh` from Bash); its initial value is `natedev`. Keep notice history separate from the settings-value sidecar. Do not repeat an accepted notice for the same key and machine, including after deletion or restart. Retain failed notices for retry. Keep notices and diagnostics out of filter stdout, which carries JSON (`scripts/settings/clean_settings_json.sh:14`).
+4. Tests use scratch repositories, settings, state and a fake sender. Test unknown-key cleaning, sidecar preservation and restoration. Test checkout when an incoming commit adds a previously local key. Test that listed keys remain local and shared edits remain tracked. Test that a baseline-read failure preserves data and reports an error. Test notice suppression across restart and deletion, and retry after failure. Change `local_key_notice_to` in a scratch config and verify the destination changes. Verify git diff and status with the real filters and the refresh path, as promotion (`scripts/production/merge_gate.py:1126`) and claude-sync (`scripts/lib/main_sync.py:94`) read them. Never touch a live setting or the message service.
+**Files:**
+- `scripts/settings/settings_local_keys.sh`
+- `scripts/settings/test_settings_local_keys.py`
+- `config/settings.conf`

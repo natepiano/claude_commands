@@ -41,6 +41,7 @@ from scripts.whoami.agent_accounts import (ClaudeDirectorySource, CodexHomeSourc
 from agent_notes import local_reset
 from scripts.whoami.note_file import Note, read_note
 from scripts.accounts import accounts, refusal_watch, refusals, role_map
+from scripts.accounts.home_test_support import scratch_accounts_config
 from scripts.production import showrunners
 from scripts.maintenance.schedule import ScheduleBusy, locked_history
 
@@ -97,6 +98,7 @@ class AgentNotesTests(unittest.TestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
+        _ = self.enterContext(scratch_accounts_config())
         self.job_config = self.root / "agent_notes.toml"
         _ = self.job_config.write_text("[mac_usage]\ninterval_seconds = 60\n")
         home_context = cast(object, self.enterContext(patch.dict(os.environ, {

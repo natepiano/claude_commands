@@ -26,15 +26,15 @@ export AGENT_NOTES_DIR="$TEST_DIR/notes"
 mkdir -p "$AGENT_NOTES_DIR"
 python3 - "$SCRIPT_DIR/../.." <<'PYTHON'
 import json, sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 sys.path.insert(0, str(Path(sys.argv[1]).resolve()))
 from scripts.accounts import accounts
-from scripts.whoami.account_test_support import write_codex_auth
+from scripts.whoami.account_test_support import write_codex_auth, write_claude_account
 notes = Path.home().parent / "notes"
 _ = (Path.home() / ".claude.json").write_text("{}")
-_ = (notes / "claude2.md").write_text("---\nlogin: launcher@example.invalid\n---\n")
-assert accounts.setup("claude2") == []
-_ = (accounts.account_dir("claude2") / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "launcher@example.invalid"}}))
+write_claude_account("claude2", "launcher@example.invalid", 100,
+                     datetime.now(timezone.utc) + timedelta(days=2))
 login = "workers@example.invalid"
 home = Path.home() / ".codex1"
 home.mkdir()
@@ -125,6 +125,7 @@ python3 - "$simplify_readonly" <<'PYTHON'
 import shlex
 import sys
 arguments = shlex.split(sys.argv[1])
+assert "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1" in arguments, arguments
 assert "--print" in arguments, arguments
 assert arguments[arguments.index("--permission-mode") + 1] == "plan", arguments
 removed = arguments[arguments.index("--disallowedTools") + 1].split(",")
@@ -215,6 +216,7 @@ cat > "$TEST_DIR/bin/claude" <<'EOF'
 printf '%s\n' "$CLAUDE_CONFIG_DIR" > "$TEST_CLAUDE_HOME_FILE"
 cat > "$TEST_CLAUDE_PROMPT_FILE"
 printf '%s\n' '{"type":"result","result":"done"}'
+exit "${TEST_CLAUDE_EXIT_CODE:-0}"
 EOF
 chmod +x "$TEST_DIR/bin/claude"
 export TEST_CLAUDE_HOME_FILE="$TEST_DIR/claude-home"
@@ -222,6 +224,27 @@ export TEST_CLAUDE_PROMPT_FILE="$TEST_DIR/claude-prompt"
 bash "$SCRIPT_DIR/agent_exec.sh" claude_case.task write "$WORKING_DIR" "$PROMPT_FILE" "$OUTPUT_FILE" "$LOG_FILE"
 assert_equal "workers ignored the named Claude account" "$HOME/.claude4" "$(cat "$TEST_CLAUDE_HOME_FILE")"
 assert_equal "Claude worker lost its prompt" "test prompt" "$(cat "$TEST_CLAUDE_PROMPT_FILE")"
+
+test_extraction_failure_preserves_the_task_exit_policy() {
+    local task claude_exit expected actual
+    while read -r task claude_exit expected; do
+        actual=0
+        TEST_CLAUDE_EXIT_CODE="$claude_exit" bash "$SCRIPT_DIR/agent_exec.sh" \
+            "$task" readonly "$WORKING_DIR" "$PROMPT_FILE" "$WORKING_DIR" "$LOG_FILE" \
+            2> "$TEST_DIR/extraction.stderr" || actual=$?
+        [[ "$(cat "$TEST_DIR/extraction.stderr")" == *IsADirectoryError* ]] \
+            || fail "the launcher did not reach the output write failure"
+        assert_equal "$task changed exit $claude_exit after extraction failed" "$expected" "$actual"
+    done <<'CASES'
+claude_case.task 0 0
+claude_case.task 7 7
+direct.simplify 0 1
+direct.simplify 7 1
+CASES
+}
+
+test_extraction_failure_preserves_the_task_exit_policy
+
 # The worker's registry-selected Claude path uses the same account.
 export STAFF_FILE="$TEST_DIR/staff.json"
 export AGENT_BG_ROLE=impl

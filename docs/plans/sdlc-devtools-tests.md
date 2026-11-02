@@ -582,6 +582,37 @@ Remaining gaps include shell command positions, executable Python aliases, and s
 
 **Ruled out:** dual-writing questions to outstanding JSON and records (one store only); a rename that rewrites question rows (sdlc, 2026-11-01); recovering questions lost during the migration (user accepted the loss).
 
+### Phase 4j — A production with no Proposals folder keeps its questions  · status: done
+
+#### As-built
+
+- `update_registration.question_folder(document, identities) -> QuestionFolder | QuestionOwnerUnavailable` is the one place that selects a production's question folder. `QuestionFolder(path, owner)` holds the folder and the showrunner's fixed staff id; `QuestionOwnerUnavailable(document)` means the doc has no local showrunner row.
+- The folder is the doc's Proposals folder when it names one, else `<SHOWRUNNER_STATE_DIR or ~/.local/state/showrunner>/<showrunner staff id>/questions`.
+- `store_questions` and `question_records_for_document` use it. A doc with no Proposals line files, lists and answers questions, and `migrate-questions` works for it; a doc with no showrunner row refuses with "no showrunner staff row".
+- `footer_counts.sources` counts and watches the question folder through `question_folder`.
+- `tidy_wrapped.can_hold_questions` reads the staff record only when the doc names a Proposals folder or a `<state>/*/questions` folder exists; the wrap then closes the questions in either folder.
+
+**Files:**
+- `scripts/production/update_registration.py` — `QuestionFolder`, `QuestionOwnerUnavailable`, `question_folder` and its record callers.
+- `scripts/production/footer_counts.py` — the question count and watched sources.
+- `scripts/production/tidy_wrapped.py` — question close at wrap cleanup.
+- `scripts/production/test_update_registration_questions.py`, `scripts/production/test_footer_counts.py`, `scripts/production/test_tidy_wrapped.py` — regressions for a doc with no Proposals line.
+
+**Binds later work:** the `issues_folder` result change switches `question_folder` and `tidy_wrapped.can_hold_questions` in the same commit and keeps the `<state>/<showrunner staff id>/questions` result. A proposal migration of the proposals folder does not touch that state folder.
+
+**Gotchas:** `store_questions` writes the outstanding JSON only when reminders exist; with questions only, the file stays absent. `tidy_wrapped` deletes `<state>/<slug>/`; question folders sit under `<state>/<staff id>/`, so a move of a production's state folder to its staff id must keep `questions/` out of that delete.
+
+### Phase 7m — Showrunners take Morty's words as the user's  · status: done
+
+#### As-built
+
+`commands/showrunner/produce.md` → `<Throughout>` holds the one rule "A message from morty is the user's", next to "A unit director's message is a peer's". Morty is the user's associate producer, a Codex session. A message from morty counts as the user's own words (answers, approvals, rulings, priorities); a relay to a unit begins `From the user (via morty and <showrunner name>):`. Morty is not a parent, and no showrunner reports to morty. The permission rules stay: a morty message never changes permission settings, CLAUDE.md or config, and never approves a permission prompt. `send.py` does not prove a sender, so a showrunner confirms an action that cannot be undone with morty by `send.py --to morty`.
+
+**Files:**
+- `commands/showrunner/produce.md` — the rule, its one source.
+
+**Binds later work:** messaging-unit's `send.py` sender check changes the rule's last point in its own commit.
+
 ### Phase 3x — Small stores keyed by staff id  · status: todo
 
 Source: herdr-unit plan Phase 3x, given to devtools-unit by sdlc 2026-11-02. Starts after herdr-unit's 3s. Scope: the stores only. devtools-unit lands stores 1, 2, 4 and 5 below. Store 3 is dropped (user, 2026-11-01). Store 6 (`stall_watch.py`) belongs to messaging-unit. herdr-unit's 3y owns the rename files (`rename.py`, `rename_unit.py`, `rename_outside.py`, `transfer_unit.py`) and removes each store's rewriter there.
@@ -599,7 +630,7 @@ Source: herdr-unit plan Phase 3x, given to devtools-unit by sdlc 2026-11-02. Sta
 2. **Phase note `unit:`** (`phase_table.py:1811`, `rename_unit` :2070): the note holds the unit's staff id.
 3. **Saved tab titles — dropped (user, 2026-11-01).** The saved layout keeps herdr names; `herdr.rename_saved_tab` (`herdr.py:2418`) replaces the title in the file at a rename, also for a stopped member (4g calls it).
 4. **Board cache** (`~/.local/state/unit-board/<slug>.json`, `board_json.py:424`; moved by `rename_outside.py:64`): `<showrunner staff id>.json`. The unit-board plugin's reader switches in the same step (the unit-board unit's file).
-5. **Proposal `unit:`** (`proposal_issue.py:261`; 4 readers): the issue field holds the staff id, and readers show the row's name. The proposals folder also holds question records, which Phase 4i already keyed by staff id. The migration changes proposal records only; each question record keeps its contents, timestamps, `production_id` and `asked_by` byte for byte. A shared-folder regression holds both kinds of record and checks proposal ownership and the `/showrunner:questions` table after the migration, after a rename and after a transfer.
+5. **Proposal `unit:`** (`proposal_issue.py:261`; 4 readers): the issue field holds the staff id, and readers show the row's name. The proposals folder also holds question records, which Phase 4i already keyed by staff id. A production with no Proposals line keeps its question records in `<state>/<showrunner staff id>/questions` instead (Phase 4j, `update_registration.question_folder`); the migration does not touch that folder. The migration changes proposal records only; each question record keeps its contents, timestamps, `production_id` and `asked_by` byte for byte. A shared-folder regression holds both kinds of record and checks proposal ownership and the `/showrunner:questions` table after the migration, after a rename and after a transfer.
 6. **Stall stretch** (`stall_watch.py:412` `stretch_path`; 4 readers): stretch files, prompt files and notification keys by staff id. The migration cancels and re-sends a live alert under the new key, so elapsed time and cancellation survive (old Phase 3h). The moves in `rename_unit.py`, `rename.py` and `transfer_unit.py` go. `PROMPT_ALERT_SECONDS = 60` (`stall_watch.py:66`) moves to `config/production.conf`, read at use through `tunables`, with a changed-config test.
 
 **Files:**
@@ -656,6 +687,7 @@ Source: herdr-unit plan Phase 3t, given to devtools-unit by sdlc 2026-11-02. Sta
 - Phase 3h review (2026-11-01): regression: `add_unit --resume --check` with a dead pending opening reports it and writes nothing; the test checks the pending file bytes unchanged. Keep the planned change of `recovery: UnitConfig | NoRetiredSession` to guaranteed retirement facts and `NoRecoveryRequired`.
 - Phase 3h review (2026-11-01): `proposals_folder.py:32` returns `ProposalsFolder(path) | ProposalsUnconfigured`, not `Path | None`.
 - Phase 4i review (2026-11-02): the `issues_folder` (`proposals_folder.py:41`) and `ledger` (`:32`) result change and every caller switch in one commit, with no `Path | None` adapter. Callers at 2f49beff4: `update_registration.py:32`, `tidy_wrapped.py:52,89`, `footer_counts`, `proposals_table`, `next_item`, `change_review`, `review_links/change_browser.py`, `review_links/change_page.py` and `rename_unit.py:1081`. `rename_unit.py` is herdr-unit's file: before dispatch, send the overlap to the showrunner and record its answer.
+- Phase 4j (d671740ef): two more `issues_folder` callers switch in the same commit: `update_registration.question_folder` (`update_registration.py:813`) and `tidy_wrapped.can_hold_questions` (`tidy_wrapped.py:52`). `footer_counts` reads questions through `question_folder`. With no Proposals folder, `question_folder` gives `<state>/<showrunner staff id>/questions`; keep that result.
 - Phase 4i (2f49beff4): `WRAPPED`, the wrapped status line, is defined once in `production_units.py:27`. `tidy_wrapped.py`, `staff_sources.py` (two function-level imports) and `staff_test_support.py` import it there. This phase does not move it. A phase that rebuilds or deletes `production_units.py` (herdr-unit 4c) moves `WRAPPED` to one leaf module and switches all three consumers in the same commit. That module must not import `update_registration` or `tidy_wrapped`: the 4i gate found that import cycle.
 - Phase 3h review (2026-11-01): `add_unit` stops writing the `> **Production:**` header only after 3u's header readers switch; 4b deletes the headers.
 
@@ -675,7 +707,7 @@ Source: herdr-unit plan Phase 4a, given to devtools-unit by sdlc 2026-11-02. Sta
 
 **Spec:** The same rule as Phase 3x, one store per landing with its own real proof, for:
 1. **Run owner** (`progress_history_state.json`, `progress_history.py:420` writes `production` and `unit`; about 15 readers, found by `grep -rln 'progress_history_state' scripts`): new runs record the unit's staff id; old runs keep their names as history.
-2. **Showrunner timers** (`~/.local/state/notifier/showrunner-<slug>/`, written by `update_registration.py`, read by `notifier.sh`, `statusline.sh`, `showrunners.registered_showrunners` and about 37 files): the folder is `showrunner-<staff id>`, and its `CHECK` line passes the staff id, so `production_check.sh` reads the doc from the row. The timer keeps its session, socket, zone and interval (decision 16), and `showrunners.timer_for` reads the folder by staff id, so its doc join (Phase 3s) goes. The search for readers covers `commands` and the Codex mirror too (`produce.md`'s `UPDATES`). The messaging unit owns `notifier.sh`; agree it first. Two question readers take meaning from the folder name and switch in the same landing (Phase 4i review, 2026-11-02): `scripts/hooks/showrunner_footer.py:112` takes the production slug from the timer folder name, and `scripts/production/tidy_wrapped.py:79` refuses cleanup while `showrunner-<slug>` exists. After the migration, tests show that cleanup still refuses while the production has a timer, the footer reminder and question counts stay the same, and a deferred question still expires on time.
+2. **Showrunner timers** (`~/.local/state/notifier/showrunner-<slug>/`, written by `update_registration.py`, read by `notifier.sh`, `statusline.sh`, `showrunners.registered_showrunners` and about 37 files): the folder is `showrunner-<staff id>`, and its `CHECK` line passes the staff id, so `production_check.sh` reads the doc from the row. The timer keeps its session, socket, zone and interval (decision 16), and `showrunners.timer_for` reads the folder by staff id, so its doc join (Phase 3s) goes. The search for readers covers `commands` and the Codex mirror too (`produce.md`'s `UPDATES`). The messaging unit owns `notifier.sh`; agree it first. Two question readers take meaning from the folder name and switch in the same landing (Phase 4i review, 2026-11-02): `scripts/hooks/showrunner_footer.py:112` takes the production slug from the timer folder name, and `scripts/production/tidy_wrapped.py:87` refuses cleanup while `showrunner-<slug>` exists. After the migration, tests show that cleanup still refuses while the production has a timer, the footer reminder and question counts stay the same, and a deferred question still expires on time.
 
 **Files:**
 - `scripts/hooks/showrunner_footer.py`, `scripts/production/tidy_wrapped.py`, `scripts/hooks/test_showrunner_footer.py`, `scripts/production/test_tidy_wrapped.py` — the timer-dependent question readers and their tests.

@@ -104,16 +104,23 @@ def sources(doc: Path, *, identities: QuestionStaff | None = None) -> list[Path]
         efficiency_queue = None
     found = [doc, *listed, *(path for path in (folder, queue, efficiency_queue) if path is not None)]
     if folder is not None:
-        from update_registration import QuestionStaff, question_records_for_document
-
         try:
             found.extend(issue.path for issue in proposals_folder.open_proposals(doc))
-            if identities is None:
-                identities = QuestionStaff.read()
-            found.extend(record.path for record in question_records_for_document(doc, identities)
-                         if record.status == "open")
         except OSError:
             pass
+    from update_registration import QuestionFolder, QuestionStaff, question_folder, question_records_for_document
+
+    try:
+        if identities is None:
+            identities = QuestionStaff.read()
+        questions = question_folder(doc, identities)
+        if isinstance(questions, QuestionFolder):
+            if questions.path not in found:
+                found.append(questions.path)
+            found.extend(record.path for record in question_records_for_document(doc, identities)
+                         if record.status == "open")
+    except OSError:
+        pass
     return found
 
 
