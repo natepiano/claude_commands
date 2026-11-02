@@ -295,7 +295,7 @@ With no eligible SSH target, the Mac and natedev verify routes and the build-hol
 
 **Gotchas:** A module that hits the 1800 s test limit in the verify suite has so far been a route defect (a retry loop with no exit), not machine load. Read its log before rerunning it.
 
-### Phase 6 — Account for AWS cost before admission  · status: todo
+### Phase 6 — Account for AWS cost before admission  · status: done
 **Depends on:** Phase 5
 
 #### Work Order
