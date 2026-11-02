@@ -4589,6 +4589,38 @@ finally:
             ("next", "hold", "units", "1", "half-point", "--expect", "1.234567", "claude2")])
         self.assertEqual(refusal_watch._load_state().get("auto_move_holds", {}), {})  # pyright: ignore[reportPrivateUsage]
 
+    def test_started_fixed_expired_and_no_pace_holds_list_exact_rows_without_state_changes(self) -> None:
+        self.login_directory("claude1", "source@example.invalid")
+        self.login_directory("claude2", "target@example.invalid")
+        groups = accounts.groups_file()
+        groups.parent.mkdir(parents=True, exist_ok=True)
+        _ = groups.write_text(json.dumps({"units": "claude1"}))
+        at = datetime(2026, 10, 17, tzinfo=timezone.utc)
+        cases = (
+            (next_moves.FixedHold(30), next_moves.ResolvedHold(30, next_moves.FixedHold(30)),
+             timedelta(minutes=18),
+             "units 1: at 1.234567% → claude2, hold 30 min (12 min left)\n"),
+            (next_moves.FixedHold(30), next_moves.ResolvedHold(30, next_moves.FixedHold(30)),
+             timedelta(minutes=31),
+             "units 1: at 1.234567% → claude2, hold 30 min (hold over)\n"),
+            (next_moves.HalfPointHold(), next_moves.ResolvedHold(40, next_moves.NoUsablePace()),
+             timedelta(minutes=22, seconds=1),
+             "units 1: at 1.234567% → claude2, hold half a point (40 min default: no pace history, 18 min left)\n"),
+        )
+        for mode, duration, elapsed, expected in cases:
+            with self.subTest(expected=expected):
+                entry = next_moves.add_next_move("units", 1.234567, "claude2", mode)
+                held = refusal_watch.HoldStarted("claude1", at, accounts.NoGroupTransition(),
+                    entry.at_percent, duration)
+                refusal_watch._save_state(refusal_watch.WatchState(sessions={}, notices={},  # pyright: ignore[reportPrivateUsage]
+                    auto_move_holds={entry.id: held}))
+                state_path = refusal_watch.state_root() / "refusal_watch.json"
+                before = state_path.read_bytes()
+                with patch.object(next_moves, "render_time", return_value=at + elapsed):
+                    self.assertEqual(self.run_cli("next", "list"), (0, expected, ""))
+                self.assertEqual(state_path.read_bytes(), before)
+                next_moves.remove_next_move("units", next_moves.FIRST_GROUP_POSITION)
+
     def test_listed_percent_guards_its_hold_update_locally_and_through_the_mac(self) -> None:
         entry = next_moves.add_next_move("units", 1.234567, "claude2", 5)
         requests: list[tuple[str, ...]] = []

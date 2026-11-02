@@ -3068,3 +3068,9 @@ User 2026-11-01 (via the natedev showrunner and sdlc): trust `~/worktrees` once,
 User 2026-11-01: the role count of 68 workers counted idle workers too; asked for busy, shell, idle and total columns, a total row, and no `in use` column.
 
 **As-built:** each `role_counts` entry in `accounts.py` stored-status JSON is `{busy, shell, idle, total}`. A Claude session takes the `status` field of its session record through the shared reader in `scripts/message/sessions.py` (also used by `promote_showrunner.py`); a missing or other value counts as idle. A Codex worker is busy while its roster status is `running` or `starting`, else idle, with a null `shell`. `mods/unit-board/hooks/accounts.tsx` shows account, left, role, busy, shell, idle, total, resets, credits, enabled, read, and a last `total` row in the wide and narrow layouts; the JSON keeps `credits_in_use` for cargo-handler. One review round; two minors closed by the director (doc line, Assertion-Change lines); style review PASS.
+
+### Phase 101p — Each started-hold text in `next list` has a test  · status: done · 784b2637
+
+natedev showrunner 2026-11-01 (C35, cef58b5c): prove each started-hold form that `next list` prints.
+
+**As-built:** `test_started_fixed_expired_and_no_pace_holds_list_exact_rows_without_state_changes` runs the real `next list` path on scratch state for a fixed hold with time left, a fixed hold that is over, and the 40-minute default with no pace history. Each case asserts the full line and unchanged hold state. The half-point line with a pace stays in `test_started_hold_row_is_shared_by_list_add_hold_reply_and_the_mac`. Tests only.
