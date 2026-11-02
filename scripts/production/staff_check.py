@@ -112,6 +112,9 @@ def read_evidence(record: staff.StaffSnapshot) -> CheckEvidence:
     else:
         uncertainties.extend(f"peer uncertain: {problem}" for problem in peer.problems)
         for entry in peer.entries:
+            if entry.role == "freestanding":
+                notes.append(f"{entry.machine} freestanding {entry.name}: not staff")
+                continue
             if isinstance(entry.session, roster.ClaudeSession):
                 identity, family = entry.session.session_id, "claude"
             elif isinstance(entry.thread, roster.CodexThread):
@@ -259,7 +262,7 @@ def wrong_rows(record: staff.StaffSnapshot, evidence: CheckEvidence) -> list[str
         row = record.by_current_session(identity)
         wrong(row.id if row is not None else identity, row.name if row is not None else "session", reason)
     for message in evidence.workers.diagnostics:
-        if message.endswith("; not staff"):
+        if staff_sources.is_non_staff_note(message):
             continue
         wrong("?", "sources", "uncertain: " + message)
     return [f"{identity} {name}: {'; '.join(reasons)}" for (identity, name), reasons in sorted(problems.items())]
@@ -276,7 +279,8 @@ def main() -> int:
     except (OSError, ValueError, KeyError, herdr.HerdrFailure, subprocess.SubprocessError) as error:
         print("staff check: cannot read source: " + str(error).replace("\n", " "))
         return 2
-    notes = {*evidence.notes, *(message for message in evidence.workers.diagnostics if message.endswith("; not staff"))}
+    notes = {*evidence.notes, *(message for message in evidence.workers.diagnostics
+                              if staff_sources.is_non_staff_note(message))}
     for note in sorted(notes):
         print("note: " + note.replace("\n", " ").replace("\r", " "))
     for line in lines:
