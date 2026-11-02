@@ -83,12 +83,10 @@ def _unit_row(lines: list[str], unit: str) -> dict[str, str]:
 
 def _session_status(pid: int) -> str:
     """The session record's `status`: `busy` while a turn runs."""
-    try:
-        record = cast(object, json.loads((unit_lookup.sessions_dir() / f"{pid}.json").read_text(encoding="utf-8")))
-    except (OSError, ValueError) as error:
-        raise Refusal(f"cannot read the unit's session record: {error}") from error
-    status = cast(dict[str, object], record).get("status") if isinstance(record, dict) else None
-    return status if isinstance(status, str) else ""
+    record = sessions.read_session(unit_lookup.sessions_dir() / f"{pid}.json")
+    if isinstance(record, sessions.UnreadableSessionRecord):
+        raise Refusal("cannot read the unit's session record")
+    return record.get("status", "")
 
 
 def _quiet(unit: str, marked: unit_lookup.MarkedUnit, claude: unit_lookup.LiveClaude) -> None:
