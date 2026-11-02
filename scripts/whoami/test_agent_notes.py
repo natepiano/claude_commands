@@ -42,7 +42,7 @@ from agent_notes import local_reset
 from scripts.whoami.note_file import Note, read_note
 from scripts.accounts import accounts, refusal_watch, refusals, role_map
 from scripts.production import showrunners
-from scripts.maintenance.schedule import locked_history
+from scripts.maintenance.schedule import ScheduleBusy, locked_history
 
 
 def apply_quota_and_write(notes: list[Note], report: Report, checked_at: datetime) -> list[str]:
@@ -152,6 +152,193 @@ class AgentNotesTests(unittest.TestCase):
         self.assertFalse(usage_store.timer_file().exists())
         self.assertFalse((self.root / "readings.jsonl").exists())
         self.rows.assert_not_called()
+
+    @contextmanager
+    def usage_only_renewal_read(self, outcome: agent_accounts.UsageReadOutcome) -> Generator[list[Report]]:
+        """Use the real usage store and renewal loop with a scratch account identity."""
+        _ = self.note("claude2.md", "desktop@example.invalid")
+        directory = self.root / ".claude2"
+        identity = agent_accounts.NumberedAccount("claude2", directory, "desktop@example.invalid")
+        selection = agent_accounts.ClaudeAccountsInUse(
+            agent_accounts.UnreadableIdentity(self.root / ".claude", "fixture"), False, (), frozenset())
+        reports = [Report("Claude", email=identity.login, source=ClaudeDirectorySource(directory),
+                          usage_read_outcome=outcome)]
+
+        class ObservationTime(datetime):
+            @classmethod
+            @override
+            def now(cls, tz: tzinfo | None = None) -> Self:
+                return cls.fromtimestamp(self.now.timestamp(), tz)
+
+        with (patch.object(accounts, "claude_account_selection", return_value=selection),
+              patch.object(accounts, "checked_named_accounts", return_value=[accounts.NamedAccount("claude2", directory)]),
+              patch.object(accounts, "account_identity", return_value=identity),
+              patch.object(agent_notes, "resolve_workers_home", return_value=agent_accounts.NoWorkersHome("fixture")),
+              patch.object(agent_notes, "live_reports", return_value=reports),
+              patch.object(subprocess, "Popen", side_effect=AssertionError("unexpected renewal child")),
+              patch.object(agent_notes, "datetime", ObservationTime)):
+            yield reports
+
+    @contextmanager
+    def saved_login_for_renewal(self, outcome: agent_accounts.UsageReadOutcome) -> Generator[None]:
+        """Save scratch usage before running the renewal command."""
+        with self.usage_only_renewal_read(outcome) as reports:
+            usage_store.save(reports, self.now)
+            yield
+
+    def test_usage_only_starts_a_detached_child_after_saving_and_printing_usage_without_waiting(self) -> None:
+        output = io.StringIO()
+        child = MagicMock()
+        cast(MagicMock, child.wait).side_effect = AssertionError("waited for renewal")
+        cast(MagicMock, child.communicate).side_effect = AssertionError("waited for renewal output")
+
+        def start(*args: object, **kwargs: object) -> MagicMock:
+            del args, kwargs
+            self.assertEqual(usage_store.latest_read_outcome(usage_store.load()["desktop@example.invalid"]),
+                             agent_accounts.UsageReadOutcome.STALE_TOKEN)
+            self.assertEqual(output.getvalue(),
+                             "usage refresh: 1 account(s) have login credentials unavailable in this session\n")
+            with locked_history(self.root / "state/agent-notes/usage-only") as history:
+                self.assertNotIsInstance(history, ScheduleBusy)
+            return child
+
+        with (self.usage_only_renewal_read(agent_accounts.UsageReadOutcome.STALE_TOKEN) as reports,
+              patch.object(accounts, "renew_login") as probe,
+              patch.object(refusal_watch, "renew_expired_logins", wraps=refusal_watch.renew_expired_logins) as renewal,
+              patch.object(subprocess, "Popen", side_effect=start) as launch,
+              redirect_stdout(output)):
+            reports.append(Report("Codex", usage_read_outcome=agent_accounts.UsageReadOutcome.CREDENTIALS_UNAVAILABLE))
+            agent_notes.usage_only()
+        renewal.assert_called_once_with(self.now, True)
+        launch.assert_called_once_with(
+            [sys.executable, str(Path(agent_notes.__file__).resolve()), "renew-logins"],
+            start_new_session=True, stdin=subprocess.DEVNULL)
+        self.assertEqual(child.mock_calls, [])
+        probe.assert_not_called()
+        self.assertFalse(accounts.login_renewals_file().exists())
+
+    def test_renew_logins_renews_outside_the_usage_lock_and_inside_the_renewal_lock(self) -> None:
+        def renew(label: str) -> accounts.LoginRenewed:
+            self.assertEqual(label, "claude2")
+            stored = usage_store.load()["desktop@example.invalid"]
+            self.assertEqual(usage_store.latest_read_outcome(stored), agent_accounts.UsageReadOutcome.STALE_TOKEN)
+            with locked_history(self.root / "state/agent-notes/usage-only") as history:
+                self.assertNotIsInstance(history, ScheduleBusy)
+            with locked_history(self.root / "state/agent-notes/login-renewal") as history:
+                self.assertIsInstance(history, ScheduleBusy)
+            return accounts.LoginRenewed()
+
+        with (self.saved_login_for_renewal(agent_accounts.UsageReadOutcome.STALE_TOKEN),
+              patch.object(accounts, "renew_login", side_effect=renew) as probe,
+              patch.object(sys, "argv", ["agent_notes.py", "renew-logins"]),
+              redirect_stdout(io.StringIO()) as output):
+            agent_notes.main()
+        probe.assert_called_once_with("claude2")
+        self.assertEqual(output.getvalue(), "claude2 login renewed\n")
+        self.assertEqual(accounts.login_renewal_attempts(),
+                         {"claude2": accounts.LoginRenewalAttempt(self.now, accounts.LoginRenewed())})
+
+    def test_usage_only_does_not_start_renewal_for_a_fresh_login(self) -> None:
+        with (self.usage_only_renewal_read(agent_accounts.UsageReadOutcome.OK),
+              patch.object(accounts, "renew_login") as probe,
+              patch.object(subprocess, "Popen") as launch,
+              redirect_stdout(io.StringIO()) as output):
+            agent_notes.usage_only()
+        launch.assert_not_called()
+        probe.assert_not_called()
+        self.assertEqual(output.getvalue(), "")
+        self.assertFalse(accounts.login_renewals_file().exists())
+
+    def test_usage_only_does_not_start_renewal_within_the_hourly_limit(self) -> None:
+        with (self.usage_only_renewal_read(agent_accounts.UsageReadOutcome.STALE_TOKEN),
+              patch.object(accounts, "renew_login", return_value=accounts.LoginRenewed()),
+              patch.object(subprocess, "Popen") as launch,
+              redirect_stdout(io.StringIO()) as output):
+            agent_notes.usage_only()
+            launch.assert_called_once()
+            agent_notes.renew_logins()
+            launch.reset_mock()
+            self.now += timedelta(minutes=59)
+            agent_notes.usage_only()
+        launch.assert_not_called()
+        self.assertEqual(output.getvalue(), "claude2 login renewed\n")
+
+    def test_renew_logins_keeps_the_hourly_renewal_limit(self) -> None:
+        with (self.saved_login_for_renewal(agent_accounts.UsageReadOutcome.STALE_TOKEN),
+              patch.object(accounts, "renew_login", return_value=accounts.LoginRenewalFailed("fixture probe failed")) as probe,
+              redirect_stdout(io.StringIO()) as output):
+            agent_notes.renew_logins()
+            self.now += timedelta(minutes=59)
+            agent_notes.renew_logins()
+            probe.assert_called_once_with("claude2")
+            self.now += timedelta(minutes=1)
+            agent_notes.renew_logins()
+        self.assertEqual(probe.call_args_list, [call("claude2"), call("claude2")])
+        self.assertEqual(output.getvalue().splitlines(),
+                         ["claude2 login renewal failed: fixture probe failed"] * 2)
+        self.assertEqual(accounts.login_renewal_attempts()["claude2"].at, self.now)
+
+    def test_usage_only_busy_schedule_skips_reads_and_renewal(self) -> None:
+        with (self.usage_only_renewal_read(agent_accounts.UsageReadOutcome.STALE_TOKEN),
+              patch.object(accounts, "renew_login") as probe,
+              patch.object(refusal_watch, "renew_expired_logins", wraps=refusal_watch.renew_expired_logins) as renewal,
+              patch.object(subprocess, "Popen") as launch,
+              redirect_stdout(io.StringIO()) as output,
+              locked_history(self.root / "state/agent-notes/usage-only")):
+            agent_notes.usage_only()
+        renewal.assert_not_called()
+        launch.assert_not_called()
+        probe.assert_not_called()
+        self.assertEqual(output.getvalue(), "")
+        self.assertFalse(usage_store.store_file().exists())
+        self.assertFalse(accounts.login_renewals_file().exists())
+
+    def test_renew_logins_skips_a_busy_renewal_lock_without_blocking_usage(self) -> None:
+        with (self.usage_only_renewal_read(agent_accounts.UsageReadOutcome.STALE_TOKEN) as reports,
+              patch.object(accounts, "renew_login") as probe,
+              patch.object(refusal_watch, "renew_expired_logins", wraps=refusal_watch.renew_expired_logins) as renewal,
+              patch.object(subprocess, "Popen") as launch,
+              redirect_stdout(io.StringIO()) as output,
+              locked_history(self.root / "state/agent-notes/login-renewal")):
+            reports.append(Report("Codex", usage_read_outcome=agent_accounts.UsageReadOutcome.CREDENTIALS_UNAVAILABLE))
+            agent_notes.usage_only()
+            agent_notes.renew_logins()
+        renewal.assert_called_once_with(self.now, True)
+        launch.assert_called_once()
+        probe.assert_not_called()
+        self.assertEqual(output.getvalue(),
+                         "usage refresh: 1 account(s) have login credentials unavailable in this session\n")
+        self.assertEqual(usage_store.latest_read_outcome(usage_store.load()["desktop@example.invalid"]),
+                         agent_accounts.UsageReadOutcome.STALE_TOKEN)
+        self.assertFalse(accounts.login_renewals_file().exists())
+
+    def test_usage_only_child_start_error_keeps_saved_usage_and_usage_lines(self) -> None:
+        with (self.usage_only_renewal_read(agent_accounts.UsageReadOutcome.STALE_TOKEN) as reports,
+              patch.object(accounts, "renew_login") as probe,
+              patch.object(subprocess, "Popen", side_effect=OSError("fixture start error\nextra detail")) as launch,
+              redirect_stdout(io.StringIO()) as output,
+              redirect_stderr(io.StringIO()) as errors):
+            reports.append(Report("Codex", usage_read_outcome=agent_accounts.UsageReadOutcome.CREDENTIALS_UNAVAILABLE))
+            agent_notes.usage_only()
+        launch.assert_called_once()
+        probe.assert_not_called()
+        self.assertEqual(output.getvalue(),
+                         "usage refresh: 1 account(s) have login credentials unavailable in this session\n")
+        self.assertEqual(errors.getvalue(), "login renewal: fixture start error\n")
+        self.assertEqual(usage_store.latest_read_outcome(usage_store.load()["desktop@example.invalid"]),
+                         agent_accounts.UsageReadOutcome.STALE_TOKEN)
+
+    def test_renew_logins_error_prints_one_line_and_preserves_saved_usage(self) -> None:
+        with (self.saved_login_for_renewal(agent_accounts.UsageReadOutcome.STALE_TOKEN),
+              patch.object(accounts, "renew_login", side_effect=OSError("fixture renewal error\nextra detail")) as probe,
+              redirect_stdout(io.StringIO()) as output,
+              redirect_stderr(io.StringIO()) as errors):
+            agent_notes.renew_logins()
+        probe.assert_called_once_with("claude2")
+        self.assertEqual(output.getvalue(), "")
+        self.assertEqual(errors.getvalue(), "login renewal: fixture renewal error\n")
+        self.assertEqual(usage_store.latest_read_outcome(usage_store.load()["desktop@example.invalid"]),
+                         agent_accounts.UsageReadOutcome.STALE_TOKEN)
 
     def test_usage_only_polls_skip_silently_and_start_jitter_does_not_add_a_poll(self) -> None:
         for polls in ((120.8, 150.9, 179.9, 210.7, 240.2), (149.9, 180.1, 210.7, 240.2, 270.3)):

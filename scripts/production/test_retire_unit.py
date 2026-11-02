@@ -104,7 +104,7 @@ class RetireUnitTests(unittest.TestCase):
     def prepared_retirement(self) -> staff.StaffRow:
         row = next(row for row in staff.find(kind="unit") if row.name == "alpha")
         filled = staff.set_worktree(row.id, staff.PresentWorktree("natedev", self.worktree))
-        unit_config.write(self.worktree, unit_config.UnitConfig(unit_config.PlanFile(Path("docs/plans/alpha.md")),
+        _ = unit_config.write(self.worktree, unit_config.UnitConfig(unit_config.PlanFile(Path("docs/plans/alpha.md")),
                                                                unit_config.AppPort(1), ("scripts",)))
         return filled
 
@@ -177,7 +177,7 @@ class RetireUnitTests(unittest.TestCase):
                     self.marked = None
 
                     def parked_then_stop(unit: staff.StaffId, worktree: Path, facts: unit_config.RetiredSession) -> None:
-                        park(unit, worktree, facts)
+                        _ = park(unit, worktree, facts)
                         raise OSError("fixture interrupted after park")
 
                     def removed_then_stop(unit: retire_unit.Unit) -> list[str]:
@@ -384,7 +384,7 @@ class RetireUnitTests(unittest.TestCase):
         parent = fixture_member("showrunner", name="alpha")
         self.unit_staff_id = fixture_member("unit", name="alpha", parent=parent.id, runtime_id=DIRECTOR,
                          worktree=staff.PresentWorktree("natedev", self.worktree)).id
-        unit_config.write(self.worktree, unit_config.UnitConfig(unit_config.PlanFile(Path("docs/plans/alpha.md")),
+        _ = unit_config.write(self.worktree, unit_config.UnitConfig(unit_config.PlanFile(Path("docs/plans/alpha.md")),
                                                                unit_config.AppPort(1), ("scripts",)))
         production = read_production(self.doc)
 

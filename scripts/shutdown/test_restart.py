@@ -157,6 +157,10 @@ class LeftSessionClient:
 
     def close_pane(self, pane: str) -> None:
         self.closed.append(pane)
+        self.rows.remove(pane)
+
+    def close_retained_pane(self, pane: str) -> None:
+        self.close_pane(pane)
 
 
 def top_level(
@@ -2216,6 +2220,14 @@ class RestartTests(ShutdownTestCase):
             }), "code": 1}
             responses["--session writing pane read w2:p1 --source visible"] = {
                 "stdout": "Do you trust this folder?", "code": 0,
+            }
+        if pane_present:
+            closed_responses = {**responses, "--session writing pane list": {
+                "stdout": json.dumps({"result": {"panes": []}}), "code": 0,
+            }}
+            responses["--session writing pane close w1:p1"] = {
+                "stdout": "", "code": 0,
+                "write_files": {str(path): json.dumps(closed_responses)},
             }
         _ = path.write_text(json.dumps(responses), encoding="utf-8")
 

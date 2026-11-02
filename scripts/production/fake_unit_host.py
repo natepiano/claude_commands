@@ -29,6 +29,30 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 PANE_RESULT = herdr.Herdr.result
 
 
+def native_claude(environment: Mapping[str, str], pid: int) -> None:
+    """Publish the private process files needed for registry and liveness reads."""
+    directory = Path(environment["HERDR_PROC"]) / str(pid)
+    directory.mkdir(parents=True, exist_ok=True)
+    for name, content in (("environ", b""), ("cmdline", b"claude\0")):
+        if not (directory / name).exists():
+            _ = (directory / name).write_bytes(content)
+
+
+def confirm_tab_close(responses: dict[str, CommandResponse | list[CommandResponse]],
+                      session: str, tab: str, path: Path) -> None:
+    """Remove the closed tab's panes from subsequent inventory responses."""
+    command = f"--session {session} pane list"
+    response = responses[command]
+    assert not isinstance(response, list)
+    result = herdr.json_object(cast(object, json.loads(response["stdout"])), "fixture response")
+    inventory = herdr.json_object(result["result"], "fixture inventory")
+    inventory["panes"] = [pane for pane in herdr.json_items(inventory["panes"], "fixture panes")
+                          if herdr.json_object(pane, "fixture pane").get("tab_id") != tab]
+    after = {**responses, command: CommandResponse(code=0, stdout=json.dumps(result))}
+    _ = responses.setdefault(f"--session {session} tab close {tab}", CommandResponse(
+        code=0, stdout="", write_files={str(path): json.dumps(after)}))
+
+
 @dataclass(frozen=True)
 class HostedUnit:
     session: str
@@ -105,6 +129,14 @@ def write(env: Mapping[str, str], units: Sequence[HostedUnit]) -> None:
                         responses[f"--session {name} pane read {unit.pane} --source {source} --lines {lines}{ansi}"] = {
                             "code": 0, "stdout": unit.screen}
     responses["--session default session list --json"] = {"code": 0, "stdout": json.dumps({"sessions": sessions})}
+    before_close = {command: dict(response) for command, response in responses.items()}
+    for unit in units:
+        after_close = {**before_close, f"--session {unit.session} pane list": {
+            "code": 0, "stdout": json.dumps({"result": {"panes": [
+                {"pane_id": pane.pane, "label": pane.label or None}
+                for pane in by_session[unit.session] if pane.pane != unit.pane]}})}}
+        responses[f"--session {unit.session} pane close {unit.pane}"]["write_files"] = {
+            str(responses_file): json.dumps(after_close)}
     _ = responses_file.write_text(json.dumps(responses))
 
 

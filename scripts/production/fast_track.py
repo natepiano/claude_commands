@@ -120,13 +120,30 @@ def limits() -> FastTrackLimits:
     )
 
 
-def git(repo: Path, *arguments: str, environment: dict[str, str] | None = None) -> str:
+def run_git(repo: Path, *arguments: str,
+            environment: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
     literal_paths = {**(os.environ if environment is None else environment), "GIT_LITERAL_PATHSPECS": "1"}
-    result = subprocess.run(["git", "-C", str(repo), *arguments], env=literal_paths,
-                            capture_output=True, text=True, check=False)
+    return subprocess.run(["git", "-C", str(repo), *arguments], env=literal_paths,
+                          capture_output=True, text=True, check=False)
+
+
+def git(repo: Path, *arguments: str, environment: dict[str, str] | None = None) -> str:
+    result = run_git(repo, *arguments, environment=environment)
     if result.returncode:
         raise Refused(failure_detail(result))
     return result.stdout
+
+
+def fetch_main(repo: Path) -> None:
+    attempts = conf.whole("fast_track", "fetch_lock_attempts")
+    wait_seconds = conf.number("fast_track", "fetch_lock_wait_seconds")
+    for attempt in range(attempts):
+        result = run_git(repo, "fetch", "origin", "main")
+        if result.returncode == 0:
+            return
+        if "cannot lock ref" not in result.stderr or attempt + 1 == attempts:
+            raise Refused(failure_detail(result))
+        time.sleep(wait_seconds)
 
 
 def selected_paths(repo: Path, names: list[str], config: FastTrackLimits) -> list[str]:
@@ -586,7 +603,7 @@ def reconcile(repo: Path, unit: str, *, finish: bool = False, paths: tuple[str, 
                     and (not published_commit or attempt["restore"]["record"]["commit"] == published_commit)]
     if not selected:
         return ""
-    _ = git(repo, "fetch", "origin", "main")
+    fetch_main(repo)
     recovered = ""
     # Old attempts finish before new attempts; the snapshots remain immutable.
     selected.sort(key=lambda entry: entry[1]["restore"]["record"]["time"])
@@ -680,7 +697,7 @@ def push_patch(repo: Path, production: Path, unit: str, why: str, paths: list[st
     digest = hashlib.sha256(patch).hexdigest()
     with tempfile.TemporaryDirectory(prefix="fast-track-") as temporary:
         copy = Path(temporary) / "checkout"
-        _ = git(repo, "fetch", "origin", "main")
+        fetch_main(repo)
         _ = git(repo, "clone", "--shared", "--no-checkout", str(repo), str(copy))
         _ = git(copy, "remote", "set-url", "origin", git(repo, "remote", "get-url", "origin").strip())
         for key in ("user.name", "user.email"):

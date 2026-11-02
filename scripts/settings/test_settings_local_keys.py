@@ -19,9 +19,11 @@ NATEDEV = {
             {"type": "command", "command": "bash '/home/natepiano/.claude/hooks/herdr-agent-state.sh' session"}]},
     ]},
     "model": "opus",
+    "theme": "dark-ansi",
 }
 MAC = {
     "enabledPlugins": {"rust-analyzer-lsp@claude-plugins-official": False},
+    "theme": "dark",
     "hooks": {"SessionStart": [
         {"matcher": "startup", "hooks": [{"type": "command", "command": "shared.py"}]},
         {"matcher": "*", "hooks": [
