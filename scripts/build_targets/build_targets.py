@@ -217,6 +217,8 @@ def mac_target_eligibility(target: LocalTarget | SshTarget, repo_root: Path,
         if isinstance(eligibility, offload.IneligibleMacStep):
             return ExcludedTarget(target, eligibility.reason)
         probe = offload.probe_mac(offload.ProcessController(), config, eligibility)
+        if isinstance(probe, offload.UnresolvedSlotStartup):
+            return ExcludedTarget(target, "busy")
         if isinstance(probe, offload.UnavailableProbe):
             return ExcludedTarget(target, "unreachable")
         if probe.free_gib < config.free_floor_gib:
