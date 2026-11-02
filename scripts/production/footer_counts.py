@@ -11,12 +11,15 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 
 import change_review
 import proposals_folder
 import proposals_table
 from production_units import Refusal, production_field
+
+if TYPE_CHECKING:
+    from update_registration import QuestionStaff
 
 EFFICIENCY_LEDGER_FIELD = "Efficiency ledger"
 COUNTS_HEAD = "For you: "
@@ -83,11 +86,10 @@ def read_counts(doc: Path, *, questions: int = 0) -> FooterCounts:
         return FooterCounts(questions=questions)
 
 
-def sources(doc: Path) -> list[Path]:
-    """The files the counts read, so a copy of them can tell when it is out of date.
+def sources(doc: Path, *, identities: QuestionStaff | None = None) -> list[Path]:
+    """Return the files that affect the counts and their containing folders.
 
-    A proposal closes in place, so each open one is named beside its folder, which a new one
-    changes.
+    Watch each open record because closing it changes the file.
     """
     try:
         listed = [item.path for item in change_review.scope_lists(change_review.scope_list(doc), doc)]
@@ -101,10 +103,17 @@ def sources(doc: Path) -> list[Path]:
         queue = None
         efficiency_queue = None
     found = [doc, *listed, *(path for path in (folder, queue, efficiency_queue) if path is not None)]
-    try:
-        found.extend(issue.path for issue in proposals_folder.open_proposals(doc))
-    except OSError:
-        pass
+    if folder is not None:
+        from update_registration import QuestionStaff, question_records_for_document
+
+        try:
+            found.extend(issue.path for issue in proposals_folder.open_proposals(doc))
+            if identities is None:
+                identities = QuestionStaff.read()
+            found.extend(record.path for record in question_records_for_document(doc, identities)
+                         if record.status == "open")
+        except OSError:
+            pass
     return found
 
 

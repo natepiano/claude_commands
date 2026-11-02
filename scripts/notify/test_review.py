@@ -30,8 +30,20 @@ REAL_REVIEW = review.review
 
 if TYPE_CHECKING:
     from ..accounts import accounts
+    from ..production import staff
+    from ..production.update_registration_test_support import RegistrationFixture
+    from ..production.cli_fixture import production_paths
+    from ..production.staff_test_support import (
+        fixture_member, isolated_staff_file, isolated_source_readers, source_environment,
+    )
 else:
     from scripts.accounts import accounts
+    from scripts.production import staff
+    from scripts.production.update_registration_test_support import RegistrationFixture
+    from scripts.production.cli_fixture import production_paths
+    from scripts.production.staff_test_support import (
+        fixture_member, isolated_staff_file, isolated_source_readers, source_environment,
+    )
 
 
 class VerdictJSON(TypedDict):
@@ -129,6 +141,11 @@ class LocalReviewTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        environment = source_environment(self.root / "sources")
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", environment))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, environment)))
+        _ = self.enterContext(isolated_source_readers())
+        _ = self.enterContext(production_paths(environment))
         notes = self.root / "notes"
         notes.mkdir()
         (self.root / ".claude").mkdir()
@@ -155,6 +172,19 @@ class LocalReviewTests(unittest.TestCase):
         _ = binary.write_text("fake reviewer\n")
         binary.chmod(0o700)
         _ = self.enterContext(mock.patch.object(shutil, "which", return_value=str(binary)))
+
+    def question_record(self, fields: dict[str, str], *, slug: str) -> Path:
+        folder = self.root / "proposals" / slug
+        folder.mkdir(parents=True, exist_ok=True)
+        document = self.root / f"{slug}-production.md"
+        _ = document.write_text(f"# Production — {slug}\n\n- **Proposals:** `{folder}`\n")
+        owner = fixture_member("showrunner", name=slug, doc=staff.LiveDoc("natedev", document))
+        record = folder / "question-fixture.md"
+        fields = {**fields, "asked_by": owner.id}
+        _ = record.write_text(f"---\nrecord_type: question\ntags: [question]\nstatus: open\n"
+                              + f"production_id: {owner.id}\nasked_by: {owner.id}\n"
+                              + f"registration: {json.dumps(fields)}\n---\n# {fields['text']}\n")
+        return record
 
     def test_review_receives_catalog_purposes_and_refuses_a_matching_fixed_template(self) -> None:
         draft = review.Draft("hana", "1", "Mac shots stopped", ActionRequired("Unlock the Mac."),
@@ -698,9 +728,11 @@ class LocalReviewTests(unittest.TestCase):
         item = {"since": "2026-10-15T10:00", "text": "Retry build",
                 "question": "Retry it?", "reviewed": accepted}
         current = directory / "demo.json"
-        _ = current.write_text(json.dumps([item]))
+        _ = current.write_text("[]")
+        record = self.question_record(item, slug="demo")
         with mock.patch.dict(os.environ, {"SHOWRUNNER_STATE_DIR": str(directory.parent)}):
             self.assertIn(" ".join(accepted.split()), review.registered_questions(cutoff))
+            record.unlink()
             _ = current.write_text("[]")
             history = review.QuestionRegistration(time=datetime.now(timezone.utc).isoformat(),
                 text=item["text"], question=item["question"], reviewed=accepted)
@@ -713,7 +745,8 @@ class LocalReviewTests(unittest.TestCase):
         choices = "Yes (recommended): retry the build.\nNo: keep the current build."
         registration = self.root / "showrunner/outstanding/build.json"
         registration.parent.mkdir(parents=True)
-        _ = registration.write_text(json.dumps([{"text": question}, {"text": registered_text}]))
+        _ = registration.write_text(json.dumps([{"since": "2026-10-13T10:00", "text": question},
+                                                  {"since": "2026-10-13T10:00", "text": registered_text}]))
         cases = [(question + "\n" + choices, 0),
                  ("Would you change the compiler?\n" + choices, 1),
                  (registered_text + ".\n" + choices, 0),
@@ -738,12 +771,14 @@ class LocalReviewTests(unittest.TestCase):
             ("2026-10-13T11:00:00Z", "The build passed.", "end_turn")])
         registration = self.root / "showrunner/outstanding/build.json"
         registration.parent.mkdir(parents=True)
-        item = {"text": "Run check", "question": question, "reviewed": question}
-        _ = registration.write_text(json.dumps([item]))
+        item = {"since": "2026-10-13T10:00", "text": "Run check", "question": question, "reviewed": question}
+        _ = registration.write_text("[]")
+        record = self.question_record(item, slug="build")
         draft = review.Draft("review.sample", "0", "", NoActionRequired(), "The build passed.", False)
         for closed in (False, True):
             with self.subTest(closed=closed):
                 if closed:
+                    record.unlink()
                     _ = registration.write_text("[]")
                     _ = registration.with_suffix(".history.jsonl").write_text(
                         json.dumps(dict(item, time="2026-10-13T10:00:00+00:00")) + "\n")
@@ -1797,6 +1832,22 @@ class LocalReviewTests(unittest.TestCase):
         self.assertTrue(self.entries()[0]["dry"])
         self.assertIsNone(self.entries()[0]["sent"])
         self.assertFalse(pushover.LOG_FILE.exists())
+
+
+class MigratedQuestionTests(RegistrationFixture):
+    def test_registered_questions_include_open_records_older_than_the_sample_window(self) -> None:
+        self.timer("example")
+        self.write_open_for("example", {"since": "2026-10-01T08:00", "text": "Choose a compiler",
+                                        "question": "Which compiler should we use?"})
+        self.outstanding().unlink()
+        _ = self.outstanding().with_suffix(".history.jsonl").write_text(json.dumps({
+            "time": "2026-10-01T08:00:00+00:00", "text": "Choose a compiler",
+            "question": "Which compiler should we use?"}) + "\n")
+        cutoff = datetime.fromisoformat("2026-10-12T00:00:00+00:00")
+        with mock.patch.dict(os.environ, self.env), production_paths(self.env):
+            questions = review.registered_questions(cutoff)
+        self.assertIn("Which compiler should we use?", questions)
+        self.assertFalse(self.outstanding().exists())
 
 
 if __name__ == "__main__":
