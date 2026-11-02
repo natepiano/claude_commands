@@ -392,6 +392,12 @@ class AccountsTests(unittest.TestCase):
     def test_stored_json_counts_local_members_per_account_and_role_without_discovery(self) -> None:
         self.assert_stored_role_counts("unit marks")
 
+    def test_stored_role_counts_follow_retained_unit_references_after_clear(self) -> None:
+        self.assert_stored_role_counts("cleared unit marks")
+
+    def test_stored_role_counts_follow_retained_unit_references_after_clear_without_marks(self) -> None:
+        self.assert_stored_role_counts("cleared staff identity")
+
     def test_stored_role_counts_resolve_a_unit_with_only_its_staff_identity(self) -> None:
         self.assert_stored_role_counts("staff identity")
 
@@ -409,12 +415,13 @@ class AccountsTests(unittest.TestCase):
 
     def assert_stored_role_counts(self, evidence: Literal[
         "unit marks", "staff identity", "damaged history", "damaged sibling", "damaged folder", "legacy flags",
+        "cleared unit marks", "cleared staff identity",
     ]) -> None:
         from scripts.message import sessions
         from scripts.shutdown import inventory
         from scripts.herdr import pane_launch
         from scripts.production import staff
-        from scripts.production.staff_test_support import unit_membership
+        from scripts.production.staff_test_support import unit_membership, fixture_runtime_id
 
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"STAFF_FILE": str(self.root / "staff.json")})))
         members = {name: unit_membership("fixture", name) for name in ("a", "b", "c")}
@@ -440,7 +447,15 @@ class AccountsTests(unittest.TestCase):
             if evidence == "staff identity" and unit:
                 # No unit mark: the session id is the row's current session.
                 identity, marked = members[unit].current_session, {}
-            launches[identity] = pane_launch.PaneLaunch(pane_id=identity, session_id=identity,
+            stored_identity = identity
+            if evidence in ("cleared unit marks", "cleared staff identity") and unit:
+                stored_identity = members[unit].id
+                current = staff.update_current_session(members[unit].current_session,
+                    staff.StaffId(fixture_runtime_id("account-clear-" + unit)))
+                identity = current.current_session
+                if evidence == "cleared staff identity":
+                    marked = {}
+            launches[identity] = pane_launch.PaneLaunch(pane_id=identity, session_id=stored_identity,
                 config_dir=str(self.home / ("." + label)), cwd=str(self.root), name=identity,
                 model="", remote_control=False, flags_read=True, written_at="2026-10-01T00:00:00Z",
                 environment=marked)
@@ -479,6 +494,7 @@ class AccountsTests(unittest.TestCase):
             ("claude2", {"claude1": (["units"], [2]), "claude2": (["showrunners"], [1])}),
             ("claude1", {"claude1": (["units", "showrunners"], [2, 1]), "claude2": ([], [])}),
         )
+        retained_bytes = (records / "fixture.json").read_bytes()
         for runner_label, expected in cases:
             _ = accounts.set_group_account("units", "claude1", why="fixture")
             _ = accounts.set_group_account("showrunners", runner_label, why="fixture")
@@ -499,6 +515,7 @@ class AccountsTests(unittest.TestCase):
             self.assertEqual(values, {**expected, "codex1": (["workers"], [2]), "codex2": (["spare"], [None])})
             self.assertIn(str(run / "mesh_roster.json"), document["session_inputs"])
             self.assertIn(str(records / "fixture.json"), document["session_inputs"])
+            self.assertEqual((records / "fixture.json").read_bytes(), retained_bytes)
 
     def run_cli(self, *arguments: str) -> tuple[int, str, str]:
         stdout = io.StringIO()

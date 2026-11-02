@@ -189,10 +189,11 @@ class NoSessionShowrunner:
 def session_showrunner(session_id: str, *, record: staff.StaffSnapshot,
                        sources: MemberSources) -> MemberFound | NoSessionShowrunner:
     """Follow the newest launch's staff id to its first showrunner."""
-    launches = [launch for launch in sources.launches if launch["session_id"] == session_id]
+    row = record.by_current_session(session_id)
+    launches = [launch for launch in sources.launches
+                if row is not None and record.by_member_reference(launch["session_id"]) == row]
     if not launches:
         return NoSessionShowrunner()
-    row = record.by_current_session(session_id)
     while row is not None:
         if row.kind == "showrunner":
             return MemberFound(row)
@@ -204,10 +205,14 @@ def unit_parent(unit: str, session_id: str = "", *, record: staff.StaffSnapshot,
                 sources: MemberSources | None = None) -> UnitProduction:
     """Resolve identity and its current parent without another owner read."""
     sources = sources if sources is not None else member_sources()
-    launches = [launch for launch in sources.launches if session_id and launch["session_id"] == session_id]
+    owner = record.by_member_reference(session_id) if session_id else None
+    launches = [launch for launch in sources.launches
+                if owner is not None and record.by_member_reference(launch["session_id"]) == owner]
     environment = max(launches, key=lambda launch: launch["written_at"])["environment"] if launches else {}
-    if launches:
-        row = unit_row(environment.get(UNIT_MARK, unit), record, staff_id=session_id)
+    if owner is not None:
+        if owner.kind != "unit":
+            raise staff.StaffUnreadable(f"{unit or session_id}: no unique staff entry")
+        row = unit_row(environment.get(UNIT_MARK, unit), record, staff_id=owner.current_session)
     else:
         selected = sources.member(ObservedUnit(unit), record)
         if isinstance(selected, NoSuchMember):

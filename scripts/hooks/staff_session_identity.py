@@ -56,7 +56,7 @@ def prove(payload: Mapping[str, object], environment: Mapping[str, str]) -> Clau
         raise staff.StaffRefused("clear: hook session_id is missing")
     observed = staff.native_id(entry["session_id"])
     record = staff.initial_snapshot()
-    owner = record.by_id(observed) or record.by_current_session(observed)
+    owner = record.by_member_reference(observed)
     old = owner.current_session if owner is not None else observed
     current = staff.runtime_id(pid)
     if payload.get("hook_event_name") == "SessionEnd":
@@ -93,8 +93,7 @@ def handle(payload: Mapping[str, object], environment: Mapping[str, str]) -> Cle
         return ClearIdentityResult.UNSTAFFED
     entry = pane_record.read_strict(environment.get("HERDR_SESSION", "")).get(
         environment.get("HERDR_PANE_ID", ""))
-    previous = ((record.by_id(staff.StaffId(entry["session_id"]))
-                 or record.by_current_session(entry["session_id"])) if entry is not None else None)
+    previous = record.by_member_reference(entry["session_id"]) if entry is not None else None
     if row is None and previous is None:
         return ClearIdentityResult.UNSTAFFED
     proof = prove(payload, environment)

@@ -1387,6 +1387,133 @@ class StaffSourcesTests(StaffTestCase):
         self.assertEqual(staff.by_path("control/panes/impl1"), worker)
         self.assertEqual(len(staff.find()), 3)
 
+    def test_persisted_member_reference_survives_two_clears_rename_and_name_reuse(self) -> None:
+        parent, unit, _ = self.tree()
+        _ = self.production("sdlc", "models-unit")
+        launch = pane_record.read_strict("agents")["fixture:sdlc/models-unit"]
+        pane_record.write("agents", launch)
+        second = staff.StaffId(fixture_runtime_id("member-clear-B"))
+        third = staff.StaffId(fixture_runtime_id("member-clear-C"))
+        _ = staff.update_current_session(unit.current_session, second)
+        current = staff.update_current_session(second, third)
+        current = staff.rename(current.id, "renamed")
+        replacement = fixture_member("unit", name="models", parent=parent.id,
+                                     runtime_id=fixture_runtime_id("replacement-models"))
+        path = pane_record.record_path("agents")
+        selector = staff_sources.UnitMember("sdlc", "models-unit")
+        for reference in (unit.id, third):
+            with self.subTest(reference=reference):
+                # The first case is the writer's retained A; the second models a
+                # retained observation already carrying the live conversation C.
+                if reference == third:
+                    launch["session_id"] = reference
+                    pane_record.save("agents", {launch["pane_id"]: launch})
+                before = path.read_bytes(), path.stat().st_mtime_ns
+                record = staff.snapshot()
+                with mock.patch.object(staff, "snapshot", side_effect=AssertionError("owner reread")):
+                    found = staff_sources.member(selector, record)
+                self.assertEqual(found, staff_sources.MemberFound(current))
+                self.assertNotEqual(current.id, replacement.id)
+                self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+
+    def test_persisted_member_continues_past_a_cleared_launch_under_another_parent(self) -> None:
+        parent, moved, _ = self.tree()
+        _ = self.production("sdlc", "models-unit")
+        other = fixture_member("showrunner", name="elsewhere")
+        moved = staff.move(moved.id, other.id)
+        moved = staff.update_current_session(moved.current_session, staff.StaffId(fixture_runtime_id("moved-B")))
+        target = fixture_member("unit", name="actual", parent=parent.id)
+        self.pane("newest-local", session_id=moved.id, written_at="2026-11-01T12:00:00Z",
+                  environment={"SHOWRUNNER_UNIT": "sdlc", "SHOWRUNNER_UNIT_ID": "models-unit"})
+        self.pane("older-transferred", session_id=target.id, written_at="2026-10-31T12:00:00Z",
+                  environment={"SHOWRUNNER_UNIT": "former", "SHOWRUNNER_UNIT_ID": "models-unit"})
+        selector = staff_sources.UnitMember("sdlc", "models-unit")
+        self.assertEqual(staff_sources.member(selector, staff.snapshot()), staff_sources.MemberFound(target))
+        # With two eligible identities, continuation must refuse ambiguity.
+        competing = fixture_member("unit", name="competing", parent=parent.id)
+        self.pane("competing", session_id=competing.id,
+                  environment={"SHOWRUNNER_UNIT": "former", "SHOWRUNNER_UNIT_ID": "models-unit"})
+        with self.assertRaisesRegex(staff.StaffUnreadable, "conflicting staff identities"):
+            _ = staff_sources.member(selector, staff.snapshot())
+
+    def test_persisted_cleared_references_preserve_kind_and_parent_safeguards(self) -> None:
+        parent, unit, worker = self.tree()
+        _ = self.production("sdlc", "models-unit")
+        other = fixture_member("showrunner", name="elsewhere")
+        moved = staff.move(unit.id, other.id)
+        _ = staff.update_current_session(moved.current_session, staff.StaffId(fixture_runtime_id("wrong-parent-B")))
+        _ = fixture_member("unit", name="models", parent=parent.id, runtime_id=fixture_runtime_id("same-name"))
+        selector = staff_sources.UnitMember("sdlc", "models-unit")
+        for reference in (fixture_runtime_id("missing"), parent.id, worker.id, unit.id):
+            with self.subTest(reference=reference):
+                self.pane("latest", session_id=reference, written_at="2026-11-01T12:00:00Z",
+                          environment={"SHOWRUNNER_UNIT": "sdlc", "SHOWRUNNER_UNIT_ID": "models-unit"})
+                self.assertEqual(staff_sources.member(selector, staff.snapshot()), staff_sources.NoSuchMember(selector))
+
+    def test_runtime_grouping_rejects_fixed_and_superseded_sessions_after_two_clears(self) -> None:
+        from scripts.production import session_staff
+
+        _, unit, _ = self.tree()
+        _ = self.production("sdlc", "models-unit")
+        second = staff.StaffId(fixture_runtime_id("group-B"))
+        third = staff.StaffId(fixture_runtime_id("group-C"))
+        _ = staff.update_current_session(unit.current_session, second)
+        _ = staff.update_current_session(second, third)
+        record = staff.snapshot()
+        sources = session_staff.member_sources()
+        for runtime in (third, unit.id, second):
+            with self.subTest(runtime=runtime):
+                marked = session_staff.MarkedUnit("models-unit",
+                    session_staff.LiveClaude("models", runtime, "", 123),
+                    herdr.HerdrPlace("agents", "fixture:sdlc/models-unit"), staff_id=runtime)
+                with mock.patch.object(staff, "snapshot", side_effect=AssertionError("owner reread")):
+                    grouped = session_staff.group_marked_units((("sdlc", marked),), record=record, sources=sources)
+                self.assertEqual(grouped.units.get("sdlc", {}), {"models-unit": marked} if runtime == third else {})
+                self.assertEqual(grouped.faults, {})
+
+    def test_current_session_parent_and_showrunner_follow_the_retained_launch_after_rename(self) -> None:
+        import unit_lookup
+        from scripts.production import session_staff
+
+        parent, unit, _ = self.tree()
+        doc = self.production("sdlc", "models-unit")
+        current = staff.update_current_session(unit.current_session, staff.StaffId(fixture_runtime_id("lookup-B")))
+        current = staff.rename(current.id, "renamed")
+        other = fixture_member("showrunner", name="other")
+        _ = fixture_member("unit", name="models", parent=other.id)
+        sources, record = session_staff.member_sources(), staff.snapshot()
+        path = pane_record.record_path("agents")
+        before = path.read_bytes(), path.stat().st_mtime_ns
+        with mock.patch.object(staff, "snapshot", side_effect=AssertionError("owner reread")):
+            self.assertEqual(unit_lookup.session_showrunner(current.current_session, record=record, sources=sources),
+                             session_staff.MemberFound(parent))
+            self.assertEqual(unit_lookup.unit_parent("models-unit", current.current_session, record=record, sources=sources),
+                             unit_lookup.UnitProduction("sdlc", str(doc)))
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+
+    def test_live_fill_uses_current_registry_session_for_a_retained_member_reference(self) -> None:
+        doc = self.fill_production("sdlc", "models-unit")
+        unit = unit_membership("sdlc", "models-unit")
+        folder = self.source_root / "worktrees/models-unit"
+        self.pane("unit", session_id=unit.id, environment={"SHOWRUNNER_UNIT": "sdlc", "SHOWRUNNER_UNIT_ID": "models-unit"})
+        current = staff.update_current_session(unit.current_session, staff.StaffId(fixture_runtime_id("fill-B")))
+        registry = self.session_record(current.current_session, "models-unit")
+        raw = cast(dict[str, object], json.loads(registry.read_text()))
+        raw["cwd"] = str(folder)
+        self.write_json(registry, raw)
+        # Without the Units entry, only the verified live launch supplies location.
+        write_text_atomic(doc, "\n".join(line for line in doc.read_text().splitlines()
+                                         if not line.startswith("| `models-unit`")) + "\n")
+        path = pane_record.record_path("agents")
+        before = path.read_bytes(), path.stat().st_mtime_ns
+        code, output, errors = self.fill_result()
+        self.assertEqual((code, errors), (0, ""), output)
+        updated = staff.by_id(unit.id)
+        assert updated is not None
+        self.assertEqual(updated.worktree, staff.PresentWorktree("natedev", folder))
+        self.assertEqual(updated.current_session, current.current_session)
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+
     def test_member_result_is_explicit_and_uses_only_the_supplied_snapshot(self) -> None:
         showrunner, unit, _ = self.tree()
         _ = self.production("sdlc", "models-unit")

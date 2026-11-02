@@ -5359,13 +5359,16 @@ def _count_role_sessions(rows: tuple[StatusRow, ...]) -> tuple[tuple[StatusRow, 
         inputs.add(path)
     for session in sessions.live_sessions():
         identity = session["sessionId"]
-        launch = launches.get(identity)
+        owner = membership.by_current_session(identity)
+        candidates = [launch for reference, launch in launches.items()
+                      if owner is not None and reference in (owner.id, owner.current_session)]
+        launch = max(candidates, key=lambda launch: launch["written_at"]) if candidates else launches.get(identity)
         role = "showrunners" if identity in runner_ids else ""
         if not role and launch is not None:
             unit = launch["environment"].get("SHOWRUNNER_UNIT_ID", "")
             try:
                 # The live session id joins first; an older launch keeps its unit mark.
-                member = session_staff.unit_match(session_staff.ObservedUnit(unit), membership, launch["session_id"])
+                member = session_staff.unit_match(session_staff.ObservedUnit(unit), membership, identity)
                 if isinstance(member, session_staff.NoSuchMember) and unit:
                     member = session_staff.unit_match(session_staff.ObservedUnit(unit), membership)
             except (staff.StaffUnreadable, ValueError):

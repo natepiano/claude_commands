@@ -98,21 +98,27 @@ class MemberSources:
                      if launch["environment"].get(PRODUCTION_MARK) == selector.slug]
             if local:
                 latest = max(local, key=lambda launch: launch["written_at"])
-                found = unit_match(selector, record, latest["session_id"], parent=parent.row)
+                # A missing durable id is not permission to reuse its old name.
+                identity = record.by_member_reference(latest["session_id"])
+                if identity is None or identity.kind != "unit":
+                    return NoSuchMember(selector)
+                found = unit_match(selector, record, identity.current_session, parent=parent.row)
                 if isinstance(found, MemberFound):
                     return found
-                # A missing durable id is not permission to reuse its old name.
-                if (identity := record.by_current_session(latest["session_id"])) is None or identity.kind != "unit":
-                    return NoSuchMember(selector)
             identities: dict[staff.StaffId, MemberFound] = {}
             for launch in launches:
-                found = unit_match(selector, record, launch["session_id"], parent=parent.row)
+                identity = record.by_member_reference(launch["session_id"])
+                if identity is None or identity.kind != "unit":
+                    continue
+                found = unit_match(selector, record, identity.current_session, parent=parent.row)
                 if isinstance(found, MemberFound):
                     identities[found.row.id] = found
             if len(identities) > 1:
                 raise staff.StaffUnreadable(f"{selector.slug}/{selector.unit}: conflicting staff identities")
             if identities:
                 return next(iter(identities.values()))
+            if launches:
+                return NoSuchMember(selector)
             return unit_match(selector, record, parent=parent.row)
         if source is None:
             row = record.by_path(selector.slug)

@@ -1678,20 +1678,20 @@ class _LiveFillSources(_FillSources):
         self.row_sessions: dict[staff.StaffId, list[sessions.RegistryObservation]] = {}
         # Use the same id-first join as every other membership reader.
         for launch in sources.launches:
-            if launch.get("ended") or launch["session_id"] not in self.running:
+            owner = record.by_member_reference(launch["session_id"])
+            if launch.get("ended") or owner is None or owner.current_session not in self.running:
                 continue
             environment = launch["environment"]
-            identity = launch["session_id"]
-            owner = record.by_current_session(identity) if identity else None
-            if owner is not None and owner.kind == "showrunner":
-                self.row_sessions.setdefault(owner.id, []).append(self.running[launch["session_id"]])
+            identity = owner.current_session
+            if owner.kind == "showrunner":
+                self.row_sessions.setdefault(owner.id, []).append(self.running[identity])
                 continue
             try:
                 found = sources.member(ObservedUnit(environment.get("SHOWRUNNER_UNIT_ID", ""), identity), record)
             except (ValueError, staff.StaffUnreadable):
                 continue
             if isinstance(found, MemberFound):
-                self.row_sessions.setdefault(found.row.id, []).append(self.running[launch["session_id"]])
+                self.row_sessions.setdefault(found.row.id, []).append(self.running[identity])
         self.timers: dict[staff.StaffId, list[showrunners.ShowrunnerSource]] = {}
         self.timer_errors: dict[staff.StaffId, str] = {}
         # The shared membership reader omits unreadable docs. Reuse its timer

@@ -265,6 +265,10 @@ class StaffSnapshot:
     def by_current_session(self, session_id: str) -> StaffRow | None:
         return next((row for row in self.rows if row.current_session == session_id), None)
 
+    def by_member_reference(self, reference: str) -> StaffRow | None:
+        """Resolve a persisted fixed member id or its current conversation."""
+        return self.by_id(StaffId(reference)) or self.by_current_session(reference)
+
     def by_path(self, names: str) -> StaffRow | None:
         return _row_by_path(self.rows, names)
 
