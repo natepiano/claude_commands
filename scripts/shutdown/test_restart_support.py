@@ -413,6 +413,7 @@ class RestartSupportTests(ShutdownTestCase):
                     push, = pushes
                     self.assertEqual(push.id, "shutdown.restart_failed")
                     self.assertEqual(push.values["stopped"], f"{len(names)} sessions")
+                    self.assertEqual(push.values["cause"], "restart prompt not submitted")
                     self.assertLess(len(push.message), 500)
                     self.assertLess(len(push.title), 45)
                     for saved in records:

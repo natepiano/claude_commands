@@ -6,6 +6,7 @@ from __future__ import annotations
 import copy
 import io
 import json
+from collections import Counter
 from contextlib import contextmanager, redirect_stdout
 from contextvars import ContextVar
 from collections.abc import Callable, Generator, Iterable, Mapping, Sequence
@@ -3221,10 +3222,9 @@ def restart_outage_pushes(label: str, failures: Sequence[FailedSessionRestart], 
     if not failures:
         return ()
     stopped = restart_support.stopped_sessions_text(len(failures))
-    cause = "not all sessions restarted"
+    cause = Counter(restart_cause(item.reason) for item in failures).most_common(1)[0][0]
     if len(failures) == 1:
         item = failures[0]
-        cause = restart_cause(item.reason)
 
         def named_push(name: str) -> RenderedPush:
             return render("shutdown.restart_failed", account=json.dumps(label),

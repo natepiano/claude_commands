@@ -4113,6 +4113,7 @@ class RestartTests(ShutdownTestCase):
                 sender.assert_called_once()
             push = cast(RenderedPush, sender.call_args.args[0])
             self.assertEqual(push.values["stopped"], "5 sessions")
+            self.assertEqual(push.values["cause"], "fixture launch failed")
             for saved in shutdown_record.session_records(LOGIN):
                 self.assertEqual(saved.get("restore_alerted"), restart_support.not_back_text(saved))
                 restart._clear_live_outage(saved, time.time())  # pyright: ignore[reportPrivateUsage]
@@ -4156,9 +4157,26 @@ class RestartTests(ShutdownTestCase):
         ], machine="natedev")
         push, = pushes
         self.assertEqual(push.values["stopped"], "5 sessions")
+        self.assertEqual(push.values["cause"], restart.restart_cause("cause 0 " + "x" * 1000))
         self.assertIn("natedev", cast(ActionRequired, push.action).text)
         self.assertIn('/shutdown restart "claude2"', cast(ActionRequired, push.action).text)
         self.assertLess(len(push.message), 500)
+
+    def test_restart_failure_push_uses_the_most_common_error_and_first_error_on_a_tie(self) -> None:
+        for reasons, expected in (
+            (("restart prompt not submitted", "window failed to open\nfirst detail",
+              "window failed to open\nsecond detail"), "window failed to open"),
+            (("restart prompt not submitted", "window failed to open"), "restart prompt not submitted"),
+            (("window failed to open", "restart prompt not submitted"), "window failed to open"),
+        ):
+            with self.subTest(reasons=reasons):
+                push, = restart.restart_push("claude2", [
+                    restart.FailedSessionRestart(f"Owner {index}", reason)
+                    for index, reason in enumerate(reasons)
+                ], machine="natedev")
+                self.assertEqual(push.values["cause"], expected)
+                self.assertEqual(push.values["stopped"], f"{len(reasons)} sessions")
+                self.assertIn(f"The restart gave this error: {expected}.", push.body)
 
     def test_restart_sends_one_count_push_within_phone_limits_for_long_names(self) -> None:
         batches = [[f"Owner{index}-" + "x" * suffix_length for index in range(6)]
