@@ -474,8 +474,9 @@ class UnitFolderMoveTests(FolderMoveFixture):
             for configured, expected in ((0.35, 0.35), (0.65, 0.65), (2.0, 1.0)):
                 with self.subTest(configured=configured):
                     _ = configuration.write_text(
-                        f"FOLDER_MOVE_STOP_SECONDS={configured}\n"
-                        + "FOLDER_MOVE_RESUME_SECONDS=3\nFOLDER_MOVE_POLL_SECONDS=0.1\n")
+                        f"# range: 5e-324..\nFOLDER_MOVE_STOP_SECONDS={configured}\n"
+                        + "# range: 5e-324..\nFOLDER_MOVE_RESUME_SECONDS=3\n"
+                        + "# range: 5e-324..\nFOLDER_MOVE_POLL_SECONDS=0.1\n")
                     clock[0] = 0.0
                     with self.assertRaisesRegex(ValueError, "session did not leave"):
                         unit_move.stop_folder_session(self.owner, launch)

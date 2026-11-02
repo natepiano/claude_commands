@@ -33,7 +33,7 @@ import pane_record  # noqa: E402
 import pane_launch  # noqa: E402
 from scripts.lib.process_failure import failure_detail  # noqa: E402
 from rename_state import RenameRefused, read_json, write_json  # noqa: E402
-from scripts.lib import atomic_file, relaunch, tunables  # noqa: E402
+from scripts.lib import atomic_file, conf, relaunch  # noqa: E402
 from scripts.production import staff, staff_sources  # noqa: E402
 from scripts.message import sessions  # noqa: E402
 from scripts.shutdown import remote  # noqa: E402
@@ -527,18 +527,14 @@ def folder_session(row: staff.StaffRow, launch: FolderLaunch | NoFolderLaunch) -
     return matches[0]
 
 
-def folder_move_seconds(key: str) -> float:
-    """Read the configured folder move limit when it is used."""
-    path = Path(os.environ.get("PRODUCTION_CONFIG", Path(__file__).resolve().parents[2] / "config/production.conf"))
-    value = tunables.number(path, key, minimum=0, maximum=float("inf"))
-    if value <= 0:
-        raise tunables.TunableUnusable(f"{path}: {key} must be greater than zero")
-    return value
+def _folder_move_config() -> Path:
+    """Select the configuration file for folder moves."""
+    return Path(os.environ.get("PRODUCTION_CONFIG", Path(__file__).resolve().parents[2] / "config/production.conf"))
 
 
 def folder_move_deadline(key: str) -> float:
     """The operation deadline can shorten the configured wait."""
-    deadline = min(time.monotonic() + folder_move_seconds(key), worker_lifecycle.effective_deadline())
+    deadline = min(time.monotonic() + conf.number(_folder_move_config(), key), worker_lifecycle.effective_deadline())
     if deadline <= time.monotonic():
         raise worker_lifecycle.OperationDeadlineExpired("folder move operation deadline expired")
     return deadline
@@ -551,7 +547,7 @@ def stop_folder_session(row: staff.StaffRow, launch: FolderLaunch) -> None:
         return
     pane = _folder_pane(row, launch)
     deadline = folder_move_deadline("FOLDER_MOVE_STOP_SECONDS")
-    poll = folder_move_seconds("FOLDER_MOVE_POLL_SECONDS")
+    poll = conf.number(_folder_move_config(), "FOLDER_MOVE_POLL_SECONDS")
     live = sessions.process_liveness(observed.pid, observed.started)
     if not isinstance(live, sessions.LiveSessionProcess):
         raise RenameRefused(f"{row.id}: process identity changed before stop")
@@ -610,7 +606,7 @@ def resume_folder_session(row: staff.StaffRow, launch: FolderLaunch) -> None:
                sys.executable, str(Path(__file__).resolve().parents[1] / "accounts/accounts.py"),
                "exec", config.name.removeprefix("."), *arguments]
     deadline = folder_move_deadline("FOLDER_MOVE_RESUME_SECONDS")
-    poll = folder_move_seconds("FOLDER_MOVE_POLL_SECONDS")
+    poll = conf.number(_folder_move_config(), "FOLDER_MOVE_POLL_SECONDS")
     try:
         client.run_in_pane(pane["pane_id"], command)
         while True:
@@ -771,7 +767,7 @@ def move_folder(unit: staff.StaffId, destination: Path) -> None:
                 raise RenameRefused(f"{unit}: retained launch cannot resume the session")
             if isinstance(observed, RunningFolderSession):
                 for key in ("FOLDER_MOVE_STOP_SECONDS", "FOLDER_MOVE_RESUME_SECONDS", "FOLDER_MOVE_POLL_SECONDS"):
-                    _ = folder_move_seconds(key)
+                    _ = conf.number(_folder_move_config(), key)
             save_folder_move(path, move)
         for step in FOLDER_MOVE_STEPS:
             if move.steps[step] is not FolderStepState.PENDING:
