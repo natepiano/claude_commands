@@ -1,9 +1,9 @@
 ---
-description: Send every unit director on both machines a message at once. Args - `<message>`.
+description: Send a message to all unit directors.
 argument-hint: "<message>"
 ---
 
-`$ARGUMENTS` is the user's message. Send it as written, never rephrased, and show the output unchanged:
+Read `~/.claude/commands/announce.md` → Message text.
 
 `python3 ~/.claude/scripts/production/broadcast.py --from <your session name> --units "From the user (via <your session name>, <HH:MM zone>): <message>"`
 

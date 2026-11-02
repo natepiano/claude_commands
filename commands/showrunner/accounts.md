@@ -1,5 +1,5 @@
 ---
-description: Show account groups, move a group or ad hoc session, or swap Codex workers.
+description: Manage account groups and Codex workers.
 argument-hint: '[--detail | exec claudeN|codexN|units|showrunners|workers [args…] | move <session-id|name> claudeN [--dry-run] [--why <text>] | move units|showrunners claudeN [--dry-run] [--why <text>] | setup claudeN | setup codexN | check codexN | cutover-home claudeN|codexN [--undo] | role workers | set-role workers codexN | swap workers codexN [--dry-run]]'
 ---
 

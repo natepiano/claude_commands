@@ -1,5 +1,5 @@
 ---
-description: Direct phased work with phase checks, review, repair, smoke gates, as-built shrink, an as-built doc pass at the end of the run, approved follow-up capture, and one checkpoint per phase. Supports automatic loop, verbose gating, bounded auto windows, and single no-commit mode.
+description: Direct phases, reviews, and checkpoints.
 ---
 
 # Direct

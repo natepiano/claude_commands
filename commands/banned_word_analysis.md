@@ -1,5 +1,5 @@
 ---
-description: Show forbidden-word hit counts and last-triggered timestamps
+description: Report forbidden word counts and times.
 ---
 
 Show the local banned-word counter report.

@@ -1,17 +1,21 @@
 ---
-description: Retire one unit of this production. It stops everything the unit owns, marks its Units row retired, and removes its worktree and branch.
+description: Retire a production unit.
 argument-hint: "<unit> [--dry-run]"
 ---
 
 # Retire unit
 
-Run from the showrunner session. `<unit>` is the unit's id or its stem.
+## Run rules
+
+Run in the showrunner session. `<unit>` is the unit's id or stem.
+
+Print the script's output without changes.
+
+## Execution
 
 ```sh
 "$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/retire_unit.py" <slug> <unit> [--dry-run]
 ```
-
-When it finishes, print its output exactly as it comes, with nothing added.
 
 It refuses uncommitted work. Before removal, commits the merge branch lacks are pushed to
 `origin` as `refs/retired/<staff id>` and confirmed at the full branch tip. A failed or unconfirmed

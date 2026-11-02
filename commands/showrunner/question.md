@@ -1,5 +1,5 @@
 ---
-description: Put a question for the user on this production's open-questions list without showing it in a reply, for a unit that asked or for the showrunner itself; the answer goes back through /next question.
+description: Queue a user question for later review.
 argument-hint: "[<unit>] <the question in full>"
 ---
 

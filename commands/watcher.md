@@ -1,5 +1,5 @@
 ---
-description: Take up the role of this machine's standing configuration session ("natedev" or "macbook"), check the counterpart is alive, and keep the message log.
+description: Start the machine configuration role.
 ---
 
 Each machine has one long-lived Claude session named for it: `natedev` on the NixOS box (repo `/etc/nixos`), `macbook` on the Mac (repo `~/nixos`). It owns configuration on its machine and the efficiency of work done there, is the address other agents message, and keeps a log of what it exchanges with them. This command starts or resumes that role. It is idempotent: run it again after a compaction.

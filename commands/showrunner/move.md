@@ -1,5 +1,5 @@
 ---
-description: Stop a local session and resume it on another Claude account, or move the units or showrunners group.
+description: Move sessions between Claude accounts.
 argument-hint: 'session <session-id|name> <claudeN> [--why <text>] | units|showrunners <claudeN> [--dry-run] [--why <text>]'
 ---
 

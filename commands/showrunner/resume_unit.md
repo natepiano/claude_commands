@@ -1,17 +1,15 @@
 ---
-description: Resume one retired unit of this production. It makes the unit's worktree again and resumes the session its director last used.
+description: Resume a retired production unit.
 argument-hint: "<unit> [--dry-run]"
 ---
 
 # Resume unit
 
-Run from the showrunner session. `<unit>` is the unit's id or its stem.
+Read `~/.claude/commands/showrunner/retire_unit.md` → Run rules.
 
 ```sh
 "$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/resume_unit.py" <slug> <unit> [--dry-run]
 ```
-
-When it finishes, print its output exactly as it comes, with nothing added.
 
 `/showrunner:retire_unit` keeps what a resume needs in the Units row: the worktree path, the branch,
 the plan, and the director's last session in the note `(retired <date>, worktree removed, session <id>)`.

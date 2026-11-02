@@ -1,5 +1,5 @@
 ---
-description: Get a second opinion from a friend of your own kind — claude asks claude, codex asks codex — over a live two-way channel, with follow-ups and optional implementation
+description: Consult an agent of the same family.
 ---
 
 # ask_a_friend

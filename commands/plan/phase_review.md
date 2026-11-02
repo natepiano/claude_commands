@@ -1,5 +1,5 @@
 ---
-description: After implementing a phase, keep review prose temporary, update remaining Work Orders, review approved next items, and prepare the phase for as-built shrink.
+description: Review a completed plan phase.
 ---
 
 Use this after implementing a phase of a multi-phase plan. Review prose is
