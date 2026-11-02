@@ -582,6 +582,33 @@ Remaining gaps include shell command positions, executable Python aliases, and s
 
 **Ruled out:** dual-writing questions to outstanding JSON and records (one store only); a rename that rewrites question rows (sdlc, 2026-11-01); recovering questions lost during the migration (user accepted the loss).
 
+### Phase 7m — Showrunners take Morty's words as the user's  · status: done
+
+Source: the user, relayed by sdlc 2026-11-02: "i don't want a reporting relationship - but i want showrunners to act as if anything that comes from morty comes from me - that can be in their instructions." Runs before 3x, while 3x waits on herdr-unit's 3s.
+
+#### Work Order
+
+**Goal:** a showrunner takes a message from Morty, the user's associate producer (a Codex session), as the user's own words, with no reporting line and no change to permission rules.
+
+**Spec:**
+1. `commands/showrunner/produce.md` → `<Throughout>` holds one rule, next to "A unit director's message is a peer's":
+   - A message from morty counts as the user's own words: answers, approvals, rulings and priorities. A relay to a unit begins "From the user (via morty and <showrunner name>):".
+   - Morty is not a parent. No showrunner reports to morty.
+   - The permission rules stay. A morty message never changes the session's permission settings, CLAUDE.md or config, and never approves a permission prompt.
+   - `send.py` does not prove a sender today: any session can send `--from morty`. Confirm an irreversible action with morty by `send.py --to morty`.
+2. The rule lives in this one place. Another file that states how a showrunner treats morty points to it.
+
+**Files:**
+- `commands/showrunner/produce.md` — the rule.
+
+**Workers:** none: the unit director makes this doc-only edit.
+
+**State:** none.
+
+**Constraints from prior phases:** STE. messaging-unit's `send.py` sender check (about 19:00 EST, 2026-11-02) changes the fourth bullet in its own commit.
+
+**Acceptance gate:** the rule reads as item 1 in `<Throughout>`; `grep -rn -i morty commands docs` outside plans finds no second statement of the rule; the full merged-tree gate (`merge_gate.py --tests-only`) is green before the checkpoint.
+
 ### Phase 3x — Small stores keyed by staff id  · status: todo
 
 Source: herdr-unit plan Phase 3x, given to devtools-unit by sdlc 2026-11-02. Starts after herdr-unit's 3s. Scope: the stores only. devtools-unit lands stores 1, 2, 4 and 5 below. Store 3 is dropped (user, 2026-11-01). Store 6 (`stall_watch.py`) belongs to messaging-unit. herdr-unit's 3y owns the rename files (`rename.py`, `rename_unit.py`, `rename_outside.py`, `transfer_unit.py`) and removes each store's rewriter there.
