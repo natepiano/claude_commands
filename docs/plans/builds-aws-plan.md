@@ -237,7 +237,7 @@ Assertion-Change: scripts/buildlog/test_target_sync.py transfer and host-mapping
 
 **Ruled out:** Manifest source copies; whole-folder removal for budget overflow; tool parity checks outside the shell; full-mirror `path:` flake evaluation; user commands for affinity.
 
-### Phase 4 — Route queued work to eligible SSH targets  · status: todo
+### Phase 4 — Route queued work to eligible SSH targets  · status: done
 **Depends on:** Phase 3
 
 #### Work Order
