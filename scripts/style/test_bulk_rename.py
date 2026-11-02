@@ -21,6 +21,7 @@ from typing import cast, override
 from unittest import mock
 
 import bulk_rename as bulk
+from style_child_test_support import StyleQueueFake, unqueued_style_children
 import approved_renames
 from approved_renames import OuterBindingBlocked, OuterBindingUnproved
 import berth_board
@@ -87,6 +88,7 @@ def word_edits(source: str, old: str, new: str, *, macros: bool = True) -> tuple
 
 
 class CargoProjectTests(unittest.TestCase):
+    queue: StyleQueueFake = StyleQueueFake()
     repo: Path = Path()
     root: Path = Path()
 
@@ -94,6 +96,7 @@ class CargoProjectTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="bulk-rename-test-")))
         self.set_up_tools()
+        self.queue = self.enterContext(unqueued_style_children())
         self.repo = self.root / "project"
         (self.repo / "src").mkdir(parents=True)
         _ = (self.repo / "Cargo.toml").write_text('[package]\nname="bulk_sample"\nversion="0.1.0"\nedition="2021"\n')
@@ -1204,6 +1207,11 @@ while True:
                 self.assertIn("let number", bulk.apply_edits(source, edits.documents[0].edits))
         messages = [bulk.object_fields(cast(object, json.loads(line))) for line in log.read_text().splitlines()]
         methods = [message.get("method") for message in messages]
+        self.assertEqual(self.queue.calls, [("rust-analyzer", self.repo)])
+        place, = self.queue.places
+        self.assertEqual(place.arguments, [("rust-analyzer",)])
+        self.assertTrue(place.closed)
+        self.assertTrue(all(process.returncode is not None for process in place.processes))
         self.assertEqual(methods.count("textDocument/prepareRename"), 2)
         self.assertEqual(methods.count("textDocument/rename"), 1)
         initialize = next(message for message in messages if message.get("method") == "initialize")

@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import json
 import os
+import signal
+import tempfile
 import sqlite3
 import socket
 import subprocess
@@ -10,14 +12,17 @@ import unittest
 from io import StringIO
 from unittest import mock
 from collections import Counter
-from collections.abc import Iterable, Sequence
-from contextlib import closing, nullcontext, redirect_stdout
+from collections.abc import Callable, Iterable, Sequence
+from contextlib import closing, nullcontext, redirect_stderr, redirect_stdout
 from dataclasses import replace
 from pathlib import Path
-from typing import cast, override
+from typing import TypedDict, cast, final, override
 
 import bulk_run as run
 import bulk_rename as bulk
+import fake_fmt
+from style_child_test_support import StyleQueueFake, install_refusal_tools, unqueued_style_children
+from scripts.build_queue import queue_place
 import berth_board
 import rules
 from ledger_test_support import machine_rename_fixture, MACHINE_RENAME_AFTER
@@ -475,8 +480,404 @@ class WorkspaceRunTests(CargoProjectTests):
         ledger.ticket_drop("read-1")
         return ledger, definition, tuple(findings)
 
+    def test_queue_refusal_keeps_workspace_tickets_without_finding_dispositions(self) -> None:
+        ledger, definition, findings = self.setup_findings()
+        self.addCleanup(ledger.close)
+        config = self.root / "lint.conf"
+        key = "program_first_peak_gib.cargo"
+        self.queue.refusals["cargo"] = f"{config}: {key} is missing or invalid"
+        errors = StringIO()
+        with redirect_stderr(errors), self.assertRaises(SystemExit) as stopped:
+            _ = run.run_rule(self.repo, definition.rule_id, self.tree, ledger,
+                             self.server, run.run_command, self.available)
+        self.assertEqual(stopped.exception.code, 2)
+        self.assertIn(str(config), errors.getvalue())
+        self.assertIn(key, errors.getvalue())
+        current = ledger.named_held(item.finding_id for item in findings)
+        self.assertEqual(len(current), len(findings))
+        tickets: set[str] = set()
+        for finding in current:
+            self.assertIsInstance(finding.build_ticket, ledger_api.BuildTicket)
+            assert isinstance(finding.build_ticket, ledger_api.BuildTicket)
+            tickets.add(finding.build_ticket.ticket)
+            self.assertIsInstance(finding.state, ledger_api.Filed)
+        self.assertTrue(tickets)
+        for ticket in tickets:
+            self.assertEqual(ledger.bulk_refusals(ticket), ())
+        self.assertTrue(all(ticket["state"] == "assigned" for ticket in ledger.proposal_tickets()
+                            if ticket["id"] in tickets))
+        self.assertFalse((ledger.database.parent / "bulk_review").exists())
+        self.assertEqual(self.queue.places, [])
+
     def available(self, _repo: Path, _path: str) -> None:
         pass
+
+    def check_repeated_queue_refusal(self, values: bool) -> None:
+        ledger, definition, findings = self.setup_values() if values else self.setup_findings()
+        self.addCleanup(ledger.close)
+        install_refusal_tools(self.root)
+        config = self.root / "lint.conf"
+        _ = config.write_text("[memory]\n")
+        key = "program_first_peak_gib.cargo"
+        sources = {str(path.relative_to(self.repo)): path.read_bytes() for path in self.repo.rglob("*.rs")}
+        formatted: list[str] = []
+
+        def refuse_check(repo: Path, arguments: Sequence[str]) -> None:
+            if "check" in arguments and key not in config.read_text():
+                changed = [path for path in repo.rglob("*.rs") if path.read_bytes().startswith(b"\n")]
+                self.assertTrue(changed)
+                formatted.extend(str(path.relative_to(repo)) for path in changed)
+                raise queue_place.QueuePlaceRefused(f"{config}: {key} is missing or invalid")
+
+        self.queue.before_start = refuse_check
+        intent = run.WorkspaceIntent(self.repo,
+            f"bulk_run --rule {definition.rule_id} --base-tree {self.tree} --repo {self.repo}")
+        ticket_records: tuple[ledger_api.TicketRecord, ...] = ()
+        claims: tuple[ledger_api.HeldFinding, ...] = ()
+        ownership: dict[str, object] = {}
+        for attempt in range(2):
+            with ledger_api.Ledger(self.repo, ledger.database) as fresh:
+                with redirect_stderr(StringIO()), self.assertRaises(bulk.StyleAdmissionStopped) as stopped:
+                    _ = run.run_rule(self.repo, definition.rule_id, self.tree, fresh,
+                                     self.server, run.run_command, self.available)
+                self.assertEqual(stopped.exception.code, 2)
+                current_tickets = fresh.proposal_tickets()
+                current_claims = fresh.named_held(item.finding_id for item in findings)
+                journal = bulk.object_fields(cast(object, json.loads(intent.path.read_text())))
+                current_ownership = {name: journal[name] for name in
+                                     ("batch", "operation", "base", "branch", "tickets", "findings", "completed_claims")}
+                self.assertIs(journal["admission_stopped"], True)
+                if attempt == 0:
+                    ticket_records, claims, ownership = current_tickets, current_claims, current_ownership
+                else:
+                    self.assertEqual(current_tickets, ticket_records)
+                    self.assertEqual(current_claims, claims)
+                    self.assertEqual(current_ownership, ownership)
+                for ticket in current_tickets:
+                    self.assertEqual(fresh.bulk_refusals(ticket["id"]), ())
+            self.assertEqual({str(path.relative_to(self.repo)): path.read_bytes()
+                              for path in self.repo.rglob("*.rs")}, sources)
+            self.assertTrue(all(place.closed for place in self.queue.places))
+        if values:
+            self.assertIn("src/constants.rs", formatted)
+            self.assertFalse((self.repo / "src/constants.rs").exists())
+        _ = config.write_text(f"[memory]\n{key}=12\n")
+        with ledger_api.Ledger(self.repo, ledger.database) as fresh:
+            with (mock.patch.object(run, "select", side_effect=AssertionError("retry must reuse selection")),
+                  mock.patch.object(run, "claim", side_effect=AssertionError("retry must reuse claims"))):
+                path = run.run_rule(self.repo, definition.rule_id, self.tree, fresh,
+                                    self.server, run.run_command, self.available)
+            report = bulk.object_fields(cast(object, json.loads(path.read_text())))
+            self.assertEqual(report["applied"], 2)
+            self.assertEqual(set(cast(list[str], report["tickets"])), set(cast(list[str], ownership["tickets"])))
+        self.assertFalse(intent.path.exists())
+
+    def test_workspace_repeated_refusal_reuses_completed_claims(self) -> None:
+        self.check_repeated_queue_refusal(False)
+
+    def test_workspace_repeated_refusal_restores_formatted_creations(self) -> None:
+        self.check_repeated_queue_refusal(True)
+
+    def test_interrupted_admission_restarts_with_original_claims(self) -> None:
+        for case in ("recovery_interrupt", "cleanup_interrupt", "analyzer_refusal"):
+            with self.subTest(case=case):
+                fixture = WorkspaceRunTests(methodName="runTest")
+                try:
+                    fixture.setUp()
+                    fixture.check_interrupted_admission_restart(case)
+                finally:
+                    _ = fixture.doCleanups()
+
+    def check_interrupted_admission_restart(self, case: str) -> None:
+        ledger, definition, findings = self.setup_findings()
+        self.addCleanup(ledger.close)
+        sources = {str(path.relative_to(self.repo)): path.read_bytes() for path in self.repo.rglob("*.rs")}
+        intent = run.WorkspaceIntent(self.repo,
+            f"bulk_run --rule {definition.rule_id} --base-tree {self.tree} --repo {self.repo}")
+        ticket_records: tuple[ledger_api.TicketRecord, ...] = ()
+        claims: tuple[ledger_api.HeldFinding, ...] = ()
+        ownership: dict[str, object] = {}
+        refused = False
+        interrupted = False
+        authority = ledger
+
+        def journal_ownership() -> dict[str, object]:
+            journal = bulk.object_fields(cast(object, json.loads(intent.path.read_text())))
+            return {name: journal[name] for name in
+                    ("batch", "operation", "base", "branch", "tickets", "findings", "completed_claims", "finding_inputs")}
+
+        def refuse_start(_repo: Path, arguments: Sequence[str]) -> None:
+            nonlocal refused, ticket_records, claims, ownership
+            program = "rust-analyzer" if case == "analyzer_refusal" else "cargo"
+            self.assertEqual(arguments[0], program)
+            if not refused:
+                ticket_records = authority.proposal_tickets()
+                claims = authority.named_held(finding.finding_id for finding in findings)
+                ownership = journal_ownership()
+                self.assertTrue(ticket_records)
+            else:
+                self.assertEqual(authority.proposal_tickets(), ticket_records)
+                self.assertEqual(authority.named_held(finding.finding_id for finding in findings), claims)
+                self.assertEqual(journal_ownership(), ownership)
+            refused = True
+            raise queue_place.QueuePlaceRefused("place lost before child start")
+
+        recover = run.WorkspaceIntent.recover
+
+        def interrupt_recovery(current: run.WorkspaceIntent) -> tuple[str, ...]:
+            nonlocal interrupted
+            if case == "recovery_interrupt" and refused and not interrupted:
+                interrupted = True
+                raise KeyboardInterrupt()
+            return recover(current)
+
+        def interrupt_cleanup() -> None:
+            nonlocal interrupted
+            if case == "cleanup_interrupt" and not interrupted:
+                interrupted = True
+                raise SystemExit(130)
+
+        self.queue.before_start = refuse_start
+        self.queue.after_close = interrupt_cleanup
+        server = run.RenameService.ON_DEMAND if case == "analyzer_refusal" else self.server
+        expected = (KeyboardInterrupt if case == "recovery_interrupt" else
+                    SystemExit if case == "cleanup_interrupt" else bulk.StyleAdmissionStopped)
+        with mock.patch.object(run.WorkspaceIntent, "recover", new=interrupt_recovery), redirect_stderr(StringIO()):
+            with ledger_api.Ledger(self.repo, ledger.database) as fresh:
+                authority = fresh
+                with self.assertRaises(expected) as stopped:
+                    _ = run.run_rule(self.repo, definition.rule_id, self.tree, fresh,
+                                     server, run.run_command, self.available)
+                if isinstance(stopped.exception, SystemExit):
+                    self.assertEqual(stopped.exception.code, 130 if case == "cleanup_interrupt" else 2)
+                self.assertTrue(refused)
+                self.assertEqual(fresh.proposal_tickets(), ticket_records)
+                self.assertEqual(fresh.named_held(finding.finding_id for finding in findings), claims)
+                self.assertEqual(journal_ownership(), ownership)
+            for succeeds in (False, True):
+                if succeeds:
+                    self.queue.before_start = lambda _repo, _arguments: None
+                with (ledger_api.Ledger(self.repo, ledger.database) as fresh,
+                      mock.patch.object(run, "select", side_effect=AssertionError("restart selected findings")),
+                      mock.patch.object(run, "claim", side_effect=AssertionError("restart claimed tickets")),
+                      mock.patch.object(fresh, "ticket_drop_batch", side_effect=AssertionError("restart dropped a batch")),
+                      mock.patch.object(fresh, "ticket_drop", side_effect=AssertionError("restart dropped a ticket"))):
+                    authority = fresh
+                    if not succeeds:
+                        with self.assertRaises(bulk.StyleAdmissionStopped):
+                            _ = run.run_rule(self.repo, definition.rule_id, self.tree, fresh,
+                                             server, run.run_command, self.available)
+                        self.assertEqual(fresh.proposal_tickets(), ticket_records)
+                        self.assertEqual(fresh.named_held(finding.finding_id for finding in findings), claims)
+                        self.assertEqual(journal_ownership(), ownership)
+                        self.assertEqual({str(path.relative_to(self.repo)): path.read_bytes()
+                                          for path in self.repo.rglob("*.rs")}, sources)
+                    else:
+                        report_path = run.run_rule(self.repo, definition.rule_id, self.tree, fresh,
+                                                   self.server, self.runner, self.available)
+                        report = bulk.object_fields(cast(object, json.loads(report_path.read_text())))
+                        self.assertEqual(report["applied"], 2)
+                        self.assertEqual(set(cast(list[str], report["tickets"])),
+                                         {ticket["id"] for ticket in ticket_records})
+                        owner = ledger_api.BatchOwner(str(ownership["batch"]))
+                        self.assertTrue(all(fresh.ticket_batch_owner(ticket["id"]) == owner for ticket in ticket_records))
+        self.assertTrue(all(place.closed for place in self.queue.places))
+        self.assertFalse(intent.path.exists())
+
+    def test_admission_window_preserves_only_admission_interrupts(self) -> None:
+        for case in ("cleanup_interrupt", "recovery_interrupt", "startup_interrupt", "tested_interrupt"):
+            with self.subTest(case=case):
+                fixture = WorkspaceRunTests(methodName="runTest")
+                try:
+                    fixture.setUp()
+                    fixture.check_admission_window(case)
+                finally:
+                    _ = fixture.doCleanups()
+
+    def check_admission_window(self, case: str) -> None:
+        ledger, definition, findings = self.setup_findings()
+        self.addCleanup(ledger.close)
+        install_refusal_tools(self.root)
+        self.queue.real_startup = True
+        self.enterContext(mock.patch.dict(os.environ, {"BUILDLOG_SCOPE": "0"}))
+        sources = {str(path.relative_to(self.repo)): path.read_bytes() for path in self.repo.rglob("*.rs")}
+        intent = run.WorkspaceIntent(self.repo,
+            f"bulk_run --rule {definition.rule_id} --base-tree {self.tree} --repo {self.repo}")
+        tickets: tuple[ledger_api.TicketRecord, ...] = ()
+        claims: tuple[ledger_api.HeldFinding, ...] = ()
+        ownership: dict[str, object] = {}
+        authority = ledger
+        refused = False
+        interrupted = False
+        allow = case == "startup_interrupt"
+
+        def journal_owner() -> dict[str, object]:
+            journal = bulk.object_fields(cast(object, json.loads(intent.path.read_text())))
+            return {key: journal[key] for key in
+                    ("batch", "operation", "base", "branch", "tickets", "findings", "completed_claims", "finding_inputs")}
+
+        def before_start(_repo: Path, arguments: Sequence[str]) -> None:
+            nonlocal tickets, claims, ownership, refused
+            if not tickets:
+                tickets = authority.proposal_tickets()
+                claims = authority.named_held(finding.finding_id for finding in findings)
+                ownership = journal_owner()
+                self.assertTrue(tickets)
+            if not allow and "check" in arguments:
+                refused = True
+                raise queue_place.QueuePlaceRefused("controlled refusal after formatting")
+
+        def before_started() -> None:
+            nonlocal interrupted
+            if case == "startup_interrupt" and not interrupted:
+                interrupted = True
+                signal.raise_signal(signal.SIGINT)
+
+        def after_close() -> None:
+            nonlocal interrupted
+            if case == "cleanup_interrupt" and refused and not interrupted:
+                interrupted = True
+                raise SystemExit(130)
+
+        recover = run.WorkspaceIntent.recover
+
+        def recover_attempt(current: run.WorkspaceIntent) -> tuple[str, ...]:
+            nonlocal interrupted
+            if case == "recovery_interrupt" and refused and not interrupted:
+                interrupted = True
+                raise KeyboardInterrupt()
+            return recover(current)
+
+        plan_rule = run.plan_rule
+
+        def plan_without_marker(repo: Path, authority: ledger_api.Ledger, base: str,
+                                selected: run.Selection, rule: rules.Rule,
+                                server: bulk.RenameServer | run.RenameService,
+                                available: Callable[[Path, str], None]) -> run.PlannedEdits:
+            self.assertFalse(intent.retry_eligible())
+            return plan_rule(repo, authority, base, selected, rule, server, available)
+
+        _ = self.enterContext(mock.patch.object(run, "plan_rule", new=plan_without_marker))
+        self.queue.before_start = before_start
+        self.queue.before_started = before_started
+        self.queue.after_close = after_close
+        expected = (bulk.StyleAdmissionStopped if case == "tested_interrupt" else
+                    SystemExit if case == "cleanup_interrupt" else KeyboardInterrupt)
+        with mock.patch.object(run.WorkspaceIntent, "recover", new=recover_attempt), redirect_stderr(StringIO()):
+            with ledger_api.Ledger(self.repo, ledger.database) as fresh:
+                authority = fresh
+                with self.assertRaises((KeyboardInterrupt, SystemExit)) as stopped:
+                    _ = run.run_rule(self.repo, definition.rule_id, self.tree, fresh,
+                                     self.server, run.run_command, self.available)
+                self.assertIsInstance(stopped.exception, expected)
+                if isinstance(stopped.exception, SystemExit):
+                    self.assertEqual(stopped.exception.code, 2 if case == "tested_interrupt" else 130)
+                self.assertEqual(self.git("rev-parse", "HEAD"), self.base)
+                if case != "startup_interrupt":
+                    self.assertEqual(fresh.proposal_tickets(), tickets)
+                    self.assertEqual(fresh.named_held(finding.finding_id for finding in findings), claims)
+                    self.assertEqual(journal_owner(), ownership)
+                    self.assertTrue(intent.retry_eligible())
+                    if case != "recovery_interrupt":
+                        self.assertEqual({str(path.relative_to(self.repo)): path.read_bytes()
+                                          for path in self.repo.rglob("*.rs")}, sources)
+            if case != "startup_interrupt":
+                allow = True
+                with (ledger_api.Ledger(self.repo, ledger.database) as fresh,
+                      mock.patch.object(run, "select", side_effect=AssertionError("restart selected findings")),
+                      mock.patch.object(run, "claim", side_effect=AssertionError("restart claimed tickets"))):
+                    authority = fresh
+                    def test_tree(repo: Path, _commit: str, _tree: str, runner: run.Runner,
+                                  times: dict[str, float]) -> run.CommandResult:
+                        self.assertNotEqual(run.git(repo, "rev-parse", "HEAD"), self.base)
+                        self.assertFalse(intent.retry_eligible())
+                        self.assertEqual(journal_owner(), ownership)
+                        if case == "tested_interrupt":
+                            raise KeyboardInterrupt()
+                        return original_test_tree(repo, _commit, _tree, runner, times)
+                    original_test_tree = run.test_tree
+                    with mock.patch.object(run, "test_tree", new=test_tree):
+                        if case == "tested_interrupt":
+                            with self.assertRaises(KeyboardInterrupt):
+                                _ = run.run_rule(self.repo, definition.rule_id, self.tree, fresh,
+                                                 self.server, run.run_command, self.available)
+                        else:
+                            with (mock.patch.object(fresh, "ticket_drop_batch", side_effect=AssertionError("dropped batch")),
+                                  mock.patch.object(fresh, "ticket_drop", side_effect=AssertionError("dropped ticket"))):
+                                path = run.run_rule(self.repo, definition.rule_id, self.tree, fresh,
+                                                    self.server, run.run_command, self.available)
+                            report = bulk.object_fields(cast(object, json.loads(path.read_text())))
+                            self.assertEqual(report["applied"], 2)
+                            self.assertEqual(set(cast(list[str], report["tickets"])), {ticket["id"] for ticket in tickets})
+                            owner = ledger_api.BatchOwner(str(ownership["batch"]))
+                            self.assertTrue(all(fresh.ticket_batch_owner(ticket["id"]) == owner for ticket in tickets))
+                            self.assertNotEqual(self.git("rev-parse", "HEAD"), self.base)
+            if case in {"startup_interrupt", "tested_interrupt"}:
+                with ledger_api.Ledger(self.repo, ledger.database) as fresh:
+                    authority = fresh
+                    self.assertEqual(self.git("rev-parse", "HEAD"), self.base)
+                    self.assertEqual({str(path.relative_to(self.repo)): path.read_bytes()
+                                      for path in self.repo.rglob("*.rs")}, sources)
+                    records = {ticket["id"]: ticket for ticket in fresh.proposal_tickets()}
+                    self.assertTrue(all(records[ticket["id"]]["state"] in ledger_api.FINAL_TICKET_STATES for ticket in tickets))
+                    self.assertTrue(all(isinstance(finding.build_ticket, ledger_api.NoBuildTicket)
+                                        for finding in fresh.named_held(finding.finding_id for finding in findings)))
+                    self.assertEqual(journal_owner(), ownership)
+                    self.assertFalse(intent.retry_eligible())
+                    with mock.patch.object(run, "select", return_value=run.Selection((), ())):
+                        path = run.run_rule(self.repo, definition.rule_id, self.tree, fresh,
+                                            self.server, run.run_command, self.available)
+                    self.assertEqual(bulk.object_fields(cast(object, json.loads(path.read_text())))["applied"], 0)
+        self.assertTrue(all(place.closed for place in self.queue.places))
+        self.assertFalse(intent.path.exists())
+
+    def test_refusal_from_popen_recovers_after_queue_cleanup(self) -> None:
+        ledger, definition, _ = self.setup_findings()
+        self.addCleanup(ledger.close)
+        original = (self.repo / "src/lib.rs").read_bytes()
+
+        def refuse_start(_repo: Path, _arguments: Sequence[str]) -> None:
+            self.assertIn(b"let number", (self.repo / "src/lib.rs").read_bytes())
+            raise queue_place.QueuePlaceRefused("place lost before child start")
+
+        self.queue.before_start = refuse_start
+        with redirect_stderr(StringIO()), self.assertRaises(bulk.StyleAdmissionStopped):
+            _ = run.run_rule(self.repo, definition.rule_id, self.tree, ledger,
+                             self.server, run.run_command, self.available)
+        self.assertEqual(len(self.queue.places), 1)
+        self.assertTrue(self.queue.places[0].closed)
+        self.assertEqual(self.queue.places[0].processes, [])
+        self.assertEqual((self.repo / "src/lib.rs").read_bytes(), original)
+
+    def test_unknown_change_blocks_admission_recovery_without_releasing_claims(self) -> None:
+        ledger, definition, findings = self.setup_findings()
+        self.addCleanup(ledger.close)
+        install_refusal_tools(self.root)
+        unknown = b"pub fn outside_change() {}\n"
+
+        def refuse_changed(repo: Path, arguments: Sequence[str]) -> None:
+            if "check" in arguments:
+                _ = (repo / "src/lib.rs").write_bytes(unknown)
+                raise queue_place.QueuePlaceRefused("place lost after unknown change")
+
+        self.queue.before_start = refuse_changed
+        errors = StringIO()
+        with redirect_stderr(errors), self.assertRaises(bulk.StyleAdmissionStopped):
+            _ = run.run_rule(self.repo, definition.rule_id, self.tree, ledger,
+                             self.server, run.run_command, self.available)
+        self.assertIn("bytes do not match the recorded edit", errors.getvalue())
+        tickets = ledger.proposal_tickets()
+        claims = ledger.named_held(item.finding_id for item in findings)
+        intent = run.WorkspaceIntent(self.repo,
+            f"bulk_run --rule {definition.rule_id} --base-tree {self.tree} --repo {self.repo}")
+        self.assertTrue(intent.path.exists())
+        with self.assertRaisesRegex(bulk.BulkRenameError, "bytes do not match the recorded edit"):
+            _ = run.run_rule(self.repo, definition.rule_id, self.tree, ledger,
+                             self.server, run.run_command, self.available)
+        self.assertEqual(ledger.proposal_tickets(), tickets)
+        self.assertEqual(ledger.named_held(item.finding_id for item in findings), claims)
+        self.assertEqual((self.repo / "src/lib.rs").read_bytes(), unknown)
+        self.assertTrue(intent.path.exists())
 
     def execute(self, ledger: ledger_api.Ledger, definition: rules.Rule) -> dict[str, object]:
         path = run.run_rule(self.repo, definition.rule_id, self.tree, ledger, self.server, self.runner,
@@ -1903,6 +2304,98 @@ class FreshMachineJudgmentTests(CargoProjectTests):
         self.assertIsInstance(result, bulk.Refusal)
         assert isinstance(result, bulk.Refusal)
         self.assertIn("not an open Rust finding", result.reason)
+
+
+class CargoPackageFixture(TypedDict):
+    id: str
+    name: str
+    manifest_path: str
+    dependencies: list[dict[str, object]]
+
+
+class CargoWorkspaceFixture(TypedDict):
+    workspace_members: list[str]
+    packages: list[CargoPackageFixture]
+
+
+@final
+class StyleChildAdmissionTests(unittest.TestCase):
+    repo: Path = Path()
+    state: Path = Path()
+    queue: StyleQueueFake = StyleQueueFake()
+
+    @override
+    def setUp(self) -> None:
+        self.repo = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="style-admission-test-")))
+        self.state = self.repo / "fmt"
+        fake_fmt.install(self.repo / "bin", self.state)
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            "PATH": str(self.repo / "bin") + os.pathsep + os.environ.get("PATH", ""),
+            fake_fmt.STATE: str(self.state),
+        })))
+        self.queue = self.enterContext(unqueued_style_children())
+
+    def test_bulk_cargo_starts_use_the_shared_place_and_verify_does_not(self) -> None:
+        for name, text in (("stdout", "out"), ("stderr", "err"), ("exit", "7")):
+            _ = (self.state / "cargo" / name).write_text(text)
+        commands = (("cargo", "check"), ("cargo", "clippy"), ("cargo", "+nightly", "fmt"))
+        for arguments in commands:
+            with self.subTest(arguments=arguments):
+                self.assertEqual(run.run_command(self.repo, arguments), run.CommandResult(7, "out", "err"))
+        self.assertEqual(self.queue.calls, [("cargo", self.repo)] * len(commands))
+        self.assertEqual([place.arguments for place in self.queue.places], [[arguments] for arguments in commands])
+        self.assertTrue(all(place.closed for place in self.queue.places))
+        verify = ("bash", "/private/verify.sh", "check")
+        with mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess(verify, 0, "ok", "")) as plain:
+            self.assertEqual(run.run_command(self.repo, verify), run.CommandResult(0, "ok", ""))
+            plain.assert_called_once()
+        self.assertEqual(len(self.queue.calls), len(commands))
+
+    def test_bulk_format_and_metadata_start_at_the_shared_place(self) -> None:
+        bulk.command(self.repo, ["cargo", "+nightly", "fmt"])
+        metadata: CargoWorkspaceFixture = {"workspace_members": ["fixture"], "packages": [
+            {"id": "fixture", "name": "fixture", "manifest_path": str(self.repo / "Cargo.toml"), "dependencies": []}]}
+        _ = (self.state / "cargo/stdout").write_text(json.dumps(metadata))
+        self.assertEqual(bulk.verification_packages(self.repo, "."), ("fixture",))
+        self.assertEqual(self.queue.calls, [("cargo", self.repo), ("cargo", self.repo)])
+        self.assertEqual([place.arguments for place in self.queue.places], [
+            [("cargo", "+nightly", "fmt")], [("cargo", "metadata", "--no-deps", "--format-version", "1")]])
+        self.assertTrue(all(place.closed for place in self.queue.places))
+
+    def test_queue_refusal_stops_each_style_start_with_exit_two(self) -> None:
+        import style_plan
+        config = self.repo / "lint.conf"
+        starts: tuple[tuple[str, Callable[[], object]], ...] = (
+            ("rust-analyzer", lambda: bulk.RustAnalyzer(self.repo)),
+            ("cargo", lambda: bulk.command(self.repo, ["cargo", "+nightly", "fmt"])),
+            ("cargo", lambda: bulk.verification_packages(self.repo, ".")),
+            ("cargo", lambda: run.run_command(self.repo, ("cargo", "check"))),
+            ("cargo", lambda: style_plan.cargo_format(self.repo)),
+        )
+        for program, start in starts:
+            with self.subTest(program=program, start=start):
+                key = f"program_first_peak_gib.{program}"
+                self.queue.refusals[program] = f"{config}: {key} is missing or invalid"
+                errors = StringIO()
+                with redirect_stderr(errors), self.assertRaises(BaseException) as stopped:
+                    _ = start()
+                self.assertIsInstance(stopped.exception, SystemExit)
+                assert isinstance(stopped.exception, SystemExit)
+                self.assertEqual(stopped.exception.code, 2)
+                self.assertIn(str(config), errors.getvalue())
+                self.assertIn(key, errors.getvalue())
+        self.assertEqual([program for program, _ in self.queue.calls], [program for program, _ in starts])
+        self.assertEqual(self.queue.places, [])
+
+    def test_plan_cargo_format_starts_at_the_shared_place(self) -> None:
+        import style_plan
+        _ = (self.state / "cargo/stdout").write_text("Formatting src/lib.rs\n")
+        result = style_plan.cargo_format(self.repo)
+        self.assertEqual(result.visited, frozenset({self.repo / "src/lib.rs"}))
+        self.assertEqual(self.queue.calls, [("cargo", self.repo)])
+        place, = self.queue.places
+        self.assertEqual(place.arguments, [style_plan.CARGO_FMT_CHECK])
+        self.assertTrue(place.closed)
 
 
 if __name__ == "__main__":

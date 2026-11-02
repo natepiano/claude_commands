@@ -582,3 +582,40 @@ admission only. Formatting, compiler validation, tests and final-tree publicatio
 require writes and remain explicitly not checked; the report forecasts no test pass
 or final applied count. The report is a point-in-time observation, not a frozen run
 or a reservation guarantee. A later real run rechecks every boundary.
+
+
+Style programs request memory through `scripts/build_queue/queue_place.py`.
+Each `bulk_rename.RustAnalyzer` retains one place for its full LSP lifetime.
+That lifetime includes all findings, Cargo build scripts, and proc macros.
+`bulk_rename.command` requests a place for Cargo commands.
+`bulk_rename.cargo_output` captures Cargo output for metadata, bulk checks, bulk lint, and planner format checks.
+Each start uses `QueuePlace.popen`; the shared queue controls admission, scope accounting, and cleanup.
+`verify.sh` retains its existing place.
+A dry run that starts no program requests no place.
+
+The queue reads `[memory]` at each program start.
+`program_first_peak_gib.rust-analyzer` and `program_first_peak_gib.cargo` supply the first peaks before this host has program history.
+The existing queue uses measured program peaks when history exists.
+Missing or invalid first peaks refuse the start, even when history exists.
+The error names the config file and key.
+`bulk_rename.style_program_place` converts queue refusals to command exit 2.
+The refusal preserves finding state, tickets, and claimed runs.
+`execute_plan` restores journaled source files after queue cleanup for refusals and marked interrupts.
+Each successful formatter guard records exact current bytes without replacing the original recovery bytes.
+Recovery removes owned creations and rejects unknown changes.
+Crate runs restore their prior claim record and retain claims.
+Workspace runs record completed claims before planning or child admission.
+This record supplies ownership evidence for a validated retry.
+One durable marker preserves claims only during each child admission.
+Successful startup clears the marker while startup signals remain deferred.
+Successful recovery and claim validation clear the marker before new planning.
+Ordinary workspace interrupts restore the base and release claims.
+Crate runs retain their existing stage resume rules.
+An interrupted recovery or queue cleanup retains the journal and claims.
+Retries validate the operation, base, branch, owner, ticket states, and finding membership before they reuse that selection.
+Incomplete claims retain their existing recovery rules.
+Failed refusal recovery retains the journal and claims without publishing finding dispositions.
+Rust-analyzer startup passes its active exception through the shared queue boundary.
+`LINT_CONFIG_FILE` selects the config file.
+The shared test helper replaces the queue boundary for direct calls and CLI child processes.
+Tests retain their private Cargo and rust-analyzer programs without a real queue place.

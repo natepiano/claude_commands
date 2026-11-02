@@ -50,7 +50,8 @@ class Runner(Protocol):
 
 
 def run_command(repo: Path, arguments: Sequence[str]) -> CommandResult:
-    result = subprocess.run(arguments, cwd=repo, capture_output=True, text=True, check=False)
+    result = (bulk.cargo_output(repo, arguments) if arguments and Path(arguments[0]).name == "cargo"
+              else subprocess.run(arguments, cwd=repo, capture_output=True, text=True, check=False))
     return CommandResult(result.returncode, result.stdout, result.stderr)
 
 
@@ -336,11 +337,103 @@ class WorkspaceIntent(bulk.BatchIntent):
         current = self.file_edits(tuple(bulk.FileRenames(file.path, file.original, file.edited, (), ())
                                        for file in plan.files if not isinstance(file, ConstantFileEdit) or not file.created))
         excluded = set(existing) - current.keys()
-        record["files"] = {**existing, **current}
+        # Keep the original bytes across every rebuilt plan.
+        record["files"] = {**existing, **{name: {**bulk.object_fields(existing.get(name, edit)), "after": edit["after"]}
+                                           for name, edit in current.items()}}
         record["formatter_restored_paths"] = sorted(excluded)
-        record["created_files"] = {file.path: file.edited.encode().hex() for file in plan.files
-                                   if isinstance(file, ConstantFileEdit) and file.created}
+        record["created_files"] = {**bulk.object_fields(record.get("created_files", {})),
+                                   **{file.path: file.edited.encode().hex() for file in plan.files
+                                      if isinstance(file, ConstantFileEdit) and file.created}}
         bulk.atomic_json(self.path, record)
+
+    def record_current(self) -> None:
+        """Record exact guarded bytes without replacing the original recovery bytes."""
+        record = bulk.object_fields(cast(object, json.loads(self.path.read_text())))
+        files = bulk.object_fields(record["files"])
+        for name, raw in files.items():
+            edit = bulk.object_fields(raw)
+            edit["after"] = (self.repo / name).read_bytes().hex()
+            files[name] = edit
+        record["files"] = files
+        created = bulk.object_fields(record.get("created_files", {}))
+        for name in created:
+            path = self.repo / name
+            if path.exists():
+                created[name] = path.read_bytes().hex()
+        record["created_files"] = created
+        bulk.atomic_json(self.path, record)
+
+    def complete_claims(self, owned: dict[str, str], selected: Selection,
+                        ledger: ledger_api.Ledger) -> None:
+        """Save the completed selection separately from the planned claim list."""
+        record = bulk.object_fields(cast(object, json.loads(self.path.read_text())))
+        record["completed_claims"] = owned
+        record["finding_inputs"] = {finding.finding_id: ledger.finding_input_identity(finding)
+                                    for finding in selected.findings}
+        record["skipped"] = [asdict(item) for item in selected.skipped]
+        bulk.atomic_json(self.path, record)
+
+    def stop_admission(self) -> None:
+        record = bulk.object_fields(cast(object, json.loads(self.path.read_text())))
+        record["admission_stopped"] = True
+        bulk.atomic_json(self.path, record)
+
+    def clear_admission(self) -> None:
+        """End preservation after startup or validated recovery."""
+        if self.path.exists():
+            record = bulk.object_fields(cast(object, json.loads(self.path.read_text())))
+            record["admission_stopped"] = False
+            bulk.atomic_json(self.path, record)
+
+    def retry_eligible(self) -> bool:
+        """Preserve claims only while a child admission remains unresolved."""
+        if not self.path.exists():
+            return False
+        record = bulk.object_fields(cast(object, json.loads(self.path.read_text())))
+        return record.get("admission_stopped") is True
+
+    def restore_admission(self, stopped: BaseException) -> None:
+        """Restore exact source bytes and retain the marker if recovery fails."""
+        try:
+            _ = self.recover()
+        except Exception as error:
+            print(f"style admission recovery: {error}", file=sys.stderr)
+            raise stopped from error
+
+    def resume_claims(self, ledger: ledger_api.Ledger, definition: rules.Rule) -> tuple[Selection, dict[str, str]]:
+        """Reuse claims only when the journal and live ownership still agree."""
+        record = bulk.object_fields(cast(object, json.loads(self.path.read_text())))
+        raw = bulk.object_fields(record.get("completed_claims", {}))
+        if (set(raw) != set(bulk.object_list(record["findings"]))
+                or set(raw.values()) != set(bulk.object_list(record["tickets"]))
+                or any(not isinstance(ticket, str) for ticket in raw.values())):
+            raise self.refuse("completed claims do not match the journal")
+        owned = {identity: str(ticket) for identity, ticket in raw.items()}
+        tickets = {ticket["id"]: ticket for ticket in ledger.proposal_tickets()}
+        for ticket in set(owned.values()):
+            item = tickets.get(ticket)
+            if (item is None or ledger.ticket_batch_owner(ticket) != ledger_api.BatchOwner(self.batch_id)
+                    or item["state"] != "assigned" or item["base"] != record["base"]
+                    or item["branch"] != record["branch"] or item["family"] != definition.family
+                    or set(item["finding_ids"]) != {identity for identity in owned if owned[identity] == ticket}):
+                raise self.refuse("completed ticket ownership or membership changed: " + ticket)
+        findings = ledger.named_held(owned)
+        inputs = bulk.object_fields(record.get("finding_inputs", {}))
+        if (set(inputs) != set(owned) or {finding.finding_id for finding in findings} != set(owned)
+                or any(finding.build_ticket != ledger_api.BuildTicket(owned[finding.finding_id])
+                       or ledger.finding_input_identity(finding) != inputs[finding.finding_id]
+                       or finding.rule.removesuffix("#uncovered") != definition.rule_id
+                       or not isinstance(finding.state, ledger_api.Filed)
+                       or str(finding.state.proposal) != tickets[owned[finding.finding_id]]["proposal"]
+                       or not approved_finding_decision(finding, definition) for finding in findings)):
+            raise self.refuse("completed finding claims changed")
+        skipped: list[bulk.Refusal] = []
+        for raw_skip in bulk.object_list(record.get("skipped", [])):
+            skip = bulk.object_fields(raw_skip)
+            skipped.append(OpenTicketRefusal(str(skip["finding_id"]), str(skip["reason"]), str(skip["path"]),
+                                            tuple(str(ticket) for ticket in bulk.object_list(skip["ticket_ids"])))
+                           if "ticket_ids" in skip else bulk.Refusal(str(skip["finding_id"]), str(skip["reason"])))
+        return Selection(findings, tuple(skipped)), owned
 
     def owned_creations(self) -> dict[str, bytes]:
         """Read owned paths from the durable journal, including files hidden by Git ignores."""
@@ -487,6 +580,7 @@ _NO_RESTORED_PATHS: frozenset[str] = frozenset()
 def format_rename_plan(workspace: WorkspaceEdits, runner: Runner, arguments: tuple[str, ...],
                        replan: Callable[[frozenset[str]], PlannedEdits],
                        record: Callable[[PlannedEdits], None], times: dict[str, float],
+                       record_current: Callable[[], None],
                        restored_paths: frozenset[str] = _NO_RESTORED_PATHS) -> dict[str, str]:
     """Drop only edit groups, then prove surviving findings on their rebuilt overlay.
 
@@ -507,6 +601,7 @@ def format_rename_plan(workspace: WorkspaceEdits, runner: Runner, arguments: tup
         dropped = workspace.refuse_format_changes()
         kept = set(workspace.files) - workspace.refused_files
         workspace.guard(kept)
+        record_current()
         if not dropped:
             return refused
         refused.update(dropped)
@@ -1014,50 +1109,58 @@ def execute_plan(workspace: WorkspaceEdits, plan: PlannedEdits, definition: rule
     preserve the caller's selection and source boundaries before any rebuilt overlay.
     Refusals update the caller's accumulator so rollback retains evidence even on failure.
     """
-    require_ready_plan(plan)
-    repo, base = workspace.repo, workspace.base
-    refused.update((item.finding_id, item.reason) for item in plan.refusals)
-    candidates = plan.files
-    workspace.set_plan(plan)
-    _ = require_base(repo, git(repo, "rev-parse", base + "^{tree}"))
-    for file in candidates:
-        available(repo, file.path)
-    require_edit_paths(repo, candidates)
-    intent.record_plan(plan)
-    for file in candidates:
-        _ = (repo / file.path).write_bytes(file.edited.encode())
-    kept = set(workspace.files)
-    if kept:
-        started = time.monotonic()
-        members = coverage_report.workspace(ledger, base)
-        directories = tuple(member.directory for member in members)
-        touched = {style_proposals.crate_for(directories, path) for path in kept}
-        packages = sorted({member.package_name for member in members if member.directory in touched})
-        if not packages:
-            raise bulk.BulkRenameError("changed files have no workspace package")
-        format_arguments = ("cargo", "+nightly", "fmt", *(arg for name in packages for arg in ("--package", name)))
-        if definition.family == "names":
-            refused.update(format_rename_plan(workspace, runner, format_arguments, replan, intent.record_plan, times))
-            kept = set(workspace.files)
-        else:
-            formatted = runner(repo, format_arguments)
-            times["fmt"] = time.monotonic() - started
-            if formatted.code:
-                raise bulk.BulkRenameError("workspace format failed: " + formatted.stderr.strip())
-            workspace.guard(kept)
-        def reprove_remaining(paths: set[str]) -> set[str]:
-            if definition.family != "names":
-                return paths
-            restored = frozenset(workspace.files.keys() - paths)
-            refused.update(reprove_rename_plan(workspace, paths, replan, intent.record_plan, times))
-            refused.update(format_rename_plan(workspace, runner, format_arguments, replan,
-                                              intent.record_plan, times, restored))
-            return set(workspace.files)
-
+    try:
+        require_ready_plan(plan)
+        repo, base = workspace.repo, workspace.base
+        refused.update((item.finding_id, item.reason) for item in plan.refusals)
+        candidates = plan.files
+        workspace.set_plan(plan)
+        _ = require_base(repo, git(repo, "rev-parse", base + "^{tree}"))
+        for file in candidates:
+            available(repo, file.path)
+        require_edit_paths(repo, candidates)
+        intent.record_plan(plan)
+        for file in candidates:
+            _ = (repo / file.path).write_bytes(file.edited.encode())
+        kept = set(workspace.files)
         if kept:
-            kept, diagnostics_refused = validate(workspace, runner, times, loops, reprove_remaining)
-            refused.update(diagnostics_refused)
-    return kept
+            started = time.monotonic()
+            members = coverage_report.workspace(ledger, base)
+            directories = tuple(member.directory for member in members)
+            touched = {style_proposals.crate_for(directories, path) for path in kept}
+            packages = sorted({member.package_name for member in members if member.directory in touched})
+            if not packages:
+                raise bulk.BulkRenameError("changed files have no workspace package")
+            format_arguments = ("cargo", "+nightly", "fmt", *(arg for name in packages for arg in ("--package", name)))
+            if definition.family == "names":
+                refused.update(format_rename_plan(workspace, runner, format_arguments, replan,
+                                                  intent.record_plan, times, intent.record_current))
+                kept = set(workspace.files)
+            else:
+                formatted = runner(repo, format_arguments)
+                times["fmt"] = time.monotonic() - started
+                if formatted.code:
+                    raise bulk.BulkRenameError("workspace format failed: " + formatted.stderr.strip())
+                workspace.guard(kept)
+                intent.record_current()
+            def reprove_remaining(paths: set[str]) -> set[str]:
+                if definition.family != "names":
+                    return paths
+                restored = frozenset(workspace.files.keys() - paths)
+                refused.update(reprove_rename_plan(workspace, paths, replan, intent.record_plan, times))
+                refused.update(format_rename_plan(workspace, runner, format_arguments, replan,
+                                                  intent.record_plan, times, intent.record_current, restored))
+                return set(workspace.files)
+
+            if kept:
+                kept, diagnostics_refused = validate(workspace, runner, times, loops, reprove_remaining)
+                refused.update(diagnostics_refused)
+        return kept
+    except (KeyboardInterrupt, SystemExit) as stopped:
+        if not intent.retry_eligible():
+            raise
+        intent.restore_admission(stopped)
+        raise
 
 
 def run_rule(repo: Path, rule: str, base_tree: str, ledger: ledger_api.Ledger,
@@ -1068,14 +1171,16 @@ def run_rule(repo: Path, rule: str, base_tree: str, ledger: ledger_api.Ledger,
         raise bulk.BulkRenameError("ledger belongs to a different checkout")
     intent = WorkspaceIntent(repo, f"bulk_run --rule {rule} --base-tree {base_tree} --repo {repo}")
     interrupted_tickets = intent.recover()
-    interrupted_owner = ledger_api.BatchOwner(intent.batch_id)
-    with ledger_api.refill_lock(repo):
-        for ticket in interrupted_tickets:
-            try:
-                ledger.ticket_drop_batch(ticket, interrupted_owner)
-            except ledger_api.TicketBatchMismatch as error:
-                print(f"bulk recovery: {error}")
-    intent.finish()
+    resume = intent.retry_eligible()
+    if not resume:
+        interrupted_owner = ledger_api.BatchOwner(intent.batch_id)
+        with ledger_api.refill_lock(repo):
+            for ticket in interrupted_tickets:
+                try:
+                    ledger.ticket_drop_batch(ticket, interrupted_owner)
+                except ledger_api.TicketBatchMismatch as error:
+                    print(f"bulk recovery: {error}")
+        intent.finish()
     base = require_base(repo, base_tree)
     definition = next((item for item in rules.load_rules(repo) if item.rule_id == rule or item.name == rule), None)
     if definition is None or definition.family not in {"names", "values"}:
@@ -1083,10 +1188,15 @@ def run_rule(repo: Path, rule: str, base_tree: str, ledger: ledger_api.Ledger,
     times: dict[str, float] = dict.fromkeys(("select", "rename", "fmt", "check_clippy", "commit", "tests", "verify_final", "verify_lint", "final_pass"), 0.0)
     started = time.monotonic()
     with ledger_api.refill_lock(repo):
-        selected = select(ledger, definition)
-        owned = claim(ledger, selected, definition.family, git(repo, "symbolic-ref", "HEAD"), intent)
-        # Claiming changes build_ticket; the shared site proof must receive that current row.
-        selected = Selection(ledger.named_held(owned), selected.skipped)
+        if resume:
+            selected, owned = intent.resume_claims(ledger, definition)
+            intent.clear_admission()
+        else:
+            selected = select(ledger, definition)
+            owned = claim(ledger, selected, definition.family, git(repo, "symbolic-ref", "HEAD"), intent)
+            # Claiming changes build_ticket; use the current rows for proof and retry validation.
+            selected = replace(selected, findings=ledger.named_held(owned))
+            intent.complete_claims(owned, selected, ledger)
     times["select"] = time.monotonic() - started
     tickets = sorted(set(owned.values()))
     refused: dict[str, str] = {}
@@ -1113,78 +1223,83 @@ def run_rule(repo: Path, rule: str, base_tree: str, ledger: ledger_api.Ledger,
         commit = ""
 
     try:
-        started = time.monotonic()
-        def release_blocked_files(plan: PlannedEdits) -> PlannedEdits:
-            # Workspace runs have no resume manifest. Release blocked groups for
-            # later selection, so every edit committed now has its full checkpoint.
-            reservation_refusals = tuple(bulk.Refusal(item.finding_id,
-                f"{item.path}: another worktree holds the file: " + "; ".join(
-                    f"{holder.holder_worktree_root} ({holder.holder_branch}, reservation {holder.reservation_id})"
-                    for holder in item.holders)) for item in plan.pending)
-            return replace(plan, refusals=(*plan.refusals, *reservation_refusals), pending=())
-
-        def replan(identities: frozenset[str]) -> PlannedEdits:
-            survivors = Selection(tuple(finding for finding in selected.findings
-                                         if finding.finding_id in identities), ())
-            return release_blocked_files(plan_rule(repo, ledger, base, survivors, definition, server, available))
-
-        plan = release_blocked_files(plan_rule(repo, ledger, base, selected, definition, server, available))
-        times["rename"] = time.monotonic() - started
-        kept = execute_plan(workspace, plan, definition, ledger, intent,
-                            runner, available, replan, times, loops, refused)
-        for ticket in tickets:
-            _ = ledger.bulk_release(ticket, {identity: reason for identity, reason in {**refused, **reverted}.items() if owned[identity] == ticket})
-        kept_findings = tuple(item for path in sorted(kept) for item in workspace.files[path].kept)
-        if kept_findings:
+        with bulk.admission_attempt(intent.stop_admission, intent.clear_admission):
             started = time.monotonic()
-            workspace.guard(kept)
-            _ = git(repo, "add", "--", *sorted(kept))
-            tree = git(repo, "write-tree")
-            operation = "rename" if definition.family == "names" else "constant extraction"
-            title = f"style({definition.name}): bulk {operation} — {len(kept_findings)} findings"
-            _ = git(repo, "commit", "-m", title)
-            commit = git(repo, "rev-parse", "HEAD")
-            if git(repo, "rev-parse", "HEAD^{tree}") != tree:
-                raise bulk.BulkRenameError("commit changed the validated tree")
-            times["commit"] = time.monotonic() - started
-            started = time.monotonic()
-            try:
-                result = test_tree(repo, commit, tree, runner, times)
-            finally:
-                times["tests"] = time.monotonic() - started
-            if result.code:
-                reason = "tests failed: " + first_failing_test(result)
-                reverted.update((item.finding.finding_id, reason) for item in kept_findings)
-                _ = git(repo, "reset", "--hard", base)
-                commit = ""
-                for ticket in tickets:
-                    _ = ledger.bulk_release(ticket, {identity: why for identity, why in reverted.items() if owned[identity] == ticket})
-                kept_findings = ()
-                status = reason
-            else:
+            def release_blocked_files(plan: PlannedEdits) -> PlannedEdits:
+                # Workspace runs have no resume manifest. Release blocked groups for
+                # later selection, so every edit committed now has its full checkpoint.
+                reservation_refusals = tuple(bulk.Refusal(item.finding_id,
+                    f"{item.path}: another worktree holds the file: " + "; ".join(
+                        f"{holder.holder_worktree_root} ({holder.holder_branch}, reservation {holder.reservation_id})"
+                        for holder in item.holders)) for item in plan.pending)
+                return replace(plan, refusals=(*plan.refusals, *reservation_refusals), pending=())
+
+            def replan(identities: frozenset[str]) -> PlannedEdits:
+                survivors = Selection(tuple(finding for finding in selected.findings
+                                             if finding.finding_id in identities), ())
+                return release_blocked_files(plan_rule(repo, ledger, base, survivors, definition, server, available))
+
+            plan = release_blocked_files(plan_rule(repo, ledger, base, selected, definition, server, available))
+            times["rename"] = time.monotonic() - started
+            kept = execute_plan(workspace, plan, definition, ledger, intent,
+                                runner, available, replan, times, loops, refused)
+            for ticket in tickets:
+                _ = ledger.bulk_release(ticket, {identity: reason for identity, reason in {**refused, **reverted}.items() if owned[identity] == ticket})
+            kept_findings = tuple(item for path in sorted(kept) for item in workspace.files[path].kept)
+            if kept_findings:
                 started = time.monotonic()
-                _ = git(repo, "commit", "--amend", "-m", f"{title}\n\nTested-Tree: {tree}")
+                workspace.guard(kept)
+                _ = git(repo, "add", "--", *sorted(kept))
+                tree = git(repo, "write-tree")
+                operation = "rename" if definition.family == "names" else "constant extraction"
+                title = f"style({definition.name}): bulk {operation} — {len(kept_findings)} findings"
+                _ = git(repo, "commit", "-m", title)
                 commit = git(repo, "rev-parse", "HEAD")
-                _ = require_base(repo, tree)
-                times["commit"] += time.monotonic() - started
-                # Once tested, keep the commit even if publishing its checkpoints fails halfway.
-                # Repeating ticket_checkpoint and bulk_share_checkpoint completes that publication.
-                active = sorted({owned[item.finding.finding_id] for item in kept_findings})
+                if git(repo, "rev-parse", "HEAD^{tree}") != tree:
+                    raise bulk.BulkRenameError("commit changed the validated tree")
+                times["commit"] = time.monotonic() - started
+                started = time.monotonic()
                 try:
-                    for ticket in active:
-                        ledger.ticket_checkpoint(ticket, commit)
-                    ledger.bulk_share_checkpoint(active)
-                except Exception as error:
-                    status = "tested; checkpoint publication pending: " + str(error)
+                    result = test_tree(repo, commit, tree, runner, times)
+                finally:
+                    times["tests"] = time.monotonic() - started
+                if result.code:
+                    reason = "tests failed: " + first_failing_test(result)
+                    reverted.update((item.finding.finding_id, reason) for item in kept_findings)
+                    _ = git(repo, "reset", "--hard", base)
+                    commit = ""
+                    for ticket in tickets:
+                        _ = ledger.bulk_release(ticket, {identity: why for identity, why in reverted.items() if owned[identity] == ticket})
+                    kept_findings = ()
+                    status = reason
                 else:
-                    status = "tested; checkpointed; built at normal ticket merge"
-        # Empty tickets are dropped; checkpointed tickets remain for normal merge.
-        for ticket in tickets:
-            if not any(item.finding.finding_id in owned and owned[item.finding.finding_id] == ticket for item in kept_findings):
-                ledger.ticket_drop(ticket)
+                    started = time.monotonic()
+                    _ = git(repo, "commit", "--amend", "-m", f"{title}\n\nTested-Tree: {tree}")
+                    commit = git(repo, "rev-parse", "HEAD")
+                    _ = require_base(repo, tree)
+                    times["commit"] += time.monotonic() - started
+                    # Once tested, keep the commit even if publishing its checkpoints fails halfway.
+                    # Repeating ticket_checkpoint and bulk_share_checkpoint completes that publication.
+                    active = sorted({owned[item.finding.finding_id] for item in kept_findings})
+                    try:
+                        for ticket in active:
+                            ledger.ticket_checkpoint(ticket, commit)
+                        ledger.bulk_share_checkpoint(active)
+                    except Exception as error:
+                        status = "tested; checkpoint publication pending: " + str(error)
+                    else:
+                        status = "tested; checkpointed; built at normal ticket merge"
+            # Empty tickets are dropped; checkpointed tickets remain for normal merge.
+            for ticket in tickets:
+                if not any(item.finding.finding_id in owned and owned[item.finding.finding_id] == ticket for item in kept_findings):
+                    ledger.ticket_drop(ticket)
+    except bulk.StyleAdmissionStopped:
+        raise
     except (bulk.BulkRenameError, OSError, UnicodeError) as error:
         rollback_failure("batch refused: " + str(error))
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, SystemExit):
+        if intent.retry_eligible():
+            raise
         rollback_failure("batch interrupted")
         raise
     except Exception as error:
