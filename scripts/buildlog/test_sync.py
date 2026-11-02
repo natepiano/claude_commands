@@ -31,8 +31,10 @@ import vault_pull
 from test_index import point_root_at
 if TYPE_CHECKING:
     from ..lib import test_hang_guard
+    from ..lint.memory_test_support import config_environment
 else:
     from scripts.lib import test_hang_guard
+    from scripts.lint.memory_test_support import config_environment
 
 
 def setUpModule() -> None:
@@ -50,7 +52,10 @@ class SyncTests(unittest.TestCase):
         temporary = self.enterContext(tempfile.TemporaryDirectory())
         self.root = Path(temporary) / "buildlog"
         point_root_at(self, self.root)
-        self.enterContext(mock.patch.dict(os.environ, {"HOME": temporary, "BUILDLOG_PEER": "test-mac"}))
+        self.enterContext(mock.patch.dict(os.environ, {
+            **config_environment(Path(temporary)),
+            "HOME": temporary, "BUILDLOG_PEER": "test-mac",
+        }))
         self.commands = []
         self.responses = []
         _ = self.enterContext(mock.patch.object(subprocess, "run", new=self.fake_run))
@@ -125,6 +130,7 @@ class SyncTests(unittest.TestCase):
         filters = self.assert_host_pull("natedev")
         self.assertEqual([rule for rule in filters if rule.startswith("--include=")], [
             "--include=/Mac/***", "--include=/Nates-MacBook-Pro-2023/***",
+            "--include=/mac/***", "--include=/macbook/***", "--include=/aws-build/***",
         ])
         # Whole subtrees include launch-only and sample-only hosts and nested
         # saved logs; no monthly-file discovery or extension filter is involved.
@@ -151,6 +157,7 @@ class SyncTests(unittest.TestCase):
         filters = self.assert_host_pull("Mac")
         self.assertEqual([rule for rule in filters if rule.startswith("--include=")], [
             "--include=/natedev/***", "--include=/Nates-MacBook-Pro-2023/***",
+            "--include=/mac/***", "--include=/macbook/***", "--include=/aws-build/***",
         ])
         self.assertEqual(filters[-1], "--exclude=*")
 
