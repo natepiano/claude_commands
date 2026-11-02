@@ -8,6 +8,7 @@
     change_review.py edit [--production DOC] [--list L] --row ID --change "<what changed for you>" --check "<how to try it>" --see "<what you see>"
     change_review.py show [--production DOC] [--list L]
     change_review.py verdict [--production DOC] [--list L] --row ID --verdict "<the user's words>"
+    change_review.py set-kind [--production DOC] [--list L] --row ID --kind "See in action|Read only"
     change_review.py mark-important [--production DOC] [--list L] --row ID
     change_review.py list-path [--production DOC]
     change_review.py showrunner [--production DOC]
@@ -96,6 +97,8 @@ CHECK = "How to check"
 URGENCY = "Urgency"
 # The production a row's change is from: its slug. A row from before the column is the root's.
 PRODUCTION = "Production"
+KIND = "Kind"
+REVIEW_KINDS = ("See in action", "Read only")
 NOT_YET = "not yet"
 FORM = "<what changed for you> | <how to try it: where and what to type> | <what you see>"
 SEPARATOR = " | "
@@ -588,6 +591,7 @@ def append_rows(path: Path, changes: list[Visible], day: date, merged: str, prod
         when = f"{day.isoformat()} · {_cell(merged)}" if merged else day.isoformat()
         rows = [_row(path, columns, {"#": f"C{number + offset}", "Change": _cell(item.change), "Merged": when,
                                      "On the Mac build": NOT_YET, CHECK: _cell(item.how()), URGENCY: _cell(rank),
+                                     KIND: "",
                                      PRODUCTION: _cell(row_production(owners[offset] if owners else production))})
                 for offset, item in enumerate(changes)]
         _insert(lines, end, rows)
@@ -1056,13 +1060,45 @@ def record_verdict(path: Path, row: str, verdict: str, day: date,
             return VerdictConflict(_plain(cells.get("Verdict", "")), _plain(cells.get("Date", "")))
         cells = dict(zip(columns, _cells(lines.pop(index))))
         _add_column(path, lines, REVIEWED, "Merged")
+        # Page rows retain their description and proof in the same record after
+        # answering. Older lists keep their existing Reviewed table shape.
+        if cells.get(KIND):
+            for column in (KIND, CHECK, PRODUCTION):
+                _add_column(path, lines, REVIEWED, column)
         reviewed, top, _ = _table(path, lines, REVIEWED)
-        _insert(lines, top, [_row(path, reviewed, {"#": row, "Change": cells.get("Change", ""),
+        _insert(lines, top, [_row(path, reviewed, {**dict.fromkeys(reviewed, ""), **cells, "#": row,
                                                    "Verdict": _cell(verdict), "Date": day.isoformat(),
                                                    "Merged": cells.get("Merged", "")})])
         return VerdictRecorded(row_merge(cells))
 
     return _edit(path, production, day, write, lambda _: f"verdict {row}")
+
+
+def review_rows(path: Path) -> list[dict[str, str]]:
+    """Read pending and saved page answers from the authoritative list."""
+    lines = read(path).splitlines(keepends=True)
+    rows: list[dict[str, str]] = []
+    for section in (SECTION, REVIEWED):
+        columns, first, end = _table(path, lines, section)
+        rows.extend(dict(zip(columns, (_plain(cell) for cell in _cells(line))))
+                    for line in lines[first:end])
+    return rows
+
+
+def set_row_kind(path: Path, row: str, kind: str, production: Path) -> str:
+    """Classify by whether the change alters something the user runs or sees."""
+    if kind not in REVIEW_KINDS:
+        raise ChangeReviewError("--kind must be 'See in action' or 'Read only'")
+
+    def write(lines: list[str]) -> str:
+        _add_column(path, lines, SECTION, KIND)
+        columns, index = _to_review(path, lines, row)
+        cells = dict(zip(columns, _cells(lines[index])))
+        written = _row(path, columns, {**cells, KIND: kind})
+        lines[index] = written + "\n"
+        return written
+
+    return _edit(path, production, today(), write, lambda _: f"kind {row}")
 
 
 def end_row_scratch(path: Path, row: str) -> list[str]:
@@ -1212,6 +1248,7 @@ class CommandLine(argparse.Namespace):
     see: str = ""
     row: str = ""
     verdict: str = ""
+    kind: str = ""
     production: str = ""
     urgency: str = ""
     due: str = ""
@@ -1296,6 +1333,9 @@ def _run(options: CommandLine) -> int:
             target = _row_option(options)
             now = datetime.now(user_zone()).replace(tzinfo=None)
             print(mark_row(target.path, target.row, now, production_doc(options.production)))
+        case "set-kind":
+            target = _row_option(options)
+            print(set_row_kind(target.path, target.row, options.kind, production_doc(options.production)))
         case "verdict":
             target = _row_option(options)
             verdict = _words("verdict", options.verdict)
@@ -1355,11 +1395,11 @@ def _run(options: CommandLine) -> int:
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     _ = parser.add_argument("action", choices=("check", "append", "drift", "add", "edit", "show", "verdict",
-                                                   "mark-important", "list-path", "showrunner",
+                                                   "mark-important", "set-kind", "list-path", "showrunner",
                                                    "backfill-production"))
     _ = parser.add_argument("--repo", default=".")
     for name in ("checkpoint", "previous", "merge-branch", "list", "merged", "since", "change", "check", "see",
-                 "row", "verdict", "production", "urgency", "due", "after"):
+                 "row", "verdict", "production", "urgency", "due", "after", "kind"):
         _ = parser.add_argument(f"--{name}", default="")
     _ = parser.add_argument("--write", action="store_true")
     _ = parser.add_argument("--hold", action="append")
