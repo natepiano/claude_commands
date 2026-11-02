@@ -30,10 +30,10 @@ def read_place(place: Place, lines: int = 60, *, joined: bool = False, ansi: boo
     return Herdr(place.session).read(place.pane, lines, joined=joined, ansi=ansi, deadline=deadline)
 
 
-def agent_status(place: Place, *, deadline: float = math.inf) -> str:
-    """herdr's state for the agent in the place's pane, such as `working`, `idle` or `blocked`; empty for none."""
+def agent_status(place: Place, *, deadline: float = math.inf) -> herdr.AgentStatus:
+    """herdr's state for the agent in the place's pane, as a typed state; unknown when no agent is present."""
     return next((agent["agent_status"] for agent in Herdr(place.session).agents(deadline=deadline)
-                 if agent["pane_id"] == place.pane), "")
+                 if agent["pane_id"] == place.pane), herdr.AgentStatus.UNKNOWN)
 
 
 def type_place(place: Place, text: str) -> None:
