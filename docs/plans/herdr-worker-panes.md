@@ -767,40 +767,25 @@ Split from 3l on 2026-10-31; the same user ask and the same sdlc acceptance as 3
 
 **Ruled out:** rekeying the row id on `/clear`; an alias table or `STAFF_ID` copy; a persisted clear handoff journal.
 
-### Phase 3a — `unit <id>` tells the user about one member  · status: todo
+### Phase 3a — `unit <id>` tells the user about one member  · status: done
 
-**Depends on:** 3h on main and its live move (Phases → Rename track). User ask, relayed by the sdlc showrunner (2026-11-01): "make sure there's a simple tool i can use to do a reverse lookup - command line tool - short like \"unit\" and if i do unit followe dby an ID it telle ms what i need to know about the unit."
+#### As-built
 
-#### Work Order
-
-**Goal:** a read-only `unit` command on PATH takes an id and prints the staff member's facts in a few short lines.
-
-**Spec:**
-1. **Input.** A full id or a short unique prefix of a row `id` or `current_session`, for any row kind (showrunner, unit, worker), retired rows included.
-2. **Output.** A few short lines: name, kind, parent's name, machine and worktree, branch (from git), plan doc, live tab, current session id.
-3. **Errors.** An unknown or ambiguous id prints one clear line (an ambiguous prefix names the matches) and exits non-zero.
-4. **Thin.** One command over the existing staff read (`staff.snapshot()` and the existing joins); no new data, store or cache.
-
-5. **Field outcomes.** Each field is a value, `not applicable` (a root showrunner has no parent; a worker shows its holder unit's worktree, marked inherited; a showrunner-held worker has no worktree; a retired unit has no live tab), or `unavailable: <cause>` (git, herdr or the Mac did not answer). Never a blank field. A retired unit whose folder is gone shows its parked `~/.local/state/staff/units/<id>.toml` facts.
-6. **Matching.** A full id match wins over a prefix match. Prefix matches over `id` and `current_session` are deduplicated by row id. No match prints `unknown id: <id>`.
+- `unit <id or unique prefix>` prints ten lines for one staff row: Name, Kind, Id, Parent, Machine, Worktree, Branch, Plan, Live tab and Current session. It takes one `staff.snapshot()` and writes nothing.
+- Matching: `record.by_member_reference(target)` wins; otherwise prefix matches over `id` and `current_session`, one per row. No match prints `unknown id: <id>`; several print `ambiguous id: <id>: <up to 5 "name (id)", sorted by id>, and N more`. Both exit 1. A usage error exits 2; an unreadable staff record prints `unavailable: <cause>` and exits 1.
+- Each field is a value, `not applicable` or `unavailable: <cause>`, never blank. A worker shows its parent's worktree with ` (inherited)`. A retired unit whose folder is gone shows its parked branch with ` (parked)` and a Live tab of `not applicable`.
+- The Live tab reads herdr's native session of each pane. Panes it cannot read print one stderr line, `anomaly: N panes unreadable (<names>); not blocking`; with no match the field reads `none found (N panes unreadable)`.
+- A member on the other machine is read over ssh (`remote.other_machine()`), which runs `local_details` there with the rows as JSON; a failed read gives `unavailable: <cause>` fields.
+- `~/.local/bin/unit` links to `~/.claude/scripts/production/unit` on natedev and the Mac.
 
 **Files:**
-- `scripts/production/unit_command.py` — the command: one `staff.snapshot()`, the existing joins, git for the branch, herdr for the tab; formatting.
-- `scripts/production/unit` — the executable entry; installed as `~/.local/bin/unit -> ~/.claude/scripts/production/unit` on natedev and the Mac, as `~/.local/bin/lint` is.
-- `scripts/production/test_unit_command.py` — its tests, with isolated fixtures where `id` differs from `current_session`.
+- `scripts/production/unit_command.py` — `main`, `describe`, `read_details`, `local_details`, `read_tab`, `read_branch`, `read_config`, `MemberDetails`.
+- `scripts/production/unit` — the executable entry; it runs `unit_command.py` through `~/.claude/scripts/lib/py`.
+- `scripts/production/test_unit_command.py` — its tests, with fixtures where `id` differs from `current_session`.
 
-**Workers:** `1 writer + 1 tester`
-- `impl` — the read-only command, its entry, and formatting.
-- `test` — the tests and fixtures.
+**Binds later work:** `unit` and `staff_check` are read-only and never call `staff.update_current_session`; the Codex thread reconciliation owns that write. Unreadable panes are counted and reported, never a refusal.
 
-**State:** none.
-**Constraints from prior phases:**
-- Phase 3h review (2026-11-01): Phase 3h: `id` is fixed, `current_session` is live; a stored reference resolves by id, then current session. 3a owns the user's identity explanation; it never infers a row for a session whose clear hook is held or failed (that shows as incomplete in `staff_check`). Tests: a root with no parent, a worker inheriting its unit's location, a retired row whose folder is gone, a failed Mac read, full-id precedence, prefix dedupe by row id; gate under the isolation rule.
-
-**Acceptance gate:** basedpyright 0/0; its tests pass; on natedev after the live migration, `unit <prefix>` for one showrunner, one unit, one worker and one retired row each prints the fields above, and an unknown and an ambiguous prefix each print one line and exit non-zero.
-
-**Read-only boundary:** `unit` and `staff_check` never update `current_session`.
-Phase 4n (after 3a) owns explicit lifecycle reconciliation.
+**Gotchas:** `.unit.toml` reads use `cleanup=False`, so a lookup never removes temporary files. Branch reads use `git --no-optional-locks`.
 
 ### Phase 4n — Reconcile a pane's current Codex thread  · status: todo
 
