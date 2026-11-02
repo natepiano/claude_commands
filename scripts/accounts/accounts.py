@@ -15,7 +15,6 @@ import os
 import random
 import re
 import shlex
-import shutil
 import socket
 import stat
 import subprocess
@@ -44,6 +43,7 @@ sys.path.insert(0, str(SCRIPTS / "whoami"))
 from scripts.whoami import account  # noqa: E402
 from scripts.whoami.account import ResolvedHistoryLabel as ResolvedHistoryLabel, HistoricalAccountUnresolved as HistoricalAccountUnresolved  # noqa: E402
 from scripts.lib import atomic_file, unit_runs  # noqa: E402
+from scripts.lib.agent_program import resolve_program as resolve_program
 from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
 from scripts.whoami import agent_accounts  # noqa: E402
 from scripts.whoami import note_file  # noqa: E402
@@ -1556,29 +1556,6 @@ def launch_shell_environment(directory: Path) -> dict[str, str]:
             _ = environment.pop("HOME", None)
         return environment
     raise LaunchShellError("accounts: nix shell helper returned an unsupported result")
-
-
-def resolve_program(tool: Literal["claude", "codex"], *, environment: Mapping[str, str] = os.environ) -> str:
-    """Find the agent itself, without loading the launch shell a second time."""
-    installed = accounts_home() / ".local" / "bin" / tool
-    directories = environment.get("PATH", os.defpath).split(os.pathsep)
-    for directory in [*directories, str(installed.parent)]:
-        found = shutil.which(tool, path=directory or os.curdir)
-        if not found:
-            continue
-        program = Path(found)
-        # Shell launchers invoke the shared helper. Agent scripts must still work.
-        try:
-            with program.open("rb") as source:
-                if source.read(2) == b"#!":
-                    script = source.read()
-                    if b"nix_env.py" in script or b"lib.nix_env" in script:
-                        continue
-        except OSError:
-            # An executable does not need read permission to run.
-            pass
-        return str(program.absolute())
-    raise FileNotFoundError(f"{tool} program not found (looked in PATH and {installed})")
 
 
 def _exec_codex_account(label: str, arguments: list[str]) -> None:

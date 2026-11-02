@@ -244,6 +244,7 @@ class HerdrSessionsTests(unittest.TestCase):
         unit = unit_membership("build", "one")
         self.process(101, 100, ["codex"], {"HERDR_PANE_ID": "w1:p1", "SHOWRUNNER_UNIT": "build",
                                                 "SHOWRUNNER_UNIT_ID": "one", "CODEX_THREAD_ID": unit.id})
+        (self.proc / "101" / "fd").mkdir()
         self.assertEqual(self.call("list"), (0, "unit\tunit build/one\t\n", ""))
 
     def test_an_inherited_codex_thread_id_does_not_assign_a_shell_to_its_parent_unit(self) -> None:

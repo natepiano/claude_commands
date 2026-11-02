@@ -38,6 +38,33 @@ from scripts.production.staff_test_support import StaffTestCase, fixture_runtime
 GIT_BINARY = shutil.which("git") or "git"
 
 
+@contextmanager
+def codex_launch_evidence(root: Path, argv: list[str]) -> Generator[dict[str, object]]:
+    """Supply one Codex process and keep its launch in a private store."""
+    pid = 998070
+    identity = fixture_runtime_id("herdr-codex-launch")
+    proc = root / "codex-launch-proc"
+    (proc / str(pid) / "fd").mkdir(parents=True, exist_ok=True)
+
+    def process_start(observed_pid: int) -> str:
+        if observed_pid != pid:
+            raise AssertionError(f"unexpected process: {observed_pid}")
+        return "codex-launch-start"
+
+    def environment(observed_pid: int) -> dict[str, str]:
+        if observed_pid != pid:
+            raise AssertionError(f"unexpected process: {observed_pid}")
+        return {"CODEX_THREAD_ID": identity, "CODEX_HOME": str(root / ".codex2")}
+
+    with (patch.dict(os.environ, {"HERDR_PANE_RECORD_DIR": str(root / "codex-launches"),
+                                 "HERDR_PROC": str(proc)}),
+          isolated_staff_file(root / "codex-staff.json", {}),
+          patch.object(sessions, "process_start", side_effect=process_start),
+          patch.object(herdr, "process_environment", side_effect=environment)):
+        yield {"process_info": {"foreground_processes": [
+            {"pid": pid, "argv": argv, "cwd": str(root)}]}}
+
+
 # herdr 0.9.0, Mac, 2026-10-16 19:47 EDT: verbatim startup-shell list entries.
 STARTUP_PANE_JSON = '{"agent_status":"unknown","cwd":"/Users/natemccoy","focused":false,"foreground_cwd":"/Users/natemccoy","pane_id":"wG:p1","revision":0,"scroll":{"max_offset_from_bottom":0,"offset_from_bottom":0,"viewport_rows":61},"tab_id":"wG:t1","terminal_id":"term_65dfdc73afbe63","workspace_id":"wG"}'
 STARTUP_WORKSPACE_JSON = '{"active_tab_id":"wG:t1","agent_status":"unknown","focused":false,"label":"~","number":1,"pane_count":1,"tab_count":1,"workspace_id":"wG"}'
@@ -991,8 +1018,10 @@ class PromptSubmissionTests(unittest.TestCase):
         self.assertEqual(self.typed[0][2], 0)
 
     def test_promptless_codex_restart_needs_no_transcript_or_submit(self) -> None:
-        outcome = self.client.start_agent("codex-worker", "destination:p1", "codex", [],
-                                          herdr.NoOpeningPrompt(), 1_000)
+        with (codex_launch_evidence(self.root, ["codex"]) as process_info,
+              patch.object(self.client, "result", return_value=process_info)):
+            outcome = self.client.start_agent("codex-worker", "destination:p1", "codex", [],
+                                              herdr.NoOpeningPrompt(), 1_000)
         self.assertIsInstance(outcome, herdr.PromptSubmissionNotRequired)
         self.assertEqual((self.typed, self.enters, self.ready_panes), ([], [], []))
 
@@ -1410,6 +1439,11 @@ class HerdrTests(unittest.TestCase):
         library.mkdir()
         _ = shutil.copy2(Path(herdr.__file__).resolve().parents[1] / "lib/nix_env.py", library / "nix_env.py")
         _ = shutil.copy2(Path(herdr.__file__).resolve().parents[1] / "lib/process_failure.py", library / "process_failure.py")
+        _ = shutil.copy2(Path(herdr.__file__).resolve().parents[1] / "lib/probe_session.py", library / "probe_session.py")
+        for relative in ("lib/atomic_file.py", "production/staff.py", "shutdown/remote.py"):
+            destination = isolated.parent / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            _ = shutil.copy2(Path(herdr.__file__).resolve().parents[1] / relative, destination)
         probe = (
             "import sys; sys.path.insert(0,sys.argv[1]); import herdr; "
             "herdr._PLATFORM='linux'; print(herdr.attached_clients('fixture'))"
@@ -1608,6 +1642,34 @@ class HerdrTests(unittest.TestCase):
         self.configure(["-a", "-p", "42", "-Fn"], code=1, stderr="permission denied")
         with self.assertRaisesRegex(herdr.HerdrFailure, "process 42 open files.*permission denied"):
             _ = herdr.darwin_open_files(42)
+
+    def test_mac_codex_rollout_proof_requires_one_unchanged_open_rollout(self) -> None:
+        self.darwin()
+        identity = fixture_runtime_id("Mac-current-rollout")
+        other_identity = fixture_runtime_id("Mac-other-rollout")
+        paths: list[Path] = []
+        for native_id in (identity, other_identity):
+            path = self.root / "account with spaces" / f"rollout-{native_id}.jsonl"
+            path.parent.mkdir(exist_ok=True)
+            _ = path.write_text(json.dumps({"type": "session_meta", "payload": {"id": native_id}}) + "\n")
+            paths.append(path)
+        arguments = ["-a", "-p", "42", "-Fn"]
+        first = f"p42\nf7\nn{paths[0]}\n"
+        second = f"p42\nf7\nn{paths[1]}\n"
+        self.configure(["-o", "lstart=,tty=", "-p", "42"], "Mon Nov  2 10:00:00 2026 ttys001\n")
+        with patch.object(sessions, "process_start", return_value="Mac-stable-start"):
+            self.configure(arguments, first)
+            self.assertEqual(herdr.codex_rollout_thread(42), identity)
+            for evidence in ("missing", "several", "changed"):
+                with self.subTest(evidence=evidence):
+                    _ = self.log.write_text("")
+                    self.configure(arguments, "" if evidence == "missing" else first + second)
+                    if evidence == "changed":
+                        self.responses[" ".join(arguments)] = [
+                            {"stdout": first, "code": 0}, {"stdout": second, "code": 0}]
+                        _ = self.responses_path.write_text(json.dumps(self.responses))
+                    with self.assertRaises((ValueError, herdr.HerdrFailure)):
+                        _ = herdr.codex_rollout_thread(42)
 
     def test_darwin_environment_uses_only_the_suffix_after_unchanged_arguments(self) -> None:
         self.darwin()
@@ -2437,10 +2499,33 @@ class HerdrTests(unittest.TestCase):
         self.share()
         with self.assertRaisesRegex(herdr.HerdrFailure, "close one tab instead"):
             herdr.stop_session("fixture")
+        self.responses["--session fixture pane list"] = [
+            {"stdout": json.dumps({"result": {"panes": [
+                {"pane_id": "w1:p1", "tab_id": "w1:t1"},
+                {"pane_id": "w1:p2", "tab_id": "w1:t2"}]}}), "code": 0},
+            {"stdout": json.dumps({"result": {"panes": [
+                {"pane_id": "w1:p1", "tab_id": "w1:t1"}]}}), "code": 0},
+        ]
+        _ = self.responses_path.write_text(json.dumps(self.responses))
+        herdr.close_agent("fixture", "w1:p2")
+        self.assertEqual(self.commands(), [
+            ["--session", "fixture", "pane", "list"],
+            ["--session", "fixture", "tab", "close", "w1:t2"],
+            ["--session", "fixture", "pane", "list"],
+        ])
+        self.assertNotIn(["--session", "fixture", "server", "stop"], self.commands())
+
+    def test_close_agent_refuses_when_the_closed_pane_is_still_listed(self) -> None:
+        self.share()
         self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": [
             {"pane_id": "w1:p1", "tab_id": "w1:t1"}, {"pane_id": "w1:p2", "tab_id": "w1:t2"}]}}))
-        herdr.close_agent("fixture", "w1:p2")
-        self.assertEqual(self.commands()[-1], ["--session", "fixture", "tab", "close", "w1:t2"])
+        with self.assertRaisesRegex(herdr.HerdrFailure, "tab closure is not confirmed"):
+            herdr.close_agent("fixture", "w1:p2")
+        self.assertEqual(self.commands(), [
+            ["--session", "fixture", "pane", "list"],
+            ["--session", "fixture", "tab", "close", "w1:t2"],
+            ["--session", "fixture", "pane", "list"],
+        ])
         self.assertNotIn(["--session", "fixture", "server", "stop"], self.commands())
 
     def test_focus_workspace_targets_the_named_session_and_reports_refusal(self) -> None:
@@ -3098,7 +3183,10 @@ class HerdrTests(unittest.TestCase):
         self.assertEqual(len(self.start_commands()), 1)
 
     def test_start_sends_exactly_one_multiline_prompt(self) -> None:
-        _ = self.herdr.start_agent("worker", "pane-1", "codex", ["-m", "fixture-model"], herdr.OpeningPrompt("opening\nprompt"), 200)
+        with codex_launch_evidence(self.root, ["codex", "-m", "fixture-model"]) as process_info:
+            self.configure_herdr(["pane", "process-info", "--pane", "pane-1"],
+                                 json.dumps({"result": process_info}))
+            _ = self.herdr.start_agent("worker", "pane-1", "codex", ["-m", "fixture-model"], herdr.OpeningPrompt("opening\nprompt"), 200)
         self.assertEqual(self.start_commands(), [
             ["--session", "fixture", "agent", "start", "worker", "--kind", "codex", "--pane", "pane-1", "--timeout", "200", "--", "-m", "fixture-model"],
             ["--session", "fixture", "agent", "prompt", "pane-1", "opening\nprompt"],

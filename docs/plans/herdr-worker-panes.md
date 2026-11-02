@@ -629,6 +629,18 @@ Split from 3l on 2026-10-31; the same user ask and the same sdlc acceptance as 3
 
 **Acceptance gate:** basedpyright 0/0 on changed files and callers; `test_unit_config*` and `test_staff_sources*` pass, with a test that runs taplo on the writer's output under an aligning config; the live rerun rewrites the files, `taplo fmt --check .unit.toml` passes in each filled worktree, and a second rerun prints `unchanged` with no byte changed.
 
+### Phase 4k — The tracked TOML taplo test fails on the host  · status: done
+
+**Depends on:** none. natedev ask, 2026-11-02 (messaging finding F009). `test_verify_lint_taplo.py` `test_badly_formatted_tracked_toml_with_spaces_and_newlines_still_fails_lint` (from the 35b13cff0 lint scope change) fails when a Codex worker runs it detached with `mesh_runs.py start`. taplo prints its INFO lines and no ERROR line, so the assertion on "not properly formatted" fails. Attached runs pass.
+
+#### Work Order
+
+1. Reproduce the failure detached, as messaging ran it.
+2. Find why taplo prints no ERROR line there, and fix the test at the cause. The test must still prove that taplo flagged the tracked newline file.
+3. The test passes attached and detached.
+
+**Result (2026-11-02):** not reproduced. The test passes attached and detached on main 750f8cfcf, and attached on messaging's tree bc0fe153a. taplo 0.10.0 prints the ERROR line with exit 1 in every probe. No test change: the test passes against the real tool. A recurrence needs the run record while it is fresh, for the taplo child status.
+
 ### Phase 3r — Writers keep the worktree, the doc and `.unit.toml` current; retired rows filled  · status: done
 
 **Depends on:** 3q.
@@ -1276,7 +1288,7 @@ Split from 3l on 2026-10-31; the same user ask and the same sdlc acceptance as 3
 
 **Acceptance gate:** `grep -nE '\bSTEPS\b|transfer_unit\.json|_migrate_journal' scripts/production/transfer_unit.py scripts/production/transfer_unit_test_support.py scripts/production/test_transfer_unit.py` finds nothing (`rename_unit.py` keeps its own `STEPS` until Phase 4g); the old-journal check lists none; tests stop a transfer after each message and show that a rerun sends each remaining message once; a real transfer of a throwaway unit moves its row parent and tab, keeps the same pane and terminal, and its stall alert, change rows and dailies follow with no rewrite; a transfer stopped after the row move finishes on rerun with each party told once; a rerun after it changes nothing and exits 0; full gate green.
 
-### Phase 4h — A unit folder moves with no rename  · status: todo
+### Phase 4h — A unit folder moves with no rename  · status: done
 
 **Depends on:** the 3h live move (every live row proved) and 3r. Not on 3s-4f. The user asked through Morty that folder moves come sooner (sdlc, 2026-11-01). It moves one folder; it rewrites no name.
 
@@ -1396,6 +1408,20 @@ Split from 3l on 2026-10-31; the same user ask and the same sdlc acceptance as 3
 - Phase 3h review (2026-11-01): worker rename in every role: `staff.rename` (`staff.py:940`) stops refusing workers. A Claude or Codex worker under a unit or a showrunner changes its row name, tab label and saved layout (`rename_saved_tab`); its fixed id, current session and recorded role do not change. A stopped worker renames with no live tab. Tests cover both backends and both holder kinds.
 
 **Acceptance gate:** `grep -rnE 'unit_rename_sweep|rename_scratch|pin_moves|_rewrite_children' scripts` finds nothing; `/showrunner:rename_unit style style` on a real unit whose names agree prints `unchanged`; a same-name rename of a throwaway showrunner and a throwaway unit whose live session name and tab differ from the row sets both to the row's name, and its rerun prints `unchanged`; a real rename of a throwaway unit changes its row, tab and pane label and keeps the same pane and terminal; a real `--move-worktree` stopped after the folder move finishes on rerun, the row's worktree is the new folder, and the unit relaunches there in the same pane; a real showrunner doc move sets the row's doc; a changed `config/production.conf` rename value takes effect with no code change; a rerun of each finished rename changes nothing and exits 0; resume, retire and transfer pass after a rename; full gate green.
+
+### Phase 4l — One live, stopped or unknown reader for restore, restart and stop  · status: todo
+
+**Depends on:** 4h (its `_session_without_foreground_agent` in `unit_move.py` is the model) and 4g (the user put rename first; sdlc ruling 2026-11-02 07:03). No ETA yet.
+
+#### Work Order
+**Constraints from prior phases:** Phase 4h: `herdr.native_process` is the one process identity reader; `running_codex_threads` reads through it; staff `current_session` is the one fact.
+- Found by Astra in the 4h round 7 review, present at HEAD 3f960361f, not caused by 4h:
+  1. `scripts/shutdown/pane_restore.py:83` builds its live set from `sessions.live_sessions()` and `running_sessions()`. These drop unreadable Claude records, so unknown reads as stopped and an idle retained pane can resume a conversation that runs elsewhere.
+  2. `scripts/shutdown/restart.py:2148` `_live_session_ids()` has the same gap on an ordinary restart launch.
+  3. `scripts/shutdown/stop_resume.py:146,225` returns `NotRunning` from Claude evidence only and accepts a Codex identity.
+- Build one reader that returns live, stopped or unknown for one conversation, for Claude and Codex. Each caller above switches to it. Unknown never launches. herdr-unit owns all three files for this phase (sdlc ruling).
+
+**Acceptance gate:** an unreadable Claude record with an idle retained pane refuses restore; an ordinary restart with unreadable Claude evidence refuses launch and keeps the saved-process check; `shutdown stop` on a live Codex identity refuses or stops it, never reports success while it runs; a stopped Claude and a stopped Codex still restore and restart; the 11-module suite and the full gate are green.
 
 ### Phase 5 — Rename agents.conf to models.conf and /agent to /default_models  · status: todo
 
