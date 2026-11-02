@@ -260,7 +260,7 @@ The builds showrunner asked (2026-10-31): merge `origin/builds` (a546fe66, the v
 
 **Ruled out:** a queue cache that serves evidence under a policy other than the one it was captured under.
 
-### Phase 4h — A queue place helper lets a non-cargo program wait for memory in the build queue  · status: todo
+### Phase 4h — A queue place helper lets a non-cargo program wait for memory in the build queue  · status: done
 **Depends on:** Phase 4g (its `[memory]` reader gives each program's first peak).
 **Blocked by:** none past Phase 4g. Promised to style-unit and the builds showrunner (2026-10-31). It lands before Phase 9, which changes the merge gate's sizing through this phase's profiles.
 
@@ -321,6 +321,33 @@ The builds showrunner asked (2026-10-31): merge `origin/builds` (a546fe66, the v
 - `git grep -n "GateProfile\|gate_estimate\|MeasuredGatePeak\|NoGateHistory"` finds nothing.
 - The notice has an `also touches` line for `merge_gate.py` and its test (the natedev showrunner and devtools-unit, against `origin/natedev`).
 - Change-Review line: rust-analyzer can wait for memory in the build queue | on natedev, run `~/.claude/scripts/lib/py -c 'from subprocess import PIPE, DEVNULL; from pathlib import Path; import sys; sys.path.insert(0, str(Path.home() / ".claude/scripts/build_queue")); from queue_place import queue_place; repo = Path.home() / "rust/hana"; place = queue_place("rust-analyzer", repo); p = place.__enter__().popen(["rust-analyzer", "--version"], cwd=repo, stdout=PIPE, stderr=DEVNULL); print(p.communicate()[0].decode()); place.__exit__(None, None, None)'`, then `/build:queue` | it prints the rust-analyzer version, and the queue shows no rust-analyzer row after it ends.
+
+### Phase 4i — A queue place with no memory scope stops a detached descendant before release  · status: todo
+**Depends on:** Phase 4h (`queue_place.py`)
+**Blocked by:** the Pending decision below. Routed from Phase 4h finding F002, 2026-11-01.
+
+#### Work Order
+
+**Goal:** with no scope (`BUILDLOG_SCOPE=0`, already in `builds.slice`, or a failed probe), no descendant of a queue place program runs after its release.
+
+**Spec:**
+1. **The gap.** Phase 4h stops every process it has seen: each sample walks the ppid tree from the pids seen before (pid plus start time) and adds the process group. A descendant that calls `setsid()` and loses its parent between two samples reparents to pid 1. `finish()` does not see it, so the release runs while it still uses memory. The scoped path has no gap: the scope cgroup holds every descendant.
+
+**Pending decision: how an unscoped queue place holds the whole program family**
+
+Actual problem:
+`scripts/build_queue/queue_place.py` charges and stops an unscoped program by `/proc` ancestry snapshots. No snapshot can see a process born and orphaned between two listings (two failed fixes in Phase 4h; the same cause as codex_mesh `_stop_daemon`).
+
+What exists now:
+- Scoped mode: complete. Unscoped mode: stops every observed member, then releases.
+- Today's unscoped build steps have the same limit (Phase 4h Spec 4: "as a step with no scope is charged today").
+
+What should change:
+- Option A: a reaper wrapper (`queue_place.py --reap`) with `PR_SET_CHILD_SUBREAPER`. It reaps until `waitpid` reports `ECHILD` and sends a completion message before the holder releases. It never dies before that message. Unexpected wrapper death counts as a failed cleanup and keeps the reservation. The Astra review of 2026-11-01 lists six conditions (the deadline, the reaping loop, the message, the start order, the `Popen` contract and the tests): /tmp/claude/astra/20261102T025052Z-3617806/review.md.
+- Option B: refuse an unscoped `popen` for every case except `BUILDLOG_SCOPE=0` in tests. In the already-in-`builds.slice` case, start the program in a nested scope.
+
+Recommendation:
+Option B if a nested scope under an existing build scope keeps the caller's charge correct, because it removes the unscoped stop path. Otherwise Option A.
 
 ### Phase 5 — The queue service, its socket protocol and its client exist and pass in-process tests; no build uses them yet  · status: done
 **Depends on:** Phase 4
@@ -496,7 +523,7 @@ Source: S2 and S3 of `docs/plans/builds-queue-service-design.md` (with §2 The s
     Why the units are disabled until the merge: the shipped unit passes `--state-dir /var/lib/build-admission`, and main's `serve` before this phase requires `--state-dir`. A rebuilt unit with no `--state-dir` that starts before the merge fails, hits the start limit and fires `OnFailure=`. A disabled, stopped unit never starts, so no alert can fire in that window. Picked over an earlier checkpoint that lands the `admission/` default first: that default with a running unit would import the live `.waiting` and `.reservation` files while `check` still admits, which makes two admitters.
 
     Prerequisite, before the merge:
-    1. queue-unit: an `/etc/nixos` branch drops `--state-dir` and `StateDirectory=` from the service, and removes `WantedBy=` from the socket and the service. Send its hash to the builds showrunner.
+    1. queue-unit: an `/etc/nixos` branch drops `--state-dir` and `StateDirectory=` from the service, and removes `WantedBy=` from the socket. The service has no `WantedBy=` since the 2026-11-01 socket-order fix. Send its hash to the builds showrunner.
     2. natedev: from the merge checkout, `~/.claude/scripts/lib/py <merge checkout>/scripts/build_queue/admission_service.py drain-check --service --state-dir /var/lib/build-admission` reports `drained`. No build uses the service before this phase, so it holds nothing live.
     3. user: `sudo systemctl stop build-admission.socket build-admission.service`, then `sudo systemctl reset-failed build-admission.service`. Stop before the rebuild: a rebuild restarts a changed unit that is running.
     4. natedev pushes the branch; user rebuilds. Check: `systemctl show -p UnitFileState,ActiveState build-admission.socket build-admission.service` gives `disabled` and `inactive` for both.
@@ -506,7 +533,7 @@ Source: S2 and S3 of `docs/plans/builds-queue-service-design.md` (with §2 The s
     1. `/build:hold hold "admission cut-over"` on natedev.
     2. Wait until `/build:hold quiet` reports quiet and the drain barrier reports `drained`: `~/.claude/scripts/lib/py <merge checkout>/scripts/build_queue/admission_service.py drain-check`, run from the merge checkout before the push. `/build:hold quiet` alone is not enough: its `quiet_verdict` counts only processes whose command name is a build command, so a shell that waits in admission (its poll sleeps between `check` passes) or that holds the old gate functions reads as quiet.
     3. Merge to main. Until step 4 ends, the socket is not active: a step's client gets transport unavailable and waits (Spec 9), and the hold is in force.
-    4. queue-unit: an `/etc/nixos` branch puts `WantedBy=` back on the socket and the service (Spec 13). natedev pushes it; user rebuilds. The rebuild starts the socket and the service on the new code; the service imports and answers.
+    4. queue-unit: an `/etc/nixos` branch puts `WantedBy=` back on the socket only (Spec 13). natedev pushes it; user rebuilds. The rebuild starts the socket on the new code; the first connect starts the service, which imports and answers.
     5. natedev: `systemctl show -p ExecStart build-admission.service` has no `--state-dir`, and `~/.claude/scripts/lib/py ~/.claude/scripts/build_queue/admission_client.py view` answers from the live service.
     6. `/build:hold release`.
 
@@ -519,7 +546,7 @@ Source: S2 and S3 of `docs/plans/builds-queue-service-design.md` (with §2 The s
     6. `/build:hold release`.
 13. **systemd system units (queue-unit writes the socket and service units in an `/etc/nixos` worktree; natedev reviews, commits and pushes; the natedev NixOS session writes the alert unit; they go live at the user's next rebuild).** natedev, 2026-10-30: a user unit cannot set `OOMScoreAdjust=-900`, because natedev's user manager runs at `oom_score_adj` 100 and an unprivileged process cannot go below its own floor. So the units are system units that run as the user. Do not lower `user@1000`'s score: that would protect every user process, builds included.
     - `build-admission.socket`: `ListenStream=/run/build-admission/build-admission.sock`, `SocketUser=natepiano`, `SocketMode=0600`, `RuntimeDirectory=build-admission`, `WantedBy=sockets.target` (from cut-over step 4).
-    - `build-admission.service`: `User=natepiano`, `Type=notify`, `NotifyAccess=all`, `ExecStart=/home/natepiano/.claude/scripts/lib/py /home/natepiano/.claude/scripts/build_queue/admission_service.py serve`, `ConditionPathExists=/home/natepiano/.claude/scripts/build_queue/admission_service.py`, `Restart=always`, `RestartSec=1`, `WatchdogSec=30`, `OOMScoreAdjust=-900`, `CPUWeight=1000`, `OnFailure=build-admission-alert.service`, outside `builds.slice`, `WantedBy=multi-user.target` (from cut-over step 4). There is no `--state-dir` and no `StateDirectory=`: `serve` uses `admission/`. From the prerequisite rebuild to cut-over step 4, both units carry no `WantedBy=` and stay stopped (Spec 12). After step 4 the service starts at boot, and the socket also starts it on the first connect.
+    - `build-admission.service`: `User=natepiano`, `Type=notify`, `NotifyAccess=all`, `ExecStart=/home/natepiano/.claude/scripts/lib/py /home/natepiano/.claude/scripts/build_queue/admission_service.py serve`, `ConditionPathExists=/home/natepiano/.claude/scripts/build_queue/admission_service.py`, `Restart=always`, `RestartSec=1`, `WatchdogSec=30`, `OOMScoreAdjust=-900`, `CPUWeight=1000`, `OnFailure=build-admission-alert.service`, outside `builds.slice`, `Requires=` and `After=build-admission.socket`, and no `WantedBy=`. Only the socket starts it: a service with its own `WantedBy=` can start before the socket listens, bind the socket itself, fail on the root-owned `/run/build-admission`, and make the socket refuse to listen (the bb634ce switch, 2026-11-01). The socket-only start (nixos d94db090) passed a real root switch at 21:32 EST on 2026-11-01 (nixos 5f926ff): the socket was active, the first `view` started the service, and no unit failed. There is no `--state-dir` and no `StateDirectory=`: `serve` uses `admission/`. From the prerequisite rebuild to cut-over step 4, the socket carries no `WantedBy=` and both units stay stopped (Spec 12). After step 4 the socket starts at boot, and it starts the service on the first connect.
     - `build-admission-alert.service`: `Type=oneshot`, `ExecStart=%h/.claude/scripts/lib/py %h/.claude/scripts/build_queue/admission_client.py down-alert`.
     - Down alert. `admission_client.py down-alert` waits until the service has been down for 2 min (the socket refuses, or no answer), takes a claim with `outage_alerts.claim("build-admission")`, sends `build admission service is down; builds wait` through `send.py`'s outage path with a new `push_catalog.py` entry, and calls `outage_alerts.delivered`. A claim that is in flight or delivered sends nothing, so there is one push for each outage. The service clears the claim after each start (Spec 5).
 14. **Tests.** Every test that needs a server uses Phase 5's `admission_test_support.py` (the in-process server, the fake clock, the per-test socket and the fault hooks); this phase adds the fault hooks its import, drain and finalization cases need there, and writes no second fixture.
@@ -644,7 +671,7 @@ No-copies rule (user, 2026-10-30): one place for each thing. A second copy of se
 - `grep -n "flock" scripts/lint/memory_admit.py scripts/lint/memory_gate.sh scripts/build_queue/admission_*.py` finds only the shared read lock in `anonymous_history_rows` (`fcntl.flock(..., LOCK_SH)`, `memory_admit.py` :1409 at this branch's head), the one history reader that report-unit's writers share; no admission lock is left. `grep -n "\.waiting\|\.reservation\|admission/lock\|queue\.json"` over the Files' code files finds only the one import in `admission_service.py`, the drain barrier that uses its readers, and those readers in `memory_admit.py` (Spec 10).
 - Before the cut-over, `admission_service.py drain-check` prints `drained` with the hold in force; the summary gives its output.
 - A user-scope rehearsal of the Spec 12 order, with scratch unit names, a socket in a temporary folder and no root: the old tree's `serve` with no `--state-dir` exits nonzero (why the units stay disabled); the disabled pair never starts and no `OnFailure=` unit runs; enabling it on the new tree starts the service, which imports and answers `view`; a restart keeps its state; a rollback with the service file present and the socket active at its start stops both and leaves them stopped after the revert. The summary gives each step's result.
-- Each `/etc/nixos` branch hash evaluates: `nix eval` of the service's `ExecStart` has no `--state-dir`, and of `wantedBy` gives `[]` for the prerequisite and rollback branches and the targets for the cut-over branch.
+- Each `/etc/nixos` branch hash evaluates: `nix eval` of the service's `ExecStart` has no `--state-dir`, the service's `wantedBy` gives `[]` on every branch, and the socket's gives `[]` for the prerequisite and rollback branches and `["sockets.target"]` for the cut-over branch.
 - Live after cut-over step 4: `systemctl show -p ExecStart build-admission.service` has no `--state-dir`; no `build-admission-alert.service` run is in the journal from the prerequisite rebuild to that step.
 - Live after the cut-over: `systemctl show -p MainPID,ControlGroup build-admission.service` gives a cgroup that is not under `builds.slice`, and `/proc/<MainPID>/oom_score_adj` reads `-900`. The summary gives both.
 - Live after the cut-over, at load above 100: 50 timed calls each of `admission_client.py view`, `build_queue.py`, `build_queue.py 4` (the card) and `build_why.py`, all under 1 s, p95 under 0.25 s. The summary gives the times.
