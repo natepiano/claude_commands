@@ -28,5 +28,5 @@ Apply this to implementation, review, fixes, escalation, and plan revisions:
 
 ## Phase style review
 
-Follow the assignment in `docs/direct/dual_review.md` <ReviewPromptContract/>.
-`commands/unit/style_review.md` is the single guide-loading and review contract.
+Follow the runner's filled assignment from `config/review/style.md` when
+present. `commands/unit/style_review.md` defines the manual entry point.

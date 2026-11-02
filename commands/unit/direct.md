@@ -129,6 +129,8 @@ The `plan:` commands a run uses are loaded the same way: Read the file, never
 the Skill tool. Claude Code puts every skill a session invoked back
 after each compaction for the rest of the session; a file loaded by Read is not.
 A call site's arguments are what that file calls `$ARGUMENTS`.
+For owed phase style, use the runner option in <ReviewPromptContract/>;
+the director neither prepares style inputs nor pastes a style assignment.
 </TagReferenceContract>
 
 <LongLivedWorkers>

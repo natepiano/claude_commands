@@ -79,6 +79,35 @@ class RecordedMarksTests(unittest.TestCase):
             files.assert_called_once_with(self.root / "panes/agents.json")
             self.assertEqual(registry.call_args_list, [call(self.registry / f"{pid}.json")] * 2)
 
+    def test_strict_reader_accepts_identity_only_launches_without_rewriting_them(self) -> None:
+        path = self.root / "launch-history.json"
+        entry = {"session_id": "conversation", "written_at": "2026-10-01T00:00:00Z",
+                 "environment": {"STAFF_ID": "s123456789ab"}}
+        _ = path.write_text(json.dumps({"legacy": entry}))
+        before = path.read_bytes(), path.stat().st_mtime_ns
+        self.assertEqual(pane_launch.read_strict(path), {"legacy": entry})
+        # Account attribution additionally needs a folder, not restore flags or hints.
+        self.assertEqual(pane_launch.read_valid_entries(path), {})
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+
+    def test_readout_skips_damaged_launch_fields_but_strict_repairs_refuse_them(self) -> None:
+        entry = pane_record.launch("valid", "conversation", "/fixture", {"STAFF_ID": "s123456789ab"}, ["claude"])
+        path = self.root / "launch-history.json"
+        corruptions: tuple[tuple[str, object], ...] = (
+            ("session_id", []), ("written_at", None), ("environment", {"STAFF_ID": 7}),
+            ("config_dir", []), ("ended", "false"), ("flags_read", 1), ("cwd", {}),
+        )
+        for field, value in corruptions:
+            with self.subTest(field=field):
+                damaged: dict[str, object] = dict(entry)
+                damaged[field] = value
+                _ = path.write_text(json.dumps({"valid": entry, "damaged": damaged}))
+                before = path.read_bytes(), path.stat().st_mtime_ns
+                self.assertEqual(pane_launch.read_valid_entries(path), {"valid": entry})
+                with self.assertRaises(ValueError):
+                    _ = pane_launch.read_strict(path)
+                self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+
 
 if __name__ == "__main__":
     _ = unittest.main()

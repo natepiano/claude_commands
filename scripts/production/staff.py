@@ -674,6 +674,11 @@ def snapshot() -> StaffSnapshot:
     return _snapshot_value(cast(dict[str, object], value))
 
 
+def local_snapshot() -> StaffSnapshot:
+    """Read only this machine's retained record; never contact its remote owner."""
+    return _load()
+
+
 def initial_snapshot() -> StaffSnapshot:
     """Read a writer's starting record, including an installation not yet seeded."""
     try:

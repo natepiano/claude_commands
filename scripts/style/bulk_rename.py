@@ -65,6 +65,34 @@ class Refusal:
     reason: str
 
 
+class ReservationBlocked(BulkRenameError):
+    """A transient writer conflict, retaining cargo-berth's authority and holder."""
+
+    def __init__(self, path: str, holders: tuple[berth_board.Reservation, ...]) -> None:
+        super().__init__(f"{path}: another worktree holds the file")
+        self.path: str = path
+        self.holders: tuple[berth_board.Reservation, ...] = holders
+
+
+@dataclass(frozen=True)
+class PendingFinding:
+    finding_id: str
+    path: str
+    holders: tuple[berth_board.Reservation, ...]
+
+
+class PendingReservation(TypedDict):
+    finding_id: str
+    path: str
+    holders: list[dict[str, str]]
+
+
+def freeze_pending(item: PendingFinding) -> PendingReservation:
+    return {"finding_id": item.finding_id, "path": item.path,
+            "holders": [{"worktree": str(holder.holder_worktree_root), "branch": holder.holder_branch,
+                         "reservation_id": holder.reservation_id} for holder in item.holders]}
+
+
 @dataclass(frozen=True)
 class RenameFinding:
     finding_id: str
@@ -1812,6 +1840,8 @@ def rename_file(server: RenameServer, path: Path, relative: str, source: str,
             # Validate every document before changing any server document.
             replacements = [(document, apply_edits(document.source, document.edits)) for document in documents]
             reads = verify_rename_references(server, path, offset, rename, replacements)
+        except ReservationBlocked:
+            raise
         except (BulkRenameError, OSError, UnicodeError, ValueError) as error:
             refused.append(Refusal(finding.finding_id, str(error)))
             continue
@@ -2121,8 +2151,10 @@ def check_available(repo: Path, path: str) -> None:
     board = berth_board.read_board(repo)
     if isinstance(board, berth_board.BoardUnavailable):
         raise BulkRenameError(f"cannot check reservation availability: {board.reason}")
-    if any(entry.blocks(path) and entry.holder_worktree_root.resolve() != repo for entry in board.reservations()):
-        raise BulkRenameError(f"{path}: another worktree holds the file")
+    holders = tuple(entry for entry in board.reservations()
+                    if entry.blocks(path) and entry.holder_worktree_root.resolve() != repo.resolve())
+    if holders:
+        raise ReservationBlocked(path, holders)
 
 
 def run_batch(repo: Path, ticket_id: str) -> Path:

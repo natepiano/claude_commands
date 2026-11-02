@@ -55,7 +55,8 @@ effect on the next run of each consumer; nothing needs restarting.
 | `doc` | `cargo doc -D warnings` | standalone `lint doc` only; `verify.sh doc` ignores this switch |
 | `fmt` | `cargo +nightly fmt` | `invoke.sh fmt` (`lint fmt`, `verify.sh lint`) |
 
-Consumers: `/unit:style_review` reads the style switch, and
+Consumers: `scripts/lint/style_review.py` reads the style switch for both
+review launchers and `/unit:style_review`, and
 `scripts/lint/invoke.sh` reads the tool switches for the `lint` CLI
 and `scripts/direct/verify.sh`.
 <PhaseChecks/> defines each phase's checks. `LINT_OP_STYLE_REVIEW=off` makes

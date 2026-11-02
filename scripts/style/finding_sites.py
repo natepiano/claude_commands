@@ -16,9 +16,28 @@ import style_footprint
 
 @final
 @dataclass(frozen=True)
+class FindingAnchor:
+    """The commit and coordinate whose bytes a finding actually names."""
+
+    commit: str
+    path: str
+    line: int
+
+
+@final
+@dataclass(frozen=True)
+class RenameJudgmentSite:
+    """A current coordinate eligible for a new rename proof, never historical continuity."""
+
+    anchor: FindingAnchor
+
+
+@final
+@dataclass(frozen=True)
 class UnchangedSite:
     path: str
     line: int
+    anchor: FindingAnchor
 
 
 @final
@@ -27,7 +46,20 @@ class NeedsJudgment:
     reason: str
 
 
-SiteEvidence = UnchangedSite | NeedsJudgment
+@final
+@dataclass(frozen=True)
+class FilingEligibleWithoutHistory:
+    """An existing finding may be filed, but no judgment proves its source bytes."""
+
+    path: str
+    line: int
+
+    @property
+    def reason(self) -> str:
+        return "no judging ticket for source anchor"
+
+
+SiteEvidence = UnchangedSite | NeedsJudgment | FilingEligibleWithoutHistory
 
 
 @dataclass(frozen=True)
@@ -37,6 +69,7 @@ class EnclosingItem:
     first: int
     last: int
     unproved_lines: range = range(0)
+    header: tuple[str, ...] = ()
 
 
 class UnreadableSourceItems(ValueError):
@@ -140,7 +173,7 @@ class SourceSites:
             last_line = bisect_right(offsets, spans[last - 1].end - 1)
             identity = (*owner, item.title)
             position = len(result)
-            result.append(EnclosingItem(identity, item.kind, first_line, last_line))
+            result.append(EnclosingItem(identity, item.kind, first_line, last_line, header=words[first:last]))
 
             def refuse_body() -> bool:
                 # An unparsed body may conceal descendants. Retain its outer span
@@ -166,6 +199,9 @@ class SourceSites:
                     close = ends.get(cursor)
                     if close is None or close >= last:
                         return refuse_body()
+                    if words[cursor] == "{" and close == last - 1:
+                        result[position] = EnclosingItem(identity, item.kind, first_line, last_line,
+                                                         header=words[first:cursor])
                     if item.kind in {"mod", "impl", "trait", "extern"} and words[cursor] == "{" and close == last - 1:
                         return visit(cursor + 1, close, identity) or refuse_body()
                     syntax = (NestedSyntax.PARAMETERS if item.kind == "fn" and words[cursor] == "("
@@ -384,6 +420,11 @@ class SourceSites:
         if (chain != other.owner_chain(new_line)
                 or any(sum(item.identity == identity for item in self.items) != 1
                        or sum(item.identity == identity for item in other.items) != 1 for identity in chain)):
+            return False
+        # Names and nesting alone do not retain a judgment across a changed signature.
+        # Headers come from the same item parser; comments and body edits are not headers.
+        if (tuple(item.header for item in self.items if item.first <= old_line <= item.last)
+                != tuple(item.header for item in other.items if item.first <= new_line <= item.last)):
             return False
         text = self.lines[old_line - 1].strip()
         if isinstance(old, declarations.DeclaredItem) and isinstance(new, declarations.DeclaredItem):

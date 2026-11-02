@@ -359,7 +359,8 @@ class LaunchMembership:
     def environment(self, launch: pane_record.PaneLaunch, *, live_name: str = "") -> dict[str, str]:
         return StaffLabels(self.record, self.sources.productions,
                            self.sources.showrunner_members(self.record)).environment(
-                               launch["environment"], launch["session_id"], live_name or launch["name"], launch["cwd"])
+                               launch["environment"], launch["session_id"],
+                               live_name or launch.get("name", ""), launch.get("cwd", ""))
 
 
 def record_membership(launch: pane_record.PaneLaunch) -> pane_record.PaneLaunch:

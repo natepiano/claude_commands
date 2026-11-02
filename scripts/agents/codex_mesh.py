@@ -26,9 +26,9 @@ Verbs:
   serve  Start the session's app-server and record where it listens.
   start  Launch one worker as a named thread; block until its turn ends.
          The last reply lands in --summary-file, unless --reply-file names
-         where replies go: then the summary file belongs to the worker,
-         which writes it as its own last act, and the reply fills it only
-         when the worker left it empty.
+         where replies go. A writable worker may supply its own summary;
+         otherwise the runner fills the empty summary from the final reply.
+         Read-only reviewers return their entire result in that reply.
          With --resident, stay attached across turns instead: each finished
          turn is printed to stdout and delivered the same way, the thread
          keeps accepting `send`, and only `end` releases the block.
@@ -2570,10 +2570,10 @@ def _finish_summary(
     """Leave the worker's answer where the caller will read it.
 
     With no reply file the summary file receives the answer. With one, the
-    answer goes there, and the summary file is written only when the worker
-    left it empty: the launcher truncates it at launch and the worker fills
-    it as its last act, so a non-empty file is the worker's own summary and
-    the last chat reply must not replace it.
+    answer goes there, and fills the summary only when it is empty. Launchers
+    truncate the summary at launch. Read-only reviewers return their entire
+    result in the reply; writable workers may instead write their own summary.
+    A non-empty worker summary must not be replaced by the last chat reply.
     """
     if reply_path is None:
         _ = summary_path.write_text(final_answer + "\n", encoding="utf-8")

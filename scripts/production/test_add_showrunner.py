@@ -510,7 +510,10 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         path = Path(self.env["HOME"]) / ".local/state/accounts/groups.json"
         before = path.read_bytes()
         result = self.run_command("kid")
-        self.refused(result, "logged in as other@example.invalid, not claude3")
+        self.refused(result, "~/.claude3 holds a different login from claude3; "
+                     + "run env -u CLAUDE_CODE_OAUTH_TOKEN "
+                     + f"CLAUDE_CONFIG_DIR={shlex.quote(str(directory))} claude, then /login as claude3")
+        self.assertNotIn("other@example.invalid", result.stdout + result.stderr)
         self.assertEqual(path.read_bytes(), before)
 
     def test_new_showrunner_repairs_a_wrong_shared_link_before_launching(self) -> None:

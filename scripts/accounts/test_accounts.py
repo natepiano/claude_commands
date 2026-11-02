@@ -18,8 +18,10 @@ import errno
 import fcntl
 import json
 import os
+import random
 import selectors
 import shlex
+import stat
 import subprocess
 import tempfile
 import time
@@ -33,7 +35,7 @@ from typing import Literal, Self, TextIO, TypedDict, cast, final, override
 from unittest.mock import AsyncMock, MagicMock, call, patch
 from zoneinfo import ZoneInfo
 
-from scripts.accounts.home_test_support import scratch_account_home
+from scripts.accounts.home_test_support import scratch_account_home, write_account_settings
 from scripts.accounts import accounts, next_moves, refusal_watch, refusals, role_map
 from scripts.accounts.nix_env_fake import fake_nix_loader, imports_with_nix_loader, installed_program
 from scripts.lib import atomic_file
@@ -166,6 +168,7 @@ class AccountsTests(unittest.TestCase):
         self.root = Path()
         self.home = Path()
         self.main_dir = Path()
+        self.trust_config = Path()
         # The live reading the status table gets for a folder; a folder without one cannot be read.
         self.live: dict[Path, agent_accounts.Report] = {}
         self.read_claude_live = agent_accounts.claude_live
@@ -194,6 +197,7 @@ class AccountsTests(unittest.TestCase):
             self.enterContext(scratch_account_home(self.home, environment)),
         )
         del environment_context
+        self.trust_config = accounts.trust_settings_file()
         _ = self.enterContext(patch.object(quota_alert, "STATE", self.root / "quota_alert.json"))
         _ = self.enterContext(patch.object(run_out, "READINGS_LOG", self.root / "pace.jsonl"))
         self.live = {}
@@ -384,6 +388,117 @@ class AccountsTests(unittest.TestCase):
         for row in rows:
             self.assertEqual(len(row), len(accounts.TABLE_HEADINGS))
         return rows
+
+    def test_stored_json_counts_local_members_per_account_and_role_without_discovery(self) -> None:
+        self.assert_stored_role_counts("unit marks")
+
+    def test_stored_role_counts_resolve_a_unit_with_only_its_staff_identity(self) -> None:
+        self.assert_stored_role_counts("staff identity")
+
+    def test_stored_role_counts_skip_damaged_launch_history_and_keep_loading(self) -> None:
+        self.assert_stored_role_counts("damaged history")
+
+    def test_stored_role_counts_keep_valid_siblings_of_an_empty_launch_entry(self) -> None:
+        self.assert_stored_role_counts("damaged sibling")
+
+    def test_stored_role_counts_skip_a_newer_launch_with_a_non_string_config_dir(self) -> None:
+        self.assert_stored_role_counts("damaged folder")
+
+    def test_stored_role_counts_keep_a_unit_without_legacy_launch_flags(self) -> None:
+        self.assert_stored_role_counts("legacy flags")
+
+    def assert_stored_role_counts(self, evidence: Literal[
+        "unit marks", "staff identity", "damaged history", "damaged sibling", "damaged folder", "legacy flags",
+    ]) -> None:
+        from scripts.message import sessions
+        from scripts.shutdown import inventory
+        from scripts.herdr import pane_launch
+        from scripts.production import staff
+        from scripts.production.staff_test_support import unit_membership
+
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"STAFF_FILE": str(self.root / "staff.json")})))
+        members = {name: unit_membership("fixture", name) for name in ("a", "b", "c")}
+
+        self.login_directory("claude1", "units@notexample.com")
+        self.login_directory("claude2", "runners@notexample.com")
+        self.write_note("codex1", "workers@notexample.com")
+        self.codex_login("workers@notexample.com", self.home / ".codex1")
+        self.write_note("codex2", "spare@notexample.com")
+        self.codex_login("spare@notexample.com", self.home / ".codex2")
+        configuration = accounts.accounts_config_file()
+        configuration.parent.mkdir(parents=True, exist_ok=True)
+        _ = configuration.write_text('{"workers": "codex1"}')
+        records = self.root / "pane-records"
+        records.mkdir()
+        owners: list[sessions.SessionRecord] = []
+        launches: dict[str, pane_launch.PaneLaunch] = {}
+        for pane, label, unit in (("unit-a", "claude1", "a"), ("unit-b", "claude1", "b"),
+                                  ("runner-a", "claude2", ""), ("runner-b", "claude1", ""),
+                                  ("stopped", "claude1", "c"), ("plain", "claude1", "")):
+            identity = pane
+            marked = {"SHOWRUNNER_UNIT_ID": unit} if unit else {}
+            if evidence == "staff identity" and unit:
+                # No unit mark: the session id is the row's current session.
+                identity, marked = members[unit].current_session, {}
+            launches[identity] = pane_launch.PaneLaunch(pane_id=identity, session_id=identity,
+                config_dir=str(self.home / ("." + label)), cwd=str(self.root), name=identity,
+                model="", remote_control=False, flags_read=True, written_at="2026-10-01T00:00:00Z",
+                environment=marked)
+            if pane != "stopped":
+                owners.append(sessions.SessionRecord(pid=12345, sessionId=identity, name=identity,
+                    messagingSocketPath="/fake.sock", updatedAt=1, tmux="", formerNames=[]))
+        # A repeated registry identity is still one session.
+        owners.append(owners[0])
+        history: dict[str, object] = dict(launches)
+        if evidence == "legacy flags":
+            history["unit-a"] = {key: value for key, value in launches["unit-a"].items() if key != "flags_read"}
+        elif evidence == "damaged sibling":
+            history["broken-pane"] = {}
+        elif evidence == "damaged folder":
+            damaged: dict[str, object] = dict(launches["unit-a"])
+            damaged.update(config_dir=[], written_at="2026-10-02T00:00:00Z")
+            history["broken-pane"] = damaged
+        _ = (records / "fixture.json").write_text(json.dumps(history))
+        if evidence == "damaged history":
+            _ = (records / "damaged.json").write_text('{"broken-pane": {}}')
+        run = self.root / "worker-runs" / "run-one"
+        run.mkdir(parents=True)
+        _ = (run / "mesh_server.json").write_text(json.dumps({
+            "pid": 12345, "port": 123, "codex_home": str(self.home / ".codex1"),
+        }))
+        _ = (run / "mesh_roster.json").write_text(json.dumps({
+            "first": {"status": "running", "thread_id": "one", "port": 123},
+            "second": {"status": "done", "thread_id": "two", "port": 123},
+            "ended": {"status": "ended", "thread_id": "ended", "port": 123},
+        }))
+        runners = inventory.ShowrunnerRegistrations((
+            inventory.ShowrunnerRegistration("runner-a", "runner-a", ""),
+            inventory.ShowrunnerRegistration("runner-b", "runner-b", ""),
+        ))
+        cases: tuple[tuple[str, dict[str, tuple[list[str], list[int]]]], ...] = (
+            ("claude2", {"claude1": (["units"], [2]), "claude2": (["showrunners"], [1])}),
+            ("claude1", {"claude1": (["units", "showrunners"], [2, 1]), "claude2": ([], [])}),
+        )
+        for runner_label, expected in cases:
+            _ = accounts.set_group_account("units", "claude1", why="fixture")
+            _ = accounts.set_group_account("showrunners", runner_label, why="fixture")
+            with (self.subTest(runner_label=runner_label),
+                  patch.object(sessions, "live_sessions", return_value=owners),
+                  patch.object(pane_launch, "record_directory", return_value=records),
+                  # Even on a client machine, counts use only the retained local record.
+                  patch.object(staff, "snapshot", side_effect=AssertionError("no owner fetch")),
+                  patch.object(inventory, "showrunner_registrations", return_value=runners),
+                  patch.object(accounts, "_mesh_server_running", return_value=True),
+                  patch.object(accounts, "live_group_members", side_effect=AssertionError("rich inventory")),
+                  patch.object(subprocess, "run", side_effect=AssertionError("no process or network discovery")),
+                  patch.object(subprocess, "Popen", side_effect=AssertionError("no process or network discovery"))):
+                code, text, error = self.run_cli("status", "--stored", "--json")
+            self.assertEqual((code, error), (0, ""))
+            document = cast(accounts.StatusDocument, json.loads(text))
+            values = {row["label"]: (row["roles"], row["role_counts"]) for row in document["accounts"]}
+            self.assertEqual(values, {**expected, "codex1": (["workers"], [2]), "codex2": (["spare"], [None])})
+            self.assertIn(str(run / "mesh_roster.json"), document["session_inputs"])
+            self.assertIn(str(records / "fixture.json"), document["session_inputs"])
 
     def run_cli(self, *arguments: str) -> tuple[int, str, str]:
         stdout = io.StringIO()
@@ -827,7 +942,30 @@ class AccountsTests(unittest.TestCase):
         self.assertIsInstance(result, accounts.AccountRefused)
         assert isinstance(result, accounts.AccountRefused)
         self.assertEqual(result.reason,
-            "accounts: ~/.claude3 is logged in as other@example.invalid, not claude3; see Log out and in in ~/.claude/docs/accounts.md")
+            ("accounts: ~/.claude3 holds a different login from claude3; run "
+            + f"env -u CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR={shlex.quote(str(accounts.account_dir('claude3')))} claude, then /login as claude3"))
+
+    def test_wrong_login_recovery_bypasses_the_alias_and_clears_the_inherited_token(self) -> None:
+        self.login_directory("claude3", "expected@example.invalid")
+        self.write_identity("claude3", "other@example.invalid")
+        refused = accounts.prepared_account("claude3", resume=False)
+        self.assertIsInstance(refused, accounts.AccountRefused)
+        assert isinstance(refused, accounts.AccountRefused)
+        command = refused.reason.split("; run ", 1)[1].split(", then /login", 1)[0]
+        self.assertEqual(command, "env -u CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR="
+            + shlex.quote(str(accounts.account_dir("claude3"))) + " claude")
+        self.assertNotIn("other@example.invalid", refused.reason)
+        code, setup, errors = self.run_cli("setup", "claude3")
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(setup.splitlines()[0], command)
+        program = self.home / ".local/bin/claude"
+        _ = program.write_text('#!/bin/sh\nprintf "%s\\n%s\\n" "$CLAUDE_CONFIG_DIR" "${CLAUDE_CODE_OAUTH_TOKEN-unset}"\n')
+        result = subprocess.run(["bash", "-c", "shopt -s expand_aliases\nalias claude='exit 77'\n" + command],
+            env={**os.environ, "PATH": str(program.parent) + os.pathsep + os.defpath,
+                 "CLAUDE_CODE_OAUTH_TOKEN": "fixture-inherited"},
+            capture_output=True, text=True, check=False)
+        self.assertEqual((result.returncode, result.stderr), (0, ""))
+        self.assertEqual(result.stdout.splitlines(), [str(accounts.account_dir("claude3")), "unset"])
 
     def test_group_launch_prepares_configured_account_for_new_work_and_resumes(self) -> None:
         """F006: every launch checks readiness without selecting another account."""
@@ -1008,7 +1146,8 @@ class AccountsTests(unittest.TestCase):
         self.login_directory("claude2", "main@example.invalid", default=True)
         self.login_directory("claude3", "expected@example.invalid")
         self.write_identity("claude3", "other@example.invalid")
-        line = "accounts: ~/.claude3 is logged in as other@example.invalid, not claude3; see Log out and in in ~/.claude/docs/accounts.md"
+        line = ("accounts: ~/.claude3 holds a different login from claude3; run "
+            + f"env -u CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR={shlex.quote(str(accounts.account_dir('claude3')))} claude, then /login as claude3")
         self.assertIsInstance(accounts.account_directory_readiness("claude3"), accounts.AccountDirectoryWrongLogin)
         self.assertEqual(accounts.check("claude3"), [line])
         with patch.object(os, "execvpe") as launch:
@@ -1016,7 +1155,7 @@ class AccountsTests(unittest.TestCase):
         launch.assert_not_called()
         result = self.run_cli("status")
         self.assertRegex(result[1], r"\| ~/\.claude3 +\| claude3 +\|")
-        self.assertIn("claude3: wrong sign-in; ~/.claude3 holds a different login from claude3; see Log out and in in ~/.claude/docs/accounts.md", result[1].splitlines())
+        self.assertIn("claude3: wrong sign-in; " + line.removeprefix("accounts: "), result[1].splitlines())
         self.assertNotIn("other@example.invalid", result[1])
         self.assertEqual(accounts.account_identity(accounts.account_dir("claude3")), agent_accounts.UnnotedLogin(self.home / ".claude3", "other@example.invalid"))
 
@@ -1322,7 +1461,8 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual(len(problems), 3)
         self.assertIn("projects", problems[0])
         self.assertIn(".credentials.json", problems[1])
-        self.assertIn("logged in as other@example.invalid", problems[2])
+        self.assertIn("holds a different login from claude3", problems[2])
+        self.assertNotIn("other@example.invalid", problems[2])
 
     def test_check_missing_note_alone_excludes_an_otherwise_matching_account(self) -> None:
         self.login_directory("claude2", "main@example.invalid", default=True)
@@ -1671,6 +1811,471 @@ class AccountsTests(unittest.TestCase):
         result, stdout, stderr = self.run_cli("burn", "--since", "2026-10-09T00:00:00Z", "--until", "2026-10-10T00:00:00Z")
         self.assertEqual((result, stdout), (1, ""))
         self.assertIn("invalid role change", stderr)
+
+    def write_trust_fixture(self) -> tuple[Path, ...]:
+        write_account_settings(self.trust_config, folders=("~/worktrees", "~/other trees"))
+        paths = [self.home / ".claude.json"]
+        for number in (1, 2):
+            home = self.home / f".claude{number}"
+            home.mkdir()
+            paths.append(home / ".claude.json")
+        for path in paths:
+            _ = path.write_text(json.dumps({"keep": [1, 2], "projects": {
+                str(self.home / "worktrees"): {"hasTrustDialogAccepted": False, "keep": "here"},
+                "/elsewhere": {"hasTrustDialogAccepted": False, "other": [1]},
+            }}))
+            path.chmod(0o640)
+        return tuple(paths)
+
+    def trust_home_snapshot(self) -> dict[Path, tuple[int, int, int, int, bytes]]:
+        """Notice content, metadata, directory, link and temporary-file changes."""
+        result: dict[Path, tuple[int, int, int, int, bytes]] = {}
+        for path in (self.home, *self.home.rglob("*")):
+            metadata = path.lstat()
+            content = os.readlink(path).encode() if path.is_symlink() else path.read_bytes() if path.is_file() else b""
+            result[path] = (metadata.st_mode, metadata.st_ino, metadata.st_mtime_ns, metadata.st_ctime_ns, content)
+        return result
+
+    def start_trust_writer(self, path: Path) -> subprocess.Popen[str]:
+        """An independent lock-respecting save, with only scratch config paths."""
+        script = '''
+import json, os, sys, time
+from pathlib import Path
+path = Path(sys.argv[1])
+lock = path.with_name(path.name + ".lock")
+deadline = time.monotonic() + 5
+announced = False
+while True:
+    try:
+        lock.mkdir()
+        break
+    except FileExistsError:
+        if not announced:
+            print("blocked", flush=True)
+            announced = True
+        if time.monotonic() >= deadline:
+            raise TimeoutError("fixture lock not released")
+        time.sleep(0.001)
+try:
+    print("acquired", flush=True)
+    sys.stdin.readline()
+    current = json.loads(path.read_text())
+    current["other writer"] = "retained"
+    temporary = path.with_name(path.name + ".writer")
+    temporary.write_text(json.dumps(current))
+    temporary.chmod(path.stat().st_mode)
+    os.replace(temporary, path)
+finally:
+    lock.rmdir()
+'''
+        process = subprocess.Popen([sys.executable, "-c", script, str(path)],
+                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, text=True)
+
+        def close_writer() -> None:
+            if process.poll() is None:
+                process.kill()
+            _ = process.communicate(timeout=5)
+
+        self.addCleanup(close_writer)
+        return process
+
+    def test_trust_waiting_writer_saves_after_publication_and_preserves_both_changes(self) -> None:
+        paths = self.write_trust_fixture()
+        publish = os.replace
+        writers: list[subprocess.Popen[str]] = []
+
+        def publish_with_contender(temporary: Path, path: Path) -> None:
+            if path == paths[0]:
+                writer = self.start_trust_writer(path)
+                writers.append(writer)
+                assert writer.stdout is not None and writer.stdin is not None
+                # This hook is after trust's compare and before its replace.
+                self.assertEqual(writer.stdout.readline(), "blocked\n")
+                _ = writer.stdin.write("save\n")
+                writer.stdin.flush()
+                self.assertIsNone(writer.poll())
+            publish(temporary, path)
+
+        with patch.object(os, "replace", side_effect=publish_with_contender):
+            code, _output, error = self.run_cli("trust")
+        self.assertEqual(code, 0, error)
+        writer = writers[0]
+        stdout, stderr = writer.communicate(timeout=5)
+        self.assertEqual((writer.returncode, stdout, stderr), (0, "acquired\n", ""))
+        final = accounts.read_json_object(paths[0])
+        self.assertEqual(final["other writer"], "retained")
+        self.assertEqual(final["projects"], accounts.read_json_object(paths[1])["projects"])
+
+    def test_trust_waits_for_held_lock_then_reads_the_holders_change(self) -> None:
+        paths = self.write_trust_fixture()
+        writer = self.start_trust_writer(paths[0])
+        assert writer.stdout is not None and writer.stdin is not None
+        self.assertEqual(writer.stdout.readline(), "acquired\n")
+        sleep = time.sleep
+
+        def release_holder(delay: float) -> None:
+            assert writer.stdin is not None
+            _ = writer.stdin.write("save\n")
+            writer.stdin.flush()
+            sleep(delay)
+
+        with patch.object(time, "sleep", side_effect=release_holder) as waited:
+            code, _output, error = self.run_cli("trust")
+        self.assertEqual(code, 0, error)
+        self.assertTrue(waited.called)
+        stdout, stderr = writer.communicate(timeout=5)
+        self.assertEqual((writer.returncode, stdout, stderr), (0, "", ""))
+        final = accounts.read_json_object(paths[0])
+        self.assertEqual(final["other writer"], "retained")
+        self.assertEqual(final["projects"], accounts.read_json_object(paths[1])["projects"])
+
+    def test_trust_recovers_a_stale_lock_using_claudes_mtime_rule(self) -> None:
+        paths = self.write_trust_fixture()
+        lock = paths[0].with_name(paths[0].name + ".lock")
+        lock.mkdir()
+        stale = time.time() - 11
+        os.utime(lock, (stale, stale))
+        code, _output, error = self.run_cli("trust")
+        self.assertEqual(code, 0, error)
+        self.assertFalse(lock.exists())
+        self.assertEqual(accounts.read_json_object(paths[0])["projects"],
+                         accounts.read_json_object(paths[1])["projects"])
+
+    def test_trust_bounds_held_lock_retries_and_continues_other_homes(self) -> None:
+        paths = self.write_trust_fixture()
+        lock = paths[0].with_name(paths[0].name + ".lock")
+        lock.mkdir()
+        before = paths[0].read_bytes()
+        with patch.object(time, "sleep") as waited:
+            code, output, error = self.run_cli("trust")
+        self.assertEqual((code, output), (1, "claude1: trust updated\nclaude2: trust updated\n"))
+        self.assertIn("~/.claude: trust failed: Claude config lock still held after retries", error)
+        self.assertEqual(waited.call_count, 2)
+        self.assertEqual(paths[0].read_bytes(), before)
+        self.assertTrue(lock.is_dir())
+
+    def test_trust_lock_uses_configured_retries_stale_age_and_budget_at_use(self) -> None:
+        paths = self.write_trust_fixture()
+        path = paths[0]
+        lock = path.with_name(path.name + ".lock")
+        lock.mkdir()
+        aged = time.time() - 200
+        os.utime(lock, (aged, aged))
+        write_account_settings(self.trust_config, retries=(0.6, 0.8), stale_seconds=300)
+        with (patch.object(time, "sleep") as waited,
+              patch.object(random, "random", return_value=0)):
+            with self.assertRaisesRegex(TimeoutError, "still held after retries"):
+                with accounts.claude_config_lock(path, accounts.trust_configuration().lock_policy):
+                    self.fail("a lock younger than the configured stale age must remain held")
+        self.assertEqual(waited.call_args_list, [call(0.6), call(0.8)])
+        self.assertTrue(lock.is_dir())
+        # A changed config applies to the next use; no module-level timing cache.
+        write_account_settings(self.trust_config, retries=(0.1,), stale_seconds=100)
+        with patch.object(time, "monotonic", return_value=40):
+            with accounts.claude_config_lock(path, accounts.trust_configuration().lock_policy) as ownership:
+                self.assertAlmostEqual(ownership.publish_before, 40.05)
+                ownership.require_current()
+        self.assertFalse(lock.exists())
+
+    def test_trust_refuses_missing_empty_or_invalid_lock_settings_without_writing(self) -> None:
+        paths = self.write_trust_fixture()
+        before = [path.read_bytes() for path in paths]
+        trust_section = self.trust_config.read_text().split("[claude_config_lock]", 1)[0]
+        cases = (
+            ("", "[claude_config_lock]"),
+            ("stale_seconds = 10", "retries"),
+            ("retries = []\nstale_seconds = 10", "retries"),
+            ('retries = ""\nstale_seconds = 10', "retries"),
+            ("retries = 1\nstale_seconds = 10", "retries"),
+            ("retries = [0]\nstale_seconds = 10", "retries"),
+            ("retries = [-1]\nstale_seconds = 10", "retries"),
+            ('retries = ["bad"]\nstale_seconds = 10', "retries"),
+            ("retries = [true]\nstale_seconds = 10", "retries"),
+            ("retries = [nan]\nstale_seconds = 10", "retries"),
+            ("retries = [inf]\nstale_seconds = 10", "retries"),
+            (f"retries = [{'9' * 400}]\nstale_seconds = 10", "retries"),
+            ("retries = [0.2]", "stale_seconds"),
+            ('retries = [0.2]\nstale_seconds = ""', "stale_seconds"),
+            ("retries = [0.2]\nstale_seconds = []", "stale_seconds"),
+            ("retries = [0.2]\nstale_seconds = 0", "stale_seconds"),
+            ("retries = [0.2]\nstale_seconds = -1", "stale_seconds"),
+            ("retries = [0.2]\nstale_seconds = true", "stale_seconds"),
+            ("retries = [0.2]\nstale_seconds = nan", "stale_seconds"),
+            ("retries = [0.2]\nstale_seconds = inf", "stale_seconds"),
+            (f"retries = [0.2]\nstale_seconds = {'9' * 400}", "stale_seconds"),
+        )
+        for trusted in (False, True):
+            if trusted:
+                write_account_settings(self.trust_config, folders=("~/worktrees", "~/other trees"))
+                code, _output, error = self.run_cli("trust")
+                self.assertEqual(code, 0, error)
+                before = [path.read_bytes() for path in paths]
+            for section, key in cases:
+                with self.subTest(trusted=trusted, key=key, section=section):
+                    _ = self.trust_config.write_text(
+                        trust_section + ("[claude_config_lock]\n" + section if section else "")
+                    )
+                    snapshot = self.trust_home_snapshot()
+                    with (patch.object(fcntl, "flock") as locked,
+                          patch.object(atomic_file, "prepared_replacement") as prepared,
+                          patch.object(atomic_file, "remove_dead_temporary_files") as cleaned):
+                        code, output, error = self.run_cli("trust")
+                    self.assertEqual((code, output), (1, ""))
+                    self.assertIn(str(self.trust_config), error)
+                    self.assertIn(key, error)
+                    self.assertEqual(len(error.splitlines()), 1)
+                    self.assertEqual([path.read_bytes() for path in paths], before)
+                    self.assertFalse(any(path.with_name(path.name + ".lock").exists() for path in paths))
+                    self.assertEqual(self.trust_home_snapshot(), snapshot)
+                    locked.assert_not_called()
+                    prepared.assert_not_called()
+                    cleaned.assert_not_called()
+
+    def test_seed_refuses_invalid_configuration_before_creating_or_cleaning_any_home(self) -> None:
+        paths = self.write_trust_fixture()
+        abandoned = paths[1].with_name(f".{paths[1].name}.999999999.abandoned.tmp")
+        _ = abandoned.write_text("retain until configuration is valid")
+        for settings, problem in (
+            ("[trust]\nfolders = []\n[claude_config_lock]\nretries = []\nstale_seconds = 10\n",
+             "claude_config_lock.retries must be a non-empty list"),
+            ("[trust]\nfolders = [false]\n[claude_config_lock]\nretries = [0.2]\nstale_seconds = 10\n",
+             "trust.folders must contain absolute or ~/ paths"),
+        ):
+            _ = self.trust_config.write_text(settings)
+            for label in ("claude1", "claude3"):
+                with self.subTest(label=label, problem=problem):
+                    snapshot = self.trust_home_snapshot()
+                    with (patch.object(fcntl, "flock") as locked,
+                          patch.object(atomic_file, "remove_dead_temporary_files") as cleaned):
+                        code, output, error = self.run_cli("setup", label)
+                    self.assertEqual((code, output), (1, ""))
+                    self.assertIn(problem, error)
+                    self.assertEqual(len(error.splitlines()), 1)
+                    self.assertEqual(self.trust_home_snapshot(), snapshot)
+                    locked.assert_not_called()
+                    cleaned.assert_not_called()
+
+    def test_trust_and_seed_read_one_validated_configuration_before_home_locks(self) -> None:
+        self.write_main_config()
+        read = Path.read_text
+        flock = fcntl.flock
+        for arguments in (("trust",), ("setup", "claude2")):
+            with self.subTest(arguments=arguments):
+                write_account_settings(self.trust_config, folders=("~/worktrees",))
+                reads: list[Path] = []
+
+                def read_settings(
+                    path: Path, encoding: str | None = None, errors: str | None = None,
+                    newline: str | None = None,
+                ) -> str:
+                    if path == self.trust_config:
+                        reads.append(path)
+                    return read(path, encoding=encoding, errors=errors, newline=newline)
+
+                def change_settings_after_validation(descriptor: int, operation: int) -> None:
+                    self.assertEqual(reads, [self.trust_config])
+                    _ = self.trust_config.write_text("[trust]\nfolders = []\n[claude_config_lock]\nretries = []\n")
+                    flock(descriptor, operation)
+
+                with (patch.object(Path, "read_text", new=read_settings),
+                      patch.object(fcntl, "flock", side_effect=change_settings_after_validation)):
+                    code, _output, error = self.run_cli(*arguments)
+                self.assertEqual(code, 0, error)
+                self.assertEqual(reads, [self.trust_config])
+                seeded = self.home / ".claude2/.claude.json" if arguments[0] == "setup" else self.home / ".claude.json"
+                projects = cast(dict[str, object], accounts.read_json_object(seeded)["projects"])
+                self.assertEqual(projects[str(self.home / "worktrees")], {"hasTrustDialogAccepted": True})
+
+    def test_trust_refuses_publication_when_its_short_lock_budget_is_used(self) -> None:
+        paths = self.write_trust_fixture()
+        before = [path.read_bytes() for path in paths]
+        with patch.object(time, "monotonic", side_effect=[0, 1] * len(paths)):
+            code, output, error = self.run_cli("trust")
+        self.assertEqual((code, output), (1, ""))
+        self.assertEqual(error.count("publication budget exceeded"), len(paths))
+        self.assertEqual([path.read_bytes() for path in paths], before)
+        self.assertFalse(any(path.with_name(path.name + ".lock").exists() for path in paths))
+
+    def test_trust_slow_preparation_leaves_lock_free_and_rebuilds_concurrent_changes(self) -> None:
+        paths = self.write_trust_fixture()
+        prepare = atomic_file.prepared_replacement
+        lock_config = accounts.claude_config_lock
+        sync = os.fsync
+        preparation_times: list[float] = []
+        hold_times: list[float] = []
+        preparations: list[Path] = []
+
+        def assert_locks_free() -> None:
+            self.assertFalse(any(path.with_name(path.name + ".lock").exists() for path in paths))
+
+        @contextmanager
+        def slow_preparation(path: Path, content: str | bytes, *, mode: int) -> Generator[Path]:
+            assert_locks_free()
+            preparations.append(path)
+            with prepare(path, content, mode=mode) as temporary:
+                assert_locks_free()
+                self.assertEqual(temporary.stat().st_mode & 0o777, 0o640)
+                if len(preparations) == 1:
+                    started = time.perf_counter()
+                    time.sleep(1.6)  # Longer than Claude's boot retry-abort window.
+                    assert_locks_free()
+                    writer = self.start_trust_writer(path)
+                    assert writer.stdout is not None
+                    self.assertEqual(writer.stdout.readline(), "acquired\n")
+                    stdout, stderr = writer.communicate("save\n", timeout=5)
+                    self.assertEqual((writer.returncode, stdout, stderr), (0, "", ""))
+                    preparation_times.append(time.perf_counter() - started)
+                yield temporary
+                assert_locks_free()
+            assert_locks_free()
+
+        @contextmanager
+        def timed_lock(path: Path, policy: accounts.ClaudeConfigLockPolicy) -> Generator[accounts.ClaudeConfigLock]:
+            with lock_config(path, policy) as ownership:
+                started = time.perf_counter()
+                yield ownership
+            hold_times.append(time.perf_counter() - started)
+
+        def sync_without_lock(descriptor: int) -> None:
+            assert_locks_free()
+            sync(descriptor)
+
+        with (patch.object(atomic_file, "prepared_replacement", side_effect=slow_preparation),
+              patch.object(accounts, "claude_config_lock", side_effect=timed_lock),
+              patch.object(os, "fsync", side_effect=sync_without_lock)):
+            code, _output, error = self.run_cli("trust")
+        self.assertEqual(code, 0, error)
+        self.assertGreater(preparation_times[0], 1.5)
+        self.assertEqual(len(hold_times), len(paths) + 1)
+        self.assertLess(max(hold_times), 0.1)
+        self.assertEqual(preparations.count(paths[0]), 2)
+        final = accounts.read_json_object(paths[0])
+        self.assertEqual(final["other writer"], "retained")
+        self.assertEqual(final["projects"], accounts.read_json_object(paths[1])["projects"])
+        self.assertTrue(all(path.stat().st_mode & 0o777 == 0o640 for path in paths))
+        self.assertFalse(list(self.home.rglob("*.tmp")))
+
+    def test_trust_rebuilds_when_permissions_tighten_during_preparation(self) -> None:
+        paths = self.write_trust_fixture()
+        paths[0].chmod(0o644)
+        sync = os.fsync
+        replace = os.replace
+        prepared_modes: list[int] = []
+
+        def tighten_during_sync(descriptor: int) -> None:
+            if stat.S_ISREG(os.fstat(descriptor).st_mode):
+                prepared_modes.append(os.fstat(descriptor).st_mode & 0o777)
+                if len(prepared_modes) == 1:
+                    self.assertFalse(paths[0].with_name(paths[0].name + ".lock").exists())
+                    paths[0].chmod(0o600)
+            sync(descriptor)
+
+        def publish(temporary: Path, destination: Path) -> None:
+            self.assertEqual(temporary.stat().st_mode & 0o777, destination.stat().st_mode & 0o777)
+            replace(temporary, destination)
+
+        with (patch.object(os, "fsync", side_effect=tighten_during_sync),
+              patch.object(os, "replace", side_effect=publish)):
+            code, _output, error = self.run_cli("trust")
+        self.assertEqual(code, 0, error)
+        self.assertEqual(prepared_modes, [0o644, 0o600, 0o640, 0o640])
+        self.assertEqual(paths[0].stat().st_mode & 0o777, 0o600)
+        self.assertEqual(accounts.read_json_object(paths[0])["projects"],
+                         accounts.read_json_object(paths[1])["projects"])
+        self.assertFalse(list(self.home.rglob("*.tmp")))
+
+    def test_trust_changes_only_configured_project_bits_in_every_home_and_reruns_unchanged(self) -> None:
+        paths = self.write_trust_fixture()
+        originals = [accounts.read_json_object(path) for path in paths]
+        code, output, error = self.run_cli("trust")
+        self.assertEqual(code, 0, error)
+        self.assertEqual(output.splitlines(), ["~/.claude: trust updated", "claude1: trust updated", "claude2: trust updated"])
+        self.assertIn("unlocked Claude save", error)
+        for path, original in zip(paths, originals):
+            with self.subTest(path=path.name, home=path.parent.name):
+                expected_projects = cast(dict[str, object], original["projects"])
+                expected_projects[str(self.home / "worktrees")] = {"hasTrustDialogAccepted": True, "keep": "here"}
+                expected_projects[str(self.home / "other trees")] = {"hasTrustDialogAccepted": True}
+                self.assertEqual(accounts.read_json_object(path), original)
+                self.assertEqual(path.stat().st_mode & 0o777, 0o640)
+        before = [(path.read_bytes(), path.stat().st_mtime_ns) for path in paths]
+        self.assertEqual(self.run_cli("trust")[:2], (0,
+            "~/.claude: trust unchanged\nclaude1: trust unchanged\nclaude2: trust unchanged\n"))
+        self.assertEqual([(path.read_bytes(), path.stat().st_mtime_ns) for path in paths], before)
+
+    def test_trust_retries_an_intervening_writer_before_publish_and_after_publish(self) -> None:
+        paths = self.write_trust_fixture()
+        apply = accounts.with_trusted_folders
+        publish = os.replace
+        before_publish = True
+        after_publish = True
+
+        def competing_change(source: dict[str, object], folders: tuple[str, ...]) -> dict[str, object]:
+            nonlocal before_publish
+            if before_publish:
+                before_publish = False
+                current = accounts.read_json_object(paths[0])
+                current["concurrent before"] = "retained"
+                _ = paths[0].write_text(json.dumps(current))
+            return apply(source, folders)
+
+        def competing_publish(temporary: Path, path: Path) -> None:
+            nonlocal after_publish
+            publish(temporary, path)
+            if after_publish:
+                after_publish = False
+                # An unlocked writer uses its earlier snapshot after our replace.
+                _ = path.write_text(json.dumps({"concurrent before": "retained", "concurrent after": True}))
+
+        with (patch.object(accounts, "with_trusted_folders", side_effect=competing_change),
+              patch.object(os, "replace", side_effect=competing_publish)):
+            code, _output, error = self.run_cli("trust")
+        self.assertEqual(code, 0, error)
+        final = accounts.read_json_object(paths[0])
+        self.assertEqual(final["concurrent before"], "retained")
+        self.assertIs(final["concurrent after"], True)
+        self.assertEqual(final["projects"], {
+            str(self.home / "worktrees"): {"hasTrustDialogAccepted": True},
+            str(self.home / "other trees"): {"hasTrustDialogAccepted": True},
+        })
+
+    def test_trust_reports_missing_and_unreadable_files_and_continues_other_homes(self) -> None:
+        paths = self.write_trust_fixture()
+        paths[0].unlink()
+        read = Path.read_bytes
+
+        def unreadable(path: Path) -> bytes:
+            if path == paths[1]:
+                raise PermissionError("fixture unreadable")
+            return read(path)
+
+        with patch.object(Path, "read_bytes", new=unreadable):
+            code, output, error = self.run_cli("trust")
+        self.assertEqual((code, output), (1, "claude2: trust updated\n"))
+        self.assertIn("~/.claude: trust failed:", error)
+        self.assertIn("claude1: trust failed: fixture unreadable", error)
+        self.assertFalse(paths[0].exists())
+        self.assertEqual(accounts.read_json_object(paths[2])["projects"], {
+            str(self.home / "worktrees"): {"hasTrustDialogAccepted": True, "keep": "here"},
+            str(self.home / "other trees"): {"hasTrustDialogAccepted": True},
+            "/elsewhere": {"hasTrustDialogAccepted": False, "other": [1]},
+        })
+
+    def test_new_account_seed_uses_trusted_folders_from_configuration_at_use(self) -> None:
+        write_account_settings(self.trust_config, folders=("~/configured root",))
+        _ = (self.home / ".claude.json").write_text('{"hasCompletedOnboarding": true}')
+        self.assertEqual(accounts.setup("claude2"), [])
+        seeded = accounts.read_json_object(self.home / ".claude2/.claude.json")
+        self.assertEqual(seeded, {"hasCompletedOnboarding": True, "projects": {
+            str(self.home / "configured root"): {"hasTrustDialogAccepted": True},
+        }})
+        self.assertEqual((self.home / ".claude2/.claude.json").stat().st_mode & 0o777, 0o600)
+        write_account_settings(self.trust_config, folders=("~/different root",))
+        self.assertEqual(accounts.setup("claude3"), [])
+        self.assertEqual(accounts.read_json_object(self.home / ".claude3/.claude.json")["projects"], {
+            str(self.home / "different root"): {"hasTrustDialogAccepted": True},
+        })
 
     def test_shared_entries_are_the_documented_complete_set(self) -> None:
         self.assertEqual(tuple(accounts.SHARED), EXPECTED_SHARED)
@@ -2331,7 +2936,7 @@ class AccountsTests(unittest.TestCase):
             getattr(accounts, "_repair_link"),
         )
         seed_config = cast(
-            Callable[[Path], list[str]],
+            Callable[[Path, accounts.TrustConfiguration], list[str]],
             getattr(accounts, "_seed_config"),
         )
         source = self.main_dir / "settings.json"
@@ -2343,7 +2948,7 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual(repair_link(link, source), [])
         self.assertEqual(repair_link(link, source), [])
         self.write_main_config()
-        self.assertEqual(seed_config(account_dir / ".claude.json"), [])
+        self.assertEqual(seed_config(account_dir / ".claude.json", accounts.trust_configuration()), [])
 
     def test_setup_replaces_a_wrong_target_link(self) -> None:
         self.write_main_config()
@@ -2512,10 +3117,31 @@ class AccountsTests(unittest.TestCase):
     # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_mac_status_describes_accounts_without_creating_any(self) -> None:
-        with patch.object(sys, "platform", "darwin"):
+        with (patch.object(sys, "platform", "darwin"),
+              patch.object(accounts, "_mac_login_keychain_visible", return_value=True),
+              patch.object(accounts, "_mac_keychain_has_entry", return_value=True)):
             self.assert_status_describes_accounts_without_creating_any(
                 "in a Mac Terminal, run accounts.py exec claude2, then /login, then /exit, "
                 + "then accounts.py cutover-home claude2; never /logout")
+
+    # Reserved fixtures model provider accounts in this status test.
+    @patch.object(accounts, "is_test_login", new=provider_fixture_login)
+    def test_mac_leftover_identity_step_clears_it_without_another_login(self) -> None:
+        self.login_directory("claude2", "main@example.invalid", default=True)
+        self.write_main_config()
+        with (patch.object(sys, "platform", "darwin"),
+              patch.object(accounts, "_mac_login_keychain_visible", return_value=True),
+              patch.object(accounts, "_mac_keychain_has_entry", return_value=False),
+              patch.object(accounts, "_claude_process_ids", return_value=[])):
+            code, output, error = self.run_cli("status", "--stored")
+            self.assertEqual((code, error), (0, ""))
+            self.assertIn("~/.claude: legacy login is stored; the home still holds a login; "
+                + "in a Mac Terminal, run accounts.py cutover-home claude2; never /logout", output)
+            self.assertNotIn("then /login", output)
+            self.assertEqual(self.run_cli("cutover-home", "claude2")[0], 0)
+            code, output, error = self.run_cli("status", "--stored")
+            self.assertEqual((code, error), (0, ""))
+            self.assertNotIn("legacy login is stored", output)
 
     def assert_status_describes_accounts_without_creating_any(self, home_step: str) -> None:
         _ = (self.main_dir / "README.md").write_text("repo entry", encoding="utf-8")
@@ -4431,9 +5057,9 @@ class AccountsTests(unittest.TestCase):
         code, output, error = self.run_cli("status", "--json")
         self.assertEqual((code, error), (0, ""))
         document = cast(dict[str, object], json.loads(output))
-        self.assertEqual(set(document), {"accounts", "problems"})
+        self.assertEqual(set(document), {"accounts", "problems", "session_inputs"})
         rows = cast(list[dict[str, object]], document["accounts"])
-        keys = {"label", "tool", "roles", "weekly_left_percent", "resets_at", "credits", "use_credits", "read_at",
+        keys = {"label", "tool", "roles", "role_counts", "weekly_left_percent", "resets_at", "credits", "use_credits", "read_at",
                 "read_ok", "credits_in_use"}
         self.assertTrue(all(set(row) == keys for row in rows))
         expected: list[tuple[str, str, list[str], float | None, str | None, float | str | None, bool, str | None]] = [
@@ -7224,7 +7850,7 @@ class SharedStatusDocumentTests(unittest.TestCase):
     def row(self) -> accounts.StatusRow:
         return accounts.StatusRow(
             label="fixture", tool="codex", folder="~/.codex1", login="fixture@example.invalid",
-            roles=("workers",), weekly_left_percent=60, resets_at=self.at + timedelta(days=1),
+            roles=("workers",), role_counts=(0,), weekly_left_percent=60, resets_at=self.at + timedelta(days=1),
             credits=13446, on_credits="no", use_credits=True, read_at=self.at,
             read_outcome=agent_accounts.UsageReadOutcome.OK, attempted_at=self.at)
 
@@ -7302,7 +7928,7 @@ class SharedStatusDocumentTests(unittest.TestCase):
             '* Fixture problem.'
         ))
         self.assertEqual(self.document(self.row()), {
-            "label": "fixture", "tool": "codex", "roles": ["workers"],
+            "label": "fixture", "tool": "codex", "roles": ["workers"], "role_counts": [0],
             "weekly_left_percent": 60, "resets_at": "2026-10-17T18:00:00+00:00",
             "credits": 13446, "use_credits": True, "read_at": "2026-10-16T18:00:00+00:00",
             "read_ok": True, "credits_in_use": False,

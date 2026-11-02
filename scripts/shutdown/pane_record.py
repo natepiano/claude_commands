@@ -69,29 +69,12 @@ def record_path(session: str) -> Path:
     return record_directory() / f"{session}.json"
 
 
-def _read_entries(session: str, *, dependencies: Callable[[Path], None] | None = None) -> dict[str, object]:
+def read_strict(session: str, *, dependencies: Callable[[Path], None] | None = None) -> dict[str, PaneLaunch]:
+    """Read validated launch evidence; only an absent file means there are no entries."""
     path = record_path(session)
     if dependencies is not None:
         dependencies(path)
-    return pane_launch.read_entries(path)
-
-
-def read_strict(session: str, *, dependencies: Callable[[Path], None] | None = None) -> dict[str, PaneLaunch]:
-    """Read validated launch evidence; only an absent file means there are no entries."""
-    entries = _read_entries(session, dependencies=dependencies)
-    for pane_id, value in entries.items():
-        location = f"{record_path(session)}: pane {pane_id}"
-        if not isinstance(value, dict):
-            raise ValueError(f"{location}: launch must be an object")
-        launch = cast(dict[str, object], value)
-        environment = launch.get("environment")
-        if (not isinstance(launch.get("session_id"), str)
-                or not isinstance(launch.get("written_at"), str)
-                or not isinstance(environment, dict)
-                or not all(isinstance(name, str) and isinstance(setting, str)
-                           for name, setting in cast(dict[object, object], environment).items())):
-            raise ValueError(f"{location}: expected session_id and written_at strings and a string environment")
-    return cast(dict[str, PaneLaunch], entries)
+    return pane_launch.read_strict(path)
 
 
 def read(session: str) -> dict[str, PaneLaunch]:
