@@ -13,7 +13,7 @@ import time
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta, tzinfo
 from typing import cast, final, override
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 from scripts.production import merge_gate
 from scripts.build_queue import queue_place as queue
@@ -24,7 +24,27 @@ from scripts.production.merge_gate_suites_test_support import GateSuitesFixture
 
 @final
 class SharedGateAdmissionTests(GateSuitesFixture):
-    def test_gate_reservation_uses_the_shared_place_with_history_sizing_and_hold(self) -> None:
+    def test_gate_reservation_refuses_unusable_config_before_explicit_sizing_admission(self) -> None:
+        config = self.root / "invalid-config" / "lint.conf"
+        self.write(config, "[memory]\n# range: 0..\nbuild_budget_gib=invalid\n")
+        diagnostics = io.StringIO()
+        with mock.patch.dict(os.environ, {**self.environment, "CONF_DIR": str(config.parent)}), \
+             mock.patch.object(memory_admit, "memory_config", wraps=memory_admit.memory_config) as read_config, \
+             mock.patch.object(memory_admit, "check", wraps=memory_admit.check) as checked, \
+             redirect_stderr(diagnostics):
+            with self.assertRaises(merge_gate.GateRefused) as refused:
+                with merge_gate.gate_reservation(self.checkout, 512, self.state, merge_gate.BuildHoldWait()):
+                    self.fail("gate admitted an unusable configuration")
+            read_config.assert_called_once_with()
+            checked.assert_not_called()
+        self.assertIn(str(config), str(refused.exception))
+        self.assertIn("build_budget_gib", str(refused.exception))
+        self.assertIn("could not convert string to float", str(refused.exception))
+        self.assertIn("no usable committed value", str(refused.exception))
+        self.assertIn("warning:", diagnostics.getvalue())
+        self.assert_gate_released()
+
+    def test_gate_reservation_uses_the_shared_place_with_fixed_cap_and_hold(self) -> None:
         hold = merge_gate.BuildHoldWait()
         with mock.patch.dict(os.environ, self.environment), \
              mock.patch.object(merge_gate, "queue_place", wraps=queue.queue_place) as acquire, \
@@ -37,8 +57,7 @@ class SharedGateAdmissionTests(GateSuitesFixture):
                 place.observe(123 * 1024 * 1024, 123 * 1024 * 1024)
                 place.status = 0
             acquire.assert_called_once_with("merge-gate", self.checkout,
-                sizing=memory_admit.HistoryPeakSizing(512 * 1024 * 1024,
-                    memory_admit.FirstProgramPeak(512 * 1024 * 1024), 0.0),
+                sizing=memory_admit.FixedCapSizing(512 * 1024 * 1024),
                 before_check=hold.wait_until_free)
             before_check.assert_called_once_with()
         self.assert_gate_released()
@@ -114,7 +133,7 @@ class SharedGateAdmissionTests(GateSuitesFixture):
         self.assert_gate_released()
 
     @gate_suites("hooks")
-    def test_gate_waiting_past_profile_expiry_refreshes_without_losing_identity(self) -> None:
+    def test_gate_waiting_past_head_seconds_keeps_its_cap_and_identity(self) -> None:
         busy = self.occupy_memory_queue()
         clock = datetime(2026, 10, 30, tzinfo=UTC)
         profiles: list[memory_admit.ProgramProfile] = []
@@ -135,7 +154,7 @@ class SharedGateAdmissionTests(GateSuitesFixture):
             profiles.append(cast(memory_admit.ProgramProfile, result.profile))
             if len(profiles) == 1:
                 self.assertEqual(result.decision.state, "hold")
-                clock += timedelta(seconds=601)
+                clock += timedelta(seconds=memory_admit.DEFAULT_ADMISSION_POLICY.timing.head_seconds + 1)
             elif len(profiles) == 2:
                 self.assertEqual(result.decision.state, "hold")
                 busy.unlink()
@@ -149,9 +168,9 @@ class SharedGateAdmissionTests(GateSuitesFixture):
         self.assertEqual(len(profiles), 3)
         for profile in profiles:
             self.assertIsInstance(profile, memory_admit.ProgramProfile)
-            self.assertEqual((profile.step, profile.worktree, cast(memory_admit.HistoryPeakSizing, profile.sizing).first_peak_bytes),
+            self.assertEqual((profile.step, profile.worktree, cast(memory_admit.FixedCapSizing, profile.sizing).cap_bytes),
                              ("merge-gate", str(self.checkout), 512 * 1024 * 1024))
-        self.assertEqual(profiles[-1].estimated_at, clock.timestamp())
+        self.assertTrue(all(profile.sizing == memory_admit.FixedCapSizing(512 * 1024 * 1024) for profile in profiles))
         self.assert_gate_released()
 
     @gate_suites("hooks")
@@ -195,8 +214,8 @@ class SharedGateAdmissionTests(GateSuitesFixture):
         self.assert_gate_released()
 
     @gate_suites("hooks")
-    def test_first_gate_asks_for_its_cap_and_release_supplies_the_next_estimate(self) -> None:
-        estimates: list[memory_admit.MeasuredProgramPeak | memory_admit.FirstProgramPeak] = []
+    def test_gate_keeps_its_cap_after_release_records_a_smaller_peak(self) -> None:
+        peaks: list[memory_admit.ExpectedPeak] = []
         reservations: list[Path] = []
 
         def sample(roots: set[int]) -> dict[int, float]:
@@ -206,7 +225,9 @@ class SharedGateAdmissionTests(GateSuitesFixture):
             self.assertEqual((result.repo, result.step), (str(Path.home() / ".claude"), "merge-gate"))
             self.assertEqual(result.profile.worktree, str(self.checkout))
             self.assertIsInstance(result.profile, memory_admit.ProgramProfile)
-            estimates.append(cast(memory_admit.HistoryPeakSizing, cast(memory_admit.ProgramProfile, result.profile).sizing).estimate)
+            peaks.append(result.peak)
+            self.assertEqual(cast(memory_admit.ProgramProfile, result.profile).sizing,
+                             memory_admit.FixedCapSizing(512 * 1024 * 1024))
             if isinstance(result.reservation, memory_admit.Reserved):
                 reservations.append(result.reservation.path)
 
@@ -215,8 +236,7 @@ class SharedGateAdmissionTests(GateSuitesFixture):
             first = self.run_gate("--tests-only", "--memory-cap-mib", "512")
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
         self.assertEqual(len(reservations), 1)
-        self.assertIsInstance(estimates[0], memory_admit.FirstProgramPeak)
-        self.assertEqual(cast(memory_admit.FirstProgramPeak, estimates[0]).bytes, 512 * 1024 * 1024)
+        self.assertEqual((peaks[0].bytes, peaks[0].source), (512 * 1024 * 1024, "cap"))
         self.assert_gate_released()
         row, = self.gate_history()
         self.assertEqual((row["step"], row["anon_peak_bytes"]), ("merge-gate", 123 * 1024 * 1024))
@@ -224,8 +244,44 @@ class SharedGateAdmissionTests(GateSuitesFixture):
         with self.observing_admission(observe):
             second = self.run_gate("--tests-only", "--memory-cap-mib", "512")
         self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
-        self.assertIsInstance(estimates[-1], memory_admit.MeasuredProgramPeak)
-        self.assertEqual(cast(memory_admit.MeasuredProgramPeak, estimates[-1]).bytes, 123 * 1024 * 1024)
+        self.assertEqual((peaks[-1].bytes, peaks[-1].source), (512 * 1024 * 1024, "cap"))
+        self.assert_gate_released()
+
+    @gate_suites("lib", "hooks")
+    def test_gate_holds_the_requested_cap_from_first_to_last_module(self) -> None:
+        cap_mib = 768
+        paths: list[Path] = []
+        kinds: list[merge_gate.GateJobKind] = []
+        started = merge_gate.start_gate_job
+        release = memory_admit.release
+
+        def assert_cap() -> None:
+            path, = self.admission_directory.glob("*.reservation")
+            row = memory_admit.read_reservation(path)
+            self.assertEqual(row["need"], cap_mib * 1024 * 1024)
+            self.assertEqual(row.get("queue_waiter", {}).get("need_source"), "cap")
+            paths.append(path)
+
+        def start(suite: str, path: Path, argv: list[str], repo: Path,
+                  environment: dict[str, str], log: Path, *,
+                  kind: merge_gate.GateJobKind = merge_gate.GateJobKind.TEST_MODULE) -> merge_gate.RunningGateJob:
+            assert_cap()
+            kinds.append(kind)
+            return started(suite, path, argv, repo, environment, log, kind=kind)
+
+        def finish(path: Path, status: int, root: Path | None = None) -> None:
+            assert_cap()
+            release(path, status, root)
+
+        with mock.patch.object(merge_gate, "start_gate_job", side_effect=start), \
+             mock.patch.object(memory_admit, "release", side_effect=finish):
+            result = self.run_gate("--tests-only", "--memory-cap-mib", str(cap_mib))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assert_all_modules_started()
+        self.assertEqual(kinds.count(merge_gate.GateJobKind.TEST_MODULE), len(self.module_events()) // 2)
+        self.assertEqual(kinds.count(merge_gate.GateJobKind.TYPE_CHECK), 1)
+        self.assertEqual(len(paths), len(kinds) + 1)
+        self.assertEqual(len(set(paths)), 1)
         self.assert_gate_released()
 
     @gate_suites("hooks")
@@ -254,6 +310,12 @@ class SharedGateAdmissionTests(GateSuitesFixture):
 
 @final
 class MergeGateAdmissionTests(unittest.TestCase):
+    @override
+    def setUp(self) -> None:
+        self.enterContext(mock.patch.dict(os.environ, {
+            "CONF_DIR": str(Path(__file__).resolve().parents[2] / "config"),
+        }))
+
     def test_swap_wait_reason_uses_the_policy_saved_in_the_check_result(self) -> None:
         pressure = memory_admit.MemoryPressure(0, 40, 80)
         peak = memory_admit.ExpectedPeak(memory_admit.GIB, "fallback", 0)

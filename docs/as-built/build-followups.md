@@ -17,7 +17,7 @@ Agents' test builds linked far more than the tests they ran, and the daily build
 | `scripts/buildlog/index.py` | `build_keys(argv) -> CargoBuildKey \| NonCargoBuild` and the step build-key columns (Rebuilds section). |
 | `scripts/buildlog/cli.py` | `buildlog disk`, listed in the usage docstring. |
 | `scripts/buildlog/store.py` | `root()` (`BUILDLOG_DIR` moves it), `DISK_NAME`, `host_name()`, `utc_iso()`. |
-| `scripts/lint/sweep.py` | `directory_blocks(directory, seen=None)`, `config_values`, `floor_bytes`, shared with the lint sweep. |
+| `scripts/lint/sweep.py` | `directory_blocks(directory, seen=None)`, `floor_bytes`, shared with the lint sweep. |
 | `scripts/buildlog/test_index.py` | `use_test_log`, `point_root_at`, `LogIsolationTests`, and the record builders other tests import. |
 | `scripts/buildlog/test_report.py`, `test_disk.py`, `scripts/lint/test_sweep.py` | Report sections; the walk on fake trees; a hard link across two `directory_blocks` calls sharing `seen`. |
 | `commands/unit/direct.md` | The workers' command table; its `--filter` row reads `--filter <name> [--filter <name> …]`. |
@@ -127,7 +127,7 @@ def measure(folders: list[tuple[str, str]], usage: Callable[[], FilesystemUsage]
 
 `filesystem.filesystem_usage(path)` is a frozen `FilesystemUsage(used, free, total, device, device_name)` from `os.statvfs` and `os.stat`: used is `(f_blocks - f_bfree) * f_frsize`, free is `f_bavail * f_frsize`, the numbers `df -B1 /` prints as Used and Avail; total is `f_blocks * f_frsize`, and the device is the path's `st_dev` as `major:minor` with its block name. `disk.py` and `sample.py` both import it from `filesystem.py`, which imports neither `sweep` nor `record`.
 
-`read_floor() -> int | None` reads lint.conf (`LINT_CONFIG_FILE`, else `~/.claude/config/lint.conf`) through `sweep.config_values`, and takes `sweep_free_floor_gib.<host>`, else `sweep_free_floor_gib`, through `sweep.floor_bytes`, with the host from `socket.gethostname()` as the sweep reads it.
+`read_floor() -> int | None` reads lint.conf (`LINT_CONFIG_FILE`, else `~/.claude/config/lint.conf`) through `scripts/lib/conf.py`, and takes `sweep_free_floor_gib.<host>`, else `sweep_free_floor_gib`, through `sweep.floor_bytes`, with the host from `socket.gethostname()` as the sweep reads it.
 
 **Rendering.** `disk_section()` takes no connection and no day. `disk.read_snapshot()` returns the parsed `disk.json`, or None when it is missing or not JSON; None leaves the section out (the Mac, or before the job's first run). Otherwise:
 

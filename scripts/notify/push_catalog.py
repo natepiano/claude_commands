@@ -9,13 +9,6 @@ from push_texts import ActionTemplate, NoActionNeeded, PushExample, PushText, Se
 
 
 ENTRIES = (
-    PushText("message.repeat_flood", "send-repeat-guard", "note", "Repeated messages held",
-        NoActionNeeded(),
-        "The {sender} sender on {host} sent {copies} messages to {receivers} sessions. "
-        + "Further repeats are held. Other messages still arrive. "
-        + "The sender's owner is being told to fix the cause.",
-        (PushExample("watchdog", {"sender": "unit-watchdog", "host": "natedev", "copies": "48", "receivers": "16"}),),
-        purpose="Repeated machine messages are held before they consume more context."),
     PushText("vault.stopped", "buildlog", "note", "Mac vault copy is not updating",
         ActionTemplate("{action}"),
         "The hourly job that updates the hanadocs vault on the Mac skipped it. {reason} It tries again each hour and sends no more alerts until an update works. Until then, the Mac copy stays out of date.",
@@ -233,6 +226,16 @@ ENTRIES = (
         (PushExample("typical", {"charge": "80", "minutes": "20"}),
          PushExample("shutdown_threshold", {"charge": "30", "minutes": "5"})),
         purpose="Power is out, and natedev runs on battery. Save your work."),
+    PushText("nixos.ups_replace_battery", "ups", "note", "UPS battery needs replacing",
+        ActionTemplate("Replace the battery in the natedev UPS."),
+        "The natedev UPS reports that its battery is worn out. During a power outage it may not keep natedev on long enough to shut down safely.",
+        (PushExample("typical", {}),),
+        purpose="The UPS battery is worn out and needs replacement."),
+    PushText("nixos.ups_no_contact", "ups", "note", "natedev lost contact with its UPS",
+        ActionTemplate("Check the USB cable between the UPS and natedev."),
+        "natedev cannot read its UPS. During a power outage it gets no warning and cannot shut down safely.",
+        (PushExample("typical", {}),),
+        purpose="natedev cannot read the UPS and needs its USB connection checked."),
     PushText("nixos.ups_power_back", "ups", "note", "Power is back", NoActionNeeded(),
         "Mains power is back on the natedev computer. Battery charge: {charge}%.",
         (PushExample("typical", {"charge": "80"}),),

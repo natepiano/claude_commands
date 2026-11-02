@@ -26,6 +26,7 @@ import proposal_issue
 
 import berth_board
 import fake_fmt
+from style_child_test_support import style_cli_command, unqueued_style_children
 import mechanical_classes
 import rules
 import style_ledger
@@ -100,11 +101,10 @@ class StylePlanFixture(unittest.TestCase):
         _ = shutil.copytree(self.snapshot, self.fixture_root, symlinks=True)
         self.addCleanup(shutil.rmtree, self.fixture_root)
         self.configure_fixture()
-        # Keep one gate case on the executable path; the others retain the real parser and handlers in-process.
-        if self._testMethodName != "test_structure_file_cells_gate_and_checkpoint_require_the_last_file_verdict":
-            _ = self.enterContext(mock.patch.object(subprocess, "run", side_effect=self.run_command))
+        _ = self.enterContext(mock.patch.object(subprocess, "run", side_effect=self.run_command))
 
     def configure_fixture(self) -> None:
+        _ = self.enterContext(unqueued_style_children())
         listed = mechanical_classes.classes()
         _ = self.enterContext(mock.patch.object(mechanical_classes, "classes", return_value=listed))
         self.root = self.fixture_root
@@ -140,6 +140,10 @@ class StylePlanFixture(unittest.TestCase):
         if command[0] == sys.executable and len(command) > 1:
             module = next((item for item in (style_plan, style_ledger, style_footprint, proposal_issue)
                            if Path(command[1]) == Path(item.__file__ or "")), None)
+        # Keep one gate case in a child interpreter with the shared queue fake.
+        if module is style_plan and self._testMethodName == "test_structure_file_cells_gate_and_checkpoint_require_the_last_file_verdict":
+            command = style_cli_command(Path(command[1]), *arguments)
+            module = None
         executable = Path(shutil.which(command[0], path=environment.get("PATH")) or command[0])
         if executable.parent == self.root / "bin" and executable.name in fake_fmt.NAMES:
             module = ModuleType("style_plan_formatter_fixture")
@@ -483,7 +487,8 @@ class StylePlanFixture(unittest.TestCase):
         return issue
 
     def judged_findings(self, rule: str, sites: tuple[tuple[str, int, str], ...], *, kind: style_ledger.FindingKind = "type",
-                        before: str = "before", after: str = "after") -> tuple[Path, tuple[style_ledger.HeldFinding, ...]]:
+                        before: str = "before", after: str = "after",
+                        clean_before_holding: bool = False) -> tuple[Path, tuple[style_ledger.HeldFinding, ...]]:
         """Files findings at sites in an approved decision, leaving its judge open for further writes.
 
         They are type findings unless named.
@@ -494,6 +499,9 @@ class StylePlanFixture(unittest.TestCase):
         ledger.ticket_assign("modules-unit-1", "style/main")
         _ = ledger.ticket_base("modules-unit-1")
         blob = next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == rule)
+        if clean_before_holding:
+            for path in sorted({site[0] for site in sites}):
+                self.record(rule, path, self.tip, "modules-unit-1")
         findings = tuple(ledger.hold(rule, path, line, text, kind, before, after, blob, "modules-unit-1")
                          for path, line, text in sites)
         for finding in findings:
@@ -557,8 +565,7 @@ class StylePlanFixture(unittest.TestCase):
         rule = self.rule("read")
         site = self.sources[0]
         self.commit_files({site: "pub struct Parent {\n    old: u32,\n}\n"})
-        issue, (finding,) = self.judged_findings(rule, ((site, 2, "old: u32,"),))
-        self.record(rule, site, self.tip, "modules-unit-1")
+        issue, (finding,) = self.judged_findings(rule, ((site, 2, "old: u32,"),), clean_before_holding=True)
         self.commit_files({site: "pub struct Parent {\n    old: u32,\n}\n\npub struct Typed;\n"})
         output = self.refill_decisions()
         # The merge made the finding's cell stale, so the refill gives its file to a ticket that judges it again.

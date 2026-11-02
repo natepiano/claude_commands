@@ -474,6 +474,7 @@ class StylePlanTests(StylePlanFixture):
         read = self.rule("read", "tier: C\nfamily: names\ninput_scope: crate\n")
         self.sync()
         _ = self.held_proposal(read, self.sources[0])
+        self.commit_files({self.sources[0]: (self.repo / self.sources[0]).read_text() + "\npub struct JudgedAgain;\n"})
         self.record(read, self.sources[0], self.tip, ticket="later-clean")
         self.write(self.sources[1], "pub fn changed() {}\n")
         self.tip = self.commit()

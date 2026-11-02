@@ -386,7 +386,7 @@ class FindingsLedgerTests(FindingsLedgerFixture):
 
     def test_a_missing_config_key_stops_the_run(self) -> None:
         """Every limit must be set, and one run names all of the missing ones."""
-        self.write_partial_config("MIN_REPAIR_BUDGET=3\n")
+        self.write_partial_config("# whole: 1..\nMIN_REPAIR_BUDGET=3\n")
         result = self.run_failing_command("gate")
         self.assertEqual(result.returncode, 2)
         self.assertIn("RUNAWAY_ROUNDS is not set", result.stderr)

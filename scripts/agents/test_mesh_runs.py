@@ -24,6 +24,7 @@ from scripts.buildlog import treekey
 from scripts.astra import design_roles
 from scripts.lib.test_hang_guard import LauncherHangGuard
 from scripts.lib.socket_test_support import short_socket_directory
+from scripts.message.repeat_guard_test_support import install_guard_test_budget
 
 WORKER = "unit-impl"
 DEAD_PID = 2 ** 22 + 12345
@@ -31,6 +32,7 @@ DEAD_PID = 2 ** 22 + 12345
 
 def setUpModule() -> None:
     install_signal_pid_guard()
+    install_guard_test_budget()
 
 
 class DirectorNotice(NamedTuple):

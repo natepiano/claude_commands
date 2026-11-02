@@ -685,8 +685,9 @@ returns it to its unit.
    review id is the row: bare `C<n>` on hana's list, `<showrunner>/C<n>` on any
    other, where `<showrunner>` is the name the list `change-review - <showrunner>.md`
    is named for (`natedev/C3`).
+   A row with no proposal skips this step.
    - A landing row runs `add --review <id>`, or `supersede --review <id>` when
-     its proposal has `--old`. Propose a missing row first; correct wrong
+     its proposal has `--old`. Correct wrong
      meaning by rerunning `propose` while it is open.
    - A returning row runs `drop --review <id> --verdict "<verdict>"`.
 
@@ -1167,7 +1168,7 @@ condition: wrap neither waits on it nor retires its worktree or branch.
 - The showrunner writes no implementation code, tests or Work Orders in a unit's
   files.
 - Only the showrunner pushes the merge branch and main, never with force.
-  Units push only their own branch.
+  Units push only their own branch except <FastTrack/> (`commands/unit/fast_track.md`).
 - Merge only from a checkpoint notice. Never merge a visible change before a
   fresh design-check pass on its shots (<MergeCheckpoint/> step 3).
 - **An out-of-date as-built doc may always be corrected.** You and every unit

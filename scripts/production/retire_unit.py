@@ -54,7 +54,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.production import staff, staff_sources, unit_config
 from scripts.shutdown.remote import local_machine
-from scripts.lib import process_group, tunables
+from scripts.lib import process_group, conf
 from scripts.agents import worker_lifecycle
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -170,11 +170,7 @@ class Found(NamedTuple):
 
 def configured_seconds(key: str) -> float:
     """Read each retirement limit when it is used, without a fallback value."""
-    path = Path(os.environ.get("PRODUCTION_CONFIG", SCRIPTS.parent / "config/production.conf"))
-    value = tunables.number(path, key, minimum=0, maximum=float("inf"))
-    if value <= 0:
-        raise tunables.TunableUnusable(f"{path}: {key} must be greater than zero")
-    return value
+    return conf.number("production", key)
 
 
 def run(argv: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
@@ -1077,7 +1073,7 @@ def _main(argv: list[str]) -> int:
     except (staff.StaffRefused, staff.StaffUnreadable):
         raise
     except (Refused, production_units.Refusal, unit_names.BadName, WorkerUnavailable, OSError,
-            tunables.TunableUnusable, unit_config.ConfigRefused, subprocess.SubprocessError) as error:
+            conf.Unusable, unit_config.ConfigRefused, subprocess.SubprocessError) as error:
         print(f"refused: {error}")
         return 1
 

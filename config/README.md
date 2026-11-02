@@ -1,5 +1,20 @@
 # Config Files
 
+## Live values
+
+Python callers read key=value settings through `scripts/lib/conf.py`; bash callers
+can source `scripts/lib/conf.sh` and call `conf_value <file> <key>`. The file name
+is its stem. Reads use `~/.claude/config` on every call; `CONF_DIR` selects a test
+fixture folder and installed scripts refuse it. The first key wins, with a
+`key.<short-host>` value taking precedence over `key`. A `# range: A..B` or
+`# one of: a, b, c` comment directly above the key sets its limits. On a missing
+or invalid value, the reader warns and uses the newest valid committed value
+under that revision's limits; with no usable history it raises `conf.Unusable`.
+Only the user approves a value change. A session asks the user and runs `/tune`
+on the user's go, with the user's words; `/tune` publishes the one config file
+and pulls the Mac without a test or release cycle. Moving an unchanged value
+from code to config needs no approval and does not use `/tune`.
+
 ## bake_textures_example.json
 
 Example configuration for the `/blender:bake_textures` command. Copy and modify this template to specify blend files, objects, texture maps, and export settings for texture baking.
@@ -73,9 +88,7 @@ limits, the unreachable retry delay, the free-space and load limits, default
 and repository size limits for each Mac mirror's build folder,
 Linux-only packages, and Mac nextest exclusions. A repository needs a
 `linux_only.<repo>` key, even when its value is empty, before tests can run on
-the Mac. An empty `ci_repo` disables CI calls. `MAC_TEST_CONFIG` selects a
-different file for a checkout's scripts in tests. Installed scripts refuse to
-run with `MAC_TEST_CONFIG` set.
+the Mac. An empty `ci_repo` disables CI calls. `CONF_DIR` selects the fixture folder in tests.
 
 ## aws_target.conf
 
@@ -104,6 +117,46 @@ Checkout tests use a temporary `HOME` for other targets and `BUILD_TARGETS_CONFI
 `mac_test.py <command> --target <name>` selects a configured SSH target.
 Explicit target status reads local records without probes or cleanup.
 
+Repository claims use the normalized origin identity from memory admission.
+Local clones and linked worktrees use the source repository identity.
+The readable name remains the source directory name from `sweep.repo_name`.
+The origin name does not change legacy Mac mirror or claim paths.
+Linux targets allocate slots under the target lock.
+`slots` sets the repository capacity. `slots.<repo>` replaces that value for one repository.
+The Mac keeps one claim per repository name and preserves its mirror paths.
+Origins with the same repository name take turns on the Mac.
+The AWS values are two slots by default and four slots for `hana` and `cargo-liner`.
+Each Linux slot uses `.local/state/build-target/mirror/<encoded-origin>/<slot>` and its own `target` folder.
+The target state directory retains the last slot for each existing worktree.
+Each affinity write removes paths that no longer exist.
+An occupied slot remains unavailable until its claim ends.
+Takeover retries retain the cleanup requirement until the owner releases the claim.
+Another worktree of the same repository can take over a lost run.
+The configured platform selects the mirror layout and slot protocol.
+
+## build_targets.conf
+
+`targets` lists active targets in routing order. The AWS target remains inactive before the user gate.
+Each SSH target names its platform and settings file.
+Natedev reads the SSH host from each active target's settings file before each record exchange.
+
+`sync.hosts.<target>` lists host directory names for synchronized records.
+This mapping supplies all allowed host names, including recorder health aliases.
+The Mac mapping includes its explicit legacy host aliases, including `macbook`.
+The AWS mapping permits `aws-build` records without activating the AWS target.
+`sync.connect_timeout_s`, `sync.reach_timeout_s`, and `sync.rsync_timeout_s` set sync time limits in seconds.
+Each exchange reads these settings again.
+Vault transfers use the same configured SSH connection timeout.
+
+Each peer retains its own status in `sync-peers/<encoded-peer>.json`.
+`sync.json` retains the Mac status for existing readers.
+A failed peer does not prevent another peer's exchange.
+The pause setting prevents exchanges with every peer.
+Transfers exclude admission and pending state directories.
+Each configured peer supplies only its own host folders.
+The `BUILDLOG_PEER` override retains the legacy transfer of all other synchronized host folders.
+Rsync replaces complete files and preserves this host's append files.
+
 ## direct.conf
 
 The `/unit:direct` tuning file: the convergence limits — how many automatic
@@ -127,13 +180,11 @@ made from what gets reported.
 integer. It is 3600, one hour (user, 2026-10-10). Unit reports come only when
 someone asks (2026-10-19): no notifier instance or timer sends them.
 
-`scripts/direct/findings.py` reads the file at startup, so an edit applies to
-the next `findings.py gate` with nothing to restart. The file is authoritative:
-no limit has a compiled default, so a missing key, a non-numeric value, or a
-value below its minimum makes `findings.py` list every problem it found and
-exit 2 before running the command. `UNIT_CONFIG` overrides the path,
-which is how `test_findings.py` supplies its own limits rather than this
-machine's.
+`scripts/direct/findings.py` reads values at use, so an edit applies to the
+next read with nothing to restart. No limit has a compiled default. A missing
+or invalid value warns and uses the newest valid committed value; without a
+usable revision, `findings.py` lists the problems and exits 2 before running
+the command. `CONF_DIR` selects the fixture folder in tests.
 
 ## dailies.conf
 
@@ -202,3 +253,50 @@ MCP server definitions for reference when setting up Claude Code on a new machin
 ## orphans_expected.json
 
 Files that the `/orphans` command should ignore when checking for unreferenced scripts and configs. Lists scripts and config files that are intentionally not referenced by any command.
+
+## Linux development shells
+
+Linux SSH targets use the admission repository name for `slots.<repo>`, `devshell.<repo>`, `skip.<repo>`, and `target_budget_gib.<repo>`.
+The source directory name still selects the legacy Mac mirror and claim.
+`kinds=test,check,doc` selects Linux commands without Mac `linux_only.*` keys.
+
+`devshell` selects the default shell. `devshell.hana=ci` selects Hana's CI shell.
+`shell_cache` gives the cache path relative to the remote home.
+`shell_timeout_s` bounds shell evaluation.
+The Linux probe first checks SSH within `probe_timeout_s`.
+Its shell probe then permits `shell_timeout_s` plus `probe_timeout_s` for evaluation and the probe reply.
+The SSH connection still uses `connect_timeout_s`.
+This adds one short SSH call per Linux probe.
+The runner hashes `flake.nix`, `flake.lock`, `nix/` paths, file contents, and the selector.
+It evaluates only this small copy. It publishes exports after successful evaluation.
+An unchanged shell key reuses exports while their referenced Nix store paths exist.
+Missing store paths force a new evaluation. Each claimed slot retains its own warm build folder.
+
+`parity.rustc`, `parity.nextest`, `parity.mend`, and `parity.scripts_commit` can pin the public tool versions and script commit.
+An empty pin uses the sender's version. A mismatch prevents execution.
+The sender transfers clean tracked scripts and named public configuration before the probe.
+It checks their contents and commit before and after transfer. A dirty script set prevents execution.
+Source transfers include untracked files and omit ignored paths, Git metadata, and the target folder.
+Directory transfers delete removed source files from warm mirrors.
+The probe checks disk capacity, the script commit, and tool versions inside the selected shell.
+The runner checks tool versions again before execution. A mismatch permits local fallback without a test result.
+The local trust rules must permit shell evaluation before the sender claims Linux capacity.
+`build_budget_gib` sets the Linux memory budget. Repository build folder budgets cannot exceed it.
+After each step, the runner uses the existing lint budget sweep on the selected build folder.
+The sweep removes the least recently used output and keeps the remaining output warm.
+Only a disk floor violation removes the whole folder.
+The runner adds no size scan beside the sweep. Explicit build folders must remain inside the claimed slot.
+The `.linux-run.json` marker identifies the runner and its process group before shell evaluation starts.
+Cleanup checks the runner's process start time and the token inherited by its children.
+Cleanup ignores zombies and retains ownership when it cannot inspect a live process.
+Remaining children report `mac_cleanup=unconfirmed`. The sender confirms their termination before it releases the claim.
+Disk cleanup failures retain the separate `mac_cleanup=1` result.
+`leftover_timeout_s` bounds cleanup confirmation. Failed confirmation retains the claim.
+
+`loopback.*` settings control the manual Tailscale SSH proof on natedev.
+`loopback.port` selects the SSH port. An empty value uses the SSH default.
+`loopback.known_hosts` selects the known_hosts file. An empty value uses the user's normal known_hosts file.
+A selected known_hosts file requires strict host key checking for SSH and rsync.
+The proof creates a managed scratch home and a tiny Rust fixture.
+It uses private memory files and executes test, check, and staged doc in one warm slot.
+It removes the scratch home when the proof ends. Automated tests never execute this proof.

@@ -24,13 +24,18 @@ import tomllib
 import uuid
 from urllib.parse import unquote, urlparse
 from collections import defaultdict
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Generator, Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
+from contextlib import ExitStack, contextmanager
+from contextvars import ContextVar
 from enum import StrEnum
 from functools import cache
 from pathlib import Path
 from types import MappingProxyType, TracebackType
 from typing import BinaryIO, Protocol, TypedDict, cast
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.build_queue import queue_place
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 
@@ -42,6 +47,45 @@ from approved_renames import (BindingComments, BindingRename, BindingScope, NoBi
                               RenameDeclaration, rename_declaration, refactor_rename, refactor_comments, binding_comments,
                               PatternBindingCollision, pattern_binding_check,
                               backtick_mentions, identifier_mentions, field_sites)
+
+
+class StyleAdmissionStopped(SystemExit):
+    """A queue refusal stops the command with its finding claims intact."""
+
+    def __init__(self) -> None:
+        super().__init__(2)
+
+
+def no_admission_change() -> None:
+    pass
+
+
+_admission_changes: ContextVar[tuple[Callable[[], None], Callable[[], None]]] = ContextVar(
+    "style_admission_changes", default=(no_admission_change, no_admission_change))
+
+
+@contextmanager
+def admission_attempt(begin: Callable[[], None], started: Callable[[], None]) -> Generator[None]:
+    """Bind the journal transitions for every child in one source edit attempt."""
+    token = _admission_changes.set((begin, started))
+    try:
+        yield
+    finally:
+        _admission_changes.reset(token)
+
+
+@contextmanager
+def style_program_place(program: str, repo: Path) -> Generator[queue_place.QueuePlace]:
+    """Stop the command before a queue refusal can change finding state."""
+    begin, started = _admission_changes.get()
+    begin()
+    try:
+        with queue_place.queue_place(program, repo) as place:
+            place.on_started = started
+            yield place
+    except queue_place.QueuePlaceRefused as error:
+        print(f"style admission: {error}", file=sys.stderr)
+        raise StyleAdmissionStopped() from error
 
 
 class BulkRenameError(Exception):
@@ -352,8 +396,14 @@ class RustAnalyzer:
     def __init__(self, repo: Path, timeout: float = 180) -> None:
         self.repo: Path = repo
         self.timeout: float = timeout
-        self.process: subprocess.Popen[bytes] = subprocess.Popen(
-            ["rust-analyzer"], cwd=repo, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        self.lifetime: ExitStack = ExitStack()
+        try:
+            place = self.lifetime.enter_context(style_program_place("rust-analyzer", repo))
+            self.process: subprocess.Popen[bytes] = place.popen(
+                ["rust-analyzer"], cwd=repo, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        except BaseException:
+            _ = self.lifetime.__exit__(*sys.exc_info())
+            raise
         self.inbox: queue.Queue[dict[str, object] | Exception] = queue.Queue()
         self.sequence: int = 0
         self.versions: dict[Path, int] = {}
@@ -364,7 +414,11 @@ class RustAnalyzer:
             "cargo": {"buildScripts": {"enable": True}}, "procMacro": {"enable": True}, "checkOnSave": False,
         }
         self.reader: threading.Thread = threading.Thread(target=self._read, daemon=True)
-        self.reader.start()
+        try:
+            self.reader.start()
+        except BaseException:
+            self.lifetime.close()
+            raise
 
     def _read(self) -> None:
         try:
@@ -463,17 +517,20 @@ class RustAnalyzer:
             raise
 
     def close(self) -> None:
-        if self.process.poll() is None:
-            self.process.terminate()
-            try:
-                _ = self.process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                _ = self.process.wait()
-        for stream in (self.process.stdin, self.process.stdout):
-            if stream is not None:
-                stream.close()
-        self.reader.join(timeout=1)
+        try:
+            if self.process.poll() is None:
+                self.process.terminate()
+                try:
+                    _ = self.process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self.process.kill()
+                    _ = self.process.wait()
+            for stream in (self.process.stdin, self.process.stdout):
+                if stream is not None:
+                    stream.close()
+            self.reader.join(timeout=1)
+        finally:
+            self.lifetime.close()
 
     def __exit__(self, exc_type: type[BaseException] | None, exc: BaseException | None, traceback: TracebackType | None) -> None:
         self.close()
@@ -1926,16 +1983,32 @@ def combine_file_renames(files: Sequence[FileRenames]) -> tuple[FileRenames, ...
     return tuple(merged.values())
 
 
+def cargo_output(repo: Path, arguments: Sequence[str]) -> subprocess.CompletedProcess[str]:
+    """Capture Cargo output while the shared queue owns the program lifetime."""
+    with style_program_place("cargo", repo) as place:
+        process = place.popen(arguments, cwd=repo, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            output, errors = process.communicate()
+            return subprocess.CompletedProcess(arguments, process.wait(), output.decode(), errors.decode())
+        finally:
+            for stream in (process.stdout, process.stderr):
+                if stream is not None:
+                    stream.close()
+
+
 def command(repo: Path, arguments: Sequence[str]) -> None:
     print("bulk rename: " + " ".join(arguments), flush=True)
-    result = subprocess.run(arguments, cwd=repo, check=False)
-    if result.returncode:
-        raise BulkRenameError(f"{' '.join(arguments)} exited {result.returncode}")
+    if arguments and Path(arguments[0]).name == "cargo":
+        with style_program_place("cargo", repo) as place:
+            code = place.popen(arguments, cwd=repo).wait()
+    else:
+        code = subprocess.run(arguments, cwd=repo, check=False).returncode
+    if code:
+        raise BulkRenameError(f"{' '.join(arguments)} exited {code}")
 
 
 def verification_packages(repo: Path, crate: str) -> tuple[str, ...]:
-    result = subprocess.run(["cargo", "metadata", "--no-deps", "--format-version", "1"], cwd=repo,
-                            capture_output=True, text=True, check=False)
+    result = cargo_output(repo, ["cargo", "metadata", "--no-deps", "--format-version", "1"])
     if result.returncode:
         raise BulkRenameError(result.stderr.strip())
     metadata = object_fields(cast(object, json.loads(result.stdout)))

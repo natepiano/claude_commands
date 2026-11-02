@@ -2269,7 +2269,7 @@ def send(options: Options) -> Result:
     elif skip is not None:
         result = Result("skipped", skip)
     elif guarded.held:
-        result = Result("held", f"repeat guard: copy {guarded.copies} held; owner and user notices queued")
+        result = Result("held", f"repeat guard: copy {guarded.copies} held; owner notice queued")
     elif isinstance(route, RecipientLookupFailed):
         result = Result("failed", route.reason)
     elif isinstance(route, RemoteDelivery):
@@ -2370,19 +2370,13 @@ def repeat_notice_owner(sender: str) -> str:
 def deliver_repeat_notice(state: repeat_guard.SenderState, notice: repeat_guard.Notice,
                           limits: repeat_guard.Limits) -> repeat_guard.NoticeOutcome:
     """Only the notifier invokes this slow path, outside every guard lock."""
-    if notice.kind == "phone":
-        push = push_texts.render(repeat_guard.PHONE_TEXT, sender=state.sender,
-                                 copies=str(notice.copies), receivers=str(notice.receivers), host=state.host)
-        arguments = push_texts.user_send_argv(push, sender=repeat_guard.NOTICE_SENDER,
-                                             timeout=limits.notice_timeout_seconds)
-    else:
-        first = datetime.fromtimestamp(notice.first, timezone.utc).isoformat()
-        last = datetime.fromtimestamp(notice.last, timezone.utc).isoformat()
-        text = (f"Message flood from {state.sender} on {state.host}: {notice.copies} copies to "
-                + f"{notice.receivers} sessions, first {first}, last {last}.\n"
-                + f"Text: {notice.text}\nRepeated copies are held; distinct texts still arrive. Find the sender's cause.")
-        arguments = [sys.executable, str(Path(__file__).resolve()), "--to", repeat_notice_owner(state.sender), "--from", repeat_guard.NOTICE_SENDER,
-                     "--text", text]
+    first = datetime.fromtimestamp(notice.first, timezone.utc).isoformat()
+    last = datetime.fromtimestamp(notice.last, timezone.utc).isoformat()
+    text = (f"Message flood from {state.sender} on {state.host}: {notice.copies} copies to "
+            + f"{notice.receivers} sessions, first {first}, last {last}.\n"
+            + f"Text: {notice.text}\nRepeated copies are held; distinct texts still arrive. Find the sender's cause.")
+    arguments = [sys.executable, str(Path(__file__).resolve()), "--to", repeat_notice_owner(state.sender), "--from", repeat_guard.NOTICE_SENDER,
+                 "--text", text]
     arguments += ["--key", "repeat:" + notice.id + ":" + notice.kind, "--repeat-minutes", "0"]
     code, out, err = run(arguments, "", limits.notice_timeout_seconds)
     if code == 0 and out.startswith("SENT:"):

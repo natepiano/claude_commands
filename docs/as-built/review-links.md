@@ -90,16 +90,26 @@ It shows both kinds.
 The short URL ends in `/changes.html`.
 The page uses the trial page's plain, narrow layout.
 Each section shows its kind, change description once, instructions or proof, and answer controls.
-The user can select Works, Not works, or Send feedback.
+The user can select Works, Not works, Validate yourself, or Send feedback.
 The feedback field accepts one line, which matches the verdict command's table-cell format.
 Works with text saves `works: <text>`.
 Not works with text saves `not works: <text>`.
 Send feedback saves the user's text without a prefix.
 The existing `change_review.lands` function decides whether the verdict lands or returns the row.
 
+**Validate yourself** sends the showrunner the row ID and **the user asks you to validate this**.
+The message includes any feedback from the form.
+This answer writes no verdict and runs no feature-log command.
+The row stays pending.
+The page calls `next_item.move_to_end` with the row key to move that row to the queue's end.
+The CLI keeps its current form and still moves the pinned item.
+An unknown key raises `NextError` before the queue changes.
+Rows from an earlier list use their qualified keys.
+
 A successful submission redirects to the same page.
-The page shows `Saved: <answer>` above a **Send saved answer again** button.
-This button retries message delivery through the same POST path.
+After a verdict saves, the page shows `Saved: <answer>`.
+After a delivery failure, the page shows a **Send saved answer again** button.
+The button retries message delivery through the same POST path.
 The server reads the saved verdict from the record and refuses replacement text during a retry.
 Every GET reads the pending and Reviewed tables, with `Cache-Control: no-store`.
 No JavaScript is necessary.
@@ -125,6 +135,13 @@ It selects projects through `ProjectSpec.closes_by_change_review` in `scripts/fe
 The existing `feature_log.py project-of` command identifies the owning production's repository from its origin.
 There is no second project policy list.
 Projects outside that policy skip the feature-log operation.
+A row with no proposal also skips the operation and saves the user's answer.
+The server passes `--if-proposed` to `add`, `supersede`, and `drop`.
+The writer checks proposal absence under its existing lock on the host that owns the feature log.
+On the Mac, the existing CLI forwards the operation and flag to natedev through SSH.
+An absent proposal prints `skipped: no proposal for <row>` and exits 0.
+Malformed proposals, incompatible states, and SSH failures remain errors.
+The server makes no separate proposal lookup.
 A Hana list uses a bare review ID, such as `C27`.
 Other lists use their filename's showrunner name, such as `natedev/C27`.
 A landing answer runs `feature_log.py add --review`.
@@ -141,7 +158,10 @@ Classified rows retain Kind, How to check, and Production in Reviewed.
 Older rows without Kind retain their existing Reviewed table behavior.
 An identical answer can retry delivery; a different saved answer is refused.
 
-After the save, the server uses the existing `scripts/message/send.py` sender.
+The server returns 303 as soon as `change_review.py verdict` writes the answer.
+The feature-log operation still runs before the verdict.
+The request thread flushes the response before it runs the existing `scripts/message/send.py` sender.
+The server starts no detached shell for message delivery.
 The list's `showrunner:` frontmatter names the showrunner recipient.
 The saved verdict alone selects the recipients for the first send and each retry.
 An exact `works` verdict goes only to the showrunner, including text from Send feedback.
@@ -154,10 +174,51 @@ An ambiguous merge is refused before the save.
 A change outside a unit goes to the production's configured Showrunner session.
 The owning production's Showrunner checkout locates the commit.
 No agent polls for answers.
-A delivery failure returns 503 and preserves the saved answer.
-The user can reload the page and select **Send saved answer again**.
+A save shows **Saved: &lt;answer&gt;** from the review record.
+`DeliveryStatus` owns one private delivery record per review list and row under the configured review root.
+The record has separate validation and verdict slots, each with its latest attempt ID and state.
+Only the validation slot stores feedback.
+Before the verdict write, the server stores a pending intent in the verdict slot with a new attempt ID.
+If this write fails, the server refuses the verdict write.
+The record contains no saved verdict, recipient, or error text.
+Validate yourself stores its feedback in the validation slot because the review record has no validation answer.
+A GET selects the verdict slot when the review record has a saved verdict.
+Otherwise, it selects the validation slot and keeps the answer form available.
+A failed verdict write preserves the validation slot, its feedback, and its resend control.
+A stop after the verdict write leaves the verdict slot available for a retry.
+A pending message shows **The message may not have sent** and a resend control.
+A failed saved-answer message shows **Saved, but the message did not send** and **Send saved answer again**.
+A failed validation message shows **The validation message did not send** and **Send validation request again**.
+The validation control retains the feedback from the intent.
+Each retry reads saved verdicts from the review record.
+A retry creates a new attempt ID.
+One stable `fcntl.flock` protects intent creation, conditional success deletion, and conditional failure updates.
+Message sends run outside the lock.
+An older attempt cannot clear or change a newer attempt's record.
+A successful current attempt removes only its slot and preserves the other slot.
+The server deletes the record only when both slots are empty.
+After successful verdict delivery, retained validation feedback does not restore the resend control.
+Existing single-intent records, `failed\n` records, and validation feedback records remain retryable.
+
+A failed POST keeps its 4xx or 503 status and uses the change page's layout and style.
+A known page shows **Not saved: &lt;reason&gt;** above the row and keeps its feedback and selected outcome.
+The reason uses short words; server stderr keeps the full error.
+The showrunner's feature-log failure message also keeps the full error.
+If the main page cannot render, a separate form retains the typed feedback and selected outcome.
+This form reads only the page manifest and notice, without row or queue reads.
+An unknown page, invalid content type, or refused bind shows one short sentence in the same style.
+
+After a save or a row move, each render reads `next_item.change_queue(production)` for the remaining count.
+Validate yourself keeps the row in that count.
+The page reads moved rows from the existing urgency state and stores no second queue.
+The Next form publishes the queue head through the existing change-page publisher and returns 303 to that page.
+It uses the same urgency order, pin, and moved rows as `/next change`.
+One stable lock in `urgency.py` protects pin, selection, and move operations across all queues.
+Each operation opens the lock separately and retains atomic file replacement.
+A GET never publishes or advances a page.
+An empty queue shows **0 changes left** without a Next control.
 A retry can repeat a delivered message; the existing sender's repeat rules apply.
-The review record remains the only answer store.
+The review record remains the only verdict store.
 
 Restart the existing review-links service after deployment.
 No NixOS or service configuration change is necessary.

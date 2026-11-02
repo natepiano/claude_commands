@@ -64,6 +64,7 @@ with open(os.environ["TEST_SENT"], "a") as handle:
 
 from scripts.production.staff_test_support import fixture_member, StaffTestCase
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.lint.memory_test_support import config_environment
 
 class LifecycleFixture(unittest.TestCase):
     staff: StaffTestCase = StaffTestCase()
@@ -152,6 +153,7 @@ class LifecycleFixture(unittest.TestCase):
                     "SHOWRUNNERS_SESSIONS": str(self.root / "sessions.py"),
                     "SHOWRUNNERS_SEND": str(self.root / "send.py"), "TEST_SENT": str(self.state / "sent.jsonl")}
         self.env.update(fake_unit_host.environment(self.root))
+        self.env.update(config_environment(self.root / "config"))
         self.write(self.root / "sessions.py", SESSIONS)
         self.write(self.root / "send.py", SEND)
         self.checkout.mkdir()
