@@ -289,32 +289,22 @@ The builds showrunner asked (2026-10-31): merge `origin/builds` (a546fe66, the v
 
 ### Phase 4i — A queue place with no memory scope stops a detached descendant before release  · status: done
 **Depends on:** Phase 4h (`queue_place.py`)
-**Blocked by:** none past Phase 4h. Routed from Phase 4h finding F002, 2026-11-01.
 
-#### Work Order
+#### As-built
 
-**Goal:** with no scope (`BUILDLOG_SCOPE=0`, already in `builds.slice`, or a failed probe), no descendant of a queue place program runs after its release.
-
-**Spec:**
-1. **The gap.** Phase 4h stops every process it has seen: each sample walks the ppid tree from the pids seen before (pid plus start time) and adds the process group. A descendant that calls `setsid()` and loses its parent between two samples reparents to pid 1. `finish()` does not see it, so the release runs while it still uses memory. The scoped path has no gap: the scope cgroup holds every descendant.
-
-2. **No unscoped program (builds showrunner, 2026-11-01: option B).** `QueuePlace.popen` refuses to start a program with no scope (`QueuePlaceRefused`), except when `BUILDLOG_SCOPE=0` (tests only). When the holder already runs in `builds.slice`, the program starts in a nested transient scope, so the scope cgroup holds every descendant. The unscoped stop path (`ProgramTree` sampling and stop) goes.
-3. **Hosts.** Before the change, list every `queue_place` caller and its host. Name any caller that runs where no systemd user manager exists.
-4. **Test-only unscoped path.** With `BUILDLOG_SCOPE=0` the place keeps the Phase 4h `ProgramTree` sampling and stop. This path is for tests only and is outside the guarantee that no descendant outlives the place.
-5. **The merge gate's own use.** `merge_gate.run_suites` calls `suite_scope_prefix` directly. Keep its output and behavior unchanged for that caller; the nested scope rule lives in `QueuePlace.popen` only.
-6. **Fallback.** If the live test shows a nested scope makes the caller's charge wrong, do not build a reaper. Keep the Phase 4h stop, write the setsid gap in `docs/as-built/build-memory-admission.md`, and close this phase. No third repair round on this race.
-
-**Acceptance gate:**
-- One live test on natedev: a holder inside a `builds.slice` scope starts a program in a nested scope; the caller's charge (its scope reading plus the program's) stays correct, and a `setsid()` grandchild whose parent exits before any sample is stopped before the release.
-- An unscoped `popen` without `BUILDLOG_SCOPE=0` raises `QueuePlaceRefused`.
-- `env -u PYTHONUNBUFFERED -u REFUSAL_WATCH_INVENTORY python3 -m unittest scripts.lib.test_process_group scripts.build_queue.test_queue_place scripts.production.test_merge_gate_suites_admission scripts.production.test_merge_gate_suites_signals` green; `basedpyright` over the changed files: `0 errors, 0 warnings, 0 notes`.
-
-**Workers:** 1 writer + 1 tester. `impl`: `queue_place.py`, the caller-host list, the live nested-scope measurement, and the fallback as-built note. `test`: `test_queue_place.py`.
+- `QueuePlace.popen` always starts the program in its own transient scope under `builds.slice`, nested when the holder already runs there (builds showrunner, 2026-11-01: option B). With no scope it raises `QueuePlaceRefused("the queued program requires a memory scope; set BUILDLOG_SCOPE=0 only for tests")` before the fork. `probe_scope_prefix()` is split out; `suite_scope_prefix()` keeps its output for `merge_gate.run_suites` and `style_plan.split_all`.
+- `StartedProgram.tracking` is `ScopedProgram | ProgramTree`. `ScopedProgram` samples the scope's `cgroup.procs` (`program_members`, nested scopes included). `ProgramTree` runs only with `BUILDLOG_SCOPE=0`, for tests, and is outside the guarantee.
+- `finish()` calls `stop_scope(scope, deadline, sample_seconds)`: it rereads the scope's `cgroup.procs` until it is empty, sends TERM until `program_stop_seconds`, then writes `cgroup.kill` (per-pid SIGKILL where the kernel has no `cgroup.kill`). The release runs only after the scope is empty. The leader's exit status stays the place's `status`.
+- Live check on natedev: holder 55.8 MB + program 71.6 MB = charge 127.8 MB; a `setsid()` grandchild whose parent exits before the first sample is stopped before the release. No fallback.
+- Callers: `merge_gate.gate_reservation` is the only `queue_place` caller; it runs on natedev, which has a systemd user manager.
 
 **Files:**
-- `scripts/build_queue/queue_place.py` — the scope-only start, nested scope, test-only unscoped path (owner queue-unit)
-- `scripts/build_queue/test_queue_place.py` — refusal, nested-scope and live charge tests (owner queue-unit)
-- `docs/as-built/build-memory-admission.md` — the setsid gap note, fallback only (owner queue-unit)
+- `scripts/build_queue/queue_place.py` — `probe_scope_prefix`, `ScopedProgram`, `scope_members`, `stop_scope`, the refusal before the fork
+- `scripts/build_queue/test_queue_place.py` — refusal, nested-scope, fork-during-stop and `BUILDLOG_SCOPE=0` tests
+
+**Binds later work:** the scope-only start, the refusal before the fork and the stop that empties the scope before release move with `queue_place` to the service (Every build, view and command uses the queue service).
+
+**Gotchas:** one read of `cgroup.procs` is not a stop: a process can fork between the read and the signal, so the stop loops until the scope is empty.
 
 ### Phase 5 — The queue service, its socket protocol and its client exist and pass in-process tests; no build uses them yet  · status: done
 **Depends on:** Phase 4
@@ -609,7 +599,7 @@ No-copies rule (user, 2026-10-30): one place for each thing. A second copy of se
 
 **Constraints from prior phases:**
 - Hold check (builds showrunner, 2026-11-01): `admission_client.admit` takes a private per-attempt hook. `queue_place` passes `before_check` to it, and its public signature stays the same. The hook runs before each attempt and once more after the grant, just before the program starts; a hold seen after the grant releases the place. Tests: a hold set during the wait keeps the program from starting, and a hold set during the grant releases the place.
-- Phase 4h/4i: `queue_place` callers start programs only in a scope (nested when the holder is in `builds.slice`); `BUILDLOG_SCOPE=0` is test-only. Keep that contract when `queue_place` moves to the service.
+- Phase 4h/4i: `queue_place` callers start programs only in a scope (nested when the holder is in `builds.slice`); `BUILDLOG_SCOPE=0` is test-only. With no scope, `QueuePlace.popen` raises `QueuePlaceRefused` before the fork. `finish()` reads the scope's `cgroup.procs` again until it is empty (TERM, then `cgroup.kill` at `program_stop_seconds`), and only then releases. Keep that contract when `queue_place` moves to the service.
 - Phase 4h: `gate_reservation` turns `QueuePlaceRefused` into `GateRefused`; the gate prints `REFUSED: …` and exits 1 before any module starts. Keep it; `test_merge_gate_suites_admission.py` holds the test.
 - Phase 4h: `ProgramSizeUnavailable` comes from `read_memory_config`; `memory_config` prints it before `queue_place` calls `check`, and the test proves `check` never runs. Keep it: name the invalid key, refuse the start, never admit zero bytes.
 - Phase 4h: `queue_place` prints its held-wait lines to stdout today. The move to the client wait lines puts them on stderr; add a held-program test that stdout carries no admission line.
