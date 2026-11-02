@@ -59,10 +59,10 @@ Design Phase 0 is done at `bc636f47`. Its queue replay selected `m7a.4xlarge` Sp
   - `scripts/production/cli_fixture.py` — synchronous CLI tests with isolated process state.
   - `pyrightconfig.json` — Python execution environments.
   - NixOS repository context: `flake.nix`, `configuration.nix`, `modules/linux/buildlog.nix`, `modules/linux/tailscale.nix`, `modules/common/agents.nix`.
-    These paths are relative to the NixOS repository. Phase 8 prepares a separate branch for the natedev showrunner.
+    These paths are relative to the NixOS repository. Phase 9 prepares a separate branch for the natedev showrunner.
 - **Test lanes:** Python uses adjacent `test_*.py` files, rather than Rust `tests/` directories.
   New tests use these same lanes in `scripts/mac_test/`, `scripts/build_targets/`, `scripts/build_hold/`, `scripts/direct/`, `scripts/buildlog/` and `scripts/aws_target/`.
-- **Build:** none for Python and shell. Phase 8 names the NixOS branch checks separately.
+- **Build:** none for Python and shell. Phase 9 names the NixOS branch checks separately.
 - **Test:** use each Work Order's exact `python3 -m unittest discover` commands from the repository root.
 - **Lint:** use each slot's exact basedpyright command. Each slot requires `0 errors, 0 warnings, 0 notes`.
   Shell changes require the listed `bash -n` command. No file-level ignores apply. Avoid `Any`; use `TypedDict` for known-key dictionaries.
@@ -85,7 +85,7 @@ Design Phase 0 is done at `bc636f47`. Its queue replay selected `m7a.4xlarge` Sp
   Reuse `record.recorded_target`, configured host mappings, and the existing Mac classification predicates.
   An active AWS `SshTarget` enables record exchange even when `offload=off`.
   Install tracked scripts and non-secret configuration before activation. Keep `BUILDLOG_PEER` unset in the normal multi-peer service.
-  Buildlog synchronization excludes admission state. Phase 6 must provide an explicit natedev-initiated guard channel.
+  Buildlog synchronization excludes admission state. Phase 7 must provide an explicit natedev-initiated guard channel.
   `verify-linux` keeps `BUILDLOG_SENT_TREE_KEY`; its successful steps supply evidence for their own target, never natedev.
 - **Configuration reader and fixtures:** Read configuration only through `scripts/lib/conf.py`.
   `conf.values` accepts an explicit `Path`; typed numeric reads require the corresponding limit comments.
@@ -110,7 +110,7 @@ Design Phase 0 is done at `bc636f47`. Its queue replay selected `m7a.4xlarge` Sp
   6. Keep `monthly_limit_usd=400` and `daily_limit_usd=20` in `config/aws_target.conf`, per the user, 2026-11-01.
   7. Derive the AWS Budget amount from `monthly_limit_usd`. Do not duplicate spending limits in code or raise either limit.
   8. Enforce the spending guard before the first AWS resource, including deployment and the first boot.
-  9. Create or start no AWS resource before the final go-live gate in Phase 8, which completes design Phase 3.
+  9. Create or start no AWS resource before the final go-live gate in Phase 9, which completes design Phase 3.
   10. Let the user run console operations, CloudFormation deployment, Tailscale login and AWS credential configuration at their terminal.
   11. Pass no password, AWS key or Tailscale auth key through a session. Do not read credential files into output.
   12. Fake all AWS CLI/API calls in tests. Fake SSH, clocks, process state and machine memory in automated tests.
@@ -140,7 +140,7 @@ Keep these changes independent until the showrunner integrates them. Do not merg
 
 ## Phases
 
-Design Phase 1 maps to Phases 1–2. Design Phase 2 maps to Phases 3–4. Design Phase 3 maps to Phases 5–8.
+Design Phase 1 maps to Phases 1–2. Design Phase 2 maps to Phases 3–5. Design Phase 3 maps to Phases 6–9.
 The divisions separate state, execution, routing, cost accounting, control, reporting and deployment.
 
 ### Phase 1 — Isolate target state and holds  · status: done
@@ -237,133 +237,66 @@ Assertion-Change: scripts/buildlog/test_target_sync.py transfer and host-mapping
 
 **Ruled out:** Manifest source copies; whole-folder removal for budget overflow; tool parity checks outside the shell; full-mirror `path:` flake evaluation; user commands for affinity.
 
-### Phase 4 — Route queued work to eligible SSH targets  · status: todo
-**Depends on:** Phase 3
+### Phase 4 — Route queued work to eligible SSH targets  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** Waiting test, check and doc steps use free Linux SSH capacity while preserving their local queue place.
-
-**Spec:**
-
-1. Generalize SSH eligibility in `command_kind_eligible` and target iteration.
-   Use configured order `mac,natedev,aws` after go-live; use fake target configuration in tests before then.
-   Let eligible Linux SSH targets take test, check and doc without a natedev hold.
-   Continue past a held natedev to AWS. Preserve Mac platform restrictions and local-only requests.
-   Represent eligible targets and the selected target explicitly in live-step records.
-   Preserve decoding of existing records.
-   Keep AWS waits and execution outside Mac idle alerts and Mac copy execution.
-   Test Linux-only eligibility with no eligible Mac. Test the record through its consumers.
-   Check config, backoff, slot capacity and SSH reachability before reservation.
-   Use a cheap eligibility check; start no shell evaluation during queue retries.
-   Run the shell-aware execution probe only after reservation and the required copies.
-   If this phase changes `StepRecord`, replace `StepRecord.package: str | None` with named package-selection states.
-2. Extend the existing leave hook to every eligible SSH target in configured order.
-   Reserve its target and slot before returning status 75 from the local wait.
-   Transfer the reservation to the runner without an unclaimed interval.
-   If another caller takes capacity, remain queued instead of starting an unreserved remote command.
-   Treat `linux_startup=unresolved` and `LeftoversRemain` as `BusyMacDecline(LostRunLeftovers())`.
-   Keep the claim and original queue age while leftovers remain or cleanup stays unconfirmed.
-   Apply no backoff for this busy state; continue to the next eligible target.
-3. Apply the same route to the existing test, check and staged doc paths.
-   Keep build, example, final and AWS lint local by the settled scope.
-   Do not move the Mac lint policy into the AWS path.
-4. Preserve the first `BUILDLOG_MEM_WAIT_SINCE` across remote loss and local retry.
-   Release a local memory reservation and cargo token before remote work.
-   Reacquire local admission before fallback when natedev is eligible and unheld.
-   Never treat a confirmed remote test failure as a reason to rerun locally.
-5. Keep one selected-target result contract for the new route.
-   Record `target=aws` for AWS attempts and `host=aws-build` for remote steps.
-   Record each SSH attempt's target, repository identity, original queue timestamp, departure timestamp, slot, and outcome.
-   Preserve earlier AWS attempts when fallback changes the call's final target to natedev.
-   Record confirmed failure separately from loss and admission refusal.
-   Introduce target-neutral Linux outcomes, such as `PassedOnTarget` and `FailedOnTarget`.
-   Keep Mac serialization unchanged at its boundary.
-   Extend `write_result` and durable attempts with completion evidence and cleanup state: confirmed or unconfirmed.
-   Persist the unresolved count and evidence time separately from completion.
-   Represent an unavailable count explicitly; keep numeric selector status internal.
-   Test AWS loss followed by local success without loss of the AWS attempt or original queue timestamp.
-   Preserve legacy Mac wire results for existing consumers.
-6. Test route order, direct use during a natedev hold, slot races, local-only refusal and fallback queue age.
-   Test check and staged doc, plus excluded kinds. Fake memory, clocks, SSH and all build commands.
-   Extend `test_verify_ssh_targets.py` through the real probe and stream parsers.
-   Cover probe refusal, run refusal, and successful probe followed by unresolved cleanup.
-   Test cold-shell routing: queue retries start no shell before reservation.
-
-**Held changes:** Verify changes `mac_retry_hook`, `run_local_test`, `try_mac_test` and adds `release_wait_claim`.
-Read `offload.py` on `origin/natedev-verify` before changing its result types or serialization; preserve the held claim-transfer boundaries.
-It preserves queue age through `BUILDLOG_MEM_WAIT_FIRST_FILE` and renews the token through `admit_with_token` and `with_token_renewal`.
-Extend routing at these boundaries; do not replace token ownership, metadata loading, clock offsets or lint cache logic.
-Resources changes `RankedWaiter`, `waiter_state`, `first_queued_waiter`, `admission_pass` and `queue_read_from` in `memory_admit.py`.
-Keep AWS selection outside admission policy. Never rewrite queue ranking or count token-wait rows as available build work.
-Resources changes `record.admission_metadata`, `record.step` and `record.queue_priority(start=...)`.
-Add attempt evidence at the record boundary. Preserve lazy imports and append deduplication.
+- Queued test, check, and staged doc steps use eligible SSH targets in configured order, including Linux capacity without a natedev hold.
+  Local-only requests, Mac platform restrictions, and local execution for build, example, final, and AWS lint remain enforced.
+- `ssh_target_eligibility` checks configuration, backoff, capacity, and reachability without shell evaluation. Only busy/blocked exclusion answers retain SSH retry eligibility.
+  `reserve` and `release-wait` manage process-bound claims. Reservation precedes queue departure; `MacClaimFromWait` transfers ownership without an unclaimed interval.
+- `linux_startup=unresolved` and `LeftoversRemain` produce `BusyMacDecline(LostRunLeftovers())` without backoff. Unconfirmed cleanup retains the claim and original queue age.
+  The next retry considers later targets first. Copies precede the execution probe; shell evaluation starts only after reservation.
+- `BUILDLOG_MEM_WAIT_SINCE` and `BUILDLOG_MEM_WAIT_FIRST_FILE` preserve the first queue timestamp across remote loss and local fallback.
+  Remote execution releases local reservations. Local fallback requires admission; confirmed remote failure does not trigger a local rerun.
+- `PassedOnMac`/`FailedOnMac` become `PassedOnTarget`/`FailedOnTarget`; Mac wire results remain compatible. `AttemptEvidence`, `write_result`, and `persist_attempt` retain completion and cleanup separately.
+  Evidence includes an explicit unavailable count and separate evidence time. Outcomes distinguish confirmed failure, loss, refusal, and `no_tests`.
+  The schema version 28 `ssh_attempts` table retains target, repository identity, queue timestamp, departure timestamp, slot, outcome, and evidence across local fallback.
+- `StepRecord` uses `SshAllowed`, `NamedPackage`, and `WorkspacePackages`, with explicit eligible targets and selected target. Existing records remain readable.
+  AWS attempts record `target=aws`; remote steps record `host=aws-build`. Linux waits and execution remain outside Mac idle alerts and copy execution.
 
 **Files:**
 
-- `scripts/direct/verify.sh` — target iteration, leave hooks and remote fallback.
-- `scripts/direct/step_record.py` — target-aware eligibility and execution state; named package-selection states if `StepRecord` changes.
-- `scripts/buildlog/mac_idle.py`, `scripts/mac_test/copy_watch.py` — preserve Mac-only observation and copy behavior.
-- `scripts/buildlog/record.py`, `scripts/buildlog/index.py` — durable SSH attempt records and indexed measurement evidence.
-- `scripts/build_targets/build_targets.py`, `scripts/build_targets/targets.py` — SSH kind eligibility.
-- `scripts/mac_test/mac_test.py`, `scripts/mac_test/offload.py` — reserve-before-leave and runner transfer boundaries.
-- `scripts/mac_test/linux_runner.py` — completion and cleanup evidence; preserve shell evaluation after reservation.
-- `scripts/lint/memory_gate.sh` — target-neutral leave integration only where required.
-- `scripts/lint/memory_admit.py` — read queue-age and admission contracts; preserve policy functions.
-- `scripts/direct/verify_mac_offload_test_support.py`, `scripts/lint/memory_test_support.py` — read fixture patterns.
-- `config/build_targets.conf`, `config/aws_target.conf` — route and retry tunables; keep AWS disabled.
-- `scripts/direct/test_verify_ssh_targets.py`, `scripts/build_targets/test_ssh_eligibility.py` — fake route and attempt regressions.
-- `scripts/direct/test_step_record.py`, `scripts/buildlog/test_mac_idle.py`, `scripts/mac_test/test_copy_watch.py` — live-step consumer regressions.
-- `scripts/buildlog/test_index.py` — attempt evidence decoding and index regressions.
+- `scripts/direct/verify.sh`, `scripts/direct/step_record.py` — routes, reservation transfer, queue age, and live target state.
+- `scripts/build_targets/build_targets.py`, `scripts/mac_test/mac_test.py` — eligibility, reservation, adoption, and release commands.
+- `scripts/mac_test/offload.py`, `scripts/mac_test/linux_runner.py` — target results and attempt evidence; `config/aws_target.conf` — timeout limits.
+- `scripts/buildlog/record.py`, `scripts/buildlog/index.py` — durable attempts; `scripts/buildlog/mac_idle.py`, `scripts/mac_test/copy_watch.py` — Mac consumers.
+- Adjacent route, eligibility, record, index, idle, copy, and Linux runner tests cover these behaviors.
 
-**Workers:** 1 writer + 1 tester; the writer owns the shared route and claim protocol.
+**Binds later work:** Admission uses `ssh_target_eligibility` and `command_reserve`.
+The consumer titled Report AWS use, cost and estimated wait saved reads `ssh_attempts`, written by `offload.persist_attempt`.
 
-- `impl` — source and config files; hub: `scripts/direct/verify.sh`, `scripts/mac_test/mac_test.py`, `scripts/mac_test/offload.py`.
-- `test` — the named test files; cover routes, attempt evidence and live-step consumers without real tools or live memory.
+**Gotchas:** Mac wait registration precedes reservation so `mac_idle.waiting_calls` sees failed reservations.
+Unresolved cleanup advances to another target without backoff. Missing completion remains loss; confirmed completion alone does not release retained capacity.
+`probe_timeout_s` and `shell_timeout_s` remain separate. Configuration fixtures use `CONF_DIR`, private configuration files, and numeric limit comments.
 
-**State:** A leave attempt holds a target slot until transfer, refusal or cleanup. Retain the first local queue timestamp across retries.
-The exit path must release an untransferred local claim. Uncertain remote cleanup keeps its claim.
-Live-step records preserve eligibility and selected-target state across decoding.
-Durable attempt records retain earlier remote outcomes when the final call target changes.
-Attempt results retain completion, cleanup state, unresolved count and evidence time.
-Confirmed completion does not release capacity when cleanup remains unconfirmed.
+**Ruled out:** A separate admission route; immediate retry of the unresolved target; AWS use of Mac lint policy.
 
-**Constraints from prior phases:** Phase 3 provides Linux execution and parity checks. Phase 2 provides slots. Phase 1 isolates holds and backoff.
-The Linux execution probe evaluates the shell; copy tracked scripts, public configuration and source before that probe.
-Use a cheap routing check before reservation; preserve `probe_timeout_s` and `shell_timeout_s` as separate limits.
-Startup refusal and unresolved leftovers are busy states without backoff; missing completion remains loss.
-Read configuration through `conf.py`; tests use `CONF_DIR`, private `build_targets.conf` and numeric limit comments.
+### Phase 5 — Repair verify and hold routes broken by SSH routing  · status: done
 
-**Verification — impl:** `bash -n scripts/direct/verify.sh scripts/lint/memory_gate.sh`
+#### As-built
 
-**Verification — impl types:** `basedpyright --pythonpath ~/.local/state/merge-gate/typecheck-venv/bin/python scripts/build_targets/build_targets.py scripts/build_targets/targets.py scripts/mac_test/mac_test.py scripts/mac_test/offload.py scripts/mac_test/linux_runner.py scripts/direct/step_record.py scripts/buildlog/mac_idle.py scripts/mac_test/copy_watch.py scripts/buildlog/record.py scripts/buildlog/index.py`
+With no eligible SSH target, the Mac and natedev verify routes and the build-hold enforcer behave as they did before SSH routing.
 
-**Verification — test:** `python3 -m unittest discover -s scripts/direct -p 'test_verify_ssh_targets.py'`
+- `hold_enforcer.protected_reason` protects every valid step state except `ON_NATEDEV`, so a hold stops only local work; `WAITING_SSH` and `ON_SSH` steps are not signalled.
+- `build_targets.py reserve` returns 0 when it reserves or recovers a claim, 11 for a busy macOS target, and 1 for no reservation. A `claim_wait` answer of 11 on macOS also reports busy.
+- `reserve --recover-only` recovers only the step's own wait claim or a retained claim and creates no new claim; otherwise a macOS target answers 11.
+- `verify.sh` `mac_retry_hook` takes the reservation command as its third argument. A `free-now` answer of `free` or `busy` (an empty successful answer counts as free) lets the retry proceed; a `busy` answer passes `--recover-only`, so a busy Mac gets no extra runner attempt.
+- `verify.sh` omits `--target` only when `target_for_settings` gives `mac`; every other macOS target is named explicitly. `target_platform` reads `build_targets platform`, and only under `mac_allowed` does the unresolved name `mac` fall back to macOS.
+- The legacy `mac_allowed` route keeps its retry deadline, idle-marker, `free-now` event and local-release reservation transfer behavior.
 
-**Verification — test:** `python3 -m unittest discover -s scripts/build_targets -p 'test_ssh_eligibility.py'`
+**Files:**
+- `scripts/build_hold/hold_enforcer.py` — natedev-work predicate for holds.
+- `scripts/build_targets/build_targets.py` — reserve status contract and `--recover-only`.
+- `scripts/direct/verify.sh` — Mac retry hook, explicit target naming and platform lookup.
+- `scripts/direct/test_verify_ssh_targets.py` — retained-claim recovery, recovery without a reservation file, named-Mac reservation under default-Mac backoff, and Linux exclusion that records no Mac decline.
 
-**Verification — test:** `python3 -m unittest discover -s scripts/direct -p 'test_step_record.py'`
+**Binds later work:** The spending guard keeps the 0/11/1 reserve statuses and adds a refusal reason of its own; only `busy` and `blocked` keep retry eligibility. Interruption fallback must record `ON_NATEDEV` before local compilation so a hold reaches it.
 
-**Verification — test:** `python3 -m unittest discover -s scripts/buildlog -p 'test_mac_idle.py'`
+**Gotchas:** A module that hits the 1800 s test limit in the verify suite has so far been a route defect (a retry loop with no exit), not machine load. Read its log before rerunning it.
 
-**Verification — test:** `python3 -m unittest discover -s scripts/mac_test -p 'test_copy_watch.py'`
-
-**Verification — test:** `python3 -m unittest discover -s scripts/buildlog -p 'test_index.py'`
-
-**Verification — test types:** `basedpyright --pythonpath ~/.local/state/merge-gate/typecheck-venv/bin/python scripts/direct/test_verify_ssh_targets.py scripts/build_targets/test_ssh_eligibility.py scripts/direct/test_step_record.py scripts/buildlog/test_mac_idle.py scripts/mac_test/test_copy_watch.py scripts/buildlog/test_index.py`
-
-**Acceptance gate:** The commands pass. A fake Linux slot takes a queued check without a hold.
-AWS loss followed by local success preserves the AWS attempt, its slot and the original queue timestamp.
-Linux-only eligibility remains outside Mac idle alerts and Mac copy execution through the live-step consumers.
-Cold-shell queue retries start no shell before reservation.
-All three startup-refusal cases preserve ownership and queue age, apply no backoff, and continue to another eligible target.
-Attempt results distinguish confirmed completion from unconfirmed cleanup and retain the unresolved count and evidence time.
-Target-neutral Linux outcomes preserve the existing Mac wire results.
-
-**Also touches:** `scripts/direct/`, `scripts/mac_test/`, offload (owner verify-unit); `scripts/build_targets/`, `config/build_targets.conf` (owner resources-unit); `scripts/buildlog/` (owner report-unit); `scripts/lint/memory_gate.sh`, `scripts/lint/memory_admit.py` if changed (owner queue-unit).
-
-### Phase 5 — Account for AWS cost before admission  · status: todo
-**Depends on:** Phase 4
+### Phase 6 — Account for AWS cost before admission  · status: todo
+**Depends on:** Phase 5
 
 #### Work Order
 
@@ -407,7 +340,7 @@ Target-neutral Linux outcomes preserve the existing Mac wire results.
    Require refusal at every spending entry point when only a recovered value exists.
 
 **Held changes:** Resources changes `read_queue_snapshot`'s decoded input types through `RankedWaiter` and typed token-wait state.
-Keep cost accounting independent of those types; Phase 6 reads the snapshot through its existing decoder.
+Keep cost accounting independent of those types; Phase 7 reads the snapshot through its existing decoder.
 Neither held branch has source changes under the new `scripts/aws_target/` paths.
 
 **Files:**
@@ -418,41 +351,58 @@ Neither held branch has source changes under the new `scripts/aws_target/` paths
 - `scripts/lib/conf.py` — the sole reader; add value-origin states only if no existing interface provides them.
 - `scripts/lib/test_conf.py` — live-value and recovered-value regressions if the reader interface changes.
 - `config/aws_target.conf`, `config/README.md` — complete controller, pricing and spending settings.
+- `scripts/build_targets/build_targets.py` — the spending guard in `ssh_target_eligibility` and `command_reserve`.
+- `scripts/build_targets/test_ssh_eligibility.py` — guard refusal through real eligibility and reservation calls.
+- `scripts/direct/test_verify_ssh_targets.py` — read-only route regressions for the Phase 5 reservation contract.
 
 **Workers:** 1 writer + 1 tester; accounting remains separate from AWS command execution.
 
-- `impl` — config and ledger implementation; hub: `scripts/aws_target/config.py`, `config/aws_target.conf`.
-- `test` — `scripts/aws_target/test_ledger.py` and reader regressions in `scripts/lib/test_conf.py` if needed.
+- `impl` — config, ledger, the `conf.py` reader and the `build_targets.py` guard integration; hub: `scripts/aws_target/config.py`, `config/aws_target.conf`.
+- `test` — `scripts/aws_target/test_ledger.py`, reader regressions in `scripts/lib/test_conf.py` if needed, and guard refusal in `scripts/build_targets/test_ssh_eligibility.py`.
+  Test guard refusal through actual `ssh_target_eligibility` and `command_reserve` calls, not a direct guard call.
   Use fixed state evidence, committed configuration history, prices, time and temporary files.
 
 **State:** A locked ledger records charged intervals, price observations, reconciliations and durable limit events under the AWS target directory.
 Commit a decision atomically before any caller can act on it. Preserve the last valid evidence during interrupted writes.
-Each named guard state carries its decision time and validation evidence for Phase 6's explicit publication channel.
+Each named guard state carries its decision time and validation evidence for Phase 7's explicit publication channel.
 Guard evidence records whether each spending limit came from a usable live setting.
 
 **Constraints from prior phases:** Phase 1 defines AWS state isolation. Phase 4 establishes remote admission and fallback boundaries.
+Phase 4 decides SSH target admission in `ssh_target_eligibility` and `command_reserve` (`scripts/build_targets/build_targets.py`); add the spending guard there, not in a new path.
+A target excluded for capacity answers `busy` or `blocked`; only these two reasons keep the step eligible to retry that target.
+`verify.sh` `try_reserved_target` then moves the step to the next configured target.
+A spending refusal is its own named reason, not occupied capacity: it moves the step on and records no capacity retry.
+Phase 5 fixed the `command_reserve` status contract: 0 means reserved or recovered, 11 means a busy macOS target, and 1 means no reservation.
+`reserve --recover-only` recovers only the step's own claim or a retained claim and creates no new claim; `verify.sh` consumes status 11 internally.
+The spending guard keeps these statuses and adds no new one.
 AWS remains disabled; this phase creates no resource and enables no timer.
 Phase 3 uses `conf.py`, which can recover committed values after a missing or malformed live setting.
 That recovery does not permit spend; preserve ordinary readers while adding the narrow spending guarantee.
 Tests use `CONF_DIR`, private `build_targets.conf` and numeric limit comments.
 
-**Verification — impl:** `basedpyright --pythonpath ~/.local/state/merge-gate/typecheck-venv/bin/python scripts/aws_target/config.py scripts/aws_target/ledger.py scripts/lib/conf.py`
+**Verification — impl:** `basedpyright --pythonpath ~/.local/state/merge-gate/typecheck-venv/bin/python scripts/aws_target/config.py scripts/aws_target/ledger.py scripts/lib/conf.py scripts/build_targets/build_targets.py`
 
 **Verification — test:** `python3 -m unittest discover -s scripts/aws_target -p 'test_ledger.py'`
 
 **Verification — test:** `python3 -m unittest discover -s scripts/lib -p 'test_conf.py'`
 
-**Verification — test types:** `basedpyright --pythonpath ~/.local/state/merge-gate/typecheck-venv/bin/python scripts/aws_target/test_ledger.py scripts/lib/test_conf.py`
+**Verification — test:** `python3 -m unittest discover -s scripts/build_targets -p 'test_*.py'`
+
+**Verification — test:** `python3 -m unittest discover -s scripts/direct -p 'test_verify_ssh_targets.py'`
+
+**Verification — test types:** `basedpyright --pythonpath ~/.local/state/merge-gate/typecheck-venv/bin/python scripts/aws_target/test_ledger.py scripts/lib/test_conf.py scripts/build_targets/test_ssh_eligibility.py`
 
 **Acceptance gate:** The commands pass. At either configured limit, every guard entry refuses new spend without changing the configured limit.
 Named allowed, refused and unavailable decisions expose their decision times and validation evidence.
 Missing or malformed live limits refuse spend despite usable committed history, including a recovered value above the intended limit.
 The guard reports why it refused spend; `conf.py` remains the sole configuration reader.
+A spending refusal through `ssh_target_eligibility` and `command_reserve` moves the step to the next target with no capacity retry.
+The Phase 5 route tests stay green, including `test_mac_memory_retry_cleans_a_retained_claim_after_its_owner_exits`, `test_mac_memory_retry_recovers_its_claim_without_a_reservation_file` and `test_retry_recovers_its_claim_when_the_reservation_file_was_not_published`.
 
-**Also touches:** `scripts/lib/conf.py` and `scripts/lib/test_conf.py` if changed; `scripts/lint/memory_admit.py` remains an input owned by queue-unit.
+**Also touches:** `scripts/lib/conf.py` and `scripts/lib/test_conf.py` if changed; `scripts/build_targets/build_targets.py` and `scripts/build_targets/test_ssh_eligibility.py` (owner resources-unit); `scripts/lint/memory_admit.py` remains an input owned by queue-unit.
 
-### Phase 6 — Control starts, drain and interruption recovery  · status: todo
-**Depends on:** Phase 5
+### Phase 7 — Control starts, drain and interruption recovery  · status: todo
+**Depends on:** Phase 6
 
 #### Work Order
 
@@ -505,13 +455,15 @@ The guard reports why it refused spend; `conf.py` remains the sole configuration
    Keep claims and markers when evidence cannot confirm recovery.
    Test restart with a retained marker and reused PID; preserve new work and permit recovery from sufficient evidence.
 7. Add tick settings with an initial 30-second interval in config.
-   Keep the actual timer disabled until Phase 8. Store every retry, timeout, stale threshold and poll interval in config.
+   Keep the actual timer disabled until Phase 9. Store every retry, timeout, stale threshold and poll interval in config.
    Bound routine tick work; refresh prices only when due, rather than on each tick.
 8. Test threshold selection, stale snapshots, concurrent tick/start, capacity backoff, limit drain, interruption and evidence-based release.
    Inject AWS, IMDS, process groups, clocks and notification delivery. Test no-work AWS restart behavior without real AWS.
    Extend `test_remote.py` through both runner entry points; invalid permission starts neither shell evaluation nor work.
    Test interruption through the real stream parser and attempt writer.
    Distinguish interruption loss, startup refusal and confirmed completion while preserving the original queue timestamp.
+   Test that interruption fallback records `ON_NATEDEV` before local compilation starts.
+   Test that a build hold keeps protecting a step in `WAITING_SSH` or `ON_SSH`, and stops only local work.
 
 **Held changes:** Resources changes `QueueInputs`, `RankedWaiter`, `waiter_state`, `first_queued_waiter` and `stored_waiter`.
 Consume decoded rows without replacing snapshot serialization or the admission walk.
@@ -530,11 +482,12 @@ Keep interruption decoding separate from `OffloadRequest.admission` and `claim_a
 - `scripts/lint/memory_admit.py` — read snapshot schema and decoder; modify only a necessary narrow reader boundary.
 - `config/aws_target.conf`, `config/README.md` — lifecycle settings.
 - `scripts/aws_target/test_control.py`, `scripts/aws_target/test_remote.py` — fake control and remote tests.
+- `scripts/direct/test_verify_ssh_targets.py` — the interruption fallback and hold-protection route regressions.
 
 **Workers:** 1 writer + 1 tester; the controller owns its side-effect order and claim release.
 
 - `impl` — source and config files; hub: `scripts/aws_target/config.py`, `scripts/mac_test/mac_test.py`, `config/aws_target.conf`.
-- `test` — the two new tests; model AWS, IMDS and queue snapshots with temporary typed fixtures.
+- `test` — the two new tests and the route regressions; model AWS, IMDS and queue snapshots with temporary typed fixtures.
 
 **State:** Controller lock, capacity backoff, current state, drain marker, idle evidence and claim-release evidence persist.
 Record intent before an AWS action; reconcile actual state after an uncertain response instead of repeating an unguarded start.
@@ -543,24 +496,31 @@ Release evidence also identifies the affected claims. Later claims remain intact
 Retained slot markers carry boot identity; recovery reconciles remote markers and local claims before new work.
 Generation-bound interruption records persist on the target and in durable attempts.
 
-**Constraints from prior phases:** Phase 5 supplies the ledger and shared guard. Phase 4 preserves queue age on loss.
+**Constraints from prior phases:** Phase 6 supplies the ledger and shared guard. Phase 4 preserves queue age on loss.
 Phase 3 supplies the Linux probe. Phase 2 supplies slot claims and retained job fields.
-Phase 5 supplies named allowed, refused and unavailable guard decisions with decision times and validation evidence.
+Phase 6 supplies named allowed, refused and unavailable guard decisions with decision times and validation evidence.
 Only usable live limits permit spend; committed recovery values do not permit spend.
 Phase 3 evaluates the shell in both `probe_shell` and `run`; copy scripts, public configuration and source before the execution probe.
 Phase 3 keeps `.linux-run.json` during uncertain cleanup; `/home` preserves these markers across restarts.
 Phase 4 preserves completion, cleanup state, unresolved count and evidence time in each attempt.
 Startup refusal and `LeftoversRemain` stay busy without backoff; missing completion remains loss.
 Keep numeric selector status internal and preserve the existing Mac serialization.
+Phase 5 made `hold_enforcer.protected_reason` protect every valid step state except `ON_NATEDEV`, so a hold stops only local work.
+A step that falls back from an interrupted AWS run must record `ON_NATEDEV` before local compilation, so the hold reaches it.
 Read configuration through `conf.py`; tests use `CONF_DIR`, private `build_targets.conf` and numeric limit comments.
 Buildlog synchronization excludes admission state. Use an explicit natedev-initiated channel for guard transfer.
-No real resource exists before Phase 8's user gate.
+No real resource exists before Phase 9's user gate.
 
 **Verification — impl:** `basedpyright --pythonpath ~/.local/state/merge-gate/typecheck-venv/bin/python scripts/aws_target/config.py scripts/aws_target/ledger.py scripts/aws_target/aws_target.py scripts/aws_target/remote.py scripts/mac_test/mac_test.py scripts/mac_test/offload.py scripts/mac_test/linux_runner.py`
 
 **Verification — test:** `python3 -m unittest discover -s scripts/aws_target -p 'test_control.py'`
 
 **Verification — test:** `python3 -m unittest discover -s scripts/aws_target -p 'test_remote.py'`
+**Verification — test:** `python3 -m unittest discover -s scripts/mac_test -p 'test_*.py'` (the full Mac suite; Phase 4 found result-class failures only there)
+
+**Verification — test:** `python3 -m unittest discover -s scripts/build_hold -p 'test_*.py'`
+
+**Verification — test:** `python3 -m unittest discover -s scripts/direct -p 'test_verify_ssh_targets.py'`
 
 **Verification — test types:** `basedpyright --pythonpath ~/.local/state/merge-gate/typecheck-venv/bin/python scripts/aws_target/test_control.py scripts/aws_target/test_remote.py`
 
@@ -571,13 +531,14 @@ Other Linux targets and the loopback proof remain usable without AWS permission.
 Missing, stale, malformed or wrong-generation evidence prevents execution.
 Stop evidence followed by restart releases only the identified old claims under the target lock.
 Recovery reconciles remote markers and local claims using boot identity before new work.
+Interruption fallback records `ON_NATEDEV` before local compilation; a hold still protects `WAITING_SSH` and `ON_SSH` steps.
 A retained marker with a reused PID cannot select or kill new work; sufficient evidence permits recovery.
 Real parsers distinguish generation-bound interruption loss, startup refusal and confirmed completion in durable attempts without changing queue age.
 
 **Also touches:** `scripts/mac_test/`, offload (owner verify-unit); `scripts/lint/memory_admit.py` if changed (owner queue-unit).
 
-### Phase 7 — Report AWS use, cost and estimated wait saved  · status: todo
-**Depends on:** Phase 6
+### Phase 8 — Report AWS use, cost and estimated wait saved  · status: todo
+**Depends on:** Phase 7
 
 #### Work Order
 
@@ -591,7 +552,7 @@ Real parsers distinguish generation-bound interruption loss, startup refusal and
    Show occupied slots per repository, including slots retained pending cleanup.
    Show confirmed test results separately from retained capacity, including confirmed completion with unconfirmed cleanup.
    Render completion, confirmed or unconfirmed cleanup, unresolved count and evidence time from the attempt result.
-   Show Phase 6's recovery action for retained capacity; keep numeric selector status internal.
+   Show Phase 7's recovery action for retained capacity; keep numeric selector status internal.
    Do not interpret `slots=2` as a global target capacity.
    Preserve read-only status without probes or writes.
    Test active work, dead owners, `cleanup_pending`, malformed claims, and recovery.
@@ -653,21 +614,22 @@ Reuse the existing schema and classification contracts. Migrate only absent meas
 A retry must not repeat a successful daily charge read or duplicate a reconciliation.
 Read retained slot evidence and peer exchange status without probes or writes.
 
-**Constraints from prior phases:** Phase 6 records controller state, drain reason and slot-release evidence.
-Phase 5 owns cost totals. Phase 4 records each SSH attempt independently of the call's final target.
+**Constraints from prior phases:** Phase 7 records controller state, drain reason and slot-release evidence.
+Phase 6 owns cost totals. Phase 4 records each SSH attempt independently of the call's final target.
 Phase 4 persists completion, cleanup state, unresolved count and evidence time through `write_result`.
-Confirmed completion can coexist with retained capacity; Phase 6 owns recovery of markers and claims using boot identity.
-Phase 6 records generation-bound interruption loss separately from startup refusal and confirmed completion.
+Confirmed completion can coexist with retained capacity; Phase 7 owns recovery of markers and claims using boot identity.
+Phase 7 records generation-bound interruption loss separately from startup refusal and confirmed completion.
 Phase 3 preserves `verify-linux` sent-tree keys and excludes their success from natedev pass evidence.
 Reuse those guarantees; add only missing measurement fields.
 Read configuration through `conf.py`; tests use `CONF_DIR`, private `build_targets.conf` and numeric limit comments.
 Phase 2 added `steps.target` in schema version 27.
+Phase 4 added the `ssh_attempts` table in schema version 28; `offload.persist_attempt` writes one row per attempt (outcome `no_tests` when no test ran).
 Reuse `record.recorded_target`, configured host mappings, and the existing Mac classification predicates.
 Add only absent AWS measurement fields.
 Preserve legacy records with missing target values and explicit target precedence over host aliases.
 Preserve AWS recorder health for active AWS configuration.
 Phase 2 keeps per-peer exchange status and the legacy Mac status reader.
-Phase 6 owns retained-claim recovery. This phase exposes retained capacity and its recovery action.
+Phase 7 owns retained-claim recovery. This phase exposes retained capacity and its recovery action.
 
 **Verification — impl:** `basedpyright --pythonpath ~/.local/state/merge-gate/typecheck-venv/bin/python scripts/aws_target/measurement.py scripts/aws_target/aws_target.py scripts/aws_target/ledger.py scripts/build_targets/build_targets.py scripts/build_targets/targets.py scripts/buildlog/record.py scripts/buildlog/index.py scripts/buildlog/report.py scripts/buildlog/sync.py`
 
@@ -681,6 +643,8 @@ Phase 6 owns retained-claim recovery. This phase exposes retained capacity and i
 
 **Verification — test:** `python3 -m unittest discover -s scripts/buildlog -p 'test_mac_report.py'`
 
+**Verification — test:** `python3 -m unittest discover -s scripts/direct -p 'test_verify_ssh_targets.py'`
+
 **Verification — test types:** `basedpyright --pythonpath ~/.local/state/merge-gate/typecheck-venv/bin/python scripts/aws_target/test_measurement.py scripts/buildlog/test_aws_report.py scripts/build_targets/test_aws_status.py scripts/buildlog/test_record.py scripts/buildlog/test_mac_report.py`
 
 **Acceptance gate:** The commands pass. Fixed mixed-host data produces the specified AWS line without changing Mac totals or double-counting charges.
@@ -689,11 +653,12 @@ Status distinguishes active execution from retained slots per repository without
 The record and Mac report tests preserve Linux tree keys without treating Linux success as natedev pass evidence.
 Rendered reports show each active peer's success, failure, never-synchronized, paused and recovered states with the relevant action.
 AWS report data carries its synchronization time. Legacy Mac records and explicit target precedence remain correct.
+An excluded Linux target records no Mac decline; `test_excluded_linux_target_does_not_record_a_mac_decline` stays green.
 
 **Also touches:** `scripts/build_targets/build_targets.py`, `scripts/build_targets/targets.py` (owner resources-unit); `scripts/buildlog/` (owner report-unit).
 
-### Phase 8 — Prepare guarded deployment and the NixOS branch  · status: todo
-**Depends on:** Phase 7
+### Phase 9 — Prepare guarded deployment and the NixOS branch  · status: todo
+**Depends on:** Phase 8
 
 #### Work Order
 
@@ -777,21 +742,21 @@ After the user gate, stack IDs, volume ID, instance ID, guard evidence and activ
 Make reruns reconcile existing resources and retained volume identity. Never reset cost evidence during redeployment.
 Preserve target claims, affinity, warm mirrors, cost evidence, and peer status during restart and redeployment.
 
-**Constraints from prior phases:** Phase 7 supplies reports. Phase 6 supplies tick, remote idle stop and interruption handling.
-Phase 5 supplies deployment preflight and the ledger. Phases 1–4 supply target state, slots and Linux routing.
+**Constraints from prior phases:** Phase 8 supplies reports. Phase 7 supplies tick, remote idle stop and interruption handling.
+Phase 6 supplies deployment preflight and the ledger. Phases 1–4 supply target state, slots and Linux routing.
 The source design's Phase 3 go-live occurs only here, after implementation and the runbook are complete.
 An active AWS `SshTarget` enables record exchange even when `offload=off`.
 Keep AWS outside `targets` until tracked scripts and non-secret configuration are installed at the user gate.
-Phase 7 supplies AWS exchange status, recorder health and retained-capacity status for the runbook's user checks.
+Phase 8 supplies AWS exchange status, recorder health and retained-capacity status for the runbook's user checks.
 Phase 3 checks parity inside the configured shell after script, public configuration and source copies.
 Its runner needs Python 3.13, Nix, Git, rsync, Rust, nextest and mend.
 Its LRU sweep trims selected-slot output; whole-folder removal occurs only for the disk floor.
 Phase 4 separates completion from cleanup state, unresolved count and evidence time in durable attempts.
 Startup refusal and remaining leftovers preserve ownership without backoff.
-Phase 5 permits spend only with usable live limits through `conf.py`; committed recovery values never permit spend.
-Phase 6 checks AWS permission before shell evaluation and `shellHook` in both runner entry points.
-Phase 6 reconciles retained markers and claims using boot identity after restart.
-Phase 6 carries generation-bound interruption evidence into the stream parser and durable attempt record.
+Phase 6 permits spend only with usable live limits through `conf.py`; committed recovery values never permit spend.
+Phase 7 checks AWS permission before shell evaluation and `shellHook` in both runner entry points.
+Phase 7 reconciles retained markers and claims using boot identity after restart.
+Phase 7 carries generation-bound interruption evidence into the stream parser and durable attempt record.
 Read configuration through `conf.py`; tests use `CONF_DIR`, private `build_targets.conf` and numeric limit comments.
 
 **Verification — impl:** `python3 -m json.tool docs/plans/builds-aws/cloudformation.json`
@@ -842,13 +807,13 @@ Keep AWS lint disabled. Pass no password or key through a session.
 **Deployment decisions (aws-unit, 2026-11-01):**
 
 1. **Persistent Spot restart at a spending limit.** A user stop (the scaler's `StopInstances`, or the box's own shutdown) disables a persistent request until the next start, so AWS does not restart a stopped box.
-   AWS restarts only a box it interrupted. Phase 6 bounds that case: a tick that finds the box running while the guard refuses spend stops it at once, and the box's idle stop is the second bound.
+   AWS restarts only a box it interrupted. Phase 7 bounds that case: a tick that finds the box running while the guard refuses spend stops it at once, and the box's idle stop is the second bound.
    The runbook's go-live check confirms the request state after a manual stop.
 2. **First SSM connection.** Use the official NixOS AMI for the selected release and region (the runbook reads its ID from the NixOS AMI list and records it in config).
    The NixOS Amazon image runs `amazon-ssm-agent`. The template gives the instance a profile with `AmazonSSMManagedInstanceCore` and open HTTPS egress.
    User data carries the non-secret NixOS config that enables Tailscale and the idle stop, so the box stops itself from first boot.
    The runbook checks `aws ssm describe-instance-information` before the Tailscale login; the EC2 serial console is the fallback.
-3. **Strict cost boundary during drain.** Phase 5's `limit_reserve_usd` covers one bounded drain (`drain_max_minutes`) and one idle interval.
+3. **Strict cost boundary during drain.** Phase 6's `limit_reserve_usd` covers one bounded drain (`drain_max_minutes`) and one idle interval.
    Fixed costs (retained volume, IPv4) are charged to the ledger daily from deploy, so the daily limit already includes them.
    Between deploy and natedev control, the box's idle stop bounds run time. The AWS Budget action is the late backstop, not the ceiling.
 

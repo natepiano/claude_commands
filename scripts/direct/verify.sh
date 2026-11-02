@@ -289,6 +289,9 @@ run() {
         set -m
         (
             set +m
+            if [[ "$CMD" != test && "$STEP_RUNS_ON" != natedev_only ]] && buildlog_step_compiles "$@"; then
+                export LINT_QUEUE_LEAVE_HOOK="$(ssh_retry_hook)"
+            fi
             if run_once "$@" 2>&1 | tee "$step_log"; then
                 exit 0
             else
@@ -326,7 +329,7 @@ run() {
             rm -f "$step_log"
             return "$status"
         fi
-        if buildlog_step_compiles "$@" && { [[ "$status" == "$LINT_LEFT_QUEUE_STATUS" && "$CMD" != test && "$STEP_RUNS_ON" == mac_allowed ]] || step_stopped_by_hold; }; then
+        if buildlog_step_compiles "$@" && { [[ "$status" == "$LINT_LEFT_QUEUE_STATUS" && "$CMD" != test && "$STEP_RUNS_ON" != natedev_only ]] || step_stopped_by_hold; }; then
             if [[ "$status" == "$LINT_LEFT_QUEUE_STATUS" ]]; then
                 STEP_FORCE_MAC=1
             else
@@ -661,7 +664,12 @@ workspace_taplo() (
     rm -f "$listing"
     # No paths means a repository scan to Taplo, so skip the empty set.
     (( ${#files[@]} )) || return 0
-    run taplo fmt "$@" -- "${files[@]}"
+    local status=0
+    run taplo fmt "$@" -- "${files[@]}" || status=$?
+    if [[ "$status" != 0 && "${1:-}" == --check ]]; then
+        echo 'verify.sh: TOML check failed; files can be invalid or not properly formatted.' >&2
+    fi
+    return "$status"
 )
 
 example_features() {
@@ -1401,6 +1409,10 @@ MAC_LEAVE_SETTINGS=""
 MAC_LEAVE_REASON=""
 MAC_RETRY_AFTER=0
 MAC_RETRY_NOTICE_SHOWN=0
+SSH_RETIRED_SETTINGS=()
+SSH_RETRY_SETTINGS=()
+SSH_RETRY_DEADLINES=()
+SSH_RETRY_AFTER_SETTINGS=""
 MAC_VERB=nextest
 MAC_SOURCE_ROOT=""
 MAC_VERB_ARGS=()
@@ -1433,7 +1445,11 @@ forward_mac_runner_signal() {
 }
 
 try_mac_test() {
-    step_state waiting_mac
+    local selected_target selected_is_mac=0
+    LAST_TARGET_OUTCOME="" LAST_TARGET_REASON=""
+    selected_target=$(target_for_settings "$1")
+    if [[ "$(target_platform "$selected_target")" == macos ]]; then selected_is_mac=1; fi
+    if [[ "$selected_is_mac" == 1 ]]; then step_state waiting_mac; else step_state waiting_ssh; fi
     MAC_PASSED=0
     [[ -z "$MAC_IDLE_MARKER" ]] || rm -f -- "$MAC_IDLE_MARKER"
     local caller_traps
@@ -1445,6 +1461,16 @@ try_mac_test() {
     local result_seconds="" result_holder="" mac_words=0 line
     local runner_args=(run --repo-root "${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}"
         --package "$PKG" --call-id "$BUILDLOG_CALL_ID" --settings "$1")
+    runner_args+=(--target "$selected_target")
+    if [[ -s "$HOLD_WAIT_DIR/ssh-reservation" ]]; then
+        local reserved_target reserved_settings
+        IFS=$'\t' read -r reserved_target reserved_settings < "$HOLD_WAIT_DIR/ssh-reservation"
+        if [[ "$reserved_target" != "$selected_target" || "$reserved_settings" != "$1" ]]; then
+            return 0
+        fi
+        runner_args+=(--claim-owner-pid $$)
+    fi
+    if declare -F release_token >/dev/null; then release_token || return $?; fi
     if [[ "$MAC_VERB" != nextest ]]; then runner_args+=(--verb "$MAC_VERB"); fi
     if [[ -n "$MAC_SOURCE_ROOT" ]]; then runner_args+=(--source-root "$MAC_SOURCE_ROOT"); fi
     if [[ "${2:-}" == busy || "${2:-}" == blocked ]]; then
@@ -1461,7 +1487,7 @@ try_mac_test() {
         runner_args+=(-- "${MAC_VERB_ARGS[@]}")
     fi
 
-    export BUILDLOG_TARGET=mac
+    export BUILDLOG_TARGET="$selected_target"
     # A Mac pass is recorded like a natedev one, judged on the tree as it was
     # when the Mac run began, with the output it printed.
     if [[ "$CMD" == test && -z "$TREE_WATCH_PID" ]]; then
@@ -1471,7 +1497,10 @@ try_mac_test() {
         VERDICT_KEY="$(tree_key)"
     fi
     MAC_LOG_FILE="$(mktemp)"
-    step_state on_mac
+    if [[ "$selected_is_mac" == 1 ]]; then step_state on_mac; else
+        env -u BUILDLOG_CALL_ID "$PY" "$STEP_RECORD_SCRIPT" state --call-id "$BUILDLOG_CALL_ID" \
+            --target "$selected_target" on_ssh || exit 2
+    fi
     "$PY" "$MAC_RUNNER" "${runner_args[@]}" > >(tee "$MAC_LOG_FILE") 2> >(tee -a "$MAC_LOG_FILE" >&2) &
     MAC_RUNNER_PID=$!
     if wait "$MAC_RUNNER_PID"; then
@@ -1483,12 +1512,18 @@ try_mac_test() {
     trap - INT TERM HUP
     eval "$caller_traps"
     MAC_RUNNER_PID=""
+    release_wait_claim
 
     if [[ -f "$MAC_RESULT_FILE" && -r "$MAC_RESULT_FILE" \
           && -s "$MAC_RESULT_FILE" ]]; then
         result_text="$(< "$MAC_RESULT_FILE")"
         while IFS= read -r line; do
             case "$line" in
+                outcome=*)
+                    if [[ "$selected_is_mac" == 0 ]]; then
+                        ((mac_words += 1)); result_word="${line#outcome=}"
+                    fi
+                    ;;
                 mac=*)
                     ((mac_words += 1))
                     result_word="${line#mac=}"
@@ -1517,10 +1552,15 @@ try_mac_test() {
         rm -f "$MAC_LOG_FILE"
         MAC_LOG_FILE=""
         export BUILDLOG_TARGET=""
-        step_state waiting_mac
+        LAST_TARGET_OUTCOME=declined LAST_TARGET_REASON=runner
+        if [[ "$selected_is_mac" == 1 ]]; then step_state waiting_mac; else
+            BUILDLOG_MAC="" BUILDLOG_MAC_REASON="" BUILDLOG_MAC_S="" BUILDLOG_MAC_HOLDER=""
+            step_state waiting_ssh
+        fi
         return
     fi
 
+    LAST_TARGET_OUTCOME="$result_word" LAST_TARGET_REASON="$result_reason"
     BUILDLOG_MAC="$result_word"
     BUILDLOG_MAC_REASON="$result_reason"
     BUILDLOG_MAC_S="$result_seconds"
@@ -1528,12 +1568,15 @@ try_mac_test() {
     if [[ "$result_word" == declined && "$result_reason" == busy ]]; then
         BUILDLOG_MAC_HOLDER="$result_holder"
     fi
+    if [[ "$selected_is_mac" == 0 ]]; then
+        BUILDLOG_MAC="" BUILDLOG_MAC_REASON="" BUILDLOG_MAC_S="" BUILDLOG_MAC_HOLDER=""
+    fi
     case "$result_word" in
         declined|lost)
             rm -f "$MAC_LOG_FILE"
             MAC_LOG_FILE=""
             export BUILDLOG_TARGET=""
-            step_state waiting_mac
+            if [[ "$selected_is_mac" == 1 ]]; then step_state waiting_mac; else step_state waiting_ssh; fi
             return
             ;;
         failed)
@@ -1549,6 +1592,12 @@ try_mac_test() {
                 rm -f "$MAC_LOG_FILE"
                 MAC_LOG_FILE=""
                 return 0
+            fi
+            if [[ "$selected_is_mac" == 0 ]]; then
+                record_mac_pass "$MAC_LOG_FILE" "$result_seconds"
+                echo "verify.sh: PASS on $selected_target (Linux)."
+                note_event ran "${SECONDS}" 0 "" 0 0
+                exit 0
             fi
             finish_mac_pass "$MAC_LOG_FILE" "$result_seconds"
             ;;
@@ -1584,7 +1633,8 @@ check_routing_hold() {
 }
 
 initialize_step_record() {
-    local answer table line name eligibility reason settings status=0 decision_reason="no eligible Mac" mac_targets=0
+    local answer table line name eligibility reason settings status=0 decision_reason="no eligible SSH target" mac_targets=0
+    local eligible_names="" mac_names=""
     local arguments=(eligible --kind "$CMD" --repo-root "$(git rev-parse --show-toplevel)")
     PKG="${ARGS[0]:-}"
     if [[ "$CMD" == doc || "$CMD" == final ]]; then PKG=""; fi
@@ -1598,6 +1648,7 @@ initialize_step_record() {
     line=${answer%%$'\n'*}
     case "$line" in
         mac_allowed) STEP_RUNS_ON=mac_allowed; table=${answer#*$'\n'} ;;
+        ssh_allowed) STEP_RUNS_ON=ssh_allowed; table=${answer#*$'\n'} ;;
         natedev_only\ *) decision_reason=${line#natedev_only }; table=${answer#*$'\n'} ;;
         *)
             printf 'verify.sh: target eligibility check returned no decision; step refused\n' >&2
@@ -1612,31 +1663,52 @@ initialize_step_record() {
             printf 'verify.sh: target eligibility check returned invalid targets; step refused\n' >&2
             exit 2
         fi
-        if [[ "$eligibility" == eligible && "$settings" != - ]]; then
-            if [[ "$STEP_RUNS_ON" != mac_allowed ]]; then
+        if [[ "$settings" != - && ( "$eligibility" == eligible || ( "$STEP_RUNS_ON" != natedev_only && "$reason" =~ ^(busy|blocked)$ ) ) ]]; then
+            if [[ "$STEP_RUNS_ON" == natedev_only ]]; then
                 printf 'verify.sh: target eligibility answer differs from its targets; step refused\n' >&2
                 exit 2
             fi
             (( mac_targets += 1 ))
+            eligible_names+="${eligible_names:+,}$name"
+            if [[ "$(target_platform "$name")" == macos ]]; then mac_names+="${mac_names:+,}$name"; fi
+        elif [[ "$eligibility" == eligible && "$settings" == - ]]; then
+            eligible_names+="${eligible_names:+,}$name"
         elif [[ "$eligibility" == excluded && "$settings" != - ]]; then
             decision_reason=$reason
         fi
     done <<< "$table"
-    if [[ "$STEP_RUNS_ON" == mac_allowed && "$mac_targets" == 0 ]]; then
+    if [[ "$STEP_RUNS_ON" != natedev_only && "$mac_targets" == 0 ]]; then
         printf 'verify.sh: target eligibility check allowed no Mac target; step refused\n' >&2
         exit 2
     fi
     STEP_TARGET_TABLE=$table
+    if [[ "$STEP_RUNS_ON" != natedev_only ]]; then
+        while IFS=$'\t' read -r name eligibility reason settings; do
+            if [[ "$settings" != - && ( "$eligibility" == eligible || "$reason" =~ ^(busy|blocked)$ ) ]]; then
+                MAC_LEAVE_SETTINGS="$settings"
+                break
+            fi
+        done <<< "$table"
+    fi
     local record_args=(write --call-id "$BUILDLOG_CALL_ID" --pid "$$"
         --repo "$(git rev-parse --show-toplevel)" --kind "$CMD"
         --runs-on "$STEP_RUNS_ON" --reason "$decision_reason" --state waiting_hold)
+    if [[ "$STEP_RUNS_ON" == ssh_allowed ]]; then
+        record_args+=(--eligible-targets "$eligible_names" --mac-targets "$mac_names")
+    fi
     if [[ "$CMD" == test ]]; then record_args+=(--package "$PKG"); fi
     env -u BUILDLOG_CALL_ID "$PY" "$STEP_RECORD_SCRIPT" "${record_args[@]}" || exit 2
     STEP_RECORD_ACTIVE=1
+    export BUILDLOG_MEM_WAIT_FIRST_FILE="${BUILDLOG_MEM_WAIT_FIRST_FILE:-$HOLD_WAIT_DIR/first-queued-at}"
+    if [[ ! -s "$BUILDLOG_MEM_WAIT_FIRST_FILE" ]]; then
+        printf '%s\n' "${BUILDLOG_MEM_WAIT_SINCE:-${EPOCHSECONDS:-$(date +%s)}}" > "$BUILDLOG_MEM_WAIT_FIRST_FILE"
+    fi
+    export BUILDLOG_MEM_WAIT_SINCE="$(< "$BUILDLOG_MEM_WAIT_FIRST_FILE")"
     export BUILDLOG_CALL_ID
-    if [[ "$CMD" != test && "$STEP_RUNS_ON" == mac_allowed ]]; then
+    if [[ "$STEP_RUNS_ON" != natedev_only ]]; then
         while IFS=$'\t' read -r name eligibility reason settings; do
-            if [[ "$eligibility" == eligible && "$settings" != - ]]; then
+            if [[ "$settings" != - && ( "$eligibility" == eligible || "$reason" =~ ^(busy|blocked)$ )
+                  && "$(target_platform "$name")" == macos ]]; then
                 MAC_LEAVE_SETTINGS=$settings
                 register_mac_wait "$settings" 0
                 break
@@ -1652,13 +1724,15 @@ route_compiling_step() {
     step_state waiting_hold
     check_routing_hold || admission=$?
     case "$admission" in
-        0) if [[ "$STEP_FORCE_MAC" == 0 ]]; then return 0; fi ;;
+        0)
+            if [[ "$STEP_RUNS_ON" != ssh_allowed && "$STEP_FORCE_MAC" == 0 ]]; then return 0; fi
+            ;;
         10) ;;
         *) return "$admission" ;;
     esac
     step_state waiting_hold
-    if [[ "$STEP_RUNS_ON" == mac_allowed && "$CMD" != test ]]; then
-        if [[ "$CMD" == lint ]]; then
+    if [[ "$STEP_RUNS_ON" != natedev_only && "$CMD" != test ]]; then
+        if [[ "$CMD" == lint && "$admission" == 10 ]]; then
             HOLD_LINT=1
             : > "$HOLD_WAIT_DIR/lint-held"
         fi
@@ -1689,7 +1763,11 @@ route_compiling_step() {
         done
         MAC_FINISH_CALL=0
         local route_status=0
-        route_test || route_status=$?
+        if [[ -s "$HOLD_WAIT_DIR/ssh-reservation" ]]; then
+            try_reserved_target || route_status=$?
+        else
+            route_test || route_status=$?
+        fi
         STEP_FORCE_MAC=0
         (( route_status == 0 )) || return "$route_status"
         if [[ "$MAC_PASSED" == 1 ]]; then STEP_RAN_ON_MAC=1; return 0; fi
@@ -1712,6 +1790,7 @@ step_stopped_by_hold() {
 # Keep one retry rule for routing and local memory or hold waits.
 register_mac_wait() {
     [[ "${OSTYPE:-}" == linux* && -f "$MAC_IDLE_SCRIPT" ]] || return 0
+    [[ "$(target_platform "$(target_for_settings "$1")")" == macos ]] || return 0
     local board="${UNIT_RUN_DIR:-${UNIT_SESSION_DIR:-}}"
     MAC_IDLE_MARKER="$("$PY" "$MAC_IDLE_SCRIPT" register "$BUILDLOG_CALL_ID" "$$" \
         "${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}" "$PKG" "$1" "$2" \
@@ -1724,8 +1803,9 @@ register_mac_wait() {
 }
 
 remember_mac_retry() {
-    case "$BUILDLOG_MAC:$BUILDLOG_MAC_REASON" in
+    case "${LAST_TARGET_OUTCOME:-$BUILDLOG_MAC}:${LAST_TARGET_REASON:-$BUILDLOG_MAC_REASON}" in
         declined:no_tests|declined:off|declined:repo|declined:linux_only|declined:local_flag)
+            SSH_RETIRED_SETTINGS+=("$1")
             if [[ "$MAC_LEAVE_SETTINGS" == "$1" ]]; then
                 MAC_LEAVE_SETTINGS="" MAC_LEAVE_REASON="" MAC_RETRY_AFTER=0
                 BUILDLOG_MAC_IDLE_HOOK=""
@@ -1736,95 +1816,216 @@ remember_mac_retry() {
             fi
             return 1 ;;
     esac
-    MAC_LEAVE_SETTINGS="$1" MAC_LEAVE_REASON="$BUILDLOG_MAC_REASON" MAC_RETRY_AFTER=0
-    if [[ "$BUILDLOG_MAC" != declined || ( "$BUILDLOG_MAC_REASON" != busy && "$BUILDLOG_MAC_REASON" != blocked ) ]]; then
+    MAC_LEAVE_SETTINGS="$1" MAC_LEAVE_REASON="${LAST_TARGET_REASON:-$BUILDLOG_MAC_REASON}" MAC_RETRY_AFTER=0
+    if [[ "$(target_platform "$(target_for_settings "$1")")" != macos ]]; then
+        SSH_RETRY_SETTINGS+=("$1") SSH_RETRY_DEADLINES+=(0)
+        return 0
+    fi
+    if [[ "${LAST_TARGET_OUTCOME:-$BUILDLOG_MAC}" != declined || ( "$MAC_LEAVE_REASON" != busy && "$MAC_LEAVE_REASON" != blocked ) ]]; then
         MAC_RETRY_AFTER="$("$PY" -c 'import time; print(time.monotonic() + 180)')"
         if [[ "$MAC_RETRY_NOTICE_SHOWN" == 0 ]]; then
             echo "verify.sh: Mac attempt ended ($BUILDLOG_MAC${BUILDLOG_MAC_REASON:+: $BUILDLOG_MAC_REASON}); waiting 180 s before each retry while natedev waits." >&2
             MAC_RETRY_NOTICE_SHOWN=1
         fi
     fi
+    SSH_RETRY_SETTINGS+=("$1") SSH_RETRY_DEADLINES+=("$MAC_RETRY_AFTER")
     register_mac_wait "$1" "$MAC_RETRY_AFTER"
 }
 
 # The same command gates routing retries and both local wait hooks. The
 # deadline uses the call's monotonic clock. free-now reads local state only.
+target_platform() {
+    local platform
+    platform="$("$PY" "$BUILD_TARGETS_SCRIPT" platform --target "$1" 2>/dev/null)" || platform=""
+    case "$platform" in
+        macos|linux) printf '%s\n' "$platform" ;;
+        *) [[ "$STEP_RUNS_ON" == mac_allowed && "$1" == mac ]] && printf '%s\n' macos ;;
+    esac
+}
+
+target_for_settings() {
+    local name eligibility reason settings
+    while IFS=$'\t' read -r name eligibility reason settings; do
+        if [[ "$settings" == "$1" ]]; then printf '%s' "$name"; return; fi
+    done <<< "$STEP_TARGET_TABLE"
+    printf '%s' mac
+}
+
+release_wait_claim() {
+    [[ -n "${HOLD_WAIT_DIR:-}" ]] || return 0
+    "$PY" "$BUILD_TARGETS_SCRIPT" release-wait --pid $$ >/dev/null 2>&1 || true
+    rm -f "$HOLD_WAIT_DIR/ssh-reservation"
+}
+
+ssh_reserve_hook() {
+    local name=$1 settings=$2 retired index deadline=0
+    for retired in "${SSH_RETIRED_SETTINGS[@]}"; do
+        if [[ "$retired" == "$settings" ]]; then printf 'false'; return; fi
+    done
+    for index in "${!SSH_RETRY_SETTINGS[@]}"; do
+        if [[ "${SSH_RETRY_SETTINGS[$index]}" == "$settings" ]]; then
+            deadline=${SSH_RETRY_DEADLINES[$index]}
+        fi
+    done
+    if [[ "$MAC_LEAVE_SETTINGS" == "$settings" ]]; then deadline=$MAC_RETRY_AFTER; fi
+    if [[ "$deadline" != 0 && "$STEP_RUNS_ON" != mac_allowed ]]; then
+        printf '%q ' "$PY" -c 'import sys, time; sys.exit(time.monotonic() < float(sys.argv[1]))' "$deadline"
+        printf ' && '
+    fi
+    printf '%q ' "$PY" "$BUILD_TARGETS_SCRIPT" reserve --repo-root "${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}" \
+        --kind "$CMD" --package "$PKG" --pid $$ --reservation-file "$HOLD_WAIT_DIR/ssh-reservation" --target "$name"
+    if [[ "$STEP_RUNS_ON" == mac_allowed ]]; then printf '${SSH_RESERVE_RECOVERY:-}'; fi
+}
+
+ssh_retry_hook() {
+    [[ "$STEP_RUNS_ON" != natedev_only && "$LOCAL_ONLY" == 0 ]] || { printf 'false'; return; }
+    local name eligibility reason settings pivot=-1 index
+    local names=() candidates=()
+    while IFS=$'\t' read -r name eligibility reason settings; do
+        [[ "$settings" != - && ( "$eligibility" == eligible || "$reason" =~ ^(busy|blocked)$ ) ]] || continue
+        names+=("$name") candidates+=("$settings")
+        if [[ "$settings" == "$SSH_RETRY_AFTER_SETTINGS" ]]; then pivot=$((${#candidates[@]} - 1)); fi
+    done <<< "$STEP_TARGET_TABLE"
+    # Finish this pass before retrying targets from the previous pass.
+    for ((index=pivot+1; index<${#candidates[@]}; index++)); do
+        printf '{ '
+        if [[ "$STEP_RUNS_ON" == mac_allowed ]]; then
+            mac_retry_hook "${candidates[$index]}" "$MAC_RETRY_AFTER" reserve
+            printf ' && '
+        fi
+        ssh_reserve_hook "${names[$index]}" "${candidates[$index]}"
+        printf '; } || '
+    done
+    for ((index=0; index<=pivot; index++)); do
+        printf '{ '
+        if [[ "$STEP_RUNS_ON" == mac_allowed ]]; then
+            mac_retry_hook "${candidates[$index]}" "$MAC_RETRY_AFTER" reserve
+            printf ' && '
+        fi
+        ssh_reserve_hook "${names[$index]}" "${candidates[$index]}"
+        printf '; } || '
+    done
+    printf 'false'
+}
+
+try_reserved_target() {
+    local target settings
+    if [[ -s "$HOLD_WAIT_DIR/ssh-reservation" ]]; then
+        IFS=$'\t' read -r target settings < "$HOLD_WAIT_DIR/ssh-reservation"
+    elif [[ "$STEP_RUNS_ON" == mac_allowed && -n "$MAC_LEAVE_SETTINGS" ]]; then
+        settings=$MAC_LEAVE_SETTINGS
+    else
+        return 0
+    fi
+    SSH_RETRY_AFTER_SETTINGS=$settings
+    try_mac_test "$settings" "$MAC_LEAVE_REASON" || return $?
+    remember_mac_retry "$settings" || true
+}
+
+
 mac_retry_hook() {
+    local target
     if [[ "$2" != 0 ]]; then
         printf '{ '
         if [[ -n "$MAC_IDLE_MARKER" ]]; then printf 'test -f %q || ' "$MAC_IDLE_MARKER"; fi
         printf '%q ' "$PY" -c 'import sys, time; sys.exit(time.monotonic() < float(sys.argv[1]))' "$2"
         printf '; } && '
     fi
-    printf '%q ' "$PY" "$MAC_TEST_SCRIPT" free-now --settings "$1" \
-        --repo-root "${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}"
+    if [[ "${3:-}" == reserve ]]; then printf '{ if SSH_RETRY_AVAILABILITY="$('; fi
+    printf '%q ' "$PY" "$MAC_TEST_SCRIPT" free-now --settings "$1"
+    target="$(target_for_settings "$1")"
+    if [[ "$target" != mac ]]; then printf '%q ' --target "$target"; fi
+    printf '%q ' --repo-root "${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}"
+    if [[ "${3:-}" == reserve ]]; then
+        printf ')"; then SSH_RETRY_AVAILABILITY="${SSH_RETRY_AVAILABILITY:-free}"; fi; '
+        printf 'case "$SSH_RETRY_AVAILABILITY" in free) SSH_RESERVE_RECOVERY= ;; busy) SSH_RESERVE_RECOVERY=--recover-only ;; *) false ;; esac; }'
+    fi
 }
 
 route_test() {
-    local table name eligibility reason settings admission=0 announced_reason="" retry_index
-    local retry_settings=() retry_reasons=() retry_after=()
-    table=$STEP_TARGET_TABLE
-    if [[ -z "$table" ]]; then
-        printf 'verify.sh: target eligibility check returned no targets; step refused\n' >&2
-        exit 2
-    fi
+    local name eligibility reason settings admission remote_candidates=0 reservation_status
+    local announced_reason="" retry=0 retry_ready
     while IFS=$'\t' read -r name eligibility reason settings; do
-        if [[ -z "$name" || ( "$eligibility" != eligible && "$eligibility" != excluded ) || -z "$reason" || -z "$settings" || "$settings" == *$'\t'* ]]; then
-            printf 'verify.sh: target eligibility check returned invalid targets; step refused\n' >&2
-            exit 2
-        fi
-    done <<< "$table"
-
-    # Read exclusions before selecting a target so local-first routing also
-    # records why a Mac cannot run this package.
-    while IFS=$'\t' read -r name eligibility reason settings; do
-        if [[ "$eligibility" == eligible && "$settings" != - && -f "$MAC_RUNNER" ]]; then
-            MAC_LEAVE_SETTINGS="$settings"
-            register_mac_wait "$settings" 0
-        fi
-        if [[ "$eligibility" == excluded && "$settings" != - ]]; then
+        if [[ "$eligibility" == excluded && "$settings" != - && "$(target_platform "$name")" == macos ]]; then
             BUILDLOG_MAC=declined
-            if [[ "$LOCAL_ONLY" -eq 0 ]]; then
-                BUILDLOG_MAC_REASON="$reason"
+            if [[ "$LOCAL_ONLY" == 0 ]]; then
+                BUILDLOG_MAC_REASON=$reason
                 export BUILDLOG_LOCAL_REASON="$reason"
             fi
         fi
-    done <<< "$table"
-
-    while IFS=$'\t' read -r name eligibility reason settings; do
-        [[ "$eligibility" == eligible ]] || continue
-        if [[ "$settings" == - ]]; then
-            if [[ "$STEP_FORCE_MAC" == 1 ]]; then continue; fi
+    done <<< "$STEP_TARGET_TABLE"
+    while true; do
+        if [[ "$retry" == 1 && "$STEP_RUNS_ON" != mac_allowed ]]; then
             admission=0
             check_routing_hold || admission=$?
             case "$admission" in
-                0) return 0 ;;
-                10) continue ;;
-                *) exit "$admission" ;;
+                0) collect_routing_wait; return 0 ;;
+                10) ;;
+                *) return "$admission" ;;
             esac
         fi
-        [[ -f "$MAC_RUNNER" ]] || continue
-        try_mac_test "$settings" || return $?
-        if [[ "$MAC_PASSED" == 1 ]]; then return 0; fi
-        if remember_mac_retry "$settings"; then
-            retry_settings+=("$settings")
-            retry_reasons+=("$MAC_LEAVE_REASON")
-            retry_after+=("$MAC_RETRY_AFTER")
-        fi
-    done <<< "$table"
-
-    [[ ${#retry_settings[@]} -gt 0 ]] || return 0
-    while true; do
+        remote_candidates=0
+        while IFS=$'\t' read -r name eligibility reason settings; do
+            if [[ "$settings" == - ]]; then
+                [[ "$retry" == 0 && "$eligibility" == eligible && "$STEP_FORCE_MAC" == 0 ]] || continue
+                admission=0
+                check_routing_hold || admission=$?
+                case "$admission" in
+                    0) collect_routing_wait; return 0 ;;
+                    10) continue ;;
+                    *) return "$admission" ;;
+                esac
+            fi
+            [[ "$STEP_RUNS_ON" != natedev_only ]] || continue
+            if [[ "$eligibility" == excluded && ! "$reason" =~ ^(busy|blocked)$ ]]; then continue; fi
+            [[ -f "$MAC_RUNNER" ]] || continue
+            if [[ "$(ssh_reserve_hook "$name" "$settings")" == false ]]; then continue; fi
+            remote_candidates=1
+            if [[ "$retry" == 1 && "$STEP_RUNS_ON" == mac_allowed ]]; then
+                retry_ready=0
+                eval "$(mac_retry_hook "$settings" "$MAC_RETRY_AFTER" reserve)" >/dev/null 2>&1 || retry_ready=$?
+                if [[ "$retry_ready" != 0 ]]; then
+                    admission=0
+                    check_routing_hold || admission=$?
+                    case "$admission" in
+                        0) collect_routing_wait; return 0 ;;
+                        10) continue ;;
+                        *) return "$admission" ;;
+                    esac
+                fi
+            fi
+            if [[ -z "$MAC_IDLE_MARKER" ]]; then register_mac_wait "$settings" 0; fi
+            reservation_status=0
+            eval "$(ssh_reserve_hook "$name" "$settings")" || reservation_status=$?
+            if [[ "$retry" == 1 && "$reservation_status" == 11 && "$STEP_RUNS_ON" == mac_allowed ]]; then
+                continue
+            fi
+            if [[ "$reservation_status" == 0 || ( "$reservation_status" == 11 && "$STEP_RUNS_ON" == mac_allowed ) ]]; then
+                if [[ "$retry" == 1 ]]; then collect_routing_wait; fi
+                MAC_LEAVE_SETTINGS=$settings
+                try_reserved_target || return $?
+                if [[ "$MAC_PASSED" == 1 ]]; then return 0; fi
+                if [[ "$retry" == 1 && "$BUILDLOG_MAC" == declined ]]; then
+                    printf '%s\n' "${BUILDLOG_MAC_S:-0}" >> "$BUILDLOG_HOLD_WAIT_FILE"
+                fi
+            fi
+        done <<< "$STEP_TARGET_TABLE"
+        if [[ "$remote_candidates" == 0 ]]; then return 0; fi
         admission=0
         check_routing_hold || admission=$?
         case "$admission" in
             0) collect_routing_wait; return 0 ;;
             10) ;;
-            *) exit "$admission" ;;
+            *) return "$admission" ;;
         esac
-        if [[ "$announced_reason" != "$BUILDLOG_MAC_REASON" ]]; then
-            echo "verify.sh: waiting for the Mac ($BUILDLOG_MAC_REASON) or natedev's release." >&2
-            announced_reason="$BUILDLOG_MAC_REASON"
+        if [[ "$STEP_RUNS_ON" == mac_allowed ]]; then
+            if [[ "$announced_reason" != "$BUILDLOG_MAC_REASON" ]]; then
+                echo "verify.sh: waiting for the Mac ($BUILDLOG_MAC_REASON) or natedev's release." >&2
+                announced_reason=$BUILDLOG_MAC_REASON
+            fi
+        elif [[ -z "$announced_reason" ]]; then
+            echo 'verify.sh: waiting for eligible SSH capacity or the local hold release.' >&2
+            announced_reason=ssh
         fi
         phase_wait_start hold "build hold"
         if [[ -z "$ROUTING_WAIT_STARTED" ]]; then
@@ -1837,33 +2038,9 @@ route_test() {
         HOLD_WAITER_PID=""
         if [[ "$admission" != 0 ]]; then
             printf 'verify.sh: local release check failed (exit %s); step refused\n' "$admission" >&2
-            exit "$admission"
+            return "$admission"
         fi
-
-        # Try a free Mac before checking natedev again.
-        for ((retry_index=0; retry_index<${#retry_settings[@]}; retry_index++)); do
-            [[ -n "${retry_settings[$retry_index]}" ]] || continue
-            eval "$(mac_retry_hook "${retry_settings[$retry_index]}" "${retry_after[$retry_index]}")" >/dev/null 2>&1 || continue
-            collect_routing_wait
-            try_mac_test "${retry_settings[$retry_index]}" "${retry_reasons[$retry_index]}" || return $?
-            if [[ "$MAC_PASSED" == 1 ]]; then return 0; fi
-            if ! remember_mac_retry "${retry_settings[$retry_index]}"; then
-                retry_settings[$retry_index]=""
-                continue
-            fi
-            # Count declined claims as hold wait. A lost run may have run
-            # tests, so its runtime does not count as hold wait.
-            if [[ "$BUILDLOG_MAC" == declined ]]; then
-                printf '%s\n' "${BUILDLOG_MAC_S:-0}" >> "$BUILDLOG_HOLD_WAIT_FILE"
-            fi
-            retry_reasons[$retry_index]="$MAC_LEAVE_REASON"
-            retry_after[$retry_index]="$MAC_RETRY_AFTER"
-            if [[ "$announced_reason" != "$BUILDLOG_MAC_REASON" ]]; then
-                echo "verify.sh: waiting for the Mac ($BUILDLOG_MAC_REASON) or natedev's release." >&2
-                announced_reason="$BUILDLOG_MAC_REASON"
-            fi
-        done
-        [[ -n "$(printf '%s' "${retry_settings[@]}")" ]] || return 0
+        retry=1
     done
 }
 
@@ -1959,9 +2136,9 @@ run_local_test() {
     while true; do
         hook=""
         copy_watch=0
-        if [[ -n "$MAC_LEAVE_SETTINGS" ]]; then
-            hook="$(mac_retry_hook "$MAC_LEAVE_SETTINGS" "$MAC_RETRY_AFTER")"
-            if [[ -f "$MAC_COPY_WATCH" && -f "$MAC_RUNNER" ]]; then
+        if [[ "$STEP_RUNS_ON" != natedev_only ]]; then
+            hook="$(ssh_retry_hook)"
+            if [[ -n "$MAC_LEAVE_SETTINGS" && "$(target_platform "$(target_for_settings "$MAC_LEAVE_SETTINGS")")" == macos && -f "$MAC_COPY_WATCH" && -f "$MAC_RUNNER" ]]; then
                 copy_watch=1
             fi
         fi
@@ -1987,8 +2164,7 @@ run_local_test() {
             return "$status"
         fi
         # The step never started and has no memory reservation.
-        try_mac_test "$MAC_LEAVE_SETTINGS" "$MAC_LEAVE_REASON"
-        remember_mac_retry "$MAC_LEAVE_SETTINGS" || true
+        try_reserved_target
     done
 }
 
@@ -2160,7 +2336,7 @@ HOLD_WAIT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/verify-hold.$$.XXXXXX")"
 export BUILDLOG_HOLD_WAIT_FILE="$HOLD_WAIT_DIR/seconds"
 export BUILDLOG_HOLD_WAITER_FILE="$HOLD_WAIT_DIR/waiter"
 export BUILDLOG_CHECK_FAILED_FILE="$HOLD_WAIT_DIR/check-failed"
-trap 'hold_status=$?; interrupt_hold_wait; finish_hold_wait; remove_step_record; final_pass_finish "$hold_status"; exit "$hold_status"' EXIT
+trap 'hold_status=$?; interrupt_hold_wait; finish_hold_wait; release_wait_claim; remove_step_record; final_pass_finish "$hold_status"; exit "$hold_status"' EXIT
 hold_interrupted() {
     local signal_name=$1 code=$2
     trap - INT TERM HUP
@@ -2185,7 +2361,7 @@ if [[ "$CMD" == test ]]; then
 fi
 while ! build_hold_nothing_held; do
     step_state waiting_hold
-    if [[ "$CMD" != test && "$STEP_RUNS_ON" == mac_allowed ]]; then
+    if [[ "$CMD" != test && "$STEP_RUNS_ON" != natedev_only ]]; then
         HOLD_WAIT_STATUS=0
         check_routing_hold || HOLD_WAIT_STATUS=$?
         case "$HOLD_WAIT_STATUS" in
@@ -2200,7 +2376,7 @@ while ! build_hold_nothing_held; do
     phase_wait_start hold "build hold"
     HOLD_WAIT_ARGS=(wait-local --call-id "$BUILDLOG_CALL_ID" --pid $$)
     if [[ "$CMD" == test && -n "$MAC_LEAVE_SETTINGS" ]]; then
-        HOLD_WAIT_ARGS+=(--leave-hook "$(mac_retry_hook "$MAC_LEAVE_SETTINGS" "$MAC_RETRY_AFTER")")
+        HOLD_WAIT_ARGS+=(--leave-hook "$(ssh_retry_hook)")
     fi
     python3 "$BUILD_TARGETS_SCRIPT" "${HOLD_WAIT_ARGS[@]}" &
     HOLD_WAITER_PID=$!
@@ -2209,8 +2385,7 @@ while ! build_hold_nothing_held; do
     HOLD_WAITER_PID=""
     phase_wait_finish hold
     if [[ "$HOLD_WAIT_STATUS" == "$LINT_LEFT_QUEUE_STATUS" && -n "$MAC_LEAVE_SETTINGS" ]]; then
-        try_mac_test "$MAC_LEAVE_SETTINGS" "$MAC_LEAVE_REASON"
-        remember_mac_retry "$MAC_LEAVE_SETTINGS" || true
+        try_reserved_target
         continue
     fi
     if [[ "$HOLD_WAIT_STATUS" != 0 ]]; then
@@ -2471,11 +2646,10 @@ acquire_token() {
             (( status != 4 )) || token_wait_orphaned
         fi
         if [[ "$CMD" == test && -n "$MAC_LEAVE_SETTINGS" ]] \
-              && eval "$(mac_retry_hook "$MAC_LEAVE_SETTINGS" "$MAC_RETRY_AFTER")" >/dev/null 2>&1; then
-            try_mac_test "$MAC_LEAVE_SETTINGS" "$MAC_LEAVE_REASON"
-            remember_mac_retry "$MAC_LEAVE_SETTINGS" || true
-        elif [[ "$CMD" != test && "$STEP_RUNS_ON" == mac_allowed && -n "$MAC_IDLE_MARKER" && -f "$MAC_IDLE_MARKER" ]] \
-              && eval "$(mac_retry_hook "$MAC_LEAVE_SETTINGS" "$MAC_RETRY_AFTER")" >/dev/null 2>&1; then
+              && eval "$(ssh_retry_hook)" >/dev/null 2>&1; then
+            try_reserved_target
+        elif [[ "$CMD" != test && "$STEP_RUNS_ON" != natedev_only ]] \
+              && eval "$(ssh_retry_hook)" >/dev/null 2>&1; then
             STEP_FORCE_MAC=1
             return "$LINT_LEFT_QUEUE_STATUS"
         fi
@@ -2655,6 +2829,10 @@ remember_tree_reservation() {
 
 buildlog_wait_for_memory() {
     local memory_wait stat fields=()
+    if [[ ! -s "$BUILDLOG_MEM_WAIT_FIRST_FILE" ]]; then
+        printf '%s\n' "${BUILDLOG_MEM_WAIT_SINCE:-${EPOCHSECONDS:-$(date +%s)}}" > "$BUILDLOG_MEM_WAIT_FIRST_FILE"
+    fi
+    export BUILDLOG_MEM_WAIT_SINCE="$(< "$BUILDLOG_MEM_WAIT_FIRST_FILE")"
     if [[ -n "${TREE_WATCH_DIR:-}" && -r "/proc/${BASHPID:-$$}/stat" ]]; then
         stat="$(< "/proc/${BASHPID:-$$}/stat")"
         read -r -a fields <<< "${stat##*) }"
@@ -2834,6 +3012,7 @@ verify_cleanup() {
         EXIT_STATUS=1
     fi
     [[ -z "${TOKEN_WAIT_FILE:-}" ]] || rm -f "$TOKEN_WAIT_FILE" "${TOKEN_WAIT_FILE}.given_back"
+    release_wait_claim
     remove_step_record
 }
 # EXIT alone would report success for a failed cargo run, so branch on the

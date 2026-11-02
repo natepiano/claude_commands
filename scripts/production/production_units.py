@@ -24,6 +24,9 @@ from scripts.production.unit_table import (
 )
 
 
+WRAPPED = "> **Status: PRODUCTION — wrapped.**"
+
+
 class Production(NamedTuple):
     doc: Path
     slug: str
