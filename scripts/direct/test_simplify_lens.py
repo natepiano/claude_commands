@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import cast, override
 
 from scripts.direct.recorder_fixture import communicate_launcher, invoke_recorder
-from scripts.direct.wait_for_test_state import wait_for_file
+from scripts.direct.wait_for_test_state import wait_for_file, wait_until
 from scripts.lib.nix_env_test_support import NixFixture, ROOT
 from scripts.lib.git_test_support import commit_repository
 from scripts.lib.test_agents_registry import write_registry
@@ -43,6 +43,8 @@ class SimplifyDispatchTests(NixFixture):
         self.env.update({"AGENTS_CONFIG_FILE": str(registry), "AGENTS_CONFIG_PUBLISH": "0",
                          "CODEX_CATALOG_SYNC_STATE_FILE": str(registry), "USAGE_STATE_DIR": str(self.root / "usage")})
         self.env.update(config_environment(self.root))
+        # The fixture sets the lens itself; the live config may switch it off.
+        _ = write_config_fixture(self.root / "direct.conf", "SIMPLIFY_LENS=on\n")
         self.env.update({"UNIT_HISTORY_DIR": str(self.root / "history"),
                          "UNIT_ACTIVE_DIR": str(self.root / "active"),
                          "UNIT_SYNC_WRITES": "0", "PYTHONPATH": str(ROOT),
@@ -117,7 +119,7 @@ raise SystemExit(int(os.environ.get("SIMPLIFY_TEST_EXIT", "0")))
         process = subprocess.Popen(self.command("--phase", phase), env=environment, text=True,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
         self.addCleanup(self.stop_review, process)
-        wait_for_file(started)
+        wait_until(started.exists, started.parent, processes=(process,))
         return process, gate
 
     def records(self) -> list[dict[str, object]]:
