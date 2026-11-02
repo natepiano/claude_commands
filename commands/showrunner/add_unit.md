@@ -1,5 +1,5 @@
 ---
-description: Add a unit to the running production, create its worktree, and start its unit director.
+description: Add and start a production unit.
 argument-hint: '<name> (--plan <path> | --brief "<goal>" | --standby | --permanent) [--port <n>] [--owns "<text>"] [--responsibility <name>]'
 ---
 

@@ -1,5 +1,5 @@
 ---
-description: Scaffold a new Rust crate from the local rust-template, either standalone under ~/rust or as a member of the current workspace.
+description: Create a Rust crate from the template.
 ---
 
 # New Rust Project

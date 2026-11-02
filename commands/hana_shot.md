@@ -1,5 +1,5 @@
 ---
-description: Frame Hana's camera on a stored or ad hoc view over BRP and save a timed screenshot (full window or cropped to the target). Args - shot|views|pose|targets|stats|launch|shutdown ...
+description: Control Hana views and screenshots.
 ---
 
 1. One line launches a test Hana, shoots, and shuts it down. Run it from the Hana worktree; build first (`cargo build -p hana`):

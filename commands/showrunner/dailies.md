@@ -1,5 +1,5 @@
 ---
-description: Report a running production's state to the executive producer (the user) — every unit and every open topic — at one of four lengths, gantt (default: the chart, with only what needs the user and what changed), simple, page or elaborate.
+description: Report production progress to the user.
 argument-hint: "[gantt|simple|page|elaborate] [default|ascii] [expand <child|all>]"
 ---
 

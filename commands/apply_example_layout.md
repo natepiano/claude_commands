@@ -1,5 +1,5 @@
 ---
-description: Reorganize a crate example so its primary-API code reads first and supporting/decorative code comes last
+description: Place the main example API code first.
 ---
 
 # Apply Example Layout

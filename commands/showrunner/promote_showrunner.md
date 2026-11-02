@@ -1,5 +1,5 @@
 ---
-description: Turn one of this production's running units into the showrunner of its own production, still reporting to this one.
+description: Promote a unit to child showrunner.
 argument-hint: "<unit> <production doc> [check]"
 ---
 

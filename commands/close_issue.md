@@ -1,5 +1,5 @@
 ---
-description: Close one Hanadocs issue using the vault's closure metadata and automatic backlog ranking.
+description: Close a Hanadocs issue.
 ---
 
 Close exactly one issue in the Hanadocs Obsidian vault. This command works from any project, so always use the fixed absolute paths below and never derive the vault from the current working directory.
