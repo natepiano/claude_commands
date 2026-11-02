@@ -3314,11 +3314,9 @@ class ProgramProfileTests(MemoryQueueFixture):
         super().setUp()
         _ = cast(object, self.enterContext(patch.dict(os.environ, fake_memory_readings(self.root))))
 
-    def test_gate_without_history_uses_its_cap_and_keeps_its_queue_identity(self) -> None:
-        estimate = gate.program_peak_estimate("merge-gate", "host", NOW, self.root, 4 * GIB)
-        self.assertEqual(estimate, gate.FirstProgramPeak(4 * GIB))
+    def test_fixed_cap_gate_keeps_its_queue_identity(self) -> None:
         profile = gate.ProgramProfile("merge-gate", "installed/.claude", "checkout",
-                                      gate.HistoryPeakSizing(4 * GIB, estimate, 0.0))
+                                      gate.FixedCapSizing(4 * GIB))
         _ = self.running(100, 20, age=1)
         with patch.object(gate, "git_identity", side_effect=AssertionError("gate inferred cargo identity")):
             result = gate.check(self.meminfo, 400, "", ["merge-gate"], root=self.root, now=NOW, profile=profile)
@@ -3327,7 +3325,7 @@ class ProgramProfileTests(MemoryQueueFixture):
         waiter, = gate.admission_dir(self.root).glob("*.waiting")
         row = cast(gate.Waiter, json.loads(waiter.read_text()))
         self.assertEqual((row.get("step"), row.get("folder"), row.get("need_source")),
-                         ("merge-gate", "checkout", "fallback"))
+                         ("merge-gate", "checkout", "cap"))
 
     def test_gate_history_uses_only_recent_gate_peaks_on_this_host(self) -> None:
         history = gate.admission_dir(self.root) / "anon_peaks.jsonl"
@@ -3353,7 +3351,7 @@ class ProgramProfileTests(MemoryQueueFixture):
         self.readings[400] = gate.MeasuredMemory(GIB)
         busy = self.running(100, 20, age=1)
         profile = gate.ProgramProfile("merge-gate", "installed/.claude", str(checkout),
-                                      gate.HistoryPeakSizing(4 * GIB, gate.FirstProgramPeak(4 * GIB), 0.0))
+                                      gate.FixedCapSizing(4 * GIB))
         for state in ("hold", "admit"):
             with self.subTest(state=state):
                 if state == "admit":
@@ -3406,6 +3404,184 @@ class ProgramProfileTests(MemoryQueueFixture):
         self.assertEqual(result.peak, gate.ExpectedPeak(4 * GIB, "fallback", 0))
         self.assertEqual(cast(gate.HistoryPeakSizing, cast(gate.ProgramProfile, result.profile).sizing).estimate, gate.FirstProgramPeak(4 * GIB))
         self.assertEqual((result.repo, result.step), ("installed/.claude", "merge-gate"))
+
+
+class FixedCapAdmissionTests(MemoryQueueFixture):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        config = self.root / "lint.conf"
+        write_memory_config(config)
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {
+            **fake_memory_readings(self.root, total_kib=60 * GIB // 1024),
+            "BUILDLOG_BUILD_BUDGET_GIB": "21", "LINT_CONFIG_FILE": str(config),
+        })))
+
+    def hold_program(self, sizing: gate.FixedCapSizing | gate.HistoryPeakSizing) -> tuple[gate.ProgramProfile, Path]:
+        profile = gate.ProgramProfile("merge-gate", "installed/.claude", "checkout", sizing)
+        _ = self.meminfo.write_text(f"MemAvailable: 0 kB\nMemTotal: {60 * GIB // 1024} kB\n")
+        result = gate.check(self.meminfo, 400, "", ["merge-gate"], root=self.root, now=NOW, profile=profile)
+        self.assertEqual(result.decision.state, "hold")
+        self.assertIsInstance(result.reservation, gate.NotReserved)
+        path = self.root / "admission/400-warmup.waiting"
+        waiter = gate.read_waiter(path)
+        self.assertEqual(waiter.get("estimated_at"), NOW.timestamp())
+        self.assertEqual(waiter.get("need_source"), profile.peak.source)
+        _ = self.meminfo.write_text(f"MemAvailable: {60 * GIB // 1024} kB\nMemTotal: {60 * GIB // 1024} kB\n")
+        return profile, path
+
+    def check_after_lock_delay(self, profile: gate.ProgramProfile) -> tuple[gate.CheckResult, str]:
+        later = NOW + timedelta(seconds=gate.DEFAULT_ADMISSION_POLICY.timing.head_seconds + 1)
+        acquire_lock = fcntl.flock
+        errors = io.StringIO()
+        with patch.object(gate, "datetime", wraps=datetime) as clock:
+            clock.configure_mock(**{"now.return_value": NOW})
+
+            def delayed_lock(file: TextIO, operation: int) -> None:
+                acquire_lock(file, operation)
+                if operation == fcntl.LOCK_EX:
+                    clock.configure_mock(**{"now.return_value": later})
+
+            with patch.object(fcntl, "flock", side_effect=delayed_lock), contextlib.redirect_stderr(errors):
+                result = gate.check(self.meminfo, 400, "", ["merge-gate"], root=self.root, profile=profile)
+        return result, errors.getvalue()
+
+    def test_aged_cap_waiter_keeps_its_cap_in_queue_views(self) -> None:
+        for sizing in (gate.FixedCapSizing(6 * GIB),
+                       gate.HistoryPeakSizing(6 * GIB, gate.MeasuredProgramPeak(6 * GIB, 10), NOW.timestamp())):
+            with self.subTest(sizing=sizing):
+                profile, path = self.hold_program(sizing)
+                later = NOW.timestamp() + gate.DEFAULT_ADMISSION_POLICY.timing.head_seconds + 1
+                directory = path.parent
+                view, ordered = gate.read_queue(directory, gate.process_table(self.root / "proc"), later)
+                with patch.object(time, "time", return_value=later):
+                    explanation = gate.explain_queue()
+                waiter, = view.waiting
+                head = explanation.head
+                assert isinstance(head, gate.HeadExplanation)
+                source = head.need_source
+                assert isinstance(source, gate.RecordedNeed)
+                self.assertEqual(waiter.need, 6 * GIB)
+                self.assertEqual(head.waiter.need, 6 * GIB)
+                self.assertEqual(source.source, profile.peak.source)
+                self.assertEqual(ordered[0][1].get("estimated_at"), NOW.timestamp())
+                if isinstance(sizing, gate.FixedCapSizing):
+                    self.assertNotIsInstance(waiter.reason, gate.EstimateExpired)
+                    self.assertNotIsInstance(head.waiter.reason, gate.EstimateExpired)
+                    self.assertEqual(head.decision.state, "admit")
+                    self.assertEqual(source.basis, gate.ProgramMemoryCap("merge-gate"))
+                else:
+                    self.assertEqual(waiter.reason, gate.EstimateExpired(NOW.timestamp()))
+                    self.assertEqual(head.waiter.reason, waiter.reason)
+                    self.assertEqual(head.decision.state, "hold")
+
+    def test_cap_waiter_admits_when_lock_wait_exceeds_head_seconds(self) -> None:
+        profile, path = self.hold_program(gate.FixedCapSizing(6 * GIB))
+        result, errors = self.check_after_lock_delay(profile)
+        self.assertEqual(result.decision.state, "admit")
+        self.assertNotIsInstance(result.head_reason, gate.EstimateExpired)
+        self.assertEqual(result.peak, profile.peak)
+        self.assertNotIn("refresh", errors)
+        self.assertNotIn("expired", errors)
+        self.assertFalse(path.exists())
+        assert isinstance(result.reservation, gate.Reserved)
+        row = gate.read_reservation(result.reservation.path)
+        self.assertEqual(row["need"], 6 * GIB)
+        assert "queue_waiter" in row
+        waiter = row["queue_waiter"]
+        self.assertEqual(waiter.get("need_source"), "cap")
+        self.assertEqual(waiter.get("estimated_at"), NOW.timestamp())
+
+    def test_history_waiter_expires_when_lock_wait_exceeds_head_seconds(self) -> None:
+        profile, path = self.hold_program(gate.HistoryPeakSizing(
+            6 * GIB, gate.MeasuredProgramPeak(6 * GIB, 10), NOW.timestamp()))
+        result, errors = self.check_after_lock_delay(profile)
+        self.assertEqual(result.decision.state, "hold")
+        self.assertEqual(result.head_reason, gate.EstimateExpired(NOW.timestamp()))
+        self.assertIsInstance(result.reservation, gate.NotReserved)
+        self.assertIn("refresh", errors)
+        self.assertEqual(gate.read_waiter(path).get("estimated_at"), NOW.timestamp())
+
+    def test_fixed_cap_ignores_smaller_history_after_head_seconds(self) -> None:
+        write_history_rows(self.root, ({"step": "merge-gate", "host": "host", "anon_peak_bytes": 2 * GIB,
+            "ended_at": store.utc_iso(HISTORY_AT.timestamp())} for _ in range(10)))
+        profile = gate.ProgramProfile("merge-gate", "installed/.claude", "checkout", gate.FixedCapSizing(6 * GIB))
+        self.assertEqual(gate.program_peak_estimate("merge-gate", "host", NOW, self.root, 6 * GIB),
+                         gate.MeasuredProgramPeak(2 * GIB, 10))
+        history_profile = replace(profile, sizing=gate.HistoryPeakSizing(
+            6 * GIB, gate.MeasuredProgramPeak(2 * GIB, 10), NOW.timestamp()))
+        history = gate.check(self.meminfo, 200, "", ["merge-gate"], root=self.root, now=NOW, profile=history_profile)
+        self.assertEqual((history.peak.bytes, history.peak.source), (2 * GIB, "measured"))
+        if isinstance(history.reservation, gate.Reserved):
+            history.reservation.path.unlink()
+        busy = self.running(100, 20, age=1, peak=20)
+        sources: list[gate.RecordedNeed] = []
+        for elapsed in (0, gate.DEFAULT_ADMISSION_POLICY.timing.head_seconds + 1):
+            instant = NOW + timedelta(seconds=elapsed)
+            with patch.object(gate, "program_peak_estimate", side_effect=AssertionError("fixed cap read history")), \
+                 patch.object(time, "time", return_value=instant.timestamp()):
+                result = gate.check(self.meminfo, 400, "", ["merge-gate"], root=self.root, now=instant, profile=profile)
+                explanation = gate.explain_queue()
+            self.assertEqual((result.peak.bytes, result.peak.source, result.peak.count), (6 * GIB, "cap", 0))
+            self.assertEqual(result.decision.state, "hold")
+            self.assertEqual(result.profile, profile)
+            self.assertEqual(result.peak.basis, gate.ProgramMemoryCap("merge-gate"))
+            head = explanation.head
+            assert isinstance(head, gate.HeadExplanation)
+            assert isinstance(head.need_source, gate.RecordedNeed)
+            sources.append(head.need_source)
+            waiter = gate.read_waiter(self.root / "admission/400-warmup.waiting")
+            assert "need_basis" in waiter
+            self.assertEqual(gate.read_need_basis(waiter["need_basis"]), result.peak.basis)
+        self.assertEqual(sources[0], sources[1])
+        busy.unlink()
+
+    def test_program_cap_basis_round_trips_for_each_program(self) -> None:
+        for program in ("merge-gate", "rust-analyzer"):
+            with self.subTest(program=program):
+                basis = gate.ProgramMemoryCap(program)
+                self.assertEqual(gate.read_need_basis(gate.need_basis_record(basis)), basis)
+
+    def test_fixed_cap_blocks_a_waiter_after_ramp_and_peak_decay(self) -> None:
+        policy = gate.DEFAULT_ADMISSION_POLICY
+        path = self.running(100, 6, age=policy.timing.ramp_seconds + 1, peak=5, fields={
+            "step": "merge-gate", "session_id": "gate-owner", "session_name": "gate-session",
+            "queue_waiter": {"need_source": "cap", "need_basis": gate.need_basis_record(gate.ProgramMemoryCap("merge-gate"))},
+        })
+        for age in (0, policy.peak_hold.seconds_for("merge-gate") + 1):
+            with self.subTest(peak_age=age):
+                _ = path.with_suffix(".wave").write_text(f"{5 * GIB} {int(NOW.timestamp() - age)}")
+                result = self.check(need=20, free=40)
+                self.assertEqual((result.decision.state, result.decision.charged, result.decision.promised),
+                                 ("hold", 6 * GIB, 5 * GIB))
+                memory = gate.reservation_memory(path, gate.read_reservation(path), NOW,
+                    gate.process_table(self.root / "proc"), self.root / "proc", policy)
+                self.assertEqual(gate.charge_basis(memory), gate.LifetimePromise(6 * GIB))
+                self.assertEqual(gate.growth_headroom(memory), 5 * GIB)
+                directory = gate.admission_dir(self.root)
+                view, _ = gate.read_queue(directory, gate.process_table(self.root / "proc"), NOW.timestamp())
+                self.assertEqual(gate.charge_basis(view.running[0].measured), gate.LifetimePromise(6 * GIB))
+                self.assertEqual(view.promised, 5 * GIB)
+                with patch.object(time, "time", return_value=NOW.timestamp()):
+                    explanation = gate.explain_queue()
+                    blocker = gate.current_blocker(directory / "400-warmup.waiting")
+                self.assertEqual((explanation.totals.charged, explanation.totals.growth), (6 * GIB, 5 * GIB))
+                self.assertEqual(explanation.running[0].basis, gate.LifetimePromise(6 * GIB))
+                self.assertEqual(gate.blocker_fields(blocker),
+                                 {"session_id": "gate-owner", "session_name": "gate-session", "pool": "memory"})
+                self.assertEqual(gate.blocker_fields(result.blocker), gate.blocker_fields(blocker))
+
+    def test_fixed_cap_promise_uses_the_recorded_source_for_other_programs(self) -> None:
+        path = self.running(100, 6, age=gate.DEFAULT_ADMISSION_POLICY.timing.ramp_seconds + 1,
+                            fields={"step": "rust-analyzer", "queue_waiter": {"need_source": "cap"}})
+        row = gate.read_reservation(path)
+        memory = gate.step_promise(row, NOW, gate.MeasuredMemory(GIB), gate.DEFAULT_ADMISSION_POLICY)
+        self.assertEqual(gate.charge_basis(memory), gate.LifetimePromise(6 * GIB))
+        self.assertEqual(gate.growth_headroom(memory), 5 * GIB)
+        for used, observed in ((7, 0), (1, 8)):
+            with self.subTest(used=used, observed=observed):
+                memory = gate.step_promise(row, NOW, gate.MeasuredMemory(used * GIB, observed_peak=observed * GIB), gate.DEFAULT_ADMISSION_POLICY)
+                self.assertEqual(gate.build_charge(memory), max(6, used, observed) * GIB)
 
 
 class AdmitHeadTests(MemoryQueueFixture):

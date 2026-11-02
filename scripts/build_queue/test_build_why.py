@@ -506,6 +506,71 @@ class BuildWhyTests(unittest.TestCase):
                          "same-shape fallback: no runs; heavier of fallback and same-profile builds, last 14 days"
                          + "; no headroom factor; capped at 21.0 GiB (uncapped 24.0 GiB)")
 
+    def test_cap_need_text_uses_the_program_in_the_recorded_basis(self) -> None:
+        for program, words in (("merge-gate", "the merge gate's memory cap"),
+                               ("rust-analyzer", "rust-analyzer's memory cap")):
+            with self.subTest(program=program):
+                basis = gate.read_need_basis(gate.need_basis_record(gate.ProgramMemoryCap(program)))
+                source = gate.RecordedNeed("cap", 0, 14, "full", "", (), gate.WidthNotRecorded(), basis)
+                self.assertEqual(build_why.need_text(source), words)
+
+    def test_gate_cap_need_and_charge_text_stay_the_same_after_head_seconds(self) -> None:
+        self.reset_running(available=40, need=20)
+        path = self.running(700, "gate", "merge-gate", 6, 1,
+                            int(gate.DEFAULT_ADMISSION_POLICY.timing.ramp_seconds + 1), peak=5)
+        row = cast(dict[str, object], json.loads(path.read_text()))
+        row["queue_waiter"] = {"need_source": "cap"}
+        _ = path.write_text(json.dumps(row))
+        self.change_head(step="merge-gate", need_source="cap", need_runs=0,
+                         need_basis=gate.need_basis_record(gate.ProgramMemoryCap("merge-gate")))
+        lines: list[tuple[str, str]] = []
+        for elapsed in (0, gate.DEFAULT_ADMISSION_POLICY.timing.head_seconds + 1):
+            with mock.patch.object(time, "time", return_value=NOW + elapsed):
+                reading = gate.queue_read()
+            assert isinstance(reading, gate.QueueRead)
+            head = reading.explanation.head
+            assert isinstance(head, gate.HeadExplanation)
+            running, = reading.explanation.running
+            lines.append((build_why.need_text(head.need_source), build_why.charge_text(
+                running.basis, user_zone(), reading.explanation.policy, running.step.step)))
+            self.assertEqual(running.charged, 6 * GIB)
+        self.assertEqual(lines[0], lines[1])
+        self.assertEqual(lines[0], ("the merge gate's memory cap", "merge gate promise: holds until the step ends"))
+
+    def test_lifetime_charge_text_names_the_merge_gate_and_release_build(self) -> None:
+        for step, name in (("merge-gate", "merge gate"), ("build", "release build")):
+            with self.subTest(step=step):
+                text = build_why.charge_text(gate.LifetimePromise(6 * GIB), user_zone(),
+                                             gate.DEFAULT_ADMISSION_POLICY, step)
+                self.assertEqual(text, f"{name} promise: holds until the step ends")
+
+    def test_aged_cap_waiter_has_no_refresh_text_but_history_waiter_does(self) -> None:
+        expired_at = NOW - gate.DEFAULT_ADMISSION_POLICY.timing.head_seconds - 1
+        for sizing in (gate.FixedCapSizing(6 * GIB),
+                       gate.HistoryPeakSizing(6 * GIB, gate.MeasuredProgramPeak(6 * GIB, 10), expired_at)):
+            with self.subTest(sizing=sizing):
+                profile = gate.ProgramProfile("merge-gate", "installed/.claude", "/tmp/gate", sizing)
+                self.change_head(step=profile.step, need=profile.peak.bytes,
+                                 need_source=profile.peak.source, need_runs=profile.peak.count,
+                                 need_basis=gate.need_basis_record(profile.peak.basis),
+                                 estimated_at=expired_at)
+                head = gate.explain_queue().head
+                assert isinstance(head, gate.HeadExplanation)
+                self.assertEqual(head.waiter.need, 6 * GIB)
+                text = self.output()
+                need_line = self.line(text, "First in line:")
+                self.assertIn("need 6.0 GiB", need_line)
+                if isinstance(sizing, gate.FixedCapSizing):
+                    self.assertNotIsInstance(head.waiter.reason, gate.EstimateExpired)
+                    self.assertIn("the merge gate's memory cap", need_line)
+                    self.assertNotIn("refresh", text)
+                    self.assertNotIn("estimate expired", text)
+                else:
+                    self.assertEqual(head.waiter.reason, gate.EstimateExpired(expired_at))
+                    self.assertIn("p90 of 10", need_line)
+                    self.assertIn("estimate refresh:", text)
+                    self.assertIn("it refreshes on the next poll", text)
+
     def test_ramp_text_uses_the_explanations_policy_after_config_changes(self) -> None:
         config = self.root / "policy.conf"
         _ = config.write_text("[memory]\nramp_seconds=420\n")

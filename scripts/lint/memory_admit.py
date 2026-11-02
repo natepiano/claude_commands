@@ -184,7 +184,7 @@ class UnknownRepository:
 Repository = RepositoryIdentity | UnknownRepository
 TestScope = Literal["full", "filtered"]
 LegacyNeedSource = Literal["measured", "buildlog", "pooled", "fallback"]
-NeedSource = LegacyNeedSource | Literal["shape"]
+NeedSource = LegacyNeedSource | Literal["shape", "cap"]
 
 
 @dataclass(frozen=True)
@@ -245,7 +245,14 @@ class ShapeFallback:
 
 
 ShapeNeedBasis = ShapeP90 | ShapeLargest | ShapeFallback
-NeedBasis = LegacyNeedSource | ShapeNeedBasis
+
+
+@dataclass(frozen=True)
+class ProgramMemoryCap:
+    program: str
+
+
+NeedBasis = LegacyNeedSource | ShapeNeedBasis | ProgramMemoryCap
 
 
 @dataclass(frozen=True)
@@ -386,6 +393,8 @@ class ExpectedPeak:
     def __post_init__(self) -> None:
         if self.source == "shape" and not isinstance(self.basis, (ShapeP90, ShapeLargest, ShapeFallback)):
             raise ValueError("a shape estimate needs its shape basis")
+        if self.source == "cap" and not isinstance(self.basis, ProgramMemoryCap):
+            raise ValueError("a cap need requires its program cap basis")
         if isinstance(self.basis, BasisNotRecorded):
             object.__setattr__(self, "basis", self.source)
 
@@ -1004,7 +1013,8 @@ class EstimateExpired:
 
 
 def estimate_expired(waiter: Waiter, now: float, policy: AdmissionPolicy) -> bool:
-    return now - waiter.get("estimated_at", now) >= policy.timing.head_seconds
+    return (waiter.get("need_source") != "cap"
+            and now - waiter.get("estimated_at", now) >= policy.timing.head_seconds)
 
 
 WaitReason = EstimateExpired | NeedsBuildBudget | NeedsMemory | BehindHead | BehindOlderFit | HeadAdmissionStatus | ReadyForAdmission | ReadingUnavailable | MemoryPressure
@@ -1437,7 +1447,7 @@ class ProgramProfile:
     @property
     def peak(self) -> ExpectedPeak:
         if isinstance(self.sizing, FixedCapSizing):
-            return ExpectedPeak(self.sizing.cap_bytes, "fallback", 0)
+            return ExpectedPeak(self.sizing.cap_bytes, "cap", 0, ProgramMemoryCap(self.program))
         estimate = self.sizing.estimate
         return (ExpectedPeak(estimate.bytes, "measured", estimate.runs)
                 if isinstance(estimate, MeasuredProgramPeak) else ExpectedPeak(estimate.bytes, "fallback", 0))
@@ -2033,6 +2043,8 @@ def _need_record(basis: NeedBasis | BasisNotRecorded | TestPhaseNeed | NoTestPha
         return {"kind": "no_test_phase_need", "reason": basis.reason}
     if isinstance(basis, (BasisNotRecorded, str)):
         return {"kind": basis if isinstance(basis, str) else "not_recorded"}
+    if isinstance(basis, ProgramMemoryCap):
+        return {"kind": "program_memory_cap", "program": basis.program}
     cap: dict[str, object] = ({"kind": "budget", "uncapped": basis.cap.uncapped}
                               if isinstance(basis.cap, CappedAtBudget) else {"kind": "none"})
     if isinstance(basis, ShapeFallback):
@@ -2054,6 +2066,9 @@ def _read_need_record(raw: object) -> NeedBasis | BasisNotRecorded | TestPhaseNe
         return BasisNotRecorded()
     row = cast(dict[str, object], raw)
     kind = row.get("kind")
+    if kind == "program_memory_cap":
+        program = row.get("program")
+        return ProgramMemoryCap(program) if isinstance(program, str) and program else BasisNotRecorded()
     if kind == "no_test_phase_need" and row.get("reason") in ("no_width", "no_history", "not_recorded"):
         return NoTestPhaseNeed(cast(Literal["no_width", "no_history", "not_recorded"], row["reason"]))
     if kind == "test_phase_need":
@@ -2625,7 +2640,8 @@ def step_memory(row: Reservation, now: datetime, processes: dict[int, ProcessIde
 
 def step_promise(row: Reservation, now: datetime, reading: StepMemory, policy: AdmissionPolicy) -> StepMemory:
     """Apply the reservation lifetime promise at this instant."""
-    if isinstance(reading, MeasuredMemory) and release_build(row):
+    if isinstance(reading, MeasuredMemory) and (release_build(row)
+            or row.get("queue_waiter", {}).get("need_source") == "cap"):
         return replace(reading, promise=LifetimePromise(row["need"]))
     if isinstance(reading, MeasuredMemory) and now.timestamp() - _epoch(row["admitted_at"]) < policy.timing.ramp_seconds:
         if reading.bytes == 0:
@@ -4479,7 +4495,8 @@ def run_action() -> None:
                 repository: Repository = (RepositoryIdentity(key, row.get("repository_name", cached_repo), row.get("legacy_name", ""))
                                           if key else UnknownRepository())
                 profile = StepProfile(cached_repo, cached_step, cached_worktree,
-                                      ExpectedPeak(row["need"], basis if isinstance(basis, str) else "shape",
+                                      ExpectedPeak(row["need"], basis if isinstance(basis, str) else
+                                                   "cap" if isinstance(basis, ProgramMemoryCap) else "shape",
                                                    row.get("need_runs", 0), basis),
                                       repository, row["test_scope"], row["estimated_at"])
         except (OSError, ValueError, TypeError, KeyError):
