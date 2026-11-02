@@ -153,6 +153,24 @@ class NextItemTests(unittest.TestCase):
             self.assertEqual(run("show", "--kind", "question")[1], "question\ndemo: Newest question\n")
             self.assertEqual(run("show", "--kind", "question", "--order", "oldest")[1], "question\ndemo: Newest question\n")
 
+    def test_move_to_end_uses_the_given_key_instead_of_the_pinned_item(self) -> None:
+        queue = self.queues["change"]
+        urgency.pin(queue.name, "C2")
+        with self.patched():
+            self.assertEqual(next_item.move_to_end("change", PRODUCTION, key="C1"),
+                             "change: moved C1 to the end")
+            self.assertEqual([entry.key for entry in urgency.queue_order(queue.entries, queue.name)], ["C2", "C1"])
+            self.assertEqual(set(urgency.ended(queue.name)), {"C1"})
+            self.assertEqual(urgency.pinned(queue.name), "C2")
+
+    def test_move_to_end_refuses_a_key_outside_the_queue_without_moving_the_pin(self) -> None:
+        queue = self.queues["change"]
+        urgency.pin(queue.name, "C1")
+        with self.patched(), self.assertRaisesRegex(NextError, "C999"):
+            _ = next_item.move_to_end("change", PRODUCTION, key="C999")
+        self.assertEqual(urgency.pinned(queue.name), "C1")
+        self.assertEqual(urgency.ended(queue.name), {})
+
     def test_the_efficiency_and_change_lists_read_their_real_files(self) -> None:
         _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         _ = unit_membership("demo", "fixture-unit")
