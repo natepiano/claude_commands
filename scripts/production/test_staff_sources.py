@@ -1239,9 +1239,14 @@ class StaffSourcesTests(StaffTestCase):
     def test_missing_codex_thread_reports_one_codex_problem(self) -> None:
         from scripts.message import process_table
 
+        _ = self.fill_production("pane-demo", "models-unit")
+        unit = staff.by_path("pane-demo/models")
+        assert unit is not None
+        launch = pane_record.launch("test:pane", unit.id, str(self.root), {}, [])
+        _ = staff.update_current_session(unit.current_session, staff.native_id(fixture_runtime_id("pane-unit-current")))
         table = {42401: process_table.Process(42401, 1, "codex", "codex resume")}
-        record = staff.StaffSnapshot(())
-        sources = MemberSources({}, ())
+        record = staff.snapshot()
+        sources = MemberSources({}, (launch,))
         with (mock.patch.object(process_table, "snapshot", return_value=table),
               mock.patch.object(herdr, "process_environment", return_value={"HERDR_PANE_ID": "test:pane"})):
             evidence = staff_sources.observe_workers(
@@ -1252,6 +1257,35 @@ class StaffSourcesTests(StaffTestCase):
         self.assertEqual(evidence.diagnostics, (expected,))
         self.assertEqual(str(refused.exception), expected)
         self.assertNotIn("Claude", str(refused.exception))
+
+    def test_codex_without_a_thread_in_an_unowned_pane_reports_a_diagnostic_without_refusal(self) -> None:
+        from scripts.message import process_table
+
+        _ = self.fill_production("other-pane-demo", "models-unit")
+        unit = staff.by_path("other-pane-demo/models")
+        assert unit is not None
+        held = pane_record.launch("other:pane", unit.id, str(self.root), {}, [])
+        unowned = pane_record.launch("test:pane", fixture_runtime_id("unowned-pane"), str(self.root), {}, [])
+        table = {42401: process_table.Process(42401, 1, "codex", "codex resume")}
+        for launches in ((held,), (held, unowned)):
+            with (self.subTest(recorded=unowned in launches),
+                  mock.patch.object(process_table, "snapshot", return_value=table),
+                  mock.patch.object(herdr, "process_environment", return_value={"HERDR_PANE_ID": "test:pane"})):
+                evidence = staff_sources.observe_workers(staff.snapshot(), MemberSources({}, launches))
+            self.assertEqual(evidence.diagnostics, (
+                "staff sources: Codex process 42401: pane holds no staff member; not staff",))
+
+    def test_missing_codex_thread_in_a_pane_with_staff_unit_labels_keeps_the_scan_incomplete(self) -> None:
+        from scripts.message import process_table
+
+        _ = self.fill_production("label-pane-demo", "models-unit")
+        launch = pane_record.launch("test:pane", "", str(self.root), {
+            "SHOWRUNNER_UNIT": "label-pane-demo", "SHOWRUNNER_UNIT_ID": "models-unit"}, [])
+        table = {42401: process_table.Process(42401, 1, "codex", "codex resume")}
+        with (mock.patch.object(process_table, "snapshot", return_value=table),
+              mock.patch.object(herdr, "process_environment", return_value={"HERDR_PANE_ID": "test:pane"})):
+            with self.assertRaisesRegex(staff.StaffUnreadable, "native thread identity is unavailable"):
+                _ = staff_sources.observe_workers(staff.snapshot(), MemberSources({}, (launch,)))
 
     def test_unparsable_claude_settings_do_not_make_the_codex_scan_incomplete(self) -> None:
         from scripts.message import process_table
