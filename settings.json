@@ -482,7 +482,6 @@
   "tui": "fullscreen",
   "skipDangerousModePermissionPrompt": true,
   "skipWorkflowUsageWarning": true,
-  "theme": "dark",
   "editorMode": "normal",
   "autoCompactEnabled": true,
   "switchModelsOnFlag": false,
