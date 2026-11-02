@@ -4,6 +4,8 @@ Shutdown, the Codex mesh and build_hold are recording stand-ins. Claude
 sessions are fixture records; nothing real stops."""
 from __future__ import annotations
 
+from scripts.production.staff_test_support import fixture_member
+
 import io
 import json
 import math
@@ -377,8 +379,8 @@ class RetireUnitTests(unittest.TestCase):
         self.calls = []
         self.claude = [session(DIRECTOR, "alpha", 4101), session(SEAT, "alpha-seat", 4102)]
         self.staff.register_production("alpha", self.doc)
-        parent = staff.ensure("showrunner", name="alpha")
-        self.unit_staff_id = staff.ensure("unit", name="alpha", parent=parent.id,
+        parent = fixture_member("showrunner", name="alpha")
+        self.unit_staff_id = fixture_member("unit", name="alpha", parent=parent.id, runtime_id=DIRECTOR,
                          worktree=staff.PresentWorktree("natedev", self.worktree)).id
         unit_config.write(self.worktree, unit_config.UnitConfig(unit_config.PlanFile(Path("docs/plans/alpha.md")),
                                                                unit_config.AppPort(1), ("scripts",)))
@@ -509,14 +511,14 @@ class RetireUnitTests(unittest.TestCase):
         original = next(row for row in staff.find(kind="unit", parent=parent.id) if row.name == "alpha")
         runner = staff.rename(parent.id, "tools")
         unit = staff.rename(original.id, "panes")
-        self.staff.pane("w1:runner", session_id="session-alpha", environment={"STAFF_ID": runner.id})
+        self.staff.pane("w1:runner", session_id=runner.id, environment={"CLAUDE_CODE_SESSION_ID": runner.id})
         self.staff.pane("w1:p1", session_id=DIRECTOR, environment={
-            "STAFF_ID": unit.id, "SHOWRUNNER_UNIT": "alpha", "SHOWRUNNER_UNIT_ID": "alpha-unit"})
+            "CLAUDE_CODE_SESSION_ID": unit.id, "SHOWRUNNER_UNIT": "alpha", "SHOWRUNNER_UNIT_ID": "alpha-unit"})
         return runner, unit
 
     def test_retire_unit_keeps_staff_workers_and_reports_each_one(self) -> None:
         runner, unit = self.staff_unit()
-        worker = staff.ensure("worker", name="impl1", parent=unit.id)
+        worker = fixture_member("worker", name="impl1", parent=unit.id)
         code, output = self.retire()
         self.assertEqual(code, 1, output)
         self.assertIn(worker.id, output)
@@ -547,7 +549,7 @@ class RetireUnitTests(unittest.TestCase):
         _ = new_doc.write_text("- **Merge branch:** main\n"
                                + f"- **Showrunner checkout:** {self.checkout}\n- **Log:** log.md\n"
                                + new_doc.read_text())
-        receiving = staff.ensure("showrunner", name="receiving")
+        receiving = fixture_member("showrunner", name="receiving")
         before = self.staff.staff_file.read_bytes(), self.staff.staff_file.stat().st_mtime_ns
         with self.assertRaisesRegex(production_units.Refusal, "resume.*remove.*free the name"):
             _ = add_unit.ensure_staff_unit(read_production(self.staff.source_root / "receiving-production.md"),

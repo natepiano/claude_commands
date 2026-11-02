@@ -1,6 +1,8 @@
 """Exercise the staff contract with isolated state and an actual fake SSH process."""
 from __future__ import annotations
 
+from scripts.production.staff_test_support import fixture_member, fixture_worker, fixture_runtime_id
+
 import fcntl
 import io
 import json
@@ -21,6 +23,7 @@ from typing import cast
 from unittest import mock
 
 from scripts.production import staff
+from scripts.message import sessions
 from scripts.production.staff_test_support import CHECKOUT, STAFF_SCRIPT, StaffTestCase
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -31,7 +34,7 @@ KILLED_WRITER = """import os, sys
 sys.platform = 'linux'
 from scripts.production import staff
 os.replace = lambda *args, **kwargs: os._exit(73)
-staff.ensure('showrunner', name='interrupted')
+staff.ensure('showrunner', name='interrupted', runtime_id='196bcb82-c226-5d2c-8b39-94b20dd50f8d')
 """
 
 
@@ -47,17 +50,111 @@ def concurrent_ensure(
     with result:
         try:
             _ = ready.wait(timeout=TEST_HANG_GUARD_SECS)
-            row = staff.ensure(kind, name=name, parent=parent)
+            row = fixture_member(kind, name=name, parent=parent)
             result.send((True, str(row.id)))
         except Exception as error:
             result.send((False, repr(error)))
 
 
+class NativeRuntimeIdentityTests(StaffTestCase):
+    def test_new_members_use_only_the_native_id_supplied_by_the_backend(self) -> None:
+        runner_id = "00000000-0000-4000-8000-000000000001"
+        unit_id = "00000000-0000-4000-8000-000000000002"
+        thread_id = "019b3a40-4250-7000-8000-000000000003"
+        runner = staff.ensure("showrunner", name="demo", runtime_id=runner_id)
+        unit = staff.ensure("unit", name="models", parent=runner.id, runtime_id=unit_id)
+        worker = staff.ensure_worker("impl", unit.id, runtime_id=thread_id)
+        self.assertEqual([runner.id, unit.id, worker.id], [runner_id, unit_id, thread_id])
+        self.assertEqual([runner.current_session, unit.current_session, worker.current_session],
+                         [runner_id, unit_id, thread_id])
+        self.assertEqual([unit.parent, worker.parent], [runner_id, unit_id])
+        self.assertEqual(staff.by_id(staff.StaffId(thread_id)), worker)
+        before = self.staff_file.read_bytes()
+        with self.assertRaisesRegex(staff.StaffRefused, "native runtime identity"):
+            _ = staff.ensure("worker", name="unstarted", parent=unit.id)
+        self.assertEqual(self.staff_file.read_bytes(), before)
+
+    def test_removing_a_worker_refuses_its_live_native_session_and_names_that_session(self) -> None:
+        _, _, worker = self.tree()
+        _ = self.session_record(worker.id, worker.name)
+        before = self.staff_file.read_bytes()
+        with mock.patch.object(sessions, "session_liveness", return_value=sessions.LiveSessionProcess(os.getpid())):
+            with self.assertRaisesRegex(staff.StaffRefused, worker.id):
+                _ = staff.retire(worker.id)
+        self.assertEqual(self.staff_file.read_bytes(), before)
+        self.assertEqual(staff.by_id(worker.id), worker)
+
+    def test_runtime_session_changes_only_current_session_in_one_write_and_rerun_changes_no_byte(self) -> None:
+        runner, unit, worker = self.tree()
+        new_id = staff.StaffId("00000000-0000-4000-8000-000000000004")
+        before_bytes = self.staff_file.read_bytes()
+        calls: list[bytes] = []
+        original = os.replace
+
+        def record_publication(source: str | Path, destination: str | Path) -> None:
+            if Path(destination) == self.staff_file:
+                calls.append(Path(source).read_bytes())
+            original(source, destination)
+
+        with mock.patch.object(os, "replace", side_effect=record_publication):
+            changed = staff.update_current_session(unit.id, new_id)
+        self.assertEqual(changed, replace(unit, current_session=new_id))
+        self.assertEqual(staff.by_id(runner.id), runner)
+        self.assertEqual(staff.by_id(unit.id), changed)
+        self.assertEqual(staff.by_id(worker.id), worker)
+        self.assertEqual(len(calls), 1)
+        published = cast(dict[str, object], json.loads(calls[0]))
+        rows = cast(list[dict[str, object]], published["rows"])
+        self.assertTrue(any(row["id"] == worker.id and row["parent"] == unit.id for row in rows))
+        self.assertTrue(any(row["id"] == unit.id and row["current_session"] == new_id for row in rows))
+        self.assertEqual(self.staff_file.read_bytes(), before_bytes.replace(
+            f'"current_session": "{unit.current_session}"'.encode(),
+            f'"current_session": "{new_id}"'.encode(), 1))
+        before = self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns
+        self.assertEqual(staff.update_current_session(unit.id, new_id), changed)
+        self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), before)
+
+    def test_running_session_lookup_after_clear_does_not_match_the_fixed_first_session(self) -> None:
+        _, unit, worker = self.tree()
+        live = staff.native_id(fixture_runtime_id("current-unit-after-clear"))
+        changed = staff.update_current_session(unit.current_session, live)
+        self.assertEqual(staff.by_id(unit.id), changed)
+        self.assertEqual(staff.by_current_session(live), changed)
+        self.assertIsNone(staff.by_current_session(unit.id))
+        snapshot = staff.snapshot()
+        self.assertEqual(snapshot.by_current_session(live), changed)
+        self.assertIsNone(snapshot.by_current_session(unit.id))
+        self.assertEqual(snapshot.by_id(worker.id), worker)
+
+    def test_failed_runtime_publication_keeps_the_old_graph_and_all_other_stores(self) -> None:
+        _, unit, worker = self.tree()
+        untouched = self.root / "panes.json"
+        _ = untouched.write_text('{"session_id":"old"}\n')
+        parked = self.root / "units" / (unit.id + ".toml")
+        parked.parent.mkdir()
+        _ = parked.write_text('plan = "plan.md"\n')
+        before = self.staff_file.read_bytes(), untouched.read_bytes(), parked.read_bytes()
+        with mock.patch.object(os, "replace", side_effect=OSError("publication interrupted")):
+            with self.assertRaises((OSError, staff.StaffUnreadable)):
+                _ = staff.update_current_session(unit.id, staff.StaffId("00000000-0000-4000-8000-000000000005"))
+        self.assertEqual((self.staff_file.read_bytes(), untouched.read_bytes(), parked.read_bytes()), before)
+        self.assertEqual(staff.by_id(worker.id), worker)
+        self.assertEqual(staff.by_id(unit.id), unit)
+
+    def test_runtime_session_refuses_another_members_identity_without_a_write(self) -> None:
+        _, unit, worker = self.tree()
+        before = self.staff_file.read_bytes()
+        with self.assertRaisesRegex(staff.StaffRefused, "already belongs"):
+            _ = staff.update_current_session(worker.id, unit.id)
+        self.assertEqual(self.staff_file.read_bytes(), before)
+        self.assertEqual(staff.by_id(worker.id), worker)
+
+
 class StaffTests(StaffTestCase):
     def test_restored_unit_survives_its_previous_pending_retirement(self) -> None:
-        parent = staff.ensure("showrunner", name="sdlc")
+        parent = fixture_member("showrunner", name="sdlc")
         location = staff.PresentWorktree("natedev", self.root / "models")
-        unit = staff.ensure("unit", name="models", parent=parent.id, worktree=location)
+        unit = fixture_member("unit", name="models", parent=parent.id, worktree=location)
         staff.defer_retire((unit.id,))
         self.assertEqual(staff.retire_pending(), ())
         self.assertEqual(staff.by_id(unit.id), replace(unit, worktree=staff.RemovedWorktree(location.machine, location.path)))
@@ -73,9 +170,9 @@ class StaffTests(StaffTestCase):
         self.assertEqual(restored.worktree, location)
 
     def test_restore_unit_keeps_the_retained_id_and_parent_and_rerun_writes_nothing(self) -> None:
-        parent = staff.ensure("showrunner", name="sdlc")
+        parent = fixture_member("showrunner", name="sdlc")
         location = staff.PresentWorktree("natedev", self.root / "models")
-        removed = staff.ensure("unit", name="models", parent=parent.id,
+        removed = fixture_member("unit", name="models", parent=parent.id,
                                worktree=staff.RemovedWorktree(location.machine, location.path))
         unit = staff.restore_unit(removed.id, location)
         self.assertEqual((unit.id, unit.kind, unit.name, unit.parent), (removed.id, "unit", "models", parent.id))
@@ -98,8 +195,8 @@ class StaffTests(StaffTestCase):
         self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), before)
 
     def test_restore_unit_refuses_a_different_retained_location_without_writing(self) -> None:
-        parent = staff.ensure("showrunner", name="sdlc")
-        removed = staff.ensure("unit", name="models", parent=parent.id,
+        parent = fixture_member("showrunner", name="sdlc")
+        removed = fixture_member("unit", name="models", parent=parent.id,
                                worktree=staff.RemovedWorktree("natedev", self.root / "models"))
         before = self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns
         for proposed in (staff.PresentWorktree("mac", self.root / "models"),
@@ -110,9 +207,9 @@ class StaffTests(StaffTestCase):
         self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), before)
 
     def test_restore_unit_from_mac_uses_the_owner_and_is_idempotent_through_the_cli(self) -> None:
-        parent = staff.ensure("showrunner", name="sdlc")
+        parent = fixture_member("showrunner", name="sdlc")
         location = staff.PresentWorktree("mac", self.root / "models")
-        removed = staff.ensure("unit", name="models", parent=parent.id,
+        removed = fixture_member("unit", name="models", parent=parent.id,
                                worktree=staff.RemovedWorktree(location.machine, location.path))
         with self.machine("mac"):
             restored = staff.restore_unit(removed.id, location)
@@ -135,7 +232,7 @@ class StaffTests(StaffTestCase):
         self.assertEqual(staff.by_id(removed.id), restored)
 
     def test_admission_publishes_identity_and_location_once_without_a_setter_window(self) -> None:
-        runner = staff.ensure("showrunner", name="sdlc")
+        runner = fixture_member("showrunner", name="sdlc")
         location = staff.PresentWorktree("natedev", self.root / "models")
         original = os.replace
         publications: list[dict[str, object]] = []
@@ -147,46 +244,46 @@ class StaffTests(StaffTestCase):
 
         with (mock.patch.object(os, "replace", side_effect=observe),
               mock.patch.object(staff, "set_worktree", side_effect=AssertionError("second write"))):
-            unit = staff.ensure("unit", name="models", parent=runner.id, worktree=location)
+            unit = fixture_member("unit", name="models", parent=runner.id, worktree=location)
         self.assertEqual(len(publications), 1)
         published = cast(list[dict[str, object]], publications[0]["rows"])
         self.assertEqual(next(row for row in published if row["id"] == unit.id), unit.to_json())
         self.assertEqual(unit.worktree, location)
         before = self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns
-        self.assertEqual(staff.ensure("unit", name="models", parent=runner.id, worktree=location), unit)
+        self.assertEqual(fixture_member("unit", name="models", parent=runner.id, worktree=location), unit)
         self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), before)
 
     def test_admission_fills_unfilled_locations_but_refuses_wrong_kind_duplicates_and_resurrection(self) -> None:
-        runner = staff.ensure("showrunner", name="sdlc", doc=staff.LiveDoc("natedev", self.root / "doc.md"))
-        blank = staff.ensure("unit", name="models", parent=runner.id)
+        runner = fixture_member("showrunner", name="sdlc", doc=staff.LiveDoc("natedev", self.root / "doc.md"))
+        blank = fixture_member("unit", name="models", parent=runner.id)
         location = staff.PresentWorktree("natedev", self.root / "models")
-        filled = staff.ensure("unit", name="models", parent=runner.id, worktree=location)
+        filled = fixture_member("unit", name="models", parent=runner.id, worktree=location)
         self.assertEqual(filled, replace(blank, worktree=location))
-        self.assert_refused(lambda: staff.ensure("showrunner", name="wrong", worktree=location))
-        self.assert_refused(lambda: staff.ensure("unit", name="wrong", parent=runner.id, doc=runner.doc))
-        self.assert_refused(lambda: staff.ensure("unit", name="duplicate", parent=runner.id, worktree=location))
-        self.assert_refused(lambda: staff.ensure("unit", name="models", parent=runner.id,
+        self.assert_refused(lambda: fixture_member("showrunner", name="wrong", worktree=location))
+        self.assert_refused(lambda: fixture_member("unit", name="wrong", parent=runner.id, doc=runner.doc))
+        self.assert_refused(lambda: fixture_member("unit", name="duplicate", parent=runner.id, worktree=location))
+        self.assert_refused(lambda: fixture_member("unit", name="models", parent=runner.id,
                                                worktree=staff.PresentWorktree("natedev", self.root / "other")))
         removed = staff.set_worktree(filled.id, staff.RemovedWorktree(location.machine, location.path))
-        self.assert_refused(lambda: staff.ensure("unit", name="models", parent=runner.id, worktree=location))
+        self.assert_refused(lambda: fixture_member("unit", name="models", parent=runner.id, worktree=location))
         self.assertEqual(staff.by_id(removed.id), removed)
 
     def test_remote_admission_sends_the_location_in_the_owner_transaction(self) -> None:
-        runner = staff.ensure("showrunner", name="sdlc")
+        runner = fixture_member("showrunner", name="sdlc")
         with self.machine("mac"):
             location = staff.PresentWorktree("mac", self.root / "mac-models")
-            unit = staff.ensure("unit", name="models", parent=runner.id, worktree=location)
+            unit = fixture_member("unit", name="models", parent=runner.id, worktree=location)
             self.assertEqual(unit.worktree, location)
             self.assertEqual(staff.by_id(unit.id), unit)
             self.assertFalse(self.mac_file.exists())
         self.assertEqual(staff.by_id(unit.id), unit)
 
     def test_active_filters_removed_and_wrapped_rows_but_raw_identity_keeps_every_state(self) -> None:
-        runners = [staff.ensure("showrunner", name=name, doc=doc) for name, doc in (
+        runners = [fixture_member("showrunner", name=name, doc=doc) for name, doc in (
             ("unfilled", staff.DocUnfilled()),
             ("live", staff.LiveDoc("natedev", self.root / "live.md")),
             ("wrapped", staff.WrappedDoc("natedev", self.root / "archive.md")))]
-        units = [staff.ensure("unit", name=name, parent=runners[0].id, worktree=worktree)
+        units = [fixture_member("unit", name=name, parent=runners[0].id, worktree=worktree)
                  for name, worktree in (("unfilled", staff.WorktreeUnfilled()),
                      ("present", staff.PresentWorktree("natedev", self.root / "present")),
                      ("removed", staff.RemovedWorktree("natedev", self.root / "removed")))]
@@ -209,11 +306,11 @@ class StaffTests(StaffTestCase):
         self.assertEqual(staff.by_id(runner.id), runner)
 
     def test_pending_retirement_keeps_ids_and_edges_and_waits_for_workers_and_known_locations(self) -> None:
-        runner = staff.ensure("showrunner", name="sdlc", doc=staff.LiveDoc("natedev", self.root / "doc.md"))
-        child = staff.ensure("showrunner", name="child", parent=runner.id)
-        unit = staff.ensure("unit", name="models", parent=runner.id,
+        runner = fixture_member("showrunner", name="sdlc", doc=staff.LiveDoc("natedev", self.root / "doc.md"))
+        child = fixture_member("showrunner", name="child", parent=runner.id)
+        unit = fixture_member("unit", name="models", parent=runner.id,
                             worktree=staff.PresentWorktree("natedev", self.root / "models"))
-        worker = staff.ensure_worker("impl1", unit.id)
+        worker = fixture_worker("impl1", unit.id)
         staff.defer_retire((runner.id, unit.id, child.id))
         self.assertCountEqual(staff.retire_pending(), (runner.id, unit.id, child.id))
         self.assertEqual(staff.by_id(worker.id), worker)
@@ -227,8 +324,8 @@ class StaffTests(StaffTestCase):
         self.assertEqual(self.staff_file.read_bytes(), before)
 
     def test_seed_retirement_retains_the_removed_row_and_cannot_reactivate_it_from_stale_membership(self) -> None:
-        runner = staff.ensure("showrunner", name="sdlc")
-        unit = staff.ensure("unit", name="models", parent=runner.id,
+        runner = fixture_member("showrunner", name="sdlc")
+        unit = fixture_member("unit", name="models", parent=runner.id,
                             worktree=staff.PresentWorktree("natedev", self.root / "models"))
         retirement = staff.SeedInput((), (staff.SeedRetirement(unit.id, runner.id),))
         record = staff.apply_seed(retirement)
@@ -259,10 +356,10 @@ class StaffTests(StaffTestCase):
 
     def test_partial_fill_survives_an_ordinary_staff_write(self) -> None:
         runner, unit, _ = self.tree()
-        other = staff.ensure("unit", name="unfilled", parent=runner.id)
+        other = fixture_member("unit", name="unfilled", parent=runner.id)
         location = staff.PresentWorktree("natedev", self.root / "filled")
         _ = staff.set_worktree(unit.id, location)
-        worker = staff.ensure_worker("test", other.id)
+        worker = fixture_worker("test", other.id)
         record = staff.snapshot()
         filled = record.by_id(unit.id)
         assert filled is not None
@@ -290,7 +387,7 @@ class StaffTests(StaffTestCase):
 
     def test_worktree_and_doc_setters_are_idempotent_and_refuse_duplicate_live_locations(self) -> None:
         runner, unit, worker = self.tree()
-        other = staff.ensure("unit", name="other", parent=runner.id)
+        other = fixture_member("unit", name="other", parent=runner.id)
         path, doc = self.root / "worktree", self.root / "production.md"
         _ = self.assert_rerun("set-worktree", unit.id, "--machine", "natedev", "--path", str(path), "--state", "present")
         _ = self.assert_rerun("set-doc", runner.id, "--machine", "natedev", "--path", str(doc), "--state", "live")
@@ -340,8 +437,8 @@ class StaffTests(StaffTestCase):
         self.assertFalse(self.mac_file.exists())
 
     def test_launcher_names_are_accepted_without_a_fixed_role_suffix(self) -> None:
-        runner = staff.ensure("showrunner", name="sdlc")
-        unit = staff.ensure("unit", name="models", parent=runner.id)
+        runner = fixture_member("showrunner", name="sdlc")
+        unit = fixture_member("unit", name="models", parent=runner.id)
         for prefix, slot in (("bevy_brp", "impl"), ("hana_catalyst-lfo", "review"),
                              ("cargo-liner", "berth-hook"), ("cargo-liner-style", "modules-judge"),
                              ("claude-build-followups-two-accounts", "writer"),
@@ -352,14 +449,14 @@ class StaffTests(StaffTestCase):
                                         capture_output=True, text=True, check=True, timeout=TEST_HANG_GUARD_SECS)
                 name = result.stdout.strip()
                 _ = staff.WorkerName.parse(name)
-                row = staff.ensure_worker(name, unit.id)
+                row = fixture_worker(name, unit.id)
                 self.assertEqual(row.name, name)
                 self.assertEqual(staff.by_id(row.id), row)
 
     def test_pending_showrunner_retirement_waits_for_direct_workers_without_rolling_back_other_rows(self) -> None:
-        runner = staff.ensure("showrunner", name="sdlc", doc=staff.LiveDoc("natedev", self.root / "sdlc.md"))
-        worker = staff.ensure_worker("sdlc-handler-astra-reviewer", runner.id)
-        other = staff.ensure("showrunner", name="unheld", doc=staff.LiveDoc("natedev", self.root / "unheld.md"))
+        runner = fixture_member("showrunner", name="sdlc", doc=staff.LiveDoc("natedev", self.root / "sdlc.md"))
+        worker = fixture_worker("sdlc-handler-astra-reviewer", runner.id)
+        other = fixture_member("showrunner", name="unheld", doc=staff.LiveDoc("natedev", self.root / "unheld.md"))
         staff.defer_retire((runner.id, other.id))
         self.assertEqual(staff.retire_pending(), (runner.id,))
         self.assertEqual(staff.by_id(other.id), replace(other, doc=staff.WrappedDoc("natedev", self.root / "unheld.md")))
@@ -370,21 +467,21 @@ class StaffTests(StaffTestCase):
         self.assertEqual(staff.by_id(runner.id), replace(runner, doc=staff.WrappedDoc("natedev", self.root / "sdlc.md")))
 
     def test_row_write_transport_refuses_unit_and_showrunner_retirement(self) -> None:
-        runner = staff.ensure("showrunner", name="sdlc")
-        unit = staff.ensure("unit", name="models", parent=runner.id)
+        runner = fixture_member("showrunner", name="sdlc")
+        unit = fixture_member("unit", name="models", parent=runner.id)
         before = self.staff_file.read_bytes()
         refused = self.cli("retire", unit.id, "--row-write", "--json", code=2)
         self.assertIn("worker", refused.stderr)
         self.assertEqual(self.staff_file.read_bytes(), before)
-        empty = staff.ensure("showrunner", name="empty")
+        empty = fixture_member("showrunner", name="empty")
         before = self.staff_file.read_bytes()
         refused = self.cli("retire", empty.id, "--row-write", "--json", code=2)
         self.assertIn("worker", refused.stderr)
         self.assertEqual(self.staff_file.read_bytes(), before)
 
     def test_showrunner_worker_paths_printed_by_show_round_trip_through_get(self) -> None:
-        runner = staff.ensure("showrunner", name="sdlc")
-        worker = staff.ensure_worker("sdlc-handler-astra-reviewer", runner.id)
+        runner = fixture_member("showrunner", name="sdlc")
+        worker = fixture_worker("sdlc-handler-astra-reviewer", runner.id)
         line = next(line for line in self.cli("show").stdout.splitlines() if line.startswith(worker.id))
         path = line.split()[2]
         self.assertEqual(staff.by_path(path), worker)
@@ -471,56 +568,60 @@ class StaffTests(StaffTestCase):
                 self.assertEqual(parsed.value, text)
 
     def test_ensure_worker_reuses_its_row_after_unit_move_and_rename(self) -> None:
-        runner = staff.ensure("showrunner", name="sdlc")
-        unit = staff.ensure("unit", name="models", parent=runner.id)
-        worker = staff.ensure_worker("impl", unit.id)
+        runner = fixture_member("showrunner", name="sdlc")
+        unit = fixture_member("unit", name="models", parent=runner.id)
+        runtime_id = fixture_runtime_id("moved-worker-backend")
+        worker = fixture_worker("impl", unit.id, runtime_id=runtime_id)
         before = self.staff_file.read_bytes()
-        self.assertEqual(staff.ensure_worker("impl", unit.id), worker)
+        self.assertEqual(fixture_worker("impl", unit.id), worker)
         self.assertEqual(self.staff_file.read_bytes(), before)
-        self.assertRegex(worker.id, r"^s[a-z0-9]{11}$")
+        self.assertEqual(worker.id, runtime_id)
         self.assertNotIn(worker.id, (runner.id, unit.id))
-        destination = staff.ensure("showrunner", name="tools")
+        destination = fixture_member("showrunner", name="tools")
         _ = staff.move(unit.id, destination.id)
         _ = staff.rename(unit.id, "registry")
-        self.assertEqual(staff.ensure_worker("impl", unit.id), worker)
+        self.assertEqual(fixture_worker("impl", unit.id), worker)
         self.assertEqual(staff.by_path("tools/registry/impl"), worker)
-        self.assertEqual(set(worker.to_json()), {"id", "kind", "name", "parent"})
+        self.assertEqual(set(worker.to_json()), {"id", "kind", "name", "parent", "current_session"})
         _ = staff.retire(worker.id)
         self.assertIsNone(staff.by_id(worker.id))
 
     def test_workers_accept_unit_and_showrunner_parents_and_refuse_invalid_parents(self) -> None:
         runner, unit, ordinary = self.tree()
-        designer = staff.ensure_worker("sdlc-handler-astra-designer", runner.id)
-        reviewer = staff.ensure_worker("sdlc-handler-astra-reviewer", runner.id)
+        designer = fixture_worker("sdlc-handler-astra-designer", runner.id)
+        reviewer = fixture_worker("sdlc-handler-astra-reviewer", runner.id)
         self.assertEqual((designer.parent, reviewer.parent), (runner.id, runner.id))
-        self.assertEqual(staff.ensure_worker(designer.name, runner.id), designer)
-        direct_test = staff.ensure_worker("test", runner.id)
+        self.assertEqual(fixture_worker(designer.name, runner.id), designer)
+        direct_test = fixture_worker("test", runner.id)
         self.assertEqual(staff.by_path("sdlc/test"), direct_test)
         for parent, name in ((ordinary.id, "fix"), (MISSING_ID, "impl")):
             with self.subTest(parent=parent, name=name):
-                self.assert_refused(lambda: staff.ensure_worker(name, parent))
-        self.assert_refused(lambda: staff.ensure("worker", name="impl"))
-        unit_reviewer = staff.ensure_worker("review", unit.id)
+                self.assert_refused(lambda: fixture_worker(name, parent))
+        self.assert_refused(lambda: fixture_member("worker", name="impl"))
+        unit_reviewer = fixture_worker("review", unit.id)
         self.assertEqual(unit_reviewer.parent, unit.id)
 
     def test_row_round_trip_is_frozen_and_stores_only_membership(self) -> None:
         _, _, worker = self.tree()
-        self.assertEqual(set(worker.to_json()), {"id", "kind", "name", "parent"})
+        self.assertEqual(set(worker.to_json()), {"id", "kind", "name", "parent", "current_session"})
         self.assertEqual(staff.StaffRow.from_json(worker.to_json()), worker)
         with self.assertRaises(FrozenInstanceError):
             setattr(worker, "name", "test1")
 
     def test_write_verbs_are_rerun_safe_and_cli_reports_unchanged(self) -> None:
-        _ = self.assert_rerun("ensure", "showrunner", "--name", "sdlc")
+        _ = self.assert_rerun("ensure", "showrunner", "--name", "sdlc",
+                              "--runtime-id", fixture_runtime_id("cli-sdlc"))
         showrunner = staff.by_path("sdlc")
         assert showrunner is not None
-        _ = self.assert_rerun("ensure", "unit", "--name", "models", "--parent", showrunner.id)
+        _ = self.assert_rerun("ensure", "unit", "--name", "models", "--parent", showrunner.id,
+                              "--runtime-id", fixture_runtime_id("cli-models"))
         unit = staff.by_path("sdlc/models")
         assert unit is not None
-        _ = self.assert_rerun("ensure", "worker", "--name", "impl1", "--parent", unit.id)
+        _ = self.assert_rerun("ensure", "worker", "--name", "impl1", "--parent", unit.id,
+                              "--runtime-id", fixture_runtime_id("cli-impl1"))
         self.assertEqual(len(staff.find(kind="worker", parent=unit.id)), 1)
         _ = self.assert_rerun("rename", unit.id, "--name=registry")
-        other = staff.ensure("showrunner", name="natedev")
+        other = fixture_member("showrunner", name="natedev")
         _ = self.assert_rerun("move", unit.id, f"--parent={other.id}")
         _ = self.assert_rerun("move", other.id, f"--parent={showrunner.id}")
         _ = self.assert_rerun("move", other.id, "--parent=none")
@@ -537,7 +638,7 @@ class StaffTests(StaffTestCase):
         for row in (showrunner, unit, worker):
             before = self.staff_file.read_bytes()
             with redirect_stderr(io.StringIO()) as errors:
-                self.assertEqual(staff.ensure(row.kind, name=row.name, parent=row.parent), row)
+                self.assertEqual(fixture_member(row.kind, name=row.name, parent=row.parent), row)
             self.assertIn("unchanged", errors.getvalue())
             self.assertEqual(self.staff_file.read_bytes(), before)
         for action in (lambda: staff.rename(unit.id, unit.name), lambda: staff.move(unit.id, unit.parent)):
@@ -549,31 +650,31 @@ class StaffTests(StaffTestCase):
 
     def test_names_are_unique_within_kind_and_parent(self) -> None:
         showrunner, unit, first = self.tree()
-        other = staff.ensure("unit", name="other", parent=showrunner.id)
-        second = staff.ensure("worker", name="impl1", parent=other.id)
+        other = fixture_member("unit", name="other", parent=showrunner.id)
+        second = fixture_member("worker", name="impl1", parent=other.id)
         self.assertNotEqual(first.id, second.id)
         self.assert_refused(lambda: staff.rename(other.id, unit.name))
-        another_showrunner = staff.ensure("showrunner", name="natedev")
-        conflict = staff.ensure("unit", name="models", parent=another_showrunner.id)
+        another_showrunner = fixture_member("showrunner", name="natedev")
+        conflict = fixture_member("unit", name="models", parent=another_showrunner.id)
         self.assert_refused(lambda: staff.move(conflict.id, showrunner.id))
         self.assert_refused(lambda: staff.rename(another_showrunner.id, showrunner.name))
         # Promotion needs both kinds to coexist briefly under the same short name.
-        promoted = staff.ensure("showrunner", name=unit.name)
+        promoted = fixture_member("showrunner", name=unit.name)
         self.assertNotEqual(promoted.id, unit.id)
 
     def test_valid_worker_shapes_and_holders_coexist_with_refused_graph_and_worker_mutations(self) -> None:
         showrunner, unit, worker = self.tree()
-        child = staff.ensure("showrunner", name="child", parent=showrunner.id)
-        direct_worker = staff.ensure("worker", name="test1", parent=showrunner.id)
-        custom_worker = staff.ensure("worker", name="impl0", parent=unit.id)
+        child = fixture_member("showrunner", name="child", parent=showrunner.id)
+        direct_worker = fixture_member("worker", name="test1", parent=showrunner.id)
+        custom_worker = fixture_member("worker", name="impl0", parent=unit.id)
         self.assertEqual(staff.by_path("sdlc/test1"), direct_worker)
         self.assertEqual(staff.by_path("sdlc/models/impl0"), custom_worker)
         rejected: tuple[Callable[[], object], ...] = (
-            lambda: staff.ensure("worker", name="test1"),
-            lambda: staff.ensure("unit", name="bad", parent=unit.id),
-            lambda: staff.ensure("unit", name="bad", parent=MISSING_ID),
-            lambda: staff.ensure("unit", name="bad"),
-            lambda: staff.ensure("showrunner", name="bad", parent=unit.id),
+            lambda: fixture_member("worker", name="test1"),
+            lambda: fixture_member("unit", name="bad", parent=unit.id),
+            lambda: fixture_member("unit", name="bad", parent=MISSING_ID),
+            lambda: fixture_member("unit", name="bad"),
+            lambda: fixture_member("showrunner", name="bad", parent=unit.id),
             lambda: staff.move(showrunner.id, child.id),
             lambda: staff.move(showrunner.id, showrunner.id),
             lambda: staff.move(unit.id, worker.id),
@@ -589,8 +690,8 @@ class StaffTests(StaffTestCase):
     def test_short_names_cannot_alias_staff_ids(self) -> None:
         showrunner, unit, worker = self.tree()
         actions: tuple[Callable[[], object], ...] = (
-            lambda: staff.ensure("showrunner", name=unit.id),
-            lambda: staff.ensure("unit", name=worker.id, parent=showrunner.id),
+            lambda: fixture_member("showrunner", name=unit.id),
+            lambda: fixture_member("unit", name=worker.id, parent=showrunner.id),
             lambda: staff.rename(showrunner.id, worker.id),
             lambda: staff.rename(unit.id, showrunner.id),
         )
@@ -600,9 +701,9 @@ class StaffTests(StaffTestCase):
 
     def test_promoted_showrunner_and_original_unit_have_distinct_paths(self) -> None:
         showrunner, unit, worker = self.tree()
-        promoted = staff.ensure("showrunner", name=unit.name, parent=showrunner.id)
-        promoted_unit = staff.ensure("unit", name="registry", parent=promoted.id)
-        promoted_worker = staff.ensure("worker", name="impl1", parent=promoted_unit.id)
+        promoted = fixture_member("showrunner", name=unit.name, parent=showrunner.id)
+        promoted_unit = fixture_member("unit", name="registry", parent=promoted.id)
+        promoted_worker = fixture_member("worker", name="impl1", parent=promoted_unit.id)
         expected = {
             showrunner.id: "sdlc", unit.id: "sdlc/models", worker.id: "sdlc/models/impl1",
             promoted.id: "models", promoted_unit.id: "models/registry",
@@ -621,8 +722,8 @@ class StaffTests(StaffTestCase):
 
     def test_lookup_filters_and_unit_retirement_follow_membership(self) -> None:
         showrunner, unit, worker = self.tree()
-        other_unit = staff.ensure("unit", name="other", parent=showrunner.id)
-        other_worker = staff.ensure("worker", name="test1", parent=other_unit.id)
+        other_unit = fixture_member("unit", name="other", parent=showrunner.id)
+        other_worker = fixture_member("worker", name="test1", parent=other_unit.id)
         self.assertEqual(staff.by_id(worker.id), worker)
         self.assertEqual(staff.by_path("sdlc"), showrunner)
         self.assertEqual(staff.by_path("sdlc/models"), unit)
@@ -654,7 +755,7 @@ class StaffTests(StaffTestCase):
         self.assertEqual(showrunner_renamed, replace(showrunner, name="tools"))
         self.assertIsNone(staff.by_path("sdlc/models/impl1"))
         self.assertEqual(staff.by_path("tools/registry/impl1"), worker)
-        other = staff.ensure("showrunner", name="natedev")
+        other = fixture_member("showrunner", name="natedev")
         moved = staff.move(unit.id, other.id)
         self.assertEqual(moved, replace(renamed, parent=other.id))
         self.assertEqual(staff.by_id(worker.id), worker)
@@ -668,9 +769,9 @@ class StaffTests(StaffTestCase):
         self.assertEqual(staff.by_path("natedev/registry/impl1"), worker)
 
     def test_retire_showrunner_detaches_child_showrunners(self) -> None:
-        parent = staff.ensure("showrunner", name="parent", doc=staff.LiveDoc("natedev", self.root / "parent.md"))
-        child = staff.ensure("showrunner", name="child", parent=parent.id)
-        unit = staff.ensure("unit", name="models", parent=child.id)
+        parent = fixture_member("showrunner", name="parent", doc=staff.LiveDoc("natedev", self.root / "parent.md"))
+        child = fixture_member("showrunner", name="child", parent=parent.id)
+        unit = fixture_member("unit", name="models", parent=child.id)
         self.assert_refused(lambda: staff.retire(parent.id))
         staff.defer_retire((parent.id,))
         self.assertEqual(staff.retire_pending(), ())
@@ -681,15 +782,17 @@ class StaffTests(StaffTestCase):
     def test_retired_ids_are_not_reused_and_all_ids_fit_herdr(self) -> None:
         showrunner, unit, worker = self.tree()
         self.assertEqual(staff.retire(worker.id), worker)
-        replacement = staff.ensure("worker", name=worker.name, parent=unit.id)
+        replacement_id = fixture_runtime_id("replacement-native-thread")
+        replacement = fixture_member("worker", name=worker.name, parent=unit.id, runtime_id=replacement_id)
+        self.assertEqual(replacement.id, replacement_id)
         self.assertNotEqual(replacement.id, worker.id)
         rows = [showrunner, unit, worker, replacement]
         for role in ("test", "fix", "review", "designer", "reviewer"):
-            rows.append(staff.ensure("worker", name=f"{role}1", parent=unit.id))
+            rows.append(fixture_member("worker", name=f"{role}1", parent=unit.id))
         self.assertEqual(len({row.id for row in rows}), len(rows))
         for row in rows:
-            self.assertRegex(row.id, r"^s[0-9a-f]{11}$")
-            self.assertRegex(row.id, r"^[a-z][a-z0-9_-]{0,31}$")
+            self.assertEqual(staff.native_id(row.id), row.id)
+            self.assertRegex(row.name, r"^[a-z][a-z0-9_-]{0,31}$")
 
     def test_file_uses_canonical_sorted_rows_and_no_cached_path(self) -> None:
         _ = self.tree()
@@ -699,7 +802,7 @@ class StaffTests(StaffTestCase):
         original = self.staff_file.read_bytes()
         elsewhere = self.root / "elsewhere" / "staff.json"
         with mock.patch.dict(os.environ, {"STAFF_FILE": str(elsewhere)}):
-            row = staff.ensure("showrunner", name="separate")
+            row = fixture_member("showrunner", name="separate")
             self.assertEqual(staff.find(), [row])
         self.assertEqual(self.staff_file.read_bytes(), original)
         self.assertCountEqual(staff.find(), rows)
@@ -710,7 +813,7 @@ class StaffTests(StaffTestCase):
                 _ = read()
             self.assertIsInstance(raised.exception, OSError)
         self.assertFalse(self.staff_file.exists())
-        created = staff.ensure("showrunner", name="sdlc")
+        created = fixture_member("showrunner", name="sdlc")
         self.assertEqual(staff.by_id(created.id), created)
 
     def test_malformed_or_unsupported_records_cannot_be_read_or_overwritten(self) -> None:
@@ -728,7 +831,7 @@ class StaffTests(StaffTestCase):
         ]
         operations: tuple[Callable[[], object], ...] = (
             lambda: staff.by_id(showrunner.id), lambda: staff.by_path("sdlc"), staff.find,
-            lambda: staff.ensure("showrunner", name="new"),
+            lambda: fixture_member("showrunner", name="new"),
             lambda: staff.rename(showrunner.id, "new"),
             lambda: staff.move(showrunner.id, None), lambda: staff.retire(showrunner.id),
         )
@@ -768,7 +871,7 @@ class StaffTests(StaffTestCase):
         before = self.staff_file.read_bytes()
         with mock.patch("os.replace", side_effect=RuntimeError("injected before replace")):
             with self.assertRaisesRegex(RuntimeError, "injected before replace"):
-                _ = staff.ensure("showrunner", name="interrupted")
+                _ = fixture_member("showrunner", name="interrupted")
         self.assertEqual(self.staff_file.read_bytes(), before)
         self.assertIsNone(staff.by_path("interrupted"))
         self.assertIsNotNone(staff.by_path("sdlc/models/impl1"))
@@ -789,14 +892,14 @@ class StaffTests(StaffTestCase):
 
         with mock.patch("scripts.lib.atomic_file.os.fsync", side_effect=fail_first_folder_sync):
             with self.assertRaisesRegex(staff.StaffUnreadable, "injected folder sync failure"):
-                _ = staff.ensure("showrunner", name="recovered")
+                _ = fixture_member("showrunner", name="recovered")
             after = self.staff_file.read_bytes()
             self.assertNotEqual(after, before)
             created = staff.by_path("recovered")
             self.assertIsNotNone(created)
             self.assertEqual(synced_versions, [after])
             with redirect_stderr(io.StringIO()) as errors:
-                self.assertEqual(staff.ensure("showrunner", name="recovered"), created)
+                self.assertEqual(fixture_member("showrunner", name="recovered"), created)
             self.assertIn("unchanged", errors.getvalue())
             self.assertEqual(synced_versions, [after, after])
         self.assertEqual(self.staff_file.read_bytes(), after)
@@ -815,14 +918,14 @@ class StaffTests(StaffTestCase):
         self.assertTrue(orphans, "writer did not leave a temp file before os.replace")
         unrelated = self.staff_file.parent / "keep.tmp"
         _ = unrelated.write_text("unrelated")
-        created = staff.ensure("showrunner", name="recovered")
+        created = fixture_member("showrunner", name="recovered")
         self.assertTrue(all(not path.exists() for path in orphans))
         self.assertEqual(unrelated.read_text(), "unrelated")
         self.assertEqual(staff.by_id(created.id), created)
 
     def test_cli_show_and_get_sort_paths_and_apply_filters(self) -> None:
         showrunner, unit, worker = self.tree()
-        other = staff.ensure("showrunner", name="aaa")
+        other = fixture_member("showrunner", name="aaa")
         rendered = self.cli("show").stdout.splitlines()
         expected = [(other, "aaa"), (showrunner, "sdlc"), (unit, "sdlc/models"), (worker, "sdlc/models/impl1")]
         self.assertEqual([line.split() for line in rendered], [[row.id, row.kind, path] for row, path in expected])
@@ -854,7 +957,7 @@ class StaffTests(StaffTestCase):
 
     def test_move_cli_requires_the_explicit_parent_option(self) -> None:
         showrunner, unit, _ = self.tree()
-        other = staff.ensure("showrunner", name="other")
+        other = fixture_member("showrunner", name="other")
         before = self.staff_file.read_bytes()
         _ = self.cli("move", unit.id, other.id, "--json", code=2)
         _ = self.cli("move", showrunner.id, "--json", code=2)
@@ -887,7 +990,8 @@ class StaffTests(StaffTestCase):
                 with self.subTest(read=read):
                     self.assertEqual(read(), expected)
             self.assertEqual(self.cli("show").stdout, owner_display)
-            created = staff.ensure("worker", name="test1", parent=unit.id)
+            created = staff.ensure("worker", name="test1", parent=unit.id,
+                                   runtime_id=fixture_runtime_id(f"worker:{unit.id}:test1"))
             moved_name = staff.rename(unit.id, "registry")
             self.assertEqual(moved_name, replace(unit, name="registry"))
             self.assertEqual(staff.move(showrunner.id, None), showrunner)
@@ -901,10 +1005,10 @@ class StaffTests(StaffTestCase):
         self.assertEqual([command[0] for command in commands[len(reads) + 1:]], ["ensure", "rename", "move", "retire", "show"])
 
     def test_mac_preserves_names_that_begin_with_a_dash(self) -> None:
-        expected = staff.ensure("showrunner", name="-scratch")
+        expected = fixture_member("showrunner", name="-scratch")
         local_file = self.mac_file
         with self.machine("mac"):
-            self.assertEqual(staff.ensure("showrunner", name="-scratch"), expected)
+            self.assertEqual(staff.ensure("showrunner", name="-scratch", runtime_id=expected.id), expected)
             renamed = staff.rename(expected.id, "-renamed")
         self.assertEqual(renamed, staff.rename(expected.id, "-renamed"))
         self.assertEqual(staff.by_path("-renamed"), renamed)
@@ -924,10 +1028,10 @@ class StaffTests(StaffTestCase):
         with mock.patch.dict(os.environ, {"STAFF_FILE": str(self.mac_file)}), mock.patch(
             "scripts.shutdown.remote.other_machine", return_value="natedev",
         ):
-            row = staff.ensure("showrunner", name="private")
+            row = fixture_member("showrunner", name="private")
             self.assertEqual(staff.snapshot().rows, (row,))
             self.assertTrue(self.mac_file.is_file())
-            worker = staff.ensure_worker("review", row.id)
+            worker = fixture_worker("review", row.id)
             self.assertEqual(staff.retire(worker.id), worker)
             self.assertEqual(staff.snapshot().rows, (row,))
         self.assertFalse(self.staff_file.exists())
@@ -963,7 +1067,7 @@ class StaffTests(StaffTestCase):
         with self.machine("mac"), mock.patch.dict(os.environ, {"STAFF_TEST_SSH_FAIL": "1"}):
             actions: tuple[Callable[[], object], ...] = (
                 lambda: staff.by_id(MISSING_ID), lambda: staff.by_path("sdlc"), staff.find,
-                lambda: staff.ensure("showrunner", name="blocked"),
+                lambda: staff.ensure("showrunner", name="blocked", runtime_id=fixture_runtime_id("showrunner::blocked")),
             )
             for action in actions:
                 with self.subTest(action=action), self.assertRaisesRegex(staff.StaffUnreadable, "^natedev not reached$"):
@@ -1018,7 +1122,7 @@ class StaffTests(StaffTestCase):
 
     def test_get_renders_the_same_complete_path_and_columns_as_show(self) -> None:
         showrunner, unit, worker = self.tree()
-        attached = staff.ensure("showrunner", name="style", parent=showrunner.id)
+        attached = fixture_member("showrunner", name="style", parent=showrunner.id)
         lines = {line.split()[0]: line for line in self.cli("show").stdout.splitlines()}
         for row, path in ((unit, "sdlc/models"), (worker, "sdlc/models/impl1"), (attached, "style")):
             with self.subTest(path=path):
@@ -1027,7 +1131,7 @@ class StaffTests(StaffTestCase):
 
     def test_mac_write_waits_for_owner_operation_lock(self) -> None:
         _, unit, _ = self.tree()
-        destination = staff.ensure("showrunner", name="other")
+        destination = fixture_member("showrunner", name="other")
         lock = self.staff_file.parent / "operation.lock"
         with self.lock_notice(lock) as listener:
             with staff.operation():
@@ -1048,7 +1152,7 @@ class StaffTests(StaffTestCase):
                 raise failure
         self.assertIs(raised.exception, failure)
         with staff.operation():
-            row = staff.ensure("showrunner", name="after-failure")
+            row = fixture_member("showrunner", name="after-failure")
         self.assertEqual(staff.by_id(row.id), row)
 
     def test_operation_lock_errors_have_the_staff_unreadable_type(self) -> None:
@@ -1069,15 +1173,16 @@ class StaffTests(StaffTestCase):
     def test_operation_joins_inherited_descriptor_and_keeps_the_outer_lock(self) -> None:
         with staff.operation():
             with staff.operation():
-                _ = staff.ensure("showrunner", name="outer")
+                _ = fixture_member("showrunner", name="outer")
             child = subprocess.run([sys.executable, "-c",
                 "from scripts.production import staff; " +
-                "exec(\"with staff.operation():\\n staff.ensure('showrunner', name='child')\")"],
+                "exec(\"with staff.operation():\\n staff.ensure('showrunner', name='child', runtime_id='02fc3c9a-b345-56a6-ac99-fdd5685739a6')\")"],
                 cwd=CHECKOUT, pass_fds=staff.operation_fds(), capture_output=True,
                 text=True, timeout=TEST_HANG_GUARD_SECS, check=False)
             self.assertEqual(child.returncode, 0, child.stderr)
             with self.lock_notice(self.staff_file.parent / "operation.lock") as listener:
-                seed = self.start_script(STAFF_SCRIPT, "ensure", "showrunner", "--name=after")
+                seed = self.start_script(STAFF_SCRIPT, "ensure", "showrunner", "--name=after",
+                                         "--runtime-id", fixture_runtime_id("cli-after"))
                 self.assert_operation_blocks(seed, listener)
         output, errors = seed.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(seed.returncode, 0, output + errors)
@@ -1094,7 +1199,7 @@ class StaffTests(StaffTestCase):
             environment = {**os.environ, "STAFF_OPERATION_FD": str(inherited.fileno())}
             child = subprocess.run([sys.executable, "-c",
                 "from scripts.production import staff; " +
-                "exec(\"with staff.operation():\\n staff.ensure('showrunner', name='orphan')\")"],
+                "exec(\"with staff.operation():\\n staff.ensure('showrunner', name='orphan', runtime_id='bace30cb-17a4-5156-a98f-c0d41e973849')\")"],
                 cwd=CHECKOUT, env=environment, pass_fds=(inherited.fileno(),), capture_output=True,
                 text=True, timeout=TEST_HANG_GUARD_SECS, check=False)
         self.assertEqual(child.returncode, 0, child.stderr)
@@ -1119,7 +1224,7 @@ class StaffTests(StaffTestCase):
                 program = (
                     "from scripts.production.staff_test_support import observe_operation_lock; "
                     "observe_operation_lock(); from scripts.production import staff; "
-                    "exec(\"with staff.operation():\\n staff.ensure('showrunner', name='fallback')\")")
+                    "exec(\"with staff.operation():\\n staff.ensure('showrunner', name='fallback', runtime_id='e49bd66f-2aaa-5521-b99d-225ca97f55f8')\")")
                 child = subprocess.Popen([sys.executable, "-c", program], cwd=CHECKOUT,
                     env=environment, pass_fds=(unlocked.fileno(),), stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE, text=True)
@@ -1138,7 +1243,7 @@ class StaffTests(StaffTestCase):
         runner, unit, worker = self.tree()
         runner = staff.set_doc(runner.id, staff.LiveDoc("natedev", self.root / "sdlc.md"))
         unit = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", self.root / "models"))
-        child = staff.ensure("showrunner", name="child", parent=runner.id)
+        child = fixture_member("showrunner", name="child", parent=runner.id)
         staff.defer_retire((runner.id, unit.id))
         original = self.staff_file.read_bytes()
         staff.defer_retire((unit.id, runner.id))
@@ -1173,7 +1278,7 @@ class StaffTests(StaffTestCase):
         ))
 
     def test_pending_retirement_drops_ids_already_retired(self) -> None:
-        runner = staff.ensure("showrunner", name="gone", doc=staff.WrappedDoc("natedev", self.root / "gone.md"))
+        runner = fixture_member("showrunner", name="gone", doc=staff.WrappedDoc("natedev", self.root / "gone.md"))
         staff.defer_retire((runner.id,))
         self.assertEqual(staff.retire_pending(), ())
         self.assertEqual(staff.snapshot().pending_retire, ())

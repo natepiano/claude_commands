@@ -128,6 +128,7 @@ class RunProcessTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(shutdown_record, "all_session_records", lambda: [STOPPED_RECORD]))
         _ = self.enterContext(mock.patch.object(unit_lookup, "marked_unit", return_value=None))
         _ = self.enterContext(mock.patch.object(unit_lookup, "marked_units", self.no_units))
+        _ = self.enterContext(mock.patch.object(unit_lookup, "observed_staff_marks", return_value=()))
 
     def run_folder(self, name: str, worktree: Path) -> Path:
         worktree.mkdir(parents=True, exist_ok=True)

@@ -89,7 +89,6 @@ ROW_NAME = re.compile(r"[A-Za-z0-9_-]+-C[0-9]+")
 WORD = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
 SUFFIX_LENGTH = 6
 SUFFIX_CHARACTERS = string.ascii_lowercase + string.digits
-SESSION_VARIABLES = ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID")
 BUSY = ".claude-busy"
 RECORD_LOCKS: ContextVar[frozenset[tuple[int, int]]] = ContextVar("scratch_record_locks", default=frozenset())
 USE_STAMP = ".lint-sweep-used"
@@ -511,7 +510,13 @@ def target(task: str, word: str, visible: bool) -> Path:
 
 
 def maker() -> str:
-    return next((os.environ[name] for name in SESSION_VARIABLES if os.environ.get(name)), "")
+    from scripts.production import staff
+    current = staff.runtime_id()
+    try:
+        row = staff.by_current_session(current) if current else None
+    except staff.StaffAbsent:
+        return ""
+    return row.id if row is not None else ""
 
 
 def task_or_default(task: str, now: float) -> str:

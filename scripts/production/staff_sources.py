@@ -8,14 +8,16 @@ from contextlib import nullcontext, redirect_stderr
 import io
 import json
 import os
+import shlex
 import re
 import subprocess
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
+from enum import Enum
 from importlib import import_module
 import sys
 from pathlib import Path
-from typing import Literal, cast
+from typing import Literal, cast, override
 
 # These source modules still use sibling imports; keep their existing module identity.
 
@@ -56,12 +58,14 @@ def member(selector: MemberSelector, record: staff.StaffSnapshot) -> MemberFound
     return _member_sources().member(selector, record)
 
 
-def ensure_staff_showrunner(child: production_units.Production, caller: str = "") -> staff.StaffRow:
+def ensure_staff_showrunner(child: production_units.Production, caller: str = "", *, runtime_id: str = "") -> staff.StaffRow:
     record = staff.initial_snapshot()
     sources = _member_sources()
     found = sources.member(ShowrunnerMember(child.slug), record)
     location = staff.LiveDoc(remote.local_machine(), child.doc.resolve())
     if isinstance(found, MemberFound):
+        if runtime_id and found.row.current_session != staff.native_id(runtime_id):
+            raise staff.StaffRefused(f"{child.slug}: native session conflicts with retained staff identity")
         if found.row.doc == location:
             return found.row
         return staff.ensure("showrunner", name=found.row.name, parent=found.row.parent, doc=location)
@@ -71,16 +75,20 @@ def ensure_staff_showrunner(child: production_units.Production, caller: str = ""
         existing = parent.row if isinstance(parent, MemberFound) else None
         parent_location = staff.LiveDoc(remote.local_machine(), parent_doc.resolve())
         if existing is None or existing.doc != parent_location:
+            source = sources.productions.get(caller)
+            if existing is None and source is None:
+                raise staff.StaffRefused(f"{caller}: native showrunner identity is not proved by its timer")
             parent = MemberFound(staff.ensure(
                 "showrunner", name=existing.name if existing else showrunners.herdr_space(caller, str(parent_doc)),
-                parent=existing.parent if existing else None, doc=parent_location))
+                parent=existing.parent if existing else None, doc=parent_location,
+                runtime_id=existing.current_session if existing else source.timer.target.removeprefix("session:") if source else ""))
     if isinstance(parent, NoSuchMember):
         if caller:
             raise staff.StaffRefused(f"{child.slug}: no staff parent or timer document for {caller}")
-        return staff.ensure("showrunner", name=showrunners.herdr_space(child.slug, str(child.doc)), doc=location)
+        return staff.ensure("showrunner", name=showrunners.herdr_space(child.slug, str(child.doc)), doc=location, runtime_id=runtime_id)
     # Admission records the live doc; attach_parent records the edge and its
     # routing notices together after the showrunner appears.
-    return staff.ensure("showrunner", name=showrunners.herdr_space(child.slug, str(child.doc)), doc=location)
+    return staff.ensure("showrunner", name=showrunners.herdr_space(child.slug, str(child.doc)), doc=location, runtime_id=runtime_id)
 
 
 def showrunner_members(record: staff.StaffSnapshot) -> dict[str, staff.StaffRow]:
@@ -98,9 +106,9 @@ def _showrunner_key(slug: str) -> str:
 
 
 def _seed_member(key: str, kind: Literal["showrunner", "unit"], name: str, found: MemberFound | NoSuchMember,
-                 parent: staff.SeedParent | staff.KeepSeedParent | staff.RootSeedParent) -> staff.SeedMember:
+                 parent: staff.SeedParent | staff.KeepSeedParent | staff.RootSeedParent, *, runtime_id: str = "") -> staff.SeedMember:
     return staff.SeedMember(key, kind, name if isinstance(found, NoSuchMember) else found.row.name,
-                           staff.NewSeedMember() if isinstance(found, NoSuchMember) else found.row.id, parent)
+                           staff.NewSeedMember() if isinstance(found, NoSuchMember) else found.row.id, parent, runtime_id)
 
 
 def _collect(record: staff.StaffSnapshot, sources: _MemberSources) -> staff.SeedInput:
@@ -112,7 +120,7 @@ def _collect(record: staff.StaffSnapshot, sources: _MemberSources) -> staff.Seed
             found = sources.member(ShowrunnerMember(slug), record)
             production_members = [_seed_member(_showrunner_key(slug), "showrunner",
                                                showrunners.space_from_text(slug, source.document), found,
-                                               staff.KeepSeedParent())]
+                                               staff.KeepSeedParent(), runtime_id=source.timer.target.removeprefix("session:"))]
             for unit_cells in cells:
                 unit = production_units.cell_value(unit_cells.get("Unit", ""))
                 name = unit_names.name(unit)
@@ -128,8 +136,15 @@ def _collect(record: staff.StaffSnapshot, sources: _MemberSources) -> staff.Seed
                 if (not path_text or not Path(path_text).expanduser().is_dir()
                         or production_units.plan_cell_is_retired(unit_cells.get("Plan", ""))):
                     continue
+                identities = {entry["session_id"] for entry in sources.launches
+                              if entry["environment"].get("SHOWRUNNER_UNIT") == slug
+                              and entry["environment"].get("SHOWRUNNER_UNIT_ID") == unit}
+                if len(identities) != 1:
+                    _problem(unit, "no unique native session identity for seed")
+                    continue
                 production_members.append(_seed_member(f"unit:{slug}/{unit}", "unit", name, selected,
-                                                       staff.SeedParent(_showrunner_key(slug))))
+                                                       staff.SeedParent(_showrunner_key(slug)),
+                                                       runtime_id=next(iter(identities))))
         except (OSError, UnicodeError, production_units.Refusal, unit_names.BadName) as error:
             print(f"seed: {slug} ({source.timer.doc}): {error}", file=sys.stderr)
             continue
@@ -222,6 +237,24 @@ def _role(value: str) -> LiveRole:
     raise ValueError(f"missing or invalid recorded worker role: {value!r}")
 
 
+def codex_thread_host(arguments: list[str]) -> bool:
+    """An app-server hosts threads; its inherited staff mark is not a session."""
+    index = 2 if arguments and Path(arguments[0]).name in ("node", "nodejs") else 1
+    while index < len(arguments):
+        option = arguments[index]
+        if option in ("-c", "--config", "--enable", "--disable", "--remote",
+                      "--remote-auth-token-env", "--local-provider", "-m", "--model",
+                      "-p", "--profile", "-s", "--sandbox", "-a", "--ask-for-approval",
+                      "-C", "--cd", "--add-dir", "-i", "--image"):
+            index += 2
+        elif option.startswith("-") and option != "--":
+            index += 1
+        else:
+            return option == "app-server"
+    return False
+
+
+
 class _WorkerSources:
     """One command's read evidence, shared by the importer and live projection."""
 
@@ -258,6 +291,24 @@ class _WorkerSources:
         self.running: dict[str, sessions.SessionRecord] = {
             session["sessionId"]: session for session in workers.running_director_sessions(registry)
         }
+        self.native_running: dict[str, dict[str, str]] = {
+            identity: {"claude": identity} for identity in self.running}
+        from scripts.message import process_table
+        import herdr
+        try:
+            for process in process_table.snapshot().values():
+                arguments = shlex.split(process.arguments)
+                if not herdr.is_codex_process(arguments) or codex_thread_host(arguments):
+                    continue
+                environment = herdr.process_environment(process.pid)
+                if native := environment.get("CODEX_THREAD_ID", ""):
+                    self.native_running[native] = {"codex": native}
+                else:
+                    self.registry_incomplete = True
+                    _problem(f"Codex process {process.pid}", "native thread identity is unavailable")
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            self.registry_incomplete = True
+            _problem("Codex processes", error)
         self._owners()
 
     def read(self, path: Path) -> dict[str, object]:
@@ -292,16 +343,17 @@ class _WorkerSources:
             except (ValueError, staff.StaffUnreadable) as error:
                 _problem(source.timer.doc, error)
                 continue
-            session_id = source.timer.target.removeprefix("session:")
+            session_id = (owner.match.current_session if isinstance(owner.match, staff.StaffRow)
+                          else source.timer.target.removeprefix("session:"))
             self.sessions[session_id] = owner
-            if session_id in self.running and isinstance(owner.match, staff.StaffRow):
-                self.identities[owner.match.id] = {"claude": session_id}
+            if session_id in self.native_running and isinstance(owner.match, staff.StaffRow):
+                self.identities[owner.match.id] = self.native_running[session_id]
         for launch in sorted(self.sources.launches, key=lambda launch: launch["written_at"]):
-            if launch.get("ended") or launch["session_id"] not in self.running:
+            if launch.get("ended") or launch["session_id"] not in self.native_running:
                 continue
             environment = launch["environment"]
-            staff_id = environment.get("STAFF_ID", "")
-            row = self.record.by_id(staff.StaffId(staff_id)) if staff_id else None
+            staff_id = launch["session_id"]
+            row = self.record.by_current_session(staff_id) if staff_id else None
             if (row is None or row.kind not in ("unit", "showrunner", "worker")) and environment.get("SHOWRUNNER_UNIT_ID"):
                 try:
                     owner = self.recorded_owner(staff_id=staff_id, unit=environment["SHOWRUNNER_UNIT_ID"],
@@ -311,12 +363,17 @@ class _WorkerSources:
                     continue
                 self.sessions[launch["session_id"]] = owner
                 if isinstance(owner.match, staff.StaffRow):
-                    self.identities[owner.match.id] = {"claude": launch["session_id"]}
+                    self.identities[owner.match.id] = self.native_running[launch["session_id"]]
                 continue
             if row is not None:
-                self.identities[row.id] = {"claude": launch["session_id"]}
+                self.identities[row.id] = self.native_running[launch["session_id"]]
                 if row.kind != "worker":
                     self.sessions[launch["session_id"]] = WorkerOwner(f"staff:{row.id}", row)
+
+        for row in self.record.rows:
+            if row.kind in ("unit", "showrunner") and row.current_session in self.native_running:
+                self.identities[row.id] = self.native_running[row.current_session]
+                self.sessions[row.current_session] = WorkerOwner(f"staff:{row.id}", row)
 
     def recorded_owner(self, *, staff_id: str = "", production: str = "", unit: str = "") -> WorkerOwner:
         selected = worker_parent(self.record, self.sources, staff_id=staff_id,
@@ -393,8 +450,7 @@ class _WorkerSources:
         """A cached live identity proves life; negative evidence needs a successful mark lookup."""
         row = parent.match if parent is not None else staff.NewSeedMember()
         if isinstance(row, staff.StaffRow):
-            identity = self.identities.get(row.id, {})
-            if identity.get("claude") in self.running:
+            if row.current_session in self.native_running:
                 return True
             if row.kind == "unit":
                 slug = unit_lookup.row_production(row, self.record, self.sources).slug
@@ -537,6 +593,10 @@ class _WorkerSources:
         return data
 
     def director_live(self, run: Path) -> bool:
+        retained = unit_runs.director(run, dependencies=self.dependencies)
+        row = self.record.by_id(staff.StaffId(retained)) or self.record.by_current_session(retained)
+        if row is not None and row.kind == "unit" and row.current_session in self.native_running:
+            return True
         if run not in self.directors:
             self.directors[run] = workers.resolve_live_unit_director(
                 run, self.record, self.sources, tuple(self.running.values()), self.dependencies)
@@ -562,7 +622,7 @@ class _WorkerSources:
         thread = _text(fields.get("thread_id"))
         if not thread:
             raise ValueError("Codex worker thread is unavailable")
-        return self.codex_thread_live(run, thread)
+        return thread in self.native_running or self.codex_thread_live(run, thread)
 
     def codex_thread_live(self, run: Path, thread: str) -> bool:
         # This coarse display/seed check can keep a stale worker while its server lives.
@@ -828,9 +888,16 @@ def _worker_seed(record: staff.StaffSnapshot, sources: _MemberSources, base: sta
                           if row.name == observed.name), None)
                     if isinstance(owner.match, staff.StaffRow) else None)
         key = f"worker:{parent_key}/{observed.name}"
+        if isinstance(observed.identity, BackendUnavailable) or len(observed.identity) != 1:
+            _problem(observed.name, "native runtime identity is unavailable or ambiguous")
+            continue
+        native = staff.native_id(next(iter(observed.identity.values())))
+        if existing is not None and existing.current_session != native:
+            _problem(observed.name, f"native runtime identity conflicts with {existing.id}")
+            continue
         members.append(staff.SeedMember(key, "worker", observed.name,
                                         existing.id if existing is not None else staff.NewSeedMember(),
-                                        staff.SeedParent(parent_key)))
+                                        staff.SeedParent(parent_key), native))
     return staff.SeedInput(tuple(members), base.retire)
 
 
@@ -843,16 +910,24 @@ class WorkerEvidence:
     diagnostics: tuple[str, ...]
 
 
-def observe_workers(record: staff.StaffSnapshot, sources: _MemberSources) -> WorkerEvidence:
+class UnavailableWorkerPolicy(Enum):
+    REFUSE = "refuse"
+    LIST = "list"
+
+
+def observe_workers(record: staff.StaffSnapshot, sources: _MemberSources, *,
+                    unavailable: UnavailableWorkerPolicy = UnavailableWorkerPolicy.REFUSE) -> WorkerEvidence:
     """Expose the shared scanner without dropping missing rows or acquiring a lock."""
     errors = io.StringIO()
     with redirect_stderr(errors):
         scan = _WorkerSources(record, sources)
         observed = scan.collect()
-    if scan.unreadable:
+    if scan.unreadable and unavailable is UnavailableWorkerPolicy.REFUSE:
         raise staff.StaffUnreadable("worker sources: " + ", ".join(map(str, sorted(scan.unreadable))))
     if scan.registry_incomplete:
-        raise staff.StaffUnreadable("Claude session registry is incomplete")
+        if unavailable is UnavailableWorkerPolicy.REFUSE:
+            raise staff.StaffUnreadable("Claude session registry is incomplete")
+        _ = errors.write("Claude session registry is incomplete\n")
     diagnostics = tuple(errors.getvalue().splitlines())
     return WorkerEvidence(observed, scan.identities, diagnostics)
 
@@ -865,10 +940,30 @@ def live() -> dict[str, object]:
     scan = _WorkerSources(record, sources, dependencies=dependencies)
     observed = scan.collect()
     members: dict[staff.StaffId, dict[str, object]] = {}
+    unregistered = sorted(identity for identity in scan.native_running if record.by_current_session(identity) is None)
+    for identity in unregistered:
+        _problem(identity, "current native session has no staff row; identity publication is incomplete")
+    incomplete = bool(unregistered) or scan.registry_incomplete
+    from scripts.production.worker_admission import pending_publications
+    for run in sorted(scan.runs):
+        try:
+            for pending in pending_publications(run):
+                if record.by_current_session(pending.identity) is None:
+                    unregistered.append(pending.identity)
+                    incomplete = True
+                    _problem(pending.identity, "backend publication is unfinished")
+        except (OSError, ValueError, staff.StaffRefused) as error:
+            incomplete = True
+            _problem(str(run), error)
     active_ids = {row.id for kind in ("unit", "showrunner") for row in staff.active(record, kind)}
+    production_owners = {row.id for row in sources.showrunner_members(record).values()}
     for row in record.rows:
         identity = scan.identities.get(row.id) if row.id in active_ids else None
-        if row.kind != "worker" and identity is not None:
+        if row.kind != "worker" and identity is not None and row.current_session in identity.values():
+            if row.kind == "showrunner" and row.id not in production_owners:
+                incomplete = True
+                _problem(row.id, "production source is unavailable; omitted from live staff")
+                continue
             member = {**row.to_json(), "role": row.kind, "identity": identity}
             parent = record.by_id(row.parent) if row.parent is not None else None
             if row.kind == "showrunner" and parent is not None and isinstance(parent.doc, staff.WrappedDoc):
@@ -880,18 +975,25 @@ def live() -> dict[str, object]:
             continue
         rows = [row for row in record.find(kind="worker", parent=owner.id) if row.name == entry.name]
         if len(rows) != 1:
+            incomplete = True
             _problem(entry.name, "no recorded worker membership; run staff_sources.py seed")
             continue
         row = rows[0]
+        if row.current_session not in entry.identity.values():
+            incomplete = True
+            _problem(entry.name, "current runtime identity has no staff row; identity hook is incomplete")
+            continue
         member: dict[str, object] = {**row.to_json(), "role": entry.role, "identity": entry.identity}
         members[row.id] = member
     # Every emitted edge ends inside this document, even if source evidence is incomplete.
     while missing := [key for key, member in members.items()
                       if member["parent"] is not None and member["parent"] not in members]:
         for key in missing:
+            incomplete = True
             _problem(key, "parent has no session identity; omitted from live staff")
             del members[key]
-    return {"schema": 3, "inputs": sorted(scan.inputs), "members": [members[key] for key in sorted(members)]}
+    return {"schema": 3, "inputs": sorted(scan.inputs), "members": [members[key] for key in sorted(members)],
+            "complete": not incomplete, "unregistered": sorted(set(unregistered))}
 
 
 def cli_live() -> int:
@@ -922,6 +1024,11 @@ def _fill_git(folder: Path, *arguments: str) -> str:
     return done.stdout.strip()
 
 
+def source_allowed(path: Path) -> bool:
+    """Scratch checkouts never provide production ownership evidence."""
+    return not path.expanduser().resolve().is_relative_to(showrunners.SCRATCH_ROOT.expanduser().resolve())
+
+
 class _FillSources:
     """The fill's manifest and document evidence, collected before any write."""
 
@@ -942,7 +1049,7 @@ class _FillSources:
 
     def source_allowed(self, path: Path) -> bool:
         resolved = path.expanduser().resolve()
-        if not resolved.is_relative_to(showrunners.SCRATCH_ROOT.expanduser().resolve()):
+        if source_allowed(resolved):
             return True
         if resolved not in self.excluded_documents:
             self.excluded_documents.add(resolved)
@@ -1184,10 +1291,10 @@ def prepare_retirement(cells: dict[str, str], sources: _MemberSources,
         name = production_units.cell_value(cells.get("Unit", ""))
         evidence = [launch for launch in sources.launches
                     if launch["session_id"] and isinstance(selected, MemberFound)
-                    and launch["environment"].get("STAFF_ID") == selected.row.id]
+                    and launch["session_id"] == selected.row.current_session]
         if not evidence:
             evidence = [launch for launch in sources.launches
-                        if launch["session_id"] and not launch["environment"].get("STAFF_ID")
+                        if launch["session_id"]
                         and launch["environment"].get("SHOWRUNNER_UNIT") == slug
                         and launch["environment"].get("SHOWRUNNER_UNIT_ID") == name]
         identities = {launch["session_id"] for launch in evidence}
@@ -1233,9 +1340,15 @@ class WrappedFillDoc:
     location: staff.WrappedDoc
 
 
-def _fill_retired(scan: _FillSources, documents: tuple[FillDocument, ...],
-                  joined: _MemberSources, machine: str, *, dry_run: bool) -> int:
-    """Repair retained retirement facts; new rows wait for the session-id migration."""
+@dataclass(frozen=True)
+class RetirementPlan:
+    owners: dict[str, WrappedFillDoc]
+    units: dict[tuple[str, str], RetiredFillUnit]
+
+
+def retirement_plan(scan: _FillSources, documents: tuple[FillDocument, ...],
+                    joined: _MemberSources, machine: str) -> RetirementPlan:
+    """Prove retired facts once for fill and the native-id migration."""
     from scripts.production.tidy_wrapped import WRAPPED
 
     owners: dict[str, WrappedFillDoc] = {}
@@ -1310,6 +1423,180 @@ def _fill_retired(scan: _FillSources, documents: tuple[FillDocument, ...],
         except (OSError, ValueError, production_units.Refusal, staff.StaffUnreadable, staff.StaffRefused) as error:
             rejected_owners.add(slug)
             scan.problem(document.source, slug, error)
+    return RetirementPlan({slug: owner for slug, owner in owners.items() if slug not in rejected_owners},
+                          {key: value for key, value in units.items()
+                           if key[0] not in rejected_owners and key not in rejected_units})
+
+
+class BoundMigrationSources(_MemberSources):
+    """Join legacy owners through their stored documents before their native ids exist."""
+
+    @override
+    def member(self, selector: MemberSelector, record: staff.StaffSnapshot) -> MemberFound | NoSuchMember:
+        if isinstance(selector, UnitMember):
+            parent = self.member(ShowrunnerMember(selector.slug), record)
+            if isinstance(parent, NoSuchMember):
+                return NoSuchMember(selector)
+            matches = [row for row in record.find(kind="unit", parent=parent.row.id)
+                       if row.name == unit_names.name(selector.unit)]
+            if len(matches) > 1:
+                raise staff.StaffUnreadable(f"{selector}: conflicting retained unit rows")
+            return MemberFound(matches[0]) if matches else NoSuchMember(selector)
+        if not isinstance(selector, ShowrunnerMember):
+            return super().member(selector, record)
+        source = self.productions.get(selector.slug)
+        if source is None:
+            return NoSuchMember(selector)
+        matches = [row for row in record.find(kind="showrunner")
+                   if isinstance(row.doc, (staff.LiveDoc, staff.WrappedDoc))
+                   and row.doc.machine == _fill_machine()
+                   and row.doc.path.resolve() == source.timer.doc.resolve()]
+        if len(matches) > 1:
+            raise staff.StaffUnreadable(f"{source.timer.doc}: no unique stored showrunner owner")
+        return MemberFound(matches[0]) if matches else NoSuchMember(selector)
+
+
+def migration_peer_identities(record: staff.StaffSnapshot) -> tuple[dict[staff.StaffId, set[str]], tuple[str, ...]]:
+    """Read the peer roster once and join runtime evidence to stored member locations."""
+    from scripts.message import roster
+
+    local = remote.local_machine()
+    remote_rows = [row for row in record.rows
+                   if ((isinstance(row.doc, (staff.LiveDoc, staff.WrappedDoc)) and row.doc.machine != local)
+                       or (isinstance(row.worktree, (staff.PresentWorktree, staff.RemovedWorktree))
+                           and row.worktree.machine != local))]
+    if not remote_rows:
+        return {}, ()
+    peer = roster.peer_snapshot(os.environ)
+    if isinstance(peer, roster.PeerNotReached):
+        return {}, (f"{peer.host}: native identity evidence uncertain: {peer.reason}",)
+    problems = list(peer.problems)
+    identities: dict[staff.StaffId, set[str]] = {}
+    entries: dict[staff.StaffId, list[roster.RosterEntry]] = {}
+    for row in remote_rows:
+        candidates: list[roster.RosterEntry] = []
+        if row.kind == "showrunner" and isinstance(row.doc, (staff.LiveDoc, staff.WrappedDoc)):
+            location = row.doc
+            if not source_allowed(location.path):
+                problems.append(f"{row.id} {row.name}: scratch production source refused: {location.path}")
+                continue
+            try:
+                result = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+                                         location.machine, "cat -- " + shlex.quote(str(location.path))],
+                                        capture_output=True, text=True, check=True, timeout=20,
+                                        stdin=subprocess.DEVNULL)
+                slug = FillDocument(location.path, result.stdout, f"{location.machine}:{location.path}").slug
+            except (OSError, ValueError, subprocess.SubprocessError) as error:
+                problems.append(f"{row.id} {row.name}: stored peer document unavailable: {error}")
+                continue
+            candidates = [entry for entry in peer.entries
+                          if entry.machine == location.machine and entry.role == "showrunner"
+                          and isinstance(entry.showrunner, roster.RunsProduction)
+                          and entry.showrunner.production == slug]
+        elif row.kind == "unit" and isinstance(row.worktree, (staff.PresentWorktree, staff.RemovedWorktree)):
+            location = row.worktree
+            candidates = [entry for entry in peer.entries
+                          if entry.machine == location.machine and entry.role == "unit director"
+                          and entry.cwd == str(location.path)]
+        if candidates:
+            entries[row.id] = candidates
+    # A worker is proved only by the address of its proved parent, never a global name.
+    for row in record.find(kind="worker"):
+        parents = entries.get(row.parent, []) if row.parent is not None else []
+        addresses = {"session:" + parent.session.session_id for parent in parents
+                     if isinstance(parent.session, roster.ClaudeSession)}
+        addresses.update("codex:" + parent.thread.thread_id for parent in parents
+                         if isinstance(parent.thread, roster.CodexThread))
+        if addresses:
+            entries[row.id] = [entry for entry in peer.entries if entry.name == row.name
+                               and ((isinstance(entry.director, roster.UnderDirector)
+                                     and entry.director.address in addresses)
+                                    or (isinstance(entry.showrunner, roster.UnderShowrunner)
+                                        and entry.showrunner.address in addresses))]
+    for identity, candidates in entries.items():
+        observed = set[str]()
+        for entry in candidates:
+            native = (entry.session.session_id if isinstance(entry.session, roster.ClaudeSession)
+                      else entry.thread.thread_id if isinstance(entry.thread, roster.CodexThread) else "")
+            try:
+                observed.add(staff.native_id(native))
+            except staff.StaffRefused as error:
+                problems.append(f"{identity}: invalid peer native identity: {error}")
+        if observed:
+            identities[identity] = observed
+    return identities, tuple(problems)
+
+
+def migration_sources(record: staff.StaffSnapshot) -> tuple[_MemberSources, tuple[str, ...]]:
+    """Read only stored production documents and non-scratch launch evidence."""
+    problems: list[str] = []
+    import herdr
+    from scripts.shutdown import pane_record
+    launches = pane_record.read_strict(herdr.shared_session())
+    permitted = tuple(launch for launch in launches.values() if source_allowed(Path(launch["cwd"])))
+    productions: dict[str, showrunners.ShowrunnerSource] = {}
+    for row in record.find(kind="showrunner"):
+        location = row.doc
+        if not isinstance(location, (staff.LiveDoc, staff.WrappedDoc)):
+            problems.append(f"{row.id} {row.name}: missing stored production document")
+            continue
+        if location.machine != _fill_machine():
+            problems.append(f"{row.id} {row.name}: remote production evidence requires peer read")
+            continue
+        if not source_allowed(location.path):
+            problems.append(f"{row.id} {row.name}: scratch production source refused: {location.path}")
+            continue
+        try:
+            document = location.path.read_text(encoding="utf-8")
+            slug = FillDocument(location.path, document, str(location.path)).slug
+            timer = showrunners.NOTIFIER_STATE_DIR / f"showrunner-{slug}"
+            if timer.exists():
+                source = showrunners.read_bound_source(timer, location.path)
+            else:
+                source = showrunners.ShowrunnerSource(showrunners.Timer(slug, "", location.path, ""), document)
+            productions[slug] = source
+        except (OSError, ValueError) as error:
+            problems.append(f"{row.id} {row.name}: {error}")
+    return BoundMigrationSources(productions, permitted), tuple(problems)
+
+
+def migration_retirements(record: staff.StaffSnapshot) -> tuple[RetirementPlan, tuple[str, ...]]:
+    """Migration production evidence comes only from each stored document."""
+    dependencies = staff.RecordInputs(set(record.inputs))
+    current, source_problems = migration_sources(record)
+    scan = _FillSources(record, current, dependencies)
+    documents: list[FillDocument] = []
+    bound: dict[str, showrunners.ShowrunnerSource] = {}
+    for row in record.find(kind="showrunner"):
+        location = row.doc
+        if not isinstance(location, (staff.LiveDoc, staff.WrappedDoc)):
+            scan.problem(row.id, row.name, "missing stored production document")
+            continue
+        if location.machine != _fill_machine():
+            scan.problem(row.id, row.name, "remote production document requires peer evidence")
+            continue
+        if not scan.source_allowed(location.path):
+            continue
+        try:
+            dependencies(location.path)
+            text = location.path.read_text(encoding="utf-8")
+            document = FillDocument(location.path, text, str(location.path))
+            documents.append(document)
+            bound[document.slug] = showrunners.ShowrunnerSource(
+                showrunners.Timer(document.slug, "session:" + row.id, location.path, ""), text)
+        except (OSError, ValueError) as error:
+            scan.problem(location.path, row.name, error)
+    joined = _MemberSources(bound, current.launches)
+    return retirement_plan(scan, tuple(documents), joined, _fill_machine()), (*source_problems, *scan.problems)
+
+
+def _fill_retired(scan: _FillSources, documents: tuple[FillDocument, ...],
+                  joined: _MemberSources, machine: str, *, dry_run: bool) -> int:
+    """Repair retained facts; native additions belong to the one-time migration."""
+    plan = retirement_plan(scan, documents, joined, machine)
+    owners, units = plan.owners, plan.units
+    rejected_owners: set[str] = set()
+    rejected_units: set[tuple[str, str]] = set()
     planned_changes = any(candidate.member.row.doc != candidate.location
                           for slug, candidate in owners.items() if slug not in rejected_owners)
     planned_changes |= any(candidate.needs_publication for (slug, name), candidate in units.items()
@@ -1391,20 +1678,20 @@ class _LiveFillSources(_FillSources):
         self.row_sessions: dict[staff.StaffId, list[sessions.RegistryObservation]] = {}
         # Use the same id-first join as every other membership reader.
         for launch in sources.launches:
-            if launch.get("ended") or launch["session_id"] not in self.running:
+            owner = record.by_member_reference(launch["session_id"])
+            if launch.get("ended") or owner is None or owner.current_session not in self.running:
                 continue
             environment = launch["environment"]
-            identity = environment.get("STAFF_ID", "")
-            owner = record.by_id(staff.StaffId(identity)) if identity else None
-            if owner is not None and owner.kind == "showrunner":
-                self.row_sessions.setdefault(owner.id, []).append(self.running[launch["session_id"]])
+            identity = owner.current_session
+            if owner.kind == "showrunner":
+                self.row_sessions.setdefault(owner.id, []).append(self.running[identity])
                 continue
             try:
                 found = sources.member(ObservedUnit(environment.get("SHOWRUNNER_UNIT_ID", ""), identity), record)
             except (ValueError, staff.StaffUnreadable):
                 continue
             if isinstance(found, MemberFound):
-                self.row_sessions.setdefault(found.row.id, []).append(self.running[launch["session_id"]])
+                self.row_sessions.setdefault(found.row.id, []).append(self.running[identity])
         self.timers: dict[staff.StaffId, list[showrunners.ShowrunnerSource]] = {}
         self.timer_errors: dict[staff.StaffId, str] = {}
         # The shared membership reader omits unreadable docs. Reuse its timer
@@ -1444,7 +1731,7 @@ class _LiveFillSources(_FillSources):
             found = sources.member(ShowrunnerMember(slug), record)
             if isinstance(found, MemberFound):
                 self.timers.setdefault(found.row.id, []).append(source)
-                session = self.running.get(source.timer.target.removeprefix("session:"))
+                session = self.running.get(found.row.current_session)
                 if session is not None:
                     self.row_sessions.setdefault(found.row.id, []).append(session)
 
@@ -1629,6 +1916,38 @@ def _fill_live(record: staff.StaffSnapshot, sources: _MemberSources,
     if not changed and not scan.problems and not recovery_errors:
         print("unchanged")
     return 1 if scan.problems or recovery_errors else 0
+
+
+def require_worker_stopped(record: staff.StaffSnapshot, identity: staff.StaffId) -> None:
+    """Refuse removal while worker or peer evidence still names the native id."""
+    from scripts.production import session_staff
+    evidence = observe_workers(record, session_staff.member_sources())
+    member = record.by_id(identity)
+    current_session = member.current_session if member is not None else identity
+    if identity in evidence.identities or any(
+        not isinstance(worker.identity, BackendUnavailable)
+        and current_session in worker.identity.values() for worker in evidence.workers
+    ):
+        raise staff.StaffRefused(f"{identity}: native worker is current; stop it before removing its row")
+    # Remote process evidence belongs to the roster's one peer reader.
+    row = record.by_id(identity)
+    while row is not None:
+        location = row.worktree if row.kind == "unit" else row.doc
+        if isinstance(location, (staff.PresentWorktree, staff.RemovedWorktree, staff.LiveDoc, staff.WrappedDoc)):
+            if location.machine != remote.local_machine():
+                from scripts.message import roster
+                peer = roster.peer_snapshot(os.environ)
+                if isinstance(peer, roster.PeerNotReached):
+                    raise staff.StaffRefused(f"{identity}: remote native session state is uncertain: {peer.reason}")
+                if peer.problems:
+                    raise staff.StaffRefused(f"{identity}: remote native session state is uncertain: {peer.problems[0]}")
+                for entry in peer.entries:
+                    native = (entry.session.session_id if isinstance(entry.session, roster.ClaudeSession)
+                              else entry.thread.thread_id if isinstance(entry.thread, roster.CodexThread) else "")
+                    if native == current_session:
+                        raise staff.StaffRefused(f"{identity}: native session is live on {entry.machine}; stop it before removing its row")
+            break
+        row = record.by_id(row.parent) if row.parent else None
 
 
 def fill(*, dry_run: bool = False, retired: bool = False) -> int:

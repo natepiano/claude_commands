@@ -173,10 +173,14 @@ class PaneShellFixture:
         self.place: herdr.HerdrPlace = herdr.HerdrPlace("agents", "w1:p1")
         self.shell: int = 991001
         self.director: int = 4242
+        from scripts.production import staff
+        owner = staff.by_path(f"{slug}/{unit.removesuffix('-unit')}")
+        assert owner is not None
+        self.native_id: str = owner.current_session
         self.stop_calls: list[str] = []
         self.lifecycle: list[str] = []
         self._found: unit_lookup.MarkedUnit | None = unit_lookup.MarkedUnit(unit,
-            unit_lookup.LiveClaude("alpha", "sid-alpha", "/fixture/socket", self.director)
+            unit_lookup.LiveClaude("alpha", self.native_id, "/fixture/socket", self.director)
             if live else unit_lookup.ClaudeNotRunning(), self.place)
         write(self.environment, [HostedUnit(self.place.session, self.place.pane,
               {unit_lookup.PRODUCTION_MARK: slug, unit_lookup.UNIT_MARK: unit})])
@@ -251,7 +255,8 @@ class PaneShellFixture:
 def stopped_record(root: Path, worktree: Path, *, name: str = "alpha", cwd: Path | None = None,
                    production: str = "demo", unit: str = "alpha-unit", doc: Path | None = None,
                    host_session: str = "agents", branch: str = "", plan: Path | None = None,
-                   progress: Literal["waiting", "ready", "stopped"] = "stopped") -> shutdown_record.SessionShutdown:
+                   progress: Literal["waiting", "ready", "stopped"] = "stopped",
+                   runtime_id: str = "5ad615f2-4e04-5121-a102-9d6b2e2a6eb3") -> shutdown_record.SessionShutdown:
     """One typed unit record builder; callers override only their scenario's values."""
     del production, doc  # Parentage is supplied by staff, never persisted here.
     saved: shutdown_record.SessionShutdown = {
@@ -260,7 +265,7 @@ def stopped_record(root: Path, worktree: Path, *, name: str = "alpha", cwd: Path
         "requested_by": {"kind": "terminal"}, "hold": "session", "then": "stop", "force": "wait for ready",
         "alerts": "none", "probe": False,
         "session": {
-            "session_id": "sid-alpha", "config_dir": str(root), "pid": 4242, "proc_start": "1",
+            "session_id": runtime_id, "config_dir": str(root), "pid": 4242, "proc_start": "1",
             "name": name, "cwd": str(cwd or worktree), "status": "idle", "updated_at": 0, "probe": False,
             "model": {"kind": "no reply yet"},
             "checkout": {"kind": "git", "path": str(worktree), "head": {"kind": "branch", "name": branch},
@@ -317,7 +322,7 @@ def record_shutdown(case: unittest.TestCase, pane: PaneShellFixture, path: Path,
             def stopped(saved: shutdown_record.SessionShutdown) -> None:
                 saved['progress'] = {'kind':'stopped','at':'2026-10-09T21:50:00+00:00'}
                 saved['stop_issues'] = []
-            _ = shutdown_record.update_session(fields['login'], 'sid-alpha', stopped)
+            _ = shutdown_record.update_session(fields['login'], pane.native_id, stopped)
             stopped_event.set()
         elif arguments[0] == 'restart':
             pane.slug, pane.unit, name = destination
@@ -326,7 +331,7 @@ def record_shutdown(case: unittest.TestCase, pane: PaneShellFixture, path: Path,
                   {'SHOWRUNNER_UNIT':pane.slug, 'SHOWRUNNER_UNIT_ID':pane.unit})])
             pane.shell = 991001
             pane.found = unit_lookup.MarkedUnit(pane.unit,
-                unit_lookup.LiveClaude(name, 'sid-alpha', '/fixture/socket', pane.shell), pane.place)
+                unit_lookup.LiveClaude(name, pane.native_id, '/fixture/socket', pane.shell), pane.place)
         else:
             raise AssertionError(f'unexpected shutdown: {arguments}')
 
