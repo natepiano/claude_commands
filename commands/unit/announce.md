@@ -3,7 +3,7 @@ description: Send a message to all unit directors.
 argument-hint: "<message>"
 ---
 
-Read `~/.claude/commands/announce.md` → Message text.
+Treat `$ARGUMENTS` as the user's message. Send it without changes. Show the command output without changes.
 
 `python3 ~/.claude/scripts/production/broadcast.py --from <your session name> --units "From the user (via <your session name>, <HH:MM zone>): <message>"`
 

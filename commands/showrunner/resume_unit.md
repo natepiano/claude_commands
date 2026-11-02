@@ -5,11 +5,13 @@ argument-hint: "<unit> [--dry-run]"
 
 # Resume unit
 
-Read `~/.claude/commands/showrunner/retire_unit.md` → Run rules.
+Run in the showrunner session. `<unit>` is the unit's id or stem.
 
 ```sh
 "$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/resume_unit.py" <slug> <unit> [--dry-run]
 ```
+
+Print the script output without changes.
 
 `/showrunner:retire_unit` keeps what a resume needs in the Units row: the worktree path, the branch,
 the plan, and the director's last session in the note `(retired <date>, worktree removed, session <id>)`.
