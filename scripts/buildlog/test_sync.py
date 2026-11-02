@@ -125,6 +125,7 @@ class SyncTests(unittest.TestCase):
         filters = self.assert_host_pull("natedev")
         self.assertEqual([rule for rule in filters if rule.startswith("--include=")], [
             "--include=/Mac/***", "--include=/Nates-MacBook-Pro-2023/***",
+            "--include=/mac/***", "--include=/macbook/***", "--include=/aws-build/***",
         ])
         # Whole subtrees include launch-only and sample-only hosts and nested
         # saved logs; no monthly-file discovery or extension filter is involved.
@@ -151,6 +152,7 @@ class SyncTests(unittest.TestCase):
         filters = self.assert_host_pull("Mac")
         self.assertEqual([rule for rule in filters if rule.startswith("--include=")], [
             "--include=/natedev/***", "--include=/Nates-MacBook-Pro-2023/***",
+            "--include=/mac/***", "--include=/macbook/***", "--include=/aws-build/***",
         ])
         self.assertEqual(filters[-1], "--exclude=*")
 

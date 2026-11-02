@@ -137,7 +137,7 @@ The divisions separate state, execution, routing, cost accounting, control, repo
 
 **Also touches:** `scripts/mac_test/` (owner verify-unit); `scripts/build_targets/`, `scripts/build_hold/`, `commands/build/hold.md` (owner resources-unit); `scripts/buildlog/record.py` (owner report-unit).
 
-### Phase 2 — Allocate repository slots and exchange target records  · status: todo
+### Phase 2 — Allocate repository slots and exchange target records  · status: done
 **Depends on:** Phase 1
 
 #### Work Order
@@ -190,6 +190,14 @@ Resources also changes the Mac `free_floor_gib` comment for clone cleanup. Keep 
 - `test` — the three new test files; use fake claims, command replies and a temporary SQLite index.
 
 **State:** Slot claims, worktree affinity, warm mirror paths and per-peer sync status persist across runs.
+
+Assertion-Change: scripts/buildlog/test_index.py schema version 26 -> 27 (step target column).
+Assertion-Change: scripts/buildlog/test_sync.py pinned host lists gain mac, macbook, aws-build (item 5).
+Assertion-Change: scripts/mac_test/test_offload_cleanup.py mirror selector call(HANA) -> call(HANA, "mac", 1).
+Assertion-Change: scripts/buildlog/test_vault_pull.py transport expects sync.ssh_options() instead of sync.SSH_OPTIONS (timeout from config).
+Assertion-Change: scripts/mac_test/test_mac_test.py takeover field comparison also excludes cleanup_pending and asserts it is True (F002 mark).
+Assertion-Change: scripts/mac_test/test_target_slots.py origin-forms test compares normalized keys and legacy names; a Mac clone under another name claims its own mirror (status 0), per the Mac mirror-name claim scope.
+Assertion-Change: scripts/buildlog/test_target_sync.py transfer and host-mapping tests expect each configured peer pull to carry only that peer's own host folders.
 Write affinity only with confirmed claim ownership. Preserve an occupied slot during reruns and uncertain cleanup.
 
 **Constraints from prior phases:** Phase 1 provides target state directories and target-aware hold dispatch. The active target list still excludes AWS.

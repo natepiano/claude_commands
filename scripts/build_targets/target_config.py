@@ -37,6 +37,11 @@ class ConfigError(ValueError):
     """A build-target key is missing or has an unsupported value."""
 
 
+def uses_legacy_mac_layout(platform: Platform) -> bool:
+    """Mac targets retain one mirror and claim per source repository name."""
+    return platform == "macos"
+
+
 def read_targets(path: Path | None = None) -> tuple[Target, ...]:
     default = path if path is not None else SCRIPTS.parent / "config/build_targets.conf"
     config = Path(os.environ.get("BUILD_TARGETS_CONFIG", str(default))).expanduser().resolve()

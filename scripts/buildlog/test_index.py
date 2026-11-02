@@ -569,7 +569,7 @@ class IndexTests(unittest.TestCase):
             _ = connection.execute("PRAGMA user_version = 25")
             connection.commit()
         self.assertEqual(index.update(), 3)
-        self.assertEqual(self.rows("PRAGMA user_version"), [(26,)])
+        self.assertEqual(self.rows("PRAGMA user_version"), [(27,)])
         self.assertEqual(path.read_bytes(), original)
         self.assertEqual(json.loads(cast(str, self.rows("SELECT slices FROM samples ORDER BY at")[1][0])), slices)
 

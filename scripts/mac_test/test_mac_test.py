@@ -51,6 +51,7 @@ class RunState(TypedDict):
     worktree: str
     since: str
     remote_host: NotRequired[str]
+    cleanup_pending: NotRequired[bool]
     holder_session: NotRequired[str]
     idle_since: NotRequired[str]
 
@@ -991,8 +992,11 @@ class MacTestCommandTests(unittest.TestCase):
         after = self.run_state()
         self.assertEqual(after["pid"], taker.pid)
         self.assertEqual(after["proc_start"], mac_test.process_start_time(taker.pid))
-        self.assertEqual({key: value for key, value in after.items() if key not in ("pid", "proc_start")},
-                         {key: value for key, value in previous.items() if key not in ("pid", "proc_start")})
+        self.assertEqual({key: value for key, value in after.items()
+                          if key not in ("pid", "proc_start", "cleanup_pending")},
+                         {key: value for key, value in previous.items()
+                          if key not in ("pid", "proc_start", "cleanup_pending")})
+        self.assertIs(after.get("cleanup_pending"), True)
         refused = self.command("claim", "--pid", str(other.pid), "--what", "third tests", "--remote", "third-mac")
         self.assertEqual(refused.returncode, 11, refused.stdout + refused.stderr)
         self.assertTrue(refused.stdout.startswith("busy: older tests since "), refused.stdout)

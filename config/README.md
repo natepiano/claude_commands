@@ -104,6 +104,46 @@ Checkout tests use a temporary `HOME` for other targets and `BUILD_TARGETS_CONFI
 `mac_test.py <command> --target <name>` selects a configured SSH target.
 Explicit target status reads local records without probes or cleanup.
 
+Repository claims use the normalized origin identity from memory admission.
+Local clones and linked worktrees use the source repository identity.
+The readable name remains the source directory name from `sweep.repo_name`.
+The origin name does not change legacy Mac mirror or claim paths.
+Linux targets allocate slots under the target lock.
+`slots` sets the repository capacity. `slots.<repo>` replaces that value for one repository.
+The Mac keeps one claim per repository name and preserves its mirror paths.
+Origins with the same repository name take turns on the Mac.
+The AWS values are two slots by default and four slots for `hana` and `cargo-liner`.
+Each Linux slot uses `.local/state/build-target/mirror/<encoded-origin>/<slot>` and its own `target` folder.
+The target state directory retains the last slot for each existing worktree.
+Each affinity write removes paths that no longer exist.
+An occupied slot remains unavailable until its claim ends.
+Takeover retries retain the cleanup requirement until the owner releases the claim.
+Another worktree of the same repository can take over a lost run.
+The configured platform selects the mirror layout and slot protocol.
+
+## build_targets.conf
+
+`targets` lists active targets in routing order. The AWS target remains inactive before the user gate.
+Each SSH target names its platform and settings file.
+Natedev reads the SSH host from each active target's settings file before each record exchange.
+
+`sync.hosts.<target>` lists host directory names for synchronized records.
+This mapping supplies all allowed host names, including recorder health aliases.
+The Mac mapping includes its explicit legacy host aliases, including `macbook`.
+The AWS mapping permits `aws-build` records without activating the AWS target.
+`sync.connect_timeout_s`, `sync.reach_timeout_s`, and `sync.rsync_timeout_s` set sync time limits in seconds.
+Each exchange reads these settings again.
+Vault transfers use the same configured SSH connection timeout.
+
+Each peer retains its own status in `sync-peers/<encoded-peer>.json`.
+`sync.json` retains the Mac status for existing readers.
+A failed peer does not prevent another peer's exchange.
+The pause setting prevents exchanges with every peer.
+Transfers exclude admission and pending state directories.
+Each configured peer supplies only its own host folders.
+The `BUILDLOG_PEER` override retains the legacy transfer of all other synchronized host folders.
+Rsync replaces complete files and preserves this host's append files.
+
 ## direct.conf
 
 The `/unit:direct` tuning file: the convergence limits — how many automatic

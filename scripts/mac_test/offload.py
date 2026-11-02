@@ -6,7 +6,7 @@ from __future__ import annotations
 import argparse
 from collections.abc import Generator, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 import os
 from pathlib import Path
@@ -20,6 +20,7 @@ import time
 import traceback
 from types import FrameType
 from typing import TYPE_CHECKING, Literal, TextIO, cast, final
+from urllib.parse import quote
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lint"))
@@ -60,9 +61,14 @@ MacDeclineReason = NonBusyMacDeclineReason | Literal["busy"]
 
 @dataclass(frozen=True)
 class KnownRepository:
-    """A repository with a stable shared-git-directory name."""
+    """A repository with its readable name and normalized origin identity."""
 
     name: str
+    key: str = ""
+
+    @property
+    def path_key(self) -> str:
+        return quote(self.key or self.name, safe="").replace(".", "%2E")
 
 
 class UnknownRepository:
@@ -279,6 +285,8 @@ class OffloadRequest:
     copy: bool = False
     verb: MacVerb = "nextest"
     source: MacSource = RepositoryWorkingTree()
+    target: str = ""
+    slot: int = 1
 
     @property
     def source_root(self) -> Path:
@@ -337,12 +345,15 @@ COMMAND_COULD_NOT_START = CommandCouldNotStart()
 class FreshMacClaim:
     """New capacity with no remote job started under it."""
 
+    slot: int = 1
+
 
 @dataclass(frozen=True)
 class TakenOverMacClaim:
     """Capacity inherited from a lost job on the host in the claim's reply."""
 
     host: str
+    slot: int = 1
 
 
 @dataclass(frozen=True)
@@ -519,6 +530,7 @@ class CliArguments(argparse.Namespace):
         self.filter_run: bool = False
         self.result: str | None = None
         self.settings: str = ""
+        self.target: str = ""
         self.last_decline: str = ""
         self.copy: bool = False
         self.nextest_words: list[str] = []
@@ -702,6 +714,7 @@ def configured_ssh_target(target: str) -> target_config.SshTarget:
 
 
 def state_directory(target: str = "mac") -> Path:
+    target = target or "mac"
     if target != "mac":
         _ = configured_ssh_target(target)
         return Path.home() / ".local/state/build-targets" / target
@@ -736,7 +749,21 @@ def read_config(path: Path | DefaultMacSettings = DEFAULT_MAC_SETTINGS) -> Offlo
 
 def repository_identity(repo_root: Path) -> RepositoryIdentity:
     name = sweep.repo_name(str(repo_root))
-    return KnownRepository(name) if name is not None else UNKNOWN_REPOSITORY
+    common = sweep.git_common_dir(str(repo_root))
+    if name is None or common is None:
+        return UNKNOWN_REPOSITORY
+    source = Path(sweep.source_git_dir(common))
+    if not (source / "config").is_file():
+        return KnownRepository(name)
+    # Load admission after module initialization to preserve its recorder boundary.
+    if TYPE_CHECKING:
+        from ..lint import memory_admit
+    else:
+        import memory_admit
+    identity = memory_admit.git_identity(["git"], str(source.parent))[0]
+    if isinstance(identity, memory_admit.RepositoryIdentity):
+        return KnownRepository(name, identity.key)
+    return KnownRepository(name)
 
 
 def comma_values(value: str) -> set[str]:
@@ -860,12 +887,16 @@ def ssh_prefix(config: OffloadConfig) -> list[str]:
     return ["ssh", *ssh_options(config), config.host]
 
 
-def remote_mirror(repository: KnownRepository) -> str:
-    return f".local/state/mac-test/mirror/{repository.name}"
+def remote_mirror(repository: KnownRepository, target: str = "mac", slot: int = 1) -> str:
+    if target_config.uses_legacy_mac_layout(configured_ssh_target(target or "mac").platform):
+        return f".local/state/mac-test/mirror/{repository.name}"
+    if slot < 1:
+        raise ValueError("slot must be positive")
+    return f".local/state/build-target/mirror/{repository.path_key}/{slot}"
 
 
-def probe_script(repository: KnownRepository) -> str:
-    mirror = shlex.quote(remote_mirror(repository))
+def probe_script(repository: KnownRepository, target: str = "mac", slot: int = 1) -> str:
+    mirror = shlex.quote(remote_mirror(repository, target, slot))
     return "\n".join(
         (
             f'mkdir -p "$HOME"/{mirror} || exit 1',
@@ -896,6 +927,7 @@ def parse_probe(output: str) -> ProbeResult:
 
 def claim_arguments(request: OffloadRequest, config: OffloadConfig) -> list[str]:
     copy_words = ["--copy"] if request.copy else []
+    selection = ["--target", request.target] if request.target else []
     return [
         sys.executable,
         str(Path(__file__).with_name("mac_test.py")),
@@ -909,10 +941,11 @@ def claim_arguments(request: OffloadRequest, config: OffloadConfig) -> list[str]
         "--remote",
         config.host,
         *copy_words,
+        *selection,
     ]
 
 
-def release_claim(controller: ProcessController) -> None:
+def release_claim(controller: ProcessController, target: str = "") -> None:
     _ = controller.capture(
         [
             sys.executable,
@@ -920,6 +953,7 @@ def release_claim(controller: ProcessController) -> None:
             "release",
             "--pid",
             str(os.getpid()),
+            *(["--target", target] if target else []),
         ]
     )
 
@@ -927,13 +961,17 @@ def release_claim(controller: ProcessController) -> None:
 def read_claim_answer(result: CapturedCommandResult) -> MacClaimAnswer:
     if not isinstance(result, CommandOutput):
         return MacClaimNotConfirmed("state", "", "")
+    slots = [line.removeprefix("slot: ") for line in result.stdout.splitlines() if line.startswith("slot: ")]
+    if slots and (len(slots) != 1 or not slots[0].isascii() or not slots[0].isdecimal() or int(slots[0]) < 1):
+        return MacClaimNotConfirmed("state", result.stdout, result.stderr)
+    slot = int(slots[0]) if slots else 1
     if result.status == 0:
-        return FreshMacClaim()
+        return FreshMacClaim(slot)
     if result.status == 13:
         hosts = [line.removeprefix("leftovers: ").strip() for line in result.stdout.splitlines()
                  if line.startswith("leftovers: ")]
         if len(hosts) == 1 and hosts[0]:
-            return TakenOverMacClaim(hosts[0])
+            return TakenOverMacClaim(hosts[0], slot)
         return TakeoverHostUnreadable()
     reason: MacDeclineReason = (
         "blocked" if result.status == 10 else "busy" if result.status == 11 else "state"
@@ -959,9 +997,11 @@ def probe_mac(
     controller: ProcessController,
     config: OffloadConfig,
     repository: KnownRepository,
+    target: str = "mac",
+    slot: int = 1,
 ) -> ProbeResult:
     result = controller.capture(
-        [*ssh_prefix(config), probe_script(repository)],
+        [*ssh_prefix(config), probe_script(repository, target, slot)],
         CommandTimeLimit(config.probe_timeout_s),
     )
     if isinstance(result, CommandTimedOut):
@@ -1037,7 +1077,7 @@ def copy_tree(
                         "-e",
                         shlex.join(["ssh", *ssh_options(config)]),
                         f"{request.source_root}/",
-                        f"{config.host}:{remote_mirror(repository)}/",
+                        f"{config.host}:{remote_mirror(repository, request.target, request.slot)}/",
                     ]
                 )
                 return isinstance(result, CommandOutput) and result.status == 0
@@ -1100,7 +1140,7 @@ def remote_test_command(
     if any(word == "--target-dir" or word.startswith("--target-dir=") for word in words):
         cleanup_command = "echo mac_cleanup=skipped"
     else:
-        target = shlex.quote(f"{remote_mirror(repository)}/target")
+        target = shlex.quote(f"{remote_mirror(repository, request.target, request.slot)}/target")
         floor = shlex.quote(f"{config.free_floor_gib:g}")
         cleanup_command = (
             'if free_gib=$(df -g "$HOME"); then '
@@ -1113,7 +1153,7 @@ def remote_test_command(
         )
     forced_config = "LINT_CONFIG_FORCE=1 " if request.verb == "doc" else ""
     return (
-        f"cd {shlex.quote(remote_mirror(repository))} && "
+        f"cd {shlex.quote(remote_mirror(repository, request.target, request.slot))} && "
         'PATH="$HOME/.cargo/bin:$PATH" '
         "BUILDLOG_CALLER=verify-mac "
         f"BUILDLOG_CALL_ID={shlex.quote(request.call_id)} "
@@ -1134,14 +1174,14 @@ def extended_regex_literal(text: str) -> str:
     character instead, which can only widen the selection by that position.
     """
     return "".join(
-        character if character.isalnum() or character in "_-"
+        character if character.isalnum() or character in "_-/"
         else "." if character in "]^\\"
         else f"[{character}]"
         for character in text
     )
 
 
-def mirror_selector_script(scope: MirrorScope) -> str:
+def mirror_selector_script(scope: MirrorScope, target: str = "mac", slot: int = 1) -> str:
     """Define select_leftovers: the user's processes running from the scoped mirrors.
 
     A repository's scope stops at its own mirror, so its leftover check never
@@ -1149,9 +1189,9 @@ def mirror_selector_script(scope: MirrorScope) -> str:
     matching this script's own text.
     """
     if isinstance(scope, KnownRepository):
-        name = extended_regex_literal(scope.name)
-        command_pattern = f"[.]local/state/mac-test/mirror/{name}([/'\"[:space:]]|$)"
-        cwd_pattern = f"^n.*/[.]local/state/mac-test/mirror/{name}(/|$)"
+        mirror = extended_regex_literal(remote_mirror(scope, target, slot))
+        command_pattern = f"{mirror}([/'\"[:space:]]|$)"
+        cwd_pattern = f"^n.*/{mirror}(/|$)"
     else:
         command_pattern = "[.]local/state/mac-test/mirror/"
         cwd_pattern = "^n.*/[.]local/state/mac-test/mirror(/|$)"
@@ -1173,8 +1213,8 @@ def mirror_selector_script(scope: MirrorScope) -> str:
     )
 
 
-def leftover_check_script(repository: KnownRepository) -> str:
-    return mirror_selector_script(repository) + r'''
+def leftover_check_script(repository: KnownRepository, target: str = "mac", slot: int = 1) -> str:
+    return mirror_selector_script(repository, target, slot) + r'''
 leftover_pids=$(select_leftovers) || exit 1
 printf '%s\n' "$leftover_pids" | while IFS= read -r leftover_pid; do
     [ -n "$leftover_pid" ] && kill "$leftover_pid" 2>/dev/null
@@ -1203,11 +1243,12 @@ def parse_leftover_check(output: str) -> LeftoverCheckResult:
     return LeftoversEnded() if count == 0 else LeftoversRemain(count)
 
 
-def check_leftovers(config: OffloadConfig, host: str, repository: KnownRepository) -> LeftoverCheckResult:
+def check_leftovers(config: OffloadConfig, host: str, repository: KnownRepository,
+                   target: str = "mac", slot: int = 1) -> LeftoverCheckResult:
     """End and count one mirror's work without exposing the check to a second signal."""
     try:
         result = subprocess.run(
-            ["ssh", *ssh_options(config), host, leftover_check_script(repository)],
+            ["ssh", *ssh_options(config), host, leftover_check_script(repository, target, slot)],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -1239,10 +1280,11 @@ def report_leftover_check(result: LeftoverCheckResult, request: OffloadRequest) 
 
 
 def check_taken_over_claim(
-    config: OffloadConfig, claim: TakenOverMacClaim | TakeoverHostUnreadable, repository: KnownRepository
+    config: OffloadConfig, claim: TakenOverMacClaim | TakeoverHostUnreadable, repository: KnownRepository,
+    target: str = "mac",
 ) -> LeftoverCheckResult:
     if isinstance(claim, TakenOverMacClaim):
-        return check_leftovers(config, claim.host, repository)
+        return check_leftovers(config, claim.host, repository, target, claim.slot)
     return LeftoverCheckFailed("the kept claim's host could not be read")
 
 
@@ -1258,12 +1300,12 @@ def claim_for_run(
     except OffloadInterrupted:
         claim = attempt.answer
         if isinstance(claim, FreshMacClaim):
-            release_claim(controller)
+            release_claim(controller, request.target)
         elif isinstance(claim, (TakenOverMacClaim, TakeoverHostUnreadable)):
-            checked = check_taken_over_claim(config, claim, repository)
+            checked = check_taken_over_claim(config, claim, repository, request.target)
             report_leftover_check(checked, request)
             if isinstance(checked, LeftoversEnded):
-                release_claim(controller)
+                release_claim(controller, request.target)
         raise
 
 
@@ -1276,9 +1318,9 @@ def claimed_run(
 ) -> MacOffloadResult:
     release_allowed = True
     try:
-        probe = probe_mac(controller, config, repository)
+        probe = probe_mac(controller, config, repository, request.target, request.slot)
         if isinstance(probe, UnavailableProbe):
-            write_backoff(time.time() + config.unreachable_backoff_s)
+            write_backoff(time.time() + config.unreachable_backoff_s, request.target)
             return declined("unreachable", started)
         if probe.free_gib < config.free_floor_gib:
             return declined("disk", started)
@@ -1303,13 +1345,13 @@ def claimed_run(
         )
         seconds = elapsed_seconds(started)
         if isinstance(remote_status, MissingMacStatus):
-            checked = check_leftovers(config, config.host, repository)
+            checked = check_leftovers(config, config.host, repository, request.target, request.slot)
             release_allowed = isinstance(checked, LeftoversEnded)
             report_leftover_check(checked, request)
             return LostMacRun(elapsed_seconds(started))
         report_cleanup(remote_status.cleanup)
         if isinstance(remote_status.cleanup, CleanupUnconfirmed):
-            checked = check_leftovers(config, config.host, repository)
+            checked = check_leftovers(config, config.host, repository, request.target, request.slot)
             release_allowed = isinstance(checked, LeftoversEnded)
             report_leftover_check(checked, request)
         else:
@@ -1321,13 +1363,13 @@ def claimed_run(
         return FailedOnMac(remote_status.status, seconds)
     except OffloadInterrupted:
         if not release_allowed:
-            checked = check_leftovers(config, config.host, repository)
+            checked = check_leftovers(config, config.host, repository, request.target, request.slot)
             release_allowed = isinstance(checked, LeftoversEnded)
             report_leftover_check(checked, request)
         raise
     finally:
         if release_allowed:
-            release_claim(controller)
+            release_claim(controller, request.target)
 
 
 @dataclass(frozen=True)
@@ -1435,14 +1477,14 @@ def run_offload(
 
     claim = claim_for_run(controller, config, request, repository)
     if isinstance(claim, (TakenOverMacClaim, TakeoverHostUnreadable)):
-        checked = check_taken_over_claim(config, claim, repository)
+        checked = check_taken_over_claim(config, claim, repository, request.target)
         report_leftover_check(checked, request)
         if isinstance(checked, LeftoverCheckFailed):
-            write_backoff(time.time() + config.unreachable_backoff_s)
+            write_backoff(time.time() + config.unreachable_backoff_s, request.target)
             return declined("unreachable", started)
         if isinstance(checked, LeftoversRemain):
             return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
-        release_claim(controller)
+        release_claim(controller, request.target)
         claim = claim_for_run(controller, config, request, repository)
         if isinstance(claim, (TakenOverMacClaim, TakeoverHostUnreadable)):
             return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
@@ -1455,7 +1497,7 @@ def run_offload(
         if claim.reason == "busy":
             return BusyMacDecline(claim_holder(claim.stdout), elapsed_seconds(started))
         return declined(claim.reason, started)
-    return claimed_run(controller, config, request, repository, started)
+    return claimed_run(controller, config, replace(request, slot=claim.slot), repository, started)
 
 
 @contextmanager
@@ -1495,6 +1537,7 @@ def parser() -> argparse.ArgumentParser:
     _ = run.add_argument("--verb", choices=("nextest", "check", "clippy", "mend-check", "doc"), default="nextest")
     _ = run.add_argument("--call-id", required=True)
     _ = run.add_argument("--settings", default="")
+    _ = run.add_argument("--target", default="")
     _ = run.add_argument("--last-decline", choices=("busy", "blocked"), default="")
     _ = run.add_argument("--filter-run", action="store_true")
     _ = run.add_argument("--copy", action="store_true")
@@ -1522,6 +1565,7 @@ def request_from_arguments(arguments: CliArguments) -> OffloadRequest:
         last_decline=last_decline,
         copy=arguments.copy,
         verb=arguments.verb,
+        target=arguments.target,
     )
 
 
@@ -1543,7 +1587,10 @@ def main() -> int:
         cli.error("--source-root applies only to a staged doc snapshot")
     restore_ignored_interrupt_default(arguments)
     request = request_from_arguments(arguments)
-    config = read_config(Path(arguments.settings)) if arguments.settings else read_config()
+    settings = arguments.settings
+    if not settings and arguments.target:
+        settings = str(configured_ssh_target(arguments.target).settings)
+    config = read_config(Path(settings)) if settings else read_config()
     controller = ProcessController()
     started = time.monotonic()
     try:
