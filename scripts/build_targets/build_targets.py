@@ -48,6 +48,7 @@ from targets import (
     target_state,
     target_eligibility,
 )
+from target_config import is_aws_target
 import offload
 import mac_test
 import conf
@@ -265,7 +266,7 @@ def ssh_target_eligibility(target: SshTarget, repo_root: Path, package: str,
 
 def aws_spending_exclusion(target: SshTarget) -> str:
     """Check AWS spending before reading the execution settings."""
-    if target.platform != "linux" or (target.name != "aws" and target.settings.name != "aws_target.conf"):
+    if not is_aws_target(target):
         return ""
     if conf.text(target.settings, "offload") != "on":
         return "off"
@@ -284,7 +285,7 @@ def ssh_target_config(target: SshTarget) -> offload.OffloadConfig | ExcludedTarg
             return ExcludedTarget(target, reason)
         return offload.read_config(target.settings)
     except conf.Unusable as error:
-        if target.platform != "linux" or (target.name != "aws" and target.settings.name != "aws_target.conf"):
+        if not is_aws_target(target):
             raise
         print(f"build targets: {target.name}: spending refused: {error}", file=sys.stderr)
         return ExcludedTarget(target, "spending_unavailable")
@@ -321,13 +322,7 @@ def cleanup_refused_claims(target: SshTarget, args: CliArguments) -> None:
     if not claims:
         return
     try:
-        # Cleanup reads only connection settings. Execution stays disabled.
-        config = offload.OffloadConfig(
-            enabled=False, host=conf.text(target.settings, "host"),
-            connect_timeout_s=conf.number(target.settings, "connect_timeout_s"),
-            probe_timeout_s=0, unreachable_backoff_s=0, free_floor_gib=0,
-            default_target_budget_gib="", values={}, source=target.settings,
-        )
+        config = offload.read_connection_settings(target.settings)
     except conf.Unusable as error:
         print(f"build targets: {target.name}: cleanup settings unavailable: {error}", file=sys.stderr)
         return

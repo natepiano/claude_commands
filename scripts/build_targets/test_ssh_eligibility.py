@@ -330,6 +330,67 @@ class SshEligibilityTests(unittest.TestCase):
                 self.assertEqual(build_targets.command_release_wait(501), 0)
                 reservation.unlink()
 
+    def test_refused_cleanup_keeps_claims_when_connection_settings_are_unusable(self) -> None:
+        settings = self.root / "aws_target.conf"
+        original_settings = settings.read_text()
+        for key in ("host", "connect_timeout_s", "leftover_timeout_s"):
+            with self.subTest(setting=key):
+                _ = settings.write_text(original_settings)
+                self.occupy(71)
+                paths = mac_test.state_paths("aws")
+                original, = mac_test.read_claims(paths)
+                numeric_settings(settings, {"daily_limit_usd": "broken"})
+                if key == "host":
+                    _ = settings.write_text(settings.read_text().replace("host=fake-aws\n", ""))
+                else:
+                    numeric_settings(settings, {key: "broken"})
+
+                def start(pid: int) -> str | None:
+                    return None if pid == 71 else self.process_start(pid)
+
+                with mock.patch.object(mac_test, "process_start_time", side_effect=start), \
+                        mock.patch.object(subprocess, "Popen", new=REAL_POPEN), \
+                        mock.patch.object(subprocess, "run", new=git_only), redirect_stderr(io.StringIO()) as errors:
+                    self.assertEqual(self.reserve(recover_only=True), 1)
+                retained, = mac_test.read_claims(paths)
+                self.assertEqual(retained.path, original.path)
+                self.assertEqual(retained.record.get("remote_host"), "fake-aws")
+                self.assertIn(key, errors.getvalue())
+                self.assertIn("cleanup settings unavailable", errors.getvalue())
+                self.assertFalse((self.root / "reservation.tsv").exists())
+                self.assertFalse(offload.backoff_path("aws").exists())
+                self.assertEqual(self.commands, [])
+                retained.path.unlink()
+
+    def test_refused_cleanup_uses_the_recorded_host_and_live_connection_limits(self) -> None:
+        self.occupy(71)
+        paths = mac_test.state_paths("aws")
+        settings = self.root / "aws_target.conf"
+        _ = settings.write_text(settings.read_text().replace("host=fake-aws", "host=new-host"))
+        numeric_settings(settings, {"daily_limit_usd": "broken", "connect_timeout_s": "9", "leftover_timeout_s": "23"})
+        calls: list[list[str]] = []
+
+        def start(pid: int) -> str | None:
+            return None if pid == 71 else self.process_start(pid)
+
+        def cleanup(arguments: Sequence[str], **options: object) -> subprocess.CompletedProcess[str]:
+            if arguments[0] == "git":
+                return git_only(arguments, **options)
+            calls.append(list(arguments))
+            self.assertEqual(arguments[-2], "fake-aws")
+            self.assertIn("ConnectTimeout=9", arguments)
+            self.assertNotIn("new-host", arguments)
+            self.assertEqual(options["timeout"], 23)
+            return subprocess.CompletedProcess(arguments, 0, "leftovers=0\nrc=0\n", "")
+
+        with mock.patch.object(mac_test, "process_start_time", side_effect=start), \
+                mock.patch.object(subprocess, "Popen", new=REAL_POPEN), \
+                mock.patch.object(subprocess, "run", side_effect=cleanup), redirect_stderr(io.StringIO()):
+            self.assertEqual(self.reserve(recover_only=True), 1)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(mac_test.read_claims(paths), ())
+        self.assertFalse((self.root / "reservation.tsv").exists())
+
     def test_recovery_only_does_not_create_a_new_claim(self) -> None:
         self.assertEqual(self.reserve(recover_only=True), 1)
         self.assertFalse((self.root / "reservation.tsv").exists())
