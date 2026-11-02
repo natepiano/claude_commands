@@ -220,6 +220,58 @@ PROGRESS_HELPER="${SCRIPT_DIR}/progress_history.py"
 PROGRESS_STATE="${SESSION_DIR}/progress_history_state.json"
 HEARTBEAT_INTERVAL_SECS=60
 
+REVIEW_FAILURE_REASON="${UNIT_REVIEW_FAILURE_REASON:-}"
+SIMPLIFY_DIR="${ARTIFACT_DIR}/simplify"
+
+review_error() {
+  REVIEW_FAILURE_REASON="$1"
+  printf 'ERROR: %s\n' "${REVIEW_FAILURE_REASON}" >&2
+}
+
+simplify_result() {
+  "$PY" "${SCRIPT_DIR}/simplify_result.py" "$1" --phase-dir "${ARTIFACT_DIR}" "${@:2}"
+}
+
+finish_simplify() {
+  local code="$1"
+  trap - EXIT
+  simplify_result finish --session-dir "${SESSION_DIR}" --phase "${PHASE_ID}" \
+    --reason "${REVIEW_FAILURE_REASON}" --exit-code "${code}" || {
+      echo error > "${STATUS_FILE}"
+      echo "ERROR: unable to finish the simplify result." >&2
+    }
+  # Review failures let the phase continue. Stop signals retain their exit code.
+  if [[ "${code}" -lt 128 ]]; then
+    code=0
+  fi
+  exit "${code}"
+}
+
+if [[ "${TASK}" == direct.simplify ]]; then
+  trap 'finish_simplify $?' EXIT
+  mkdir -p "${SIMPLIFY_DIR}"
+  exec {SIMPLIFY_LOCK}>"${SIMPLIFY_DIR}/launch.lock"
+  if ! flock -n "${SIMPLIFY_LOCK}"; then
+    review_error "the Claude lens is busy"
+    [[ -z "${UNIT_REVIEW_CACHE_FILE:-}" ]] || rm -f "${PROMPT_FILE}"
+    exit 1
+  fi
+  if [[ -n "${REVIEW_FAILURE_REASON}" ]]; then
+    review_error "${REVIEW_FAILURE_REASON}"
+    printf 'ERROR: %s\n' "${REVIEW_FAILURE_REASON}" > "${FINDINGS_FILE}"
+    exit 1
+  fi
+  if [[ -n "${UNIT_REVIEW_CACHE_FILE:-}" && -e "${UNIT_REVIEW_CACHE_FILE}" ]] && simplify_result reuse; then
+    [[ -z "${UNIT_REVIEW_CACHE_FILE:-}" ]] || rm -f "${PROMPT_FILE}"
+    trap - EXIT
+    exit 0
+  fi
+  if [[ -n "${UNIT_REVIEW_CACHE_FILE:-}" ]]; then
+    mv "${PROMPT_FILE}" "${SIMPLIFY_DIR}/prompt.md"
+    PROMPT_FILE="${SIMPLIFY_DIR}/prompt.md"
+  fi
+fi
+
 # Validate before worker allocation, compaction or any reviewer starts. UX has no
 # pass window, so this command also records its launch evidence.
 if [[ -f "${PROGRESS_STATE}" ]]; then
@@ -511,33 +563,16 @@ finish_review_exit() {
   finish_style_review "${code}" || code=1
   count_turn_findings
   refresh_turn_thread_id
-  local evidence_code=0
   if ! write_turn_record; then
-    echo "ERROR: unable to write review turn record." >&2
+    review_error "unable to write review turn record"
     echo error > "${STATUS_FILE}"
-    evidence_code=1
     code=1
   fi
-  if [[ "${TASK}" == direct.simplify && "${TURN_FINDINGS_READY}" -eq 1 && "${PASS_STARTED}" -eq 0 && "${TURN_RECORD_STATUS}" != canceled && "${evidence_code}" -eq 0 ]]; then
-    if [[ -n "${UNIT_REVIEW_CACHE_FILE:-}" ]] && ! "$PY" - \
-      "${UNIT_REVIEW_CACHE_FILE}" "${STATUS_FILE}" "${FINDINGS_FILE}" "${SCRIPT_DIR}" <<'PY'
-import json
-import sys
-from pathlib import Path
-sys.path.insert(0, str(Path(sys.argv[4]).resolve().parents[1]))
-from scripts.lib.atomic_file import write_text_atomic
-write_text_atomic(Path(sys.argv[1]), json.dumps({
-    "status": Path(sys.argv[2]).read_text().strip(),
-    "summary": Path(sys.argv[3]).read_text(),
-}) + "\n")
-PY
-    then
-      echo "ERROR: unable to publish the review cache." >&2
-      echo error > "${STATUS_FILE}"
-      code=1
-    fi
-  fi
+
   cleanup_mesh_review
+  if [[ "${TASK}" == direct.simplify ]]; then
+    finish_simplify "${code}"
+  fi
   exit "${code}"
 }
 
@@ -605,7 +640,7 @@ fi
 # shellcheck source=/dev/null
 source "${SCRIPT_DIR}/../agents/agents_config.sh"
 if [[ "${TASK}" == direct.simplify && "$(_agents_live_family direct simplify)" != claude ]]; then
-  echo "ERROR: direct.simplify requires a Claude assignment." >&2
+  review_error "direct.simplify requires a Claude assignment"
   echo error > "${STATUS_FILE}"
   exit 1
 fi
@@ -842,22 +877,15 @@ if [[ "${TREE_BASELINE_READY}" -ne 0 ]]; then
   fi
   if [[ -n "${CHANGED_PATHS}" ]]; then
     TREE_CHANGED=1
-    echo "ERROR: ${REVIEWER_LABEL} changed the working tree: ${CHANGED_PATHS}" >&2
+    review_error "${REVIEWER_LABEL} changed the working tree: ${CHANGED_PATHS}"
   fi
   rm -f "${TREE_BASELINE_FILE}"
 fi
 
 if [[ "${TASK}" == direct.simplify ]]; then
-  if [[ -f "${FINDINGS_FILE}" ]]; then
-    "$PY" - "${FINDINGS_FILE}" <<'PY' || AGENT_CODE=1
-import re
-import sys
-from pathlib import Path
-
-report = Path(sys.argv[1]).read_text(encoding="utf-8").strip()
-sys.exit(0 if report == "Pass" or re.match(r"^1[.)]\s", report) else 1)
-PY
-  else
+  if ! REPORT_ERROR="$("$PY" "${SCRIPT_DIR}/simplify_result.py" check \
+    --report-file "${FINDINGS_FILE}" --log-file "${LOG_FILE}")"; then
+    review_error "${REPORT_ERROR}"
     AGENT_CODE=1
   fi
 fi

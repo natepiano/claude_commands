@@ -640,72 +640,31 @@ def execute_simplify(args: Arguments, run: Path, phase: str, cwd: Path, source_p
                      env: dict[str, str]) -> int:
     directory = phase_reservation.phase_directory(run, phase)
     directory.mkdir(parents=True, exist_ok=True)
-    summary = directory / "review_findings_1_simplify.txt"
-    status = directory / "review_status_simplify"
-
-    def report_error(message: str) -> int:
-        _ = status.write_text("error\n")
-        print(f"simplify: error: {message}; summary {summary}", file=sys.stderr)
+    if conf.text("direct", "SIMPLIFY_LENS") == "off":
+        print("simplify: off")
         return 0
-
+    if args.pass_number != 1:
+        print("simplify: skipped; broad review only")
+        return 0
+    prompt = source_prompt
+    env["UNIT_REVIEW_CACHE_FILE"] = ""
+    _ = env.pop("UNIT_REVIEW_FAILURE_REASON", None)
     try:
-        if conf.text("direct", "SIMPLIFY_LENS") == "off":
-            print("simplify: off")
-            return 0
-        if args.pass_number != 1:
-            print("simplify: skipped; broad review only")
-            return 0
         diff = (cwd / Path(args.diff).expanduser()).resolve()
         digest = hashlib.sha256(diff.read_bytes()).hexdigest()
         cache = directory / "simplify"
         cache.mkdir(exist_ok=True)
-        with (cache / "launch.lock").open("a+") as lock:
-            try:
-                worker_lifecycle.acquire_flock(lock, mode=fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                return report_error("the Claude lens is busy")
-            record_path = cache / f"{digest}.json"
-            if record_path.exists():
-                record = read_object(record_path)
-                outcome, output = text(record.get("status")), text(record.get("summary"))
-                action = "reused"
-            else:
-                prompt = cache / "prompt.md"
-                standing = (conf.directory() / "review/simplify.md").read_text()
-                _ = prompt.write_text(f"/simplify {shlex.quote(str(diff))}\n\n"
-                                      + standing + "\n\n" + source_prompt.read_text() + "\n")
-                env["UNIT_REVIEW_CACHE_FILE"] = str(record_path)
-                command = ["bash", str(SCRIPTS / "review.sh"), "--phase", phase, str(run), str(cwd),
-                           str(prompt), "simplify", "simplify review", "reviewing the completed phase diff", "1", "simplify"]
-                # The child retains the lock if this launcher stops before it can send a signal.
-                with subprocess.Popen(command, env=env, start_new_session=True,
-                                      pass_fds=(lock.fileno(),)) as reviewer:
-                    def interrupt(signum: int, frame: FrameType | None) -> NoReturn:
-                        del frame
-                        reviewer.send_signal(signum)
-                        raise SystemExit(128 + signum)
-
-                    previous = {number: signal.signal(number, interrupt)
-                                for number in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)}
-                    try:
-                        _ = reviewer.wait()
-                    finally:
-                        if reviewer.poll() is None:
-                            reviewer.terminate()
-                            _ = reviewer.wait()
-                        for number, handler in previous.items():
-                            _ = signal.signal(number, handler)
-                outcome = status.read_text().strip() if status.exists() else "error"
-                output = summary.read_text() if summary.exists() else ""
-                action = outcome
-            _ = status.write_text(outcome + "\n")
-            _ = summary.write_text(output)
-            if args.summary:
-                _ = Path(args.summary).write_text(output)
-            print(f"simplify: {action}; summary {summary}")
-            return 0
-    except (OSError, ValueError) as error:
-        return report_error(str(error))
+        prompt = cache / f"prompt-{os.getpid()}.md"
+        standing = (conf.directory() / "review/simplify.md").read_text()
+        _ = prompt.write_text(f"/simplify {shlex.quote(str(diff))}\n\n"
+                              + standing + "\n\n" + source_prompt.read_text() + "\n")
+        env["UNIT_REVIEW_CACHE_FILE"] = str(cache / f"{digest}.json")
+    except OSError as error:
+        env["UNIT_REVIEW_FAILURE_REASON"] = f"unable to prepare the simplify review: {error}"
+    env["UNIT_REVIEW_SUMMARY_FILE"] = str(Path(args.summary).resolve()) if args.summary else ""
+    command = ["bash", str(SCRIPTS / "review.sh"), "--phase", phase, str(run), str(cwd),
+               str(prompt), "simplify", "simplify review", "reviewing the completed phase diff", "1", "simplify"]
+    os.execvpe(command[0], command, env)
 
 
 def main() -> int:
