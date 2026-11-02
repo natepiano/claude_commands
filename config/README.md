@@ -129,6 +129,9 @@ Stopped instances continue to incur fixed costs.
 
 The target directory stores `cost-ledger.json` and `cost-ledger.lock`.
 The ledger retains observations, prices, inventories, reconciliations, decisions and limit events.
+New observations must confirm a lifecycle state.
+An `unknown` observation raises `ObservationRejected` and changes no evidence.
+Older `unknown` rows do not prevent accounting from later confirmed observations.
 Each decision publishes current totals and current-day intervals.
 Admission computes the current month and the complete periods needed by overlapping reconciliations.
 Atomic publication preserves previous evidence when replacement fails.
@@ -137,7 +140,10 @@ A corrupt or unreadable ledger refuses spending and remains unchanged.
 `notification_timeout_s` bounds each delivery attempt.
 Each limit event stores a pending or delivered state.
 The guard sends pending events after releasing the ledger lock.
-A later guard retries an unconfirmed delivery with the same message key.
+Each pending event stores its retry deadline and delivery owner.
+`notification_retry_s=300` sets the minimum interval between delivery attempts.
+A separate delivery lock prevents concurrent sends.
+A later guard retries an unconfirmed delivery after its deadline with the same message key.
 Confirmed delivery prevents further attempts.
 
 The SSH, retry, storage, slot, hold and claim settings apply when each command reads this file.

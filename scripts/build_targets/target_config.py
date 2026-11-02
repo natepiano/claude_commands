@@ -30,6 +30,11 @@ class SshTarget:
     settings: Path
 
 
+def is_aws_target(target: SshTarget) -> bool:
+    """Identify Linux targets governed by the AWS spending guard."""
+    return target.platform == "linux" and (target.name == "aws" or target.settings.name == "aws_target.conf")
+
+
 Target = LocalTarget | SshTarget
 
 

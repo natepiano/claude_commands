@@ -14,6 +14,7 @@ from pathlib import Path
 import subprocess
 import sys
 import time
+from uuid import uuid4
 from typing import Literal, cast
 from zoneinfo import ZoneInfo
 
@@ -147,6 +148,18 @@ class DeliveryState(str, Enum):
 
 
 @dataclass(frozen=True)
+class DeliveryUnowned:
+    """No caller has reserved this notice for delivery."""
+
+
+@dataclass(frozen=True)
+class DeliveryOwner:
+    """The caller that holds the delivery lock for this notice."""
+
+    token: str
+
+
+@dataclass(frozen=True)
 class LimitEvent:
     event_id: str
     at: int
@@ -156,6 +169,8 @@ class LimitEvent:
     recipient: str
     timeout_s: int
     delivery: DeliveryState = DeliveryState.PENDING
+    retry_after: int = 0
+    owner: DeliveryOwner | DeliveryUnowned = DeliveryUnowned()
 
 
 @dataclass
@@ -167,6 +182,10 @@ class LedgerEvidence:
     events: list[LimitEvent] = field(default_factory=list)
     price_refresh_at: int = 0
     decision: dict[str, object] = field(default_factory=dict)
+
+
+class ObservationRejected(ValueError):
+    """The observation does not confirm a lifecycle state."""
 
 
 class LedgerUnavailable(ValueError):
@@ -219,7 +238,10 @@ def _decode(row: dict[str, object]) -> LedgerEvidence:
                             money(_text(r, "usd")), _text(r, "source")) for r in _rows(row, "reconciliations")],
         [LimitEvent(_text(r, "event_id"), _instant(r, "at"), _text(r, "period"), money(_text(r, "estimate_usd")),
                     money(_text(r, "limit_usd")), _text(r, "recipient"), _instant(r, "timeout_s"),
-                    DeliveryState(r.get("delivery", "pending"))) for r in _rows(row, "events")],
+                    DeliveryState(r.get("delivery", "pending")),
+                    _instant(r, "retry_after") if "retry_after" in r else 0,
+                    DeliveryOwner(_text(r, "owner")) if r.get("owner") else DeliveryUnowned())
+         for r in _rows(row, "events")],
         _instant(row, "price_refresh_at"), _mapping(row["decision"]))
     for inventory in evidence.inventories:
         names = [resource.name for resource in inventory.resources]
@@ -227,6 +249,8 @@ def _decode(row: dict[str, object]) -> LedgerEvidence:
             raise LedgerUnavailable("expected distinct priced resources")
     states: dict[int, str] = {}
     for observation in evidence.observations:
+        if observation.state == "unknown":
+            continue
         if observation.at in states and states[observation.at] != observation.state:
             raise LedgerUnavailable("conflicting instance observations")
         states[observation.at] = observation.state
@@ -253,7 +277,8 @@ def _encode(state: LedgerEvidence) -> dict[str, object]:
                              "usd": str(r.usd), "source": r.source} for r in state.reconciliations],
         "events": [{"event_id": r.event_id, "at": r.at, "period": r.period, "estimate_usd": str(r.estimate_usd),
                     "limit_usd": str(r.limit_usd), "recipient": r.recipient, "timeout_s": r.timeout_s,
-                    "delivery": r.delivery.value} for r in state.events],
+                    "delivery": r.delivery.value, "retry_after": r.retry_after,
+                    "owner": r.owner.token if isinstance(r.owner, DeliveryOwner) else ""} for r in state.events],
         "price_refresh_at": state.price_refresh_at, "decision": state.decision,
     }
 
@@ -288,7 +313,7 @@ def _charges(state: LedgerEvidence, settings: SpendingSettings, now: int, *,
     if not state.inventories:
         raise LedgerUnavailable("a priced resource inventory is required before spending")
     inventories = sorted(state.inventories, key=lambda item: item.at)
-    observations = sorted(state.observations, key=lambda item: item.at)
+    observations = sorted((r for r in state.observations if r.state != "unknown"), key=lambda item: item.at)
     prices = sorted(state.prices, key=lambda item: item.at)
     if any(r.at > now for r in (*inventories, *observations, *prices, *state.reconciliations)):
         raise LedgerUnavailable("cost evidence is from the future")
@@ -323,8 +348,6 @@ def _charges(state: LedgerEvidence, settings: SpendingSettings, now: int, *,
         end = observations[index + 1].at if index + 1 < len(observations) else now
         if end <= window_start:
             continue
-        if observation.state == "unknown":
-            raise LedgerUnavailable("an instance transition is unknown")
         confirmed_end = min(end, observation.at + settings.observation_max_age_seconds)
         fallback(confirmed_end, end)
         if observation.state not in ("running", "pending", "stopping"):
@@ -386,12 +409,14 @@ def _reserved_fixed_costs(state: LedgerEvidence, settings: SpendingSettings, cos
 def send_limit_event(event: LimitEvent) -> bool:
     """Use the existing message interface after persisting the event identity."""
     script = Path(__file__).resolve().parents[1] / "message" / "send.py"
+    # Keep the key active across every date that the message interface can represent.
+    repeat_minutes = (datetime.max - datetime.min) // timedelta(minutes=1) + 1
     result = subprocess.run([sys.executable, str(script), "--to", event.recipient, "--from", "aws-spending-guard",
-                             "--key", f"aws-limit:{event.event_id}", "--text",
+                             "--key", f"aws-limit:{event.event_id}", "--repeat-minutes", str(repeat_minutes), "--text",
                              f"AWS spending guard: {event.period} limit refuses new work; drain the target. "
                              + f"Estimate ${event.estimate_usd}; limit ${event.limit_usd}."],
                             capture_output=True, text=True, timeout=event.timeout_s, check=False)
-    return result.returncode == 0
+    return result.returncode == 0 and result.stdout.startswith(("SENT:", "SKIPPED:"))
 
 
 def _decision_record(decision: SpendingDecision) -> dict[str, object]:
@@ -447,8 +472,10 @@ class CostLedger:
         write_text_atomic(self.path, json.dumps(document, sort_keys=True) + "\n")
 
     def observe(self, observation: InstanceObservation) -> None:
+        if observation.state == "unknown":
+            raise ObservationRejected("unknown does not confirm an instance lifecycle state")
         with self._locked() as state:
-            if any(r.at == observation.at and r.state != observation.state for r in state.observations):
+            if any(r.at == observation.at and r.state not in (observation.state, "unknown") for r in state.observations):
                 raise LedgerUnavailable("conflicting instance observations")
             if observation not in state.observations:
                 state.observations.append(observation)
@@ -506,7 +533,7 @@ class CostLedger:
             evidence = GuardEvidence(purpose, settings.limits, evidence.costs, settings)
             costs = _charges(state, settings, now, current_window=True)
             evidence = GuardEvidence(purpose, settings.limits, costs, settings)
-            if purpose != "deployment" and not state.observations:
+            if purpose != "deployment" and not any(r.state != "unknown" for r in state.observations):
                 raise LedgerUnavailable("instance state evidence is missing")
             daily_fixed, monthly_fixed = _reserved_fixed_costs(state, settings, costs)
             evidence = GuardEvidence(purpose, settings.limits, costs, settings, daily_fixed, monthly_fixed)
@@ -528,8 +555,50 @@ class CostLedger:
         except (OSError, ValueError, ArithmeticError) as error:
             return SpendingUnavailable(now, str(error), evidence)
 
+    def _deliver_pending(self, settings_path: Path, clock: Callable[[], float],
+                         notify: Callable[[LimitEvent], bool]) -> None:
+        # The delivery lock prevents concurrent sends without holding the ledger lock.
+        with (self.directory / "cost-notice.lock").open("a") as delivery_lock:
+            try:
+                fcntl.flock(delivery_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return
+            try:
+                retry_s = read_settings(settings_path).notification_retry_s
+                with self._locked() as state:
+                    pending = tuple(event for event in state.events
+                                    if event.delivery is DeliveryState.PENDING)
+                for candidate in pending:
+                    owner = DeliveryOwner(uuid4().hex)
+                    with self._locked() as state:
+                        event = next(saved for saved in state.events if saved.event_id == candidate.event_id)
+                        attempt_at = int(clock())
+                        if event.delivery is not DeliveryState.PENDING or event.retry_after > attempt_at:
+                            continue
+                        event = replace(event, retry_after=attempt_at + retry_s, owner=owner)
+                        state.events = [event if saved.event_id == event.event_id else saved for saved in state.events]
+                        self._save(state)
+                    try:
+                        delivered = notify(event)
+                    except Exception:
+                        delivered = False
+                    with self._locked() as state:
+                        state.events = [replace(saved, owner=DeliveryUnowned(),
+                                                delivery=DeliveryState.DELIVERED if delivered else DeliveryState.PENDING)
+                                        if saved.event_id == event.event_id and saved.owner == owner else saved
+                                        for saved in state.events]
+                        self._save(state)
+            finally:
+                fcntl.flock(delivery_lock, fcntl.LOCK_UN)
+
     def guard(self, settings_path: Path, purpose: SpendingPurpose, now: int,
-              notify: Callable[[LimitEvent], bool] = send_limit_event) -> SpendingDecision:
+              notify: Callable[[LimitEvent], bool] = send_limit_event, *,
+              clock: Callable[[], float] = time.monotonic) -> SpendingDecision:
+        clock_started = clock()
+
+        def delivery_time() -> float:
+            return now + clock() - clock_started
+
         evidence = GuardEvidence(purpose, (), CostEvidenceUnavailable("ledger evidence is unavailable"))
         try:
             with self._locked() as state:
@@ -537,24 +606,16 @@ class CostLedger:
                 evidence = decision.evidence
                 state.decision = _decision_record(decision)
                 self._save(state)
-                pending = [event for event in state.events if event.delivery is DeliveryState.PENDING]
         except (OSError, ValueError, ArithmeticError) as error:
             return SpendingUnavailable(now, str(error), evidence)
-        for event in pending:
-            try:
-                if not notify(event):
-                    continue
-                with self._locked() as state:
-                    state.events = [replace(saved, delivery=DeliveryState.DELIVERED)
-                                    if saved.event_id == event.event_id else saved for saved in state.events]
-                    self._save(state)
-            except Exception:
-                # Keep an unconfirmed delivery pending for a later guard call.
-                continue
+        try:
+            self._deliver_pending(settings_path, delivery_time, notify)
+        except (OSError, ValueError, ArithmeticError) as error:
+            print(f"AWS limit notice remains pending: {error}", file=sys.stderr)
         return decision
 
 
 def spending_guard(settings_path: Path, directory: Path, purpose: SpendingPurpose = "admission", *,
                    clock: Callable[[], float] = time.time,
                    notify: Callable[[LimitEvent], bool] = send_limit_event) -> SpendingDecision:
-    return CostLedger(directory).guard(settings_path, purpose, int(clock()), notify)
+    return CostLedger(directory).guard(settings_path, purpose, int(clock()), notify, clock=clock)
