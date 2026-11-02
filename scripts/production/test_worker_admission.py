@@ -2,11 +2,87 @@
 from __future__ import annotations
 
 import os
+import json
 from dataclasses import replace
 from unittest import mock
 
+from scripts.lib import unit_runs
 from scripts.production import staff, worker_admission
+from scripts.production import session_staff
 from scripts.production.staff_test_support import StaffTestCase, fixture_runtime_id
+
+
+class RecordedDirectorAdmissionTests(StaffTestCase):
+    def test_old_caller_resolves_recorded_native_director_before_run_names(self) -> None:
+        _, unit, _ = self.tree()
+        run = self.root / "run"
+        run.mkdir()
+        _ = (run / unit_runs.DIRECTOR_FILE).write_text(unit.id + "\n")
+        _ = (run / unit_runs.STATE_FILE).write_text(json.dumps({
+            "production": "former-production", "unit": "former-unit",
+        }))
+        before = self.staff_file.read_bytes()
+        found = worker_admission.parent(staff.snapshot(), staff_id="s0123456789ab", run=run)
+        self.assertEqual(found, unit)
+        self.assertEqual(self.staff_file.read_bytes(), before)
+
+    def test_old_or_missing_caller_resolves_director_with_empty_run_names(self) -> None:
+        _, unit, _ = self.tree()
+        run = self.root / "run"
+        run.mkdir()
+        _ = (run / unit_runs.DIRECTOR_FILE).write_text(unit.id + "\n")
+        _ = (run / unit_runs.STATE_FILE).write_text('{"production": "", "unit": ""}')
+        before = self.staff_file.read_bytes()
+        for caller in ("s0123456789ab", ""):
+            with self.subTest(caller=caller), mock.patch.object(staff, "runtime_id", return_value=caller):
+                allowed = worker_admission.admit("new-worker", run, role="impl")
+                self.assertEqual(allowed.parent, unit.id)
+                self.assertEqual(self.staff_file.read_bytes(), before)
+
+    def test_worker_caller_resolves_its_fixed_parent_after_session_replacement(self) -> None:
+        _, unit, worker = self.tree()
+        current = staff.native_id(fixture_runtime_id("dispatching-worker-current-session"))
+        _ = staff.update_current_session(worker.current_session, current)
+        before = self.staff_file.read_bytes()
+        found = worker_admission.parent(staff.snapshot(), staff_id=current)
+        self.assertEqual(found, unit)
+        self.assertEqual(self.staff_file.read_bytes(), before)
+
+    def test_unknown_caller_without_run_or_names_keeps_the_refusal(self) -> None:
+        _ = self.tree()
+        before = self.staff_file.read_bytes()
+        with self.assertRaises(ValueError) as refused:
+            _ = worker_admission.parent(
+                staff.snapshot(), session_staff.MemberSources({}, ()), staff_id="s0123456789ab",
+            )
+        self.assertEqual(str(refused.exception), "no showrunner staff row for ")
+        self.assertEqual(self.staff_file.read_bytes(), before)
+
+    def test_recorded_fixed_director_resolves_after_clear(self) -> None:
+        _, unit, _ = self.tree()
+        run = self.root / "run"
+        run.mkdir()
+        director = run / unit_runs.DIRECTOR_FILE
+        _ = director.write_text(unit.id + "\n")
+        current = staff.native_id(fixture_runtime_id("cleared-dispatch-director"))
+        changed = staff.update_current_session(unit.current_session, current)
+        before = self.staff_file.read_bytes(), director.read_bytes()
+        found = worker_admission.parent(staff.snapshot(), staff_id="s0123456789ab", run=run)
+        self.assertEqual(found, changed)
+        self.assertEqual((self.staff_file.read_bytes(), director.read_bytes()), before)
+
+    def test_recorded_director_and_worker_caller_cannot_admit_under_retired_parent(self) -> None:
+        _, unit, worker = self.tree()
+        run = self.root / "run"
+        run.mkdir()
+        _ = (run / unit_runs.DIRECTOR_FILE).write_text(unit.id + "\n")
+        _ = staff.set_worktree(unit.id, staff.RemovedWorktree("natedev", self.root / "gone"))
+        before = self.staff_file.read_bytes()
+        for caller in ("s0123456789ab", worker.current_session):
+            with self.subTest(caller=caller), mock.patch.object(staff, "runtime_id", return_value=caller):
+                with self.assertRaisesRegex(worker_admission.AdmissionRefused, "not opened:.*retired"):
+                    _ = worker_admission.admit("new-worker", run, role="impl")
+                self.assertEqual(self.staff_file.read_bytes(), before)
 
 
 class WorkerAdmissionTests(StaffTestCase):

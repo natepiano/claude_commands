@@ -37,7 +37,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 import berth_board
 import style_footprint
 import style_ledger
-from approved_renames import (BindingComments, BindingRename, BindingScope, NoBindingScope,
+import approved_renames
+from approved_renames import (BindingComments, BindingRename, BindingScope, NoBindingScope, OuterBindingBlocked, OuterBindingUnproved,
                               RenameDeclaration, rename_declaration, refactor_rename, refactor_comments, binding_comments,
                               PatternBindingCollision, pattern_binding_check,
                               backtick_mentions, identifier_mentions, field_sites)
@@ -63,6 +64,13 @@ def object_list(value: object) -> list[object]:
 class Refusal:
     finding_id: str
     reason: str
+
+
+@dataclass(frozen=True)
+class BlockedRename(Refusal):
+    """A non-executable rename whose enclosing binding must be resolved by a person."""
+
+    blocker: OuterBindingBlocked | OuterBindingUnproved
 
 
 class ReservationBlocked(BulkRenameError):
@@ -98,6 +106,8 @@ class RenameFinding:
     finding_id: str
     path: str
     rename: BindingRename
+    authority: approved_renames.AnchoredRenameSource | approved_renames.RenameAnchorUnavailable
+    finding_version: str
 
 
 @dataclass(frozen=True)
@@ -1773,6 +1783,36 @@ def rename_file(server: RenameServer, path: Path, relative: str, source: str,
     for finding in findings:
         try:
             declaration = rename_declaration(source, finding.rename)
+            admission = approved_renames.admit_anchored_rename(finding.authority, finding.finding_version, finding.rename, relative, source,
+                purpose=approved_renames.RenameAdmissionPurpose.EXECUTE_PENDING_EDIT)
+            if isinstance(admission, OuterBindingBlocked | OuterBindingUnproved):
+                reason = ("outer binding visibility unproved: " if isinstance(admission, OuterBindingUnproved) else "") + admission.reason
+                # Keep the existing collision and external-text diagnostics. Policy
+                # refusal remains typed even when an earlier guard also refuses.
+                if isinstance(declaration, RenameDeclaration):
+                    try:
+                        _ = rename_guard(server, path, source, declaration, finding.rename)
+                        parsed = server.sources.tokens(source)
+                        mentions = tuple(SourceEdit(span.start, span.end, finding.rename.new) for span in parsed.spans
+                                         if span.token.value == finding.rename.old)
+                        text_name_guard(server, DocumentEdits(path, source, mentions), finding.rename)
+                    except BulkRenameError as error:
+                        reason = str(error) + "; " + reason
+                refused.append(BlockedRename(finding.finding_id, reason, admission))
+                continue
+            if isinstance(admission, approved_renames.AdmittedLocalRename):
+                if not admission.covers(finding.finding_version, finding.rename, relative, source):
+                    refused.append(BlockedRename(finding.finding_id, "local admission snapshot changed",
+                                                  OuterBindingUnproved("local admission snapshot changed", finding.rename.line, finding.rename.text)))
+                    continue
+                offset = dict(admission.edit_mapping)[admission.declaration_position]
+                token = next((span.token.value for span in server.sources.tokens(source).spans if span.start == offset), "")
+                if token.removeprefix("r#") != finding.rename.old.removeprefix("r#"):
+                    refused.append(BlockedRename(finding.finding_id, "recorded declaration no longer has the old name",
+                                                  OuterBindingUnproved("recorded declaration no longer has the old name", finding.rename.line, finding.rename.text)))
+                    continue
+                line = source.count("\n", 0, offset) + 1
+                declaration = rename_declaration(source, BindingRename(line, source.splitlines()[line - 1], finding.rename.old, finding.rename.new))
             if isinstance(declaration, NoBindingScope):
                 raise BulkRenameError(declaration.reason)
             located.append((finding, declaration))
@@ -2186,7 +2226,7 @@ def run_batch(repo: Path, ticket_id: str) -> Path:
             elif path.resolve() != path or not path.is_file() or not finding.path.endswith(".rs"):
                 refused.append(Refusal(finding.finding_id, "finding path is not a regular Rust file"))
             else:
-                groups[finding.path].append(RenameFinding(finding.finding_id, finding.path, rename))
+                groups[finding.path].append(RenameFinding(finding.finding_id, finding.path, rename, ledger.rename_authority(finding), finding.finding_id + ":" + ledger.finding_input_identity(finding)))
         packages = verification_packages(repo, ticket["crate"])
         files: list[FileRenames] = []
         with RustAnalyzer(repo) as server:
@@ -2229,7 +2269,7 @@ def run_batch(repo: Path, ticket_id: str) -> Path:
                 "sample": [asdict(item) for item in sample],
                 "files": {path: {"before": workspace.files[path].original, "after": (repo / path).read_text()} for path in good},
             })
-            _ = ledger.bulk_release(ticket_id, {refusal.finding_id: refusal.reason for refusal in refused})
+            _ = ledger.bulk_release(ticket_id, {refusal.finding_id: refusal.blocker if isinstance(refusal, BlockedRename) else refusal.reason for refusal in refused})
         except BaseException:
             workspace.restore()
             intent.finish()
