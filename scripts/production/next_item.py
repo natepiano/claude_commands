@@ -139,11 +139,14 @@ def show(kind: str, order: str, production: Path | None, below: bool = False) ->
     return f"{kinds[name]}\n{shown.item}"
 
 
-def move_to_end(kind: str, production: Path | None, below: bool = False) -> str:
-    """Move the item /next last showed from the `kind` list to its end."""
+def move_to_end(kind: str, production: Path | None, below: bool = False, *, key: str = "") -> str:
+    """Move the given key, or the item /next last showed, to the list's end."""
     queue = read_queue(kind, production, below)
-    key = urgency.pinned(queue.name)
-    if not key or key not in {entry.key for entry in queue.entries}:
+    present = {entry.key for entry in queue.entries}
+    if key and key not in present:
+        raise NextError(f"no {kind} with key {key} is waiting")
+    key = key or urgency.pinned(queue.name)
+    if not key or key not in present:
         raise NextError(f"no {kind} that /next showed is waiting; show one first")
     urgency.move_to_end(queue.name, key, datetime.now(user_zone()).replace(tzinfo=None))
     return f"{kind}: moved {key} to the end"
