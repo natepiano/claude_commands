@@ -298,6 +298,8 @@ class ImplementLauncherFixture(LauncherFixture):
     def build_script_tree(self) -> Path:
         """Copy the real wrapper beside a stub agent, so nothing calls a model."""
         direct_dir, agents, lib = prepare_launcher_runtime(self.root)
+        for name in ("conf.py", "conf.sh"):
+            _ = shutil.copy2(DIRECT_DIR.parent / "lib" / name, lib / name)
         _ = shutil.copy2(DIRECT_DIR.parent / "lib/nix_env.py", lib / "nix_env.py")
         home_lib = self.root / ".claude/scripts/lib"
         home_lib.mkdir(parents=True, exist_ok=True)
@@ -331,7 +333,6 @@ class ImplementLauncherFixture(LauncherFixture):
     def environment(self) -> dict[str, str]:
         environment = launcher_environment(self.root)
         environment["CONF_DIR"] = str(self.root)
-        environment["UNIT_CONFIG"] = str(self.config_file)
         environment["STAFF_FILE"] = str(self.root / "staff.json")
         environment["CODEX_THREAD_ID"] = self.staff_parent
         _ = environment.pop("STAFF_ID", None)
@@ -474,6 +475,7 @@ printf '%s\\n' '{answer}'
                 ["python3", str(findings), arguments[0], "--session-dir", str(session_dir),
                  *arguments[1:]],
                 check=False, capture_output=True, text=True, env=self.environment(),
+                timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
 

@@ -26,6 +26,19 @@ Known input for the inventory: `scripts/agents/test_codex_mesh.py` was killed at
   - Python is typed throughout, with no `Any` and no file-level type ignores (user, `~/.claude/CLAUDE.md`).
   - All text uses Simplified Technical English (user, 2026-10-18).
   - One place for each thing: no second list of suites anywhere (user, 2026-10-30).
+  - Preserve Phase 7d recovery snapshots and their Git refs.
+  - Restore an attempt only when its paths overlap the requested paths.
+  - Validate every original path before restoring any path in that attempt.
+  - Preserve later index and worktree edits.
+  - Retain attempt JSON records after permanent restore closure.
+  - Remove attempt recovery refs only after permanent restore closure.
+  - Acquire the gate-record lock before `main-push.lock`.
+  - Release the gate-record lock before local promotion.
+  - Hold `main-push.lock` through the last promotion push to main.
+  - Run Mac pulls and notice delivery after releasing `main-push.lock`.
+  - Record publication even when promotion fails.
+  - Mark a style notice complete only after successful delivery.
+  - Preserve silent, idempotent completion of repeated handoffs.
 
 ## Phases
 
@@ -241,8 +254,15 @@ Source: Phase 7 repair round 4 (landing rule; showrunner ruling 2026-10-31). Ast
 **Spec:**
 - Combined base. When `commit_bases` returns more than one base and none was given by `--base` or `VERIFY_ASSERTION_BASE`, `run` builds one combined tree with `git merge-tree --write-tree` over those bases (folding them in order; the Phase 7 round 3 fold in `/tmp/claude/unit/fe59e5e3-0e2d-4361-a843-3881414f5f2e/phases/7/round3_wip/assertion_guard.py` is a design input) and compares the target against that tree in one pass. One base needs no fold. `commit_bases` stays the one selector.
 - Conflicts. A path the fold reports as conflicted is compared against each base and intersected for that path only (Phase 7's `intersect_findings`), never by a whole-path fallback that reports imported removals. A distant header conflict where production removed one assertion and the branch removes another gives the branch's removal only, for commit, index and pending-merge judgments.
-- Local changes. Index and working-tree judgments compare against the same combined tree; no HEAD-to-tree supplement exists. The tree/index count is never above the `--base HEAD` count for the same local change; a committed removal plus an unrelated local removal stays 2 blocking.
-- Owners and rulings. The printed owner is HEAD's current test name. A ruling clears exactly that occurrence; an identical assertion in another test stays blocking (identical assertions in `test_a` and `test_b`, `test_a`'s removed in a commit and `test_b`'s locally, a ruling for `test_b`: `test_a`'s removal stays blocking). The count limit is over the final reported blockers, after `aggregate_test_removals` and rulings.
+- Local changes. Compare the index and working tree against the combined tree.
+  Use no HEAD-to-tree supplement.
+  Count each local removal once.
+  Apply the local count limit after aggregation and rulings.
+  Apply that limit only to matching local occurrences.
+  Keep committed removals in the automatic total.
+  A committed removal and a distinct local removal produce two blockers.
+- Owners and rulings. The printed owner is HEAD's current test name. A ruling clears exactly that occurrence; an identical assertion in another test stays blocking (identical assertions in `test_a` and `test_b`, `test_a`'s removed in a commit and `test_b`'s locally, a ruling for `test_b`: `test_a`'s removal stays blocking). Apply aggregation and rulings before checking duplicate local occurrences.
+  Do not cap the automatic total at the total from `--base HEAD`.
 - Explicit bases. `--base` and `VERIFY_ASSERTION_BASE` keep their list, their order and Phase 7's per-base intersection. Name in the summary every natedev-verify multi-`--base` test whose expectation changes; the aim is none.
 - Keep: the commit hook's HEAD/index and pending-merge behavior, the shared `RevisionSourceCache`, `test_large_diff_guard_call_uses_less_than_one_cpu_second`, and the lint cache key in `tree_watch.py` (a changed comparison input, the combined tree included, invalidates a cached green lint).
 - New regressions, each red on 4b353c42: (a) the plan's distinguishing test above (fork `assertEqual(value, 1)`; pushed U changes it to `2`; P changes another file; merge U and P, replace the assertion with `pass`; add an unrelated commit; no `--base`, `--head HEAD` gives exactly one blocking removal of `self.assertEqual(value, 2)`); (b) the same removal made in the index and in the working tree instead, one blocker with HEAD's spelling each; (c) production renames `test_old` to `test_new`, the merge weakens `assertEqual(value, 1)` to `assertTrue(value)`, then a local removal: one blocker; (d) the header-conflict case; (e) the `test_a`/`test_b` ruling case; (f) a base test with two assertions whose signature HEAD changes, deleted in the tree: one grouped `test removed` blocker. Keep `test_local_removal_after_production_test_rename_is_counted_once` and the changed-spelling regression near `test_assertion_guard_revisions.py:1185` (one removal with HEAD's spelling in both modes).
@@ -266,53 +286,58 @@ Assertion-Change: scripts/direct/test_assertion_guard_revisions.py::test_local_r
 **Constraints from prior phases:** Phase 7 As-built above (one selector, one comparison path, owner-free identity). Phase 7 round 4's HEAD supplement double-counted after a rename merge; Astra reviews `/tmp/claude/astra/20261031T113652Z-318765/review.md` and `/tmp/claude/astra/20261031T121403Z-1704209/review.md` list the owner, replacement and grouping edges. Inspectors HEAD 03fafc1d6c with no `--base` gives 1 blocking; `~/rust/cargo-liner` `--base e21d5b93^ --head e21d5b93` gives `assertion guard: 73 blocking`; both must hold.
 
 **Acceptance gate:** from the worktree root, `python3 -m unittest scripts.direct.test_assertion_guard scripts.direct.test_assertion_guard_revisions scripts.direct.test_assertion_guard_strings scripts.direct.test_verify_assertion_guard scripts.direct.test_verify_assertion_guard_fake scripts.direct.test_verify_lint_guard_key` green, with (a)-(f) red on 4b353c42; `basedpyright` on each slot's files `0 errors, 0 warnings, 0 notes`; the director reruns the Inspectors and cargo-liner figures above and puts them in the checkpoint notice.
+Add a regression with one committed removal and one distinct local removal.
+The automatic comparison reports two blockers.
+The `--base HEAD` comparison reports one blocker.
+A ruling for the local occurrence leaves the committed occurrence blocking.
 
-### Phase 7d — Small fixes fast-track to main  · status: todo
+### Phase 7d — Small fixes fast-track to main  · status: done
 **Depends on:** Phase 8 (the one config reader; 7d lands after it and reads through it)
 
-Source: the user via the sdlc showrunner, 2026-10-31: "yes i want a fast track" for fixes a unit director could make "in 2 minutes", and "a fast track can be followed by the standard process just to make sure things are in good shape". Showrunner ruling 2026-10-31 on devtools-unit's 10-line design: accepted, with these changes: the fast check never uses `merge_gate.py` and never waits on a queue or a running gate (target: minutes); a lock is held only for the push; settings.json, hooks and `scripts/lib/py` are refused; the nightly stays: a red run messages the sdlc showrunner by the existing path, and the showrunner acts and tells the user (showrunner ruling 2026-10-31 dropped the user push and Phase 7c); devtools-unit edits the rule lines in its own checkpoint (`--also` in the notice).
+#### As-built
 
-#### Work Order
-
-**Goal:** one command lets a unit director push a small fix to `~/.claude` main in minutes, and the same fix then gets the unit's next blind review and the next merge gate with no step a director can skip.
-
-**Spec:**
-- Command: `~/.claude/scripts/lib/py ~/.claude/scripts/production/fast_track.py --unit <unit> --production <production doc> --why "<one line>" <path>...`, run from the director's own `~/.claude` worktree. `--production` is the doc named in the unit's plan header; its `Promote:` field gives the promotion targets (director's call, 2026-10-31: the approved shape had no way to find them). It takes the uncommitted changes of the named paths against HEAD (new files included). It refuses, exit 2 and nothing pushed: no change, a path outside the repo, a refused path, a limit exceeded.
-- Config `config/fast_track.conf`, read at use through `scripts/lib/conf.py` (`conf.whole`, `conf.words`), a limit comment directly above each number key that matches its read (`# whole:` for `conf.whole`, as on `max_changed_lines`, `max_files` and `max_push_attempts`; `# range:` for `conf.number`), no defaults in code; a key `conf.py` cannot supply (`conf.Unusable`) refuses and names the key. No second reader and no copied parsing: `max_changed_lines`, `max_files`, `check_time_limit_seconds`, `max_push_attempts`, `refused_paths` (globs). Refused paths: `settings.json`, `scripts/hooks/`, `scripts/lib/py`, the staff record and every script that writes it, the account move, rename and shutdown scripts, `scripts/production/merge_gate.py`, `scripts/production/merge_checkpoint.py`, `scripts/direct/verify.sh`, `scripts/production/build_hold.py`, `scripts/production/fast_track.py` and `config/fast_track.conf`. Name each exact path in the summary.
-- Copy: fetch origin main, `git clone --shared` into a temporary folder (its own git directory; never a worktree, never a copied `.git` pointer), check out origin/main detached, `git apply --3way` the patch. A conflict refuses with nothing pushed.
-- Fast check, in the copy, under `check_time_limit_seconds`, with no build queue, memory queue or merge gate: (1) each changed Python file's direct test modules (`<dir>/test_<stem>.py`, `<dir>/test_<stem>_*.py`, and a changed test module itself), each run the merge gate's way from the copy root: `python3 -m unittest discover -s <dir> -p <file>` in the environment `merge_gate.test_module_environment` builds (`merge_gate.py:632`; import it, do not copy it, and never run the gate or its queues), with `HERDR_BIN=/nonexistent/herdr` and without `PYTHONUNBUFFERED`, `REFUSAL_WATCH_INVENTORY`, `STAFF_OPERATION_FD`; (2) an import of each changed module as a package (`python3 -c "import scripts.<pkg>.<mod>"` from the copy root); (3) `basedpyright <changed Python files>`, passing only on the `0 errors, 0 warnings, 0 notes` footer. No full-suite fallback. Over the limit: stop the check's process group and refuse with "over the fast-track time limit; use the normal path".
-- Commit in the copy: subject `fast-track(<unit>): <why>`, trailer `Fast-Track: <unit>`.
-- Push: one short lock, `<git common dir>/main-push.lock`, held only from the final fetch to the end of the push; `git push origin HEAD:main`, fast-forward only. When origin/main moved: fetch, re-apply, rerun the fast check, push again, at most `max_push_attempts` times. The fast check runs outside the lock.
-- The lock in `merge_checkpoint.py` (one helper, one place, used by both): `push_git` fetches and merges origin/main into the merge branch, and `promote_local_checkout` then fast-forwards main to that tip and pushes it. A fast fix that lands between those two steps makes the tip lack it, so the main push is refused (current code, `merge_checkpoint.py:867-976`). So `run` and `run_handoff` hold the lock from `push_git`'s fetch of origin/main (or the start of `push_validate`) to the end of promotion's last `git push origin main`, or to the end of the merge-branch push when the production has no promotion. Tests run before that span, so they are never held. Name the measured span length in the summary.
-- Promote: the existing path in `merge_checkpoint.py`. Split the checkout and Mac loop of `promote()` into one function that takes the promotion, the branch and the tip, and call it from `promote()` and from `fast_track.py` with branch `main` and the pushed commit. `promote_local_checkout(checkout, "main", tip)` fast-forwards each local checkout and finds nothing unpushed; `pull_mac_checkout` pulls the Mac. `merge_gate.py --promote-only --merge-branch main` refuses this case (`merge_gate.py:1358-1366`: local main behind origin/main) and is not used; do not edit `merge_gate.py`. A promotion failure after the push prints what failed and exits 1; the push stays, and a rerun promotes again (`already on main` path).
-- Phase 8 leftover (2026-11-02 landing check): `scripts/direct/implement.sh:199` and `scripts/direct/review.sh:599` still parse `direct.conf` with `sed` (last value wins, `UNIT_CONFIG` override). Switch both to `conf_value direct UNIT_COMPACT_ABOVE_TOKENS` from `scripts/lib/conf.sh`, drop `UNIT_CONFIG`, and drop the `UNIT_CONFIG` env entries from `scripts/direct/demo_refusals.sh`, `implement_launcher_test_support.py`, `review_launcher_test_support.py` and `test_assign_launcher.py`. `MAC_TEST_CONFIG` stays: `build_hold/override_guard` still names it.
-- Worktree: after a successful push, restore the named paths in the director's worktree to HEAD (new files removed): main has them, and the next merge of the merge branch brings them.
-- Record and rerun: `${FAST_TRACK_STATE_DIR:-~/.local/state/fast-track}/records.jsonl`, one row per push: patch sha256, unit, commit, why, UTC time, `review: pending`. A rerun of a pushed patch, or a rerun after the restore, runs the promotion again (no change when it is done; it finishes a promotion that failed), prints `already on main at <short commit>` and exits 0.
-- Follow-up review, automatic: `scripts/direct/review.sh` adds the unit's pending fast-track commits' diffs to every broad review prompt it sends for that unit (`fast_track.py --pending --unit <unit>` prints them), and when that review pass finishes it marks those rows `reviewed` with the pass. A finding goes through the normal ledger and repair. The merge gate needs nothing new: merge branches take main at their next push.
-- One exception in one place: new `commands/unit/fast_track.md` defines `<FastTrack/>` (who may use it, the command, the limits by config key, the follow-up). Add it to the TagReferenceContract table in `commands/unit/direct.md`, and add "except <FastTrack/>" to: `commands/unit/direct.md` CoreContract lines 155-156 (no implementation code), 157-161 (no other commit) and 164-165 (never the default branch); `docs/production_format.md` ProductionUnit item 4, lines 318-319; `commands/showrunner/produce.md` line 1162.
+- `~/.claude/scripts/lib/py ~/.claude/scripts/production/fast_track.py --unit <unit> --production <production doc> --why "<one line>" <path>...` takes the named paths' changes against HEAD (new files included), applies them with `git apply --3way` in a `git clone --shared` copy of origin/main, and runs the fast check there under `check_time_limit_seconds`: each changed Python file's direct test modules in `merge_gate.test_module_environment`, a package import of each changed module, and `basedpyright` (footer only). No merge gate, build queue or memory queue runs. It commits `fast-track(<unit>): <why>` with trailer `Fast-Track: <unit>` and pushes main fast-forward only under `main-push.lock`; a moved main re-applies and re-checks, at most `max_push_attempts` times.
+- Refusals exit 2 with nothing pushed: no change, a path outside the repo, a `refused_paths` match, a Python file that imports a refused repo module (directly or through repo modules), a limit exceeded, a conflict with main, or a key `conf.py` cannot supply (`conf.Unusable`).
+- After the push it promotes through the production doc's `Promote:` targets with `merge_checkpoint.promote_targets(promotion, "main", commit, ...)`, restores the named worktree paths to HEAD (new files removed) and appends a `review: pending` row to `${FAST_TRACK_STATE_DIR:-~/.local/state/fast-track}/records.jsonl`. A promotion failure keeps the push and exits 1. A rerun prints `already on main at <commit>`, promotes again and exits 0.
+- Recovery: each attempt keeps a `PushAttempt` JSON record and refs under `refs/fast-track/{selections,attempts}/`, which protect the original trees from GC. Restore runs only for an attempt whose paths overlap the request (equal, or one contains the other), validates every original path before any restore, and keeps later index and worktree edits; an unrelated pending attempt prints a warning. `--close-restore <attempt>` retires automatic restore permanently: the JSON record stays and the refs go. HEAD that contains the pushed commit closes the restore.
+- `--pending --unit <unit>` prints pending fast-track diffs (review input, not recovery status). `scripts/direct/review.sh` adds them to every broad review prompt for the unit and marks the rows `reviewed` with the pass. The next merge gate tests the fix when merge branches take main. The nightly full suite (natedev `claude-nightly.timer`, 03:00, `claude-nightly.service` on origin/main) messages the sdlc showrunner on red.
+- `merge_checkpoint.main_push_lock` is the one lock helper. Lock order: the gate-record lock, then `main-push.lock`; the gate-record lock is released before local promotion; `main-push.lock` holds through the last promotion push to main; Mac pulls and notice delivery run after its release. Publication is recorded even when promotion fails; a style notice is marked complete only after delivery, so a failed delivery retries; a repeated hand-off completes silently. The measured lock span in the checkpoint suite is 0.05 s.
+- `implement.sh` and `review.sh` read `UNIT_COMPACT_ABOVE_TOKENS` through `conf_value`; `UNIT_CONFIG` no longer exists. `commands/unit/fast_track.md` defines `<FastTrack/>`; `direct.md` CoreContract, `production_format.md` ProductionUnit item 4 and `produce.md` name it as the one exception.
+- Live proof (2026-11-02): one real fix pushed and promoted on natedev and the Mac in 6.5 s; the same command then printed `already on main` in 2.6 s with main unchanged. The concurrent case (a fast fix during a real `merge_checkpoint`, its promotion still finishing) stays with the director in this phase.
 
 **Files:**
-- `scripts/production/fast_track.py` — the command and `--pending`
-- `config/fast_track.conf` — limits and refused paths
-- `scripts/production/merge_checkpoint.py` — the shared main-push lock around promotion's main push
-- `scripts/direct/review.sh` — pending fast-track diffs in broad reviews; rows marked reviewed
-- `scripts/direct/implement.sh` — reads `UNIT_COMPACT_ABOVE_TOKENS` through `conf.sh`
-- `scripts/direct/demo_refusals.sh`, `scripts/direct/implement_launcher_test_support.py`, `scripts/direct/test_assign_launcher.py` — no `UNIT_CONFIG`
-- `scripts/production/test_merge_checkpoint_bump.py`, `scripts/production/merge_checkpoint_test_support.py` — the saved patch's bump cases and fixture
+- `scripts/production/fast_track.py` — the command, recovery, `--close-restore` and `--pending`
+- `config/fast_track.conf` — `max_changed_lines` 100, `max_files` 5, `check_time_limit_seconds` 120, `max_push_attempts` 3, `refused_paths` (settings, hooks, `scripts/lib/py`, staff writers, account move/rename/shutdown scripts, `merge_gate.py`, `merge_checkpoint.py`, `verify.sh`, `build_hold.py`, `fast_track.py`, this file)
+- `scripts/production/merge_checkpoint.py` — `main_push_lock`, `promote_targets`, publication and notice records
+- `scripts/direct/review.sh`, `scripts/direct/implement.sh` — pending diffs in broad reviews; conf reads
 - `commands/unit/fast_track.md`, `commands/unit/direct.md`, `docs/production_format.md`, `commands/showrunner/produce.md` — the one exception
-- `scripts/production/test_fast_track.py` — the command's tests
-- `scripts/production/test_merge_checkpoint_promotion.py` — the lock in promotion
-- `scripts/direct/test_review_launcher.py` — the pending diffs and the reviewed mark
+- `scripts/production/test_fast_track.py`, `test_merge_checkpoint_promotion.py`, `test_merge_checkpoint_bump.py`, `test_merge_checkpoint_validation.py`, `merge_checkpoint_test_support.py` — command, lock, promotion and notice tests
+- `scripts/direct/test_review_launcher.py`, `review_launcher_test_support.py`, `implement_launcher_test_support.py`, `test_assign_launcher.py`, `test_implement_launcher_compaction.py` — launcher tests without `UNIT_CONFIG`
 
-**Workers:** 1 writer + 1 tester
-- `impl` — `fast_track.py`, `config/fast_track.conf`, `merge_checkpoint.py`, `review.sh`, `implement.sh`, `demo_refusals.sh`, the four docs
-- `test` — `test_fast_track.py`, `test_merge_checkpoint_promotion.py`, `test_merge_checkpoint_bump.py`, `merge_checkpoint_test_support.py`, `test_review_launcher.py`, `review_launcher_test_support.py`, `implement_launcher_test_support.py`, `test_assign_launcher.py`, from this Spec alone
+**Binds later work:** the Delegation Context invariants hold the recovery and lock-order rules; a change to `fast_track.py` or `merge_checkpoint.py` goes through the normal phase path, never through the fast track.
 
-**State:** `~/.local/state/fast-track/records.jsonl` (rows per push); `<git common dir>/main-push.lock`.
+**Gotchas:** `notify_style` returns bool; a test wrapper that patches it returns the value, or basedpyright reports the unused result. The fast check's empty-suite exception applies only to discovery; an import run that finds 0 tests fails. basedpyright exits 3 when the configured `.venv` is absent; only the footer counts.
 
-**Constraints from prior phases:** the timeout cleanup signals its process group only through `process_group.send_process_group` (the guard `unguarded_group_signals` in `scripts/lib/test_process_group.py` must stay empty). Changes to `push_git` and `push_validate` keep the before-merge rollback of an unpublished tip at `scripts/production/merge_checkpoint.py:870`. The refused-path inventory includes the restoration writers. The environment helper is `merge_gate.test_module_environment` (`merge_gate.py:632`); it does not set `CONF_DIR`. The command, config, command docs and tests exist as uncommitted work in the worktree; the `merge_checkpoint.py` part is saved as a patch in the run's phase folder; keep both. Landing order (Phase 8 landing, 2026-11-02): `config/fast_track.conf` lands on main in its own commit first, and both machines' installed config holds it before the consumer's merge gate runs. Config contract from Phase 8: every test that reaches a conf read sets `CONF_DIR` to a fixture folder; fixture keys carry the real limit comments; a history-recovery fixture has its own committed git repository; `conf` loads as `conf` and as `scripts.lib.conf`, so a handler catches the producer's `conf.Unusable` or its translated domain error. Acceptance adds the process-group guard test and the unpublished-tip rollback regression.
+**Ruled out:** `merge_gate.py --promote-only --merge-branch main` (it refuses a local main behind origin/main); a worktree or a copied `.git` pointer for the copy; a full-suite fallback in the fast check.
 
-**Acceptance gate:** from the worktree root, `python3 -m unittest discover -s scripts/production -p test_fast_track.py`, the same for `test_merge_checkpoint_promotion.py`, and `python3 -m unittest discover -s scripts/direct -p test_review_launcher.py` green, covering: each refusal and its exit 2, each config key missing and invalid, a conflicting patch, origin/main moving between check and push (re-apply, re-check, push), the time limit, a rerun (exit 0, no change), the worktree restore, the record row, `--pending`, and a review pass marking rows reviewed. `basedpyright` on each slot's Python files `0 errors, 0 warnings, 0 notes`. Live, by the director: one real small fix through the command to main, then the same command again (exit 0, `already on main`); a fast fix landing while a real `merge_checkpoint` runs, with that merge's promotion still finishing, and the showrunner's 08:54 gate result as the second case. Put the timings in the checkpoint notice.
+### Phase 7l — A fast fix during a checkpoint merge exits 0  · status: done
+
+#### As-built
+
+- `fetch_main(repo)` in `scripts/production/fast_track.py` fetches origin main in the director's repository. `reconcile` and `push_patch` call it. The fetches in the temporary copy use plain `git()`; the copy has its own refs.
+- When a fetch fails and its stderr contains `cannot lock ref`, `fetch_main` waits `fetch_lock_wait_seconds` and fetches again, at most `fetch_lock_attempts` fetches in total. Any other failure, and a lock failure on the last attempt, raises `Refused` with the current text. A failure before the push exits 2; a failure after the push exits 1.
+- `run_git()` runs git with literal pathspecs and returns the `CompletedProcess`; `git()` and `fetch_main()` both call it.
+- `config/fast_track.conf` holds `fetch_lock_attempts = 3` (`# whole: 1..`) and `fetch_lock_wait_seconds = 0.5` (`# range: 0..`). `fetch_main` reads them at use through `scripts/lib/conf.py`; the first call comes before any push, so a missing or invalid key refuses with exit 2.
+
+**Files:**
+- `scripts/production/fast_track.py` — `fetch_main`, `run_git`
+- `config/fast_track.conf` — the two retry keys
+- `commands/unit/fast_track.md` — names the two keys
+- `scripts/production/test_fast_track.py` — lock regressions that hold a real `refs/remotes/origin/main.lock` while real git fetches: before the push, after the push, exhausted attempts, other failures, invalid keys
+
+**Gotchas:** The test fixture `save_config()` copies the real conf and drops keys its settings do not name; a dropped key takes its limit comment with it, or the comment applies to the next key. A conf change that lands before its code must pass the old tests on that exact tree.
+
+**Ruled out:** reading the retry keys through `FastTrackLimits`/`limits()` — keys are read at use, and the first fetch precedes the push.
 
 ### Phase 7e — Every process-group kill checks its pid  · status: done
 
@@ -351,36 +376,63 @@ Source: the user via the sdlc showrunner, 2026-10-31: "yes i want a fast track" 
 ### Phase 7g — Run cleanup and the role list skip another unit's damaged record  · status: todo
 **Depends on:** Phase 7f (same file; it checkpoints first)
 
-Source: the sdlc showrunner, 2026-10-31. Phase 7f review found that `unbind_run()` and `list_roles()` in `design_roles.py` read every record strictly. One damaged record of any unit stops a run's cleanup unbind, and `list` prints the error on stdout.
+Source: Phase 7f already skips unrelated damaged records through `_read_designs`.
+Remaining defects affect matching damage, list diagnostics, markerless publication retries, and domain types.
 
 #### Work Order
 
 **Goal:** a run's cleanup unbind and the role list are not stopped by another unit's damaged record.
 
 **Spec:**
-1. `unbind_run()` uses the holder-aware scan from Phase 7f: another holder's damaged record is skipped with the one named stderr line; a damaged record bound to the run being unbound still refuses by name.
-2. `list_roles()` skips a damaged record with the same one named stderr line, and nothing about it goes to stdout.
-3. A rerun changes nothing: a second `unbind-run` of the same run exits 0 and writes nothing.
-4. From Phase 7f review (F003): a `rebind` repair interrupted with no transition marker, whose retry then fails to publish the census, must not report success on the next retry: the retry finishes the census publication first (`design_roles.py:993`).
+1. Preserve the holder-aware scan and its single named warning for each damaged record.
+2. Refuse matching damaged records during `unbind-run`, including records with ended or unopened roles.
+3. Print plain-text list diagnostics on stderr.
+4. Keep plain-text stdout limited to valid roles or `no held roles`.
+5. Preserve the structured `roles` and `problems` fields from `list_roles()` and `list --json`.
+6. Keep a repeated successful `unbind-run` free of writes.
+7. Complete census publication before a markerless repair retry reports success.
+8. Preserve the generation and lifecycle effects during publication retries.
+9. Replace optional holder and binding arguments with explicit keep/change types.
+10. Convert omitted CLI arguments to `KeepHolder` and `KeepBinding` at the CLI boundary.
+11. Represent explicit unbinding as `ChangeBinding(DesignUnbound())`.
+12. Replace `held_document()` absence with `NoHeldDocument`.
+13. Preserve `HeldDesign` as the successful lookup result.
+14. Update `astra_review.py` to select held and standalone reviews through those result types.
+
+Assertion-Change: scripts/astra/test_design_roles.py::test_list_prints_empty_inventory_and_record_problems
+— replace the two-line stdout expectation with exactly `no held roles\n`.
+Move the damaged-record path and nonempty-reason assertions to stderr.
+Require exactly one warning line.
+Keep the JSON inventory and problem assertions unchanged.
 
 **Files:**
-- `scripts/astra/design_roles.py` — `unbind_run()`, `list_roles()` and the markerless repair retry
-- `scripts/astra/test_design_roles.py` — regression tests
+- `scripts/astra/design_roles.py` — cleanup, diagnostics, publication retries, and semantic domain results
+- `scripts/astra/astra_review.py` — the held-document lookup consumer
+- `scripts/astra/test_design_roles.py` — domain and CLI regressions
+- `scripts/astra/test_astra_review.py` — held and standalone review selection
 
 **Workers:** 1 writer + 1 tester
-- `impl` — `design_roles.py`
-- `test` — `test_design_roles.py`, from this Spec alone
+- `impl` — `scripts/astra/design_roles.py`, `scripts/astra/astra_review.py`
+- `test` — `scripts/astra/test_design_roles.py`, `scripts/astra/test_astra_review.py`, from this Spec alone
 
 **State:** design-role records (tests use a temporary state root only).
 
 **Constraints from prior phases:** `unbind_run` (`scripts/astra/design_roles.py:1480`) already reads through `_read_designs` and has tests that skip another unit's damage; this phase keeps that, refuses matching damage also when no role is live, fixes the `list` diagnostics, and completes markerless publication (the early return at `design_roles.py:981` remains). `rebind` (`:949`) takes `Holder | None` and `Binding | None`, where absence means "keep the current value" and also decides whether damaged-record repair is allowed: replace both with explicit keep/change types (convert the argument parser's absence at the CLI boundary) and test that keeping a binding differs from an explicit unbind. Acceptance adds: matching damage with ended or unopened roles is refused; a markerless retry that publishes the context, fails the census publication, then retries again ends published.
 
 **Acceptance gate:** tests with a temporary state root and a planted damaged record of another unit show that `unbind-run` unbinds this run's records, prints one named stderr line, and exits 0; a rerun writes nothing; `list` prints the named line on stderr and nothing about the record on stdout. Also: matching damage with no live role refuses by name; the markerless retry publishes the census before it reports success; the CLI cases for `KeepHolder`/`ChangeHolder` and `KeepBinding`/`ChangeBinding` stay green.
+Test omitted holder and binding arguments separately from explicit changes.
+Test explicit unbinding and damaged-binding repair.
+Test a markerless retry that saves context, fails census publication, and then completes census publication.
+Test `NoHeldDocument` and `HeldDesign` results through the review caller.
+Run `python3 -m unittest scripts.astra.test_design_roles scripts.astra.test_astra_review`.
+Run `basedpyright` on all four owned Python files.
+Require `0 errors, 0 warnings, 0 notes`.
 
 ### Phase 7h — The group-kill guard reads commands, not text  · status: todo
 **Depends on:** Phase 7e (same test file; it checkpoints first)
 
-Source: Phase 7e closure review (F002), moved here under the landing rule (models-unit waits on Phase 7e; the guard is a backstop, and no such call is in the tree). The guard in `scripts/lib/test_process_group.py` matches text with regular expressions. Each review round found one more form that it lets through: `kill -TERM -- 0` inside an `if`/`else` arm (line 43), and a Python heredoc that binds `send = platform.killpg`, then calls `send(pid, 15)` (line 116).
+Source: Phase 7e already added Python AST checks and shell tokenization.
+Remaining gaps include shell command positions, executable Python aliases, and shell parse failures.
 
 #### Work Order
 
@@ -389,9 +441,16 @@ Source: Phase 7e closure review (F002), moved here under the landing rule (model
 **Spec:**
 1. Python files and Python text inside other files are parsed with `ast`: any reference to `killpg` (attribute or name, through any alias or assignment) outside `scripts/lib/process_group.py` fails the guard.
 2. Shell text is split into commands with a real shell tokenizer (`shlex` in punctuation mode), so a `kill` in any command position (after `;`, `&&`, `||`, `then`, `else`, `do`, a pipe, or inside `bash -c '…'`) is found; a target of `0`, `-0`, or a negative group fails the guard unless the command is the process_group CLI.
-3. Text the guard cannot parse fails the guard with its path, so a new form is refused, never let through.
-4. Each form named in the Source, plus each form of Phase 7e's F002, is a planted case in a temporary tree that fails the guard. The real tree passes, `scripts/lib/conf.sh` included.
-5. Scope (Phase 8 review): the guard already uses `ast` and `shlex` punctuation mode. Complete it, do not replace it: executable Python fragments inside other files, command-position gaps, and a shell parse error that today returns false. Literal fixture data stays allowed.
+3. Parse complete executable units before treating a parse failure as unsafe.
+   Report an unparseable executable unit with its path.
+   Preserve valid multiline commands and literal fixture data.
+4. Add planted cases for an `else` command and a Python heredoc assignment alias.
+   Add malformed executable shell text.
+   Keep the existing direct, imported-alias, zero-group, negative-group, nested-shell, continuation, and shared-sender cases.
+5. Extend the existing AST and `shlex` implementation.
+   Distinguish executable fragments from literal fixture data.
+   Keep the sole raw-send exception inside `send_process_group`.
+   Send no real signal in these tests.
 
 **Files:**
 - `scripts/lib/test_process_group.py` — the guard and its planted cases
