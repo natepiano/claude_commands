@@ -50,7 +50,8 @@ def charge_text(basis: gate.ChargeBasis, zone: ZoneInfo, policy: gate.AdmissionP
     if isinstance(basis, gate.RampPromise):
         return f"ramp promise: first {policy.timing.ramp_seconds / 60:g} min after admission"
     if isinstance(basis, gate.LifetimePromise):
-        return "release build promise: holds until the step ends"
+        name = "release build" if step == "build" else "merge gate" if step == "merge-gate" else step
+        return f"{name} promise: holds until the step ends"
     if isinstance(basis, gate.TestPhaseCharge):
         need = basis.need
         return (f"tests since {minute(basis.started_at, zone)}: peak so far {gib(basis.peak_so_far)}, "
@@ -83,6 +84,9 @@ def need_text(source: gate.RecordedNeed | gate.NeedSourceNotRecorded) -> str:
     if isinstance(source, gate.NeedSourceNotRecorded):
         return "source not recorded"
     basis = source.basis
+    if isinstance(basis, gate.ProgramMemoryCap):
+        program = "the merge gate" if basis.program == "merge-gate" else basis.program
+        return f"{program}'s memory cap"
     if isinstance(basis, (gate.ShapeP90, gate.ShapeLargest, gate.ShapeFallback)):
         if isinstance(basis, gate.ShapeP90):
             text = f"same-shape p90 of {basis.runs} runs"
@@ -118,6 +122,8 @@ def need_text(source: gate.RecordedNeed | gate.NeedSourceNotRecorded) -> str:
         text = "fallback: fewer than 5 runs"
     elif source.source == "shape":
         text = "same-shape promise: basis not recorded"
+    elif source.source == "cap":
+        text = "memory cap: program not recorded"
     else:
         assert_never(source.source)
     text += f", last {source.history_days} days"

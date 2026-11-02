@@ -19,6 +19,7 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 VERIFY = Path(__file__).with_name("verify.sh")
 SCRIPTS = VERIFY.parent.parent
+TAPLO_RESULTS_FILE = "taplo-results.jsonl"
 
 
 def workspace_taplo_script(source: str) -> str:
@@ -307,9 +308,31 @@ class VerifyLintScopeFixture(unittest.TestCase):
             executable = shutil.which(name)
             if executable is None:
                 self.fail(f"fixture requires {name}")
+            source = f"import os, sys\nos.execv({executable!r}, [{executable!r}, *sys.argv[1:]])\n"
+            if name == "taplo":
+                results = self.root / TAPLO_RESULTS_FILE
+                _ = results.write_bytes(b"")
+                source = f"executable = {executable!r}\nresults = {str(results)!r}\n" + r'''
+import json
+from pathlib import Path
+import subprocess
+import sys
+
+result = subprocess.run([executable, *sys.argv[1:]], stderr=subprocess.PIPE, check=False)
+signal = -result.returncode if result.returncode < 0 else 0
+with Path(results).open("a", encoding="utf-8") as output:
+    output.write(json.dumps({
+        "args": sys.argv[1:],
+        "returncode": result.returncode,
+        "signal": signal,
+        "stderr": result.stderr.decode("utf-8", errors="backslashreplace"),
+    }) + "\n")
+sys.stderr.buffer.write(result.stderr)
+raise SystemExit(128 + signal if signal else result.returncode)
+'''
             self.write_executable(
                 self.root / "bin" / name,
-                f"import os, sys\nos.execv({executable!r}, [{executable!r}, *sys.argv[1:]])\n",
+                source,
             )
         shutil.rmtree(self.root / ".git")
         self.run_git("init", "--quiet", "--initial-branch=main")

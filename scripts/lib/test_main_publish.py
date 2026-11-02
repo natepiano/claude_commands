@@ -225,6 +225,189 @@ class MainPublishTests(PublicationTestCase):
         self.assertEqual(repo.head(), repo.remote_tip())
         self.assertEqual((repo.checkout / "remote.txt").read_text(), "remote work\n")
 
+    def other_writer(self) -> Path:
+        repo = self.repository
+        clone = repo.root / "other-writer"
+        _ = repo.git(repo.root, "clone", "-q", "-b", "main", str(repo.origin), str(clone))
+        _ = repo.git(clone, "config", "user.name", "Other writer")
+        _ = repo.git(clone, "config", "user.email", "other@example.invalid")
+        return clone
+
+    def advance_origin(self, clone: Path) -> str:
+        repo = self.repository
+        _ = (clone / "remote.txt").write_text("another writer's work\n")
+        _ = repo.git(clone, "add", "remote.txt")
+        _ = repo.git(clone, "commit", "-qm", "another writer's work")
+        _ = repo.git(clone, "push", "-q", "origin", "main")
+        return repo.remote_tip()
+
+    def retry_tune(self) -> subprocess.CompletedProcess[str]:
+        repo = self.repository
+        return subprocess.run(
+            [sys.executable, str(Path(__file__).with_name("tune.py")),
+             "example", "amount", "3", "--why", "Approved capacity", "--user-words", "yes set 3"],
+            cwd=repo.checkout, env=repo.env, capture_output=True, text=True,
+            check=False, timeout=TEST_HANG_GUARD_SECS,
+        )
+
+    def rejected_tune(self) -> str:
+        repo = self.repository
+        hook = repo.origin / "hooks/pre-receive"
+        _ = hook.write_text("#!/bin/sh\necho fixture-rejected >&2\nexit 1\n")
+        hook.chmod(0o755)
+        first = self.retry_tune()
+        self.assertEqual(first.returncode, 1, first.stdout + first.stderr)
+        self.assertIn("not pushed", first.stdout)
+        self.assertNotEqual(repo.head(), repo.remote_tip())
+        self.assertFalse(repo.ssh_log.exists())
+        hook.unlink()
+        return repo.git(repo.checkout, "log", "-1", "--format=%B")
+
+    def test_same_value_retry_rebases_a_rejected_tune_after_another_writer_pushes(self) -> None:
+        repo = self.repository
+        approval = self.rejected_tune()
+        advanced = self.advance_origin(self.other_writer())
+
+        repeated = self.retry_tune()
+
+        self.assertEqual(repeated.returncode, 0, repeated.stdout + repeated.stderr)
+        self.assertEqual(repeated.stdout, "already amount=3\n")
+        self.assertEqual(repo.head(), repo.remote_tip())
+        self.assertEqual(repo.git(repo.checkout, "rev-parse", "HEAD^"), advanced)
+        self.assertEqual(repo.git(repo.checkout, "rev-list", "--count", f"{advanced}..HEAD"), "1")
+        self.assertEqual(repo.git(repo.checkout, "log", "-1", "--format=%B"), approval)
+        self.assertIn("User-Approved: yes set 3", approval)
+        self.assertIn("amount=3", repo.git(repo.origin, "show", "main:config/example.conf"))
+        self.assertEqual((repo.checkout / "remote.txt").read_text(), "another writer's work\n")
+        self.assertIn("git pull -q --ff-only", repo.ssh_log.read_text())
+        head = repo.head()
+        again = self.retry_tune()
+        self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+        self.assertEqual(again.stdout, "already amount=3\n")
+        self.assertEqual((repo.head(), repo.remote_tip()), (head, head))
+
+    def test_same_value_retry_drops_a_rejected_change_already_published_by_another_writer(self) -> None:
+        repo = self.repository
+        _ = self.rejected_tune()
+        clone = self.other_writer()
+        config = clone / "config/example.conf"
+        _ = config.write_text(config.read_text().replace("amount=2", "amount=3"))
+        _ = repo.git(clone, "commit", "-qam", "approved value from another writer")
+        advanced = self.advance_origin(clone)
+        count = repo.git(repo.origin, "rev-list", "--count", "main")
+
+        repeated = self.retry_tune()
+
+        self.assertEqual(repeated.returncode, 0, repeated.stdout + repeated.stderr)
+        self.assertEqual(repeated.stdout, "already amount=3\n")
+        self.assertEqual((repo.head(), repo.remote_tip()), (advanced, advanced))
+        self.assertEqual(repo.git(repo.checkout, "rev-list", "--count", "HEAD"), count)
+        self.assertEqual(repo.git(repo.checkout, "status", "--porcelain=v1"), "")
+        self.assertIn("git pull -q --ff-only", repo.ssh_log.read_text())
+
+    def test_ready_rebases_tune_zone_and_installed_zone_commits_in_order(self) -> None:
+        repo = self.repository
+        subjects = ("tune(example): amount 2 -> 3", "zone(UTC): approved zone", "user zone: UTC (UTC)")
+        _ = repo.change()
+        _ = repo.git(repo.checkout, "commit", "-qam", subjects[0])
+        for name, subject in zip(("zone.txt", "installed-zone.txt"), subjects[1:]):
+            _ = (repo.checkout / name).write_text(subject + "\n")
+            _ = repo.git(repo.checkout, "add", name)
+            _ = repo.git(repo.checkout, "commit", "-qm", subject)
+        tree = repo.git(repo.checkout, "rev-parse", "HEAD^{tree}")
+        advanced = self.advance_origin(self.other_writer())
+
+        main_publish.ready(repo.checkout)
+
+        self.assertEqual(repo.git(repo.checkout, "log", "--reverse", "--format=%s", f"{advanced}..HEAD"),
+                         "\n".join(subjects))
+        self.assertEqual(repo.git(repo.checkout, "diff", "--name-only", tree, "HEAD"), "remote.txt")
+        pushed, detail = main_publish.push(repo.checkout)
+        self.assertTrue(pushed, detail)
+        self.assertEqual(repo.head(), repo.remote_tip())
+
+    def test_ready_refuses_an_unrelated_commit_when_main_is_only_ahead_of_origin(self) -> None:
+        repo = self.repository
+        remote = repo.remote_tip()
+        _ = (repo.checkout / "other.txt").write_text("unpublished feature\n")
+        subject = "keep this unpublished feature"
+        _ = repo.git(repo.checkout, "commit", "-qam", subject)
+        rejected = repo.head()
+        short_id = repo.git(repo.checkout, "rev-parse", "--short", "HEAD")
+        self.assertEqual(repo.git(repo.checkout, "rev-parse", "HEAD^"), remote)
+        self.assertEqual(repo.git(repo.checkout, "status", "--porcelain=v1"), "")
+
+        with self.assertRaises(main_publish.Refusal) as refused:
+            main_publish.ready(repo.checkout)
+
+        message = str(refused.exception)
+        self.assertIn(short_id, message)
+        self.assertIn(subject, message)
+        self.assertEqual(len(message.splitlines()), 1)
+        self.assertEqual(repo.head(), rejected)
+        self.assertEqual(repo.remote_tip(), remote)
+        self.assertEqual(repo.git(repo.checkout, "status", "--porcelain=v1"), "")
+        self.assertEqual((repo.checkout / "other.txt").read_text(), "unpublished feature\n")
+
+    def test_ready_names_an_unrelated_commit_and_preserves_main_when_origin_diverges(self) -> None:
+        repo = self.repository
+        _ = repo.change()
+        _ = repo.git(repo.checkout, "commit", "-qam", "tune(example): amount 2 -> 3")
+        _ = (repo.checkout / "other.txt").write_text("local work\n")
+        subject = "keep this unpublished feature"
+        _ = repo.git(repo.checkout, "commit", "-qam", subject)
+        rejected = repo.head()
+        advanced = self.advance_origin(self.other_writer())
+        before = repo.head(), repo.config.read_bytes(), repo.git(repo.checkout, "status", "--porcelain=v1")
+
+        with self.assertRaises(main_publish.Refusal) as refused:
+            main_publish.ready(repo.checkout)
+
+        message = str(refused.exception)
+        self.assertIn(subject, message)
+        self.assertIn(rejected[:7], message)
+        self.assertEqual(len(message.splitlines()), 1)
+        self.assertEqual((repo.head(), repo.config.read_bytes(),
+                          repo.git(repo.checkout, "status", "--porcelain=v1")), before)
+        self.assertEqual(repo.remote_tip(), advanced)
+        self.assertEqual((repo.checkout / "other.txt").read_text(), "local work\n")
+
+    def test_ready_names_a_conflicting_commit_and_restores_main_after_partial_rebase(self) -> None:
+        repo = self.repository
+        zone = repo.checkout / "zone.txt"
+        _ = zone.write_text("UTC\n")
+        _ = repo.git(repo.checkout, "add", "zone.txt")
+        _ = repo.git(repo.checkout, "commit", "-qm", "zone(UTC): approved zone")
+        _ = repo.change()
+        subject = "tune(example): amount 2 -> 3"
+        _ = repo.git(repo.checkout, "commit", "-qam", subject)
+        rejected = repo.head()
+        clone = self.other_writer()
+        config = clone / "config/example.conf"
+        _ = config.write_text(config.read_text().replace("amount=2", "amount=4"))
+        _ = repo.git(clone, "commit", "-qam", "conflicting capacity")
+        _ = repo.git(clone, "push", "-q", "origin", "main")
+        advanced = repo.remote_tip()
+        before = repo.head(), repo.git(repo.checkout, "rev-parse", "HEAD^{tree}"), repo.config.read_bytes()
+
+        with self.assertRaises(main_publish.Refusal) as refused:
+            main_publish.ready(repo.checkout)
+
+        message = str(refused.exception)
+        self.assertIn("conflict", message)
+        self.assertIn(subject, message)
+        self.assertIn(rejected[:7], message)
+        self.assertIn("config/example.conf", message)
+        self.assertEqual(len(message.splitlines()), 1)
+        self.assertEqual((repo.head(), repo.git(repo.checkout, "rev-parse", "HEAD^{tree}"),
+                          repo.config.read_bytes()), before)
+        self.assertEqual(repo.git(repo.checkout, "status", "--porcelain=v1"), "")
+        self.assertEqual(repo.git(repo.checkout, "branch", "--show-current"), "main")
+        self.assertEqual(zone.read_text(), "UTC\n")
+        self.assertEqual(repo.remote_tip(), advanced)
+        for name in ("rebase-merge", "rebase-apply"):
+            self.assertFalse((repo.checkout / ".git" / name).exists())
+
     def test_mac_pull_uses_the_callers_ssh_and_reports_an_asleep_mac(self) -> None:
         repo = self.repository
         self.assertIsInstance(main_publish.pull_mac(repo.checkout, ssh_program=str(repo.ssh)), main_publish.MacPulled)
