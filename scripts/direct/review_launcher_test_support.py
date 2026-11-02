@@ -230,6 +230,7 @@ class ReviewLauncherFixture(LauncherFixture):
             check=True,
             capture_output=True,
             text=True,
+            timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
         _ = subprocess.run(
             ["git", "-c", "user.name=Review Test", "-c",
@@ -238,6 +239,7 @@ class ReviewLauncherFixture(LauncherFixture):
             check=True,
             capture_output=True,
             text=True,
+            timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
         self.review_script = self.build_script_tree()
 
@@ -252,6 +254,14 @@ class ReviewLauncherFixture(LauncherFixture):
         _ = shutil.copy2(DIRECT_DIR.parent / "production/showrunners.py",
                          self.root / "scripts/production/showrunners.py")
         _ = shutil.copy2(DIRECT_DIR.parent / "lib/probe_session.py", lib / "probe_session.py")
+        _ = shutil.copy2(DIRECT_DIR.parent / "lib/process_failure.py", lib / "process_failure.py")
+        for name in ("conf.py", "conf.sh"):
+            _ = shutil.copy2(DIRECT_DIR.parent / "lib" / name, lib / name)
+        _ = shutil.copy2(DIRECT_DIR.parent / "production/fast_track.py",
+                         self.root / "scripts/production/fast_track.py")
+        config = self.root / "config"
+        config.mkdir(exist_ok=True)
+        _ = shutil.copy2(DIRECT_DIR.parents[1] / "config/fast_track.conf", config / "fast_track.conf")
         for name in ("review.sh", "review_tree.py", "tag_inventory.py"):
             _ = shutil.copy2(DIRECT_DIR / name, direct_dir / name)
         configure_launcher_fixture(direct_dir / "review.sh")
@@ -280,8 +290,8 @@ class ReviewLauncherFixture(LauncherFixture):
         environment["LINT_CONFIG_FILE"] = str(self.root / "lint.conf")
         environment["UNIT_EARLY_POLL_SECS"] = "0.01"
         environment["TEST_WAIT_HELPER_DIR"] = str(DIRECT_DIR.resolve())
+        environment["FAST_TRACK_STATE_DIR"] = str(self.root / "fast-track-state")
         environment["CONF_DIR"] = str(self.root)
-        environment["UNIT_CONFIG"] = str(self.config_file)
         # Early mode starts a detached Stage 2 run; the stub records its arguments instead.
         mesh_runs = self.root / "mesh_runs_stub.py"
         if not mesh_runs.exists():
@@ -453,11 +463,12 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
         session = self.start_implementation(name)
         self.finish_implementation(session)
         # The stub's commit adds every file, so the plan start_implementation writes is committed first.
-        _ = subprocess.run(["git", "add", "plan.md"], cwd=self.working_dir, check=True, capture_output=True)
+        _ = subprocess.run(["git", "add", "plan.md"], cwd=self.working_dir, check=True, capture_output=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
         _ = subprocess.run(
             ["git", "-c", "user.name=Review Test", "-c", "user.email=review@example.com",
              "commit", "-q", "-m", "plan"],
             cwd=self.working_dir, check=True, capture_output=True, text=True,
+            timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
         for phase, files in (("3", "reviewed.txt\n"), ("4", "other.txt\n")):
             directory = session / "phases" / phase

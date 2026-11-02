@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from scripts.lint.memory_test_support import config_environment
-from contextlib import closing
+from collections.abc import Generator, Mapping, Sequence
+from contextlib import closing, contextmanager
+import fcntl
 import json
 import os
 import select
@@ -18,7 +20,7 @@ from types import ModuleType
 import unittest
 from unittest import mock
 from pathlib import Path
-from typing import ClassVar, NamedTuple, cast, override
+from typing import IO, ClassVar, NamedTuple, cast, override
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 import process_group
@@ -107,6 +109,7 @@ import sys
 state = Path(os.environ["CHECKPOINT_TEST_STATE"])
 name = Path(sys.argv[0]).name
 args = sys.argv[1:]
+TEST_HANG_GUARD_SECS = __HANG_GUARD__
 with (state / "events.jsonl").open("a") as output:
     output.write(json.dumps({"command": name, "args": args}) + "\\n")
 if name == "ssh":
@@ -117,7 +120,7 @@ if name == "style_sync.py":
     repo = args[args.index("--repo-dir") + 1]
     branch = args[args.index("--branch") + 1]
     observed = subprocess.run(["git", "-C", repo, "ls-remote", "origin", "refs/heads/" + branch],
-                              capture_output=True, text=True, check=True).stdout.split()[0]
+                              capture_output=True, text=True, check=True, timeout=TEST_HANG_GUARD_SECS).stdout.split()[0]
     (state / "notified-tip").write_text(observed)
 if name == "verify.sh":
     fail_rows = state / "fail-rows"
@@ -146,26 +149,26 @@ if name == "basedpyright":
     print("0 errors, 0 warnings, 0 notes", flush=True)
     print("venv .venv subdirectory not found in venv path " + os.getcwd() + ".", file=sys.stderr)
     raise SystemExit(3)
-'''
+'''.replace("__HANG_GUARD__", str(TEST_HANG_GUARD_SECS))
 
 
 BUMP_TEST_STUB = STUB + '''
 import subprocess
-import uuid
 sys.path.insert(0, __TEST_REPOSITORY__)
 from scripts.direct.wait_for_test_state import wait_for_file
 from scripts.message import sessions
 
 def git(*arguments):
-    return subprocess.run(["git", *arguments], capture_output=True, text=True, check=True).stdout.strip()
+    return subprocess.run(["git", *arguments], capture_output=True, text=True, check=True, timeout=TEST_HANG_GUARD_SECS).stdout.strip()
 
 gate_pid = os.getppid()
 run = {"cwd": str(Path.cwd()), "head": git("rev-parse", "HEAD"),
        "origin": git("ls-remote", os.environ["BUMP_TEST_ORIGIN"], "refs/heads/production").split()[0],
-       "branch": subprocess.run(["git", "symbolic-ref", "-q", "HEAD"], capture_output=True, text=True).stdout.strip(),
+       "branch": subprocess.run(["git", "symbolic-ref", "-q", "HEAD"], capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS).stdout.strip(),
        "gate_pid": gate_pid, "gate_start": sessions.process_start(gate_pid),
        "session": os.getsid(0), "stdin_closed": os.read(0, 1) == b""}
-path = state / "gate-runs" / (uuid.uuid4().hex + ".json")
+# A red command is retried inside the same gate. Observe runners, not attempts.
+path = state / "gate-runs" / f"{gate_pid}-{run['gate_start']}.json"
 temporary = path.with_suffix(".pending")
 temporary.write_text(json.dumps(run))
 temporary.replace(path)
@@ -182,6 +185,11 @@ if (state / "gate-red").exists() and "-E" not in args:
 
 BUMP_SEND_STUB = STUB + '''
 import uuid
+if (state / "slow-delivery").exists():
+    sys.path.insert(0, __TEST_REPOSITORY__)
+    from scripts.direct.wait_for_test_state import wait_for_file
+    (state / "delivery-started").touch()
+    wait_for_file(state / "delivery-release")
 if (state / "stop-before-showrunner-notice").exists() and "showrunner" in args[args.index("--to") + 1]:
     import signal
     os.kill(os.getppid(), signal.SIGKILL)
@@ -196,7 +204,7 @@ temporary = path.with_suffix(".pending")
 temporary.write_text(json.dumps(args))
 temporary.replace(path)
 print("SENT: fixture", flush=True)
-'''
+'''.replace("__TEST_REPOSITORY__", repr(str(Path(__file__).resolve().parents[2])))
 
 
 class BumpGateObservation(NamedTuple):
@@ -351,7 +359,7 @@ class MergeCheckpointFixture(unittest.TestCase):
 
     def git(self, *args: str, cwd: Path | None = None) -> str:
         result = subprocess.run(["git", *args], cwd=cwd or self.checkout,
-                                capture_output=True, text=True, check=False)
+                                capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, (args, result.stdout, result.stderr))
         return result.stdout.strip()
 
@@ -502,6 +510,22 @@ class MergeCheckpointFixture(unittest.TestCase):
                         + "    print('fixture clone refused', file=sys.stderr)\n    raise SystemExit(1)\n"
                         + f"os.execv({git!r}, [{git!r}, *sys.argv[1:]])\n")
 
+    @contextmanager
+    def refuse_bump_gate_launch(self) -> Generator[None]:
+        original = subprocess.Popen
+
+        def launch(command: Sequence[str], *, stdin: int | None = None,
+                   stdout: int | IO[str] | None = None, stderr: int | IO[str] | None = None,
+                   cwd: str | Path | None = None, env: Mapping[str, str] | None = None,
+                   text: bool = False, start_new_session: bool = False) -> subprocess.Popen[str] | subprocess.Popen[bytes]:
+            if any(Path(word).name == "bump_gate.py" for word in command):
+                raise OSError("fixture gate launch refused")
+            return original(command, stdin=stdin, stdout=stdout, stderr=stderr, cwd=cwd, env=env,
+                            text=text, start_new_session=start_new_session)
+
+        with mock.patch.object(subprocess, "Popen", side_effect=launch):
+            yield
+
     def move_bump_recipients(self) -> None:
         timer = self.root / "notifier/showrunner-example/conf"
         timer_text = timer.read_text()
@@ -541,10 +565,19 @@ class MergeCheckpointFixture(unittest.TestCase):
         path = merge_checkpoint.checkpoint_step_record(self.checkout, tip, "bump-gate")
         return cast(dict[str, object], json.loads(path.read_text()))
 
+    def assert_main_push_lock_available(self) -> None:
+        common = Path(self.git("rev-parse", "--path-format=absolute", "--git-common-dir"))
+        with (common / "main-push.lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
     def wait_bump_result(self, tip: str) -> dict[str, object]:
         path = merge_checkpoint.checkpoint_step_record(self.checkout, tip, "bump-gate")
-        wait_until(lambda: path.exists() and self.bump_gate_record(tip)["result"] in ("red", "green"), path.parent)
-        record = self.bump_gate_record(tip)
+        return self.wait_bump_result_at(path)
+
+    def wait_bump_result_at(self, path: Path) -> dict[str, object]:
+        wait_until(lambda: path.exists() and merge_checkpoint.read_record(path)["result"] in ("red", "green"), path.parent)
+        record = cast(dict[str, object], json.loads(path.read_text()))
         pid = cast(int, record["pid"])
         if pid:
             self.wait_bump_process_exit(pid)
@@ -685,7 +718,7 @@ class MergeCheckpointFixture(unittest.TestCase):
         self.write(self.unit, "src/alpha.txt", message)
         _ = self.git("add", "src/alpha.txt", cwd=self.unit)
         _ = subprocess.run(["git", "commit", "-q", "-m", message], cwd=self.unit, check=True,
-                           env={**os.environ, "GIT_COMMITTER_DATE": "2026-10-15T12:00:00-04:00"})
+                           env={**os.environ, "GIT_COMMITTER_DATE": "2026-10-15T12:00:00-04:00"}, timeout=TEST_HANG_GUARD_SECS)
         _ = self.git("push", "origin", "alpha-branch", cwd=self.unit)
         return self.git("rev-parse", "HEAD", cwd=self.unit)
 
