@@ -938,7 +938,7 @@ def clear_check(timeout: float = CHECK_TIMEOUT_S) -> tuple[int, list[str]]:
         for record in records:
             name = f"{record['key']} from {record['sender']}"
             expires = datetime.fromisoformat(record["expires"])
-            if now() >= expires:
+            if now() >= expires and not record["key"].startswith("github.keys_cold:"):
                 done.append(record)
                 lines.append(f"dropped: {name}: its push expired at {expires.astimezone(zone):%H:%M:%S %Z}")
                 continue
@@ -989,7 +989,8 @@ def log(message: Message, result: Result, at: datetime, route: Route = NO_CLAUDE
 # ---------------------------------------------------------------------------
 
 
-def claim(message: Message, repeat: timedelta | None, at: datetime, *, live: bool = False) -> str | None:
+def claim(message: Message, repeat: timedelta | None, at: datetime, *, live: bool = False,
+          clears_when: str = "", posted_on: str = "") -> str | None:
     """Why this send is skipped, or None after recording it as the key's latest attempt.
 
     Recording before delivery, under the lock, keeps two overlapping runs with
@@ -1002,11 +1003,19 @@ def claim(message: Message, repeat: timedelta | None, at: datetime, *, live: boo
         if "acknowledged" in state:
             return acknowledged_skip_reason(message.key, state["acknowledged"])
         last = state["last"].get(message.to)
+        if last is not None and message.key.startswith("github.keys_cold:"):
+            return f"key {message.key!r}: GitHub keys still cold; this event already sent its push"
         if repeat is not None and last is not None and at - datetime.fromisoformat(last) < repeat:
             if live:
                 return still_live(message.key, message.sender, datetime.fromisoformat(last), repeat)
             minutes = repeat.total_seconds() / 60
             return f"key {message.key!r} last sent to {message.to} at {last}, inside its {minutes:g}-minute window"
+        if clears_when:
+            clear_record = Emergency(key=message.key, sender=message.sender, check=clears_when, machine=posted_on,
+                                     sent=at.isoformat(), expires=(at + emergency_lifetime()).isoformat())
+            # Persist recovery before the claim: a crash can leave an extra check, never an orphan claim.
+            kept = [old for old in read_emergencies() if old["key"] != clear_record["key"]]
+            write_emergencies([*kept, clear_record])
         state["last"][message.to] = at.isoformat()
     return None
 
@@ -2065,6 +2074,10 @@ def parse(argv: list[str]) -> Options:
         args.action = rendered.action.text if isinstance(rendered.action, ActionRequired) else None
         args.no_action = isinstance(rendered.action, NoActionRequired)
         args.sender = optional_str(attr(args, "sender")) or rendered.sender
+        if text_id == "github.keys_cold":
+            args.key = "github.keys_cold:" + values["machine"]
+            if attr(args, "self_clearing") is not True:
+                args.clears_when = "github-warm-status"
         if text_id == AUTO_MODE_TEXT and attr(args, "key") is None:
             args.key = auto_mode_key(values["session"], tuple(commands))
     elif raw_values:
@@ -2199,9 +2212,9 @@ def send(options: Options) -> Result:
     if options.text_id == AUTO_MODE_TEXT:
         options = reviewed_waits(options)
     text = body_text(options).rstrip("\n")
-    if not text.strip():
+    if not text.strip() and not options.text_id:
         usage_error("the message is empty")
-    first = text.strip().splitlines()[0]
+    first = next(iter(text.strip().splitlines()), options.summary or "")
     summary = options.summary or (first if len(first) <= 60 else first[:59] + "…")
     # A forwarded display is authoritative; only recipient lookup may read the receiver's roster.
     needs_recipient_roster = (isinstance(options.selection, RosterLookup) and options.to != USER
@@ -2239,7 +2252,10 @@ def send(options: Options) -> Result:
     # An emergency push with no clear step would repeat after its cause is fixed: refused, not claimed.
     refused = emergency and not options.clears_when and not options.self_clearing
     held = None if refused else wrong_template(options, "\n".join((summary, text, action_text)))
-    skip = None if refused or held is not None else claim(message, window, started, live=live)
+    cold_check = options.clears_when if options.text_id == "github.keys_cold" else ""
+    skip = None if refused or held is not None else claim(
+        message, window, started, live=live, clears_when=cold_check,
+        posted_on=options.scope.host if isinstance(options.scope, NamedMachine) else machine())
     log_route: Route = NO_CLAUDE_ROUTE
     guarded = repeat_guard.Decision()
     if not refused and held is None and skip is None and not isinstance(route, (RecipientLookupFailed, CodexWorkerRecipient, RemoteDelivery)):
@@ -2328,7 +2344,7 @@ def send(options: Options) -> Result:
     if (key is not None and not refused and held is None and skip is None
             and result.outcome in {"failed", "refused", "held"}):
         forget_sent(key, message.to, started)
-    if emergency and options.clears_when and key is not None and result.outcome == "sent":
+    if emergency and options.clears_when and key is not None and not cold_check and result.outcome == "sent":
         posted_on = options.scope.host if isinstance(options.scope, NamedMachine) else machine()
         record_emergency(Emergency(key=key, sender=sender, check=options.clears_when, machine=posted_on,
                                    sent=started.isoformat(), expires=(started + emergency_lifetime()).isoformat()))

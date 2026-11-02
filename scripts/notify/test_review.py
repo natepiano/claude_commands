@@ -103,8 +103,8 @@ class FakeReviewer:
 
 
 def with_footer(message: str, sender: str, template: str = "none (free text)") -> str:
-    """A posted push: the message, then its "Sent by" and "Template" lines last."""
-    return f"{message}\n\nSent by: {sender}\nTemplate: {template}"
+    """A posted push: the message, then its sender and template on one last line."""
+    return f"{message}\n\nSent by: {sender} · Template: {template}"
 
 
 def verdict(draft: review.Draft, decision: str = "send", /, **changes: object) -> VerdictJSON:
@@ -155,6 +155,39 @@ class LocalReviewTests(unittest.TestCase):
         _ = binary.write_text("fake reviewer\n")
         binary.chmod(0o700)
         _ = self.enterContext(mock.patch.object(shutil, "which", return_value=str(binary)))
+
+    def test_review_receives_catalog_purposes_and_refuses_a_matching_fixed_template(self) -> None:
+        draft = review.Draft("hana", "1", "Mac shots stopped", ActionRequired("Unlock the Mac."),
+                             "Every Mac screenshot is black.", False)
+        failure: review.RuleFailureRecord = {"rule": "use-registered-template:mac.locked", "quote": draft.body}
+        runner = FakeReviewer(verdict(draft, "withhold", failed_rules=[failure]))
+        outcome = review.review(draft, False, runner=runner)
+        self.assertIsInstance(outcome, review.Withheld)
+        self.assertIn("use-registered-template:mac.locked", outcome.failed_rules if isinstance(outcome, review.Withheld) else [])
+        prompt = runner.calls[-1].argv[runner.calls[-1].argv.index("--system-prompt") + 1]
+        for entry in push_texts.catalog():
+            if not entry.agent_written:
+                self.assertIn(f"{entry.id}: {entry.purpose}", prompt)
+        self.assertIn("return withhold with rule use-registered-template:<id>", prompt)
+
+    def test_fixed_registered_live_review_omits_template_fit_instruction(self) -> None:
+        draft = review.Draft("ups", "0", "Power is back", NoActionRequired(), "Mains power is back.", False)
+        runner = FakeReviewer(verdict(draft))
+        self.assertIsInstance(review.review(draft, False, runner=runner, text_id="nixos.ups_power_back"), review.Approved)
+        prompt = runner.calls[-1].argv[runner.calls[-1].argv.index("--system-prompt") + 1]
+        self.assertNotIn("use-registered-template:", prompt)
+        self.assertNotIn("When a registered template fits", prompt)
+
+    def test_catalog_review_omits_template_fit_instruction(self) -> None:
+        entry = push_texts.PushText("test", "script", "note", "Finished", push_texts.NoActionNeeded(),
+                                   "The check passed.", (push_texts.PushExample("typical", {}),), purpose="Test.")
+        draft = review.Draft("script", "0", entry.title, NoActionRequired(), entry.body, False)
+        runner = FakeReviewer(verdict(draft))
+        with mock.patch.object(push_texts, "catalog", return_value=(entry,)), redirect_stdout(io.StringIO()):
+            self.assertEqual(review.texts(["test"], runner=runner), 0)
+        prompt = runner.calls[-1].argv[runner.calls[-1].argv.index("--system-prompt") + 1]
+        self.assertNotIn("use-registered-template:", prompt)
+        self.assertNotIn("When a registered template fits", prompt)
 
     def test_questions_keep_multiline_headers_and_long_text_without_push_limits(self) -> None:
         for prefix in ("Session: Owner", "Action: choose one", "No action needed."):
