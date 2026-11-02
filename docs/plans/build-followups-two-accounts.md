@@ -3117,7 +3117,7 @@ natedev 2026-11-02 (urgent): the user turned on voice on the Mac; its `settings.
 
 **As-built:** `voice` joins `SETTINGS_LOCAL_KEYS_JSON` in `scripts/settings/settings_local_keys.sh`, beside `theme`. The Mac fixture in `scripts/settings/test_settings_local_keys.py` has `voice: {enabled: true, mode: hold}`; the cleaned copy has no `voice` key and the sidecar merge puts the full object back. Tests were not run at the checkpoint (hana build hold); the merge gate runs them.
 
-### Phase 101w — Account tunables live in config  · status: todo
+### Phase 101w — Account tunables live in config  · status: done
 
 natedev 2026-11-02: the hard-coded values proposal, phase 3 (user approved 2026-11-01). Move each tunable value in the accounts code to config through `scripts/lib/conf.py`, with the same value.
 
@@ -3143,3 +3143,18 @@ natedev 2026-11-02: the hard-coded values proposal, phase 3 (user approved 2026-
 - `scripts/accounts/outage_alerts.py`
 - `scripts/accounts/test_accounts.py`
 - `docs/accounts.md`
+
+### Phase 101y — A new settings key on one machine never blocks promotion  · status: todo
+
+natedev 2026-11-02 accepted the general rule after 101x: a top-level key in the live `~/.claude/settings.json` that `HEAD`'s `settings.json` does not have is machine-local by default.
+
+#### Work Order
+**Goal:** a new top-level settings key added on one machine stays in that machine's live file, is stripped from the tracked copy, and never blocks promotion or claude-sync.
+**Spec:**
+1. In the settings clean and merge path that uses `SETTINGS_LOCAL_KEYS_JSON`, treat each top-level live key absent from `HEAD`'s `settings.json` as local, in addition to the listed keys.
+2. A key that a merged commit adds is in `HEAD`, so it stays shared; only a key added in the live file becomes local.
+3. Send one notice per new local key with `send.py --to natedev`, naming the key and the machine, so a person can make it shared; never repeat a notice for the same key and machine.
+4. Tests (scratch data only, no live send): an unknown live key stays local; a key present in `HEAD` stays shared; the notice goes once per new key.
+**Files:**
+- `scripts/settings/settings_local_keys.sh`
+- `scripts/settings/test_settings_local_keys.py`

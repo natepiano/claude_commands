@@ -26,6 +26,7 @@ from scripts.lib import names
 from scripts.lib.test_names import fixture_names
 
 from scripts.whoami.note_file import note_name
+from scripts.accounts.home_test_support import scratch_accounts_config
 
 import argparse
 import ast
@@ -17404,10 +17405,12 @@ class DevShellServerTests(unittest.TestCase):
         self.workers_home = root / "workers"
         self.workers_home.mkdir()
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
+            "HOME": str(Path.home()), "AGENT_NOTES_DIR": os.environ["AGENT_NOTES_DIR"],
             "PATH": "/caller/bin", "CODEX_HOME": "/caller/home",
             "UNIT_RUN_DIR": "/caller/run", "TMPDIR": str(root),
             "NIX_LDFLAGS": "caller linker flags",
         }, clear=True)))
+        _ = self.enterContext(scratch_accounts_config())
         _ = self.enterContext(patch.object(codex_mesh, "RUN_ROOTS", (self.session_dir.parent,)))
         _ = self.enterContext(patch.object(codex_mesh, "_design_context", return_value={}))
         _ = self.enterContext(patch.object(codex_mesh, "_holds_old_sign_in", return_value=False))

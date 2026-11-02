@@ -31,6 +31,7 @@ import launch_permission
 from scripts.whoami import account
 from scripts.whoami import agent_accounts
 from scripts.accounts import accounts, refusals
+from scripts.accounts.home_test_support import scratch_accounts_config
 from scripts.accounts.move_test_support import FakeSessionMoves, MoveCall
 from scripts.shutdown import stop_resume
 from test_restart import entry, worker_session, showrunner, top_level, unit
@@ -48,6 +49,7 @@ class AccountMoveTests(ShutdownTestCase):
     @override
     def setUp(self) -> None:
         super().setUp()
+        _ = self.enterContext(scratch_accounts_config())
         _ = self.enterContext(patch.object(launch_permission, "launch_permission", return_value=launch_permission.AllowedByShutdownState()))
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         notes = self.root / "notes"
@@ -204,6 +206,7 @@ class AccountMoveTests(ShutdownTestCase):
         environment = {
             "HOME": str(self.root),
             "PATH": os.defpath,
+            "CONF_DIR": os.environ["CONF_DIR"],
             "AGENT_NOTES_DIR": str(self.root / "notes"),
             "SHUTDOWN_STATE_DIR": str(self.root / "shutdown"),
             "NOTIFIER_STATE_DIR": str(self.root / "notifier"),
@@ -464,7 +467,7 @@ class AccountMoveTests(ShutdownTestCase):
         for group in (False, True):
             for has_room in (False, True):
                 with self.subTest(group=group, has_room=has_room):
-                    def reading(_tool: str, login: str, _now: datetime) -> refusals.FreshReading:
+                    def reading(_tool: str, login: str, _now: datetime, *_age: timedelta) -> refusals.FreshReading:
                         if not has_room or login == "target@example.invalid":
                             return empty
                         days = 2 if login == "default@example.invalid" else 3
@@ -473,6 +476,7 @@ class AccountMoveTests(ShutdownTestCase):
 
                     before = self.disk_state()
                     with (patch.object(refusals, "stored_reading", side_effect=reading),
+                          patch.object(refusals, "stored_reading_with_age", side_effect=reading),
                           patch.object(subprocess, "run") as process):
                         result, output, error = self.batch_cli() if group else self.cli()
                     self.assertNotEqual(result, 0)
