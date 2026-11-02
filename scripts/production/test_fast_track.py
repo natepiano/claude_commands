@@ -131,6 +131,51 @@ sys.exit(result.returncode)
 '''.replace("__HANG_GUARD__", str(TEST_HANG_GUARD_SECS))
 
 
+FETCH_RACE_GIT = '''#!/usr/bin/env python3
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+args = sys.argv[1:]
+control = Path(os.environ["FAST_TRACK_TEST_CONTROL"])
+director = Path(os.environ["FAST_TRACK_FETCH_DIRECTOR"])
+lock = Path(os.environ["FAST_TRACK_FETCH_LOCK"])
+plan = json.loads((control / "fetch-plan.json").read_text())
+armed = control / "fetch-armed"
+events = control / "fetch-events.jsonl"
+in_director = args[:2] == ["-C", str(director)]
+is_fetch = in_director and args[2:] == ["fetch", "origin", "main"]
+if is_fetch and (armed.exists() or plan["point"] == "before-push"):
+    rows = events.read_text().splitlines() if events.exists() else []
+    failure = plan["failures"][len(rows)] if len(rows) < len(plan["failures"]) else ""
+    if failure == "lock":
+        if plan["point"] == "before-push" and not rows:
+            subprocess.run([os.environ["FAST_TRACK_REAL_GIT"], "-C", str(director),
+                            "update-ref", "refs/remotes/origin/main", "HEAD^"],
+                           check=True, timeout=__HANG_GUARD__)
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        lock.touch()
+    if failure == "other":
+        result = subprocess.CompletedProcess(args, 128, "", "fatal: fixture fetch transport failed\\n")
+    else:
+        result = subprocess.run([os.environ["FAST_TRACK_REAL_GIT"], *args],
+                                capture_output=True, text=True, check=False, timeout=__HANG_GUARD__)
+    with events.open("a") as output:
+        output.write(json.dumps({"returncode": result.returncode, "stderr": result.stderr}) + "\\n")
+    if failure == "lock" and not plan["persistent"]:
+        lock.unlink()
+    sys.stdout.write(result.stdout)
+    sys.stderr.write(result.stderr)
+    sys.exit(result.returncode)
+result = subprocess.run([os.environ["FAST_TRACK_REAL_GIT"], *args], check=False, timeout=__HANG_GUARD__)
+if "push" in args and "HEAD:main" in args and result.returncode == 0:
+    armed.touch()
+sys.exit(result.returncode)
+'''.replace("__HANG_GUARD__", str(TEST_HANG_GUARD_SECS))
+
+
 @final
 class FastTrackTests(MergeCheckpointFixture):
     def __init__(self, methodName: str = "runTest") -> None:
@@ -187,10 +232,12 @@ class FastTrackTests(MergeCheckpointFixture):
                 "max_files": conf.whole("fast_track", "max_files"),
                 "check_time_limit_seconds": conf.number("fast_track", "check_time_limit_seconds"),
                 "max_push_attempts": conf.whole("fast_track", "max_push_attempts"),
+                "fetch_lock_attempts": conf.whole("fast_track", "fetch_lock_attempts"),
+                "fetch_lock_wait_seconds": conf.number("fast_track", "fetch_lock_wait_seconds"),
                 "refused_paths": list(conf.words("fast_track", "refused_paths")),
             }
         self.settings.update(max_changed_lines=100, max_files=10, check_time_limit_seconds=30,
-                             max_push_attempts=2)
+                             max_push_attempts=2, fetch_lock_attempts=3, fetch_lock_wait_seconds=0.01)
         self.save_config()
         self.executable(self.bin / "basedpyright", TYPE_TOOL)
         self.promotions = str(self.promote) + ", mac " + str(self.root / "mac-installed")
@@ -257,6 +304,112 @@ class FastTrackTests(MergeCheckpointFixture):
         self.env["FAST_TRACK_REAL_GIT"] = str(real_git)
         self.executable(self.bin / "git", INTERRUPTED_GIT)
         _ = (self.control / "stop-git").write_text(point)
+
+    def arrange_fetch_failures(self, point: str, failures: list[str], *, persistent: bool = False) -> Path:
+        real_git = shutil.which("git", path=self.env["PATH"])
+        self.assertIsNotNone(real_git)
+        common = Path(self.git("rev-parse", "--path-format=absolute", "--git-common-dir", cwd=self.unit))
+        lock = common / "refs/remotes/origin/main.lock"
+        self.env.update(FAST_TRACK_REAL_GIT=str(real_git), FAST_TRACK_FETCH_DIRECTOR=str(self.unit),
+                        FAST_TRACK_FETCH_LOCK=str(lock))
+        _ = (self.control / "fetch-plan.json").write_text(json.dumps({
+            "point": point, "failures": failures, "persistent": persistent,
+        }))
+        self.executable(self.bin / "git", FETCH_RACE_GIT)
+        return lock
+
+    def director_fetches(self) -> list[dict[str, object]]:
+        return [cast(dict[str, object], json.loads(line))
+                for line in (self.control / "fetch-events.jsonl").read_text().splitlines()]
+
+    def test_post_push_ref_lock_retries_then_restores_and_promotes(self) -> None:
+        self.change_module()
+        lock = self.arrange_fetch_failures("after-push", ["lock"])
+        result = self.fast_track()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        fetches = self.director_fetches()
+        self.assertEqual(len(fetches), 2, fetches)
+        self.assertNotEqual(fetches[0]["returncode"], 0)
+        self.assertIn("cannot lock ref", str(fetches[0]["stderr"]))
+        self.assertEqual(fetches[1]["returncode"], 0)
+        self.assertFalse(lock.exists())
+        tip = self.git("rev-parse", "main", cwd=self.origin)
+        self.assertNotEqual(tip, self.initial)
+        self.assertEqual((self.unit / "scripts/sample/item.py").read_text(), MODULE)
+        self.assertEqual(self.git("rev-parse", "HEAD", cwd=self.promote), tip)
+        self.assertEqual(len(self.events("ssh")), 1)
+        row, = self.records()
+        self.assertEqual(row["commit"], tip)
+
+    def test_pre_push_ref_lock_retries_before_the_patch_is_published(self) -> None:
+        self.change_module()
+        _ = self.arrange_fetch_failures("before-push", ["lock"])
+        result = self.fast_track()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        fetches = self.director_fetches()
+        self.assertIn("cannot lock ref", str(fetches[0]["stderr"]))
+        self.assertEqual(fetches[1]["returncode"], 0)
+        tip = self.git("rev-parse", "main", cwd=self.origin)
+        self.assertNotEqual(tip, self.initial)
+        self.assertEqual((self.unit / "scripts/sample/item.py").read_text(), MODULE)
+        self.assertEqual(self.git("rev-parse", "HEAD", cwd=self.promote), tip)
+
+    def test_persistent_post_push_ref_lock_stops_at_the_fetch_attempt_limit(self) -> None:
+        self.change_module()
+        self.settings["fetch_lock_attempts"] = 2
+        self.save_config()
+        lock = self.arrange_fetch_failures("after-push", ["lock", "lock"], persistent=True)
+        result = self.fast_track()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        fetches = self.director_fetches()
+        self.assertEqual(len(fetches), 2, fetches)
+        self.assertTrue(all(row["returncode"] != 0 and "cannot lock ref" in str(row["stderr"])
+                            for row in fetches), fetches)
+        self.assertIn(str(fetches[-1]["stderr"]).strip(), result.stderr)
+        self.assertTrue(lock.exists())
+        self.assertNotEqual(self.git("rev-parse", "main", cwd=self.origin), self.initial)
+        self.assertIn('VALUE = "after"', (self.unit / "scripts/sample/item.py").read_text())
+        self.assertEqual(self.git("rev-parse", "HEAD", cwd=self.promote), self.initial)
+        self.assertEqual(self.events("ssh"), [])
+
+    def test_transport_failure_after_a_ref_lock_is_not_retried(self) -> None:
+        self.change_module()
+        _ = self.arrange_fetch_failures("after-push", ["lock", "other"])
+        result = self.fast_track()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        fetches = self.director_fetches()
+        self.assertEqual(len(fetches), 2, fetches)
+        self.assertIn("cannot lock ref", str(fetches[0]["stderr"]))
+        self.assertIn("fatal: fixture fetch transport failed", result.stderr)
+        self.assertNotIn("cannot lock ref", result.stderr)
+        self.assertNotEqual(self.git("rev-parse", "main", cwd=self.origin), self.initial)
+        self.assertEqual(self.git("rev-parse", "HEAD", cwd=self.promote), self.initial)
+
+    def test_pre_push_transport_failure_refuses_without_retry_or_publication(self) -> None:
+        self.change_module()
+        _ = self.arrange_fetch_failures("before-push", ["other"])
+        result = self.fast_track()
+        self.assert_refused(result, "fatal: fixture fetch transport failed")
+        self.assertEqual(len(self.director_fetches()), 1)
+        self.assertIn('VALUE = "after"', (self.unit / "scripts/sample/item.py").read_text())
+
+    def test_fetch_retry_keys_missing_or_invalid_refuse_before_publication(self) -> None:
+        self.change_module()
+        valid = self.settings.copy()
+        for key, invalid in {
+            "fetch_lock_attempts": [0, -1, 1.5, "many", True],
+            "fetch_lock_wait_seconds": [-1, "soon", True, "nan", "inf"],
+        }.items():
+            for value in [None, *invalid]:
+                with self.subTest(key=key, value=value):
+                    self.settings = valid.copy()
+                    if value is None:
+                        del self.settings[key]
+                    else:
+                        self.settings[key] = value
+                    self.save_config()
+                    self.assert_refused(self.fast_track(), key)
+        self.assertEqual(self.observations("types"), [])
 
     def retry_interrupted_restore(self, point: str) -> None:
         self.change_module()

@@ -15,7 +15,8 @@ no change, conflicts with main, and the `refused_paths` in
 `config/fast_track.conf`; Python files that import a refused repo module, directly or through other repo modules, are also refused.
 
 That file alone sets `max_changed_lines`, `max_files`,
-`check_time_limit_seconds`, and `max_push_attempts`. A missing or invalid key
+`check_time_limit_seconds`, `max_push_attempts`, `fetch_lock_attempts`, and
+`fetch_lock_wait_seconds`. A missing or invalid key
 refuses the request. Use the normal phase path when a limit is exceeded.
 
 The command applies the patch in a shared clone of origin/main. It runs each
