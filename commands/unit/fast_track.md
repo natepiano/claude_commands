@@ -15,14 +15,17 @@ no change, conflicts with main, and the `refused_paths` in
 `config/fast_track.conf`; Python files that import a refused repo module, directly or through other repo modules, are also refused.
 
 That file alone sets `max_changed_lines`, `max_files`,
-`check_time_limit_seconds`, and `max_push_attempts`. A missing or invalid key
+`check_time_limit_seconds`, `max_push_attempts`, `fetch_lock_attempts`, and
+`fetch_lock_wait_seconds`. A missing or invalid key
 refuses the request. Use the normal phase path when a limit is exceeded.
 
 The command applies the patch in a shared clone of origin/main. It runs each
 changed Python file's direct test modules, package import and basedpyright,
 without the merge gate or a build queue. It pushes main fast-forward only,
 then installs that commit through the production's promotion targets. A moved
-main causes a new apply and check before another push attempt.
+main causes a new apply and check before another push attempt. A fetch of
+origin main that fails with `cannot lock ref`, for example during a checkpoint
+merge, waits `fetch_lock_wait_seconds` and fetches again.
 
 After push, the named worktree paths return to HEAD; new files are removed.
 The next merge of the merge branch brings the fix back. A promotion failure
