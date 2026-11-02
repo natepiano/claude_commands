@@ -167,9 +167,9 @@ Run these in a terminal:
 | `claude2` | claude2 |
 | `claude3` | claude3 |
 | `claude4` | claude4 |
-| `codex` | The configured workers account, through `accounts.py exec workers` after the shell alias is updated. |
-| `codex1` | codex1 |
-| `codex2` | codex2 |
+| `codex` | Use the configured workers account through `accounts.py exec workers`. `codex update` updates the shared install on both machines. |
+| `codex1` | Use codex1. `codex1 update` updates the shared install on both machines. |
+| `codex2` | Use codex2. `codex2 update` updates the shared install on both machines. |
 
 The showrunner installs these aliases in the shell configuration on Linux and the Mac after this change merges. In a shell without them, run:
 
@@ -188,7 +188,9 @@ The executable is found on the loaded shell's PATH, then in `~/.local/bin`. The 
 
 `scripts/accounts/hello.sh <claudeN>` starts a throwaway probe session on that account, sends hello, prints the reply and exits. It needs no prompt; an allow rule covers it.
 
-For `codexN` or `workers`, arguments pass through to `codex` and the launch sets `CODEX_HOME` to the home holding that account's login. After the Codex cutover, codex2 uses `~/.codex2` and codex1 uses `~/.codex1`. The `codex1`, `codex2` and bare `codex` shell aliases follow these launchers; bare `codex` follows `exec workers`. `--probe` applies only to Claude accounts.
+For `codexN` or `workers`, normal launches pass arguments to `codex` and set `CODEX_HOME` to the account's home. After the Codex cutover, codex2 uses `~/.codex2` and codex1 uses `~/.codex1`. The shell aliases use these launchers. The `codex` alias uses `exec workers`. `--probe` applies only to Claude accounts.
+
+When the first argument is `update`, the launcher uses the shared `~/.codex` install without account checks. The local update uses the terminal and receives the remaining arguments. It then updates the other machine through SSH with a 600-second limit. Each machine gets one version or failure summary line. An unreachable machine shows `unreachable; run codex update there`. The command returns zero only when both updates and version reads succeed.
 
 Configuration decides the account every launch starts on: new, standby and resumed units and nightly reviews use the units account; new and resumed showrunners use the showrunners account. Set a group with `accounts.py move units|showrunners claudeN`. An unconfigured group refuses with that command; an `--account` or `--config-dir` override must name its configured account. New unit launches use herdr panes carrying the selected account variables; legacy tmux options remain available for observation and model recovery, and never choose a resume account. Every selected account runs in its own numbered folder, with the shared memory directory set to `~/.claude`. The launch removes any inherited OAuth token. Commands accept account numbers and the launch groups; `default` refuses.
 
