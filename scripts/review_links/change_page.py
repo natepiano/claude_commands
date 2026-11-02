@@ -61,8 +61,14 @@ class StoredValidationIntent(StoredDeliveryIntent):
     feedback: str
 
 
+class StoredValidationRequested(TypedDict):
+    attempt: str
+    state: Literal["sent"]
+    feedback: str
+
+
 class StoredDeliverySlots(TypedDict, total=False):
-    validation: StoredValidationIntent
+    validation: StoredValidationIntent | StoredValidationRequested
     verdict: StoredDeliveryIntent
 
 
@@ -82,14 +88,23 @@ class DeliveryIntent:
 
 
 @dataclass(frozen=True)
-class DeliverySlots:
-    """Keep validation and verdict attempts independent in one record."""
+class ValidationRequested:
+    """The showrunner owns validation after a delivered request."""
 
-    validation: DeliveryIntent | NoDelivery
+    attempt: str
+    feedback: str
+
+
+@dataclass(frozen=True)
+class DeliverySlots:
+    """Keep validation ownership and message attempts in one record."""
+
+    validation: DeliveryIntent | ValidationRequested | NoDelivery
     verdict: DeliveryIntent | NoDelivery
 
     def selected(self, saved: bool) -> DeliveryIntent | NoDelivery:
-        return self.verdict if saved else self.validation
+        intent = self.verdict if saved else self.validation
+        return intent if isinstance(intent, DeliveryIntent) else NoDelivery()
 
     def updated(self, kind: Literal["verdict", "validation"], intent: DeliveryIntent | NoDelivery) -> DeliverySlots:
         return replace(self, verdict=intent) if kind == "verdict" else replace(self, validation=intent)
@@ -172,7 +187,7 @@ class DeliveryStatus:
             return DeliverySlots(NoDelivery(), DeliveryIntent("", "failed", "verdict"))
         fields = cast(dict[str, object], value) if isinstance(value, dict) else {}
         if "validation" in fields or "verdict" in fields:
-            return DeliverySlots(self.decode_slot(fields.get("validation"), "validation"),
+            return DeliverySlots(self.decode_validation(fields.get("validation")),
                                  self.decode_slot(fields.get("verdict"), "verdict"))
         # Older records contain one intent or only validation feedback.
         feedback = fields.get("feedback", "")
@@ -184,6 +199,13 @@ class DeliveryStatus:
         else:
             intent = DeliveryIntent("", "failed", "validation" if "feedback" in fields else "verdict", feedback)
         return DeliverySlots(NoDelivery(), NoDelivery()).updated(intent.kind, intent)
+
+    def decode_validation(self, value: object) -> DeliveryIntent | ValidationRequested | NoDelivery:
+        fields = cast(dict[str, object], value) if isinstance(value, dict) else {}
+        attempt, feedback = fields.get("attempt"), fields.get("feedback", "")
+        if fields.get("state") == "sent" and isinstance(attempt, str) and isinstance(feedback, str):
+            return ValidationRequested(attempt, feedback)
+        return self.decode_slot(fields, "validation")
 
     def decode_slot(self, value: object, kind: Literal["verdict", "validation"]) -> DeliveryIntent | NoDelivery:
         if not isinstance(value, dict):
@@ -204,6 +226,9 @@ class DeliveryStatus:
         fields: StoredDeliverySlots = {}
         if isinstance(slots.validation, DeliveryIntent):
             fields["validation"] = {"attempt": slots.validation.attempt, "state": slots.validation.state,
+                                    "feedback": slots.validation.feedback}
+        elif isinstance(slots.validation, ValidationRequested):
+            fields["validation"] = {"attempt": slots.validation.attempt, "state": "sent",
                                     "feedback": slots.validation.feedback}
         if isinstance(slots.verdict, DeliveryIntent):
             fields["verdict"] = {"attempt": slots.verdict.attempt, "state": slots.verdict.state}
@@ -229,8 +254,13 @@ class DeliveryStatus:
             slots = self.slots(delivery.page, delivery.row)
             for current in (slots.validation, slots.verdict):
                 if isinstance(current, DeliveryIntent) and current.attempt == delivery.attempt:
-                    intent = replace(current, state="failed") if failed else NoDelivery()
-                    self.write_slots(delivery.page, delivery.row, slots.updated(current.kind, intent))
+                    if failed:
+                        updated = slots.updated(current.kind, replace(current, state="failed"))
+                    elif current.kind == "validation":
+                        updated = replace(slots, validation=ValidationRequested(current.attempt, current.feedback))
+                    else:
+                        updated = slots.updated("verdict", NoDelivery())
+                    self.write_slots(delivery.page, delivery.row, updated)
                     return
 
 
@@ -573,8 +603,8 @@ def submit(page: ReviewPage, body: str, status: DeliveryStatus, *,
         if row.get("Verdict"):
             raise AnswerRefused("this row already has a saved answer")
         _ = row_production(page, row)
-        attempt = status.begin(page, row_id, "validation", feedback)
         _ = next_item.move_to_end(next_item.CHANGE, page.production, key=queue_key(page, row_id), prepared=prepared)
+        attempt = status.begin(page, row_id, "validation", feedback)
         message = (f"Change review {row_id}: the user asks you to validate this\n"
                    f"List: {page.review_list}\nProduction: {page.production}\n"
                    f"Change: {row['Change']}\nUser feedback: {feedback}")

@@ -934,14 +934,15 @@ class CodexPaneRestoreTests(FolderMoveFixture):
         from datetime import timezone
 
         backend = self.folder_backend("claude", live=False)
-        client = FakeClient([{"pane_id": "w1:p1", "workspace_id": "w1", "label": "kept-name"}])
+        client = FakeClient([{"pane_id": "w1:p1", "workspace_id": "w1", "label": "kept-name",
+                              "terminal_id": "kept-terminal"}])
         owner = TopLevelSession(**common_session(self.owner.current_session, "kept-name", cwd=str(self.old_folder)),
                                 kind="top-level", host=UnknownHost(kind="unknown"))
         owner["config_dir"] = str(backend.config)
         parts = restart.ResumeParts(str(self.old_folder), {}, ("--resume", self.owner.current_session),
             "Continue.", restart.RetainResumeAccount(backend.config), restart.ResumeConversation(self.owner.current_session))
 
-        def launch(_name: str, _space: str, _title: str, _prepared: herdr.PreparedAgentEnvironment,
+        def launch(_name: str, _destination: herdr.NewTab, _prepared: herdr.PreparedAgentEnvironment,
                    kind: str, agent_arguments: list[str], opening: herdr.OpeningPrompt | herdr.NoOpeningPrompt,
                    timeout_ms: int, *, agent: str) -> herdr.AgentLaunched:
             _ = (opening, timeout_ms, agent)
