@@ -32,16 +32,15 @@ from scripts.production import showrunners
 import sessions
 import inventory as stop_work
 from user_zone import user_zone
-from scripts.accounts import outage_alerts
 if TYPE_CHECKING:
     from ..message import send as message_send
     from . import restart as restart_work
     from ..notify import review
-    from ..notify.push_texts import RenderedPush, render, user_send_argv
+    from ..notify.push_texts import RenderedPush, user_send_argv
 else:
     import send as message_send
     import review
-    from push_texts import RenderedPush, render, user_send_argv
+    from push_texts import RenderedPush, user_send_argv
 
 NOTIFIER = SCRIPTS / "message" / "notifier.sh"
 
@@ -259,7 +258,7 @@ def send_message(
 
 def stopped_sessions_text(count: int) -> str:
     """Name the number of sessions still waiting on a stop or restart."""
-    return "One session" if count == 1 else f"{count} sessions"
+    return "1 session" if count == 1 else f"{count} sessions"
 
 
 def alert_user(push: RenderedPush, *, machine: str = "") -> bool:
@@ -464,28 +463,23 @@ def report_stop(records: list[SessionShutdown]) -> None:
     route = "natedev" if remote.local_machine().casefold() == "mac" else ""
     unpushed = [saved for saved in restore_failed
                 if saved["progress"]["kind"] != "timers pending" and saved["alerts"] == "user"
-                and saved.get("restore_alerted") != not_back_text(saved)]
+                and not saved.get("restore_alerted")]
     try:
-        due = [saved for saved in unpushed if saved["progress"]["kind"] == "restart failed"]
-        for machine in dict.fromkeys(saved["machine"] for saved in due):
-            items = [saved for saved in due if saved["machine"] == machine]
+        for machine in dict.fromkeys(saved["machine"] for saved in unpushed):
+            items = [saved for saved in unpushed if saved["machine"] == machine]
             restarted = [restart_work.FailedSessionRestart(saved["session"]["name"], progress["reason"],
                                                           progress.get("trust_command", ""))
                          for saved in items if (progress := saved["progress"])["kind"] == "restart failed"]
+            manual = frozenset(saved["session"]["name"] for saved in items
+                               if saved["progress"]["kind"] == "manual restart")
+            restarted.extend(restart_work.FailedSessionRestart(name, "manual restart required") for name in manual)
             sent = restart_work.send_failure_pushes(first["label"], restarted, machine=machine,
                 identities={saved["session"]["name"]: saved["session"]["session_id"] for saved in items},
-                moved={saved["session"]["name"]: saved for saved in items if saved.get("target")},
-                send=lambda push: alert_user(push, machine=route))
+                folders={saved["session"]["name"]: Path(saved["session"]["cwd"]) for saved in items},
+                send=lambda push: alert_user(push, machine=route), manual=manual)
             for saved in items:
                 if saved["session"]["name"] in sent:
                     mark_not_back_pushed(saved)
-        for saved in unpushed:
-            if saved["progress"]["kind"] == "manual restart":
-                with outage_alerts.reserve((saved["session"]["session_id"],)) as claims:
-                    if claims and alert_user(render("shutdown.manual_restart", session=saved["session"]["name"],
-                                                   machine=saved["machine"]), machine=route):
-                        outage_alerts.delivered(claims[saved["session"]["session_id"]])
-                        mark_not_back_pushed(saved)
     finally:
         if not origins:
             print(text)
