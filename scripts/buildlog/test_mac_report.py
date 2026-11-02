@@ -207,6 +207,44 @@ class MacReportTests(unittest.TestCase):
         )
         self.assertIn("Mac failures with a natedev pass of the same tree: 1 recorded", self.report())
 
+    def test_linux_tree_keys_never_supply_natedev_pass_evidence(self) -> None:
+        self.write(
+            self.mac_call("mac-failure", "failed"),
+            step("mac-failure-step", started_at=START, call_id="mac-failure",
+                 caller="verify-mac", host="Mac", target="mac", step="nextest",
+                 status=1, tree_key="linux-tree"),
+            self.mac_call("linux-pass", "declined", "local_flag", target="aws"),
+            step("linux-pass-step", started_at=START, call_id="linux-pass",
+                 caller="verify-linux", host="aws-build", target="aws", step="nextest",
+                 status=0, tree_key="linux-tree"),
+            self.mac_call("loopback-pass", "declined", "local_flag", target="loopback"),
+            step("loopback-pass-step", started_at=START, call_id="loopback-pass",
+                 caller="verify-linux", host="natedev", target="loopback", step="nextest",
+                 status=0, tree_key="loopback-tree"),
+            self.mac_call("mac-pass"),
+            step("mac-pass-step", started_at=START, call_id="mac-pass",
+                 caller="verify-mac", host="Mac", target="mac", step="nextest",
+                 status=0, tree_key="mac-tree"),
+            self.mac_call("local-pass", "declined", "local_flag"),
+            step("local-pass-step", started_at=START, call_id="local-pass",
+                 host="natedev", target="natedev", step="nextest", status=0,
+                 tree_key="local-tree"),
+        )
+
+        _ = index.update()
+        with closing(index.read_only()) as connection:
+            evidence = mac_report.read_test_tree_evidence(connection, START, END)
+
+        selection = mac_report.TestSelectionTree("hana", "test hana", "local-tree")
+        self.assertEqual(evidence.passing_natedev_trees, {selection})
+        self.assertEqual(set(evidence.keyed_mac_calls), {"mac-failure", "mac-pass"})
+        self.assertIn("Mac failures with a natedev pass of the same tree: 0 recorded", self.report())
+
+        self.write(step("local-retry-step", started_at=START, call_id="local-pass",
+                        host="natedev", target="natedev", step="nextest", status=0,
+                        tree_key="linux-tree"))
+        self.assertIn("Mac failures with a natedev pass of the same tree: 1 recorded", self.report())
+
     def record_sent_mac_step(self, call_id: str, sent_key: str) -> None:
         mirror = self.root.parent / "mac-mirror"
         mirror.mkdir()

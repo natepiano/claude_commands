@@ -186,7 +186,7 @@ Assertion-Change: scripts/buildlog/test_target_sync.py transfer and host-mapping
 
 **Also touches:** `scripts/mac_test/` (owner verify-unit); `scripts/build_targets/`, `config/build_targets.conf` (owner resources-unit); `scripts/buildlog/` (owner report-unit); `config/README.md`, `config/aws_target.conf` (hub).
 
-### Phase 3 — Execute Linux work in cached development shells  · status: todo
+### Phase 3 — Execute Linux work in cached development shells  · status: done
 **Depends on:** Phase 2
 
 #### Work Order
@@ -217,7 +217,7 @@ Assertion-Change: scripts/buildlog/test_target_sync.py transfer and host-mapping
    Preserve caller arguments, the sent tree key, staged doc snapshots, real failure status and cleanup evidence.
 4. Extend the probe with `rustc -V`, `cargo nextest --version`, mend version and tracked script commit.
    Keep the target not ready during a mismatch.
-   Install matching public tools or copy tracked scripts before work begins.
+   Copy tracked scripts before work begins. Matching public tools come from the target's NixOS configuration (Phase 8); on a tool mismatch the runner keeps the target not ready.
    Transfer no GitHub credentials, AWS credentials, untracked secret files or source remote credentials.
 5. Use Linux disk and process commands in Linux probes and cleanup.
    Quote every remote path and argument. Preserve a claim when the runner cannot confirm cleanup.
@@ -294,6 +294,13 @@ The user performs these steps at that gate:
 6. Rebuild natedev and the box from the prepared NixOS branch.
 
 No session receives the credentials or login secrets. Phase 8 supplies the complete command arguments and deployment order.
+
+Assertion-Change: scripts/mac_test/test_target_slots.py::test_repository_override_and_config_reload_control_capacity — the reload fixture keys capacity by the origin policy name (slots.hana) instead of the source name (slots.phase-copy); all capacity assertions stay.
+Assertion-Change: scripts/mac_test/test_target_slots.py::test_linux_mirrors_isolate_origins_slots_and_build_folders — mirror and build-folder checks read the runner's parsed --mirror argument instead of searching shell text; new runtime tests check the warm target folder.
+Assertion-Change: scripts/mac_test/test_linux_runner.py::LinuxDispatchTests::test_copy_excludes_private_files_and_preserves_the_received_slot — the source copy is a directory rsync with --exclude-from and --delete (review F001: untracked files and real deletion), so the manifest check keeps only the script inventory and the copy check asserts --delete and the .git, target and private exclusions; the no-copy-links, slot, claim and behavior assertions stay.
+Assertion-Change: scripts/mac_test/test_linux_runner.py::test_failed_linux_probe_changes_only_the_linux_backoff — the production probe reads the cached shell exports, which need the copied shell inputs, so the test asserts the source copy comes before the probe instead of no source copy; the decline, Linux-only backoff, no-run and released-claim assertions stay.
+Assertion-Change: scripts/mac_test/test_linux_runner.py LinuxShellTests budget tests (test_slot_budget_removes_only_the_selected_build_folder and its peer that required the folder to disappear) — review F012: over the budget, the existing LRU workspace sweep trims old output, so the tests require retained recent output and trimming only in the selected folder; whole-folder removal stays only for the disk floor.
+Assertion-Change: scripts/mac_test/test_linux_runner.py detached-child tests — review F011: remaining slot children report mac_cleanup=unconfirmed instead of mac_cleanup=1, so the claim stays until the leftover check ends; marker-kept and ownership assertions stay.
 
 **Also touches:** `scripts/mac_test/`, offload and `scripts/lint/invoke.sh` if changed (owner verify-unit); `config/build_targets.conf` (owner resources-unit); `scripts/lint/memory_admit.py` (owner queue-unit).
 

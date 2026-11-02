@@ -930,10 +930,12 @@ def claim_scope(worktree: str) -> ClaimScope:
 
 
 def target_claim_scope(paths: StatePaths, worktree: str) -> ClaimScope:
-    scope = claim_scope(worktree)
-    if target_config.uses_legacy_mac_layout(paths.platform) and isinstance(scope, RepositoryScope):
-        return RepositoryScope(scope.name)
-    return scope
+    repository = offload.repository_identity(Path(worktree))
+    if not isinstance(repository, offload.KnownRepository):
+        return WHOLE_MAC
+    if target_config.uses_legacy_mac_layout(paths.platform):
+        return RepositoryScope(repository.legacy_mirror_name)
+    return RepositoryScope(repository.policy_name, repository.key)
 
 
 def claim_path(paths: StatePaths, scope: ClaimScope) -> Path:

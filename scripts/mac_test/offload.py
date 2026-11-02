@@ -19,7 +19,7 @@ import tempfile
 import time
 import traceback
 from types import FrameType
-from typing import TYPE_CHECKING, Literal, TextIO, cast, final
+from typing import TYPE_CHECKING, Literal, NewType, TextIO, TypedDict, cast, final
 from urllib.parse import quote
 
 
@@ -59,12 +59,26 @@ NonBusyMacDeclineReason = Literal[
 MacDeclineReason = NonBusyMacDeclineReason | Literal["busy"]
 
 
+LegacyMirrorName = NewType("LegacyMirrorName", str)
+RepositoryPolicyName = NewType("RepositoryPolicyName", str)
+
+
 @dataclass(frozen=True)
 class KnownRepository:
     """A repository with its readable name and normalized origin identity."""
 
     name: str
     key: str = ""
+
+    @property
+    def legacy_mirror_name(self) -> LegacyMirrorName:
+        return LegacyMirrorName(self.name)
+
+    @property
+    def policy_name(self) -> RepositoryPolicyName:
+        if self.key and not self.key.startswith("git-root:"):
+            return RepositoryPolicyName(self.key.rsplit("/", 1)[-1])
+        return RepositoryPolicyName(self.name)
 
     @property
     def path_key(self) -> str:
@@ -307,8 +321,13 @@ class LeftoversEnded:
 
 
 @dataclass(frozen=True)
+class UnresolvedLeftoverCount:
+    """Process evidence cannot establish the number of remaining processes."""
+
+
+@dataclass(frozen=True)
 class LeftoversRemain:
-    count: int
+    count: int | UnresolvedLeftoverCount
 
 
 @dataclass(frozen=True)
@@ -468,7 +487,12 @@ class MissingMacStatus:
     """The remote command ended without a usable test status."""
 
 
-RemoteRunStatus = ReportedMacStatus | MissingMacStatus
+@dataclass(frozen=True)
+class UnresolvedSlotStartup:
+    """The Linux slot refused startup because earlier ownership remains unresolved."""
+
+
+RemoteRunStatus = ReportedMacStatus | MissingMacStatus | UnresolvedSlotStartup
 MISSING_MAC_STATUS = MissingMacStatus()
 
 
@@ -476,7 +500,7 @@ class UnavailableProbe:
     """A probe that did not return a complete availability snapshot."""
 
 
-ProbeResult = ProbeSnapshot | UnavailableProbe
+ProbeResult = ProbeSnapshot | UnavailableProbe | UnresolvedSlotStartup
 UNAVAILABLE_PROBE = UnavailableProbe()
 
 
@@ -641,6 +665,11 @@ class ProcessController:
         try:
             for line in output:
                 marker = line.rstrip("\r\n")
+                if marker == "linux_startup=unresolved":
+                    status = UnresolvedSlotStartup()
+                    held_status_line = ""
+                    cleanup = CleanupUnconfirmed()
+                    continue
                 status_match = re.fullmatch(r"mac_exit=([0-9]+)", marker)
                 if status_match is not None:
                     if held_status_line:
@@ -670,6 +699,8 @@ class ProcessController:
             output.close()
         if isinstance(status, ReportedMacStatus):
             return ReportedMacStatus(status.status, cleanup)
+        if isinstance(status, UnresolvedSlotStartup):
+            return status
         return MISSING_MAC_STATUS
 
 
@@ -689,13 +720,14 @@ def parse_cleanup(value: str) -> CleanupOutcome:
     return CleanupDone() if rc == 0 else CleanupFailed(rc)
 
 
-def report_cleanup(cleanup: CleanupOutcome) -> None:
+def report_cleanup(cleanup: CleanupOutcome, target: str = "") -> None:
+    label = target or "Mac"
     if isinstance(cleanup, CleanupFailed):
-        print(f"Mac build output not removed: {cleanup.rc}", flush=True)
+        print(f"{label} build output not removed: {cleanup.rc}", flush=True)
     elif isinstance(cleanup, CleanupSkipped):
-        print("Mac build output kept: the run used another target dir", flush=True)
+        print(f"{label} build output kept: the run used another target dir", flush=True)
     elif isinstance(cleanup, CleanupUnconfirmed):
-        print("Mac build output cleanup unconfirmed", flush=True)
+        print(f"{label} build output cleanup unconfirmed", flush=True)
 
 
 def config_path() -> Path:
@@ -791,8 +823,10 @@ def write_result(
     destination: ResultDestination,
     last_decline: LastMacDecline = NO_PRIOR_MAC_DECLINE,
     verb: MacVerb = "nextest",
+    target: str = "",
 ) -> int:
     """Write the wire form and return the exit status for one outcome."""
+    label = target or "Mac"
     if isinstance(result, PassedOnMac):
         mac = "passed"
         reason = ""
@@ -801,7 +835,7 @@ def write_result(
         mac = "declined"
         reason = "no_tests"
         status = 75
-        print("mac_test: no test matched on the Mac; running on natedev instead")
+        print(f"mac_test: no test matched on the {label}; running on natedev instead")
     elif isinstance(result, FailedOnMac):
         mac = "failed"
         reason = ""
@@ -810,18 +844,21 @@ def write_result(
             "only a test that must run on Linux may rerun with --local to run it on natedev."
             if verb == "nextest" else "fix the finding in the local worktree; the mirror sends no edits back."
         )
-        print("mac_test: this ran on the Mac (macOS). Treat the failure as real and fix it; " + advice)
+        if target:
+            print(f"mac_test: this ran on {label}. Treat the failure as real. Fix it in the local worktree.")
+        else:
+            print("mac_test: this ran on the Mac (macOS). Treat the failure as real and fix it; " + advice)
     elif isinstance(result, LostMacRun):
         mac = "lost"
         reason = ""
         status = 75
-        print("mac_test: the link to the Mac dropped; running on natedev instead")
+        print(f"mac_test: the link to the {label} dropped; running on natedev instead")
     else:
         mac = "declined"
         reason = result.reason
         status = 75
         if not decline_already_shown(result.reason, last_decline):
-            print(f"mac_test: not running on the Mac ({reason})")
+            print(f"mac_test: not running on the {label} ({reason})")
     if isinstance(destination, ResultFile):
         holder_line = f"holder={holder_value(result.holder)}\n" if isinstance(result, BusyMacDecline) else ""
         _ = destination.path.write_text(
@@ -889,13 +926,19 @@ def ssh_prefix(config: OffloadConfig) -> list[str]:
 
 def remote_mirror(repository: KnownRepository, target: str = "mac", slot: int = 1) -> str:
     if target_config.uses_legacy_mac_layout(configured_ssh_target(target or "mac").platform):
-        return f".local/state/mac-test/mirror/{repository.name}"
+        return f".local/state/mac-test/mirror/{repository.legacy_mirror_name}"
     if slot < 1:
         raise ValueError("slot must be positive")
     return f".local/state/build-target/mirror/{repository.path_key}/{slot}"
 
 
 def probe_script(repository: KnownRepository, target: str = "mac", slot: int = 1) -> str:
+    if not target_config.uses_legacy_mac_layout(configured_ssh_target(target or "mac").platform):
+        if TYPE_CHECKING:
+            from . import linux_runner
+        else:
+            import linux_runner
+        return linux_runner.probe_script(remote_mirror(repository, target, slot))
     mirror = shlex.quote(remote_mirror(repository, target, slot))
     return "\n".join(
         (
@@ -993,6 +1036,99 @@ def probe_reachability(
     return UnreachableHost(f"SSH probe failed for {config.host}")
 
 
+def trusted_linux_source(root: Path) -> bool:
+    """Keep the local shell approval boundary before remote evaluation."""
+    if TYPE_CHECKING:
+        from ..lib import nix_env
+    else:
+        from scripts.lib import nix_env
+    envrc = nix_env.nearest_envrc(root)
+    if envrc is not None:
+        if nix_env.trusted_envrc(envrc):
+            return True
+        return isinstance(nix_env.ensure(root), nix_env.Loaded)
+    return nix_env.trusted_root(root) or nix_env.registered_worktree(root)
+
+
+class PublicToolParity(TypedDict):
+    rustc: str
+    nextest: str
+    mend: str
+    scripts_commit: str
+
+
+@dataclass(frozen=True)
+class UnavailableToolParity:
+    """The sender could not read every public tool version."""
+
+
+def expected_linux_parity(controller: ProcessController, config: OffloadConfig) -> PublicToolParity | UnavailableToolParity:
+    """Compare public tools with configured pins or the sender's versions."""
+    expected: dict[str, str] = {}
+    commands = (("rustc", ["rustc", "-V"]),
+                ("nextest", ["cargo", "nextest", "--version"]),
+                ("mend", ["cargo", "mend", "--version"]),
+                ("scripts_commit", ["git", "-C", str(Path(__file__).resolve().parents[2]), "rev-parse", "HEAD"]))
+    for key, arguments in commands:
+        value = config.values.get(f"parity.{key}", "")
+        if not value:
+            result = controller.capture(arguments, CommandTimeLimit(config.probe_timeout_s))
+            if not isinstance(result, CommandOutput) or result.status != 0 or not result.stdout.strip():
+                return UnavailableToolParity()
+            value = result.stdout.strip()
+        expected[key] = value
+    return {"rustc": expected["rustc"], "nextest": expected["nextest"],
+            "mend": expected["mend"], "scripts_commit": expected["scripts_commit"]}
+
+
+def copy_tracked_scripts(controller: ProcessController, config: OffloadConfig) -> bool:
+    """Send tracked scripts and named public configuration without Git metadata."""
+    root = Path(__file__).resolve().parents[2]
+    listing = controller.capture(["git", "-C", str(root), "ls-files", "-z", "scripts",
+                                  "config/lint.conf", "config/build_targets.conf",
+                                  "config/aws_target.conf", "config/mac_test.conf",
+                                  "config/user_zone.conf"])
+    if not isinstance(listing, CommandOutput) or listing.status != 0:
+        return False
+    paths = [path for path in listing.stdout.split("\0") if path]
+    # The sender must include the new tracked runner before target activation.
+    if "scripts/mac_test/linux_runner.py" not in paths:
+        return False
+    for name in paths:
+        path = root / name
+        if not path.is_file() or path.is_symlink():
+            return False
+    clean = controller.capture(["git", "-C", str(root), "diff", "HEAD", "--quiet", "--", *paths])
+    if not isinstance(clean, CommandOutput) or clean.status != 0:
+        return False
+    expected = expected_linux_parity(controller, config)
+    if isinstance(expected, UnavailableToolParity):
+        return False
+    commit = controller.capture(["git", "-C", str(root), "rev-parse", "HEAD"],
+                                CommandTimeLimit(config.probe_timeout_s))
+    if not isinstance(commit, CommandOutput) or commit.status != 0 or commit.stdout.strip() != expected["scripts_commit"]:
+        return False
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", prefix="target-scripts-") as manifest:
+        _ = manifest.write("\n".join(paths) + "\n")
+        manifest.flush()
+        result = controller.capture(["rsync", "-rlpc", f"--files-from={manifest.name}",
+                                     "-e", shlex.join(["ssh", *ssh_options(config)]),
+                                     f"{root}/", f"{config.host}:.claude/"])
+    if not isinstance(result, CommandOutput) or result.status != 0:
+        return False
+    clean = controller.capture(["git", "-C", str(root), "diff", "HEAD", "--quiet", "--", *paths])
+    current_commit = controller.capture(["git", "-C", str(root), "rev-parse", "HEAD"],
+                                       CommandTimeLimit(config.probe_timeout_s))
+    if (not isinstance(clean, CommandOutput) or clean.status != 0
+            or not isinstance(current_commit, CommandOutput) or current_commit.status != 0
+            or current_commit.stdout != commit.stdout):
+        return False
+    stamp = controller.capture([*ssh_prefix(config),
+        "printf '%s\\n' " + shlex.quote(commit.stdout.strip())
+        + ' > "$HOME/.claude/.build-target-script-commit"'])
+    return isinstance(stamp, CommandOutput) and stamp.status == 0
+
+
 def probe_mac(
     controller: ProcessController,
     config: OffloadConfig,
@@ -1000,22 +1136,48 @@ def probe_mac(
     target: str = "mac",
     slot: int = 1,
 ) -> ProbeResult:
+    linux = not target_config.uses_legacy_mac_layout(configured_ssh_target(target or "mac").platform)
+    if linux:
+        if TYPE_CHECKING:
+            from . import linux_runner
+        else:
+            import linux_runner
+        script = linux_runner.probe_command_script(remote_mirror(repository, target, slot), config.values,
+                                                   repository.policy_name)
+        if isinstance(probe_reachability(controller, config), UnreachableHost):
+            print(f"mac_test: could not reach {target}: SSH reachability check failed",
+                  file=sys.stderr, flush=True)
+            return UNAVAILABLE_PROBE
+        timeout_s = linux_runner.positive_setting(config.values, "shell_timeout_s") + config.probe_timeout_s
+    else:
+        script = probe_script(repository, target, slot)
+        timeout_s = config.probe_timeout_s
     result = controller.capture(
-        [*ssh_prefix(config), probe_script(repository, target, slot)],
-        CommandTimeLimit(config.probe_timeout_s),
+        [*ssh_prefix(config), script],
+        CommandTimeLimit(timeout_s),
     )
+    if (linux and isinstance(result, CommandOutput)
+            and result.stdout.strip() == "linux_startup=unresolved"):
+        return UnresolvedSlotStartup()
     if isinstance(result, CommandTimedOut):
-        reason = f"SSH probe timed out after {config.probe_timeout_s:g} s"
+        reason = f"SSH probe timed out after {timeout_s:g} s"
     elif isinstance(result, CommandCouldNotStart):
-        reason = f"SSH probe could not start (time limit {config.probe_timeout_s:g} s)"
+        reason = f"SSH probe could not start (time limit {timeout_s:g} s)"
     elif result.status != 0:
         reason = " ".join(result.stderr.split()) or f"SSH probe exited with status {result.status}"
     else:
         probe = parse_probe(result.stdout)
         if isinstance(probe, ProbeSnapshot):
-            return probe
+            if not linux:
+                return probe
+            expected = expected_linux_parity(controller, config)
+            values = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+            if not isinstance(expected, UnavailableToolParity) and all(values.get(key) == value for key, value in expected.items()):
+                return probe
+            print(f"mac_test: {target} is not ready: public tools or tracked scripts differ", file=sys.stderr)
+            return UNAVAILABLE_PROBE
         reason = "the probe answer could not be read"
-    print(f"mac_test: could not reach the Mac: {reason}", file=sys.stderr, flush=True)
+    print(f"mac_test: could not reach the {'Mac' if target in ('', 'mac') else target}: {reason}", file=sys.stderr, flush=True)
     return UNAVAILABLE_PROBE
 
 
@@ -1077,7 +1239,7 @@ def copy_tree(
                         "-e",
                         shlex.join(["ssh", *ssh_options(config)]),
                         f"{request.source_root}/",
-                        f"{config.host}:{remote_mirror(repository, request.target, request.slot)}/",
+                        f"{config.host}:{shlex.quote(remote_mirror(repository, request.target, request.slot))}/",
                     ]
                 )
                 return isinstance(result, CommandOutput) and result.status == 0
@@ -1103,21 +1265,15 @@ def copy_tree_with_key(
 
 
 def nextest_words_with_skip(
-    words: tuple[str, ...], skip_expression: str
+    words: tuple[str, ...], skip_expression: str, *, insert_filter: bool = False
 ) -> tuple[str, ...]:
     if not skip_expression:
         return words
-    updated = list(words)
-    try:
-        expression_index = updated.index("-E") + 1
-    except ValueError:
-        return words
-    if expression_index >= len(updated):
-        return words
-    updated[expression_index] = (
-        f"({updated[expression_index]}) & not ({skip_expression})"
-    )
-    return tuple(updated)
+    if TYPE_CHECKING:
+        from . import linux_runner
+    else:
+        import linux_runner
+    return linux_runner.nextest_words_with_skip(words, skip_expression, insert_filter=insert_filter)
 
 
 def remote_test_command(
@@ -1126,6 +1282,17 @@ def remote_test_command(
     repository: KnownRepository,
     sent_tree_key: TreeKey = UNAVAILABLE_TREE_KEY,
 ) -> str:
+    if not target_config.uses_legacy_mac_layout(configured_ssh_target(request.target or "mac").platform):
+        if TYPE_CHECKING:
+            from . import linux_runner
+        else:
+            import linux_runner
+        words = request.nextest_words
+        return linux_runner.command_script(
+            remote_mirror(repository, request.target, request.slot), config.values,
+            repository.policy_name, request.verb, words, request.call_id,
+            sent_tree_key.value if isinstance(sent_tree_key, KnownTreeKey) else "",
+        )
     budget = config.values.get(
         f"mac_budget_gib.{repository.name}", config.default_target_budget_gib
     )
@@ -1188,6 +1355,14 @@ def mirror_selector_script(scope: MirrorScope, target: str = "mac", slot: int = 
     reaches another repository's run. The `[.]` keeps each pattern from
     matching this script's own text.
     """
+    if not target_config.uses_legacy_mac_layout(configured_ssh_target(target or "mac").platform):
+        if not isinstance(scope, KnownRepository):
+            raise ValueError("Linux cleanup requires a repository and slot")
+        if TYPE_CHECKING:
+            from . import linux_runner
+        else:
+            import linux_runner
+        return linux_runner.mirror_selector_script(remote_mirror(scope, target, slot))
     if isinstance(scope, KnownRepository):
         mirror = extended_regex_literal(remote_mirror(scope, target, slot))
         command_pattern = f"{mirror}([/'\"[:space:]]|$)"
@@ -1215,16 +1390,16 @@ def mirror_selector_script(scope: MirrorScope, target: str = "mac", slot: int = 
 
 def leftover_check_script(repository: KnownRepository, target: str = "mac", slot: int = 1) -> str:
     return mirror_selector_script(repository, target, slot) + r'''
-leftover_pids=$(select_leftovers) || exit 1
+leftover_pids=$(select_leftovers) || exit "$?"
 printf '%s\n' "$leftover_pids" | while IFS= read -r leftover_pid; do
     [ -n "$leftover_pid" ] && kill "$leftover_pid" 2>/dev/null
 done
 sleep 1 || exit 1
-leftover_pids=$(select_leftovers) || exit 1
+leftover_pids=$(select_leftovers) || exit "$?"
 printf '%s\n' "$leftover_pids" | while IFS= read -r leftover_pid; do
     [ -n "$leftover_pid" ] && kill -9 "$leftover_pid" 2>/dev/null
 done
-leftover_pids=$(select_leftovers) || exit 1
+leftover_pids=$(select_leftovers) || exit "$?"
 leftover_count=$(printf '%s\n' "$leftover_pids" | awk 'NF { count++ } END { print count+0 }') || exit 1
 printf 'leftovers=%s\nrc=0\n' "$leftover_count"
 '''
@@ -1260,6 +1435,15 @@ def check_leftovers(config: OffloadConfig, host: str, repository: KnownRepositor
         return LeftoverCheckFailed(f"SSH leftover check timed out after {config.leftover_timeout_s:g} s")
     except OSError:
         return LeftoverCheckFailed(f"SSH leftover check could not start (time limit {config.leftover_timeout_s:g} s)")
+    if result.returncode != 0:
+        if not target_config.uses_legacy_mac_layout(configured_ssh_target(target or "mac").platform):
+            if TYPE_CHECKING:
+                from . import linux_runner
+            else:
+                import linux_runner
+            if result.returncode == linux_runner.SLOT_PROCESSES_UNRESOLVED:
+                return LeftoversRemain(UnresolvedLeftoverCount())
+        return LeftoverCheckFailed(" ".join(result.stderr.split()) or f"SSH cleanup exited with status {result.returncode}")
     answer = parse_leftover_check(result.stdout)
     if isinstance(answer, LeftoverCheckFailed):
         reason = " ".join(result.stderr.split())
@@ -1269,14 +1453,17 @@ def check_leftovers(config: OffloadConfig, host: str, repository: KnownRepositor
 
 
 def report_leftover_check(result: LeftoverCheckResult, request: OffloadRequest) -> None:
+    label = request.target or "Mac"
     if isinstance(result, LeftoversRemain):
         if not decline_already_shown("busy", request.last_decline):
-            print(f"mac_test: {result.count} leftover processes of a lost run are still on the Mac; "
+            remaining = (f"{result.count} leftover processes of a lost run are still" if isinstance(result.count, int)
+                         else "leftover process ownership remains unresolved")
+            print(f"mac_test: {remaining} on the {label}; "
                   + "it stays busy until they end", file=sys.stderr, flush=True)
     elif isinstance(result, LeftoverCheckFailed):
         if not decline_already_shown("unreachable", request.last_decline):
             print("mac_test: could not confirm that a lost run's leftovers ended: "
-                  + f"{result.reason}; the Mac stays busy", file=sys.stderr, flush=True)
+                  + f"{result.reason}; the {label} stays busy", file=sys.stderr, flush=True)
 
 
 def check_taken_over_claim(
@@ -1318,23 +1505,56 @@ def claimed_run(
 ) -> MacOffloadResult:
     release_allowed = True
     try:
-        probe = probe_mac(controller, config, repository, request.target, request.slot)
-        if isinstance(probe, UnavailableProbe):
-            write_backoff(time.time() + config.unreachable_backoff_s, request.target)
-            return declined("unreachable", started)
-        if probe.free_gib < config.free_floor_gib:
-            return declined("disk", started)
-
-        copy_started = time.monotonic()
-        copied = copy_tree_with_key(controller, config, request, repository)
-        if isinstance(copied, TreeCopyFailed):
-            return declined("copy", started)
-        copy_seconds = elapsed_seconds(copy_started)
+        linux = not target_config.uses_legacy_mac_layout(configured_ssh_target(request.target or "mac").platform)
+        if linux:
+            expected = expected_linux_parity(controller, config)
+            if isinstance(expected, UnavailableToolParity):
+                return declined("state", started)
+            config = replace(config, values={**config.values, **{f"parity.{key}": value for key, value in expected.items()}})
+            if not copy_tracked_scripts(controller, config):
+                return declined("copy", started)
+            copy_started = time.monotonic()
+            copied = copy_tree_with_key(controller, config, request, repository)
+            if isinstance(copied, TreeCopyFailed):
+                return declined("copy", started)
+            copy_seconds = elapsed_seconds(copy_started)
+            release_allowed = False
+            probe = probe_mac(controller, config, repository, request.target, request.slot)
+            if isinstance(probe, UnresolvedSlotStartup):
+                checked = check_leftovers(config, config.host, repository, request.target, request.slot)
+                release_allowed = isinstance(checked, LeftoversEnded)
+                report_leftover_check(checked, request)
+                return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
+            if isinstance(probe, UnavailableProbe):
+                checked = check_leftovers(config, config.host, repository, request.target, request.slot)
+                release_allowed = isinstance(checked, LeftoversEnded)
+                report_leftover_check(checked, request)
+                write_backoff(time.time() + config.unreachable_backoff_s, request.target)
+                return declined("unreachable", started)
+            if probe.free_gib < config.free_floor_gib:
+                checked = check_leftovers(config, config.host, repository, request.target, request.slot)
+                release_allowed = isinstance(checked, LeftoversEnded)
+                report_leftover_check(checked, request)
+                return declined("disk", started)
+        else:
+            probe = probe_mac(controller, config, repository, request.target, request.slot)
+            if isinstance(probe, (UnavailableProbe, UnresolvedSlotStartup)):
+                write_backoff(time.time() + config.unreachable_backoff_s, request.target)
+                return declined("unreachable", started)
+            if probe.free_gib < config.free_floor_gib:
+                return declined("disk", started)
+            copy_started = time.monotonic()
+            copied = copy_tree_with_key(controller, config, request, repository)
+            if isinstance(copied, TreeCopyFailed):
+                return declined("copy", started)
+            copy_seconds = elapsed_seconds(copy_started)
         running = (
             f"running a copy on the Mac while natedev compiles (host {probe.hostname})"
             if request.copy
             else f"running on the Mac (macOS, host {probe.hostname})"
         )
+        if linux:
+            running = f"running on {request.target} (Linux, host {probe.hostname})"
         print(f"mac_test: {running}; tree copied in {copy_seconds:.1f} s", flush=True)
         release_allowed = False
         remote_status = controller.stream_mac_run(
@@ -1344,18 +1564,25 @@ def claimed_run(
             ]
         )
         seconds = elapsed_seconds(started)
-        if isinstance(remote_status, MissingMacStatus):
+        if linux and isinstance(remote_status, UnresolvedSlotStartup):
+            checked = check_leftovers(config, config.host, repository, request.target, request.slot)
+            release_allowed = isinstance(checked, LeftoversEnded)
+            report_leftover_check(checked, request)
+            return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
+        if isinstance(remote_status, (MissingMacStatus, UnresolvedSlotStartup)):
             checked = check_leftovers(config, config.host, repository, request.target, request.slot)
             release_allowed = isinstance(checked, LeftoversEnded)
             report_leftover_check(checked, request)
             return LostMacRun(elapsed_seconds(started))
-        report_cleanup(remote_status.cleanup)
+        report_cleanup(remote_status.cleanup, request.target)
         if isinstance(remote_status.cleanup, CleanupUnconfirmed):
             checked = check_leftovers(config, config.host, repository, request.target, request.slot)
             release_allowed = isinstance(checked, LeftoversEnded)
             report_leftover_check(checked, request)
         else:
             release_allowed = True
+        if linux and remote_status.status == 75:
+            return declined("state", started)
         if remote_status.status == 0:
             return PassedOnMac(seconds)
         if remote_status.status == 4 and request.verb == "nextest":
@@ -1433,13 +1660,20 @@ def workspace_has_linux_only(repo_root: Path, excluded: set[str]) -> bool:
 
 
 def mac_step_eligibility(config: OffloadConfig, repo_root: Path, package: str,
-                         verb: MacVerb) -> KnownRepository | IneligibleMacStep:
+                         verb: MacVerb, target: str = "") -> KnownRepository | IneligibleMacStep:
     """Share repository, package/workspace and backoff rules with eligible --kind."""
     if not config.enabled:
         return IneligibleMacStep("off")
     repository = repository_identity(repo_root)
     if isinstance(repository, UnknownRepository):
         return IneligibleMacStep("repo")
+    if target and not target_config.uses_legacy_mac_layout(configured_ssh_target(target).platform):
+        kind = "test" if verb == "nextest" else verb
+        if kind not in ("test", "check", "doc") or kind not in comma_values(config.values.get("kinds", "")):
+            return IneligibleMacStep("repo")
+        if isinstance(read_backoff(time.time(), target), ActiveBackoff):
+            return IneligibleMacStep("backoff")
+        return repository
     key = f"linux_only.{repository.name}"
     if key not in config.values:
         return IneligibleMacStep("repo")
@@ -1453,7 +1687,7 @@ def mac_step_eligibility(config: OffloadConfig, repo_root: Path, package: str,
                 return IneligibleMacStep("linux_only")
         except (OSError, UnicodeError, ValueError):
             return IneligibleMacStep("repo")
-    if isinstance(read_backoff(time.time()), ActiveBackoff):
+    if isinstance(read_backoff(time.time(), target), ActiveBackoff):
         return IneligibleMacStep("backoff")
     return repository
 
@@ -1464,11 +1698,14 @@ def run_offload(
     request: OffloadRequest,
     started: float,
 ) -> MacOffloadResult:
-    eligibility = mac_step_eligibility(config, request.repo_root, request.package, request.verb)
+    eligibility = mac_step_eligibility(config, request.repo_root, request.package, request.verb, request.target)
     if isinstance(eligibility, IneligibleMacStep):
         return declined(eligibility.reason, started)
     repository = eligibility
-    if isinstance(request.source, StagedDocSnapshot):
+    linux = not target_config.uses_legacy_mac_layout(configured_ssh_target(request.target or "mac").platform)
+    if linux and not trusted_linux_source(request.repo_root):
+        return declined("repo", started)
+    if not linux and isinstance(request.source, StagedDocSnapshot):
         try:
             if workspace_has_linux_only(request.source.root, comma_values(config.values[f"linux_only.{repository.name}"])):
                 return declined("linux_only", started)
@@ -1596,7 +1833,7 @@ def main() -> int:
     try:
         with interrupt_handlers(controller):
             result = run_offload(controller, config, request, started)
-        return write_result(result, request.result, request.last_decline, request.verb)
+        return write_result(result, request.result, request.last_decline, request.verb, request.target)
     except OffloadInterrupted as interrupted:
         return 128 + interrupted.signal_number
     except Exception:

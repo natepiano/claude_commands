@@ -9,6 +9,7 @@ import io
 import json
 import os
 from pathlib import Path, PurePosixPath
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -233,11 +234,10 @@ class RepositorySlotTests(unittest.TestCase):
     def test_repository_override_and_config_reload_control_capacity(self) -> None:
         root = self.repository("phase-copy", "https://github.com/nate/hana.git")
         settings = self.root / "aws.conf"
-        _ = settings.write_text(settings.read_text() + "slots.phase-copy=4\n")
         for pid in range(101, 105):
             self.assertEqual(self.claim("aws", root, pid)[0], 0)
         self.assertEqual(self.claim("aws", root, 105)[0], 11)
-        _ = settings.write_text(settings.read_text().replace("slots.phase-copy=4", "slots.phase-copy=5"))
+        _ = settings.write_text(settings.read_text().replace("slots.hana=4", "slots.hana=5"))
 
         self.assertEqual(self.claim("aws", root, 105)[0], 0)
         self.assertEqual(len(self.claims("aws")), 5)
@@ -357,8 +357,9 @@ class RepositorySlotTests(unittest.TestCase):
         command = offload.remote_test_command(config, request, first_id)
 
         self.assertIn(mirrors[1], command)
-        self.assertIn(mirrors[1] + "/target", command)
-        self.assertNotIn(mirrors[0] + "/target", command)
+        words = shlex.split(command)
+        self.assertEqual(words[words.index("--mirror") + 1], mirrors[1])
+        self.assertNotIn(mirrors[0], words)
 
     def test_invalid_slot_answers_never_confirm_a_claim(self) -> None:
         for output in ("claimed\nslot: 0\n", "claimed\nslot: -1\n", "claimed\nslot: x\n",
@@ -470,6 +471,68 @@ class RepositorySlotTests(unittest.TestCase):
         self.assertIsInstance(state, targets.Running)
         if isinstance(state, targets.Running):
             self.assertEqual(len(state.jobs), 2)
+
+    def test_linux_origin_slot_override_applies_to_differently_named_clones(self) -> None:
+        origin = "https://github.com/nate/hana.git"
+        main = self.repository("hana", origin)
+        clone = self.repository("phase-copy", origin)
+        settings = self.root / "aws.conf"
+        _ = settings.write_text(settings.read_text().replace("slots.hana=4", "slots.hana=3")
+                                + "slots.phase-copy=1\n")
+
+        for root, pid in ((clone, 101), (clone, 102), (main, 103)):
+            self.assertEqual(self.claim("aws", root, pid)[0], 0)
+
+        self.assertEqual(self.claim("aws", clone, 104)[0], 11)
+        self.assertEqual(self.claim("aws", main, 104)[0], 11)
+        self.assertEqual(len({record.get("slot") for record in self.claims("aws").values()}), 3)
+
+    def test_mac_skip_keeps_legacy_filters_when_linux_filter_support_expands(self) -> None:
+        identity = offload.KnownRepository("hana", "https://github.com/nate/hana")
+        settings = self.root / "mac.conf"
+        _ = settings.write_text(settings.read_text() + "mac_skip.hana=test(gpu)\n")
+        cases = (
+            (("-E", "test(a)"), ("-E", "(test(a)) & not (test(gpu))")),
+            (("--workspace",), ("--workspace",)),
+            (("-E",), ("-E",)),
+            (("--filterset=test(a)",), ("--filterset=test(a)",)),
+            (("-E=test(a)",), ("-E=test(a)",)),
+        )
+        for words, expected in cases:
+            with self.subTest(words=words):
+                request = offload.OffloadRequest(self.root / "hana", "hana", "call", offload.NO_RESULT_FILE, words)
+
+                command = offload.remote_test_command(offload.read_config(settings), request, identity)
+
+                invocation = shlex.split(command.rpartition("; echo mac_exit=$?")[0])
+                start = invocation.index("~/.claude/scripts/lint/lint") + 1
+                self.assertEqual(invocation[start:], ["nextest", *expected])
+
+    def test_deleted_worktree_takeover_preserves_the_other_occupied_slot(self) -> None:
+        source = self.repository("project", "https://github.com/nate/project.git")
+        old = self.repository("deleted", "https://github.com/nate/project.git", source)
+        self.assertEqual(self.claim("aws", old, 101, remote=True)[0], 0)
+        self.assertEqual(self.claim("aws", source, 102, remote=True)[0], 0)
+        before = self.claims("aws")
+        (old / ".git").unlink()
+        old.rmdir()
+        self.dead.add(101)
+
+        self.assertEqual(self.claim("aws", source, 103, remote=True)[0], 13)
+        retained = self.claims("aws")[103]
+        self.assertEqual(retained.get("slot"), before[101].get("slot"))
+        self.assertEqual(retained.get("repo_key"), before[101].get("repo_key"))
+        self.assertEqual(retained.get("repo_name"), before[101].get("repo_name"))
+        self.assertEqual(retained.get("worktree"), str(old))
+        self.assertIs(retained.get("cleanup_pending"), True)
+        self.assertEqual(self.claim("aws", source, 103, remote=True)[0], 13)
+        self.assertEqual(self.claim("aws", source, 104, remote=True)[0], 11)
+        self.assertEqual(self.claims("aws")[102], before[102])
+
+        self.release("aws", 103)
+        self.assertEqual(self.claim("aws", source, 104, remote=True)[0], 0)
+        self.assertEqual(self.claims("aws")[104].get("slot"), before[101].get("slot"))
+        self.assertEqual(self.claims("aws")[102], before[102])
 
 
 if __name__ == "__main__":

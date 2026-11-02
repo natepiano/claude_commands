@@ -242,3 +242,50 @@ MCP server definitions for reference when setting up Claude Code on a new machin
 ## orphans_expected.json
 
 Files that the `/orphans` command should ignore when checking for unreferenced scripts and configs. Lists scripts and config files that are intentionally not referenced by any command.
+
+## Linux development shells
+
+Linux SSH targets use the admission repository name for `slots.<repo>`, `devshell.<repo>`, `skip.<repo>`, and `target_budget_gib.<repo>`.
+The source directory name still selects the legacy Mac mirror and claim.
+`kinds=test,check,doc` selects Linux commands without Mac `linux_only.*` keys.
+
+`devshell` selects the default shell. `devshell.hana=ci` selects Hana's CI shell.
+`shell_cache` gives the cache path relative to the remote home.
+`shell_timeout_s` bounds shell evaluation.
+The Linux probe first checks SSH within `probe_timeout_s`.
+Its shell probe then permits `shell_timeout_s` plus `probe_timeout_s` for evaluation and the probe reply.
+The SSH connection still uses `connect_timeout_s`.
+This adds one short SSH call per Linux probe.
+The runner hashes `flake.nix`, `flake.lock`, `nix/` paths, file contents, and the selector.
+It evaluates only this small copy. It publishes exports after successful evaluation.
+An unchanged shell key reuses exports while their referenced Nix store paths exist.
+Missing store paths force a new evaluation. Each claimed slot retains its own warm build folder.
+
+`parity.rustc`, `parity.nextest`, `parity.mend`, and `parity.scripts_commit` can pin the public tool versions and script commit.
+An empty pin uses the sender's version. A mismatch prevents execution.
+The sender transfers clean tracked scripts and named public configuration before the probe.
+It checks their contents and commit before and after transfer. A dirty script set prevents execution.
+Source transfers include untracked files and omit ignored paths, Git metadata, and the target folder.
+Directory transfers delete removed source files from warm mirrors.
+The probe checks disk capacity, the script commit, and tool versions inside the selected shell.
+The runner checks tool versions again before execution. A mismatch permits local fallback without a test result.
+The local trust rules must permit shell evaluation before the sender claims Linux capacity.
+`build_budget_gib` sets the Linux memory budget. Repository build folder budgets cannot exceed it.
+After each step, the runner uses the existing lint budget sweep on the selected build folder.
+The sweep removes the least recently used output and keeps the remaining output warm.
+Only a disk floor violation removes the whole folder.
+The runner adds no size scan beside the sweep. Explicit build folders must remain inside the claimed slot.
+The `.linux-run.json` marker identifies the runner and its process group before shell evaluation starts.
+Cleanup checks the runner's process start time and the token inherited by its children.
+Cleanup ignores zombies and retains ownership when it cannot inspect a live process.
+Remaining children report `mac_cleanup=unconfirmed`. The sender confirms their termination before it releases the claim.
+Disk cleanup failures retain the separate `mac_cleanup=1` result.
+`leftover_timeout_s` bounds cleanup confirmation. Failed confirmation retains the claim.
+
+`loopback.*` settings control the manual Tailscale SSH proof on natedev.
+`loopback.port` selects the SSH port. An empty value uses the SSH default.
+`loopback.known_hosts` selects the known_hosts file. An empty value uses the user's normal known_hosts file.
+A selected known_hosts file requires strict host key checking for SSH and rsync.
+The proof creates a managed scratch home and a tiny Rust fixture.
+It uses private memory files and executes test, check, and staged doc in one warm slot.
+It removes the scratch home when the proof ends. Automated tests never execute this proof.
