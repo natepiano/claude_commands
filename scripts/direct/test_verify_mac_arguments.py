@@ -13,6 +13,26 @@ from scripts.direct.verify_mac_offload_test_support import BusyClaimRecord, Veri
 
 @final
 class VerifyMacArgumentsTests(VerifyMacOffloadFixture):
+    def test_only_plain_package_runs_allow_no_tests_on_both_machines(self) -> None:
+        cases = (((), True), (("--filter", "alpha"), False), (("integration_suite",), False))
+        for arguments, allow_empty in cases:
+            with self.subTest(arguments=arguments):
+                self.clear_observations()
+                result = self.verify("test", "sample", *arguments, "--no-cache", extra={
+                    "TEST_RUNNER_MAC": "declined",
+                    "TEST_RUNNER_REASON": "busy",
+                    "TEST_RUNNER_STATUS": "75",
+                })
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                runners = self.runner_events()
+                local = self.local_runs()
+                self.assertEqual(len(runners), 1)
+                self.assertEqual(len(local), 1)
+                runner_arguments = runners[0]["args"]
+                nextest_arguments = runner_arguments[runner_arguments.index("--") + 1:]
+                self.assertEqual(nextest_arguments, local[0]["args"][4:])
+                self.assertEqual("--no-tests=warn" in nextest_arguments, allow_empty)
+
     def test_decline_runs_same_nextest_words_locally_after_runner(self) -> None:
         result = self.verify(
             "test",
