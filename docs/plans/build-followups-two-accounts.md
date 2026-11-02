@@ -3087,13 +3087,8 @@ User 2026-11-02: "i want accounts renewal on the mac for sure". natedev renewed 
 
 **As-built:** `agent_notes.py usage-only` (Mac launchd job, nixos `modules/darwin/account-usage.nix`) runs `refusal_watch.renew_expired_logins` as a dry run after it saves usage. When an account is due, it starts `agent_notes.py renew-logins` as a detached child (`start_new_session`) and returns: launchd runs one job instance, so the usage job never waits on a 120 s probe. `renew-logins` holds the `login-renewal` schedule lock and calls the same function, which keeps the hourly limit and `~/.local/state/accounts/login_renewals.json`. Two repair rounds (F001: the probe held the usage job, first by its lock, then by launchd's one instance). Style review PASS. Live proof: the Mac after promotion.
 
-### Phase 101s — The accounts board has no read column  · status: done
+### Phase 101s — The accounts board has no read column  · status: done · 9b161976
 
-User 2026-11-02: remove the `read` column from the accounts board; an account that cannot be read shows in the problems, not in a permanent column. Start after 101r. Keep handler-unit (cargo-handler shows accounts) told of each change.
+User 2026-11-02: remove the `read` column; a reading that fails or is old shows in the problems, not in a permanent column.
 
-**Goal:** the board shows account, left, role, busy, shell, idle, total, resets, credits, enabled; a failed or old reading shows only as a problem line and the red dot.
-**Spec:** drop the `read` column and the narrow-layout `read … ago` fact in `mods/unit-board/hooks/accounts.tsx`. Keep `read_at` and `read_ok` in the JSON (the dot and cargo-handler read them). Check that every read failure the status computes reaches the problems list; add any that does not. Update `docs/accounts.md` where it lists the board columns.
-**Files:**
-- mods/unit-board/hooks/accounts.tsx
-- mods/unit-board/tests/accounts.test.ts
-- docs/accounts.md
+**As-built:** `mods/unit-board/hooks/accounts.tsx` drops the `read` column and the narrow `read … ago` fact. `accounts.py` status adds a problem line for a usage or credits reading older than the existing ten-minute limit and sets `read_ok` false for it; a reading saved after status starts counts as fresh (F001). `read_at` and `read_ok` stay in the JSON; cargo-handler colours its dot from `read_ok` (handler-unit Phase 61 drops its own read column). One repair round; style review PASS.
