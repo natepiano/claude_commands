@@ -162,10 +162,17 @@ class UnitFolderMoveTests(FolderMoveFixture):
         self.outside_codex_evidence(backend)
         self.assert_idle_move_refused(backend)
 
-    def test_idle_retained_pane_refuses_a_move_when_codex_evidence_is_unreadable(self) -> None:
+    def test_idle_retained_pane_moves_when_codex_evidence_is_unreadable(self) -> None:
         backend = self.folder_backend("codex")
         self.outside_codex_evidence(backend, readable=False)
-        self.assert_idle_move_refused(backend)
+        with (mock.patch.object(herdr, "herdr_place_of", return_value=herdr.NotInHerdr()),
+              mock.patch.object(sessions, "running_sessions", return_value=[])):
+            result = self.move_folder()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"anomaly: pid {backend.pid} (Codex thread unknown); not blocking", result.stderr)
+        self.assert_moved(backend)
+        self.assertEqual((backend.starts, backend.stops, backend.live), ([], [], False))
+        self.assert_finished_rerun(backend)
 
     def test_idle_retained_pane_refuses_a_pending_resume_when_its_codex_thread_runs_elsewhere(self) -> None:
         backend = self.folder_backend("codex", live=True)
@@ -204,6 +211,89 @@ class UnitFolderMoveTests(FolderMoveFixture):
                     case.assert_finished_rerun(backend)
                 finally:
                     case.doCleanups()
+
+    def assert_move_with_unidentifiable_codex(self, kind: Literal["claude", "codex"],
+                                             *, target_live: bool = False) -> None:
+        for pending_resume in (False, True):
+            with self.subTest(kind=kind, pending_resume=pending_resume, target_live=target_live):
+                case = UnitFolderMoveTests()
+                case.setUp()
+                try:
+                    read_environment = herdr.process_environment
+                    backend = case.folder_backend(kind, live=pending_resume)
+                    progress = staff.folder_move_path(case.owner.id)
+                    if pending_resume:
+                        with mock.patch.object(unit_move, "resume_folder_session",
+                                               side_effect=OSError("interrupted before resume")):
+                            interrupted = case.move_folder()
+                        case.assertEqual(interrupted.returncode, 1, interrupted.stderr)
+                        case.assertIn("interrupted before resume", interrupted.stderr)
+                        case.assertIs(unit_move.read_folder_move(progress).steps["resume"],
+                                      unit_move.FolderStepState.PENDING)
+                    pid = backend.pid + 1
+                    process = case.root / "folder-processes" / str(pid)
+                    (process / "fd").mkdir(parents=True)
+                    write_bytes_atomic(process / "cmdline", b"codex\0")
+                    write_bytes_atomic(process / "environ", b"")
+                    write_text_atomic(process / "stat", f"{pid} (codex) S 1 0\n")
+
+                    def environment(candidate: int) -> dict[str, str]:
+                        return (read_environment(candidate) if candidate == pid
+                                else backend.environment(candidate))
+
+                    _ = case.enterContext(mock.patch.object(herdr, "process_environment",
+                                                           side_effect=environment))
+                    _ = case.enterContext(mock.patch.object(herdr, "herdr_place_of",
+                                                           return_value=herdr.NotInHerdr()))
+                    _ = case.enterContext(mock.patch.object(sessions, "running_sessions", return_value=[]))
+                    with case.assertRaisesRegex(ValueError, "Codex launch identity is unavailable"):
+                        _ = herdr.native_process(pid, "codex")
+                    if target_live and kind == "claude":
+                        _ = case.enterContext(mock.patch.object(sessions, "session_liveness",
+                            return_value=sessions.LiveSessionProcess(pid + 1)))
+                    elif target_live:
+                        case.outside_codex_evidence(backend)
+                    elif kind == "codex":
+                        _ = case.enterContext(mock.patch.object(sessions, "session_liveness",
+                            return_value=sessions.SessionLivenessUnknown("Claude registry is unavailable")))
+                    paths = (case.staff_file, case.records / "agents.json", case.history,
+                             case.run_dir / "progress_history_state.json", case.run_dir / "working_dir")
+                    if pending_resume:
+                        paths += (progress,)
+                    before = [path.read_bytes() for path in paths]
+                    starts, stops = backend.starts.copy(), backend.stops.copy()
+                    result = case.move_folder()
+                    if target_live:
+                        case.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                        case.assertIn("live Codex thread" if kind == "codex" else "live session", result.stderr)
+                        case.assertEqual([path.read_bytes() for path in paths], before)
+                        case.assertEqual((backend.starts, backend.stops), (starts, stops))
+                        case.assertEqual(case.old_folder.exists(), not pending_resume)
+                        case.assertEqual(case.new_folder.exists(), pending_resume)
+                        if not pending_resume:
+                            case.assertFalse(progress.exists())
+                    else:
+                        case.assertEqual(result.returncode, 0, result.stderr)
+                        case.assertIn(f"anomaly: pid {pid} (Codex thread unknown); not blocking", result.stderr)
+                        if kind == "codex":
+                            case.assertIn("anomaly: Claude registry is unavailable; not blocking", result.stderr)
+                        case.assert_moved(backend)
+                        case.assertEqual(backend.stops, stops)
+                        case.assertEqual(len(backend.starts), int(pending_resume))
+                        case.assertEqual(backend.live, pending_resume)
+                        case.assert_finished_rerun(backend)
+                finally:
+                    case.doCleanups()
+
+    def test_stopped_claude_target_moves_with_an_unidentifiable_codex_process(self) -> None:
+        self.assert_move_with_unidentifiable_codex("claude")
+
+    def test_stopped_codex_target_moves_with_an_unidentifiable_codex_process(self) -> None:
+        self.assert_move_with_unidentifiable_codex("codex")
+
+    def test_idle_retained_pane_refuses_when_its_target_session_is_proven_live(self) -> None:
+        for kind in ("claude", "codex"):
+            self.assert_move_with_unidentifiable_codex(kind, target_live=True)
 
     def assert_live_move(self, kind: Literal["claude", "codex"]) -> None:
         backend = self.folder_backend(kind, live=True)

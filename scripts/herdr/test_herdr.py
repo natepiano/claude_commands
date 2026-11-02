@@ -19,7 +19,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from typing import BinaryIO, cast, final, override
+from typing import BinaryIO, Literal, cast, final, override
 from unittest.mock import Mock, call, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -98,6 +98,64 @@ class NativePaneSessionTests(StaffTestCase):
             self.write_json(registry, observation)
             with self.assertRaisesRegex(herdr.HerdrFailure, "native registry identity is unavailable"):
                 _ = herdr.Herdr("agents").native_session("w1:p1", "claude", 1)
+
+
+class CodexAnomalyNameTests(StaffTestCase):
+    def assert_unknown_codex_note(self, source: Literal["tab", "registry", "pid"]) -> None:
+        pid = 998071
+        proc = self.root / "unknown-codex-proc"
+        process = proc / str(pid)
+        (process / "fd").mkdir(parents=True)
+        _ = (process / "cmdline").write_bytes(b"codex\0")
+        _ = (process / "environ").write_bytes(b"")
+        records: list[sessions.SessionRecord] = [{
+            "pid": pid + 1, "sessionId": fixture_runtime_id("unrelated-registry-process"),
+            "name": "unrelated", "messagingSocketPath": "", "updatedAt": 1, "tmux": "", "formerNames": [],
+        }, {
+            "pid": pid, "sessionId": fixture_runtime_id("named-registry-process"),
+            "name": "registry-name", "messagingSocketPath": "", "updatedAt": 1, "tmux": "", "formerNames": [],
+        }]
+        output = io.StringIO()
+        with (patch.dict(os.environ, {"HERDR_PROC": str(proc), "HERDR_BIN": "/nonexistent/herdr"}),
+              patch.object(herdr, "_PLATFORM", "linux"),
+              patch.object(sessions, "process_start", return_value="fixture-start"),
+              patch.object(herdr, "herdr_place_of") as placement,
+              patch.object(herdr.Herdr, "result") as result,
+              patch.object(sessions, "running_sessions", return_value=records) as registry,
+              redirect_stderr(output)):
+            if source == "tab":
+                placement.return_value = herdr.HerdrPlace("agents", "w1:p1")
+                result.side_effect = [{"panes": [
+                    {"pane_id": "w1:p2", "tab_id": "w1:t2"},
+                    {"pane_id": "w1:p1", "tab_id": "w1:t1"}]}, {"tabs": [
+                    {"tab_id": "w1:t2", "label": "other-tab"},
+                    {"tab_id": "w1:t1", "label": "morty"}]}]
+            else:
+                placement.side_effect = herdr.HerdrFailure("placement is unavailable")
+            if source == "pid":
+                registry.side_effect = OSError("registry is unavailable")
+            with self.assertRaisesRegex(ValueError, "Codex launch identity is unavailable"):
+                _ = herdr.native_process(pid, "codex")
+            self.assertEqual(herdr.running_codex_threads(thread_host=lambda _argv: False), set())
+            name = {"tab": "morty", "registry": "registry-name", "pid": f"pid {pid}"}[source]
+            self.assertEqual(output.getvalue(), f"anomaly: {name} (Codex thread unknown); not blocking\n")
+            placement.assert_called_once_with(pid)
+            if source == "tab":
+                self.assertNotIn(str(pid), output.getvalue())
+                self.assertEqual(result.call_args_list, [call("pane", "list"), call("tab", "list")])
+                registry.assert_not_called()
+            else:
+                result.assert_not_called()
+                registry.assert_called_once_with()
+
+    def test_unknown_codex_note_uses_the_tab_label_before_the_registry_name(self) -> None:
+        self.assert_unknown_codex_note("tab")
+
+    def test_unknown_codex_note_uses_the_registry_name_when_placement_is_unavailable(self) -> None:
+        self.assert_unknown_codex_note("registry")
+
+    def test_unknown_codex_note_uses_the_pid_when_both_name_readers_fail(self) -> None:
+        self.assert_unknown_codex_note("pid")
 
 
 class StartupClock:

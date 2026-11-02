@@ -2750,6 +2750,32 @@ def native_process(pid: int, kind: str) -> NativeAgentProcess:
     return NativeAgentProcess(identity, started, environment)
 
 
+def _process_display_name(pid: int) -> str:
+    """Use the tab or registry name when available; otherwise use the pid."""
+    try:
+        place = herdr_place_of(pid)
+        if isinstance(place, HerdrPlace):
+            client = Herdr(place.session)
+            panes = [json_object(item, "herdr pane") for item in json_items(
+                client.result("pane", "list").get("panes"), "herdr pane list")]
+            tab = next((pane.get("tab_id") for pane in panes if pane.get("pane_id") == place.pane), None)
+            if isinstance(tab, str) and tab:
+                for item in json_items(client.result("tab", "list").get("tabs"), "herdr tab list"):
+                    entry = json_object(item, "herdr tab")
+                    name = entry.get("label")
+                    if entry.get("tab_id") == tab and isinstance(name, str) and name.strip():
+                        return name
+    except (HerdrFailure, OSError, ValueError, RuntimeError, subprocess.SubprocessError):
+        pass
+    try:
+        for record in runtime_sessions.running_sessions():
+            if record["pid"] == pid and record["name"].strip():
+                return record["name"]
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
+        pass
+    return f"pid {pid}"
+
+
 def running_codex_threads(*, thread_host: Callable[[list[str]], bool]) -> set[str]:
     """Read Codex identities across this user's processes, including processes outside herdr."""
     candidates: list[tuple[int, list[str]]] = []
@@ -2775,6 +2801,8 @@ def running_codex_threads(*, thread_host: Callable[[list[str]], bool]) -> set[st
                 identities.add(native_process(pid, "codex").identity)
             except ProcessLookupError:
                 continue
+            except (HerdrFailure, OSError, ValueError):
+                print(f"anomaly: {_process_display_name(pid)} (Codex thread unknown); not blocking", file=sys.stderr)
     return identities
 
 

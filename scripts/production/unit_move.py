@@ -473,16 +473,17 @@ def _folder_pane(row: staff.StaffRow, launch: FolderLaunch) -> herdr.PaneIdentit
 def _session_without_foreground_agent(
         row: staff.StaffRow, *, claude_live_reason: str = "live session has no retained pane launch",
 ) -> StoppedFolderSession:
-    """Require stopped Claude and Codex evidence before accepting a missing foreground agent."""
+    """Refuse a live target and report unknown liveness without blocking."""
     live = sessions.session_liveness(row.current_session)
     if isinstance(live, sessions.SessionLivenessUnknown):
-        raise RenameRefused(live.reason)
+        print(f"anomaly: {live.reason}; not blocking", file=sys.stderr)
     if isinstance(live, sessions.LiveSessionProcess):
         raise RenameRefused(f"{row.id}: {claude_live_reason}")
     try:
         threads = herdr.running_codex_threads(thread_host=staff_sources.codex_thread_host)
     except (herdr.HerdrFailure, OSError, ValueError) as error:
-        raise RenameRefused(f"{row.id}: Codex liveness is unknown: {error}") from error
+        print(f"anomaly: Codex liveness is unknown: {error}; not blocking", file=sys.stderr)
+        threads = set[str]()
     if row.current_session in threads:
         raise RenameRefused(f"{row.id}: live Codex thread has no retained pane launch")
     return StoppedFolderSession()

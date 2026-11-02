@@ -763,27 +763,42 @@ class CodexPaneRestoreTests(FolderMoveFixture):
         self.assertEqual(client.started, [])
         self.assertEqual(client.closed, [])
 
-    def test_codex_without_a_retained_pane_never_counts_unknown_liveness_as_stopped(self) -> None:
+    def assert_codex_without_a_retained_pane(self, rollout: Literal["current", "unreadable"]) -> None:
         for retained in ("missing", "closed"):
-            for rollout in ("current", "unreadable"):
-                with self.subTest(retained=retained, rollout=rollout):
-                    case = CodexPaneRestoreTests()
-                    case.setUp()
-                    try:
-                        backend = case.folder_backend("codex", live=True)
-                        launch = unit_move.folder_launch(case.owner)
-                        if retained == "missing":
-                            launch = unit_move.NoFolderLaunch()
-                        before = pane_record.read("agents")
-                        with (case.replaced_codex_process(backend, rollout=rollout),
-                              mock.patch.object(backend, "panes", return_value=[])):
+            with self.subTest(retained=retained):
+                case = CodexPaneRestoreTests()
+                case.setUp()
+                try:
+                    backend = case.folder_backend("codex", live=True)
+                    launch = unit_move.folder_launch(case.owner)
+                    if retained == "missing":
+                        launch = unit_move.NoFolderLaunch()
+                    before = pane_record.read("agents")
+                    output = io.StringIO()
+                    with (case.replaced_codex_process(backend, rollout=rollout),
+                          mock.patch.object(backend, "panes", return_value=[]),
+                          mock.patch.object(herdr, "herdr_place_of", return_value=herdr.NotInHerdr()),
+                          mock.patch.object(runtime_sessions, "running_sessions", return_value=[]),
+                          redirect_stderr(output)):
+                        if rollout == "current":
                             with case.assertRaises(RenameRefused):
                                 _ = unit_move.folder_session(case.owner, launch)
-                        case.assertEqual(pane_record.read("agents"), before)
-                        case.assertEqual((backend.starts, backend.stops), ([], []))
-                        case.assertTrue(case.old_folder.is_dir())
-                    finally:
-                        case.doCleanups()
+                        else:
+                            case.assertIsInstance(unit_move.folder_session(case.owner, launch),
+                                                  unit_move.StoppedFolderSession)
+                            case.assertEqual(output.getvalue(),
+                                f"anomaly: pid {backend.pid} (Codex thread unknown); not blocking\n")
+                    case.assertEqual(pane_record.read("agents"), before)
+                    case.assertEqual((backend.starts, backend.stops), ([], []))
+                    case.assertTrue(case.old_folder.is_dir())
+                finally:
+                    case.doCleanups()
+
+    def test_codex_without_a_retained_pane_refuses_when_its_current_rollout_proves_it_live(self) -> None:
+        self.assert_codex_without_a_retained_pane("current")
+
+    def test_codex_without_a_retained_pane_reports_unreadable_evidence_without_refusing(self) -> None:
+        self.assert_codex_without_a_retained_pane("unreadable")
 
     def test_codex_move_rerun_keeps_records_when_no_rollout_file_is_open(self) -> None:
         backend, client = self.finished_pair("codex")
