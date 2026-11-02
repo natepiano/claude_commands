@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from dataclasses import replace
 import io
+import json
+import os
 import subprocess
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -16,7 +19,7 @@ import sessions
 import resume_unit
 import retire_unit
 import atomic_file
-from production_units import read_production
+from production_units import Refusal, read_production
 from scripts.production import staff, unit_config
 
 
@@ -25,6 +28,96 @@ def setUpModule() -> None:
 
 
 class AddUnitRerunTests(AddUnitTestCase):
+    def dead_pending_resume(self) -> tuple[add_unit.RequestedUnitLaunch, Path]:
+        worktree = self.root / "project-alpha"
+        self.commit_prepared_row(self.unit_row())
+        owner = self.prepare_restored_worktree("alpha", worktree)
+        request = add_unit.RequestedUnitLaunch(
+            production=read_production(self.doc), requested_name="alpha", unit="alpha-unit",
+            branch="build-followups-alpha", worktree=worktree,
+            plan=add_unit.PlanGiven(Path("docs/plans/given.md")),
+            port=add_unit.OmittedCell(), owns=add_unit.OmittedCell(),
+            session=add_unit.ResumedSession(owner.current_session, worktree),
+            launch_kind=add_unit.NewWorkLaunch(), timeout=5,
+        )
+        pending = add_unit.opening_record(request.production, request.unit)
+        pending.parent.mkdir(parents=True, exist_ok=True)
+        _ = pending.write_text(json.dumps({
+            "session_id": owner.current_session,
+            "config_dir": str(Path(self.env["HOME"]) / ".claude2"),
+            "prompt": "/unit:direct docs/plans/given.md",
+            "launched_at": datetime.now(timezone.utc).isoformat(),
+        }) + "\n")
+        return request, pending
+
+    def test_resume_check_keeps_dead_pending_opening_without_a_recorded_model(self) -> None:
+        request, pending = self.dead_pending_resume()
+        assert isinstance(request.session, add_unit.ResumedSession)
+        before = pending.read_bytes(), pending.stat().st_mtime_ns
+        state = self.staff.staff_file.read_bytes(), self.repository_state()
+        with (patch.object(sessions, "session_liveness", return_value=sessions.SessionNotLive()),
+              patch.object(unit_lookup, "marked_unit", return_value=None)):
+            checked = self.cli("alpha", "--plan", "docs/plans/given.md", "--resume",
+                               request.session.session_id, "--cwd", str(request.worktree), "--check")
+        self.assertEqual(checked.returncode, 0, checked.stdout + checked.stderr)
+        self.assertTrue(pending.exists(), "--check removed the dead pending opening")
+        self.assertEqual((pending.read_bytes(), pending.stat().st_mtime_ns), before)
+        self.assertEqual((self.staff.staff_file.read_bytes(), self.repository_state()), state)
+        self.assertFalse(any(command[2:4] == ["agent", "start"] for command in self.herdr_calls()))
+
+    def test_dead_pending_resume_does_not_bypass_the_recorded_worktree(self) -> None:
+        request, pending = self.dead_pending_resume()
+        assert isinstance(request.session, add_unit.ResumedSession)
+        wrong = self.root / "prior-session"
+        wrong.mkdir()
+        request = replace(request, session=request.session._replace(cwd=wrong))
+        before = pending.read_bytes()
+        with (patch.dict(os.environ, self.env),
+              patch.object(sessions, "session_liveness", return_value=sessions.SessionNotLive())):
+            selected = add_unit.account_for_launch(request)
+            with self.assertRaisesRegex(Refusal, "its Units row names"):
+                _ = add_unit.preflight(request, selected)
+        assert isinstance(request.session, add_unit.ResumedSession)
+        with (patch.object(sessions, "session_liveness", return_value=sessions.SessionNotLive()),
+              patch.object(unit_lookup, "marked_unit", return_value=None)):
+            checked = self.cli("alpha", "--plan", "docs/plans/given.md", "--resume",
+                               request.session.session_id, "--cwd", str(wrong), "--check")
+        self.assertEqual(checked.returncode, 2, checked.stdout + checked.stderr)
+        self.assertIn("its Units row names", checked.stderr)
+        self.assertEqual(pending.read_bytes(), before)
+
+    def test_dead_pending_lookup_keeps_the_marked_unit_fallback_and_evidence(self) -> None:
+        request, pending = self.dead_pending_resume()
+        before = pending.read_bytes()
+        marked = unit_lookup.MarkedUnit(
+            "alpha-unit", unit_lookup.LiveClaude("alpha", self.env["FAKE_CLAUDE_SESSION_ID"], "/fixture", 1234),
+            herdr.HerdrPlace("agents", "w1:p1"),
+        )
+        with (patch.dict(os.environ, self.env),
+              patch.object(sessions, "session_liveness", return_value=sessions.SessionNotLive()),
+              patch.object(unit_lookup, "marked_unit", return_value=marked) as lookup):
+            found = add_unit.launched_unit(request)
+        self.assertEqual(found, add_unit.MarkedUnitFound(marked))
+        lookup.assert_called_once_with(request.production.slug, request.unit)
+        self.assertTrue(pending.exists(), "read-only marked lookup removed the pending opening")
+        self.assertEqual(pending.read_bytes(), before)
+
+    def test_execution_cleans_dead_pending_opening_after_read_only_discovery(self) -> None:
+        request, pending = self.dead_pending_resume()
+        before = pending.read_bytes()
+        with (patch.dict(os.environ, self.env),
+              patch.object(sessions, "session_liveness", return_value=sessions.SessionNotLive()),
+              patch.object(unit_lookup, "marked_unit", return_value=None)):
+            self.assertEqual(add_unit.model_for_resume(request), "")
+            self.assertTrue(pending.exists(), "model discovery removed the pending opening")
+            self.assertEqual(pending.read_bytes(), before)
+            with patch.object(add_unit, "launch_session", side_effect=RuntimeError("stopped at new backend")) as launch:
+                result = self.cli("alpha", "--plan", "docs/plans/given.md")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("stopped at new backend", result.stderr)
+        launch.assert_called_once()
+        self.assertFalse(pending.exists(), "execution retained the dead pending opening")
+
     def test_retry_after_brief_commit_updates_the_worktree_before_launch(self) -> None:
         commit = add_unit.commit_unit
 
@@ -67,15 +160,29 @@ class AddUnitRerunTests(AddUnitTestCase):
         with patch.object(unit_config, "write", side_effect=interrupted):
             stopped = self.cli(*arguments)
         self.assertEqual(stopped.returncode, 1, stopped.stdout + stopped.stderr)
-        row = next(row for row in staff.find(kind="unit") if row.name == "alpha")
+        self.assertEqual(staff.find(kind="unit"), [])
         path = self.root / "project-alpha/.unit.toml"
-        self.assertEqual(row.worktree, staff.PresentWorktree("natedev", path.parent))
         before = path.read_bytes(), path.stat().st_mtime_ns
         self.assertFalse(any(command[2:4] == ["agent", "start"] for command in self.herdr_calls()))
-        _ = self.successful(*arguments)
-        self.assertEqual(staff.by_id(row.id), row)
+        submitted: list[str] = []
+
+        def submit(client: herdr.Herdr, pane: str, opening: herdr.OpeningPrompt,
+                   _at: datetime, _timeout: int) -> herdr.PromptSubmitted:
+            assert isinstance(opening.transcript, herdr.SessionTranscript)
+            row = staff.by_id(staff.native_id(opening.transcript.session_id))
+            assert row is not None
+            self.assertEqual((row.name, row.worktree), ("alpha", staff.PresentWorktree("natedev", path.parent)))
+            submitted.append(row.id)
+            client.prompt(pane, opening.text)
+            return herdr.PromptSubmitted(datetime.now(timezone.utc))
+
+        with patch.object(herdr.Herdr, "submit_opening_prompt", submit):
+            _ = self.successful(*arguments)
+        row = next(row for row in staff.find(kind="unit") if row.name == "alpha")
+        self.assertEqual(submitted, [row.id])
+        self.assertEqual(row.id, self.env["FAKE_CLAUDE_SESSION_ID"])
         self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
-        self.assertEqual(self.pane_environment()["STAFF_ID"], row.id)
+        self.assertNotIn("STAFF_ID", self.pane_environment())
         calls = self.herdr_calls()
         _ = self.successful(*arguments)
         self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
@@ -86,16 +193,16 @@ class AddUnitRerunTests(AddUnitTestCase):
     def test_retired_resume_finishes_the_live_sessions_pending_opening(self) -> None:
         prior = self.root / "prior-session"
         prior.mkdir()
-        arguments = ("alpha", "--plan", "docs/plans/given.md", "--resume", "session-123", "--cwd", str(prior))
+        arguments = ("alpha", "--plan", "docs/plans/given.md", "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766", "--cwd", str(prior))
         with (patch.object(sessions, "session_liveness", return_value=sessions.SessionNotLive()),
               patch.object(add_unit, "launched_unit", return_value=add_unit.NoMarkedUnit()),
               patch.object(herdr.Herdr, "submit_opening_prompt", side_effect=RuntimeError("stopped before prompt"))):
             stopped = self.cli(*arguments)
         self.assertEqual(stopped.returncode, 1, stopped.stderr)
-        marked = unit_lookup.MarkedUnit("alpha-unit", unit_lookup.LiveClaude("alpha", "session-123", "/fixture", 1234),
+        marked = unit_lookup.MarkedUnit("alpha-unit", unit_lookup.LiveClaude("alpha", "62ccbd64-f22e-5647-b20e-7899aa39d766", "/fixture", 1234),
                                        herdr.HerdrPlace("agents", "w1:p1"))
         unit = resume_unit.RetiredUnit(read_production(self.doc), "alpha-unit", self.root / "project-alpha",
-            "build-followups-alpha", "docs/plans/given.md", "session-123", True, resume_unit.RecordedStartFolder(prior))
+            "build-followups-alpha", "docs/plans/given.md", "62ccbd64-f22e-5647-b20e-7899aa39d766", True, resume_unit.RecordedStartFolder(prior))
         before = sum(row[2:4] == ["agent", "start"] for row in self.herdr_calls())
         output = io.StringIO()
 
@@ -110,7 +217,7 @@ class AddUnitRerunTests(AddUnitTestCase):
               redirect_stdout(output)):
             resume_unit.launch(unit)
         self.assertIn("alpha-unit started:", output.getvalue())
-        self.assertIn("resumed: session session-123", output.getvalue())
+        self.assertIn("resumed: session 62ccbd64-f22e-5647-b20e-7899aa39d766", output.getvalue())
         self.assertIn("Run /unit:direct", self.opening_prompt())
         self.assertEqual(sum(row[2:4] == ["agent", "start"] for row in self.herdr_calls()), before)
         self.assertFalse((self.checkout / ".git/add-unit-openings/alpha-unit.json").exists())
@@ -118,14 +225,14 @@ class AddUnitRerunTests(AddUnitTestCase):
     def test_live_resumed_session_finishes_its_pending_opening_without_second_start(self) -> None:
         prior = self.root / "prior-session"
         prior.mkdir()
-        arguments = ("alpha", "--plan", "docs/plans/given.md", "--resume", "session-123", "--cwd", str(prior),
+        arguments = ("alpha", "--plan", "docs/plans/given.md", "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766", "--cwd", str(prior),
                      "--autocompact", "200k")
         with (patch.object(sessions, "session_liveness", return_value=sessions.SessionNotLive()),
               patch.object(add_unit, "launched_unit", return_value=add_unit.NoMarkedUnit()),
               patch.object(herdr.Herdr, "submit_opening_prompt", side_effect=RuntimeError("stopped before prompt"))):
             stopped = self.cli(*arguments)
         self.assertEqual(stopped.returncode, 1, stopped.stderr)
-        marked = unit_lookup.MarkedUnit("alpha-unit", unit_lookup.LiveClaude("alpha", "session-123", "/fixture", 1234),
+        marked = unit_lookup.MarkedUnit("alpha-unit", unit_lookup.LiveClaude("alpha", "62ccbd64-f22e-5647-b20e-7899aa39d766", "/fixture", 1234),
                                        herdr.HerdrPlace("agents", "w1:p1"))
         before = sum(row[2:4] == ["agent", "start"] for row in self.herdr_calls())
         with (patch.object(sessions, "session_liveness", return_value=sessions.LiveSessionProcess(1234)),
@@ -173,8 +280,8 @@ class AddUnitRerunTests(AddUnitTestCase):
               patch.object(herdr.Herdr, "submit_opening_prompt", side_effect=RuntimeError("stopped before prompt"))):
             stopped = self.cli("alpha", "--plan", "docs/plans/given.md")
         self.assertEqual(stopped.returncode, 1, stopped.stderr)
-        arguments = self.agent_arguments()
-        session_id = arguments[arguments.index("--session-id") + 1]
+        session_id = self.env["FAKE_CLAUDE_SESSION_ID"]
+        self.assertNotIn("--session-id", self.agent_arguments())
         marked = unit_lookup.MarkedUnit("alpha-unit", unit_lookup.LiveClaude("alpha", session_id, "/fixture", 1234),
                                        herdr.HerdrPlace("agents", "w1:p1"))
         with (patch.object(add_unit, "launched_unit", return_value=add_unit.MarkedUnitFound(marked)),
@@ -234,8 +341,8 @@ class AddUnitRerunTests(AddUnitTestCase):
               patch.object(herdr.Herdr, "submit_opening_prompt", side_effect=RuntimeError("stopped before prompt"))):
             stopped = self.cli("alpha", "--plan", "docs/plans/given.md")
         self.assertEqual(stopped.returncode, 1, stopped.stderr)
-        arguments = self.agent_arguments()
-        session_id = arguments[arguments.index("--session-id") + 1]
+        session_id = self.env["FAKE_CLAUDE_SESSION_ID"]
+        self.assertNotIn("--session-id", self.agent_arguments())
         marked = unit_lookup.MarkedUnit("alpha-unit", unit_lookup.LiveClaude("alpha", session_id, "/fixture", 1234),
                                        herdr.HerdrPlace("agents", "w1:p1"))
         before = sum(row[2:4] == ["agent", "start"] for row in self.herdr_calls())

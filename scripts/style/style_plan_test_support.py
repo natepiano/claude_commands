@@ -483,7 +483,8 @@ class StylePlanFixture(unittest.TestCase):
         return issue
 
     def judged_findings(self, rule: str, sites: tuple[tuple[str, int, str], ...], *, kind: style_ledger.FindingKind = "type",
-                        before: str = "before", after: str = "after") -> tuple[Path, tuple[style_ledger.HeldFinding, ...]]:
+                        before: str = "before", after: str = "after",
+                        clean_before_holding: bool = False) -> tuple[Path, tuple[style_ledger.HeldFinding, ...]]:
         """Files findings at sites in an approved decision, leaving its judge open for further writes.
 
         They are type findings unless named.
@@ -494,6 +495,9 @@ class StylePlanFixture(unittest.TestCase):
         ledger.ticket_assign("modules-unit-1", "style/main")
         _ = ledger.ticket_base("modules-unit-1")
         blob = next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == rule)
+        if clean_before_holding:
+            for path in sorted({site[0] for site in sites}):
+                self.record(rule, path, self.tip, "modules-unit-1")
         findings = tuple(ledger.hold(rule, path, line, text, kind, before, after, blob, "modules-unit-1")
                          for path, line, text in sites)
         for finding in findings:
@@ -557,8 +561,7 @@ class StylePlanFixture(unittest.TestCase):
         rule = self.rule("read")
         site = self.sources[0]
         self.commit_files({site: "pub struct Parent {\n    old: u32,\n}\n"})
-        issue, (finding,) = self.judged_findings(rule, ((site, 2, "old: u32,"),))
-        self.record(rule, site, self.tip, "modules-unit-1")
+        issue, (finding,) = self.judged_findings(rule, ((site, 2, "old: u32,"),), clean_before_holding=True)
         self.commit_files({site: "pub struct Parent {\n    old: u32,\n}\n\npub struct Typed;\n"})
         output = self.refill_decisions()
         # The merge made the finding's cell stale, so the refill gives its file to a ticket that judges it again.
@@ -654,12 +657,17 @@ class StylePlanFixture(unittest.TestCase):
         issue = self.root / "reference-approval.md"
         with style_ledger.open_ledger(self.repo) as ledger:
             blob = next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == rule)
+            judging = ledger.next_ticket_id("judging")
+            ledger.ticket_add(judging, "judging", "read", "names", ".", [self.sources[0]], [rule])
+            ledger.ticket_assign(judging, "main")
+            _ = ledger.ticket_base(judging)
             ids: list[str] = []
             for index, (before, after) in enumerate(pairs):
                 finding = ledger.hold(rule, self.sources[0], index + 1, "rename", kinds[index % len(kinds)],
-                                      before, after, blob, "outside")
+                                      before, after, blob, judging)
                 ledger.file_held(finding.finding_id, issue)
                 ids.append(finding.finding_id)
+            ledger.ticket_drop(judging)
             _ = issue.write_text("---\nstatus: open\ntags: [proposal, style]\nunit: names-unit\nplan: approved\n"
                                  + f"style_rule: {rule}\nstyle_crate: crates/alpha\nstyle_rule_blob: {blob}\n---\n")
             ledger.ticket_add("names-unit-1", "names-unit", "proposal", "names", "crates/alpha",
@@ -683,12 +691,17 @@ class StylePlanFixture(unittest.TestCase):
         issue = self.root / "binding-approval.md"
         ledger = self.ledger()
         blob = next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == rule)
+        judging = ledger.next_ticket_id("judging")
+        ledger.ticket_add(judging, "judging", "read", "names", ".", [self.sources[0]], [rule])
+        ledger.ticket_assign(judging, "main")
+        _ = ledger.ticket_base(judging)
         ids: list[str] = []
         for line, old, new in pairs:
             finding = ledger.hold(rule, self.sources[0], line, source.splitlines()[line - 1], "rename",
-                                  old, new, blob, "outside")
+                                  old, new, blob, judging)
             ledger.file_held(finding.finding_id, issue)
             ids.append(finding.finding_id)
+        ledger.ticket_drop(judging)
         _ = issue.write_text("---\nstatus: open\ntags: [proposal, style]\nunit: names-unit\nplan: approved\n"
                              + f"style_rule: {rule}\nstyle_crate: crates/alpha\nstyle_rule_blob: {blob}\n---\n")
         ticket = "names-unit-1"

@@ -12,6 +12,7 @@ import io
 import json
 import math
 import os
+import random
 import re
 import shlex
 import shutil
@@ -20,6 +21,8 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
+import tomllib
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextvars import ContextVar
 from collections.abc import Callable, Generator, Mapping, Sequence
@@ -822,14 +825,227 @@ def _identity_link_problems(
     ]
 
 
-def _read_json_object(path: Path | io.StringIO) -> dict[str, object]:
+def read_json_object(path: Path | io.StringIO) -> dict[str, object]:
     decoded = cast(object, json.loads(path.read_text(encoding="utf-8") if isinstance(path, Path) else path.read()))
     if not isinstance(decoded, dict):
         raise ValueError("expected a JSON object")
     return cast(dict[str, object], decoded)
 
 
-def _filtered_seed(source: dict[str, object]) -> ClaudeConfigSeed:
+def trust_settings_file() -> Path:
+    return REPOSITORY_ROOT / "config" / "accounts.toml"
+
+
+def _accounts_settings_section(document: dict[str, object], name: str) -> dict[str, object]:
+    section = document.get(name)
+    if not isinstance(section, dict):
+        raise AccountsError(f"accounts: {trust_settings_file()}: expected [{name}] section")
+    return cast(dict[str, object], section)
+
+
+def _trusted_folders(document: dict[str, object]) -> tuple[str, ...]:
+    """Configured absolute project paths, resolved for this machine at use."""
+    path = trust_settings_file()
+    try:
+        folders = _accounts_settings_section(document, "trust").get("folders")
+        if not isinstance(folders, list):
+            raise ValueError("trust.folders must be a list of paths")
+        result: list[str] = []
+        for folder in cast(list[object], folders):
+            if not isinstance(folder, str) or not folder or not Path(folder).expanduser().is_absolute():
+                raise ValueError("trust.folders must contain absolute or ~/ paths")
+            result.append(str(Path(folder).expanduser().absolute()))
+        return tuple(dict.fromkeys(result))
+    except AccountsError:
+        raise
+    except ValueError as error:
+        raise AccountsError(f"accounts: {path}: {error}") from error
+
+
+def with_trusted_folders(source: dict[str, object], folders: tuple[str, ...]) -> dict[str, object]:
+    """Change only the configured projects' trust bit; seed and repair share it."""
+    if not folders:
+        return source
+    raw_projects = source.get("projects", {})
+    if not isinstance(raw_projects, dict):
+        raise ValueError("projects must be an object")
+    projects = dict(cast(dict[str, object], raw_projects))
+    for folder in folders:
+        raw_project = projects.get(folder, {})
+        if not isinstance(raw_project, dict):
+            raise ValueError("configured trust project must be an object")
+        projects[folder] = {**cast(dict[str, object], raw_project), "hasTrustDialogAccepted": True}
+    return {**source, "projects": projects}
+
+
+@contextmanager
+def _account_home_lock(home: Path) -> Generator[None]:
+    """Serialize account-file publication with setup's directory flock."""
+    directory = os.open(home, os.O_RDONLY)
+    try:
+        fcntl.flock(directory, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(directory)
+
+
+@dataclass(frozen=True)
+class ClaudeConfigLockPolicy:
+    """Configured timing for interoperating with Claude's directory lock."""
+
+    retries: tuple[float, ...]
+    stale_seconds: float
+
+
+def _positive_lock_seconds(value: object, key: str) -> float:
+    try:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError
+        seconds = float(value)
+        if not math.isfinite(seconds) or seconds <= 0:
+            raise ValueError
+        return seconds
+    except (ValueError, OverflowError) as error:
+        raise AccountsError(
+            f"accounts: {trust_settings_file()}: claude_config_lock.{key} must contain finite positive seconds"
+        ) from error
+
+
+def _claude_config_lock_policy(document: dict[str, object]) -> ClaudeConfigLockPolicy:
+    section = _accounts_settings_section(document, "claude_config_lock")
+    retries = section.get("retries")
+    if not isinstance(retries, list) or not retries:
+        raise AccountsError(f"accounts: {trust_settings_file()}: claude_config_lock.retries must be a non-empty list")
+    return ClaudeConfigLockPolicy(
+        tuple(_positive_lock_seconds(value, "retries") for value in cast(list[object], retries)),
+        _positive_lock_seconds(section.get("stale_seconds"), "stale_seconds"),
+    )
+
+
+@dataclass(frozen=True)
+class TrustConfiguration:
+    """Validated folders and lock timing for one trust or seed operation."""
+
+    folders: tuple[str, ...]
+    lock_policy: ClaudeConfigLockPolicy
+
+
+def trust_configuration() -> TrustConfiguration:
+    """Read and validate all trust settings before any home mutation or lock."""
+    path = trust_settings_file()
+    try:
+        document = cast(dict[str, object], tomllib.loads(path.read_text(encoding="utf-8")))
+    except (OSError, ValueError) as error:
+        raise AccountsError(f"accounts: {path}: {error}") from error
+    return TrustConfiguration(_trusted_folders(document), _claude_config_lock_policy(document))
+
+
+@dataclass(frozen=True)
+class ClaudeConfigLock:
+    """Ownership of Claude's directory lock for one short publication."""
+
+    path: Path
+    inode: int
+    publish_before: float
+
+    def require_current(self) -> None:
+        if self.path.stat().st_ino != self.inode:
+            raise OSError("Claude config lock ownership changed")
+        if time.monotonic() >= self.publish_before:
+            raise TimeoutError("Claude config lock publication budget exceeded; rerun trust")
+
+
+@contextmanager
+def claude_config_lock(path: Path, policy: ClaudeConfigLockPolicy) -> Generator[ClaudeConfigLock]:
+    """Wait like Claude, recovering locks older than the configured stale age.
+
+    Our critical section has no waits: its publication budget is half Claude's
+    shortest retry, also below its 1.5s boot retry-abort window. No heartbeat is
+    needed for such a short hold (Claude normally updates its lock every 5s).
+    """
+    lock = path.with_name(path.name + ".lock")
+    for attempt in range(len(policy.retries) + 1):
+        if _try_claude_config_lock(lock, policy.stale_seconds):
+            break
+        if attempt == len(policy.retries):
+            raise TimeoutError("Claude config lock still held after retries; rerun trust")
+        time.sleep(policy.retries[attempt] * (1 + random.random()))
+    ownership = ClaudeConfigLock(lock, lock.stat().st_ino,
+                                time.monotonic() + min(policy.retries) / 2)
+    try:
+        yield ownership
+    finally:
+        # A stolen/replaced lock belongs to its new writer, even on failure.
+        try:
+            if lock.stat().st_ino == ownership.inode:
+                lock.rmdir()
+        except FileNotFoundError:
+            pass
+
+
+def _try_claude_config_lock(lock: Path, stale_seconds: float) -> bool:
+    try:
+        lock.mkdir(mode=0o700)
+        return True
+    except FileExistsError:
+        pass
+    try:
+        if lock.stat().st_mtime >= time.time() - stale_seconds:
+            return False
+        lock.rmdir()
+    except FileNotFoundError:
+        pass
+    # Like proper-lockfile, make only one fresh acquisition after stale removal.
+    try:
+        lock.mkdir(mode=0o700)
+        return True
+    except FileExistsError:
+        return False
+
+
+def _trust_file(home: Path, path: Path, configuration: TrustConfiguration) -> bool:
+    if home.is_symlink() or path.is_symlink():
+        raise ValueError("linked account configuration refused")
+    with _account_home_lock(home):
+        while True:
+            before_mode = stat.S_IMODE(path.stat().st_mode)
+            before = path.read_bytes()
+            original = read_json_object(io.StringIO(before.decode("utf-8")))
+            updated = with_trusted_folders(original, configuration.folders)
+            if updated == original:
+                return False
+            published = json.dumps(updated, indent=2, ensure_ascii=False) + "\n"
+            with atomic_file.prepared_replacement(path, published, mode=before_mode) as temporary:
+                with claude_config_lock(path, configuration.lock_policy) as ownership:
+                    if path.read_bytes() != before or stat.S_IMODE(path.stat().st_mode) != before_mode:
+                        continue
+                    ownership.require_current()
+                    os.replace(temporary, path)
+                atomic_file.sync_folder(path.parent)
+                if path.read_bytes() == published.encode("utf-8"):
+                    return True
+                # Release before retrying a detected unlocked writer's change.
+
+
+def trust_accounts() -> int:
+    """Apply configured trust to each home independently without inspecting identity."""
+    configuration = trust_configuration()
+    homes = [NamedAccount("~/.claude", main_config_dir()), *_existing_named_accounts()]
+    failures = False
+    for home in homes:
+        path = accounts_home() / ".claude.json" if home.dir == main_config_dir() else home.dir / ".claude.json"
+        try:
+            changed = _trust_file(home.dir, path, configuration)
+            state = "updated" if changed else "unchanged"
+            print(f"{home.label}: trust {state}")
+        except (OSError, ValueError) as error:
+            print(f"{home.label}: trust failed: {error}", file=sys.stderr)
+            failures = True
+    print("A later unlocked Claude save can overwrite trust; rerun accounts.py trust if prompted.", file=sys.stderr)
+    return int(failures)
+
+
+def _filtered_seed(source: dict[str, object], folders: tuple[str, ...]) -> ClaudeConfigSeed:
     seed: dict[str, object] = {
         key: source[key] for key in TOP_LEVEL_SEED_KEYS if key in source
     }
@@ -847,30 +1063,25 @@ def _filtered_seed(source: dict[str, object]) -> ClaudeConfigSeed:
             }
             projects[project_path] = cast(ProjectSeed, cast(object, filtered))
         seed["projects"] = projects
-    return cast(ClaudeConfigSeed, cast(object, seed))
+    return cast(ClaudeConfigSeed, cast(object, with_trusted_folders(seed, folders)))
 
 
-def _seed_config(destination: Path) -> list[str]:
+def _seed_config(destination: Path, configuration: TrustConfiguration) -> list[str]:
     if destination.is_symlink():
         return [
             f"accounts: {destination} is a link; identity stays in each account dir"
         ]
     source = accounts_home() / ".claude.json"
     try:
-        directory = os.open(destination.parent, os.O_RDONLY)
-        try:
-            # Serialize seed cleanup and publication within this account home.
-            fcntl.flock(directory, fcntl.LOCK_EX)
+        with _account_home_lock(destination.parent):
             atomic_file.remove_dead_temporary_files(destination)
             if destination.exists():
                 existing = destination.lstat()
                 if not stat.S_ISREG(existing.st_mode) or existing.st_size:
                     return []
                 destination.unlink()
-            seed = _filtered_seed(_read_json_object(source))
+            seed = _filtered_seed(read_json_object(source), configuration.folders)
             _ = atomic_file.create_text_atomic(destination, json.dumps(seed, indent=2, sort_keys=True) + "\n")
-        finally:
-            os.close(directory)
     except (OSError, ValueError, TypeError) as error:
         return [f"accounts: could not seed {destination} from {source}: {error}"]
     return []
@@ -881,6 +1092,7 @@ def setup(label: str) -> list[str]:
     label = note_file.canonical_label(label)
     if _label_is(label, "codex"):
         return _setup_codex_home(label)
+    configuration = trust_configuration()
     destination = account_dir(label)
     problems: list[str] = []
     if destination.is_symlink():
@@ -902,7 +1114,7 @@ def setup(label: str) -> list[str]:
         destination, main_config_dir().absolute(), SHARED, ALWAYS_LINKED,
     ))
 
-    problems.extend(_seed_config(destination / ".claude.json"))
+    problems.extend(_seed_config(destination / ".claude.json", configuration))
     return problems
 
 
@@ -943,7 +1155,7 @@ def _shared_link_problems(
 def _directory_identity(config_dir: Path) -> ClaudeDirectoryIdentity:
     path = agent_accounts.claude_config_file(config_dir)
     try:
-        values = _read_json_object(path)
+        values = read_json_object(path)
     except FileNotFoundError:
         return ClaudeDirectoryLoggedOut()
     except (OSError, ValueError, UnicodeError) as error:
@@ -994,7 +1206,7 @@ def _private_identity_problems(destination: Path) -> list[str]:
             continue
         try:
             if name == ".credentials.json":
-                _ = _read_json_object(path)
+                _ = read_json_object(path)
             else:
                 _ = path.read_text(encoding="utf-8")
         except FileNotFoundError:
@@ -2355,7 +2567,7 @@ def resolve_history_label(label: str, at: str, *, login: str = "") -> ResolvedHi
         if isinstance(parsed, note_file.NumberedAccountLabel) and parsed.tool == tool:
             return ResolvedHistoryLabel(parsed.label)
     try:
-        rows = _read_json_object(accounts_config_file()).get("home_cutovers", [])
+        rows = read_json_object(accounts_config_file()).get("home_cutovers", [])
         stamp = datetime.fromisoformat(at)
         if stamp.tzinfo is None or not isinstance(rows, list):
             return HistoricalAccountUnresolved()
@@ -2526,7 +2738,7 @@ class MacHomeCutover(HomeCutover):
 
 def _record_home_cutover(journal: HomeCutover) -> None:
     with _roles_lock():
-        configuration = _read_json_object(accounts_config_file()) if accounts_config_file().exists() else {}
+        configuration = read_json_object(accounts_config_file()) if accounts_config_file().exists() else {}
         rows = configuration.get("home_cutovers", [])
         if not isinstance(rows, list):
             raise AccountsError("accounts: invalid home_cutovers history")
@@ -2669,7 +2881,7 @@ def _clear_leftover_home_account(journal_path: Path) -> bool:
             original = source.read()
     except FileNotFoundError:
         return False
-    seed = _read_json_object(io.StringIO(original))
+    seed = read_json_object(io.StringIO(original))
     credentials = main_config_dir() / ".credentials.json"
     if credentials.is_symlink() or credentials.exists():
         return False
@@ -2708,7 +2920,7 @@ def _cutover_home_macos(label: str, *, undo: bool) -> None:
             _cutover_session_check(main_config_dir())
             if _clear_leftover_home_account(path):
                 return
-        raw = _read_json_object(path) if path.exists() else {}
+        raw = read_json_object(path) if path.exists() else {}
         if raw and raw.get("platform") != "darwin":
             raise AccountsError("accounts: finish the recorded cutover on its original platform")
         if raw:
@@ -2733,7 +2945,7 @@ def _cutover_home_macos(label: str, *, undo: bool) -> None:
         numbered_path = destination / ".claude.json"
         if any(item.is_symlink() for item in (main_config_dir(), destination, seed_path, numbered_path)):
             raise AccountsError("accounts: cutover homes and identity files must not be links")
-        seed = _read_json_object(seed_path)
+        seed = read_json_object(seed_path)
         if raw:
             journal = cast(MacHomeCutover, cast(object, raw))
         else:
@@ -2760,7 +2972,7 @@ def _cutover_home_macos(label: str, *, undo: bool) -> None:
         if journal["state"] == "undoing":
             raise AccountsError("accounts: finish undo before starting again")
         expected = _account_note(journal["label"])
-        numbered = _read_json_object(numbered_path) if numbered_path.exists() else {}
+        numbered = read_json_object(numbered_path) if numbered_path.exists() else {}
         numbered_oauth = _mac_oauth_account(numbered)
         source_oauth = journal["oauthAccount"]
         if source_oauth["accountUuid"] != numbered_oauth["accountUuid"]:
@@ -2854,7 +3066,7 @@ def cutover_codex_home(label: str, *, undo: bool = False) -> None:
     with path.with_suffix(".lock").open("a") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         try:
-            raw = _read_json_object(path)
+            raw = read_json_object(path)
         except FileNotFoundError:
             raw = {}
         if raw and not undo and raw.get("state") in ("complete", "undone") and _codex_home_login(source):
@@ -2965,6 +3177,7 @@ def cutover_home(label: str = "", *, undo: bool = False) -> None:
     if sys.platform == "darwin":
         _cutover_home_macos(label, undo=undo)
         return
+    folders = trust_configuration().folders if not undo else ()
     path = accounts_home() / ".local/state/accounts/cutover-home.json"
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     with path.with_suffix(".lock").open("a") as lock:
@@ -2976,7 +3189,7 @@ def cutover_home(label: str = "", *, undo: bool = False) -> None:
             if _clear_leftover_home_account(path):
                 return
         try:
-            raw = _read_json_object(path)
+            raw = read_json_object(path)
         except FileNotFoundError:
             raw = {}
         if raw and not undo and raw.get("state") in ("complete", "undone"):
@@ -3009,8 +3222,8 @@ def cutover_home(label: str = "", *, undo: bool = False) -> None:
             raise AccountsError("accounts: cutover homes must be real directories")
         seed_path = accounts_home() / ".claude.json"
         numbered_path = destination / ".claude.json"
-        seed = _read_json_object(seed_path)
-        numbered = _read_json_object(numbered_path) if numbered_path.exists() else {}
+        seed = read_json_object(seed_path)
+        numbered = read_json_object(numbered_path) if numbered_path.exists() else {}
         home_credentials = main_config_dir() / ".credentials.json"
         numbered_credentials = destination / ".credentials.json"
         if any(item.is_symlink() for item in (seed_path, numbered_path, home_credentials, numbered_credentials)):
@@ -3051,7 +3264,7 @@ def cutover_home(label: str = "", *, undo: bool = False) -> None:
         if "oauthAccount" in seed:
             if "oauthAccount" in numbered and numbered["oauthAccount"] != seed["oauthAccount"]:
                 raise AccountsError("accounts: destination holds another oauthAccount")
-            numbered = {**_filtered_seed(seed), **numbered, "oauthAccount": seed["oauthAccount"]}
+            numbered = {**_filtered_seed(seed, folders), **numbered, "oauthAccount": seed["oauthAccount"]}
             _atomic_write(numbered_path, json.dumps(numbered) + "\n")
             del seed["oauthAccount"]
             _atomic_write(seed_path, json.dumps(seed) + "\n")
@@ -3682,7 +3895,7 @@ def _mcp_server_names(config_file: Path, project: Path) -> ReadMcpConfiguration 
     try:
         with config_file.open(encoding="utf-8") as stream:
             source = ExistingMcpFile(stream.read(), stat.S_IMODE(os.fstat(stream.fileno()).st_mode))
-        configuration = _read_json_object(io.StringIO(source.text))
+        configuration = read_json_object(io.StringIO(source.text))
     except FileNotFoundError:
         # Claude can start without a configuration file.
         return ReadMcpConfiguration(frozenset(), MissingMcpFile())
@@ -4167,6 +4380,36 @@ class WeeklyNotReadSince:
 
 
 @dataclass(frozen=True)
+class NoRoleCount:
+    """A spare account has no role membership to count."""
+
+
+@dataclass(frozen=True)
+class UnknownShellCount:
+    """The worker roster does not report shell activity."""
+
+
+@dataclass(frozen=True)
+class RoleSessionCounts:
+    """Distinct live members of one role, grouped by activity."""
+
+    busy: int
+    shell: int | UnknownShellCount
+    idle: int
+
+    @property
+    def total(self) -> int:
+        return self.busy + (self.shell if isinstance(self.shell, int) else 0) + self.idle
+
+
+class RoleSessionCountsDocument(TypedDict):
+    busy: int
+    shell: int | None
+    idle: int
+    total: int
+
+
+@dataclass(frozen=True)
 class StatusRow:
     """One account's values, shared by the table and JSON renderers."""
     label: str
@@ -4182,6 +4425,7 @@ class StatusRow:
     read_at: datetime | StatusUnavailable
     read_outcome: agent_accounts.UsageReadOutcome
     attempted_at: datetime | StatusUnavailable
+    role_counts: tuple[RoleSessionCounts | NoRoleCount, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -4192,12 +4436,14 @@ class StatusReading:
     zone: tzinfo
     checked_at: datetime
     represented_stderr: tuple[str, ...] = ()
+    session_inputs: tuple[str, ...] = ()
 
 
 class StatusAccountDocument(TypedDict):
     label: str
     tool: Literal["claude", "codex"]
     roles: list[str]
+    role_counts: list[RoleSessionCountsDocument | None]
     weekly_left_percent: float | None
     resets_at: str | None
     credits: float | Literal["unlimited"] | None
@@ -4208,6 +4454,7 @@ class StatusAccountDocument(TypedDict):
 
 
 class StatusDocument(TypedDict):
+    session_inputs: list[str]
     accounts: list[StatusAccountDocument]
     problems: list[str]
 
@@ -4308,6 +4555,10 @@ def render_status_json(reading: StatusReading) -> str:
     accounts: list[StatusAccountDocument] = []
     for row in reading.rows:
         item = StatusAccountDocument(label=row.label, tool=row.tool, roles=list(row.roles),
+            role_counts=[RoleSessionCountsDocument(busy=count.busy,
+                shell=count.shell if isinstance(count.shell, int) else None, idle=count.idle, total=count.total)
+                if isinstance(count, RoleSessionCounts) else None for count in
+                (row.role_counts or tuple(NoRoleCount() for _role in row.roles))],
             weekly_left_percent=None if isinstance(row.weekly_left_percent, (StatusUnavailable, WeeklyNotReadSince)) else row.weekly_left_percent,
             resets_at=None if isinstance(row.resets_at, StatusUnavailable) else row.resets_at.astimezone(timezone.utc).isoformat(),
             credits=None if isinstance(row.credits, StatusUnavailable) else row.credits,
@@ -4317,7 +4568,7 @@ def render_status_json(reading: StatusReading) -> str:
                 agent_accounts.UsageReadOutcome.OK, agent_accounts.UsageReadOutcome.HELD),
             credits_in_use=row.on_credits == "yes")
         accounts.append(item)
-    return json.dumps(StatusDocument(accounts=accounts, problems=[note.removeprefix("* ") for note in reading.notes]))
+    return json.dumps(StatusDocument(session_inputs=list(reading.session_inputs), accounts=accounts, problems=[note.removeprefix("* ") for note in reading.notes]))
 
 
 ProblemKind = Literal["warning", "usage claim", "usage save", "startup", "usage", "legacy", "unnoted", "test login", "access", "identity", "signed out", "wrong login", "unreadable note", "note", "state", "check", "role", "unclassified", "mcp servers"]
@@ -4892,6 +5143,7 @@ def _read_status(source: UsageSource, *, detail: bool) -> StatusReading:
         *(_status_row(status, usage.get(usage_store.key("Codex", status.login)), now,
             (status.role,) if status.role in (CODEX_ROLE, "spare") else ()) for status in codex),
     )
+    rows, session_inputs = _count_role_sessions(rows)
     home_step = "run accounts.py cutover-home"
     all_statuses: list[AccountStatus | CodexStatus] = [*statuses, *codex]
     diagnostics_by_status = [_status_problems(status, detail=detail, zone=zone) for status in all_statuses]
@@ -4946,7 +5198,7 @@ def _read_status(source: UsageSource, *, detail: bool) -> StatusReading:
                       if isinstance(source, RefreshStaleUsage) else ())
         detail_lines = (*live_lines,
             *_move_status_lines(moves.account_moves(journal), zone), *_routing_status_lines(journal, zone))
-    return StatusReading(rows, tuple(notes), detail_lines, zone, now, tuple(represented_stderr))
+    return StatusReading(rows, tuple(notes), detail_lines, zone, now, tuple(represented_stderr), session_inputs)
 
 
 @dataclass
@@ -5101,6 +5353,129 @@ def status_report(*, detail: bool = False, source: UsageSource = REFRESH_STALE_U
 WORKERS_RUN_ROOTS = unit_runs.run_roots()
 
 
+def _count_role_sessions(rows: tuple[StatusRow, ...]) -> tuple[tuple[StatusRow, ...], tuple[str, ...]]:
+    """Count local owners from the detail view's registries, without host discovery."""
+    from scripts.message import sessions
+    from scripts.shutdown import inventory
+    from scripts.herdr import pane_launch
+    from scripts.production import showrunners, session_staff, staff
+
+    inputs = {sessions.sessions_dir(), pane_launch.record_directory(), showrunners.NOTIFIER_STATE_DIR}
+    counts: dict[tuple[Path, str], dict[str, str]] = {}
+    launches: dict[str, pane_launch.PaneLaunch] = {}
+    for path in pane_launch.record_directory().glob("*.json"):
+        inputs.add(path)
+        try:
+            entries = pane_launch.read_valid_entries(path)
+        except (OSError, ValueError):
+            continue
+        for launch in entries.values():
+            previous = launches.get(launch["session_id"])
+            if previous is None or previous["written_at"] < launch["written_at"]:
+                launches[launch["session_id"]] = launch
+    try:
+        membership = staff.local_snapshot()
+    except staff.StaffUnreadable:
+        membership = staff.StaffSnapshot(())
+    inputs.update(Path(path) for path in membership.inputs)
+    runners = inventory.showrunner_registrations()
+    runner_ids = {runner.session_id for runner in runners.entries}
+    for path in showrunners.NOTIFIER_STATE_DIR.glob("showrunner-*/conf"):
+        inputs.add(path)
+    for path in sessions.sessions_dir().glob("*.json"):
+        inputs.add(path)
+    for session in sessions.live_sessions():
+        identity = session["sessionId"]
+        owner = membership.by_current_session(identity)
+        candidates = [launch for reference, launch in launches.items()
+                      if owner is not None and reference in (owner.id, owner.current_session)]
+        launch = max(candidates, key=lambda launch: launch["written_at"]) if candidates else launches.get(identity)
+        role = "showrunners" if identity in runner_ids else ""
+        if not role and launch is not None:
+            unit = launch["environment"].get("SHOWRUNNER_UNIT_ID", "")
+            try:
+                # The live session id joins first; an older launch keeps its unit mark.
+                member = session_staff.unit_match(session_staff.ObservedUnit(unit), membership, identity)
+                if isinstance(member, session_staff.NoSuchMember) and unit:
+                    member = session_staff.unit_match(session_staff.ObservedUnit(unit), membership)
+            except (staff.StaffUnreadable, ValueError):
+                continue
+            if isinstance(member, session_staff.MemberFound):
+                role = "units"
+        if not role:
+            continue
+        if launch is not None and launch.get("ended", False):
+            continue
+        if launch is not None:
+            directory_name = launch.get("config_dir", "")
+            if not directory_name:
+                continue
+            directory = Path(directory_name)
+        else:
+            setting = account.process_config_dir(session["pid"])
+            if not isinstance(setting, account.ConfiguredClaudeFolder):
+                continue
+            directory = setting.path
+        counts.setdefault((directory, role), {})[identity] = session.get("status", "")
+    from scripts.message.unit_labels import MeshWorker, listed_mesh_worker
+
+    for run, name, entry, home in _worker_status_records(inputs):
+        if home and listed_mesh_worker(cast(MeshWorker, cast(object, entry))):
+            counts.setdefault((Path(home), "workers"), {})[str(run / name)] = (
+                "busy" if entry.get("status") in ("running", "starting") else "idle")
+    counted = tuple(replace(row, role_counts=tuple(
+        NoRoleCount() if role == "spare" else _role_session_counts(
+            tuple(counts.get((Path(row.folder).expanduser(), role), {}).values()), row.tool)
+        for role in row.roles)) for row in rows)
+    return counted, tuple(str(path) for path in sorted(inputs))
+
+
+def _role_session_counts(states: tuple[str, ...], tool: Literal["claude", "codex"]) -> RoleSessionCounts:
+    """Treat unknown activity as idle without changing role membership."""
+    busy = states.count("busy")
+    shell = states.count("shell") if tool == "claude" else 0
+    return RoleSessionCounts(busy, shell if tool == "claude" else UnknownShellCount(), len(states) - busy - shell)
+
+
+def _worker_status_records(inputs: set[Path]) -> list[tuple[Path, str, dict[str, object], str]]:
+    """Read each live mesh once for counts and the detail view's continuation lines."""
+    from scripts.message.unit_labels import read_object
+
+    found: list[tuple[Path, str, dict[str, object], str]] = []
+    for root in WORKERS_RUN_ROOTS:
+        inputs.add(root)
+        for path in sorted(root.glob("*/mesh_roster.json")):
+            inputs.update((path.parent, path, path.parent / "mesh_server.json"))
+            if not _mesh_server_running(path.parent):
+                continue
+            try:
+                raw = read_object(path)
+                server = read_object(path.parent / "mesh_server.json")
+            except (OSError, ValueError):
+                continue
+            homes: dict[int, str] = {}
+            try:
+                retired = read_object(path.parent / "mesh_retired.json").get("servers", [])
+            except (OSError, ValueError):
+                retired = []
+            inputs.add(path.parent / "mesh_retired.json")
+            servers = [*(cast(list[object], retired) if isinstance(retired, list) else []), server]
+            for value in servers:
+                if isinstance(value, dict):
+                    record = cast(dict[str, object], value)
+                    port, home = record.get("port"), record.get("codex_home")
+                    if isinstance(port, int) and isinstance(home, str):
+                        homes[port] = home
+            for name, value in raw.items():
+                if not isinstance(value, dict):
+                    continue
+                entry = cast(dict[str, object], value)
+                port = entry.get("port", server.get("port"))
+                home = homes.get(port, "") if isinstance(port, int) else ""
+                found.append((path.parent, name, entry, home))
+    return found
+
+
 def _live_status_lines(groups: GroupAccounts) -> list[str]:
     from scripts.message import sessions
     members = live_group_members()
@@ -5151,26 +5526,14 @@ def _workers_status_lines(now: datetime, selected: CodexWorkersAccount) -> list[
     chosen = pick("codex", now, exclude=exclude, keep=NoKeep())
     destination = chosen.label if isinstance(chosen, PickedAccount) else no_room_line("codex", chosen)
     lines = [f"Codex workers: {selected.label}; on refusal: {destination}"] if selected.label else []
-    for path in sorted(path for root in WORKERS_RUN_ROOTS for path in root.glob("*/mesh_roster.json")):
-        if not _mesh_server_running(path.parent):
-            continue
-        try:
-            raw = cast(object, json.loads(path.read_text()))
-        except (OSError, ValueError):
-            continue
-        if not isinstance(raw, dict):
-            continue
-        for name, value in cast(dict[str, object], raw).items():
-            if not isinstance(value, dict):
-                continue
-            entry = cast(dict[str, object], value)
-            if entry.get("continuation_owed") is True:
-                reason = entry.get("continuation_reason")
-                if not isinstance(reason, str):
-                    reason = "quota refusal; waiting for account recovery or a confirmed move"
-                    if entry.get("status") == "waiting_capacity":
-                        reason = "waiting for capacity on the selected account"
-                lines.append(f"worker {path.parent.name}/{name}: continuation owed — {reason}")
+    for run, name, entry, _home in _worker_status_records(set()):
+        if entry.get("continuation_owed") is True:
+            reason = entry.get("continuation_reason")
+            if not isinstance(reason, str):
+                reason = "quota refusal; waiting for account recovery or a confirmed move"
+                if entry.get("status") == "waiting_capacity":
+                    reason = "waiting for capacity on the selected account"
+            lines.append(f"worker {run.name}/{name}: continuation owed — {reason}")
     return lines
 
 
@@ -5239,6 +5602,7 @@ def _routing_status_lines(entries: list[moves.JournalEntry], zone: tzinfo) -> li
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="action")
+    _ = commands.add_parser("trust", help="trust configured folders in every Claude home")
     _ = commands.add_parser("role-map-read")
     writer = commands.add_parser("role-map-write")
     _ = writer.add_argument("change")
@@ -5351,6 +5715,8 @@ def main(argv: list[str]) -> int:
     if hasattr(options, "label"):
         options.label = note_file.canonical_label(options.label)
     try:
+        if options.action == "trust":
+            return trust_accounts()
         if options.action in ("next-read", "next-write"):
             if not role_map.is_role_map_host():
                 raise AccountsError("accounts: account moves belong on natedev")

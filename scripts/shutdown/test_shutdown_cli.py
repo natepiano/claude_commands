@@ -39,6 +39,7 @@ import shutdown
 import restart_support
 import remote
 from push_texts import RenderedPush
+from user_action import ActionRequired
 import restart as restart_work
 from scripts.whoami.account import Account, UnreadableAccount
 
@@ -1370,10 +1371,10 @@ class OnlySessionCliTests(ShutdownTestCase):
         alert.assert_called_once()
         push = cast(RenderedPush, alert.call_args.args[0])
         self.assertEqual(push.id, "shutdown.restart_failed")
-        self.assertEqual(push.values["stopped"], "One session (Beta)")
+        self.assertEqual(push.values["stopped"], "1 session (Beta)")
         self.assertIn("window launch failed", output)
 
-    def test_selected_restart_of_a_failed_move_pushes_the_move_alert_not_a_restart_onto_the_source(self) -> None:
+    def test_selected_restart_of_a_failed_move_pushes_a_retry_that_keeps_the_target(self) -> None:
         _ = self.save_three({"kind": "stopped", "at": OCTOBER})
         def move(current: shutdown_store.SessionShutdown) -> None:
             current["target"], current["source_label"] = "claude3", current["label"]
@@ -1385,8 +1386,12 @@ class OnlySessionCliTests(ShutdownTestCase):
         self.assertEqual((status, error), (1, ""))
         alert.assert_called_once()
         push = cast(RenderedPush, alert.call_args.args[0])
-        self.assertEqual(push.id, "shutdown.move_failed")
-        self.assertEqual((push.values["session"], push.values["target"]), ("Beta", "claude3"))
+        self.assertEqual(push.id, "shutdown.restart_failed")
+        self.assertEqual(push.values["stopped"], "1 session (Beta)")
+        self.assertIn('/shutdown restart "claude2"', cast(ActionRequired, push.action).text)
+        saved = shutdown_store.find_session(LOGIN, "beta-id")
+        assert saved is not None
+        self.assertEqual(saved.get("target"), "claude3")
 
 
     def test_selected_restart_fresh_claim_names_existing_worker_without_launch_or_alert(self) -> None:

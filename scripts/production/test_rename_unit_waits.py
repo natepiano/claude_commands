@@ -28,7 +28,7 @@ class UnitRenameWaitsTests(UnitRenameFixture):
     def test_verify_fails_while_a_process_works_in_the_old_worktree(self) -> None:
         _ = self.seed_record()
         self.assert_refused(self.rename("apply"), "gamma-unit is not running")
-        _ = self.mark_live("gamma-unit", "sid-alpha")
+        _ = self.mark_live("gamma-unit", "5ad615f2-4e04-5121-a102-9d6b2e2a6eb3")
         old = self.rust / "claude-demo-alpha"
         old.mkdir()
         child = subprocess.Popen(
@@ -75,21 +75,21 @@ class UnitRenameWaitsTests(UnitRenameFixture):
 
     def test_a_running_unit_plans_and_apply_stops_it_through_the_shutdown_path(self) -> None:
         log = self.seed_record()
-        (self.home / ".local/state/shutdown/owner@example.com/sessions/sid-alpha.json").unlink()
-        _ = self.mark_live("alpha-unit", "sid-alpha")
+        (self.home / ".local/state/shutdown/owner@example.com/sessions/5ad615f2-4e04-5121-a102-9d6b2e2a6eb3.json").unlink()
+        _ = self.mark_live("alpha-unit", "5ad615f2-4e04-5121-a102-9d6b2e2a6eb3")
         self.record_live_launch()
         planned = self.rename("plan")
         self.assert_ok(planned)
         self.assertIn("1. pause alpha-unit and its Codex workers through the shutdown path", planned.stdout)
-        with patch.object(self, "stop_session", return_value=stop_resume.StopFailed("sid-alpha", "fixture stop refused")) as stop:
+        with patch.object(self, "stop_session", return_value=stop_resume.StopFailed("5ad615f2-4e04-5121-a102-9d6b2e2a6eb3", "fixture stop refused")) as stop:
             applied = self.rename("apply")
         self.assert_refused(applied, "stop refused: fixture stop refused")
-        stop.assert_called_once_with("sid-alpha")
+        stop.assert_called_once_with("5ad615f2-4e04-5121-a102-9d6b2e2a6eb3")
         self.assertEqual(log.read_text(), "")
         self.assertEqual(self.journal()["step"], 0)
 
     def test_a_running_new_id_is_refused(self) -> None:
-        _ = self.mark_live("gamma-unit", "sid-gamma")
+        _ = self.mark_live("gamma-unit", "1351e6fc-2f8f-5413-95b1-e910dae2314c")
         self.assert_refused(self.rename("plan"), "gamma-unit already runs in session demo-gamma-unit")
 
 

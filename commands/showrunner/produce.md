@@ -679,14 +679,15 @@ beginning `works` or `fine`, after optional `okay`/`ok` and a row id (`c17`),
 lands the row. Case and later words do not affect the result; any other start
 returns it to its unit.
 
-1. **Feature log.** Only when the production's project closes out by change
-   review: Hana (`~/rust/hana`, `~/rust/hana_catalyst`) and `~/.claude`. Other
+1. **Feature log.** Use only `ProjectSpec.closes_by_change_review` in
+   `scripts/feature_log/feature_log.py` to select projects, such as Hana and `~/.claude`. Other
    projects close out through `/validate_and_push`, so skip to step 2. The
    review id is the row: bare `C<n>` on hana's list, `<showrunner>/C<n>` on any
    other, where `<showrunner>` is the name the list `change-review - <showrunner>.md`
    is named for (`natedev/C3`).
+   A row with no proposal skips this step.
    - A landing row runs `add --review <id>`, or `supersede --review <id>` when
-     its proposal has `--old`. Propose a missing row first; correct wrong
+     its proposal has `--old`. Correct wrong
      meaning by rerunning `propose` while it is open.
    - A returning row runs `drop --review <id> --verdict "<verdict>"`.
 

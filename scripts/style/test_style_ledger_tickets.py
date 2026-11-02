@@ -1219,7 +1219,7 @@ class StyleLedgerTicketsTests(LedgerTestCase):
         self.set_tip(self.initial_tip)
         _ = self.hold_finding(rule_id, 1, ticket="A")
         self.record(rule_id, self.sources[0], self.initial_tip, "held", ticket="A")
-        self.record(rule_id, self.sources[0], self.initial_tip, "clean", ticket="B")
+        self.record(rule_id, self.sources[0], self.initial_tip, "exception", ticket="B", detail="Reviewed exception")
         self.record(rule_id, self.sources[0], self.initial_tip, "held", ticket="A")
 
         row = next(line.split("\t") for line in self.cli("status").stdout.splitlines() if line.startswith(rule_id + "\t"))

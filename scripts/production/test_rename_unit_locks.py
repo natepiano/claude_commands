@@ -1,6 +1,7 @@
 """Real merge and staff lock ordering across fresh and resumed renames."""
 from __future__ import annotations
 
+
 import json
 import subprocess
 import sys
@@ -35,7 +36,7 @@ class UnitRenameLockTests(UnitRenameFixture):
                         program = (
                             "from scripts.production import staff; "
                             "exec(\"with staff.operation():\\n "
-                            "staff.ensure('showrunner', name='beside-rename')\"); "
+                            "staff.ensure('showrunner', name='beside-rename', runtime_id='ab5a9935-413a-570e-8484-caaf54dc5b2e')\"); "
                             "print(staff.by_path('beside-rename').name)"
                         )
                         writer = subprocess.run(
@@ -72,7 +73,7 @@ class UnitRenameLockTests(UnitRenameFixture):
             self.assertNotIn("merge lock: waiting", output)
             self.assertEqual(self.journal()["step"], 10)
             self.assertEqual(len(log.read_text().splitlines()), len(before.splitlines()) + 1)
-            _ = self.mark_live("gamma-unit", "sid-alpha")
+            _ = self.mark_live("gamma-unit", "5ad615f2-4e04-5121-a102-9d6b2e2a6eb3")
             process = self.start_apply()
             try:
                 output, errors = process.communicate(timeout=5)

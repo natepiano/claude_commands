@@ -1970,13 +1970,13 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 - `submit_opening_prompt` captures the recipient after input readiness, before typing. A recipient that changed by the time the turn appears gives `PromptNotSubmitted("prompt recipient changed during submission")`; each Enter retry first rechecks it (`"prompt recipient changed before Enter retry"`).
 - `restart._prompt_outcome` accepts a `PromptSubmitted` receipt only when its process equals the session's current registry process, under every progress kind; the attempt check while `restarting` stays, and a timer-only retry of the same process still reads its proof. Receipt saving stores the recipient the launcher captured and never samples the registry.
 - `prompt_in_input` takes the composer between the last two rule lines; every nonblank row after the closing rule must be wholly one enumerated footer phrase, else the bordered region is scrollback. The composer match allows a screen newline without a space only inside a word. The enumerated rows reject real Claude screens (labelled top rule; status-line, mode and agent rows), so Enter-only retries do not fire live; "Enter retries reach a real session's composer" replaces the phrase list with layout rules.
-- `restart_push(label, names, *, machine) -> tuple[RenderedPush, ...]` groups names greedily so each push keeps `stopped` ≤ 400 characters, message < 500 and title < 45, and every session is named; a name that alone exceeds the limits gets its own push, shortened to the longest fitting prefix plus a visible `…`; no names gives one `shutdown.restart_incomplete`. `restart.restart` and `settle.report_stop` send every push, and nothing raises through either.
-- `shutdown.restart_failed` catalog examples name one session each (`typical` "One session (organon-unit)", `many_long_names` "One session (build-followups-two-accounts-unit-director)"), approved under the user spec.
+- `restart_push(label, failures, *, machine)` returns one push with the failed session count. It never splits the list. Without known failures, it returns one `shutdown.restart_incomplete` push.
+- `shutdown.restart_failed` shows a retryable failure count, the machine and one retry command. Trust failures keep separate commands. Manual failures share one count push per machine. All changed examples require the normal text review.
 
 **Files:**
 - `scripts/herdr/herdr.py` — recipient identity and lookup, process-bound outcome, Enter-retry recheck, composer footer and wrap-aware match.
-- `scripts/shutdown/restart.py` — receipt read bound to the recipient process; `restart_push` splitting; `restart` sends each push.
-- `scripts/shutdown/settle.py` — `report_stop` sends each push.
+- `scripts/shutdown/restart.py` — process-bound receipts and one phone push per kind of fix in a restart problem.
+- `scripts/shutdown/restart_support.py` — `report_stop` uses the same fix groups and retains delivery marks.
 - `scripts/notify/push_catalog.py`, `scripts/notify/push_texts_reviewed.json` — named `shutdown.restart_failed` examples and their approvals.
 - `scripts/herdr/test_herdr.py`, `scripts/shutdown/test_restart.py`, `scripts/shutdown/test_settle.py`, `scripts/shutdown/test_shutdown_cli.py`, `scripts/notify/test_push_texts.py` — regressions through real receipt files, fake registry identities and fake panes.
 
@@ -3051,16 +3051,26 @@ Found 2026-11-01: a leftover `oauthAccount` with no credential that `cutover-hom
 
 **As-built:** `cutover-home` removes leftover account data (dated private backup, atomic write) when no credential file or keychain entry exists, also after a complete journal; an already-clean home exits 0 with one line and no write. `accounts.py exec claudeN` refuses a wrong sign-in with the label only and prints `env -u CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR=<home> claude`, then `/login`; `docs/accounts.md` matches. The brp job and its setup check share one script that removes user-scope brp and registers brp at local scope in `~/rust/{hana,nateroids,bevy_brp}` for `~/.claude` and each numbered home, writing only on a difference: /etc/nixos branch `accounts-brp-local-scope` (881cc227), pushed by the showrunner. Also: `mac_usage.interval_seconds` went back to 120, because at 60 the provider answered 429 across the four Claude accounts in turn while Codex read fine. One repair round (credential-file check on macOS; clean-home rerun).
 
-### Phase 101m — The accounts board shows how many sessions use each role  · status: todo
+### Phase 101m — The accounts board shows how many sessions use each role  · status: done · ab8092aa
 
-User 2026-11-01: "i want the accounts-board modified to add the count of the role and swap the column order account, left, role, count, resets, credits, enabled, in use, read". Also: "if two roles are on one account show the counts for each separated by comma in the same order that you output the role names". The user found the `in use` column empty; it marks an account that spends paid credits, so it is blank in normal use. Director call: keep it in the order the user gave. The user asked to tell the handler unit about the change.
+User 2026-11-01: add a role count to the accounts board and order the columns account, left, role, count, resets, credits, enabled, in use, read; two roles show two counts in role order. The handler unit was told.
 
-**Depends on:** 101l (same file, `accounts.py`).
+**As-built:** `accounts.py` stored-status JSON carries `role_counts` per account: live members per role from the local session registry, launch history and the shared staff classifier, with no ssh or usage read. `mods/unit-board/hooks/accounts.tsx` shows the requested order; the count cell joins counts with `, ` in role order, blank for spare. `scripts/herdr/pane_launch.py` validates each history entry and skips only a damaged one. An unchanged board tick refreshes counts; a failed refresh keeps its retry. `in use` stays: it marks paid-credit use. Also fixed two tests the 101l gate turned red. Three repair rounds; style review PASS.
 
-#### Work Order
+### Phase 101n — Every Claude account trusts ~/worktrees  · status: done · fe60721b
 
-- **Count.** The stored-status JSON from `accounts.py` gives each account a live session count per role, in the same order as its roles. Units, showrunners and workers count their live members on that account; `spare` has no count. The count comes from the same live-session source that `--detail` uses, read without ssh.
-- **Board.** `mods/unit-board/hooks/accounts.tsx` shows the columns in this order: account, left, role, count, resets, credits, enabled, in use, read. The count cell joins the role counts with `, ` in role order (`units, showrunners` → `3, 2`). The narrow layout keeps the same order.
-- Tests: JSON counts for one role, two roles on one account and a spare account; board column order and the joined count cell. Tests never read live homes, sessions or state.
+User 2026-11-01 (via the natedev showrunner and sdlc): trust `~/worktrees` once, so a new folder under it starts with no trust prompt. Claude Code carries trust from a parent folder to every folder below it, also after a move (herdr-unit test).
 
-**Files:** `scripts/accounts/accounts.py`, its tests, `mods/unit-board/hooks/accounts.tsx`, `mods/unit-board/types/accounts.d.ts`, `mods/unit-board/tests/accounts.test.ts`, `docs/accounts.md`.
+**As-built:** `config/accounts.toml` `[trust] folders` lists `~/worktrees`. `accounts.py trust` sets `hasTrustDialogAccepted` for each folder in every Claude account file on the machine, touches no other key and prints one line per account; a rerun changes nothing. It follows Claude Code 2.1.296's `.claude.json.lock` protocol (waits for a held lock, 10 s stale rule; both timings in `[claude_config_lock]`, checked with the folders before any lock or write, fix c73d7e90), prepares and fsyncs outside the lock, and under the lock only compares bytes and mode and replaces (hold well under Claude's 1.5 s boot retry). A new account's seed carries the folders through the same helper. `scripts/lib/atomic_file.py` keeps late mode selection for its other callers. Residual, stated in `docs/accounts.md`: a Claude save that skips its own lock can lose any writer's change; rerun `trust`. Three repair rounds; style review PASS. Live apply and proof follow the user's confirmation.
+
+### Phase 101o — The accounts board shows busy, shell and idle counts and a total  · status: done · a4562e76
+
+User 2026-11-01: the role count of 68 workers counted idle workers too; asked for busy, shell, idle and total columns, a total row, and no `in use` column.
+
+**As-built:** each `role_counts` entry in `accounts.py` stored-status JSON is `{busy, shell, idle, total}`. A Claude session takes the `status` field of its session record through the shared reader in `scripts/message/sessions.py` (also used by `promote_showrunner.py`); a missing or other value counts as idle. A Codex worker is busy while its roster status is `running` or `starting`, else idle, with a null `shell`. `mods/unit-board/hooks/accounts.tsx` shows account, left, role, busy, shell, idle, total, resets, credits, enabled, read, and a last `total` row in the wide and narrow layouts; the JSON keeps `credits_in_use` for cargo-handler. One review round; two minors closed by the director (doc line, Assertion-Change lines); style review PASS.
+
+### Phase 101p — Each started-hold text in `next list` has a test  · status: done · 784b2637
+
+natedev showrunner 2026-11-01 (C35, cef58b5c): prove each started-hold form that `next list` prints.
+
+**As-built:** `test_started_fixed_expired_and_no_pace_holds_list_exact_rows_without_state_changes` runs the real `next list` path on scratch state for a fixed hold with time left, a fixed hold that is over, and the 40-minute default with no pace history. Each case asserts the full line and unchanged hold state. The half-point line with a pace stays in `test_started_hold_row_is_shared_by_list_add_hold_reply_and_the_mac`. Tests only.

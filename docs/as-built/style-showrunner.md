@@ -331,9 +331,17 @@ Schema 25 also adds `held_findings.built_at`. For old built findings it uses the
 
 ### Declaration follow, renames, trait identity, outside-rename proof
 
+The names enclosing-local-binding policy uses one fail-closed presence check in `approved_renames`. It reads the target's complete containing item, signature and const/static initializer included, plus enclosing impl/trait generic headers, using `SourceSites` token boundaries. Every identifier occurrence of the normalized wanted name counts, including raw identifiers, paths, fields, labels and shorthand; comments and literals do not. The existing pattern reader supplies a confirmed `OuterBindingBlocked` diagnostic with the blocking binding and site when its scope is proved to enclose the target. Other occurrences return terminal `OuterBindingUnproved` with reason and site. An unread target, unread token stream or uncertain item boundary also returns that terminal outcome. Unknown attributes on the item or its enclosing items and unresolved bang macros anywhere in the region refuse; the inert attribute and standard macro lists live in `scripts/style/rename_policy.toml`, read at use. Absence proves only this local policy: analyzer definition, reference-preservation and collision checks remain required.
+
+The gate, bulk rename, `ticket merge`, `held built` and `held built --commit --by` all refuse both outcome kinds; a person's reading cannot override them. A skipped rename remains filed and its claim is released for refill. Schema 33 stores structured blockers in `rename_outer_binding_blocks`; schema 34 copies those records into the idempotently created `rename_dispositions` table with the outcome kind and full reason for unproved dispositions. Syntax location and generic token-edit proofs stay separate from local-rename admission; names build entry points compose the two, so other proof paths retain their existing results. Both outcomes survive reopening, finding JSON and later ticket instructions, so a person can choose another name or decline. Recording the same disposition again leaves the ledger unchanged. One brace-ancestry walk checks inner attributes of the file and every enclosing scope, including modules, impls, traits, extern blocks, function bodies and nested blocks; sibling scopes do not contribute attributes. Admission at a built boundary always reads the current item. Admission locates the declaration at its recorded coordinate in the original item, requires a unique enclosing item path in the current source, and maps that declaration through the shared token-edit alignment; another item's identical line cannot supply the target. When the rename is already applied, the shared binding reader undoes only its precisely aligned binding, read and format-capture edits for admission; later bindings and attributes remain visible. Unread or ambiguous own edits return terminal `OuterBindingUnproved`; a historical anchor never substitutes old enclosing bytes. Independent items do not contribute identifier presence, while any occurrence in the same item does, including another branch or a completed sibling block. An unblocked applied rename still builds normally.
+Local build admission takes identity exclusively from `Ledger.finding_anchor`, including its proved follow and legacy rules. A saved build base supplies edit-comparison bytes, never target identity. Missing or ambiguous source authority is terminal `OuterBindingUnproved`; unknown target kinds follow the local policy. A nonlocal field exemption requires a direct field position in a struct, union or enum variant; bindings inside field types and initializers remain local, including nested const blocks and closures. An item exemption requires an item declaration proved by the shared item reader at an item or block statement position; a preceding keyword alone never exempts a generic or other parameter. The item reader reports header proof separately from body readability: a proved item name keeps its exemption when its body is unread, while an unread header grants none and an unread body cannot prove a local site inside it. The admission classifier accepts raw identifier pairs independently of the narrower applied-check parser. `AdmittedLocalRename` carries the finding/version, pair, authoritative source, unique item path, declaration position, current path/source hash and complete proved token mapping. Ledger built boundaries keep this capability beside the applied/person result; gate and direct bulk obtain it from the same admission function. Each snapshot is admitted again, so a capability cannot authorize changed source. Companion edits must have independent applied proofs. A changed signature may retain a precisely aligned body. Local admission refuses an unread body before checking blockers. Admission checks blockers in the complete current item after reversing only the rename's edits. A removed historical parameter cannot block the current rename. An added current parameter remains visible and blocks the rename. Body token ranges exist only on `ReadItemBody`: local mapping, fallback alignment, field lookup and admission cannot use an unread body, even when its header is proved. Unexplained body edits, missing or duplicate item identity, and unproved cross-file/item moves refuse. A fresh machine judgment supplies new authority rather than continuity. Bulk findings carry their authority through execution, and released refusals persist typed dispositions through admission even without a saved build base.
+The applied-edit query retains its saved-base precondition (`NoAppliedCheck` without a saved build-ticket base). Every built entry point additionally requires local-binding admission, including when a person supplies the applied reading without a saved base. Local-binding admission remains terminal even when the stored site text is stale: a coordinate probe identifies the target but cannot prove stale bytes applied. A blocked or unproved local rename remains filed through gate, checkpoint/merge and either person-marked build path. Item and field renames, and reference companions that name no local target in their source or recorded site, retain their separate proof path.
+
 The declaration step (`Ledger.declaration_reading(ids, approved)`, `follow_declarations(ids, at, approved)`) reads each unfiled or filed `.rs` finding at its proved `finding_anchor` (last follow commit/path/line, else the recorded source anchor) when that commit is in the synced tip. Schema 32 adds `held_findings.anchor_commit` and `followed_from_commit`; a new finding records its judging ticket's base, the source revision known at hold time, independently of later checkpoints. A new judging ticket refreshes that anchor and clears prior follow coordinates. Every follow saves the preceding endpoint commit beside its old path and line, so built-rename trait evidence never combines revisions after repeated follows. Legacy rows retain an empty anchor: identical candidate file blobs establish the same coordinate without a text match; otherwise checkpoint and base are candidates only when their line at the stored coordinate matches the finding text. One matching candidate proves the anchor. Two distinct matching commits prove it only when the shared `finding_sites.unchanged_lines` mapping leaves that base coordinate unchanged at the checkpoint; the base is then the anchor. Ambiguous or missing evidence requires judgment. Follows retain the original judgment's ancestry and removal barrier. Anchor results share the existing row-version invalidation, and legacy source candidates are read in the site batch. Identical-file carry retains its established eligibility. A finding without a recorded judging ticket returns `FilingEligibleWithoutHistory(path, line)`: filing and refill may retain it, but that value asserts no historical anchor and cannot authorize bulk execution or a source follow. `judged_commit` and `_judged_from` retain judging-ticket completion semantics for merge evidence, not coordinate reads. `declarations.read_declarations(text) -> DeclaredFile`; `Declaration(keyword, name, owner: ModuleItem | ImplOrTraitItem(name))`; inline module names are not part of identity.
 
-`UnchangedSite(path, line, anchor)` carries both the current coordinate and the old `FindingAnchor(commit, path, line)` that proved it. Bulk execution consumes that evidence directly: historical physical bytes come from the old end and current physical bytes from the planner's checkout. It does not search the whole historical file for unique text or infer another judged commit. A refusal includes the ledger's reason; `FilingEligibleWithoutHistory` refuses bulk execution with `no judging ticket for source anchor`. Changed declaration bytes, removed sites and unproved owners remain refusals.
+`UnchangedSite(path, line, anchor)` carries both the current coordinate and the old `FindingAnchor(commit, path, line)` that proved it. Bulk execution consumes that evidence directly: historical physical bytes come from the old end and current physical bytes from the planner's checkout. It does not search the whole historical file for unique text or infer another judged commit. A refusal includes the ledger's reason; `FilingEligibleWithoutHistory` refuses bulk execution with `no judging ticket for source anchor`. Removed sites and unproved history remain refusals. A changed owner or declaration may instead receive a **new** `FreshMachineJudgment` at the current plan tip; it never turns the old judgment into `UnchangedSite`. `Ledger.rename_judgment_site` retains the original ancestry, removal, generation, reach and pinned-rule checks and uses the existing diff mapper only to propose a coordinate. `approved_renames.machine_rename_rule` recognizes only the complete pinned `TYPE_NAMED_PARAMETER_RULE` contract (metadata and body), and `type_named_parameter` checks that contract against the current declaration. Sharing the filename is insufficient: extra conditions, unreadable conditions and the existing prose rule with “when it reads naturally” have no machine contract and still need judgment. The recognized contract covers only direct named-type function parameters; inferred/compound types, fields, role names and other rules still need judgment. The shared `bulk_rename.rename_file` must then prove references, capture, documentation, visibility and every module instance. Selection and fresh judgment use the same decision approval check; declines and withdrawals never receive fresh authority. Current bytes must equal the fresh tip's bytes, and the ordinary physical byte gate remains in force.
+
+A crate plan saves its fresh judgments (tip anchor, pinned rule blob, finding/source-history identity and physical input hashes) in `machine_judgments` before writing source. Resume checks these frozen inputs and reuses their authority; it never updates a fingerprint or manufactures a replacement judgment. An empty frozen set is also final. The ordinary rename proof still checks each combined edit plan, including interactions with other findings. A changed tip, rule, finding or physical input refuses the frozen judgment. This evidence is run-local; filing/refill site continuity and historical ledger judgments are unchanged.
 
 Outcomes (`DeclarationOutcome`): `DeclarationNotRead`, `DeclarationInPlace`, `DeclarationMoved`, `DeclarationRemoved`, `DeclarationRenamed` (filed approved own rename → built), `RenameAwaitingApproval`, `KeptForOpenBuild`, and the left set `DeclarationLeft = DeclaredInSeveralFiles | DeclaredInAnotherCrate | DeclarationGoneFromFile | TraitIdentityUncertain | OutsideRenameUnresolved | StatementNotFollowed`. `style_plan`'s match over `DeclarationLeft` is exhaustive through `assert_never`.
 
@@ -352,6 +360,11 @@ All follow writes run in one `BEGIN IMMEDIATE` transaction. The write refuses wh
 ### Held-verdict refusal
 
 `record --verdict held` needs a live (`unfiled` or `filed`) finding at the cell (`_cell_findings` maps sites through `_finding_cell`, so a manifest rule maps to its crate). For a cell whose only findings are waived, record `waived`. Structure tickets list waived findings under `Waived by the user: do not hold these again. Record waived for a cell whose only findings are these.` A `waived` verdict expires with its inputs. `unwaive_held` and `replace_held` turn a newest `waived` verdict back into `held` without going through `record` (`_restore_held_findings`).
+
+`record --verdict clean` refuses when a live finding contradicts the same cell input and rule text. The refusal names each finding id. The guard uses the holding judgment's input evidence and `_judgment_inputs_match`. A recorded follow does not replace that evidence. Without a holding judgment, the guard compares the proved anchor's input through `_fingerprint`. It uses `judged_text_unchanged` for the rule comparison. The first clean judgment therefore needs no earlier judgment to trigger refusal. A clean judgment on changed file or rule inputs keeps the existing withdrawal and settlement behavior. Both verdicts use the existing cell mapping. A waived, built or withdrawn finding does not make a cell held.
+
+`correct-clean-to-held --repo <checkout> --ticket <merged-ticket> --rule <rule> --path <cell>` corrects the latest recorded cell of that ticket. The ticket must be merged, the cell must be clean, and the ledger must show live findings at the synced tip. The correction changes only the verdict to `held`. It preserves the judgment's input evidence, generation and timestamp, so it cannot restore stale coverage. Schema 35 stores one `held_cell_corrections` event per corrected judgment. The event records the ticket, cell, old outcome, new outcome, proving finding ids and correction time. A repeat correction exits successfully and writes nothing. The `--dry-run` form reads the database through a read-only connection. It applies normal schema migrations to an in-memory copy, then disables writes to that copy. It prints the change without changing the database. Preview accepts schemas 32 through the current schema. Ordinary `record` still refuses a merged ticket with `cannot judge from merged`.
+
 
 ## Invariants
 
@@ -505,3 +518,67 @@ paths, covering later references and unplanned edits. A legacy overlap waits
 for repair; its successor can be dropped to recover.
 The ledger's independent guard conservatively counts every module-name mention
 and possible path-attribute owner, with refill's shared build-input protection.
+
+
+### Reservation waits in identified crate runs
+
+`bulk_rename.check_available` remains the cargo-berth authority: only another
+worktree's matching `Reservation.blocks` claim blocks editing. A clear read
+claim permits work. A blocking claim raises `ReservationBlocked(path, holders)`;
+planning retains it as `PendingFinding`, separately from terminal `Refusal`.
+Each holder carries the worktree, branch and reservation id supplied by berth.
+Private checkouts always check the canonical repository's board.
+
+An identified serial crate run records pending findings in its manifest, keeps
+its existing ticket claims and enters `waiting for reservations`. Independent
+findings finish planning, then availability is retried once with a fresh answer.
+If any remain blocked, this invocation returns nonzero without source edits,
+tests or an incomplete checkpoint. The complete crate remains one atomic proof
+and publication group; it is not split into another ticket. There is no sleep,
+polling loop or new wait limit. Resume the same `--run` and `--crate` after a
+release: ownership and frozen finding inputs are rechecked, availability is read
+again, and admitted findings pass the normal site, semantic and execution checks.
+Only findings not previously admitted may receive their first fresh machine
+judgment; existing frozen proofs are validated and never silently replaced.
+A writer appearing at the execution boundary rolls back journaled private edits
+and keeps the batch pending. A completed run executes no second edit on resume.
+
+Only terminal refusals enter the refusal publication/release path, including
+terminal failures discovered after a reservation releases. Their durable manifest
+record precedes release; pending siblings keep their claims across interruption.
+The anonymous `bulk_run --rule` workspace entry point has no resume manifest.
+It refuses and releases a blocked file's findings, naming the path and berth
+holders in the refusal. Independent ready groups still run; every ticket that
+contributes edits receives the tested checkpoint and joins the complete workspace
+proof group. Release returns a held finding to selection: a later invocation can
+pick it after the reservation clears and the earlier tickets merge. A writer
+arriving during execution fails the atomic batch, rolling back edits and releasing
+its findings; it cannot leave a partial ticket. Identified crate runs alone keep
+reservation-blocked findings pending for automatic manifest resume.
+A terminal error in any member of an atomic group takes precedence over a
+reservation wait: each finding is refused once and never also persisted as pending.
+
+
+### Read-only crate admission report
+
+`bulk_run.py --repo R --crate PACKAGE [--crate PACKAGE...] --rule RULE --base-tree TREE --dry-run`
+reports through `crate_run.admission_plan`, the same boundary used before real
+crate execution. It requires the exact clean current base and reads an existing,
+current-schema ledger through SQLite `mode=ro`; it creates no run, ticket, manifest,
+checkout, result or publication. Reservations use the canonical cargo-berth board.
+Selection and cross-crate proposal exclusions, source ownership, site anchors,
+fresh-judgment eligibility, supported rename syntax and dependent edit group
+availability use the production owners. Values planning uses the shared frozen Cargo
+manifest/source inventory directly, without exporting sources or creating temporary
+directories; the constant proof remains in memory. Each finding reports `admitted`, `pending`
+(with path and berth holders), `refused` (with reason), or `not checked` (with why).
+
+The default report does not start rust-analyzer: that service enables build scripts
+and procedural macros and can write build artifacts. Findings requiring its semantic
+or fresh-machine-judgment proof are explicitly selection-only for that proof, never
+reported admitted. An injected read-only analyzer can complete the shared planner's
+semantic proof without applying its overlay edits. An admitted result proves planning
+admission only. Formatting, compiler validation, tests and final-tree publication
+require writes and remain explicitly not checked; the report forecasts no test pass
+or final applied count. The report is a point-in-time observation, not a frozen run
+or a reservation guarantee. A later real run rechecks every boundary.

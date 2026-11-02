@@ -11,13 +11,16 @@ import subprocess
 import sys
 import time
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from io import BytesIO
 from pathlib import Path
 from typing import TYPE_CHECKING, BinaryIO, TypeVar, cast
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 if __package__:
+    from . import change_page
     from .review_link import private_name
 else:
+    import change_page  # pyright: ignore[reportImplicitRelativeImport]
     from review_link import private_name  # pyright: ignore[reportImplicitRelativeImport]
 
 if TYPE_CHECKING:
@@ -89,6 +92,28 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
     def send_head(self) -> BinaryIO | None:
         root = cast(ReviewLinksServer, self.server).root
         try:
+            page = change_page.page_at(root, self.path)
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError) as error:
+            print(f"review-links page: {error}", file=sys.stderr)
+            self.html_response(503, change_page.document("<p>This review page is not available.</p>"))
+            return None
+        else:
+            try:
+                content = change_page.render(page, cast(ReviewLinksServer, self.server).delivery_status)
+            except (OSError, ValueError, change_page.change_review.ChangeReviewError, change_page.Refusal) as error:
+                print(f"review-links render: {error}", file=sys.stderr)
+                self.html_response(503, change_page.document("<p>This review page is not available.</p>"))
+                return None
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(content)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            return BytesIO(content)
+        try:
             decoded = unquote(urlsplit(self.path).path)
             if ".." in decoded.split("/"):
                 raise FileNotFoundError("parent traversal")
@@ -101,7 +126,7 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
                 raise FileNotFoundError("private publisher file")
             stream = file.open("rb")
         except (OSError, ValueError, RuntimeError):
-            self.send_error(404, "File not found")
+            self.html_response(404, change_page.document("<p>This review page is not available.</p>"))
             return None
         try:
             stat = os.fstat(stream.fileno())
@@ -115,6 +140,81 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             stream.close()
             raise
         return stream
+
+    def html_response(self, status: int, content: bytes) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(content)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        _ = self.wfile.write(content)
+
+    def failed_answer(self, page: change_page.ReviewPage, body: str, status: int, reason: str,
+                      error: Exception) -> None:
+        print(f"review-links answer: {error}", file=sys.stderr)
+        server = cast(ReviewLinksServer, self.server)
+        try:
+            content = change_page.render(page, server.delivery_status, change_page.answer_notice(page, body, reason))
+        except (OSError, ValueError, change_page.change_review.ChangeReviewError, change_page.Refusal) as render_error:
+            print(f"review-links error page: {render_error}", file=sys.stderr)
+            content = change_page.fallback_answer(page, change_page.answer_notice(page, body, reason))
+        self.html_response(status, content)
+
+    def redirect(self, location: str) -> None:
+        self.send_response(303)
+        self.send_header("Location", location)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+        self.wfile.flush()
+
+    def do_POST(self) -> None:
+        server = cast(ReviewLinksServer, self.server)
+        try:
+            if server.bound_address != tailscale_ip():
+                self.html_response(403, change_page.document("<p>Open this page through this machine's Tailscale address.</p>"))
+                return
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            print(f"review-links address: {error}", file=sys.stderr)
+            self.html_response(403, change_page.document("<p>The Tailscale address is not available.</p>"))
+            return
+        if urlsplit(self.path).query or self.headers.get_content_type() != "application/x-www-form-urlencoded":
+            self.html_response(400, change_page.document("<p>Use the answer form on the review page.</p>"))
+            return
+        try:
+            page = change_page.page_at(server.root, self.path)
+        except (OSError, ValueError) as error:
+            print(f"review-links page: {error}", file=sys.stderr)
+            self.html_response(404, change_page.document("<p>This review page is not available.</p>"))
+            return
+        body = ""
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if length <= 0:
+                raise ValueError("Empty answer")
+            body = self.rfile.read(length).decode("utf-8")
+            if parse_qs(body).get("outcome") == ["next"]:
+                location = change_page.publish_next(page, body)
+                self.redirect(location)
+                return
+            delivery = change_page.submit(page, body, server.delivery_status)
+        except (ValueError, change_page.change_review.ChangeReviewError) as error:
+            self.failed_answer(page, body, 400, "Check the answer and submit it again.", error)
+            return
+        except change_page.FeatureLogFailed as error:
+            self.failed_answer(page, body, 503, "The feature log could not be updated.", error)
+            return
+        except (OSError, RuntimeError, subprocess.SubprocessError, change_page.Refusal) as error:
+            self.failed_answer(page, body, 503, "The answer could not be saved. Try again.", error)
+            return
+        try:
+            self.redirect(urlsplit(self.path).path)
+        finally:
+            # The request thread sends messages after it flushes the response.
+            try:
+                change_page.deliver(delivery, server.delivery_status)
+            except OSError as error:
+                print(f"review-links delivery status: {error}", file=sys.stderr)
 
     @override
     def guess_type(self, path: str | os.PathLike[str]) -> str:
@@ -130,6 +230,7 @@ class ReviewLinksServer(ThreadingHTTPServer):
     def __init__(self, address: tuple[str, int], root: Path) -> None:
         self.root: Path = root.resolve()
         self.bound_address: str = address[0]
+        self.delivery_status: change_page.DeliveryStatus = change_page.DeliveryStatus(self.root)
         self.next_tailscale_check: float = time.monotonic() + TAILSCALE_CHECK_SECONDS
         self.next_sweep: float = time.monotonic() + SWEEP_SECONDS
         _ = sweep_snapshots(self.root, time.time())

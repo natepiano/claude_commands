@@ -98,8 +98,7 @@ class AgentNotesTests(unittest.TestCase):
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
         self.job_config = self.root / "agent_notes.toml"
-        _ = self.job_config.write_text(
-            (Path(__file__).resolve().parents[2] / "config/agent_notes.toml").read_text())
+        _ = self.job_config.write_text("[mac_usage]\ninterval_seconds = 60\n")
         home_context = cast(object, self.enterContext(patch.dict(os.environ, {
             "HOME": str(self.root), "AGENT_NOTES_DIR": str(self.root),
             "XDG_STATE_HOME": str(self.root / "state"), "AGENT_NOTES_JOB_CONFIG": str(self.job_config),

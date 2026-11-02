@@ -68,6 +68,161 @@ The lock file stays on disk. Closing it releases the lock, also on an error. If 
 - Code blocks and the `<pre>` fallback scroll sideways without wrapping. Tables are centered and use as much of the window width as their content needs; wider tables scroll inside the page. Cells wrap at spaces, never inside a word or number. Images fit the width.
 - A custom `marked` renderer escapes raw HTML. A `<details>` or `<script>` block shows as text and does not run.
 
+### Answering a change review
+
+`change_page.py` publishes one page for one or more change-review rows.
+The record's `Kind` column is the only source for each change's kind.
+Use these commands:
+
+```sh
+python3 scripts/production/change_review.py set-kind --production DOC --list LIST --row C27 --kind 'See in action'
+python3 scripts/production/change_review.py set-kind --production DOC --list LIST --row C28 --kind 'Read only'
+python3 scripts/review_links/change_page.py --production DOC --list LIST C27 C28
+```
+
+Omit `--list` to use the production's configured list.
+Pass only `C27` to publish one change.
+A change that alters something the user runs or sees has the kind **See in action**.
+Other changes have the kind **Read only**.
+The publisher refuses rows without a valid kind, a change description, or proof in the How to check cell.
+It shows both kinds.
+
+The short URL ends in `/changes.html`.
+The page uses the trial page's plain, narrow layout.
+Each section shows its kind, change description once, instructions or proof, and answer controls.
+The user can select Works, Not works, Validate yourself, or Send feedback.
+The feedback field accepts one line, which matches the verdict command's table-cell format.
+Works with text saves `works: <text>`.
+Not works with text saves `not works: <text>`.
+Send feedback saves the user's text without a prefix.
+The existing `change_review.lands` function decides whether the verdict lands or returns the row.
+
+**Validate yourself** sends the showrunner the row ID and **the user asks you to validate this**.
+The message includes any feedback from the form.
+This answer writes no verdict and runs no feature-log command.
+The row stays pending.
+The page calls `next_item.move_to_end` with the row key to move that row to the queue's end.
+The CLI keeps its current form and still moves the pinned item.
+An unknown key raises `NextError` before the queue changes.
+Rows from an earlier list use their qualified keys.
+
+A successful submission redirects to the same page.
+After a verdict saves, the page shows `Saved: <answer>`.
+After a delivery failure, the page shows a **Send saved answer again** button.
+The button retries message delivery through the same POST path.
+The server reads the saved verdict from the record and refuses replacement text during a retry.
+Every GET reads the pending and Reviewed tables, with `Cache-Control: no-store`.
+No JavaScript is necessary.
+
+The publisher stores a private `.review-link-changes.json` beside a placeholder HTML file.
+The manifest contains local list and production paths, selected row IDs, and a random form token.
+It contains no answer or copied change content.
+The server never serves the manifest.
+The selected IDs form an immutable allowlist; each publication creates a new page.
+Each form must contain one row, token, outcome, and feedback field.
+The server returns 4xx for unknown rows, extra fields, wrong tokens, POST queries, invalid outcomes, and multiline feedback.
+This includes path fields, command fields, and non-ASCII tokens.
+The request cannot select a local file, command, or recipient.
+
+The server accepts writes only when its bound address equals the current `tailscale ip -4` address.
+A different bind or a failed address lookup refuses the write.
+The server resolves each row's Production slug across the root production's complete hierarchy.
+A child page can therefore answer sibling rows on the shared root list.
+An unknown production is refused before the verdict saves.
+
+The server follows `CloseChangeReview` in `commands/showrunner/produce.md` before it saves a new verdict.
+It selects projects through `ProjectSpec.closes_by_change_review` in `scripts/feature_log/feature_log.py`.
+The existing `feature_log.py project-of` command identifies the owning production's repository from its origin.
+There is no second project policy list.
+Projects outside that policy skip the feature-log operation.
+A row with no proposal also skips the operation and saves the user's answer.
+The server passes `--if-proposed` to `add`, `supersede`, and `drop`.
+The writer checks proposal absence under its existing lock on the host that owns the feature log.
+On the Mac, the existing CLI forwards the operation and flag to natedev through SSH.
+An absent proposal prints `skipped: no proposal for <row>` and exits 0.
+Malformed proposals, incompatible states, and SSH failures remain errors.
+The server makes no separate proposal lookup.
+A Hana list uses a bare review ID, such as `C27`.
+Other lists use their filename's showrunner name, such as `natedev/C27`.
+A landing answer runs `feature_log.py add --review`.
+If the writer reports that the proposal requires `supersede`, the server runs that operation instead.
+A returning answer runs `feature_log.py drop --review` with the saved verdict.
+An operation failure keeps the row open and sends the showrunner the row ID and failure.
+The server does not repeat the feature-log operation for a saved answer.
+
+The server then runs `change_review.py verdict` with arguments from the private manifest.
+It passes the user's words with `--verdict=<text>`, so text that starts with a dash remains valid.
+That command remains the only answer writer.
+It retains its lock, conflict checks, scratch cleanup, and list commit behavior.
+Classified rows retain Kind, How to check, and Production in Reviewed.
+Older rows without Kind retain their existing Reviewed table behavior.
+An identical answer can retry delivery; a different saved answer is refused.
+
+The server returns 303 as soon as `change_review.py verdict` writes the answer.
+The feature-log operation still runs before the verdict.
+The request thread flushes the response before it runs the existing `scripts/message/send.py` sender.
+The server starts no detached shell for message delivery.
+The list's `showrunner:` frontmatter names the showrunner recipient.
+The saved verdict alone selects the recipients for the first send and each retry.
+An exact `works` verdict goes only to the showrunner, including text from Send feedback.
+Every other verdict also goes to the owning unit through the existing checkpoint route.
+The route reads the merge's checkpoints, or the named commit itself when the hash names a checkpoint.
+It matches the checkpoint's branch, plan, unit, or worktree name against the owning production's Units table.
+An exact change trailer selects among checkpoints.
+A single unit also covers a reworded row.
+An ambiguous merge is refused before the save.
+A change outside a unit goes to the production's configured Showrunner session.
+The owning production's Showrunner checkout locates the commit.
+No agent polls for answers.
+A save shows **Saved: &lt;answer&gt;** from the review record.
+`DeliveryStatus` owns one private delivery record per review list and row under the configured review root.
+The record has separate validation and verdict slots, each with its latest attempt ID and state.
+Only the validation slot stores feedback.
+Before the verdict write, the server stores a pending intent in the verdict slot with a new attempt ID.
+If this write fails, the server refuses the verdict write.
+The record contains no saved verdict, recipient, or error text.
+Validate yourself stores its feedback in the validation slot because the review record has no validation answer.
+A GET selects the verdict slot when the review record has a saved verdict.
+Otherwise, it selects the validation slot and keeps the answer form available.
+A failed verdict write preserves the validation slot, its feedback, and its resend control.
+A stop after the verdict write leaves the verdict slot available for a retry.
+A pending message shows **The message may not have sent** and a resend control.
+A failed saved-answer message shows **Saved, but the message did not send** and **Send saved answer again**.
+A failed validation message shows **The validation message did not send** and **Send validation request again**.
+The validation control retains the feedback from the intent.
+Each retry reads saved verdicts from the review record.
+A retry creates a new attempt ID.
+One stable `fcntl.flock` protects intent creation, conditional success deletion, and conditional failure updates.
+Message sends run outside the lock.
+An older attempt cannot clear or change a newer attempt's record.
+A successful current attempt removes only its slot and preserves the other slot.
+The server deletes the record only when both slots are empty.
+After successful verdict delivery, retained validation feedback does not restore the resend control.
+Existing single-intent records, `failed\n` records, and validation feedback records remain retryable.
+
+A failed POST keeps its 4xx or 503 status and uses the change page's layout and style.
+A known page shows **Not saved: &lt;reason&gt;** above the row and keeps its feedback and selected outcome.
+The reason uses short words; server stderr keeps the full error.
+The showrunner's feature-log failure message also keeps the full error.
+If the main page cannot render, a separate form retains the typed feedback and selected outcome.
+This form reads only the page manifest and notice, without row or queue reads.
+An unknown page, invalid content type, or refused bind shows one short sentence in the same style.
+
+After a save or a row move, each render reads `next_item.change_queue(production)` for the remaining count.
+Validate yourself keeps the row in that count.
+The page reads moved rows from the existing urgency state and stores no second queue.
+The Next form publishes the queue head through the existing change-page publisher and returns 303 to that page.
+It uses the same urgency order, pin, and moved rows as `/next change`.
+One stable lock in `urgency.py` protects pin, selection, and move operations across all queues.
+Each operation opens the lock separately and retains atomic file replacement.
+A GET never publishes or advances a page.
+An empty queue shows **0 changes left** without a Next control.
+A retry can repeat a delivered message; the existing sender's repeat rules apply.
+The review record remains the only verdict store.
+
+Restart the existing review-links service after deployment.
+No NixOS or service configuration change is necessary.
+
 ### Server
 
 `serve.py [--port PORT]`. The default port is 8765. `--port` is for tests.
@@ -75,7 +230,7 @@ The lock file stays on disk. Closing it releases the lock, also on an error. If 
 - At start, the server runs `tailscale ip -4` (10 s timeout) and parses the output as IPv4. It creates the root if it is missing and runs the sweep. Then it binds a `ThreadingHTTPServer` to that address and port, and prints `review-links: serving <root> on <address>:<port>`. A failure at start, for example no address or a failed bind, prints one `review-links: <error>` line to stderr, and the server exits 1.
 - Every 60 s (monotonic clock), the server runs `tailscale ip -4` again. A failed lookup prints `tailscale address gone (was <address>)`. A different address prints `tailscale address changed (was <old>, now <new>)`. In both cases the server exits 1, and the service manager starts it again on the current address. If Tailscale stops but still reports the same address, the server keeps running, because its socket stays bound to that address.
 - The server percent-decodes the path and drops the query. A path with a `..` segment gets 404. The server resolves the path under the root and follows symlinks. The result must be a regular file under the root. A folder (the root `/` included), a target outside the root, the resolved `<root>/.index.json` and a name that starts with `.review-link-` get 404. The server never lists a folder.
-- Every other regular file gets 200 with `Content-Type`, `Content-Length`, `Last-Modified` and `X-Content-Type-Options: nosniff`. The server never sends 304.
+- A published `changes.html` with a private manifest is rendered from the review record. Every other regular file gets 200 with `Content-Type`, `Content-Length`, `Last-Modified` and `X-Content-Type-Options: nosniff`. The server never sends 304.
 - Content types: `.html` and `.htm`, in any case, go out as `text/html; charset=utf-8`. A type that Python's `mimetypes` lists under `image/` keeps that type. All other files, `.md`, `.txt`, `.json` and `.pdf` included, go out as `text/plain; charset=utf-8`.
 - Each request writes the standard access line to stderr.
 
@@ -99,7 +254,7 @@ Both machines import `/etc/nixos/modules/common/review-links.nix`. It defines th
 
 ## Invariants
 
-- A printed link changes content only when the same file set is published again without `--new`. Nothing else writes into a snapshot folder, and the sweep deletes only whole folders.
+- Ordinary snapshot content changes only when the same file set is published again without `--new`. Change pages read their selected rows live from the change review record. Their publisher writes only a private manifest and placeholder into the snapshot folder; the sweep deletes whole folders.
 - A new ID never takes an existing folder. The exclusive `mkdir` refuses a taken ID.
 - Each output and the index change by one `os.replace` of a complete temporary file in the same folder. A reader gets the old bytes or the new bytes, never part of a file.
 - Every index read, ID pick, snapshot write, cleanup and index write happens under the one `flock` on `<root>/.index.lock`.
@@ -107,7 +262,7 @@ Both machines import `/etc/nixos/modules/common/review-links.nix`. It defines th
 - New snapshot folders hold only regular files. The flat-or-legacy test of the sweep depends on this.
 - Temporary files start with `.review-link-`, and the publisher refuses inputs with that prefix or with an index name. The 404 rule of the server and the skip rule of the sweep depend on these names.
 - The server binds only the IPv4 address from `tailscale ip -4`. `--port` changes only the port. The server exits 1 when that address is gone or changes, and it never serves on an old address.
-- The server serves only regular files under the resolved root and never lists a folder. It must not serve the index or an unfinished write; see the Mac case gap below.
+- The server serves regular files under the resolved root and the selected rows of published change pages, and never lists a folder. It never serves index files, page manifests or unfinished writes, including names in a different letter case.
 - One failed sweep entry never stops the bind, the server or the sweep of other entries. The sweep never follows a symlink.
 - Only the 7-day sweep deletes snapshots. A session end deletes nothing.
 - The skill gives a link only after `curl` on the same machine returns `200`, and only for the review-links service, never for a hand-run server.
@@ -116,7 +271,7 @@ Both machines import `/etc/nixos/modules/common/review-links.nix`. It defines th
 
 - **Test port.** The publisher always prints port 8765, so a test server on another `--port` is not at the printed link.
 - **Mac case-insensitive filesystem.** The publisher compares output names after `str.casefold`, which is full Unicode case folding. `Report.txt` and `report.txt` collide. `Straße.txt` and `STRASSE.txt` collide. `Review.md`, with its `Review.html`, collides with `review.HTML`. This stops one output from overwriting another on the Mac.
-- **Mac case gap in the server.** `send_head` in `serve.py` compares `.index.json` and the `.review-link-` prefix with exact case. On the case-insensitive Mac filesystem, a request for `/.INDEX.JSON` passes that check and gets the index, which lists resolved source paths. `.index.lock` is served on both machines, with 200 and an empty body.
+- **Private filenames.** `private_name` blocks index names and the `.review-link-` prefix using case folding, before and after resolving symlinks. This includes page manifests on both machines.
 - **Symlink aliases.** The key uses the resolved path and the published name. A symlink with a different name gets its own ID and its own copy, and the original link stays. A path through a symlinked folder to a file with the same name reuses the ID.
 - **The legacy `manual/` folder.** `manual` is six lowercase letters, so it matches the ID pattern. A new snapshot never holds a subfolder or a symlink. So a six-character folder that holds one is a legacy session, and the sweep checks its children one by one. A `manual/` that holds only a symlink keeps it. Empty legacy session folders stay.
 - **Links between Markdown files.** A `.md` output goes out as `text/plain`, so a link to `other.md` opens the raw text. Link to `other.html` for the rendered page.
@@ -135,7 +290,7 @@ Both machines import `/etc/nixos/modules/common/review-links.nix`. It defines th
 - **A short URL.** The URL must not wrap in a terminal. The target is 60 characters. The IPv4 address of each machine has 13 characters, so a 20-character file name gives 53 characters, and a test checks the limit. The full name `natedev.tail21e383.ts.net` gives 65 characters. Percent-encoding makes names longer: a space becomes `%20`, and each non-ASCII letter becomes 6 or more characters.
 - **Plain HTTP on the tailnet, no `tailscale serve`.** The server binds only the Tailscale address, so only tailnet devices can reach it. One user service per machine needs no change to the Tailscale configuration. HTTPS, `tailscale serve` and access from outside the tailnet are out of scope.
 - **`marked` in the browser.** natedev has no `pandoc` and no Python `markdown` module, so the publisher does not render Markdown itself. The escaped `<pre>` keeps the page readable with no network.
-- **Snapshots, not a live view.** The server serves one folder and nothing else, and a copy puts a file from anywhere on disk into that folder. A snapshot also stays after the session that made it ends, so the 7-day sweep is the only cleanup.
+- **Snapshots and change pages.** Ordinary files are copied into the served root and stay after their publishing session ends. Change pages instead show only the review rows authorized by their private manifests. Both expire through the 7-day sweep.
 - **Refresh in place.** A second run on the same file set updates the same link, so the user refreshes the page that is already open to see an edit. `--new` keeps the old content when a separate link is necessary.
 - **Exit 1 on an address change.** A socket stays bound to one address, and only a new process can bind a new address. Exit 1 makes the service manager start the server again on the current address.
 - **`StartLimitIntervalSec=0` and `RestartSec=10s`.** When Tailscale is down at login, the server exits 1 at once. A user unit cannot order itself after the system's `tailscaled.service`, so the restart every 10 s is the wait. The systemd defaults, a 100 ms restart delay and a limit of five starts in ten seconds, would stop the unit for good before the tailnet returns.

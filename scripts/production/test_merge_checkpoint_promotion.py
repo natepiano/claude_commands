@@ -21,7 +21,7 @@ from merge_checkpoint import promote, request_from
 # Importable once merge_checkpoint has put scripts/lib on the path.
 
 
-from scripts.production.merge_checkpoint_test_support import DELIVERS, MergeCheckpointFixture, PARALLEL, STARTED, TRIAL, configure_test_environment
+from scripts.production.merge_checkpoint_test_support import DELIVERS, MergeCheckpointFixture, PARALLEL, STARTED, STUB, TRIAL, configure_test_environment
 
 
 MERGED_AT = datetime(2026, 10, 6, 12, tzinfo=ZoneInfo("America/Los_Angeles"))
@@ -223,6 +223,45 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertIn(f"into: {self.checkout} (production)", result.process.stdout)
         self.assertIn(f"into: {self.promote} (main)", result.process.stdout)
         self.assertNotIn("into: " + str(self.root / "mac-installed"), result.process.stdout)
+    def test_mac_pull_retries_once_then_succeeds(self) -> None:
+        config = self.root / "merge_checkpoint.conf"
+        _ = config.write_text("MAC_PULL_TRIES=3\nMAC_PULL_RETRY_SECONDS=0\n")
+        self.env["MERGE_CHECKPOINT_CONFIG"] = str(config)
+        self.promotions = str(self.promote) + ", mac " + str(self.root / "mac-installed")
+        self.production_doc()
+        self.executable(self.bin / "ssh", STUB.replace('if name == "ssh":\n',
+            'if name == "ssh":\n'
+            + '    calls = [json.loads(line) for line in (state / "events.jsonl").read_text().splitlines()]\n'
+            + '    rc = "128" if sum(row["command"] == "ssh" for row in calls) == 1 else "0"\n'
+            + '    (state / "mac-rc").write_text(rc)\n'))
+        result = self.run_checkpoint(self.checkpoint())
+        self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
+        calls = self.events("ssh")
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0], calls[1])
+        self.assertIn(f"promote: ok — mac {self.root / 'mac-installed'} main pulled", result.process.stdout)
+
+    def test_mac_pull_stops_after_configured_tries_with_the_last_failure(self) -> None:
+        config = self.root / "merge_checkpoint.conf"
+        _ = config.write_text("MAC_PULL_TRIES=2\nMAC_PULL_RETRY_SECONDS=0\n")
+        self.env["MERGE_CHECKPOINT_CONFIG"] = str(config)
+        self.promotions = str(self.promote) + ", mac " + str(self.root / "mac-installed")
+        self.production_doc()
+        _ = (self.state / "mac-rc").write_text("128\n")
+        self.executable(self.bin / "ssh", STUB.replace('if name == "ssh":\n',
+            'if name == "ssh":\n'
+            + '    calls = [json.loads(line) for line in (state / "events.jsonl").read_text().splitlines()]\n'
+            + '    count = sum(row["command"] == "ssh" for row in calls)\n'
+            + '    print("fatal: diverged checkout, attempt " + str(count), file=sys.stderr)\n'))
+        result = self.run_checkpoint(self.checkpoint())
+        self.assertEqual(result.process.returncode, 1)
+        calls = self.events("ssh")
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0], calls[1])
+        self.assertIn("promote: failed", result.process.stdout)
+        self.assertIn("fatal: diverged checkout, attempt 2", result.process.stdout)
+        self.assertNotIn("fatal: diverged checkout, attempt 1", result.process.stdout)
+
     def test_record_failure_resumes_after_push_without_second_merge(self) -> None:
         sha = self.checkpoint()
         _ = (self.state / "fail-review_regime.py").touch()

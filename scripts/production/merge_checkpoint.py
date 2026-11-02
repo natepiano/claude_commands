@@ -19,6 +19,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import tomllib
 from collections.abc import Generator
 from contextlib import contextmanager, redirect_stdout
@@ -40,6 +41,7 @@ from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
 from scripts.lib.atomic_file import write_text_atomic  # noqa: E402
 import sessions  # noqa: E402
 from scripts.lib.process_failure import failure_detail  # noqa: E402
+from scripts.lib import tunables  # noqa: E402
 
 # /zone queues a change for the Mac while it is offline; a promotion's Mac pull sends it.
 ZONE_SCRIPT = Path(__file__).resolve().parents[1] / "lib/zone.py"
@@ -962,13 +964,26 @@ def remote_path(path: PurePosixPath) -> str:
 
 
 def pull_mac_checkout(mac: PurePosixPath, source: Path) -> None:
+    path = Path(os.environ.get("MERGE_CHECKPOINT_CONFIG", Path(__file__).resolve().parents[2] / "config/merge_checkpoint.conf"))
+    try:
+        configured_tries = tunables.number(path, "MAC_PULL_TRIES", minimum=1, maximum=float("inf"))
+        if not configured_tries.is_integer():
+            raise ValueError("MAC_PULL_TRIES must be a positive integer")
+        tries = int(configured_tries)
+        retry_seconds = tunables.number(path, "MAC_PULL_RETRY_SECONDS", minimum=0, maximum=float("inf"))
+    except ValueError as error:
+        raise Stop("promote", "failed", str(error), "repair the Mac pull configuration and rerun this checkpoint") from error
     remote = (f"cd {remote_path(mac)} && git pull --ff-only "
               f"natedev:{shlex.quote(str(source))} main; printf 'rc=%s\\n' \"$?\"")
-    result = subprocess.run(["ssh", "mac", remote], capture_output=True, text=True, check=False)
-    match = re.search(r"(?:^|\n)rc=(\d+)", result.stdout)
-    if result.returncode or match is None or int(match.group(1)):
-        raise Stop("promote", "failed", f"mac {mac}: {result.stdout.strip()} {result.stderr.strip()}",
-                   "the showrunner will repair the Mac pull and rerun this checkpoint")
+    for attempt in range(tries):
+        result = subprocess.run(["ssh", "mac", remote], capture_output=True, text=True, check=False)
+        match = re.search(r"(?:^|\n)rc=(\d+)", result.stdout)
+        if result.returncode == 0 and match is not None and int(match.group(1)) == 0:
+            return
+        if attempt + 1 == tries:
+            raise Stop("promote", "failed", f"mac {mac}: {result.stdout.strip()} {result.stderr.strip()}",
+                       "the showrunner will repair the Mac pull and rerun this checkpoint")
+        time.sleep(retry_seconds)
 
 
 def send_queued_zone() -> None:

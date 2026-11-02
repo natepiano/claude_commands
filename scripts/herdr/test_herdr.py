@@ -31,8 +31,9 @@ import trust_survey
 from fake_herdr import CommandResponse
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff
+from scripts.message import sessions
 from scripts.message.sessions_test_support import copy_session_modules
-from scripts.production.staff_test_support import isolated_staff_file, unit_membership
+from scripts.production.staff_test_support import StaffTestCase, fixture_runtime_id, isolated_staff_file, unit_membership
 
 GIT_BINARY = shutil.which("git") or "git"
 
@@ -50,6 +51,26 @@ def startup_shell(workspace_id: str) -> tuple[dict[str, object], dict[str, objec
     pane.update(workspace_id=workspace_id, pane_id=workspace_id + ":p1", tab_id=workspace_id + ":t1",
                 cwd=str(Path.home()), foreground_cwd=str(Path.home()))
     return workspace, pane
+
+
+class NativePaneSessionTests(StaffTestCase):
+    def test_native_pane_identity_uses_its_exact_claude_pid_registry_without_an_exported_id(self) -> None:
+        identity = fixture_runtime_id("herdr-native-Claude")
+        registry = Path(os.environ["NOTIFIER_SESSIONS_DIR"]) / f"{os.getpid()}.json"
+        observation: dict[str, object] = {"pid": os.getpid(), "sessionId": identity,
+            "procStart": sessions.process_start(os.getpid()), "name": "same-name",
+            "messagingSocketPath": str(self.root / "private.sock"), "updatedAt": 1}
+        self.write_json(registry, observation)
+        payload = {"result": {"process_info": {"foreground_processes": [
+            {"pid": os.getpid(), "argv": ["claude", "-n", "same-name"]}]}}}
+        result = subprocess.CompletedProcess[str]([], 0, json.dumps(payload), "")
+        with (patch.object(herdr, "run_program", return_value=result),
+              patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "", "CODEX_THREAD_ID": ""})):
+            self.assertEqual(herdr.Herdr("agents").native_session("w1:p1", "claude", 1), identity)
+            observation["procStart"] = "reused-process-id"
+            self.write_json(registry, observation)
+            with self.assertRaisesRegex(herdr.HerdrFailure, "native registry identity is unavailable"):
+                _ = herdr.Herdr("agents").native_session("w1:p1", "claude", 1)
 
 
 class StartupClock:
@@ -232,6 +253,7 @@ class PromptSubmissionTests(unittest.TestCase):
 
     def test_shared_tab_lost_enter_is_retried_once_without_typing_the_prompt_twice(self) -> None:
         self.submit_on_enter = 1
+        _ = self.enterContext(patch.object(self.client, "native_session", return_value=self.transcript.session_id))
         outcome = self.client.start_agent("moved-session", "destination:p1", "claude",
             ["--resume", "moved-session"], herdr.OpeningPrompt("resume the saved work", self.transcript), 30_000)
         self.assertIsInstance(outcome, herdr.PromptSubmitted)
@@ -3331,8 +3353,7 @@ class HerdrTests(unittest.TestCase):
                 self.assertEqual(self.commands().count(
                     ["--session", "fixture", "pane", "process-info", "--pane", pane]), 1)
                 self.assertEqual({row.pid: row.place for row in herdr.herdr_processes()}, expected)
-                self.assertEqual(next(row.marks for row in herdr.herdr_processes() if row.pid == 12),
-                                 {"STAFF_ID": "unit-id"})
+                self.assertEqual(next(row.marks for row in herdr.herdr_processes() if row.pid == 12), {})
 
     def test_missing_live_pane_never_returns_the_launch_environment_place(self) -> None:
         server = self.process(10, 1, ["herdr", "server"], {})
@@ -3595,7 +3616,7 @@ class HerdrTests(unittest.TestCase):
 
         def current_slug(slug: str) -> str:
             return slug
-        live = lookup.LiveClaude("Unit", "session-unit", "/fixture/socket", 12)
+        live = lookup.LiveClaude("Unit", unit.id, "/fixture/socket", 12)
         with (patch.object(herdr, "live_sessions", return_value=[{"name": "fixture"}]),
               patch.object(herdr.Herdr, "agents", return_value=[{
                   "agent": "codex", "pane_id": "pane-codex", "agent_status": "idle",
@@ -3617,7 +3638,7 @@ class HerdrTests(unittest.TestCase):
                 observed = read_callers()
             self.assertEqual(scans.call_count, 1)
         self.assertEqual(observed, expected)
-        self.assertIn("session-unit", cast(dict[str, object], observed[1]))
+        self.assertIn(unit.id, cast(dict[str, object], observed[1]))
         self.assertEqual(cast(roster.Roster, observed[2]).entries[0].account, roster.AccountLabel("codex2"))
 
     def test_process_reads_outside_scope_and_after_scope_exit_are_fresh(self) -> None:
@@ -4267,7 +4288,7 @@ class SavedLayoutTests(unittest.TestCase):
         # Hand resumes have no marks; a transferred process can retain the old production mark.
         processes = [
             herdr.HerdrProcess(1, herdr.HerdrPlace("fixture", client.tabs[7]["pane_id"]),
-                               {"STAFF_ID": pinned.id, "SHOWRUNNER_UNIT": "natedev"}, "claude", "/repo"),
+                               {"CLAUDE_CODE_SESSION_ID": pinned.id, "SHOWRUNNER_UNIT": "natedev"}, "claude", "/repo"),
             herdr.HerdrProcess(2, herdr.HerdrPlace("fixture", client.tabs[6]["pane_id"]),
                                {"SHOWRUNNER_UNIT": "sdlc", "SHOWRUNNER_UNIT_ID": "gone-unit"}, "claude", "/repo"),
         ]

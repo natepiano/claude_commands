@@ -255,9 +255,13 @@ def claude_names() -> dict[str, str]:
     return {pane: record["name"] for pane, record in newest.items()}
 
 
-def unit_roles(client: herdr.Herdr, panes: list[herdr.PaneIdentity]) -> dict[str, str]:
+def unit_roles(client: herdr.Herdr, panes: list[herdr.PaneIdentity], *,
+               record: staff.StaffSnapshot) -> dict[str, str]:
     """Classify live unit panes using the same staff join as tab ordering."""
-    classifier = herdr.UnitTabClassifier(client.session, herdr.herdr_processes(), staff.initial_snapshot())
+    from scripts.production.session_labels import StaffLabels
+
+    classifier = herdr.UnitTabClassifier(
+        client.session, herdr.herdr_processes(membership=StaffLabels.for_record(record)), record)
     spaces: dict[str, str] = {}
     if any(classifier.has_unit_title(pane.get("label") or "") for pane in panes):
         for item in herdr.json_items(client.result("workspace", "list").get("workspaces"), "herdr workspace list"):
@@ -330,8 +334,10 @@ def _main(argv: list[str]) -> int:
         with herdr.pane_snapshot() as read_panes:
             panes = read_panes(shared)
             names = claude_names()
-            roles = unit_roles(herdr.Herdr(shared), panes)
-            showrunner_names = {runner["session"] for runner in require_complete(registered_showrunners()) if runner["session"]}
+            membership = staff.initial_snapshot()
+            roles = unit_roles(herdr.Herdr(shared), panes, record=membership)
+            showrunner_names = {runner["session"] for runner in require_complete(
+                registered_showrunners(membership=membership)) if runner["session"]}
             for row in panes:
                 pane = row["pane_id"]
                 claude = names.get(pane, "")

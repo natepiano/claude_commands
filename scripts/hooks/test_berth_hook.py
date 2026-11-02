@@ -20,6 +20,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "direct"))
 import phase_reservation  # noqa: E402
 from scripts.astra import design_roles  # noqa: E402
+from scripts.production import staff  # noqa: E402
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 HOOK = Path(__file__).with_name("pre-tool-use-berth.py")
@@ -164,6 +165,7 @@ class BerthHookTests(unittest.TestCase):
         decide = cast(Callable[[str], int], runpy.run_path(str(HOOK))["decide"])
         payload = json.dumps({"tool_name": "apply_patch", "cwd": str(self.repo), "tool_input": {"command": patch}})
         with mock.patch.dict(os.environ, self.environment), \
+                mock.patch.object(staff, "runtime_id", return_value=DIRECTOR), \
                 mock.patch.object(design_roles, "resolve_holder", return_value=design_roles.HolderReach(DIRECTOR)), \
                 contextlib.redirect_stdout(io.StringIO()) as output:
             self.assertEqual(decide(payload), 0)

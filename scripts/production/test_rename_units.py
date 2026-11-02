@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest import mock
 
 from scripts.production import staff, staff_sources, unit_config
+from scripts.production.staff_test_support import unit_membership
 from scripts.production import rename_test_support as support
 from scripts.production.rename_test_support import INTERRUPT_UNIT_GIT, NEW, OLD
 from scripts.production.rename_rerun_test_support import final_files
@@ -59,14 +60,14 @@ class ProductionRenameTests(support.ProductionRenameFixture):
         host = cast(dict[str, object], session["host"])
         new = self.unit_worktree(NEW, "alpha-unit")
         self.assertEqual((session["session_id"], session["name"], host["unit"]),
-                         ("sid-alpha", "alpha", "alpha-unit"))
+                         (unit_membership(NEW, "alpha-unit").id, "alpha", "alpha-unit"))
         self.assertEqual(session["cwd"], f"{new}/sub")
         self.assertEqual(cast(list[dict[str, object]], saved["workers"])[0]["cwd"], f"{new}/worker")
         self.assertEqual(cast(dict[str, object], host["plan"])["path"], f"{new}/docs/plans/alpha-unit.md")
         self.assertEqual(host["session_name"], "new-alpha-unit")
         self.assertNotIn("production", host)
         self.assertNotIn("doc", host)
-        self.assertEqual(staff_sources.unit_parent("alpha-unit", "sid-alpha"),
+        self.assertEqual(staff_sources.unit_parent("alpha-unit", unit_membership(NEW, "alpha-unit").id),
                          staff_sources.UnitProduction(NEW, str(self.new_doc)))
         worker = cast(list[dict[str, object]], saved["codex_seats"])[0]
         self.assertEqual(worker["launcher_command"],
@@ -74,7 +75,7 @@ class ProductionRenameTests(support.ProductionRenameFixture):
         note = (self.root / "runs/r1/impl.resume-prompt.md").read_text()
         self.assertTrue(note.startswith("Continue the task.\n"))
         self.assertIn(f"your worktree is now {new} on branch new-alpha-unit", note)
-        self.assertIn("shutdown.py restart --only sid-alpha", result.stdout)
+        self.assertIn(f"shutdown.py restart --only {unit_membership(NEW, 'alpha-unit').id}", result.stdout)
 
     def test_unit_refuses_an_unstopped_restore_before_any_change(self) -> None:
         self.prepare_unit_moves()
@@ -123,7 +124,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         self.assert_unit_moved("alpha-unit")
         self.assertEqual(path.read_bytes(), before)
         self.assertEqual(prompt.read_bytes(), note)
-        self.assertIn("shutdown.py restart --only sid-alpha", result.stdout)
+        self.assertIn(f"shutdown.py restart --only {unit_membership(NEW, 'alpha-unit').id}", result.stdout)
 
     def test_a_journal_that_counted_seven_steps_finishes_with_the_new_steps_only(self) -> None:
         self.prepare_unit_moves()

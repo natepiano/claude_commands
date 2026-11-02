@@ -587,12 +587,12 @@ describe("accounts pane clock", () => {
       const ui = await $.ui.mount({ plugin: "unit-board", requestId: "accounts-board", component: "Pane", surface,
         props: { ...props, title: "Accounts", bodyColumns: 120 } });
       const before = drawnText(await ui.drawn()).replace(/\s+/g, " ");
-      expect(before).toContain("account role left resets credits enabled in use read");
-      expect(before).toMatch(/● Fixture workers 60% 23:59 0s\s*$/);
+      expect(before).toContain("account left role busy shell idle total resets credits enabled read");
+      expect(before).toMatch(/● Fixture 60% workers 23:59 0s total 0 0 0\s*$/);
       await fake.clock.advance(10_000);
       const after = drawnText(await ui.drawn()).replace(/\s+/g, " ");
-      expect(after).toContain("account role left resets credits enabled in use read");
-      expect(after).toMatch(/● Fixture workers 60% Fri 23:59 10s\s*$/);
+      expect(after).toContain("account left role busy shell idle total resets credits enabled read");
+      expect(after).toMatch(/● Fixture 60% workers Fri 23:59 10s total 0 0 0\s*$/);
       expect(fake.snapshots.at(-1)?.now).toBe((midnight + 5_000) / 1000);
       expect(fake.processes.length).toBe(1);
       expect(fake.reads).toEqual([]);

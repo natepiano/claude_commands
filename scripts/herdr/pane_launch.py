@@ -15,7 +15,7 @@ import sessions
 from place import HerdrPlace
 
 UNIT_MARKS = ("SHOWRUNNER_UNIT", "SHOWRUNNER_UNIT_ID")
-MEMBER_MARKS = (*UNIT_MARKS, "STAFF_ID")
+MEMBER_MARKS = UNIT_MARKS
 
 
 class PaneLaunch(TypedDict):
@@ -31,6 +31,8 @@ class PaneLaunch(TypedDict):
     flags_read: bool
     ended: NotRequired[bool]
     written_at: str
+    pid: NotRequired[int]
+    proc_start: NotRequired[str]
 
 
 def record_directory() -> Path:
@@ -56,6 +58,48 @@ def read(path: Path) -> dict[str, PaneLaunch]:
         return {}
 
 
+def _validated_launch(path: Path, pane_id: str, value: object, *, required_strings: frozenset[str]) -> PaneLaunch:
+    location = f"{path}: pane {pane_id}"
+    if not isinstance(value, dict):
+        raise ValueError(f"{location}: launch must be an object")
+    launch = cast(dict[str, object], value)
+    for field in ("pane_id", "session_id", "config_dir", "cwd", "name", "model", "written_at"):
+        if field not in launch and field not in required_strings:
+            continue
+        if not isinstance(launch.get(field), str):
+            raise ValueError(f"{location}: {field} must be a string")
+    for field in ("remote_control", "flags_read", "ended"):
+        if field not in launch:
+            continue
+        if not isinstance(launch.get(field), bool):
+            raise ValueError(f"{location}: {field} must be a boolean")
+    environment = launch.get("environment")
+    if (not isinstance(environment, dict)
+            or not all(isinstance(name, str) and isinstance(setting, str)
+                       for name, setting in cast(dict[object, object], environment).items())):
+        raise ValueError(f"{location}: environment must contain string names and settings")
+    return cast(PaneLaunch, cast(object, launch))
+
+
+def read_strict(path: Path) -> dict[str, PaneLaunch]:
+    """Require identity evidence; refuse damage in any present launch field."""
+    required_strings = frozenset({"session_id", "written_at"})
+    return {pane: _validated_launch(path, pane, value, required_strings=required_strings)
+            for pane, value in read_entries(path).items()}
+
+
+def read_valid_entries(path: Path) -> dict[str, PaneLaunch]:
+    """Keep usable evidence for a readout without losing a damaged entry's siblings."""
+    valid: dict[str, PaneLaunch] = {}
+    required_strings = frozenset({"session_id", "written_at", "config_dir"})
+    for pane, value in read_entries(path).items():
+        try:
+            valid[pane] = _validated_launch(path, pane, value, required_strings=required_strings)
+        except ValueError:
+            continue
+    return valid
+
+
 def matching_launch(entries: Mapping[str, PaneLaunch], place: HerdrPlace, session_id: str) -> PaneLaunch | None:
     entry = entries.get(place.pane)
     if entry is None or entry.get("pane_id") != place.pane or entry.get("session_id") != session_id:
@@ -77,21 +121,14 @@ class RecordedLabels:
 
     def resolve(self, pid: int, environment: Mapping[str, str],
                 placement: Callable[[], object]) -> dict[str, str]:
-        if environment.get("STAFF_ID"):
-            return dict(environment)
+        # Raw discovery already has these process labels. Ownership projections
+        # pass their staff snapshot explicitly and still require native proof.
+        if isinstance(self.membership, StaffLabelsRead) and all(environment.get(key) for key in UNIT_MARKS):
+            return {key: value for key, value in environment.items() if key != "STAFF_ID"}
         record = sessions.read_session(sessions.sessions_dir() / f"{pid}.json")
         if (isinstance(record, sessions.UnreadableSessionRecord) or record["pid"] != pid
                 or not sessions.running_session(record)):
             return dict(environment)
-        values = dict(environment)
-        place = placement()
-        if isinstance(place, HerdrPlace):
-            if place.session not in self.entries:
-                self.entries[place.session] = read(record_directory() / f"{place.session}.json")
-            entry = matching_launch(self.entries[place.session], place, record["sessionId"])
-            if entry is not None:
-                values = {**{key: value for key, value in entry.get("environment", {}).items()
-                             if key in MEMBER_MARKS}, **values}
         if self.membership is StaffLabelsRead.PENDING:
             from scripts.production import staff
             from scripts.production.session_labels import StaffLabels
@@ -100,6 +137,20 @@ class RecordedLabels:
                 self.membership = StaffLabels.read()
             except (staff.StaffUnreadable, OSError, ValueError):
                 self.membership = StaffLabelsRead.UNAVAILABLE
+        values = dict(environment)
+        place = placement()
+        if isinstance(place, HerdrPlace):
+            if place.session not in self.entries:
+                self.entries[place.session] = read(record_directory() / f"{place.session}.json")
+            entries = self.entries[place.session]
+            entry = matching_launch(entries, place, record["sessionId"])
+            if entry is None and not isinstance(self.membership, StaffLabelsRead):
+                owner = self.membership.record.by_current_session(record["sessionId"])
+                if owner is not None:
+                    entry = matching_launch(entries, place, owner.id)
+            if entry is not None:
+                values = {**{key: value for key, value in entry.get("environment", {}).items()
+                             if key in MEMBER_MARKS}, **values}
         if not isinstance(self.membership, StaffLabelsRead):
             values = self.membership.environment(values, record["sessionId"], record["name"], record.get("cwd", ""))
         return values

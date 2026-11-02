@@ -6,6 +6,7 @@ from collections import defaultdict
 from contextlib import redirect_stderr
 from dataclasses import dataclass
 import io
+import os
 from pathlib import Path
 import shlex
 import subprocess
@@ -15,6 +16,7 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.production import staff, staff_sources, unit_lookup, showrunners
 from scripts.production import production_units
+from scripts.lib import unit_runs
 from scripts.message import process_table
 from scripts.shutdown import remote
 import herdr
@@ -37,23 +39,11 @@ class CheckEvidence:
     sessions: tuple[LiveStaffSession, ...]
     workers: staff_sources.WorkerEvidence
     uncertainties: tuple[str, ...] = ()
+    notes: tuple[str, ...] = ()
 
 
 def _codex_thread_host(arguments: list[str]) -> bool:
-    """An app-server hosts threads; its inherited staff mark is not a session."""
-    index = 2 if arguments and Path(arguments[0]).name in ("node", "nodejs") else 1
-    while index < len(arguments):
-        option = arguments[index]
-        if option in ("-c", "--config", "--enable", "--disable", "--remote",
-                      "--remote-auth-token-env", "--local-provider", "-m", "--model",
-                      "-p", "--profile", "-s", "--sandbox", "-a", "--ask-for-approval",
-                      "-C", "--cd", "--add-dir", "-i", "--image"):
-            index += 2
-        elif option.startswith("-") and option != "--":
-            index += 1
-        else:
-            return option == "app-server"
-    return False
+    return staff_sources.codex_thread_host(arguments)
 
 
 def read_evidence(record: staff.StaffSnapshot) -> CheckEvidence:
@@ -74,6 +64,7 @@ def read_evidence(record: staff.StaffSnapshot) -> CheckEvidence:
     records = {entry.record["pid"]: entry.record for entry in registry.entries}
     observed: list[LiveStaffSession] = []
     uncertainties: list[str] = []
+    notes: list[str] = []
     for process in sorted(table.values(), key=lambda entry: entry.pid):
         try:
             arguments = shlex.split(process.arguments)
@@ -94,23 +85,61 @@ def read_evidence(record: staff.StaffSnapshot) -> CheckEvidence:
             environment = herdr.process_environment(process.pid)
         except (OSError, herdr.HerdrFailure, subprocess.SubprocessError) as error:
             raise staff.StaffUnreadable(f"process {process.pid} environment: {error}") from error
-        identity = environment.get("STAFF_ID", "")
-        if not identity:
-            continue
+        identity = running[process.pid]["sessionId"] if process.pid in running else environment.get("CODEX_THREAD_ID", "")
         registered = running.get(process.pid)
         if claude:
             if registered is None:
                 uncertainties.append(
-                    f"{identity} uncertain: Claude process pid {process.pid} has no live registry session (STAFF_ID={identity})"
+                    f"pid {process.pid} uncertain: Claude process has no live registry identity"
                 )
                 continue
             key = "claude:" + registered["sessionId"]
         else:
             key = "codex:" + environment.get("CODEX_THREAD_ID", f"pid:{process.pid}")
+        if not identity:
+            if reason := staff_sources.codex_non_staff_reason(record, sources, environment):
+                notes.append(f"staff sources: Codex process {process.pid}: {reason}")
+                continue
+            uncertainties.append(f"pid {process.pid} uncertain: Codex runtime identity is unavailable")
+            continue
         observed.append(LiveStaffSession(process.pid, key, staff.StaffId(identity),
                                         registered.get("cwd", "") if registered is not None else ""))
+    # The peer roster is the one remote runtime snapshot; an outage is uncertainty.
+    from scripts.message import roster
+    peer = roster.peer_snapshot(os.environ)
+    if isinstance(peer, roster.PeerNotReached):
+        uncertainties.append(f"{peer.host} uncertain: {peer.reason}")
+    else:
+        uncertainties.extend(f"peer uncertain: {problem}" for problem in peer.problems)
+        for entry in peer.entries:
+            if entry.role == "freestanding":
+                notes.append(f"{entry.machine} freestanding {entry.name}: not staff")
+                continue
+            if isinstance(entry.session, roster.ClaudeSession):
+                identity, family = entry.session.session_id, "claude"
+            elif isinstance(entry.thread, roster.CodexThread):
+                identity, family = entry.thread.thread_id, "codex"
+            else:
+                continue
+            observed.append(LiveStaffSession(0, family + ":" + identity, staff.StaffId(identity), entry.cwd))
+    for root in unit_runs.run_roots(os.environ.get("ROSTER_RUN_ROOT")):
+        for run in sorted(root.glob("*")):
+            try:
+                publications = staff_sources.pending_publication_evidence(run)
+                uncertainties.extend(f"{run} uncertain: {message}" for message in publications.diagnostics)
+                pending = publications.workers
+                if not pending:
+                    continue
+                from scripts.agents import codex_mesh
+                import time
+                loaded = codex_mesh.loaded_threads(run, time.monotonic() + codex_mesh.THREAD_RELEASE_TIMEOUT_SECS)
+                for backend in pending:
+                    if backend.identity in loaded:
+                        observed.append(LiveStaffSession(0, "codex:" + backend.identity, backend.identity))
+            except (OSError, ValueError, staff.StaffRefused) as error:
+                uncertainties.append(f"{run} uncertain: {error}")
     workers = staff_sources.observe_workers(record, sources)
-    return CheckEvidence(sources, tuple(observed), workers, tuple(uncertainties))
+    return CheckEvidence(sources, tuple(observed), workers, tuple(uncertainties), tuple(notes))
 
 
 def wrong_rows(record: staff.StaffSnapshot, evidence: CheckEvidence) -> list[str]:
@@ -128,15 +157,19 @@ def wrong_rows(record: staff.StaffSnapshot, evidence: CheckEvidence) -> list[str
     by_identity: dict[str, LiveStaffSession] = {}
     for session in evidence.sessions:
         by_identity[session.identity] = session
-        row = record.by_id(session.staff_id)
+        row = record.by_current_session(session.staff_id)
         if row is None:
             wrong(session.staff_id, f"pid {session.pid}", "live session names a removed or missing staff row")
             continue
         claims[session.identity].add(row.id)
     for identity, backend in evidence.workers.identities.items():
-        if record.by_id(identity) is not None:
+        row = record.by_id(identity)
+        if row is not None:
             for family, value in backend.items():
-                claims[f"{family}:{value}"].add(identity)
+                if value == row.current_session:
+                    claims[f"{family}:{value}"].add(identity)
+                else:
+                    row_wrong(row, f"runtime identity differs from current session: {family}:{value}")
     for observation in evidence.workers.workers:
         owner = observation.owner.match
         if not isinstance(owner, staff.StaffRow):
@@ -151,12 +184,15 @@ def wrong_rows(record: staff.StaffSnapshot, evidence: CheckEvidence) -> list[str
         if not matches:
             wrong("?", observation.name, f"live worker has no row under {owner.id} {owner.name}")
         for session in actual:
-            row = record.by_id(session.staff_id)
+            row = record.by_current_session(session.staff_id)
             if row is not None and (row.kind != "worker" or row.parent != owner.id):
                 row_wrong(row, f"live worker belongs under {owner.id} {owner.name}")
         for row in matches:
             for family, value in observation.identity.items():
-                claims[f"{family}:{value}"].add(row.id)
+                if row.current_session == value:
+                    claims[f"{family}:{value}"].add(row.id)
+                else:
+                    row_wrong(row, f"runtime identity differs from current session: {family}:{value}")
     live: dict[staff.StaffId, set[str]] = defaultdict(set)
     for identity, claimed_rows in sorted(claims.items()):
         if len(claimed_rows) > 1:
@@ -223,9 +259,11 @@ def wrong_rows(record: staff.StaffSnapshot, evidence: CheckEvidence) -> list[str
                 row_wrong(row, "production doc belongs elsewhere: timer names " + ", ".join(map(str, bound)))
     for message in evidence.uncertainties:
         identity, _, reason = message.partition(" ")
-        row = record.by_id(staff.StaffId(identity))
-        wrong(identity, row.name if row is not None else "session", reason)
+        row = record.by_current_session(identity)
+        wrong(row.id if row is not None else identity, row.name if row is not None else "session", reason)
     for message in evidence.workers.diagnostics:
+        if staff_sources.is_non_staff_note(message):
+            continue
         wrong("?", "sources", "uncertain: " + message)
     return [f"{identity} {name}: {'; '.join(reasons)}" for (identity, name), reasons in sorted(problems.items())]
 
@@ -241,6 +279,10 @@ def main() -> int:
     except (OSError, ValueError, KeyError, herdr.HerdrFailure, subprocess.SubprocessError) as error:
         print("staff check: cannot read source: " + str(error).replace("\n", " "))
         return 2
+    notes = {*evidence.notes, *(message for message in evidence.workers.diagnostics
+                              if staff_sources.is_non_staff_note(message))}
+    for note in sorted(notes):
+        print("note: " + note.replace("\n", " ").replace("\r", " "))
     for line in lines:
         print(line.replace("\n", " ").replace("\r", " "))
     print(f"checked {len(record.rows)} rows; {len(lines)} wrong")
