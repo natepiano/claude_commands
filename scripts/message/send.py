@@ -30,10 +30,15 @@ name is separate from the sender, who is named in the message. Delivery is read 
 SendMessage tool result in the relay's stream, never from what the model says;
 the last stream per recipient stays in STATE/relay/<to>.jsonl.
 `worker:` addresses queue through codex_mesh.py; `codex:` addresses queue through
-the shared Codex daemon. A unique roster name resolves to either. `--codex`
-with `--session-dir` still selects codex_mesh.py directly. Names and addresses
-resolve here first, then on the peer. `--here` keeps resolution here; `--machine`
-runs this script on HOST over ssh, where ~/.claude is this repo.
+the shared Codex daemon. One staff snapshot selects each staff recipient.
+Unit names accept the optional `-unit` suffix. Ambiguous staff names stop delivery.
+A staff recipient uses its current_session, including for an explicit address.
+A non-staff name uses a unique live roster session, locally before the peer.
+A name without a staff row or live session is refused without a relay or queue.
+Explicit non-staff addresses keep their transport and queue behavior.
+Worker addresses use native IDs from the local or peer roster for staff lookup.
+`--codex` with `--session-dir` selects a run-scoped slot without staff lookup.
+`--here` checks only this machine. `--machine` runs this script on HOST over ssh.
 
 `--to user` reaches the user wherever they are; `--summary` is the title. `--need`
 says what they must do: `note` nothing, `decision` decide while work goes on,
@@ -78,8 +83,8 @@ message text as one JSON line in STATE/log.jsonl:
   QUEUED: why    a Claude recipient not reached; kept in          exit 1
                  STATE/queue/, the latest per key, under the
                  recipient's Claude session id, so a rename loses
-                 nothing; under the name as given when no live
-                 session answers to it, which the outcome says
+                 nothing. A known staff member without live transport
+                 keeps messages under its current session id.
   FAILED: why    not delivered and not kept: a Codex recipient,   exit 3
                  the user, or ssh to HOST
   REPLACED: why  a newer version replaced this push; not sent     exit 0
@@ -126,6 +131,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "notify"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 import process_group
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.production import staff, unit_names
 import sessions  # noqa: E402
 from relay_identity import SavedRelaySender, read_relay_sender, relay_session_name
 import postmaster  # noqa: E402
@@ -522,6 +529,11 @@ class RemoteDelivery:
 @dataclass(frozen=True)
 class RecipientLookupFailed:
     reason: str
+
+
+@dataclass(frozen=True)
+class NoStaffRecipient:
+    """The target keeps its transport resolution because no staff row matches."""
 
 
 DeliveryRoute = SessionRecipient | UserDelivery | RemoteDelivery | RecipientLookupFailed
@@ -1093,8 +1105,22 @@ def dead_socket_reason(address: str, name: str = "") -> str:
 
 
 def socket_recipient(address: str, records: list[sessions.SessionRecord], metadata: dict[str, object], *,
-                     disconnected: bool = False) -> ClaudeRecipient | RecipientLookupFailed:
-    """Keep direct sockets until their one delivery connect fails, then resolve the saved name."""
+                     disconnected: bool = False, membership: staff.StaffSnapshot | None = None) -> ClaudeRecipient | RecipientLookupFailed:
+    """Use the staff current session, or retain direct socket transport."""
+    membership = staff.snapshot() if membership is None else membership
+    registered = any(f"uds:{record['messagingSocketPath']}" == address for record in records)
+    target = address if registered else socket_sender(address, metadata) or address
+    member = resolve_staff_recipient(target, membership, records=records)
+    if isinstance(member, RecipientLookupFailed):
+        return member
+    if isinstance(member, staff.StaffRow):
+        session = next((record for record in records if record["sessionId"] == member.current_session), None)
+        if session is None:
+            return ClaudeRecipient(f"session:{member.current_session}")
+        current_address = f"uds:{session['messagingSocketPath']}"
+        if disconnected and current_address == address:
+            return RecipientLookupFailed(dead_socket_reason(address, member.name))
+        return ClaudeRecipient(current_address)
     if not disconnected and Path(address.removeprefix("uds:")).is_socket():
         return ClaudeRecipient(address)
     name = socket_sender(address, metadata)
@@ -1105,13 +1131,13 @@ def socket_recipient(address: str, records: list[sessions.SessionRecord], metada
 
 
 def relay_socket(message: Message, timeout: float, records: list[sessions.SessionRecord],
-                 metadata: dict[str, object]) -> Result:
+                 metadata: dict[str, object], *, membership: staff.StaffSnapshot | None = None) -> Result:
     """Reuse the delivery connect: only a definite missing/refused socket permits a name retry."""
     started = time.monotonic()
     result = relay(message, timeout)
     if message.to.startswith("uds:") and result.outcome == "queued" and re.search(
             r"\b(?:ENOENT|ECONNREFUSED)\b", result.detail):
-        recipient = socket_recipient(message.to, records, metadata, disconnected=True)
+        recipient = socket_recipient(message.to, records, metadata, disconnected=True, membership=membership)
         if isinstance(recipient, RecipientLookupFailed):
             return Result("failed", f"{result.detail}; {recipient.reason}")
         return relay(replace(message, to=recipient.address), max(1.0, timeout - (time.monotonic() - started)))
@@ -1170,6 +1196,7 @@ def finish_socket_reply(path: Path, remaining: list[QueuedMessage], entry: Queue
 
 def recover_socket_queues(records: list[sessions.SessionRecord], at: datetime) -> tuple[int, list[str]]:
     """With the drain lock held, retry known failures and archive uncertain deliveries."""
+    membership = staff.snapshot()
     outcomes = socket_reply_outcomes()
     old_files: list[tuple[Path, list[datetime]]] = []
     lines: list[str] = []
@@ -1224,7 +1251,7 @@ def recover_socket_queues(records: list[sessions.SessionRecord], at: datetime) -
         for entry in remaining.copy():
             identity = entry.get("socket_recovery", "")
             metadata = cast("dict[str, object]", cast(object, entry))
-            recipient = socket_recipient(entry["to"], records, metadata)
+            recipient = socket_recipient(entry["to"], records, metadata, membership=membership)
             if isinstance(recipient, RecipientLookupFailed):
                 lines.append(f"unresolved socket queue {path}: {recipient.reason}; left in place")
                 code = EXIT["failed"]
@@ -1238,7 +1265,7 @@ def recover_socket_queues(records: list[sessions.SessionRecord], at: datetime) -
             started = now()
             append_record(STATE / "socket-recovery-attempts.jsonl",
                           SocketRecoveryAttempt(key=identity, time=started.isoformat()), durable=True)
-            result = relay_socket(message, TIMEOUT, records, metadata)
+            result = relay_socket(message, TIMEOUT, records, metadata, membership=membership)
             log(message, result, started)
             if result.outcome != "sent":
                 lines.append(f"FAILED: socket queue {path}: {result.detail}; kept for retry")
@@ -1338,7 +1365,80 @@ def _ambiguous_name(name: str, entries: list[roster.RosterEntry]) -> NoReturn:
     usage_error("\n".join(lines))
 
 
-def _recipient_matches(to: str, entries: list[roster.RosterEntry]) -> list[roster.RosterEntry]:
+def resolve_staff_recipient(
+    target: str, membership: staff.StaffSnapshot, *, records: tuple[sessions.SessionRecord, ...] | list[sessions.SessionRecord] = (),
+    observed: tuple[roster.RosterEntry, ...] | list[roster.RosterEntry] = (),
+) -> staff.StaffRow | NoStaffRecipient | RecipientLookupFailed:
+    """Select one staff identity before any transport lookup."""
+    import roster
+
+    reference = target
+    if target.startswith("worker:"):
+        for entry in observed:
+            if isinstance(entry.reach, roster.Messageable) and entry.reach.address == target:
+                if isinstance(entry.thread, roster.CodexThread):
+                    reference = entry.thread.thread_id
+                elif isinstance(entry.session, roster.ClaudeSession):
+                    reference = entry.session.session_id
+    if target.startswith("uds:"):
+        record = next((record for record in records
+                       if f"uds:{record['messagingSocketPath']}" == target), None)
+        reference = record["sessionId"] if record is not None else socket_sender(target, {})
+    elif target.startswith(("session:", "codex:")):
+        reference = target.split(":", 1)[1]
+    member = membership.by_id(staff.StaffId(reference)) or membership.by_current_session(reference)
+    if member is not None:
+        return member
+    if target.startswith(("session:", "codex:", "worker:")) or not reference:
+        return NoStaffRecipient()
+    def normalized_name(value: str) -> str:
+        try:
+            return unit_names.name(value).casefold()
+        except unit_names.BadName:
+            return value.casefold()
+
+    normalized = "/".join(normalized_name(part) for part in reference.split("/"))
+    matches: dict[staff.StaffId, staff.StaffRow] = {}
+    for candidate in membership.find():
+        chain = [candidate.name]
+        parent = candidate
+        visited = {candidate.id}
+        while parent.kind != "showrunner" and parent.parent is not None:
+            ancestor = membership.by_id(parent.parent)
+            if ancestor is None or ancestor.id in visited:
+                break
+            visited.add(ancestor.id)
+            chain.insert(0, ancestor.name)
+            parent = ancestor
+        path = "/".join(chain)
+        canonical = "/".join(normalized_name(part) for part in chain)
+        short = normalized_name(candidate.name)
+        if normalized == canonical or ("/" not in normalized and normalized == short):
+            # by_path handles canonical paths; by_id preserves duplicate-path evidence.
+            found = membership.by_path(path)
+            row = found if found is not None and found.id == candidate.id else membership.by_id(candidate.id)
+            if row is not None:
+                matches[row.id] = row
+    if len(matches) == 1:
+        return next(iter(matches.values()))
+    if matches:
+        details = ", ".join(f"{row.name} (staff:{row.id}, session:{row.current_session})" for row in matches.values())
+        return RecipientLookupFailed(f"ambiguous staff row for {target!r}: {details}")
+    return NoStaffRecipient()
+
+
+def _staff_transport_matches(member: staff.StaffRow, entries: list[roster.RosterEntry]) -> list[roster.RosterEntry]:
+    import roster
+
+    return [entry for entry in entries if (
+        isinstance(entry.session, roster.ClaudeSession) and entry.session.session_id == member.current_session
+        or isinstance(entry.thread, roster.CodexThread) and entry.thread.thread_id == member.current_session
+        or isinstance(entry.reach, roster.Messageable)
+        and entry.reach.address in (f"session:{member.current_session}", f"codex:{member.current_session}", member.current_session)
+    )]
+
+
+def _sender_label_matches(to: str, entries: list[roster.RosterEntry]) -> list[roster.RosterEntry]:
     import roster
 
     if to.startswith(("session:", "worker:", "codex:")):
@@ -1363,12 +1463,18 @@ def _matched_recipient(
 
 
 def matching_recipients(
-    to: str, scope: LocalOnly | LocalThenPeer, observed: roster.Roster,
+    to: str, scope: LocalOnly | LocalThenPeer, observed: roster.Roster, *,
+    membership: staff.StaffSnapshot | None = None,
 ) -> RecipientMatches | LocalRosterIncomplete | RecipientSearchFailed:
     """Find rows without delivering or exiting; ask the peer only after a local miss."""
     import roster
 
-    matches = _recipient_matches(to, observed.entries)
+    membership = staff.snapshot() if membership is None else membership
+    member = resolve_staff_recipient(to, membership, observed=observed.entries)
+    if isinstance(member, RecipientLookupFailed):
+        return RecipientSearchFailed(member.reason, [member.reason])
+    matches = (_staff_transport_matches(member, observed.entries) if isinstance(member, staff.StaffRow)
+               else _sender_label_matches(to, observed.entries))
     if matches or isinstance(scope, LocalOnly):
         return RecipientMatches(matches, LocalOnly(), observed.diagnostics)
     addressed = to.startswith(("session:", "worker:", "codex:"))
@@ -1376,25 +1482,41 @@ def matching_recipients(
         return LocalRosterIncomplete(observed.diagnostics)
     peer = roster.peer_roster(os.environ)
     problems = [*observed.diagnostics, *peer.diagnostics]
-    matches = _recipient_matches(to, peer.entries)
+    member = resolve_staff_recipient(to, membership, observed=[*observed.entries, *peer.entries])
+    if isinstance(member, RecipientLookupFailed):
+        return RecipientSearchFailed(member.reason, [*problems, member.reason])
+    if isinstance(member, staff.StaffRow):
+        matches = _staff_transport_matches(member, observed.entries)
+        if matches:
+            return RecipientMatches(matches, LocalOnly(), problems)
+        matches = _staff_transport_matches(member, peer.entries)
+    else:
+        matches = _sender_label_matches(to, peer.entries)
     if not matches and peer.problems:
         return RecipientSearchFailed("; ".join(peer.problems), problems)
     return RecipientMatches(matches, NamedMachine(roster.remote.other_machine()), problems)
 
 
 def resolve_recipient(
-    to: str, scope: RecipientResolutionScope, observed: roster.Roster,
+    to: str, scope: RecipientResolutionScope, observed: roster.Roster, *,
+    membership: staff.StaffSnapshot | None = None,
 ) -> DeliveryRoute:
     """Resolve locally first; a remote row supplies the address sent to its machine."""
+    membership = staff.snapshot() if membership is None else membership
     if to.startswith("uds:"):
-        return socket_recipient(to, sessions.live_sessions(), {})
+        return socket_recipient(to, sessions.live_sessions(), {}, membership=membership)
+    member = resolve_staff_recipient(to, membership, observed=observed.entries)
+    if isinstance(member, RecipientLookupFailed):
+        usage_error(member.reason)
     if isinstance(scope, NamedMachine):
-        return RemoteDelivery(scope.host, to)
+        return RemoteDelivery(scope.host, (f"codex:{member.current_session}" if to.startswith("codex:")
+                                          else to if to.startswith("worker:") else f"session:{member.current_session}")
+                              if isinstance(member, staff.StaffRow) else to)
     if to.startswith("codex:"):
         thread_id = to.removeprefix("codex:")
         if not thread_id:
             usage_error("codex: needs a thread id")
-    result = matching_recipients(to, scope, observed)
+    result = matching_recipients(to, scope, observed, membership=membership)
     _print_roster_problems(result.problems)
     if isinstance(result, LocalRosterIncomplete):
         usage_error(f"absence of {to} here is not proven; use an address or --machine")
@@ -1410,7 +1532,11 @@ def resolve_recipient(
         checked = ", ".join(codex_home_display(daemon.home) for daemon in codex_daemon.daemons(os.environ))
         return RecipientLookupFailed(
             f"no live Codex daemon has thread {to.removeprefix('codex:')} loaded; checked {checked}")
-    return ClaudeRecipient(to)
+    if isinstance(member, staff.StaffRow):
+        return ClaudeRecipient(f"session:{member.current_session}")
+    if to.startswith("session:"):
+        return ClaudeRecipient(to)
+    usage_error(f"no staff row or live session for {to!r}")
 
 
 def run(command: list[str], stdin: str, timeout: float, env: dict[str, str] | None = None,
@@ -2181,7 +2307,7 @@ def sender_shown_name(sender: str, observed: roster.Roster) -> str:
     """Resolve display text without changing sender keys or reply addresses."""
     import roster
 
-    matches = _recipient_matches(sender, observed.entries)
+    matches = _sender_label_matches(sender, observed.entries)
     if len(matches) == 1:
         return roster.shown_name(matches[0]).render()
     return sender
@@ -2216,11 +2342,16 @@ def send(options: Options) -> Result:
         usage_error("the message is empty")
     first = next(iter(text.strip().splitlines()), options.summary or "")
     summary = options.summary or (first if len(first) <= 60 else first[:59] + "…")
+    try:
+        membership = (staff.snapshot() if options.to != USER and isinstance(options.selection, RosterLookup)
+                      else staff.StaffSnapshot(()))
+    except staff.StaffUnreadable as error:
+        usage_error(f"staff lookup for {options.to!r}: {error}")
     # A forwarded display is authoritative; only recipient lookup may read the receiver's roster.
     needs_recipient_roster = (isinstance(options.selection, RosterLookup) and options.to != USER
                               and not options.to.startswith("uds:") and not isinstance(options.scope, NamedMachine))
     needs_sender_roster = options.to != USER and isinstance(options.shown_sender, SenderNotResolved)
-    observed = (roster.roster(os.environ, roster.ThisMachine()) if needs_recipient_roster or needs_sender_roster
+    observed = (roster.roster(os.environ, roster.ThisMachine(), membership=membership) if needs_recipient_roster or needs_sender_roster
                 else roster.Roster([], []))
     if isinstance(options.selection, MeshWorker):
         route: DeliveryRoute = (
@@ -2231,7 +2362,7 @@ def send(options: Options) -> Result:
         route = (RemoteDelivery(options.scope.host, USER) if isinstance(options.scope, NamedMachine)
                  else UserDelivery())
     else:
-        route = resolve_recipient(options.to, options.scope, observed)
+        route = resolve_recipient(options.to, options.scope, observed, membership=membership)
     destination = route.address if isinstance(route, SessionRecipient | RemoteDelivery) else options.to
     sender = options.sender or default_sender()
     if options.to == USER and options.sender is None and sender != "send.py":
@@ -2296,7 +2427,7 @@ def send(options: Options) -> Result:
     else:
         claude_started = time.monotonic()
         def relay_and_queue(relay_message: Message, timeout: float) -> Result:
-            relayed_result = relay_socket(relay_message, timeout, sessions.live_sessions(), {})
+            relayed_result = relay_socket(relay_message, timeout, sessions.live_sessions(), {}, membership=membership)
             if relayed_result.outcome == "queued":
                 recipient = sessions.addressed(message.to, sessions.live_sessions())
                 if message.to.startswith("uds:") and recipient is None:
@@ -2358,13 +2489,23 @@ def send(options: Options) -> Result:
 
 
 def repeat_notice_owner(sender: str) -> str:
-    """Use the roster's existing ownership join, then rca's showrunner resolution."""
-    import roster
-    observed = roster.roster(os.environ, roster.ThisMachine())
-    matches = _recipient_matches(sender, observed.entries)
-    if len(matches) == 1 and isinstance(matches[0].showrunner, roster.UnderShowrunner):
-        return rca.owner_address(matches[0].showrunner.production)
-    return rca.owner_address("")
+    """Follow staff parents to the sender's showrunner."""
+    membership = staff.snapshot()
+    member = resolve_staff_recipient(sender, membership)
+    if isinstance(member, NoStaffRecipient):
+        return rca.owner_address("")
+    if isinstance(member, RecipientLookupFailed):
+        usage_error(member.reason)
+    visited: set[staff.StaffId] = set()
+    while member.kind != "showrunner":
+        if member.parent is None or member.id in visited:
+            usage_error(f"missing showrunner staff row for {sender!r}")
+        visited.add(member.id)
+        parent = membership.by_id(member.parent)
+        if parent is None:
+            usage_error(f"missing showrunner staff row for {sender!r}")
+        member = parent
+    return f"session:{member.current_session}"
 
 
 def deliver_repeat_notice(state: repeat_guard.SenderState, notice: repeat_guard.Notice,
