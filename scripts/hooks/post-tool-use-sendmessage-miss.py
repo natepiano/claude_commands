@@ -44,11 +44,13 @@ def main() -> None:
         sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
         import roster
         import send
+        from scripts.production import staff
         import sessions
         from relay_identity import RelayIdentity, live_relay_identity, message_sender_name, relay_senders_directory
 
-        observed = roster.roster(os.environ, roster.ThisMachine())
-        found = send.matching_recipients(name, send.LocalThenPeer(), observed)
+        membership = staff.snapshot()
+        observed = roster.roster(os.environ, roster.ThisMachine(), membership=membership)
+        found = send.matching_recipients(name, send.LocalThenPeer(), observed, membership=membership)
         if (isinstance(found, send.RecipientMatches) and not found.entries
                 and message_sender_name(name) != name):
             registry = sessions.read_registry()
@@ -58,9 +60,12 @@ def main() -> None:
                 for item in registry.entries
             ):
                 name = message_sender_name(name)
-                found = send.matching_recipients(name, send.LocalThenPeer(), observed)
+                found = send.matching_recipients(name, send.LocalThenPeer(), observed, membership=membership)
         if isinstance(found, (send.LocalRosterIncomplete, send.RecipientSearchFailed)):
-            context("send.py roster error: " + "; ".join(found.problems))
+            details = "send.py roster error: " + "; ".join(found.problems)
+            if isinstance(found, send.RecipientSearchFailed) and found.reason.startswith("ambiguous staff row"):
+                details += '\nSeveral staff rows match; send to one listed address. --to "<one listed address>"'
+            context(details)
             return
         lines: list[str] = []
         if found.entries:

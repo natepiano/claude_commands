@@ -524,3 +524,18 @@ an unrelated numbered account remains usable.
 ### brp registration at login
 
 The `claude-brp-mcp` login job registers brp only at local scope in existing `~/rust/hana`, `~/rust/nateroids` and `~/rust/bevy_brp` checkouts, for the shared Claude home and each numbered home. It removes user-scope brp registrations so other projects do not inherit the server. The setup check verifies those same local registrations. A correct registration is left untouched.
+
+## Account configuration
+
+`config/accounts.conf` defines the account limits, timeouts, sizes, ages, and hold durations.
+The scripts read each value when they use it through `scripts/lib/conf.py`.
+Install the file in `~/.claude/config`, or select a folder with `CONF_DIR`.
+A configuration change needs no build.
+The values remain unchanged.
+The file also defines the default notes folder and the home NixOS repository.
+A leading `~` uses `HOME`; `AGENT_NOTES_DIR` still overrides the notes folder.
+Account creation and account checks use the same notes-folder helper.
+Each process reads the configured notes folder once.
+Start a new process after a notes-folder change.
+Missing-note instructions name that folder.
+The refusal pass reads the usage age once and passes it through account selection.
