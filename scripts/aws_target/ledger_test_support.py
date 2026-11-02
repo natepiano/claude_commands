@@ -38,6 +38,8 @@ def numeric_settings(path: Path, values: dict[str, str]) -> None:
              if line.partition("=")[0].strip() not in values]
     for key, value in values.items():
         form = "whole" if key.endswith(("_seconds", "_timeout_s")) else "range"
+        if key in ("connect_timeout_s", "leftover_timeout_s"):
+            form = "range"
         lines.extend((f"# {form}: 0..", f"{key}={value}"))
     _ = path.write_text("\n".join(lines) + "\n")
 
@@ -59,7 +61,7 @@ def install_cost_settings(path: Path, overrides: str = "") -> None:
         "gp3_throughput_usd_per_month": "0", "cost_explorer_read_usd": "0",
         "price_refresh_seconds": "3600", "price_max_age_seconds": "7200",
         "observation_max_age_seconds": "86400", "cost_explorer_interval_seconds": "86400",
-        "notification_timeout_s": "5",
+        "notification_timeout_s": "5", "notification_retry_s": "60",
     })
     text_setting(path, "accounting_zone", "UTC")
     text_setting(path, "notification_recipient", "fixture-showrunner")

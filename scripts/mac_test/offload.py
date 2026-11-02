@@ -293,12 +293,18 @@ DEFAULT_MAC_SETTINGS = DefaultMacSettings()
 
 
 @dataclass(frozen=True)
-class OffloadConfig:
-    """Settings that govern one Mac offload decision."""
-
-    enabled: bool
+class SshConnectionSettings:
     host: str
     connect_timeout_s: float
+    leftover_timeout_s: float
+
+
+@dataclass(frozen=True)
+class OffloadConfig:
+    """Settings that govern one remote execution decision."""
+
+    enabled: bool
+    connection: SshConnectionSettings
     probe_timeout_s: float
     unreachable_backoff_s: float
     free_floor_gib: float
@@ -307,9 +313,16 @@ class OffloadConfig:
     source: Path | DefaultMacSettings = DEFAULT_MAC_SETTINGS
 
     @property
+    def host(self) -> str:
+        return self.connection.host
+
+    @property
+    def connect_timeout_s(self) -> float:
+        return self.connection.connect_timeout_s
+
+    @property
     def leftover_timeout_s(self) -> float:
-        """Bound the cleanup SSH call independently of the reachability probe."""
-        return conf.number(config_path() if isinstance(self.source, DefaultMacSettings) else self.source, "leftover_timeout_s")
+        return self.connection.leftover_timeout_s
 
 
 @dataclass(frozen=True)
@@ -793,13 +806,18 @@ def state_directory(target: str = "mac") -> Path:
     return Path(configured).expanduser()
 
 
+def read_connection_settings(path: Path | DefaultMacSettings = DEFAULT_MAC_SETTINGS) -> SshConnectionSettings:
+    settings = config_path() if isinstance(path, DefaultMacSettings) else path.expanduser()
+    return SshConnectionSettings(conf.text(settings, "host"), conf.number(settings, "connect_timeout_s"),
+                                 conf.number(settings, "leftover_timeout_s"))
+
+
 def read_config(path: Path | DefaultMacSettings = DEFAULT_MAC_SETTINGS) -> OffloadConfig:
     settings = config_path() if isinstance(path, DefaultMacSettings) else path.expanduser()
     values = conf.values(settings)
     return OffloadConfig(
         enabled=conf.text(settings, "offload") == "on",
-        host=conf.text(settings, "host"),
-        connect_timeout_s=conf.number(settings, "connect_timeout_s"),
+        connection=read_connection_settings(settings),
         probe_timeout_s=conf.number(settings, "probe_timeout_s"),
         unreachable_backoff_s=conf.number(settings, "unreachable_backoff_s"),
         free_floor_gib=conf.number(settings, "free_floor_gib"),
@@ -946,7 +964,7 @@ def write_backoff(until: float, target: str = "mac") -> None:
         return
 
 
-def ssh_options(config: OffloadConfig) -> list[str]:
+def ssh_options(config: SshConnectionSettings) -> list[str]:
     return [
         "-o",
         "BatchMode=yes",
@@ -960,7 +978,7 @@ def ssh_options(config: OffloadConfig) -> list[str]:
 
 
 def ssh_prefix(config: OffloadConfig) -> list[str]:
-    return ["ssh", *ssh_options(config), config.host]
+    return ["ssh", *ssh_options(config.connection), config.host]
 
 
 def remote_mirror(repository: KnownRepository, target: str = "mac", slot: int = 1) -> str:
@@ -1154,7 +1172,7 @@ def copy_tracked_scripts(controller: ProcessController, config: OffloadConfig) -
         _ = manifest.write("\n".join(paths) + "\n")
         manifest.flush()
         result = controller.capture(["rsync", "-rlpc", f"--files-from={manifest.name}",
-                                     "-e", shlex.join(["ssh", *ssh_options(config)]),
+                                     "-e", shlex.join(["ssh", *ssh_options(config.connection)]),
                                      f"{root}/", f"{config.host}:.claude/"])
     if not isinstance(result, CommandOutput) or result.status != 0:
         return False
@@ -1279,7 +1297,7 @@ def copy_tree(
                         "--delete",
                         f"--exclude-from={exclude_path}",
                         "-e",
-                        shlex.join(["ssh", *ssh_options(config)]),
+                        shlex.join(["ssh", *ssh_options(config.connection)]),
                         f"{request.source_root}/",
                         f"{config.host}:{shlex.quote(remote_mirror(repository, request.target, request.slot))}/",
                     ]
@@ -1460,7 +1478,7 @@ def parse_leftover_check(output: str) -> LeftoverCheckResult:
     return LeftoversEnded() if count == 0 else LeftoversRemain(count)
 
 
-def check_leftovers(config: OffloadConfig, host: str, repository: KnownRepository,
+def check_leftovers(config: SshConnectionSettings, host: str, repository: KnownRepository,
                    target: str = "mac", slot: int = 1) -> LeftoverCheckResult:
     """End and count one mirror's work without exposing the check to a second signal."""
     try:
@@ -1508,12 +1526,23 @@ def report_leftover_check(result: LeftoverCheckResult, request: OffloadRequest) 
                   + f"{result.reason}; the {label} stays busy", file=sys.stderr, flush=True)
 
 
+def check_current_leftovers(
+    config: OffloadConfig, host: str, repository: KnownRepository, target: str = "mac", slot: int = 1,
+) -> LeftoverCheckResult:
+    """Read the current connection settings before checking retained work."""
+    try:
+        connection = read_connection_settings(config.source)
+    except (OSError, ValueError) as error:
+        return LeftoverCheckFailed(f"cleanup settings unavailable: {error}")
+    return check_leftovers(connection, host, repository, target, slot)
+
+
 def check_taken_over_claim(
     config: OffloadConfig, claim: TakenOverMacClaim | TakeoverHostUnreadable, repository: KnownRepository,
     target: str = "mac",
 ) -> LeftoverCheckResult:
     if isinstance(claim, TakenOverMacClaim):
-        return check_leftovers(config, claim.host, repository, target, claim.slot)
+        return check_current_leftovers(config, claim.host, repository, target, claim.slot)
     return LeftoverCheckFailed("the kept claim's host could not be read")
 
 
@@ -1572,13 +1601,13 @@ def claimed_run(
             release_allowed = False
             probe = probe_mac(controller, config, repository, request.target, request.slot)
             if isinstance(probe, UnresolvedSlotStartup):
-                checked = check_leftovers(config, config.host, repository, request.target, request.slot)
+                checked = check_current_leftovers(config, config.host, repository, request.target, request.slot)
                 release_allowed = isinstance(checked, LeftoversEnded)
                 observe_cleanup(evidence, checked)
                 report_leftover_check(checked, request)
                 return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
             if isinstance(probe, UnavailableProbe):
-                checked = check_leftovers(config, config.host, repository, request.target, request.slot)
+                checked = check_current_leftovers(config, config.host, repository, request.target, request.slot)
                 release_allowed = isinstance(checked, LeftoversEnded)
                 observe_cleanup(evidence, checked)
                 report_leftover_check(checked, request)
@@ -1587,7 +1616,7 @@ def claimed_run(
                 write_backoff(time.time() + config.unreachable_backoff_s, request.target)
                 return declined("unreachable", started)
             if probe.free_gib < config.free_floor_gib:
-                checked = check_leftovers(config, config.host, repository, request.target, request.slot)
+                checked = check_current_leftovers(config, config.host, repository, request.target, request.slot)
                 release_allowed = isinstance(checked, LeftoversEnded)
                 observe_cleanup(evidence, checked)
                 report_leftover_check(checked, request)
@@ -1621,13 +1650,13 @@ def claimed_run(
         )
         seconds = elapsed_seconds(started)
         if linux and isinstance(remote_status, UnresolvedSlotStartup):
-            checked = check_leftovers(config, config.host, repository, request.target, request.slot)
+            checked = check_current_leftovers(config, config.host, repository, request.target, request.slot)
             release_allowed = isinstance(checked, LeftoversEnded)
             observe_cleanup(evidence, checked)
             report_leftover_check(checked, request)
             return BusyMacDecline(LostRunLeftovers(), elapsed_seconds(started))
         if isinstance(remote_status, (MissingMacStatus, UnresolvedSlotStartup)):
-            checked = check_leftovers(config, config.host, repository, request.target, request.slot)
+            checked = check_current_leftovers(config, config.host, repository, request.target, request.slot)
             release_allowed = isinstance(checked, LeftoversEnded)
             observe_cleanup(evidence, checked)
             report_leftover_check(checked, request)
@@ -1635,7 +1664,7 @@ def claimed_run(
         evidence.completion = "confirmed"
         report_cleanup(remote_status.cleanup, request.target)
         if isinstance(remote_status.cleanup, CleanupUnconfirmed):
-            checked = check_leftovers(config, config.host, repository, request.target, request.slot)
+            checked = check_current_leftovers(config, config.host, repository, request.target, request.slot)
             release_allowed = isinstance(checked, LeftoversEnded)
             observe_cleanup(evidence, checked)
             report_leftover_check(checked, request)
@@ -1650,7 +1679,7 @@ def claimed_run(
         return FailedOnMac(remote_status.status, seconds)
     except OffloadInterrupted:
         if not release_allowed:
-            checked = check_leftovers(config, config.host, repository, request.target, request.slot)
+            checked = check_current_leftovers(config, config.host, repository, request.target, request.slot)
             release_allowed = isinstance(checked, LeftoversEnded)
             observe_cleanup(evidence, checked)
             report_leftover_check(checked, request)

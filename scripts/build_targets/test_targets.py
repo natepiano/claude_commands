@@ -27,6 +27,10 @@ import targets
 import build_hold
 import mac_test
 import offload
+if TYPE_CHECKING:
+    from . import target_config
+else:
+    import target_config
 
 
 from override_guard import require_checkout
@@ -157,6 +161,20 @@ class IsolatedTargetTest(unittest.TestCase):
 
 
 class ConfigurationTests(IsolatedTargetTest):
+    def test_aws_classification_requires_linux_and_a_name_or_settings_match(self) -> None:
+        cases: tuple[tuple[str, target_config.Platform, str, bool], ...] = (
+            ("aws", "linux", "custom.conf", True),
+            ("builder", "linux", "aws_target.conf", True),
+            ("builder", "linux", "custom.conf", False),
+            ("aws", "macos", "custom.conf", False),
+            ("builder", "macos", "aws_target.conf", False),
+            ("aws", "macos", "aws_target.conf", False),
+        )
+        for name, platform, filename, expected in cases:
+            with self.subTest(name=name, platform=platform, filename=filename):
+                target = target_config.SshTarget(name, platform, self.root / filename)
+                self.assertEqual(target_config.is_aws_target(target), expected)
+
     def test_shipped_config_reads_mac_then_natedev(self) -> None:
         self.assertEqual(targets.read_targets(SHIPPED_CONFIG), (
             targets.SshTarget("mac", "macos", SHIPPED_CONFIG.with_name("mac_test.conf")),

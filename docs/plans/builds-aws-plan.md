@@ -324,7 +324,7 @@ A durable cost ledger estimates AWS spend, and one spending guard refuses AWS ad
 
 **Ruled out:** A separate cleanup path for retained claims: refusal cleanup reuses `take_over_kept_claim` and `check_leftovers`.
 
-### Phase 7 — Tighten the spending guard and SSH cleanup boundaries  · status: todo
+### Phase 7 — Tighten the spending guard and SSH cleanup boundaries  · status: done
 **Depends on:** Phase 6
 
 #### Work Order

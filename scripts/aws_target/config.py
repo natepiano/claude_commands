@@ -39,6 +39,7 @@ class SpendingSettings:
     cost_explorer_read_usd: Decimal
     notification_recipient: str
     notification_timeout_s: int
+    notification_retry_s: int
     limits: tuple[LimitSettingEvidence, ...]
 
 
@@ -110,4 +111,5 @@ def read_settings(path: Path) -> SpendingSettings:
     return SpendingSettings(daily, monthly, reserve, fallback, max(fixed, sum((cost for _, cost in components), Decimal(0))),
                             components, zone, seconds("price_refresh_seconds"), seconds("price_max_age_seconds"),
                             seconds("observation_max_age_seconds"), seconds("cost_explorer_interval_seconds"),
-                            explorer, live_text("notification_recipient"), seconds("notification_timeout_s"), tuple(limits))
+                            explorer, live_text("notification_recipient"), seconds("notification_timeout_s"),
+                            seconds("notification_retry_s"), tuple(limits))
