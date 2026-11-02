@@ -253,6 +253,7 @@ class QueuePlace:
     wave_at: float = 0.0
     status: int = 1
     program: ProgramNotStarted | StartedProgram = field(default_factory=ProgramNotStarted, init=False)
+    on_started: Callable[[], None] = no_hold_wait
     _samples: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
     def observe(self, peak_bytes: int, current_bytes: int) -> None:
@@ -305,6 +306,7 @@ class QueuePlace:
                     if process.poll() is not None and not self.sidecar.read_text().strip():
                         raise QueuePlaceRefused("the program exited before it published its memory scope")
                     time.sleep(memory_admit.read_memory_config().program_sample_seconds)
+            self.on_started()
         return process
 
     def _sample(self, tracking: ScopedProgram | ProgramTree, stopped: threading.Event) -> None:
@@ -381,7 +383,7 @@ def queue_place(program: str, repo: Path, *,
     if isinstance(sizing, ConfiguredFirstPeak):
         first = config.program_first_peaks.get(program)
         if first is None:
-            raise QueuePlaceRefused(f"no first peak for {program} in lint.conf [memory]")
+            raise QueuePlaceRefused(f"no first peak for {program} in lint.conf [memory]; {conf.path('lint')}: program_first_peak_gib.{program} is missing or invalid")
         sizing = memory_admit.HistoryPeakSizing(first, memory_admit.FirstProgramPeak(first), 0.0)
     profile: memory_admit.ProgramProfile | memory_admit.StepProfile = memory_admit.ProgramProfile(
         program, str(Path.home() / ".claude"), str(repo.resolve()), sizing)

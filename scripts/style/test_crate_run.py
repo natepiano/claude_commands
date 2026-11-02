@@ -8,7 +8,7 @@ import os
 import sys
 import tempfile
 from dataclasses import replace
-from contextlib import closing
+from contextlib import closing, redirect_stderr
 from collections.abc import Callable, Sequence
 from functools import cached_property
 from pathlib import Path
@@ -24,6 +24,8 @@ import style_ledger as ledger_api
 from approved_renames import BindingRename
 from ledger_test_support import machine_rename_fixture
 from test_bulk_rename import ScriptedServer, word_edits, CargoProjectTests
+from style_child_test_support import install_refusal_tools
+from scripts.build_queue import queue_place
 
 
 class Commands:
@@ -688,6 +690,125 @@ class CrateRunTests(CargoProjectTests):
                          "no selected findings: 3 findings held by open tickets: holder-a-1, holder-b-1")
         self.assertEqual(other_result["crates"]["beta"].get("error"),
                          "no selected findings: 1 finding held by open tickets: other-crate-1")
+
+    def test_queue_refusal_keeps_the_claimed_run_and_its_tickets(self) -> None:
+        self.freeze()
+        config = self.root / "lint.conf"
+        key = "program_first_peak_gib.cargo"
+        self.queue.refusals["cargo"] = f"{config}: {key} is missing or invalid"
+        errors = io.StringIO()
+        with redirect_stderr(errors), self.assertRaises(SystemExit) as stopped:
+            _ = self.batch.advance("bulk_sample", renamed, run.run_command, available)
+        self.assertEqual(stopped.exception.code, 2)
+        self.assertIn(str(config), errors.getvalue())
+        self.assertIn(key, errors.getvalue())
+        record = self.batch.read()["crates"]["bulk_sample"]
+        self.assertEqual(record["stage"], crates.CrateStage.CLAIMED)
+        checkout = Path(record["checkout"])
+        self.assertEqual(run.git(checkout, "status", "--porcelain"), "")
+        self.assertEqual((checkout / "src/lib.rs").read_bytes(), (self.repo / "src/lib.rs").read_bytes())
+        self.assertNotIn("error", record)
+        assert "tickets" in record and "owner" in record
+        self.assertTrue(record["tickets"])
+        for identity, ticket in record["tickets"].items():
+            finding, = self.authority.named_held((identity,))
+            self.assertEqual(finding.build_ticket, ledger_api.BuildTicket(ticket))
+            self.assertIsInstance(finding.state, ledger_api.Filed)
+            self.assertEqual(self.authority.bulk_refusals(ticket), ())
+            self.assertEqual(self.authority.ticket_batch_owner(ticket), ledger_api.BatchOwner(record["owner"]))
+        self.assertTrue(all(ticket["state"] == "assigned" for ticket in self.authority.proposal_tickets()
+                            if ticket["id"] in record["tickets"].values()))
+        self.assertEqual(self.queue.places, [])
+
+    def test_repeated_refusal_after_format_restores_claimed_record_and_bytes(self) -> None:
+        self.freeze()
+        install_refusal_tools(self.root)
+        config = self.root / "lint.conf"
+        key = "program_first_peak_gib.cargo"
+        _ = config.write_text("[memory]\n")
+        original = (self.repo / "src/lib.rs").read_bytes()
+        checks: list[bytes] = []
+
+        def refuse_check(checkout: Path, arguments: Sequence[str]) -> None:
+            if "check" in arguments and key not in config.read_text():
+                formatted = (checkout / "src/lib.rs").read_bytes()
+                self.assertTrue(formatted.startswith(b"\n"))
+                self.assertIn(b"let number", formatted)
+                checks.append(formatted)
+                raise queue_place.QueuePlaceRefused(f"{config}: {key} is missing or invalid")
+
+        self.queue.before_start = refuse_check
+        preserved: crates.CrateRecord = self.batch.read()["crates"]["bulk_sample"]
+        tickets: tuple[ledger_api.TicketRecord, ...] = ()
+        claims: tuple[ledger_api.HeldFinding, ...] = ()
+        ownership: dict[str, object] = {}
+        for attempt in range(2):
+            with ledger_api.Ledger(self.repo, self.authority.database) as fresh:
+                batch = crates.CrateRun(fresh, self.batch.run_id)
+                with redirect_stderr(io.StringIO()), self.assertRaises(bulk.StyleAdmissionStopped) as stopped:
+                    _ = batch.advance("bulk_sample", renamed, run.run_command, available)
+                self.assertEqual(stopped.exception.code, 2)
+                record = batch.read()["crates"]["bulk_sample"]
+                self.assertEqual(record["stage"], crates.CrateStage.CLAIMED)
+                assert "tickets" in record and "owner" in record
+                current_tickets = fresh.proposal_tickets()
+                current_claims = fresh.named_held(record["tickets"])
+                checkout = Path(record["checkout"])
+                intent = run.WorkspaceIntent(checkout,
+                    f"bulk_run --run {batch.run_id} --crate bulk_sample --repo {self.repo}")
+                journal = bulk.object_fields(cast(object, json.loads(intent.path.read_text())))
+                current_ownership = {name: journal[name] for name in
+                                     ("batch", "operation", "base", "branch", "tickets", "findings")}
+                if attempt == 0:
+                    preserved, tickets, claims, ownership = record, current_tickets, current_claims, current_ownership
+                else:
+                    self.assertEqual(record, preserved)
+                    self.assertEqual(current_tickets, tickets)
+                    self.assertEqual(current_claims, claims)
+                    self.assertEqual(current_ownership, ownership)
+                self.assertEqual((checkout / "src/lib.rs").read_bytes(), original)
+                self.assertEqual(run.git(checkout, "status", "--porcelain"), "")
+                self.assertTrue(all(place.closed for place in self.queue.places))
+        self.assertEqual(len(checks), 2)
+        self.assertEqual(checks[0], checks[1])
+        _ = config.write_text(f"[memory]\n{key}=12\n")
+        with ledger_api.Ledger(self.repo, self.authority.database) as fresh:
+            batch = crates.CrateRun(fresh, self.batch.run_id)
+            with mock.patch.object(run, "claim", side_effect=AssertionError("retry must keep claims")):
+                result = batch.advance("bulk_sample", renamed, run.run_command, available)
+            record = result["crates"]["bulk_sample"]
+            self.assertEqual(record["stage"], crates.CrateStage.INTEGRATED)
+            self.assertEqual(record.get("tickets"), preserved.get("tickets"))
+            self.assertEqual(record.get("owner"), preserved.get("owner"))
+
+    def test_failed_refusal_recovery_never_abandons_crate_on_retry(self) -> None:
+        self.freeze()
+        install_refusal_tools(self.root)
+        unknown = b"pub fn outside_change() {}\n"
+
+        def refuse_changed(checkout: Path, arguments: Sequence[str]) -> None:
+            if "check" in arguments:
+                _ = (checkout / "src/lib.rs").write_bytes(unknown)
+                raise queue_place.QueuePlaceRefused("place lost after unknown change")
+
+        self.queue.before_start = refuse_changed
+        with redirect_stderr(io.StringIO()), self.assertRaises(bulk.StyleAdmissionStopped):
+            _ = self.batch.advance("bulk_sample", renamed, run.run_command, available)
+        record = self.batch.read()["crates"]["bulk_sample"]
+        self.assertEqual(record["stage"], crates.CrateStage.CLAIMED)
+        assert "tickets" in record
+        tickets = self.authority.proposal_tickets()
+        claims = self.authority.named_held(record["tickets"])
+        with ledger_api.Ledger(self.repo, self.authority.database) as fresh:
+            batch = crates.CrateRun(fresh, self.batch.run_id)
+            with self.assertRaisesRegex(bulk.BulkRenameError, "bytes do not match the recorded edit"):
+                _ = batch.advance("bulk_sample", renamed, run.run_command, available)
+            self.assertEqual(batch.read()["crates"]["bulk_sample"], record)
+            self.assertEqual(fresh.proposal_tickets(), tickets)
+            self.assertEqual(fresh.named_held(record["tickets"]), claims)
+        checkout = Path(record["checkout"])
+        self.assertEqual((checkout / "src/lib.rs").read_bytes(), unknown)
+        self.assertTrue(run.WorkspaceIntent(checkout, "read journal path").path.exists())
 
     def test_one_crate_failure_releases_only_its_claims_and_the_other_proceeds(self) -> None:
         self.freeze()
