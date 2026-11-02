@@ -258,6 +258,8 @@ def validate_worker_state(path: Path, value: object) -> dict[str, object]:
             if not isinstance(revision, int) or isinstance(revision, bool) or revision < 0:
                 raise WorkerStateUnreadable(path, f"{name}: invalid revision")
     elif path.name.endswith(".pending.json"):
+        if not record:
+            return record
         if (not isinstance(record.get("thread_id"), str) or not isinstance(record.get("messages"), list)
                 or any(not isinstance(item, str) for item in cast(list[object], record.get("messages", [])))
                 or ("accepting_messages" in record and not isinstance(record["accepting_messages"], bool))

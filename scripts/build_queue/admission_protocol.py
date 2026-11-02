@@ -72,7 +72,7 @@ class NoCallRecord:
 
 
 Call = CallRecord | NoCallRecord
-Profile = gate.StepProfile | gate.GateProfile
+Profile = gate.StepProfile | gate.ProgramProfile
 
 
 @dataclass(frozen=True)

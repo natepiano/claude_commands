@@ -252,6 +252,20 @@ class SessionLookupTests(ShutdownTestCase):
         self.assertEqual([record["sessionId"] for record in running], ["socketless", "reachable"])
         self.assertEqual([record["sessionId"] for record in live], ["reachable"])
 
+    def test_session_activity_uses_the_shared_record_reader(self) -> None:
+        for state, expected in (("busy", "busy"), ("shell", "shell"), ("idle", "idle"),
+                                ("unknown", "unknown"), (None, ""), (42, "")):
+            with self.subTest(state=state):
+                self.record("activity.json")
+                path = self.sessions / "activity.json"
+                data = cast(dict[str, object], json.loads(path.read_text()))
+                if state is not None:
+                    data["status"] = state
+                _ = path.write_text(json.dumps(data))
+                result = sessions.read_session(path)
+                assert not isinstance(result, sessions.UnreadableSessionRecord)
+                self.assertEqual(result.get("status"), expected)
+
     def test_live_sessions_selects_records_through_the_live_session_predicate(self) -> None:
         self.record("fixture.json", pid=2**29 + os.getpid(), socket_path=self.root / "absent.sock")
         record = sessions.read_session(self.sessions / "fixture.json")

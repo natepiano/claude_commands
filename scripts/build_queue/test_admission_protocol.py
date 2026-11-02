@@ -20,7 +20,11 @@ class ProtocolTests(unittest.TestCase):
         with AdmissionFixture() as fixture:
             request = fixture.request()
             requests: list[wire.Request] = [request, fixture.launch(),
-                replace(request, profile=gate.GateProfile("repo", "tree", GIB, gate.NoGateHistory(GIB))),
+                replace(request, profile=gate.ProgramProfile("merge-gate", "repo", "tree", gate.FixedCapSizing(3 * GIB))),
+                replace(request, profile=gate.ProgramProfile("rust-analyzer", "repo", "tree",
+                    gate.HistoryPeakSizing(18 * GIB, gate.FirstProgramPeak(18 * GIB), NOW))),
+                replace(request, profile=gate.ProgramProfile("rust-analyzer", "repo", "tree",
+                    gate.HistoryPeakSizing(18 * GIB, gate.MeasuredProgramPeak(7 * GIB, 5), NOW))),
                 wire.ReleaseRequest("release", "/tmp/stem", 137),
                 wire.WidthRequest("width", "/tmp/stem", 4), wire.ViewRequest(),
                 wire.ExplainRequest(), wire.MineRequest("session"),

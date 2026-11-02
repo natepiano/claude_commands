@@ -1397,36 +1397,50 @@ INFER_FROM_ARGV = InferFromArgv()
 
 
 @dataclass(frozen=True)
-class MeasuredGatePeak:
+class MeasuredProgramPeak:
     bytes: int
     runs: int
 
 
 @dataclass(frozen=True)
-class NoGateHistory:
-    cap_bytes: int
-
-
-GateEstimate = MeasuredGatePeak | NoGateHistory
+class FirstProgramPeak:
+    bytes: int
 
 
 @dataclass(frozen=True)
-class GateProfile:
+class FixedCapSizing:
+    cap_bytes: int
+
+
+@dataclass(frozen=True)
+class HistoryPeakSizing:
+    first_peak_bytes: int
+    estimate: MeasuredProgramPeak | FirstProgramPeak
+    estimated_at: float
+
+
+@dataclass(frozen=True)
+class ProgramProfile:
+    program: str
     repo: str
     worktree: str
-    cap_bytes: int
-    estimate: GateEstimate
-    estimated_at: float = 0.0
+    sizing: FixedCapSizing | HistoryPeakSizing
 
     @property
-    def step(self) -> Literal["merge-gate"]:
-        return "merge-gate"
+    def step(self) -> str:
+        return self.program
+
+    @property
+    def estimated_at(self) -> float:
+        return self.sizing.estimated_at if isinstance(self.sizing, HistoryPeakSizing) else 0.0
 
     @property
     def peak(self) -> ExpectedPeak:
-        estimate = self.estimate
+        if isinstance(self.sizing, FixedCapSizing):
+            return ExpectedPeak(self.sizing.cap_bytes, "fallback", 0)
+        estimate = self.sizing.estimate
         return (ExpectedPeak(estimate.bytes, "measured", estimate.runs)
-                if isinstance(estimate, MeasuredGatePeak) else ExpectedPeak(estimate.cap_bytes, "fallback", 0))
+                if isinstance(estimate, MeasuredProgramPeak) else ExpectedPeak(estimate.bytes, "fallback", 0))
 
     @property
     def repository(self) -> UnknownRepository:
@@ -1447,14 +1461,15 @@ def anonymous_history_rows(source: Path | BinaryIO) -> Iterator[dict[str, object
     yield from store.whole_rows(source, 0)
 
 
-def gate_estimate(cap_bytes: int, host: str, now: datetime, root: Path) -> GateEstimate:
-    """Read the gate's one peak history, without using cargo estimates."""
+def program_peak_estimate(program: str, host: str, now: datetime, root: Path,
+                          first_peak_bytes: int) -> MeasuredProgramPeak | FirstProgramPeak:
+    """Read one program's peak history, without using cargo estimates."""
     cutoff = now - timedelta(days=HISTORY_DAYS)
     peaks: list[int] = []
     try:
         for row in anonymous_history_rows(root / "admission/anon_peaks.jsonl"):
             try:
-                if row.get("host") != host or row.get("step") != "merge-gate":
+                if row.get("host") != host or row.get("step") != program:
                     continue
                 peak, ended = row.get("anon_peak_bytes"), row.get("ended_at")
                 if not isinstance(peak, int) or peak <= 0 or not isinstance(ended, str):
@@ -1465,7 +1480,7 @@ def gate_estimate(cap_bytes: int, host: str, now: datetime, root: Path) -> GateE
                 continue
     except FileNotFoundError:
         pass
-    return MeasuredGatePeak(percentile(peaks), len(peaks)) if peaks else NoGateHistory(cap_bytes)
+    return MeasuredProgramPeak(percentile(peaks), len(peaks)) if peaks else FirstProgramPeak(first_peak_bytes)
 
 
 @dataclass(frozen=True)
@@ -1509,7 +1524,7 @@ class CheckResult:
     repo: str
     step: str
     available: int
-    profile: StepProfile | GateProfile
+    profile: StepProfile | ProgramProfile
     head_need: int = 0
     head_label: str = ""
     head_reason: WaitReason = ReadyForAdmission()
@@ -1542,10 +1557,15 @@ class InvalidValue:
 
 
 @dataclass(frozen=True)
+class ProgramSizeUnavailable:
+    pass
+
+
+@dataclass(frozen=True)
 class ConfigFallback:
     key: str
     found: MissingValue | InvalidValue
-    used: int | float
+    used: int | float | ProgramSizeUnavailable
 
 
 @dataclass(frozen=True)
@@ -1565,6 +1585,10 @@ class MemoryConfig:
     source_settle_seconds: float = 2.0
     override_reconnect_seconds: float = 10.0
     request_max_bytes: int = 1048576
+    program_first_peaks: Mapping[str, int] = field(default_factory=dict[str, int])
+    program_sample_seconds: float = 1.0
+    program_stop_seconds: float = 5.0
+    peak_wave_seconds: float = 60.0
 
 
 DEFAULT_MEMORY_CONFIG = MemoryConfig(DEFAULT_ADMISSION_POLICY, FALLBACK_TEST_PHASE_MARGIN,
@@ -1637,7 +1661,19 @@ def read_memory_config() -> MemoryConfig:
         number("source_settle_seconds", defaults.source_settle_seconds),
         number("override_reconnect_seconds", defaults.override_reconnect_seconds),
         int(number("request_max_bytes", defaults.request_max_bytes, whole=True)))
-    return replace(config, fallbacks=tuple(fallbacks))
+    first_peaks: dict[str, int] = {}
+    for key, raw in values.items():
+        if key.startswith("program_first_peak_gib."):
+            size = _positive_gib_bytes(raw)
+            if size is None:
+                fallbacks.append(ConfigFallback(key, InvalidValue(raw), ProgramSizeUnavailable()))
+            else:
+                first_peaks[key.removeprefix("program_first_peak_gib.")] = size
+    return replace(config, program_first_peaks=first_peaks,
+                   program_sample_seconds=number("program_sample_seconds", defaults.program_sample_seconds),
+                   program_stop_seconds=number("program_stop_seconds", defaults.program_stop_seconds),
+                   peak_wave_seconds=number("peak_wave_seconds", defaults.peak_wave_seconds),
+                   fallbacks=tuple(fallbacks))
 
 
 _warned_config_fallbacks: set[ConfigFallback] = set()
@@ -1651,7 +1687,9 @@ def memory_config() -> MemoryConfig:
         _warned_config_fallbacks.add(fallback)
         found = ("is missing" if isinstance(fallback.found, MissingValue)
                  else json.dumps(fallback.found.raw) + " is not valid")
-        print(f"memory admission: lint.conf [memory] {fallback.key} {found}; using {fallback.used:g}", file=sys.stderr)
+        action = ("program size unavailable; program refused" if isinstance(fallback.used, ProgramSizeUnavailable)
+                  else f"using {fallback.used:g}")
+        print(f"memory admission: lint.conf [memory] {fallback.key} {found}; {action}", file=sys.stderr)
     return config
 
 
@@ -2486,22 +2524,26 @@ def process_table(proc: Path = PROC) -> dict[int, ProcessIdentity]:
     return processes
 
 
-def tree_memory(pid: int, start: str, processes: dict[int, ProcessIdentity],
-                proc: Path = PROC) -> MeasuredMemory | GoneMemory:
-    """Sum resident and swapped bytes from one process table reading."""
-    identity = processes.get(pid)
-    if identity is None or identity.start != start:
-        return GoneMemory()
+def process_tree(roots: Mapping[int, str], processes: dict[int, ProcessIdentity]) -> set[int]:
+    """Find live roots and their descendants from one process table reading."""
     children: dict[int, list[int]] = {}
     for child, identity in processes.items():
         children.setdefault(identity.parent, []).append(child)
-    pending, seen, used, swapped = [pid], set[int](), 0, 0
+    pending = [pid for pid, start in roots.items() if pid in processes and processes[pid].start == start]
+    seen: set[int] = set()
     while pending:
         child = pending.pop()
         if child in seen:
             continue
         seen.add(child)
         pending.extend(children.get(child, []))
+    return seen
+
+
+def process_memory(pids: set[int], proc: Path = PROC) -> MeasuredMemory:
+    """Sum resident and swapped bytes for a set of processes."""
+    used, swapped = 0, 0
+    for child in pids:
         try:
             for line in (proc / str(child) / "status").read_text().splitlines():
                 parts = line.split()
@@ -2513,6 +2555,13 @@ def tree_memory(pid: int, start: str, processes: dict[int, ProcessIdentity],
         except (OSError, ValueError, IndexError):
             continue
     return MeasuredMemory(used, swap_bytes=swapped)
+
+
+def tree_memory(pid: int, start: str, processes: dict[int, ProcessIdentity],
+                proc: Path = PROC) -> MeasuredMemory | GoneMemory:
+    """Sum resident and swapped bytes from one process table reading."""
+    members = process_tree({pid: start}, processes)
+    return process_memory(members, proc) if members else GoneMemory()
 
 
 @dataclass(frozen=True)
@@ -3225,7 +3274,7 @@ def token_wait(path: Path, root: Path | None = None) -> None:
 
 def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float = 0.0,
           root: Path | None = None, now: datetime | None = None,
-          profile: InferFromArgv | StepProfile | GateProfile = INFER_FROM_ARGV) -> CheckResult:
+          profile: InferFromArgv | StepProfile | ProgramProfile = INFER_FROM_ARGV) -> CheckResult:
     """Admit or hold one step. A held step is a waiter from `since` (epoch seconds; 0 means now), so a
     step that gave its reservation back for the cargo token keeps its place."""
     root = root if root is not None else store.root()
@@ -3235,9 +3284,13 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
     fresh = False
     width = test_threads(argv)
     package, filters = test_package(argv), test_filters(argv)
-    if isinstance(profile, GateProfile) and (not profile.estimated_at or estimate_time.timestamp() - profile.estimated_at >= policy.timing.head_seconds):
-        profile = replace(profile, estimate=gate_estimate(profile.cap_bytes, store.host_name(), estimate_time, root),
-                          estimated_at=estimate_time.timestamp())
+    if isinstance(profile, ProgramProfile) and isinstance(profile.sizing, HistoryPeakSizing):
+        sizing = profile.sizing
+        if not sizing.estimated_at or estimate_time.timestamp() - sizing.estimated_at >= policy.timing.head_seconds:
+            profile = replace(profile, sizing=replace(sizing,
+                estimate=program_peak_estimate(profile.program, store.host_name(), estimate_time, root,
+                                               sizing.first_peak_bytes),
+                estimated_at=estimate_time.timestamp()))
     elif isinstance(profile, StepProfile) and profile.estimated_at and estimate_time.timestamp() - profile.estimated_at >= policy.timing.head_seconds:
         profile = InferFromArgv()
     if isinstance(profile, InferFromArgv):
@@ -3258,7 +3311,7 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
                              package=package, filters=filters, fresh=fresh,
                              shape=build_shape(argv) if step == "build" else NoBuildShape())
         profile = StepProfile(repo, step, worktree, peak, repository, scope, estimate_time.timestamp())
-    elif not profile.estimated_at:
+    elif isinstance(profile, StepProfile) and not profile.estimated_at:
         profile = replace(profile, estimated_at=estimate_time.timestamp())
     repo, step, worktree, peak = profile.repo, profile.step, profile.worktree, profile.peak
     if not argv and not (root / "admission").exists():
@@ -3291,7 +3344,7 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
                         and ("shape" not in row or recorded_build_shape(row["shape"]) == build_shape(argv))):
                     # Use the existing expiry path; the next poll estimates outside the lock.
                     # An old row may get its shape from the index outside this lock.
-                    profile = replace(profile, estimated_at=now.timestamp() - policy.timing.head_seconds)
+                    profile = replace(profile, estimated_at=now.timestamp() - policy.timing.head_seconds) if isinstance(profile, StepProfile) else profile
                 continue
             live.append((path, row))
         compilers = sccache_memory()
@@ -3309,7 +3362,7 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
         waiter["test_scope"] = profile.scope
         waiter["package"] = package
         waiter["filters"] = list(filters)
-        waiter["estimated_at"] = profile.estimated_at
+        waiter["estimated_at"] = profile.estimated_at or estimate_time.timestamp()
         waiter["fresh_test"] = fresh
         waiter["need_source"] = peak.source
         waiter["need_runs"] = peak.count
@@ -3327,7 +3380,7 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
                 waiter["token_left_at"] = previous["token_left_at"]
         identity = waiter_identity(step, worktree)
         waiter["session_id"], waiter["session_name"] = identity["session_id"], identity["session_name"]
-        waiter["step"], waiter["folder"] = identity["step"], profile.worktree if isinstance(profile, GateProfile) else identity["folder"]
+        waiter["step"], waiter["folder"] = identity["step"], profile.worktree if isinstance(profile, ProgramProfile) else identity["folder"]
         host = read_meminfo(meminfo)
         snapshot.host = host
         available = host.available

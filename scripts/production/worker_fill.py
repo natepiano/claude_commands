@@ -94,6 +94,9 @@ def fill(*, dry_run: bool = False) -> int:
         observations = sources.collect()
     for line in errors.getvalue().splitlines():
         line = line.removeprefix("staff sources: ")
+        if staff_sources.is_non_staff_note(line):
+            print(f"note: {line}")
+            continue
         match = re.fullmatch(r"(.*) worker (.*?): (.*)", line)
         problems.append(f"{match[1]}:workers {match[2]}: {match[3]}" if match else f"{line}:record ?: source unavailable")
     active = {row.id for row in record.rows if row.kind in ("unit", "showrunner")

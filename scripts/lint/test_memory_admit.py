@@ -3299,15 +3299,15 @@ class BuildNeedBasisTests(BuildPromiseFixture):
                 self.assertEqual(refreshed["need_basis"], first["need_basis"])
 
 
-class GateProfileTests(MemoryQueueFixture):
-    def test_unfinished_rows_do_not_change_the_gate_estimate(self) -> None:
+class ProgramProfileTests(MemoryQueueFixture):
+    def test_unfinished_rows_do_not_change_the_program_estimate(self) -> None:
         history = gate.admission_dir(self.root) / "anon_peaks.jsonl"
         _ = history.write_text(json.dumps({
             "step": "merge-gate", "host": "host", "anon_peak_bytes": 3 * GIB,
             "ended_at": store.utc_iso(HISTORY_AT.timestamp()),
         }) + "\n")
         assert_unfinished_history_ignored(
-            self, history, lambda: gate.gate_estimate(4 * GIB, "host", NOW, self.root))
+            self, history, lambda: gate.program_peak_estimate("merge-gate", "host", NOW, self.root, 4 * GIB))
 
     @override
     def setUp(self) -> None:
@@ -3315,9 +3315,10 @@ class GateProfileTests(MemoryQueueFixture):
         _ = cast(object, self.enterContext(patch.dict(os.environ, fake_memory_readings(self.root))))
 
     def test_gate_without_history_uses_its_cap_and_keeps_its_queue_identity(self) -> None:
-        estimate = gate.gate_estimate(4 * GIB, "host", NOW, self.root)
-        self.assertEqual(estimate, gate.NoGateHistory(4 * GIB))
-        profile = gate.GateProfile("installed/.claude", "checkout", 4 * GIB, estimate)
+        estimate = gate.program_peak_estimate("merge-gate", "host", NOW, self.root, 4 * GIB)
+        self.assertEqual(estimate, gate.FirstProgramPeak(4 * GIB))
+        profile = gate.ProgramProfile("merge-gate", "installed/.claude", "checkout",
+                                      gate.HistoryPeakSizing(4 * GIB, estimate, 0.0))
         _ = self.running(100, 20, age=1)
         with patch.object(gate, "git_identity", side_effect=AssertionError("gate inferred cargo identity")):
             result = gate.check(self.meminfo, 400, "", ["merge-gate"], root=self.root, now=NOW, profile=profile)
@@ -3340,7 +3341,7 @@ class GateProfileTests(MemoryQueueFixture):
              "ended_at": store.utc_iso((NOW - timedelta(days=gate.HISTORY_DAYS + 1)).timestamp())},
         ])
         _ = history.write_text("".join(json.dumps(row) + "\n" for row in rows))
-        self.assertEqual(gate.gate_estimate(4 * GIB, "host", NOW, self.root), gate.MeasuredGatePeak(9 * GIB, 10))
+        self.assertEqual(gate.program_peak_estimate("merge-gate", "host", NOW, self.root, 4 * GIB), gate.MeasuredProgramPeak(9 * GIB, 10))
 
     def test_gate_queue_view_keeps_checkout_when_launch_directory_differs(self) -> None:
         checkout, launch = self.root / "gate-checkout", self.root / "launch"
@@ -3351,7 +3352,8 @@ class GateProfileTests(MemoryQueueFixture):
         (owner / "cwd").symlink_to(launch)
         self.readings[400] = gate.MeasuredMemory(GIB)
         busy = self.running(100, 20, age=1)
-        profile = gate.GateProfile("installed/.claude", str(checkout), 4 * GIB, gate.NoGateHistory(4 * GIB))
+        profile = gate.ProgramProfile("merge-gate", "installed/.claude", str(checkout),
+                                      gate.HistoryPeakSizing(4 * GIB, gate.FirstProgramPeak(4 * GIB), 0.0))
         for state in ("hold", "admit"):
             with self.subTest(state=state):
                 if state == "admit":
@@ -3364,8 +3366,9 @@ class GateProfileTests(MemoryQueueFixture):
                 self.assertEqual(visible.folder, str(checkout))
 
     def test_expired_gate_profile_refreshes_outside_lock_without_cargo_inference(self) -> None:
-        profile = gate.GateProfile("installed/.claude", "checkout", 4 * GIB,
-                                   gate.NoGateHistory(4 * GIB), NOW.timestamp() - gate.DEFAULT_ADMISSION_POLICY.timing.head_seconds)
+        profile = gate.ProgramProfile("merge-gate", "installed/.claude", "checkout",
+            gate.HistoryPeakSizing(4 * GIB, gate.FirstProgramPeak(4 * GIB),
+                                   NOW.timestamp() - gate.DEFAULT_ADMISSION_POLICY.timing.head_seconds))
         locked = False
         acquire = fcntl.flock
 
@@ -3374,13 +3377,14 @@ class GateProfileTests(MemoryQueueFixture):
             acquire(file, operation)
             locked = True
 
-        def estimate(cap: int, host: str, now: datetime, root: Path) -> gate.GateEstimate:
+        def estimate(program: str, host: str, now: datetime, root: Path, cap: int) -> gate.MeasuredProgramPeak | gate.FirstProgramPeak:
             self.assertFalse(locked)
+            self.assertEqual(program, "merge-gate")
             self.assertEqual((cap, now, root), (4 * GIB, NOW, self.root))
             self.assertTrue(host)
-            return gate.MeasuredGatePeak(6 * GIB, 2)
+            return gate.MeasuredProgramPeak(6 * GIB, 2)
 
-        with patch.object(gate, "gate_estimate", side_effect=estimate) as refreshed, \
+        with patch.object(gate, "program_peak_estimate", side_effect=estimate) as refreshed, \
                 patch.object(gate, "git_identity", side_effect=AssertionError("gate inferred cargo identity")), \
                 patch.object(fcntl, "flock", side_effect=lock):
             result = gate.check(self.meminfo, 400, "", ["merge-gate"], root=self.root, now=NOW, profile=profile)
@@ -3394,12 +3398,13 @@ class GateProfileTests(MemoryQueueFixture):
             self.assertEqual((row["repo"], row["step"], row["need"]), ("installed/.claude", "merge-gate", 6 * GIB))
 
     def test_expired_measured_gate_profile_retains_its_original_fallback_cap(self) -> None:
-        profile = gate.GateProfile("installed/.claude", "checkout", 4 * GIB,
-                                   gate.MeasuredGatePeak(GIB, 1), NOW.timestamp() - gate.DEFAULT_ADMISSION_POLICY.timing.head_seconds)
+        profile = gate.ProgramProfile("merge-gate", "installed/.claude", "checkout",
+            gate.HistoryPeakSizing(4 * GIB, gate.MeasuredProgramPeak(GIB, 1),
+                                   NOW.timestamp() - gate.DEFAULT_ADMISSION_POLICY.timing.head_seconds))
         with patch.object(gate, "git_identity", side_effect=AssertionError("gate inferred cargo identity")):
             result = gate.check(self.meminfo, 400, "", ["merge-gate"], root=self.root, now=NOW, profile=profile)
         self.assertEqual(result.peak, gate.ExpectedPeak(4 * GIB, "fallback", 0))
-        self.assertEqual(cast(gate.GateProfile, result.profile).estimate, gate.NoGateHistory(4 * GIB))
+        self.assertEqual(cast(gate.HistoryPeakSizing, cast(gate.ProgramProfile, result.profile).sizing).estimate, gate.FirstProgramPeak(4 * GIB))
         self.assertEqual((result.repo, result.step), ("installed/.claude", "merge-gate"))
 
 
@@ -7464,6 +7469,39 @@ class ConfiguredAdmissionPolicyTests(MemoryQueueFixture):
         self.assertEqual(config.test_phase_margin, 1.7)
         self.assertEqual(config.build_budget_bytes, int(9.5 * GIB))
         self.assertEqual(config.running_pass_seconds, 3)
+
+    def test_program_first_peaks_are_private_bytes_and_reload_at_use(self) -> None:
+        self.write_config(**{"program_first_peak_gib.rust-analyzer": "18",
+                             "program_first_peak_gib.indexer": "2.5"})
+        with contextlib.redirect_stderr(io.StringIO()) as errors:
+            config = gate.read_memory_config()
+        self.assertEqual(dict(config.program_first_peaks),
+                         {"rust-analyzer": 18 * GIB, "indexer": int(2.5 * GIB)})
+        self.assertEqual(errors.getvalue(), "")
+        self.write_config(**{"program_first_peak_gib.rust-analyzer": "7"})
+        self.assertEqual(dict(gate.read_memory_config().program_first_peaks), {"rust-analyzer": 7 * GIB})
+        self.assertEqual(config.program_first_peaks["rust-analyzer"], 18 * GIB)
+
+    def test_absent_program_first_peak_has_no_invented_default(self) -> None:
+        self.write_config()
+        config = gate.read_memory_config()
+        self.assertEqual(dict(config.program_first_peaks), {})
+        self.assertFalse(any(item.key.startswith("program_first_peak_gib.") for item in config.fallbacks))
+
+    def test_invalid_program_first_peak_is_diagnosed_without_authorizing_a_size(self) -> None:
+        key = "program_first_peak_gib.rust-analyzer"
+        for raw in ("abc", "0", "-1", "nan", "inf", "1e308"):
+            with self.subTest(raw=raw):
+                self.write_config(**{key: raw, "program_first_peak_gib.indexer": "2"})
+                with contextlib.redirect_stderr(io.StringIO()) as errors:
+                    config = gate.read_memory_config()
+                self.assertNotIn("rust-analyzer", config.program_first_peaks)
+                self.assertEqual(config.program_first_peaks["indexer"], 2 * GIB)
+                self.assertEqual([item.found for item in config.fallbacks if item.key == key],
+                                 [gate.InvalidValue(raw)])
+                self.assertEqual([item.used for item in config.fallbacks if item.key == key],
+                                 [gate.ProgramSizeUnavailable()])
+                self.assertEqual(errors.getvalue(), "")
 
     def test_warning_boundary_reports_each_fallback_once_and_checker_stays_silent(self) -> None:
         self.write_config(head_seconds="abc", ramp_seconds=None)

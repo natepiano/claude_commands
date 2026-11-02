@@ -39,13 +39,13 @@ import berth_board
 import coverage_report
 import finding_sites
 import mechanical_classes
-import merge_gate
 from approved_renames import (BindingProof, AppliedInCode, AppliedCheck, ApprovedRename, BindingRename, Declarations, FileRename, Folder, InlineModule,
                               MissingFile, NoAppliedCheck, OuterBindingBlocked, OuterBindingUnproved, RenameNotApplied, UncertainScan, applied_check,
                               approved_rename, binding_rename, binding_rename_check, binding_admission_check, declaration_sites, enclosing,
                               file_rename, inline_modules)
 from add_style import StandingStyleProduction, standing_style_production
 import rules
+from scripts.build_queue import queue_place
 from scripts.production import showrunners
 import style_ledger
 import approved_renames
@@ -3245,7 +3245,7 @@ def split_all(production: Path) -> int:
         print("no style units")
         return 0
     with redirect_stdout(io.StringIO()):
-        prefix = merge_gate.suite_scope_prefix()
+        prefix = queue_place.suite_scope_prefix()
     failed = False
     for row in rows:
         unit = cell_value(row["Unit"])
