@@ -69,10 +69,7 @@ def read_entries(path: Path) -> dict[str, object]:
 
 def read(path: Path) -> dict[str, PaneLaunch]:
     try:
-        entries = cast(dict[str, PaneLaunch], read_entries(path))
-        for entry in entries.values():
-            _ = agent_kind(entry)
-        return entries
+        return cast(dict[str, PaneLaunch], read_entries(path))
     except (OSError, ValueError):
         return {}
 
@@ -285,19 +282,20 @@ def _usable_replacement(path: Path, attempt: ResumeAttempt, entry: PaneLaunch,
         raise ValueError(f"{attempt.pane_id}: replacement launch does not match the proved resume")
 
 
-def retire_launch(path: Path, original: PaneLaunch, *, replacement: ResumeAttempt | UnpublishedResume = UNPUBLISHED_RESUME) -> None:
+def retire_launch(path: Path, pane_id: str, original: PaneLaunch, *,
+                  replacement: ResumeAttempt | UnpublishedResume = UNPUBLISHED_RESUME) -> None:
     """Remove the exact old publication after confirmed closure."""
     with locked(path):
         entries = read_strict(path)
-        current = entries.get(original["pane_id"])
+        current = entries.get(pane_id)
         if current is None:
             return
         if current != original:
-            raise ValueError(f"{original['pane_id']}: retained launch changed before retirement")
+            raise ValueError(f"{pane_id}: retained launch changed before retirement")
         if (isinstance(replacement, ResumeAttempt) and not isinstance(replacement.publication, UnpublishedResume)
                 and entries.get(replacement.pane_id) != replacement.publication):
             raise ValueError(f"{replacement.pane_id}: replacement launch changed before retirement")
-        del entries[original["pane_id"]]
+        del entries[pane_id]
         save(path, entries)
 
 
@@ -339,7 +337,7 @@ def finish_restore(path: Path, original: PaneLaunch | NoOriginalLaunch, attempt:
             return
         close(attempt.pane_id)
         if not isinstance(attempt.publication, UnpublishedResume):
-            retire_launch(path, attempt.publication,
+            retire_launch(path, attempt.pane_id, attempt.publication,
                            replacement=ResumeAttempt(attempt.pane_id, UnpublishedResume()))
         return
     try:
@@ -363,7 +361,7 @@ def finish_restore(path: Path, original: PaneLaunch | NoOriginalLaunch, attempt:
         finish_restore(path, original, attempt, FailedResume(), close=close)
         raise
     close(original["pane_id"])
-    retire_launch(path, original, replacement=retained)
+    retire_launch(path, original["pane_id"], original, replacement=retained)
 
 
 @dataclass(frozen=True)

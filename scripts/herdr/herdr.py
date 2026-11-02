@@ -1435,7 +1435,7 @@ class Herdr:
         if any(row["pane_id"] == pane for row in self.panes()):
             raise HerdrFailure(f"{pane}: pane closure is not confirmed")
         if original is not None:
-            pane_launch.retire_launch(path, original)
+            pane_launch.retire_launch(path, pane, original)
 
     def focus_tab_of(self, pane: str) -> None:
         """Show the tab holding `pane`, and its workspace, in the session's attached clients."""
@@ -2538,12 +2538,12 @@ def close_agent(session: str, pane: str) -> None:
         entries = pane_launch.read_strict(path)
         if session and session == shared_session():
             Herdr(session).close_tab_confirmed(pane)
-            selected = [entry for key, entry in entries.items() if key == pane]
+            selected = [(key, entry) for key, entry in entries.items() if key == pane]
         else:
             stop_session(session)
-            selected = list(entries.values())
-        for entry in selected:
-            pane_launch.retire_launch(path, entry)
+            selected = list(entries.items())
+        for pane_id, entry in selected:
+            pane_launch.retire_launch(path, pane_id, entry)
     except (OSError, ValueError) as error:
         raise HerdrFailure(f"{session}:{pane}: retained launch retirement failed: {error}") from error
 
@@ -2626,7 +2626,7 @@ def repair_retained_launches(record: staff.StaffSnapshot, directory: Path, *,
             if not dry_run:
                 if selected is not None:
                     client.close_tab_confirmed(pane)
-                pane_launch.retire_launch(publication.path, publication.entry)
+                pane_launch.retire_launch(publication.path, pane, publication.entry)
             notes.append(f"{publication.path.stem}:{pane}: stale launch retired" if not dry_run
                          else f"{publication.path.stem}:{pane}: would retire stale launch")
     return notes

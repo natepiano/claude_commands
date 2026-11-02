@@ -230,7 +230,7 @@ def forget_unit(unit_id: str) -> list[str]:
     for path in sorted(record_directory().glob("*.json")):
         for pane, entry in pane_launch.read_strict(path).items():
             if entry["environment"].get("SHOWRUNNER_UNIT_ID") == unit_id:
-                pane_launch.retire_launch(path, entry)
+                pane_launch.retire_launch(path, pane, entry)
                 dropped.append(f"{path.stem}:{pane}")
     return dropped
 
