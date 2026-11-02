@@ -101,7 +101,7 @@ The spending limit is the user's number; it is the one question in this design.
 | 0. Replay | A replay of the last 14 days of natedev's queue with a second machine of each candidate size: wait saved, up-hours and expected dollars per saved hour. It confirms or changes the instance type and gives the user numbers before any spend. | none (reads the build log) | nothing |
 | 1. Per-target storage and slots | The open item in `build-followups-build-targets-next.md`: claims, block and backoff under `~/.local/state/build-targets/<target>/` (the Mac's paths unchanged); `slots.<repo>`; `/build:hold --target <name>`; hold events per target; `buildlog sync` with each `ssh` peer; reports select the Mac by target, not by `host <> 'natedev'` (that test would count box steps as Mac steps). | `scripts/mac_test/` (verify-unit), `scripts/build_targets/`, `scripts/build_hold/` (resources-unit), `scripts/buildlog/` (report-unit) | showrunner: who owns these edits |
 | 2. Linux runner and queue leave | The Linux remote command (devshell from the flake copy, box budget, `skip.<repo>`), mirrors by origin URL, and the leave hook for every eligible `ssh` target, for test, check and doc. Live proof against a loopback target (natedev over Tailscale SSH into a scratch home folder), at no cost. | `scripts/mac_test/offload.py`, `scripts/direct/verify.sh` (verify-unit), `scripts/lint/memory_gate.sh` (queue-unit) | Phase 1 |
-| 3. AWS control and measurement — go-live | `scripts/aws_target/` (tick, start, stop, ledger, spend guard, claim release on instance state, interruption handling), `config/aws_target.conf`, the `aws:` status row, the `### AWS` report section, a CloudFormation template and a runbook the user runs, and the `aws-build` host plus natedev's tick timer in the nixos repo (a branch to the natedev showrunner). | `scripts/build_targets/build_targets.py` (resources-unit), `scripts/buildlog/report.py` (report-unit), `/etc/nixos` (natedev) | the user: account, stack deploy, Tailscale login, key file, cap |
+| 3. AWS control and measurement — go-live | `scripts/aws_target/` (tick, start, stop, ledger, spend guard, claim release on instance state, interruption handling), `config/aws_target.conf`, the `aws:` status row, the `### AWS` report section, a CloudFormation template and a runbook the user runs, and the `aws-build` host plus natedev's tick timer in the nixos repo (a branch to the natedev showrunner). | `scripts/build_targets/build_targets.py` (resources-unit), `scripts/buildlog/report.py` (report-unit), `/etc/nixos` (natedev) | the user: account, stack deploy, Tailscale login, key file |
 | 4. Lint on the box with write-back | The full lint order (mend --fix, fmt, taplo, clippy fix, fmt, clippy judgment) runs in the mirror. The rewritten files come back and are applied only when the local tree key still equals the key sent with the tree (`copy_tree_with_key` already reads it before and after the copy). Otherwise the result is discarded and the step runs again. Agents keep their automatic fixes. | `scripts/direct/verify.sh`, `scripts/mac_test/offload.py` (verify-unit) | Phase 3 |
 
 Go-live is the end of Phase 3, with test, check and doc: about 1,000 of last week's 2,314 waiting hours. Phase 4 adds lint, about 1,240 more.
@@ -113,14 +113,14 @@ Go-live is the end of Phase 3, with test, check and doc: about 1,000 of last wee
 ## What the user does (at go-live, at their own terminal)
 
 1. Create the account and an admin login (in progress).
-2. Run the runbook: `aws cloudformation deploy` of the template, with the region from the placement score and the cap.
+2. Run the runbook: `aws cloudformation deploy` of the template, with the region from the placement score and the $400 cap.
 3. In SSM Session Manager on the box: `sudo tailscale up --ssh --advertise-tags=tag:build-aws`, then add the tag rule to the tailnet policy.
 4. Create the scaler user's access key and write it with `aws configure --profile build-scaler` on natedev.
 5. Rebuild natedev and the box from the nixos branch.
 
-## Open question for the user
+## Spending cap (user, 2026-11-01)
 
-- **The monthly cap in dollars** (and a daily cap, default the monthly cap / 20). Phase 0's replay gives the expected cost and the expected saved wait hours before the user picks.
+`monthly_limit_usd=400` and `daily_limit_usd=20` (the monthly cap / 20). The AWS Budget uses the same $400. Phase 0 expects about $250 a month on Spot for test, check and doc, so the cap leaves room for Phase 4's lint (about $274).
 
 ## Phase 0 result — queue replay (2026-10-31)
 
