@@ -83,6 +83,50 @@ class StaffCheckTests(StaffTestCase):
               mock.patch.object(staff_sources, "observe_workers", return_value=staff_sources.WorkerEvidence((), {}, ()))):
             return staff_check.read_evidence(staff.snapshot())
 
+    def test_codex_without_a_thread_in_an_unowned_pane_is_one_note_and_no_wrong_row(self) -> None:
+        process = process_table.Process(104, 1, "codex", "codex resume")
+        evidence = self.process_evidence(process, sessions.RegistryRead((), ()), {"HERDR_PANE_ID": "unowned:pane"})
+        self.assertEqual(evidence.sessions, ())
+        self.assertEqual(evidence.uncertainties, ())
+        note = "staff sources: Codex process 104: pane holds no staff member; not staff"
+        self.assertEqual(evidence.notes, (note,))
+        evidence = replace(evidence, sessions=self.fixture.live,
+                           workers=replace(self.fixture.evidence.workers, diagnostics=(note,)))
+        self.assertEqual(self.check(evidence), (0, f"note: {note}\nchecked 3 rows; 0 wrong\n"))
+
+    def test_codex_without_a_thread_in_a_staff_pane_stays_uncertain(self) -> None:
+        self.pane("staff:pane", session_id=self.fixture.unit.id, environment={})
+        process = process_table.Process(104, 1, "codex", "codex resume")
+        evidence = self.process_evidence(process, sessions.RegistryRead((), ()), {"HERDR_PANE_ID": "staff:pane"})
+        self.assertEqual(evidence.notes, ())
+        self.assertEqual(evidence.uncertainties, ("pid 104 uncertain: Codex runtime identity is unavailable",))
+
+    def test_damaged_pending_files_have_identical_sorted_reports_without_file_changes(self) -> None:
+        run = Path(os.environ["ROSTER_RUN_ROOT"]) / "damaged-inboxes"
+        run.mkdir(parents=True)
+        for name, text in (("z.pending.json", ""), ("a.pending.json", "{}")):
+            _ = (run / name).write_text(text)
+        other = run.with_name("other-damaged-inboxes")
+        other.mkdir()
+        _ = (other / "bad.pending.json").write_text("{}")
+        def disk() -> dict[Path, tuple[bytes, int]]:
+            return {path: (path.read_bytes(), path.stat().st_mtime_ns)
+                    for folder in (run, other) for path in folder.iterdir()}
+
+        before = disk()
+        outputs: list[str] = []
+        with mock.patch.object(process_table, "snapshot", return_value={}):
+            for _ in range(2):
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    code = staff_check.main()
+                self.assertEqual(code, 1, output.getvalue())
+                outputs.append(output.getvalue())
+        self.assertEqual(outputs[0], outputs[1])
+        self.assertIn("checked 3 rows; 2 wrong", outputs[0])
+        self.assertLess(outputs[0].index("a.pending.json"), outputs[0].index("z.pending.json"))
+        self.assertEqual(disk(), before)
+
     def test_codex_app_server_with_a_director_staff_mark_is_not_a_second_session(self) -> None:
         process = process_table.Process(104, 1, "codex", "codex app-server --listen stdio://")
         evidence = self.process_evidence(process, sessions.RegistryRead((), ()),

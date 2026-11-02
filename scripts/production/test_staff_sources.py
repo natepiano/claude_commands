@@ -1214,6 +1214,32 @@ class StaffSourcesTests(StaffTestCase):
                 self.assertTrue(errors.getvalue().strip())
                 write_text_atomic(path, original)
 
+    def test_pending_evidence_reads_every_damaged_file_without_recovery_or_locks(self) -> None:
+        from scripts.agents import worker_lifecycle
+
+        run = self.root / "pending-run"
+        run.mkdir()
+        empty = run / "z.pending.json"
+        invalid = run / "a.pending.json"
+        valid = run / "zz.pending.json"
+        _ = empty.write_text("")
+        self.write_json(invalid, {"messages": []})
+        native = fixture_runtime_id("pending-native")
+        parent = fixture_runtime_id("pending-parent")
+        self.write_json(valid, {"thread_id": "", "messages": [],
+                                "unpublished_thread": {"id": native, "parent": parent}})
+        before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in run.iterdir()}
+        with mock.patch.object(worker_lifecycle, "locked_state", side_effect=AssertionError("reader took a lock")):
+            first = staff_sources.pending_publication_evidence(run)
+            second = staff_sources.pending_publication_evidence(run)
+        self.assertEqual(first, second)
+        self.assertEqual(first.diagnostics, (
+            f"{invalid}: worker state unreadable: invalid queue fields",
+            f"{empty}: worker state unreadable: invalid queue fields"))
+        self.assertEqual([(entry.inbox, entry.identity, entry.parent) for entry in first.workers],
+                         [(valid, native, parent)])
+        self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns) for path in run.iterdir()}, before)
+
     def test_codex_scan_continues_after_unparsable_process_arguments(self) -> None:
         from scripts.message import process_table
 
