@@ -94,7 +94,7 @@ the Mac. An empty `ci_repo` disables CI calls. `CONF_DIR` selects the fixture fo
 
 This file defines the disabled AWS SSH target. `offload=off` prevents work.
 The active target list remains `targets=mac,natedev` in `build_targets.conf`.
-Phase 8 requires the user's deployment steps before target activation.
+Phase 9 requires the user's deployment steps before target activation.
 
 `host=aws-build` names the Tailscale SSH host. `instance_id` and `region` remain empty before deployment.
 `credentials_profile=build-scaler` names the user's AWS CLI profile. This file contains no credential.
@@ -105,6 +105,40 @@ The AWS Budget must read `monthly_limit_usd`. Code must never raise either limit
 The spending reserve is $3. The maximum drain time is 60 minutes.
 Each repository budget stays within the 32 GiB build budget.
 The fixed and hourly costs are estimates from the design's queue replay.
+
+The spending guard requires usable live spending settings through `conf.value_origin`.
+A missing or malformed live limit refuses spending, even when committed history supplies a usable value.
+`daily_limit_usd` and `monthly_limit_usd` include `limit_reserve_usd` when the guard compares costs.
+Equality refuses deployment, starts and new admission. `limit_action=drain` rejects new work.
+`offload=off` leaves ordinary builds outside accounting and performs no AWS call.
+
+`accounting_zone` selects day and month boundaries, including clock changes.
+`price_refresh_seconds=3600` bounds reads from the injected price source.
+`price_max_age_seconds=7200` expires recorded prices; expired or absent prices use `fallback_usd_per_hour`.
+`observation_max_age_seconds=300` bounds instance state evidence for admission.
+Gaps past this age incur running costs at the fallback price.
+Stale latest evidence refuses admission.
+`cost_explorer_interval_seconds=86400` schedules reconciliation reads.
+`cost_explorer_read_usd=0.01` reserves each scheduled read's cost.
+
+`fixed_usd_per_month` includes retained storage, root storage, IPv4 and provisioned gp3 performance.
+The corresponding component keys state each monthly estimate.
+The guard uses the greater of the total and the component sum.
+A priced resource inventory can increase that estimate before deployment.
+Stopped instances continue to incur fixed costs.
+
+The target directory stores `cost-ledger.json` and `cost-ledger.lock`.
+The ledger retains observations, prices, inventories, reconciliations, decisions and limit events.
+Each decision publishes current totals and current-day intervals.
+Admission computes the current month and the complete periods needed by overlapping reconciliations.
+Atomic publication preserves previous evidence when replacement fails.
+A corrupt or unreadable ledger refuses spending and remains unchanged.
+`notification_recipient` selects the showrunner through the existing message interface.
+`notification_timeout_s` bounds each delivery attempt.
+Each limit event stores a pending or delivered state.
+The guard sends pending events after releasing the ledger lock.
+A later guard retries an unconfirmed delivery with the same message key.
+Confirmed delivery prevents further attempts.
 
 The SSH, retry, storage, slot, hold and claim settings apply when each command reads this file.
 Block and claim settings use the same units as `mac_test.conf`.
