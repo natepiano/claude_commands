@@ -18,6 +18,7 @@ from scripts.production.staff_test_support import fixture_runtime_id
 
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.lib.signal_test_support import SignalPidGuard, install_signal_pid_guard
+from scripts.message.repeat_guard_test_support import install_guard_test_budget
 
 from scripts.lib.test_agents_registry import write_registry
 
@@ -459,6 +460,7 @@ def select_fixture_workers(home: Path, *, notes: Path) -> None:
 
 def setUpModule() -> None:
     install_signal_pid_guard()
+    install_guard_test_budget()
     # Registered first, checked last; unittest reports cleanup assertions as module errors.
     unittest.addModuleCleanup(assert_real_codex_unchanged)
     # codex_mesh and its callers share this imported module; fixture-side locks
