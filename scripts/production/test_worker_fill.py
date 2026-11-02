@@ -7,6 +7,7 @@ import os
 import json
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
@@ -33,6 +34,33 @@ class WorkerFillTests(StaffTestCase):
             entry["ownership"] = {"kind": "Paused"}
             entry["events"] = [{"kind": "opened", "cause": "fixture launch", "run": str(run), "at": 1.0}]
         self.write_json(path, data)
+
+    def test_non_staff_diagnostic_is_a_note_and_clean_reruns_are_unchanged(self) -> None:
+        _ = self.tree()
+        before = self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns
+        note = "Codex process 817898: pane holds no staff member; not staff"
+
+        def collect() -> tuple[staff_sources.WorkerObservation, ...]:
+            print(f"staff sources: {note}", file=sys.stderr)
+            return ()
+
+        with mock.patch.object(worker_fill.FillSources, "collect", side_effect=collect):
+            for _ in range(2):
+                self.assertEqual(self.result(), (0, f"note: {note}\nunchanged\n", ""))
+                self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), before)
+
+    def test_non_staff_note_does_not_hide_a_source_problem(self) -> None:
+        _ = self.tree()
+        note = "Codex process 817898: pane holds no staff member; not staff"
+
+        def collect() -> tuple[staff_sources.WorkerObservation, ...]:
+            print(f"staff sources: {note}", file=sys.stderr)
+            print("staff sources: damaged source", file=sys.stderr)
+            return ()
+
+        with mock.patch.object(worker_fill.FillSources, "collect", side_effect=collect):
+            self.assertEqual(self.result(), (
+                1, f"note: {note}\nplaced 0; listed 1\n", "damaged source:record ?: source unavailable\n"))
 
     def test_paused_backends_follow_the_live_parent_without_a_run_and_rerun_unchanged(self) -> None:
         _ = self.production("demo", "models-unit")

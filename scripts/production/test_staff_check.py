@@ -214,6 +214,57 @@ class StaffCheckTests(StaffTestCase):
                          [("claude:" + self.fixture.unit.id, self.fixture.unit.id)])
         self.assertEqual(self.staff_file.read_bytes(), before)
 
+    def test_peer_freestanding_agents_are_one_note_without_missing_staff_rows(self) -> None:
+        identity = "746a8678-798b-4e84-9973-52e5de973302"
+        peer = roster.RosterEntry(
+            machine="mac", kind="claude", role="freestanding", name="same-display",
+            status="running", reach=roster.Messageable("session:" + identity), cwd="/remote/home",
+            showrunner=roster.NoShowrunner(), director=roster.NoDirector(), assignment=roster.NotAWorker(),
+            session=roster.ClaudeSession(identity),
+        )
+        codex = replace(peer, kind="codex", session=roster.NoClaudeSession(), thread=roster.CodexThread(identity))
+        before = self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns
+        for entry in (peer, codex):
+            with self.subTest(kind=entry.kind), mock.patch.object(
+                roster, "peer_snapshot", return_value=roster.Roster([entry, entry], [])
+            ):
+                evidence = self.process_evidence(
+                    process_table.Process(104, 1, "bash", "bash"), sessions.RegistryRead((), ()), {},
+                )
+                self.assertEqual(evidence.sessions, ())
+                self.assertEqual(evidence.uncertainties, ())
+                evidence = replace(evidence, sessions=self.fixture.live, workers=self.fixture.evidence.workers)
+                self.assertEqual(self.check(evidence), (
+                    0, "note: mac freestanding same-display: not staff\nchecked 3 rows; 0 wrong\n"))
+                self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), before)
+
+    def test_peer_staff_roles_without_rows_remain_problems(self) -> None:
+        identity = "746a8678-798b-4e84-9973-52e5de973302"
+        roles: tuple[roster.Role, ...] = ("showrunner", "unit director", "worker", "astra-designer", "astra-reviewer")
+        for role in roles:
+            peer = roster.RosterEntry(
+                machine="mac", kind="claude", role=role, name="same-display", status="running",
+                reach=roster.Messageable("session:" + identity), cwd="/remote/home",
+                showrunner=roster.NoShowrunner(), director=roster.NoDirector(), assignment=roster.NotAWorker(),
+                session=roster.ClaudeSession(identity),
+            )
+            codex = replace(peer, kind="codex", session=roster.NoClaudeSession(), thread=roster.CodexThread(identity))
+            for entry in (peer, codex):
+                with self.subTest(role=role, kind=entry.kind), mock.patch.object(
+                    roster, "peer_snapshot", return_value=roster.Roster([entry], [])
+                ):
+                    evidence = self.process_evidence(
+                        process_table.Process(104, 1, "bash", "bash"), sessions.RegistryRead((), ()), {},
+                    )
+                    self.assertEqual(evidence.notes, ())
+                    self.assertEqual(len(evidence.sessions), 1)
+                    self.assertEqual(evidence.sessions[0].staff_id, identity)
+                    evidence = replace(evidence, sessions=(*self.fixture.live, *evidence.sessions),
+                                       workers=self.fixture.evidence.workers)
+                    self.assertEqual(self.check(evidence), (
+                        1, f"{identity} pid 0: live session names a removed or missing staff row\n"
+                        + "checked 3 rows; 1 wrong\n"))
+
     def test_unavailable_peer_snapshot_lists_uncertainty_without_confirming_remote_absence(self) -> None:
         before = self.staff_file.read_bytes()
         with mock.patch.object(roster, "peer_snapshot", return_value=roster.PeerNotReached("mac", "offline")):

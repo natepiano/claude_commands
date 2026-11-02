@@ -237,6 +237,11 @@ def _role(value: str) -> LiveRole:
     raise ValueError(f"missing or invalid recorded worker role: {value!r}")
 
 
+def is_non_staff_note(message: str) -> bool:
+    """Identify a diagnostic that excludes an agent from staff."""
+    return message.endswith("; not staff")
+
+
 def codex_thread_host(arguments: list[str]) -> bool:
     """An app-server hosts threads; its inherited staff mark is not a session."""
     index = 2 if arguments and Path(arguments[0]).name in ("node", "nodejs") else 1
