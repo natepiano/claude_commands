@@ -313,6 +313,8 @@ class _WorkerSources:
                     self.native_running[native] = {"codex": native}
                 elif not environment.get("HERDR_PANE_ID", ""):
                     _problem(f"Codex process {process.pid}", "not in a herdr pane; not staff")
+                elif not self.pane_holds_staff_member(environment["HERDR_PANE_ID"]):
+                    _problem(f"Codex process {process.pid}", "pane holds no staff member; not staff")
                 else:
                     self.codex_scan_incomplete = True
                     _problem(f"Codex process {process.pid}", "native thread identity is unavailable")
@@ -320,6 +322,22 @@ class _WorkerSources:
             self.codex_scan_incomplete = True
             _problem("Codex processes", error)
         self._owners()
+
+    def pane_holds_staff_member(self, pane: str) -> bool:
+        """Join the pane's retained identity or unit labels to the supplied staff snapshot."""
+        for launch in self.sources.launches:
+            if launch.get("pane_id") != pane or launch.get("ended"):
+                continue
+            if self.record.by_member_reference(launch["session_id"]) is not None:
+                return True
+            environment = launch["environment"]
+            production = environment.get("SHOWRUNNER_UNIT", "")
+            unit = environment.get("SHOWRUNNER_UNIT_ID", "")
+            if production and unit:
+                found = self.sources.member(UnitMember(production, unit), self.record)
+                if isinstance(found, MemberFound):
+                    return True
+        return False
 
     def read(self, path: Path) -> dict[str, object]:
         path = path.expanduser().absolute()
