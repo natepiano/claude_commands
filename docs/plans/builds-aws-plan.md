@@ -113,65 +113,27 @@ The divisions separate state, execution, routing, cost accounting, control, repo
 ### Phase 1 — Isolate target state and holds  · status: done
 **Depends on:** none
 
-#### Work Order
-
-**Goal:** A configured SSH target has independent claims, blocks and backoff state.
-
-**Spec:**
-
-1. Add target-aware state resolution beside `StatePaths` and `state_paths` in `mac_test.py`.
-   Keep the Mac's existing `~/.local/state/mac-test` paths and fixture overrides.
-   Use `~/.local/state/build-targets/<target>/` for each other target's claims, locks, block and unreachable backoff.
-2. Thread the selected target through claim, release, status, block and backoff operations.
-   Resolve its settings through `read_targets`; reject unknown names before any state write.
-   Preserve the current no-target Mac CLI behavior.
-3. Generalize `parse_hold_target`, `run_mac_hold` and `release_mac_hold` to configured SSH targets.
-   Accept `target aws`, `--target aws` and the existing Mac forms.
-   Keep natedev holds local to natedev. Record the actual target on hold begin and end events.
-4. Make `targets.target_state` use the selected target's state without probing hosts.
-   Keep read-only status free of state writes. Make a malformed block refuse admission for that target.
-5. Create `config/aws_target.conf` as disabled configuration with `host=aws-build`, empty `instance_id`, and the settled spending limits.
-   Keep `targets=mac,natedev` active until Phase 8's user gate.
-   Add required target settings without code defaults for new tunables.
-6. Test independent holds, claims and backoff for Mac and two fake Linux targets.
-   Test unknown targets, malformed state and compatibility with existing Mac records.
-
-**Held changes:** Verify changes `process_matches`, `run_is_live`, `run_is_kept`, `claim_once` and `command_claim` in `mac_test.py`.
-It adds `adopt_wait_claim` and `command_claim_wait`. Add state arguments at their boundaries; preserve their ownership checks when integrated.
-Do not replace process identity code or copy the held implementations.
-Resources has no held source diff for the state and hold functions in this phase.
+#### As-built
+- `mac_test.state_paths(target)` returns a target-aware `StatePaths`. The Mac keeps `~/.local/state/mac-test` and its fixture overrides; every other target uses `~/.local/state/build-targets/<target>/` for claims, locks, block and unreachable backoff.
+- `mac_test.configured_ssh_target(target)` resolves every target, the Mac too, through `target_config.read_targets`. Platform and kind come from `config/build_targets.conf`; an unknown or non-ssh name is refused before any state write. `mac_test.read_config(target)` reads the target's `settings.<target>` file.
+- Claim, release, status, block and backoff take the selected target. The no-target Mac CLI keeps its behavior. Hold notices, expiry and warning texts and their repeat keys name the actual target.
+- `offload.state_directory`, `backoff_path`, `read_backoff` and `write_backoff` take the target name. `targets.target_state` reads the selected target's state with no probe and no write; a malformed block refuses admission for that target; only the named state-read errors count as unreadable state.
+- `build_hold.py` accepts `target <name>` and `--target <name>` for hold and release. `run_mac_hold` and `release_mac_hold` always pass `--target <name>` to `mac_test.py`, so the Mac is checked against the registry like any target. natedev holds stay local. `record.py` records the actual target on hold begin and end events.
+- `config/aws_target.conf` holds the disabled AWS settings: `host=aws-build`, empty `instance_id`, `credentials_profile=build-scaler`, `kinds=test,check,doc`, empty `ci_repo`, `monthly_limit_usd=400`, `daily_limit_usd=20`, `limit_reserve_usd=3`, `drain_max_minutes=60`, `build_budget_gib=32`, `target_budget_gib=24`, `target_budget_gib.hana=32`, `slots=2`, `slots.hana=4`, `slots.cargo-liner=4`. The active list stays `targets=mac,natedev`.
 
 **Files:**
+- `scripts/mac_test/mac_test.py` — target state, configuration and hold plumbing
+- `scripts/mac_test/offload.py` — per-target backoff
+- `scripts/build_targets/targets.py` — selected-target state reading
+- `scripts/build_hold/build_hold.py` — configured SSH hold dispatch
+- `scripts/buildlog/record.py` — actual target on hold events
+- `config/aws_target.conf`, `config/README.md` — AWS settings and reference
+- `commands/build/hold.md` — target syntax
+- `scripts/mac_test/test_target_state.py`, `scripts/build_hold/test_target_hold.py` — regression tests
 
-- `scripts/mac_test/mac_test.py` — target state selection and CLI plumbing.
-- `scripts/mac_test/offload.py` — target-aware backoff paths.
-- `scripts/build_targets/targets.py` — state selection.
-- `scripts/build_hold/build_hold.py` — configured SSH hold dispatch.
-- `scripts/buildlog/record.py` — actual target on hold events, if the existing event path needs it.
-- `config/aws_target.conf`, `config/README.md` — disabled AWS settings and reference.
-- `commands/build/hold.md` — target syntax.
-- `scripts/mac_test/test_target_state.py`, `scripts/build_hold/test_target_hold.py` — new isolated regression tests.
+**Binds later work:** `state_paths(target)` is the one place that maps a target to its state directory. `configured_ssh_target` is the one registry check for every target. No repository budget in `config/aws_target.conf` may exceed `build_budget_gib`.
 
-**Workers:** 1 writer + 1 tester; the writer owns coordination changes across the shared files.
-
-- `impl` — all source, config and command files; hub: `scripts/mac_test/mac_test.py` and `config/aws_target.conf`.
-- `test` — `scripts/mac_test/test_target_state.py`, `scripts/build_hold/test_target_hold.py`; test only the specified target boundaries.
-
-**State:** Independent target directories contain locks, claims, blocks and backoff records. Preserve existing Mac state in place.
-
-**Constraints from prior phases:** none.
-
-**Verification — impl:** `basedpyright --pythonpath ~/.local/state/merge-gate/typecheck-venv/bin/python scripts/mac_test/mac_test.py scripts/mac_test/offload.py scripts/build_targets/targets.py scripts/build_hold/build_hold.py scripts/buildlog/record.py`
-
-**Verification — test:** `python3 -m unittest discover -s scripts/mac_test -p 'test_target_state.py'`
-
-**Verification — test:** `python3 -m unittest discover -s scripts/build_hold -p 'test_target_hold.py'`
-
-**Verification — regression:** `python3 -m unittest discover -s scripts/mac_test -p 'test_mac_test.py'`
-
-**Verification — test types:** `basedpyright --pythonpath ~/.local/state/merge-gate/typecheck-venv/bin/python scripts/mac_test/test_target_state.py scripts/build_hold/test_target_hold.py`
-
-**Acceptance gate:** The verification commands pass. Blocking fake AWS leaves Mac admission unchanged and writes no AWS state outside its directory.
+**Gotchas:** The held verify branch adds attributes to the same `mac_test.py` class as `self.target`; a merge keeps both.
 
 **Also touches:** `scripts/mac_test/` (owner verify-unit); `scripts/build_targets/`, `scripts/build_hold/`, `commands/build/hold.md` (owner resources-unit); `scripts/buildlog/record.py` (owner report-unit).
 
@@ -231,6 +193,11 @@ Resources also changes the Mac `free_floor_gib` comment for clone cleanup. Keep 
 Write affinity only with confirmed claim ownership. Preserve an occupied slot during reruns and uncertain cleanup.
 
 **Constraints from prior phases:** Phase 1 provides target state directories and target-aware hold dispatch. The active target list still excludes AWS.
+`mac_test.state_paths(target)` owns the path choice: the Mac keeps `~/.local/state/mac-test`; every other target uses `~/.local/state/build-targets/<target>/`.
+`mac_test.configured_ssh_target(target)` resolves every target, the Mac too, through `read_targets`. It refuses an unknown or non-ssh name before any state write.
+`mac_test.read_config(target)` reads the target's `settings.<target>` file. `offload.state_directory`, `backoff_path`, `read_backoff` and `write_backoff` take the target name.
+`build_hold.run_mac_hold` and `release_mac_hold` always pass `--target <name>` to `mac_test.py`.
+`config/aws_target.conf` sets `build_budget_gib=32`, `target_budget_gib=24`, `target_budget_gib.hana=32`, `slots=2` and `slots.hana=4`. No repository budget may exceed `build_budget_gib`.
 
 **Verification — impl:** `basedpyright --pythonpath ~/.local/state/merge-gate/typecheck-venv/bin/python scripts/mac_test/mac_test.py scripts/mac_test/offload.py scripts/build_targets/targets.py scripts/lint/memory_admit.py scripts/buildlog/sync.py scripts/buildlog/record.py scripts/buildlog/report.py`
 
