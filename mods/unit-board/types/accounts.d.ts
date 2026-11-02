@@ -10,6 +10,8 @@ export interface StoredAccount {
   tool: 'claude' | 'codex';
   roles: string[];
   role_counts: (RoleSessionCounts | null)[];
+  /** Local and fresh peer counts, keyed by machine and role. */
+  role_counts_by_machine?: Record<string, Record<string, RoleSessionCounts>>;
   weekly_left_percent: number | null;
   resets_at: string | null;
   credits: number | 'unlimited' | null;

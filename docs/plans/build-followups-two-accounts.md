@@ -3098,3 +3098,22 @@ User 2026-11-02: remove the `read` column; a reading that fails or is old shows 
 User 2026-11-02 "go", via natedev: the `codex` alias set a numbered `CODEX_HOME`, so `codex update` failed with "Could not detect the Codex installation method".
 
 **As-built:** `_exec_codex_account` in `scripts/accounts/accounts.py` sends a first argument of `update` to `_update_codex`, with no account check. It runs the local program with `CODEX_HOME=~/.codex`, attached to the terminal, then reads its version. Then it runs `CODEX_HOME="$HOME/.codex" "$HOME/.local/bin/codex" update >&2 && … --version` on `remote.other_machine()` over ssh (600 s limit; stderr discarded, so stdout holds only the version). It prints one version or failure line per machine; ssh 255 or a timeout prints `unreachable; run codex update there`. Exit 0 only when both machines updated. Two repair rounds (F001: update text could print as the version; F002: invalid stderr bytes raised a traceback). Style review PASS.
+
+### Phase 101u — The accounts board counts sessions on both machines  · status: done
+
+User 2026-11-02 (via the Mac session): "the accounts board should show the counts for all configured machines for both Mac and for Nate Dev. If Mac is unavailable, it should show that." Read as the per-account session counts (busy, shell, idle, total), which today count only the machine that draws the board.
+
+**Goal:** `/accounts-board` on either machine counts each account's sessions on natedev and on the Mac. When the other machine cannot be read, the board says so in one problem line, and the counts are this machine's only.
+**Spec:**
+1. Find where `accounts.py status` computes busy, shell, idle and total, and where the board (mods/unit-board/hooks/accounts.tsx) draws them.
+2. The board read never waits on ssh. Each machine publishes its own per-account counts to a small state file on each status pass; the other machine's counts come from a cached copy fetched in the background with a short limit (reuse the role-map fetch pattern in scripts/accounts/role_map.py and `remote.other_machine()`; no copy).
+3. Each count column shows the sum for both machines. A copy older than the existing ten-minute limit, or a failed fetch, adds one problem line: `<machine> unavailable: counts are <this machine> only`. The JSON keeps each machine's counts apart for cargo-handler.
+4. Tests use scratch data only; no ssh, no live state.
+5. Docs: docs/accounts.md (board section) and commands/showrunner/accounts.md if it names the counts. Tell handler-unit of the JSON change.
+**Files:**
+- scripts/accounts/accounts.py
+- scripts/accounts/test_accounts.py
+- mods/unit-board/hooks/accounts.tsx
+- mods/unit-board/tests/accounts.test.ts
+- mods/unit-board/types/accounts.d.ts
+- docs/accounts.md

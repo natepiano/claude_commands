@@ -52,6 +52,15 @@ from scripts.whoami import run_out
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 send_role_map_command = role_map.ssh_role_map
+start_session_counts_fetch = cast(Callable[[], bool], getattr(accounts, "_start_session_counts_fetch"))
+session_counts_cache = cast(Callable[[], Path], getattr(accounts, "_session_counts_cache"))
+session_counts_file = cast(Callable[[], Path], getattr(accounts, "_session_counts_file"))
+publish_session_counts = cast(Callable[[dict[tuple[Path, str], dict[str, str]]], accounts.MachineSessionCounts],
+    getattr(accounts, "_publish_session_counts"))
+decode_session_counts = cast(Callable[[str, str], accounts.MachineSessionCounts], getattr(accounts, "_decode_session_counts"))
+machine_role_counts = cast(Callable[[tuple[accounts.StatusRow, ...], datetime],
+    tuple[tuple[accounts.StatusRow, ...], tuple[str, ...]]], getattr(accounts, "_machine_role_counts"))
+fetch_session_counts = cast(Callable[[], int], getattr(accounts, "_fetch_session_counts"))
 
 
 def stored_group_labels(path: Path) -> dict[str, str]:
@@ -70,6 +79,7 @@ def named_environment(config_dir: Path) -> dict[str, str]:
 
 def setUpModule() -> None:
     install_signal_pid_guard()
+    _ = unittest.enterModuleContext(patch.object(accounts, "_start_session_counts_fetch", return_value=True))
     _ = cast(object, unittest.enterModuleContext(patch.object(accounts, "import_module", side_effect=imports_with_nix_loader(fake_nix_loader()))))
     root = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory())).resolve()
     _ = unittest.enterModuleContext(patch.object(accounts, "WORKERS_RUN_ROOTS", (root / "worker-runs",)))
@@ -198,6 +208,10 @@ class AccountsTests(unittest.TestCase):
             self.enterContext(scratch_account_home(self.home, environment)),
         )
         del environment_context
+        counts_cache = session_counts_cache()
+        counts_cache.parent.mkdir(parents=True, exist_ok=True)
+        _ = counts_cache.write_text(json.dumps({"machine": remote.other_machine(),
+            "at": datetime.now(timezone.utc).isoformat(), "accounts": {}}))
         self.trust_config = accounts.trust_settings_file()
         _ = self.enterContext(patch.object(quota_alert, "STATE", self.root / "quota_alert.json"))
         _ = self.enterContext(patch.object(run_out, "READINGS_LOG", self.root / "pace.jsonl"))
@@ -529,6 +543,147 @@ class AccountsTests(unittest.TestCase):
             self.assertIn(str(run / "mesh_roster.json"), document["session_inputs"])
             self.assertIn(str(records / "fixture.json"), document["session_inputs"])
             self.assertEqual((records / "fixture.json").read_bytes(), retained_bytes)
+
+    def test_machine_counts_publish_and_merge_on_either_machine_without_waiting_for_ssh(self) -> None:
+        from scripts.message import sessions
+        local = accounts.RoleSessionCounts(1, 1, 2)
+        row = replace(SharedStatusDocumentTests().row(), label="claude1", tool="claude",
+            folder=str(self.home / ".claude1"), roles=("units",), role_counts=(local,))
+        now = datetime.now(timezone.utc)
+        count = accounts.RoleSessionCountsDocument(busy=3, shell=2, idle=1, total=6)
+        for here, peer in (("natedev", "mac"), ("mac", "natedev")):
+            with (self.subTest(here=here), patch.object(remote, "local_machine", return_value=here),
+                  patch.object(remote, "other_machine", return_value=peer),
+                  patch.object(sessions, "live_sessions", return_value=[]),
+                  patch.object(role_map, "ssh_role_map", side_effect=AssertionError("status waited on ssh"))):
+                _ = publish_session_counts({(self.home / ".claude1", "units"):
+                    {"one": "busy", "two": "shell", "three": "idle", "four": "idle"}})
+                published = decode_session_counts(session_counts_file().read_text(), here)
+                self.assertEqual(published["accounts"]["claude1"]["units"]["total"], 4)
+                atomic_file.write_text_atomic(session_counts_cache(), json.dumps({
+                    "machine": peer, "at": now.isoformat(), "accounts": {"claude1": {"units": count}}}))
+                rows, problems = machine_role_counts((row,), now)
+                document = cast(accounts.StatusDocument, json.loads(accounts.render_status_json(
+                    accounts.StatusReading(rows, problems, (), timezone.utc, now))))
+                self.assertEqual(document["problems"], [])
+                machines = document["accounts"][0]["role_counts_by_machine"]
+                self.assertEqual(machines[peer]["units"], count)
+                self.assertEqual(machines[here]["units"], {"busy": 1, "shell": 1, "idle": 2, "total": 4})
+                self.assertEqual(document["accounts"][0]["role_counts"], [{"busy": 1, "shell": 1, "idle": 2, "total": 4}])
+
+    def test_session_counts_use_aliases_when_hostnames_differ(self) -> None:
+        now = datetime.now(timezone.utc)
+        row = replace(SharedStatusDocumentTests().row(), label="claude1", tool="claude",
+            roles=("units",), role_counts=(accounts.RoleSessionCounts(1, 0, 0),))
+        for hostname, here, peer in (("MacBook-Pro", "mac", "natedev"),
+                                     ("development-box", "natedev", "mac")):
+            with (self.subTest(hostname=hostname),
+                  patch.object(remote, "local_machine", return_value=hostname),
+                  patch.object(remote, "other_machine", return_value=peer)):
+                published = publish_session_counts({(self.home / ".claude1", "units"): {"unit": "busy"}})
+                self.assertEqual(published["machine"], here)
+                self.assertEqual(decode_session_counts(session_counts_file().read_text(), here), published)
+                atomic_file.write_text_atomic(session_counts_cache(), json.dumps({
+                    "machine": peer, "at": now.isoformat(), "accounts": {}}))
+                rows, problems = machine_role_counts((row,), now)
+                self.assertEqual(problems, ())
+                self.assertEqual(set(rows[0].role_counts_by_machine), {here, peer})
+            with (patch.object(remote, "other_machine", return_value=here),
+                  patch.object(role_map, "ssh_role_map", return_value=json.dumps(published))):
+                self.assertEqual(fetch_session_counts(), 0)
+                self.assertEqual(decode_session_counts(session_counts_cache().read_text(), here), published)
+
+    def test_published_worker_counts_resolve_the_legacy_codex_home(self) -> None:
+        self.write_note("codex1", "fixture-worker")
+        self.codex_login("fixture-worker")
+        self.codex_login("fixture-worker", self.home / ".codex1")
+        published = publish_session_counts({
+            (self.home / ".codex", "workers"): {"legacy-worker": "busy"},
+            (self.home / ".codex1", "workers"): {"numbered-worker": "idle"},
+        })
+        self.assertEqual(published["accounts"], {
+            "codex1": {"workers": {"busy": 1, "shell": None, "idle": 1, "total": 2}}})
+        self.assertEqual(decode_session_counts(session_counts_file().read_text(), published["machine"]), published)
+
+    def test_published_worker_counts_resolve_accounts_in_numbered_codex_homes(self) -> None:
+        self.write_note("codex1", "fixture-first")
+        self.write_note("codex2", "fixture-second")
+        self.codex_login("fixture-second", self.home / ".codex1")
+        self.codex_login("fixture-first", self.home / ".codex2")
+        published = publish_session_counts({
+            (self.home / ".codex1", "workers"): {"first-worker": "busy"},
+            (self.home / ".codex2", "workers"): {"second-worker": "idle"},
+        })
+        self.assertEqual(published["accounts"], {
+            "codex1": {"workers": {"busy": 0, "shell": None, "idle": 1, "total": 1}},
+            "codex2": {"workers": {"busy": 1, "shell": None, "idle": 0, "total": 1}},
+        })
+        self.assertEqual(decode_session_counts(session_counts_file().read_text(), published["machine"]), published)
+
+    def test_peer_counts_age_failure_and_recovery_use_only_the_local_counts(self) -> None:
+        row = SharedStatusDocumentTests().row()
+        now = datetime.now(timezone.utc)
+        peer = remote.other_machine()
+        local = "mac" if peer == "natedev" else "natedev"
+        for seconds, available in ((600, True), (601, False), (-1, True)):
+            with self.subTest(seconds=seconds):
+                atomic_file.write_text_atomic(session_counts_cache(), json.dumps({
+                    "machine": peer, "at": (now - timedelta(seconds=seconds)).isoformat(), "accounts": {}}))
+                rows, problems = machine_role_counts((row,), now)
+                self.assertEqual(peer in rows[0].role_counts_by_machine, available)
+                self.assertEqual(problems, () if available else
+                    (f"{peer} unavailable: counts are {local} only",))
+        for content in ('{"unavailable": true}', '{}', 'broken'):
+            _ = session_counts_cache().write_text(content)
+            rows, problems = machine_role_counts((row,), now)
+            self.assertNotIn(peer, rows[0].role_counts_by_machine)
+            self.assertEqual(len(problems), 1)
+        reply = json.dumps({"machine": peer, "at": now.isoformat(), "accounts": {}})
+        with patch.object(role_map, "ssh_role_map", return_value=reply) as fetch:
+            self.assertEqual(fetch_session_counts(), 0)
+        fetch.assert_called_once_with(("session-counts-read",), machine=peer)
+        self.assertEqual(machine_role_counts((row,), now)[1], ())
+        for failure in (OSError("offline"), subprocess.TimeoutExpired("fixture", 20), ValueError("bad reply")):
+            with self.subTest(failure=type(failure).__name__), patch.object(role_map, "ssh_role_map", side_effect=failure):
+                self.assertEqual(fetch_session_counts(), 1)
+            self.assertEqual(len(machine_role_counts((row,), now)[1]), 1)
+
+    def test_count_fetch_detaches_once_and_transfers_its_lock(self) -> None:
+        held: list[int] = []
+        def detached(arguments: list[str], **options: object) -> MagicMock:
+            descriptor = int(arguments[-1])
+            held.append(os.dup(descriptor))
+            self.assertEqual(arguments[2:4], ["session-counts-fetch", "--counts-lock"])
+            self.assertEqual(options, {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL,
+                "stderr": subprocess.DEVNULL, "start_new_session": True, "pass_fds": (descriptor,)})
+            return MagicMock()
+        with patch.object(subprocess, "Popen", side_effect=detached) as launch:
+            try:
+                self.assertTrue(start_session_counts_fetch())
+                self.assertTrue(start_session_counts_fetch())
+                launch.assert_called_once()
+            finally:
+                for descriptor in held:
+                    os.close(descriptor)
+        with patch.object(subprocess, "Popen", side_effect=OSError("cannot detach")):
+            self.assertFalse(start_session_counts_fetch())
+
+    def test_counts_read_uses_only_local_registries_and_shared_transport_selects_the_peer(self) -> None:
+        from scripts.message import sessions
+        peer = remote.other_machine()
+        with (patch.object(sessions, "live_sessions", return_value=[]),
+              patch.object(accounts, "group_accounts", side_effect=AssertionError("role fetch")),
+              patch.object(accounts, "account_statuses", side_effect=AssertionError("account read")),
+              patch.object(subprocess, "run", side_effect=AssertionError("network or process probe"))):
+            result, text, error = self.run_cli("session-counts-read")
+        self.assertEqual((result, error), (0, ""))
+        local = "mac" if peer == "natedev" else "natedev"
+        self.assertEqual(decode_session_counts(text, local)["accounts"], {})
+        with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, stdout=text, stderr="")) as fetch:
+            self.assertEqual(role_map.ssh_role_map(("session-counts-read",), machine=peer), text)
+        fetch.assert_called_once_with(("ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", peer,
+            "python3 ~/.claude/scripts/accounts/accounts.py session-counts-read"),
+            capture_output=True, text=True, timeout=20)
 
     def run_cli(self, *arguments: str) -> tuple[int, str, str]:
         stdout = io.StringIO()
@@ -5203,7 +5358,7 @@ finally:
         document = cast(dict[str, object], json.loads(output))
         self.assertEqual(set(document), {"accounts", "problems", "session_inputs"})
         rows = cast(list[dict[str, object]], document["accounts"])
-        keys = {"label", "tool", "roles", "role_counts", "weekly_left_percent", "resets_at", "credits", "use_credits", "read_at",
+        keys = {"label", "tool", "roles", "role_counts", "role_counts_by_machine", "weekly_left_percent", "resets_at", "credits", "use_credits", "read_at",
                 "read_ok", "credits_in_use"}
         self.assertTrue(all(set(row) == keys for row in rows))
         expected: list[tuple[str, str, list[str], float | None, str | None, float | str | None, bool, str | None]] = [
@@ -8143,7 +8298,7 @@ class SharedStatusDocumentTests(unittest.TestCase):
             "label": "fixture", "tool": "codex", "roles": ["workers"], "role_counts": [{"busy": 0, "shell": None, "idle": 0, "total": 0}],
             "weekly_left_percent": 60, "resets_at": "2026-10-17T18:00:00+00:00",
             "credits": 13446, "use_credits": True, "read_at": "2026-10-16T18:00:00+00:00",
-            "read_ok": True, "credits_in_use": False,
+            "read_ok": True, "credits_in_use": False, "role_counts_by_machine": {},
         })
 
 
@@ -8159,6 +8314,10 @@ class StatusProblemCauseTests(unittest.TestCase):
             "AGENT_NOTES_DIR": str(self.home / "notes"),
             "CODEX_HOME": str(self.home / ".codex"), "USER_ZONE": "UTC",
         }, clear=True)))
+        cache = session_counts_cache()
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        _ = cache.write_text(json.dumps({"machine": remote.other_machine(),
+            "at": datetime.now(timezone.utc).isoformat(), "accounts": {}}))
         _ = self.enterContext(patch.object(subprocess, "run", side_effect=AssertionError("no real child")))
         _ = self.enterContext(patch.object(subprocess, "Popen", side_effect=AssertionError("no real child")))
 
