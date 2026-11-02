@@ -325,77 +325,33 @@ A durable cost ledger estimates AWS spend, and one spending guard refuses AWS ad
 **Ruled out:** A separate cleanup path for retained claims: refusal cleanup reuses `take_over_kept_claim` and `check_leftovers`.
 
 ### Phase 7 — Tighten the spending guard and SSH cleanup boundaries  · status: done
-**Depends on:** Phase 6
 
-#### Work Order
+#### As-built
 
-**Goal:** Cleanup, AWS classification and limit notices use narrow, bounded boundaries before the controller adds more guard callers.
-
-**Spec:**
-
-1. Add `SshConnectionSettings` in `scripts/mac_test/offload.py` with the host, `connect_timeout_s` and `leftover_timeout_s`.
-   `OffloadConfig` carries one `SshConnectionSettings`. `ssh_options` and `check_leftovers` take `SshConnectionSettings`, not `OffloadConfig`.
-   Update every caller of both functions. Read each connection value through `conf.py` at use.
-   `cleanup_refused_claims` in `scripts/build_targets/build_targets.py` builds only `SshConnectionSettings`; remove its hand-built `OffloadConfig`.
-   Cleanup still uses the claim's recorded `remote_host`. An unusable connection setting keeps the claim and prints the reason.
-2. Define `is_aws_target` beside `SshTarget` in `scripts/build_targets/target_config.py`.
-   Keep the current rule: platform `linux`, and name `aws` or settings file `aws_target.conf`.
-   Use it at every AWS guard boundary in `build_targets.py`; remove the two inline copies.
-3. Bound limit-notice delivery in `scripts/aws_target/ledger.py`.
-   Persist a retry deadline and delivery owner for each `PENDING` event under the ledger lock.
-   A guard call sends a pending notice only when its retry deadline has passed and no other caller owns delivery.
-   Read the retry interval from `config/aws_target.conf` as `notification_retry_s`. Keep `DeliveryState.PENDING` and `DELIVERED`.
-   A failed delivery, a process restart or a failed ledger write never resets a limit event or sends it twice.
-4. Accept only confirmed lifecycle states in ledger observations.
-   `CostLedger.observe` refuses `unknown` with a named rejection and stores nothing; earlier evidence stays intact.
-   A stored `unknown` row from older evidence never blocks later valid observations from charging.
-5. Test each item with real calls: cleanup through `command_reserve` with a malformed spending limit and a malformed connection setting;
-   AWS classification for each rule branch; concurrent guard callers, failed delivery, restart and the retry deadline; a refused `unknown` observation followed by valid ones.
+- `SshConnectionSettings(host, connect_timeout_s, leftover_timeout_s)` supplies `ssh_options` and `check_leftovers`; `OffloadConfig` carries these settings.
+  `read_connection_settings` reads through `conf.py`; `check_current_leftovers` reads current settings before each cleanup check.
+- `cleanup_refused_claims` uses connection settings and the claim's recorded `remote_host`.
+  Unusable settings produce `LeftoverCheckFailed`, print the reason, and preserve the claim. Release requires `LeftoversEnded` and an unchanged record.
+- `is_aws_target(target)` serves every AWS guard boundary: platform `linux` and either name `aws` or settings file `aws_target.conf`.
+- `CostLedger.observe` raises `ObservationRejected` for unknown states and preserves existing evidence. Older stored `unknown` rows do not block later valid charges.
+- Each `PENDING` limit event persists `LimitEvent.retry_after` and `owner` under the ledger lock; ownership uses `DeliveryOwner` or `DeliveryUnowned`.
+  `cost-notice.lock` serializes delivery; retries require an expired deadline and no delivery owner. Successful delivery sets `DeliveryState.DELIVERED`.
+- `CostLedger.guard(clock=...)` anchors elapsed clock time to explicit `now`; each event's attempt time starts its delivery deadline.
+  `notification_retry_s=300` bounds retries. The send key `aws-limit:<event_id>` and its repeat window suppress duplicates across failures and restarts.
 
 **Files:**
 
-- `scripts/mac_test/offload.py` — `SshConnectionSettings`, `ssh_options`, `check_leftovers` and their callers.
-- `scripts/build_targets/target_config.py` — `is_aws_target` beside `SshTarget`.
-- `scripts/build_targets/build_targets.py` — use `is_aws_target`; cleanup builds `SshConnectionSettings`.
-- `scripts/aws_target/ledger.py`, `scripts/aws_target/config.py` — notice retry deadline and delivery owner; confirmed observations only.
-- `config/aws_target.conf`, `config/README.md` — `notification_retry_s`.
-- `scripts/aws_target/test_ledger.py` — notice and observation regressions.
-- `scripts/build_targets/test_ssh_eligibility.py`, `scripts/build_targets/test_targets.py` — cleanup and classification regressions.
-- `scripts/mac_test/test_offload_cleanup_leftovers.py`, `scripts/mac_test/test_offload_cleanup.py` — callers of the narrowed functions.
+- `scripts/mac_test/offload.py` — connection settings, readers, and cleanup checks.
+- `scripts/build_targets/target_config.py`, `scripts/build_targets/build_targets.py` — AWS classification and refusal cleanup.
+- `scripts/aws_target/ledger.py`, `scripts/aws_target/config.py` — observations, delivery ownership, retry deadlines, and settings.
+- `config/aws_target.conf`, `config/README.md` — `notification_retry_s=300` and its documentation.
 
-**Workers:** 1 writer + 1 tester.
+**Binds later work:** **Control starts, drain and interruption recovery** passes its injected clock to `spending_guard` and records only confirmed instance states.
 
-- `impl` — `offload.py`, `target_config.py`, `build_targets.py`, `ledger.py`, `config.py` and config; hub: `scripts/mac_test/offload.py`.
-- `test` — the ledger, SSH eligibility, target and offload cleanup regressions.
+**Gotchas:** The repeat window covers all dates represented by `datetime`. Only exit 0 with `SENT` or `SKIPPED` confirms message delivery.
+Delivery failures, restarts, and failed ledger writes preserve the event and duplicate suppression. Cleanup reads settings at use, including inside `claimed_run`.
 
-**State:** Each pending limit event persists its retry deadline and delivery owner in the ledger. No other new state.
-
-**Constraints from prior phases:** Phase 6 supplies `ledger.spending_guard`, `CostLedger`, `LimitEvent` with `DeliveryState`, and `build_targets.ssh_target_config`.
-Keep `spending_limit` and `spending_unavailable` outside capacity retries. Preserve reservation statuses 0, 11 and 1.
-Keep refusal cleanup implementation-only: release a claim only after `LeftoversEnded` and an unchanged-record check; keep uncertain ownership.
-Keep `off` an inert exclusion with no guard call, ledger write or cleanup. Reservation reuse requires an enabled, permitted target.
-`check_leftovers` has eight callers in `offload.py` and one in `build_targets.py`; the full Mac suite covers them.
-Read configuration through `conf.py`; tests use `CONF_DIR`, private `build_targets.conf` and numeric limit comments.
-AWS remains disabled; this phase creates no resource and makes no AWS call.
-
-**Verification — impl:** `basedpyright --pythonpath ~/.local/state/merge-gate/typecheck-venv/bin/python scripts/mac_test/offload.py scripts/build_targets/target_config.py scripts/build_targets/build_targets.py scripts/aws_target/ledger.py scripts/aws_target/config.py`
-
-**Verification — test:** `python3 -m unittest discover -s scripts/aws_target -p 'test_ledger.py'`
-
-**Verification — test:** `python3 -m unittest discover -s scripts/build_targets -p 'test_*.py'`
-
-**Verification — test:** `python3 -m unittest discover -s scripts/mac_test -p 'test_*.py'` (the full Mac suite)
-
-**Verification — test:** `python3 -m unittest discover -s scripts/direct -p 'test_verify_ssh_targets.py'`
-
-**Verification — test types:** `basedpyright --pythonpath ~/.local/state/merge-gate/typecheck-venv/bin/python scripts/aws_target/test_ledger.py scripts/build_targets/test_ssh_eligibility.py scripts/build_targets/test_targets.py`
-
-**Acceptance gate:** The commands pass. No caller builds an `OffloadConfig` only to reach SSH cleanup.
-One `is_aws_target` decides AWS classification at every guard boundary.
-Concurrent and repeated guard calls send each limit notice at most once per retry interval and never reset an event.
-A refused `unknown` observation stores nothing, and later valid observations still charge.
-
-**Also touches:** `scripts/mac_test/offload.py` and its tests (owner verify-unit); `scripts/build_targets/` (owner resources-unit).
+**Ruled out:** Changes to `send.py`; its existing repeat window suppresses duplicates.
 
 ### Phase 8 — Control starts, drain and interruption recovery  · status: todo
 **Depends on:** Phase 7
@@ -503,6 +459,7 @@ Generation-bound interruption records persist on the target and in durable attem
 
 **Constraints from prior phases:** Phase 6 supplies the ledger and shared guard. Phase 4 preserves queue age on loss.
 Phase 7 supplies `SshConnectionSettings` for SSH cleanup, `is_aws_target` beside `SshTarget`, bounded limit-notice retries and confirmed-only ledger observations.
+`CostLedger.observe` raises `ObservationRejected` for an unknown instance state and leaves the ledger unchanged; record only confirmed states. Pass the controller's injected clock to `spending_guard`, which forwards it to `CostLedger.guard`. Limit notices send with key `aws-limit:<event_id>` and retry no sooner than `notification_retry_s`.
 Use `is_aws_target` at every controller and runner permission check. Each guard call writes a decision record.
 `ledger._decision_record` stores one latest decision with conditional fields and current-day intervals, and no target or generation identity.
 Keep `spending_limit` and `spending_unavailable` outside capacity retries; keep `off` inert; preserve reservation statuses 0, 11 and 1.
