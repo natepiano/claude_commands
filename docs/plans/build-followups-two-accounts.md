@@ -3081,16 +3081,11 @@ natedev showrunner 2026-11-02: the user ran /theme at 09:06 EST; Claude Code wro
 
 **As-built:** `theme` joins the per-machine keys in `scripts/settings/settings_local_keys.sh` (with `model`, `effortLevel`, `modelSettings`, `extraKnownMarketplaces`). The clean filter strips it, the sidecar keeps it, and the smudge restores it. The committed `settings.json` has no `theme`. `test_settings_local_keys.py` fixtures give each machine a different theme and still clean to one blob.
 
-### Phase 101r — The Mac renews an expired Claude login by itself  · status: done
+### Phase 101r — The Mac renews an expired Claude login by itself  · status: done · ef9480b6
 
-User 2026-11-02: "i want accounts renewal on the mac for sure". On natedev the notes job's refusals part calls `refusal_watch.renew_expired_logins` each pass: for a noted Claude account whose stored usage read shows a stale or missing token, it runs a quiet probe session (`accounts.py exec --probe claudeN -p hello`), at most once an hour per account, and records it in `login_renewals.json`. The Mac runs only `agent_notes.py usage-only` (nixos `modules/darwin/account-usage.nix`), which never reaches that call, so idle Mac accounts stay expired ("login token expired; start a session on it").
+User 2026-11-02: "i want accounts renewal on the mac for sure". natedev renewed idle logins in its notes job's refusal-watch pass; the Mac ran only `agent_notes.py usage-only`, which never renewed.
 
-**Goal:** the Mac's usage-only pass renews an expired local Claude login the same way natedev does.
-**Spec:** after `usage_only` in `scripts/whoami/agent_notes.py` saves its readings, and still under its schedule lock, call the same renewal (`refusal_watch.renew_expired_logins`) and print its lines. One renewal path for both machines; no copy. A busy schedule skips renewal too. Keep the 60-minute attempt limit and the record file. A probe failure never stops the usage read. Update the module docstring and `docs/accounts.md` where they say usage-only runs no consumers or that only a session renews a login.
-**Files:**
-- scripts/whoami/agent_notes.py
-- scripts/whoami/test_agent_notes.py (or the test module that covers usage_only)
-- docs/accounts.md
+**As-built:** `agent_notes.py usage-only` (Mac launchd job, nixos `modules/darwin/account-usage.nix`) runs `refusal_watch.renew_expired_logins` as a dry run after it saves usage. When an account is due, it starts `agent_notes.py renew-logins` as a detached child (`start_new_session`) and returns: launchd runs one job instance, so the usage job never waits on a 120 s probe. `renew-logins` holds the `login-renewal` schedule lock and calls the same function, which keeps the hourly limit and `~/.local/state/accounts/login_renewals.json`. Two repair rounds (F001: the probe held the usage job, first by its lock, then by launchd's one instance). Style review PASS. Live proof: the Mac after promotion.
 
 ### Phase 101s — The accounts board has no read column  · status: todo
 
