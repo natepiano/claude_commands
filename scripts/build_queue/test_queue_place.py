@@ -24,7 +24,7 @@ from scripts.build_queue.admission_test_support import AdmissionFixture
 from scripts.build_queue.queue_fixture import write_process
 from scripts.lib.process_group import send_process_group
 from scripts.lint import memory_admit as gate
-from scripts.lint.memory_test_support import fake_memory_readings, gate_isolation_environment
+from scripts.lint.memory_test_support import commit_config_fixture, fake_memory_readings, gate_isolation_environment
 from scripts.lint.test_memory_admit import write_memory_config
 
 GIB = gate.GIB
@@ -115,6 +115,9 @@ class QueuePlaceFixture(ExitStack):
 
         def start(argv: list[str], **kwargs: Unpack[queue.PopenArguments]) -> subprocess.Popen[bytes]:
             child = spawn(argv, **kwargs)
+            # Git reads config history and does not start the queued program.
+            if argv[:1] == ["git"]:
+                return child
             self.children.append(child)
             self.supply_process(child.pid, GIB)
             if self.complete_scoped_launch and argv[0] == "systemd-run":
@@ -567,16 +570,18 @@ class QueuePlaceTests(unittest.TestCase):
         with QueuePlaceFixture() as fixture:
             write_memory_config(fixture.config, **{"program_first_peak_gib.rust-analyzer": "abc"})
             diagnostics = io.StringIO()
-            with mock.patch.object(gate, "_warned_config_fallbacks", set[gate.ConfigFallback]()), \
-                 mock.patch.object(gate, "check", wraps=gate.check) as checked, redirect_stderr(diagnostics):
+            with mock.patch.object(gate, "check", wraps=gate.check) as checked, redirect_stderr(diagnostics):
                 for _ in range(2):
-                    with self.assertRaisesRegex(queue.QueuePlaceRefused, "no first peak for rust-analyzer"):
+                    with self.assertRaises(queue.QueuePlaceRefused) as refused:
                         with queue.queue_place("rust-analyzer", fixture.root):
                             self.fail("program with an invalid first peak was admitted")
+                    self.assertIn(str(fixture.config), str(refused.exception))
+                    self.assertIn("program_first_peak_gib.rust-analyzer", str(refused.exception))
+                    self.assertIn("could not convert string to float", str(refused.exception))
+                    self.assertIn("no usable committed value", str(refused.exception))
                 checked.assert_not_called()
-            self.assertEqual(diagnostics.getvalue(),
-                'memory admission: lint.conf [memory] program_first_peak_gib.rust-analyzer "abc" is not valid; ' +
-                'program size unavailable; program refused\n')
+            self.assertIn("program_first_peak_gib.rust-analyzer='abc'", diagnostics.getvalue())
+            self.assertIn("could not convert string to float", diagnostics.getvalue())
             self.assertNotIn("using 0", diagnostics.getvalue())
             self.assertEqual(fixture.children, [])
             self.assertEqual(list(fixture.directory.glob("*.reservation")), [])
@@ -597,18 +602,18 @@ class QueuePlaceTests(unittest.TestCase):
 
     def test_invalid_config_warns_once_and_does_not_corrupt_child_protocol(self) -> None:
         with QueuePlaceFixture() as fixture:
+            commit_config_fixture(fixture.config)
             write_memory_config(fixture.config, head_seconds="abc", **{"program_first_peak_gib.rust-analyzer": "18"})
             diagnostics, output = io.StringIO(), io.StringIO()
-            with mock.patch.object(gate, "_warned_config_fallbacks", set[gate.ConfigFallback]()), \
-                 redirect_stderr(diagnostics), redirect_stdout(output):
+            with redirect_stderr(diagnostics), redirect_stdout(output):
                 for _ in range(2):
                     with queue.queue_place("rust-analyzer", fixture.root) as place:
                         child = place.popen([sys.executable, "-c", CHILD, "0"],
                                             stdin=subprocess.PIPE, stdout=subprocess.PIPE)
                         echoed, _ = child.communicate(b"Content-Length: 4\r\n\r\n{}\x00\xff", timeout=3)
                         self.assertEqual(echoed, b"Content-Length: 4\r\n\r\n{}\x00\xff")
-            warning = 'memory admission: lint.conf [memory] head_seconds "abc" is not valid; using 600\n'
-            self.assertEqual(diagnostics.getvalue().count(warning), 1)
+            self.assertIn("head_seconds='abc'", diagnostics.getvalue())
+            self.assertIn("expected a whole number", diagnostics.getvalue())
             self.assertEqual(output.getvalue(), "")
 
     def test_waiting_checks_the_hold_before_each_attempt_and_never_starts_early(self) -> None:

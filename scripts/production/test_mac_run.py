@@ -13,6 +13,7 @@ import time
 import unittest
 from pathlib import Path
 from typing import TypedDict, cast, final, override
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -173,7 +174,7 @@ class MacRunTests(unittest.TestCase):
         self.config_path = self.root / "mac_test.conf"
         self.temp_directory = self.root / "tmp"
         self.temp_directory.mkdir()
-        _ = self.config_path.write_text("ci_repo=\n", encoding="utf-8")
+        _ = write_config_fixture(self.config_path, "ci_repo=\n")
         stub = self.bin_directory / "command-stub"
         self.write_executable(stub, COMMAND_STUB)
         for name in ("ssh", "scp", "git", "systemd-run", "gh", "rsync"):
@@ -190,7 +191,7 @@ class MacRunTests(unittest.TestCase):
             "PATH": f"{self.bin_directory}{os.pathsep}{os.environ['PATH']}",
             "PYTHONPATH": str(startup),
             "MAC_TEST_STATE_DIR": str(self.state_directory),
-            "MAC_TEST_CONFIG": str(self.config_path),
+            "MAC_TEST_CONFIG": str(self.config_path), "CONF_DIR": str(Path(self.config_path).parent),
             "MAC_RUN_STUB_STATE": str(self.stub_state),
             "MAC_RUN_SHA": SHA,
             "TMPDIR": str(self.temp_directory),

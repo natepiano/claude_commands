@@ -13,7 +13,7 @@ import time
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta, tzinfo
 from typing import cast, final, override
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 from scripts.production import merge_gate
 from scripts.build_queue import queue_place as queue
@@ -24,6 +24,26 @@ from scripts.production.merge_gate_suites_test_support import GateSuitesFixture
 
 @final
 class SharedGateAdmissionTests(GateSuitesFixture):
+    def test_gate_reservation_refuses_unusable_config_before_explicit_sizing_admission(self) -> None:
+        config = self.root / "invalid-config" / "lint.conf"
+        self.write(config, "[memory]\n# range: 0..\nbuild_budget_gib=invalid\n")
+        diagnostics = io.StringIO()
+        with mock.patch.dict(os.environ, {**self.environment, "CONF_DIR": str(config.parent)}), \
+             mock.patch.object(memory_admit, "memory_config", wraps=memory_admit.memory_config) as read_config, \
+             mock.patch.object(memory_admit, "check", wraps=memory_admit.check) as checked, \
+             redirect_stderr(diagnostics):
+            with self.assertRaises(merge_gate.GateRefused) as refused:
+                with merge_gate.gate_reservation(self.checkout, 512, self.state, merge_gate.BuildHoldWait()):
+                    self.fail("gate admitted an unusable configuration")
+            read_config.assert_called_once_with()
+            checked.assert_not_called()
+        self.assertIn(str(config), str(refused.exception))
+        self.assertIn("build_budget_gib", str(refused.exception))
+        self.assertIn("could not convert string to float", str(refused.exception))
+        self.assertIn("no usable committed value", str(refused.exception))
+        self.assertIn("warning:", diagnostics.getvalue())
+        self.assert_gate_released()
+
     def test_gate_reservation_uses_the_shared_place_with_history_sizing_and_hold(self) -> None:
         hold = merge_gate.BuildHoldWait()
         with mock.patch.dict(os.environ, self.environment), \
@@ -254,6 +274,12 @@ class SharedGateAdmissionTests(GateSuitesFixture):
 
 @final
 class MergeGateAdmissionTests(unittest.TestCase):
+    @override
+    def setUp(self) -> None:
+        self.enterContext(mock.patch.dict(os.environ, {
+            "CONF_DIR": str(Path(__file__).resolve().parents[2] / "config"),
+        }))
+
     def test_swap_wait_reason_uses_the_policy_saved_in_the_check_result(self) -> None:
         pressure = memory_admit.MemoryPressure(0, 40, 80)
         peak = memory_admit.ExpectedPeak(memory_admit.GIB, "fallback", 0)
