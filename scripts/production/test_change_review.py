@@ -13,9 +13,9 @@ import tempfile
 import threading
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
-from typing import override
+from typing import cast, override
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -281,6 +281,46 @@ class StampTest(unittest.TestCase):
     def frontmatter(self) -> list[str]:
         lines = self.path.read_text(encoding="utf-8").splitlines()
         return lines[:lines.index("---", 1) + 1]
+
+    def test_every_row_writer_preserves_pipes_through_sorting_and_the_saved_verdict(self) -> None:
+        item = Visible("Use A | B", "Print A | B", "A | B appears")
+        _ = change_review.append_rows(self.path, [item], date(2026, 11, 2), "abc12345", PRODUCTION)
+        _ = change_review.set_row_kind(self.path, "C1", "See in action", PRODUCTION)
+        edited = Visible("Use C | D", r"grep 'C\|D'", "C | D appears")
+        _ = change_review.edit_row(self.path, "C1", edited, date(2026, 11, 2), PRODUCTION)
+        _ = change_review.mark_row(self.path, "C1", datetime(2026, 11, 2, 12), PRODUCTION)
+        _ = change_review.append_rows(self.path, [item], date(2026, 11, 2), "def12345", PRODUCTION)
+        before = change_review.review_snapshot(self.path)
+        self.assertEqual(before.pending[0]["Change"], edited.change)
+        self.assertEqual(before.pending[0][change_review.CHECK], edited.how())
+        _ = change_review.record_verdict(self.path, "C1", "works: C | D", date(2026, 11, 2), PRODUCTION)
+        after = change_review.review_snapshot(self.path)
+        self.assertEqual(after.reviewed[0]["Verdict"], "works: C | D")
+        self.assertEqual(after.reviewed[0][change_review.CHECK], edited.how())
+        self.assertEqual(after.pending[0]["Change"], item.change)
+
+    def test_a_malformed_cell_count_is_refused_before_a_snapshot_can_misroute_a_row(self) -> None:
+        _ = change_review.append_rows(self.path, [Visible("A", "B", "C")], date(2026, 11, 2), "", PRODUCTION)
+        text = self.path.read_text().replace("| A |", "| A | extra |")
+        _ = self.path.write_text(text)
+        with self.assertRaisesRegex(change_review.ChangeReviewError, "C1 has the wrong number of cells"):
+            _ = change_review.review_snapshot(self.path)
+
+    def test_page_and_save_readers_refuse_the_same_malformed_review_rows(self) -> None:
+        _ = change_review.append_rows(self.path, [Visible("A", "B", "C")], date(2026, 11, 2), "", PRODUCTION)
+        for reviewed in (False, True):
+            with self.subTest(reviewed=reviewed):
+                if reviewed:
+                    _ = change_review.record_verdict(self.path, "C1", "works", date(2026, 11, 2), PRODUCTION)
+                original = self.path.read_text()
+                _ = self.path.write_text(original.replace("| A |", "| A | extra |"))
+                for reader in (change_review.review_rows, change_review.review_snapshot):
+                    with self.assertRaisesRegex(change_review.ChangeReviewError, "C1 has the wrong number of cells"):
+                        _ = reader(self.path)
+                if not reviewed:
+                    with self.assertRaisesRegex(change_review.ChangeReviewError, "C1 has the wrong number of cells"):
+                        _ = change_review.pending(self.path)
+                _ = self.path.write_text(original)
 
     def test_a_write_moves_date_modified_and_keeps_a_listed_production_in_either_form(self) -> None:
         _ = change_review.append_rows(self.path, [Visible("A", "B", "C")], date(2026, 10, 15), "",
@@ -1047,6 +1087,35 @@ class RepositoryTest(unittest.TestCase):
         self.assertEqual([commit.subject for commit in commits], ["checkpoint(u): grid"])
         self.assertEqual(change_review.missing(commits), [])
         self.assertEqual(change_review.visible(commits), [GRID])
+
+    def test_a_parent_batch_reads_several_merges_and_keeps_unknown_commits_as_errors(self) -> None:
+        checkpoint = self.commit("a.py", f"checkpoint(u): grid\n\n{SEE}")
+        merged = self.merged("unit", "Merge u")
+        with mock.patch.object(subprocess, "run", wraps=subprocess.run) as commands:
+            parents = change_review.read_commit_parents(self.repo, (merged, checkpoint, merged))
+        self.assertEqual(commands.call_count, 1)
+        full_merge = self.git("rev-parse", merged)
+        self.assertEqual(parents[full_merge][1], checkpoint)
+        self.assertEqual(len(parents[checkpoint]), 1)
+        self.assertEqual([commit.sha for commit in change_review.merge_commits(self.repo, merged)], [checkpoint])
+        self.assertEqual(change_review.merge_commits(self.repo, checkpoint), [])
+        with self.assertRaises(change_review.ChangeReviewError):
+            _ = change_review.read_commit_parents(self.repo, (merged, "f" * 40))
+        with self.assertRaises(change_review.ChangeReviewError):
+            _ = change_review.merge_commits(self.repo, "f" * 40)
+
+    def test_a_tree_reads_a_branch_first_parent_line_once(self) -> None:
+        checkpoint = self.commit("a.py", f"checkpoint(u): grid\n\n{SEE}")
+        merged = self.merged("unit", "Merge u")
+        doc = self.repo / "production.md"
+        _ = doc.write_text(f"- **Repository:** {self.repo}\n- **Merge branch:** merge\n\n## Units\n\n")
+        tree = change_review.Tree([doc])
+        with mock.patch.object(subprocess, "run", wraps=subprocess.run) as commands:
+            self.assertEqual(tree.landed_on(self.repo, merged), doc)
+            self.assertIsNone(tree.landed_on(self.repo, checkpoint))
+            self.assertEqual(tree.landed_on(self.repo, merged), doc)
+        invocations = [cast(list[str], call.args[0]) for call in commands.call_args_list]
+        self.assertEqual(sum("--first-parent" in command for command in invocations), 1)
 
     def test_a_markdown_only_checkpoint_needs_no_line_but_its_line_is_read(self) -> None:
         _ = self.commit("a.md", "checkpoint(u): doc without a line")

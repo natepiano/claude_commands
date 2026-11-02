@@ -28,6 +28,7 @@ import argparse
 import sys
 from collections.abc import Callable, Iterable
 from datetime import datetime
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, TypeVar, cast
 
@@ -81,9 +82,19 @@ def _doc(production: Path | None) -> Path:
     return production
 
 
-def change_queue(doc: Path, below: bool = False) -> Queue:
+@dataclass(frozen=True)
+class ReadChangeLists:
+    """Read the current lists when no request snapshot exists."""
+
+
+READ_CHANGE_LISTS = ReadChangeLists()
+
+
+def change_queue(doc: Path, below: bool = False, *,
+                 prepared: change_review.ChangeQueue | ReadChangeLists = READ_CHANGE_LISTS) -> Queue:
     """The production's current and earlier change rows, and with `below` each lower one's."""
-    queue = change_review.change_queue(change_review.scope_list(doc), doc, below)
+    queue = (change_review.change_queue(change_review.scope_list(doc), doc, below)
+             if isinstance(prepared, ReadChangeLists) else prepared)
     return Queue(queue.name, _as_text(queue.entries, lambda entry: change_review.describe(entry.item)))
 
 
@@ -139,9 +150,12 @@ def show(kind: str, order: str, production: Path | None, below: bool = False) ->
     return f"{kinds[name]}\n{shown.item}"
 
 
-def move_to_end(kind: str, production: Path | None, below: bool = False, *, key: str = "") -> str:
+def move_to_end(kind: str, production: Path | None, below: bool = False, *, key: str = "",
+                prepared: change_review.ChangeQueue | ReadChangeLists = READ_CHANGE_LISTS) -> str:
     """Move the given key, or the item /next last showed, to the list's end."""
-    queue = read_queue(kind, production, below)
+    queue = (change_queue(_doc(production), below, prepared=prepared)
+             if kind == CHANGE and not isinstance(prepared, ReadChangeLists)
+             else read_queue(kind, production, below))
     present = {entry.key for entry in queue.entries}
     if key and key not in present:
         raise NextError(f"no {kind} with key {key} is waiting")
