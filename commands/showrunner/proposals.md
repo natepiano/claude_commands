@@ -1,5 +1,5 @@
 ---
-description: List every proposal still open for the user in one table - the production's open proposal issues, the plan backlog and the add-ons waiting for a decision.
+description: List pending production proposals.
 ---
 
 # Proposals

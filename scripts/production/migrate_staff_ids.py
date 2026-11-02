@@ -328,13 +328,13 @@ def publish_references(migration: MigrationPlan) -> None:
             raise staff.StaffRefused(f"{source}: {config.reason}")
         if target.exists() and unit_config.read_parked(native, cleanup=False) != config:
             raise staff.StaffRefused(f"{target}: unequal migration destination")
-        unit_config.write_parked(native, config)
+        _ = unit_config.write_parked(native, config)
         # Keep the old source until staff is durable, so a stopped migration can prove it again.
     for item in migration.parked:
         target = unit_config.parked_path(item.identity)
         if target.exists() and unit_config.read_parked(item.identity, cleanup=False) != item.configuration:
             raise staff.StaffRefused(f"{target}: unequal parked destination")
-        unit_config.write_parked(item.identity, item.configuration)
+        _ = unit_config.write_parked(item.identity, item.configuration)
     for path in sorted(_reference_files(migration)):
         value = rename_state.read_json(path)
         changed = _replace_references(value, migration.identities)

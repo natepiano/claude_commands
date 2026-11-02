@@ -1,5 +1,5 @@
 ---
-description: Run a production as its showrunner — launch each unit director (a /unit:direct session), merge and test every checkpoint on the merge branch, check visible work in screenshots before merging, clear waits between units, relay the user's words, and report each unit's ETA when asked.
+description: Direct units, merges, and production.
 ---
 
 # Produce
@@ -262,6 +262,11 @@ State:
   the list when `open_for_user` leaves it out; it leaves only through `answer`.
   User, 2026-10-28: "i asked it to add it to your question list not to bring
   it directly to my attention".
+  File every held simplify finding with `/showrunner:question`, led by the owning unit.
+  Include its finding id, phase, files, proposed change, and ledger location.
+  Only the user can decide it. This rule overrides the showrunner's design authority for these items.
+  After approval, send the owning unit a `next` item or a phase.
+  After either answer, require the unit to record `findings.py decision` with the user's words.
   A change waiting for the user's check is never an open question: it goes on
   the change review list through `/change_review` add, never into
   `open_for_user` or the count, and the user asks for "change review" when
@@ -547,6 +552,7 @@ Routing arrivals and ordering that queue are the showrunner's calls.
 
 <MergeCheckpoint>
 Input: the unit, phase, hash, shots, and `review trial:` line from its notice.
+File each `Held simplify:` item under <Throughout/> → Open questions before processing the checkpoint.
 Take the phase start time from the unit's previous merge time in `LOG`, or
 from its launch line in `LOG` for the first phase.
 

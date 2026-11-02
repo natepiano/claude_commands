@@ -6084,28 +6084,33 @@ class RecordedCodeFindings:
 
 
 CodeReviewEvidence = NoRecordedCodeReview | RecordedCodeFindings
+SEPARATE_TRIAL_LENSES = ("ux", "simplify")
 
 
-def _raised_code_findings(session_dir: Path, instance_id: str) -> CodeReviewEvidence:
-    """The code findings the phase's reviewers raised, from review.sh's turn records.
-
-    Sums `raised` over the phase's finished (`reviewed`) code-review turns, as
-    historical and current review records do. No record differs from a
-    recorded review that raised zero findings.
-    """
-    evidence: CodeReviewEvidence = NoRecordedCodeReview()
+def _phase_review_records(session_dir: Path, instance_id: str) -> Iterable[dict[str, object]]:
+    """Read the durable review records for one phase instance."""
     root = plan_history.history_root() / "review_turns" / session_dir.name
     for path in sorted(root.glob("*.json")):
         try:
             record = _object_dict(cast(object, json.loads(path.read_text(encoding="utf-8"))))
         except (OSError, ValueError):
             continue
-        if (
-            record is None
-            or _string(record.get("phase_instance_id")) != instance_id
-            or _string(record.get("status")) != "reviewed"
-            or _string(record.get("kind")) == "ux"
-        ):
+        if record is not None and _string(record.get("phase_instance_id")) == instance_id:
+            yield record
+
+
+def _is_code_review(record: dict[str, object]) -> bool:
+    return (
+        _string(record.get("kind")) not in SEPARATE_TRIAL_LENSES
+        and _string(record.get("lens")) not in SEPARATE_TRIAL_LENSES
+    )
+
+
+def _raised_findings(records: Iterable[dict[str, object]]) -> CodeReviewEvidence:
+    """Count findings from completed reviews."""
+    evidence: CodeReviewEvidence = NoRecordedCodeReview()
+    for record in records:
+        if _string(record.get("status")) != "reviewed":
             continue
         count = evidence.count if isinstance(evidence, RecordedCodeFindings) else 0
         evidence = RecordedCodeFindings(count + _integer(record.get("raised")))
@@ -6113,19 +6118,18 @@ def _raised_code_findings(session_dir: Path, instance_id: str) -> CodeReviewEvid
 
 
 def _review_trial(args: argparse.Namespace) -> None:
-    """Print one line: the phase's UX and code findings, and review time.
+    """Print the phase's findings and review minutes for the checkpoint notice.
 
-    It feeds the unit's checkpoint notice line, which the showrunner records with
-    review_regime.py. The phase is the one --phase-id names -- an open one, else
-    the latest this run started under that id -- or, without it, the one in
-    state, active or just closed by finish-phase. Only events stamped with its
-    instance count. The code number is what the reviewers raised, from the
-    phase's review turn records; a phase with none counts the code findings
-    the unit director opened. Review-worker
-    minutes are every worker's finished review passes, whatever their status, plus
-    the UX review activities. The screenshot check's own cost follows: its `UX
-    review` activities alone, then every fix pass of a round whose dispatched
-    batch covered a `ux` finding. All round to the nearest whole minute.
+    A named phase selects its open instance or its latest completed instance.
+    An unnamed command selects the current phase, including a completed phase.
+    Only events and review records for that instance count.
+    Completed reviews supply the code and simplify counts.
+    Without completed reviews, each count uses the findings that the director opened.
+    Review-worker minutes count finished review passes except `direct.simplify`, plus UX review activities.
+    Simplify minutes count its review records, including failed runs.
+    UX check minutes count `UX review` activities.
+    UX repair minutes count fix passes whose dispatched batch includes a UX finding.
+    Each time rounds to the nearest whole minute.
     """
     session_dir = _session_dir(args)
     state = _read_state(session_dir)
@@ -6156,6 +6160,7 @@ def _review_trial(args: argparse.Namespace) -> None:
     code_findings = 0
     review_seconds = 0
     ux_check_seconds = 0
+    simplify_findings = 0
     ux_finding_ids: set[str] = set()
     dispatched: list[dict[str, object]] = []
     fix_passes: list[dict[str, object]] = []
@@ -6168,12 +6173,15 @@ def _review_trial(args: argparse.Namespace) -> None:
             if "ux" in lenses:
                 ux_findings += 1
                 ux_finding_ids.add(_string(event.get("finding_id")))
-            if not lenses or lenses - {"ux"}:
+            if "simplify" in lenses:
+                simplify_findings += 1
+            if not lenses or lenses.difference(SEPARATE_TRIAL_LENSES):
                 code_findings += 1
         elif event_type == "finding_batch_dispatched":
             dispatched.append(event)
         elif event_type == "pass_finished" and _string(event.get("pass_kind")) == "review":
-            review_seconds += _integer(event.get("pass_elapsed_seconds"))
+            if _string(event.get("called_task")) != "direct.simplify":
+                review_seconds += _integer(event.get("pass_elapsed_seconds"))
         elif event_type == "pass_finished" and _string(event.get("pass_kind")) == "fix":
             fix_passes.append(event)
         elif (
@@ -6195,14 +6203,26 @@ def _review_trial(args: argparse.Namespace) -> None:
         for event in fix_passes
         if _integer(event.get("fix_pass")) in ux_rounds
     )
-    raised = _raised_code_findings(session_dir, instance_id)
+    records = list(_phase_review_records(session_dir, instance_id))
+    raised = _raised_findings(filter(_is_code_review, records))
     if isinstance(raised, RecordedCodeFindings):
         code_findings = raised.count
+    # Count the Claude run separately, including runs that report an error.
+    simplify_records = [record for record in records if _string(record.get("lens")) == "simplify"]
+    simplify_raised = _raised_findings(simplify_records)
+    simplify_seconds = sum(
+        max(0, int(_number(record.get("finished_at")) - _number(record.get("started_at"))))
+        for record in simplify_records
+    )
+    if isinstance(simplify_raised, RecordedCodeFindings):
+        simplify_findings = simplify_raised.count
+    simplify_line = (f", simplify {simplify_findings} findings, simplify minutes {(simplify_seconds + 30) // 60}"
+                     if simplify_records or simplify_findings else "")
     print(
         f"review trial: ux {ux_findings} findings, code {code_findings} findings, "
         + f"review-worker minutes {(review_seconds + 30) // 60}, "
         + f"ux check minutes {(ux_check_seconds + 30) // 60}, "
-        + f"ux repair minutes {(ux_repair_seconds + 30) // 60}"
+        + f"ux repair minutes {(ux_repair_seconds + 30) // 60}" + simplify_line
     )
 
 

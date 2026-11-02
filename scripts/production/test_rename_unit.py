@@ -47,7 +47,7 @@ class UnitRenameTests(UnitRenameFixture):
         _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", source))
         config = unit_config.UnitConfig(unit_config.PlanFile(Path("docs/plans/alpha.md")),
                                         unit_config.AppPort(8123), ("nightly",))
-        unit_config.write(source, config)
+        _ = unit_config.write(source, config)
         data = (source / ".unit.toml").read_bytes()
         with mock.patch.object(staff, "set_worktree", side_effect=OSError("stopped after folder move")):
             interrupted = self.rename("apply")

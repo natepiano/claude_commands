@@ -1,5 +1,5 @@
 ---
-description: Answer a question about build, lint, test and CI timings, failures and flaky tests from the build log, on both machines.
+description: Report build, test, lint, and CI logs.
 ---
 
 `$ARGUMENTS` is the question.

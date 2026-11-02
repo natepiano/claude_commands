@@ -61,7 +61,7 @@ class LifecycleTests(LifecycleFixture):
         original = unit_config.read(self.alpha)
         assert isinstance(original, unit_config.UnitConfig)
         expected = replace(original, responsibilities=("nightly", "build-check"))
-        unit_config.write(self.alpha, expected)
+        _ = unit_config.write(self.alpha, expected)
         result = self.run_lifecycle("wrap", "--no-ci")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         with mock.patch.dict(os.environ, {"HOME": self.env["HOME"]}):

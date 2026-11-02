@@ -995,7 +995,7 @@ def retire(unit: Unit, wait_minutes: float) -> int:
     if refused:
         print("\n".join(f"refused: {reason}" for reason in refused))
         return 1
-    unit_config.park(member.row.id, unit.worktree, facts)
+    _ = unit_config.park(member.row.id, unit.worktree, facts)
     saved = preserve_branch(unit)
     pane = unit_move.unit_pane(unit_lookup.marked_unit(unit.production.slug, unit.name), unit.production.slug)
     if not isinstance(facts.start_folder, unit_config.RecordedStartFolder):

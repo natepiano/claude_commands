@@ -1,5 +1,5 @@
 ---
-description: Show or edit agent family, agent, and effort assignments in the shared registry
+description: Set agent, family, and effort choices.
 ---
 
 # agent

@@ -1,5 +1,5 @@
 ---
-description: Generate a changelog entry from the current git changes, optionally tied to an issue or PR number.
+description: Write a changelog from Git changes.
 ---
 
 **IMPORTANT** don't commit any changes. Just do the following:

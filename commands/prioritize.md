@@ -1,5 +1,5 @@
 ---
-description: Focused comparative re-rating of one band of the Hanadocs backlog; the background watcher recomputes scores and ranks.
+description: Rate a band of the Hanadocs backlog.
 ---
 
 Redistribute one band of open issues in the Hanadocs Obsidian vault by re-rating them comparatively against each other, so their scores spread across the full rubric range instead of compressing into ties. Ratings enter the system through `/issue` at creation; `/prioritize` corrects compression later, in the band where rank actually drives decisions.

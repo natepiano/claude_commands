@@ -19,14 +19,14 @@ from io import StringIO
 from pathlib import Path
 from typing import Literal, cast, override
 from unittest.mock import patch
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import urlencode, urljoin, urlsplit
 
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lib import urgency
-from scripts.production import change_review, next_item, showrunners
+from scripts.production import change_review, next_item, showrunners, staff
 from scripts.production.staff_test_support import fixture_member
 from scripts.feature_log import feature_log
-from scripts.review_links import change_page, serve
+from scripts.review_links import change_browser, change_page, review_link, serve
 
 
 @dataclass(frozen=True)
@@ -61,6 +61,52 @@ class SavedAnswerForm(HTMLParser):
             self.saved_answers[self.fields["row"]] = dict(self.fields)
         if tag == "button" and value == "validate":
             self.validation_requests[self.fields["row"]] = dict(self.fields)
+
+
+class BrowserForms(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.rows: dict[str, dict[str, str]] = {}
+        self.tabs: dict[str, str] = {}
+        self.save_urls: dict[str, str] = {}
+        self.counts: dict[str, int] = {}
+        self.pending: dict[str, bool] = {}
+        self.outcomes: dict[str, list[str]] = {}
+        self.current: str = ""
+        self.count_tab: str = ""
+        self.read_count: bool = False
+
+    @override
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        values = dict(attrs)
+        if tag == "section" and values.get("data-key"):
+            self.current = values["data-key"] or ""
+            self.rows[self.current] = {}
+            self.tabs[self.current] = values.get("data-tab") or ""
+            self.pending[self.current] = values.get("data-pending") == "true"
+            self.outcomes[self.current] = []
+        if tag == "input" and self.current and values.get("name"):
+            self.rows[self.current][values["name"] or ""] = values.get("value") or ""
+        if tag == "form" and self.current and values.get("method") == "post":
+            self.save_urls[self.current] = values.get("action") or ""
+        if tag == "button" and self.current and values.get("name") == "outcome":
+            self.outcomes[self.current].append(values.get("value") or "")
+        if tag == "button" and values.get("data-showrunner"):
+            self.count_tab = values["data-showrunner"] or ""
+        if tag == "span" and "data-count" in values:
+            self.read_count = True
+
+    @override
+    def handle_data(self, data: str) -> None:
+        if self.read_count:
+            self.counts[self.count_tab] = int(data)
+
+    @override
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "section":
+            self.current = ""
+        if tag == "span":
+            self.read_count = False
 
 
 class ChangePageTests(unittest.TestCase):
@@ -177,6 +223,405 @@ class ChangePageTests(unittest.TestCase):
 
     def answer(self, row: str = "C1", outcome: str = "works", feedback: str = "") -> dict[str, str]:
         return {"row": row, "outcome": outcome, "feedback": feedback, "token": self.page.token}
+
+    def browser(self) -> tuple[str, BrowserForms, str]:
+        path = urlsplit(change_browser.publish()).path
+        reply = self.request(path, {})
+        self.assertEqual(reply.status, 200)
+        forms = BrowserForms()
+        forms.feed(reply.body)
+        return path, forms, reply.body
+
+    def browser_fields(self, forms: BrowserForms, key: str, outcome: str = "works", feedback: str = "") -> dict[str, str]:
+        return forms.rows[key] | {"row": key, "outcome": outcome, "feedback": feedback}
+
+    def test_all_lists_load_once_and_the_browser_contains_the_whole_waiting_queue(self) -> None:
+        other = self.temporary / "change-review - another.md"
+        _ = change_review.append_rows(other, [change_review.Visible("Other change", "Read the proof", "It agrees")],
+                                      date(2026, 11, 2), "", self.production)
+        path = urlsplit(change_browser.publish()).path
+        with patch.object(change_review, "read", wraps=change_review.read) as reads:
+            reply = self.request(path, {})
+        self.assertEqual(reply.status, 200)
+        for review_list in (self.review_list, other):
+            self.assertEqual(sum(call.args == (review_list,) for call in reads.call_args_list), 1)
+        forms = BrowserForms()
+        forms.feed(reply.body)
+        self.assertEqual(set(forms.rows), {"page-owner/C1", "page-owner/C2", "page-owner/C3", "another/C1"})
+        self.assertIn('another (<span data-count>1</span>)', reply.body)
+        self.assertIn('page-owner (<span data-count>3</span>)', reply.body)
+        self.assertIn("Read only", reply.body)
+        self.assertIn("The old and new comments agree with the tests", reply.body)
+        self.assertNotIn('value="next"', reply.body)
+
+    def test_staff_moves_the_unit_changes_to_its_current_showrunner_tab(self) -> None:
+        runner = fixture_member("showrunner", name="sdlc", doc=staff.LiveDoc("natedev", self.production))
+        _ = fixture_member("unit", name="builder-unit", parent=runner.id)
+        path, forms, body = self.browser()
+        self.assertEqual(forms.tabs["page-owner/C1"], "sdlc")
+        self.assertIn('sdlc (<span data-count>3</span>)', body)
+        reply = self.http_request(path, self.browser_fields(forms, "page-owner/C1", "validate", "Check this yourself"))
+        self.assertEqual(reply.status, 200)
+        self.assertTrue(self.delivery_done.wait(TEST_HANG_GUARD_SECS))
+        self.assertEqual([recipient for recipient, _, _ in self.messages], ["sdlc"])
+        self.assertIn("Check this yourself", self.messages[0][2])
+        self.assertEqual(len(change_review.pending(self.review_list)), 3)
+        refreshed = BrowserForms()
+        refreshed.feed(self.request(path, {}).body)
+        self.assertEqual(list(refreshed.rows), ["page-owner/C2", "page-owner/C3", "page-owner/C1"])
+
+    def test_production_aliases_share_one_document_read_per_page_request(self) -> None:
+        runner = fixture_member("showrunner", name="sdlc", doc=staff.LiveDoc("natedev", self.production))
+        _ = fixture_member("unit", name="builder-unit", parent=runner.id)
+        reads: list[Path] = []
+        read_text = Path.read_text
+
+        def read_document(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+            reads.append(path)
+            return read_text(path, encoding=encoding, errors=errors)
+
+        with patch.object(Path, "read_text", new=read_document):
+            path, forms, body = self.browser()
+        del path, body
+        self.assertEqual(reads.count(self.production), 1)
+        self.assertEqual(forms.counts["sdlc"], 3)
+        self.assertEqual(set(forms.save_urls), {"page-owner/C1", "page-owner/C2", "page-owner/C3"})
+
+    def test_a_page_reads_all_commit_parents_once_per_repository(self) -> None:
+        runner = fixture_member("showrunner", name="sdlc", doc=staff.LiveDoc("natedev", self.production))
+        _ = fixture_member("unit", name="builder-unit", parent=runner.id)
+        other_repo = self.temporary / "other-repo"
+        _ = subprocess.run(["git", "clone", "--quiet", str(self.repo), str(other_repo)], check=True)
+        other_doc = self.temporary / "other-production.md"
+        other_list = self.temporary / "change-review - other.md"
+        _ = other_doc.write_text(self.production.read_text().replace(str(self.repo), str(other_repo))
+                                .replace(str(self.review_list), str(other_list)))
+        _ = change_review.append_rows(other_list, [change_review.Visible("Other change", "Read", "Proof")],
+                                      date(2026, 11, 2), self.git("rev-parse", "HEAD"), other_doc)
+        path = urlsplit(change_browser.publish()).path
+        with patch.object(subprocess, "run", wraps=subprocess.run) as commands:
+            reply = self.request(path, {})
+        self.assertEqual(reply.status, 200, reply.body)
+        invocations = [cast(list[str], call.args[0]) for call in commands.call_args_list]
+        parent_reads = [command for command in invocations if "rev-list" in command and "--parents" in command]
+        self.assertCountEqual([command[2] for command in parent_reads],
+                              [str(self.repo / ".git"), str(other_repo / ".git")])
+        self.assertTrue(all("--stdin" in command and "--no-walk" in command for command in parent_reads))
+        forms = BrowserForms()
+        forms.feed(reply.body)
+        self.assertEqual(set(forms.rows), {"page-owner/C1", "page-owner/C2", "page-owner/C3", "other/C1"})
+        self.assertEqual(set(forms.tabs.values()), {"sdlc"})
+
+    def test_unknown_staff_keeps_a_change_under_its_source_list(self) -> None:
+        path, forms, body = self.browser()
+        del path, body
+        self.assertEqual(forms.tabs["page-owner/C1"], "page-owner")
+
+    def test_an_unknown_unit_stays_in_its_list_even_when_production_names_another_showrunner(self) -> None:
+        foreign = self.temporary / "sdlc-production.md"
+        _ = foreign.write_text(self.production.read_text())
+        _ = fixture_member("showrunner", name="sdlc", doc=staff.LiveDoc("natedev", foreign))
+        _ = change_review.append_rows(self.review_list, [change_review.Visible("Unknown unit", "Read", "Proof")],
+                                      date(2026, 11, 2), self.git("rev-parse", "HEAD"), foreign)
+        path, forms, body = self.browser()
+        del path, body
+        self.assertEqual(forms.tabs["page-owner/C4"], "page-owner")
+
+    def test_a_registered_production_saves_when_the_list_has_only_a_missing_document_reference(self) -> None:
+        text = self.review_list.read_text().replace(str(self.production), str(self.temporary / "missing.md"))
+        _ = self.review_list.write_text(text)
+        with patch.object(showrunners, "timer_docs", return_value={"page-owner": self.production}):
+            path, forms, body = self.browser()
+            del body
+            reply = self.http_request(urljoin(path, forms.save_urls["page-owner/C1"]),
+                                      self.browser_fields(forms, "page-owner/C1"))
+        self.assertEqual(reply.status, 200, reply.body)
+        self.assertEqual(cast(object, json.loads(reply.body)), {"answer": "works"})
+        self.assertTrue(self.delivery_done.wait(TEST_HANG_GUARD_SECS))
+        row = next(row for row in change_review.review_rows(self.review_list) if row["#"] == "C1")
+        self.assertEqual(row["Verdict"], "works")
+        self.assertEqual([recipient for recipient, _, _ in self.messages], ["page-owner"])
+
+    def test_a_list_without_a_production_document_shows_its_changes_without_answer_controls(self) -> None:
+        text = self.review_list.read_text().replace(str(self.production), str(self.temporary / "missing.md"))
+        _ = self.review_list.write_text(text)
+        path, forms, body = self.browser()
+        self.assertEqual(set(forms.rows), {"page-owner/C1", "page-owner/C2", "page-owner/C3"})
+        self.assertEqual(forms.save_urls, {})
+        self.assertIn("The production document is not available. This change cannot accept an answer.", body)
+        browser = change_browser.page_at(self.root, path)
+        fields = {"row": "page-owner/C1", "token": change_browser.row_token(browser, "page-owner/C1"),
+                  "outcome": "works", "feedback": ""}
+        self.assertEqual(self.http_request(path, fields).status, 400)
+        self.assertEqual(len(change_review.pending(self.review_list)), 3)
+
+    def test_an_earlier_lists_prerequisites_keep_qualified_ids_in_the_embedded_tab_order(self) -> None:
+        runner = fixture_member("showrunner", name="sdlc", doc=staff.LiveDoc("natedev", self.production))
+        _ = fixture_member("unit", name="builder-unit", parent=runner.id)
+        earlier = self.temporary / "change-review - earlier.md"
+        _ = change_review.append_rows(earlier, [change_review.Visible("First", "Read", "Proof")],
+                                      date(2026, 11, 2), self.git("rev-parse", "HEAD"), self.production,
+                                      urgency.cell(urgency.read(), "C2"))
+        _ = change_review.append_rows(earlier, [change_review.Visible("Second", "Read", "Proof")],
+                                      date(2026, 11, 2), self.git("rev-parse", "HEAD"), self.production)
+        path, forms, body = self.browser()
+        del body
+        keys = list(forms.rows)
+        self.assertLess(keys.index("earlier/C2"), keys.index("earlier/C1"))
+        self.assertEqual(forms.tabs["earlier/C1"], "sdlc")
+        self.assertEqual(forms.tabs["earlier/C2"], "sdlc")
+        self.assertEqual(forms.counts["sdlc"], 5)
+        self.assertEqual(forms.counts["earlier"], 0)
+        self.assertEqual(forms.counts["page-owner"], 0)
+        self.assertEqual(set(forms.save_urls), set(forms.rows))
+        reply = self.http_request(urljoin(path, forms.save_urls["earlier/C2"]),
+                                  self.browser_fields(forms, "earlier/C2", "not works", "Needs a correction"))
+        self.assertEqual(reply.status, 200, reply.body)
+        self.assertTrue(self.delivery_done.wait(TEST_HANG_GUARD_SECS))
+        row = next(row for row in change_review.review_rows(earlier) if row["#"] == "C2")
+        self.assertEqual(row["Verdict"], "not works: Needs a correction")
+
+    def test_a_merge_with_two_units_uses_each_change_trailer_for_its_staff_tab(self) -> None:
+        first = fixture_member("showrunner", name="sdlc", doc=staff.LiveDoc("natedev", self.production))
+        second = fixture_member("showrunner", name="other", doc=staff.LiveDoc("natedev", self.production))
+        _ = fixture_member("unit", name="builder-unit", parent=first.id)
+        _ = fixture_member("unit", name="second-unit", parent=second.id)
+        _ = self.git("checkout", "-b", "mixed")
+        _ = self.git("commit", "--allow-empty", "-m",
+                     "checkpoint(builder-unit): first change\n\nChange-Review: First mixed change | Read | First proof")
+        _ = self.git("commit", "--allow-empty", "-m",
+                     "checkpoint(second-unit): second change\n\nChange-Review: Second mixed change | Read | Second proof")
+        _ = self.git("checkout", "main")
+        _ = self.git("merge", "--no-ff", "mixed", "-m", "merge both units")
+        _ = change_review.append_rows(self.review_list,
+                                      [change_review.Visible("First mixed change", "Read", "First proof"),
+                                       change_review.Visible("Second mixed change", "Read", "Second proof")],
+                                      date(2026, 11, 2), self.git("rev-parse", "HEAD"), self.production)
+        path, forms, body = self.browser()
+        del path, body
+        self.assertEqual(forms.tabs["page-owner/C4"], "sdlc")
+        self.assertEqual(forms.tabs["page-owner/C5"], "other")
+
+    def test_the_browser_response_does_not_wait_for_a_message_and_a_reload_shows_pending_delivery(self) -> None:
+        path, forms, body = self.browser()
+        del body
+        entered, release = threading.Event(), threading.Event()
+
+        def slow_send(recipient: str, sender: str, message: str) -> None:
+            entered.set()
+            if not release.wait(TEST_HANG_GUARD_SECS):
+                raise RuntimeError("send was not released")
+            self.capture_message(recipient, sender, message)
+
+        with patch.object(change_page, "send_message", side_effect=slow_send):
+            try:
+                reply = self.http_request(path, self.browser_fields(forms, "page-owner/C1"))
+                self.assertEqual(reply.status, 200)
+                self.assertEqual(json.loads(reply.body), {"answer": "works"})
+                self.assertTrue(entered.wait(TEST_HANG_GUARD_SECS))
+                self.assertFalse(self.delivery_done.is_set())
+                pending = self.request(path, {}).body
+                self.assertIn("Saved: works", pending)
+                self.assertIn("The message may not have sent", pending)
+                self.assertIn("Send saved answer again", pending)
+                self.assertIn('page-owner (<span data-count>2</span>)', pending)
+            finally:
+                release.set()
+                self.assertTrue(self.delivery_done.wait(TEST_HANG_GUARD_SECS))
+        landed = self.request(path, {}).body
+        self.assertNotIn("Send saved answer again", landed)
+
+    def test_a_failed_browser_save_returns_plain_words_and_accepts_the_same_typed_answer_again(self) -> None:
+        path, forms, body = self.browser()
+        del body
+        fields = self.browser_fields(forms, "page-owner/C1", "not works", "Keep <my> words & outcome")
+        with patch.object(change_page, "close_feature_log", side_effect=RuntimeError("bad proposal /private/file.json")):
+            failed = self.http_request(path, fields)
+        self.assertEqual(failed.status, 503)
+        self.assertEqual(json.loads(failed.body), {"reason": "The feature log could not be updated."})
+        self.assertNotIn("/private/", failed.body)
+        self.assertEqual(len(change_review.pending(self.review_list)), 3)
+        self.delivery_done.clear()
+        saved = self.http_request(path, fields)
+        self.assertEqual(saved.status, 200)
+        self.assertTrue(self.delivery_done.wait(TEST_HANG_GUARD_SECS))
+        rows = change_review.review_rows(self.review_list)
+        self.assertEqual(next(row["Verdict"] for row in rows if row["#"] == "C1"), "not works: Keep <my> words & outcome")
+
+    def test_a_later_browser_delivery_failure_remains_retryable_after_a_reload(self) -> None:
+        path, forms, body = self.browser()
+        del body
+        with patch.object(change_page, "send_message", side_effect=RuntimeError("socket unavailable")):
+            reply = self.http_request(path, self.browser_fields(forms, "page-owner/C1", "not works", "Please fix"))
+            self.assertEqual(reply.status, 200)
+            self.assertTrue(self.delivery_done.wait(TEST_HANG_GUARD_SECS))
+        failed = self.request(path, {}).body
+        self.assertIn("Saved: not works: Please fix", failed)
+        self.assertIn("Saved, but the message did not send", failed)
+        self.assertIn("Send saved answer again", failed)
+        retry = BrowserForms()
+        retry.feed(failed)
+        self.delivery_done.clear()
+        reply = self.http_request(path, self.browser_fields(retry, "page-owner/C1", "retry"))
+        self.assertEqual(reply.status, 200)
+        self.assertTrue(self.delivery_done.wait(TEST_HANG_GUARD_SECS))
+        self.assertEqual([recipient for recipient, _, _ in self.messages], ["builder-unit", "page-owner"])
+        self.assertNotIn("Send saved answer again", self.request(path, {}).body)
+
+    def test_the_browser_refuses_extra_fields_bad_tokens_and_unshown_rows(self) -> None:
+        path, forms, body = self.browser()
+        del body
+        before = self.review_list.read_bytes()
+        valid = self.browser_fields(forms, "page-owner/C1")
+        for fields in (valid | {"path": str(self.review_list)}, valid | {"command": "true"},
+                       valid | {"token": "é"}, valid | {"row": "page-owner/C999"}, valid | {"row": "../C1"}):
+            with self.subTest(fields=fields):
+                self.assertEqual(self.http_request(path, fields).status, 400)
+        self.assertEqual(self.review_list.read_bytes(), before)
+        self.assertEqual(self.messages, [])
+
+    def test_the_browser_uses_the_existing_pin_and_move_order_without_publishing_next_pages(self) -> None:
+        _ = next_item.move_to_end(next_item.CHANGE, self.production, key="C1")
+        queue = next_item.change_queue(self.production)
+        urgency.pin(queue.name, "C3")
+        path, forms, body = self.browser()
+        self.assertEqual(list(forms.rows), ["page-owner/C3", "page-owner/C2", "page-owner/C1"])
+        before = set(self.root.iterdir())
+        self.assertEqual(self.request(path, {}).status, 200)
+        self.assertEqual(set(self.root.iterdir()), before)
+        self.assertIn('data-next hidden>Next', body)
+
+    def test_empty_lists_keep_their_zero_count_tabs(self) -> None:
+        for row in ("C1", "C2", "C3"):
+            _ = change_review.record_verdict(self.review_list, row, "works", date(2026, 11, 2), self.production)
+        path, forms, body = self.browser()
+        del path
+        self.assertEqual(forms.rows, {})
+        self.assertIn('page-owner (<span data-count>0</span>)', body)
+
+    def test_validation_requests_leave_the_browser_queue_after_delivery_and_a_fresh_prepare(self) -> None:
+        path, forms, body = self.browser()
+        del body
+        self.delivery_done.clear()
+        reply = self.http_request(path, self.browser_fields(forms, "page-owner/C1", "validate", "Check the proof"))
+        self.assertEqual(reply.status, 200)
+        self.assertTrue(self.delivery_done.wait(TEST_HANG_GUARD_SECS))
+        browser = change_browser.page_at(self.root, path)
+        status = change_page.DeliveryStatus(self.root)
+        prepared = change_browser.prepare(browser, status)
+        self.assertEqual([item.key for item in prepared.changes if item.waiting], ["page-owner/C2", "page-owner/C3"])
+        self.assertEqual([entry.key for entry in prepared.queues["page-owner"].entries], ["C2", "C3"])
+        self.assertFalse(any(row.get("Verdict") for row in change_review.review_rows(self.review_list)))
+        fresh = BrowserForms()
+        content = change_browser.render(browser, change_page.DeliveryStatus(self.root)).decode()
+        fresh.feed(content)
+        self.assertEqual(fresh.counts["page-owner"], 2)
+        self.assertFalse(fresh.pending["page-owner/C1"])
+        self.assertEqual(fresh.outcomes["page-owner/C1"], [])
+        self.assertNotIn("page-owner/C1", fresh.save_urls)
+        self.assertIn("The showrunner will validate this", content)
+        self.assertIn("C1: the user asks you to validate this", self.messages[0][2])
+        queue = next_item.change_queue(self.production)
+        self.assertEqual(urgency.queue_order(queue.entries, queue.name)[-1].key, "C1")
+
+    def test_removing_a_validation_record_restores_waiting_until_a_verdict_saves(self) -> None:
+        path, forms, body = self.browser()
+        del body
+        status = change_page.DeliveryStatus(self.root)
+        browser = change_browser.page_at(self.root, path)
+        delivery, answer = change_browser.submit(browser, urlencode(
+            self.browser_fields(forms, "page-owner/C1", "validate")), status)
+        self.assertEqual(answer, "")
+        status.record(delivery, False)
+        self.assertNotIn("page-owner/C1", [item.key for item in change_browser.prepare(browser, status).changes if item.waiting])
+        status.path(delivery.page, "C1").unlink()
+        self.assertIn("page-owner/C1", [item.key for item in change_browser.prepare(browser, status).changes if item.waiting])
+        _ = change_review.record_verdict(self.review_list, "C1", "works", date(2026, 11, 2), self.production)
+        prepared = change_browser.prepare(browser, change_page.DeliveryStatus(self.root))
+        self.assertNotIn("page-owner/C1", [item.key for item in prepared.changes if item.waiting])
+        refreshed = BrowserForms()
+        refreshed.feed(change_browser.render(browser, status).decode())
+        self.assertEqual(refreshed.counts["page-owner"], 2)
+
+    def test_unsent_validation_records_keep_the_waiting_count_and_resend_control(self) -> None:
+        path, forms, body = self.browser()
+        del forms, body
+        browser = change_browser.page_at(self.root, path)
+        status = change_page.DeliveryStatus(self.root)
+        for failed in (False, True):
+            with self.subTest(state="failed" if failed else "pending"):
+                attempt = status.begin(self.page, "C1", "validation", "Keep these words")
+                if failed:
+                    status.record(change_page.MessageDelivery(self.page, "C1", (), "", attempt), True)
+                prepared = change_browser.prepare(browser, change_page.DeliveryStatus(self.root))
+                self.assertIn("page-owner/C1", [item.key for item in prepared.changes if item.waiting])
+                self.assertIn("C1", [entry.key for entry in prepared.queues["page-owner"].entries])
+                content = change_browser.render(browser, change_page.DeliveryStatus(self.root)).decode()
+                refreshed = BrowserForms()
+                refreshed.feed(content)
+                self.assertEqual(refreshed.counts["page-owner"], 3)
+                self.assertTrue(refreshed.pending["page-owner/C1"])
+                self.assertIn('data-resend>Send validation request again</button>', content)
+                self.assertIn("The validation message did not send" if failed else "The message may not have sent", content)
+
+    def test_failed_validation_delivery_stays_in_the_count_and_can_retry(self) -> None:
+        path, forms, body = self.browser()
+        del body
+        fields = self.browser_fields(forms, "page-owner/C1", "validate", "Keep <these> words")
+        with patch.object(change_page, "send_message", side_effect=RuntimeError("socket unavailable")):
+            self.delivery_done.clear()
+            self.assertEqual(self.http_request(path, fields).status, 200)
+            self.assertTrue(self.delivery_done.wait(TEST_HANG_GUARD_SECS))
+        failed = BrowserForms()
+        failed.feed(self.request(path, {}).body)
+        self.assertEqual(failed.counts["page-owner"], 3)
+        self.assertTrue(failed.pending["page-owner/C1"])
+        self.assertEqual(failed.outcomes["page-owner/C1"], ["works", "not works", "validate", "feedback"])
+        self.assertEqual(failed.rows["page-owner/C1"]["feedback"], "Keep <these> words")
+        self.delivery_done.clear()
+        self.assertEqual(self.http_request(path, self.browser_fields(
+            failed, "page-owner/C1", "validate", failed.rows["page-owner/C1"]["feedback"])).status, 200)
+        self.assertTrue(self.delivery_done.wait(TEST_HANG_GUARD_SECS))
+        self.assertIn("Keep <these> words", self.messages[-1][2])
+        self.assertNotIn("Send validation request again", self.request(path, {}).body)
+
+    def test_a_failed_validation_save_keeps_the_waiting_count(self) -> None:
+        path, forms, body = self.browser()
+        del body
+        with patch.object(next_item, "move_to_end", side_effect=OSError("queue unavailable")):
+            reply = self.http_request(path, self.browser_fields(forms, "page-owner/C1", "validate", "Keep this answer"))
+        self.assertEqual(reply.status, 503)
+        refreshed = BrowserForms()
+        refreshed.feed(self.request(path, {}).body)
+        self.assertEqual(refreshed.counts["page-owner"], 3)
+        self.assertTrue(refreshed.pending["page-owner/C1"])
+
+    def test_browser_feedback_removes_the_count_only_after_its_verdict_saves(self) -> None:
+        path, forms, body = self.browser()
+        del body
+        self.delivery_done.clear()
+        reply = self.http_request(path, self.browser_fields(forms, "page-owner/C1", "feedback", "Needs a clearer proof"))
+        self.assertEqual(reply.status, 200)
+        self.assertEqual(json.loads(reply.body), {"answer": "Needs a clearer proof"})
+        self.assertTrue(self.delivery_done.wait(TEST_HANG_GUARD_SECS))
+        row = next(row for row in change_review.review_rows(self.review_list) if row["#"] == "C1")
+        self.assertEqual(row["Verdict"], "Needs a clearer proof")
+        self.assertFalse(change_review.lands(row["Verdict"]))
+        refreshed = BrowserForms()
+        refreshed.feed(self.request(path, {}).body)
+        self.assertEqual(refreshed.counts["page-owner"], 2)
+
+    def test_browser_markup_supplies_waiting_rows_and_navigation_after_saves(self) -> None:
+        path, forms, body = self.browser()
+        del path
+        self.assertEqual(forms.pending, dict.fromkeys(forms.rows, True))
+        self.assertEqual(forms.outcomes["page-owner/C1"], ["works", "not works", "validate", "feedback"])
+        self.assertIn('data-next hidden>Next', body)
+        self.assertIn('<p data-left></p>', body)
+        self.assertIn("current===row && tab===row.dataset.tab && navigation===position", body)
+        self.assertIn("row.dataset.pending='false';form.hidden=true", body)
+        self.assertIn("go(following?.dataset.key || '')", body)
+        self.assertNotIn("rows.push(row)", body)
 
     def test_submit_writes_through_verdict_and_a_fresh_get_reads_the_saved_record(self) -> None:
         reply = self.request(self.page_path, self.answer())
@@ -871,13 +1316,17 @@ class ChangePageTests(unittest.TestCase):
                 status.record(first_delivery, True)
                 after = status.slots(self.page, "C1")
                 self.assertEqual(after.verdict if other == "verdict" else after.validation, remaining)
-                self.assertIsInstance(after.validation if first == "validation" else after.verdict,
-                                      change_page.NoDelivery)
+                if first == "validation":
+                    self.assertEqual(after.validation, change_page.ValidationRequested(validation, "Keep these words"))
+                else:
+                    self.assertIsInstance(after.verdict, change_page.NoDelivery)
                 stored = status.path(self.page, "C1").read_text(encoding="utf-8")
-                self.assertNotIn(f'"{first}"', stored)
+                self.assertEqual(f'"{first}"' in stored, first == "validation")
                 self.assertIn(f'"{other}"', stored)
                 status.record(other_delivery, False)
-                self.assertFalse(status.path(self.page, "C1").exists())
+                self.assertEqual(status.slots(self.page, "C1").validation,
+                                 change_page.ValidationRequested(validation, "Keep these words"))
+                self.assertIsInstance(status.slots(self.page, "C1").verdict, change_page.NoDelivery)
 
     def test_single_intent_records_migrate_to_their_kind_without_losing_feedback(self) -> None:
         status = change_page.DeliveryStatus(self.root)
@@ -946,14 +1395,14 @@ class ChangePageTests(unittest.TestCase):
         checked = threading.Event()
         release = threading.Event()
         entering = threading.Event()
-        unlink = Path.unlink
+        replace_file = review_link.replace_file
 
-        def pause_before_delete(path: Path, missing_ok: bool = False) -> None:
+        def pause_before_write(path: Path, content: bytes) -> None:
             if path == status.path(self.page, "C1") and threading.current_thread().name.startswith("old-attempt"):
                 checked.set()
                 if not release.wait(TEST_HANG_GUARD_SECS):
                     raise RuntimeError("the old attempt was not released")
-            unlink(path, missing_ok=missing_ok)
+            replace_file(path, content)
 
         def newer_failure() -> str:
             entering.set()
@@ -961,7 +1410,7 @@ class ChangePageTests(unittest.TestCase):
             status.record(change_page.MessageDelivery(self.page, "C1", (), "", newer), True)
             return newer
 
-        with patch.object(Path, "unlink", new=pause_before_delete), \
+        with patch.object(review_link, "replace_file", new=pause_before_write), \
                 ThreadPoolExecutor(max_workers=1, thread_name_prefix="old-attempt") as old_worker, \
                 ThreadPoolExecutor(max_workers=1) as new_worker:
             previous = old_worker.submit(status.record, old, False)

@@ -40,6 +40,7 @@ from scripts.accounts import accounts, next_moves, refusal_watch, refusals, role
 from scripts.accounts.nix_env_fake import fake_nix_loader, imports_with_nix_loader, installed_program
 from scripts.lib import atomic_file
 from scripts.production import showrunners
+from scripts.shutdown import remote
 from scripts.agents import codex_mesh
 from scripts.message import roster
 from scripts.accounts import moves, worker_names
@@ -1343,7 +1344,7 @@ class AccountsTests(unittest.TestCase):
                 with (scratch_account_home(self.home, environment),
                       patch.object(sys.stdin, "isatty", return_value=tty),
                       patch.object(os, "execvpe") as launch):
-                    accounts.exec_account("claude3", ["--resume", "conversation-id"])
+                    _ = accounts.exec_account("claude3", ["--resume", "conversation-id"])
                 executable, argv, child_environment = cast(tuple[str, list[str], dict[str, str]], launch.call_args.args)
                 if tty and not supervised:
                     self.assertEqual(executable, sys.executable)
@@ -1402,6 +1403,88 @@ class AccountsTests(unittest.TestCase):
             self.assertEqual(accounts.renew_login("claude2"), accounts.LoginRenewalFailed(
                 f"claude program not found (looked in PATH and {program})"))
         self.live_reads.assert_not_called()
+
+    def test_codex_update_uses_the_shared_install_on_both_machines_without_account_checks(self) -> None:
+        program = "/fixture/codex"
+        for label in ("workers", "codex1", "codex2"):
+            for machine, peer in (("natedev", "mac"), ("mac", "natedev")):
+                with (self.subTest(label=label, machine=machine),
+                      patch.object(accounts, "launch_shell_environment", return_value={"CODEX_HOME": "/unused"}),
+                      patch.object(accounts, "resolve_program", return_value=program),
+                      patch.object(accounts, "role_account") as role,
+                      patch.object(accounts, "check_codex_target") as target,
+                      patch.object(remote, "local_machine", return_value=machine),
+                      patch.object(remote, "other_machine", return_value=peer),
+                      patch.object(os, "execvpe") as launch,
+                      patch.object(subprocess, "run", side_effect=[
+                          subprocess.CompletedProcess[str]([], 0),
+                          subprocess.CompletedProcess[str]([], 0, "codex-cli 0.166.0\n", ""),
+                          subprocess.CompletedProcess[str]([], 0, "codex-cli 0.166.0\n"),
+                      ]) as run):
+                    self.assertEqual(self.run_cli("exec", label, "update", "--yes"),
+                        (0, f"{machine}: codex-cli 0.166.0\n{peer}: codex-cli 0.166.0\n", ""))
+                    environment = {"CODEX_HOME": str(self.home / ".codex")}
+                    self.assertEqual(run.call_args_list, [
+                        call([program, "update", "--yes"], env=environment, check=False),
+                        call([program, "--version"], env=environment, capture_output=True, text=True, timeout=15, check=False),
+                        call(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", peer,
+                            'CODEX_HOME="$HOME/.codex" "$HOME/.local/bin/codex" update >&2 && "$HOME/.local/bin/codex" --version'],
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=600, check=False),
+                    ])
+                    role.assert_not_called()
+                    target.assert_not_called()
+                    launch.assert_not_called()
+
+    def test_codex_update_reports_remote_failures_without_remote_output(self) -> None:
+        failures = (
+            (subprocess.CompletedProcess[str]([], 255, "hidden"), "unreachable; run codex update there"),
+            (subprocess.TimeoutExpired("ssh", 600), "unreachable; run codex update there"),
+            (OSError("hidden"), "unreachable; run codex update there"),
+            (subprocess.CompletedProcess[str]([], 7, "hidden"), "update failed (exit 7)"),
+            (subprocess.CompletedProcess[str]([], 0, ""), "version read failed"),
+            (subprocess.CompletedProcess[str]([], 0, " \n"), "version read failed"),
+        )
+        for failure, detail in failures:
+            with (self.subTest(detail=detail, failure=type(failure).__name__),
+                  patch.object(accounts, "launch_shell_environment", return_value={}),
+                  patch.object(accounts, "resolve_program", return_value="/fixture/codex"),
+                  patch.object(remote, "local_machine", return_value="natedev"),
+                  patch.object(remote, "other_machine", return_value="mac"),
+                  patch.object(subprocess, "run", side_effect=[subprocess.CompletedProcess[str]([], 0),
+                      subprocess.CompletedProcess[str]([], 0, "codex-cli 0.166.0\n", ""), failure])):
+                self.assertEqual(self.run_cli("exec", "workers", "update"),
+                    (1, f"natedev: codex-cli 0.166.0\nmac: {detail}\n", ""))
+
+    def test_codex_update_still_updates_the_peer_after_a_local_failure(self) -> None:
+        for failure, detail in ((subprocess.CompletedProcess[str]([], 9), "update failed (exit 9)"),
+                                (OSError("hidden"), "codex could not start")):
+            with (self.subTest(detail=detail),
+                  patch.object(accounts, "launch_shell_environment", return_value={}),
+                  patch.object(accounts, "resolve_program", return_value="/fixture/codex"),
+                  patch.object(remote, "local_machine", return_value="natedev"),
+                  patch.object(remote, "other_machine", return_value="mac"),
+                  patch.object(subprocess, "run", side_effect=[failure,
+                      subprocess.CompletedProcess[str]([], 0, "codex-cli 0.166.0\n")]) as run):
+                self.assertEqual(self.run_cli("exec", "codex1", "update"),
+                    (1, f"natedev: {detail}\nmac: codex-cli 0.166.0\n", ""))
+                self.assertEqual(run.call_count, 2)
+
+    def test_codex_update_requires_a_successful_local_version_read(self) -> None:
+        failures = (
+            (subprocess.CompletedProcess[str]([], 4, "hidden", "hidden"), "version read failed (exit 4)"),
+            (subprocess.CompletedProcess[str]([], 0, "", "hidden"), "version read failed (exit 0)"),
+            (subprocess.TimeoutExpired("codex", 15), "version read timed out"),
+        )
+        for failure, detail in failures:
+            with (self.subTest(detail=detail),
+                  patch.object(accounts, "launch_shell_environment", return_value={}),
+                  patch.object(accounts, "resolve_program", return_value="/fixture/codex"),
+                  patch.object(remote, "local_machine", return_value="natedev"),
+                  patch.object(remote, "other_machine", return_value="mac"),
+                  patch.object(subprocess, "run", side_effect=[subprocess.CompletedProcess[str]([], 0), failure,
+                      subprocess.CompletedProcess[str]([], 0, "codex-cli 0.166.0\n")])):
+                self.assertEqual(self.run_cli("exec", "codex2", "update"),
+                    (1, f"natedev: {detail}\nmac: codex-cli 0.166.0\n", ""))
 
     def test_exec_codex_labels_use_the_home_holding_each_login_and_preserve_arguments(self) -> None:
         home, numbered = self.workers_fixture()
@@ -5201,6 +5284,9 @@ finally:
               patch.object(subprocess, "Popen", side_effect=AssertionError("stored Popen"))):
             code, output, error = self.run_cli("status", "--json", "--stored")
             self.assertEqual((code, error), (0, ""))
+            document = cast(accounts.StatusDocument, json.loads(output))
+            self.assertEqual(sum("usage reading is old" in problem for problem in document["problems"]), 2)
+            self.assertEqual(sum("credits reading is old" in problem for problem in document["problems"]), 1)
             rows = cast(list[dict[str, object]], json.loads(output)["accounts"])
             self.assertEqual([row["weekly_left_percent"] for row in rows], [65, 25])
             self.assertEqual([row["read_at"] for row in rows], [read.isoformat(), read.isoformat()])
@@ -5585,7 +5671,10 @@ finally:
         _ = usage_store.store_file().write_text(json.dumps(stored))
         code, output, error = self.run_cli("status", "--stored", "--json")
         self.assertEqual((code, error), (0, ""))
-        row = cast(accounts.StatusDocument, json.loads(output))["accounts"][0]
+        document = cast(accounts.StatusDocument, json.loads(output))
+        self.assertTrue(any("credits reading is old" in problem for problem in document["problems"]))
+        row = document["accounts"][0]
+        self.assertIs(row["read_ok"], False)
         self.assertIsNone(row["credits"])
         self.assertFalse(row["credits_in_use"])
         code, table, error = self.run_cli("status", "--stored")
@@ -5659,7 +5748,7 @@ finally:
 
     # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
-    def test_a_refresh_without_session_credentials_keeps_a_good_reading_unstarred(self) -> None:
+    def test_a_refresh_without_session_credentials_keeps_a_good_reading_but_marks_its_age(self) -> None:
         self.login_directory("claude2", "desktop@example.invalid")
         at = datetime.now(timezone.utc) - timedelta(minutes=20)
         usage_store.save([agent_accounts.Report("Claude", email="desktop@example.invalid",
@@ -5682,10 +5771,43 @@ finally:
         self.assertEqual((code, error), (0, ""))
         rows = cast(list[dict[str, object]], json.loads(document)["accounts"])
         held = next(item for item in rows if item["label"] == "claude2")
-        self.assertIs(held["read_ok"], True)
+        self.assertIs(held["read_ok"], False)
         self.assertEqual(held["weekly_left_percent"], 75)
         self.assertEqual(usage_store.store_file().read_bytes(), before)
         self.assertEqual(self.live_reads.call_count, 2)
+
+    @patch.object(accounts, "is_test_login", new=provider_fixture_login)
+    def test_stored_status_read_failures_and_old_readings_reach_board_problems(self) -> None:
+        self.login_directory("claude2", "idle@example.invalid")
+        now = datetime.now(timezone.utc)
+        old = now - timedelta(days=15)
+        cases = (
+            (agent_accounts.UsageReadOutcome.STALE_TOKEN, "login token expired"),
+            (agent_accounts.UsageReadOutcome.NO_LOGIN_TOKEN, "no login token"),
+            (agent_accounts.UsageReadOutcome.REFUSED_401, "the usage service did not accept this login"),
+            (agent_accounts.UsageReadOutcome.RATE_LIMITED_429, "the usage service is busy"),
+            (agent_accounts.UsageReadOutcome.CREDENTIALS_UNAVAILABLE, "login credentials unavailable in this session"),
+            (agent_accounts.UsageReadOutcome.ERROR, "the usage read failed"),
+            (agent_accounts.UsageReadOutcome.OK, "usage reading is old"),
+            (agent_accounts.UsageReadOutcome.HELD, "usage reading is old"),
+        )
+        for outcome, cause in cases:
+            with self.subTest(outcome=outcome):
+                usage = usage_store.StoredUsage(read_outcome=outcome, attempt_outcome=outcome,
+                    attempted_at=now.isoformat(), weekly=usage_store.StoredWindow(left=75,
+                        at=old.isoformat(), resets=(now + timedelta(days=1)).isoformat()))
+                with usage_store.read_lock():
+                    usage_store.write({"idle@example.invalid": usage})
+                code, output, error = self.run_cli("status", "--stored", "--json")
+                self.assertEqual((code, error), (0, ""))
+                document = cast(accounts.StatusDocument, json.loads(output))
+                self.assertTrue(any(cause in problem for problem in document["problems"]))
+                self.assertIs(document["accounts"][0]["read_ok"], False)
+                self.assertEqual(document["accounts"][0]["read_at"], old.isoformat())
+                code, table, error = self.run_cli("status", "--stored")
+                self.assertEqual((code, error), (0, ""))
+                self.assertIn(cause, table)
+        self.live_reads.assert_not_called()
 
     def test_login_renewal_uses_a_quiet_probe_and_keeps_the_new_reading(self) -> None:
         self.login_directory("claude2", "idle@example.invalid")
@@ -7966,6 +8088,35 @@ class SharedStatusDocumentTests(unittest.TestCase):
                     self.assertIs(document.get("read_ok"), expected)
                     self.assertIs(document.get("credits_in_use"), False)
                     self.assertEqual(document["read_at"], self.at.isoformat() if has_reading else None)
+
+    def test_old_reading_dot_uses_the_existing_refresh_age_limit(self) -> None:
+        for outcome in (agent_accounts.UsageReadOutcome.OK, agent_accounts.UsageReadOutcome.HELD):
+            for age, expected in ((timedelta(minutes=10), True), (timedelta(minutes=10, microseconds=1), False)):
+                with self.subTest(outcome=outcome, age=age):
+                    row = replace(self.row(), read_outcome=outcome, read_at=self.at - age)
+                    self.assertIs(self.document(row)["read_ok"], expected)
+
+    def test_usage_and_credit_readings_just_after_status_time_are_fresh(self) -> None:
+        read_at = self.at + timedelta(seconds=0.1)
+        credit_reading = cast(Callable[[usage_store.StoredUsage, datetime],
+                                      tuple[str, float | Literal["unlimited"] | accounts.StatusUnavailable]],
+                              getattr(accounts, "_credit_reading"))
+        read_problem = cast(Callable[..., list[accounts.StatusProblem]], getattr(accounts, "_read_failure_problem"))
+        usage = usage_store.StoredUsage(credits={"at": read_at.isoformat(), "balance": "13446"})
+        on_credits, credits = credit_reading(usage, self.at)
+        self.assertEqual(credits, 13446)
+        self.assertNotEqual(on_credits, "stale")
+        for outcome in (agent_accounts.UsageReadOutcome.OK, agent_accounts.UsageReadOutcome.HELD):
+            with self.subTest(outcome=outcome):
+                row = replace(self.row(), read_outcome=outcome, read_at=read_at, on_credits=on_credits, credits=credits)
+                problems = read_problem(row, timezone.utc, now=self.at)
+                self.assertEqual(problems, [])
+                reading = replace(self.reading(row), notes=tuple(accounts.render_status_problem(problem) for problem in problems))
+                document = cast(accounts.StatusDocument, json.loads(accounts.render_status_json(reading)))
+                self.assertEqual(document["problems"], [])
+                self.assertIs(document["accounts"][0]["read_ok"], True)
+                self.assertEqual(document["accounts"][0]["read_at"], read_at.isoformat())
+                self.assertEqual(document["accounts"][0]["credits"], 13446)
 
     def test_credit_spending_is_independent_of_enabled_balance_and_access(self) -> None:
         for enabled in (True, False):

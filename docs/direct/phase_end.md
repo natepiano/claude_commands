@@ -31,6 +31,8 @@ Run these steps in order for each completed loop or verbose phase:
    `<YYYY-MM-DDTHH:MM>`. State the time the recorder printed. Its hash is
    mergeable now;
    `Phase <next> ETA` counts from this commit.
+   Read `findings.py status --phase <completed phase>` before sending the notice.
+   Include every `held_for_decision` item as `Held simplify: <id> — <files> — <proposed change>; ledger <path>`.
    Outside a production, report
    `Checkpoint <short hash> — phase N: <title>.`.
 3. **Plan review.** Run <RunPhaseReview/> before the next phase's Work Order is

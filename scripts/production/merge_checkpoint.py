@@ -147,12 +147,22 @@ class AsBuiltCommit(NamedTuple):
     """A unit's closing commit: its as-built docs and the plan's deletion, after its last phase merged."""
 
 
+class SimplifyReviewMetrics(NamedTuple):
+    findings: str
+    minutes: str
+
+
+class NoSimplifyReview(NamedTuple):
+    pass
+
+
 class ReviewTrial(NamedTuple):
     ux_findings: str
     code_findings: str
     review_minutes: str
     ux_check_minutes: str
     ux_repair_minutes: str
+    simplify: SimplifyReviewMetrics | NoSimplifyReview
 
 
 class NoReviewTrial(NamedTuple):
@@ -1079,12 +1089,15 @@ def finish_promotion_targets(promotion: production_doc.NoPromotion | production_
 
 def review_numbers(line: str) -> ReviewTrial:
     pattern = (r"review trial: ux (\d+) findings, code (\d+) findings, review-worker minutes ([\d.]+), "
-               r"ux check minutes ([\d.]+), ux repair minutes ([\d.]+)")
+               r"ux check minutes ([\d.]+), ux repair minutes ([\d.]+)"
+               r"(?:, simplify (\d+) findings, simplify minutes ([\d.]+))?")
     match = re.fullmatch(pattern, line.strip())
     if match is None:
         raise Refusal("--review-trial must read: review trial: ux <N> findings, code <N> findings, "
-                      + "review-worker minutes <M>, ux check minutes <U>, ux repair minutes <R>")
-    return ReviewTrial(*match.groups())
+                      + "review-worker minutes <M>, ux check minutes <U>, ux repair minutes <R>"
+                      + "[, simplify <N> findings, simplify minutes <S>]")
+    simplify = SimplifyReviewMetrics(match[6], match[7]) if match[6] is not None else NoSimplifyReview()
+    return ReviewTrial(match[1], match[2], match[3], match[4], match[5], simplify)
 
 
 def check_parallel(line: str | None) -> None:
@@ -1121,6 +1134,9 @@ def record(request: MergeRequest, merge_head: str, tests_green: str) -> None:
                    "--ux-findings", numbers.ux_findings, "--code-findings", numbers.code_findings,
                    "--review-minutes", numbers.review_minutes, "--ux-check-minutes", numbers.ux_check_minutes,
                    "--ux-repair-minutes", numbers.ux_repair_minutes]
+        if isinstance(numbers.simplify, SimplifyReviewMetrics):
+            command.extend(("--simplify-findings", numbers.simplify.findings,
+                            "--simplify-minutes", numbers.simplify.minutes))
         if request.excluded:
             command.extend(("--excluded", request.excluded))
         result = subprocess.run(command, cwd=request.production.checkout, capture_output=True, text=True, check=False)

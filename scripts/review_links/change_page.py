@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Publish a change-review page: change_page.py --production DOC [--list L] C27 [C28 ...]."""
+"""Publish all change reviews, or retain an older selected-row link with --production DOC C27."""
 from __future__ import annotations
 
 import argparse
@@ -30,6 +30,19 @@ from scripts.review_links import review_link
 
 MANIFEST = ".review-link-changes.json"
 PAGE_NAME = "changes.html"
+BROWSER_MANIFEST = ".review-link-browser.json"
+DELIVERY_PREFIX = ".review-link-delivery-"
+
+
+class BrowserManifest(TypedDict):
+    token: str
+    initial: str
+
+
+@dataclass(frozen=True)
+class ReviewBrowser:
+    token: str
+    initial: str = ""
 
 
 class PageManifest(TypedDict):
@@ -48,8 +61,14 @@ class StoredValidationIntent(StoredDeliveryIntent):
     feedback: str
 
 
+class StoredValidationRequested(TypedDict):
+    attempt: str
+    state: Literal["sent"]
+    feedback: str
+
+
 class StoredDeliverySlots(TypedDict, total=False):
-    validation: StoredValidationIntent
+    validation: StoredValidationIntent | StoredValidationRequested
     verdict: StoredDeliveryIntent
 
 
@@ -69,14 +88,23 @@ class DeliveryIntent:
 
 
 @dataclass(frozen=True)
-class DeliverySlots:
-    """Keep validation and verdict attempts independent in one record."""
+class ValidationRequested:
+    """The showrunner owns validation after a delivered request."""
 
-    validation: DeliveryIntent | NoDelivery
+    attempt: str
+    feedback: str
+
+
+@dataclass(frozen=True)
+class DeliverySlots:
+    """Keep validation ownership and message attempts in one record."""
+
+    validation: DeliveryIntent | ValidationRequested | NoDelivery
     verdict: DeliveryIntent | NoDelivery
 
     def selected(self, saved: bool) -> DeliveryIntent | NoDelivery:
-        return self.verdict if saved else self.validation
+        intent = self.verdict if saved else self.validation
+        return intent if isinstance(intent, DeliveryIntent) else NoDelivery()
 
     def updated(self, kind: Literal["verdict", "validation"], intent: DeliveryIntent | NoDelivery) -> DeliverySlots:
         return replace(self, verdict=intent) if kind == "verdict" else replace(self, validation=intent)
@@ -88,6 +116,13 @@ class ReviewPage:
     production: Path
     rows: tuple[str, ...]
     token: str
+
+
+@dataclass(frozen=True)
+class AssignedReviewPage(ReviewPage):
+    """The staff record supplies this row's current showrunner."""
+
+    showrunner_name: str
 
 
 class AnswerRefused(ValueError):
@@ -124,6 +159,9 @@ class DeliveryStatus:
     def __init__(self, root: Path) -> None:
         self.root: Path = root
 
+    def read_view(self) -> DeliveryReadView:
+        return DeliveryReadView(self, frozenset(self.root.glob(DELIVERY_PREFIX + "*")))
+
     @contextmanager
     def locked(self) -> Generator[None, None, None]:
         self.root.mkdir(parents=True, exist_ok=True)
@@ -136,7 +174,7 @@ class DeliveryStatus:
 
     def path(self, page: ReviewPage, row: str) -> Path:
         identity = json.dumps([str(page.review_list.resolve()), row]).encode("utf-8")
-        return self.root / (".review-link-delivery-" + hashlib.sha256(identity).hexdigest())
+        return self.root / (DELIVERY_PREFIX + hashlib.sha256(identity).hexdigest())
 
     def slots(self, page: ReviewPage, row: str) -> DeliverySlots:
         try:
@@ -149,7 +187,7 @@ class DeliveryStatus:
             return DeliverySlots(NoDelivery(), DeliveryIntent("", "failed", "verdict"))
         fields = cast(dict[str, object], value) if isinstance(value, dict) else {}
         if "validation" in fields or "verdict" in fields:
-            return DeliverySlots(self.decode_slot(fields.get("validation"), "validation"),
+            return DeliverySlots(self.decode_validation(fields.get("validation")),
                                  self.decode_slot(fields.get("verdict"), "verdict"))
         # Older records contain one intent or only validation feedback.
         feedback = fields.get("feedback", "")
@@ -161,6 +199,13 @@ class DeliveryStatus:
         else:
             intent = DeliveryIntent("", "failed", "validation" if "feedback" in fields else "verdict", feedback)
         return DeliverySlots(NoDelivery(), NoDelivery()).updated(intent.kind, intent)
+
+    def decode_validation(self, value: object) -> DeliveryIntent | ValidationRequested | NoDelivery:
+        fields = cast(dict[str, object], value) if isinstance(value, dict) else {}
+        attempt, feedback = fields.get("attempt"), fields.get("feedback", "")
+        if fields.get("state") == "sent" and isinstance(attempt, str) and isinstance(feedback, str):
+            return ValidationRequested(attempt, feedback)
+        return self.decode_slot(fields, "validation")
 
     def decode_slot(self, value: object, kind: Literal["verdict", "validation"]) -> DeliveryIntent | NoDelivery:
         if not isinstance(value, dict):
@@ -181,6 +226,9 @@ class DeliveryStatus:
         fields: StoredDeliverySlots = {}
         if isinstance(slots.validation, DeliveryIntent):
             fields["validation"] = {"attempt": slots.validation.attempt, "state": slots.validation.state,
+                                    "feedback": slots.validation.feedback}
+        elif isinstance(slots.validation, ValidationRequested):
+            fields["validation"] = {"attempt": slots.validation.attempt, "state": "sent",
                                     "feedback": slots.validation.feedback}
         if isinstance(slots.verdict, DeliveryIntent):
             fields["verdict"] = {"attempt": slots.verdict.attempt, "state": slots.verdict.state}
@@ -206,9 +254,27 @@ class DeliveryStatus:
             slots = self.slots(delivery.page, delivery.row)
             for current in (slots.validation, slots.verdict):
                 if isinstance(current, DeliveryIntent) and current.attempt == delivery.attempt:
-                    intent = replace(current, state="failed") if failed else NoDelivery()
-                    self.write_slots(delivery.page, delivery.row, slots.updated(current.kind, intent))
+                    if failed:
+                        updated = slots.updated(current.kind, replace(current, state="failed"))
+                    elif current.kind == "validation":
+                        updated = replace(slots, validation=ValidationRequested(current.attempt, current.feedback))
+                    else:
+                        updated = slots.updated("verdict", NoDelivery())
+                    self.write_slots(delivery.page, delivery.row, updated)
                     return
+
+
+@dataclass(frozen=True)
+class DeliveryReadView:
+    """One request scans record names once and reads only existing records."""
+
+    status: DeliveryStatus
+    paths: frozenset[Path]
+
+    def slots(self, page: ReviewPage, row: str) -> DeliverySlots:
+        if not self.paths or self.status.path(page, row) not in self.paths:
+            return DeliverySlots(NoDelivery(), NoDelivery())
+        return self.status.slots(page, row)
 
 
 def document(content: str) -> bytes:
@@ -293,6 +359,14 @@ def shown_rows(page: ReviewPage) -> list[dict[str, str]]:
             raise ValueError(f"{row_id}: needs what changed and how to check / proof")
         selected.append(row)
     return selected
+
+
+def answer_rows(page: ReviewPage) -> list[dict[str, str]]:
+    """Allow older unclassified rows when the browser supplied a signed row token."""
+    found = {row["#"]: row for row in change_review.review_rows(page.review_list)}
+    if any(row not in found for row in page.rows):
+        raise AnswerRefused("this change is no longer on the review list")
+    return [found[row] for row in page.rows]
 
 
 def render(page: ReviewPage, delivery: DeliveryStatus, notice: AnswerNotice = NO_ANSWER_NOTICE) -> bytes:
@@ -395,6 +469,8 @@ def publish(production: Path, review_list: Path, rows: list[str]) -> str:
 
 def showrunner(page: ReviewPage) -> str:
     """The record names the recipient, including when its production is offline."""
+    if isinstance(page, AssignedReviewPage):
+        return page.showrunner_name
     text = change_review.read(page.review_list)
     frontmatter = text.split("---", 2)
     if len(frontmatter) == 3:
@@ -505,7 +581,8 @@ def closeout_before_save(page: ReviewPage, doc: Path, row_id: str, verdict: str)
         raise FeatureLogFailed(message) from error
 
 
-def submit(page: ReviewPage, body: str, status: DeliveryStatus) -> MessageDelivery:
+def submit(page: ReviewPage, body: str, status: DeliveryStatus, *,
+           prepared: change_review.ChangeQueue | next_item.ReadChangeLists = next_item.READ_CHANGE_LISTS) -> MessageDelivery:
     fields = parse_qs(body, keep_blank_values=True, strict_parsing=True)
     if set(fields) != {"row", "token", "outcome", "feedback"} or any(len(values) != 1 for values in fields.values()):
         raise AnswerRefused("expected only row, token, outcome and feedback")
@@ -519,14 +596,15 @@ def submit(page: ReviewPage, body: str, status: DeliveryStatus) -> MessageDelive
     verdict = feedback.strip() if feedback.strip() else outcome
     if outcome in ("works", "not works") and feedback.strip():
         verdict = f"{outcome}: {feedback.strip()}"
-    row = next(row for row in shown_rows(page) if row["#"] == row_id)
+    rows = answer_rows(page) if isinstance(page, AssignedReviewPage) else shown_rows(page)
+    row = next(row for row in rows if row["#"] == row_id)
     recipient = showrunner(page)
     if outcome == "validate":
         if row.get("Verdict"):
             raise AnswerRefused("this row already has a saved answer")
         _ = row_production(page, row)
+        _ = next_item.move_to_end(next_item.CHANGE, page.production, key=queue_key(page, row_id), prepared=prepared)
         attempt = status.begin(page, row_id, "validation", feedback)
-        _ = next_item.move_to_end(next_item.CHANGE, page.production, key=queue_key(page, row_id))
         message = (f"Change review {row_id}: the user asks you to validate this\n"
                    f"List: {page.review_list}\nProduction: {page.production}\n"
                    f"Change: {row['Change']}\nUser feedback: {feedback}")
@@ -566,17 +644,36 @@ def deliver(delivery: MessageDelivery, status: DeliveryStatus) -> None:
     status.record(delivery, bool(errors))
 
 
+def publish_browser(initial: str = "") -> str:
+    """Publish one all-list page without copying change records."""
+    with tempfile.TemporaryDirectory(prefix="review-browser-") as temporary:
+        source = Path(temporary) / PAGE_NAME
+        _ = source.write_text("<!doctype html><title>Changes to review</title>", encoding="utf-8")
+        url = review_link.snapshot([source], new=True)[0]
+    folder = review_link.review_root() / urlsplit(url).path.split("/")[1]
+    manifest: BrowserManifest = {"token": secrets.token_urlsafe(), "initial": initial}
+    review_link.replace_file(folder / BROWSER_MANIFEST, json.dumps(manifest).encode())
+    return url
+
+
 def main(arguments: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    _ = parser.add_argument("rows", nargs="+")
-    _ = parser.add_argument("--production", type=Path, required=True)
+    _ = parser.add_argument("rows", nargs="*")
+    _ = parser.add_argument("--production", type=Path)
     _ = parser.add_argument("--list", type=Path)
     args = parser.parse_args(arguments)
-    production = cast(Path, args.production).expanduser()
+    rows = cast(list[str], args.rows)
+    production = cast(Path | None, args.production)
     review_list = cast(Path | None, args.list)
     try:
+        if not rows:
+            print(publish_browser())
+            return 0
+        if production is None:
+            raise ValueError("pass --production for an older selected-row link")
+        production = production.expanduser()
         path = review_list.expanduser() if review_list else change_review.production_list(str(production))
-        print(publish(production, path, cast(list[str], args.rows)))
+        print(publish(production, path, rows))
     except (OSError, ValueError, change_review.ChangeReviewError, subprocess.SubprocessError, Refusal) as error:
         print(f"change page: {error}", file=sys.stderr)
         return 1

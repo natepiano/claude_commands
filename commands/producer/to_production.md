@@ -1,5 +1,5 @@
 ---
-description: Split greenlit phased plans into one direct-ready plan per unit plus a production doc, so /showrunner:produce can launch the unit directors.
+description: Split plans into production units.
 ---
 
 # To Production

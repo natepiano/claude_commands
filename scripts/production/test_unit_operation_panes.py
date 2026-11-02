@@ -1,6 +1,7 @@
 """Unit operations close only the unit's exact session-qualified pane after stopping."""
 from __future__ import annotations
 
+import json
 import math
 import os
 import sys
@@ -145,9 +146,11 @@ class UnitOperationPaneTests(unittest.TestCase):
     def test_a_pane_already_gone_counts_as_closed(self) -> None:
         pane = unit_move.unit_pane(self.pane.found, 'demo')
         gone = herdr.HerdrFailure('herdr pane close: pane_not_found: pane w1:p1 not found', 'pane_not_found')
-        with mock.patch.object(herdr.Herdr, 'run', side_effect=gone) as close:
+        with mock.patch.object(herdr.Herdr, 'run', side_effect=[
+                gone, json.dumps({'result': {'panes': []}})]) as close:
             unit_move.close_unit_pane(pane)
-        close.assert_called_once_with('pane', 'close', 'w1:p1')
+        self.assertEqual(close.call_args_list, [
+            mock.call('pane', 'close', 'w1:p1'), mock.call('pane', 'list')])
 
     def test_herdr_close_error_is_reported_for_the_units_exact_place(self) -> None:
         pane = unit_move.unit_pane(self.pane.found, 'demo')
