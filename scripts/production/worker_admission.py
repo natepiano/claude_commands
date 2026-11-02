@@ -95,11 +95,17 @@ def showrunner_member(record: staff.StaffSnapshot, sources: session_staff.Member
 def parent(record: staff.StaffSnapshot, sources: session_staff.MemberSources | None = None, *,
            staff_id: str = "", production: str = "", unit: str = "",
            pending: tuple[staff.SeedMember, ...] = (), run: Path | None = None) -> staff.StaffRow | staff.SeedMember:
-    """Use a surviving owner id, otherwise the unique unit across productions."""
+    """Resolve the caller or recorded director before using production names."""
     row = record.by_current_session(staff_id) if staff_id else None
+    if row is not None and row.kind == "worker" and row.parent is not None:
+        row = record.by_id(row.parent)
     if row is not None and row.kind in ("unit", "showrunner"):
         return row
     if run is not None:
+        director = unit_runs.director(run)
+        row = record.by_member_reference(director) if director else None
+        if row is not None and row.kind in ("unit", "showrunner"):
+            return row
         state = worker_lifecycle.read_json_object(run / unit_runs.STATE_FILE)
         production = value if isinstance(value := state.get("production"), str) else ""
         unit = value if isinstance(value := state.get("unit"), str) else ""
