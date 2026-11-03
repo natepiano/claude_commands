@@ -392,7 +392,7 @@ class AuditUnitPortsTests(StaffTestCase):
         self.assertEqual(self.versions(), before)
 
     def test_missing_worktree_and_missing_bound_document_are_visible(self) -> None:
-        web = fixture_member("unit", name="web", parent=self.parent)
+        web = fixture_member("unit", name="unfilled", parent=self.parent)
         self.document.unlink()
         before = self.versions()
         result = self.results()[web.id]

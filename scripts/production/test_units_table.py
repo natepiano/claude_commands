@@ -310,7 +310,7 @@ class BranchLedgerLocationTests(StaffTestCase):
         assert row is not None
         selected = staff_sources.MemberFound(row)
         with patch.object(phase_reservation, "repository_root") as git_root:
-            self.assertEqual(unit_lookup.plan_worktree(cells, selected), self.source_root / "director")
+            self.assertEqual(unit_lookup.plan_worktree(cells, selected), fixture.worktree)
         git_root.assert_not_called()
 
     def test_style_ledger_uses_the_plan_worktree_without_the_worktree_column(self) -> None:

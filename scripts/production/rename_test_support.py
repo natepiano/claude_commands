@@ -25,7 +25,7 @@ from scripts.direct import workers
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.production import fake_unit_host
 from scripts.production import staff, unit_config
-from scripts.production.staff_test_support import fixture_member, fixture_worker, fixture_runtime_id, unit_membership, StaffTestCase, isolated_source_readers
+from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, unit_membership, StaffTestCase, isolated_source_readers
 from scripts.lib.atomic_file import write_text_atomic
 import fake_herdr
 import herdr
@@ -36,7 +36,6 @@ from scripts.direct.recorder_state import STATE_FILENAME
 import merge_checkpoint
 import production_units
 import rename
-import rename_unit
 import rename_state
 from scripts.production import showrunners
 import stall_watch
@@ -435,8 +434,7 @@ def run_rename(arguments: list[str], environment: dict[str, str], cwd: Path,
         # Failure injection scripts assign these names just as they do in a CLI
         # subprocess. Each call restores them before another test can observe it.
         for module, names in ((os, ("rename", "replace")),
-                              (workers, ("move_unit", "rename_unit", "end_unit", "repoint_unit_worktree")),
-                              (rename_unit, ("repoint_shutdown_worktree",))):
+                              (workers, ("move_unit", "rename_unit", "end_unit", "repoint_unit_worktree"))):
             for name in names:
                 _ = scope.enter_context(mock.patch.object(module, name, cast(object, getattr(module, name))))
 
@@ -730,41 +728,6 @@ class ProductionRenameFixture(StaffTestCase):
     def run_command(self, *arguments: str, wrapper: str = "", **environment: str) -> subprocess.CompletedProcess[str]:
         return run_rename(list(arguments), {**self.env, **environment}, self.checkout, wrapper)
 
-    def seed_shutdown_record(self, progress: str = "stopped") -> Path:
-        old = self.unit_worktree(OLD, "alpha-unit")
-        native_session = unit_membership(OLD, "alpha-unit").id
-        session: dict[str, object] = {
-            "session_id": native_session, "config_dir": str(self.home / ".claude"), "pid": 4242, "proc_start": "1",
-            "name": "alpha", "cwd": f"{old}/sub", "status": "idle", "updated_at": 0, "probe": False,
-            "model": {"kind": "no reply yet"},
-            "checkout": {"kind": "git", "path": str(old), "head": {"kind": "branch", "name": "old-alpha-unit"},
-                         "upstream": {"kind": "tracking", "ahead": 0}, "dirty": []},
-            "run_dirs": [], "codex_servers": [], "timers": [], "kind": "unit",
-            "host": {"kind": "unit", "production": OLD, "unit": "alpha-unit", "doc": str(self.doc),
-                     "session_name": "old-alpha-unit", "session_host": "herdr",
-                     "plan": {"kind": "plan", "path": f"{old}/docs/plans/alpha-unit.md"}}}
-        worker_row = fixture_worker("worker", staff.StaffId(native_session))
-        worker = {**session, "session_id": worker_row.current_session, "name": "worker", "cwd": str(old),
-                  "kind": "worker", "host": {"kind": "terminal"},
-                  "owner": {"kind": "director", "session_id": native_session}}
-        saved: dict[str, object] = {
-            "login": "owner@example.com", "label": "claude2", "machine": "natedev",
-            "requested_at": "2026-10-09T21:49:10+00:00", "request_id": "request",
-            "requested_by": {"kind": "terminal"}, "hold": "session", "then": "stop", "force": "wait for ready",
-            "alerts": "none", "probe": False, "session": session, "workers": [worker], "timers": [],
-            "settle_message": {"kind": "not sent"}, "where": {"kind": "not said"},
-            "progress": {"kind": progress, "at": "2026-10-09T21:50:00+00:00"}, "stop_issues": [], "trail": [],
-            "codex_seats": [{"run_dir": str(self.root / "runs/r1"), "seat": "impl", "role": "impl",
-                             "thread_id": "thread-impl", "turn_live": True, "launcher_command": [
-                                 "bash", "/scripts/direct/implement.sh", str(old), f"{old}/prompt.md"]}]}
-        self.write(self.root / "runs/r1/impl.resume-prompt.md", "Continue the task.\n")
-        script = ("import json, sys; sys.path.insert(0, sys.argv[1]); import shutdown_record; "
-                  "assert shutdown_record.create_session(json.loads(sys.stdin.read()))")
-        created = subprocess.run([sys.executable, "-c", script, str(SCRIPT.parents[1] / "shutdown")],
-                                 input=json.dumps(saved), env=self.env, capture_output=True, text=True,
-                                 check=False, timeout=TEST_HANG_GUARD_SECS)
-        self.assertEqual(created.returncode, 0, created.stderr)
-        return self.home / ".local/state/shutdown/owner@example.com/sessions" / f"{native_session}.json"
 
     def marked_unit(self, unit: str) -> None:
         fake_unit_host.write(self.env, [fake_unit_host.HostedUnit(

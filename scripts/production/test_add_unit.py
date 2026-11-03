@@ -648,7 +648,7 @@ class AddUnitLaunchTests(AddUnitTestCase):
         _ = self.git("commit", "-am", "an older production doc")
         _ = self.git("push", "origin", "build-followups")
         _ = self.successful("alpha", "--plan", "docs/plans/given.md", "--port", "8123")
-        self.assertIn(f"| alpha-unit | docs/plans/given.md | {self.root / 'project-alpha'} | build-followups-alpha "
+        self.assertIn("| alpha-unit | docs/plans/given.md | — | build-followups-alpha "
                       + "| — | 8123 | — |", self.doc.read_text())
 
     def test_a_rerun_finds_the_unit_by_its_mark_after_its_tab_was_renamed(self) -> None:

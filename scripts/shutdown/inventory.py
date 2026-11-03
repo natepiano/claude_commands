@@ -1293,7 +1293,8 @@ def _session_details(record: SessionFile, entry: ListedSession, *, directories: 
     elif entry.kind == "worker":
         common["owner"] = worker_owner
     session = parse_session(common, "observed session")
-    session["checkout"] = _checkout(session["cwd"])
+    folder = session["cwd"]
+    session["checkout"] = _checkout(folder) if isinstance(folder, str) else NotACheckout(kind="not a checkout")
     return session
 
 

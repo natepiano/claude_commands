@@ -1612,7 +1612,11 @@ def _checked_launch(
 
 def _check_launch(args: argparse.Namespace) -> None:
     session_dir = _session_dir(args)
-    state = _read_state(session_dir)
+    try:
+        state = _read_state(session_dir)
+    except staff.StaffUnreadable as error:
+        print(f"staff: {_arg_string(args, 'pass_kind')}: not opened: {error}", file=sys.stderr)
+        raise SystemExit(3) from error
     phase, launch_check = _checked_launch(args, state, session_dir)
     if _optional_arg(args, "lens") == "ux":
         event = _event(state, "launch_checked", plan_history.now_epoch(), phase_record=phase)

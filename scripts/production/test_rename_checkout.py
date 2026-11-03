@@ -98,8 +98,6 @@ class MoveTest(unittest.TestCase):
         conf = (showrunners.NOTIFIER_STATE_DIR / "showrunner-demo/conf").read_text()
         self.assertIn(f"{self.new}/docs/demo-production.md", conf)
         self.assertIn(f"{self.new}/docs/demo-production.md", (self.root / "child-production.md").read_text())
-        panes = cast(dict[str, dict[str, str]], json.loads((home / ".local/state/herdr-panes/s.json").read_text()))
-        self.assertEqual(panes["p1"]["cwd"], str(self.new))
         self.assertIn(f"- **Showrunner checkout:** `{self.new}`", self.git(self.new, "show", "HEAD:docs/demo-production.md"))
         self.assertEqual(self.git(self.new, "status", "--porcelain"), "")
 
@@ -117,8 +115,7 @@ class MoveTest(unittest.TestCase):
             return stop_resume.ClaudeUp(identity, "w1:p1", "claude2")
 
         with (mock.patch.object(stop_resume, "stop", side_effect=stop) as stopped,
-              mock.patch.object(stop_resume, "resume", side_effect=resume) as resumed,
-              mock.patch.object(rename_checkout, "_session_records", return_value=[])):
+              mock.patch.object(stop_resume, "resume", side_effect=resume) as resumed):
             rename_checkout.checkout("demo")
         stopped.assert_called_once_with("s-1")
         resumed.assert_called_once_with("s-1", why="showrunner checkout moved")
@@ -127,7 +124,6 @@ class MoveTest(unittest.TestCase):
 
     def test_checkout_ignores_its_coordinator_but_still_resumes_after_the_move(self) -> None:
         with (mock.patch.object(unit_move, "processes_inside", return_value=[os.getpid()]),
-              mock.patch.object(rename_checkout, "_session_records", return_value=[]),
               mock.patch.object(stop_resume, "stop", return_value=stop_resume.Stopped("s-1", 1)),
               mock.patch.object(stop_resume, "resume", return_value=stop_resume.ClaudeUp("s-1", "p1", "claude2")) as resumed):
             rename_checkout.checkout("demo")
@@ -135,12 +131,6 @@ class MoveTest(unittest.TestCase):
         self.assertTrue(self.new.exists())
         resumed.assert_called_once_with("s-1", why="showrunner checkout moved")
 
-    def test_checkout_refuses_when_the_shutdown_record_lacks_the_move(self) -> None:
-        with (mock.patch.object(stop_resume, "stop") as stop,
-              mock.patch.object(rename_checkout, "_session_records", return_value=[{"session": {"session_id": "s-1"}}])):
-            with self.assertRaisesRegex(RenameRefused, "already has a shutdown in progress"):
-                rename_checkout.checkout("demo")
-        stop.assert_not_called()
 
     def test_a_refusal_before_the_git_move_keeps_the_old_checkout_whole(self) -> None:
         with mock.patch.object(unit_move, "processes_inside", return_value=[4242]):

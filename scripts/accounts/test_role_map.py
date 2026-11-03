@@ -102,6 +102,18 @@ class RoleMapTests(unittest.TestCase):
         server_config = self.server_home / ".claude/config/accounts.json"
         self.assertNotIn("workers_claude", cast(dict[str, object], json.loads(server_config.read_text())))
 
+    def test_stale_transition_metadata_reports_anomalies_and_keeps_the_account(self) -> None:
+        for change in ({"move_id": None}, {"reset": "old"}, {"why": 1}):
+            with self.subTest(change=change):
+                output = io.StringIO()
+                selected = {"label": "claude2", "move_id": "move", "cause": "by hand", "window": "unknown"}
+                text = json.dumps({"groups": {"units": {**selected, **change}}, "workers": "codex1"})
+                with redirect_stderr(output):
+                    result = role_map.decode_role_map(text)
+                self.assertEqual(result.groups.get("units"), "claude2" if "move_id" in change else selected)
+                self.assertEqual(len(output.getvalue().splitlines()), 1)
+                self.assertIn("anomaly:", output.getvalue())
+
     def test_workers_launch_refuses_an_unreadable_map_without_a_cache(self) -> None:
         self.seed(self.home, groups={})
         self.assertEqual(accounts.setup("claude1"), [])
@@ -298,7 +310,6 @@ class RoleMapTests(unittest.TestCase):
               patch.object(role_map, "datetime", RoleMapReadTime),
               patch.object(accounts, "account_identity", side_effect=identity),
               patch.object(refusals, "stored_reading_with_age", return_value=reading),
-              patch("shutdown_record.all_session_records", return_value=[]),
               patch.object(refusal_watch, "_notify_blocked_head", return_value=False),
               patch.object(accounts, "prepared_account", side_effect=AssertionError("blocked target was prepared"))):
             with patch.object(Path, "mkdir", new=stop_after_selection):
@@ -746,8 +757,6 @@ class RoleMapTests(unittest.TestCase):
                 expected_codex = (f"~/.codex1: not logged in; the home has no readable sign-in; affected roles: workers; sign in as codex1 at ~/.codex1; {codex_step}"
                     if is_set_up else f"* codex1: {state}; no folder holds this account; affected roles: workers; {codex_step}")
                 self.assertIn(expected_codex, output.splitlines())
-
-
 
 
 if __name__ == "__main__":

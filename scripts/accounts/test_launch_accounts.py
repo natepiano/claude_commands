@@ -23,7 +23,7 @@ ROOT = Path(__file__).resolve().parents[1]
 # These are account decisions with a separate, explicit contract.
 EXCEPTIONS = {
     ("accounts/accounts.py", "exec_account"): "the user explicitly names the account",
-    ("shutdown/restart.py", "_resume_parts"): "ungrouped resumes retain their recorded directory; groups use the resolver",
+    ("shutdown/restart.py", "session_launch"): "a resume retains the account that holds its transcript",
     ("message/send.py", "relay"): "the relay retains the caller account or uses the showrunners resolver",
     ("notify/review.py", "reviewer_environment"): "the headless reviewer uses the units account through role_account",
 }
@@ -423,7 +423,7 @@ subprocess.run(["claude", "--resume", "session"], env={"CLAUDE_CONFIG_DIR": str(
 
     def test_recorded_resume_exception_does_not_allow_selecting_a_groups_launch_account(self) -> None:
         source = '''\
-def _resume_parts(session: Session, prompt: str):
+def session_launch(identity: str):
     selected = accounts.role_account("unit")
     return selected
 '''

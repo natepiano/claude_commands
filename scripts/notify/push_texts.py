@@ -204,7 +204,7 @@ def shown(entry: PushText) -> str:
 
 
 def user_send_argv(rendered: RenderedPush, *, sender: str = "", machine: str = "",
-                   priority: str = "", due: str = "", timeout: float = 0, key: str = "", self_clearing: bool = False) -> list[str]:
+                   priority: str = "", due: str = "", question: str = "", timeout: float = 0, key: str = "", self_clearing: bool = False) -> list[str]:
     """The send.py argv; a `key` lets `send.py retire --to user --key KEY` stop a blocked push's repeats.
     `self_clearing`: the caller retires its own blocked push, so send.py needs no --clears-when."""
     command = [sys.executable, str(SEND_SCRIPT), "--to", "user", "--from", sender or rendered.sender,
@@ -217,6 +217,8 @@ def user_send_argv(rendered: RenderedPush, *, sender: str = "", machine: str = "
         command.extend(["--value", f"{name}={value}"])
     if machine:
         command.extend(["--machine", machine])
+    if question:
+        command.extend(["--question", question])
     if due:
         command.extend(["--due", due])
     if priority:

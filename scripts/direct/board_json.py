@@ -312,6 +312,7 @@ def unit_ticket_progress(worktree: Path, unit_name: str, sources: set[Path]) -> 
 
 def unit(cells: dict[str, str], clock: BoardClock, sources: set[Path],
          *, resolver: session_staff.RowResolver | None = None) -> dict[str, object]:
+    resolver = resolver if resolver is not None else session_staff.RowResolver(staff.snapshot())
     value = cell_value
     worktree = Path(value(cells.get("Worktree", ""))).expanduser().resolve()
     plan_cell = value(cells.get("Plan", ""))
@@ -321,7 +322,7 @@ def unit(cells: dict[str, str], clock: BoardClock, sources: set[Path],
     if not (plan_history.history_root() / "runs").exists():
         sources.add(plan_history.history_root())
     sources.update(unit_runs.run_roots())
-    found = unit_run.local_run(plan_history.history_root(), str(worktree))
+    found = unit_run.local_run(plan_history.history_root(), str(worktree), record=resolver.record)
     events: list[dict[str, object]] = []
     worker_rows: list[dict[str, object]] = []
     if isinstance(found, unit_run.RunFound):
@@ -334,7 +335,7 @@ def unit(cells: dict[str, str], clock: BoardClock, sources: set[Path],
     run_plan = text(header.get("project_plan_doc")) or text(header.get("plan_doc"))
     record_plan = plan_history.resolve_plan_path(worktree, run_plan) if run_plan else plan
     sources.add(record_plan)
-    sources.update(plan_history.plan_runs(record_plan))
+    sources.update(plan_history.plan_runs(record_plan, record=resolver.record))
     try:
         record = phase_table.build_plan(record_plan, resolver=resolver)
     except phase_table.NoPlan:

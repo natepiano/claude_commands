@@ -65,9 +65,9 @@ class UnitWorktreeAvailabilityTests(StaffTestCase):
         owner = fixture_member('showrunner', name='style', doc=staff.LiveDoc('natedev', doc))
         live_folder = self.root / 'live'
         live_folder.mkdir()
-        for name in ('standby', 'live'):
-            _ = fixture_member('unit', name=name, parent=owner.id,
-                               worktree=staff.PresentWorktree('natedev', self.root / name))
+        _ = fixture_member('unit', name='standby', parent=owner.id)
+        _ = fixture_member('unit', name='live', parent=owner.id,
+                           worktree=staff.PresentWorktree('natedev', live_folder))
         errors = io.StringIO()
         with redirect_stderr(errors):
             result = unit_files.unit_worktrees(doc)
@@ -75,7 +75,7 @@ class UnitWorktreeAvailabilityTests(StaffTestCase):
         messages = errors.getvalue().splitlines()
         self.assertEqual(len(messages), 2)
         self.assertIn('standby-unit', messages[0])
-        self.assertIn('Plan folder is unavailable', messages[0])
+        self.assertIn('staff worktree is unfilled', messages[0])
         self.assertIn('missing-unit', messages[1])
         self.assertIn('no matching staff member', messages[1])
 

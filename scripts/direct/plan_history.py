@@ -214,7 +214,8 @@ def staff_directory(fields: dict[str, object], record: staff.StaffSnapshot) -> d
     return fields
 
 
-def plan_runs(plan_path: Path) -> list[Path]:
+def plan_runs(plan_path: Path, *,
+              record: staff.StaffSnapshot | session_staff.ReadCurrentStaff = session_staff.ReadCurrentStaff.CURRENT) -> list[Path]:
     """Return this plan's durable run files, oldest first."""
     target = plan_path.expanduser().resolve()
     try:
@@ -222,8 +223,9 @@ def plan_runs(plan_path: Path) -> list[Path]:
     except OSError:
         return []
     starts = [(path, event) for path in paths if (event := run_started_event(path)) is not None]
-    record = (staff.snapshot() if any(event.get("main_agent") or event.get("owner_session") for _, event in starts)
-              else staff.StaffSnapshot(()))
+    if isinstance(record, session_staff.ReadCurrentStaff):
+        record = (staff.snapshot() if any(event.get("main_agent") or event.get("owner_session") for _, event in starts)
+                  else staff.StaffSnapshot(()))
     matches: list[tuple[float, str, Path]] = []
     for path, event in starts:
         event = staff_directory(event, record)

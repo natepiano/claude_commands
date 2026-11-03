@@ -337,7 +337,8 @@ class HeldRunUnknown:
 class HeldRunLookup:
     """Read only held histories and retain each result for one watch pass."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, record: staff.StaffSnapshot | session_staff.ReadCurrentStaff = session_staff.ReadCurrentStaff.CURRENT) -> None:
+        self._record: staff.StaffSnapshot | session_staff.ReadCurrentStaff = record
         self._folders: dict[str, list[str]] | None = None
         self._histories: dict[Path, HeldRun | HeldRunUnknown] = {}
 
@@ -354,7 +355,9 @@ class HeldRunLookup:
                         first = _event(handle.readline().decode("utf-8"))
                     if first is None or first.get("event_type") != "run_started":
                         raise ValueError("history does not start with run_started")
-                    row = staff.snapshot().by_member_reference(session_id)
+                    if isinstance(self._record, session_staff.ReadCurrentStaff):
+                        self._record = staff.snapshot()
+                    row = self._record.by_member_reference(session_id)
                     if row is None or isinstance(row.worktree, staff.WorktreeUnfilled):
                         raise ValueError(f"{session_id}: the staff worktree is unavailable")
                     last = _last_event(path)

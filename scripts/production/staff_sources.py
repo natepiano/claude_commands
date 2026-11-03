@@ -193,7 +193,7 @@ def seed(*, dry_run: bool = False) -> None:
 
 
 # The source scan is shared by seed and the live handler. It never writes source records.
-LiveRole = Literal["showrunner", "unit", "worker", "impl", "test", "review", "fix", "astra-designer", "astra-reviewer"]
+LiveRole = Literal["showrunner", "unit", "worker", "agent", "impl", "test", "review", "fix", "astra-designer", "astra-reviewer"]
 
 
 @dataclass(frozen=True)
@@ -446,7 +446,7 @@ class _WorkerSources:
             environment = launch["environment"]
             staff_id = launch["session_id"]
             row = self.record.by_current_session(staff_id) if staff_id else None
-            if (row is None or row.kind not in ("unit", "showrunner", "worker")) and environment.get("SHOWRUNNER_UNIT_ID"):
+            if row is None and environment.get("SHOWRUNNER_UNIT_ID"):
                 try:
                     owner = self.recorded_owner(staff_id=staff_id, unit=environment["SHOWRUNNER_UNIT_ID"],
                                                 production=environment.get("SHOWRUNNER_UNIT", ""))
@@ -463,7 +463,7 @@ class _WorkerSources:
                     self.sessions[launch["session_id"]] = WorkerOwner(f"staff:{row.id}", row)
 
         for row in self.record.rows:
-            if row.kind in ("unit", "showrunner") and row.current_session in self.native_running:
+            if row.kind != "worker" and row.current_session in self.native_running:
                 self.identities[row.id] = self.native_running[row.current_session]
                 self.sessions[row.current_session] = WorkerOwner(f"staff:{row.id}", row)
 
@@ -1081,14 +1081,14 @@ def live() -> dict[str, object]:
         except (OSError, ValueError, staff.StaffRefused) as error:
             incomplete = True
             _problem(str(run), error)
-    active_ids = {row.id for kind in ("unit", "showrunner") for row in staff.active(record, kind)}
+    active_ids = {row.id for kind in ("unit", "showrunner", "agent") for row in staff.active(record, kind)}
     resolver = session_staff.RowResolver(record, dependencies=dependencies)
     for row in record.rows:
         identity = scan.identities.get(row.id) if row.id in active_ids else None
         if row.kind != "worker" and identity is not None and row.current_session in identity.values():
             problems: list[str] = []
             document = resolver.production_doc(row)
-            if not isinstance(document, session_staff.ProductionDoc):
+            if row.kind != "agent" and not isinstance(document, session_staff.ProductionDoc):
                 problems.append(document.reason)
             if row.kind == "unit":
                 branch = resolver.unit_branch(row)
@@ -1298,7 +1298,7 @@ class _FillSources:
                 self.document(path)
                 self.repository(path)
         for row in self.record.rows:
-            location = row.worktree if row.kind == "unit" else row.doc
+            location = row.worktree if isinstance(row.worktree, (staff.PresentWorktree, staff.RemovedWorktree)) else row.doc
             if isinstance(location, (staff.PresentWorktree, staff.RemovedWorktree, staff.LiveDoc, staff.WrappedDoc)):
                 if location.machine == _fill_machine():
                     if location.path.exists():
@@ -1632,6 +1632,8 @@ def migration_sources(record: staff.StaffSnapshot) -> tuple[_MemberSources, tupl
     permitted: list[pane_record.PaneLaunch] = []
     for launch in launches.values():
         owner = record.by_member_reference(launch["session_id"])
+        if owner is None:
+            owner = record.by_id(staff.StaffId(launch["environment"].get("STAFF_ID", "")))
         if owner is not None and owner.kind == "worker":
             owner = record.by_id(owner.parent) if owner.parent else None
         if owner is not None:
@@ -2052,7 +2054,7 @@ def require_worker_stopped(record: staff.StaffSnapshot, identity: staff.StaffId)
     # Remote process evidence belongs to the roster's one peer reader.
     row = record.by_id(identity)
     while row is not None:
-        location = row.worktree if row.kind == "unit" else row.doc
+        location = row.worktree if isinstance(row.worktree, (staff.PresentWorktree, staff.RemovedWorktree)) else row.doc
         if isinstance(location, (staff.PresentWorktree, staff.RemovedWorktree, staff.LiveDoc, staff.WrappedDoc)):
             if location.machine != remote.local_machine():
                 from scripts.message import roster

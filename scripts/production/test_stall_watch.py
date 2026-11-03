@@ -272,7 +272,8 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
             parent = showrunner_relationship(session)
             live_units = [unit for unit in units if "retired" not in self.plans.get(unit, "").lower()]
             intended = {fixture_member("unit", name=unit_names.name(unit), parent=parent.id,
-                                       runtime_id=unit_session(unit)).id for unit in live_units}
+                                       runtime_id=unit_session(unit), worktree=staff.PresentWorktree(
+                                           local_machine(), self.root / "worktrees" / unit)).id for unit in live_units}
             for row in staff.snapshot().find(kind="unit", parent=parent.id):
                 if row.id not in intended:
                     _ = staff.set_worktree(row.id, staff.RemovedWorktree(

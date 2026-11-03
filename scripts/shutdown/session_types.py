@@ -160,12 +160,16 @@ class CodexServer(TypedDict):
     busy_workers: list[str]
 
 
+class UnknownFolder(TypedDict):
+    kind: Literal["unknown folder"]
+
+
 class SessionFields(TypedDict):
     session_id: str
     pid: int
     proc_start: str
     name: str
-    cwd: str
+    cwd: str | UnknownFolder
     # Records from before account-directory capture use the default directory.
     config_dir: NotRequired[str]
     probe: bool
@@ -463,20 +467,13 @@ def unit_worktree(session_id: str) -> staff.PresentWorktree | staff.RemovedWorkt
     """Join a unit or its worker to the unit's staff location."""
     try:
         record = staff.snapshot()
-    except staff.StaffUnreadable as error:
-        raise InvalidInventory(f"{session_id}: cannot read the staff folder: {error}") from error
+    except staff.StaffUnreadable:
+        return staff.WORKTREE_UNFILLED
     row = record.by_member_reference(session_id)
-    if row is None:
-        raise InvalidInventory(f"{session_id}: no staff row for the session")
-    if row.kind == "worker":
-        parent = record.by_id(row.parent) if row.parent is not None else None
-        if parent is None:
-            raise InvalidInventory(f"{session_id}: no staff parent for the worker")
-        row = parent
-    if row.kind != "unit":
-        return staff.WorktreeUnfilled()
-    if isinstance(row.worktree, staff.WorktreeUnfilled):
-        raise InvalidInventory(f"{session_id}: the staff worktree is unavailable")
+    if row is not None and row.kind == "worker":
+        row = record.by_id(row.parent) if row.parent is not None else None
+    if row is None or row.kind != "unit":
+        return staff.WORKTREE_UNFILLED
     return row.worktree
 
 
@@ -489,9 +486,9 @@ def parse_session(value: object, place: str) -> Session:
     if kind in {"unit", "worker"}:
         identity = wire_string(wire_required(data, "session_id", place), f"{place}.session_id")
         location = unit_worktree(identity)
-        if kind == "unit" and isinstance(location, staff.WorktreeUnfilled):
-            raise InvalidInventory(f"{place}: {identity}: the staff worktree is unavailable")
-        if not isinstance(location, staff.WorktreeUnfilled):
+        if isinstance(location, staff.WorktreeUnfilled):
+            data = {**data, "cwd": UnknownFolder(kind="unknown folder"), "checkout": {"kind": "not a checkout"}}
+        else:
             data = {**data, "cwd": str(location.path)}
             checkout = wire_object(wire_required(data, "checkout", place), f"{place}.checkout")
             if checkout.get("kind") == "git":
@@ -508,7 +505,8 @@ def parse_session(value: object, place: str) -> Session:
         "name": wire_string(
             wire_required(data, "name", place), f"{place}.name"
         ),
-        "cwd": wire_string(wire_required(data, "cwd", place), f"{place}.cwd"),
+        "cwd": data["cwd"] if isinstance(data.get("cwd"), dict) and kind in {"unit", "worker"}
+               else wire_string(wire_required(data, "cwd", place), f"{place}.cwd"),
         "status": wire_string(data.get("status", ""), f"{place}.status"),
         "updated_at": wire_integer(data.get("updated_at", 0), f"{place}.updated_at"),
         "model": _parse_model(wire_required(data, "model", place), f"{place}.model"),

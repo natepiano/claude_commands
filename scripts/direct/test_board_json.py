@@ -273,8 +273,11 @@ class BoardJsonTests(unittest.TestCase):
     def write_run(self, fixture: ProductionFixture, events: list[dict[str, object]],
                   *, name: str = "current", started: int = NOW - 7_200) -> Path:
         path = self.history / "runs" / f"{name}.jsonl"
+        member = next(row for row in staff.find(kind="unit")
+                      if isinstance(row.worktree, staff.PresentWorktree) and row.worktree.path == fixture.worktree)
         first: dict[str, object] = {
             "event_type": "run_started", "working_dir": str(fixture.worktree),
+            "main_agent": {"session_id": member.current_session},
             "plan_doc": str(fixture.plan), "project_plan_doc": str(fixture.plan),
             "timestamp_epoch": started, "run_started_at": started,
         }

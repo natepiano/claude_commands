@@ -69,6 +69,24 @@ def concurrent_ensure(
 
 
 class NativeRuntimeIdentityTests(StaffTestCase):
+    def test_guarded_cli_adds_an_agent_without_a_parent_and_reads_its_locations(self) -> None:
+        identity = fixture_runtime_id("morty-agent")
+        for field, state in (("worktree", "present"), ("doc", "live")):
+            with self.subTest(field=field):
+                self.staff_file.unlink(missing_ok=True)
+                result = self.cli("ensure", "agent", "--name", "morty", "--runtime-id", identity,
+                                  "--" + field, "natedev", str(self.root / "morty"), state, "--json")
+                payload = cast(object, json.loads(result.stdout))
+                row = staff.StaffRow.from_json(payload)
+                self.assertEqual((row.id, row.current_session, row.kind, row.name, row.parent),
+                                 (identity, identity, "agent", "morty", None))
+                self.assertEqual(staff.snapshot().rows, (row,))
+                self.assertEqual(staff.by_path("morty"), row)
+                shown = self.cli("show", "--kind", "agent")
+                self.assertIn("morty", shown.stdout)
+                self.assertIn("agent", shown.stdout)
+                self.assertEqual(staff.StaffRow.from_json(row.to_json()), row)
+
     def test_repeated_id_lookups_scan_the_staff_rows_at_most_once(self) -> None:
         _, unit, _ = self.tree()
         expected = tuple(replace(unit, id=staff.StaffId(fixture_runtime_id(f"indexed-{number}")))
@@ -1129,11 +1147,10 @@ class StaffTests(StaffTestCase):
         self.assertEqual(self.staff_file.read_bytes(), original)
         self.assertCountEqual(staff.find(), rows)
 
-    def test_missing_file_is_unreadable_for_reads_but_bootstraps_on_write(self) -> None:
-        for read in (lambda: staff.by_id(MISSING_ID), lambda: staff.by_path("sdlc"), staff.find):
-            with self.subTest(read=read), self.assertRaises(staff.StaffUnreadable) as raised:
-                _ = read()
-            self.assertIsInstance(raised.exception, OSError)
+    def test_missing_file_reads_as_empty_and_bootstraps_on_write(self) -> None:
+        self.assertIsNone(staff.by_id(MISSING_ID))
+        self.assertIsNone(staff.by_path("sdlc"))
+        self.assertEqual(staff.find(), [])
         self.assertFalse(self.staff_file.exists())
         created = fixture_member("showrunner", name="sdlc")
         self.assertEqual(staff.by_id(created.id), created)
@@ -1514,11 +1531,10 @@ class StaffTests(StaffTestCase):
                 with staff.operation():
                     self.fail("entered an operation without acquiring its lock")
 
-    def test_absent_records_have_the_same_typed_signal_on_owner_and_mac(self) -> None:
+    def test_absent_records_are_empty_on_owner_and_mac(self) -> None:
         for machine in ("natedev", "mac"):
             with self.subTest(machine=machine), self.machine(machine):
-                with self.assertRaises(staff.StaffAbsent):
-                    _ = staff.snapshot()
+                self.assertEqual(staff.snapshot(), staff.StaffSnapshot(()))
         self.assertEqual(self.ssh_commands(), [["show", "--snapshot", "--json"]])
         self.assertFalse(self.staff_file.exists())
         self.assertFalse(self.mac_file.exists())

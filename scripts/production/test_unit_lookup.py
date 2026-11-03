@@ -1027,6 +1027,20 @@ print(observed.row.id)
         current.unlink()
         self.assertEqual(runs.unfinished_held_run(fixture_runtime_id("staff-director")), found)
 
+    def test_held_run_uses_the_supplied_staff_snapshot(self) -> None:
+        history = self.record("run", self.root / "tree", 1.0)
+        director = fixture_runtime_id("director")
+        _ = self.held_folder(history, director)
+        record = staff.snapshot()
+        row = record.by_member_reference(director)
+        assert row is not None
+        _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", self.root / "later"), expected=row.worktree)
+        with mock.patch.object(staff, "snapshot", side_effect=AssertionError("another staff read")):
+            found = unit_lookup.HeldRunLookup(record=record).unfinished_held_run(director)
+        self.assertIsInstance(found, unit_lookup.HeldRun)
+        assert isinstance(found, unit_lookup.HeldRun)
+        self.assertEqual((found.path, found.worktree), (history, self.root / "tree"))
+
     def test_recorded_replacement_director_owns_the_run_even_with_a_stale_marker(self) -> None:
         history = self.record("run", self.root / "tree", 1.0)
         lines = history.read_text().splitlines()

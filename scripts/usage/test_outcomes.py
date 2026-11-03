@@ -239,7 +239,7 @@ class ProductionPathsTests(unittest.TestCase):
         with isolated_staff_file(Path(directory.name) / "staff.json", {}):
             owner = fixture_member("showrunner", name="sample", doc=staff.LiveDoc("natedev", document))
             _ = fixture_member("unit", name="a", parent=owner.id,
-                               worktree=staff.PresentWorktree("natedev", Path("/director")))
+                               worktree=staff.PresentWorktree("natedev", branch_worktree))
             self.assertEqual(
                 outcomes.production_paths(document),
                 (Path("/repo/main"), branch_worktree),

@@ -1114,7 +1114,7 @@ def build_plan(plan_path: Path, *, resolver: session_staff.RowResolver | None = 
     except (OSError, UnicodeError) as error:
         raise NoPlan(f"Unable to read plan {plan_path}") from error
 
-    run_events = [_events(path) for path in plan_history.plan_runs(plan_path)]
+    run_events = [_events(path) for path in plan_history.plan_runs(plan_path, record=resolver.record)]
     instances = _phase_instances(run_events)
     open_instance = _newest_open_instance(run_events)
     return _build_phase_record(

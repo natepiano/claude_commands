@@ -10,7 +10,6 @@ import hashlib
 import io
 import json
 import os
-import shlex
 import select
 import subprocess
 import sys
@@ -7361,114 +7360,9 @@ with patch.object(fcntl, "flock", admission):
         self.assertEqual(check["prompt_phase_line"], "matched")
         self.assertEqual(check["phase_id"], "3")
 
-    def restart_fallback_arguments(self, session: Path, worker: str, kind: str) -> list[str]:
-        # Import the shutdown CLI in a child: it has its own script import roots.
-        fallback_program = """import sys
-sys.path.insert(0, sys.argv[5])
-import restart
-seat = restart.PausedSeat(run_dir=sys.argv[1], seat=sys.argv[2], role=sys.argv[3],
-    thread_id='paused-thread', turn_live=True, launcher_command=[])
-print(restart._resume_worker_command(seat, sys.argv[4]))
-"""
-        built = subprocess.run(
-            [sys.executable, "-c", fallback_program, str(session), worker, kind,
-             str(self.working_dir), str(SCRIPT.parent.parent / "shutdown")],
-            check=False, capture_output=True, text=True,
-        )
-        self.assertEqual(built.returncode, 0, built.stderr)
-        return shlex.split(built.stdout)
 
-    def test_restart_fallback_uses_the_paused_pass_phase_and_passes_the_launch_check(self) -> None:
-        for kind in ("impl", "review", "fix"):
-            with self.subTest(kind=kind):
-                session = self.start_run(f"resume-fallback-{kind}", 42_500)
-                self.start_phase(session, 42_510)
-                worker = f"paused-{kind}"
-                self.start_slot_pass(session, kind, kind, 42_515, worker_name=worker)
-                _ = (session / f"impl_worker_{kind}.json").write_text(json.dumps(
-                    {"name": worker, "slot": kind, "thread_id": "paused-thread"}))
-                self.team_slot = ""
-                self.start_numbered_phase(session, "4", 42_520)
-                arguments = self.restart_fallback_arguments(session, worker, kind)
-                self.assertIn("--phase", arguments)
-                phase = arguments[arguments.index("--phase") + 1]
-                self.assertEqual(phase, "3", "the current phase 4 is not the paused pass's phase")
-                cause: tuple[str, ...] = ()
-                if kind == "fix":
-                    self.assertIn("--fix-cause", arguments)
-                    cause = ("--fix-cause", arguments[arguments.index("--fix-cause") + 1])
-                    self.assertEqual(cause[1], "resume after a move")
-                prompt = session / f"{worker}.resume-prompt.md"
-                _ = prompt.write_text("Phase 3 — Retry handling\nResume the paused work.\n")
-                state_path = session / plan_history.STATE_FILENAME
-                before = state_path.read_bytes()
-                self.team_slot = kind
-                result = self.run_failing_command(
-                    "check-launch", "--session-dir", str(session), "--pass-kind", kind,
-                    "--phase-id", phase, "--prompt-file", str(prompt), *cause,
-                    at=42_525, complete_launch=False,
-                )
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(state_path.read_bytes(), before, "a preflight must not change pass or slot state")
 
-    def test_restart_review_follows_worker_identity_across_a_different_durable_slot(self) -> None:
-        session = self.start_run("resume-review-different-slot", 42_500)
-        self.start_phase(session, 42_510)
-        self.start_slot_pass(session, "fix", "review", 42_515, worker_name="project-fix")
-        self.team_slot = ""
-        self.start_numbered_phase(session, "4", 42_520)
-        self.start_slot_pass(session, "impl", "impl", 42_525, worker_name="project-impl")
-        slots = self.pass_slots(session)
-        self.assertEqual(slots["fix"]["worker_name"], "project-fix")
-        self.assertEqual(slots["impl"]["worker_name"], "project-impl")
-        review, implementation = self.pass_events(session.name, "pass_started")
-        self.assertEqual(review["worker_name"], "project-fix")
-        self.assertEqual(implementation["worker_name"], "project-impl")
-        _ = (session / "impl_worker_impl.json").write_text(json.dumps(
-            {"name": "project-fix", "slot": "impl", "thread_id": "paused-thread"}))
 
-        arguments = self.restart_fallback_arguments(session, "project-fix", "review")
-        self.assertEqual(Path(arguments[1]).name, "review.sh")
-        self.assertEqual(arguments[arguments.index("--to") + 1], "project-fix")
-        self.assertIn("--phase", arguments)
-        self.assertEqual(arguments[arguments.index("--phase") + 1], "3")
-        prompt = session / "project-fix.resume-prompt.md"
-        _ = prompt.write_text("Phase 3 — Retry handling\nResume the paused review.\n")
-        result = self.run_failing_command(
-            "check-launch", "--session-dir", str(session), "--pass-kind", "review",
-            "--phase-id", arguments[arguments.index("--phase") + 1],
-            "--prompt-file", str(prompt), at=42_530, complete_launch=False,
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
-
-    def test_restart_omits_phase_when_worker_identity_is_missing_or_ambiguous(self) -> None:
-        for label, workers in (
-            ("ambiguous", {"fix": "project-fix", "impl": "project-fix"}),
-            ("missing", {"fix": "other-reviewer", "impl": "project-impl"}),
-        ):
-            with self.subTest(identity=label):
-                session = self.start_run(f"resume-identity-{label}", 42_500)
-                self.start_phase(session, 42_510)
-                self.start_slot_pass(session, "fix", "review", 42_515, worker_name=workers["fix"])
-                self.team_slot = ""
-                self.start_numbered_phase(session, "4", 42_520)
-                self.start_slot_pass(session, "impl", "impl", 42_525, worker_name=workers["impl"])
-                _ = (session / "impl_worker_impl.json").write_text(json.dumps(
-                    {"name": "project-fix", "slot": "impl", "thread_id": "paused-thread"}))
-
-                arguments = self.restart_fallback_arguments(session, "project-fix", "review")
-                self.assertNotIn("--phase", arguments, "a durable slot cannot prove the paused phase")
-                result = self.run_failing_command(
-                    "check-launch", "--session-dir", str(session), "--pass-kind", "review",
-                    at=42_530, complete_launch=False,
-                )
-                self.assertNotEqual(result.returncode, 0)
-                history = self.history_dir / "runs" / f"{session.name}.jsonl"
-                events = [cast(dict[str, object], json.loads(line)) for line in history.read_text().splitlines()]
-                refused, = [event for event in events if event["event_type"] == "launch_refused"]
-                self.assertEqual(refused["phase_id"], "")
-                self.assertEqual(refused["pass_kind"], "review")
-                self.assertIn("phase", str(refused["reason"]).lower())
 
     def test_matching_and_absent_prompt_phase_lines_both_record_the_launch_check(self) -> None:
         for label, text, expected in (

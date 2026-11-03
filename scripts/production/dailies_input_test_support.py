@@ -515,6 +515,9 @@ class DailiesInputFixture(unittest.TestCase):
         events: list[dict[str, object]] = [
             {"event_type": "run_started", "working_dir": str(worktree.resolve()), "run_started_at": 1.0},
             {"event_type": "run_finished"}]
+        member = next(row for row in staff.snapshot().rows
+                      if isinstance(row.worktree, staff.PresentWorktree) and row.worktree.path == worktree)
+        events[0]["main_agent"] = {"session_id": member.current_session}
         _ = (runs / f"{worktree.name}.jsonl").write_text(
             "".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
         self.env["UNIT_HISTORY_DIR"] = str(self.root / "history")

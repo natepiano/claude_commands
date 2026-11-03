@@ -87,11 +87,7 @@ class ProofRefusal:
     reset: refusals.KnownReset | refusals.NoResetKnown = field(default_factory=refusals.NoResetKnown)
 
 
-class AssumedRefusalFile(TypedDict):
-    uuid: str
-    timestamp: str
-    window: Literal["weekly", "five_hour"]
-    reset: str
+_assumed_refusals: ContextVar[Mapping[str, ProofRefusal]] = ContextVar("assumed_refusals", default={})
 
 
 class FirstRefusalObservation(TypedDict):
@@ -198,12 +194,6 @@ def read_auto_move_rules() -> tuple[AutoMoveRule | UnreadableNextMoveLog, ...]:
 
 def state_root() -> Path:
     return Path.home() / ".local" / "state" / "accounts"
-
-
-def assumed_file(session_id: str) -> Path:
-    if not session_id or Path(session_id).name != session_id:
-        raise ValueError("invalid session id")
-    return state_root() / "assumed_refusals" / (session_id + ".json")
 
 
 def _object(path: Path) -> dict[str, object]:
@@ -320,8 +310,9 @@ def started_next_move_holds(entries: tuple[next_moves.NextMove, ...]) -> dict[st
         return {}
     try:
         state = _load_state()
-    except (OSError, ValueError, OverflowError):
-        return next_moves.WatchStateUnreadable()
+    except (OSError, ValueError, OverflowError) as error:
+        print(f"accounts: anomaly: cannot read started holds: {error}", file=sys.stderr)
+        return {}
     holds = state.get("auto_move_holds", {})
     if not holds:
         return {}
@@ -509,18 +500,7 @@ def _transcript_refusal(paths: list[Path], chunk_bytes: int) -> TranscriptRefusa
 
 
 def assumed_refusal(session_id: str) -> ProofRefusal | NoSessionRefusal:
-    value = _object(assumed_file(session_id))
-    if not value:
-        return NoSessionRefusal()
-    if (not all(isinstance(value.get(key), str) for key in ("uuid", "timestamp", "window", "reset"))
-            or value["window"] not in ("weekly", "five_hour")):
-        raise ValueError("invalid assumed refusal")
-    held = cast(AssumedRefusalFile, cast(object, value))
-    at = datetime.fromisoformat(held["timestamp"])
-    reset = refusals.KnownReset(datetime.fromisoformat(held["reset"])) if held["reset"] else refusals.NoResetKnown()
-    if at.tzinfo is None or isinstance(reset, refusals.KnownReset) and reset.at.tzinfo is None:
-        raise ValueError("assumed refusal time needs an offset")
-    return ProofRefusal(held["uuid"], RefusedAt(at), refusals.KnownWindow(held["window"]), reset)
+    return _assumed_refusals.get().get(session_id, NoSessionRefusal())
 
 
 def session_refusal(session_id: str, *, account_config: conf.ConfigRead | accounts.ReadCurrentAccountSettings = accounts.CURRENT_ACCOUNT_SETTINGS) -> TranscriptRefusal | ProofRefusal | NoSessionRefusal:
@@ -568,7 +548,7 @@ def session_refusals(session_ids: list[str], *, account_config: conf.ConfigRead 
 
 
 def clear_assumed(session_id: str) -> None:
-    assumed_file(session_id).unlink(missing_ok=True)
+    _ = _assumed_refusals.set({key: value for key, value in _assumed_refusals.get().items() if key != session_id})
 
 
 def cancelled(session_id: str, *, account_config: conf.ConfigRead | accounts.ReadCurrentAccountSettings = accounts.CURRENT_ACCOUNT_SETTINGS) -> None:
@@ -654,8 +634,6 @@ def _notify_no_room(text: str, now: datetime) -> bool:
         for recipient in quota_alert.recipients(config)], now.isoformat())
 
 
-
-
 def _blocked_head_line(rule: AutoMoveRule, reason: BlockedHeadReason) -> str:
     return blocked_next_move_line(rule.group, rule.to, rule.entry_id, reason)
 
@@ -703,6 +681,17 @@ def _continue_session(session_id: str, entry_id: str) -> ContinuationDelivered |
     return ContinuationNotDelivered((delivery.get("reason", "send not delivered").splitlines() or ["queued"])[0])
 
 
+def _continue_wait(state: WatchState, session_id: str, name: str, previous: WatchedSession, *, dry_run: bool) -> str:
+    if dry_run:
+        return f"{name}: refused; continue on its current account"
+    delivery = _continue_session(session_id, previous["entry_id"])
+    if isinstance(delivery, ContinuationNotDelivered):
+        return f"{name}: continuation not delivered: {delivery.reason}"
+    clear_assumed(session_id)
+    _set_transition(state, session_id, previous["entry_id"], "continued", previous["move_id"])
+    return f"{name}: continued on its current account"
+
+
 def _reading_values_fingerprint() -> str:
     values: dict[str, dict[str, object]] = {}
     for identity, reading in usage_store.load().items():
@@ -738,8 +727,18 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
     selected_groups = accounts.GroupAccounts() if proof_group else accounts.group_accounts()
     unconfigured = {group for group in (() if proof_group else accounts.CLAUDE_GROUPS) if isinstance(accounts.group_label(selected_groups, group), accounts.GroupNotConfigured)}
     reported_unconfigured: set[accounts.ClaudeGroup] = set()
-    detected = session_refusals([session["sessionId"] for session in sessions.live_sessions()
-        if not proof_group or session["sessionId"] in proof_group], account_config=account_config)
+    live = [session for session in sessions.live_sessions()
+        if not proof_group or session["sessionId"] in proof_group]
+    detected = session_refusals([session["sessionId"] for session in live], account_config=account_config)
+    for session in live:
+        session_id = session["sessionId"]
+        previous = state["sessions"].get(session_id)
+        if not previous or previous["state"] != "waited" or not isinstance(detected[session_id], NoSessionRefusal):
+            continue
+        waited = next((entry for entry in entries if entry["kind"] == "waited"
+            and entry["move_id"] == previous["move_id"]), None)
+        if waited is not None and datetime.fromisoformat(waited["reset"]) <= now:
+            lines.append(_continue_wait(state, session_id, session["name"], previous, dry_run=dry_run))
     refused_ids = frozenset(session_id for session_id, refusal in detected.items()
         if isinstance(refusal, (TranscriptRefusal, ProofRefusal))
         and not ((previous := state["sessions"].get(session_id)) and previous["entry_id"] == refusal.entry_id
@@ -859,16 +858,7 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
         if previous and previous["entry_id"] == refusal.entry_id and previous["state"] == "waited":
             waited = next((entry for entry in entries if entry["kind"] == "waited" and entry["move_id"] == previous["move_id"]), None)
             if waited is not None and datetime.fromisoformat(waited["reset"]) <= now:
-                if dry_run:
-                    lines.append(f"{session['name']}: refused; continue on its current account")
-                else:
-                    delivery = _continue_session(session_id, refusal.entry_id)
-                    if isinstance(delivery, ContinuationNotDelivered):
-                        lines.append(f"{session['name']}: continuation not delivered: {delivery.reason}")
-                    else:
-                        clear_assumed(session_id)
-                        _set_transition(state, session_id, refusal.entry_id, "continued", previous["move_id"])
-                        lines.append(f"{session['name']}: continued on its current account")
+                lines.append(_continue_wait(state, session_id, session["name"], previous, dry_run=dry_run))
                 continue
         if isinstance(refusal, TranscriptRefusal):
             refusing_logins.add(login.casefold())
@@ -1287,26 +1277,33 @@ def main(argv: list[str] | None = None, *, account_config: conf.ConfigRead | acc
         name, window = args.assume_refused
         if window not in ("weekly", "five-hour"):
             parser.error("window must be weekly or five-hour")
+        from scripts.production import staff
+        record = staff.initial_snapshot()
         owners = live_owners()
         selected: dict[str, inventory_module.Session] = {}
         for probe in [name, *(args.proof_group or [])]:
-            matching = [session for session in owners if session["session_id"] == probe or session["name"] == probe]
+            matching = [session for session in owners if session["session_id"] == probe
+                        or (member.name if (member := record.by_current_session(session["session_id"]))
+                            is not None else session["name"]) == probe]
             if len(matching) != 1:
                 parser.error("name or id must identify one local live owner")
-            if accounts.session_group(matching[0]) != "ungrouped":
-                parser.error("--assume-refused requires an ungrouped probe, neither unit nor showrunner")
             selected[matching[0]["session_id"]] = matching[0]
         if args.proof_group:
             proof_ids.update(selected)
         now = datetime.now(timezone.utc)
-        held = AssumedRefusalFile(uuid=uuid4().hex, timestamp=now.isoformat(),
-            window="weekly" if window == "weekly" else "five_hour",
-            reset=(now + timedelta(minutes=float(args.reset_in))).isoformat() if args.reset_in is not None else "")
-        if not args.dry_run:
-            for session_id in selected:
-                _atomic_json(assumed_file(session_id), held)
-    for line in run(dry_run=bool(args.dry_run), proof_group=frozenset(proof_ids), account_config=account_config):
-        print(line)
+        held = ProofRefusal(uuid4().hex, RefusedAt(now), refusals.KnownWindow(
+            "weekly" if window == "weekly" else "five_hour"),
+            refusals.KnownReset(now + timedelta(minutes=float(args.reset_in)))
+            if args.reset_in is not None else refusals.NoResetKnown())
+        assumed = {session_id: held for session_id in selected} if not args.dry_run else {}
+    else:
+        assumed = {}
+    token = _assumed_refusals.set(assumed)
+    try:
+        for line in run(dry_run=bool(args.dry_run), proof_group=frozenset(proof_ids), account_config=account_config):
+            print(line)
+    finally:
+        _assumed_refusals.reset(token)
     return 0
 
 
