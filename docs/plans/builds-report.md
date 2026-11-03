@@ -143,3 +143,14 @@ Do not wait for sdlc's exact keys. Print our definition, our number and sdlc's n
 - `buildlog moments` shows it as the newest section, with Build rules 1 (Moment 1) as its before window. Its after window is thin until a day of data exists.
 
 **Files:** `scripts/buildlog/moments.py`; `scripts/buildlog/test_moments.py` (the pinned moment order).
+
+### Phase 4 — /build:report names the hourly memory table  · status: done
+**Depends on:** Phase 1
+
+#### As-built
+
+- `commands/build/report.md` names `buildlog usage-hours [YYYY-MM-DD]` near its top. The line lists what the table holds: hourly build memory, process memory, file cache, build and CI CPU, disk traffic, lowest free disk and free pool tokens.
+- A second line tells the agent to run it for questions about memory, CPU or disk by hour, and to answer from its table in a few lines.
+- Source: the user's change review C682 (2026-11-02). The table is hard to read in the CLI; agents use it for analysis.
+
+**Files:** `commands/build/report.md`.
