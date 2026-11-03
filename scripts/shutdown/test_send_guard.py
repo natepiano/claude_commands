@@ -204,15 +204,15 @@ class SendGuardTests(ShutdownTestCase):
         class DryRunRestartRetirement(ShutdownTestCase):
             def test_retire(self) -> None:
                 retire = cast(RetireShutdownSession, getattr(restart, "_retire"))
-                retire(current, dry_run=True)
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    retire(current, dry_run=True)
+                self.assertIn("retire --to session:x", output.getvalue())
 
-        output = io.StringIO()
-        with redirect_stdout(output):
-            result = self.run_without_subprocesses(
-                DryRunRestartRetirement("test_retire")
-            )
+        result = self.run_without_subprocesses(
+            DryRunRestartRetirement("test_retire")
+        )
         self.assertTrue(result.wasSuccessful(), result.failures)
-        self.assertIn("retire --to session:x", output.getvalue())
 
     def test_allowing_delivery_in_a_test_runs_only_the_fake_script(self) -> None:
         script, log = self.send_script()
