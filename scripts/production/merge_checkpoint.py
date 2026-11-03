@@ -188,18 +188,17 @@ class Unit(NamedTuple):
     owns: tuple[str, ...]
 
 
-class OtherUnit(NamedTuple):
+class UnitRow(NamedTuple):
     name: str
     plan: Path
     branch: str
     owns: tuple[str, ...]
     cells: dict[str, str]
-    member: staff_sources.MemberFound | staff_sources.NoSuchMember
 
 
 class MergeRequest(NamedTuple):
     production: Production
-    unit: Unit
+    unit: Unit | UnitRow
     phase: str
     commit: str
     also: tuple[str, ...]
@@ -209,7 +208,7 @@ class MergeRequest(NamedTuple):
     merge_tests: tuple[tuple[str, ...], ...]
     flakes: frozenset[str]
     flaky_tests: frozenset[str]
-    units: tuple[Unit | OtherUnit, ...]
+    units: tuple[Unit | UnitRow, ...]
     lines: tuple[str, ...]
     scratch: Path
     trailer: tuple[str, ...]
@@ -294,9 +293,8 @@ def listed_names(lines: list[str], field: str) -> frozenset[str]:
     return frozenset(name.strip() for name in names if name.strip())
 
 
-def parse_units(lines: list[str], production: Production, record: staff.StaffSnapshot,
-                requested_unit: str) -> tuple[Unit | OtherUnit, ...]:
-    result: list[Unit | OtherUnit] = []
+def parse_units(lines: list[str]) -> tuple[UnitRow, ...]:
+    result: list[UnitRow] = []
     for cells in unit_table(lines):
         if not all(heading in cells for heading in ("Unit", "Branch", "Owns")):
             continue
@@ -318,12 +316,8 @@ def parse_units(lines: list[str], production: Production, record: staff.StaffSna
         else:
             owns = tuple(part.strip() for part in plain.split(",") if part.strip())
         name = cell_value(cells["Unit"])
-        member = staff_sources.member(staff_sources.UnitMember(production.slug, name), record)
         branch = cell_value(cells["Branch"])
-        if name == requested_unit:
-            result.append(Unit(name, plan, unit_lookup.plan_worktree(cells, member), branch, owns))
-        else:
-            result.append(OtherUnit(name, plan, branch, owns, cells, member))
+        result.append(UnitRow(name, plan, branch, owns, cells))
     return tuple(result)
 
 
@@ -379,8 +373,8 @@ def request_from(args: argparse.Namespace) -> MergeRequest:
     production = read_production(Path(cast(str, args.production)))
     lines = production.doc.read_text(encoding="utf-8").splitlines()
     name = cast(str, args.unit)
-    units = parse_units(lines, production, staff.snapshot(), name)
-    unit = next((candidate for candidate in units if isinstance(candidate, Unit) and candidate.name == name), None)
+    units = parse_units(lines)
+    unit = next((candidate for candidate in units if candidate.name == name), None)
     if unit is None:
         raise Refusal(f"unit {name} not in production doc")
     push_field = production_doc.optional_field(lines, "Push")
@@ -696,7 +690,21 @@ def conflicts(request: MergeRequest) -> None:
     report("conflicts", "ok", "merge tree is clean")
 
 
+def unit_worktree(production: Production, unit: Unit | UnitRow, record: staff.StaffSnapshot) -> Path:
+    if isinstance(unit, Unit):
+        return unit.worktree
+    member = staff_sources.member(staff_sources.UnitMember(production.slug, unit.name), record)
+    return unit_lookup.plan_worktree(unit.cells, member)
+
+
 def other_units(request: MergeRequest, paths: tuple[str, ...]) -> None:
+    if len(request.units) == 1:
+        report("other units", "ok", "no other units")
+        return
+    try:
+        record = staff.snapshot()
+    except staff.StaffUnreadable as error:
+        record = error
     for unit in request.units:
         if unit.name == request.unit.name:
             continue
@@ -705,15 +713,15 @@ def other_units(request: MergeRequest, paths: tuple[str, ...]) -> None:
         branch_paths: set[str] = set(diff.stdout.splitlines()) if diff.returncode == 0 else set()
         worktree_paths: set[str] = set()
         try:
-            worktree = unit.worktree if isinstance(unit, Unit) else unit_lookup.plan_worktree(unit.cells, unit.member)
+            if isinstance(record, staff.StaffUnreadable):
+                raise record
+            worktree = unit_worktree(request.production, unit, record)
             status = git(worktree, "status", "--short")
             worktree_paths = {line[3:] for line in status.stdout.splitlines() if len(line) >= 4}
         except (staff.StaffUnreadable, staff.StaffRefused) as error:
             report("other units", "unavailable", f"{unit.name}: {error}")
         overlap = sorted(set(paths) & (branch_paths | worktree_paths))
         report("other units", "ok", f"{unit.name}: {', '.join(overlap) if overlap else 'no overlap'}")
-    if len(request.units) == 1:
-        report("other units", "ok", "no other units")
 
 
 def gate_names(request: MergeRequest, first_code_merge: bool) -> str:
@@ -1489,7 +1497,10 @@ def bump_gate_addresses(slug: str, unit: str) -> tuple[str, str]:
 
 def run(request: MergeRequest) -> int:
     try:
-        checkpoint = git(request.unit.worktree, "rev-parse", "--verify", f"{request.commit}^{{commit}}")
+        checkpoint = git(request.production.checkout, "rev-parse", "--verify", f"{request.commit}^{{commit}}")
+        if checkpoint.returncode:
+            checkpoint = git(unit_worktree(request.production, request.unit, staff.snapshot()),
+                             "rev-parse", "--verify", f"{request.commit}^{{commit}}")
         if checkpoint.returncode:
             raise Stop("ancestry", "failed", f"commit {request.commit} is absent",
                        "push the checkpoint and send its hash again")
@@ -1530,7 +1541,13 @@ def run(request: MergeRequest) -> int:
         elif isinstance(pushed, NotYetPushed):
             try:
                 if isinstance(request.kind, CodeCheckpoint):
-                    with merge_gate_wait(request.unit.worktree, request.phase, request.unit.name, request.commit):
+                    with ExitStack() as wait:
+                        try:
+                            worktree = unit_worktree(request.production, request.unit, staff.snapshot())
+                        except (staff.StaffUnreadable, staff.StaffRefused) as error:
+                            report("wait", "NotRecorded", str(error))
+                        else:
+                            _ = wait.enter_context(merge_gate_wait(worktree, request.phase, request.unit.name, request.commit))
                         tests_green = tests(request, paths, merge_head)
                 else:
                     tests_green = tests(request, paths, merge_head)

@@ -90,7 +90,8 @@ class FolderMoveBackend:
             self.environment(self.pid), self.kind + " resume " + self.fixture.owner.current_session, str(self.cwd))]
 
     def pane_activity(self, pane: str) -> herdr.PaneAtShell | herdr.PaneRunning:
-        self.fixture.assertEqual(pane, "w1:p1")
+        entry = pane_record.read(self.session)[pane]
+        self.fixture.assertIn(entry["session_id"], (self.fixture.owner.id, self.fixture.owner.current_session))
         return herdr.PaneRunning((self.kind,)) if self.live else herdr.PaneAtShell()
 
     def result(self, *arguments: str) -> dict[str, object]:
