@@ -16,7 +16,8 @@ Refer to finding numbers, or write `Pass` for an agent with no finding.
 Give each item a file, a line, the proposed change, and its reason.
 Mark each item `in-phase` or `held-for-decision`.
 An in-phase item preserves behavior and stays within the phase change.
-Hold every behavior change and every change outside the phase for the user's decision.
+Hold every behavior change and every change outside the phase.
+A held item goes to the user only when it touches money, safety, product behavior the user sees, or an act that cannot be undone. The director settles every other held item.
 Never hold an item that removes a copy. Mark it `in-phase`, also when it is outside the phase change.
 The director fixes it in the unit's own files, or sends it to the owner of the other files.
 Hold an item that adds a copy.
