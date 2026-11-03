@@ -17,9 +17,10 @@ Codex review prompts also include section 3's command block.
    State both file sets under <TeamFilePartition/>. Block changes to a peer's files.
    Require the summary as the last act at the full `${PHASE_DIR}/impl_summary_<slot>.txt` path.
    Include files, reasons, deviations, doubts, unverified checks, and edits outside the file set.
-   Include this instruction verbatim in implementation, fix, and test prompts:
+   Implementation, fix and test prompts carry verbatim:
    "Do not open the `rust_style` skill or run `load-rust-style.sh`; the reviewer worker owns the phase style review."
-   Use <ReviewPromptContract/> for the reviewer's style assignment.
+   Review prompts use
+   <ReviewPromptContract/>'s style assignment instead.
 3. Narration: require this command when the activity changes, with the concrete path and assigned slot:
    `bash ~/.claude/scripts/direct/board.sh post <concrete SESSION_DIR> <slot> status "<activity>"`.
    Use short present-tense text. Do not read the heartbeat file or post unchanged activity.
