@@ -622,7 +622,7 @@ def _summarize(entry: dict[str, object]) -> dict[str, object]:
     detail = _string(entry.get("detail"))
     if detail:
         summary["detail"] = detail
-    for key in ("route", "astra_reviews", "decision"):
+    for key in ("route", "astra_reviews", "decision", "decision_history"):
         if key in entry:
             summary[key] = entry[key]
     return summary
@@ -785,7 +785,10 @@ def _verdict(args: argparse.Namespace) -> None:
     entry = _finding(state, finding_id)
     outcome = _arg_string(args, "state")
     current = _string(entry.get("state"))
-    if current in (STATE_HELD, STATE_DECIDED):
+    answer = _string((_object_dict(entry.get("decision")) or {}).get("answer"))
+    if current == STATE_DECIDED and answer == "declined":
+        raise SystemExit(f"{finding_id} is closed by the declined decision; no closure verdict can change it")
+    if current == STATE_HELD or (current == STATE_DECIDED and answer != "approved"):
         raise SystemExit(f"{finding_id} requires the user's decision; no closure verdict can change it")
     # A verdict judges a repair that exists. While one is in flight nothing has
     # confirmed any edit landed, so there is nothing a reviewer could have read.
@@ -1220,26 +1223,58 @@ def _abandon(args: argparse.Namespace) -> None:
     )
 
 
+def _record_decision_event(session_dir: Path, state: dict[str, object], entry: dict[str, object]) -> None:
+    """Record the saved decision once, including its withdrawn ruling."""
+    decision = _object_dict(entry.get("decision")) or {}
+    event: dict[str, object] = {
+        "event_type": "finding_decision", "finding_id": entry["id"],
+        "timestamp": _iso_time(_number(decision.get("timestamp_epoch"))), **decision,
+        "phase_instance_id": _string(state.get("phase_instance_id")),
+    }
+    history = _object_list(entry.get("decision_history"))
+    if history:
+        event["withdrew"] = history[-1]
+    history_file = _history_file(session_dir)
+    if history_file is not None and history_file.exists():
+        for line in history_file.read_text(encoding="utf-8").splitlines():
+            recorded = _json_object(line)
+            if recorded is not None and all(recorded.get(key) == value for key, value in event.items()):
+                return
+    _append_event(session_dir, state, event)
+
+
 def _decision(args: argparse.Namespace) -> None:
     """Record the user's answer without applying the proposed change."""
     session_dir = _session_dir(args)
     now = _now_epoch()
     state = _read_state(session_dir, now, _arg_string(args, "phase"), closed_phase_ok=True)
     entry = _finding(state, _arg_string(args, "id"))
-    if _string(entry.get("state")) != STATE_HELD:
-        raise SystemExit("Only a finding held for a decision can receive an answer")
+    current = _string(entry.get("state"))
+    withdrawing = hasattr(args, "withdraw")
+    if current not in (STATE_HELD, STATE_DECIDED):
+        raise SystemExit("Only a held or decided finding can receive an answer")
+    if current == STATE_HELD and withdrawing:
+        raise SystemExit("--withdraw requires a decided finding; this finding has no ruling to withdraw")
+    previous = _object_dict(entry.get("decision")) or {}
+    answer = _arg_string(args, "answer")
+    words = _arg_string(args, "user_words").strip()
+    repeated = (current == STATE_DECIDED and previous.get("answer") == answer
+                and previous.get("user_words") == words)
+    if current == STATE_DECIDED and not withdrawing and not repeated:
+        raise SystemExit("This finding is decided; use --withdraw to replace its current ruling")
     decision: dict[str, object] = {
-        "answer": _arg_string(args, "answer"),
+        "answer": answer,
         "user_words": _required_text(args, "user_words"),
         "timestamp_epoch": now,
     }
-    entry["state"] = STATE_DECIDED
-    entry["decision"] = decision
-    _write_state(session_dir, state)
-    _append_event(session_dir, state, {
-        "event_type": "finding_decision", "finding_id": entry["id"],
-        "timestamp": _iso_time(now), **decision,
-    })
+    if not repeated:
+        if current == STATE_DECIDED:
+            withdrew = {**previous, "withdrawn_epoch": now, "withdraw_reason": _required_text(args, "withdraw")}
+            entry["decision_history"] = [*_object_list(entry.get("decision_history")), withdrew]
+        entry["state"] = STATE_DECIDED
+        entry["decision"] = decision
+        _write_state(session_dir, state)
+    _record_decision_event(session_dir, state, entry)
     print(f"{entry['id']} decided: {decision['answer']}")
 
 
@@ -1311,12 +1346,14 @@ def _build_parser() -> argparse.ArgumentParser:
     _ = opened.add_argument("--held-for-decision", action="store_true")
     opened.set_defaults(handler=_open)
 
-    decision = subparsers.add_parser("decision", help="record the user's answer to a held finding")
+    decision = subparsers.add_parser("decision", help="record the user's answer to a held or decided finding")
     _ = decision.add_argument("--session-dir", required=True)
     _ = decision.add_argument("--phase", default="", help=PHASE_HELP)
     _ = decision.add_argument("--id", required=True)
     _ = decision.add_argument("--answer", choices=("approved", "declined"), required=True)
     _ = decision.add_argument("--user-words", required=True)
+    _ = decision.add_argument("--withdraw", default=argparse.SUPPRESS,
+                              help="explain why the current ruling no longer stands")
     decision.set_defaults(handler=_decision)
 
     verdict = subparsers.add_parser("verdict", help="record a closure review's outcome")

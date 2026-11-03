@@ -688,7 +688,7 @@ class CodexZeroEpisodeTests(support.CodexZeroEpisodeFixture):
             _ = self.alert(spare_left=0)
             fallback.assert_called_once()
             self.assertEqual(quota_alert.registry_assignments()["direct"], "claude")
-            self.assertEqual(quota_alert.registry_assignments()["module_review"], "claude")
+            self.assertEqual(quota_alert.registry_assignments()["design_roles"], "claude")
             for minute in (2, 30):
                 _ = self.alert(self.now + timedelta(minutes=minute), spare_left=0)
             fallback.assert_called_once()
@@ -697,7 +697,7 @@ class CodexZeroEpisodeTests(support.CodexZeroEpisodeFixture):
         routed = [entry for entry in moves.read_journal() if entry["kind"] == "routed to claude"]
         self.assertEqual(len(routed), 1)
         self.assertEqual(routed[0]["cause"], "credits off")
-        self.assertEqual(set(routed[0]["moved"]), {"direct", "module_review"})
+        self.assertEqual(set(routed[0]["moved"]), {"direct", "design_roles"})
         push = self.zero_pushes()[-1]
         self.assertIn("Claude", push.body)
         self.assertIn("codex1", push.body)

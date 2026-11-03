@@ -714,15 +714,13 @@ def _routed_review_entries(path: Path, doc: Path, below: bool, record: staff.Sta
             print(f"change review: {source}: {error}", file=sys.stderr)
             continue
         snapshots[source] = snapshot
-        docs = change_routing.list_documents(snapshot.text)
-        for known in docs:
-            _ = documents.setdefault(slug_of(known), known)
-        if docs:
-            _ = documents.setdefault(listed[source].default_production, docs[0])
+    documents = change_routing.production_documents(documents,
+        ((listed[source].default_production, snapshot.text) for source, snapshot in snapshots.items()))
     routing = change_routing.StaffRouting(record, documents, ReviewHistoryReader())
     routing.prepare((listed[source].default_production, snapshot.pending) for source, snapshot in snapshots.items())
     return [(listed[source], routing.owner(row, listed[source].default_production), row)
-            for source, snapshot in snapshots.items() for row in snapshot.pending]
+            for source, snapshot in snapshots.items()
+            for row in change_routing.waiting_rows(source, snapshot.pending)]
 
 
 def scoped_review_entries(path: Path, doc: Path, below: bool = False) -> list[ScopedReviewEntry]:
@@ -785,7 +783,7 @@ class ChangeQueue:
 def change_queue(path: Path, scope: Path | WholeReviewList, below: bool = False) -> ChangeQueue:
     """The same change rows and pin for /next and change_review show."""
     if isinstance(scope, WholeReviewList):
-        return ChangeQueue(queue(path), row_entries(pending(path)))
+        return ChangeQueue(queue(path), row_entries(change_routing.waiting_rows(path, pending(path))))
     import showrunner_tree
 
     slug = slug_of(scope)

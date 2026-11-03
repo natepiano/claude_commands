@@ -1724,9 +1724,7 @@ def exec_account(label: str, arguments: list[str], *, probe: bool = False, accou
             "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_REMOTE_MEMORY_DIR", "CLAUDE_CODE_OAUTH_TOKEN",
         }))
     else:
-        prepared = prepared_account(label, resume="--resume" in arguments)
-    if isinstance(prepared, AccountRefused):
-        raise AccountsError(prepared.reason)
+        prepared = prepare_claude_launch(label, resume="--resume" in arguments)
     environment = launch_shell_environment(Path.cwd())
     for name in prepared.remove:
         _ = environment.pop(name, None)
@@ -1822,6 +1820,23 @@ def _claude_role_selection(group: ClaudeGroup, label: str) -> NamedAccount:
     return NamedAccount(label, claude_account_dir(label))
 
 
+def prepare_claude_launch(label: str, *, resume: bool) -> PreparedAccount:
+    """Prepare the account or report its refusal."""
+    prepared = prepared_account(label, resume=resume)
+    if isinstance(prepared, AccountRefused):
+        raise AccountsError(prepared.reason)
+    return prepared
+
+
+def claude_account_with_room(now: datetime) -> NamedAccount:
+    """Select and prepare a Claude account with quota."""
+    selected = pick("claude", now)
+    if isinstance(selected, NoAccountWithRoom):
+        raise AccountsError(no_room_line("claude", selected))
+    _ = prepare_claude_launch(selected.label, resume=False)
+    return NamedAccount(selected.label, selected.dir)
+
+
 def account_for_group_launch(role: Literal["unit", "showrunner"], *, resume: bool,
                              target: str = "", config_dir: str = "", source_fallback: bool = False) -> ClaudeLaunchAccount:
     """Use the group account, except for a moved unit restored on its source."""
@@ -1839,9 +1854,7 @@ def account_for_group_launch(role: Literal["unit", "showrunner"], *, resume: boo
     requested = claude_account_dir(target) if target else Path(config_dir).expanduser() if config_dir else directory
     if requested.resolve() != directory.resolve():
         raise AccountsError(f"accounts: {group} account is {label}; --account and --config-dir must name {label}")
-    prepared = prepared_account(label, resume=resume)
-    if isinstance(prepared, AccountRefused):
-        raise AccountsError(prepared.reason)
+    _ = prepare_claude_launch(label, resume=resume)
     return selected
 
 
@@ -1857,9 +1870,7 @@ def account_for_unscoped_launch(environment: Mapping[str, str], *, workers: bool
         target = read_role_map().workers_claude
         if isinstance(target, role_map.NamedWorkersClaudeAccount) and datetime.now(timezone.utc) < target.until:
             selected = claude_workers_account(target.label)
-            prepared = prepared_account(target.label, resume=True)
-            if isinstance(prepared, AccountRefused):
-                raise AccountsError(prepared.reason)
+            _ = prepare_claude_launch(target.label, resume=True)
             return selected
     configured = environment.get("CLAUDE_CONFIG_DIR", "")
     if not configured:
@@ -1870,9 +1881,7 @@ def account_for_unscoped_launch(environment: Mapping[str, str], *, workers: bool
     if not isinstance(identity, agent_accounts.NumberedAccount):
         raise AccountsError("accounts: caller has no numbered Claude account")
     directory = claude_account_dir(identity.label)
-    prepared = prepared_account(identity.label, resume=False)
-    if isinstance(prepared, AccountRefused):
-        raise AccountsError(prepared.reason)
+    _ = prepare_claude_launch(identity.label, resume=False)
     return NamedAccount(identity.label, directory)
 
 
@@ -5501,7 +5510,8 @@ def _local_session_counts() -> tuple[dict[tuple[Path, str], dict[str, str]], tup
             unit = launch["environment"].get("SHOWRUNNER_UNIT_ID", "")
             try:
                 # The live session id joins first; an older launch keeps its unit mark.
-                member = session_staff.unit_match(session_staff.ObservedUnit(unit), membership, identity)
+                member = session_staff.unit_match(session_staff.ObservedUnit(unit), membership,
+                                                 session_staff.LiveSession(identity))
                 if isinstance(member, session_staff.NoSuchMember) and unit:
                     member = session_staff.unit_match(session_staff.ObservedUnit(unit), membership)
             except (staff.StaffUnreadable, ValueError):

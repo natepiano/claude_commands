@@ -14,6 +14,63 @@ from scripts.lib.atomic_file import write_text_atomic
 
 
 class AtomicFileTests(unittest.TestCase):
+    def test_temporary_targets_match_the_names_used_for_publication(self) -> None:
+        for target in (".index.json", "report.1.2.html", ".draft.txt", "draft\nnotes.txt"):
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as directory:
+                self.assertEqual(atomic_file.temporary_target(f".{target}.123.456.tmp"), target)
+                path = Path(directory) / target
+                publish = os.replace
+                temporary_names: list[str] = []
+
+                def replace_file(source: Path, destination: Path) -> None:
+                    temporary_names.append(source.name)
+                    publish(source, destination)
+
+                with patch.object(os, "replace", side_effect=replace_file):
+                    atomic_file.write_bytes_atomic(path, b"complete content")
+                self.assertEqual(len(temporary_names), 1)
+                self.assertEqual(atomic_file.temporary_target(temporary_names[0]), target)
+                self.assertEqual(path.read_bytes(), b"complete content")
+        for name in ("index.json", ".index.json.bak", ".review-link-x", "draft.tmp"):
+            with self.subTest(name=name):
+                self.assertIsNone(atomic_file.temporary_target(name))
+
+    def test_cleanup_matches_the_complete_target_before_checking_the_process(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            temporary = root / ".report.12.34.5678.tmp"
+            _ = temporary.write_bytes(b"unfinished")
+            self.assertEqual(atomic_file.temporary_target(temporary.name), "report.12")
+            with patch.object(os, "kill", side_effect=ProcessLookupError(34)) as process:
+                atomic_file.remove_dead_temporary_files(root / "report")
+                process.assert_not_called()
+                self.assertTrue(temporary.exists())
+                atomic_file.remove_dead_temporary_files(root / "report.12")
+                process.assert_called_once_with(34, 0)
+            self.assertFalse(temporary.exists())
+
+    def test_explicit_binary_mode_applies_to_the_temporary_and_published_file(self) -> None:
+        for exists in (False, True):
+            with self.subTest(exists=exists), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "private.json"
+                if exists:
+                    _ = path.write_bytes(b"old")
+                    path.chmod(0o644)
+                publish = os.replace
+                modes: list[int] = []
+
+                def replace_file(source: Path, destination: Path) -> None:
+                    modes.append(stat.S_IMODE(source.stat().st_mode))
+                    self.assertEqual(source.read_bytes(), b"complete private record")
+                    publish(source, destination)
+
+                with patch.object(os, "replace", side_effect=replace_file):
+                    atomic_file.write_bytes_atomic(path, b"complete private record", mode=0o600)
+                self.assertEqual(modes, [0o600])
+                self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+                self.assertEqual(path.read_bytes(), b"complete private record")
+                self.assertEqual(list(path.parent.iterdir()), [path])
+
     def test_publication_failure_identifies_whether_the_complete_replacement_is_visible(self) -> None:
         for binary in (False, True):
             for stage in ("write", "flush", "fsync", "replace", "folder fsync"):

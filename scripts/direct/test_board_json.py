@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from scripts.production.staff_test_support import fixture_member, fixture_runtime_id
+from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, recorded_unit
 
 import json
 import os
@@ -136,7 +136,7 @@ class BoardJsonTests(unittest.TestCase):
         checkout.mkdir()
         worktree.mkdir()
         # live_unit_table retains a linked worktree without querying session marks.
-        _ = (worktree / ".git").write_text("gitdir: fixture\n", encoding="utf-8")
+        _ = subprocess.run(["git", "init", "-b", "branch", "--separate-git-dir", str(self.root / f"{slug}-unit-git"), str(worktree)], check=True, capture_output=True)
         plan = worktree / "plan.md"
         document = checkout / f"{slug}-production.md"
         _ = document.write_text("\n".join((
@@ -150,7 +150,7 @@ class BoardJsonTests(unittest.TestCase):
         )), encoding="utf-8")
         fixture = ProductionFixture(slug, checkout, worktree, plan, document)
         self.plan(fixture)
-        production_membership(slug, unit_name)
+        _ = recorded_unit(slug, unit_name, worktree, document, plan="plan.md")
         row = next(row for row in staff.find(kind="showrunner") if row.name == slug)
         _ = staff.set_doc(row.id, staff.LiveDoc("natedev", document))
         _ = fake_showrunner.write_timer(self.notifier, slug, row.id, "UTC", document)
@@ -219,12 +219,16 @@ class BoardJsonTests(unittest.TestCase):
             result = subprocess.run(arguments, capture_output=True, text=True, check=False)
             self.assertEqual(result.returncode, 0, result.stderr)
         fixture.plan.unlink()
+        configuration = fixture.worktree / ".unit.toml"
+        configuration_text = configuration.read_text(encoding="utf-8")
+        configuration.unlink()
         (fixture.worktree / ".git").unlink()
         result = subprocess.run(
             ["git", "-C", str(fixture.checkout), "worktree", "add", "--quiet", "--detach",
              str(fixture.worktree), "HEAD"], capture_output=True, text=True, check=False,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
+        _ = configuration.write_text(configuration_text, encoding="utf-8")
         _ = fixture.plan.write_text(
             "> **Standing:** style_plan.py\n\n"
             + f"### Phase {phase_id} — {title} · status: todo\n", encoding="utf-8",
@@ -721,6 +725,7 @@ class BoardJsonTests(unittest.TestCase):
             encoding="utf-8",
         )
 
+        _ = recorded_unit(fixture.slug, "alpha-unit", fixture.worktree, fixture.document, plan="as-built.md")
         _, unit = self.unit(fixture)
 
         self.assertEqual(unit["plan"], str(as_built))

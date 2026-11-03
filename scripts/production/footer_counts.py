@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import re
-import os
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
@@ -35,9 +34,7 @@ def total(each: list[FooterCounts]) -> FooterCounts:
 
 def changes(doc: Path) -> int:
     try:
-        root = Path(os.environ.get("REVIEW_LINKS_ROOT") or Path.home() / ".local/share/review-links").expanduser()
-        return sum(change_routing.waits_for_user(entry.review_list.path, entry.entry.item, root)
-                   for entry in change_review.scoped_review_entries(change_review.scope_list(doc), doc))
+        return len(change_review.scoped_review_entries(change_review.scope_list(doc), doc))
     except (change_review.ChangeReviewError, OSError):
         return 0
 
@@ -46,10 +43,8 @@ def unrouted_changes(doc: Path) -> int:
     """Count the same global unrouted tab as the change page."""
     try:
         current = change_review.scope_list(doc)
-        root = Path(os.environ.get("REVIEW_LINKS_ROOT") or Path.home() / ".local/share/review-links").expanduser()
         return sum(isinstance(owner, change_routing.UnroutedChange)
-                   and change_routing.waits_for_user(item.path, row, root)
-                   for item, owner, row in change_review.routed_review_entries(current, doc))
+                   for _, owner, _ in change_review.routed_review_entries(current, doc))
     except (change_review.ChangeReviewError, OSError):
         return 0
 
@@ -98,7 +93,7 @@ def read_counts(doc: Path, *, questions: int = 0) -> FooterCounts:
 
 def routing_sources() -> list[Path]:
     """Watch staff, all review lists, and delivery records for tab count changes."""
-    root = Path(os.environ.get("REVIEW_LINKS_ROOT") or Path.home() / ".local/share/review-links").expanduser()
+    root = change_routing.review_root()
     record = staff.snapshot()
     routing = change_routing.StaffRouting(record, showrunners.timer_docs(), change_review.ReviewHistoryReader())
     return [*(source for repo in routing.repository_choices({}, "") for source in change_routing.history_sources(repo)),

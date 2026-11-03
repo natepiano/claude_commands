@@ -160,11 +160,11 @@ class Nowhere:
     pass
 
 
-def parked_path(unit: StaffId) -> Path:
+def parked_path(unit: StaffId, *, home: Path | None = None) -> Path:
     """Park on this machine, independently of the staff record's owner."""
     if not unit or Path(unit).name != unit or unit in (".", ".."):
         raise ConfigRefused(f"invalid staff id for parked configuration: {unit!r}")
-    return Path.home() / ".local/state/staff/units" / f"{unit}.toml"
+    return (Path.home() if home is None else home) / ".local/state/staff/units" / f"{unit}.toml"
 
 
 def _string(fields: dict[str, object], key: str) -> str:
@@ -174,7 +174,8 @@ def _string(fields: dict[str, object], key: str) -> str:
     return value
 
 
-def _decode(fields: dict[str, object]) -> UnitConfig:
+def decode(fields: dict[str, object]) -> UnitConfig:
+    """Validate configuration fields from local or remote TOML."""
     unknown = set(fields) - {"plan", "port", "responsibilities", "retired", "taplo_config"}
     if unknown:
         raise ConfigRefused(f"unknown key: {sorted(unknown)[0]}")
@@ -215,7 +216,7 @@ def _read_file(path: Path, *, cleanup: bool = True) -> UnitConfig | ConfigMissin
     try:
         if cleanup and path.parent.exists():
             atomic_file.remove_dead_temporary_files(path)
-        return _decode(cast(dict[str, object], tomllib.loads(path.read_text(encoding="utf-8"))))
+        return decode(cast(dict[str, object], tomllib.loads(path.read_text(encoding="utf-8"))))
     except FileNotFoundError:
         return ConfigMissing(f"{path}: configuration is missing")
     except (OSError, UnicodeError, ValueError) as error:
@@ -301,7 +302,7 @@ def _formatted(config: UnitConfig, worktree: Path | UnrecordedStartFolder,
         raise ConfigRefused(f"{worktree}: cannot format configuration with taplo: {error}") from error
     if result.returncode:
         raise ConfigRefused(f"{worktree}: taplo failed: {result.stderr.decode('utf-8', errors='replace').strip()}")
-    if _decode(cast(dict[str, object], tomllib.loads(result.stdout.decode("utf-8")))) != config:
+    if decode(cast(dict[str, object], tomllib.loads(result.stdout.decode("utf-8")))) != config:
         raise ConfigRefused(f"{worktree}: taplo changed configuration values")
     return result.stdout
 

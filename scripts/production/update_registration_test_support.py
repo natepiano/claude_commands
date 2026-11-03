@@ -27,9 +27,10 @@ from scripts.production import staff, unit_names
 import dailies_render as dailies_render
 from production_units import read_production as read_production
 from scripts.production.cli_fixture import invoke_cli, production_paths
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production.staff_test_support import (
-    fixture_member, fixture_showrunner_name, isolated_staff_file, showrunner_launch, showrunner_relationship,
+    fixture_member, fixture_showrunner_name, isolated_staff_file, recorded_showrunner, showrunner_launch, showrunner_relationship,
 )
 
 if TYPE_CHECKING:
@@ -177,8 +178,7 @@ class RegistrationFixture(unittest.TestCase):
             f"| `alpha-unit` | `docs/alpha.md` | `{alpha}` | `alpha` | — | — |",
             "", "## Gates", "",
         )), encoding="utf-8")
-        runner = showrunner_relationship(fixture_showrunner_name("example", self.doc))
-        _ = staff.set_doc(runner.id, staff.LiveDoc("natedev", self.doc))
+        runner = recorded_showrunner(fixture_showrunner_name("example", self.doc), self.doc)
         _ = fixture_member("unit", name="alpha", parent=runner.id,
                            worktree=staff.PresentWorktree("natedev", alpha))
         _ = self.git("add", ".")
@@ -288,7 +288,8 @@ class RegistrationFixture(unittest.TestCase):
             return self.doc
         document = self.doc.with_name(f"{slug}-production.md")
         if not document.exists():
-            _ = document.write_text(self.doc.read_text().replace("# Production — example", f"# Production — {slug}"))
+            write_text_atomic(document, self.doc.read_text().replace("example", slug).replace(
+                "- **Showrunner session:** first-showrunner", f"- **Showrunner session:** {slug}"))
         return document
 
     def fixture_staff_id(self, reference: str = "", slug: str = "example") -> staff.StaffId:
