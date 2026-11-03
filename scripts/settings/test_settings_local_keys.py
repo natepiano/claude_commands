@@ -284,6 +284,20 @@ else:
                 self.assertEqual(bool(status), shared != 1)
                 self.assertEqual(json.loads(self.git("show", ":settings.json")), {"shared": 1})
 
+    def test_refresh_keeps_an_executable_mode_change_unstaged(self) -> None:
+        self.write_settings({"shared": 1, "voice": {"enabled": True}})
+        self.settings.chmod(0o755)
+        for filemode in ("true", "false"):
+            with self.subTest(filemode=filemode):
+                _ = self.git("config", "core.filemode", filemode)
+                before = self.git("ls-files", "--stage", "--", "settings.json")
+                self.assertTrue(before.startswith("100644 "))
+                _ = self.refresh()
+                self.assertEqual(self.git("ls-files", "--stage", "--", "settings.json"), before)
+                status = self.git("status", "--porcelain", "--untracked-files=no")
+                self.assertEqual(status, " M settings.json\n" if filemode == "true" else "")
+                self.assertEqual(self.settings.stat().st_mode & 0o777, 0o755)
+
     def test_snapshot_failure_stops_required_filter_and_keeps_its_error_log(self) -> None:
         self.write_settings({"shared": 1, "newSetting": True})
         self.sidecar.mkdir()
