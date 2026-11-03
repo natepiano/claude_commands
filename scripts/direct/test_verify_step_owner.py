@@ -80,6 +80,7 @@ class VerifyStepOwnerTests(unittest.TestCase):
             "XDG_STATE_HOME": str(self.root / "state"),
             "BUILDLOG_DIR": str(self.root / "buildlog"),
             "BUILDLOG_PEAK": "",
+            "BUILD_FOLDERS_SCRIPT": str(VERIFY.parent.parent / "lib" / "build_folders.py"),
             "BUILD_HOLD_DIR": str(self.root / "holders"),
             "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
             "BOARD_DIR": str(self.root / "board"),

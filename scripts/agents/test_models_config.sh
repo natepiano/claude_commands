@@ -3,22 +3,22 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-source "$SCRIPT_DIR/../lib/test_agents_registry.sh"
+source "$SCRIPT_DIR/../lib/test_models_registry.sh"
 TEST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/agents-config.XXXXXX")"
 trap 'rm -rf "$TEST_DIR"' EXIT
 
-AGENTS_CONFIG_FILE="$TEST_DIR/agents.conf"
-AGENTS_CONFIG_PUBLISH=0
+MODELS_CONFIG_FILE="$TEST_DIR/models.conf"
+MODELS_CONFIG_PUBLISH=0
 CODEX_CONFIG_FILE="$TEST_DIR/codex.toml"
 CODEX_MODELS_CACHE_FILE="$TEST_DIR/models.json"
 CODEX_CATALOG_SYNC_STATE_FILE="$TEST_DIR/last_success"
-export AGENTS_CONFIG_FILE AGENTS_CONFIG_PUBLISH CODEX_CONFIG_FILE
+export MODELS_CONFIG_FILE MODELS_CONFIG_PUBLISH CODEX_CONFIG_FILE
 export CODEX_MODELS_CACHE_FILE CODEX_CATALOG_SYNC_STATE_FILE
 
 touch "$CODEX_CATALOG_SYNC_STATE_FILE"
 
 write_fixture() {
-    cp "$1" "$AGENTS_CONFIG_FILE"
+    cp "$1" "$MODELS_CONFIG_FILE"
 }
 
 write_test_registry "$TEST_DIR/base.conf" --replace-provided-sections --replace-section claude.families \
@@ -99,7 +99,7 @@ write_test_registry "$TEST_DIR/model.conf" --replace-provided-sections \
     claude.agents/sonnet=low,medium,high,max
 
 write_fixture "$TEST_DIR/base.conf"
-source "$SCRIPT_DIR/agents_config.sh"
+source "$SCRIPT_DIR/models_config.sh"
 
 fail() {
     echo "$1" >&2
@@ -116,16 +116,16 @@ assert_fails() {
 
 # Compare every semantic row so edits outside the requested target fail.
 assert_registry_matches() {
-    diff -u <(registry_records < "$1") <(agents_registry_text | registry_records)
+    diff -u <(registry_records < "$1") <(models_registry_text | registry_records)
 }
 
 test_resolve_reads_registry_once() (
-    AGENTS_CONFIG_FILE="$TEST_DIR/read-once.conf"
+    MODELS_CONFIG_FILE="$TEST_DIR/read-once.conf"
     write_fixture "$TEST_DIR/base.conf"
     # A file counts reads in command substitutions as well as this shell.
-    registry_reader="$(declare -f agents_registry_text)"
-    eval "${registry_reader/agents_registry_text /test_original_registry_text }"
-    agents_registry_text() {
+    registry_reader="$(declare -f models_registry_text)"
+    eval "${registry_reader/models_registry_text /test_original_registry_text }"
+    models_registry_text() {
         printf 'read\n' >> "$TEST_DIR/registry-reads"
         test_original_registry_text "$@"
     }
@@ -143,53 +143,53 @@ test_resolve_reads_registry_once() (
                 || fail "single-read resolve changed the exact-task override"
         fi
     done
-    echo "agents_config single-read tests passed"
+    echo "models_config single-read tests passed"
 )
 
 test_registry_edit_refreshes_readers() (
-    AGENTS_CONFIG_FILE="$TEST_DIR/edit-refresh.conf"
+    MODELS_CONFIG_FILE="$TEST_DIR/edit-refresh.conf"
     write_fixture "$TEST_DIR/base.conf"
     agents_resolve alpha.work
     [[ "$AGENT_EFFORT" == high ]] || fail "edit fixture did not start at high effort"
     store_changed_effort() {
-        sed 's/^work=gpt-test:high$/work=gpt-test:medium/' < <(agents_registry_text) \
+        sed 's/^work=gpt-test:high$/work=gpt-test:medium/' < <(models_registry_text) \
             > "$TEST_DIR/edited-registry.conf"
-        agents_registry_store "$TEST_DIR/edited-registry.conf" "test effort edit"
+        models_registry_store "$TEST_DIR/edited-registry.conf" "test effort edit"
     }
-    agents_registry_edit store_changed_effort
+    models_registry_edit store_changed_effort
     agents_resolve alpha.work
     [[ "$AGENT_MODEL" == gpt-test && "$AGENT_EFFORT" == medium ]] \
         || fail "same-shell resolve kept registry values from before the edit"
-    echo "agents_config edit refresh tests passed"
+    echo "models_config edit refresh tests passed"
 )
 
 test_changed_registry_file_refreshes_readers() (
-    AGENTS_CONFIG_FILE="$TEST_DIR/first-registry.conf"
+    MODELS_CONFIG_FILE="$TEST_DIR/first-registry.conf"
     write_fixture "$TEST_DIR/base.conf"
     sed 's/^work=gpt-test:high$/work=gpt-test:medium/' "$TEST_DIR/base.conf" \
         > "$TEST_DIR/second-registry.conf"
     agents_resolve alpha.work
     [[ "$AGENT_EFFORT" == high ]] || fail "first registry did not resolve high effort"
-    AGENTS_CONFIG_FILE="$TEST_DIR/second-registry.conf"
+    MODELS_CONFIG_FILE="$TEST_DIR/second-registry.conf"
     agents_resolve alpha.work
     [[ "$AGENT_MODEL" == gpt-test && "$AGENT_EFFORT" == medium ]] \
         || fail "same-shell resolve kept values from the previous registry file"
-    AGENTS_CONFIG_FILE="$TEST_DIR/first-registry.conf"
+    MODELS_CONFIG_FILE="$TEST_DIR/first-registry.conf"
     agents_resolve alpha.work
     [[ "$AGENT_MODEL" == gpt-test && "$AGENT_EFFORT" == high ]] \
         || fail "switching back to the first registry kept the second file's values"
-    echo "agents_config file refresh tests passed"
+    echo "models_config file refresh tests passed"
 )
 
 test_model_families() (
     # Keep these fixtures separate from the legacy mutation cases below. A
     # generated family row may lag the cache until the next catalog sync.
-    AGENTS_CONFIG_FILE="$TEST_DIR/families.conf"
-    # /agent sources the resolver in a child; keep the freshness gate closed
+    MODELS_CONFIG_FILE="$TEST_DIR/families.conf"
+    # /default_models sources the resolver in a child; keep the freshness gate closed
     # so these effort-less cache fixtures exercise resolution alone.
-    AGENTS_CONFIG_TIER_ONLY=1
-    export AGENTS_CONFIG_TIER_ONLY
-    write_test_registry "$AGENTS_CONFIG_FILE" --replace-provided-sections \
+    MODELS_CONFIG_TIER_ONLY=1
+    export MODELS_CONFIG_TIER_ONLY
+    write_test_registry "$MODELS_CONFIG_FILE" --replace-provided-sections \
         assignments/launch=codex \
         assignments/launch.claude=claude \
         launch.codex/work=sol:xhigh \
@@ -234,11 +234,11 @@ EOF
         || fail "invalid family effort was reported as an unknown model"
     assert_fails "cache family absent from [codex.families]" agents_resolve launch.undeclared
 
-    admin_output="$(bash "$SCRIPT_DIR/agent_admin.sh" launch)" \
-        || fail "/agent could not display family assignments"
+    admin_output="$(bash "$SCRIPT_DIR/default_models.sh" launch)" \
+        || fail "/default_models could not display family assignments"
     family_display="$(printf '%s\n' "$admin_output" | awk '$1 == "task=launch.work" { print }')"
     [[ "$family_display" == *" word=sol"* && "$family_display" == *" agent=gpt-6.10-sol "* ]] \
-        || fail "/agent did not display both the family word and its current slug"
+        || fail "/default_models did not display both the family word and its current slug"
 
     # Unreadable and hidden-only caches must never fall back to the
     # previously generated family row. Explicit slugs remain usable offline.
@@ -277,17 +277,17 @@ EOF
         [[ "$cache_state" != unreadable ]] || chmod 600 "$CODEX_MODELS_CACHE_FILE"
     done
     rm -f "$CODEX_MODELS_CACHE_FILE"
-    echo "agents_config model-family tests passed"
+    echo "models_config model-family tests passed"
 )
 
 test_model_families
 
 test_family_repairs() (
-    AGENTS_CONFIG_FILE="$TEST_DIR/family-repairs.conf"
+    MODELS_CONFIG_FILE="$TEST_DIR/family-repairs.conf"
     CODEX_MODELS_CACHE_FILE="$TEST_DIR/family-repairs.json"
-    AGENTS_CONFIG_TIER_ONLY=1
-    export AGENTS_CONFIG_TIER_ONLY
-    write_test_registry "$AGENTS_CONFIG_FILE" --replace-provided-sections \
+    MODELS_CONFIG_TIER_ONLY=1
+    export MODELS_CONFIG_TIER_ONLY
+    write_test_registry "$MODELS_CONFIG_FILE" --replace-provided-sections \
         assignments/direct=codex \
         assignments/probe=codex \
         assignments/dormant=claude \
@@ -324,12 +324,12 @@ EOF
             || fail "numeric version tie depended on cache order: $slug_order"
     done
 
-    agents_registry_text > "$TEST_DIR/family-row-before.conf"
+    models_registry_text > "$TEST_DIR/family-row-before.conf"
     awk '/^\[/ { editing = ($0 == "[direct.codex]") }
          editing { sub(/^review=gpt-6.1-sol:high$/, "review=sol:max") }
          { print }' "$TEST_DIR/family-row-before.conf" > "$TEST_DIR/family-row-expected.conf"
-    bash "$SCRIPT_DIR/agent_admin.sh" direct.review sol:max > "$TEST_DIR/family-admin-output" \
-        || fail "/agent direct.review sol:max rejected a valid family edit"
+    bash "$SCRIPT_DIR/default_models.sh" direct.review sol:max > "$TEST_DIR/family-admin-output" \
+        || fail "/default_models direct.review sol:max rejected a valid family edit"
     assert_registry_matches "$TEST_DIR/family-row-expected.conf" \
         || fail "family row edit stored a slug or changed another registry row"
     agents_resolve direct.review || fail "stored family review row did not resolve"
@@ -341,8 +341,8 @@ EOF
          /^dormant=claude$/ { $0 = "dormant=codex" }
          codex_rows { sub(/=gpt-6.1-sol:/, "=sol:") }
          { print }' "$TEST_DIR/family-row-expected.conf" > "$TEST_DIR/family-sweep-expected.conf"
-    bash "$SCRIPT_DIR/agent_admin.sh" sol > "$TEST_DIR/family-admin-output" \
-        || fail "/agent sol rejected a valid family sweep"
+    bash "$SCRIPT_DIR/default_models.sh" sol > "$TEST_DIR/family-admin-output" \
+        || fail "/default_models sol rejected a valid family sweep"
     assert_registry_matches "$TEST_DIR/family-sweep-expected.conf" \
         || fail "family sweep expanded the word to a slug, lost efforts, or changed unrelated rows"
     agents_resolve direct.impl || fail "swept family implementation row did not resolve"
@@ -352,7 +352,7 @@ EOF
     agents_set_assignment dormant claude
     rm "$CODEX_MODELS_CACHE_FILE"
     no_model_message="the models cache could not be read: $CODEX_MODELS_CACHE_FILE"
-    admin_output="$(bash "$SCRIPT_DIR/agent_admin.sh" dormant)" \
+    admin_output="$(bash "$SCRIPT_DIR/default_models.sh" dormant)" \
         || fail "missing cache blocked status for a function running on Claude"
     dormant_display="$(printf '%s\n' "$admin_output" | awk '/^task=dormant.work family=codex /')"
     [[ "$dormant_display" == *"sol (unresolved: $no_model_message"* && "$dormant_display" == *"active=no"* ]] \
@@ -362,7 +362,7 @@ EOF
         || fail "unresolved Codex status stopped before the active Claude row"
     agents_resolve dormant.work || fail "unresolved dormant family blocked a Claude launch"
     [[ "$AGENT_MODEL" == haiku ]] || fail "Claude launch used the dormant family"
-    admin_output="$(bash "$SCRIPT_DIR/agent_admin.sh" probe)" \
+    admin_output="$(bash "$SCRIPT_DIR/default_models.sh" probe)" \
         || fail "missing cache blocked status for an active family row"
     [[ "$admin_output" == *"sol (unresolved: $no_model_message"* ]] \
         || fail "active family status did not show its resolution failure"
@@ -370,7 +370,7 @@ EOF
     stderr_out="$(agents_resolve probe.work 2>&1 >/dev/null)" || resolve_status=$?
     [[ "$resolve_status" -eq 1 && "$stderr_out" == *"$no_model_message"* ]] \
         || fail "a launch needing the unresolved family did not fail with the recovery reason"
-    echo "agents_config family repair tests passed"
+    echo "models_config family repair tests passed"
 )
 
 test_family_repairs
@@ -393,8 +393,8 @@ assert_fails "empty effort" agents_resolve empty_effort.work
 
 agents_resolve literal.work
 [[ "$AGENT_FAMILY" == "codex" ]] || fail "regex-like exact-task key matched literal.work"
-[[ -z "$(_agents_registry_get assignments literal.work)" ]] || fail "literal lookup matched literalxwork"
-[[ "$(_agents_registry_get assignments literalxwork)" == "claude" ]] || fail "literal lookup missed literalxwork"
+[[ -z "$(_models_registry_get assignments literal.work)" ]] || fail "literal lookup matched literalxwork"
+[[ "$(_models_registry_get assignments literalxwork)" == "claude" ]] || fail "literal lookup missed literalxwork"
 
 agents_resolve bare.work
 [[ "$AGENT_MODEL" == "gpt-test" && -z "$AGENT_EFFORT" ]] || fail "bare agent did not produce empty effort"
@@ -407,13 +407,13 @@ stderr_out="$(agents_resolve bare_catalog_effort.work 2>&1 >/dev/null || true)"
 [[ "$stderr_out" != *"is not allowed for family"* ]] || fail "empty-effort catalog agent with effort failed as an unknown-agent error"
 
 before="$TEST_DIR/before.conf"
-agents_registry_text | sed 's/[[:space:]]*#.*$//' > "$before"
+models_registry_text | sed 's/[[:space:]]*#.*$//' > "$before"
 assert_fails "invalid assignment set" agents_set_assignment switchable claude
 assert_registry_matches "$before" || fail "rejected assignment changed the registry"
 
 before="$TEST_DIR/assignable-before.conf"
 expected="$TEST_DIR/assignable-expected.conf"
-agents_registry_text | sed 's/[[:space:]]*#.*$//' > "$before"
+models_registry_text | sed 's/[[:space:]]*#.*$//' > "$before"
 sed 's/^assignable=codex$/assignable=claude/' "$before" > "$expected"
 agents_set_assignment assignable claude
 assert_registry_matches "$expected" || fail "successful assignment changed rows other than its assignment"
@@ -423,7 +423,7 @@ agents_resolve assignable.work
 
 before="$TEST_DIR/editable-before.conf"
 expected="$TEST_DIR/editable-expected.conf"
-agents_registry_text | sed 's/[[:space:]]*#.*$//' > "$before"
+models_registry_text | sed 's/[[:space:]]*#.*$//' > "$before"
 assert_fails "invalid row agent" agents_set_row editable.work nosuch:high
 assert_registry_matches "$before" || fail "rejected row agent changed the registry"
 assert_fails "invalid row effort" agents_set_row editable.work gpt-test:max
@@ -446,7 +446,7 @@ assert_registry_matches "$expected" || fail "row edit did not preserve a literal
 write_fixture "$TEST_DIR/base.conf"
 before="$TEST_DIR/infer-before.conf"
 expected="$TEST_DIR/infer-expected.conf"
-agents_registry_text | sed 's/[[:space:]]*#.*$//' > "$before"
+models_registry_text | sed 's/[[:space:]]*#.*$//' > "$before"
 
 # The agent names its own family: a claude agent edits the claude row even
 # though the function is assigned to codex, and reports the row as dormant.
@@ -477,7 +477,7 @@ agents_set_row alpha.claude_task opus:high
 
 write_fixture "$TEST_DIR/base.conf"
 before="$TEST_DIR/reject-before.conf"
-agents_registry_text | sed 's/[[:space:]]*#.*$//' > "$before"
+models_registry_text | sed 's/[[:space:]]*#.*$//' > "$before"
 
 assert_fails "agent in two catalogs" agents_set_row editable.work collide:low
 assert_registry_matches "$before" || fail "ambiguous agent changed the registry"
@@ -512,7 +512,7 @@ printf '%s\n' "$assignment_list" | grep -q '^task=override.work family=claude ' 
 write_fixture "$TEST_DIR/switchall.conf"
 before="$TEST_DIR/switchall-before.conf"
 expected="$TEST_DIR/switchall-expected.conf"
-agents_registry_text | sed 's/[[:space:]]*#.*$//' > "$before"
+models_registry_text | sed 's/[[:space:]]*#.*$//' > "$before"
 sed -e 's/^one=codex$/one=claude/' \
     -e 's/^one\.work=codex$/one.work=claude/' \
     -e 's/^two=codex$/two=claude/' \
@@ -527,7 +527,7 @@ agents_set_all_assignments codex
 assert_registry_matches "$before" || fail "switch-all reversal changed registry rows"
 
 before="$TEST_DIR/switchall-reject.conf"
-agents_registry_text | sed 's/[[:space:]]*#.*$//' > "$before"
+models_registry_text | sed 's/[[:space:]]*#.*$//' > "$before"
 assert_fails "unknown family" agents_set_all_assignments nosuch
 assert_registry_matches "$before" || fail "unknown family changed the registry"
 stderr_out="$(agents_set_all_assignments nosuch 2>&1 >/dev/null || true)"
@@ -537,7 +537,7 @@ stderr_out="$(agents_set_all_assignments nosuch 2>&1 >/dev/null || true)"
 # codex-only functions in this fixture are pinned and do not cause it.
 write_fixture "$TEST_DIR/base.conf"
 before="$TEST_DIR/switchall-base.conf"
-agents_registry_text | sed 's/[[:space:]]*#.*$//' > "$before"
+models_registry_text | sed 's/[[:space:]]*#.*$//' > "$before"
 assert_fails "switch-all with a missing set" agents_set_all_assignments claude
 assert_registry_matches "$before" || fail "rejected switch-all changed the registry"
 stderr_out="$(agents_set_all_assignments claude 2>&1 >/dev/null || true)"
@@ -550,7 +550,7 @@ stderr_out="$(agents_set_all_assignments claude 2>&1 >/dev/null || true)"
 write_fixture "$TEST_DIR/model.conf"
 before="$TEST_DIR/model-before.conf"
 expected="$TEST_DIR/model-expected.conf"
-agents_registry_text | sed 's/[[:space:]]*#.*$//' > "$before"
+models_registry_text | sed 's/[[:space:]]*#.*$//' > "$before"
 sed -e 's/^one=claude$/one=codex/' \
     -e 's/^one\.work=claude$/one.work=codex/' \
     -e 's/^two=claude$/two=codex/' \
@@ -641,7 +641,7 @@ agents_resolve plain.work
 [[ "$AGENT_FAMILY" == "codex" ]] || fail "a fixed assignment beside a caller stopped resolving"
 
 before="$TEST_DIR/caller-before.conf"
-agents_registry_text | sed 's/[[:space:]]*#.*$//' > "$before"
+models_registry_text | sed 's/[[:space:]]*#.*$//' > "$before"
 assert_fails "switching a caller function" agents_set_assignment friend codex
 assert_registry_matches "$before" || fail "rejected caller switch changed the registry"
 stderr_out="$(agents_set_assignment friend codex 2>&1 >/dev/null || true)"
@@ -745,7 +745,7 @@ write_test_registry "$TEST_DIR/tierset.conf" --replace-provided-sections \
 write_fixture "$TEST_DIR/tierset.conf"
 before="$TEST_DIR/tierset-before.conf"
 expected="$TEST_DIR/tierset-expected.conf"
-agents_registry_text | sed 's/[[:space:]]*#.*$//' > "$before"
+models_registry_text | sed 's/[[:space:]]*#.*$//' > "$before"
 
 # A function without an options section gets one after its last row.
 awk '{ print }
@@ -766,7 +766,7 @@ assert_registry_matches "$expected" || fail "function tier changed rows other th
 sed '/^codex_service_tier=flex/d' "$before" > "$expected"
 agents_set_service_tier inherit kept
 assert_registry_matches "$expected" || fail "inherit removed more than the tier key"
-[[ "$(_agents_registry_get kept.options codex_mesh)" == "1" ]] || fail "inherit dropped another launch flag"
+[[ "$(_models_registry_get kept.options codex_mesh)" == "1" ]] || fail "inherit dropped another launch flag"
 
 # A row key beats its function's key; inherit on the row falls back to it.
 write_fixture "$TEST_DIR/tierset.conf"
@@ -793,7 +793,7 @@ agents_set_service_tier default kept.check
 agents_set_service_tier fast kept
 agents_resolve kept.check
 [[ "$AGENT_SERVICE_TIER" == "fast" ]] || fail "function tier left a row key in charge"
-if grep -q '^codex_service_tier.check=' <(agents_registry_text); then fail "function tier did not clear the row key"; fi
+if grep -q '^codex_service_tier.check=' <(models_registry_text); then fail "function tier did not clear the row key"; fi
 
 # Every function at once: each function with a codex set, row keys cleared.
 write_fixture "$TEST_DIR/tierset.conf"
@@ -801,10 +801,10 @@ agents_set_service_tier default kept.check
 agents_set_service_tier fast
 [[ "$AGENT_TIER_FUNCTIONS" == "kept bare resting friend" ]] || fail "every-function tier covered '$AGENT_TIER_FUNCTIONS'"
 for fn in kept bare resting friend; do
-    [[ "$(_agents_registry_get "$fn.options" codex_service_tier)" == "fast" ]] || fail "every-function tier missed $fn"
+    [[ "$(_models_registry_get "$fn.options" codex_service_tier)" == "fast" ]] || fail "every-function tier missed $fn"
 done
-if _agents_config_has_section clauded.options; then fail "every-function tier wrote a function with no codex set"; fi
-if grep -q '^codex_service_tier.check=' <(agents_registry_text); then fail "every-function tier did not clear a row key"; fi
+if _models_config_has_section clauded.options; then fail "every-function tier wrote a function with no codex set"; fi
+if grep -q '^codex_service_tier.check=' <(models_registry_text); then fail "every-function tier did not clear a row key"; fi
 
 # A claude function keeps its tier dormant: stored, shown, never passed on.
 agents_resolve resting.work
@@ -826,18 +826,18 @@ assert_fails "tier for a three-segment task" agents_set_service_tier fast kept.w
 assert_fails "tier for an empty sub-task" agents_set_service_tier fast kept.
 assert_registry_matches "$before" || fail "a rejected tier changed the registry"
 
-# agent_admin.sh routes a tier word at each level and says whether it runs.
+# default_models.sh routes a tier word at each level and says whether it runs.
 admin_first_line() {
     local output
-    output="$(AGENTS_CONFIG_FILE="$AGENTS_CONFIG_FILE" CODEX_CONFIG_FILE="$CODEX_CONFIG_FILE" \
+    output="$(MODELS_CONFIG_FILE="$MODELS_CONFIG_FILE" CODEX_CONFIG_FILE="$CODEX_CONFIG_FILE" \
         CODEX_MODELS_CACHE_FILE="$CODEX_MODELS_CACHE_FILE" \
         CODEX_CATALOG_SYNC_STATE_FILE="$CODEX_CATALOG_SYNC_STATE_FILE" \
-        bash "$SCRIPT_DIR/agent_admin.sh" "$@")"
+        bash "$SCRIPT_DIR/default_models.sh" "$@")"
     printf '%s' "${output%%$'\n'*}"
 }
 [[ "$(admin_first_line bare fast)" == "# set [bare.options] codex_service_tier=fast — live" ]] \
     || fail "function tier message is wrong"
-[[ "$(admin_first_line resting.work flex)" == "# set [resting.options] codex_service_tier.work=flex — dormant: resting.work runs on claude. Make it live with: agent_admin.sh resting codex" ]] \
+[[ "$(admin_first_line resting.work flex)" == "# set [resting.options] codex_service_tier.work=flex — dormant: resting.work runs on claude. Make it live with: default_models.sh resting codex" ]] \
     || fail "dormant row tier message is wrong"
 [[ "$(admin_first_line friend fast)" == "# set [friend.options] codex_service_tier=fast — live whenever a codex session runs friend" ]] \
     || fail "caller tier message is wrong"
@@ -847,7 +847,7 @@ admin_first_line() {
     || fail "every-function tier message is wrong"
 [[ "$(admin_first_line inherit)" == "# cleared every function's codex tier — codex rows follow ~/.codex/config.toml, which sets no service_tier" ]] \
     || fail "every-function inherit message is wrong"
-assert_registry_matches "$expected" || fail "agent_admin.sh inherit did not clear every key"
+assert_registry_matches "$expected" || fail "default_models.sh inherit did not clear every key"
 
 # `pace` takes the pacer's fresh decision, and default when it is stale or absent.
 write_test_registry "$TEST_DIR/pace.conf" --replace-provided-sections \
@@ -871,7 +871,7 @@ agents_resolve paced.work
 [[ "$AGENT_SERVICE_TIER" == "default" ]] || fail "a missing pacer decision did not fall back to default"
 agents_set_service_tier default paced
 agents_set_service_tier pace paced
-[[ "$(_agents_registry_get paced.options codex_service_tier)" == "pace" ]] || fail "pace could not be set"
+[[ "$(_models_registry_get paced.options codex_service_tier)" == "pace" ]] || fail "pace could not be set"
 
 # Production has only a Claude set. Every-function switches keep it, while a
 # direct switch of production must refuse before changing a byte.
@@ -889,15 +889,15 @@ write_test_registry "$TEST_DIR/production.conf" --replace-provided-sections \
     claude.agents/sonnet=low,medium,high,xhigh
 
 admin() {
-    AGENTS_CONFIG_FILE="$AGENTS_CONFIG_FILE" CODEX_CONFIG_FILE="$CODEX_CONFIG_FILE" \
+    MODELS_CONFIG_FILE="$MODELS_CONFIG_FILE" CODEX_CONFIG_FILE="$CODEX_CONFIG_FILE" \
         CODEX_MODELS_CACHE_FILE="$CODEX_MODELS_CACHE_FILE" \
         CODEX_CATALOG_SYNC_STATE_FILE="$CODEX_CATALOG_SYNC_STATE_FILE" \
-        bash "$SCRIPT_DIR/agent_admin.sh" "$@"
+        bash "$SCRIPT_DIR/default_models.sh" "$@"
 }
 
 assert_production_refusal() {
     local output
-    agents_registry_text > "$TEST_DIR/production-before.conf"
+    models_registry_text > "$TEST_DIR/production-before.conf"
     if output="$(admin "$@" 2>&1)"; then
         fail "production switch unexpectedly succeeded: $*"
     fi
@@ -913,9 +913,9 @@ admin_output="$(admin codex)"
     || fail "family switch did not report kept production after switched line"
 [[ "$admin_output" == *"# kept codex_only on codex: its only set"* ]] \
     || fail "family switch did not report kept Codex-only function"
-[[ "$(_agents_registry_get assignments ordinary)" == "codex" ]] || fail "family switch missed ordinary"
-[[ "$(_agents_registry_get assignments production)" == "claude" ]] || fail "family switch moved production"
-[[ "$(_agents_registry_get assignments codex_only)" == "codex" ]] || fail "family switch moved Codex-only function"
+[[ "$(_models_registry_get assignments ordinary)" == "codex" ]] || fail "family switch missed ordinary"
+[[ "$(_models_registry_get assignments production)" == "claude" ]] || fail "family switch moved production"
+[[ "$(_models_registry_get assignments codex_only)" == "codex" ]] || fail "family switch moved Codex-only function"
 agents_resolve production.director
 [[ "$AGENT_FAMILY" == "claude" && "$AGENT_MODEL" == "opus" && "$AGENT_EFFORT" == "xhigh" ]] \
     || fail "family switch changed production director"
@@ -952,4 +952,4 @@ test_registry_edit_refreshes_readers
 test_changed_registry_file_refreshes_readers
 test_resolve_reads_registry_once
 
-echo "agents_config tests passed"
+echo "models_config tests passed"

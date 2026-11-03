@@ -256,7 +256,10 @@ if [[ "${1:-}" == final-pass || ( "${1:-}" == --session-dir && "${3:-}" == final
     export CLAUDE_PYTHON="${CLAUDE_PYTHON:-python3}"
     exec "$PY" "$VERIFY_QUERY_DIR/final_pass.py" query "$VERIFY_QUERY_DIR/verify.sh" "$@"
 fi
-if [[ -n "${TMPDIR:-}" && ! -d "$TMPDIR" ]]; then mkdir -p -- "$TMPDIR"; fi
+# Create the inherited temporary parent before environment commands use it.
+VERIFY_INVOKE_DIR="${BASH_SOURCE[0]%/*}"
+[[ "$VERIFY_INVOKE_DIR" != "${BASH_SOURCE[0]}" ]] || VERIFY_INVOKE_DIR=.
+source "$VERIFY_INVOKE_DIR/../lint/invoke.sh" --prepare-temp || exit 2
 # Load the environment once through the shared helper, before tool setup or records.
 if [[ -n "${VERIFY_NIX_ENV_REEXEC:-}" ]]; then
     if [[ -n "${IN_NIX_SHELL:-}" ]]; then
@@ -899,8 +902,9 @@ if [[ "${1:-}" == "--session-dir" ]]; then
     export UNIT_SESSION_DIR="${2:?verify.sh --session-dir <dir> <command> ...}"
     shift 2
     # Test temp folders land in the run folder and end with it (tmp_sweep.py judges each entry).
-    if mkdir -p "${UNIT_SESSION_DIR}/tmp" 2>/dev/null; then
-        export TMPDIR="${UNIT_SESSION_DIR}/tmp"
+    SESSION_TMPDIR="$("$PY" "$BUILD_FOLDERS_SCRIPT" run-temp-path "$UNIT_SESSION_DIR")"
+    if [[ -d "$SESSION_TMPDIR" ]] || "$PY" "$BUILD_FOLDERS_SCRIPT" stable --run-temp "$UNIT_SESSION_DIR" >/dev/null 2>&1; then
+        export TMPDIR="$SESSION_TMPDIR"
     fi
 fi
 
@@ -1135,14 +1139,12 @@ phase_wait_finish_all() {
     done
 }
 
-# The memory gate announces only blocked admission. A granted first check
-# emits no line and therefore creates no zero-length wait.
-buildlog_memory_line() {
+# Record only blocked admission. An immediate grant creates no wait.
+buildlog_memory_event() {
     case "$1" in
         first) phase_wait_start memory "memory admission" ;;
         done|left) phase_wait_finish memory ;;
     esac
-    buildlog_memory_line_inner "$@"
 }
 
 collect_routing_wait() {
@@ -1312,17 +1314,6 @@ cancel_tree_run() {
     if [[ -n "${TOKEN_WAITER_FILE:-}" ]]; then
         rm -f "$TOKEN_WAITER_FILE" "${TOKEN_WAITER_FILE}.again"
     fi
-    # run_once owns admission in a pipeline subshell. Its exact ledger paths
-    # are shared with us before cargo starts, so killing it cannot leak them.
-    local memory_path
-    if [[ -f "$TREE_WATCH_DIR/reservations" ]]; then
-        while IFS= read -r memory_path; do
-            BUILDLOG_MEM_RESERVATION="$memory_path" buildlog_release_memory "$TREE_CHANGED_STATUS"
-        done < "$TREE_WATCH_DIR/reservations"
-    fi
-    if [[ -f "$TREE_WATCH_DIR/waiters" ]]; then
-        while IFS= read -r memory_path; do rm -f "$memory_path"; done < "$TREE_WATCH_DIR/waiters"
-    fi
     [[ -z "${MAC_LOG_FILE:-}" ]] || rm -f "$MAC_LOG_FILE"
     [[ -z "${MAC_RESULT_FILE:-}" ]] || rm -f "$MAC_RESULT_FILE"
     printf 'verify.sh: cancelled — the tree changed while %s ran, so this result would be stale. Resubmit the %s when your edits are done.\n' "$CMD" "$CMD" >&2
@@ -1334,7 +1325,7 @@ cancel_tree_run() {
 
 start_tree_watch() {
     [[ -z "$TREE_WATCH_PID" ]] || return 0
-    TREE_WATCH_DIR="$(mktemp -d "${TMPDIR:-/tmp}/verify-tree.$$.XXXXXX")"
+    TREE_WATCH_DIR="$("$PY" "$BUILD_FOLDERS_SCRIPT" unique --kind verify-tree --owner "$$")"
     set_verdict_keys --watch-start "$TREE_WATCH_DIR/start"
     [[ -s "$TREE_WATCH_DIR/start" ]] || { rm -rf "$TREE_WATCH_DIR"; TREE_WATCH_DIR=""; return 0; }
     local scope=()
@@ -1355,23 +1346,25 @@ finish_tree_watch() {
 # Git's staged tree identity. A private copy avoids updating the real index's
 # cache-tree extension when write-tree runs.
 doc_tree() {
-    VERIFY_PY_HELPER=DOC_TREE_PY "$PY" - <<'PYDOC'
+    VERIFY_PY_HELPER=DOC_TREE_PY "$PY" - "$BUILD_FOLDERS_SCRIPT" <<'PYDOC'
 import os
 from pathlib import Path
 import subprocess
-import tempfile
+import sys
 import shutil
 
-with tempfile.TemporaryDirectory(prefix="verify-doc-", dir="/tmp") as temporary:
+sys.path.insert(0, str(Path(sys.argv[1]).resolve().parents[2]))
+from scripts.lib import build_folders
+
+with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(
+        build_folders.FOLDER_PREFIXES["verify-doc"], build_folders.SystemTemporaryParent())) as temporary:
     top = subprocess.check_output(["git", "rev-parse", "--show-toplevel"], text=True).strip()
     original = Path(subprocess.check_output(["git", "rev-parse", "--git-path", "index"], text=True).strip())
-    private_index = Path(temporary) / "index"
+    private_index = temporary / "index"
     if original.exists():
         shutil.copyfile(original, private_index)
     environment = {**os.environ, "GIT_INDEX_FILE": str(private_index)}
-    def git(*arguments: str) -> str:
-        return subprocess.check_output(["git", "-C", top, *arguments], env=environment, text=True).strip()
-    print(git("write-tree"))
+    print(subprocess.check_output(["git", "-C", top, "write-tree"], env=environment, text=True).strip())
 PYDOC
 }
 
@@ -1513,6 +1506,7 @@ COPY_WORD="" COPY_MAC="" COPY_REASON="" COPY_SECONDS="" COPY_RUNNER_STATUS="" CO
 MAC_RESULT_FILE=""
 MAC_LOG_FILE=""
 MAC_RUNNER_PID=""
+ROUTING_QUEUED_AT="" ROUTING_QUEUE_FIRST_FILE=""
 # A waiting local test can still leave for this eligible Mac. Non-busy
 # declines set a retry deadline; busy and blocked use the normal poll.
 MAC_LEAVE_SETTINGS=""
@@ -1631,6 +1625,8 @@ sys.path[0] = os.path.dirname(os.path.abspath(sys.argv[0]))
 runpy.run_path(sys.argv[0], run_name="__main__")
 '
     (
+        export BUILDLOG_MEM_WAIT_SINCE="${ROUTING_QUEUED_AT:-}"
+        export BUILDLOG_MEM_WAIT_FIRST_FILE="${ROUTING_QUEUE_FIRST_FILE:-}"
         if [[ -z ${VERIFY_MAC_ENVIRONMENT[0]+set} ]]; then
             exec "$PY" "$MAC_RUNNER" "${runner_args[@]}"
         fi
@@ -1844,11 +1840,10 @@ initialize_step_record() {
     VERIFY_MONOTONIC_OFFSET_US="$(env -u BUILDLOG_CALL_ID "$PY" "$STEP_RECORD_SCRIPT" \
         "${record_args[@]}" --clock-offset)" || exit 2
     STEP_RECORD_ACTIVE=1
-    export BUILDLOG_MEM_WAIT_FIRST_FILE="${BUILDLOG_MEM_WAIT_FIRST_FILE:-$HOLD_WAIT_DIR/first-queued-at}"
-    if [[ ! -s "$BUILDLOG_MEM_WAIT_FIRST_FILE" ]]; then
-        printf '%s\n' "${BUILDLOG_MEM_WAIT_SINCE:-${EPOCHSECONDS:-$(date +%s)}}" > "$BUILDLOG_MEM_WAIT_FIRST_FILE"
-    fi
-    export BUILDLOG_MEM_WAIT_SINCE="$(< "$BUILDLOG_MEM_WAIT_FIRST_FILE")"
+    # Routing keeps one queue age. Memory accounting starts only at a memory wait.
+    ROUTING_QUEUED_AT="${EPOCHSECONDS:-$(date +%s)}"
+    ROUTING_QUEUE_FIRST_FILE="$HOLD_WAIT_DIR/first-queued-at"
+    printf '%s\n' "$ROUTING_QUEUED_AT" > "$ROUTING_QUEUE_FIRST_FILE"
     export BUILDLOG_CALL_ID
     if [[ "$MAC_ONLY" == 1 ]]; then
         printf 'verify.sh: Mac only (%s): route this test to the Mac.\n' "$MAC_REASON" >&2
@@ -2272,7 +2267,9 @@ start_copy_watch() {
     # $$ stays the outer shell's pid in a subshell. Bash 3.2 has no BASHPID;
     # an exec'd child shell reports this launching shell through its PPID.
     local parent_pid="${BASHPID:-$(exec sh -c 'printf "%s\n" "$PPID"')}"
-    COPY_WATCH_DIR="$(mktemp -d "${HOLD_WAIT_DIR:-${TMPDIR:-/tmp}}/verify-copy.$$.XXXXXX")"
+    local copy_parent=()
+    [[ -z "${HOLD_WAIT_DIR:-}" ]] || copy_parent=(--parent "$HOLD_WAIT_DIR")
+    COPY_WATCH_DIR="$("$PY" "$BUILD_FOLDERS_SCRIPT" unique --kind verify-copy --owner "$$" "${copy_parent[@]}")"
     VERIFY_STEP_INFO_FILE="$COPY_WATCH_DIR/step"
     local watch_args=(--info "$VERIFY_STEP_INFO_FILE" --result "$COPY_WATCH_DIR/result"
         --runner "$MAC_RUNNER" --settings "$MAC_LEAVE_SETTINGS"
@@ -2282,7 +2279,9 @@ start_copy_watch() {
     if [[ "$FILTER_RUN" -eq 1 ]]; then
         watch_args+=(--filter-run)
     fi
-    "$PY" "$MAC_COPY_WATCH" "${watch_args[@]}" -- "${NEXTEST_ARGS[@]}" &
+    BUILDLOG_MEM_WAIT_SINCE="${ROUTING_QUEUED_AT:-}" \
+        BUILDLOG_MEM_WAIT_FIRST_FILE="${ROUTING_QUEUE_FIRST_FILE:-}" \
+        "$PY" "$MAC_COPY_WATCH" "${watch_args[@]}" -- "${NEXTEST_ARGS[@]}" &
     COPY_WATCH_PID=$!
 }
 
@@ -2563,7 +2562,7 @@ if [[ "$CMD" == test && -z "${GATE_METADATA}" ]]; then
     GATE_METADATA="$(cargo metadata --no-deps --format-version 1 2>/dev/null)" || GATE_METADATA=""
 fi
 
-HOLD_WAIT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/verify-hold.$$.XXXXXX")"
+HOLD_WAIT_DIR="$("$PY" "$BUILD_FOLDERS_SCRIPT" unique --kind verify-hold --owner "$$")"
 MAC_WAIT_CLAIM_FILE="$HOLD_WAIT_DIR/mac-wait-claim"
 export BUILDLOG_HOLD_WAIT_FILE="$HOLD_WAIT_DIR/seconds"
 export BUILDLOG_HOLD_WAITER_FILE="$HOLD_WAIT_DIR/waiter"
@@ -3159,14 +3158,6 @@ record_token_wait() {
 # gate again with the token held. The step runs in run()'s subshell, so its
 # token wait reaches the call record through TOKEN_WAIT_FILE.
 eval "$(declare -f buildlog_wait_for_memory | sed '1s/buildlog_wait_for_memory/buildlog_wait_for_memory_only/')"
-# Share exact admission paths across run_once's subshell boundary. Releasing
-# a reservation twice is safe; keep earlier paths if the step re-enters admission.
-remember_tree_reservation() {
-    if [[ -n "${TREE_WATCH_DIR:-}" && -n "${BUILDLOG_MEM_RESERVATION:-}" ]]; then
-        printf '%s\n' "$BUILDLOG_MEM_RESERVATION" >> "$TREE_WATCH_DIR/reservations"
-    fi
-}
-
 note_memory_admission() {
     # Publish only actual memory waits, including subsecond waits identified by
     # the first-wait file. A hold-only wait must still record zero memory wait.
@@ -3174,7 +3165,6 @@ note_memory_admission() {
             || (( BUILDLOG_MEM_WAIT_S > 0 )); then
         BUILDLOG_MEM_WAIT_SINCE=$BUILDLOG_MEM_WAIT_FROM
     fi
-    remember_tree_reservation
 }
 
 admit_with_token() {
@@ -3207,17 +3197,6 @@ admit_with_token() {
 }
 
 buildlog_wait_for_memory() {
-    local memory_wait stat fields=()
-    if [[ ! -s "$BUILDLOG_MEM_WAIT_FIRST_FILE" ]]; then
-        printf '%s\n' "${BUILDLOG_MEM_WAIT_SINCE:-${EPOCHSECONDS:-$(date +%s)}}" > "$BUILDLOG_MEM_WAIT_FIRST_FILE"
-    fi
-    export BUILDLOG_MEM_WAIT_SINCE="$(< "$BUILDLOG_MEM_WAIT_FIRST_FILE")"
-    if [[ -n "${TREE_WATCH_DIR:-}" && -r "/proc/${BASHPID:-$$}/stat" ]]; then
-        stat="$(< "/proc/${BASHPID:-$$}/stat")"
-        read -r -a fields <<< "${stat##*) }"
-        printf '%s/admission/%s-%s.waiting\n' "${BUILDLOG_DIR:-$HOME/.local/state/buildlog}" \
-            "${BASHPID:-$$}" "${fields[19]}" >> "$TREE_WATCH_DIR/waiters"
-    fi
     step_state waiting_hold
     TOKEN_WAITED=0
     if [[ "${TOKEN_RETRY_ADMISSION:-0}" -eq 1 ]]; then
@@ -3727,12 +3706,12 @@ case "$CMD" in
         if ! lint_config_enabled doc; then
             echo 'verify.sh: the phase rustdoc check cannot be switched off; ignoring doc=off.'
         fi
-        (
-            cd "$DOC_CHECKOUT/tree"
-            # Keep repository identity at the caller and copy only the judged tree.
-            MAC_SOURCE_ROOT="$DOC_CHECKOUT/tree"
-            LINT_CONFIG_FORCE=1 invoke_doc --workspace "${DOC_FEATURE_FLAGS[@]}"
-        )
+        DOC_CALLER_DIR=$PWD
+        cd "$DOC_CHECKOUT/tree"
+        # Keep the signal handlers and the active step PID in the caller shell.
+        MAC_SOURCE_ROOT="$DOC_CHECKOUT/tree"
+        LINT_CONFIG_FORCE=1 invoke_doc --workspace "${DOC_FEATURE_FLAGS[@]}"
+        cd "$DOC_CALLER_DIR"
         doc_record
         ;;
     example)

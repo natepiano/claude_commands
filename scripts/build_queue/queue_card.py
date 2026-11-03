@@ -50,6 +50,12 @@ def render_card(model: QueueModel, matches: Sequence[int], columns: int) -> list
             add((Span(priority),))
         add()
         checks = step_checks(model, position)
+        if position == 1 and isinstance(checks, gate.HeadExplanation) and checks.decision.state == "hold":
+            add((Span(f"Free {checks.free.available / gate.GIB:.1f} GiB; "
+                + f"reserve {checks.free.reserve / gate.GIB:.1f} GiB; need {checks.free.need / gate.GIB:.1f} GiB."),))
+        for running in model.reading.view.running:
+            if isinstance(running.measured, gate.UnownedSliceMemory):
+                add((Span(f"{running.measured.owner}: {running.measured.bytes / gate.GIB:.1f} GiB (unowned)."),))
         if (isinstance(step.reason, gate.ReadyForAdmission)
                 or isinstance(checks, gate.HeadExplanation) and checks.decision.state == "admit"):
             add((Span("Next? Yes. It starts at the next check.", bold=True),))

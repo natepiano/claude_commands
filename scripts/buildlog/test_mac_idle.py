@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -30,6 +31,8 @@ import sample
 if TYPE_CHECKING:
     from .mac_idle_test_support import NotificationGuardedTestCase, NotificationTransportBlocked, private_sender_acceptance, write_idle_config
     from ..mac_test import mac_test
+    from ..build_queue import admission_protocol as wire
+    from ..build_queue.admission_test_support import AdmissionFixture, caller_admission
     from ..direct import step_record
     from ..lint.memory_test_support import fake_memory_readings
     from ..notify.push_texts import catalog, render_entry
@@ -39,6 +42,8 @@ if TYPE_CHECKING:
 else:
     from scripts.buildlog.mac_idle_test_support import NotificationGuardedTestCase, NotificationTransportBlocked, private_sender_acceptance, write_idle_config
     from scripts.mac_test import mac_test
+    from scripts.build_queue import admission_protocol as wire
+    from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
     from scripts.direct import step_record
     from scripts.lint.memory_test_support import fake_memory_readings
     from scripts.notify.push_texts import catalog, render_entry
@@ -47,9 +52,9 @@ else:
     from scripts.message.test_send_delivery import stopped_sender
 from test_index import use_test_log
 if TYPE_CHECKING:
-    from ..lib import test_hang_guard
+    from ..lib.process_group import send_process_group
 else:
-    from scripts.lib import test_hang_guard
+    from scripts.lib.process_group import send_process_group
 
 use_test_log()
 REAL_NOTIFY_OUTAGE = mac_idle.notify_outage
@@ -60,6 +65,7 @@ REAL_SUBPROCESS_POPEN = subprocess.Popen
 
 @final
 class MacIdleTests(NotificationGuardedTestCase):
+    admission: AdmissionFixture = cast(AdmissionFixture, cast(object, None))
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
         self.root = Path()
@@ -101,7 +107,11 @@ class MacIdleTests(NotificationGuardedTestCase):
         self.process(124, 123, "457", ("bash", "-c", "step"),
                      {"BUILDLOG_CALL_ID": self.call.call_id, "LINT_QUEUE_LEAVE_HOOK": "check Mac"})
         mac_idle.write_record(mac_idle.call_path(self.paths, self.call.call_id), asdict(self.call))
-        mac_idle.write_record(self.paths.admission / "124-457.waiting", {"pid": 124, "start_time": "457", "since": 100})
+        self.admission = caller_admission(self, self.root, dict(os.environ))
+        self.admission.free(0)
+        owner = self.admission.fixture_owner(124, "457")
+        request = self.admission.request(owner=owner, since=100)
+        _ = self.admission.server.handle_request(request)
         mac_idle.write_record(self.paths.state / "idle.json", {"since": 1000})
         self.step()
         _ = self.enterContext(mock.patch.object(mac_idle, "notify_outage", return_value=True))
@@ -537,11 +547,10 @@ class MacIdleTests(NotificationGuardedTestCase):
         self.assertEqual(mac_idle.marker_path(self.paths, self.call.call_id).read_text(), "retry_delayed\n")
         self.assertEqual([(row["cause"], row["action"], row["wait"]) for row in self.rows()],
                          [("retry_delayed", "retry_marker", "memory")])
-        self.assertEqual(len(list(self.paths.admission.glob("*.waiting"))), 1)
+        self.assertEqual(len(self.admission.server.waiters), 1)
 
     def test_waiting_check_doc_and_lint_records_get_repairs_without_argv_selection(self) -> None:
-        for path in self.paths.admission.iterdir():
-            path.unlink()
+        self.admission.end_fixture_owner(124)
         self.process(123, 1, "456", ("bash", "unrelated-name"))
         for kind, state in (("check", step_record.StepState.WAITING_HOLD),
                             ("doc", step_record.StepState.WAITING_MAC),
@@ -684,8 +693,7 @@ class MacIdleTests(NotificationGuardedTestCase):
         self.assertEqual([row["cause"] for row in self.rows()], ["retry_delayed"])
 
     def test_hold_wait_without_explicit_hook_uses_marker(self) -> None:
-        for path in self.paths.admission.iterdir():
-            path.unlink()
+        self.admission.end_fixture_owner(124)
         self.process(124, 123, "457", (sys.executable, "/scripts/build_targets.py", "wait-local",
             "--call-id", self.call.call_id), {"BUILDLOG_CALL_ID": self.call.call_id})
         mac_idle.write_record(Path(self.call.hold_waiter), {"pid": 124, "proc_start": "457", "call_id": self.call.call_id})
@@ -695,8 +703,7 @@ class MacIdleTests(NotificationGuardedTestCase):
         self.assertTrue(mac_idle.marker_path(self.paths, self.call.call_id).exists())
 
     def test_token_wait_evidence_is_reported_for_a_live_waiting_record(self) -> None:
-        for path in self.paths.admission.iterdir():
-            path.unlink()
+        self.admission.end_fixture_owner(124)
         token = Path(self.call.token_dir)
         token.mkdir()
         _ = (token / "impl.key.stamp.123").write_text("")
@@ -713,8 +720,7 @@ class MacIdleTests(NotificationGuardedTestCase):
         self.assertFalse(mac_idle.marker_path(self.paths, self.call.call_id).exists())
 
     def test_routing_wait_requires_a_child_with_the_call_id(self) -> None:
-        for path in self.paths.admission.iterdir():
-            path.unlink()
+        self.admission.end_fixture_owner(124)
         self.process(124, 123, "457", (sys.executable, "/scripts/direct/local_release_wait.py", "15", self.call.call_id))
         self.two_passes()
         self.assertEqual([row["wait"] for row in self.rows()], ["routing"])
@@ -775,24 +781,46 @@ class MacIdleTests(NotificationGuardedTestCase):
         self.assertEqual(watch.call_args.args[1], 1000)
 
     def test_memory_wait_reads_the_marker_when_its_normal_hook_is_empty(self) -> None:
-        meminfo = self.root / "meminfo"
-        _ = meminfo.write_text("MemAvailable: 0 kB\n")
+        self.admission.free(0)
+        self.admission.configure(running_pass_seconds=0.01, wait_reply_seconds=0.05)
         marker = self.root / "retry"
+        def publish_marker(reply: wire.Reply) -> wire.Reply:
+            if isinstance(reply, wire.Wait):
+                _ = marker.write_text("retry\n")
+            return reply
+        self.admission.server.reply_filter = publish_marker
         command = '''
 set -euo pipefail
 source "$1"
-buildlog_memory_python() { printf '%s\\n' 'hold|1|1|fallback|0|0|0|0|-||repo|nextest|0|held|worktree'; }
-buildlog_memory_line() { :; }
-sleep() { : > "$TEST_RETRY_MARKER"; }
 BUILDLOG_MAC_IDLE_HOOK='test -f "$TEST_RETRY_MARKER"'
 LINT_QUEUE_LEAVE_HOOK=''
 buildlog_wait_for_memory cargo nextest run
 test "$BUILDLOG_MEM_OUTCOME" = LeftQueue
 '''
-        result = subprocess.run(["bash", "-c", command, "memory-marker-test",
-            str(mac_idle.SCRIPTS / "lint/memory_gate.sh")], env={**os.environ, "BUILDLOG_MEMINFO": str(meminfo),
-            "TEST_RETRY_MARKER": str(marker)}, capture_output=True, text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        with tempfile.TemporaryFile(mode="w+") as output, tempfile.TemporaryFile(mode="w+") as errors:
+            process = subprocess.Popen(["bash", "-c", command, "memory-marker-test",
+                str(mac_idle.SCRIPTS / "lint/memory_gate.sh")], env={**os.environ,
+                "TEST_RETRY_MARKER": str(marker)}, stdout=output, stderr=errors, start_new_session=True)
+            expired = False
+            try:
+                _ = process.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                expired = True
+            finally:
+                try:
+                    send_process_group(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                try:
+                    _ = process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    self.fail("the marker test process did not stop within 3 seconds after SIGKILL")
+            _ = output.seek(0)
+            _ = errors.seek(0)
+            diagnostics = output.read() + errors.read()
+        if expired:
+            self.fail("the memory wait did not read the retry marker within 30 seconds\n" + diagnostics)
+        self.assertEqual(process.returncode, 0, diagnostics)
         self.assertTrue(marker.exists())
 
 

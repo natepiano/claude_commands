@@ -32,8 +32,10 @@ from build_hold_test_support import (
     HoldEventRecord, SCRIPT, invoke_hold, recorded_hold_events, write_holder,
 )
 if TYPE_CHECKING:
+    from ..build_queue.admission_test_support import only_admitted
     from ..lib import test_hang_guard
 else:
+    from scripts.build_queue.admission_test_support import only_admitted
     from scripts.lib import test_hang_guard
 
 
@@ -2238,12 +2240,13 @@ class BuildAuditTests(IsolatedBuildHoldTest):
         return directory
 
     def admission(self, pid: int, start: str) -> None:
-        ledger = self.log / "admission"
-        ledger.mkdir(parents=True, exist_ok=True)
-        _ = (ledger / f"{pid}.reservation").write_text(json.dumps({"pid": pid, "start_time": start}))
+        fixture = self.admission_fixture
+        with fixture.loop_turn():
+            owner = fixture.fixture_owner(pid, start)
+            _ = only_admitted(fixture.server.handle_request(fixture.request(owner=owner)))
 
     def builds(self) -> tuple[build_hold.AuditedBuild, ...]:
-        return build_hold.audit_builds(self.proc, build_hold.natedev_holds(self.holders).in_force, self.log)
+        return build_hold.audit_builds(self.proc, build_hold.natedev_holds(self.holders).in_force)
 
     def rows(self) -> list[dict[str, object]]:
         self.reap_recorders()

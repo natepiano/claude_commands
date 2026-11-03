@@ -16,12 +16,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 import conf
 import mac_idle_alert
+from test_index import use_test_log
 if TYPE_CHECKING:
     from .mac_idle_test_support import write_idle_config
     from ..lint.memory_test_support import commit_config_fixture
 else:
     from scripts.buildlog.mac_idle_test_support import write_idle_config
     from scripts.lint.memory_test_support import commit_config_fixture
+
+
+use_test_log()
 
 
 class MacIdleConfigTests(unittest.TestCase):

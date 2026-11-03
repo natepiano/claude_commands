@@ -56,17 +56,19 @@ from datetime import datetime
 from pathlib import Path
 from typing import cast
 
-import tmp_sweep
-from tmp_sweep import SYSTEM_TEMP_NAMES, SYSTEM_TEMP_PREFIXES, TEMPFILE_NAME
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-import scratch  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lint import tmp_sweep
+from scripts.lint.tmp_sweep import SYSTEM_TEMP_NAMES, SYSTEM_TEMP_PREFIXES, TEMPFILE_NAME
+from scripts.lib import copy_record, scratch, unit_runs
 
 RUST_ROOTS_FILE = Path(__file__).resolve().parents[2] / "config" / "rust_roots.txt"
 RUST_SCRATCH_NAME = "scratch"
 MIN_AGE_SECONDS = 24 * 3600
 REMOVE_AFTER_SECONDS = tmp_sweep.WIDE_IDLE_SECONDS
-KEPT_NAMES = SYSTEM_TEMP_NAMES | {"unit", "delegate", "scratch", "repro", "session", "copies"}
+KEPT_NAMES = SYSTEM_TEMP_NAMES | {
+    *(root.name for root in unit_runs.run_roots()), copy_record.root().name,
+    copy_record.copies_root().name, Path(tmp_sweep.SESSION_TEMP_ROOT).name, "repro",
+}
 KEPT_PREFIXES = SYSTEM_TEMP_PREFIXES
 IDLE_DEPTH = 3
 # A folder with more entries than this inside IDLE_DEPTH is not read to the end, and stays.

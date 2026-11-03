@@ -32,6 +32,7 @@ from types import FrameType
 from typing import TYPE_CHECKING, Literal, TypedDict, cast
 
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lint"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_hold"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
@@ -40,8 +41,10 @@ import override_guard
 import mac_test
 import offload
 if TYPE_CHECKING:
+    from ..lib import build_folders
     from ..direct import step_record
 else:
+    from scripts.lib import build_folders
     from scripts.direct import step_record
 
 
@@ -633,12 +636,12 @@ def main() -> int:
     override_guard.refuse_overrides(Path(__file__), "mac_test/copy_watch.py")
     arguments = parser().parse_args(namespace=CliArguments())
     request = request_from_arguments(arguments)
-    with wakeup_on_signals(arguments.parent_pid) as wakeup, tempfile.TemporaryDirectory(prefix="copy-watch.") as work:
+    with wakeup_on_signals(arguments.parent_pid) as wakeup, build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(prefix=build_folders.FOLDER_PREFIXES["copy-watch"])) as work:
         repository = offload.repository_identity(request.repo_root)
         if isinstance(repository, offload.UnknownRepository):
             report = wait_for_stop(wakeup)
         else:
-            watch = Watch(request, repository, Path(work))
+            watch = Watch(request, repository, work)
             try:
                 report = watch.run(wakeup)
             finally:

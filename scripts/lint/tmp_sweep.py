@@ -81,6 +81,7 @@ folders it also covers.
 from __future__ import annotations
 
 import json
+from importlib import import_module
 import os
 import re
 import shutil
@@ -94,20 +95,13 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, TypedDict, cast
+from typing import Protocol, TypedDict, cast
 from urllib.parse import unquote, urlparse
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-import scratch  # noqa: E402
-from scripts.lib import copy_record  # noqa: E402
-from user_zone import user_zone  # noqa: E402
-if TYPE_CHECKING:
-    from ..lib import unit_runs
-    from ..message import sessions
-else:
-    import unit_runs
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
-    import sessions
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib import build_folders, copy_record, scratch, unit_runs  # noqa: E402
+from scripts.lib.user_zone import user_zone  # noqa: E402
+from scripts.message import sessions  # noqa: E402
 
 GIB = 1 << 30
 HOUR_SECONDS = 3600
@@ -123,11 +117,18 @@ SESSION_ENTRY_MIN_BYTES = GIB
 RUN_INTERVAL_SECONDS = HOUR_SECONDS
 LOG_KEEP_SECONDS = 7 * 24 * HOUR_SECONDS
 TMP_ROOT = "/tmp/claude"
-RUN_ROOTS = (os.path.join(TMP_ROOT, "delegate"), os.path.join(TMP_ROOT, "unit"))
+RUN_ROOTS = tuple(str(root) for root in unit_runs.run_roots())
 # Each Claude session's TMPDIR is SESSION_TEMP_ROOT/<session id> (hooks/session-start-temp-root.py),
 # and each run's is <run folder>/RUN_TEMP_NAME; the entries in both are judged with the 4 h rule.
-SESSION_TEMP_ROOT = os.path.join(TMP_ROOT, "session")
-RUN_TEMP_NAME = "tmp"
+class SessionTemporaryRoot(Protocol):
+    ROOT: str
+
+    def temp_parent(self) -> Path: ...
+
+
+_session_temp = cast(SessionTemporaryRoot, cast(object, import_module("scripts.hooks.session-start-temp-root")))
+SESSION_TEMP_ROOT = _session_temp.ROOT
+RUN_TEMP_NAME = unit_runs.RUN_TEMP_NAME
 # Claude Code keeps each session's scratch in /tmp/claude-<uid>/<project>/<session id>/.
 SESSION_SCRATCH_PREFIX = "claude-"
 RUN_MARKERS = "active"
@@ -150,12 +151,16 @@ EMPTY_PREFIXES = ("nix-",)
 # lint/invoke.sh's own logs in $TMPDIR or /tmp; a killed run leaves them (1,308 lint_invoke and
 # 1,438 buildlog files in natedev /tmp on 2026-10-27).
 INVOKE_TEMP_NAME = re.compile(r"lint_invoke\.\d+\.\d+\.log|buildlog\.\d+\.\d+\.(?:log|peak|peak\.cgroup)")
-TEMPFILE_NAME = re.compile(r"\.tmp[A-Za-z0-9]{6}|tmp\.[A-Za-z0-9]{8,10}|tmp[a-z0-9_]{8}")
+TEMPFILE_NAME = re.compile(r"\.tmp[A-Za-z0-9]{6}|tmp\.[A-Za-z0-9]{8,10}|tmp" + build_folders.MKDTEMP_SUFFIX_PATTERN)
 # direct/verify.sh's run folder (its copy folders sit inside it), named with the run's pid. Its EXIT
 # trap removes it, but a killed run leaves it (47 hold and 6 copy folders in natedev /tmp, 2026-10-27).
 # A named pid that is no verify.sh run started before the folder ends the folder at once; an old name
 # with no pid waits out the 4 h rule.
-VERIFY_TEMP_NAME = re.compile(r"verify-(?:hold|copy)\.(?:(\d+)\.)?[A-Za-z0-9]{6}")
+VERIFY_TEMP_NAME = re.compile(
+    "(?:" + "|".join(re.escape(build_folders.FOLDER_PREFIXES[kind].split("{owner}")[0])
+                    for kind in ("verify-hold", "verify-copy"))
+    + r")(?:(\d+)\.)?(?:" + build_folders.LEGACY_MKTEMP_SUFFIX_PATTERN
+    + "|" + build_folders.MKDTEMP_SUFFIX_PATTERN + ")")
 VERIFY_SCRIPT = "verify.sh"
 # ps prints elapsed time to the second, so a run's start can read up to this late.
 START_SLACK_SECONDS = 2.0
@@ -168,6 +173,7 @@ STATE_ENV = "LINT_SWEEP_STATE_DIR"
 DEFAULT_STATE_DIR = os.path.join("~", ".local", "state", "lint-sweep")
 LOG_NAME = "tmp-sweep.jsonl"
 STAMP_NAME = "tmp-sweep.stamp"
+TARGET_DELETES_NAME = "target-deletes.json"
 DRY_RUN_FLAG = "--dry-run"
 
 ROOT = "a root or a run-marker folder"
@@ -333,13 +339,14 @@ class Sweep:
         self.kept.setdefault(reason, []).append(path)
 
 
-def default_roots(tmp_root: str = TMP_ROOT, run_roots: Sequence[str] = RUN_ROOTS,
+def default_roots(tmp_root: str = TMP_ROOT, run_roots: Sequence[str] | None = None,
                   session_roots: Sequence[str] | None = None, temp_roots: Sequence[str] | None = None,
                   scratch_roots: Sequence[str] | None = None, wide_roots: Sequence[str] | None = None,
                   session_temp_roots: Sequence[str] | None = None) -> Roots:
     """The same roots on natedev and the Mac, each by its real path: the Mac's /tmp is a link to
     /private/tmp, and lsof prints real paths. The wide root is /tmp alone: $TMPDIR and the Mac's
     temp folder hold app state, and macOS clears its own."""
+    runs = tuple(str(root) for root in unit_runs.run_roots()) if run_roots is None else run_roots
     sessions_at = session_scratch_roots() if session_roots is None else session_roots
     projects = tuple(entry.path for root in sessions_at for entry in listing(os.path.realpath(root))
                      if entry.name.startswith("-") and entry.is_dir(follow_symlinks=False))
@@ -347,12 +354,14 @@ def default_roots(tmp_root: str = TMP_ROOT, run_roots: Sequence[str] = RUN_ROOTS
     task_roots = (str(copy_record.root()),) if scratch_roots is None else scratch_roots
     temp_real = tuple(os.path.realpath(root) for root in temp)
     wide = ("/tmp",) if wide_roots is None else wide_roots
-    session_temp = (SESSION_TEMP_ROOT,) if session_temp_roots is None else session_temp_roots
-    return Roots((os.path.realpath(tmp_root),), tuple(os.path.realpath(root) for root in run_roots), projects,
+    session_parent = str(_session_temp.temp_parent()) if SESSION_TEMP_ROOT == _session_temp.ROOT else SESSION_TEMP_ROOT
+    session_temp = (session_parent,) if session_temp_roots is None else session_temp_roots
+    copies = copy_record.copies_root() if os.path.realpath(tmp_root) == os.path.realpath(TMP_ROOT) else Path(tmp_root) / "copies"
+    return Roots((os.path.realpath(tmp_root),), tuple(os.path.realpath(root) for root in runs), projects,
                  temp_real, tuple(os.path.realpath(root) for root in task_roots if os.path.isdir(root)),
                  tuple(real for root in wide if (real := os.path.realpath(root)) in temp_real),
                  tuple(os.path.realpath(root) for root in session_temp if os.path.isdir(root)),
-                 (os.path.realpath(os.path.join(tmp_root, "copies")),))
+                 (os.path.realpath(copies),))
 
 
 def session_scratch_roots() -> tuple[str, ...]:

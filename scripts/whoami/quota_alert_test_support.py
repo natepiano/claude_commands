@@ -19,7 +19,7 @@ from typing import ClassVar, cast, override
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.lib.test_agents_registry import ExactRows, registry_text, write_registry
+from scripts.lib.test_models_registry import ExactRows, registry_text, write_registry
 from scripts.whoami.account_test_support import create_claude_account
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -109,7 +109,7 @@ class QuotaReminderFixture(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(note_file, "AGENTS_DIR", self.root))
         _ = self.enterContext(mock.patch.object(agent_notes, "READINGS_LOG", self.root / "readings.jsonl"))
         config = self.root / "showrunners.json"
-        registry = self.root / "agents.conf"
+        registry = self.root / "models.conf"
         for name, value in (("CONFIG", config), ("STATE", self.root / "state.json"), ("relay", self.relay),
                             ("tell_user", self.tell_user), ("REGISTRY", registry)):
             patcher = mock.patch.object(quota_alert, name, value)
@@ -118,7 +118,7 @@ class QuotaReminderFixture(unittest.TestCase):
         recipients_patch = mock.patch.object(quota_alert, "recipients", configured_recipients)
         _ = recipients_patch.start()
         self.addCleanup(recipients_patch.stop)
-        # A fresh sync stamp and no Codex config keep agents_config.sh from syncing the catalog into the fixture.
+        # A fresh sync stamp and no Codex config keep models_config.sh from syncing the catalog into the fixture.
         synced = self.root / "catalog synced"
         for key, value in (("CODEX_CATALOG_SYNC_STATE_FILE", synced), ("CODEX_CONFIG_FILE", self.root / "absent"),
                            ("CODEX_MODELS_CACHE_FILE", self.root / "absent")):
@@ -143,7 +143,7 @@ class QuotaReminderFixture(unittest.TestCase):
         _ = (self.root / "showrunners.json").write_text(json.dumps({
             "threshold_percent": 1, "repeat_minutes": 30, "stall_minutes": 5,
             "faults_to": "natedev", "always": ["natedev"]}))
-        _ = write_registry((self.root / "agents.conf"), base_text=REGISTRY)
+        _ = write_registry((self.root / "models.conf"), base_text=REGISTRY)
         (self.root / "catalog synced").touch()
 
     @staticmethod
@@ -353,7 +353,7 @@ class CodexZeroEpisodeFixture(unittest.TestCase):
         config = self.root / "showrunners.json"
         _ = config.write_text(json.dumps({"threshold_percent": 1, "repeat_minutes": 30,
             "stall_minutes": 5, "faults_to": "director", "always": ["director"]}))
-        registry = self.root / "agents.conf"
+        registry = self.root / "models.conf"
         _ = write_registry(registry, base_text=REGISTRY)
         _ = self.enterContext(mock.patch.object(quota_alert, "CONFIG", config))
         _ = self.enterContext(mock.patch.object(quota_alert, "REGISTRY", registry))

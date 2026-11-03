@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from scripts.lib.test_agents_registry import write_registry
+from scripts.lib.test_models_registry import write_registry
 
 import argparse
 import hashlib
@@ -73,7 +73,7 @@ class ProgressHistoryTests(unittest.TestCase):
     history_dir: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     working_dir: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     config_file: Path  # pyright: ignore[reportUninitializedInstanceVariable]
-    agents_config_file: Path  # pyright: ignore[reportUninitializedInstanceVariable]
+    models_config_file: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     team_slot: str  # pyright: ignore[reportUninitializedInstanceVariable]
     last_recorder_stderr: str = ""
 
@@ -94,13 +94,13 @@ class ProgressHistoryTests(unittest.TestCase):
         self.config_file = self.root / "direct.conf"
         self.write_interval(180)
         # The temporary home's registry path. Named so the digest hashes a file
-        # the test controls rather than the machine's own agents.conf, which
-        # would differ per machine and per registry edit. write_agents_registry
+        # the test controls rather than the machine's own models.conf, which
+        # would differ per machine and per registry edit. write_models_registry
         # writes to this same path: one file, so arm-review resolves the agent
         # the test wrote instead of reading an empty one beside it.
         self.team_slot = ""
-        self.agents_config_file = self.root / ".claude" / "config" / "agents.conf"
-        _ = write_registry(self.agents_config_file)
+        self.models_config_file = self.root / ".claude" / "config" / "models.conf"
+        _ = write_registry(self.models_config_file)
         _ = subprocess.run(
             ["git", "init", "-b", "feature/rubric"],
             cwd=self.working_dir,
@@ -185,7 +185,7 @@ from scripts.lib import user_zone
 
 root, working = map(Path, sys.argv[1:])
 caller = (os.environ.copy(), Path.cwd(), sys.argv.copy(), sys.path.copy(),
-          progress_history.DEFAULT_AGENTS_CONFIG_PATH,
+          progress_history.DEFAULT_MODELS_CONFIG_PATH,
           user_zone.CONF, {sig: signal.getsignal(sig) for sig in
                           (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)})
 plan = working / 'cold-plan.md'
@@ -195,13 +195,13 @@ for number in (1, 2):
     config = home / '.claude/config'
     config.mkdir(parents=True)
     settings = config / 'direct.conf'
-    registry = config / 'agents.conf'
+    registry = config / 'models.conf'
     settings.write_text(f'UNIT_PROGRESS_INTERVAL_SECONDS={number * 60}\n')
     registry.write_text(f'registry-{number}\n')
     environment = {**os.environ, 'HOME': str(home), 'USER_ZONE': 'UTC',
                    'UNIT_SYNC_WRITES': '0', 'UNIT_PASS_OWNER': 'launcher',
                    'UNIT_NOW_EPOCH': '1000'}
-    for key in ('CONF_DIR', 'AGENTS_CONFIG_FILE', 'UNIT_HISTORY_DIR',
+    for key in ('CONF_DIR', 'MODELS_CONFIG_FILE', 'UNIT_HISTORY_DIR',
                 'CODEX_THREAD_ID', 'CLAUDE_CODE_SESSION_ID'):
         environment.pop(key, None)
     session = home / 'session'
@@ -225,7 +225,7 @@ for number in (1, 2):
     assert started['config_digest'] == hashlib.sha256(registry.read_bytes() + settings.read_bytes()).hexdigest()[:12]
     assert progress_history._config_digest.cache_info().currsize == 0
     restored = (os.environ.copy(), Path.cwd(), sys.argv.copy(), sys.path.copy(),
-                progress_history.DEFAULT_AGENTS_CONFIG_PATH,
+                progress_history.DEFAULT_MODELS_CONFIG_PATH,
                 user_zone.CONF, {sig: signal.getsignal(sig) for sig in caller[-1]})
     assert restored == caller, (restored, caller)
 print('two homes isolated; recorder lock retained; caller restored')
@@ -285,7 +285,7 @@ print('two homes isolated; recorder lock retained; caller restored')
         environment = os.environ.copy()
         environment["UNIT_HISTORY_DIR"] = str(self.history_dir)
         environment["CONF_DIR"] = str(Path(self.config_file).parent)
-        environment["AGENTS_CONFIG_FILE"] = str(self.agents_config_file)
+        environment["MODELS_CONFIG_FILE"] = str(self.models_config_file)
         environment["TZ"] = zone
         environment["USER_ZONE"] = zone
         environment["UNIT_NOW_EPOCH"] = str(at)
@@ -314,7 +314,7 @@ print('two homes isolated; recorder lock retained; caller restored')
         environment = os.environ.copy()
         environment["UNIT_HISTORY_DIR"] = str(self.history_dir)
         environment["CONF_DIR"] = str(Path(self.config_file).parent)
-        environment["AGENTS_CONFIG_FILE"] = str(self.agents_config_file)
+        environment["MODELS_CONFIG_FILE"] = str(self.models_config_file)
         environment["TZ"] = zone
         environment["USER_ZONE"] = zone
         environment["UNIT_NOW_EPOCH"] = str(at)
@@ -342,7 +342,7 @@ print('two homes isolated; recorder lock retained; caller restored')
         environment = os.environ.copy()
         environment["UNIT_HISTORY_DIR"] = str(self.history_dir)
         environment["CONF_DIR"] = str(Path(self.config_file).parent)
-        environment["AGENTS_CONFIG_FILE"] = str(self.agents_config_file)
+        environment["MODELS_CONFIG_FILE"] = str(self.models_config_file)
         environment["UNIT_NOW_EPOCH"] = str(at)
         environment["UNIT_PASS_OWNER"] = "launcher"
         environment["TZ"] = "UTC"
@@ -2259,7 +2259,7 @@ print('two homes isolated; recorder lock retained; caller restored')
         commit = "f" * 40
         _ = self.run_command("checkpoint", "--session-dir", str(session), "--phase", "6", "--commit", commit, at=1015)
         environment = {**os.environ, "UNIT_HISTORY_DIR": str(self.history_dir), "UNIT_NOW_EPOCH": "1030",
-                       "CONF_DIR": str(Path(self.config_file).parent), "AGENTS_CONFIG_FILE": str(self.agents_config_file)}
+                       "CONF_DIR": str(Path(self.config_file).parent), "MODELS_CONFIG_FILE": str(self.models_config_file)}
         self.isolate_recorder_roots(environment)
         self.isolate_identity(environment)
         finish_program = '''import sys
@@ -3214,7 +3214,7 @@ with patch.object(fcntl, "flock", admission):
         environment = os.environ.copy()
         environment["UNIT_HISTORY_DIR"] = str(self.history_dir)
         environment["CONF_DIR"] = str(Path(self.config_file).parent)
-        environment["AGENTS_CONFIG_FILE"] = str(self.agents_config_file)
+        environment["MODELS_CONFIG_FILE"] = str(self.models_config_file)
         environment["TZ"] = "UTC"
         environment["USER_ZONE"] = "UTC"
         environment["UNIT_NOW_EPOCH"] = str(at)
@@ -3381,11 +3381,11 @@ with patch.object(fcntl, "flock", admission):
         ]
 
     def test_a_pass_records_a_digest_of_the_configuration_it_ran_under(self) -> None:
-        _ = write_registry(self.agents_config_file, {"direct.codex": {"impl": "gpt-called:xhigh"}})
+        _ = write_registry(self.models_config_file, {"direct.codex": {"impl": "gpt-called:xhigh"}})
         session_dir = self.start_run("digest", 20_000)
         self.start_phase_and_pass(session_dir, 20_010)
         expected = hashlib.sha256(
-            self.agents_config_file.read_bytes() + self.config_file.read_bytes()
+            self.models_config_file.read_bytes() + self.config_file.read_bytes()
         ).hexdigest()[:12]
         started = self.pass_events("digest", "pass_started")
         self.assertEqual(len(started), 1)
@@ -3440,7 +3440,7 @@ with patch.object(fcntl, "flock", admission):
         self.assertEqual(started[0].get("team_slot"), "")
 
     def test_an_unreadable_conf_leaves_the_digest_empty_and_records_the_pass(self) -> None:
-        self.agents_config_file.unlink()
+        self.models_config_file.unlink()
         session_dir = self.start_run("no-registry", 21_000)
         self.start_phase_and_pass(session_dir, 21_010)
         started = self.pass_events("no-registry", "pass_started")
@@ -5409,10 +5409,10 @@ with patch.object(fcntl, "flock", admission):
         self.assertEqual((stage_rows[4][1], stage_rows[4][2]), ("gpt-main xhigh", ""))
         self.assertEqual(stage_rows[0][1], "gpt-main xhigh")
 
-    def write_agents_registry(self) -> None:
+    def write_models_registry(self) -> None:
         """A registry under the temporary home, so arm-review resolves the same
         agent review.sh would without reading this machine's real assignments."""
-        _ = write_registry(self.agents_config_file, {
+        _ = write_registry(self.models_config_file, {
             "direct.codex": {"impl": "gpt-called:xhigh", "review": "gpt-blind:max"},
             "codex.agents": {"gpt-called": "low,medium,high,xhigh,max", "gpt-blind": "low,medium,high,xhigh,max"},
         })
@@ -5439,7 +5439,7 @@ with patch.object(fcntl, "flock", admission):
 
     def test_an_early_review_naming_its_phase_watches_that_phase_directory(self) -> None:
         """`review.sh --phase` writes its status there, so the marker must watch the same file."""
-        self.write_agents_registry()
+        self.write_models_registry()
         started_at = 90_000
         session_dir = self.start_run("early-phase", started_at)
         self.start_phase_and_pass(session_dir, started_at)
@@ -5454,7 +5454,7 @@ with patch.object(fcntl, "flock", admission):
 
     def test_an_early_review_runs_as_its_own_row_beside_the_open_pass(self) -> None:
         """The one moment two agents work at once, shown as two running rows."""
-        self.write_agents_registry()
+        self.write_models_registry()
         started_at = 90_000
         session_dir = self.start_run("early", started_at)
         self.start_phase_and_pass(session_dir, started_at)
@@ -5500,7 +5500,7 @@ with patch.object(fcntl, "flock", admission):
         self.assertIn("▸ **Fix 2 - correcting retry recovery**", header)
 
     def test_the_early_reviewers_real_pass_supersedes_its_armed_row(self) -> None:
-        self.write_agents_registry()
+        self.write_models_registry()
         started_at = 91_000
         session_dir = self.start_run("adopted", started_at)
         self.start_phase_and_pass(session_dir, started_at)
@@ -5554,7 +5554,7 @@ with patch.object(fcntl, "flock", admission):
 
     def test_a_killed_early_reviewer_leaves_no_row_behind(self) -> None:
         """A marker outliving its launcher would show a phantom agent working."""
-        self.write_agents_registry()
+        self.write_models_registry()
         started_at = 92_000
         session_dir = self.start_run("orphan", started_at)
         self.start_phase_and_pass(session_dir, started_at)
@@ -5578,7 +5578,7 @@ with patch.object(fcntl, "flock", admission):
 
     def test_a_reviewer_that_failed_before_delivery_leaves_no_row_behind(self) -> None:
         """review.sh's own status retires the row a killed launcher cannot."""
-        self.write_agents_registry()
+        self.write_models_registry()
         started_at = 94_000
         session_dir = self.start_run("failed-early", started_at)
         self.start_phase_and_pass(session_dir, started_at)

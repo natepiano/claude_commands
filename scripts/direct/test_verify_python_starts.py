@@ -38,12 +38,10 @@ class VerifyPythonStartsTests(VerifyLintCacheFixture):
         self.assertNotIn("STDIN_PY", counts, rows)
         # Clean judgment skips the two repair-convergence tree keys.
         self.assertEqual(counts["tree_watch.py"], 8, rows)
-        # Omitted fix: five step states, including memory admission's
-        # waiting_hold/on_natedev. Omitted fmt: two more. Together with the
-        # two convergence keys, these remove nine starts. SSH routing adds
-        # one target eligibility query to the previous total of 31.
+        # SSH routing reads eligibility twice. P10 creates two temporary folders.
         self.assertEqual(counts["build-targets.py"], 2, rows)
-        self.assertEqual(len(rows), 32, counts)
+        self.assertEqual(counts["build_folders.py"], 2, rows)
+        self.assertEqual(len(rows), 34, counts)
 
     def test_lint_code_key_tracks_inputs_and_clears_unreadable_keys_with_both_hash_tools(self) -> None:
         home = self.root / "key-home"

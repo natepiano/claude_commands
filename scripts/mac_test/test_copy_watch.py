@@ -708,7 +708,7 @@ class CopyWatchProcessTests(unittest.TestCase):
         index = arguments.index("--parent-pid")
         del arguments[index:index + 2]
         result = subprocess.run(arguments, env=self.environment, capture_output=True,
-                                text=True, timeout=HANG_GUARD_S)
+                                text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertIn("--parent-pid", result.stderr)
         self.assertFalse(self.result.exists())

@@ -33,7 +33,7 @@ def token_renewal_functions() -> str:
 
 def token_admission_functions() -> str:
     return shell_functions(VERIFY,
-        "record_token_wait", "remember_tree_reservation", "note_memory_admission", "admit_with_token",
+        "record_token_wait", "note_memory_admission", "admit_with_token",
         "buildlog_wait_for_memory")
 
 
@@ -476,15 +476,20 @@ build_hold_wait_local() {
 }
 build_hold_check_local() { hold_checks=$(( hold_checks + 1 )); (( hold_checks > 1 )) || return 10; }
 buildlog_memory_python() {
-    if [[ "${2:-}" == check ]]; then
-        local polls=0
+    if [[ "${2:-}" == admit ]]; then
+        local grant="" polls=0 duration=0
+        while (( $# )); do
+            if [[ "$1" == --shell-state ]]; then grant=$2; break; fi
+            shift
+        done
         if [[ -f "$TMPDIR/polls" ]]; then read -r polls < "$TMPDIR/polls"; fi
         polls=$(( polls + 1 )); printf '%s\n' "$polls" > "$TMPDIR/polls"
         if (( polls == 1 || polls == 4 )); then
-            printf 'hold|100|100|fallback|0|0|0|0|fixture||repo|nextest|1|held|tree\n'
-        else
-            printf 'admit|100|100|fallback|0|0|0|0|fixture|reservation|repo|nextest|100|reserved|tree\n'
+            duration=20
+            printf 'first\ndone\n'
         fi
+        printf 'EPOCHSECONDS=%s\nSECONDS=%s\nBUILDLOG_MEM_WAIT_S=%s\nBUILDLOG_MEM_OUTCOME=Granted\nBUILDLOG_MEM_RESERVATION=reservation\n' \
+            "$(( EPOCHSECONDS + duration ))" "$(( SECONDS + duration ))" "$duration" > "$grant"
     elif [[ "${2:-}" == token-wait ]]; then
         printf '%s:%s\n' "$3" "$BUILDLOG_MEM_WAIT_SINCE" >> "$TMPDIR/token-handoffs"
     else
@@ -529,10 +534,17 @@ printf '%s\n' "$acquisitions:$hold_checks" > "$TMPDIR/rechecks"
             _ = (root / "meminfo").write_text("MemAvailable: 1 kB\n")
             harness = root / "retry.sh"
             _ = harness.write_text('set -eu\nsource "$1"\n' + shell_functions(VERIFY, "run_local_test") + r'''
-# A valid checker reply, still held; no fake admission or reservation.
-buildlog_memory_python() { printf 'hold|100|100|fallback|0|0|0|0|fixture||repo|nextest|1|held|tree\n'; }
-buildlog_memory_line() { :; }
-sleep() { :; }
+# The client reports a wait and then releases this attempt to the Mac.
+buildlog_memory_python() {
+    local grant=""
+    while (( $# )); do
+        if [[ "$1" == --shell-state ]]; then grant=$2; break; fi
+        shift
+    done
+    printf 'first\nleft\n'
+    printf 'BUILDLOG_MEM_OUTCOME=LeftQueue\nBUILDLOG_MEM_WAIT_S=0\n' > "$grant"
+    return 75
+}
 ssh_retry_hook() { echo true; }
 try_reserved_target() { try_mac_test; }
 target_for_settings() { echo mac; }
@@ -597,18 +609,27 @@ sweep_after_step() { :; }
 buildlog_begin() { BUILDLOG_START=100 BUILDLOG_PEAK="" BUILDLOG_TREE=""; }
 buildlog_now() { BUILDLOG_NOW=$EPOCHSECONDS; }
 buildlog_memory_python() {
-    if [[ "${2:-}" == check ]]; then
-        if (( rounds == 3 && EPOCHSECONDS >= 310 )); then
-            printf 'admit|100|100|fallback|0|0|0|0|fixture|reservation|repo|nextest|100|reserved|tree\n'
+    if [[ "${2:-}" == admit ]]; then
+        local grant=""
+        while (( $# )); do
+            if [[ "$1" == --shell-state ]]; then grant=$2; break; fi
+            shift
+        done
+        printf 'first\n'
+        if (( rounds == 3 )); then
+            printf 'done\n'
+            printf 'EPOCHSECONDS=310\nBUILDLOG_MEM_WAIT_S=10\nBUILDLOG_MEM_OUTCOME=Granted\nBUILDLOG_MEM_RESERVATION=reservation\n' > "$grant"
+            printf 'memory free after 3 min 30 s: starting\n' >&2
         else
-            printf 'hold|100|100|fallback|0|0|0|0|fixture||repo|nextest|1|held|tree\n'
+            printf 'left\n'
+            printf 'BUILDLOG_MEM_WAIT_S=0\nBUILDLOG_MEM_OUTCOME=LeftQueue\n' > "$grant"
+            return 75
         fi
     else
         "$HOME/.claude/scripts/lib/py" "$@"
     fi
 }
-# Keep run_once, buildlog_end, memory_gate and record.py real. Only the
-# command itself and admission replies are controlled by this fixture.
+# Keep the recorder and memory gate real. The fixture controls client events and the command.
 buildlog_exec() { :; }
 run_nextest() {
     rounds=$(( rounds + 1 ))

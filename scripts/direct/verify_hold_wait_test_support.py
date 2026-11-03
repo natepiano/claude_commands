@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.build_queue.admission_test_support import caller_admission
+
 import json
 import os
 import select
@@ -153,8 +155,7 @@ class VerifyHoldTools(VerifyMacOffloadFixture):
     @classmethod
     @override
     def setUpClass(cls) -> None:
-        # The committed Mac fixture exposes setUp(), not a seed builder. Own
-        # the copying here so this suite needs only that public lifecycle.
+        # Create the tools once. Each test must start its own admission service.
         builder = VerifyMacOffloadFixture()
         cls.addClassCleanup(builder.doCleanups)
         builder.setUp()
@@ -178,7 +179,8 @@ class VerifyHoldTools(VerifyMacOffloadFixture):
             "BUILDLOG_BUILD_BUDGET_GIB": "64",
         }
         _ = shutil.copytree(cls.fixture_root, cls.fixture_seed, symlinks=True)
-        shutil.rmtree(cls.fixture_root)
+        if not builder.doCleanups():
+            raise AssertionError("the seed fixture did not close its admission service")
 
     @override
     def setUp(self) -> None:
@@ -193,6 +195,7 @@ class VerifyHoldTools(VerifyMacOffloadFixture):
         self.runner_state: Path = self.root / "runner-state"
         self.cargo_events_path: Path = self.root / "cargo-events.jsonl"
         self.environment: dict[str, str] = self.fixture_environment.copy()
+        _ = caller_admission(self, self.root, self.environment)
 
     @override
     def stop_verify(self, process: subprocess.Popen[str]) -> None:

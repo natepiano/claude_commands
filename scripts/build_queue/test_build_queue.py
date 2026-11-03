@@ -1,10 +1,12 @@
 """The queue CLI uses one admission reading, file-only labels and shared span renders."""
 from __future__ import annotations
 
+from scripts.build_queue.admission_test_support import AdmissionFixture
+from scripts.build_queue import admission_client, admission_protocol as wire
+
 from contextlib import redirect_stderr, redirect_stdout
 from collections.abc import Callable, Mapping
 from dataclasses import replace
-import fcntl
 import io
 import json
 import os
@@ -22,11 +24,11 @@ from scripts.build_queue.queue_fixture import (
     NOW, ZONE, QueueFixture, bump_line, head_reading, queue_read_fixture,
     queue_time_line, token_gap_line, waiting_rows, write_bumps, write_process, write_token_gaps,
 )
-from scripts.build_queue.queue_lines import QueueLines, Span, plain, terminal_width
+from scripts.build_queue.queue_lines import QueueLines, Span, json_form, plain, terminal_width
 from scripts.buildlog import store
 from scripts.buildlog.mac_idle_test_support import NotificationGuardedTestCase, write_idle_alert
 from scripts.lint import memory_admit
-from scripts.lint.test_memory_admit import write_memory_config
+from scripts.build_queue.queue_fixture import write_memory_config
 from scripts.lint.memory_test_support import commit_config_fixture
 from scripts.message import roster, unit_labels
 from scripts.message.unit_labels import UnitLabels, unit_labels_for
@@ -56,6 +58,7 @@ class QueueTests(NotificationGuardedTestCase):
         super().setUp()
         self.fixture = self.enterContext(QueueFixture(captured=False))
         self.root = self.fixture.root
+        _ = cast(object, self.enterContext(mock.patch.object(memory_admit, "queue_read", side_effect=self.fixture.read)))
         self.labels_read = cast(LabelReadMock, self.enterContext(mock.patch.object(unit_labels, "unit_labels_for", return_value={})))
         config = self.root / "lint.conf"
         write_memory_config(config)
@@ -79,28 +82,39 @@ class QueueTests(NotificationGuardedTestCase):
         model = self.model(queue_read_fixture(view, policy=memory_admit.DEFAULT_ADMISSION_POLICY))
         return plain(queue_view.check_lines(queue_view.step_checks(model, 1), model))
 
-    def invoke(self, reading: memory_admit.QueueRead | memory_admit.QueueBusy,
+    def invoke(self, reading: memory_admit.QueueRead,
                *arguments: str) -> tuple[int, str, str]:
         output, errors = io.StringIO(), io.StringIO()
         with mock.patch.object(memory_admit, "queue_read", return_value=reading) as read, \
+             mock.patch.object(admission_client, "mine", return_value=reading) as mine, \
              mock.patch("sys.argv", ["build_queue.py", *arguments]), \
              redirect_stdout(output), redirect_stderr(errors):
             status = build_queue.main()
-        read.assert_called_once_with()
+        if "mine" in arguments:
+            mine.assert_called_once_with(build_queue.caller())
+            read.assert_not_called()
+        else:
+            read.assert_called_once_with()
+            mine.assert_not_called()
         return status, output.getvalue(), errors.getvalue()
 
     def test_queue_command_warns_about_a_missing_key_once_per_process(self) -> None:
         config = self.root / "lint.conf"
+        write_memory_config(config)
         commit_config_fixture(config)
         write_memory_config(config, head_seconds=None)
-        with mock.patch.dict(os.environ, {"CONF_DIR": str(config.parent)}), \
-             mock.patch.object(memory_admit, "queue_read", return_value=memory_admit.QueueBusy()), \
-             mock.patch("sys.argv", ["build_queue.py"]), \
-             redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as errors:
-            self.assertEqual(build_queue.main(), 0)
-            self.assertEqual(build_queue.main(), 0)
-        self.assertEqual(errors.getvalue().count("head_seconds="), 2)
-        self.assertIn("key is missing", errors.getvalue())
+        with AdmissionFixture() as admission:
+            with mock.patch.dict(os.environ, {"CONF_DIR": str(config.parent)}):
+                _ = admission.server.run_pass()
+            with admission.serving(), \
+                 mock.patch.object(memory_admit, "queue_read", side_effect=admission_client.view), \
+                 mock.patch.object(memory_admit, "_warned_config_fallbacks", set[memory_admit.ConfigFallback]()), \
+                 mock.patch("sys.argv", ["build_queue.py"]), \
+                 redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as errors:
+                self.assertEqual(build_queue.main(), 0)
+                self.assertEqual(build_queue.main(), 0)
+            self.assertEqual(errors.getvalue().count(
+                "head_seconds='<missing>'"), 1)
 
     def snapshot(self, reading: memory_admit.QueueRead, *arguments: str) -> QueueLines:
         status, output, errors = self.invoke(reading, "--json", "--columns", "400", *arguments)
@@ -147,22 +161,20 @@ class QueueTests(NotificationGuardedTestCase):
                     self.assertEqual(data["lines"][0], [{"text": expected, "tone": "error", "bold": True}])
                     self.assertGreater(len(data["lines"]), 1)
 
-    def test_mac_idle_alert_precedes_busy_queue_in_text_and_json(self) -> None:
-        _ = write_idle_alert(self.root / "mac-idle", NOW)
-        with mock.patch.object(time, "time", return_value=NOW):
-            for arguments in ((), ("--json",)):
-                with self.subTest(arguments=arguments):
-                    code, output, errors = self.invoke(memory_admit.QueueBusy(), *arguments)
-                    self.assertEqual((code, errors), (0, ""))
-                    if arguments:
-                        data = cast(QueueLines, json.loads(output))
-                        first = data["lines"][0][0]
-                        self.assertTrue(first["text"].startswith("MAC IDLE 10 min: 7 steps"))
-                        self.assertEqual((first.get("tone"), first.get("bold")), ("error", True))
-                        self.assertEqual(data["lines"][1], [{"text": "queue busy; try again"}])
-                    else:
-                        self.assertTrue(output.splitlines()[0].startswith("MAC IDLE 10 min: 7 steps"))
-                        self.assertEqual(output.splitlines()[1], "queue busy; try again")
+    def test_unavailable_service_preserves_the_saved_mac_alert(self) -> None:
+        path = write_idle_alert(self.root / "mac-idle", NOW)
+        saved = path.read_bytes()
+        for arguments in ((), ("--json",)):
+            with self.subTest(arguments=arguments):
+                output, errors = io.StringIO(), io.StringIO()
+                with mock.patch.object(memory_admit, "queue_read", side_effect=wire.AdmissionUnavailable("offline")), \
+                     mock.patch("sys.argv", ["build_queue.py", *arguments]), \
+                     redirect_stdout(output), redirect_stderr(errors):
+                    code = build_queue.main()
+                self.assertEqual(code, 2)
+                self.assertEqual(output.getvalue(), "")
+                self.assertEqual(errors.getvalue(), "build queue: admission service unavailable: offline\n")
+                self.assertEqual(path.read_bytes(), saved)
 
     def test_stale_mac_reading_precedes_queue(self) -> None:
         _ = write_idle_alert(self.root / "mac-idle", NOW, written_age=301)
@@ -221,44 +233,7 @@ class QueueTests(NotificationGuardedTestCase):
         self.assertTrue(any(span.get("tone") == "error" and "estimate expired" in span["text"]
                             for line in data["lines"] for span in line))
 
-    def test_busy_read_is_bounded_for_plain_card_and_pane_json(self) -> None:
-        directory = self.fixture.directory
-        for cache in ("missing", "corrupt"):
-            path = directory / "queue.json"
-            if cache == "corrupt":
-                _ = path.write_text("{")
-            else:
-                path.unlink(missing_ok=True)
-            for arguments in ([], ["4"], ["--json"]):
-                with self.subTest(cache=cache, arguments=arguments):
-                    output, errors = io.StringIO(), io.StringIO()
-                    with (directory / "lock").open("a+") as lock, \
-                         mock.patch("sys.argv", ["build_queue.py", *arguments]), \
-                         redirect_stdout(output), redirect_stderr(errors):
-                        fcntl.flock(lock, fcntl.LOCK_EX)
-                        started = time.perf_counter()
-                        status = build_queue.main()
-                        elapsed = time.perf_counter() - started
-                    self.assertLess(elapsed, 1.0)
-                    self.assertEqual(status, 0)
-                    self.assertEqual(errors.getvalue(), "")
-                    if "--json" in arguments:
-                        data = cast(QueueLines, json.loads(output.getvalue()))
-                        self.assertEqual(self.snapshot_text(data), "queue busy; try again")
-                    else:
-                        self.assertEqual(output.getvalue(), "queue busy; try again\n")
 
-    def test_bump_leaves_snapshot_bytes_untouched(self) -> None:
-        _ = self.fixture.waiter(100, "head-id", "head")
-        inputs = self.fixture.inputs(policy=memory_admit.DEFAULT_ADMISSION_POLICY)
-        memory_admit.write_queue_snapshot(self.fixture.directory, inputs, policy=memory_admit.DEFAULT_ADMISSION_POLICY)
-        path = self.fixture.directory / "queue.json"
-        before = (path.read_bytes(), path.stat().st_mtime_ns)
-        with mock.patch.object(memory_admit, "queue_read", side_effect=AssertionError("bump read snapshot")):
-            status, output, errors = self.bump_output("berth")
-        self.assertEqual((status, output, errors),
-                         (3, "build queue: type /build:queue bump berth in a showrunner pane\n", ""))
-        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
 
     def test_bump_refuses_other_sessions_without_moving_or_logging(self) -> None:
         first = self.fixture.waiter(100, "head-id", "head")
@@ -281,31 +256,86 @@ class QueueTests(NotificationGuardedTestCase):
         first = self.fixture.waiter(100, "head-id", "head")
         second = self.fixture.waiter(200, "worker-id", "worker")
         before = (first.read_bytes(), second.read_bytes())
+        admission = self.private_mutation_service()
         with mock.patch.object(memory_admit, "require_showrunner", return_value="showrunner"), \
              mock.patch.object(memory_admit, "priority_labels", return_value={"worker-id": UnitLabels("worker", unit="berth")}):
-            status, output, errors = self.bump_output("berth")
+            self.labels_read.return_value = {"worker-id": UnitLabels("worker", unit="berth")}
+            status, output, errors = self.bump_output("2")
             self.assertEqual([step.pid for step in memory_admit.queue_view().waiting], [200, 100])
-        self.assertEqual((status, output, errors), (0, "queue priority set for berth: first step now #1\n", ""))
+        self.assertEqual((status, output, errors), (0, "queue priority set for berth (step #2): first step now #1\n", ""))
         self.assertEqual((first.read_bytes(), second.read_bytes()), before)
-        priority = memory_admit.read_queue_priority(self.fixture.directory)
+        priority = admission.server.priority
         self.assertNotIsInstance(priority, memory_admit.NoQueuePriority)
         if not isinstance(priority, memory_admit.NoQueuePriority):
             self.assertEqual((priority["unit"], priority["why"]), ("berth", "the user's bump"))
 
-    def test_bump_keeps_priority_when_the_unit_has_no_waiting_step(self) -> None:
-        with mock.patch.object(memory_admit, "require_showrunner", return_value="showrunner"):
+    def test_unmatched_bump_selector_refuses_without_writing_priority(self) -> None:
+        admission = self.private_mutation_service()
+        with mock.patch.object(memory_admit, "require_showrunner", return_value="showrunner"), \
+             mock.patch.object(admission_client, "priority_set", side_effect=AssertionError("unmatched priority write")):
             status, output, errors = self.bump_output("berth")
-        self.assertEqual((status, output, errors), (0, "queue priority set for berth: no waiting step yet\n", ""))
-        priority = memory_admit.read_queue_priority(self.fixture.directory)
-        self.assertNotIsInstance(priority, memory_admit.NoQueuePriority)
-        if not isinstance(priority, memory_admit.NoQueuePriority):
-            self.assertEqual(priority["unit"], "berth")
+        self.assertEqual((status, output, errors), (3, "build queue: no waiting step matches berth\n", ""))
+        self.assertIsInstance(admission.server.priority, memory_admit.NoQueuePriority)
 
-    def test_bump_requires_exactly_one_unit_without_running_priority(self) -> None:
-        for units in ((), ("berth", "other"), ("two words",)):
-            with self.subTest(units=units), \
-                 mock.patch.object(memory_admit, "run_priority", side_effect=AssertionError("usage ran priority")):
-                self.assertEqual(self.bump_output(*units), (3, "build queue: use /build:queue bump <unit>\n", ""))
+    def test_bump_requires_exactly_one_selector_without_running_priority(self) -> None:
+        for selectors in ((), ("berth", "other"), ("two words",)):
+            with self.subTest(selectors=selectors), \
+                 mock.patch.object(admission_client, "priority_set", side_effect=AssertionError("usage ran priority")):
+                self.assertEqual(self.bump_output(*selectors),
+                    (3, "build queue: use /build:queue bump <position|session|folder>\n", ""))
+
+    def test_bump_selectors_send_the_selected_rows_real_unit_and_actor(self) -> None:
+        _ = self.fixture.waiter(100, "head-id", "head")
+        _ = self.fixture.waiter(200, "worker-id", "worker")
+        self.labels_read.return_value = {"worker-id": UnitLabels("worker", unit="actual-unit")}
+        for selector in ("2", "worker-id", "worker", "/tmp/tree-200", "tree-200"):
+            with self.subTest(selector=selector), \
+                 mock.patch.object(memory_admit, "require_showrunner", return_value="director"), \
+                 mock.patch.object(admission_client, "priority_set", return_value=wire.Ok()) as mutation:
+                self.assertEqual(self.bump_output(selector),
+                    (0, "queue priority set for actual-unit (step #2): first step now #2\n", ""))
+                mutation.assert_called_once_with("actual-unit", "the user's bump", "director")
+
+    def test_bump_row_without_a_unit_refuses_without_writing_priority(self) -> None:
+        _ = self.fixture.waiter(100, "head-id", "head")
+        self.labels_read.return_value = {}
+        with mock.patch.object(memory_admit, "require_showrunner", return_value="director"), \
+             mock.patch.object(admission_client, "priority_set", side_effect=AssertionError("unitless priority write")):
+            self.assertEqual(self.bump_output("1"), (3, "build queue: waiting step #1 has no unit\n", ""))
+
+    def test_admit_head_and_clear_refuse_other_roles_without_any_mutation(self) -> None:
+        for arguments in (("admit-head", "urgent"), ("clear",)):
+            for codex in ("", "worker-thread"):
+                with self.subTest(arguments=arguments, codex=codex), \
+                     mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "inherited", "CODEX_THREAD_ID": codex}), \
+                     mock.patch.object(memory_admit, "showrunner_is_registered", return_value=bool(codex)), \
+                     mock.patch.object(admission_client, "admit_head", side_effect=AssertionError("unauthorized head")), \
+                     mock.patch.object(admission_client, "priority_clear", side_effect=AssertionError("unauthorized clear")):
+                    output, errors = io.StringIO(), io.StringIO()
+                    with mock.patch("sys.argv", ["build_queue.py", *arguments]), \
+                         redirect_stdout(output), redirect_stderr(errors):
+                        status = build_queue.main()
+                    self.assertEqual(status, 3)
+                    self.assertIn("showrunner", output.getvalue() + errors.getvalue())
+                    self.assertNotIn("Traceback", output.getvalue() + errors.getvalue())
+
+    def private_mutation_service(self) -> AdmissionFixture:
+        files = {path: path.read_bytes() for path in self.fixture.directory.glob("*.waiting")}
+        admission = self.enterContext(AdmissionFixture(root=self.root, log_dir=self.root / "buildlog"))
+        for path, contents in files.items():
+            _ = path.write_bytes(contents)
+        admission.clock.epoch = NOW
+        admission.free(0)
+        for path in self.fixture.directory.glob("*.waiting"):
+            row = memory_admit.read_waiter(path)
+            owner = admission.fixture_owner(row["pid"], row["start_time"])
+            request = admission.request(owner=owner, need=row["need"], since=row["since"])
+            request = replace(request, identity=wire.Identity(row.get("session_id", ""),
+                row.get("session_name", ""), row.get("step", ""), row.get("folder", "")))
+            _ = admission.server.handle_request(request)
+        _ = self.enterContext(admission.serving())
+        _ = self.enterContext(mock.patch.object(memory_admit, "queue_read", side_effect=admission_client.view))
+        return admission
 
     def bump_output(self, *units: str) -> tuple[int, str, str]:
         output, errors = io.StringIO(), io.StringIO()
@@ -316,19 +346,6 @@ class QueueTests(NotificationGuardedTestCase):
         return status, output.getvalue(), errors.getvalue()
 
 
-    def test_cli_reports_busy_queue_on_stdout_with_status_zero(self) -> None:
-        directory = self.root / "buildlog/admission"
-        directory.mkdir(parents=True, exist_ok=True)
-        errors = io.StringIO()
-        output = io.StringIO()
-        with (directory / "lock").open("a+") as lock, \
-             mock.patch.object(memory_admit, "QUEUE_READ_LOCK_SECONDS", 0.03), \
-             mock.patch("sys.argv", ["build_queue.py"]), \
-             redirect_stderr(errors), redirect_stdout(output):
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            self.assertEqual(build_queue.main(), 0)
-        self.assertEqual(errors.getvalue(), "")
-        self.assertEqual(output.getvalue(), "queue busy; try again\n")
 
     def test_queue_read_failures_exit_two_with_diagnostics_only_on_stderr(self) -> None:
         for error in (PermissionError(13, "Permission denied", "/private/admission/lock"),
@@ -350,7 +367,7 @@ class QueueTests(NotificationGuardedTestCase):
         fixture.setUp()
         self.addCleanup(fixture.doCleanups)
         _ = self.enterContext(mock.patch.object(unit_labels, "unit_labels_for", self.labels_read))
-        reading = memory_admit.locked_queue_read()
+        reading = memory_admit.queue_read()
         facts = head_facts.read_head_facts(reading)
         why = "\n".join(build_why.render_explanation(reading.explanation, ZONE, {}, facts))
         legacy = replace(reading.view.waiting[0], reason=memory_admit.ReadyForAdmission(), need=GIB)
@@ -1096,8 +1113,8 @@ class QueueTests(NotificationGuardedTestCase):
         self.assertEqual(text.strip(), "build queue: type /build:queue bump berth in a showrunner pane")
         self.assertNotIn("worker-", text)
         docs = (Path(__file__).resolve().parents[2] / "commands/build/queue.md").read_text()
-        self.assertIn(text.strip().replace("berth", "<unit>"), docs)
-        self.assertIn("/build:queue bump <unit>", docs)
+        self.assertIn(text.strip().replace("berth", "<position|session|folder>"), docs)
+        self.assertIn("/build:queue bump <position|session|folder>", docs)
 
     def test_explicit_columns_override_environment_for_text_and_json(self) -> None:
         reading = queue_read_fixture(memory_admit.QueueView((), (), 20 * GIB, 0, GIB, NOW), policy=memory_admit.DEFAULT_ADMISSION_POLICY)
@@ -1124,10 +1141,78 @@ class QueueTests(NotificationGuardedTestCase):
 
     def test_cli_card_no_match_succeeds_without_a_bump(self) -> None:
         reading = queue_read_fixture(memory_admit.QueueView((), (), 20 * GIB, 0, GIB, NOW), policy=memory_admit.DEFAULT_ADMISSION_POLICY)
-        with mock.patch.object(memory_admit, "run_priority", side_effect=AssertionError("card cannot move queue")):
+        with mock.patch.object(admission_client, "priority_set", side_effect=AssertionError("card cannot move queue")):
             status, text, errors = self.invoke(reading, "nobody")
-        self.assertEqual((status, text, errors), (0, "No waiting or running step matches nobody.\n", ""))
+        self.assertEqual((status, errors), (0, ""))
+        self.assertTrue(text.startswith("Build queue · 10:46\n\n"))
+        self.assertTrue(text.endswith("\n\nNo waiting or running step matches nobody.\n"))
+
+    def test_selector_page_starts_with_the_full_view_and_ends_with_the_card(self) -> None:
+        fixture = self.enterContext(QueueFixture())
+        model = fixture.model()
+        self.labels_read.return_value = fixture.labels
+        session = "id-work-lead"
+        for columns in (60, 80, 100, 140):
+            for selector in ("1", session, "/tmp/tree", "mine"):
+                for as_json in (False, True):
+                    with self.subTest(columns=columns, selector=selector, json=as_json), \
+                         mock.patch.dict(os.environ, {"CODEX_THREAD_ID": session}):
+                        args = ["--columns", str(columns), "--you", session, selector]
+                        if as_json:
+                            args.insert(0, "--json")
+                        status, output, errors = self.invoke(model.reading, *args)
+                        self.assertEqual((status, errors), (0, ""))
+                        view = queue_view.render_view(model, columns, colour=as_json, you=session)
+                        card = queue_card.render_selection(model, session if selector == "mine" else selector, columns)
+                        if as_json:
+                            data = cast(QueueLines, json.loads(output))
+                            self.assertEqual(data["lines"][:len(view)], json_form(view, columns, NOW)["lines"])
+                            self.assertEqual(data["lines"][len(view)], [])
+                            self.assertEqual(data["lines"][len(view) + 1:], json_form(card, columns, NOW)["lines"])
+                            text = self.snapshot_text(data)
+                        else:
+                            text = output.removesuffix("\n")
+                            self.assertTrue(text.startswith(plain(view) + "\n\n"))
+                            self.assertTrue(text.endswith("\n\n" + plain(card)))
+                        self.assertEqual(text.splitlines()[0], "Build queue · 10:46")
+                        self.assertTrue(all(terminal_width(line) <= columns for line in text.splitlines()))
 
 
 if __name__ == "__main__":
     _ = unittest.main()
+
+
+class ServiceQueryFailureTests(unittest.TestCase):
+    def test_views_fail_within_one_second_for_missing_and_silent_services(self) -> None:
+        from scripts.build_queue import build_why
+        for silent in (False, True):
+            with self.subTest(silent=silent), AdmissionFixture() as fixture:
+                if silent:
+                    # The fixture accepts requests but sends no complete reply line.
+                    _ = self.enterContext(fixture.server.silent_replies())
+                else:
+                    fixture.server.close()
+                    fixture.socket_path.unlink(missing_ok=True)
+                with fixture.serving() if silent else mock.patch.dict(os.environ, {}):
+                    for main, arguments in ((build_queue.main, []), (build_queue.main, ["4"]),
+                                            (build_why.main, [])):
+                        output, errors = io.StringIO(), io.StringIO()
+                        started = time.monotonic()
+                        with mock.patch("sys.argv", ["queue", *arguments]), \
+                             redirect_stdout(output), redirect_stderr(errors):
+                            status = main()
+                        self.assertLess(time.monotonic() - started, 1)
+                        self.assertEqual(status, 2)
+                        self.assertEqual(output.getvalue(), "")
+                        reason = "no answer in 0.5 s" if silent else "no socket"
+                        self.assertEqual(errors.getvalue(),
+                            f"build queue: admission service unavailable: {reason}\n")
+
+    def test_queue_read_returns_the_private_services_exact_reading(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.free(0)
+            _ = fixture.server.handle_request(fixture.request())
+            reply = fixture.server.handle_request(wire.ViewRequest())[0]
+            assert isinstance(reply, wire.ViewReply)
+            with fixture.serving():
+                self.assertEqual(memory_admit.queue_read(), reply.reading)

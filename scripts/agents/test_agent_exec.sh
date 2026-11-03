@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 
 set -euo pipefail
-export AGENTS_CONFIG_PUBLISH=0
+export MODELS_CONFIG_PUBLISH=0
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-source "$SCRIPT_DIR/../lib/test_agents_registry.sh"
+source "$SCRIPT_DIR/../lib/test_models_registry.sh"
 TEST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/agent-exec.XXXXXX")"
 trap 'rm -rf "$TEST_DIR"' EXIT
 
@@ -44,7 +44,7 @@ accounts.set_role("workers", "codex1")
 PYTHON
 export CLAUDE_CONFIG_DIR="$HOME/.claude2"
 
-export AGENTS_CONFIG_FILE="$TEST_DIR/agents.conf"
+export MODELS_CONFIG_FILE="$TEST_DIR/models.conf"
 export CODEX_CONFIG_FILE="$TEST_DIR/codex.toml"
 export CODEX_MODELS_CACHE_FILE="$TEST_DIR/models.json"
 export CODEX_CATALOG_SYNC_STATE_FILE="$TEST_DIR/last_success"
@@ -52,7 +52,7 @@ export CODEX_CATALOG_SYNC_STATE_FILE="$TEST_DIR/last_success"
 unset AGENT_EXEC_DRY_RUN AGENT_EXEC_EXTRA_ARGS || true
 touch "$CODEX_CATALOG_SYNC_STATE_FILE"
 
-write_test_registry "$AGENTS_CONFIG_FILE" \
+write_test_registry "$MODELS_CONFIG_FILE" \
     assignments/codex_case=codex \
     assignments/direct.simplify=claude \
     direct.claude/simplify=opus:max \
@@ -326,10 +326,10 @@ assert_equal "friend took the workers account" "$HOME/.claude2" "$(cat "$TEST_CL
 assert_equal "friend did not launch" "abcdef12" "$(cat "$TEST_DIR/friend-id")"
 
 # CLI assignments also come from the registry.
-write_test_registry "$AGENTS_CONFIG_FILE" --update cli.claude/commit_prep=opus:max
-cp "$AGENTS_CONFIG_FILE" "$TEST_DIR/cli.conf"
+write_test_registry "$MODELS_CONFIG_FILE" --update cli.claude/commit_prep=opus:max
+cp "$MODELS_CONFIG_FILE" "$TEST_DIR/cli.conf"
 write_test_registry "$TEST_DIR/cli.conf" --update assignments/cli.commit_prep=claude
-AGENTS_CONFIG_FILE="$TEST_DIR/cli.conf" bash "$SCRIPT_DIR/../cli_agent/cli_agent.sh" commit_prep < /dev/null > "$TEST_DIR/cli-output"
+MODELS_CONFIG_FILE="$TEST_DIR/cli.conf" bash "$SCRIPT_DIR/../cli_agent/cli_agent.sh" commit_prep < /dev/null > "$TEST_DIR/cli-output"
 assert_equal "CLI worker ignored the named Claude account" "$HOME/.claude4" "$(cat "$TEST_CLAUDE_HOME_FILE")"
 python3 - "$SCRIPT_DIR/../.." <<'PYTHON'
 import sys
