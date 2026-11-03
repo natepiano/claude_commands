@@ -59,9 +59,24 @@ def schedule(value: object) -> Schedule:
     return Schedule(positive(values, "interval_seconds"), positive(values, "timeout_seconds"))
 
 
+def configuration_path() -> Path:
+    return Path(os.environ.get("AGENT_NOTES_JOB_CONFIG", str(Path(__file__).resolve().parents[2] / "config/agent_notes.toml")))
+
+
+def configuration() -> dict[str, object]:
+    return table(tomllib.loads(configuration_path().read_text(encoding="utf-8")))
+
+
+def usage_only_interval() -> float:
+    """Read the Mac usage cadence at use; absent or invalid config refuses a read."""
+    try:
+        return positive(table(configuration().get("mac_usage")), "interval_seconds")
+    except (OSError, ValueError, OverflowError) as error:
+        raise ValueError(f"{configuration_path()}: mac_usage.interval_seconds must be a finite positive number") from error
+
+
 def settings() -> Settings:
-    path = Path(os.environ.get("AGENT_NOTES_JOB_CONFIG", str(Path(__file__).resolve().parents[2] / "config/agent_notes.toml")))
-    values = table(tomllib.loads(path.read_text(encoding="utf-8")))
+    values = configuration()
     parts = table(values.get("parts"))
     hierarchy, vault = table(values.get("hierarchy")), table(values.get("vault"))
     named = vault.get("named_paths")

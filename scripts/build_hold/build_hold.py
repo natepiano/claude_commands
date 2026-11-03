@@ -33,7 +33,7 @@ import unit_runs
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import override_guard
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_targets"))
-from target_config import ConfigError, read_targets
+from target_config import ConfigError, SshTarget, read_targets
 
 
 BUILD_COMMANDS = frozenset({"cargo", "rustc", "cargo-nextest"})
@@ -217,6 +217,11 @@ class MacHoldTarget:
 
 
 @dataclass(frozen=True)
+class ConfiguredSshHoldTarget:
+    name: str
+
+
+@dataclass(frozen=True)
 class UnknownHoldTarget:
     name: str
     configured: tuple[str, ...]
@@ -228,7 +233,7 @@ class UncheckedHoldTarget:
     reason: str
 
 
-HoldTarget = NatedevHoldTarget | MacHoldTarget | UnknownHoldTarget | UncheckedHoldTarget
+HoldTarget = NatedevHoldTarget | MacHoldTarget | ConfiguredSshHoldTarget | UnknownHoldTarget | UncheckedHoldTarget
 
 
 def parse_hold_target(name: str) -> HoldTarget:
@@ -238,8 +243,11 @@ def parse_hold_target(name: str) -> HoldTarget:
         return MacHoldTarget()
     try:
         configured = read_targets()
-    except (ConfigError, UnicodeError) as error:
+    except (ConfigError, OSError, UnicodeError) as error:
         return UncheckedHoldTarget(name, str(error))
+    for target in configured:
+        if target.name == name and isinstance(target, SshTarget):
+            return ConfiguredSshHoldTarget(name)
     return UnknownHoldTarget(name, tuple(target.name for target in configured))
 
 
@@ -250,14 +258,18 @@ class MacHoldResult:
     stderr: str
 
 
-def run_mac_hold(arguments: Sequence[str]) -> MacHoldResult:
+def run_mac_hold(arguments: Sequence[str], target: str = "mac") -> MacHoldResult:
     script = Path(__file__).resolve().parent.parent / "mac_test" / "mac_test.py"
-    result = subprocess.run([sys.executable, str(script), *arguments], capture_output=True, text=True)
+    result = subprocess.run([sys.executable, str(script), *arguments, "--target", target], capture_output=True, text=True)
     return MacHoldResult(result.returncode, result.stdout, result.stderr)
 
 
-def release_mac_hold(identity: HolderIdentity, given: str) -> MacHoldResult:
-    result = run_mac_hold(["unblock", "--holder", identity.name])
+def release_mac_hold(identity: HolderIdentity, given: str, target: str = "mac") -> MacHoldResult:
+    def unblock(holder: str) -> MacHoldResult:
+        arguments = ["unblock", "--holder", holder]
+        return run_mac_hold(arguments, target)
+
+    result = unblock(identity.name)
     prefix = "blocked by "
     line = result.stdout.rstrip("\n")
     if result.status != 1 or not line.startswith(prefix):
@@ -267,7 +279,7 @@ def release_mac_hold(identity: HolderIdentity, given: str) -> MacHoldResult:
     former = next((record["formerNames"] for record in live_sessions()
                    if record["sessionId"] == identity.key), no_former_names)
     if holder != identity.name and holder in (identity.name, given, *former):
-        return run_mac_hold(["unblock", "--holder", holder])
+        return unblock(holder)
     return result
 
 
@@ -1636,6 +1648,8 @@ def wait_for_quiet(
 
 def main(arguments: list[str]) -> int:
     override_guard.refuse_overrides(Path(__file__), "build_hold/build_hold.py")
+    if arguments[:1] in (["hold"], ["release"]) and len(arguments) >= 3 and arguments[-2] == "target":
+        arguments = [*arguments[:-2], "--target", arguments[-1]]
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="action", required=True)
     hold = commands.add_parser("hold")
@@ -1670,7 +1684,8 @@ def main(arguments: list[str]) -> int:
             if isinstance(target, UncheckedHoldTarget):
                 print(f"unknown target {target.name}; the target config cannot be read: {target.reason}")
                 return 2
-            if isinstance(target, MacHoldTarget):
+            if isinstance(target, (MacHoldTarget, ConfiguredSshHoldTarget)):
+                target_name = "mac" if isinstance(target, MacHoldTarget) else target.name
                 refused: list[str] = []
                 if action == "hold":
                     if cast(list[int], options.keep):
@@ -1682,13 +1697,16 @@ def main(arguments: list[str]) -> int:
                 elif cast(bool, options.resume):
                     refused.append("--resume")
                 if refused:
-                    print(f"{refused[0]} is not supported with --target mac")
+                    print(f"{refused[0]} is not supported with --target {target_name}")
                     return 2
                 identity = holder_of(cast(str | None, options.holder))
                 if action == "hold":
-                    return print_mac_hold_result(run_mac_hold(
-                        ["block", "--holder", identity.name, "--for", cast(str, options.purpose)]))
-                return print_mac_hold_result(release_mac_hold(identity, cast(str | None, options.holder) or identity.name))
+                    command = ["block", "--holder", identity.name, "--for", cast(str, options.purpose)]
+                    result = run_mac_hold(command, target_name)
+                else:
+                    given = cast(str | None, options.holder) or identity.name
+                    result = release_mac_hold(identity, given, target_name)
+                return print_mac_hold_result(result)
         if action == "hold":
             request = release_request(cast(str | None, options.release_eta), cast(str | None, options.zone))
             identity = holder_of(cast(str | None, options.holder))

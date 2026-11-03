@@ -1,5 +1,5 @@
 ---
-description: Open a file in the Zed editor.
+description: Open a file in Zed.
 ---
 
 # Open File in Zed

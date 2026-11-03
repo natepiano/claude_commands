@@ -27,6 +27,7 @@ else:
 import folder_audit
 import scratch
 import tmp_sweep
+from scripts.lib import copy_record
 
 DAY = 86_400
 
@@ -179,7 +180,7 @@ class FolderAuditTests(unittest.TestCase):
     def test_below_the_mac_floor_dirty_clone_loses_only_its_target(self) -> None:
         clone = self.clone_folder("dirty-clone", 0.25, dirty=True)
         checkout = clone / "checkout"
-        before = (clone / scratch.RECORD).read_bytes()
+        before = (clone / copy_record.RECORD).read_bytes()
 
         _ = self.judge_clones([clone], mac=True, free_space=16 * 1024**3)
         self.assertTrue((checkout / "target" / "build").exists())
@@ -190,7 +191,7 @@ class FolderAuditTests(unittest.TestCase):
         self.assertFalse((checkout / "target").exists())
         self.assertEqual((checkout / "asset").read_text(), "unsaved source")
         self.assertTrue((checkout / ".git").is_dir())
-        self.assertEqual((clone / scratch.RECORD).read_bytes(), before)
+        self.assertEqual((clone / copy_record.RECORD).read_bytes(), before)
         _ = self.judge_clones([clone], mac=True, free_space=0)
         self.assertEqual((checkout / "asset").read_text(), "unsaved source")
 
@@ -308,7 +309,7 @@ class FolderAuditTests(unittest.TestCase):
         with unittest.mock.patch.object(tmp_sweep, "delete_tree", side_effect=stop_during_git_delete):
             with self.assertRaisesRegex(RuntimeError, "stopped during git deletion"):
                 _ = self.judge_clones([clone])
-        self.assertIsInstance(scratch.pending_removal(clone), scratch.Registered)
+        self.assertIsInstance(scratch.pending_removal(clone), copy_record.Registered)
         self.assertTrue(clone.exists())
         _ = scratch.hold(clone, "gate:keep-partial", "test")
         outcomes = self.judge_clones([clone], mac=True, free_space=0)
@@ -328,7 +329,7 @@ class FolderAuditTests(unittest.TestCase):
             clone_roots=[self.root / "scratch"], mac=True, free_space=lambda _: 0)
         self.assertIn((clone, folder_audit.REMOVED), [(entry.path, entry.outcome) for entry in found])
         self.assertFalse(clone.exists())
-        self.assertIsInstance(scratch.pending_removal(clone), scratch.NotRegistered)
+        self.assertIsInstance(scratch.pending_removal(clone), copy_record.NotRegistered)
 
     def test_unavailable_process_inventory_keeps_an_overdue_clone_and_its_target(self) -> None:
         clone = self.clone_folder("unknown-use", 3)
@@ -343,7 +344,7 @@ class FolderAuditTests(unittest.TestCase):
     def test_copies_root_keeps_an_old_open_phase_copy(self) -> None:
         import json
         copy = folder(self.temp / "copies" / "show-maker" / "21-gate", 30)
-        _ = (copy / scratch.RECORD).write_text(json.dumps({"task": "phase:maker-unit/21"}))
+        _ = (copy / copy_record.RECORD).write_text(json.dumps({"task": "phase:maker-unit/21"}))
         age(self.temp / "copies", 30)
         proc = self.root / "proc"
         proc.mkdir()

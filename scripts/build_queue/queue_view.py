@@ -109,14 +109,15 @@ def has_move_priority(model: QueueModel, position: int) -> bool:
 
 
 def pressure_check(pressure: gate.Pressure, model: QueueModel) -> tuple[bool, str]:
+    policy = model.reading.explanation.policy
     if isinstance(pressure, gate.NoPressureHold):
         return True, "memory pressure: no hold"
     if pressure.next_start_at:
-        return False, "recovery spacing: one start per 30 s; next start at " + clock(model, pressure.next_start_at, seconds=True)
-    if pressure.swap_used_percent > gate.SWAP_USED_LIMIT and pressure.some_avg10 > gate.SOME_PRESSURE_LIMIT:
+        return False, f"recovery spacing: one start per {policy.timing.recovery_start_seconds:g} s; next start at " + clock(model, pressure.next_start_at, seconds=True)
+    if pressure.swap_used_percent > policy.pressure.swap_used_limit and pressure.some_avg10 > policy.pressure.some_avg10_limit:
         return False, (f"memory pressure: swap {pressure.swap_used_percent:.1f}% used and some avg10 {pressure.some_avg10:.1f}; "
-                       + f"starts when swap is at most {gate.SWAP_USED_LIMIT:g}% or some avg10 at most {gate.SOME_PRESSURE_LIMIT:.1f}")
-    return False, (f"memory pressure: full avg10 {pressure.full_avg10:.1f} now; starts below {gate.FULL_PRESSURE_LIMIT:.1f}")
+                       + f"starts when swap is at most {policy.pressure.swap_used_limit:g}% or some avg10 at most {policy.pressure.some_avg10_limit:.1f}")
+    return False, (f"memory pressure: full avg10 {pressure.full_avg10:.1f} now; starts below {policy.pressure.full_avg10_limit:.1f}")
 
 
 def check_line(passes: bool, text: str) -> Line:

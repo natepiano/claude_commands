@@ -66,7 +66,8 @@ from tmp_sweep import ProcessUsesUnavailable as ProcessUsesUnavailable
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 import scratch  # noqa: E402
-from config_values import config_values  # noqa: E402
+import conf  # noqa: E402
+from scripts.lib import copy_record  # noqa: E402
 
 RUST_ROOTS_FILE = Path(__file__).resolve().parents[2] / "config" / "rust_roots.txt"
 RUST_SCRATCH_NAME = "scratch"
@@ -118,7 +119,7 @@ def clone_policy() -> ClonePolicy:
 
     def number(file: str, override: str, key: str) -> float:
         path = os.environ.get(override) or str(config / file)
-        values = config_values(path)
+        values = conf.values(Path(path))
         try:
             value = float(values[key])
         except (KeyError, ValueError) as error:
@@ -134,7 +135,7 @@ def clone_policy() -> ClonePolicy:
 def is_clone(path: Path) -> bool:
     """A registered test clone (also when partial), or a loose independent Git clone."""
     record = scratch.task_of(path)
-    if isinstance(record, scratch.Registered) and record.fields.get("test_hana_clone") is True:
+    if isinstance(record, copy_record.Registered) and record.fields.get("test_hana_clone") is True:
         return True
     return (path / ".git").is_dir() and not (path / ".git").is_symlink()
 
@@ -151,7 +152,7 @@ def test_clones(roots: list[Path]) -> list[Path]:
             if entry.is_symlink() or not entry.is_dir():
                 continue
             record = scratch.task_of(entry)
-            if isinstance(record, scratch.Registered) and record.fields.get("test_hana_clone") is True:
+            if isinstance(record, copy_record.Registered) and record.fields.get("test_hana_clone") is True:
                 found.append(entry)
     return found
 
@@ -405,7 +406,7 @@ def judge(found: list[tuple[Path, float]], now: float, removing: bool, proc: str
     on_mac = sys.platform == "darwin" if mac is None else mac
     space = free_bytes if free_space is None else free_space
     clones = {path for path, _ in found if is_clone(path)}
-    pending = {path for path, _ in found if isinstance(scratch.pending_removal(path), scratch.Registered)}
+    pending = {path for path, _ in found if isinstance(scratch.pending_removal(path), copy_record.Registered)}
     due = [path for path, changed in found
            if now - changed >= (policy.max_idle_seconds if path in clones else REMOVE_AFTER_SECONDS)
            or on_mac and path in clones or path in pending]
@@ -444,7 +445,7 @@ def judge(found: list[tuple[Path, float]], now: float, removing: bool, proc: str
                 continue
             # This certificate was published only after the original Git check.
             # A partial deletion can no longer pass that check, but all live-use guards still apply.
-            resuming = isinstance(scratch.pending_removal(path), scratch.Registered)
+            resuming = isinstance(scratch.pending_removal(path), copy_record.Registered)
             git = tmp_sweep.GitWork.SAVED if resuming else tmp_sweep.git_work(path)
             if git is not tmp_sweep.GitWork.SAVED:
                 outcomes[path] = (remove_clone_targets(path, removing)
@@ -516,7 +517,7 @@ def audit(rust: Path, temps: list[Path], expected: frozenset[str] | None, now: f
     if removing:
         resume_pending_prunes()
     changes: dict[Path, float | str] = {}
-    discovered = candidates(rust, temps, expected) + test_clones([scratch.root()] if clone_roots is None else clone_roots)
+    discovered = candidates(rust, temps, expected) + test_clones([copy_record.root()] if clone_roots is None else clone_roots)
     # macOS reports /private/tmp in lsof even when discovery started through /tmp.
     # Resolve once at discovery, before age, hold, process, socket and lock checks.
     for entry in dict.fromkeys(entry.resolve() for entry in discovered):

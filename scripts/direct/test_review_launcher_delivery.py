@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 import unittest
@@ -149,6 +150,37 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
             output, errors = self.finish_early_launcher(process, ready, finish)
         self.assertEqual(process.returncode, 0, output + errors)
 
+    def test_canceling_a_fresh_codex_launcher_group_stops_its_child(self) -> None:
+        session = self.start_implementation("fresh-codex-cancellation")
+        self.finish_implementation(session)
+        child_ready = session / "codex-child-pid"
+        environment = self.environment()
+        environment.update({"TEST_PYTHON": sys.executable, "TEST_CODEX_CHILD_PID": str(child_ready)})
+        with (self.root / "scripts/agents/agent_exec.sh").open("a") as agent:
+            _ = agent.write(
+                'exec "$TEST_PYTHON" -c \'import os, signal; from pathlib import Path; '
+                + 'Path(os.environ["TEST_CODEX_CHILD_PID"]).write_text(str(os.getpid())); signal.pause()\'\n'
+            )
+        with (session / "cancellation-output").open("w") as output:
+            process = subprocess.Popen(self.review_command(session, "", ""), env=environment,
+                                       stdout=output, stderr=output, text=True, start_new_session=True)
+            try:
+                descriptor = os.pidfd_open(wait_for_pid(child_ready, processes=(process,)))
+                try:
+                    send_process_group(process.pid, signal.SIGTERM)
+                    _ = process.wait(timeout=TEST_HANG_GUARD_SECS)
+                    self.assertEqual(select.select([descriptor], [], [], TEST_HANG_GUARD_SECS)[0], [descriptor])
+                finally:
+                    if not select.select([descriptor], [], [], 0)[0]:
+                        signal.pidfd_send_signal(descriptor, signal.SIGKILL)
+                    os.close(descriptor)
+            finally:
+                try:
+                    send_process_group(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                _ = process.wait(timeout=TEST_HANG_GUARD_SECS)
+
     def test_early_launcher_timeout_reaps_its_group_before_fixture_cleanup(self) -> None:
         child_ready = self.root / "blocked-review-child"
         child_code = ("import os, signal, sys; from pathlib import Path; "
@@ -174,7 +206,7 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
                 os.close(descriptor)
         finally:
             try:
-                os.killpg(process.pid, signal.SIGKILL)
+                send_process_group(process.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
             _ = process.communicate()
@@ -366,7 +398,7 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
             timeout=TEST_HANG_GUARD_SECS,
         )
         self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertIn("unknown review lens 'style' (adversary, contract, craft, ux, rerun)", result.stderr)
+        self.assertIn("unknown review lens 'style' (adversary, contract, craft, ux, rerun, simplify)", result.stderr)
         self.assertFalse((session_dir / "review_status_style").exists())
         self.assertEqual(
             [event["event_type"] for event in self.pass_events("unknown-lens")],

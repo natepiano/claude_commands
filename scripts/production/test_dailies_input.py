@@ -3,9 +3,8 @@
 from __future__ import annotations
 
 import json
-import dailies_input
-import dailies_render
 import os
+import sqlite3
 import subprocess
 import sys
 import unittest
@@ -15,12 +14,15 @@ from typing import TextIO, cast
 from unittest import mock
 from zoneinfo import ZoneInfo
 
+import dailies_input
+import dailies_render
 from production_units import read_production
 from dailies_render import LENGTHS
 from dailies_input import (BevyUpgradeUnavailable, Block, ClaudeNotRunning, Decision, FormWaiting,
                            Running, SessionGone, StillWaiting, TicksFailing, bevy_upgrade_watch)
 import unit_lookup
 from scripts.production import staff
+from scripts.shutdown.remote import local_machine
 from scripts.production.staff_test_support import fixture_showrunner_name, unit_membership
 from unit_lookup import UnitState
 from dailies_input_test_support import (DailiesInputFixture, SCRIPT, RENDERER, WAITING, STAMP, AT,
@@ -581,7 +583,9 @@ class DailiesInputTests(DailiesInputFixture):
         self.assertEqual(cast(dict[str, object], self.unit()["eta"])["time"], "23:40")
 
     def test_a_dailies_leaves_a_retired_units_note_for_the_timer_to_prune(self) -> None:
-        _ = staff.retire(unit_membership(fixture_showrunner_name("example", self.doc), ALPHA).id)
+        _ = staff.set_worktree(
+            unit_membership(fixture_showrunner_name("example", self.doc), ALPHA).id,
+            staff.RemovedWorktree(local_machine(), self.root / "alpha"))
         note = self.root / "vault/old-showrunner/alpha-unit.md"
         note.parent.mkdir(parents=True)
         _ = note.write_text(
@@ -665,7 +669,9 @@ class DailiesInputTests(DailiesInputFixture):
         self.assertEqual([unit["unit"] for unit in units], [ALPHA])
 
     def test_all_retired_units_report_no_live_units(self) -> None:
-        _ = staff.retire(unit_membership(fixture_showrunner_name("example", self.doc), ALPHA).id)
+        _ = staff.set_worktree(
+            unit_membership(fixture_showrunner_name("example", self.doc), ALPHA).id,
+            staff.RemovedWorktree(local_machine(), self.root / "alpha"))
         content = self.doc.read_text(encoding="utf-8")
         _ = self.doc.write_text(content.replace("`docs/alpha.md`", "retired after completion", 1),
                                 encoding="utf-8")
@@ -1641,7 +1647,8 @@ class DailiesInputTests(DailiesInputFixture):
         self.assertEqual(parsed.waiting.count, 1)
         created = datetime.fromisoformat(cast(str, summary["oldest_waiting"]))
         local_created = created.astimezone(ZoneInfo("America/Los_Angeles"))
-        self.assertEqual(parsed.waiting.oldest_pending_since, local_created)
+        self.assertEqual(parsed.waiting.oldest_pending_since.astimezone(ZoneInfo("UTC")),
+                         local_created.astimezone(ZoneInfo("UTC")))
         _ = self.output.write_text(json.dumps({
             "length": "simple", "zone": "America/Los_Angeles", "units": [],
             "children": [{"name": "hana-style", "open": 0, "report": saved}],
@@ -1650,6 +1657,28 @@ class DailiesInputTests(DailiesInputFixture):
         rendered = self.run_renderer(render_at.strftime("%Y-%m-%dT%H:%M"))
         self.assertEqual(rendered.returncode, 0, rendered.stderr)
         self.assertIn(" · hand-off waiting 5h", rendered.stdout)
+
+    def assert_handoff_age_at(self, created_at: str) -> None:
+        ledger_cli = self.style_ledger_cli
+
+        def with_fixed_creation_time(*arguments: str) -> subprocess.CompletedProcess[str]:
+            result = ledger_cli(*arguments)
+            if arguments[:2] == ("handoff", "add"):
+                # The ledger runs in a child: fix its saved clock in the disposable database.
+                database, = Path(self.env["STYLE_LEDGER_STATE_DIR"]).rglob("ledger.sqlite")
+                with sqlite3.connect(database) as connection:
+                    _ = connection.execute("UPDATE handoffs SET created_at=?, updated_at=?",
+                                           (created_at, created_at))
+            return result
+
+        with mock.patch.object(self, "style_ledger_cli", side_effect=with_fixed_creation_time):
+            self.test_unsent_handoff_age_from_the_ledger_flags_the_saved_style_report()
+
+    def test_unsent_handoff_age_in_the_first_fold_of_the_repeated_hour(self) -> None:
+        self.assert_handoff_age_at("2026-11-01T08:01:42.340892+00:00")
+
+    def test_unsent_handoff_age_in_the_second_fold_of_the_repeated_hour(self) -> None:
+        self.assert_handoff_age_at("2026-11-01T09:01:42.340892+00:00")
 
     def test_failed_or_invalid_summary_saves_unavailable_and_the_report_still_succeeds(self) -> None:
         self.mark_style_production()

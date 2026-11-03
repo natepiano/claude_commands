@@ -14,6 +14,7 @@ from typing import Literal, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from scripts.lib import conf
 from scripts.whoami import usage_store  # noqa: E402
 
 @dataclass(frozen=True)
@@ -67,14 +68,21 @@ def _reading_window(window: usage_store.StoredWindow) -> ReadingWindow:
 
 
 def stored_reading(tool: Literal["claude", "codex"], login: str, now: datetime) -> FreshReading | StaleReading | NoReading:
-    """Convert optional saved windows at the boundary into named reading states."""
+    """Read saved usage with the configured age limit."""
+    stale_after = timedelta(minutes=conf.whole("accounts", "usage_stale_minutes"))
+    return stored_reading_with_age(tool, login, now, stale_after)
+
+
+def stored_reading_with_age(tool: Literal["claude", "codex"], login: str, now: datetime,
+                            stale_after: timedelta) -> FreshReading | StaleReading | NoReading:
+    """Read saved usage with the caller's age limit."""
     held = usage_store.load().get(usage_store.key(tool.capitalize(), login))
     if held is None or "weekly" not in held:
         return NoReading()
     try:
         weekly = _reading_window(held["weekly"])
         five = _reading_window(held["five_hour"]) if "five_hour" in held else NoWindow()
-        if now - weekly.at > timedelta(minutes=10) or weekly.at > now:
+        if now - weekly.at > stale_after or weekly.at > now:
             return StaleReading(weekly, five)
         credits = held["credits"]["balance"] if "credits" in held else ""
         return FreshReading(weekly, five, credits)

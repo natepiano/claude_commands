@@ -18,6 +18,7 @@ from unittest import mock
 from urllib.error import HTTPError
 from urllib.request import Request
 
+from scripts.issue_score.test_config import ConfiguredTestCase
 from scripts.issue_score import client, questions
 
 FIXTURES = Path(__file__).with_name("fixtures")
@@ -34,12 +35,13 @@ class FixtureHTTPResponse(io.BytesIO):
         self.headers = Message()
 
 
-class ClientTests(unittest.TestCase):
+class ClientTests(ConfiguredTestCase):
     root: Path = Path()
     ledger: Path = Path()
 
     @override
     def setUp(self) -> None:
+        super().setUp()
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.ledger = self.root / "spend.jsonl"
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"TYPESAFE_API_KEY": FAKE_KEY})))
@@ -132,6 +134,47 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(set(cast(dict[str, object], payload["state"])), {"issue"})
         self.assertNotIn(FAKE_KEY.encode(), payload_bytes)
 
+    def test_default_request_settings_and_cost_change_after_a_config_edit(self) -> None:
+        first_ledger = self.root / "first" / "spend.jsonl"
+        second_ledger = self.root / "second" / "spend.jsonl"
+        path = self.configuration(spend_ledger=str(first_ledger))
+        with mock.patch.object(client, "urlopen", return_value=FixtureHTTPResponse(
+                (FIXTURES / "main_response.json").read_bytes())) as http:
+            _ = client.system_one({}, questions.main_questions())
+        request = cast(Request, http.call_args_list[0].args[0])
+        self.assertEqual(request.full_url, "https://api.typesafe.ai/v1/systemone")
+        self.assertEqual(http.call_args_list[0].kwargs["timeout"], 120)
+        first = cast(dict[str, object], json.loads(first_ledger.read_text()))
+        self.assertAlmostEqual(cast(float, first["cost_usd"]), .000084)
+        self.change_configuration(path, model="fixture-model", endpoint="https://fixture.invalid/systemone",
+                                  request_timeout="7.5", input_usd_per_million="0.21",
+                                  spend_ledger=str(second_ledger))
+        with mock.patch.object(client, "urlopen", return_value=FixtureHTTPResponse(
+                (FIXTURES / "main_response.json").read_bytes())) as http:
+            _ = client.system_one({}, questions.main_questions())
+        request = cast(Request, http.call_args_list[0].args[0])
+        payload = cast(dict[str, object], json.loads(gzip.decompress(cast(bytes, request.data))))
+        self.assertEqual(payload["model"], "fixture-model")
+        self.assertEqual(request.full_url, "https://fixture.invalid/systemone")
+        self.assertEqual(http.call_args_list[0].kwargs["timeout"], 7.5)
+        second = cast(dict[str, object], json.loads(second_ledger.read_text()))
+        self.assertAlmostEqual(cast(float, second["cost_usd"]), .00042)
+        self.assertEqual(len(first_ledger.read_text().splitlines()), 1)
+        self.change_configuration(path, budget_usd="0")
+        with mock.patch.object(client, "urlopen") as http:
+            with self.assertRaises(client.BudgetExceeded):
+                _ = client.system_one({}, questions.main_questions())
+        http.assert_not_called()
+
+    def test_retry_count_and_backoff_use_the_configured_values(self) -> None:
+        _ = self.configuration(max_attempts="3", retry_backoff_base="3.0")
+        with mock.patch.object(client, "urlopen", side_effect=[self.error(429) for _ in range(3)]) as http, \
+                mock.patch("time.sleep") as sleep:
+            with self.assertRaises(client.TypeSafeError):
+                _ = self.call()
+        self.assertEqual(http.call_count, 3)
+        self.assertEqual(sleep.call_args_list, [mock.call(1.), mock.call(3.)])
+
     def test_500_raises_with_status_and_body_without_retry_or_charge(self) -> None:
         with mock.patch.object(client, "urlopen", side_effect=self.error(500)) as http, \
                 mock.patch("time.sleep") as sleep:
@@ -182,7 +225,7 @@ class ClientTests(unittest.TestCase):
         self.assertFalse(self.ledger.exists())
 
     def test_budget_at_cap_refuses_before_http_and_preserves_ledger(self) -> None:
-        prior = json.dumps({"input_tokens": 1, "cost_usd": questions.BUDGET_USD}) + "\n"
+        prior = json.dumps({"input_tokens": 1, "cost_usd": questions.budget_usd()}) + "\n"
         _ = self.ledger.write_text(prior)
         with mock.patch.object(client, "urlopen") as http:
             with self.assertRaises(client.BudgetExceeded):
@@ -217,7 +260,7 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(len(self.ledger.read_text().splitlines()), 1)
 
     def test_budget_exhausted_during_backoff_refuses_the_retry(self) -> None:
-        charged = json.dumps({"input_tokens": 1, "cost_usd": questions.BUDGET_USD}) + "\n"
+        charged = json.dumps({"input_tokens": 1, "cost_usd": questions.budget_usd()}) + "\n"
 
         def concurrent_charge(delay: float) -> None:
             _ = delay

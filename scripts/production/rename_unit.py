@@ -66,6 +66,7 @@ from rename_state import RenameRefused, read_json, write_json, write_text  # noq
 from unit_move import PathMove, git  # noqa: E402
 from user_zone import user_zone  # noqa: E402
 from scripts.production import staff, staff_sources
+from scripts.lib import git_exclude, conf
 from scripts.astra import design_roles
 
 if TYPE_CHECKING:
@@ -298,6 +299,30 @@ def _check_stopped(rename: UnitRename, *, relaunch: bool = False) -> None:
     relaunch may accept its recorded session already live under the new id."""
     try:
         marked = unit_lookup.marked_units(rename.slug)
+        # Membership omits unregistered runtimes. They still prevent reuse of
+        # a retained pane, so inspect occupancy before any relaunch or write.
+        places = {found.place: unit for unit in (rename.old, rename.new)
+                  if (found := marked.get(unit)) is not None}
+        if rename.pane_session and rename.pane_id:
+            places[herdr.HerdrPlace(rename.pane_session, rename.pane_id)] = rename.new
+        observations = unit_lookup.observed_staff_marks()
+        # An initially stopped unit has no journaled live pane. Its launch
+        # labels still identify an occupied destination to refuse, even when
+        # the replacement conversation has no staff row. This grants no row
+        # ownership to that conversation.
+        for slug, observed in observations:
+            if slug == rename.slug and observed.unit in (rename.old, rename.new):
+                _ = places.setdefault(observed.place, observed.unit)
+        for _, observed in observations:
+            if observed.place not in places:
+                continue
+            unit = places[observed.place]
+            if isinstance(observed.claude, unit_lookup.ClaudeUnknown):
+                raise RenameRefused(f"{unit}: cannot tell whether Claude is running: {observed.claude.reason}")
+            if (isinstance(observed.claude, unit_lookup.LiveClaude)
+                    and not (relaunch and unit == rename.new
+                             and observed.claude.session_id == rename.session_id)):
+                raise RenameRefused(f"{unit} has a live Claude; stop it first")
     except OSError as error:
         raise RenameRefused(f"{rename.old}: cannot tell whether Claude is running: {error}") from error
     relaunched = False
@@ -533,7 +558,22 @@ def _merge(rename: UnitRename, _save: Callable[[], None]) -> None:
     rename.merged = unit_move.merge_into(worktree, f"origin/{rename.merge_branch}", message)
 
 
+def relocate_staff_worktree(member_id: staff.StaffId, worktree: Path) -> None:
+    """Change a recorded worktree path without changing its lifecycle state."""
+    row = staff.by_id(member_id)
+    if row is None or row.kind != "unit":
+        raise RenameRefused(f"{member_id}: no matching unit staff row")
+    if isinstance(row.worktree, staff.WorktreeUnfilled):
+        return
+    _ = staff.set_worktree(member_id, dataclasses.replace(row.worktree, path=worktree))
+
+
 def _move_git(rename: UnitRename, _save: Callable[[], None]) -> None:
+    if isinstance(rename.staff_id, UnboundStaffMember):
+        raise RenameRefused(f"{rename.slug}/{rename.old}: no journaled staff identity")
+    source = Path(rename.old_worktree)
+    git_exclude.require_untracked_ignored(source if source.exists() else Path(rename.new_worktree),
+                                          ".unit.toml", planned_pattern="/.unit.toml")
     checkout = Path(rename.checkout)
     if rename.old_branch != rename.new_branch:
         unit_move.push_branch(checkout, rename.old_branch, rename.new_branch, rename.merged)
@@ -542,6 +582,9 @@ def _move_git(rename: UnitRename, _save: Callable[[], None]) -> None:
                                 Path(rename.new_worktree), rename.merged)
     elif rename.old_branch != rename.new_branch:
         _ = git(Path(rename.new_worktree), "switch", rename.new_branch)
+    worktree = Path(rename.new_worktree)
+    git_exclude.ensure_excluded(worktree, "/.unit.toml")
+    relocate_staff_worktree(rename.staff_id, worktree)
 
 
 def _move_claude(rename: UnitRename, _save: Callable[[], None]) -> None:
@@ -1506,7 +1549,9 @@ def _main(argv: list[str]) -> int:
     except RenameWaiting as error:
         print(f"rename_unit: {error}", file=sys.stderr)
         return 2
-    except (RenameRefused, production_units.Refusal, unit_names.BadName, WorkerUnavailable, OSError, UnicodeError) as error:
+    except (RenameRefused, production_units.Refusal, unit_names.BadName, WorkerUnavailable,
+            git_exclude.ExcludeRefused, conf.Unusable, subprocess.SubprocessError,
+            OSError, UnicodeError) as error:
         print(f"rename_unit: {error}", file=sys.stderr)
         return 1
     for line in describe(rename):

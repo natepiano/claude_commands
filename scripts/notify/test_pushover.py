@@ -35,8 +35,8 @@ def footed(message: str, sender: str = PARENT, template: str = "none (free text)
     return with_footer(message, sender, template)
 
 
-def approve(draft: review.Draft, revision: bool) -> review.ReviewOutcome:
-    del revision
+def approve(draft: review.Draft, revision: bool, *, text_id: str = "") -> review.ReviewOutcome:
+    del revision, text_id
     return review.Approved(draft)
 
 
@@ -370,7 +370,7 @@ class PushoverTests(unittest.TestCase):
         posted = form["message"][0]
         self.assertEqual(len(posted), pushover.MESSAGE_MAX)
         self.assertTrue(posted.startswith("Action: restart the service\n"))
-        self.assertTrue(posted.endswith("B\n\nSent by: python test_pushover.py\nTemplate: none (free text)"))
+        self.assertTrue(posted.endswith("B\n\nSent by: python test_pushover.py · Template: none (free text)"))
 
     def test_action_too_long_for_its_line_is_refused_without_posting(self) -> None:
         action = "A" * pushover.MESSAGE_MAX
@@ -390,7 +390,24 @@ class PushoverTests(unittest.TestCase):
         self.assertEqual(self.log_lines()[0]["source"], "python test_pushover.py")
 
     def assert_footer(self, message: str, sender: str, template: str) -> None:
-        self.assertEqual(message.splitlines()[-3:], ["", f"Sent by: {sender}", f"Template: {template}"])
+        self.assertEqual(message.splitlines()[-2:], ["", f"Sent by: {sender} · Template: {template}"])
+
+    def test_cold_keys_template_has_only_its_action_and_delivery_footer(self) -> None:
+        code, form = self.run_send(["--text-id", "github.keys_cold", "--value", "sender=hana",
+                                    "--value", "machine=natedev"])
+        self.assertEqual(code, 0)
+        self.assertEqual(form["title"], ["GitHub keys locked on natedev"])
+        self.assertEqual(form["message"], [footed("Action: Run github-warmup in a terminal on natedev", "hana", "github.keys_cold")])
+
+    def test_emergency_agent_text_is_withheld_when_review_names_a_fixed_template(self) -> None:
+        failure = review.RuleFailure("use-registered-template:mac.locked", "Every Mac screenshot is black.")
+        draft = review.Draft("hana", "2", "Mac shots stopped", ActionRequired("Unlock the Mac."),
+                             "Every Mac screenshot is black.", False)
+        with mock.patch.object(review, "review", return_value=review.Withheld(draft, "Use mac.locked", failures=(failure,))):
+            code, form = self.run_send(["--text-id", "alert.blocked", "--value", "sender=hana",
+                                        "--value", "title=Mac shots stopped", "--value", "action=Unlock the Mac.",
+                                        "--value", "body=Every Mac screenshot is black."])
+        self.assertEqual((code, form), (6, {}))
 
     def test_every_post_ends_with_its_sender_then_its_template(self) -> None:
         entry = next(item for item in push_texts.catalog() if item.id == "nixos.ups_battery")
@@ -637,6 +654,20 @@ class PushoverTests(unittest.TestCase):
         self.assertEqual(code, 0)
         read.assert_called_once()
         self.assertEqual(push_texts.approval_date("test"), "")
+
+    def test_fixed_registered_text_still_sends_when_live_review_names_a_template(self) -> None:
+        entry = push_texts.PushText("test", "script", "decision", "Choose retry", push_texts.ActionTemplate("Choose retry."),
+                                   "The build stopped.", (push_texts.PushExample("typical", {}),), purpose="Test.")
+        draft = review.Draft("script", "1", entry.title, ActionRequired("Choose retry."), entry.body, False)
+        failure = review.RuleFailure("use-registered-template:test", draft.body)
+        with (mock.patch.object(push_texts, "catalog", return_value=(entry,)),
+              mock.patch.object(review, "review", return_value=review.Withheld(draft, "Use test", failures=(failure,))) as read,
+              redirect_stdout(io.StringIO())):
+            code, form = self.run_send(["--text-id", "test"])
+        self.assertEqual(code, 0)
+        self.assertEqual(read.call_args.kwargs["text_id"], "test")
+        self.assertEqual(form["message"], [footed("Action: Choose retry.\nThe build stopped.", "script", "test")])
+        self.assertIn("sent despite failed review", cast(str, self.log_lines()[-1]["outcome"]))
 
     def adhoc(self) -> tuple[review.Draft, list[str]]:
         description = "You asked to be told when the /nate skill is ready. It is ready now."
@@ -893,6 +924,30 @@ class PushoverTests(unittest.TestCase):
             code, form = self.run_send(["--no-action", "Third", "Third body."])
         self.assertEqual(form["title"], ["Third"])
 
+
+    def test_silence_release_discards_saved_repeat_flood_pushes_and_posts_other_pushes(self) -> None:
+        self.silence_on()
+        with redirect_stdout(io.StringIO()):
+            kept = silence.keep({"source": "send-repeat-guard", "priority": "0",
+                "title": "Repeated messages held", "message": "No action needed.",
+                "detail": "", "key": "old-flood", "text_id": "message.repeat_flood"})
+            self.assertIsInstance(kept, silence.Kept)
+            code, form = self.run_send(["--no-action", "Build done", "The build passed."])
+        self.assertEqual((code, form), (0, {}))
+        posted: list[str] = []
+
+        def post(_url: str, data: bytes) -> tuple[int, bytes]:
+            posted.append(urllib.parse.parse_qs(data.decode())["title"][0])
+            return 200, b'{"status":1}'
+
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(silence.off(lambda _argv: 0,
+                lambda push: pushover.post_kept(push, self.keys, post)), 0)
+        self.assertEqual(posted, ["Build done"])
+        self.assertEqual(silence.read_kept(), [])
+        self.assertEqual([line["outcome"] for line in self.log_lines()
+                          if line["source"] == "send-repeat-guard"],
+                         ["dropped: retired template message.repeat_flood"])
 
     def test_a_push_after_a_missed_end_posts_the_kept_pushes_first(self) -> None:
         self.silence_on()

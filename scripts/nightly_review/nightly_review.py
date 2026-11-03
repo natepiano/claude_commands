@@ -120,7 +120,7 @@ def showrunner_transcripts(since: datetime) -> list[Path]:
     """Find dated replies in each showrunner's own account, including natedev."""
     from scripts.production import showrunners
 
-    names = {runner["session"] for runner in showrunners.registered_showrunners() if runner["session"]}
+    names = {runner["session"] for runner in showrunners.require_complete(showrunners.registered_showrunners()) if runner["session"]}
     found: set[Path] = set()
     for path in sorted(SESSIONS_DIR.glob("*.json")):
         try:
@@ -250,7 +250,7 @@ def nightly_production() -> NightlyProduction | str:
         import production_units
 
     found: list[NightlyProduction] = []
-    for runner in showrunners.registered_showrunners():
+    for runner in showrunners.require_complete(showrunners.registered_showrunners()):
         try:
             rows = production_units.unit_table(Path(runner["doc"]).read_text(encoding="utf-8").splitlines())
         except (OSError, UnicodeError, production_units.Refusal):

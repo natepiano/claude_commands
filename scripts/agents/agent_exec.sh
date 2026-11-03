@@ -21,12 +21,14 @@ agents_exec_print_argv() {
 # this extracts the final result event's text into the output file to keep the
 # caller contract: output_file = final answer, log_file = full log.
 agents_claude_extract_result() {
-    "$PY" - "$1" "$2" <<'PY'
+    "$PY" - "$1" "$2" "$3" <<'PY'
 import json
 import sys
 
-log_path, out_path = sys.argv[1], sys.argv[2]
+log_path, out_path, task = sys.argv[1:]
 result = None
+errors = []
+strict = task == "direct.simplify"
 try:
     with open(log_path, encoding="utf-8", errors="replace") as log:
         for line in log:
@@ -37,12 +39,23 @@ try:
                 event = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if event.get("type") == "result" and isinstance(event.get("result"), str):
-                result = event["result"]
+            if event.get("type") == "result":
+                if isinstance(event.get("errors"), list):
+                    errors.extend(reason for reason in event["errors"] if isinstance(reason, str) and reason.strip())
+                if event.get("is_error"):
+                    errors.append(event.get("result") or event.get("api_error") or event.get("subtype") or "Claude returned an error")
+                if isinstance(event.get("result"), str):
+                    result = event["result"]
 except OSError:
     pass
+if strict:
+    if errors:
+        result = "ERROR: " + "; ".join(dict.fromkeys(errors))
+        print(result, file=sys.stderr)
 with open(out_path, "w", encoding="utf-8") as out:
     out.write(result if result is not None else "")
+if strict and errors:
+    sys.exit(1)
 PY
 }
 
@@ -58,8 +71,9 @@ agents_exec_main() {
     local prompt_file="$4"
     local output_file="$5"
     local log_file="$6"
-    local script_dir prompt family_args_line claude_code workers_home
-    local -a family_args extra_args command
+    local script_dir prompt family_args_line claude_code workers_home simplify_home selection_log claude_log_prefix=""
+    local extraction_failure_is_error=false
+    local -a family_args extra_args command task_args=() claude_env=()
 
     if [[ ! -f "$prompt_file" ]]; then
         printf 'Prompt not found: %s\n' "$prompt_file" > "$log_file"
@@ -77,6 +91,10 @@ agents_exec_main() {
     script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     source "$script_dir/agents_config.sh"
     agents_resolve "$task"
+    if [[ "$task" == direct.simplify ]]; then
+        [[ "$mode" == readonly ]] || return 2
+        task_args=(--disallowedTools Edit,Write,NotebookEdit)
+    fi
 
     prompt="$(cat "$prompt_file")"
     if [[ -n "${AGENT_EXEC_EXTRA_ARGS:-}" ]]; then
@@ -118,15 +136,35 @@ agents_exec_main() {
             ;;
         claude)
             source "$script_dir/claude_account.sh"
-            claude_launch_environment workers || return 1
+            if [[ "$task" == direct.simplify ]]; then
+                extraction_failure_is_error=true
+                claude_env=(env CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1)
+                selection_log="$log_file"
+                [[ "${AGENT_EXEC_DRY_RUN:-}" != 1 ]] || selection_log=/dev/stderr
+                if ! simplify_home="$(claude_launch_environment quota 2>"$selection_log")"; then
+                    printf 'ERROR: %s\n' "${simplify_home:-unable to select a Claude account}" > "$log_file"
+                    cat "$log_file" >&2
+                    return 1
+                fi
+                export CLAUDE_CONFIG_DIR="$simplify_home"
+                export CLAUDE_CODE_REMOTE_MEMORY_DIR="$HOME/.claude"
+                unset CLAUDE_CODE_OAUTH_TOKEN
+                if [[ "${AGENT_EXEC_DRY_RUN:-}" != 1 ]]; then
+                    claude_log_prefix="$(cat "$log_file")"$'\n'
+                    printf '%s' "$claude_log_prefix" >&2
+                fi
+            else
+                claude_launch_environment workers || return 1
+            fi
             family_args_line="$(agents_claude_args)"
             read -r -a family_args <<< "$family_args_line"
-            command=("$PY" "$script_dir/../lib/nix_env.py" exec "$(command -v claude)" --print)
+            command=("${claude_env[@]}" "$PY" "$script_dir/../lib/nix_env.py" exec "$(command -v claude)" --print)
             if [[ "$mode" == "write" ]]; then
                 command+=(--dangerously-skip-permissions)
             else
                 command+=(--permission-mode plan)
             fi
+            command+=("${task_args[@]}")
             command+=(--settings '{"sandbox":{"enabled":false}}')
             command+=(--verbose --output-format stream-json)
             command+=("${family_args[@]}")
@@ -151,8 +189,13 @@ agents_exec_main() {
                 return 0
             fi
             claude_code=0
-            ( cd "$working_dir" && "${command[@]}" < "$prompt_file" > "$log_file" 2>&1 ) || claude_code=$?
-            agents_claude_extract_result "$log_file" "$output_file" || true
+            printf '%s' "$claude_log_prefix" > "$log_file"
+            ( cd "$working_dir" && "${command[@]}" < "$prompt_file" >> "$log_file" 2>&1 ) || claude_code=$?
+            if ! agents_claude_extract_result "$log_file" "$output_file" "$task"; then
+                if "$extraction_failure_is_error"; then
+                    claude_code=1
+                fi
+            fi
             return "$claude_code"
             ;;
         *)
@@ -162,4 +205,6 @@ agents_exec_main() {
     esac
 }
 
-agents_exec_main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    agents_exec_main "$@"
+fi

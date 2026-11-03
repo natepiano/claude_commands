@@ -394,7 +394,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
                      "--unit-branch", "unit-phase", "--checkpoint", self.checkpoint,
                      "--previous-checkpoint", self.base, "--unit", "fixture-unit", "--phase", "phase-2",
                      "--body", "Fixture checkpoint gate.", "--type-dirs", "scripts/production",
-                     "--settings-blob", self.settings_blob, "--main-repo", str(self.main),
+                     "--main-repo", str(self.main),
                      "--ssh", str(self.bin / "ssh"), "--production", str(self.quiet_production)]
         output = io.StringIO()
         with mock.patch.dict(os.environ, self.environment), mock.patch.object(

@@ -13,7 +13,7 @@ import json
 import io
 import os
 import subprocess
-from typing import cast
+from typing import cast, override
 from unittest.mock import patch
 
 from scripts.hierarchies import measure as m, log_records, push_audit as audit
@@ -22,6 +22,12 @@ from scripts.lib.user_zone import user_zone
 from scripts.lib import unit_runs
 from scripts.production.issues import Issue
 from scripts.usage import collect
+from scripts.production.update_registration_test_support import RegistrationFixture
+from scripts.production.cli_fixture import production_paths
+from scripts.production import staff
+from scripts.production.staff_test_support import (
+    fixture_member, isolated_staff_file, isolated_source_readers, source_environment,
+)
 
 
 def row_cells(output: str) -> dict[str, list[str]]:
@@ -3135,6 +3141,15 @@ class TrunkGitFixture:
 
 
 class SourcesTest(unittest.TestCase):
+    @override
+    def setUp(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        environment = source_environment(root / "sources")
+        _ = self.enterContext(isolated_staff_file(root / "staff.json", environment))
+        _ = cast(object, self.enterContext(patch.dict(os.environ, environment)))
+        _ = self.enterContext(isolated_source_readers())
+        _ = self.enterContext(production_paths(environment))
+
     def test_closed_window_keeps_trunk_merges_after_a_unit_checkpoint_fast_forward(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             fixture = TrunkGitFixture(Path(directory))
@@ -3332,9 +3347,19 @@ class SourcesTest(unittest.TestCase):
             )
             _ = (state / "notify/questions/one.json").write_text('{"question":"Held push review; not an open question"}')
             _ = (state / "showrunner/outstanding/hana.json").write_text(
-                '[{"since":"2026-10-05T12:00","text":"Which?","question":"Which size?"},' +
-                '{"since":"2026-10-01T12:00","text":"A reminder"}]'
+                '[{"since":"2026-10-01T12:00","text":"A reminder"}]'
             )
+            questions = root / "questions"
+            questions.mkdir()
+            document = root / "hana-production.md"
+            _ = document.write_text(f"# Production — hana\n\n- **Proposals:** `{questions}`\n")
+            owner = fixture_member("showrunner", name="hana", doc=staff.LiveDoc("natedev", document))
+            fields = {"since": "2026-10-05T12:00", "text": "Which?", "question": "Which size?",
+                      "asked_by": owner.id}
+            _ = (questions / "question-size.md").write_text(
+                f"---\nrecord_type: question\ntags: [question]\nstatus: open\n"
+                + f"production_id: {owner.id}\nasked_by: {owner.id}\n"
+                + f"registration: {json.dumps(fields)}\n---\n# Which?\n")
             answered = state / "showrunner/outstanding/hana.answered.jsonl"
             _ = answered.write_text(json.dumps({"time": "2026-10-07T11:00:00-04:00", "slug": "hana",
                                                 "text": "Answered recently", "asked_by": "fixture-unit"}) + "\n")
@@ -3523,6 +3548,28 @@ class SourcesTest(unittest.TestCase):
             _ = (gitdir / "commondir").write_text('../..')
             _ = (tree / ".git").write_text(f'gitdir: {gitdir}')
             self.assertEqual(m.repository(str(tree)), str(repo))
+
+
+class CanonicalQuestionWaitingTests(RegistrationFixture):
+    def test_waiting_counts_question_records_without_an_outstanding_json_file(self) -> None:
+        self.timer("example")
+        self.write_open_for("example", {"since": "2026-10-05T12:00", "text": "Choose the layout",
+                                        "question": "Keep this layout?"})
+        self.outstanding().unlink()
+        problems: list[log_records.SourceProblem] = []
+        with patch.dict(os.environ, self.env), production_paths(self.env):
+            waiting = m.read_waiting(self.state, self.root / "vault", [], problems)
+        questions = [item for item in waiting if item.kind == "questions"]
+        self.assertEqual(len(questions), 1)
+        self.assertEqual(questions[0].opened, log_records.moment("2026-10-05T12:00"))
+        question_sources = (str(self.doc), str(self.root / "issues"), self.env["STAFF_FILE"],
+                            "question", "staff")
+        self.assertEqual([
+            problem for problem in problems
+            if any(source.casefold() in f"{problem.source} {problem.reason}".casefold()
+                   for source in question_sources)
+        ], [])
+        self.assertFalse(self.outstanding().exists())
 
 
 if __name__ == "__main__":

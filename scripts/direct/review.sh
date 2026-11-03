@@ -2,7 +2,7 @@
 # review.sh — Invoke the configured worker agent for a review.
 #
 # Usage: review.sh [--to <worker> | --slot <new-slot>]
-#                  [--phase <id>] <session_dir>
+#                  [--phase <id>] [--style-since <commit> [--style-until <commit>]] <session_dir>
 #                  [working_dir] [prompt_file] [task]
 #                  [role_description] [pass_activity] [pass_index] [lens]
 #                  [early_ready_file]
@@ -48,10 +48,10 @@
 #                                        start + [wrapper] beats every 60s, each
 #                                        carrying an activity digest decoded from
 #                                        the reviewer's streamed log. Fresh
-#                                        reviewers are read-only; assigned reviewers
-#                                        are checked for an unchanged tree after
-#                                        their turn, less any path another open
-#                                        phase's files list holds (review_tree.py).
+#                                        reviewers are read-only. Assigned reviewers
+#                                        and simplify reviews get a tree check.
+#                                        The check excludes paths held by another
+#                                        open phase (review_tree.py).
 
 set -euo pipefail
 UNIT_ENV_SHIM="${BASH_SOURCE[0]%/*}/../lib/unit_env.sh"
@@ -61,12 +61,17 @@ FOLLOW_TO=""
 NEW_SLOT=""
 # A phase running beside the current one names itself, so start-pass stamps this pass with it.
 PHASE_ID=""
+STYLE_SINCE=""
+STYLE_UNTIL=""
+STYLE_INPUT_DIR=""
 REQUESTED_LENS=""
 while [[ "${1:-}" == --* ]]; do
   case "$1" in
     --to) FOLLOW_TO="${2:?--to requires a worker}" ;;
     --slot) NEW_SLOT="${2:?--slot requires a slot}" ;;
     --lens) REQUESTED_LENS="${2:?--lens requires a lens}" ;;
+    --style-since) STYLE_SINCE="${2:?--style-since requires a baseline}" ;;
+    --style-until) STYLE_UNTIL="${2:?--style-until requires an end commit}" ;;
     --phase) PHASE_ID="${2:?--phase requires a phase id}" ;;
     *) echo "ERROR: unknown review option '$1'." >&2; exit 2 ;;
   esac
@@ -88,6 +93,14 @@ if [[ -n "${PHASE_ID}" ]]; then
     exit 2
   fi
   ARTIFACT_DIR="${SESSION_DIR}/phases/${PHASE_DIR_NAME}"
+fi
+if [[ -n "${STYLE_SINCE}" && ( -z "${PHASE_ID}" || -n "${9:-}" ) ]]; then
+  echo "ERROR: --style-since requires --phase and a final-diff dispatch (no early review)." >&2
+  exit 2
+fi
+if [[ -n "${STYLE_UNTIL}" && -z "${STYLE_SINCE}" ]]; then
+  echo "ERROR: --style-until requires --style-since." >&2
+  exit 2
 fi
 WORKING_DIR="${2:-$(pwd)}"
 PROMPT_FILE="${3:-${ARTIFACT_DIR}/review_prompt.md}"
@@ -137,6 +150,9 @@ elif [[ -n "${NEW_SLOT}" ]]; then
   fi
 else
   TEAM_SLOT="${LENS_SLOT}"
+  if [[ "${TASK}" == direct.simplify ]]; then
+    TEAM_SLOT="simplify-$$"
+  fi
 fi
 
 SUFFIX="${LENS:+_${LENS}}"
@@ -156,6 +172,14 @@ elif [[ -n "${NEW_SLOT}" ]]; then
 else
   REVIEW_WORKER=""
 fi
+RECORDS_TURN=0
+if [[ -n "${REVIEW_WORKER}" || "${TASK}" == direct.simplify ]]; then
+  RECORDS_TURN=1
+fi
+REVIEWER_LABEL="review worker ${REVIEW_WORKER}"
+if [[ -z "${REVIEW_WORKER}" ]]; then
+  REVIEWER_LABEL="${LENS:-fresh} reviewer"
+fi
 
 # python3 goes through the repo shim, which picks an interpreter by VERSION
 # rather than by path: the python3 on PATH is Apple 3.9 on the Mac, and this
@@ -168,6 +192,7 @@ TURN_FINDINGS_READY=0
 TURN_RAISED=0
 TURN_COUNT_READY=0
 TURN_RECORD_STATUS="error"
+PASS_STARTED=0
 mkdir -p "${ARTIFACT_DIR}"
 # Every dispatch names the run's director in the run folder (unit_runs.py), which the
 # production tree reads: a marker names one run per director, and a director runs phases side by side.
@@ -194,6 +219,58 @@ HEARTBEAT_FILE="${SESSION_DIR}/heartbeat.log"
 PROGRESS_HELPER="${SCRIPT_DIR}/progress_history.py"
 PROGRESS_STATE="${SESSION_DIR}/progress_history_state.json"
 HEARTBEAT_INTERVAL_SECS=60
+
+REVIEW_FAILURE_REASON="${UNIT_REVIEW_FAILURE_REASON:-}"
+SIMPLIFY_DIR="${ARTIFACT_DIR}/simplify"
+
+review_error() {
+  REVIEW_FAILURE_REASON="$1"
+  printf 'ERROR: %s\n' "${REVIEW_FAILURE_REASON}" >&2
+}
+
+simplify_result() {
+  "$PY" "${SCRIPT_DIR}/simplify_result.py" "$1" --phase-dir "${ARTIFACT_DIR}" "${@:2}"
+}
+
+finish_simplify() {
+  local code="$1"
+  trap - EXIT
+  simplify_result finish --session-dir "${SESSION_DIR}" --phase "${PHASE_ID}" \
+    --reason "${REVIEW_FAILURE_REASON}" --exit-code "${code}" || {
+      echo error > "${STATUS_FILE}"
+      echo "ERROR: unable to finish the simplify result." >&2
+    }
+  # Review failures let the phase continue. Stop signals retain their exit code.
+  if [[ "${code}" -lt 128 ]]; then
+    code=0
+  fi
+  exit "${code}"
+}
+
+if [[ "${TASK}" == direct.simplify ]]; then
+  trap 'finish_simplify $?' EXIT
+  mkdir -p "${SIMPLIFY_DIR}"
+  exec {SIMPLIFY_LOCK}>"${SIMPLIFY_DIR}/launch.lock"
+  if ! flock -n "${SIMPLIFY_LOCK}"; then
+    review_error "the Claude lens is busy"
+    [[ -z "${UNIT_REVIEW_CACHE_FILE:-}" ]] || rm -f "${PROMPT_FILE}"
+    exit 1
+  fi
+  if [[ -n "${REVIEW_FAILURE_REASON}" ]]; then
+    review_error "${REVIEW_FAILURE_REASON}"
+    printf 'ERROR: %s\n' "${REVIEW_FAILURE_REASON}" > "${FINDINGS_FILE}"
+    exit 1
+  fi
+  if [[ -n "${UNIT_REVIEW_CACHE_FILE:-}" && -e "${UNIT_REVIEW_CACHE_FILE}" ]] && simplify_result reuse; then
+    [[ -z "${UNIT_REVIEW_CACHE_FILE:-}" ]] || rm -f "${PROMPT_FILE}"
+    trap - EXIT
+    exit 0
+  fi
+  if [[ -n "${UNIT_REVIEW_CACHE_FILE:-}" ]]; then
+    mv "${PROMPT_FILE}" "${SIMPLIFY_DIR}/prompt.md"
+    PROMPT_FILE="${SIMPLIFY_DIR}/prompt.md"
+  fi
+fi
 
 # Validate before worker allocation, compaction or any reviewer starts. UX has no
 # pass window, so this command also records its launch evidence.
@@ -224,7 +301,7 @@ initialize_review_artifacts() {
   ln -sfn "review_findings_${PASS_INDEX}${SUFFIX}.txt" "${ARTIFACT_DIR}/review_findings${SUFFIX}.txt"
   ln -sfn "review_agent_${PASS_INDEX}${SUFFIX}${SEAT_SUFFIX}.log" "${ARTIFACT_DIR}/review_agent${SUFFIX}.log"
   rm -f "${REPLY_FILE}"
-  if [[ -n "${REVIEW_WORKER}" ]]; then
+  if [[ "${RECORDS_TURN}" -eq 1 ]]; then
     : > "${FINDINGS_FILE}"
     TURN_FINDINGS_READY=1
   fi
@@ -458,6 +535,19 @@ for sequence in itertools.count():
 PY
 }
 
+finish_style_review() {
+  [[ -n "${STYLE_INPUT_DIR}" ]] || return 0
+  "$PY" "${SCRIPT_DIR}/../lint/style_review.py" finish \
+    --input-dir "${STYLE_INPUT_DIR}" --result "${FINDINGS_FILE}" --dispatch-code "$1"
+}
+
+finish_fresh_exit() {
+  local code=$?
+  trap - EXIT
+  finish_style_review "${code}" || code=1
+  exit "${code}"
+}
+
 finish_review_exit() {
   local code=$?
   trap - EXIT
@@ -465,19 +555,34 @@ finish_review_exit() {
   if [[ "${code}" -ne 0 && "${TURN_FINDINGS_READY}" -eq 1 ]]; then
     echo error > "${STATUS_FILE}"
   fi
+  if [[ "${TASK}" == direct.simplify && "${PASS_STARTED}" -eq 1 ]]; then
+    UNIT_PASS_OWNER=launcher "$PY" "${PROGRESS_HELPER}" finish-pass \
+      --session-dir "${SESSION_DIR}" --status error \
+      && PASS_STARTED=0 || code=1
+  fi
+  finish_style_review "${code}" || code=1
   count_turn_findings
   refresh_turn_thread_id
   if ! write_turn_record; then
-    echo "ERROR: unable to write review turn record." >&2
+    review_error "unable to write review turn record"
+    echo error > "${STATUS_FILE}"
     code=1
   fi
+
   cleanup_mesh_review
+  if [[ "${TASK}" == direct.simplify ]]; then
+    finish_simplify "${code}"
+  fi
   exit "${code}"
 }
 
 interrupt_review() {
   TURN_RECORD_STATUS="canceled"
-  # The persistent worker keeps its running turn when this wrapper stops.
+  # A fresh reviewer owns its process group. Persistent workers retain their turns.
+  if [[ -z "${REVIEW_WORKER}" && -n "${AGENT_PID:-}" ]]; then
+    "$PY" "${SCRIPT_DIR}/../lib/process_group.py" "${AGENT_PID}" TERM || true
+    wait "${AGENT_PID}" 2>/dev/null || true
+  fi
   if [[ -n "${HEARTBEAT_LOOP_PID:-}" ]]; then
     kill "${HEARTBEAT_LOOP_PID}" 2>/dev/null || true
     wait "${HEARTBEAT_LOOP_PID}" 2>/dev/null || true
@@ -486,7 +591,7 @@ interrupt_review() {
   exit "$1"
 }
 
-if [[ -n "${FOLLOW_TO}" || -n "${NEW_SLOT}" ]]; then
+if [[ "${RECORDS_TURN}" -eq 1 ]]; then
   TURN_STARTED_AT="$(date +%s)"
   # The record joins to the phase --phase names, the same phase start-pass stamps:
   # with phases open side by side, the newest open phase is often another one.
@@ -516,10 +621,29 @@ PY
   trap 'interrupt_review 143' TERM
   trap 'interrupt_review 130' INT
   trap 'interrupt_review 129' HUP
+else
+  trap finish_fresh_exit EXIT
+fi
+
+if [[ -n "${STYLE_SINCE}" ]]; then
+  STYLE_DIRECTORY_FILE="${ARTIFACT_DIR}/style_directory.$$.txt"
+  "$PY" "${SCRIPT_DIR}/../lint/style_review.py" prepare \
+    --working-dir "${WORKING_DIR}" --since "${STYLE_SINCE}" \
+    --until "${STYLE_UNTIL}" \
+    --phase-dir "${ARTIFACT_DIR}" --prompt "${PROMPT_FILE}" \
+    --owner-pid "$$" --pass-name "pass-${PASS_INDEX}${SUFFIX}" --directory-file "${STYLE_DIRECTORY_FILE}"
+  STYLE_INPUT_DIR="$(cat "${STYLE_DIRECTORY_FILE}")"
+  rm -f "${STYLE_DIRECTORY_FILE}"
+  PROMPT_FILE="${STYLE_INPUT_DIR}/prompt.md"
 fi
 
 # shellcheck source=/dev/null
 source "${SCRIPT_DIR}/../agents/agents_config.sh"
+if [[ "${TASK}" == direct.simplify && "$(_agents_live_family direct simplify)" != claude ]]; then
+  review_error "direct.simplify requires a Claude assignment"
+  echo error > "${STATUS_FILE}"
+  exit 1
+fi
 if ! agents_resolve "${TASK}" 2>"${LOG_FILE}"; then
   if [[ -z "${REVIEW_WORKER}" ]]; then
     echo "error" > "${STATUS_FILE}"
@@ -555,24 +679,15 @@ if [[ -n "${REVIEW_WORKER}" ]]; then
     exit 2
   fi
   if [[ -n "${FOLLOW_TO}" ]]; then
-    DIRECT_CONFIG="${UNIT_CONFIG:-${HOME}/.claude/config/direct.conf}"
-    COMPACT_ABOVE_TOKENS=""
-    if [[ -r "${DIRECT_CONFIG}" ]]; then
-      COMPACT_ABOVE_TOKENS="$(sed -n \
-        's/^UNIT_COMPACT_ABOVE_TOKENS=\([0-9][0-9]*\).*$/\1/p' \
-        "${DIRECT_CONFIG}" | tail -n 1)"
-    fi
-    if [[ ! "${COMPACT_ABOVE_TOKENS}" =~ ^[0-9]+$ ]] || (( COMPACT_ABOVE_TOKENS <= 0 )); then
-      echo "ERROR: UNIT_COMPACT_ABOVE_TOKENS in ${DIRECT_CONFIG} must be a positive integer." >&2
-      exit 2
-    fi
+    source "${SCRIPT_DIR}/../lib/conf.sh"
+    COMPACT_ABOVE_TOKENS="$(conf_value direct UNIT_COMPACT_ABOVE_TOKENS)"
     export FOLLOW_LAUNCHER_PID="$$"
     claim_follow
     MESH_CLAIMED=1
   fi
-  if [[ -z "${EARLY_READY_FILE}" || -e "${EARLY_READY_FILE}" ]]; then
-    capture_tree_baseline
-  fi
+fi
+if [[ "${RECORDS_TURN}" -eq 1 && ( -z "${EARLY_READY_FILE}" || -e "${EARLY_READY_FILE}" ) ]]; then
+  capture_tree_baseline
 fi
 initialize_review_artifacts
 
@@ -593,7 +708,6 @@ fi
 board_post register \
   "${LENS} review ${LAUNCH_NOTE} (${AGENT_FAMILY}/${AGENT_MODEL}:${AGENT_EFFORT:-unset}); ${MESH_FIELD}; role=review; status in review_status${SUFFIX}"
 
-PASS_STARTED=0
 record_pass_start() {
   # UX time belongs to the director's activity, including early launches.
   [[ "${LENS}" != ux ]] || return 0
@@ -644,6 +758,44 @@ if [[ -n "${EARLY_READY_FILE}" && -n "${REVIEW_WORKER}" ]]; then
   fi
 fi
 
+# A broad pass reviews the exact pending snapshot it receives. New pushes made
+# during this pass stay pending for the next pass.
+FAST_TRACK_UNIT=""
+FAST_TRACK_COMMITS=()
+FAST_TRACK_SCRIPT="${SCRIPT_DIR}/../production/fast_track.py"
+if [[ "${PASS_INDEX}" == 1 && "${LENS}" != ux && -f "${PROGRESS_STATE}" ]]; then
+  FAST_TRACK_UNIT="$("$PY" - "${PROGRESS_STATE}" <<'PY'
+import json
+import sys
+from pathlib import Path
+print(json.loads(Path(sys.argv[1]).read_text()).get("unit", ""))
+PY
+)"
+  if [[ -n "${FAST_TRACK_UNIT}" ]]; then
+    FAST_TRACK_DIFF="${ARTIFACT_DIR}/review_fast_track_${PASS_INDEX}.diff"
+    # One atomic snapshot for every lens and retry of this phase's broad pass.
+    (
+      flock -x 9
+      if [[ ! -f "${FAST_TRACK_DIFF}" ]]; then
+        SNAPSHOT_TEMP="${FAST_TRACK_DIFF}.$$.tmp"
+        trap 'rm -f "${SNAPSHOT_TEMP}"' EXIT
+        (cd "${WORKING_DIR}" && "$PY" "${FAST_TRACK_SCRIPT}" --pending --unit "${FAST_TRACK_UNIT}") > "${SNAPSHOT_TEMP}"
+        mv "${SNAPSHOT_TEMP}" "${FAST_TRACK_DIFF}"
+      fi
+    ) 9>"${FAST_TRACK_DIFF}.lock"
+    while IFS= read -r commit; do
+      [[ -z "${commit}" ]] || FAST_TRACK_COMMITS+=(--commit "${commit}")
+    done < <(sed -n 's/^## Fast-track \([0-9a-f]*\) .*/\1/p' "${FAST_TRACK_DIFF}")
+    if [[ ${#FAST_TRACK_COMMITS[@]} -gt 0 ]]; then
+      REVIEW_PROMPT="${ARTIFACT_DIR}/review_with_fast_track_${PASS_INDEX}${SUFFIX}.$$.md"
+      cat "${PROMPT_FILE}" > "${REVIEW_PROMPT}"
+      printf '\nReview these pending fast-track fixes against the same rules:\n' >> "${REVIEW_PROMPT}"
+      cat "${FAST_TRACK_DIFF}" >> "${REVIEW_PROMPT}"
+      PROMPT_FILE="${REVIEW_PROMPT}"
+    fi
+  fi
+fi
+
 TURN_WORKTREE_ARGS=(--cwd "${WORKING_DIR}" --read-only)
 if [[ -n "${FOLLOW_TO}" ]]; then
   "$PY" "${SCRIPT_DIR}/../agents/codex_mesh.py" follow \
@@ -659,7 +811,16 @@ elif [[ -n "${NEW_SLOT}" ]]; then
     --summary-file "${FINDINGS_FILE}" --reply-file "${REPLY_FILE}" \
     --log-file "${LOG_FILE}" --task "${TASK}" --service-tier "${AGENT_SERVICE_TIER:-}" &
 else
-  bash "${SCRIPT_DIR}/../agents/agent_exec.sh" \
+  FRESH_REVIEW_PREFIX=()
+  FRESH_REVIEW_ARGS="${AGENT_EXEC_EXTRA_ARGS:-}"
+  if [[ "${TASK}" == direct.simplify ]]; then
+    TURN_THREAD_ID="$(uuidgen | tr '[:upper:]' '[:lower:]')"
+    "$PY" "${SCRIPT_DIR}/../usage/agents_log.py" append \
+      --id "${TURN_THREAD_ID}" --role review --lens "${LENS}" || true
+    FRESH_REVIEW_ARGS+=" --session-id ${TURN_THREAD_ID}"
+    FRESH_REVIEW_PREFIX=("$PY" -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])')
+  fi
+  AGENT_EXEC_EXTRA_ARGS="${FRESH_REVIEW_ARGS}" "${FRESH_REVIEW_PREFIX[@]}" bash "${SCRIPT_DIR}/../agents/agent_exec.sh" \
     "${TASK}" readonly "${WORKING_DIR}" "${PROMPT_FILE}" "${FINDINGS_FILE}" "${LOG_FILE}" &
 fi
 AGENT_PID=$!
@@ -706,7 +867,7 @@ wait "${HEARTBEAT_LOOP_PID}" 2>/dev/null || true
 
 TREE_CHANGED=0
 CHANGED_PATHS=""
-if [[ -n "${REVIEW_WORKER}" && "${TREE_BASELINE_READY}" -ne 0 ]]; then
+if [[ "${TREE_BASELINE_READY}" -ne 0 ]]; then
   if [[ "${TREE_BASELINE_READY}" -eq 1 ]] && CHANGED_PATHS="$("$PY" "${SCRIPT_DIR}/review_tree.py" changes \
     --root "${WORKING_DIR}" --baseline "${TREE_BASELINE_FILE}" \
     --session-dir "${SESSION_DIR}" --phase "${PHASE_ID}" 2>>"${LOG_FILE}")"; then
@@ -716,15 +877,21 @@ if [[ -n "${REVIEW_WORKER}" && "${TREE_BASELINE_READY}" -ne 0 ]]; then
   fi
   if [[ -n "${CHANGED_PATHS}" ]]; then
     TREE_CHANGED=1
-    echo "ERROR: review worker ${REVIEW_WORKER} changed the working tree: ${CHANGED_PATHS}" >&2
+    review_error "${REVIEWER_LABEL} changed the working tree: ${CHANGED_PATHS}"
   fi
   rm -f "${TREE_BASELINE_FILE}"
 fi
 
-# The durable record stores this count before finish-pass closes the pass.
-if [[ -n "${FOLLOW_TO}" || -n "${NEW_SLOT}" ]]; then
-  count_turn_findings
+if [[ "${TASK}" == direct.simplify ]]; then
+  if ! REPORT_ERROR="$("$PY" "${SCRIPT_DIR}/simplify_result.py" check \
+    --report-file "${FINDINGS_FILE}" --log-file "${LOG_FILE}")"; then
+    review_error "${REPORT_ERROR}"
+    AGENT_CODE=1
+  fi
 fi
+
+# The durable record stores this count before finish-pass closes the pass.
+count_turn_findings
 
 if [[ "${AGENT_CODE}" -eq 0 && "${TREE_CHANGED}" -eq 0 ]]; then
   # A completed early review is a real pass only once the sentinel exists: the
@@ -748,12 +915,21 @@ if [[ "${AGENT_CODE}" -eq 0 && "${TREE_CHANGED}" -eq 0 ]]; then
       echo "error" > "${STATUS_FILE}"
       exit 1
     fi
+    PASS_STARTED=0
   fi
   if [[ -n "${EARLY_READY_FILE}" && ! -e "${EARLY_READY_FILE}" ]]; then
     TURN_RECORD_STATUS="void"
     bash "${HEARTBEAT_HELPER}" "${HEARTBEAT_FILE}" wrapper \
       "${BEAT_TAG} agent finished before delivery — no pass recorded, verdict void" || true
   else
+    if [[ ${#FAST_TRACK_COMMITS[@]} -gt 0 ]]; then
+      if ! (cd "${WORKING_DIR}" && "$PY" "${FAST_TRACK_SCRIPT}" --mark-reviewed \
+        --unit "${FAST_TRACK_UNIT}" --pass "${PHASE_ID}/${PASS_INDEX}/${LENS}" "${FAST_TRACK_COMMITS[@]}"); then
+        echo error > "${STATUS_FILE}"
+        echo "ERROR: unable to record the fast-track review completion." >&2
+        exit 1
+      fi
+    fi
     TURN_RECORD_STATUS="reviewed"
     bash "${HEARTBEAT_HELPER}" "${HEARTBEAT_FILE}" wrapper "${BEAT_TAG} agent finished" || true
   fi
@@ -766,13 +942,14 @@ else
   if [[ -f "${PROGRESS_STATE}" && "${PASS_STARTED}" -eq 1 ]]; then
     UNIT_PASS_OWNER=launcher "$PY" "${PROGRESS_HELPER}" finish-pass \
       --session-dir "${SESSION_DIR}" --status error \
+      && PASS_STARTED=0 \
       || echo "ERROR: unable to record the review pass error." >&2
   fi
   if [[ "${TREE_CHANGED}" -eq 1 ]]; then
     bash "${HEARTBEAT_HELPER}" "${HEARTBEAT_FILE}" wrapper \
-      "${BEAT_TAG} review worker ${REVIEW_WORKER} changed the working tree: ${CHANGED_PATHS}" || true
+      "${BEAT_TAG} ${REVIEWER_LABEL} changed the working tree: ${CHANGED_PATHS}" || true
     board_post blocked \
-      "launcher: review worker ${REVIEW_WORKER} changed the working tree: ${CHANGED_PATHS}; findings kept in review_findings_${PASS_INDEX}${SUFFIX}.txt"
+      "launcher: ${REVIEWER_LABEL} changed the working tree: ${CHANGED_PATHS}; findings kept in review_findings_${PASS_INDEX}${SUFFIX}.txt"
     exit 1
   fi
   bash "${HEARTBEAT_HELPER}" "${HEARTBEAT_FILE}" wrapper "${BEAT_TAG} agent exited with code ${AGENT_CODE}" || true

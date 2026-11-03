@@ -47,7 +47,7 @@ function commandSelection(data: BoardSnapshot<BoardData>, wanted: string): Selec
 }
 
 function retainWatch(active: OpenPane, path: RefreshPaths) {
-  if (path.kind === 'board') { active.paths.push(path); return; }
+  if (path.kind !== 'discovery') { active.paths.push(path); return; }
   const previous = active.paths.filter(path => path.kind === 'discovery');
   active.paths = [...active.paths.filter(path => path.kind === 'board'), {
     kind: 'discovery', sources: [...new Set([...previous.flatMap(path => path.sources), ...path.sources])],
@@ -148,9 +148,23 @@ interface TablePaneCalls<Ready, Context> {
 function tablePane<Ready extends { kind: 'accounts' | 'queue' }, Context>(settings: TablePaneSettings) {
   let lifecycle: TablePaneLifecycle<Context> = { kind: 'closed', generation: 0 };
   let latestGeneration = 0;
+  const load = async (calls: TablePaneCalls<Ready, Context>, current: OpenTablePane<Context>) => {
+    const isOpen = () => lifecycle === current;
+    let pendingPaths = current.paths;
+    try {
+      const fresh = await calls.load(current.context, isOpen, paths => { pendingPaths = paths; });
+      if (isOpen()) current.paths = pendingPaths;
+      return fresh;
+    } catch (error) {
+      // A first load still needs discovery watches for recovery. Once loaded,
+      // keep all previous watches until a replacement succeeds.
+      if (isOpen() && !current.paths.length) current.paths = pendingPaths;
+      throw error;
+    }
+  };
   const read = async (calls: TablePaneCalls<Ready, Context>, current: OpenTablePane<Context>) => {
     const isOpen = () => lifecycle === current;
-    const fresh = await calls.load(current.context, isOpen, paths => { if (isOpen()) current.paths = paths; });
+    const fresh = await load(calls, current);
     if (isOpen()) await calls.put(fresh, isOpen);
   };
   const refresh = async (calls: TablePaneCalls<Ready, Context>, force = false) => {
@@ -168,7 +182,7 @@ function tablePane<Ready extends { kind: 'accounts' | 'queue' }, Context>(settin
         return;
       }
       const regenerated = await refreshIfChanged({ stat: path => calls.stat(path) }, current.paths,
-        () => calls.load(current.context, isOpen, paths => { if (isOpen()) current.paths = paths; }),
+        () => load(calls, current),
         fresh => calls.put(fresh, isOpen), isOpen);
       if (regenerated || !isOpen()) return;
       const state = await calls.read();
@@ -416,7 +430,7 @@ export const register: Register = on => {
       if (words.length !== 2) return { text: 'build queue: use /build:queue bump <unit>' };
       let line: string;
       try {
-        const output = await queueRun($, ['priority', 'set', '--unit', words[1], '--why', "the user's bump"]);
+        const output = await queueRun($, ['priority', 'set', '--unit', words[1]!, '--why', "the user's bump"]);
         line = output.trim();
         if (!line || /[\r\n]/.test(line)) throw new Error('Invalid bump result.');
       } catch { return { text: 'Build queue could not be read.' }; }

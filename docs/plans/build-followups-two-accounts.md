@@ -1,5 +1,7 @@
 # Two accounts: showrunners on one Claude account, unit directors on another
 
+Current maintenance: snapshot-removal replaces the historical snapshot-timer wiring below with `agent-notes` (`scripts/maintenance/agent_notes_job.py`, runtime schedules and limits in `config/agent_notes.toml`). `herdr-upkeep` owns layout saves and detection-rule refreshes, using `config/herdr_upkeep.toml`. The desktop note and shutdown recovery snapshots are deleted. Historical phase notes below describe the earlier implementation.
+
 > Scheduler update (2026-10-31): the agent-notes job in
 > `scripts/maintenance/agent_notes_job.py` now owns notes, quota alerts, the
 > pacer, refusal moves, crash recovery, phase-note pruning, the hierarchy note
@@ -1968,13 +1970,13 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 - `submit_opening_prompt` captures the recipient after input readiness, before typing. A recipient that changed by the time the turn appears gives `PromptNotSubmitted("prompt recipient changed during submission")`; each Enter retry first rechecks it (`"prompt recipient changed before Enter retry"`).
 - `restart._prompt_outcome` accepts a `PromptSubmitted` receipt only when its process equals the session's current registry process, under every progress kind; the attempt check while `restarting` stays, and a timer-only retry of the same process still reads its proof. Receipt saving stores the recipient the launcher captured and never samples the registry.
 - `prompt_in_input` takes the composer between the last two rule lines; every nonblank row after the closing rule must be wholly one enumerated footer phrase, else the bordered region is scrollback. The composer match allows a screen newline without a space only inside a word. The enumerated rows reject real Claude screens (labelled top rule; status-line, mode and agent rows), so Enter-only retries do not fire live; "Enter retries reach a real session's composer" replaces the phrase list with layout rules.
-- `restart_push(label, names, *, machine) -> tuple[RenderedPush, ...]` groups names greedily so each push keeps `stopped` ≤ 400 characters, message < 500 and title < 45, and every session is named; a name that alone exceeds the limits gets its own push, shortened to the longest fitting prefix plus a visible `…`; no names gives one `shutdown.restart_incomplete`. `restart.restart` and `settle.report_stop` send every push, and nothing raises through either.
-- `shutdown.restart_failed` catalog examples name one session each (`typical` "One session (organon-unit)", `many_long_names` "One session (build-followups-two-accounts-unit-director)"), approved under the user spec.
+- `restart_push(label, failures, *, machine)` returns one push with the failed session count. It never splits the list. Without known failures, it returns one `shutdown.restart_incomplete` push.
+- `shutdown.restart_failed` shows a retryable failure count, the machine and one retry command. Trust failures keep separate commands. Manual failures share one count push per machine. All changed examples require the normal text review.
 
 **Files:**
 - `scripts/herdr/herdr.py` — recipient identity and lookup, process-bound outcome, Enter-retry recheck, composer footer and wrap-aware match.
-- `scripts/shutdown/restart.py` — receipt read bound to the recipient process; `restart_push` splitting; `restart` sends each push.
-- `scripts/shutdown/settle.py` — `report_stop` sends each push.
+- `scripts/shutdown/restart.py` — process-bound receipts and one phone push per kind of fix in a restart problem.
+- `scripts/shutdown/restart_support.py` — `report_stop` uses the same fix groups and retains delivery marks.
 - `scripts/notify/push_catalog.py`, `scripts/notify/push_texts_reviewed.json` — named `shutdown.restart_failed` examples and their approvals.
 - `scripts/herdr/test_herdr.py`, `scripts/shutdown/test_restart.py`, `scripts/shutdown/test_settle.py`, `scripts/shutdown/test_shutdown_cli.py`, `scripts/notify/test_push_texts.py` — regressions through real receipt files, fake registry identities and fake panes.
 
@@ -3030,3 +3032,115 @@ User 2026-10-31 07:5x EDT: claude3 showed a red dot on the Mac board while signe
 Showrunner defect 2026-10-31 09:3x EDT, reported by hana: the validation line opened with memory-wait lines and hid a killed nextest; no log was kept.
 
 **As-built:** `ci_start` writes validation's stdout and stderr, in order, to `<state dir>/ci_validation.log`, replaced at each start and kept after the copy is removed. A failure reads `validation: failed — step <label> failed; log <path>` from the last `!!! VALIDATION FAILED at step: <label> !!!` line (`validate_ci.sh` `run_step`), or `exit <code>, no step named; log <path>`. The scan uses `errors="replace"`, so bytes that are not UTF-8 never hide the step. An `OSError` stays a `PointFailure("validation", …)`. `merge_checkpoint.push_validate` keeps `failure_detail`. Review: two lenses found F001 (strict UTF-8 scan); one fix round; closure approved.
+
+### Phase 101j — The account board lists only true problems, each with its full step  · status: done · b034f13e
+
+User 2026-11-01 07:4x EST: "please look at the problems coming from the script feeding the accounts board and correct them". Seen on the Mac board (stored-mode `accounts.py status`).
+
+**As-built:** a stored-mode read with a cached role map lists no role-map problem; with no cache it refuses as before. A usage reading not from today shows its date (`10-29 01:14`). The retry promise is gone: the line says `last read attempted at <time>` or `no usage read has been attempted`, because the notes timer can reuse a failed report for ten minutes. `MAC_HOME_LOGIN_STEP` gives the whole Mac step: `accounts.py exec claude2`, `/login`, `/exit`, then `accounts.py cutover-home claude2`, never `/logout`. When `~/.codex` and the numbered home hold the same login, one line reads `~/.codex still holds codex2's login; stop what uses ~/.codex (such as the ChatGPT app), then run accounts.py cutover-home codex2`; when the numbered home holds another login, one label-only line gives its repair instead of a cutover that would refuse. The login command is one shared `env CODEX_HOME=<quoted home> codex login`, which the `codex` alias cannot redirect, also used by `setup codexN`. No problem line prints a login; a test fails if one holds a fixture login. Review: two lenses found F001 (cutover step for a home holding another login) and F002 (false retry promise); two fix rounds; closure approved.
+
+### Phase 101k — The Mac reads account usage at an interval set in config, now one minute  · status: done · d7b8562d
+
+User 2026-11-01 09:2x EST, through the Mac session: "make that interval configurable - and to make the refresh interval 1 minute instead of 2 minutes". Director call: the key is for the Mac read only; natedev's usage read stays in `[parts.notes]` (120 s), because that pass also routes quota and moves sessions.
+
+**As-built:** `mac_usage.interval_seconds = 60` in `config/agent_notes.toml`, read at use; a bad or huge value refuses with the file and key. `agent_notes.py usage-only --poll-seconds 30` reads an account when its own last granted claim is at least interval minus half a poll (45 s) old, so start jitter never skips a poll and one slow account never delays another; a held claim leaves that account's time unchanged. The shared claim guard and the 600 s rate-limit backoff stay; natedev's 90 s guard is unchanged. Due checks share `scripts/maintenance/schedule.py` with `agent_notes_job.py`. Tests script two accounts with 0 s, 15 s and changing credential latency and assert per-account gaps of 45–90 s. The Mac job change (30 s launchd poll, `--poll-seconds 30`) is on /etc/nixos branch `accounts-mac-usage-interval` (afb41714), pushed by the showrunner; it takes effect after a Mac `rebuild`. Three repair rounds; the third used an Astra design.
+
+### Phase 101l — A legacy-login line and the brp registration each stay fixed  · status: done · 2967ed8b
+
+Found 2026-11-01: a leftover `oauthAccount` with no credential that `cutover-home` could not clear, and the nixos login job `claude-brp-mcp` re-adding brp at user scope at each login.
+
+**As-built:** `cutover-home` removes leftover account data (dated private backup, atomic write) when no credential file or keychain entry exists, also after a complete journal; an already-clean home exits 0 with one line and no write. `accounts.py exec claudeN` refuses a wrong sign-in with the label only and prints `env -u CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CONFIG_DIR=<home> claude`, then `/login`; `docs/accounts.md` matches. The brp job and its setup check share one script that removes user-scope brp and registers brp at local scope in `~/rust/{hana,nateroids,bevy_brp}` for `~/.claude` and each numbered home, writing only on a difference: /etc/nixos branch `accounts-brp-local-scope` (881cc227), pushed by the showrunner. Also: `mac_usage.interval_seconds` went back to 120, because at 60 the provider answered 429 across the four Claude accounts in turn while Codex read fine. One repair round (credential-file check on macOS; clean-home rerun).
+
+### Phase 101m — The accounts board shows how many sessions use each role  · status: done · ab8092aa
+
+User 2026-11-01: add a role count to the accounts board and order the columns account, left, role, count, resets, credits, enabled, in use, read; two roles show two counts in role order. The handler unit was told.
+
+**As-built:** `accounts.py` stored-status JSON carries `role_counts` per account: live members per role from the local session registry, launch history and the shared staff classifier, with no ssh or usage read. `mods/unit-board/hooks/accounts.tsx` shows the requested order; the count cell joins counts with `, ` in role order, blank for spare. `scripts/herdr/pane_launch.py` validates each history entry and skips only a damaged one. An unchanged board tick refreshes counts; a failed refresh keeps its retry. `in use` stays: it marks paid-credit use. Also fixed two tests the 101l gate turned red. Three repair rounds; style review PASS.
+
+### Phase 101n — Every Claude account trusts ~/worktrees  · status: done · fe60721b
+
+User 2026-11-01 (via the natedev showrunner and sdlc): trust `~/worktrees` once, so a new folder under it starts with no trust prompt. Claude Code carries trust from a parent folder to every folder below it, also after a move (herdr-unit test).
+
+**As-built:** `config/accounts.toml` `[trust] folders` lists `~/worktrees`. `accounts.py trust` sets `hasTrustDialogAccepted` for each folder in every Claude account file on the machine, touches no other key and prints one line per account; a rerun changes nothing. It follows Claude Code 2.1.296's `.claude.json.lock` protocol (waits for a held lock, 10 s stale rule; both timings in `[claude_config_lock]`, checked with the folders before any lock or write, fix c73d7e90), prepares and fsyncs outside the lock, and under the lock only compares bytes and mode and replaces (hold well under Claude's 1.5 s boot retry). A new account's seed carries the folders through the same helper. `scripts/lib/atomic_file.py` keeps late mode selection for its other callers. Residual, stated in `docs/accounts.md`: a Claude save that skips its own lock can lose any writer's change; rerun `trust`. Three repair rounds; style review PASS. Live apply and proof follow the user's confirmation.
+
+### Phase 101o — The accounts board shows busy, shell and idle counts and a total  · status: done · a4562e76
+
+User 2026-11-01: the role count of 68 workers counted idle workers too; asked for busy, shell, idle and total columns, a total row, and no `in use` column.
+
+**As-built:** each `role_counts` entry in `accounts.py` stored-status JSON is `{busy, shell, idle, total}`. A Claude session takes the `status` field of its session record through the shared reader in `scripts/message/sessions.py` (also used by `promote_showrunner.py`); a missing or other value counts as idle. A Codex worker is busy while its roster status is `running` or `starting`, else idle, with a null `shell`. `mods/unit-board/hooks/accounts.tsx` shows account, left, role, busy, shell, idle, total, resets, credits, enabled, read, and a last `total` row in the wide and narrow layouts; the JSON keeps `credits_in_use` for cargo-handler. One review round; two minors closed by the director (doc line, Assertion-Change lines); style review PASS.
+
+### Phase 101p — Each started-hold text in `next list` has a test  · status: done · 784b2637
+
+natedev showrunner 2026-11-01 (C35, cef58b5c): prove each started-hold form that `next list` prints.
+
+**As-built:** `test_started_fixed_expired_and_no_pace_holds_list_exact_rows_without_state_changes` runs the real `next list` path on scratch state for a fixed hold with time left, a fixed hold that is over, and the 40-minute default with no pace history. Each case asserts the full line and unchanged hold state. The half-point line with a pace stays in `test_started_hold_row_is_shared_by_list_add_hold_reply_and_the_mac`. Tests only.
+
+### Phase 101q — /theme never blocks a promotion  · status: done · 378b778c
+
+natedev showrunner 2026-11-02: the user ran /theme at 09:06 EST; Claude Code wrote `theme` into live `~/.claude/settings.json`, and merge_gate refused every promotion because the tracked file differed from HEAD.
+
+**As-built:** `theme` joins the per-machine keys in `scripts/settings/settings_local_keys.sh` (with `model`, `effortLevel`, `modelSettings`, `extraKnownMarketplaces`). The clean filter strips it, the sidecar keeps it, and the smudge restores it. The committed `settings.json` has no `theme`. `test_settings_local_keys.py` fixtures give each machine a different theme and still clean to one blob.
+
+### Phase 101r — The Mac renews an expired Claude login by itself  · status: done · ef9480b6
+
+User 2026-11-02: "i want accounts renewal on the mac for sure". natedev renewed idle logins in its notes job's refusal-watch pass; the Mac ran only `agent_notes.py usage-only`, which never renewed.
+
+**As-built:** `agent_notes.py usage-only` (Mac launchd job, nixos `modules/darwin/account-usage.nix`) runs `refusal_watch.renew_expired_logins` as a dry run after it saves usage. When an account is due, it starts `agent_notes.py renew-logins` as a detached child (`start_new_session`) and returns: launchd runs one job instance, so the usage job never waits on a 120 s probe. `renew-logins` holds the `login-renewal` schedule lock and calls the same function, which keeps the hourly limit and `~/.local/state/accounts/login_renewals.json`. Two repair rounds (F001: the probe held the usage job, first by its lock, then by launchd's one instance). Style review PASS. Live proof: the Mac after promotion.
+
+### Phase 101s — The accounts board has no read column  · status: done · 9b161976
+
+User 2026-11-02: remove the `read` column; a reading that fails or is old shows in the problems, not in a permanent column.
+
+**As-built:** `mods/unit-board/hooks/accounts.tsx` drops the `read` column and the narrow `read … ago` fact. `accounts.py` status adds a problem line for a usage or credits reading older than the existing ten-minute limit and sets `read_ok` false for it; a reading saved after status starts counts as fresh (F001). `read_at` and `read_ok` stay in the JSON; cargo-handler colours its dot from `read_ok` (handler-unit Phase 61 drops its own read column). One repair round; style review PASS.
+
+### Phase 101t — `codex update` works through the codex alias on both machines  · status: done · 2f0877b2
+
+User 2026-11-02 "go", via natedev: the `codex` alias set a numbered `CODEX_HOME`, so `codex update` failed with "Could not detect the Codex installation method".
+
+**As-built:** `_exec_codex_account` in `scripts/accounts/accounts.py` sends a first argument of `update` to `_update_codex`, with no account check. It runs the local program with `CODEX_HOME=~/.codex`, attached to the terminal, then reads its version. Then it runs `CODEX_HOME="$HOME/.codex" "$HOME/.local/bin/codex" update >&2 && … --version` on `remote.other_machine()` over ssh (600 s limit; stderr discarded, so stdout holds only the version). It prints one version or failure line per machine; ssh 255 or a timeout prints `unreachable; run codex update there`. Exit 0 only when both machines updated. Two repair rounds (F001: update text could print as the version; F002: invalid stderr bytes raised a traceback). Style review PASS.
+
+### Phase 101u — The accounts board counts sessions on both machines  · status: done · 06901023
+
+User 2026-11-02 (via the Mac session): "the accounts board should show the counts for all configured machines for both Mac and for Nate Dev. If Mac is unavailable, it should show that."
+
+**As-built:** each status pass in `scripts/accounts/accounts.py` publishes this machine's per-account busy, shell, idle and total counts to `~/.local/state/accounts/session_counts.json` (`_publish_session_counts`), keyed by the machine alias. `_start_session_counts_fetch` starts a detached fetch of the other machine's file under a nonblocking lock, through `role_map.ssh_role_map(..., machine=)`, into `peer_session_counts.json`; the board read never waits on ssh. `_machine_role_counts` sums both machines into each count column and keeps them apart in the JSON field `role_counts_by_machine`. A missing, damaged, failed or older-than-ten-minutes copy adds one problem line, `<machine> unavailable: counts are <this machine> only`, and the board shows local counts. Legacy `~/.codex` sessions count, and numbered Codex homes count under `codex_home_label()`. The unit-board hook and types read the new field. Three findings closed in two repair rounds (F001 machine alias; F002 legacy `~/.codex` counts; F003 numbered-home label).
+
+### Phase 101v — Status reads stay read-only and test runs start no ssh  · status: done · cc347b39
+
+natedev 2026-11-02 (urgent): main was red from 101u (069010236): `test_role_map` and `test_refusal_watch`, 4 failures and 1 error.
+
+**As-built:** `_count_role_sessions` counts in memory and writes no file; `_session_counts_document` (was `_publish_session_counts`) builds the document that `session-counts-read` prints, and `_session_counts_file` is gone. `_machine_role_counts` takes the status `UsageSource` and starts the detached fetch only for `RefreshStaleUsage`, so `status --stored` reads only `peer_session_counts.json` and opens no lock. `test_role_map.py`, `test_refusal_watch.py` and `test_cutover_home.py` stub `_start_session_counts_fetch` for the whole module. New test `test_stored_status_starts_no_counts_fetch_and_writes_nothing`. 3251 tests in the accounts modules and their importers pass. No code review ran (urgent red-main repair; the director read the diff).
+
+### Phase 101x — The Mac voice setting stays local  · status: done · 0dc14b47
+
+natedev 2026-11-02 (urgent): the user turned on voice on the Mac; its `settings.json` gained a top-level `voice` key, and promotion and claude-sync refused the tracked edit from about 16:00 EST.
+
+**As-built:** `voice` joins `SETTINGS_LOCAL_KEYS_JSON` in `scripts/settings/settings_local_keys.sh`, beside `theme`. The Mac fixture in `scripts/settings/test_settings_local_keys.py` has `voice: {enabled: true, mode: hold}`; the cleaned copy has no `voice` key and the sidecar merge puts the full object back. Tests were not run at the checkpoint (hana build hold); the merge gate runs them.
+
+### Phase 101w — Account tunables live in config  · status: done · 5d9b3eec
+
+natedev 2026-11-02: the hard-coded values proposal, phase 3 (user approved 2026-11-01).
+
+**As-built:** `config/accounts.conf` holds one commented key per accounts tunable (timeouts, intervals, ages, counts, the nixos and notes path roots), each with its old value; the code reads each key at use through `scripts/lib/conf.py` with no fallback literal. Owner loops (refusal watch placement and pick) read the usage age once and pass it down. `scripts/whoami/note_file.py` resolves the notes folder as `AGENT_NOTES_DIR`, then the `AGENTS_DIR` override, then `notes_directory`, read once per process (`functools.cache`); `new_account.py` and the missing-note repair steps in `accounts.py` use that one helper. Tests run on a scratch `CONF_DIR` copy (`scratch_accounts_config` in `scripts/accounts/home_test_support.py`); caller test fixtures that clear `CONF_DIR` (herdr sessions, account move, send, codex mesh, profile notes pass) enter it too. `docs/accounts.md` names the file and says a change needs no build, and a new process for a notes-folder change.
+
+### Phase 101z — Accounts config reads work in temp-home tests  · status: done · 046009a3b
+**Depends on:** Phase 101w (order only).
+
+**As-built:** `scripts/lib/conf.py` resolves a value from the live file, then, for the default `~/.claude/config` only, the repository's `config/<stem>.conf` when the file or key is absent, then Git recovery. `CONF_DIR` stays authoritative: a missing value there still refuses. Invalid present values keep Git recovery. `value_origin`, the typed readers and `values` share `_resolve` and `_repository_path`. `scripts/lib/test_conf.py` covers each case. Full merge gate passed; merged to main 4da324700.
+
+### Phase 101y — A new settings key on one machine never blocks promotion  · status: todo
+**Depends on:** Phase 101x (order only; both edit `scripts/settings/settings_local_keys.sh`).
+
+natedev 2026-11-02 accepted the general rule after 101x: a top-level key in the live `~/.claude/settings.json` that `HEAD`'s `settings.json` does not have is machine-local by default.
+
+#### Work Order
+**Goal:** a new top-level settings key added on one machine stays in that machine's live file, is stripped from the tracked copy, and never blocks promotion or claude-sync.
+**Spec:**
+1. Keep the listed keys local, including `theme` and `voice`. Also treat live top-level keys absent from committed `HEAD:settings.json` as local. Preserve their values in the sidecar before checkout removes the live file (`scripts/settings/settings_local_keys.sh:7`, `scripts/settings/refresh_filtered_index.sh:33`). Apply this rule through the shared clean, snapshot, restore and smudge definitions. Keep the existing hook-group and plugin-entry rules.
+2. An unlisted key supplied by an incoming committed settings blob becomes shared. Preserve that blob during checkout, including before HEAD advances (smudge gets it on stdin, `scripts/settings/smudge_settings_json.sh:21`). Stop treating the key as local after HEAD contains it. A listed key remains local even when a commit contains it. Preserve changes to existing shared keys as tracked edits. If the committed baseline cannot be read, report the error; never assume an empty baseline.
+3. Send a notice naming each newly detected local key and its machine, with `send.py`. Read the destination `local_key_notice_to` from `config/settings.conf` at use (`scripts/lib/conf.py`; `scripts/lib/conf.sh` from Bash); its initial value is `natedev`. Keep notice history separate from the settings-value sidecar. Do not repeat an accepted notice for the same key and machine, including after deletion or restart. Retain failed notices for retry. Keep notices and diagnostics out of filter stdout, which carries JSON (`scripts/settings/clean_settings_json.sh:14`).
+4. Tests use scratch repositories, settings, state and a fake sender. Test unknown-key cleaning, sidecar preservation and restoration. Test checkout when an incoming commit adds a previously local key. Test that listed keys remain local and shared edits remain tracked. Test that a baseline-read failure preserves data and reports an error. Test notice suppression across restart and deletion, and retry after failure. Change `local_key_notice_to` in a scratch config and verify the destination changes. Verify git diff and status with the real filters and the refresh path, as promotion (`scripts/production/merge_gate.py:1126`) and claude-sync (`scripts/lib/main_sync.py:94`) read them. Never touch a live setting or the message service.
+**Files:**
+- `scripts/settings/settings_local_keys.sh`
+- `scripts/settings/test_settings_local_keys.py`
+- `config/settings.conf`

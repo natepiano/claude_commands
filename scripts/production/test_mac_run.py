@@ -14,6 +14,9 @@ import time
 import unittest
 from pathlib import Path
 from typing import TypedDict, cast, final, override
+from scripts.lint.memory_test_support import write_config_fixture
+from scripts.lib.process_group import send_process_group
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 # Script completion deadlines only bound hangs; startup can be slow under load.
@@ -189,7 +192,7 @@ class MacRunTests(unittest.TestCase):
         self.config_path = self.root / "mac_test.conf"
         self.temp_directory = self.root / "tmp"
         self.temp_directory.mkdir()
-        _ = self.config_path.write_text("ci_repo=\n", encoding="utf-8")
+        _ = write_config_fixture(self.config_path, "ci_repo=\n")
         stub = self.bin_directory / "command-stub"
         self.write_executable(stub, COMMAND_STUB)
         for name in ("ssh", "scp", "git", "systemd-run", "gh", "rsync"):
@@ -206,7 +209,7 @@ class MacRunTests(unittest.TestCase):
             "PATH": f"{self.bin_directory}{os.pathsep}{os.environ['PATH']}",
             "PYTHONPATH": str(startup),
             "MAC_TEST_STATE_DIR": str(self.state_directory),
-            "MAC_TEST_CONFIG": str(self.config_path),
+            "MAC_TEST_CONFIG": str(self.config_path), "CONF_DIR": str(Path(self.config_path).parent),
             "MAC_RUN_STUB_STATE": str(self.stub_state),
             "MAC_RUN_SHA": SHA,
             "MAC_RUN_CHECKOUT": str(self.home / "scratch" / "gate-mac-run-private" / "checkout"),
@@ -226,7 +229,7 @@ class MacRunTests(unittest.TestCase):
             capture_output=True,
             text=True,
             check=False,
-            timeout=300,
+            timeout=TEST_HANG_GUARD_SECS,
         )
 
     def mac_run(
@@ -283,7 +286,7 @@ class MacRunTests(unittest.TestCase):
         self.assertFalse((self.state_directory / "run.json").exists())
 
     def wait_for_path(self, path: Path) -> None:
-        deadline = time.monotonic() + 300
+        deadline = time.monotonic() + TEST_HANG_GUARD_SECS
         while time.monotonic() < deadline:
             if path.exists():
                 return
@@ -554,11 +557,11 @@ class MacRunTests(unittest.TestCase):
                 )
                 try:
                     self.wait_for_path(self.stub_state / "build-started")
-                    os.killpg(process.pid, signal_number)
-                    output, errors = process.communicate(timeout=300)
+                    send_process_group(process.pid, signal_number)
+                    output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
                 except BaseException:
-                    os.killpg(process.pid, signal.SIGKILL)
-                    _ = process.communicate(timeout=300)
+                    send_process_group(process.pid, signal.SIGKILL)
+                    _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
                     raise
 
                 self.assertEqual(

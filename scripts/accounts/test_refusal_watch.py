@@ -25,6 +25,7 @@ from importlib import import_module
 from typing import TYPE_CHECKING, Literal, Self, cast, final, override
 from unittest.mock import call, patch
 
+from scripts.lib import conf
 from scripts.accounts.home_test_support import scratch_account_home
 from scripts.accounts import accounts, moves, next_moves, refusal_watch, refusals, role_map
 from scripts.accounts.move_test_support import FakeSessionMoves, MoveCall
@@ -51,6 +52,10 @@ else:
     restart_support = import_module("restart_support")
     sessions = import_module("sessions")
     pane_record = import_module("pane_record")
+
+
+def setUpModule() -> None:
+    _ = unittest.enterModuleContext(patch.object(accounts, "_start_session_counts_fetch", return_value=True))
 
 
 NOW = datetime(2026, 10, 14, 12, tzinfo=timezone.utc)
@@ -150,9 +155,7 @@ class RefusalWatchTests(unittest.TestCase):
         identity = accounts.account_identity(directory.path)
         return account.Account("claude", identity.login, identity.label) if isinstance(identity, agent_accounts.NumberedAccount) else None
 
-    def inventory_for(self, login: str, only: frozenset[str] = NO_SESSION_FILTER, *,
-                      refresh_desktops: bool = True) -> inventory.Inventory:
-        self.assertFalse(refresh_desktops, "the watcher must read the desktop snapshot without invoking its timer")
+    def inventory_for(self, login: str, only: frozenset[str] = NO_SESSION_FILTER) -> inventory.Inventory:
         owners = [owner for owner in self.owners
                   if (identity := self.process_account(owner["pid"], home_state=account.home_account_state())) is not None
                   and identity.login.casefold() == login.casefold()
@@ -1118,10 +1121,9 @@ class RefusalWatchTests(unittest.TestCase):
         fresh = herdr.HerdrProcess(owner["pid"], herdr.HerdrPlace("agents", "new-pane"),
             {"SHOWRUNNER_UNIT": "fixture", "SHOWRUNNER_UNIT_ID": "new-unit"}, "claude", str(self.home))
         original_inventory = self.inventory_for
-        def observed(login: str, only: frozenset[str] = NO_SESSION_FILTER, *,
-                     refresh_desktops: bool = True) -> inventory.Inventory:
+        def observed(login: str, only: frozenset[str] = NO_SESSION_FILTER) -> inventory.Inventory:
             rows = herdr.herdr_processes()
-            found = original_inventory(login, only, refresh_desktops=refresh_desktops)
+            found = original_inventory(login, only)
             if not rows:
                 # The report predates the new marked pane, so this is top-level.
                 ungrouped: list[inventory.Session] = []
@@ -2097,9 +2099,10 @@ class RefusalWatchTests(unittest.TestCase):
         events: list[str] = []
         original = accounts.placement
 
-        def place(group: accounts.ClaudeGroup, now: datetime, *, exclude: frozenset[str] = NO_SESSION_FILTER) -> accounts.GroupPlacement:
+        def place(group: accounts.ClaudeGroup, now: datetime, *, exclude: frozenset[str] = NO_SESSION_FILTER,
+                  reading_age_minutes: int | accounts.ConfiguredReadingAge) -> accounts.GroupPlacement:
             events.append("placement")
-            return original(group, now, exclude=exclude)
+            return original(group, now, exclude=exclude, reading_age_minutes=reading_age_minutes)
 
         with patch.object(accounts, "placement", side_effect=place):
             _ = refusal_watch.run(NOW, refresh_usage=lambda: events.append("fresh usage"))
@@ -2556,7 +2559,7 @@ class RefusalWatchTests(unittest.TestCase):
         _ = self.groups()
         _ = self.owner("unit", host="unit")
         def manual_inventory(login: str, only: frozenset[str] = NO_SESSION_FILTER, **_options: object) -> inventory.Inventory:
-            return self.inventory_for(login, only, refresh_desktops=False)
+            return self.inventory_for(login, only)
         with patch.object(inventory, "inventory", side_effect=manual_inventory):
             result = accounts.move("unit", "claude3")
         self.assertIsInstance(result, accounts.MoveRefused)
@@ -3173,6 +3176,39 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertEqual(len(self.moves.calls), 2)
         self.assertTrue(all(command.target == "claude2" for command in self.moves.calls))
 
+    def test_owner_loops_read_each_config_value_once(self) -> None:
+        for identity in ("first", "second"):
+            _ = self.owner(identity)
+            _ = self.transcript(identity, "You've hit your session limit")
+        self.reading(SOURCE_LOGIN, 80, five=0, five_reset=NOW + timedelta(minutes=5))
+        with patch.object(conf, "whole", wraps=conf.whole) as read:
+            _ = refusal_watch._run(NOW, True)  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(read.call_args_list.count(call("accounts", "transcript_chunk_bytes")), 1)
+        self.assertEqual(read.call_args_list.count(call("accounts", "usage_stale_minutes")), 1)
+
+    def test_refused_units_read_usage_age_once_through_placement(self) -> None:
+        _ = self.groups()
+        for identity in ("first", "second"):
+            _ = self.owner(identity, host="unit")
+            _ = self.transcript(identity)
+        with (patch.object(conf, "whole", wraps=conf.whole) as read,
+              patch.object(accounts, "placement", wraps=accounts.placement) as placement,
+              patch.object(accounts, "pick", wraps=accounts.pick) as pick):
+            _ = refusal_watch._run(NOW, True)  # pyright: ignore[reportPrivateUsage]
+        self.assertGreaterEqual(placement.call_count, 2)
+        self.assertGreaterEqual(pick.call_count, 2)
+        self.assertEqual(read.call_args_list.count(call("accounts", "usage_stale_minutes")), 1)
+
+    def test_refused_terminal_sessions_read_usage_age_once_through_pick(self) -> None:
+        for identity, label in (("first", "claude1"), ("second", "claude3")):
+            _ = self.owner(identity, label=label)
+            _ = self.transcript(identity)
+        with (patch.object(conf, "whole", wraps=conf.whole) as read,
+              patch.object(accounts, "pick", wraps=accounts.pick) as pick):
+            _ = refusal_watch._run(NOW, True)  # pyright: ignore[reportPrivateUsage]
+        self.assertGreaterEqual(pick.call_count, 2)
+        self.assertEqual(read.call_args_list.count(call("accounts", "usage_stale_minutes")), 1)
+
     def test_transcript_lookup_ignores_deeper_folders_and_reads_each_live_owner_once_per_tick(self) -> None:
         _ = self.owner("refused")
         transcript = self.transcript("refused")
@@ -3183,7 +3219,7 @@ class RefusalWatchTests(unittest.TestCase):
         with patch.object(refusal_watch, "_newest_exchange", wraps=refusal_watch._newest_exchange) as detect:  # pyright: ignore[reportPrivateUsage]
             _, output, _ = self.cli("--dry-run")
         self.assertIn("owner refused: refused; move", output)
-        detect.assert_called_once_with(transcript)
+        detect.assert_called_once_with(transcript, 65536)
 
     def test_refusal_pass_searches_projects_once_and_keeps_each_latest_exchange(self) -> None:
         for identity in ("first", "second", "continued"):

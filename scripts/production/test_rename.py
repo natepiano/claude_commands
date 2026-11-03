@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.production.staff_test_support import fixture_member
+
 import json
 import os
 import shlex
@@ -20,6 +22,37 @@ from scripts.production.rename_test_support import CHECK_TIMER_HANDOFF, FAIL_GIT
 
 @final
 class ProductionRenameTests(support.ProductionRenameFixture):
+    def test_document_rename_updates_a_wrapped_location_without_reactivating_its_row(self) -> None:
+        row = self.production_row()
+        _ = staff.set_doc(row.id, staff.WrappedDoc("natedev", self.doc))
+        self.assert_success(self.run_rename("apply"))
+        retained = staff.by_id(row.id)
+        assert retained is not None
+        self.assertEqual((retained.id, retained.name, retained.parent, retained.doc),
+                         (row.id, NEW, row.parent, staff.WrappedDoc("natedev", self.new_doc)))
+        before = self.snapshot()
+        self.assert_success(self.run_rename("apply"))
+        self.assertEqual(self.snapshot(), before)
+
+    def test_retry_after_doc_move_updates_the_live_doc_on_the_same_staff_id(self) -> None:
+        row = self.production_row()
+        _ = staff.set_doc(row.id, staff.LiveDoc("natedev", self.doc))
+        with mock.patch.object(staff, "set_doc", side_effect=OSError("stopped after doc move")):
+            interrupted = self.run_rename("apply")
+        self.assertNotEqual(interrupted.returncode, 0, interrupted.stdout + interrupted.stderr)
+        self.assertFalse(self.doc.exists())
+        self.assertTrue(self.new_doc.is_file())
+        retained = staff.by_id(row.id)
+        assert retained is not None
+        self.assertEqual(retained.doc, staff.LiveDoc("natedev", self.doc))
+        self.assert_success(self.run_rename("apply"))
+        renamed = staff.by_id(row.id)
+        assert renamed is not None
+        self.assertEqual(renamed.doc, staff.LiveDoc("natedev", self.new_doc))
+        before = self.snapshot()
+        self.assert_success(self.run_rename("apply"))
+        self.assertEqual(self.snapshot(), before)
+
     def production_row(self) -> staff.StaffRow:
         return next(row for row in staff.find(kind="showrunner") if row.name == OLD)
 
@@ -38,12 +71,12 @@ class ProductionRenameTests(support.ProductionRenameFixture):
         _ = self.git("add", str(self.doc))
         _ = self.git("commit", "-m", "Record workspace name")
         self.assert_success(self.run_rename("apply"))
-        self.assertEqual(staff.snapshot().by_id(row.id), staff.StaffRow(row.id, "showrunner", "new", None))
+        self.assertEqual(staff.snapshot().by_id(row.id), staff.StaffRow(row.id, "showrunner", "new", None, current_session=row.id))
         self.assertEqual(self.journal()["staff_id"], row.id)
         self.assertIn("- **Showrunner session:** `new`", self.new_doc.read_text())
 
     def test_taken_staff_name_refuses_before_sources_change(self) -> None:
-        _ = staff.ensure("showrunner", name=NEW)
+        _ = fixture_member("showrunner", name=NEW)
         before = self.snapshot()
         failed = self.run_rename("apply")
         self.assertEqual(failed.returncode, 2, failed.stderr)
@@ -52,9 +85,7 @@ class ProductionRenameTests(support.ProductionRenameFixture):
 
     def test_missing_staff_member_refuses_before_sources_change(self) -> None:
         row = self.production_row()
-        for unit in staff.snapshot().find(kind="unit", parent=row.id):
-            _ = staff.retire(unit.id)
-        _ = staff.retire(row.id)
+        self.forget_rows(row.id, *(unit.id for unit in staff.snapshot().find(kind="unit", parent=row.id)))
         before = self.snapshot()
         failed = self.run_rename("apply")
         self.assertEqual(failed.returncode, 2, failed.stderr)

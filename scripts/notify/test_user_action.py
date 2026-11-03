@@ -37,6 +37,13 @@ class ActionConflictTests(unittest.TestCase):
             with self.subTest(body=body):
                 self.assertEqual(action_conflicts(TILE, body), [])
 
+    def test_session_counts_are_not_names_but_explicit_numeric_names_are(self) -> None:
+        for body in ("1 session did not restart.", "5 sessions did not restart.", "1 pane did not open."):
+            with self.subTest(body=body):
+                self.assertEqual(action_conflicts(TILE, body), [])
+        self.assertEqual(action_conflicts(TILE, "The session named 1 needs input."), [
+            "the body names the 1 pane or session, which the Action line does not name"])
+
     def test_text_the_action_line_holds_is_one_action(self) -> None:
         action = ActionRequired("On natedev, in the trunk pane, type: Go: remove arrange_jacks/")
         self.assertEqual(action_conflicts(action, "Type Go: remove arrange_jacks/ in the trunk pane."), [])

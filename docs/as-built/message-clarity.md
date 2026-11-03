@@ -1,14 +1,53 @@
 # Message clarity
 
+`send.py` resolves staff names and addresses through one staff snapshot. Staff selects the row's `current_session`.
+Unit names accept the optional `-unit` suffix. Ambiguous staff names stop delivery.
+A non-staff name uses a unique live roster session, locally before the peer.
+A missing name exits 2 with a named note. It creates no relay or queue.
+Explicit non-staff addresses retain their transport and queue behavior. Worker staff lookup uses native IDs from either machine's roster.
+`--codex --session-dir DIR --to SLOT` remains a run-scoped worker selection.
+
 ## What it is
 
 The user wanted every message sent to them to be checked for clarity by an agent that speaks for them. This feature does that. A written message guide sets the rules for pushes, questions and replies. Sessions load the guide with `/message_style` before they write to the user. Before any phone push is posted, a headless reviewer reads it cold against the guide. The reviewer can approve it, rewrite it, ask for missing facts or withhold it. A push that fails review is not sent, and the sender is told to revise it. Claude's built-in `PushNotification` is gated so it cannot bypass the review. Every fixed script push is a catalog entry that has been approved ahead of time. When a showrunner asks the user a question in a reply, the question is registered and reviewed first; no hook checks the reply (user, 2026-10-19). A nightly `messages` pass measures how messages did and proposes new guide rules.
 
 ## How it works
 
+### Sender identity
+
+`send.py` reads the sender's native ID through `roster.sender_identity(os.environ)` once per send.
+A Codex thread ID takes precedence over an inherited Claude director hint.
+Claude identity comes from the runtime registry checks.
+`--from` remains the display and reply name. It does not select the native ID.
+
+Every agent message includes `Sender native id: session:<id>`, `Sender native id: codex:<id>`, or `Sender native id: unavailable`.
+The generated metadata forms one block directly after the preview line.
+Only the `Authority:` line in that block grants authority.
+Quoted labels elsewhere grant no authority.
+Only an exact match with `MORTY_NATIVE_ID` in `config/send.conf` adds `Authority: morty (speaks for the user)`.
+The live key must contain a valid native address. A missing or invalid key grants no mark.
+A different runtime that uses `--from morty` gets a stderr note. Delivery continues without the mark.
+The mark proves runtime attribution, not authentication.
+Code under the same operating-system account can set its environment.
+
+`Message.stamp` stores a known Claude sender, a known Codex sender, or an unavailable sender.
+Queue records and message log records store its address in `sender_native_id`.
+SSH forwarding preserves the origin stamp. The receiving shell does not replace it with its own identity.
+`--forwarded-sender-stamp` requires `--here` and an environment with `SSH_CONNECTION`.
+This context check prevents accidental use. It does not prove that `remote()` supplied the stamp.
+A session can inherit `SSH_CONNECTION`. Code under the same account can also set it.
+Queue recovery preserves the stored stamp. An old record without the field has an unavailable sender.
+A drain never attributes an old message to its own runtime.
+Delivered caller lines that start with `Authority:` or `Sender native id:` get a `> ` prefix.
+Rendering first converts CR, CRLF, and Unicode line separators to LF.
+This rule covers the summary, body, sender name, and forwarded display text.
+The prefix also applies after leading spaces. Generated stamp lines keep their original form.
+Queue records and logs keep the raw caller text.
+These fields do not change the recipient, reply name, or message key.
+
 ### Replies to relay sockets
 
-Before the headless relay starts Claude, it atomically saves its PID and sender name in `message/relay_senders/<pid>`. It then execs Claude with that same PID, which owns `cc-socks/<pid>.sock`. A reply to a missing socket, or one whose delivery connect returns `ENOENT` or `ECONNREFUSED`, resolves the saved name through the live session registry. Send and drain share this rule; a live socket takes only its delivery connect. Without a saved name or a live session, `send.py` reports `FAILED` (exit 3), names the address and sender on stderr, and keeps no raw socket queue. A queued message uses the session ID found at the queue decision, even if that session then exits.
+The headless relay uses the session name `relay/<sender>`. Session lookups identify a relay only when its saved sender and process start identity match the live process; on Linux the boot ID must also match. A real session with the same name form, or a reused PID, stays visible. Its message body names the real sender in `Shown sender:`. The name rule and its readers are described in [session-roster.md](session-roster.md). Before the headless relay starts Claude, it atomically publishes the process lifetime and sender in `message/relay_senders/<pid>.identity`, then the plain sender name in `message/relay_senders/<pid>`. The plain sender remains available after the process exits for reply recovery. It then execs Claude with that same PID, which owns `cc-socks/<pid>.sock`. A reply to a missing socket, or one whose delivery connect returns `ENOENT` or `ECONNREFUSED`, checks the saved name through staff. A staff sender uses its current session. A non-staff sender uses the live registry. Send and drain share this rule; a live socket takes only its delivery connect. Without a saved name or a live session, `send.py` reports `FAILED` (exit 3), names the address and sender on stderr, and keeps no raw socket queue. A queued message uses the session ID found at the queue decision, even if that session then exits.
 
 `send.py drain-sockets` recovers old raw `uds__*.sock.jsonl` queues. It delivers each message in a file whose newest entry is under 24 hours old to the named live session, marked `Stuck message from <original time>:`. Recovery uses the relay record, then queued recipient metadata (`to_name`, `to-name`, `recipient_name`, or a named `to`). Each stable recovery ID gets a flushed and fsynced attempt in `message/socket-recovery-attempts.jsonl` before delivery, followed by its durable result in `message/log.jsonl`. The message log keeps one row per result; attempts do not count as messages. A rerun skips confirmed sends. An attempt without a result is archived without resending: `UNCONFIRMED: stuck reply from <time> to <name> may have arrived; archived, not resent` (exit 3); a later run has nothing to repeat. Known failed sends remain for retry, without another queued copy. Unresolved or unreadable files stay in place and are reported by path (exit 3); other files still run. Older files move intact to `message/socket-queue-archive/`; one line gives the file count and oldest and newest message times. Archive names never overwrite another item, and a retry reuses an identical uncertain entry's archive. `UNCONFIRMED` and `SENT` lines are printed and flushed before removing the queue entry; a rerun may repeat the report, without sending again. The old-file summary (`archiving <n> socket queue files: …`) is printed and flushed before any of its files move, so an interrupted move cannot hide the count; a rerun names only the files still to move.
 
@@ -109,13 +148,12 @@ PushNotification (built-in) ── PreToolUse gate ── allowed only with that
 ### `scripts/notify/pushover.py`
 
 - Usage: `pushover.py [--priority 0|1|2] [--source NAME] [--key KEY] [--answerable] (--action TEXT | --no-action) TITLE MESSAGE`, or `--text-id ID --value k=v…`, which takes no positional arguments and no action flags.
-- Footer (user ask, 2026-10-27: an emergency push from the hana session did not say who sent it). `post_message()` is the one place a push goes out, also a push kept during silence (`post_kept()`) and a held push sent at hold expiry. It adds two last lines after the review and the length checks, so a reviewed text and its approval do not change:
+- Footer (user ask, 2026-10-27: an emergency push from the hana session did not say who sent it). `post_message()` is the one place a push goes out, also a push kept during silence (`post_kept()`) and a held push sent at hold expiry. It adds one last line after the review and the length checks, so a reviewed text and its approval do not change:
 
   ```
   <message>
 
-  Sent by: hana
-  Template: auto_mode.refused
+  Sent by: hana · Template: auto_mode.refused
   ```
 
   - `Sent by` is `sender_name(source)`: the source on one line, at most 80 characters. A `send.py in <session>` source (`send.py`'s `default_sender()`) shows only the session; any other source (`stall-watch`, `rca`, `natedev`, `build-followups`, `send.py`, or the parent command line when there is no `--source`) shows as it is.
@@ -144,7 +182,7 @@ PushNotification (built-in) ── PreToolUse gate ── allowed only with that
 - Failed or Withheld:
   - When the priority is 2 or the push has a registered id that is not agent-written (one with no current approval), it is still sent. Such a registered id sends its rendered text and requests a template fix. The log detail is `sent despite failed review: <rules>`.
   - Otherwise, including `nate.adhoc`, nothing is posted. The command prints `pushover: not sent: <why>` and exits 6. Agent-written ids request no template fix, including at priority 2.
-- `Rewritten` sends the rewrite and prints `pushover: sent as rewritten:`, followed by the title, the header line(s) and the body. This includes agent-written ids (`nate.adhoc`). Other registered ids always send their rendered text; review is only a logged check, with detail `registered text sent as rendered, rewrite not applied`. Agent-written ids keep their `Template:` footer, reviewed JSON `text_id` and review.jsonl `text_id`.
+- `Rewritten` sends the rewrite and prints `pushover: sent as rewritten:`, followed by the title, the header line(s) and the body. This includes agent-written ids (`nate.adhoc`, `alert.blocked`, `alert.decision`). Other registered ids always send their rendered text; review is only a logged check, with detail `registered text sent as rendered, rewrite not applied`. Agent-written ids keep their `Template:` footer, reviewed JSON `text_id` and review.jsonl `text_id`.
 - `deliver(draft, keys_file, post, *, detail, header)` posts a draft that has already been reviewed. `trimmed_body()` is the only body trim. Keys are read from `~/.config/pushover/env` and are never printed. `post: Post` is injectable, so tests never reach Pushover.
 
 | pushover exit | Meaning |
@@ -200,6 +238,8 @@ PushNotification (built-in) ── PreToolUse gate ── allowed only with that
 
 `escalate.py close` keeps a sent blocked hold until `send.py retire` succeeds; a failed cancellation still reports its error, and the next close retries it. A review refusal saves `review_held` with a pending `review_reason`. `due` retries forwarding that result until the relay succeeds, then clears the reason; it never resubmits the refused user push.
 
+Silence release discards saved `message.repeat_flood` pushes and records each discard in the push log. Other saved pushes keep their existing delivery rules.
+
 Silence extension stops the old end timer before replacing its saved timer; a failed stop leaves that record for a retry. Each end timer runs `off --timer <unit>`, which checks the saved timer under the silence lock: when a saved silence names another timer it does nothing and exits 0. A stray timer from an interrupted extension cannot end the replacement silence or post its kept pushes. With no saved silence, timer `off` releases leftover pushes, so rerunning the same command retries failed or interrupted delivery. Plain `off` still ends any silence. `silence.claim()` ends silence but leaves the kept-push file intact. `release()` serializes posts under the silence lock and removes each push only after it posts successfully. Failed and interrupted posts stay saved for a repeated `off`; callers skip pushes another release already delivered.
 
 ### Legacy holds and claims
@@ -233,7 +273,7 @@ The gate is a PreToolUse hook. Its `settings.json` entry has matcher `PushNotifi
 ### Script push texts
 
 - `scripts/notify/push_texts.py`:
-  - `PushText(id, sender, need, title, action: ActionTemplate | NoActionNeeded, body, examples: tuple[PushExample, ...], purpose, session: SessionTemplate | NoSessionLine, header: bool = True, agent_written: bool = False)` and `PushExample(name, values)`. `purpose` is one line (72 characters at most) that says when the push goes out. It is not part of the fingerprint, so a change to it moves no approval. With `header=False` the phone shows only the title and the body, with no `No action needed.` line. `catalog()` refuses `header=False` on an entry that has an action or a session. `nate.adhoc` uses it, and `fingerprint` includes it only when it is False. Only `nate.adhoc` has `agent_written=True`; this field is excluded from the fingerprint. `agent_written(text_id: str) -> bool` returns False for unknown ids.
+  - `PushText(id, sender, need, title, action: ActionTemplate | NoActionNeeded, body, examples: tuple[PushExample, ...], purpose, session: SessionTemplate | NoSessionLine, header: bool = True, agent_written: bool = False)` and `PushExample(name, values)`. `purpose` is one line (72 characters at most) that says when the push goes out. It is not part of the fingerprint, so a change to it moves no approval. With `header=False` the phone shows only the title and the body, with no `No action needed.` line. `catalog()` refuses `header=False` on an entry that has an action or a session. `nate.adhoc` uses it, and `fingerprint` includes it only when it is False. `nate.adhoc`, `alert.blocked` and `alert.decision` have `agent_written=True`; this field is excluded from the fingerprint. `agent_written(text_id: str) -> bool` returns False for unknown ids.
   - `render(id, **values)` and `render_entry(entry, values) -> RenderedPush`. An unknown id, a missing value or an extra value raises `ValueError`.
   - `user_send_argv(rendered, *, sender, machine, priority, timeout)` builds the `send.py --to user --from … --need … --text-id … --value …` argv. User-send wrappers take a rendered push, never a string.
   - `fingerprint(entry)` is the sha256 over the templates and every example's values and filled text.
@@ -258,6 +298,46 @@ The gate is a PreToolUse hook. Its `settings.json` entry has matcher `PushNotifi
 
   It also fails any literal phone send under `scripts/` outside `push_texts.py`, `pushover.py`, `send.py` and `escalate.py`. A literal phone send is `--to user`, `--to=user`, a `pushover.py` path, or `broadcast.send("user", …)`, and the test tracks list mutations and aliases.
 - A status note that asks nothing goes to a log or to the requesting session, not the phone. For example, `quota_alert.py` logs `quota status <name>: …`.
+
+### Repeated machine messages
+
+`repeat_guard` counts a resolved recipient once across send.py, direct mesh and run-result routes. Adoption is followed before counting; a director fallback counts at the director boundary. The first two exact copies pass. Later exact copies to the same receiver are held. Arbitrary prose compares literally, including times, timestamps, PIDs, socket paths, message IDs and placeholders: these may be meaningful. Counter identity version 2 retires the old masked counters without dropping unfinished notices. Exact-text replay retained all 746 historical watchdog holds, so no producer-specific repeat key is needed.
+
+`config/send_repeat_guard.conf` owns holding policy and notice deadlines. The caller has a fixed I/O-free 250 ms safety ceiling; it reads no configuration at import. Policy reads, state I/O, nonblocking locks and publication run inside an isolated checker. Errors, busy locks, corrupt state and timeout admit the message and print a diagnostic. Person and phone exemptions precede worker launch. Lock identity is independent of reloadable capacity; records and previews are bounded.
+
+Recipient counters and aggregate `(sender, literal text)` episodes expire after a full window without a copy.
+The sender record holds one owner notice per literal-repeat flood across receivers.
+Each receiver-rate flood also has one owner notice.
+The guard sends no phone push.
+Reading saved state drops old phone notices, regardless of their delivery status.
+Completed owner notices stay through the active episode.
+Exit 0 with `SENT:` proves delivery; durable `QUEUED:` or `KEPT:` owns its queued copy.
+Abnormal termination, empty success and `SKIPPED:` remain unknown and retry until confirmed or the configured age limit.
+`notice_max_age_seconds` sets that limit to 86400 seconds after notice creation.
+Unfinished entries survive episode expiry and keep an inactive sender record alive.
+Completed entries expire with their episode.
+The bounded outbox never removes unfinished notices to make room.
+At capacity, new attempts admit delivery.
+Notices disable expiring repeat claims.
+Owner delivery can repeat after a lost acknowledgement.
+The rate check counts each sender–receiver pair in its own fixed window.
+`receiver_rate_count` sets the threshold in config.
+Traffic to different receivers never adds up.
+A receiver that reaches the threshold gets one owner notice per active episode.
+The notice names that receiver and reports one session.
+Rate notices never hold delivery.
+Rate counters expire after receiver inactivity.
+Each sender keeps at most `max_keys` rate counters.
+Decoding removes saved sender-wide rate counters and their active outbox entries without a warning.
+Literal counters and owner notices keep their existing rules.
+
+`--from user`, `--human` (also mesh send/steer/interrupt), phone destinations and the reserved `send-repeat-guard` sender bypass counting. Accounting ownership is chosen before forwarding: the originating send.py records its outcome, including failures; internal mesh/SSH calls suppress duplicate rows and return their canonical receiver when available. Standalone transports record themselves. All event writers share one JSONL append helper, with original text, canonical receiver, provenance and observed outcome. An accounting fault never disables delivery.
+
+The notifier detaches one supervised notice job with explicit HOME, XDG, configuration and repeat-state paths. The supervisor owns its process group, including delivery children, and kills descendants at its configured deadline or normal completion on Linux and macOS. Delivery subprocesses inherit this group. There is no nested drain worker or alarm. The nonblocking drain lock prevents overlap. Scheduling progress records admitted attempts, never inspection: insufficient budget leaves the sender cursor and notice order unchanged. An admitted attempt persists its claim and rotation to the tail of the sender’s notice list, then advances the sender cursor before discovery or delivery. Discovery and delivery share one bounded child attempt. A new attempt starts only when the supervisor deadline leaves its full configured budget plus subprocess cleanup; otherwise it stays pending for the next job. No synchronous launcher fallback runs.
+
+With recurring jobs that have enough budget to admit work, accessible state, and notices still within retention, rotation gives later senders and notices their turn despite interrupted attempts. It cannot guarantee acceptance by an unavailable destination or service before expiry under an arbitrary backlog.
+
+`python3 scripts/message/repeats.py` reports observed send-log totals here and on the peer through existing SSH selection. `--here --replay` instead simulates decisions without sends or state writes. Independent `safety` labels in replay records check distinct-message holds; historical records without labels have unknown distinctness coverage. Older records without human provenance also have unknown coverage; neither is presented as proven zero. All known phone and person traffic remains protected. Peer reporting requires this command on both machines.
 
 ### Permission root cause: `scripts/message/rca.py`
 
@@ -429,3 +509,14 @@ The user asked for this on 2026-10-23: each permission alert starts a root cause
 - **No recipient filter in the nightly count:** one day's measurement found 29 of 578 showrunner replies with an unregistered ask. Only one (3.4%) was addressed to a peer only, well under the one-in-four bar, so peer asks are too small a share to matter.
 - **No Stop hook for unregistered asks** (user, 2026-10-19: "i have already asked you to get rid of the stop hook that does this"). It once blocked 28 unregistered asks in one day; the nightly count still measures them.
 - **One loader for the UX and message guides:** one way to do a thing.
+
+
+Registered alerts and delivery footer (2026-11-01):
+- Every posted push ends in `Sent by: <sender> · Template: <id>` on one line. Free text keeps `none (free text)`. The audit reads both this and historical two-line footers.
+- `mac.locked`, `github.keys_cold`, `build_hold.blocking` and `nixos.ups_power_back` carry the approved fixed wording. GitHub cold keys need no body. UPS battery and shutdown alerts also use their existing ids.
+- `nixos.ups_replace_battery` asks the user to replace the worn UPS battery after REPLBATT.
+- `nixos.ups_no_contact` asks the user to check the UPS USB cable after NOCOMM.
+- `/alert_user` selects a fixed template first, else `alert.blocked` or `alert.decision`. These two use agent-written title, action and body: short and to the point, with live review like `nate.adhoc`.
+- For agent-written and free-text pushes, the push review receives every fixed template's id and purpose. When one fits, it withholds the draft under `use-registered-template:<id>`, including emergency drafts; it names the required id instead of rewriting around it. Fixed registered live reviews and catalog example reviews do not get this instruction; fixed registered texts still send as rendered and report review failures.
+- `send.py` gives `github.keys_cold` a shared `github.keys_cold:<machine>` key in its existing locked claim store. Every sender uses it. Under the claim lock, the warm-check record is saved before the key, so a sender crash before delivery cannot strand a claim without its check; a failed send releases the claim. A delivered event suppresses later sessions until the existing `github-warm-status` clear check retires it. The check survives phone expiry so a continuing cold spell cannot start a second event. Run the template on the machine with cold keys, forwarding delivery with `--machine natedev` on the Mac. No extra ledger or time window.
+- Free text is still accepted pending the nixos rebuild; this phase adds no missing-id refusal.

@@ -5,7 +5,8 @@ import unittest
 import subprocess
 from pathlib import Path
 from typing import final
-from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, HANG_GUARD_S as HANG_GUARD_S, VERIFY as VERIFY
+from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, VERIFY as VERIFY
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 @final
@@ -47,7 +48,7 @@ class VerifyMacResultPathsTests(VerifyMacOffloadFixture):
                              ["bash", str(lint / entry), "fmt", "--all", "--check"])
                 result = subprocess.run(arguments, cwd=self.root,
                     env={**self.environment, "TMPDIR": str(missing)}, capture_output=True,
-                    text=True, check=False, timeout=HANG_GUARD_S)
+                    text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertTrue(missing.is_dir())
 

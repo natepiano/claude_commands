@@ -26,6 +26,7 @@ from typing import Literal, NotRequired, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.accounts import accounts  # noqa: E402
+from scripts.lib import conf  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
 from scripts.whoami import agent_accounts  # noqa: E402
 from scripts.whoami import note_file  # noqa: E402
@@ -92,7 +93,7 @@ def parse_account(tool: str, name: str) -> NewAccount:
 
 
 def notes_directory() -> Path:
-    return Path(os.environ.get("AGENT_NOTES_DIR", str(accounts.accounts_home() / "rust" / "hanadocs" / "agents")))
+    return note_file.notes_dir()
 
 
 def note_path(account: NewAccount) -> Path:
@@ -291,7 +292,7 @@ def _shell_module_path() -> Path:
 
 def nixos_shell_module() -> Path | None:
     relative = _shell_module_path()
-    for repository in (Path("/etc/nixos"), accounts.accounts_home() / "nixos"):
+    for repository in (Path(conf.text("accounts", "nixos_repository_root")), Path(conf.text("accounts", "home_nixos_repository_root")).expanduser()):
         module = repository / relative
         if module.is_file():
             return module

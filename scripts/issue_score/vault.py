@@ -11,14 +11,33 @@ from typing import cast
 from urllib.parse import unquote, urlsplit
 
 from scripts.feature_log import feature_log
+from scripts.lib import conf
+from .selection import UseConfiguredValue
 
-from .questions import BODY_CHARACTER_LIMIT, GOAL_LABELS, IssueState, PROJECT_ABOUT, StyleState
+from .questions import body_character_limit, GOAL_LABELS, IssueState, PROJECT_ABOUT, StyleState
 
-VAULT_ROOT = Path.home() / "rust/hanadocs"
-ISSUES_DIR = VAULT_ROOT / "issues"
-AREA_DEFINITIONS_PATH = VAULT_ROOT / "conf/issue-areas.md"
-PROJECT_BASES_DIR = VAULT_ROOT / "home-base"
-STYLE_RULES_DIRS = (Path.home() / "rust/nate_style", Path(__file__).resolve().parents[2] / "docs/style")
+
+def vault_root() -> Path:
+    return Path(conf.text("issue_score", "vault_root")).expanduser()
+
+
+def issue_directory() -> Path:
+    return vault_root() / "issues"
+
+
+def area_definitions_path() -> Path:
+    return vault_root() / "conf/issue-areas.md"
+
+
+def project_bases_dir() -> Path:
+    return vault_root() / "home-base"
+
+
+def style_rules_dirs() -> tuple[Path, ...]:
+    return (Path(conf.text("issue_score", "style_rules_root")).expanduser(),
+            Path(__file__).resolve().parents[2] / "docs/style")
+
+
 RATING_FIELDS = ("backlog_alignment", "backlog_impact", "backlog_urgency", "backlog_effort")
 LABEL_FIELDS = ("backlog_goal", *RATING_FIELDS, "category", "area", "backlog_score")
 WIKILINK = re.compile(r"\[\[([^\]\n]+)\]\]")
@@ -119,12 +138,13 @@ def plain(value: str) -> str:
 
 def clean_body(body: str) -> str:
     cleaned = WIKILINK.sub(lambda match: match[1].split("|", 1)[-1], body)
-    if len(cleaned) <= BODY_CHARACTER_LIMIT:
+    limit = body_character_limit()
+    if len(cleaned) <= limit:
         return cleaned
-    prefix = cleaned[:BODY_CHARACTER_LIMIT]
+    prefix = cleaned[:limit]
     headings = list(re.finditer(r"(?m)^#{1,6}\s", prefix))
     # If the only heading opens the document, keep useful text up to the cap.
-    cut = headings[-1].start() if headings and headings[-1].start() > 0 else BODY_CHARACTER_LIMIT
+    cut = headings[-1].start() if headings and headings[-1].start() > 0 else limit
     return prefix[:cut].rstrip()
 
 
@@ -132,8 +152,9 @@ def normalize_area(area: str) -> str:
     return plain(area).strip("\"'").strip().casefold()
 
 
-def load_area_definitions(path: Path = AREA_DEFINITIONS_PATH) -> dict[str, str]:
+def load_area_definitions(path: Path | UseConfiguredValue = UseConfiguredValue.CURRENT) -> dict[str, str]:
     """Require a two-column area table; missing rows retain name-only criteria."""
+    path = area_definitions_path() if isinstance(path, UseConfiguredValue) else path
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
     except FileNotFoundError:
@@ -160,8 +181,9 @@ def load_area_definitions(path: Path = AREA_DEFINITIONS_PATH) -> dict[str, str]:
     return definitions
 
 
-def load_project_names(base_dir: Path = PROJECT_BASES_DIR) -> dict[str, str]:
+def load_project_names(base_dir: Path | UseConfiguredValue = UseConfiguredValue.CURRENT) -> dict[str, str]:
     """Read each shorthand's project filter from the same bases `/issue` uses."""
+    base_dir = project_bases_dir() if isinstance(base_dir, UseConfiguredValue) else base_dir
     names: dict[str, str] = {}
     for path in sorted(base_dir.glob("issues - *.base")):
         matches = set(re.findall(r'''project\.contains\(link\(["']([^"']+)["']\)\)''', path.read_text(encoding="utf-8")))
@@ -209,7 +231,8 @@ def _documents(issues_dir: Path) -> list[VaultDocument]:
     return [_frontmatter(path) for path in sorted(issues_dir.glob("*.md")) if path.is_file()]
 
 
-def load_open_issues(issues_dir: Path = ISSUES_DIR) -> list[Issue]:
+def load_open_issues(issues_dir: Path | UseConfiguredValue = UseConfiguredValue.CURRENT) -> list[Issue]:
+    issues_dir = issue_directory() if isinstance(issues_dir, UseConfiguredValue) else issues_dir
     return [document.issue() for document in _documents(issues_dir)
             if plain(document.value("status")).casefold() == "open" and not document.is_style]
 
@@ -252,8 +275,9 @@ def _rule_summary(reference: str, rules_dirs: tuple[Path, ...]) -> RuleSummary |
     return MissingStyleRule(reference)
 
 
-def scoring_issue(document: VaultDocument, *, rules_dirs: tuple[Path, ...] = STYLE_RULES_DIRS) -> Issue:
+def scoring_issue(document: VaultDocument, *, rules_dirs: tuple[Path, ...] | UseConfiguredValue = UseConfiguredValue.CURRENT) -> Issue:
     """Build scoring inputs from one issue snapshot, including its owning rules."""
+    rules_dirs = style_rules_dirs() if isinstance(rules_dirs, UseConfiguredValue) else rules_dirs
     issue = document.issue()
     if not document.is_style:
         return issue
@@ -265,9 +289,11 @@ def scoring_issue(document: VaultDocument, *, rules_dirs: tuple[Path, ...] = STY
     return Issue(issue.path, issue.title, issue.project, issue.body, issue.labels, True, inputs)
 
 
-def load_scoring_issues(issues_dir: Path = ISSUES_DIR, *,
-                        rules_dirs: tuple[Path, ...] = STYLE_RULES_DIRS) -> list[Issue]:
+def load_scoring_issues(issues_dir: Path | UseConfiguredValue = UseConfiguredValue.CURRENT, *,
+                        rules_dirs: tuple[Path, ...] | UseConfiguredValue = UseConfiguredValue.CURRENT) -> list[Issue]:
     """Include open style proposals with explicit available or missing rule state."""
+    issues_dir = issue_directory() if isinstance(issues_dir, UseConfiguredValue) else issues_dir
+    rules_dirs = style_rules_dirs() if isinstance(rules_dirs, UseConfiguredValue) else rules_dirs
     issues = load_open_issues(issues_dir)
     for document in _documents(issues_dir):
         if not document.is_style or plain(document.value("status")).casefold() != "open":
@@ -289,7 +315,8 @@ def _style_formula(document: VaultDocument, project_goals: dict[str, str]) -> di
     }
 
 
-def load_rated_issues(issues_dir: Path = ISSUES_DIR) -> RatedIssues:
+def load_rated_issues(issues_dir: Path | UseConfiguredValue = UseConfiguredValue.CURRENT) -> RatedIssues:
+    issues_dir = issue_directory() if isinstance(issues_dir, UseConfiguredValue) else issues_dir
     documents = _documents(issues_dir)
     goals: dict[str, Counter[str]] = {}
     for document in documents:

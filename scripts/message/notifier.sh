@@ -300,7 +300,7 @@ instance_tick() {
     fi
   fi
 
-  socket=$(NOTIFIER_SESSIONS_DIR="$SESSIONS_DIR" "$PY" "$SESSIONS" socket "${conf[TARGET]}" 2>/dev/null)
+  socket=$(NOTIFIER_SESSIONS_DIR="$SESSIONS_DIR" "$PY" "$SESSIONS" member-socket "${conf[TARGET]}" 2>/dev/null)
   rc=$?
   if [[ -z $socket ]]; then
     # Exit 1 is no such live session. Any other failure is the lookup itself failing.
@@ -443,10 +443,19 @@ launch_run() {
   local -a command
   command=(/usr/bin/env "HOME=$HOME" "PATH=$PATH" "NOTIFIER_STATE_DIR=$STATE_DIR"
     "NOTIFIER_SESSIONS_DIR=$SESSIONS_DIR" "NOTIFIER_NOW_EPOCH=$NOW" "$SCRIPT" run-due "$name")
+  launch_job "$label" "${command[@]}"
+}
+
+# One detached service launcher for scheduled runs and the repeat-notice drain.
+launch_job() {
+  local label=$1
+  shift
+  local -a command
+  command=("$@")
   case ${NOTIFIER_PLATFORM:-$OSTYPE} in
     linux*) systemd-run --user --collect --quiet --no-block --unit "$label" -- "${command[@]}" >/dev/null 2>&1 ;;
     darwin*)
-      command[-2,-1]=(run-due-and-remove "$name" "$label")
+      command=(/bin/sh -c '"$@"; launchctl remove "$0"' "$label" "${command[@]}")
       launchctl submit -l "$label" -- "${command[@]}" >/dev/null 2>&1 || return 1
       # macOS only registers a submitted job; kickstart starts it.
       launchctl kickstart "gui/$UID/$label" >/dev/null 2>&1 && return 0
@@ -500,6 +509,25 @@ cmd_tick() {
     run_due "$name"
   done
   # After the unlock, so a slow check never holds the scheduled messages back.
+  local repeat_state=${NOTIFIER_REPEAT_STATE:-}
+  if [[ -z $repeat_state && -z ${NOTIFIER_STATE_DIR:-} ]]; then
+    repeat_state=${XDG_STATE_HOME:-$HOME/.local/state}/message/repeats
+  fi
+  if [[ -n $repeat_state && -d $repeat_state ]]; then
+    local -a drain_command
+    drain_command=(/usr/bin/env "HOME=$HOME" "PATH=$PATH"
+      "XDG_STATE_HOME=${XDG_STATE_HOME:-$HOME/.local/state}"
+      "SEND_REPEAT_STATE=$repeat_state"
+      "SEND_REPEAT_CONFIG=${SEND_REPEAT_CONFIG:-$HOME/.claude/config/send_repeat_guard.conf}")
+    drain_command+=("$PY" "${SEND:h}/repeat_guard.py" notices)
+    if [[ -n ${NOTIFIER_SEND:-} ]]; then
+      drain_command+=("$NOTIFIER_SEND" repeat-notices)
+    else
+      drain_command+=("$PY" "$SEND" repeat-notices)
+    fi
+    launch_job "send-repeat-notices-$$-$RANDOM" "${drain_command[@]}" || log_error "repeat drain launcher unavailable"
+
+  fi
   [[ -n $EMERGENCIES && -s $EMERGENCIES ]] && clear_check
   return 0
 }

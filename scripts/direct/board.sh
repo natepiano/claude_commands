@@ -231,13 +231,11 @@ write_lock_meta() {
 cleanup_owned_group() {
   local dir="$1"
   [[ -f "$dir/owned" ]] || return 0
-  python3 - "$dir/owned" <<'PY'
+  python3 - "$dir/owned" "${BASH_SOURCE[0]%/*}/../lib" <<'PY'
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
-import signal
 import subprocess
 import sys
 import time
@@ -282,7 +280,7 @@ if identity(group) != start:
     sys.exit(0)
 
 try:
-    os.killpg(group, signal.SIGKILL)
+    if (sent := subprocess.run([str(Path(sys.argv[2]).resolve() / "py"), str(Path(sys.argv[2]).resolve() / "process_group.py"), str(group), "KILL"], capture_output=True, text=True)).returncode: raise ProcessLookupError if sent.returncode == 3 else SystemExit("board.sh: process group helper failed: " + " ".join(sent.stderr.splitlines()))
 except ProcessLookupError:
     pass
 

@@ -37,6 +37,19 @@ class LiveUnitsTests(unittest.TestCase):
     doc: Path = Path()
     records: Path = Path()
     environment: dict[str, str] = {}
+    pane_sessions: dict[str, str] = {}
+
+    def test_retired_backfill_does_not_add_a_retained_removed_row_to_the_active_output(self) -> None:
+        self.write_doc(HEADER, "| live-unit | plan.md | /missing/live | live | — | — |")
+        self.hosts({})
+        before = self.run_script()
+        self.assertEqual(before.returncode, 0, before.stderr)
+        retired = unit_membership("show", "retired-unit")
+        _ = staff.set_worktree(retired.id, staff.RemovedWorktree("natedev", self.root / "retired"))
+        after = self.run_script()
+        self.assertEqual(after.returncode, 0, after.stderr)
+        self.assertEqual(after.stdout, before.stdout)
+        self.assertIsNotNone(staff.by_id(retired.id))
 
     @override
     def setUp(self) -> None:
@@ -45,6 +58,7 @@ class LiveUnitsTests(unittest.TestCase):
         self.doc = self.root / "show-production.md"
         self.records = self.root / "sessions"
         self.records.mkdir()
+        self.pane_sessions = {}
         self.environment = {**os.environ, "NOTIFIER_STATE_DIR": str(self.timers),
                             "NOTIFIER_SESSIONS_DIR": str(self.records),
                             "HERDR_PANE_RECORD_DIR": str(self.root / "pane-records"),
@@ -59,6 +73,12 @@ class LiveUnitsTests(unittest.TestCase):
         _ = (self.root / "herdr-responses.json").write_text(json.dumps({"default": {"stdout": "", "code": 1}}))
 
     def hosts(self, units: dict[str, HostedUnit]) -> None:
+        for unit in units.values():
+            if unit.marks.get("SHOWRUNNER_UNIT") == "show":
+                rows = [row for row in staff.find(kind="unit")
+                        if row.name == unit.marks["SHOWRUNNER_UNIT_ID"].removesuffix("-unit")]
+                if rows:
+                    self.pane_sessions[unit.pane] = rows[0].id
         fake_unit_host.write(self.environment, list(units.values()))
 
     def write_doc(self, header: tuple[str, str], *rows: str, members: tuple[str, ...] | None = None) -> None:
@@ -79,7 +99,7 @@ class LiveUnitsTests(unittest.TestCase):
         held.bind(str(path))
         self.addCleanup(held.close)
         _ = (self.records / f"{name}.json").write_text(json.dumps({
-            "pid": os.getpid(), "sessionId": f"id-{name}", "name": name,
+            "pid": os.getpid(), "sessionId": self.pane_sessions[pane], "name": name,
             "messagingSocketPath": str(path), "updatedAt": 1, "tmux": f"label-at-start:@1.{pane}" if pane else ""}))
 
     def run_script(self, *arguments: str) -> subprocess.CompletedProcess[str]:

@@ -153,10 +153,10 @@ class NoClaudeSession:
 
 
 def sender_identity(environment: Mapping[str, str]) -> SenderIdentity:
-    """A Codex shell can inherit its launching Claude session's id."""
+    """Prefer the caller's thread; resolve Claude from its current process registry."""
     if thread_id := environment.get("CODEX_THREAD_ID", ""):
         return CodexThread(thread_id)
-    if session_id := environment.get("CLAUDE_CODE_SESSION_ID", ""):
+    if session_id := staff.runtime_id():
         return ClaudeSession(session_id)
     return NoSession()
 
@@ -854,9 +854,10 @@ def mesh_shown_name(session_dir: str, name: str, record: Mapping[str, object]) -
     problems: list[str] = []
     records = _newest_sessions()
     details = _raw_session_details(records, problems)
-    registered = _registered_showrunners(os.environ, problems)
+    membership = staff.initial_snapshot()
+    registered = _registered_showrunners(os.environ, problems, membership=membership)
     places = (_production_places(records, details, registered,
-                                 _showrunner_ids(records, registered), set(), problems, record=staff.snapshot())
+                                 _showrunner_ids(records, registered), set(), problems, record=membership)
               if registered else {})
     place = places.get(unit_runs.director(run))
     if place is not None:
@@ -1336,7 +1337,7 @@ def _herdr_codex_panes(machine: str) -> Roster:
             process = codex_processes.get(herdr.HerdrPlace(name, pane))
             entries.append(RosterEntry(
                 machine=machine, kind="codex", role="freestanding",
-                name=f"herdr {name}:{pane}", status=agent["agent_status"],
+                name=f"herdr {name}:{pane}", status=str(agent["agent_status"]),
                 reach=CannotReceiveMessages("interactive Codex in a herdr pane"),
                 cwd=cwds.get(herdr.HerdrPlace(name, pane), ""),
                 showrunner=NoShowrunner(), director=NoDirector(), assignment=NotAWorker(),
@@ -1349,14 +1350,20 @@ def machine_name() -> str:
     return socket.gethostname().split(".", 1)[0]
 
 
-def _local_roster(environment: Mapping[str, str]) -> Roster:
+def _local_roster(environment: Mapping[str, str], *, membership: staff.StaffSnapshot | None = None) -> Roster:
     home_state = account.home_account_state()
     problems: list[str] = []
     warnings: list[str] = []
     machine = machine_name()
     records = _newest_sessions()
     details = _raw_session_details(records, problems)
-    registered = _registered_showrunners(environment, problems)
+    try:
+        if membership is None:
+            membership = staff.initial_snapshot()
+    except staff.StaffUnreadable as error:
+        _problem(problems, "staff membership", error)
+        membership = staff.StaffSnapshot(())
+    registered = _registered_showrunners(environment, problems, membership=membership)
     runner_ids = _showrunner_ids(records, registered)
     roots = unit_runs.run_roots(environment.get("ROSTER_RUN_ROOT"))
     runs = _live_runs(roots, {record["sessionId"] for record in records}, problems)
@@ -1364,9 +1371,8 @@ def _local_roster(environment: Mapping[str, str]) -> Roster:
     production_places: dict[str, _ProductionPlace] = {}
     if registered:
         try:
-            record = staff.snapshot()
             production_places = _production_places(
-                records, details, registered, runner_ids, set(workers), problems, record=record
+                records, details, registered, runner_ids, set(workers), problems, record=membership
             )
         except staff.StaffUnreadable as error:
             _problem(problems, "staff membership", error)
@@ -1450,14 +1456,15 @@ def peer_roster(environment: Mapping[str, str]) -> Roster:
 
 
 @role_map_command
-def roster(environment: Mapping[str, str], scope: RosterScope) -> Roster:
+def roster(environment: Mapping[str, str], scope: RosterScope, *,
+           membership: staff.StaffSnapshot | None = None) -> Roster:
     match scope:
         case ThisMachine():
-            return _local_roster(environment)
+            return _local_roster(environment, membership=membership)
         case AllMachines():
             with ThreadPoolExecutor(max_workers=2) as pool:
                 peer = pool.submit(peer_roster, environment)
-                local = _local_roster(environment)
+                local = _local_roster(environment, membership=membership)
                 other = peer.result()
             return Roster([*local.entries, *other.entries], [*local.problems, *other.problems],
                           [*local.warnings, *other.warnings])

@@ -1,5 +1,5 @@
 ---
-description: Acknowledge context passed in arguments and stop without taking any action.
+description: Acknowledge context and stop.
 ---
 
 # ACK

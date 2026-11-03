@@ -1,6 +1,8 @@
 """Move staff membership and a live tab without relaunching its director."""
 from __future__ import annotations
 
+from scripts.production.staff_test_support import fixture_member
+
 import io
 import json
 import os
@@ -47,12 +49,12 @@ class StaffMoveTests(StaffTestCase):
         _ = self.production("target", workspace="new-tools")
         self.members = {}
         self.destination_panes = []
-        self.members["source"] = staff.ensure("showrunner", name="tools")
-        self.members["destination"] = staff.ensure("showrunner", name="new-tools")
-        self.members["unit"] = staff.ensure("unit", name="panes", parent=self.source.id)
-        self.members["worker"] = staff.ensure("worker", name="impl1", parent=self.unit.id)
-        self.pane("w1:p1", session_id="director-session", environment={
-            "STAFF_ID": self.unit.id, "SHOWRUNNER_UNIT": "sdlc", "SHOWRUNNER_UNIT_ID": "models-unit",
+        self.members["source"] = fixture_member("showrunner", name="tools")
+        self.members["destination"] = fixture_member("showrunner", name="new-tools")
+        self.members["unit"] = fixture_member("unit", name="panes", parent=self.source.id)
+        self.members["worker"] = fixture_member("worker", name="impl1", parent=self.unit.id)
+        self.pane("w1:p1", session_id=self.unit.id, environment={
+            "CLAUDE_CODE_SESSION_ID": self.unit.id, "SHOWRUNNER_UNIT": "sdlc", "SHOWRUNNER_UNIT_ID": "models-unit",
         })
         self.log = self.root / "herdr.jsonl"
         self.responses_path = self.root / "herdr-responses.json"
@@ -114,7 +116,7 @@ class StaffMoveTests(StaffTestCase):
 
     def assert_unit_tab_is_sorted(self, *, already_placed: bool) -> None:
         for name in ("devtools", "herdr"):
-            _ = staff.ensure("unit", name=name, parent=self.destination.id)
+            _ = fixture_member("unit", name=name, parent=self.destination.id)
         self.members["unit"] = staff.rename(self.unit.id, "style")
         tabs = [
             {"tab_id": "w2:t0", "workspace_id": "w2", "label": "new-tools", "pane_count": 1},
@@ -183,15 +185,28 @@ class StaffMoveTests(StaffTestCase):
         with self.assertRaises(FrozenInstanceError):
             setattr(result, "row", self.unit)
 
-    def test_staff_move_rerun_reports_done_without_a_second_move_or_file_change(self) -> None:
+    def test_staff_move_rerun_reports_one_unchanged_line_without_a_second_move_or_file_change(self) -> None:
         _ = staff_move.move_unit("sdlc", "models-unit", "target")
         before = self.staff_file.read_bytes()
+        modified = self.staff_file.stat().st_mtime_ns
+        with (redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors,
+              mock.patch.object(staff, "move", wraps=staff.move) as move):
+            code = staff.main(["move", "sdlc/models-unit", "target"])
+        self.assertEqual(code, 0, errors.getvalue())
+        self.assertEqual(output.getvalue(), "unchanged: panes under new-tools\n")
+        self.assertEqual(errors.getvalue(), "")
+        move.assert_not_called()
+        self.assertEqual(self.staff_file.read_bytes(), before)
+        self.assertEqual(self.staff_file.stat().st_mtime_ns, modified)
+        self.assertEqual(sum(command[2:4] == ["pane", "move"] for command in self.commands()), 1)
+
+    def test_first_staff_move_keeps_its_done_line_and_changes_parent_and_tab(self) -> None:
         with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
             code = staff.main(["move", "sdlc/models-unit", "target"])
         self.assertEqual(code, 0, errors.getvalue())
-        self.assertIn("done", output.getvalue())
-        self.assertIn("unchanged", errors.getvalue())
-        self.assertEqual(self.staff_file.read_bytes(), before)
+        self.assertEqual(output.getvalue(), "done: panes under new-tools\n")
+        self.assertEqual(errors.getvalue(), "")
+        self.assertEqual(staff.by_id(self.unit.id), replace(self.unit, parent=self.destination.id))
         self.assertEqual(sum(command[2:4] == ["pane", "move"] for command in self.commands()), 1)
 
     def test_no_live_pane_keeps_parent_change_and_reports_the_unmoved_tab_once(self) -> None:
@@ -260,7 +275,7 @@ class StaffMoveTests(StaffTestCase):
 
     def test_name_only_unit_rerun_resolves_destination_after_source_row_is_removed(self) -> None:
         # Before pane identity is recorded, member uses the tab's source name.
-        self.pane("w1:p1", session_id="director-session", environment={
+        self.pane("w1:p1", session_id=self.unit.id, environment={
             "SHOWRUNNER_UNIT": "sdlc", "SHOWRUNNER_UNIT_ID": "models-unit",
         })
         self.members["unit"] = staff.rename(self.unit.id, "models")
@@ -283,7 +298,7 @@ class StaffMoveTests(StaffTestCase):
         self.assertEqual(sum(command[2:4] == ["pane", "move"] for command in self.commands()), 1)
 
     def test_pinned_identity_keeps_renamed_unit_across_source_removal(self) -> None:
-        self.pane("w1:p1", session_id="director-session", environment={})
+        self.pane("w1:p1", session_id=self.unit.id, environment={})
         identity = staff_move.PinnedUnit(self.unit.id, self.destination.id)
         first = staff_move.move_unit("sdlc", "models-unit", "target", identity=identity)
         self.units_doc(self.source_root / "sdlc-production.md", (), workspace="tools")
@@ -297,7 +312,7 @@ class StaffMoveTests(StaffTestCase):
         self.assertEqual(sum(command[2:4] == ["pane", "move"] for command in self.commands()), 1)
 
     def test_missing_pinned_identity_never_selects_destination_name(self) -> None:
-        replacement = staff.ensure("unit", name="models", parent=self.destination.id)
+        replacement = fixture_member("unit", name="models", parent=self.destination.id)
         before = self.staff_file.read_bytes()
         with self.assertRaises(staff.StaffRefused):
             _ = staff_move.move_unit("sdlc", "models-unit", "target",
@@ -343,8 +358,8 @@ class StaffMoveTests(StaffTestCase):
         with self.machine("mac"):
             _ = self.production("sdlc", "models-unit", workspace="tools")
             _ = self.production("target", workspace="new-tools")
-            self.pane("w1:p1", session_id="director-session", environment={
-                "STAFF_ID": self.unit.id, "SHOWRUNNER_UNIT": "sdlc", "SHOWRUNNER_UNIT_ID": "models-unit",
+            self.pane("w1:p1", session_id=self.unit.id, environment={
+                "CLAUDE_CODE_SESSION_ID": self.unit.id, "SHOWRUNNER_UNIT": "sdlc", "SHOWRUNNER_UNIT_ID": "models-unit",
             })
             result = staff_move.move_unit("sdlc", "models-unit", "target")
             self.assertEqual(result.row, replace(self.unit, parent=self.destination.id))
@@ -357,7 +372,7 @@ class StaffMoveTests(StaffTestCase):
                       self.commands())
 
     def test_taken_unit_name_refuses_before_tab_move(self) -> None:
-        _ = staff.ensure("unit", name=self.unit.name, parent=self.destination.id)
+        _ = fixture_member("unit", name=self.unit.name, parent=self.destination.id)
         before = self.staff_file.read_bytes()
         with self.assertRaises(staff.StaffRefused):
             _ = staff_move.move_unit("sdlc", "models-unit", "target")

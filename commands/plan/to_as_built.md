@@ -1,5 +1,5 @@
 ---
-description: Turn shipped work into an as-built doc — an overview of the feature for future implementers. Works from a fully-implemented phased plan, or from a diff when the work shipped without one. Strips Work Order / phase scaffolding, keeps the context that governs later changes (architecture, types, invariants, gotchas, rationale), and relocates it into the repo's as-built directory. Work stamped `As-built disposition: amend` creates no new doc — the shipped changes are folded into the existing as-built docs and the plan, if there is one, is deleted.
+description: Document shipped work as built.
 ---
 
 # Plan → As-Built

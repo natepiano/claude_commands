@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from collections.abc import Callable, Sequence
 from datetime import datetime, timedelta, timezone
 import json
@@ -18,8 +20,18 @@ import io
 from pathlib import Path
 from typing import cast, final, override
 from unittest import mock
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
+if TYPE_CHECKING:
+    from ..lint.memory_test_support import config_environment, write_config_fixture, write_config_fault, commit_config_fixture
+else:
+    from memory_test_support import config_environment, write_config_fixture, write_config_fault, commit_config_fixture
+
 import offload
+import conf
 from offload_test_support import OffloadCommandFixture, FILTER, HANA, HANA_COMMAND_PATTERN
+
+RUN_SUBPROCESS = subprocess.run
+START_SUBPROCESS = subprocess.Popen
 
 
 class LintVerbTests(unittest.TestCase):
@@ -50,9 +62,10 @@ class OffloadSettingsTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.settings = self.root / "mac_test.conf"
-        _ = self.settings.write_text("", encoding="utf-8")
+        _ = write_config_fixture(self.settings, "", template="mac_test")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
-            "MAC_TEST_CONFIG": str(self.settings),
+            **config_environment(self.root),
+            "MAC_TEST_CONFIG": str(self.settings), "CONF_DIR": str(Path(self.settings).parent),
             "MAC_TEST_STATE_DIR": str(self.root / "state"),
         })))
         _ = self.enterContext(mock.patch.object(Path, "home", return_value=self.root))
@@ -61,12 +74,9 @@ class OffloadSettingsTests(unittest.TestCase):
 
     def test_explicit_settings_path_controls_every_offload_field(self) -> None:
         settings = self.root / "other-mac.conf"
-        _ = settings.write_text(
-            "offload=on\nhost=other-mac\nconnect_timeout_s=2\nprobe_timeout_s=3\n"
+        _ = write_config_fixture(settings, "offload=on\nhost=other-mac\nconnect_timeout_s=2\nprobe_timeout_s=3\n"
             + "unreachable_backoff_s=4\nfree_floor_gib=5\nmac_budget_gib=6\n"
-            + "mac_budget_gib.hana=7\nlinux_only.hana=local-package\n",
-            encoding="utf-8",
-        )
+            + "mac_budget_gib.hana=7\nlinux_only.hana=local-package\n", template="mac_test")
         config = offload.read_config(settings)
         self.assertTrue(config.enabled)
         self.assertEqual(config.host, "other-mac")
@@ -78,32 +88,43 @@ class OffloadSettingsTests(unittest.TestCase):
         self.assertEqual(config.values["mac_budget_gib.hana"], "7")
         self.assertEqual(config.values["linux_only.hana"], "local-package")
 
-    def test_no_argument_config_reader_keeps_existing_defaults(self) -> None:
-        expected = offload.OffloadConfig(False, "mac", 6.0, 15.0, 300.0, 60.0, "24", {})
-        self.assertEqual(offload.read_config(), expected)
-        self.assertEqual(offload.read_config(self.settings), expected)
+    def test_no_argument_config_reader_uses_the_file_values(self) -> None:
+        config = offload.read_config()
+        self.assertEqual(config, offload.read_config(self.settings))
+        self.assertTrue(config.enabled)
+        self.assertEqual(config.free_floor_gib, 100)
+        self.assertEqual(config.host, "mac")
 
-    def test_no_argument_config_reader_still_uses_environment_path(self) -> None:
-        _ = self.settings.write_text("offload=on\nhost=environment-mac\nprobe_timeout_s=7\n", encoding="utf-8")
-        expected = offload.OffloadConfig(
-            True, "environment-mac", 6.0, 7.0, 300.0, 60.0, "24",
-            {"offload": "on", "host": "environment-mac", "probe_timeout_s": "7"},
-        )
-        self.assertEqual(offload.read_config(), expected)
+    def test_no_argument_config_reader_uses_conf_dir(self) -> None:
+        _ = write_config_fixture(self.settings, "host=environment-mac\nprobe_timeout_s=7\n", template="mac_test")
+        config = offload.read_config()
+        self.assertEqual(config.host, "environment-mac")
+        self.assertEqual(config.probe_timeout_s, 7)
+        self.assertEqual(config.connect_timeout_s, 6)
 
-    def test_path_reader_keeps_invalid_numeric_defaults(self) -> None:
-        _ = self.settings.write_text(
-            "connect_timeout_s=bad\nprobe_timeout_s=0\nunreachable_backoff_s=-1\nfree_floor_gib=nan\n",
-            encoding="utf-8",
-        )
-        config = offload.read_config(self.settings)
+    @mock.patch("subprocess.run", new=RUN_SUBPROCESS)
+    @mock.patch("subprocess.Popen", new=START_SUBPROCESS)
+    def test_path_reader_recovers_invalid_numbers_from_its_history(self) -> None:
+        commit_config_fixture(self.settings)
+        _ = write_config_fault(self.settings,
+            "connect_timeout_s=bad\nprobe_timeout_s=0\nunreachable_backoff_s=-1\nfree_floor_gib=nan\n")
+        warning = io.StringIO()
+        with redirect_stderr(warning):
+            config = offload.read_config(self.settings)
         self.assertEqual(
             (config.connect_timeout_s, config.probe_timeout_s, config.unreachable_backoff_s, config.free_floor_gib),
-            (6.0, 15.0, 300.0, 60.0),
+            (6.0, 15.0, 300.0, 100.0),
         )
+        self.assertIn("connect_timeout_s", warning.getvalue())
+        self.assertIn("free_floor_gib", warning.getvalue())
+        # An explicit new file with no good revision cannot recover.
+        unknown = self.root / "uncommitted.conf"
+        _ = unknown.write_text("offload=on\n")
+        with redirect_stderr(io.StringIO()), self.assertRaises(conf.Unusable):
+            _ = offload.read_config(unknown)
 
     def test_reachability_probe_runs_only_a_read_only_remote_command(self) -> None:
-        _ = self.settings.write_text("host=other-mac\nconnect_timeout_s=2\nprobe_timeout_s=3\n", encoding="utf-8")
+        _ = write_config_fixture(self.settings, "host=other-mac\nconnect_timeout_s=2\nprobe_timeout_s=3\n", template="mac_test")
         config = offload.read_config(self.settings)
         controller = offload.ProcessController()
         calls: list[tuple[list[str], offload.CommandDeadline]] = []
@@ -163,9 +184,9 @@ class OffloadSettingsTests(unittest.TestCase):
             with self.subTest(answer=answer):
                 response = subprocess.CompletedProcess(["ssh"], 0, answer, "")
                 with mock.patch.object(subprocess, "run", return_value=response) as run:
-                    self.assertEqual(offload.check_leftovers(config, "kept-host", HANA), expected)
+                    self.assertEqual(offload.check_leftovers(config.connection, "kept-host", HANA), expected)
                 arguments = cast(list[str], run.call_args.args[0])
-                self.assertEqual(arguments[:-1], ["ssh", *offload.ssh_options(config), "kept-host"])
+                self.assertEqual(arguments[:-1], ["ssh", *offload.ssh_options(config.connection), "kept-host"])
                 self.assertEqual(run.call_args.kwargs["timeout"], 10)
                 self.assertIn('pgrep -u "$(id -u)" -f "$mirror_command_pattern"', arguments[-1])
                 self.assertIn(f"mirror_command_pattern={shlex.quote(HANA_COMMAND_PATTERN)}\n", arguments[-1])
@@ -173,7 +194,7 @@ class OffloadSettingsTests(unittest.TestCase):
             with self.subTest(answer=answer):
                 response = subprocess.CompletedProcess(["ssh"], 0, answer, "")
                 with mock.patch.object(subprocess, "run", return_value=response):
-                    result = offload.check_leftovers(config, "kept-host", HANA)
+                    result = offload.check_leftovers(config.connection, "kept-host", HANA)
                 self.assertIsInstance(result, offload.LeftoverCheckFailed)
                 if isinstance(result, offload.LeftoverCheckFailed):
                     self.assertIn("answer could not be read", result.reason)
@@ -184,32 +205,39 @@ class OffloadSettingsTests(unittest.TestCase):
                                 (FileNotFoundError("ssh missing"), "could not start")):
             with self.subTest(error=type(error).__name__):
                 with mock.patch.object(subprocess, "run", side_effect=error):
-                    result = offload.check_leftovers(config, "kept-host", HANA)
+                    result = offload.check_leftovers(config.connection, "kept-host", HANA)
                 self.assertIsInstance(result, offload.LeftoverCheckFailed)
                 if isinstance(result, offload.LeftoverCheckFailed):
                     self.assertIn(expected, result.reason)
                     self.assertIn("10", result.reason)
         response = subprocess.CompletedProcess(["ssh"], 255, "", "connection\n refused\tby host")
         with mock.patch.object(subprocess, "run", return_value=response):
-            result = offload.check_leftovers(config, "kept-host", HANA)
+            result = offload.check_leftovers(config.connection, "kept-host", HANA)
         self.assertIsInstance(result, offload.LeftoverCheckFailed)
         if isinstance(result, offload.LeftoverCheckFailed):
             self.assertEqual(result.reason, "connection refused by host")
 
+    @mock.patch("subprocess.run", new=RUN_SUBPROCESS)
+    @mock.patch("subprocess.Popen", new=START_SUBPROCESS)
     def test_leftover_check_uses_configured_timeout_and_reports_it(self) -> None:
-        _ = self.settings.write_text("leftover_timeout_s=0.125\n")
+        _ = write_config_fixture(self.settings, "leftover_timeout_s=0.125\n", template="mac_test")
         config = offload.read_config(self.settings)
         with mock.patch.object(subprocess, "run", side_effect=subprocess.TimeoutExpired("ssh", 0.125)) as run:
-            result = offload.check_leftovers(config, "kept-host", HANA)
+            result = offload.check_leftovers(config.connection, "kept-host", HANA)
         self.assertEqual(run.call_args.kwargs["timeout"], 0.125)
         self.assertEqual(result, offload.LeftoverCheckFailed("SSH leftover check timed out after 0.125 s"))
+        _ = write_config_fixture(self.settings, template="mac_test")
+        commit_config_fixture(self.settings)
         for value in ("bad", "0", "-1", "nan", "inf"):
             with self.subTest(value=value):
-                _ = self.settings.write_text(f"leftover_timeout_s={value}\n")
-                self.assertEqual(offload.read_config(self.settings).leftover_timeout_s, 10)
+                _ = write_config_fixture(self.settings, f"leftover_timeout_s={value}\n", template="mac_test")
+                warning = io.StringIO()
+                with redirect_stderr(warning):
+                    self.assertEqual(offload.read_config(self.settings).leftover_timeout_s, 10)
+                self.assertIn("leftover_timeout_s", warning.getvalue())
 
     def test_probe_that_cannot_start_reports_its_limit_through_run(self) -> None:
-        _ = self.settings.write_text("offload=on\nlinux_only.hana=\nprobe_timeout_s=2.5\n")
+        _ = write_config_fixture(self.settings, "offload=on\nlinux_only.hana=\nprobe_timeout_s=2.5\n", template="mac_test")
         destination = self.root / "result"
         responses = [offload.COMMAND_COULD_NOT_START, offload.CommandOutput(0, "", "")]
 
@@ -374,7 +402,8 @@ class OffloadCommandTests(OffloadCommandFixture):
     def test_run_settings_selects_alternate_host_and_budget_over_environment_default(self) -> None:
         alternate = self.root / "alternate settings.conf"
         values = {**self.config, "host": "alternate-mac", "mac_budget_gib.hana": "8"}
-        _ = alternate.write_text("".join(f"{key}={value}\n" for key, value in values.items()))
+        _ = write_config_fixture(alternate, "".join(f"{key}={value}\n" for key, value in values.items()),
+                                 template="mac_test")
         self.config["offload"] = "off"
         self.sync_config()
         result = self.command(settings=alternate)

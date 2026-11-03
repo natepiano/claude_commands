@@ -26,9 +26,9 @@ import style_plan
 from scripts.production import showrunners
 from scripts.production.staff_test_support import isolated_staff_file, production_membership
 from scripts.build_hold import build_hold
+from scripts.build_queue import queue_place
 import live_units
 import unit_lookup
-import merge_gate
 import unit_plans
 import style_proposals
 
@@ -488,6 +488,18 @@ class AllStyleProductionsTests(unittest.TestCase):
             self.assertEqual((code, output.getvalue(), errors.getvalue()),
                              (0, "split-all: natedev build hold in force; skipped\n", ""))
 
+    def test_all_splits_healthy_productions_but_reports_incomplete_discovery(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            runner = self.runner(Path(folder), "healthy")
+            partial = showrunners.ShowrunnerDiscovery([runner], (
+                showrunners.ShowrunnerLookupFailure("missing", "fixture lookup failed"),))
+            with (mock.patch.object(showrunners, "registered_showrunners", return_value=partial),
+                  mock.patch.object(build_hold, "natedev_holds", return_value=build_hold.NatedevHolds(())),
+                  mock.patch.object(style_plan, "split_all", return_value=0) as split,
+                  redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO())):
+                self.assertEqual(style_plan.main(["split-all", "--all"]), 1)
+            split.assert_called_once_with(Path(runner["doc"]))
+
     def test_all_reports_a_discovery_failure_as_a_command_failure(self) -> None:
         output, errors = io.StringIO(), io.StringIO()
         with (mock.patch.object(showrunners, "registered_showrunners", side_effect=OSError("no timers")),
@@ -530,7 +542,7 @@ class RefillRecordingTests(unittest.TestCase):
                                       + f"| names-unit | docs/names.md | {root / 'gone'} | style-names |\n")
             output, errors = io.StringIO(), io.StringIO()
             with (mock.patch.object(unit_lookup, "marked_units", return_value={}),
-                  mock.patch.object(merge_gate, "suite_scope_prefix", side_effect=AssertionError("no child for a retired unit")),
+                  mock.patch.object(queue_place, "suite_scope_prefix", side_effect=AssertionError("no child for a retired unit")),
                   redirect_stdout(output), redirect_stderr(errors)):
                 code = style_plan.main(["split-all", "--production", str(production)])
             self.assertEqual((code, output.getvalue(), errors.getvalue()), (0, "no style units\n", ""))
@@ -567,7 +579,7 @@ class RefillRecordingTests(unittest.TestCase):
                 return subprocess.CompletedProcess(command, 0, f"{unit}: 1/2/3/4 in 0.25 min\n", "")
 
             output = io.StringIO()
-            with (mock.patch.object(merge_gate, "suite_scope_prefix", return_value=[
+            with (mock.patch.object(queue_place, "suite_scope_prefix", return_value=[
                     "systemd-run", "--user", "--scope", "--slice=builds.slice"]),
                   mock.patch.object(subprocess, "run", side_effect=child), redirect_stdout(output)):
                 code = style_plan.main(["split-all", "--production", str(production)])

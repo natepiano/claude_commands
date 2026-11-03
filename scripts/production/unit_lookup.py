@@ -58,6 +58,7 @@ from scripts.production.session_staff import (
     lookup_slug as _lookup_slug,
     production_members as production_members,
     group_marked_units as group_marked_units,
+    retained_unit_marks,
     session_staff_and_directors as session_staff_and_directors,
 )
 
@@ -69,6 +70,7 @@ class ProductionMembers:
         self._slug: str = slug
         self._record: staff.StaffSnapshot | None = record
         self._units: set[str] | None = None
+        self._retired: set[str] = set()
 
     def has(self, unit: str) -> bool:
         """Whether the unit is a current staff child, including an offline child."""
@@ -77,13 +79,23 @@ class ProductionMembers:
             sources = member_sources()
             members = production_members(record, sources)
             self._units = {row.name for row in members.get(showrunners.canonical_slug(self._slug), ())}
+            parent = sources.member(ShowrunnerMember(self._slug), record)
+            if isinstance(parent, MemberFound):
+                self._retired = {row.name for row in record.find(kind="unit", parent=parent.row.id)
+                                 if isinstance(row.worktree, staff.RemovedWorktree)}
         return unit_names.name(unit) in self._units
 
 
+    def is_retired(self, unit: str) -> bool:
+        """Only a retained row's removed worktree marks retirement."""
+        _ = self.has(unit)
+        return unit_names.name(unit) in self._retired
+
+
 def unit_is_retired(cells: dict[str, str], marks: ProductionMembers) -> bool:
-    """A unit is retired when it has no current row under this showrunner."""
+    """Read retirement from the retained row, never from a missing membership."""
     unit = cell_value(cells.get("Unit", ""))
-    return not unit or not marks.has(unit)
+    return bool(unit) and marks.is_retired(unit)
 
 
 def unit_metadata(record: staff.StaffSnapshot, sources: MemberSources, *,
@@ -109,7 +121,7 @@ def unit_metadata(record: staff.StaffSnapshot, sources: MemberSources, *,
                 direct[local[name].id] = cells
             else:
                 orphans.setdefault(name, []).append((slug, cells))
-    units = record.find(kind="unit")
+    units = tuple(row for rows in members.values() for row in rows)
     for row in units:
         if row.id in direct:
             continue
@@ -138,7 +150,7 @@ def live_unit_table(lines: list[str], slug: str, *, record: staff.StaffSnapshot 
 
 
 def retired_units(lines: list[str], slug: str, *, record: staff.StaffSnapshot | None = None) -> set[str]:
-    """Document unit names that are no longer recorded under this showrunner."""
+    """Document unit names whose retained row has a removed worktree."""
     marks = ProductionMembers(slug, record=record)
     return {cell_value(cells.get("Unit", "")) for cells in unit_table(lines) if unit_is_retired(cells, marks)} - {""}
 
@@ -177,11 +189,11 @@ class NoSessionShowrunner:
 def session_showrunner(session_id: str, *, record: staff.StaffSnapshot,
                        sources: MemberSources) -> MemberFound | NoSessionShowrunner:
     """Follow the newest launch's staff id to its first showrunner."""
-    launches = [launch for launch in sources.launches if launch["session_id"] == session_id]
+    row = record.by_current_session(session_id)
+    launches = [launch for launch in sources.launches
+                if row is not None and record.by_member_reference(launch["session_id"]) == row]
     if not launches:
         return NoSessionShowrunner()
-    environment = max(launches, key=lambda launch: launch["written_at"])["environment"]
-    row = record.by_id(staff.StaffId(environment.get("STAFF_ID", "")))
     while row is not None:
         if row.kind == "showrunner":
             return MemberFound(row)
@@ -193,10 +205,14 @@ def unit_parent(unit: str, session_id: str = "", *, record: staff.StaffSnapshot,
                 sources: MemberSources | None = None) -> UnitProduction:
     """Resolve identity and its current parent without another owner read."""
     sources = sources if sources is not None else member_sources()
-    launches = [launch for launch in sources.launches if session_id and launch["session_id"] == session_id]
+    owner = record.by_member_reference(session_id) if session_id else None
+    launches = [launch for launch in sources.launches
+                if owner is not None and record.by_member_reference(launch["session_id"]) == owner]
     environment = max(launches, key=lambda launch: launch["written_at"])["environment"] if launches else {}
-    if launches:
-        row = unit_row(environment.get(UNIT_MARK, unit), record, staff_id=environment.get("STAFF_ID", ""))
+    if owner is not None:
+        if owner.kind != "unit":
+            raise staff.StaffUnreadable(f"{unit or session_id}: no unique staff entry")
+        row = unit_row(environment.get(UNIT_MARK, unit), record, staff_id=owner.current_session)
     else:
         selected = sources.member(ObservedUnit(unit), record)
         if isinstance(selected, NoSuchMember):
@@ -219,6 +235,62 @@ def runs_dir() -> Path:
 class RunRecord(NamedTuple):
     path: Path
     state: UnitState
+
+
+class HeldRun(NamedTuple):
+    """A directed run and its recorded worktree and state."""
+
+    path: Path
+    worktree: Path
+    state: UnitState
+
+
+@dataclass(frozen=True)
+class NoUnfinishedRun:
+    """The director holds no run with an unfinished history."""
+
+
+@dataclass(frozen=True)
+class HeldRunUnknown:
+    """A held history cannot establish the unit's run state."""
+
+    path: Path
+    reason: str
+
+
+class HeldRunLookup:
+    """Read only held histories and retain each result for one watch pass."""
+
+    def __init__(self) -> None:
+        self._folders: dict[str, list[str]] | None = None
+        self._histories: dict[Path, HeldRun | HeldRunUnknown] = {}
+
+    def unfinished_held_run(self, session_id: str) -> HeldRun | HeldRunUnknown | NoUnfinishedRun:
+        if not session_id:
+            return NoUnfinishedRun()
+        if self._folders is None:
+            self._folders = unit_runs.held_by_session()
+        for folder in unit_runs.held(session_id, scanned=self._folders):
+            path = runs_dir() / (Path(folder).name + ".jsonl")
+            if path not in self._histories:
+                try:
+                    with path.open("rb") as handle:
+                        first = _event(handle.readline().decode("utf-8"))
+                    if first is None or first.get("event_type") != "run_started":
+                        raise ValueError("history does not start with run_started")
+                    worktree = first.get("working_dir")
+                    if not isinstance(worktree, str) or not worktree:
+                        raise ValueError("run_started has no worktree")
+                    last = _last_event(path)
+                    state = (UnitState.RUN_FINISHED if last is not None
+                             and last.get("event_type") == "run_finished" else UnitState.RUNNING)
+                    self._histories[path] = HeldRun(path, Path(worktree).expanduser().resolve(), state)
+                except (OSError, UnicodeError, ValueError) as error:
+                    self._histories[path] = HeldRunUnknown(path, str(error))
+            run = self._histories[path]
+            if isinstance(run, HeldRunUnknown) or run.state is UnitState.RUNNING:
+                return run
+        return NoUnfinishedRun()
 
 
 class RunStates(NamedTuple):
@@ -388,7 +460,7 @@ def _herdr_marked(claudes: dict[int, LiveClaude], unread: UnreadAt,
         if place.session not in running:
             continue
         slug, unit = process.marks.get(PRODUCTION_MARK, ""), process.marks.get(UNIT_MARK, "")
-        staff_id = process.marks.get("STAFF_ID", "")
+        staff_id = claudes[process.pid].session_id if process.pid in claudes else ""
         if not unit and not staff_id:
             continue
         claude: Claude
@@ -439,7 +511,15 @@ def marked_unit(slug: str, name: str, *, record: staff.StaffSnapshot | None = No
                 running: Sequence[SessionRecord] | None = None) -> MarkedUnit | None:
     """One unit of the production. Unreadable herdr, or this unit's mark on two sessions, raises OSError."""
     slug = _lookup_slug(slug)
-    found = group_marked_units(observed_staff_marks(running=running), record=record, sources=sources)
+    record = record if record is not None else staff.snapshot()
+    sources = sources if sources is not None else member_sources()
+    selected = sources.member(UnitMember(slug, name), record)
+    marked = observed_staff_marks(running=running)
+    if isinstance(selected, MemberFound):
+        # A retained row still needs pane liveness checks when cleanup is retried.
+        found = retained_unit_marks(marked, selected.row, slug, record=record, sources=sources)
+    else:
+        found = group_marked_units(marked, record=record, sources=sources)
     if fault := found.faults.get(slug, {}).get(name):
         raise OSError(fault)
     return found.units.get(slug, {}).get(name)

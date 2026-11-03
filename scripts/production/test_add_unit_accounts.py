@@ -89,7 +89,7 @@ class AddUnitAccountsTests(AddUnitTestCase):
     def test_explicit_account_environment_omits_every_prepared_removal(self) -> None:
         prior = self.root / "prior-session"
         prior.mkdir()
-        flags = ("alpha", "--plan", "docs/plans/given.md", "--resume", "session-123",
+        flags = ("alpha", "--plan", "docs/plans/given.md", "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766",
                  "--cwd", str(prior), "--account", "claude2")
         self.prepare_herdr_launch(*flags)
         prepared = accounts.PreparedAccount({"ACCOUNT_TEST_VARIABLE": "selected", "CLAUDE_CODE_OAUTH_TOKEN": "remove-me"},
@@ -110,7 +110,7 @@ class AddUnitAccountsTests(AddUnitTestCase):
         with (patch.dict(os.environ, self.env), redirect_stderr(errors),
               patch.object(accounts, "prepared_account", return_value=accounts.AccountRefused("account logged out")) as prepared):
             code = add_unit.main(["--production", str(self.doc), "alpha", "--plan", "docs/plans/given.md",
-                                  "--resume", "session-123", "--cwd", str(prior), "--account", "claude3"])
+                                  "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766", "--cwd", str(prior), "--account", "claude3"])
         self.assertEqual(code, 2)
         self.assertIn("account logged out", errors.getvalue())
         prepared.assert_called_once_with("claude3", resume=True)
@@ -119,7 +119,7 @@ class AddUnitAccountsTests(AddUnitTestCase):
     def test_attach_refuses_unclear_source_account_before_stopping(self) -> None:
         prior, trace = self.prepare_attach()
         with patch.object(inventory, "listing", return_value=[]):
-            result = self.cli("alpha", "--permanent", "--attach", "session-123", "--cwd", str(prior))
+            result = self.cli("alpha", "--permanent", "--attach", "62ccbd64-f22e-5647-b20e-7899aa39d766", "--cwd", str(prior))
         self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
         self.assertIn("source account is unclear", result.stderr)
         self.assertEqual(trace, [])
@@ -130,12 +130,12 @@ class AddUnitAccountsTests(AddUnitTestCase):
         prior = self.root / "prior-session"
         prior.mkdir()
         self.persist_herdr_unit("alpha", prior)
-        transcript = Path(self.env["HOME"]) / ".claude/projects/project/session-123.jsonl"
+        transcript = Path(self.env["HOME"]) / ".claude/projects/project/62ccbd64-f22e-5647-b20e-7899aa39d766.jsonl"
         transcript.parent.mkdir(parents=True)
         _ = transcript.write_text('\n'.join([json.dumps({"type": "assistant", "message": {"model": "opus"}}),
             json.dumps({"type": "user", "message": {"model": "ignored"}}),
             json.dumps({"type": "assistant", "message": {"model": "<synthetic>"}}), "{partial"]))
-        result = self.successful("alpha", "--plan", "docs/plans/given.md", "--resume", "session-123", "--cwd", str(prior))
+        result = self.successful("alpha", "--plan", "docs/plans/given.md", "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766", "--cwd", str(prior))
         self.assertIn("herdr session attach agents, workspace director, tab alpha", result.stdout)
         self.assertEqual(self.pane_environment()["CLAUDE_CONFIG_DIR"], str(directory))
         self.assertEqual(self.agent_arguments()[:4], ["--model", "opus", "--effort", "high"])
@@ -146,7 +146,7 @@ class AddUnitAccountsTests(AddUnitTestCase):
         prior = self.root / "prior-session"
         prior.mkdir()
         self.persist_herdr_unit("alpha", prior)
-        _ = self.successful("alpha", "--plan", "docs/plans/given.md", "--resume", "session-123", "--cwd", str(prior))
+        _ = self.successful("alpha", "--plan", "docs/plans/given.md", "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766", "--cwd", str(prior))
         self.assertEqual(self.agent_arguments()[:2], ["--model", "sonnet"])
         self.assertEqual(self.pane_environment()["CLAUDE_CONFIG_DIR"], str(Path(self.env["HOME"]) / ".claude2"))
 
@@ -239,7 +239,7 @@ class AddUnitAccountsTests(AddUnitTestCase):
         prior = self.root / "prior-session"
         prior.mkdir()
         _ = self.successful("alpha", "--plan", "docs/plans/given.md",
-            "--resume", "session-123", "--cwd", str(prior), "--account", "claude3")
+            "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766", "--cwd", str(prior), "--account", "claude3")
         self.assertEqual(self.pane_environment()["CLAUDE_CONFIG_DIR"], str(directory))
 
     def test_manual_unit_resume_keeps_its_recorded_model_despite_changed_director_configuration(self) -> None:
@@ -249,40 +249,40 @@ class AddUnitAccountsTests(AddUnitTestCase):
         prior = self.root / "prior-session"
         prior.mkdir()
         _ = self.successful("alpha", "--plan", "docs/plans/given.md",
-            "--resume", "session-123", "--cwd", str(prior))
+            "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766", "--cwd", str(prior))
         arguments = self.agent_arguments()
         self.assertEqual(arguments[arguments.index("--model") + 1], "opus")
 
     def test_resume_autocompact_is_recorded_and_passed_to_claude(self) -> None:
         prior = self.root / "prior-session"
         prior.mkdir()
-        _ = self.successful("alpha", "--plan", "docs/plans/given.md", "--resume", "session-123",
+        _ = self.successful("alpha", "--plan", "docs/plans/given.md", "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766",
                             "--cwd", str(prior), "--autocompact", "200k")
         arguments = self.agent_arguments()
         self.assertEqual(arguments[arguments.index("--resume"):arguments.index("--resume") + 4],
-                         ["--resume", "session-123", "--autocompact", "200k"])
+                         ["--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766", "--autocompact", "200k"])
         with patch.dict(os.environ, self.env):
-            self.assertEqual(autocompact.recorded("session-123"), "200k")
+            self.assertEqual(autocompact.recorded("62ccbd64-f22e-5647-b20e-7899aa39d766"), "200k")
 
     def test_registered_unit_autocompact_records_without_new_work_checks(self) -> None:
         _ = self.commit_row_off_the_naming_pattern()
         before = self.repository_state()
         result = self.set_unit_autocompact("200k")
         self.assertEqual(result.stdout.strip(),
-                         "trunk-unit: auto-compact 200k applies to session session-trunk at its next restart")
+                         "trunk-unit: auto-compact 200k applies to session 3001165e-ca76-59c2-9490-878224585fad at its next restart")
         with patch.dict(os.environ, self.env):
-            self.assertEqual(autocompact.recorded("session-trunk"), "200k")
+            self.assertEqual(autocompact.recorded("3001165e-ca76-59c2-9490-878224585fad"), "200k")
         self.assertEqual(self.repository_state(), before)
         self.assertEqual(self.herdr_calls(), [])
 
     def test_registered_unit_autocompact_auto_deletes_the_record(self) -> None:
         _ = self.commit_row_off_the_naming_pattern()
         with patch.dict(os.environ, self.env):
-            autocompact.record("session-trunk", "200k")
+            autocompact.record("3001165e-ca76-59c2-9490-878224585fad", "200k")
         result = self.set_unit_autocompact("auto")
         self.assertIn("the saved setting applies", result.stdout)
         with patch.dict(os.environ, self.env):
-            self.assertEqual(autocompact.recorded("session-trunk"), "")
+            self.assertEqual(autocompact.recorded("3001165e-ca76-59c2-9490-878224585fad"), "")
         self.assertEqual(self.herdr_calls(), [])
 
     def test_registered_unit_autocompact_check_writes_nothing(self) -> None:
@@ -290,7 +290,7 @@ class AddUnitAccountsTests(AddUnitTestCase):
         before = self.repository_state()
         result = self.set_unit_autocompact("300k", "--check")
         self.assertEqual(result.stdout.strip(),
-                         "trunk-unit: auto-compact 300k would apply to session session-trunk at its next restart")
+                         "trunk-unit: auto-compact 300k would apply to session 3001165e-ca76-59c2-9490-878224585fad at its next restart")
         self.assertFalse((Path(self.env["HOME"]) / ".local/state/unit-launch").exists())
         self.assertEqual(self.repository_state(), before)
         self.assertEqual(self.herdr_calls(), [])
@@ -300,9 +300,9 @@ class AddUnitAccountsTests(AddUnitTestCase):
         prior.mkdir()
         before = self.repository_state()
         for flags, reason in ((("--autocompact", "200k"), "--autocompact requires --resume"),
-                              (("--resume", "session-123", "--cwd", str(prior), "--autocompact", "50k"),
+                              (("--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766", "--cwd", str(prior), "--autocompact", "50k"),
                                "outside 100k to 1M"),
-                              (("--resume", "session-123", "--cwd", str(prior), "--autocompact", "big"),
+                              (("--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766", "--cwd", str(prior), "--autocompact", "big"),
                                "token count such as 200k")):
             with self.subTest(flags=flags):
                 result = self.cli("alpha", "--plan", "docs/plans/given.md", *flags)
@@ -322,18 +322,19 @@ class AddUnitAccountsTests(AddUnitTestCase):
         prior = self.root / "prior-session"
         prior.mkdir()
         self.prepare_herdr_launch("alpha", "--plan", "docs/plans/given.md",
-                                  "--resume", "session-123", "--cwd", str(prior))
+                                  "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766", "--cwd", str(prior))
         with (patch.dict(os.environ, self.env),
               patch.object(accounts, "prepared_account", wraps=accounts.prepared_account) as prepared):
             code = add_unit.main(["--production", str(self.doc), "alpha", "--plan", "docs/plans/given.md",
-                "--resume", "session-123", "--cwd", str(prior)])
+                "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766", "--cwd", str(prior)])
         self.assertEqual(code, 0)
         prepared.assert_any_call("claude2", resume=True)
         self.assertEqual(self.pane_environment()["CLAUDE_CONFIG_DIR"], str(old))
-        self.assertIn("--resume session-123", self.launch_command())
+        self.assertIn("--resume 62ccbd64-f22e-5647-b20e-7899aa39d766", self.launch_command())
 
     def test_restore_uses_its_pane_account_instead_of_the_current_group(self) -> None:
         self.commit_prepared_row(self.unit_row())
+        _ = self.prepare_restored_worktree("alpha", self.root / "project-alpha")
         directory = self.prepare_unit_account("claude1")
         other_directory = self.prepare_unit_account("claude3")
         self.env["CLAUDE_CONFIG_DIR"] = str(other_directory)
@@ -345,14 +346,14 @@ class AddUnitAccountsTests(AddUnitTestCase):
 
         _ = self.successful(
             "alpha", "--plan", "docs/plans/given.md",
-            "--resume", "session-123", "--cwd", str(prior),
+            "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766", "--cwd", str(prior),
             "--restart-note", str(note),
             "--session-name", "recorded-name", "--host-session", "recorded-herdr",
         )
 
         self.assertEqual(self.pane_environment()["CLAUDE_CONFIG_DIR"], str(directory))
         self.assertFalse(any(argument.endswith("/accounts.py") for argument in self.agent_arguments()))
-        self.assertIn("--resume session-123", self.launch_command())
+        self.assertIn("--resume 62ccbd64-f22e-5647-b20e-7899aa39d766", self.launch_command())
         self.assertNotIn(str(directory), self.launch_command())
 
     def test_unit_resume_without_recorded_account_uses_configured_units(self) -> None:
@@ -361,7 +362,7 @@ class AddUnitAccountsTests(AddUnitTestCase):
         prior = self.root / "prior-session"
         prior.mkdir()
         _ = self.successful("alpha", "--plan", "docs/plans/given.md",
-            "--resume", "unrecorded-session", "--cwd", str(prior))
+            "--resume", "9c4ae85d-eb74-56be-a309-c9d336878d2b", "--cwd", str(prior))
         self.assertEqual(self.pane_environment()["CLAUDE_CONFIG_DIR"], str(directory))
 
     def test_unit_resume_refuses_config_directory_outside_configured_account(self) -> None:
@@ -371,7 +372,7 @@ class AddUnitAccountsTests(AddUnitTestCase):
         _ = self.prepare_unit_account("claude1")
         before = self.repository_state()
         result = self.cli("alpha", "--plan", "docs/plans/given.md",
-            "--resume", "session-123", "--cwd", str(self.checkout), "--config-dir", str(directory))
+            "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766", "--cwd", str(self.checkout), "--config-dir", str(directory))
         self.assertEqual(result.returncode, 2)
         self.assertIn("claude1", result.stderr)
         self.assertEqual(self.repository_state(), before)
@@ -384,7 +385,7 @@ class AddUnitAccountsTests(AddUnitTestCase):
         prior.mkdir()
         before = self.repository_state()
         result = self.cli("alpha", "--plan", "docs/plans/given.md",
-            "--resume", "session-123", "--cwd", str(prior), "--config-dir", str(directory))
+            "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766", "--cwd", str(prior), "--config-dir", str(directory))
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(len(result.stderr.splitlines()), 1)
         self.assertIn("units account is claude2", result.stderr)
@@ -398,7 +399,7 @@ class AddUnitAccountsTests(AddUnitTestCase):
         prior = self.root / "prior-session"
         prior.mkdir()
         _ = self.successful("alpha", "--plan", "docs/plans/given.md",
-            "--resume", "session-123", "--cwd", str(prior), "--account", "claude3", "--model", "opus")
+            "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766", "--cwd", str(prior), "--account", "claude3", "--model", "opus")
         arguments = self.agent_arguments()
         self.assertEqual(arguments[arguments.index("--model") + 1], "opus")
         self.assertNotIn(str(directory), self.launch_command())
@@ -409,7 +410,7 @@ class AddUnitAccountsTests(AddUnitTestCase):
         _ = self.prepare_unit_account("claude1")
         before = self.repository_state()
         result = self.cli("alpha", "--plan", "docs/plans/given.md",
-            "--resume", "session-123", "--cwd", str(self.checkout), "--account", "claude2")
+            "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766", "--cwd", str(self.checkout), "--account", "claude2")
         self.assertEqual(result.returncode, 2)
         self.assertIn("claude1", result.stderr)
         self.assertEqual(self.repository_state(), before)
@@ -422,7 +423,7 @@ class AddUnitAccountsTests(AddUnitTestCase):
         document = self.doc.read_text()
         head = self.git("rev-parse", "HEAD")
         for mode in (("--plan", "docs/plans/given.md"), ("--standby",),
-                     ("--plan", "docs/plans/given.md", "--resume", "session-123", "--cwd", str(self.checkout))):
+                     ("--plan", "docs/plans/given.md", "--resume", "62ccbd64-f22e-5647-b20e-7899aa39d766", "--cwd", str(self.checkout))):
             with self.subTest(mode=mode):
                 result = self.cli("alpha", *mode)
                 self.assertEqual(result.returncode, 2, result.stderr)

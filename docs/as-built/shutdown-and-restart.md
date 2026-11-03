@@ -14,9 +14,9 @@ The shared session registry reader skips a file that vanishes during the scan. I
 
 Retirement, checkout moves, running-session attach and nix-shell healing use this API. Retirement removes the unit’s pane launch entries after successful stop and cleanup. Retirement and unit rename close the unit's own pane after their ownership checks. A pane already gone counts as closed. Checkout moves stop before moving files and resume afterward. The checkout coordinator excludes only its own pid from cwd holders; other holders still refuse. Attach keeps its process and prompt-submission proofs. The conductor, bounded stop, pause messages and `down`, `now`, `ready`, `cancel`, `conduct` and `follow` commands are deleted.
 
-Watchdog recovery reads the unit's pane launch and live liveness. It keeps one notes pass of grace and resumes the same conversation on the launch account. The unit must not be retired, must have a worktree, and its run must not have finished. A unit with no run record is standing by and can recover. A queued recovery refuses a changed or ended launch. Shared resume creates a fresh tab when the pane is gone. Pending jobs prevent duplicate dispatch; unreadable live confirmation preserves their evidence. The watchdog reads no shutdown records, recovery snapshots or account holds. Its outage state retains pending recovery jobs and first-seen times. The agent-notes job runs this check in its own process with the limits in `config/agent_notes.toml`. Shared resume supplies the restarted session’s prompt; the watchdog sends no messages to live sessions, showrunner notices or phone pushes. Record-driven restart still retries unconfirmed owner cleanup through `stop_resume.stop` before launching; a failed retry keeps the issue and a retry command.
+Watchdog recovery reads the unit's pane launch and live liveness. It keeps one notes pass of grace and resumes the same conversation on the launch account. The unit must not be retired, must have a worktree, and its run must not have finished. A unit with no run record is standing by and can recover. A queued recovery refuses a changed or ended launch. Shared resume creates a fresh tab when the pane is gone. Pending jobs prevent duplicate dispatch; unreadable live confirmation preserves their evidence. The watchdog excludes existing intentional stop records at or after the retained pane launch. It checks the record again before a queued recovery starts. An explicit later launch supersedes an older stop. It does not read account holds. Its outage state retains pending recovery jobs and first-seen times. The agent-notes job runs this check in its own process with the limits in `config/agent_notes.toml`. Shared resume supplies the restarted session’s prompt; the watchdog sends no messages to live sessions, showrunner notices or phone pushes. Record-driven restart still retries unconfirmed owner cleanup through `stop_resume.stop` before launching; a failed retry keeps the issue and a retry command.
 
-Record-driven restart, status, recovery snapshots, forget, account holds and launch barriers remain until Phase 8. `restart_support.py` owns their retained message, notifier and record-status helpers. Inventory owns fresh session attribution. Unit rename and production rename keep their Phase 9 journals; their stop boundary uses `stop_resume`.
+Record-driven restart, status, forget, account holds and launch barriers remain until Phase 8. The recovery snapshot command, collector, stored observations and all their restore/status readers are deleted. `restart_support.py` owns the retained record-driven message, notifier and status helpers. Inventory owns fresh session attribution. Unit rename and production rename keep their Phase 9 journals; their stop boundary uses `stop_resume`.
 
 ## Session hosting and manual recovery
 
@@ -34,15 +34,28 @@ A Mac `terminal` host restarts into a new herdr session, attached in the same
 window through its supervisor, else in a new Ghostty window. An
 unavailable desktop refuses with an unlock-and-restart instruction. A session
 with no conversation starts fresh under its recorded id and prints a plain
-explanation. `forget` retires stopped and failed shutdown-record entries as
-well as recovery snapshot entries.
+explanation. `forget` retires stopped and failed shutdown-record entries.
 
 Old host records normalize to explicit manual-recovery states. Their names
 never become herdr destinations. Unconfirmed cleanup stays in the record;
-status and restart print the cleanup and resume commands. An old Codex
-snapshot prints its recorded `CODEX_HOME` and `codex resume <id>` (or its
-picker), remains unacknowledged and makes restart partial with exit 1.
+status and restart print the cleanup and resume commands. Recovery snapshots no longer supply Claude or Codex restore candidates.
 
 The Remote Control fixer resolves the newly registered pid's herdr pane and
 checks identity and idle state before input. Tests use disposable state and
 fake host commands.
+
+`herdr-upkeep` runs `scripts/maintenance/herdr_upkeep.py`. It saves the running shared session’s layout and refreshes detection rules. `config/herdr_upkeep.toml` supplies its interval and process deadline at each invocation. A successful run saves its completion time; a not-due rerun changes nothing. The worker and its descendants are killed at the configured deadline, and a failed run stays due. Inventory no longer runs a desktop updater or reads the deleted `agent sessions.md`; production identity comes from `staff.json`. No reboot is part of the removal proof.
+
+A restart problem sends one phone push per kind of fix.
+Retryable failures share one count push with a retry command and its machine.
+Different retryable causes and long session names do not create more pushes.
+Trust failures share one count push per machine for plain restarts and failed moves.
+An all-account restart groups trust failures across accounts.
+If every folder has a configured trust key, the action runs `accounts.py trust`, then retries the restart.
+Otherwise, the action asks the natedev session to trust the stopped sessions’ folders from their shutdown records.
+The restart output keeps the trust command for each folder.
+Configured trust covers exact folder, repository-root, or main-checkout keys, not arbitrary descendants.
+Manual failures share one count push per machine. Its action requests a resume from the shutdown records.
+The same failed sessions, a subset, or a changed failure reason sends no second push.
+A confirmed recovery clears the outage claims. A later failure can send a new push.
+Failed push delivery releases the claims for a retry.

@@ -10,9 +10,8 @@ import tempfile
 from typing import ClassVar, override
 
 from scripts.direct.test_verify_untested_examples import ExampleWorkspaceFixture, VERIFY, workspace_metadata
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
-# load 136 on natedev, 2026-10-29
-TEST_HANG_GUARD_SECS = 300
 
 
 class FinalPassFixture(ExampleWorkspaceFixture):

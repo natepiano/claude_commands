@@ -1,5 +1,5 @@
 ---
-description: Turn the review of pushes to the user's phone on or off, or show its state.
+description: Set phone message review.
 ---
 
 Load `/message_style` before the first message to the user in this session.

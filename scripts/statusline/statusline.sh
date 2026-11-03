@@ -18,7 +18,7 @@
 #                zone= line of USER_ZONE_CONF or config/user_zone.conf, else
 #                user_zone.py's default. jq's strflocaltime writes reset times in it.
 #   staff        the current staff rows, from STAFF_FILE or the shared staff.json.
-#                jq joins STAFF_ID, timer target, exact local worktree, then the
+#                jq joins the native runtime identity to the
 #                unique normalized name, just as session_labels.StaffLabels does.
 #   machine      the local hostname, matching shutdown.remote.local_machine.
 #   timer_*      each notifier conf, for its target and checked document path.

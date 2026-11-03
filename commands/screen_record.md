@@ -1,5 +1,5 @@
 ---
-description: Record an existing X11 window on Linux to a short MP4 clip (1 to 60 s, required); every run prunes old clips. Args - '<window title substring>' <seconds> [name]
+description: Record an X11 window as MP4.
 ---
 
 1. `$ARGUMENTS` is `'<window title substring>' <seconds> [name]`; quote a substring that holds spaces. This command runs on Linux (natedev). The Mac (`screencapture -v` or avfoundation) waits for a real consumer there.
