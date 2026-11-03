@@ -10,10 +10,12 @@ import sys
 import tempfile
 import threading
 import unittest
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stderr
 from dataclasses import replace
 from io import StringIO
+from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 from typing import cast, override
 from unittest.mock import patch
@@ -39,6 +41,14 @@ class UnroutedAlertTests(unittest.TestCase):
 
     def notify(self, reason: str = "conflict") -> None:
         unrouted_alert.notify(self.root / "links", "top", self.row, reason, ("one", "two"))
+
+    def isolated_sender(self) -> Callable[[str, str, str], None]:
+        """Use the sender implementation with a fake subprocess, independent of the probe."""
+        spec = spec_from_file_location("fixture_alert_sender", unrouted_alert.__file__)
+        assert spec is not None and spec.loader is not None
+        module = module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return cast(Callable[[str, str, str], None], module.send_message)
 
     def test_importing_the_alert_does_not_load_the_sender(self) -> None:
         command = """import sys
@@ -137,7 +147,8 @@ assert 'send' not in sys.modules
         self.notify_after_acceptance()
 
     def test_a_queued_alert_is_marked_after_acceptance_and_never_sent_again(self) -> None:
-        with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "QUEUED: recipient absent", "")) as send:
+        with (patch.object(unrouted_alert, "send_message", side_effect=self.isolated_sender()),
+              patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "QUEUED: recipient absent", "")) as send):
             self.notify()
             self.notify()
         send.assert_called_once()
@@ -146,7 +157,8 @@ assert 'send' not in sys.modules
     def test_delivered_and_kept_alerts_remain_accepted_after_another_render(self) -> None:
         for header in ("SENT", "KEPT"):
             with self.subTest(header=header):
-                with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, header + ": accepted", "")) as send:
+                with (patch.object(unrouted_alert, "send_message", side_effect=self.isolated_sender()),
+                      patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, header + ": accepted", "")) as send):
                     self.notify(header)
                     self.notify(header)
                 send.assert_called_once()
@@ -155,7 +167,8 @@ assert 'send' not in sys.modules
         for code, header in ((0, "SKIPPED"), (0, "REPLACED"), (3, "FAILED"), (2, "REFUSED"), (4, "HELD")):
             with self.subTest(header=header):
                 error = StringIO()
-                with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], code, header + ": unaccepted", "")), redirect_stderr(error):
+                with (patch.object(unrouted_alert, "send_message", side_effect=self.isolated_sender()),
+                      patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], code, header + ": unaccepted", "")), redirect_stderr(error)):
                     self.notify(header)
                 self.assertEqual(error.getvalue().splitlines(), ["review-links unrouted alert: " + header + ": unaccepted"])
         for path in (self.root / "links/.review-link-unrouted").glob("*.json"):
@@ -165,7 +178,8 @@ assert 'send' not in sys.modules
         for code, header in ((0, "QUEUED"), (1, "SENT"), (1, "KEPT")):
             with self.subTest(header=header):
                 error = StringIO()
-                with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], code, header + ": inconsistent", "")), redirect_stderr(error):
+                with (patch.object(unrouted_alert, "send_message", side_effect=self.isolated_sender()),
+                      patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], code, header + ": inconsistent", "")), redirect_stderr(error)):
                     self.notify(header)
                 self.assertEqual(error.getvalue().splitlines(), ["review-links unrouted alert: " + header + ": inconsistent"])
         for path in (self.root / "links/.review-link-unrouted").glob("*.json"):
@@ -173,7 +187,8 @@ assert 'send' not in sys.modules
 
     def test_a_zero_exit_without_a_send_header_keeps_the_alert_pending(self) -> None:
         error = StringIO()
-        with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")), redirect_stderr(error):
+        with (patch.object(unrouted_alert, "send_message", side_effect=self.isolated_sender()),
+              patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")), redirect_stderr(error)):
             self.notify()
         self.assertEqual(error.getvalue().splitlines(), ["review-links unrouted alert: message delivery failed"])
         path = next((self.root / "links/.review-link-unrouted").glob("*.json"))
@@ -215,8 +230,28 @@ assert 'send' not in sys.modules
         self.assertFalse((self.root / "links").exists())
 
     def test_a_failed_alert_keeps_the_broken_producer_unrouted(self) -> None:
+        _ = self.enterContext(patch.object(change_routing, "LISTS", self.root))
         router, _, unit = self.orphan_router()
         with (patch.object(unrouted_alert, "send_message", side_effect=RuntimeError("not reached")), redirect_stderr(StringIO())):
             owner = router.owner(self.row | {"Producer": str(unit.id)}, self.root / "change-review - top.md")
         self.assertIsInstance(owner, change_routing.UnroutedChange)
         self.assertEqual(owner.tab, "unrouted")
+
+    def test_an_unrouted_list_in_the_real_folder_sends_once_through_the_fake_sender(self) -> None:
+        router, _, unit = self.orphan_router()
+        with (patch.object(change_routing, "LISTS", self.root),
+              patch.object(unrouted_alert, "send_message") as send):
+            for _ in range(2):
+                owner = router.owner(self.row | {"Producer": str(unit.id)}, self.root / "change-review - top.md")
+                self.assertIsInstance(owner, change_routing.UnroutedChange)
+        send.assert_called_once()
+        self.assertIn("Row: C8", cast(str, send.call_args.args[2]))
+
+    def test_a_fixture_list_leaves_the_alert_storage_untouched(self) -> None:
+        router, _, unit = self.orphan_router()
+        with patch.object(unrouted_alert, "send_message") as send:
+            owner = router.owner(self.row | {"Producer": str(unit.id)}, self.root / "change-review - top.md")
+        self.assertIsInstance(owner, change_routing.UnroutedChange)
+        send.assert_not_called()
+        self.assertFalse((self.root / "links/.review-link-unrouted").exists())
+        self.assertFalse((self.root / "links").exists())

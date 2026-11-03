@@ -334,7 +334,9 @@ class FooterCountsTests(unittest.TestCase):
         self.assertIn(listing, footer_counts.sources(kid))
 
     def test_a_missing_alert_setting_keeps_footer_and_next_routing_available(self) -> None:
-        from scripts.production import unrouted_alert
+        from scripts.production import change_routing, unrouted_alert
+
+        _ = self.enterContext(mock.patch.object(change_routing, "LISTS", self.root))
 
         config = self.root / "config"
         config.mkdir()
