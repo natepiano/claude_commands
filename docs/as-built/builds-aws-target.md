@@ -4,6 +4,16 @@
 
 AWS is a Linux SSH build target named `aws` on host `aws-build`. It runs `test`, `check` and staged `doc` steps. `build`, `example`, `final` and lint stay on natedev. The machine is one persistent Spot `m7a.4xlarge` (x86_64, NixOS) with a retained, encrypted 500 GiB gp3 data volume at `/home`. A durable cost ledger and one spending guard refuse AWS work at either cap: `monthly_limit_usd=400` and `daily_limit_usd=20` in `config/aws_target.conf`. The user approved the $400 monthly cap on 2026-11-01. `daily_limit_usd=20` is derived (the monthly cap / 20); the user approved it on 2026-11-03. No code may raise either cap or copy it.
 
+The user approved these spending and capacity values on 2026-11-03, all in `config/aws_target.conf`:
+
+1. `limit_reserve_usd=3`: the spend reserve below each cap.
+2. `drain_max_minutes=60`: at a cap, no new steps start, and the box stops within 60 minutes.
+3. `spot_max_usd_per_hour=0.483`: the Spot maximum price.
+4. `start_min_waiting=2`, `start_after_wait_s=120` and `idle_stop_minutes=15`: the box starts when 2 steps wait 120 s, and stops after 15 idle minutes.
+5. `slots=2`, `slots.hana=4`, `slots.cargo-liner=4` and `build_budget_gib=32`: the slots per repository and the build space.
+
+`notification_email_file` is not part of that approval yet.
+
 The target is built and disabled. `offload=off`, and `targets=mac,natedev` does not list AWS. No AWS resource exists. The user's go-live gate creates the resources and turns the target on, with [the runbook](../plans/builds-aws-runbook.md). The source design is [builds-aws-design.md](../plans/builds-aws-design.md). Its Phase 4 (lint with write-back) is not built.
 
 ## How it works
@@ -85,7 +95,7 @@ The target is built and disabled. `offload=off`, and `targets=mac,natedev` does 
 - An established day total can exceed a later bill or estimate. That is the cost of a total that never falls.
 - `limit_reserve_usd` covers one drain and one idle interval. The Budget action is the late backstop, not the cap.
 - A user stop disables the persistent Spot request until the next start. AWS restarts only a box it interrupted.
-- The compressed bootstrap must fit the 4096-byte CloudFormation parameter limit. On 2026-11-03 the encoded bootstrap measured 3908 bytes. `aws-build-base.nix` is copied into it, so put new host packages and services in `modules/linux/aws-build.nix`.
+- The compressed bootstrap must fit the 4096-byte CloudFormation parameter limit. On 2026-11-03 the encoded bootstrap measured 3908 bytes. `aws-build-base.nix` is copied into it, so put new box packages and services in `hosts/aws-build.nix` (`modules/linux/aws-build.nix` is the natedev `aws-target` unit).
 - A pending notice that keeps failing delays each guard call by up to `notification_timeout_s`.
 - A verify module that hits the 1800 s test limit has so far been a route defect, not machine load.
 - Fake AWS tests do not prove real bootstrap or persistent-request behavior. The runbook's user checks prove them.
