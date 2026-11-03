@@ -2,7 +2,7 @@
 
 ## What it is
 
-AWS is a Linux SSH build target named `aws` on host `aws-build`. It runs `test`, `check` and staged `doc` steps. `build`, `example`, `final` and lint stay on natedev. The machine is one persistent Spot `m7a.4xlarge` (x86_64, NixOS) with a retained, encrypted 500 GiB gp3 data volume at `/home`. A durable cost ledger and one spending guard refuse AWS work at either cap: `monthly_limit_usd=400` and `daily_limit_usd=20` in `config/aws_target.conf`. The user approved the $400 monthly cap on 2026-11-01. `daily_limit_usd=20` is derived (the monthly cap / 20) and waits for the user's approval at go-live. No code may raise either cap or copy it.
+AWS is a Linux SSH build target named `aws` on host `aws-build`. It runs `test`, `check` and staged `doc` steps. `build`, `example`, `final` and lint stay on natedev. The machine is one persistent Spot `m7a.4xlarge` (x86_64, NixOS) with a retained, encrypted 500 GiB gp3 data volume at `/home`. A durable cost ledger and one spending guard refuse AWS work at either cap: `monthly_limit_usd=400` and `daily_limit_usd=20` in `config/aws_target.conf`. The user approved the $400 monthly cap on 2026-11-01. `daily_limit_usd=20` is derived (the monthly cap / 20); the user approved it on 2026-11-03. No code may raise either cap or copy it.
 
 The target is built and disabled. `offload=off`, and `targets=mac,natedev` does not list AWS. No AWS resource exists. The user's go-live gate creates the resources and turns the target on, with [the runbook](../plans/builds-aws-runbook.md). The source design is [builds-aws-design.md](../plans/builds-aws-design.md). Its Phase 4 (lint with write-back) is not built.
 

@@ -19,7 +19,7 @@ The AWS host imports no desktop configuration or natedev jobs.
 Keep the configured `instance_type`, x86_64, persistent Spot, interruption behavior `stop`, and hostname `aws-build`.
 Keep the encrypted retained `/home` volume with the configured `data_volume_gib`, `data_volume_iops`, and `data_volume_throughput`.
 Keep `monthly_limit_usd=400` and `ci_repo=`.
-Approve `daily_limit_usd=20` (derived: the monthly cap / 20). Do not raise it.
+Keep `daily_limit_usd=20` (derived: the monthly cap / 20; the user approved it on 2026-11-03). Do not raise it.
 Keep AWS lint disabled.
 AWS accepts only test, check, and doc work.
 Build, example, and final work remain on natedev.
@@ -43,7 +43,7 @@ There is no separate charge timer.
 9. Confirm that the fixed components sum to `fixed_usd_per_month`.
 10. Confirm that `limit_reserve_usd` covers the configured drain and idle intervals.
 
-A placement score for one instance type is always low. AWS needs at least three types for a useful score. On 2026-11-03 every `us-east-2` zone scored 1, so the zone choice uses price. The proposed zone, waiting for the user's approval, is `us-east-2c` (`use2-az3`) at $0.2250/h.
+A placement score for one instance type is always low. AWS needs at least three types for a useful score. On 2026-11-03 every `us-east-2` zone scored 1, so the zone choice uses price. The user approved `us-east-2c` (`use2-az3`) at $0.2250/h on 2026-11-03.
 
 A new account's "All Standard Spot Instance Requests" quota (`L-34B43A08`) defaults to 5 vCPU. `m7a.4xlarge` needs 16. A start below the quota fails with "Max spot instance count exceeded".
 

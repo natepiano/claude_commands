@@ -122,7 +122,7 @@ Go-live is the end of Phase 3, with test, check and doc: about 1,000 of last wee
 
 ## Spending cap (user, 2026-11-01)
 
-`monthly_limit_usd=400`: the user's words were "$400/month cap is fine to start". `daily_limit_usd=20` is derived (the monthly cap / 20); it waits for the user's approval at go-live. The AWS Budget uses the same $400. Phase 0 expects about $250 a month on Spot for test, check and doc, so the cap leaves room for Phase 4's lint (about $274).
+`monthly_limit_usd=400`: the user's words were "$400/month cap is fine to start". `daily_limit_usd=20` is derived (the monthly cap / 20); the user approved it on 2026-11-03 ("approve all 4"). The AWS Budget uses the same $400. Phase 0 expects about $250 a month on Spot for test, check and doc, so the cap leaves room for Phase 4's lint (about $274).
 
 ## Review answers (user, 2026-11-02)
 
