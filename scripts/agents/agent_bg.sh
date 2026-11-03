@@ -52,7 +52,7 @@ fi
 
 # python3 goes through the repo shim, which picks an interpreter by VERSION
 # rather than by path: the python3 on PATH is Apple 3.9 on the Mac, and this
-# repo needs >= 3.11.
+# repo needs >= 3.12.
 PY="${HOME}/.claude/scripts/lib/py"
 NIX_ENV_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)"
 

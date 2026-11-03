@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
 
 import change_review
+from scripts.lib import conf
 from scripts.production import change_routing, staff
 import proposals_folder
 import proposals_table
@@ -99,7 +100,8 @@ def routing_sources(record: staff.StaffSnapshot | None = None) -> list[Path]:
     """Watch staff, all review lists, and delivery records for tab count changes."""
     root = change_routing.review_root()
     record = record if record is not None else staff.snapshot()
-    return [change_review.LISTS, *change_review.LISTS.glob(change_review.PREFIX + "*.md"),
+    lists = change_review.lists_directory()
+    return [conf.path("change_review"), lists, *lists.glob(change_review.PREFIX + "*.md"),
             *(Path(path) for path in record.inputs), root, *root.glob(".review-link-delivery-*")]
 
 

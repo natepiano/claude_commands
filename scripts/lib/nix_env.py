@@ -18,13 +18,13 @@ from typing import TYPE_CHECKING, NamedTuple, cast
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
+    from scripts.lib.conf import ConfigRead
 
 if __name__ == "nix_env":
     _ = sys.modules.setdefault("scripts.lib.nix_env", sys.modules[__name__])
 elif __name__ == "scripts.lib.nix_env":
     _ = sys.modules.setdefault("nix_env", sys.modules[__name__])
 
-TIMEOUT_SECONDS = 600
 # Internal, one-session handoff from the healer to shutdown restart. These are
 # consumed before opening a pane and never exported to the resumed agent.
 HEAL_SESSION_ENV = "NIX_HEAL_PREPARED_SESSION"
@@ -44,6 +44,15 @@ class Refused(NamedTuple):
     reason: str
 
 
+def _settings() -> ConfigRead:
+    if __package__:
+        from . import conf
+    else:
+        import conf  # pyright: ignore[reportImplicitRelativeImport]
+
+    return conf.read("nix_env")
+
+
 def nearest_envrc(directory: Path) -> Path | None:
     """Find the nearest envrc, including the directory itself."""
     directory = directory.expanduser().resolve()
@@ -57,8 +66,9 @@ def trusted_root(path: Path) -> bool:
         relative = path.resolve().relative_to(Path.home().resolve())
     except (OSError, ValueError, RuntimeError):
         return False
-    return bool(relative.parts and (relative.parts[0] in {"rust", "worktrees"}
-                                  or relative.parts[0].startswith(".claude")))
+    settings = _settings()
+    return bool(relative.parts and (relative.parts[0] in settings.words("trusted_home_folders")
+                                  or relative.parts[0].startswith(settings.text("trusted_home_prefix"))))
 
 
 def registered_worktree(folder: Path) -> bool:
@@ -120,13 +130,14 @@ def registered_copy(envrc: Path) -> bool:
         source = Path(source_path).resolve(strict=True)
         if not source.is_dir() or not trusted_root(source):
             return False
+        timeout = _settings().number("command_timeout_seconds")
         environment = _git_environment()
         expected = subprocess.run(
             ["git", "rev-parse", "--verify", "--end-of-options", f"{source_commit}:.envrc"],
-            cwd=source, env=environment, capture_output=True, text=True, timeout=TIMEOUT_SECONDS, check=True)
+            cwd=source, env=environment, capture_output=True, text=True, timeout=timeout, check=True)
         actual = subprocess.run(
             ["git", "hash-object", "--no-filters", "--", str(folder / ".envrc")],
-            cwd=source, env=environment, capture_output=True, text=True, timeout=TIMEOUT_SECONDS, check=True)
+            cwd=source, env=environment, capture_output=True, text=True, timeout=timeout, check=True)
         return bool(expected.stdout.strip()) and expected.stdout.strip() == actual.stdout.strip()
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
         return False
@@ -159,6 +170,7 @@ def ensure(directory: Path, base_env: Mapping[str, str] = os.environ) -> Loaded 
         # Avoid subprocess's startup cost when no envrc needs loading.
         import subprocess
 
+        timeout = _settings().number("command_timeout_seconds")
         trusted = trusted_envrc(envrc)
         commands = (["direnv", "allow", str(envrc)], ["direnv", "export", "json"]) if trusted else (
             ["direnv", "export", "json"],)
@@ -166,7 +178,7 @@ def ensure(directory: Path, base_env: Mapping[str, str] = os.environ) -> Loaded 
         try:
             for command in commands:
                 result = subprocess.run(command, cwd=directory, env=environment, capture_output=True,
-                                        text=True, timeout=TIMEOUT_SECONDS, check=False)
+                                        text=True, timeout=timeout, check=False)
                 if result.returncode:
                     reason = last_line(result.stderr, f"direnv exit {result.returncode}")
                     if not trusted and any(word in result.stderr.lower() for word in ("not allowed", "blocked", "denied")):
@@ -179,7 +191,7 @@ def ensure(directory: Path, base_env: Mapping[str, str] = os.environ) -> Loaded 
         except subprocess.TimeoutExpired as error:
             detail = error.stderr
             stderr = detail.decode(errors="replace") if isinstance(detail, bytes) else detail or ""
-            return Refused(f"nix_env: {directory}: " + last_line(stderr, "direnv timed out after 600 s"))
+            return Refused(f"nix_env: {directory}: " + last_line(stderr, f"direnv timed out after {timeout:g} s"))
         # Pay JSON's startup cost only when decoding an envrc export.
         import json
 

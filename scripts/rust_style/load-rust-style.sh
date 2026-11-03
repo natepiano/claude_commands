@@ -3,7 +3,7 @@ set -euo pipefail
 
 # python3 goes through the repo shim, which picks an interpreter by VERSION
 # rather than by path: the python3 on PATH is Apple 3.9 on the Mac, and this
-# repo needs >= 3.11.
+# repo needs >= 3.12.
 # Explicit discovery keeps the interpreter shim from writing its cache.
 export CLAUDE_PYTHON="${CLAUDE_PYTHON:-python3}"
 PY="${HOME}/.claude/scripts/lib/py"

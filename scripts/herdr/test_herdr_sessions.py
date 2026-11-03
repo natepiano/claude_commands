@@ -32,6 +32,7 @@ from scripts.accounts import accounts
 from scripts.accounts.home_test_support import scratch_accounts_config
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.production import staff
+from scripts.message import sessions as runtime_sessions
 from scripts.production.staff_test_support import isolated_staff_file, showrunner_relationship, unit_membership
 
 
@@ -245,7 +246,8 @@ class HerdrSessionsTests(unittest.TestCase):
         self.process(101, 100, ["codex"], {"HERDR_PANE_ID": "w1:p1", "SHOWRUNNER_UNIT": "build",
                                                 "SHOWRUNNER_UNIT_ID": "one", "CODEX_THREAD_ID": unit.id})
         (self.proc / "101" / "fd").mkdir()
-        self.assertEqual(self.call("list"), (0, "unit\tunit build/one\t\n", ""))
+        with patch.object(runtime_sessions, "process_start", return_value="fixture-codex-start"):
+            self.assertEqual(self.call("list"), (0, "unit\tunit build/one\t\n", ""))
 
     def test_an_inherited_codex_thread_id_does_not_assign_a_shell_to_its_parent_unit(self) -> None:
         self.respond(["agents"], tabs=("terminal",))

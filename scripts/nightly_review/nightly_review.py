@@ -17,7 +17,6 @@ Nothing offers the proposals: the ledger's queue grows until the user asks for /
 
 from __future__ import annotations
 
-import os
 import json
 import re
 import subprocess
@@ -37,16 +36,12 @@ from scripts.lib.process_failure import failure_detail
 from scripts.whoami import account  # noqa: E402
 
 if TYPE_CHECKING:
+    from scripts.lib.conf import ConfigRead
     from scripts.production.session_staff import LiveClaude, RowResolver
     from scripts.production.staff import StaffRow
     from scripts.production.unit_config import UnitConfig
 
-ROOT = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state") / "nightly-review"
-MODES = ("config", "rust", "messages")
-SESSION = "nightly-review"
-PROMPT = "/nightly_review " + " ".join(MODES)
 SETTINGS = Path(__file__).with_name("settings.json")
-SESSIONS_DIR = Path.home() / ".claude/sessions"
 REVIEW_SCRIPT = SCRIPTS / "notify/review.py"
 
 
@@ -118,16 +113,27 @@ def recent_replies(path: Path, since: datetime) -> bool:
     return False
 
 
+def _settings() -> ConfigRead:
+    from scripts.lib import conf
+
+    return conf.read("nightly_review")
+
+
+def sessions_directory() -> Path:
+    return Path(_settings().text("sessions_directory")).expanduser()
+
+
 def showrunner_transcripts(since: datetime) -> list[Path]:
     """Find dated replies in each showrunner's own account, including natedev."""
     from scripts.production import staff
 
+    primary = _settings().text("primary_showrunner_name")
     membership = staff.snapshot()
     owners = staff.active(membership, "showrunner")
     identities = {identity for row in owners for identity in (row.id, row.current_session)}
     names = {row.name for row in owners}
     found: set[Path] = set()
-    for path in sorted(SESSIONS_DIR.glob("*.json")):
+    for path in sorted(sessions_directory().glob("*.json")):
         try:
             data = json_record(path.read_text(encoding="utf-8"))
             pid = data.get("pid", 0)
@@ -139,7 +145,7 @@ def showrunner_transcripts(since: datetime) -> list[Path]:
             session, name = record.get("sessionId", ""), record.get("name", "")
             if not session or Path(session).name != session:
                 continue
-            if name != "natedev" and session not in identities and name not in names:
+            if name != primary and session not in identities and name not in names:
                 continue
             recorded = record.get("transcript_path", "") or record.get("transcriptPath", "")
             config = record.get("config_dir", "")
@@ -214,10 +220,12 @@ def messages(since: datetime) -> list[str]:
     transcripts = showrunner_transcripts(since)
     if not transcripts:
         return [*lines, "No showrunner replies in this interval."]
+    settings = _settings()
+    sample_rows = settings.whole("message_sample_rows")
     try:
         result = subprocess.run([sys.executable, str(REVIEW_SCRIPT), "sample", *(str(path) for path in transcripts),
-                                 "--limit", "20", "--since", since.isoformat()],
-                                capture_output=True, text=True, check=False, timeout=20 * review.user_send_seconds() + 15)
+                                 "--limit", str(sample_rows), "--since", since.isoformat()],
+                                capture_output=True, text=True, check=False, timeout=sample_rows * review.user_send_seconds() + settings.number("sample_timeout_overhead_seconds"))
     except (OSError, subprocess.TimeoutExpired) as error:
         return [*lines, f"Sample failed: {error}"]
     lines.extend(result.stdout.splitlines())
@@ -226,14 +234,23 @@ def messages(since: datetime) -> list[str]:
     return lines
 
 
+def state_root() -> Path:
+    from scripts.nightly_review.candidates import state_root as candidate_state_root
+
+    return candidate_state_root()
+
+
 def night_dir(day: date) -> Path:
-    return ROOT / day.isoformat()
+    return state_root() / day.isoformat()
 
 
 def job(day: date) -> str:
     """The night's work, sent to the permanent unit as a message."""
-    return (f"Nightly review for NIGHT={day.isoformat()}: follow ~/.claude/commands/nightly_review.md "
-            + f"with the modes {' '.join(MODES)}, in that order.")
+    settings = _settings()
+    modes = settings.words("review_modes")
+    command = settings.text("command_path")
+    return (f"Nightly review for NIGHT={day.isoformat()}: follow {command} "
+            + f"with the modes {' '.join(modes)}, in that order.")
 
 
 @dataclass(frozen=True)
@@ -369,7 +386,8 @@ def launch(today: date) -> list[str]:
 def main() -> None:
     match sys.argv[1:]:
         case ["messages"]:
-            for line in messages(datetime.now(timezone.utc) - timedelta(hours=24)):
+            hours = _settings().number("message_history_hours")
+            for line in messages(datetime.now(timezone.utc) - timedelta(hours=hours)):
                 print(line)
         case ["launch"]:
             for line in launch(date.today()):
