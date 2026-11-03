@@ -38,6 +38,14 @@ There is no separate charge timer.
 4. Read the free placement scores for `m7a.4xlarge` in `us-east-2`.
 5. Read current Spot, EBS, gp3 performance, root storage, and public IPv4 prices.
 6. Select one available zone in `us-east-2` from those reads.
+7. Read the standard Spot vCPU quota. Request an increase if it is below 16.
+8. Record the Spot price and its read time just before `deploy.py prepare`. Deployment refuses a price older than `price_max_age_seconds`.
+9. Confirm that the fixed components sum to `fixed_usd_per_month`.
+10. Confirm that `limit_reserve_usd` covers the configured drain and idle intervals.
+
+A placement score for one instance type is always low. AWS needs at least three types for a useful score. On 2026-11-03 every `us-east-2` zone scored 1, so the zone choice uses price. The proposed zone, waiting for the user's approval, is `us-east-2c` (`use2-az3`) at $0.2250/h.
+
+A new account's "All Standard Spot Instance Requests" quota (`L-34B43A08`) defaults to 5 vCPU. `m7a.4xlarge` needs 16. A start below the quota fails with "Max spot instance count exceeded".
 
 The account (created 2026-11-03) is a project account. The user activated advanced features on 2026-11-03. Its service control policies now set these limits:
 
@@ -45,9 +53,6 @@ The account (created 2026-11-03) is a project account. The user activated advanc
 - No policy denies Spot. Activation removed the Paid Plan policy. A `run-instances --dry-run` with `MarketType=spot` in `us-east-2` succeeded on 2026-11-03.
 - The AWS spend limit is gone. The stack's $400 Budget with its stop action is the AWS-side backstop.
 - The four `BudgetsSpendLimit*` policies must have no target. In the Organizations console, open each policy's Targets tab, and detach the project account if it is listed.
-7. Record the public prices and their read time in configuration.
-8. Confirm that the fixed components sum to `fixed_usd_per_month`.
-9. Confirm that `limit_reserve_usd` covers the configured drain and idle intervals.
 
 The following commands are user-run examples.
 Replace the uppercase values with public account inputs from the configuration.
@@ -66,7 +71,15 @@ aws --profile build-admin ec2 get-spot-placement-scores \
 aws --profile build-admin ec2 describe-spot-price-history \
   --region us-east-2 --instance-types m7a.4xlarge \
   --product-descriptions Linux/UNIX --max-results 20
+aws --profile build-admin service-quotas get-service-quota \
+  --region us-east-2 --service-code ec2 --quota-code L-34B43A08 \
+  --query Quota.Value
+aws --profile build-admin service-quotas request-service-quota-increase \
+  --region us-east-2 --service-code ec2 --quota-code L-34B43A08 \
+  --desired-value 32
 ```
+
+Run the increase request only when the quota is below 16. The value 32 also covers a later move to `m7a.8xlarge`. A quota request has no charge.
 
 Read gp3, root storage and public IPv4 prices for `us-east-2` from the public [EC2](https://aws.amazon.com/ec2/pricing/on-demand/) and [EBS](https://aws.amazon.com/ebs/pricing/) price pages.
 Price-list and placement reads do not launch capacity.
