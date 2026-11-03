@@ -1367,7 +1367,11 @@ def _fill_config(cells: dict[str, str]) -> unit_config.UnitConfig:
     return unit_config.UnitConfig(plan, port, duties)
 
 
-def _fill_worktree(cells: dict[str, str], machine: str) -> staff.PresentWorktree:
+def _fill_worktree(row: staff.StaffRow, cells: dict[str, str], machine: str) -> staff.PresentWorktree:
+    if isinstance(row.worktree, staff.PresentWorktree):
+        return row.worktree
+    if isinstance(row.worktree, staff.RemovedWorktree):
+        raise ValueError(f"{row.name}: staff worktree is removed")
     path_text = production_units.cell_value(cells.get("Worktree", ""))
     branch = production_units.cell_value(cells.get("Branch", ""))
     if not path_text or path_text in ("—", "-"):
@@ -1445,7 +1449,16 @@ def prepare_retirement(cells: dict[str, str], sources: _MemberSources,
         if identities:
             session_id = next(iter(identities))
         else:
-            worktree = Path(production_units.cell_value(cells.get("Worktree", ""))).expanduser()
+            if isinstance(selected, MemberFound) and not isinstance(selected.row.worktree, staff.WorktreeUnfilled):
+                location = selected.row.worktree
+                if location.machine != remote.local_machine():
+                    raise ValueError(f"staff worktree is on {location.machine}")
+                worktree = location.path
+            else:
+                path_text = production_units.cell_value(cells.get("Worktree", ""))
+                if not path_text or path_text in ("—", "-"):
+                    raise ValueError("missing legacy Worktree cell")
+                worktree = Path(path_text).expanduser()
             recover = cast(Callable[..., str], retirement.last_interactive_session)
             session_id = recover(worktree, dependencies=dependencies)
             if not session_id:
@@ -1536,14 +1549,22 @@ def retirement_plan(scan: _FillSources, documents: tuple[FillDocument, ...],
                     continue
                 try:
                     selected = joined.member(UnitMember(slug, name), scan.record)
-                    path_text = production_units.cell_value(cells.get("Worktree", ""))
-                    if not path_text or path_text in ("—", "-"):
-                        raise ValueError("missing Worktree cell")
-                    location = staff.RemovedWorktree(machine, Path(path_text).expanduser())
+                    if isinstance(selected, MemberFound) and isinstance(selected.row.worktree, staff.RemovedWorktree):
+                        location = selected.row.worktree
+                    else:
+                        path_text = production_units.cell_value(cells.get("Worktree", ""))
+                        if not path_text or path_text in ("—", "-"):
+                            raise ValueError("missing Worktree cell")
+                        location = staff.RemovedWorktree(machine, Path(path_text).expanduser())
+                        if (isinstance(selected, MemberFound)
+                                and isinstance(selected.row.worktree, staff.PresentWorktree)
+                                and (selected.row.worktree.machine, selected.row.worktree.path)
+                                != (location.machine, location.path)):
+                            raise ValueError(f"existing worktree {selected.row.worktree!r} conflicts with removed location {location!r}")
+                    if location.machine != machine:
+                        raise ValueError(f"{name}: staff worktree is on {location.machine}")
                     if location.path.exists():
                         raise ValueError(f"retired worktree still exists: {location.path}")
-                    if isinstance(selected, MemberFound) and not isinstance(selected.row.worktree, staff.WorktreeUnfilled) and selected.row.worktree != location:
-                        raise ValueError(f"existing worktree {selected.row.worktree!r} conflicts with removed location {location!r}")
                     config = prepare_retirement(cells, joined, selected, slug, dependencies=scan.dependencies)
                     repository = Path(_fill_git(document.path.parent, "rev-parse", "--show-toplevel"))
                     config = replace(config, formatting=unit_config.repository_formatting(repository))
@@ -1995,7 +2016,7 @@ class _LiveFillSources(_FillSources):
         if production_units.plan_cell_is_retired(cells.get("Plan", "")):
             return _RetiredUnitDeferred()
         try:
-            location = _fill_worktree(cells, selected.source.machine)
+            location = _fill_worktree(row, cells, selected.source.machine)
         except (OSError, ValueError) as error:
             try:
                 location = self.session_worktree(row, machine)

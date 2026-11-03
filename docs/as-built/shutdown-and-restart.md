@@ -24,17 +24,11 @@ It restores a closed tab when a saved launch exists.
 An explicit CLI resume can restore an intentionally stopped session.
 Automatic recovery preserves an intentional stop.
 A separate terminal starts the account command in the target pane.
+The action check confirms the session before signals or pane input.
 The command changes to the saved folder before the account launch.
 The pane receives one opening message after identity confirmation.
 
-An empty target pane cannot receive its own foreground command through pane typing.
-The own-pane path saves the resolved launch as an attempt before `exec`.
-It preserves the intentional-stop state and records no verified proof before the launch.
-An exec error uses the existing failure path and keeps the pane.
-It uses the same account command with the opening message as a Claude argument.
-It changes to the saved folder and replaces the foreground process.
-The SessionStart hook records the new process and clears the intentional-stop state.
-This path cannot perform the later pid confirmation or detached stay check.
+Resume from its own empty pane executes the saved launch in that pane.
 
 `resume_message.py` builds every opening message.
 The restore paths use these causes:
@@ -49,7 +43,13 @@ The restore paths use these causes:
 The relaunch supervisor preserves explicit prompts.
 The pane path marks prompt delivery as `pane` to prevent a second automatic prompt.
 
-`ClaudeUp` means the registry reports a live Claude within 20 seconds. The command prints `ID: Claude is up on ACCOUNT in PANE (2.4 s)` and returns. The elapsed time includes that session's move stop. A detached check watches its pid and start generation for ten seconds. If it ends, the check tells the showrunner, sends the reviewed `shutdown.restart_failed` push, and enters the existing unit watchdog pass for a unit. Probe sessions skip the user push. The watchdog owns later recovery; the stay check does not retry. Resume launches once. A Claude that never starts returns `ResumeFailed: never started`. A missing tab or unreadable identity returns a named failure. Batch stops and resumes run concurrently; all stops finish before any resume. Launch seeding reads process info only for selected panes; the seed CLI still reads all panes.
+`ClaudeUp` means the registry reports a live Claude within 20 seconds.
+Resume makes one attempt.
+A detached check watches its pid and start generation for ten seconds.
+The watchdog owns later recovery.
+A missing tab or unreadable liveness returns a named error.
+All batch stops finish before any resume.
+Launch seeding reads process information only for selected panes.
 
 The shared session registry reader skips a file that vanishes during the scan. It retries a transient unreadable file up to three times, 50 milliseconds apart. Other unreadable evidence remains visible.
 
@@ -63,17 +63,21 @@ The watchdog does not read shutdown session records.
 
 ## Restart
 
-`shutdown.py restart --all` selects live Claude rows on this machine from `staff.json`.
-It saves their row IDs, stops each session, then starts each session.
+`shutdown.py restart --all` selects live Claude and Codex rows on this machine from `staff.json`.
+It stops each session, then starts each session.
+It saves only the row IDs whose starts failed.
 A stop checks the current conversation before it sends a signal.
 A failed row prints one anomaly line. Other rows continue.
 
 `shutdown.py restart` resumes the saved rows that do not run.
 A running row prints `unchanged`.
 A row leaves the saved list when it starts or already runs.
-A failed start or a refused row lock leaves the row on the list.
+A failed start adds the row to the list.
+A refused row lock changes no saved row.
 `--only` leaves other saved rows on the list.
-`--dry-run` prints the selected rows and changes nothing.
+`--dry-run` prints each selected name, row ID, kind, and saved tab position.
+A row without a saved tab says so on the same line.
+The command changes nothing.
 `--only ID[,ID...]` selects staff rows for callers that resume a moved unit.
 
 `shutdown_record.py` stores only a JSON list of staff row IDs in `shutdown/restart.json`.

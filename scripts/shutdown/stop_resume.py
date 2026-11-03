@@ -229,6 +229,8 @@ def _start_session(tab: herdr.TabSession, entry: pane_record.PaneLaunch, account
     client = herdr.Herdr(herdr.shared_session())
     command = _pane_command(tab, entry, account)
     launched_at = datetime.now(timezone.utc)
+    if not isinstance(client.pane_activity(tab.pane_id), herdr.PaneAtShell):
+        raise herdr.HerdrFailure(f"{entry['session_id']}: target pane has live work")
     client.run_in_pane(tab.pane_id, command)
     deadline = monotonic() + START_SECONDS
     live = sessions.session_liveness(entry["session_id"])
@@ -376,15 +378,13 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
         if isinstance(trust, (herdr.Untrusted, herdr.UnreadableTrustFile)):
             reason = str(trust) if isinstance(trust, herdr.UnreadableTrustFile) else f"Claude has not trusted {entry['cwd']}"
             print(f"{entry['name']}: trust anomaly: {reason}", file=sys.stderr)
-        if to is not None and original is not None and Path(original.entry["config_dir"]) != target_dir:
-            try:
-                original = pane_launch.finish_restore(original.path, original.entry,
-                    pane_launch.ResumeAttempt(original.entry["pane_id"], original.entry),
-                    pane_launch.PreparedAccountMove(target_dir, account_environment), close=client.close_tab_confirmed)
-            except (OSError, ValueError, herdr.HerdrFailure) as error:
-                print(f"{identity}: account record anomaly: {error}", file=sys.stderr)
         entry["config_dir"] = str(target_dir)
         entry["environment"] = {**entry["environment"], **account_environment}
+        if to is not None and original is not None and Path(original.entry["config_dir"]) != target_dir:
+            try:
+                pane_record.write(client.session, entry)
+            except (OSError, ValueError) as error:
+                print(f"{identity}: account record anomaly: {error}", file=sys.stderr)
         if isinstance(tab, SessionNotFound):
             with herdr.restore_staff(names.tab_record, labels=names.labels):
                 pane = client.open_tab(entry["environment"].get("SHOWRUNNER_UNIT", "agents"),
@@ -626,18 +626,20 @@ def move_sessions(sessions: list[str], target: str, *, why: str, warn_seconds: i
                        for index, result in enumerate(stopped) if isinstance(result, (Stopped, NotRunning))}
             outcomes: list[MoveResult] = []
             for index, result in enumerate(stopped):
-                if isinstance(result, (StopFailed, SessionNotFound, ClaudeUp)):
+                if isinstance(result, (StopFailed, ClaudeUp, SessionNotFound)):
                     outcomes.append(result)
                     continue
+                identity = result.session_id
                 try:
                     resumed = resumes[index].result()
                     if isinstance(resumed, ClaudeUp):
                         outcomes.append(resumed)
+                    elif isinstance(resumed, SessionNotFound):
+                        outcomes.append(ResumePending(identity, target, "session has no tab after stop"))
                     else:
-                        reason = "session has no tab after stop" if isinstance(resumed, SessionNotFound) else resumed.reason
-                        outcomes.append(ResumePending(result.session_id, target, reason))
+                        outcomes.append(ResumePending(identity, target, resumed.reason))
                 except Exception as error:
-                    outcomes.append(ResumePending(result.session_id, target, str(error)))
+                    outcomes.append(ResumePending(identity, target, str(error)))
             return outcomes
 
 

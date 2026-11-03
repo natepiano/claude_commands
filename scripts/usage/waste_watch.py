@@ -30,6 +30,7 @@ from scripts.usage.agents_log import state_dir
 from scripts.usage.usage_report import UnitWorktree
 from scripts.production import session_staff, staff
 from scripts.shutdown import remote
+from scripts.message import send_budget
 
 
 WINDOW = timedelta(hours=2)
@@ -319,7 +320,7 @@ def send(address: str, text: str) -> Delivered | NotSent:
     """send.py exit 0 is delivered and exit 1 is queued for the session; both count as delivered."""
     try:
         result = subprocess.run([sys.executable, str(send_script()), "--to", address, "--from", SENDER,
-                                 "--text", text], capture_output=True, text=True, check=False, timeout=120)
+                                 "--text", text], capture_output=True, text=True, check=False, timeout=send_budget.seconds())
     except (OSError, subprocess.TimeoutExpired) as error:
         return NotSent(f"send.py failed: {' '.join(str(error).split())}")
     if result.returncode in (0, 1):

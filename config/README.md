@@ -110,7 +110,7 @@ The user completes deployment before target activation.
 `credentials_profile=build-scaler` names the user's AWS CLI profile. This file contains no credential.
 `kinds=test,check,doc` excludes lint. An empty `ci_repo` disables GitHub calls.
 
-`monthly_limit_usd=400` is the user's monthly spending limit (approved 2026-11-01). `daily_limit_usd=20` is derived (the monthly limit / 20) and waits for the user's approval at go-live.
+`monthly_limit_usd=400` is the user's monthly spending limit (approved 2026-11-01). `daily_limit_usd=20` is derived (the monthly limit / 20); the user approved it on 2026-11-03.
 The AWS Budget must read `monthly_limit_usd`. Code must never raise either limit.
 The spending reserve is $3. The maximum drain time is 60 minutes.
 Each repository budget stays within the 32 GiB build budget.
@@ -280,6 +280,14 @@ Transfers exclude admission and pending state directories.
 Each configured peer supplies only its own host folders.
 The `BUILDLOG_PEER` override retains the legacy transfer of all other synchronized host folders.
 Rsync replaces complete files and preserves this host's append files.
+
+## test_times.conf
+
+`SLOW_TEST_S` sets the minimum test time retained in the build log.
+Failed tests, errors, and unexpected successes remain in the log at every duration.
+`TOP_RUNS` sets the number of recent gate runs used to rank each module by its median wall time.
+Callers read these settings through `scripts/lib/conf.py` at each use.
+`CONF_DIR` selects a fixture folder for tests.
 
 ## direct.conf
 

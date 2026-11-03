@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import shlex
 import sqlite3
 import sys
@@ -9,6 +10,11 @@ import unittest
 from contextlib import closing
 from pathlib import Path
 from typing import final
+from unittest import mock
+
+import style_ledger
+from scripts.style import unit_files
+from scripts.production.staff_test_support import fixture_unit_location, recorded_showrunner
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -18,6 +24,27 @@ from scripts.production.rename_unit_test_support import UnitRenameFixture, SLUG
 
 @final
 class UnitRenameStyleTests(UnitRenameFixture):
+
+    def test_held_files_follow_staff_locations_when_worktree_cells_disagree(self) -> None:
+        fixture = self.style_production()
+        worktree, database = fixture[0], fixture[2]
+        stale = self.root / "stale-names"
+        _ = self.git("worktree", "add", "-b", "stale-names", str(stale), SLUG)
+        self.write(worktree / "staff-held.txt", "The staff location holds this file.\n")
+        self.write(stale / "cell-held.txt", "The stale cell holds this file.\n")
+        parent = self.root / "parent-production.md"
+        self.write(parent, "# Parent\n- **Merge branch:** demo\n\n## Units\n\n"
+                   + "| Unit | Plan | Worktree | Branch |\n| --- | --- | --- | --- |\n")
+        self.write(self.doc, self.doc.read_text().replace(f"`{worktree}`", f"`{stale}`")
+                   + f"\n- **Parent production:** `{parent}`\n")
+        with mock.patch.dict(os.environ, self.env):
+            _ = recorded_showrunner("parent", parent)
+            owner = recorded_showrunner(SLUG, self.doc)
+            _ = fixture_unit_location(owner, "names-unit", worktree)
+            with style_ledger.Ledger(self.checkout, database) as ledger:
+                holders = unit_files.unit_file_holders(self.checkout, self.doc, ledger)
+        self.assertIn("staff-held.txt", holders["names-unit"])
+        self.assertNotIn("cell-held.txt", holders["names-unit"])
 
     def test_style_rename_keeps_git_paths_plan_names_and_ticket_ids(self) -> None:
         worktree, plan, database = self.style_production()
@@ -54,6 +81,9 @@ class UnitRenameStyleTests(UnitRenameFixture):
                    + f"- **Proposals:** `{self.root / 'issues'}`\n\n## Units\n\n"
                    + "| Unit | Plan | Worktree | Branch |\n| --- | --- | --- | --- |\n"
                    + "| names-unit | docs/style-production/units/names-unit.md | /other/names | other-names |\n")
+        with mock.patch.dict(os.environ, self.env):
+            other_owner = recorded_showrunner("other-style", other_doc)
+            _ = fixture_unit_location(other_owner, "names-unit", self.root / "other/names")
         owned = self.root / "issues/style.md"
         other = self.root / "issues/other-style.md"
         self.write(other, owned.read_text().replace("proposed_by: demo", "proposed_by: other-style"))
@@ -88,6 +118,9 @@ class UnitRenameStyleTests(UnitRenameFixture):
                    "EVERY=15\nTARGET=session:test-showrunner\nCHECK="
                    + shlex.join(["zsh", "/scripts/production_check.sh", str(doc)]) + "\n")
         self.env["STYLE_LEDGER_STATE_DIR"] = str(self.root / "state/style")
+        with mock.patch.dict(os.environ, self.env):
+            owner = recorded_showrunner(slug, doc)
+            _ = fixture_unit_location(owner, f"{slug}-names-unit", worktree)
         before = self.snapshot()
 
         result = self.invoke(

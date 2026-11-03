@@ -40,6 +40,110 @@ class ResumeClock(local):
 
 @final
 class StopResumeTests(unittest.TestCase):
+    def test_admitted_pane_run_with_no_start_fails_after_one_attempt(self) -> None:
+        with patch.object(self.client, "run", self.start):
+            result = stop_resume.resume("alpha", why="maintenance")
+        self.assertEqual(result, stop_resume.ResumeFailed("019b3a40-4250-7000-8000-000000000102", "never started"))
+        self.assertEqual(self.start.call_count, 1)
+        self.assertEqual(self.clock.elapsed, 20.0)
+        self.assertEqual({invocation.args[2] for invocation in self.start.call_args_list}, {"w1:p2"})
+
+
+    def test_batch_without_a_tab_reaches_the_shared_restore(self) -> None:
+        up = stop_resume.ClaudeUp("saved", "new-pane", "claude4")
+        with (patch.object(stop_resume, "_stop", return_value=stop_resume.NotRunning("saved")),
+              patch.object(stop_resume, "resume", return_value=up) as resumed):
+            results = stop_resume.move_sessions(["saved"], "claude4", why="limit")
+        self.assertEqual(results, [up])
+        resumed.assert_called_once_with("saved", why="limit", to="claude4")
+
+
+    def test_stale_launch_metadata_does_not_prevent_resume(self) -> None:
+        identity = self.entry["session_id"]
+        self.entry.update(session_id="sid-other", flags_read=False, ended=True)
+        pane_record.write("agents", self.entry)
+        tab = herdr.TabSession("w1:p2", "alpha", "w1", identity)
+        with (patch.object(stop_resume, "_tab_of", return_value=tab), redirect_stderr(io.StringIO()) as output):
+            result = stop_resume.resume(identity)
+        self.assertIsInstance(result, stop_resume.ClaudeUp)
+        self.assertIn("launch record anomaly:", output.getvalue())
+        self.start.assert_called_once()
+        self.assertIn(identity, self.launched)
+
+
+    def test_failed_stop_bookkeeping_reports_an_anomaly_and_keeps_the_stopped_result(self) -> None:
+        result = stop_resume.Stopped(self.entry["session_id"], 123)
+        with (patch.object(stop_resume, "_stop", return_value=result),
+              patch.object(pane_record, "end", side_effect=OSError("fixture write failed")),
+              redirect_stderr(io.StringIO()) as output):
+            self.assertEqual(stop_resume.stop("alpha"), result)
+        self.assertEqual(output.getvalue().splitlines(),
+                         [f"{result.session_id}: stop note anomaly: fixture write failed"])
+
+
+    def test_failed_account_bookkeeping_reports_an_anomaly_and_resumes(self) -> None:
+        with (patch.object(pane_record, "write", side_effect=OSError("fixture")),
+              redirect_stderr(io.StringIO()) as output):
+            result = stop_resume.resume("alpha", to="claude4")
+        self.assertIsInstance(result, stop_resume.ClaudeUp)
+        self.assertIn("account record anomaly: fixture", output.getvalue())
+        self.start.assert_called_once()
+
+
+    def test_missing_prompt_confirmation_reports_an_anomaly_and_keeps_the_live_result(self) -> None:
+        with (patch.object(self.client, "submit_opening_prompt", return_value=herdr.PromptNotSubmitted("fixture")),
+              redirect_stderr(io.StringIO()) as output):
+            result = stop_resume.resume("alpha")
+        self.assertIsInstance(result, stop_resume.ClaudeUp)
+        self.assertIn("prompt anomaly: fixture", output.getvalue())
+        self.start.assert_called_once()
+
+
+    def test_missing_stay_generation_reports_an_anomaly_and_keeps_the_live_result(self) -> None:
+        with (patch.object(sessions, "process_start", return_value=None), redirect_stderr(io.StringIO()) as output):
+            result = stop_resume.resume("alpha")
+        self.assertIsInstance(result, stop_resume.ClaudeUp)
+        self.assertIn("observer anomaly: process generation is unavailable", output.getvalue())
+        self.start.assert_called_once()
+        self.detach.assert_not_called()
+
+
+    def test_failed_stay_launch_reports_an_anomaly_and_keeps_the_live_result(self) -> None:
+        self.detach.side_effect = OSError("fixture")
+        with redirect_stderr(io.StringIO()) as output:
+            result = stop_resume.resume("alpha")
+        self.assertIsInstance(result, stop_resume.ClaudeUp)
+        self.assertIn("observer anomaly: fixture", output.getvalue())
+        self.start.assert_called_once()
+
+
+    def test_failed_title_change_reports_an_anomaly_and_resumes(self) -> None:
+        with (patch.object(self.client, "retitle", side_effect=herdr.HerdrFailure("fixture")),
+              redirect_stderr(io.StringIO()) as output):
+            result = stop_resume.resume("alpha")
+        self.assertIsInstance(result, stop_resume.ClaudeUp)
+        self.assertIn("title anomaly: fixture", output.getvalue())
+        self.start.assert_called_once()
+
+
+    def test_enveloped_resume_launch_paths_need_no_source_record(self) -> None:
+        from scripts.lib import script_prompts
+
+        with patch.object(script_prompts, "record", side_effect=AssertionError("recorded resume")):
+            result = stop_resume.resume("alpha")
+        self.assertIsInstance(result, stop_resume.ClaudeUp)
+        self.assertTrue(self.client.prompts[0][1].text.startswith('<system-reminder source="script">'))
+
+
+    def test_resume_does_not_type_into_a_pane_with_other_work(self) -> None:
+        with patch.object(self.client, "pane_activity", return_value=herdr.PaneRunning(("other work",))):
+            result = stop_resume.resume("alpha")
+        self.assertEqual(result, stop_resume.ResumeFailed(
+            self.entry["session_id"], f"{self.entry['session_id']}: target pane has live work"))
+        self.start.assert_not_called()
+        self.assertEqual(self.client.prompts, [])
+
+
     def test_resume_names_use_a_fresh_snapshot_under_the_row_lock(self) -> None:
         identity = staff.StaffId(self.entry["session_id"])
         row = staff.StaffRow(staff.StaffId("accounts-unit"), "unit", "accounts", None,
@@ -52,6 +156,7 @@ class StopResumeTests(unittest.TestCase):
             self.assertIsInstance(result, stop_resume.ClaudeUp)
             self.assertEqual(read.call_count, 2)
             self.assertIn("resumed by name", self.client.prompts[0][1].text)
+            self.assertTrue(self.client.prompts[0][1].text.startswith('<system-reminder source="script">'))
             self.assertNotIn("the herdr server restarted", self.client.prompts[0][1].text)
 
     def test_unknown_ambiguous_and_remote_names_refuse(self) -> None:

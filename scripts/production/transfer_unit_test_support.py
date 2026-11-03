@@ -76,7 +76,10 @@ class UnitTransferFixture(StaffTestCase):
         _ = shutil.copytree(self.snapshot, self.fixture_root)
         self.addCleanup(shutil.rmtree, self.fixture_root)
         self.bind_fixture(self.fixture_root)
-        bind_staff_fixture(self, self.env, {"demo": ("alpha-unit", "beta-unit"), "other": ("gamma-unit",)})
+        bind_staff_fixture(self, self.env, {"demo": ("alpha-unit", "beta-unit"), "other": ("gamma-unit",)},
+                           locations={("demo", "alpha-unit"): self.unit,
+                                      ("demo", "beta-unit"): self.rust / "claude-demo-beta",
+                                      ("other", "gamma-unit"): self.root / "absent-gamma"})
         row = unit_membership("demo", "alpha-unit")
         self.pane("w1:p1", session_id="5ad615f2-4e04-5121-a102-9d6b2e2a6eb3", environment={
             "SHOWRUNNER_UNIT": "demo", "SHOWRUNNER_UNIT_ID": "alpha-unit", "CLAUDE_CODE_SESSION_ID": row.id,
@@ -91,14 +94,12 @@ class UnitTransferFixture(StaffTestCase):
             (showrunners, "NOTIFIER_STATE_DIR", self.root / "state/notifier"),
             (showrunners, "SHOWRUNNER_STATE_DIR", self.root / "state/showrunner"),
             (showrunners, "CONFIG", self.root / "home/.claude/showrunners.json"),
-            (showrunners, "SESSIONS_DIR", self.root / "state/sessions"),
             (progress_history, "SESSION_ROOTS", (self.root / "sessions",)),
             (pane_record, "RECORD_DIR", self.root / "home/.local/state/herdr-panes"),
             (pane_record, "PROC", self.root / "proc"),
             (tidy_wrapped, "STATE_DIR", self.root / "state/showrunner"),
             (tidy_wrapped, "NOTIFIER_STATE_DIR", self.root / "state/notifier"),
             (stall_watch, "STATE_DIR", self.root / "state/stall-watch"),
-            (stall_watch, "SESSIONS_DIR", self.root / "state/sessions"),
             (stall_watch, "PROJECTS_DIR", self.root / "home/.claude/projects"),
         ):
             _ = self.enterContext(mock.patch.object(module, name, value))

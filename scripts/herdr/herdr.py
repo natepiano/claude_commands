@@ -45,6 +45,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import pane_launch
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.script_envelope import script_prompt
 from scripts.message import sessions as runtime_sessions
 from scripts.production import staff
 
@@ -2026,6 +2027,7 @@ class Herdr:
                               timeout_ms: int) -> PromptSubmitOutcome:
         if timeout_ms <= 0 or not opening.text.strip():
             return PromptNotSubmitted("opening prompt deadline elapsed or text is empty")
+        opening = OpeningPrompt(script_prompt(opening.text), opening.transcript, opening.before_prompt)
         deadline = time.monotonic() + timeout_ms / 1000
         cursor = (TranscriptCursor(opening.transcript, launched_at)
                   if isinstance(opening.transcript, SessionTranscript) else UnspecifiedPromptTranscript())
@@ -2124,7 +2126,7 @@ class Herdr:
                         if rejections > 1:
                             if fallback is None:
                                 return failure(f"Claude answered Unknown command: {_slash_command(current)}")
-                            current = fallback
+                            current = script_prompt(fallback)
                         elif (remaining := deadline - time.monotonic()) > 0:
                             time.sleep(min(PROMPT_SETTLE_SECONDS, remaining))
                         if time.monotonic() >= deadline:
@@ -2196,13 +2198,12 @@ class Herdr:
             return failure(str(error))
 
     def prompt(self, pane: str, text: str) -> None:
-        """Type a prompt, recorded first so that the prompt hook does not count it as the user's."""
+        """Mark generated prose; retain slash-command evidence after uncertain delivery."""
         import script_prompts
 
-        try:
+        text = script_prompt(text)
+        if text.lstrip().startswith("/"):
             script_prompts.record(pane, text)
-        except OSError as error:
-            print(f"herdr: script prompt not recorded: {error}", file=sys.stderr)
         _ = self.run("agent", "prompt", pane, text)
 
     def wait_until(self, pane: str, state: str, timeout_ms: int) -> ObservedAgentState | WaitTimedOut:

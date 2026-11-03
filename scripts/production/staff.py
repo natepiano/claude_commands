@@ -12,6 +12,7 @@ import shlex
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import Mapping, Callable, Generator, Sequence
 from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
@@ -518,8 +519,12 @@ class SeedInput:
         return cls(tuple(members), tuple(retire))
 
 
+def _default_file() -> Path:
+    return Path.home() / ".local/state/staff/staff.json"
+
+
 def _file() -> Path:
-    return Path(os.environ.get("STAFF_FILE") or Path.home() / ".local/state/staff/staff.json").expanduser()
+    return Path(os.environ.get("STAFF_FILE") or _default_file()).expanduser()
 
 
 def folder_move_path(unit: StaffId) -> Path:
@@ -896,6 +901,18 @@ def find(*, kind: Kind | None = None, parent: StaffId | None = None) -> list[Sta
     return snapshot().find(kind=kind, parent=parent)
 
 
+def _under_test_root(path: Path) -> bool:
+    """Identify temporary locations before a write to the real staff record."""
+    resolved = path.expanduser().resolve()
+    return any(resolved.is_relative_to(root.resolve())
+               for root in (Path(tempfile.gettempdir()), Path("/tmp"), Path("/dev/shm")))
+
+
+def _location_paths(row: StaffRow) -> tuple[Path, ...]:
+    return tuple(location.path for location in (row.doc, row.worktree)
+                 if isinstance(location, (LiveDoc, WrappedDoc, PresentWorktree, RemovedWorktree)))
+
+
 def _store(rows: list[StaffRow], pending: set[StaffId]) -> None:
     document: dict[str, object] = {"schema": 2, "rows": [row.to_json() for row in rows]}
     if pending:
@@ -917,6 +934,13 @@ def _record_transaction(edit: Callable[[list[StaffRow], set[StaffId]], _Result])
             proposed = list(original.rows)
             pending = set(original.pending_retire)
             result = edit(proposed, pending)
+            if path.resolve() == _default_file().resolve():
+                previous = {row.id: row for row in original.rows}
+                for row in proposed:
+                    if previous.get(row.id) != row:
+                        for location in _location_paths(row):
+                            if _under_test_root(location):
+                                raise StaffRefused(f"test-root path cannot enter the real staff record: {location}")
             _validate(proposed)
             proposed.sort(key=lambda row: row.id)
             if original.schema == 2 and original.current_sessions_recorded and proposed == list(original.rows) and pending == set(original.pending_retire):
@@ -1197,6 +1221,54 @@ def retire(staff_id: StaffId) -> StaffRow | None:
 
     require_stopped(staff_id)
     return _transaction(lambda rows: _retire_row(rows, staff_id))
+
+
+@dataclass(frozen=True)
+class FixtureRemoved:
+    """The stopped fixture tree no longer exists in the staff record."""
+
+    row: StaffRow
+
+
+@dataclass(frozen=True)
+class FixtureAlreadyAbsent:
+    """The staff record already has no selected fixture."""
+
+
+def _remove_test_fixture(staff_id: StaffId) -> FixtureRemoved | FixtureAlreadyAbsent:  # pyright: ignore[reportUnusedFunction]
+    """Remove a stopped fixture tree whose locations name test folders."""
+    if not _is_owner():
+        raise StaffRefused("remove the fixture on the staff owner machine")
+    record = snapshot()
+    row = record.by_id(staff_id)
+    if row is None:
+        return FixtureAlreadyAbsent()
+    selected = {row.id: row}
+    while True:
+        children = {candidate.id: candidate for candidate in record.rows
+                    if candidate.parent in selected and candidate.id not in selected}
+        if not children:
+            break
+        selected.update(children)
+    from scripts.message import sessions
+
+    for candidate in selected.values():
+        locations = _location_paths(candidate)
+        if not locations or not all(_under_test_root(path) for path in locations):
+            raise StaffRefused(f"{candidate.id}: the location is not under a test root")
+        observed = sessions.session_liveness(candidate.current_session)
+        if not isinstance(observed, sessions.SessionNotLive):
+            raise StaffRefused(f"{candidate.id}: the fixture conversation is live or unreadable")
+
+    def edit(rows: list[StaffRow]) -> FixtureRemoved:
+        if any(_row_by_id(rows, identity) != expected for identity, expected in selected.items()):
+            raise StaffRefused(f"{staff_id}: the fixture changed before removal")
+        if any(candidate.parent in selected and candidate.id not in selected for candidate in rows):
+            raise StaffRefused(f"{staff_id}: the fixture gained a member before removal")
+        rows[:] = [candidate for candidate in rows if candidate.id not in selected]
+        return FixtureRemoved(row)
+
+    return _transaction(edit)
 
 
 def _retire_row(rows: list[StaffRow], staff_id: StaffId) -> StaffRow | None:

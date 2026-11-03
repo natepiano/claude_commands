@@ -701,15 +701,18 @@ def _saved_restore(record: dict[str, object]) -> UnitRestore:
     return StoppedUnitRestore(kind="stopped", session_id=_string(restore, "session_id"))
 
 
-def _prepare_unit(plan: RenamePlan, name: str, row: dict[str, str]) -> dict[str, object]:
-    for field in ("Worktree", "Branch"):
+def _prepare_unit(plan: RenamePlan, name: str, row: dict[str, str], members: staff.StaffSnapshot) -> dict[str, object]:
+    for field in ("Branch",):
         if field not in row:
             raise RenameRefused(f"{name}: Units table lacks {field} column")
     branch = production_units.cell_value(row.get("Branch", ""))
     if not branch.startswith(plan.old + "-"):
         raise RenameRefused(f"{name}: branch {branch} does not start with {plan.old}-")
     stem = branch[len(plan.old) + 1:]
-    worktree = Path(production_units.cell_value(row.get("Worktree", ""))).expanduser().resolve()
+    selected = staff_sources.member(staff_sources.UnitMember(plan.new, name), members)
+    if isinstance(selected, staff_sources.NoSuchMember):
+        selected = staff_sources.member(staff_sources.UnitMember(plan.old, name), members)
+    worktree = unit_lookup.local_worktree(selected).path
     if not (worktree / ".git").is_file():
         raise RenameRefused(f"{name}: no linked worktree at {worktree}")
     new_branch = f"{plan.new}-{stem}"
@@ -733,7 +736,7 @@ def _prepare_unit(plan: RenamePlan, name: str, row: dict[str, str]) -> dict[str,
 def _unit_doc(plan: RenamePlan, name: str, record: dict[str, object]) -> None:
     lines = plan.new_doc.read_text(encoding="utf-8").splitlines(keepends=True)
     headings = production_units.unit_headings([line.rstrip("\n") for line in lines])
-    for field in ("Worktree", "Branch"):
+    for field in ("Branch",):
         if field not in headings:
             raise RenameRefused(f"{name}: Units table lacks {field} column")
     in_units = False
@@ -746,6 +749,8 @@ def _unit_doc(plan: RenamePlan, name: str, record: dict[str, object]) -> None:
         if cells and production_units.cell_value(cells[0]) == name:
             for field, value in (("Worktree", _string(record, "new_worktree")),
                                  ("Branch", _string(record, "new_branch"))):
+                if field not in headings:
+                    continue
                 column = headings.index(field)
                 cells[column] = f"`{value}`"
             lines[index] = "| " + " | ".join(cells) + " |\n"
@@ -763,7 +768,6 @@ def _commit_unit(plan: RenamePlan, name: str, record: dict[str, object]) -> None
     rows = production_units.unit_table(unit_move.git(plan.checkout, "show", f"HEAD:{path}").splitlines())
     matching = [row for row in rows if production_units.cell_value(row.get("Unit", "")) == name]
     committed = (len(matching) == 1
-                 and production_units.cell_value(matching[0].get("Worktree", "")) == _string(record, "new_worktree")
                  and production_units.cell_value(matching[0].get("Branch", "")) == _string(record, "new_branch"))
     changed = set(unit_move.git(plan.checkout, "diff", "--name-only", "-z", "HEAD").split("\0")) - {""}
     changed.update(set(unit_move.git(plan.checkout, "diff", "--cached", "--name-only", "-z", "HEAD").split("\0")) - {""})
@@ -809,19 +813,19 @@ def repair_workers(new: str, *, dry_run: bool = False) -> None:
             if isinstance(checked, showrunners.NoCheckedDoc):
                 raise RenameRefused(f"{new}: no production doc: {checked.reason}")
             doc = checked.path
-        production = read_production(doc)
         text = doc.read_text(encoding="utf-8")
         former_names = [_string(journal, "old")] if journal else []
         for line in text.splitlines():
             if line.startswith("- **Formerly:**"):
                 former_names.extend(cast(list[str], re.findall(r"`([^`]+)`", line)))
         former = tuple(dict.fromkeys(former_names))
+        members = staff.snapshot()
         units = tuple(workers.UnitWorktree(new, production_units.cell_value(row.get("Unit", "")),
-            production.checkout / Path(production_units.cell_value(row.get("Worktree", ""))).expanduser(),
+            unit_lookup.local_worktree(staff_sources.member(staff_sources.UnitMember(
+                new, production_units.cell_value(row.get("Unit", ""))), members)).path,
             production_units.cell_value(row.get("Branch", "")))
             for row in production_units.unit_table(text.splitlines())
-            if not production_units.plan_cell_is_retired(row.get("Plan", ""))
-            and production_units.cell_value(row.get("Worktree", "")) not in ("", "—", "-"))
+            if not production_units.plan_cell_is_retired(row.get("Plan", "")))
         found = workers.find_moved_unit_runs(units, former)
         for skipped in found.skipped:
             print(skipped)
@@ -878,7 +882,7 @@ def unit(new: str, name: str) -> None:
                 raise RenameRefused("complete interrupted unit moves before starting another unit")
             _stopped_unit(result, name)
             restore = _stopped_restore(result, name)
-            record = _prepare_unit(result, name, row)
+            record = _prepare_unit(result, name, row, members)
             record["restore"] = restore
             records[name] = record
             journal["unit_moves"] = records
@@ -896,6 +900,13 @@ def unit(new: str, name: str) -> None:
         completed = record.get("step")
         if type(completed) is not int or not 0 <= completed <= 5:
             raise RenameRefused(f"{name}: invalid unit rename progress")
+        if completed >= 2:
+            current = members.by_id(staff.StaffId(_string(record, "staff_id")))
+            if current is None:
+                raise staff.StaffUnreadable(f"{name}: no retained staff member")
+            location = unit_lookup.local_worktree(staff_sources.MemberFound(current))
+            if not isinstance(location, staff.PresentWorktree) or location.path != Path(_string(record, "new_worktree")):
+                raise RenameRefused(f"{name}: staff worktree differs from the rename record")
         _retarget_phase_notes(result)
         if completed < 5:
             _stopped_unit(result, name)

@@ -8,7 +8,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Literal, TypedDict
 
-from scripts.message import send as message_send, send_result
+from scripts.message import send as message_send, send_result, send_budget
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 SEND = SCRIPTS / "message/send.py"
@@ -64,7 +64,7 @@ def _send_command() -> list[str]:
 def _deliver_message(
     command: list[str], recipient: str, text: str
 ) -> MessageSendOutcome:
-    timeout = 60.0
+    timeout = send_budget.seconds()
     if recipient == "user":
         raise ValueError("user messages require the user delivery path")
     try:

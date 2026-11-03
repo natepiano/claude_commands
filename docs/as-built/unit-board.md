@@ -250,7 +250,7 @@ The build queue reads process memory every ten seconds while open.
 - A close during a pending `session.start` load or zone lookup must not restart the accounts timer; the lifecycle counter guards it.
 - The mod runs the generator, `accounts.py` and `build_queue.py` installed under `~/.claude/scripts`, not a worktree's copy, so a live check of the mod proves only promoted code; a contract change can only be checked live after it reaches main.
 - The accounts view uses numbered labels and requests no login column.
-  Stored reads start no SSH request, counts fetch, fetch lock, or cache write.
+  Stored reads do not wait for the detached counts fetch.
 - A fresh checkout's `tsc` reports `TS2688` for `claude-code`, `claude-code-tools` and `claude-code-mcp` until a live session loads the folder and the engine writes `mods/unit-board/.claude-plugin/types/`.
 - Tests patch `plan_history.now_epoch` for the clock.
 - A session loads mod hooks when it starts. A session started before a mod change keeps the old hooks until `/reload-plugins`, and the command file's fallback line answers in their place; the line names `/reload-plugins` for that reason. The natedev showrunner hit this on 2026-10-18.
@@ -277,10 +277,10 @@ Discovery paths detect a new production or input.
 The accounts pane also refreshes local liveness each tick when its generator reports session inputs.
 The build queue refreshes process memory each tick.
 
-The accounts view uses `accounts.py status --json --stored` to avoid account probes and network work.
+The accounts view uses `accounts.py status --json --stored` to read saved usage without account probes.
 It watches usage, group selection, worker selection, role-map cache, peer-count cache, and reported session inputs.
 When the generator reports session inputs, each open-pane tick refreshes local liveness counts.
-The stored read uses an existing peer-count cache and starts no peer fetch.
+The stored read uses an existing peer-count cache without waiting for its refresh.
 The separate machine counts let the view sum available observations without hiding a missing peer.
 Aligned headers and complete facts keep the same contract readable in wide and narrow panes.
 

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from scripts.production.staff_test_support import ClaudeBackendFixture, StaffTestCase, fixture_member, fixture_runtime_id
+from scripts.production.staff_test_support import fixture_member, ClaudeBackendFixture, StaffTestCase, fixture_runtime_id
 
 from scripts.lib import names
 from scripts.lib.test_names import fixture_names
@@ -296,8 +296,9 @@ class AddUnitLaunchTests(AddUnitTestCase):
         requests: list[add_unit.UnitLaunch] = []
         pending: list[add_unit.UnitAdmissionPending | add_unit.UnitMembershipPublished] = []
 
-        def observe(request: add_unit.UnitLaunch) -> add_unit.UnitAdmissionPending | add_unit.UnitMembershipPublished:
-            result = admit(request)
+        def observe(request: add_unit.UnitLaunch, *,
+                    record: staff.StaffSnapshot) -> add_unit.UnitAdmissionPending | add_unit.UnitMembershipPublished:
+            result = admit(request, record=record)
             requests.append(request)
             pending.append(result)
             self.assertEqual(staff.find(kind="unit"), [])
@@ -680,11 +681,17 @@ class AddUnitLaunchTests(AddUnitTestCase):
                   "docs/plans/other.md", "docs/plans/given.md"),
                  ("Branch", self.prepared_row(branch="other-branch"),
                   "other-branch", "build-followups-alpha"),
-                 ("Worktree", self.prepared_row(worktree=self.root / "other-worktree"),
+                 ("Worktree", self.prepared_row(),
                   str(self.root / "other-worktree"), str(self.root / "project-alpha")))
         for cell, row, actual, expected in cases:
             with self.subTest(cell=cell):
                 self.commit_prepared_row(row)
+                if cell == "Worktree":
+                    parent = next(owner for owner in staff.snapshot().find(kind="showrunner")
+                                  if isinstance(owner.doc, staff.LiveDoc) and owner.doc.path == self.doc)
+                    member = next(row for row in staff.snapshot().find(kind="unit")
+                                  if row.name == "alpha" and row.parent == parent.id)
+                    _ = staff.set_worktree(member.id, staff.PresentWorktree("natedev", self.root / "other-worktree"), expected=member.worktree)
                 document = self.doc.read_text()
                 head = self.git("rev-parse", "HEAD")
                 result = self.cli("alpha", "--plan", "docs/plans/given.md")

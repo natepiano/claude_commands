@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
-from scripts.direct.worker_state import worker_slot
+from scripts.lib.script_envelope import script_prompt
 
 if TYPE_CHECKING:
     from scripts.shutdown.inventory import PausedSeat
@@ -47,7 +47,8 @@ def resume_message(why: str, *, moved_from: str | None = None, moved_to: str | N
     elif why:
         lines.append("Codex workers keep their existing threads. Use implement.sh --to <worker> or "
                      + "codex_mesh.py resume for a paused worker; do not open a replacement thread.")
-    return ("\n" if workers.seats else " ").join(lines)
+    text = ("\n" if workers.seats else " ").join(lines)
+    return script_prompt(text)
 
 
 def _resume_phase_id(seat: PausedSeat) -> str:
@@ -83,6 +84,8 @@ def _resume_phase_id(seat: PausedSeat) -> str:
 
 def resume_worker_command(seat: PausedSeat, cwd: str) -> str:
     """Build a complete launcher invocation that continues this worker's thread."""
+    from scripts.direct.worker_state import worker_slot
+
     launcher = "review.sh" if seat["role"] == "review" else "implement.sh"
     prompt = str(Path(seat["run_dir"]) / f"{seat['seat']}.resume-prompt.md")
     resumed = _resumed_launcher_command(seat["launcher_command"], seat["seat"], prompt) if seat["turn_live"] else None
