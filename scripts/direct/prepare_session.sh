@@ -28,15 +28,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 "${SCRIPT_DIR}/../lib/py" "${SCRIPT_DIR}/remove_workers.py" || true
 
 SESSION_ID="$(uuidgen | tr '[:upper:]' '[:lower:]')"
-SESSION_DIR="/tmp/claude/unit/${SESSION_ID}"
-
-mkdir -p "${SESSION_DIR}"
+SESSION_DIR="$("${SCRIPT_DIR}/../lib/py" "${SCRIPT_DIR}/../lib/build_folders.py" stable --unit-root --name "${SESSION_ID}")"
 
 if [[ -n "${CLAUDE_CODE_SESSION_ID:-}" ]]; then
-  ACTIVE_DIR=/tmp/claude/unit/active
-  mkdir -p "${ACTIVE_DIR}"
-  printf '%s\n' "${SESSION_DIR}" > "${ACTIVE_DIR}/${CLAUDE_CODE_SESSION_ID}"
-  rm -f "/tmp/claude/delegate/active/${CLAUDE_CODE_SESSION_ID}"
+  "${SCRIPT_DIR}/../lib/py" "${SCRIPT_DIR}/../lib/unit_runs.py" activate "$SESSION_DIR" "$CLAUDE_CODE_SESSION_ID"
   "${SCRIPT_DIR}/../lib/py" "${SCRIPT_DIR}/../usage/agents_log.py" append --id "${CLAUDE_CODE_SESSION_ID}" --role director || true
 fi
 

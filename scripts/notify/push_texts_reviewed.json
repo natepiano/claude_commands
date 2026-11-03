@@ -82,6 +82,27 @@
       "time": "2026-10-23T19:45:00.398996-04:00"
     }
   },
+  "build_admission.down": {
+    "down": {
+      "objections": [
+        {
+          "quote": "build admission service is down; builds wait",
+          "rule": "push-only-what-the-user-must-do"
+        },
+        {
+          "quote": "build admission service",
+          "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "build admission service is down; builds wait",
+          "rule": "what-happened-why-what-you-do"
+        }
+      ],
+      "reviewer": "user-spec: Phase 10 user Work Order, Spec 13: sends build admission service is down; builds wait. Keep the specified outage text.; reviewer: opus",
+      "sha256": "3741f0b48d7d5ba71bd63ef134424978c95da6eca114c4364a8d047102e8e53c",
+      "time": "2026-11-02T18:17:06.517179-05:00"
+    }
+  },
   "build_hold.blocking": {
     "typical": {
       "objections": [],

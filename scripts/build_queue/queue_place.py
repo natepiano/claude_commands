@@ -3,22 +3,23 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Generator, Mapping, Sequence
-from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from contextlib import contextmanager, redirect_stdout
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-import io
 import os
 from pathlib import Path
 import signal
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 from typing import TYPE_CHECKING, BinaryIO, TypedDict, Unpack
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib import build_folders
 from scripts.lint import memory_admit
+from scripts.build_queue import admission_client, admission_protocol as wire
+import uuid
 
 if TYPE_CHECKING:
     from scripts.lib import conf
@@ -113,25 +114,8 @@ def atomic_sample(path: Path, value: str) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def wait_reasons(result: memory_admit.CheckResult) -> tuple[str, ...]:
-    """Describe why admission holds, without treating changing samples as a new reason."""
-    decision = result.decision
-    if isinstance(decision.pressure, memory_admit.MemoryPressure):
-        if decision.pressure.next_start_at:
-            return ("memory pressure recovery",)
-        if decision.pressure.swap_used_percent > result.policy.pressure.swap_used_limit:
-            return ("swap memory pressure",)
-        return ("memory pressure",)
-    if isinstance(result.head_reason, memory_admit.BehindOlderFit):
-        return (memory_admit.older_fit_text(result.head_reason),)
-    reasons: list[str] = []
-    if result.head_need:
-        reasons.append(f"queue head {result.head_label}")
-    if decision.charged + result.peak.bytes > decision.budget:
-        reasons.append("build memory budget")
-    if result.available < decision.threshold:
-        reasons.append("free memory")
-    return tuple(reasons) or ("admission refresh",)
+def wait_reasons(result: memory_admit.AdmissionWaitSnapshot) -> tuple[str, ...]:
+    return admission_client.wait_reasons(result)
 
 
 class PopenArguments(TypedDict, total=False):
@@ -387,64 +371,44 @@ def queue_place(program: str, repo: Path, *,
         sizing = memory_admit.HistoryPeakSizing(first, memory_admit.FirstProgramPeak(first), 0.0)
     profile: memory_admit.ProgramProfile | memory_admit.StepProfile = memory_admit.ProgramProfile(
         program, str(Path.home() / ".claude"), str(repo.resolve()), sizing)
-    root = memory_admit.store.root()
     pid = os.getpid()
-    previous_need = 0
-    previous_reasons: tuple[str, ...] = ()
-    reported_at = 0.0
-    with tempfile.TemporaryDirectory(prefix="queue-place-") as temporary:
-        sidecar = Path(temporary) / "program.cgroup"
+    with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(prefix=build_folders.FOLDER_PREFIXES["queue-place"])) as temporary:
+        sidecar = temporary / "program.cgroup"
         _ = sidecar.write_text("")
         handlers = {number: signal.getsignal(number) for number in (signal.SIGTERM, signal.SIGINT)}
         for number, handler in handlers.items():
             if handler in (signal.SIG_DFL, signal.default_int_handler):
                 _ = signal.signal(number, _stop_holder)
         try:
-            while True:
-                before_check()
-                diagnostics = io.StringIO()
-                try:
-                    with redirect_stderr(diagnostics):
-                        result = memory_admit.check(
-                            Path(os.environ.get("BUILDLOG_MEMINFO", "/proc/meminfo")), pid, str(sidecar),
-                            [program], root=root, profile=profile)
-                except Exception as error:
-                    lines = diagnostics.getvalue().splitlines()
-                    raise QueuePlaceRefused(lines[-1] if lines else str(error)) from error
-                profile = result.profile
-                if result.decision.state == "admit":
-                    if not isinstance(result.reservation, memory_admit.Reserved):
-                        raise QueuePlaceRefused("memory admission did not return a program reservation")
-                    place = QueuePlace(result.reservation.path, sidecar)
-                    failed = False
-                    try:
-                        yield place
-                    except BaseException as error:
-                        failed = True
-                        place.status = error.code if isinstance(error, SystemExit) and isinstance(error.code, int) else 1
-                        raise
-                    finally:
-                        with defer_cleanup_signals():
-                            place.finish(failed=failed)
-                            memory_admit.release(place.path, place.status, root=root)
-                    return
-                now = time.monotonic()
-                reasons = wait_reasons(result)
-                if result.peak.bytes != previous_need or reasons != previous_reasons or now - reported_at >= config.wait_reply_seconds:
-                    print(f"{program} memory wait: {result.peak.bytes / memory_admit.GIB:.3f} GiB needed; "
-                          + "; ".join(reasons), flush=True)
-                    previous_need, previous_reasons, reported_at = result.peak.bytes, reasons, now
-                time.sleep(config.waiting_pass_seconds)
+            start = memory_admit.process_start_time(pid)
+            if start is None:
+                raise QueuePlaceRefused("owner no longer exists")
+            owner, episode, since = wire.Owner(pid, start), uuid.uuid4().hex, time.time()
+            def refresh() -> wire.AdmitRequest:
+                return admission_client.step_request([program], str(repo), owner, since, str(sidecar), episode, profile)
+            output = admission_client.WaitOutput()
+            grant = admission_client.admit(refresh(), output, refresh, _attempt=before_check)
+            if isinstance(grant, wire.Refused):
+                raise QueuePlaceRefused(grant.reason)
+            if isinstance(grant, admission_client.LeftQueue):
+                raise QueuePlaceRefused("left the admission queue")
+            output.finished()
+            place = QueuePlace(Path(grant.max_path).with_suffix(""), sidecar)
+            failed = False
+            try:
+                yield place
+            except BaseException as error:
+                failed = True
+                place.status = error.code if isinstance(error, SystemExit) and isinstance(error.code, int) else 1
+                raise
+            finally:
+                with defer_cleanup_signals():
+                    place.finish(failed=failed)
+                    _ = admission_client.release(grant.reservation, place.status)
         finally:
             with defer_cleanup_signals():
-                try:
-                    memory_admit.cancel_waiter(pid, root=root)
-                    for path, row in memory_admit.live_reservations(memory_admit.admission_dir(root)):
-                        if row["pid"] == pid and row["sidecar"] == str(sidecar):
-                            memory_admit.release(path, 1, root=root)
-                finally:
-                    for number, handler in handlers.items():
-                        _ = signal.signal(number, handler)
+                for number, handler in handlers.items():
+                    _ = signal.signal(number, handler)
 
 
 if __name__ == "__main__":

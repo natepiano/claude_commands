@@ -90,7 +90,7 @@ from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed, write_text_atom
 from scripts.agents import worker_lifecycle
 
 NO_LOCK_DEADLINE = worker_lifecycle.NO_LOCK_DEADLINE
-from scripts.lib import nix_env, process_group, unit_runs
+from scripts.lib import build_folders, nix_env, process_group, unit_runs
 from scripts.lib.probe_session import PROBE_ENV
 from scripts.production import worker_admission, staff
 from scripts.production.worker_admission import WorkerStartAllowed
@@ -3081,9 +3081,9 @@ def _server_environment(session_dir: str, workers_home: Path) -> dict[str, str]:
 def _set_run(environment: dict[str, str], run: str) -> None:
     """Name the run, and point TMPDIR into its folder so test temp folders end with the run."""
     environment["UNIT_RUN_DIR"] = run
-    temp = Path(run) / "tmp"
     try:
-        temp.mkdir(parents=True, exist_ok=True)
+        temp = build_folders.create_build_folder(build_folders.StableOwnerFolder(
+            unit_runs.RUN_TEMP_NAME, build_folders.ExplicitBuildParent(Path(run))))
     except OSError:
         return
     environment["TMPDIR"] = str(temp)

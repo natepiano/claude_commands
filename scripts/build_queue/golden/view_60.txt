@@ -37,3 +37,4 @@ budget 21.0                         ░░░░██████████�
 30 tool-base… trunk     nextest   2 ██████████▊ 10.8
 31 tool-base… fastest   clippy    1 ██████▊ 6.8
 32 tool-base… assembly  clippy    0 ██████▊ 6.8
+Head: free 24.5 GiB; reserve 3.0 GiB; need 7.6 GiB
