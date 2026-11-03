@@ -1779,6 +1779,17 @@ def run(arguments: list[str]) -> int:
                          for base in bases)
     rulings = read_rulings(args.rulings, messages)
     blocking = 0
+    for (path, test), why in list(rulings.items()):
+        if test.endswith("*"):
+            matches = {(finding.source.path, finding.test) for finding in shared
+                       if finding.kind == "test removed" and finding.source.path == path
+                       and finding.test.startswith(test[:-1])}
+            del rulings[path, test]
+            if not matches:
+                print(f"Assertion-Change: {path}::{test} — {why} — matched no removed test")
+                blocking += 1
+            for key in matches:
+                _ = rulings.setdefault(key, why)
     for finding in aggregate_test_removals(shared):
         why = rulings.get((finding.source.path, finding.test), "")
         prefix = "note: " if finding.kind == "changed" else ""

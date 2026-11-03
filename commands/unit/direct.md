@@ -1389,6 +1389,12 @@ the user, a deploy), run in that repository:
 
 `python3 ~/.claude/scripts/direct/assertion_guard.py --base main`
 
+Use `Assertion-Change: <path>::<test> — <why>` for one test.
+Use `Assertion-Change: <path>::<test-name-prefix>* — <mechanism> deleted` for deleted tests with the same prefix in that path.
+The prefix rules only `test removed` findings.
+It does not rule assertions in tests that remain.
+A prefix that matches no removed test blocks.
+
 Exit 1 (a removed, weaker or turned-off assertion or test with no
 `Assertion-Change:` ruling) or exit 2 (it could not run) stops the hand-off:
 route the finding through <FixDispatch/>, or record its ruling, then run it
