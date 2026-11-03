@@ -500,34 +500,20 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 
 ### Phase 17 — The held-merge message says the covering commit cannot be a merge commit  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** When the merge gate holds a unit's checkpoint for a missing Change-Review line, its message says that the commit carrying the `Change-Review-Covers` line must be a plain commit, not a merge commit.
-
-**Spec:**
-- Source (sdlc showrunner, 2026-10-31, from natedev): the hold message tells the unit to name each listed commit in a `Change-Review-Covers: <hash>` line. `change_review.unit_commits` (`scripts/production/change_review.py:255`) reads with `git log --no-merges`, so a Covers line on a merge commit is never read. This cost verify-unit one failed merge.
-- `merge_checkpoint.change_review_commits` (`scripts/production/merge_checkpoint.py:461-464`): the `Stop("change review", "held", …)` next-step text becomes: `commit a checkpoint (a plain commit, not a merge: the gate does not read merge commits) whose Change-Review lines describe the change and that names each listed commit in a `Change-Review-Covers: <hash>` line, push it, and send its hash`. Build the trailer name from `change_review.TRAILER` as today. Keep the stage name, status and refused list as they are.
-- `scripts/production/change_review.py` module docstring (line 24, "A pushed checkpoint that missed its line is covered by a later one carrying the lines and `Change-Review-Covers: <hash>`"): add that the later one must be a plain commit, because merge commits are not read.
-- Do not change `unit_commits`, `missing` or what the gate reads. Only the text changes.
+- `merge_checkpoint.change_review_commits`: the `change review: held` next step now starts `commit a checkpoint (a plain commit, not a merge: the gate does not read merge commits)`, because `change_review.unit_commits` reads with `--no-merges`. The stage, status and refused list are unchanged.
+- `change_review.COVERS` (`Change-Review-Covers`) is the one name for the Covers trailer; the `_COVERS` regex and the held text use it. The module docstring states the plain-commit rule.
+- Review routed three items to Phase 18: the hook accepts a line on a merge commit (F005), 31 checkpoint merge commits carry unread visible lines (F006), and `merge_gate.py` gives no next step (F008).
 
 **Files:**
-- `scripts/production/merge_checkpoint.py` — the held next-step text
-- `scripts/production/change_review.py` — the module docstring sentence
-- `scripts/production/test_merge_checkpoint_validation.py` — the existing held-before-merge test checks the plain-commit rule (review F001: no second gate run)
-- `docs/as-built/showrunner-automation.md` — the Covers sentence names a plain commit (review F004)
-
-**Workers:** 1 writer; the change is two strings and one test, so nothing splits.
-- `impl` — all three files
-
-**State:** none
-
-**Constraints from prior phases:** Phase 6d's `lands()` in `change_review.py` decides a verdict by its first word; leave it as is.
-
-Assertion-Change: scripts/production/test_merge_checkpoint_validation.py test_a_checkpoint_without_a_change_review_line_is_held_before_merge — `assertNotEqual(result.process.returncode, 0)` becomes `assertEqual(result.process.returncode, 1)` (stricter), and its `"Change-Review-Covers"` literal becomes `change_review.COVERS` (same value).
-
-**Acceptance gate:** `python3 -m unittest scripts.production.test_merge_checkpoint` and `python3 -m unittest scripts.production.test_change_review` pass from the worktree root; `basedpyright scripts/production/merge_checkpoint.py scripts/production/change_review.py scripts/production/test_merge_checkpoint.py` ends `0 errors, 0 warnings, 0 notes`.
+- `scripts/production/merge_checkpoint.py`, `scripts/production/change_review.py`.
+- `scripts/production/test_merge_checkpoint_validation.py` — the held-before-merge test requires exit 1, the refused short hash, the plain-commit phrase and `change_review.COVERS` (no second gate run).
+- `docs/as-built/showrunner-automation.md` — a later plain (non-merge) commit carries the Covers line.
 
 ### Phase 18 — The change-review hook and the merge gate read one rule for merge commits  · status: todo
+
+**Depends on:** Phase 17 (the held next-step text that change_review will own)
 
 #### Work Order
 
