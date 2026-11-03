@@ -116,9 +116,7 @@ The `folder_*` keys control the folder audit. The `sweep_*` keys control the bui
 | `sweep_unexplained_fall_bytes` | Unexplained disk loss that triggers an alert. |
 | `sweep_large_removal_bytes` | Removed bytes that trigger an alert. |
 | `sweep_floor_search_depth` | Maximum folder depth for target discovery. |
-| `sweep_send_timeout_seconds` | Maximum time for a session alert process. |
 | `sweep_sender_timeout_seconds` | Maximum time passed to the session sender. |
-| `sweep_phone_send_grace_seconds` | Extra process time after the phone review limit. |
 | `sweep_holder_lookback_seconds` | Use window before a build hold starts. |
 | `sweep_delete_stamp_grace_seconds` | Use stamp tolerance after a sweep deletion. |
 | `sweep_history_timeout_seconds` | Maximum time to read build history. |
@@ -236,7 +234,7 @@ The user completes deployment before target activation.
 `credentials_profile=build-scaler` names the user's AWS CLI profile. This file contains no credential.
 `kinds=test,check,doc` excludes lint. An empty `ci_repo` disables GitHub calls.
 
-`monthly_limit_usd=400` is the user's monthly spending limit (approved 2026-11-01). `daily_limit_usd=20` is derived (the monthly limit / 20) and waits for the user's approval at go-live.
+`monthly_limit_usd=400` is the user's monthly spending limit (approved 2026-11-01). `daily_limit_usd=20` is derived (the monthly limit / 20); the user approved it on 2026-11-03.
 The AWS Budget must read `monthly_limit_usd`. Code must never raise either limit.
 The spending reserve is $3. The maximum drain time is 60 minutes.
 Each repository budget stays within the 32 GiB build budget.
@@ -285,7 +283,11 @@ Deployment settings require the account inputs before preparation.
 `deployment_profile` names the administrator profile. `credentials_profile` names the scaler profile.
 `stack_name`, `availability_zone`, `vpc_id`, and `subnet_id` select the deployment location.
 `ami_id`, `ami_owner_id`, `nixos_release`, and `root_device_name` identify the official x86_64 NixOS image.
-`notification_email` receives the Budget notices. The `budget_notice_*_percent` keys set their thresholds.
+`notification_email_file` names a private file with one address for Budget notices.
+The default path is `~/.config/aws-build/notification-email`.
+Keep this file outside the public repository. Never put the address in a tracked file.
+Only `prepare` and `apply` read the address file. `bootstrap` needs no address file.
+The `budget_notice_*_percent` keys set the notice thresholds.
 `budget_stop_percent` sets the stop threshold. The live spending guard remains the primary limit.
 `root_volume_gib` sizes the root volume.
 `data_volume_gib`, `data_volume_iops`, and `data_volume_throughput` fix the retained volume settings through their conf limits.

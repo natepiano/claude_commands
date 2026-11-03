@@ -12,3 +12,6 @@ def copy_session_modules(destination: Path) -> None:
     destination.mkdir(parents=True, exist_ok=True)
     for name in _SESSION_MODULE_FILES:
         _ = shutil.copy2(source / name, destination / name)
+    library = destination.parent / "lib"
+    library.mkdir(parents=True, exist_ok=True)
+    _ = shutil.copy2(source.parent / "lib/session_paths.py", library / "session_paths.py")

@@ -179,6 +179,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypeGuard, TypedDict, cast, overload, override
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.message import send_budget
 import conf
 from process_failure import failure_detail
 from user_zone import user_zone  # noqa: E402
@@ -2671,7 +2673,7 @@ def send_holder_message(session: str, message: str, *,
     if isinstance(lint_settings, UseConfiguredValue):
         lint_settings = conf.read("lint")
     try:
-        result = subprocess.run(session_send_argv(session, lint_settings=lint_settings), input=message, text=True, capture_output=True, timeout=lint_settings.number("sweep_send_timeout_seconds"))
+        result = subprocess.run(session_send_argv(session, lint_settings=lint_settings), input=message, text=True, capture_output=True, timeout=send_budget.seconds(lint_settings.number("sweep_sender_timeout_seconds")))
     except (OSError, subprocess.TimeoutExpired) as error:
         print(f"lint sweep: message to {session} failed: {error}", file=sys.stderr)
         return False
@@ -2709,7 +2711,7 @@ def send_floor_alert(message: str, channels: FloorAlertChannels, *,
     delivered = False
     for channel, command in commands:
         try:
-            timeout = review.user_send_seconds() + lint_settings.number("sweep_phone_send_grace_seconds") if channel == "phone" else lint_settings.number("sweep_send_timeout_seconds")
+            timeout = send_budget.user_seconds(review.user_send_seconds()) if channel == "phone" else send_budget.seconds(lint_settings.number("sweep_sender_timeout_seconds"))
             result = subprocess.run(command, input=message if channel == "message" else None, text=True, capture_output=True, timeout=timeout)
             if result.returncode == 0 or (channel == "message" and result.returncode == 1):
                 delivered = True

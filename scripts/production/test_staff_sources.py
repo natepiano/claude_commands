@@ -39,6 +39,18 @@ from unit_lookup import ProductionMembers, live_unit_table, retired_units, unit_
 
 
 class StaffSourcesTests(StaffTestCase):
+    def test_existing_member_location_ignores_an_absent_worktree_column(self) -> None:
+        from scripts.production.staff_test_support import without_worktree_column
+        fixture = self.row_production()
+        without_worktree_column(fixture.doc)
+        before = self.staff_file.read_bytes()
+        selected = staff_sources.member(staff_sources.UnitMember(fixture.slug, "member-unit"), staff.snapshot())
+        self.assertIsInstance(selected, staff_sources.MemberFound)
+        assert isinstance(selected, staff_sources.MemberFound)
+        self.assertEqual(selected.row.worktree, staff.PresentWorktree("natedev", fixture.worktree))
+        self.assertEqual(self.staff_file.read_bytes(), before)
+
+
     @override
     def tree(self) -> tuple[staff.StaffRow, staff.StaffRow, staff.StaffRow]:
         owner, unit, worker = super().tree()
