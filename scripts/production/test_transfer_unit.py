@@ -1,7 +1,7 @@
 """Transfer units between disposable productions with real Git worktrees."""
 from __future__ import annotations
 
-from scripts.production.staff_test_support import fixture_member, fixture_runtime_id
+from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, unit_membership
 
 import json
 import os
@@ -40,6 +40,34 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 @final
 class UnitTransferTests(UnitTransferFixture):
+    def test_transfer_uses_staff_after_the_worktree_column_is_removed(self) -> None:
+        from scripts.production.staff_test_support import without_worktree_column
+        document = self.giving / "docs/plans/demo-production.md"
+        without_worktree_column(document)
+        _ = self.git("add", str(document), cwd=self.giving)
+        _ = self.git("commit", "-m", "Remove the display column", cwd=self.giving)
+        self.assert_ok(self.transfer("apply"))
+        self.assertTrue(self.unit.is_dir())
+        row = unit_membership("other", "alpha-unit")
+        self.assertEqual(row.worktree, staff.PresentWorktree("natedev", self.unit))
+
+
+    def test_transfer_uses_the_absolute_plan_when_the_director_runs_elsewhere(self) -> None:
+        document = self.giving / "docs/plans/demo-production.md"
+        plan = self.unit / "docs/plans/alpha.md"
+        _ = document.write_text(document.read_text().replace("docs/plans/alpha.md", str(plan)))
+        _ = self.git("add", str(document), cwd=self.giving)
+        _ = self.git("commit", "-m", "Record the branch plan", cwd=self.giving)
+        director = self.root / "director-folder"
+        director.mkdir()
+        row = unit_membership("demo", "alpha-unit")
+        _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", director), expected=row.worktree)
+        self.assert_ok(self.transfer("apply"))
+        retained = unit_membership("other", "alpha-unit")
+        self.assertEqual(retained.id, row.id)
+        self.assertEqual(retained.worktree, staff.PresentWorktree("natedev", director))
+        self.assertTrue(self.unit.is_dir())
+
     @override
     def setUp(self) -> None:
         super().setUp()
@@ -646,6 +674,9 @@ class UnitTransferTests(UnitTransferFixture):
         _ = self.git("init", "-b", "far", cwd=elsewhere)
         self.write(elsewhere / "docs/plans/far-production.md", self.production_doc(
             "far", elsewhere, "| Unit | Plan | Worktree | Branch |", "| --- | --- | --- | --- |"))
+        document = elsewhere / "docs/plans/far-production.md"
+        self.register_production("far", document)
+        _ = fixture_member("showrunner", name="far", doc=staff.LiveDoc("natedev", document))
         self.assert_refused(self.transfer("plan", to=elsewhere / "docs/plans/far-production.md"),
                             "another repository")
 

@@ -210,7 +210,7 @@ Canonical `mac` and `natedev` names identify observations independently of a des
 The board sums available machine counts and identifies an unavailable peer.
 
 `status --stored` reads saved usage, role maps, and peer counts.
-It starts no discovery, SSH request, detached counts fetch, fetch lock, or cache write.
+It starts no discovery and does not wait for the detached counts fetch.
 Local session counts still use current local registry evidence.
 The [board design](unit-board.md) owns the display contract and refresh lifecycle.
 

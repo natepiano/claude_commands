@@ -8,6 +8,7 @@ import subprocess
 import tomllib
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field, replace
+from enum import Enum
 from pathlib import Path
 from typing import NamedTuple, cast
 
@@ -24,6 +25,10 @@ from sessions import SessionRecord
 from place import HerdrPlace
 from pane_launch import PaneLaunch
 import unit_names
+
+
+class ReadCurrentStaff(Enum):
+    CURRENT = "current"
 
 
 PRODUCTION_MARK = "SHOWRUNNER_UNIT"

@@ -162,7 +162,6 @@ class RosterTests(unittest.TestCase):
         _ = self.enterContext(environment_patch)
         _ = self.enterContext(mock.patch.object(showrunners, "CONFIG", config))
         _ = self.enterContext(mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", self.notifier))
-        _ = self.enterContext(mock.patch.object(showrunners, "SESSIONS_DIR", self.sessions))
         _ = self.enterContext(mock.patch.object(
             showrunners, "SESSIONS", Path(__file__).with_name("sessions.py"),
         ))
@@ -1929,7 +1928,7 @@ class RosterTests(unittest.TestCase):
                 ))
             with mock.patch.dict(os.environ, {
                 "HOME": str(home), "AGENT_NOTES_DIR": str(notes), "ROSTER_CODEX_SOCKET": "",
-            }), mock.patch.object(codex_daemon, "TIMEOUT_SECONDS", 0.3), \
+            }), mock.patch.object(codex_daemon, "timeout_seconds", return_value=0.3), \
                     mock.patch.object(codex_daemon, "read_daemons", new=timed_read_daemons):
                 found = roster.roster(os.environ, roster.ThisMachine())
             self.assertEqual(len(read_times), 1)

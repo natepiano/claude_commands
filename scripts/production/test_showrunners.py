@@ -376,7 +376,7 @@ class ShowrunnerRegistryTests(ShowrunnerFixture):
             with (self.subTest(command=command),
                   mock.patch.dict(os.environ, self.environment()),
                   mock.patch.multiple(showrunners, NOTIFIER_STATE_DIR=self.notifier,
-                                      SESSIONS_DIR=self.sessions, SESSIONS=self.sessions_script,
+                                      SESSIONS=self.sessions_script,
                                       SHOWRUNNER_STATE_DIR=self.state),
                   mock.patch.object(showrunners, "socket_for", side_effect=lookup),
                   redirect_stdout(output), redirect_stderr(errors)):
@@ -541,7 +541,6 @@ class ShowrunnerRegistryTests(ShowrunnerFixture):
         self.assertEqual(self.successful("name", "old"), "new-name\n")
         with (mock.patch.dict(os.environ, self.environment()),
               mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", self.notifier),
-              mock.patch.object(showrunners, "SESSIONS_DIR", self.sessions),
               mock.patch.object(showrunners, "SESSIONS", self.sessions_script)):
             self.assertEqual(showrunners.current_address("old"), address)
             self.assertEqual(showrunners.current_name("old"), "new-name")
@@ -550,7 +549,6 @@ class ShowrunnerRegistryTests(ShowrunnerFixture):
         self.showrunner("new", formerly=("old",), name="new-name")
         with (mock.patch.dict(os.environ, self.environment()),
               mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", self.notifier),
-              mock.patch.object(showrunners, "SESSIONS_DIR", self.sessions),
               mock.patch.object(showrunners, "SESSIONS", self.sessions_script)):
             self.assertEqual(showrunners.named("new-name")["slug"], "new")
             self.assertEqual(showrunners.named("old")["slug"], "new")
@@ -562,7 +560,6 @@ class ShowrunnerRegistryTests(ShowrunnerFixture):
         self.showrunner("z-new", formerly=("old",))
         with (mock.patch.dict(os.environ, self.environment()),
               mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", self.notifier),
-              mock.patch.object(showrunners, "SESSIONS_DIR", self.sessions),
               mock.patch.object(showrunners, "SESSIONS", self.sessions_script)):
             self.assertEqual(showrunners.named("old")["slug"], "z-new")
 

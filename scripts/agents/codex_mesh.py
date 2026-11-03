@@ -97,6 +97,7 @@ from scripts.production.worker_admission import WorkerStartAllowed
 from scripts.astra.design_roles import PhaseBoundDesigner, ReadOnlyReviewer, ThreadAccessPolicy
 from scripts.message import sessions, process_table
 from scripts.message import repeat_guard
+from scripts.message import send_budget
 from scripts.whoami import account
 from scripts.usage import agents_log
 from scripts.whoami.agent_accounts import (
@@ -8609,7 +8610,6 @@ def command_sweep(args: argparse.Namespace) -> int:
 
 # Delivers the sign-in change notice to the session holding a run.
 SEND_SCRIPT = Path(__file__).resolve().parent.parent / "message" / "send.py"
-NOTICE_TIMEOUT_SECS = 120
 
 
 def _marker_sessions(roots: tuple[Path, ...], folder: Path) -> list[str]:
@@ -8677,7 +8677,7 @@ def _notify_holder(session_id: str, line: str, kind: CodexNoticeKind) -> None:
         sent = subprocess.run(
             [sys.executable, str(SEND_SCRIPT), "--to", f"session:{session_id}", "--from", "codex-workers" if workers_changed else "codex-sign-in",
              "--summary", "Codex workers account changed" if workers_changed else "Codex sign-in changed", "--text", line],
-            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=NOTICE_TIMEOUT_SECS, check=False,
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=send_budget.seconds(), check=False,
         )
     except (OSError, subprocess.SubprocessError) as exc:
         print(f"codex_mesh: could not tell session {session_id}: {exc}", file=sys.stderr)
