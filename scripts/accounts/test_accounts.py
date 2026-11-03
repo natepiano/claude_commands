@@ -87,6 +87,28 @@ def setUpModule() -> None:
 
 
 
+def accounts_reader_calls(source: str) -> dict[str, set[str]]:
+    """Collect each method called on the accounts configuration."""
+    readers: dict[str, set[str]] = {}
+    for node in ast.walk(ast.parse(source)):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.args and isinstance(node.args[0], ast.Constant)
+                and isinstance(node.args[0].value, str)):
+            continue
+        receiver = node.func.value
+        configured = isinstance(receiver, ast.Name) and receiver.id == "account_config"
+        if isinstance(receiver, ast.Call):
+            configured = (isinstance(receiver.func, ast.Name) and receiver.func.id == "read_account_settings"
+                or isinstance(receiver.func, ast.Attribute) and receiver.func.attr == "read_account_settings"
+                or isinstance(receiver.func, ast.Attribute) and isinstance(receiver.func.value, ast.Name)
+                and receiver.func.value.id == "conf" and receiver.func.attr == "read"
+                and bool(receiver.args) and isinstance(receiver.args[0], ast.Constant)
+                and receiver.args[0].value == "accounts")
+        if configured:
+            readers.setdefault(node.args[0].value, set()).add(node.func.attr)
+    return readers
+
+
 class AccountsConfigurationTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
@@ -99,19 +121,15 @@ class AccountsConfigurationTests(unittest.TestCase):
             config = Path(temporary) / "accounts.conf"
             _ = config.write_bytes((root / "config/accounts.conf").read_bytes())
             with patch.dict(os.environ, {"CONF_DIR": temporary}):
-                configured = conf.values("accounts")
+                account_config = conf.read("accounts")
+                configured = account_config.values()
                 readers: dict[str, set[str]] = {}
                 sources = [*(root / "scripts/accounts").glob("*.py"), root / "scripts/whoami/note_file.py"]
                 for source in sources:
                     if source.name.startswith("test_"):
                         continue
-                    for node in ast.walk(ast.parse(source.read_text())):
-                        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-                                and isinstance(node.func.value, ast.Name) and node.func.value.id == "conf"
-                                and len(node.args) == 2 and isinstance(node.args[0], ast.Constant)
-                                and node.args[0].value == "accounts" and isinstance(node.args[1], ast.Constant)
-                                and isinstance(node.args[1].value, str)):
-                            readers.setdefault(node.args[1].value, set()).add(node.func.attr)
+                    for key, kinds in accounts_reader_calls(source.read_text()).items():
+                        readers.setdefault(key, set()).update(kinds)
                 self.assertEqual(set(configured), set(readers))
                 for key, kinds in readers.items():
                     with self.subTest(key=key):
@@ -119,11 +137,31 @@ class AccountsConfigurationTests(unittest.TestCase):
                         kind = next(iter(kinds))
                         self.assertIn(kind, ("whole", "number", "text"))
                         if kind == "whole":
-                            self.assertEqual(conf.whole("accounts", key), int(configured[key]))
+                            self.assertEqual(account_config.whole(key), int(configured[key]))
                         elif kind == "number":
-                            self.assertEqual(conf.number("accounts", key), float(configured[key]))
+                            self.assertEqual(account_config.number(key), float(configured[key]))
                         else:
-                            self.assertEqual(conf.text("accounts", key), configured[key])
+                            self.assertEqual(account_config.text(key), configured[key])
+
+    def test_accounts_reader_scan_exposes_a_wrong_usage_age_method(self) -> None:
+        source = Path(accounts.__file__).read_text()
+        changed = source.replace('.whole("usage_stale_minutes")', '.words("usage_stale_minutes")', 1)
+        readers = accounts_reader_calls(changed)
+        self.assertEqual(readers["usage_stale_minutes"], {"whole", "words"})
+        self.assertNotEqual(readers, accounts_reader_calls(source))
+        self.assertNotIn("unrelated", accounts_reader_calls('other.words("unrelated")'))
+
+        original_read = Path.read_text
+
+        def mutated_read(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+            return changed if path == Path(accounts.__file__) else original_read(path, encoding=encoding, errors=errors)
+
+        result = unittest.TestResult()
+        with patch.object(Path, "read_text", new=mutated_read):
+            result = cast(unittest.TestResult, AccountsConfigurationTests("test_each_accounts_key_has_a_typed_reader_and_parses").run(result))
+        self.assertEqual(len(result.failures), 1)
+        self.assertEqual(result.errors, [])
+        self.assertIn("usage_stale_minutes", str(result.failures[0][0]))
 
     def test_usage_age_changes_without_a_module_reload(self) -> None:
         root = Path(__file__).resolve().parents[2]
@@ -3654,7 +3692,8 @@ finally:
         self.assertIn("fixture render failed", error)
 
     def test_piped_status_replays_render_warning_when_rendering_fails(self) -> None:
-        def render(_reading: accounts.StatusReading) -> str:
+        def render(_reading: accounts.StatusReading, *, account_config: conf.ConfigRead) -> str:
+            del account_config
             print("fixture render warning", file=sys.stderr)
             raise accounts.AccountsError("accounts: fixture render failed")
         with patch.object(accounts, "render_status_json", side_effect=render):
@@ -3676,9 +3715,9 @@ finally:
 
     def test_piped_status_preserves_unknown_reader_and_renderer_warnings(self) -> None:
         original = accounts.render_status_json
-        def render(reading: accounts.StatusReading) -> str:
+        def render(reading: accounts.StatusReading, *, account_config: conf.ConfigRead) -> str:
             print("fixture renderer warning", file=sys.stderr)
-            return original(reading)
+            return original(reading, account_config=account_config)
         with patch.object(accounts, "render_status_json", side_effect=render):
             code, output, error = self.run_cli("status", "--stored", "--json")
         self.assertEqual(code, 0)

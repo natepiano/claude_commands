@@ -94,7 +94,7 @@ def configured_peers() -> tuple[SyncPeer, ...]:
     peers: list[SyncPeer] = []
     for target in read_targets():
         if isinstance(target, SshTarget):
-            host = conf.values(target.settings).get("host", "")
+            host = conf.read(target.settings).values().get("host", "")
             if not host or host.startswith("-") or any(character.isspace() for character in host):
                 raise ValueError(f"invalid sync host for {target.name}")
             peers.append(SyncPeer(target.name, host))

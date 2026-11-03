@@ -37,11 +37,12 @@ def send_failure_once(session: Path, phase: str, reason: str) -> None:
     from scripts.lib import conf
     from scripts.lib.process_failure import failure_detail
 
+    settings_read = conf.read('direct')
     try:
         state = json_object((session / "progress_history_state.json").read_text())
         unit = state.get("unit") or session.name
-        target = conf.text("direct", "SIMPLIFY_FAILURE_TARGET")
-        repeat = conf.whole("direct", "SIMPLIFY_FAILURE_REPEAT_MINUTES")
+        target = settings_read.text("SIMPLIFY_FAILURE_TARGET")
+        repeat = settings_read.whole("SIMPLIFY_FAILURE_REPEAT_MINUTES")
         digest = Path(os.environ.get("UNIT_REVIEW_CACHE_FILE", "")).stem
         key = hashlib.sha256(json.dumps([digest, reason]).encode()).hexdigest()
         sender = os.environ.get("SIMPLIFY_FAILURE_SENDER") or str(Path(__file__).resolve().parents[1] / "message/send.py")
@@ -161,7 +162,7 @@ def main() -> int:
     log_path = cast(Path, args.log_file)
     report = report_path.read_text() if report_path.exists() else ""
     log = log_path.read_text(errors="replace") if log_path.exists() else ""
-    reason = validate(report, log, conf.whole("direct", "SIMPLIFY_AGENT_COUNT"))
+    reason = validate(report, log, conf.read("direct").whole("SIMPLIFY_AGENT_COUNT"))
     if reason:
         if not report.strip() or report.strip().splitlines()[:1] == ["Pass"] or re.match(r"^1[.)]\s", report.strip()):
             _ = report_path.write_text(f"ERROR: {reason}")

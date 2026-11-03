@@ -50,7 +50,7 @@ def note_name(label: str) -> str:
 
 @cache
 def _configured_notes_dir() -> Path:
-    return Path(conf.text("accounts", "notes_directory")).expanduser()
+    return Path(conf.read("accounts").text("notes_directory")).expanduser()
 
 
 def notes_dir() -> Path:

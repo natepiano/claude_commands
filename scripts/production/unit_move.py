@@ -634,9 +634,9 @@ def _folder_move_config() -> Path:
     return Path(os.environ.get("PRODUCTION_CONFIG", Path(__file__).resolve().parents[2] / "config/production.conf"))
 
 
-def folder_move_deadline(key: str) -> float:
+def folder_move_deadline(key: str, settings: conf.ConfigRead) -> float:
     """The operation deadline can shorten the configured wait."""
-    deadline = min(time.monotonic() + conf.number(_folder_move_config(), key), worker_lifecycle.effective_deadline())
+    deadline = min(time.monotonic() + settings.number(key), worker_lifecycle.effective_deadline())
     if deadline <= time.monotonic():
         raise worker_lifecycle.OperationDeadlineExpired("folder move operation deadline expired")
     return deadline
@@ -645,13 +645,14 @@ def folder_move_deadline(key: str) -> float:
 class FolderMoveWait:
     """A bounded wait with one poll interval for a folder-move step."""
 
-    def __init__(self, key: str) -> None:
+    def __init__(self, key: str, settings: conf.ConfigRead) -> None:
         self.key: str = key
-        self.poll: float = conf.number(_folder_move_config(), "FOLDER_MOVE_POLL_SECONDS")
-        self.deadline: float = folder_move_deadline(key)
+        self.settings: conf.ConfigRead = settings
+        self.poll: float = settings.number("FOLDER_MOVE_POLL_SECONDS")
+        self.deadline: float = folder_move_deadline(key, settings)
 
     def restart(self) -> None:
-        self.deadline = folder_move_deadline(self.key)
+        self.deadline = folder_move_deadline(self.key, self.settings)
 
     def sleep(self, failure: str) -> None:
         remaining = self.deadline - time.monotonic()
@@ -660,13 +661,14 @@ class FolderMoveWait:
         time.sleep(min(self.poll, remaining))
 
 
-def stop_folder_session(row: staff.StaffRow, launch: FolderLaunch) -> None:
+def stop_folder_session(row: staff.StaffRow, launch: FolderLaunch,
+                        settings: conf.ConfigRead) -> None:
     """Stop only the proved member and retain its pane at the shell."""
     observed = folder_session(row, launch)
     if isinstance(observed, StoppedFolderSession):
         return
     pane = _folder_pane(row, launch)
-    wait = FolderMoveWait("FOLDER_MOVE_STOP_SECONDS")
+    wait = FolderMoveWait("FOLDER_MOVE_STOP_SECONDS", settings)
     live = sessions.process_liveness(observed.pid, observed.started)
     if not isinstance(live, sessions.LiveSessionProcess):
         raise RenameRefused(f"{row.id}: process identity changed before stop")
@@ -685,7 +687,8 @@ def stop_folder_session(row: staff.StaffRow, launch: FolderLaunch) -> None:
         wait.sleep(f"{row.id}: session did not leave its retained pane at the shell")
 
 
-def resume_folder_session(row: staff.StaffRow, launch: FolderLaunch) -> None:
+def resume_folder_session(row: staff.StaffRow, launch: FolderLaunch,
+                          settings: conf.ConfigRead) -> None:
     """Resume the same conversation and account in the retained terminal."""
     pane = _folder_pane(row, launch)
     entry = pane_record.read_strict(launch.session).get(launch.entry["pane_id"])
@@ -717,7 +720,7 @@ def resume_folder_session(row: staff.StaffRow, launch: FolderLaunch) -> None:
                "sh", "-c", 'cd -- "$1" && shift && exec "$@"', "resume", entry["cwd"],
                sys.executable, str(Path(__file__).resolve().parents[1] / "accounts/accounts.py"),
                "exec", config.name.removeprefix("."), *arguments]
-    wait = FolderMoveWait("FOLDER_MOVE_RESUME_SECONDS")
+    wait = FolderMoveWait("FOLDER_MOVE_RESUME_SECONDS", settings)
     try:
         client.run_in_pane(pane["pane_id"], command)
         while True:
@@ -980,7 +983,8 @@ def validate_folder_workers(selected: FolderSessions) -> None:
                 raise RenameRefused(f"{run}/{worker.name}: worker changed during the folder move")
 
 
-def pause_folder_workers(selected: FolderSessions | UnrecordedFolderSessions) -> None:
+def pause_folder_workers(selected: FolderSessions | UnrecordedFolderSessions,
+                         settings: conf.ConfigRead) -> None:
     """Use the shutdown pause, then stop only the proved remaining run processes."""
     if not isinstance(selected, FolderSessions):
         return
@@ -1001,7 +1005,7 @@ def pause_folder_workers(selected: FolderSessions | UnrecordedFolderSessions) ->
             raise RenameRefused(f"{run}: shutdown did not pause every worker")
     if not selected.processes:
         return
-    wait = FolderMoveWait("FOLDER_MOVE_STOP_SECONDS")
+    wait = FolderMoveWait("FOLDER_MOVE_STOP_SECONDS", settings)
     remaining: list[OwnedFolderProcess] = []
     for process in selected.processes:
         if not folder_process_live(process):
@@ -1275,13 +1279,14 @@ def _resume_worker(path: Path, move: FolderMove, worker: FolderWorker, wait: Fol
         wait.sleep(f"{worker.name}: worker resume is not yet proved; rerun move-folder")
 
 
-def restore_folder_workers(path: Path, move: FolderMove) -> None:
+def restore_folder_workers(path: Path, move: FolderMove,
+                           settings: conf.ConfigRead) -> None:
     """Resume only the workers that were running, using their existing thread launchers."""
     if not isinstance(move.sessions, FolderSessions) or not move.sessions.workers:
         return
     validate_folder_workers(move.sessions)
     waiting = tuple(worker for worker in move.sessions.workers if not worker.restored)
-    wait = FolderMoveWait("FOLDER_MOVE_RESUME_SECONDS") if any(worker.was_running for worker in waiting) else None
+    wait = FolderMoveWait("FOLDER_MOVE_RESUME_SECONDS", settings) if any(worker.was_running for worker in waiting) else None
     for worker in waiting:
         if worker.was_running:
             assert wait is not None
@@ -1397,6 +1402,7 @@ def folder_move_lock(unit: staff.StaffId) -> Generator[None]:
 def move_folder(unit: staff.StaffId, destination: Path) -> None:
     """Finish one folder move without changing the member's name or branch."""
     destination = destination.expanduser().resolve()
+    settings = conf.read(_folder_move_config())
     with folder_move_lock(unit), ExitStack() as operation:
         _ = operation.enter_context(staff.operation())
         _ = operation.enter_context(herdr.process_action())
@@ -1421,7 +1427,7 @@ def move_folder(unit: staff.StaffId, destination: Path) -> None:
                     if isinstance(launch, FolderLaunch) and launch.entry.get("ended", False):
                         observed = folder_session(row, launch)
                         if isinstance(observed, RunningFolderSession):
-                            resume_folder_session(row, launch)
+                            resume_folder_session(row, launch, settings)
                 print("unchanged")
                 return
             move = previous
@@ -1461,7 +1467,7 @@ def move_folder(unit: staff.StaffId, destination: Path) -> None:
                 move.steps["stop"] = move.steps["resume"] = FolderStepState.SKIPPED
             if selected.prior is PriorFolderSession.RUNNING or has_mesh:
                 for key in ("FOLDER_MOVE_STOP_SECONDS", "FOLDER_MOVE_RESUME_SECONDS", "FOLDER_MOVE_POLL_SECONDS"):
-                    _ = conf.number(_folder_move_config(), key)
+                    _ = settings.number(key)
             save_folder_move(path, move)
         unit_running = not isinstance(move.sessions, FolderSessions) or move.sessions.prior is PriorFolderSession.RUNNING
         for step in FOLDER_MOVE_STEPS:
@@ -1469,8 +1475,8 @@ def move_folder(unit: staff.StaffId, destination: Path) -> None:
                 continue
             if step == "stop":
                 if unit_running:
-                    stop_folder_session(row, retained_launch(launch))
-                pause_folder_workers(move.sessions)
+                    stop_folder_session(row, retained_launch(launch), settings)
+                pause_folder_workers(move.sessions, settings)
             elif step == "worktree":
                 if isinstance(folder_session(row, launch), RunningFolderSession):
                     raise RenameRefused(f"{unit}: session resumed before the folder move")
@@ -1495,9 +1501,9 @@ def move_folder(unit: staff.StaffId, destination: Path) -> None:
                 move_folder_worker_paths(move)
             else:
                 if unit_running:
-                    resume_folder_session(row, retained_launch(launch))
+                    resume_folder_session(row, retained_launch(launch), settings)
                 operation.close()
-                restore_folder_workers(path, move)
+                restore_folder_workers(path, move, settings)
             move.steps[step] = FolderStepState.DONE
             save_folder_move(path, move)
         print(f"moved {unit}: {move.old} -> {move.new}")

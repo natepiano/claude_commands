@@ -566,7 +566,7 @@ def trim_build_folder(target: Path, environment: dict[str, str]) -> int:
         'import sweep',
         'import conf',
         'config = conf.path("lint")',
-        'recent_seconds = int(conf.number(config, sweep.RECENT_KEY) * 60)',
+        'recent_seconds = int(conf.read(config).number(sweep.RECENT_KEY) * 60)',
         'sys.exit(sweep.sweep_workspace(sys.argv[1], str(config), False, recent_seconds / 60))',
     ))
     return subprocess.run([sys.executable, '-c', code, str(target)],

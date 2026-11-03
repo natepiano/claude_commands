@@ -60,13 +60,14 @@ def positive_seconds(value: str) -> int:
     return seconds
 
 
-def read_settings(path: Path) -> SpendingSettings:
+def read_settings(path: Path | conf.ConfigRead) -> SpendingSettings:
     """Refuse recovered spending data while preserving ordinary configuration recovery."""
+    settings = conf.read(path) if isinstance(path, Path) else path
     limits: list[LimitSettingEvidence] = []
     errors: list[str] = []
 
     def amount(key: str) -> Decimal:
-        origin = conf.value_origin(path, key, money)
+        origin = settings.origin(key, money)
         state = "live" if isinstance(origin, conf.UsableLiveValue) else "recovered" if isinstance(origin, conf.RecoveredValue) else "unavailable"
         reason = "" if isinstance(origin, conf.UsableLiveValue) else origin.reason
         if key in ("daily_limit_usd", "monthly_limit_usd"):
@@ -89,7 +90,7 @@ def read_settings(path: Path) -> SpendingSettings:
         raise SpendingConfigurationUnavailable("; ".join(errors), tuple(limits))
 
     def live_text(key: str) -> str:
-        result = conf.value_origin(path, key, str)
+        result = settings.origin(key, str)
         if not isinstance(result, conf.UsableLiveValue):
             raise SpendingConfigurationUnavailable(result.reason, tuple(limits))
         if not result.value:
@@ -97,7 +98,7 @@ def read_settings(path: Path) -> SpendingSettings:
         return result.value
 
     def seconds(key: str) -> int:
-        result = conf.value_origin(path, key, positive_seconds)
+        result = settings.origin(key, positive_seconds)
         if not isinstance(result, conf.UsableLiveValue):
             raise SpendingConfigurationUnavailable(result.reason, tuple(limits))
         return result.value
@@ -136,20 +137,21 @@ class ControlSettings:
     remote_state_directory: str
 
 
-def read_control_settings(path: Path) -> ControlSettings:
-    values = conf.values(path)
-    enabled = conf.text(path, 'offload') == 'on'
+def read_control_settings(path: Path | conf.ConfigRead) -> ControlSettings:
+    settings = conf.read(path) if isinstance(path, Path) else path
+    values = settings.values()
+    enabled = settings.text('offload') == 'on'
     def required(key: str) -> str:
-        value = conf.text(path, key)
+        value = settings.text(key)
         if not value.strip():
             raise ValueError(f'{key}: expected nonempty text')
         return value
     return ControlSettings(enabled, required('instance_type'), required('region') if enabled else values.get('region', ''),
                            required('instance_id') if enabled else values.get('instance_id', ''),
-                           required('credentials_profile'), conf.number(path, 'start_after_wait_s'),
-                           conf.whole(path, 'start_min_waiting'), conf.number(path, 'capacity_backoff_s'),
-                           conf.number(path, 'drain_max_minutes'), conf.number(path, 'idle_stop_minutes'),
-                           conf.number(path, 'tick_interval_s'), conf.number(path, 'aws_timeout_s'),
-                           conf.number(path, 'snapshot_max_age_s'), conf.number(path, 'permission_ttl_s'),
-                           conf.number(path, 'interruption_poll_s'), conf.number(path, 'imds_timeout_s'),
+                           required('credentials_profile'), settings.number('start_after_wait_s'),
+                           settings.whole('start_min_waiting'), settings.number('capacity_backoff_s'),
+                           settings.number('drain_max_minutes'), settings.number('idle_stop_minutes'),
+                           settings.number('tick_interval_s'), settings.number('aws_timeout_s'),
+                           settings.number('snapshot_max_age_s'), settings.number('permission_ttl_s'),
+                           settings.number('interruption_poll_s'), settings.number('imds_timeout_s'),
                            required('remote_state_directory'))

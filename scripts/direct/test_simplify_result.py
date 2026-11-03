@@ -15,6 +15,7 @@ import unittest
 from unittest.mock import patch
 
 from scripts.direct import simplify_result
+from scripts.lib import conf
 from scripts.lib.nix_env_test_support import NixFixture, ROOT
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.whoami.account_test_support import write_claude_account
@@ -128,6 +129,23 @@ class SimplifyResultTests(unittest.TestCase):
             with patch("scripts.direct.simplify_result.subprocess.run", return_value=subprocess.CompletedProcess([], 0, "", "")) as send:
                 simplify_result.send_failure_once(self.directory, "phase", "failure")
         return cast(list[str], send.call_args.args[0])
+
+    def test_failure_finish_reads_the_direct_settings_once(self) -> None:
+        from scripts.lint.memory_test_support import write_config_fixture
+
+        _ = write_config_fixture(self.directory / "direct.conf", "")
+        _ = (self.directory / "progress_history_state.json").write_text('{"unit": "fixture-unit"}')
+        _ = (self.directory / "review_findings_1_simplify.txt").write_text("ERROR: review stopped")
+        with (patch.dict(os.environ, {"CONF_DIR": str(self.directory)}, clear=True),
+              patch.object(conf, "read", wraps=conf.read) as reads,
+              patch.object(subprocess, "run",
+                           return_value=subprocess.CompletedProcess([], 0, "", "")) as send,
+              contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO())):
+            simplify_result.finish(self.directory, self.directory, "phase", "", 1)
+        reads.assert_called_once_with("direct")
+        arguments = cast(list[str], send.call_args.args[0])
+        self.assertIn("Reason: review stopped", arguments[arguments.index("--text") + 1])
+        self.assertEqual((self.directory / "review_status_simplify").read_text(), "error\n")
 
     def test_failure_messages_use_the_sender_beside_the_review_module(self) -> None:
         arguments = self.failure_message_arguments("")

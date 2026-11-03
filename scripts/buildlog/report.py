@@ -1495,7 +1495,7 @@ def moments_section(connection: sqlite3.Connection, day: str) -> list[str]:
     ]
     if any(isinstance(window.moment, moments.MemoryMoment) for window in windows):
         lines += [
-            f"Earlyoom kills/day, builds: oom_score_adj {conf.whole("lint", "build_oom_score_adj")}, plus any other adjustment whose cmdline program is under /target/; the latter are outside the build gate. Others are every remaining kill; journal unavailable is not zero.",
+            f"Earlyoom kills/day, builds: oom_score_adj {conf.read("lint").whole("build_oom_score_adj")}, plus any other adjustment whose cmdline program is under /target/; the latter are outside the build gate. Others are every remaining kill; journal unavailable is not zero.",
             "Full memory stall: stall_full_us deltas ÷ sampled elapsed microseconds, natedev's 60 s samples; resets, boot changes and gaps are unknown.",
             "Memory wait p90: nearest-rank 90th percentile of recorded mem_wait_s on natedev steps started in the window, zero waits included.",
             "Memory-kill retries/day: (sum(mem_kills) − sum(mem_kill_stopped)) ÷ window days on natedev calls started in the window; stopped calls are in brackets, per day.", "",

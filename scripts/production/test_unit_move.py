@@ -18,7 +18,7 @@ from unittest import mock
 from scripts.agents import worker_lifecycle
 from scripts.accounts import accounts
 from scripts.lib.atomic_file import write_bytes_atomic, write_text_atomic
-from scripts.lib import relaunch
+from scripts.lib import relaunch, conf
 from scripts.message import sessions
 from scripts.production import staff
 from scripts.production.cli_fixture import invoke_cli
@@ -217,6 +217,33 @@ class UnitFolderMoveTests(FolderMoveFixture):
         self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "unchanged\n", ""))
         self.assertEqual([(path.read_bytes(), path.stat().st_mtime_ns) for path in paths], before)
         self.assertEqual((backend.starts, backend.stops), (starts, stops))
+
+    def test_one_folder_move_shares_settings_through_stop_and_resume(self) -> None:
+        backend = self.folder_backend(live=True)
+        configuration = self.root / "move-config"
+        configuration.mkdir()
+        path = configuration / "production.conf"
+        _ = path.write_text(folder_move_config(3, 3, 0.01))
+        with (mock.patch.dict(os.environ, {"CONF_DIR": str(configuration), "PRODUCTION_CONFIG": str(path)}),
+              mock.patch.object(conf, "read", wraps=conf.read) as reads):
+            result = self.move_folder()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual([call.args[0] for call in reads.call_args_list if call.args[0] == path], [path])
+        self.assert_moved(backend)
+        self.assertTrue(backend.starts)
+        self.assertTrue(backend.stops)
+
+    def test_worker_wait_restart_uses_the_same_settings_as_its_first_deadline(self) -> None:
+        path = self.root / "production.conf"
+        _ = path.write_text(folder_move_config(3, 4, 0.01))
+        with (mock.patch.dict(os.environ, {"CONF_DIR": str(self.root), "PRODUCTION_CONFIG": str(path)}),
+              mock.patch.object(conf, "read", wraps=conf.read) as reads,
+              mock.patch.object(time, "monotonic", return_value=0.0)):
+            wait = unit_move.FolderMoveWait("FOLDER_MOVE_RESUME_SECONDS", settings=conf.read(Path(os.environ["PRODUCTION_CONFIG"])))
+            _ = path.write_text(folder_move_config(3, 9, 0.01))
+            wait.restart()
+        self.assertEqual(reads.call_count, 1)
+        self.assertEqual(wait.deadline, 4.0)
 
     def test_stopped_move_updates_every_path_without_starting_or_renaming(self) -> None:
         backend = self.folder_backend()
@@ -900,7 +927,7 @@ class UnitFolderMoveTests(FolderMoveFixture):
                     _ = configuration.write_text(folder_move_config(configured, 3, 0.1))
                     clock[0] = 0.0
                     with self.assertRaisesRegex(ValueError, "session did not leave"):
-                        unit_move.stop_folder_session(self.owner, launch)
+                        unit_move.stop_folder_session(self.owner, launch, settings=conf.read(Path(os.environ["PRODUCTION_CONFIG"])))
                     self.assertAlmostEqual(clock[0], expected)
         self.assertEqual(signals, [backend.pid] * 3)
         self.assertEqual(backend.starts, [])
@@ -1194,7 +1221,7 @@ class UnitFolderMoveTests(FolderMoveFixture):
               mock.patch.object(pane_record, "PROC", self.root / "folder-processes"),
               mock.patch("pane_record.PROC", self.root / "folder-processes"),
               mock.patch.object(os, "kill") as kill):
-            unit_move.pause_folder_workers(selected)
+            unit_move.pause_folder_workers(selected, settings=conf.read(Path(os.environ["PRODUCTION_CONFIG"])))
         self.assertGreaterEqual(len(observations), 2)
         kill.assert_not_called()
 

@@ -18,10 +18,11 @@ from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from typing import TYPE_CHECKING, Self, cast, override
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import ANY, MagicMock, call, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.signal_test_support import install_signal_pid_guard
+from scripts.lib import conf
 from scripts.whoami.note_file import note_name
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -220,8 +221,9 @@ class AgentNotesTests(unittest.TestCase):
         self.assertFalse(accounts.login_renewals_file().exists())
 
     def test_renew_logins_renews_outside_the_usage_lock_and_inside_the_renewal_lock(self) -> None:
-        def renew(label: str) -> accounts.LoginRenewed:
+        def renew(label: str, *, account_config: conf.ConfigRead) -> accounts.LoginRenewed:
             self.assertEqual(label, "claude2")
+            self.assertIsInstance(account_config, conf.ConfigRead)
             stored = usage_store.load()["desktop@example.invalid"]
             self.assertEqual(usage_store.latest_read_outcome(stored), agent_accounts.UsageReadOutcome.STALE_TOKEN)
             with locked_history(self.root / "state/agent-notes/usage-only") as history:
@@ -235,7 +237,7 @@ class AgentNotesTests(unittest.TestCase):
               patch.object(sys, "argv", ["agent_notes.py", "renew-logins"]),
               redirect_stdout(io.StringIO()) as output):
             agent_notes.main()
-        probe.assert_called_once_with("claude2")
+        probe.assert_called_once_with("claude2", account_config=ANY)
         self.assertEqual(output.getvalue(), "claude2 login renewed\n")
         self.assertEqual(accounts.login_renewal_attempts(),
                          {"claude2": accounts.LoginRenewalAttempt(self.now, accounts.LoginRenewed())})
@@ -272,10 +274,10 @@ class AgentNotesTests(unittest.TestCase):
             agent_notes.renew_logins()
             self.now += timedelta(minutes=59)
             agent_notes.renew_logins()
-            probe.assert_called_once_with("claude2")
+            probe.assert_called_once_with("claude2", account_config=ANY)
             self.now += timedelta(minutes=1)
             agent_notes.renew_logins()
-        self.assertEqual(probe.call_args_list, [call("claude2"), call("claude2")])
+        self.assertEqual(probe.call_args_list, [call("claude2", account_config=ANY), call("claude2", account_config=ANY)])
         self.assertEqual(output.getvalue().splitlines(),
                          ["claude2 login renewal failed: fixture probe failed"] * 2)
         self.assertEqual(accounts.login_renewal_attempts()["claude2"].at, self.now)
@@ -336,7 +338,7 @@ class AgentNotesTests(unittest.TestCase):
               redirect_stdout(io.StringIO()) as output,
               redirect_stderr(io.StringIO()) as errors):
             agent_notes.renew_logins()
-        probe.assert_called_once_with("claude2")
+        probe.assert_called_once_with("claude2", account_config=ANY)
         self.assertEqual(output.getvalue(), "")
         self.assertEqual(errors.getvalue(), "login renewal: fixture renewal error\n")
         self.assertEqual(usage_store.latest_read_outcome(usage_store.load()["desktop@example.invalid"]),

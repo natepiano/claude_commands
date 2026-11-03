@@ -663,7 +663,7 @@ Source: Phase 4o review (simplify lens), 2026-11-02. Each item removes a copy th
 9. A worker process that exits between the liveness check and its argument read in `pause_folder_workers`, or just after `Popen` in the resume path, reads as exited; the move goes on. Add a regression test for each read.
 10. Each `codex_mesh` import in `unit_move` comes after the early exits, so a move whose runs have no mesh imports no `codex_mesh`.
 11. Copy removals from the Phase 4o review (sdlc showrunner ruling, 2026-11-02; where two copies differ, keep the owner's rule): the move starts workers through the unit's resume message, as `stop_resume.py:337` and `restart.py:2246` do, and starts no worker itself; one worker resume path keeps the `codex_seats` "was working" rule; one `codex_mesh.pause_run` serves `unit_move` and `rename_unit.py:909`, in place of the `Namespace` call and the subprocess call; `codex_mesh` owns "unpause an idle worker" for a run and its idle workers, and `unit_move` writes no roster status; `has_mesh` comes from the mesh files only; the move record always holds `sessions`, and the legacy branch goes.
-12. For each of these, first find why the code is as it is: two folder scans (`unit_move.py:736, 1237`) — is the second needed?; does `codex_mesh` lock the app-server start, so all workers can start before one wait loop?; does anything read `launcher_command` of a worker that is not running (else list Codex seats only for runs with a running worker)?; why the unlocked first roster read (can all runs be checked under the locks before any write)?; can a run state folder have another name, and who writes it (else read the run's own state file first)? Where the answer shows no behavior difference, make the change. Where a real difference stays, the director files it with /unit:question in plain words and the change waits for the user's answer.
+12. For each of these, first find why the code is as it is: two folder scans (`unit_move.py:736, 1237`) — is the second needed?; does `codex_mesh` lock the app-server start, so all workers can start before one wait loop?; does anything read `launcher_command` of a worker that is not running (else list Codex seats only for runs with a running worker)?; why the unlocked first roster read (can all runs be checked under the locks before any write)?; can a run state folder have another name, and who writes it (else read the run's own state file first)? The director settles each item under DecisionEconomy and states the call in one line (user via builds and the sdlc showrunner, 2026-11-02). Only an item that touches money, safety, behavior the user sees, or an act that cannot be undone goes to /unit:question, and its change waits for the user's answer.
 
 **Files:**
 - `scripts/production/unit_move.py`, `scripts/direct/workers.py`, `scripts/production/rename_unit.py`, `scripts/production/retire_unit.py`, `scripts/agents/codex_mesh.py`, `scripts/lib/resume_message.py`, `scripts/shutdown/inventory.py`, `scripts/direct/progress_history.py`, `scripts/herdr/herdr.py` — source.
@@ -679,7 +679,7 @@ Source: Phase 4o review (simplify lens), 2026-11-02. Each item removes a copy th
 
 **Acceptance gate:** `grep` shows one definition of each rule above; the existing suites of every changed module pass with no assertion change; `basedpyright` on the changed files and every caller module footer `0 errors, 0 warnings, 0 notes`; per-file `unittest discover`; full gate.
 
-### Phase 4r — One config read serves many settings  · status: todo
+### Phase 4r — One config read serves many settings  · status: done
 
 **Depends on:** Phase 4o
 
@@ -692,18 +692,25 @@ Source: the user via the sdlc showrunner, 2026-11-02: "i want only one way of do
 **Spec:**
 1. `conf.read(file) -> ConfigRead` (`scripts/lib/conf.py`) reads and parses the file once. `ConfigRead` has `text`, `number`, `whole`, `words` and `values`, with the same limits, host keys and messages as the module functions have now.
 2. A key with no usable value in the read still falls back to the newest valid committed value, read at use. Nothing is cached: no module state, and each `conf.read` reads the file again.
-3. The module functions `text`, `number`, `whole`, `words` and `values` go. `ConfigRead` is the one reader; there is no second reader beside it. `effective_line`, `editable_line` and `check` stay as they are.
+3. The module functions `text`, `number`, `whole`, `words` and `values` go. `ConfigRead` is the one reader; there is no second reader beside it. `value_origin` becomes `ConfigRead.origin(key, convert)` with the same three results (director, 2026-11-02: a second module-level reader breaks item 3). `effective_line`, `editable_line` and `check` stay as they are.
 4. Every caller switches in this phase. A caller that takes several settings from one file in one pass (one tick, one command) holds one `ConfigRead` for that pass. A caller that takes one setting uses `conf.read(file).<kind>(key)`.
-5. At phase start, after the merge of origin/sdlc, grep again for callers (`conf.text(`, `conf.number(`, `conf.whole(`, `conf.words(`, `conf.values(` and imports of those names). Add each new caller file to Files.
+5. At phase start, after the merge of origin/sdlc, grep again for callers (`conf.text(`, `conf.number(`, `conf.whole(`, `conf.words(`, `conf.values(` and imports of those names). Add each new caller file to Files. `scripts/hanas/hanas.py` and `scripts/lint/folder_audit.py` become callers in resources-unit's Phase 45 (branch builds-resources); switch them when that change is in the tree, else tell resources-unit when 4r is on origin/sdlc so its Phase 45 uses `conf.read`.
 
 **Files:**
-- `scripts/lib/conf.py` — source.
-- `scripts/lint/memory_admit.py`, `scripts/lint/sweep.py`, `scripts/direct/findings.py`, `scripts/direct/assign.py`, `scripts/mac_test/mac_test.py`, `scripts/mac_test/offload.py`, `scripts/mac_test/loopback_proof.py`, `scripts/mac_test/linux_runner.py`, `scripts/mac_test/audit.py`, `scripts/production/fast_track.py`, `scripts/production/unit_move.py`, `scripts/production/merge_checkpoint.py`, `scripts/production/retire_unit.py`, `scripts/buildlog/memory.py`, `scripts/buildlog/sync.py`, `scripts/buildlog/report.py`, `scripts/buildlog/record.py`, `scripts/buildlog/disk.py`, `scripts/build_targets/target_config.py` — callers.
+- `scripts/lib/conf.py` — source. `config/README.md` — the reader's description (one read per `conf.read`; `ConfigRead.origin`).
+- `scripts/lint/memory_admit.py`, `scripts/lint/sweep.py`, `scripts/direct/findings.py`, `scripts/direct/assign.py`, `scripts/direct/simplify_result.py`, `scripts/production/fast_track.py`, `scripts/production/unit_move.py`, `scripts/production/merge_checkpoint.py`, `scripts/production/retire_unit.py`, `scripts/lib/tune.py` — callers (impl).
+- `scripts/mac_test/mac_test.py`, `scripts/mac_test/offload.py`, `scripts/mac_test/loopback_proof.py`, `scripts/mac_test/linux_runner.py`, `scripts/mac_test/audit.py`, `scripts/buildlog/memory.py`, `scripts/buildlog/sync.py`, `scripts/buildlog/report.py`, `scripts/buildlog/record.py`, `scripts/buildlog/disk.py`, `scripts/build_targets/target_config.py`, `scripts/build_targets/build_targets.py`, `scripts/build_queue/queue_place.py`, `scripts/message/send.py`, `scripts/whoami/note_file.py` — callers (impl2).
+- `scripts/accounts/accounts.py`, `scripts/accounts/new_account.py`, `scripts/accounts/next_moves.py`, `scripts/accounts/outage_alerts.py`, `scripts/accounts/refusals.py`, `scripts/accounts/refusal_watch.py`, `scripts/accounts/role_map.py`, `scripts/aws_target/aws_target.py`, `scripts/aws_target/config.py`, `scripts/issue_score/blind.py`, `scripts/issue_score/client.py`, `scripts/issue_score/evaluate.py`, `scripts/issue_score/questions.py`, `scripts/issue_score/records.py`, `scripts/issue_score/score_issues.py`, `scripts/issue_score/vault.py`, `scripts/astra/design_roles.py` — callers (fix), added by the Spec 5 re-grep after the merge of origin/sdlc d9c5e2569.
+- `scripts/lint/test_memory_admit.py`, `scripts/lint/test_sweep.py`, `scripts/lint/test_invoke_scope.py`, `scripts/production/test_fast_track.py`, `scripts/production/test_affected_modules.py` — caller tests (impl) that patch or wrap a removed function; each changes only its patch target, with no assertion change.
+- `scripts/mac_test/test_mac_test.py`, `scripts/mac_test/test_offload.py`, `scripts/mac_test/test_target_state.py`, `scripts/whoami/test_note_file.py` — caller tests (impl2), the same rule.
+- `scripts/accounts/test_accounts.py`, `scripts/accounts/test_refusal_watch.py`, `scripts/aws_target/test_remote.py`, `scripts/issue_score/test_config.py`, `scripts/agents/test_agents_conf_publish.py` — caller tests (fix), the same rule.
 - `scripts/lib/test_conf.py` — regressions.
+- `scripts/hanas/hanas.py`, `scripts/lint/folder_audit.py` — not in the tree at d9c5e2569; resources-unit is told when 4r is on origin/sdlc.
 
-**Workers:** `2 writers + 1 tester`.
-- `impl` — `conf.py` and the `lint`, `direct` and `production` callers.
-- `impl2` — the `mac_test`, `buildlog` and `build_targets` callers.
+**Workers:** `3 writers + 1 tester` (director, 2026-11-02: the re-grep found 45 caller files, not 19).
+- `impl` — `conf.py` (hub), `config/README.md`, and the `lint`, `direct`, `production` and `lib/tune.py` callers with their tests.
+- `impl2` — the `mac_test`, `buildlog`, `build_targets`, `build_queue`, `message` and `whoami` callers with their tests.
+- `fix` (as a writer) — the `accounts`, `aws_target`, `issue_score` and `astra` callers with their tests, and `scripts/agents/test_agents_conf_publish.py`.
 - `test` — `test_conf.py`.
 
 **State:** none; settings keep their values.

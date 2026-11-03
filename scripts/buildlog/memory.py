@@ -87,13 +87,14 @@ class EarlyoomKill:
 
     @property
     def outside_build_gate(self) -> bool:
-        if self.oom_score_adj == conf.whole("lint", "build_oom_score_adj") or not isinstance(self.cmdline, str):
+        if self.oom_score_adj == conf.read("lint").whole("build_oom_score_adj") or not isinstance(self.cmdline, str):
             return False
         return "/target/" in cmdline_program(self.cmdline)
 
     @property
     def is_build(self) -> bool:
-        return self.oom_score_adj == conf.whole("lint", "build_oom_score_adj") or self.outside_build_gate
+        return (self.oom_score_adj == conf.read("lint").whole("build_oom_score_adj")
+                or isinstance(self.cmdline, str) and "/target/" in cmdline_program(self.cmdline))
 
 
 def service_state(value: int | None) -> ServiceState:
