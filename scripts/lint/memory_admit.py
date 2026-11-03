@@ -28,6 +28,10 @@ from types import UnionType, MappingProxyType
 from urllib.parse import urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
+from scripts.build_queue.scope_activity import (
+    EmptyBuildScope, LiveBuildRun, NoLiveBuildRun, ScopeActivityReader, ScopeProcesses,
+)
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "buildlog"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
@@ -403,6 +407,7 @@ class Reservation(TypedDict):
     queue_waiter: NotRequired[Waiter]
     test_phase_need: NotRequired[dict[str, object]]
     test_phase_charge_use: NotRequired[TestPhaseChargeUse]
+    build_run: NotRequired[LiveBuildRun | NoLiveBuildRun]
 
 
 @dataclass(frozen=True)
@@ -531,6 +536,7 @@ class CompilerServiceMemory(MeasuredMemory):
 class UnownedSliceMemory(MeasuredMemory):
     cgroup: str = ""
     owner: str = ""
+    activity: ScopeProcesses | EmptyBuildScope = EmptyBuildScope()
 
 
 @dataclass(frozen=True)
@@ -1030,6 +1036,8 @@ class RunningStep:
     folder: str
     promise: int
     measured: StepMemory
+    run: LiveBuildRun | NoLiveBuildRun = NoLiveBuildRun()
+    started_at: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -3558,6 +3566,11 @@ def parse_snapshot_value(value: object, schema: object) -> object:
                 if name in annotations}
     if schema is StepProfile and record.keys() == annotations.keys() - {"build_history_generation"} | {"kind"}:
         record = {**record, "build_history_generation": snapshot_value(NoBuildHistoryGeneration())}
+    if schema in (RunningStep, UnownedSliceMemory):
+        # Older services omit display evidence that these fields add.
+        for member in fields(schema):
+            if member.name not in record and member.name in ("activity", "run", "started_at"):
+                record = {**record, member.name: snapshot_value(member.default)}
     if not is_dataclass(schema) or record.get("kind") != schema.__name__:
         raise ValueError("invalid snapshot record tag")
     if record.keys() != annotations.keys() | {"kind"}:
@@ -3850,17 +3863,26 @@ def build_queue_inputs(ordered: list[tuple[Path, Waiter]],
             continue
         identity = reservation_identity(row)
         running.append(RunningStep(identity["session_id"], identity["session_name"],
-                                   identity["step"], identity["folder"], row["need"], memory))
+                                   identity["step"], identity["folder"], row["need"], memory,
+                                   row.get("build_run", NoLiveBuildRun()), _epoch(row["admitted_at"])))
         rows.append(row)
     running.extend(RunningStep("", "sccache.service", "compile", "builds.slice", 0, value)
                    for value in readings.compilers)
-    running.extend(RunningStep("", value.owner, "unowned", value.cgroup, 0, value) for value in unowned)
+    for value in unowned:
+        activity = value.activity
+        running.append(RunningStep(
+            activity.session_id if isinstance(activity, ScopeProcesses) else "",
+            activity.session_name if isinstance(activity, ScopeProcesses) else "",
+            "between steps" if isinstance(activity, ScopeProcesses) and isinstance(activity.run, LiveBuildRun) else "unowned",
+            activity.folder if isinstance(activity, ScopeProcesses) else value.cgroup, 0, value,
+            activity.run if isinstance(activity, ScopeProcesses) else NoLiveBuildRun(),
+            activity.started_at if isinstance(activity, ScopeProcesses) else 0.0))
     return QueueInputs(sorted(ordered, key=lambda item: waiter_order(item[1])), tuple(running), tuple(rows),
                        readings.host, readings.pressure, readings.recovery, override, now, priority)
 
 
-def unowned_slice_memory(rows: list[Reservation], processes: dict[int, ProcessIdentity], proc: Path
-                         ) -> tuple[UnownedSliceMemory, ...]:
+def unowned_slice_memory(rows: list[Reservation], processes: dict[int, ProcessIdentity], proc: Path,
+                         *, activity_reader: ScopeActivityReader | None = None) -> tuple[UnownedSliceMemory, ...]:
     """Count child scopes that no reservation owns, without duplicate process charges."""
     directory = Path(os.environ.get("BUILDLOG_BUILDS_CGROUP",
         f"/sys/fs/cgroup/user.slice/user-{os.getuid()}.slice/user@{os.getuid()}.service/builds.slice"))
@@ -3876,6 +3898,7 @@ def unowned_slice_memory(rows: list[Reservation], processes: dict[int, ProcessId
         else:
             tree_pids.update(process_tree({row["pid"]: row["start_time"]}, processes))
     result: list[UnownedSliceMemory] = []
+    activity_reader = activity_reader or ScopeActivityReader(processes, proc)
     try:
         children = list(directory.iterdir())
     except OSError:
@@ -3893,8 +3916,9 @@ def unowned_slice_memory(rows: list[Reservation], processes: dict[int, ProcessId
             members = {int(pid) for membership in child.rglob("cgroup.procs") for pid in membership.read_text().split()}
             duplicate = process_memory(members & tree_pids, proc).bytes
             amount = max(0, amount + swapped - duplicate)
-            if amount:
-                result.append(UnownedSliceMemory(amount, cgroup=str(child), owner=child.name))
+            if amount or members:
+                result.append(UnownedSliceMemory(amount, cgroup=str(child), owner=child.name,
+                                                 activity=activity_reader.scope(members, child.name)))
         except (OSError, ValueError):
             continue
     return tuple(result)

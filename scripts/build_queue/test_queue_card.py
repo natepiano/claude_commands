@@ -7,6 +7,7 @@ import unittest
 from scripts.build_queue import head_facts, queue_card, queue_view
 from scripts.build_queue.queue_fixture import GOLDEN, NOW, QueueFixtureTests, queue_read_fixture
 from scripts.build_queue.queue_lines import plain
+from scripts.build_queue.scope_activity import LiveBuildRun, ScopeProcesses
 from scripts.lib.terminal_cells import terminal_width
 from scripts.lint import memory_admit as gate
 
@@ -44,8 +45,11 @@ class QueueCardTests(QueueFixtureTests):
     def test_unowned_slice_owner_selector_marks_its_running_record_once_on_the_complete_page(self) -> None:
         model = self.fixture.model()
         running = model.reading.explanation.running[0]
-        memory = gate.UnownedSliceMemory(5 * gate.GIB, cgroup="verify.scope", owner="run-owner")
-        step = replace(running.step, session_id="run-owner", session_name="run-owner", measured=memory)
+        run = LiveBuildRun(123, "123", NOW - 600)
+        activity = ScopeProcesses(1, "run-owner", "run-owner", "/tmp/run", "bash", NOW - 600, False, run)
+        memory = gate.UnownedSliceMemory(5 * gate.GIB, cgroup="verify.scope", owner="run-owner", activity=activity)
+        step = replace(running.step, session_id="run-owner", session_name="run-owner", measured=memory,
+                       step="between steps", promise=0, run=run)
         running = replace(running, step=step, measured=5 * gate.GIB)
         model = replace(model, reading=replace(model.reading,
             view=replace(model.reading.view, running=(step,)),
@@ -53,13 +57,14 @@ class QueueCardTests(QueueFixtureTests):
         view = queue_view.render_view(model, 400, selector="run-owner")
         card = queue_card.render_selection(model, "run-owner", 400)
         text = plain([*view, (), *card])
-        self.assertIn("Selected running step:", text)
-        self.assertIn("(unowned)", text)
+        self.assertIn("▸", text)
+        self.assertNotIn("(unowned)", text)
         self.assertIn("run-owner", text)
         self.assertNotIn("No waiting or running step matches", text)
-        self.assertEqual(text.count("run-owner: 5.0 GiB (unowned)"), 1)
-        self.assertIn("Selected running step: run-owner: 5.0 GiB (unowned)", plain(view))
-        self.assertNotIn("run-owner: 5.0 GiB (unowned)", plain(card))
+        self.assertEqual(text.count("run-owner"), 1)
+        self.assertIn("between steps", plain(view))
+        self.assertIn("5.0", plain(view))
+        self.assertNotIn("run-owner", plain(card))
 
     def test_step_ahead_keeps_its_run_place_instead_of_joining_earlier(self) -> None:
         inputs = self.fixture.inputs(policy=gate.DEFAULT_ADMISSION_POLICY)

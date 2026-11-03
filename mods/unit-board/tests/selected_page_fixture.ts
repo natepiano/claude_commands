@@ -53,6 +53,60 @@ export default {
     [],
     [
       {
+        "text": "Running",
+        "bold": true
+      }
+    ],
+    [
+      {
+        "text": "   showrunner        unit              step    min used / grant",
+        "tone": "inactive"
+      }
+    ],
+    [
+      {
+        "text": "  ",
+        "tone": "inactive"
+      },
+      {
+        "text": " ",
+        "tone": "suggestion"
+      },
+      {
+        "text": "tool-based-ui     "
+      },
+      {
+        "text": "widget            ",
+        "tone": "suggestion"
+      },
+      {
+        "text": "nextest "
+      },
+      {
+        "text": "  0 ",
+        "tone": "inactive"
+      },
+      {
+        "text": "█████▏",
+        "tone": "suggestion"
+      },
+      {
+        "text": "░░░░░░",
+        "tone": "inactive"
+      },
+      {
+        "text": " 5.1 / 11.1"
+      }
+    ],
+    [],
+    [
+      {
+        "text": "Queued",
+        "bold": true
+      }
+    ],
+    [
+      {
         "text": " # showrunner        unit              step    min need",
         "tone": "inactive"
       }
@@ -63,7 +117,11 @@ export default {
         "tone": "warning"
       },
       {
-        "text": " tool-based-ui     "
+        "text": " ",
+        "tone": "suggestion"
+      },
+      {
+        "text": "tool-based-ui     "
       },
       {
         "text": "cables            ",
@@ -91,7 +149,11 @@ export default {
         "tone": "inactive"
       },
       {
-        "text": " tool-based-ui     "
+        "text": " ",
+        "tone": "suggestion"
+      },
+      {
+        "text": "tool-based-ui     "
       },
       {
         "text": "cables            ",
@@ -119,7 +181,11 @@ export default {
         "tone": "inactive"
       },
       {
-        "text": " tool-based-ui     "
+        "text": " ",
+        "tone": "suggestion"
+      },
+      {
+        "text": "tool-based-ui     "
       },
       {
         "text": "cables            ",
@@ -147,7 +213,11 @@ export default {
         "tone": "inactive"
       },
       {
-        "text": " tool-based-ui     "
+        "text": " ",
+        "tone": "suggestion"
+      },
+      {
+        "text": "tool-based-ui     "
       },
       {
         "text": "hana-migration    ",
@@ -175,7 +245,11 @@ export default {
         "tone": "inactive"
       },
       {
-        "text": " cargo-liner       "
+        "text": " ",
+        "tone": "suggestion"
+      },
+      {
+        "text": "cargo-liner       "
       },
       {
         "text": "berth             ",
@@ -203,7 +277,11 @@ export default {
         "tone": "inactive"
       },
       {
-        "text": " tool-based-ui     "
+        "text": " ",
+        "tone": "suggestion"
+      },
+      {
+        "text": "tool-based-ui     "
       },
       {
         "text": "lfo               ",
@@ -231,7 +309,11 @@ export default {
         "tone": "inactive"
       },
       {
-        "text": " cargo-liner-style "
+        "text": " ",
+        "tone": "suggestion"
+      },
+      {
+        "text": "cargo-liner-style "
       },
       {
         "text": "modules           ",
@@ -259,10 +341,14 @@ export default {
         "tone": "inactive"
       },
       {
-        "text": " cargo-liner-style "
+        "text": " ",
+        "tone": "suggestion"
       },
       {
-        "text": "—                 ",
+        "text": "cargo-liner-style "
+      },
+      {
+        "text": "cargo-liner-style ",
         "tone": "suggestion"
       },
       {
@@ -287,7 +373,11 @@ export default {
         "tone": "inactive"
       },
       {
-        "text": " performance       "
+        "text": " ",
+        "tone": "suggestion"
+      },
+      {
+        "text": "performance       "
       },
       {
         "text": "metrics-gathering ",
@@ -315,10 +405,14 @@ export default {
         "tone": "inactive"
       },
       {
-        "text": " tool-based-ui     "
+        "text": " ",
+        "tone": "suggestion"
       },
       {
-        "text": "—                 ",
+        "text": "tool-based-ui     "
+      },
+      {
+        "text": "hana              ",
         "tone": "suggestion"
       },
       {
@@ -343,7 +437,11 @@ export default {
         "tone": "inactive"
       },
       {
-        "text": " cargo-liner-style "
+        "text": " ",
+        "tone": "suggestion"
+      },
+      {
+        "text": "cargo-liner-style "
       },
       {
         "text": "types             ",
@@ -371,7 +469,11 @@ export default {
         "tone": "inactive"
       },
       {
-        "text": " tool-based-ui     "
+        "text": " ",
+        "tone": "suggestion"
+      },
+      {
+        "text": "tool-based-ui     "
       },
       {
         "text": "geometry-material ",
@@ -399,7 +501,11 @@ export default {
         "tone": "inactive"
       },
       {
-        "text": " tool-based-ui     "
+        "text": " ",
+        "tone": "suggestion"
+      },
+      {
+        "text": "tool-based-ui     "
       },
       {
         "text": "trunk             ",
@@ -427,7 +533,11 @@ export default {
         "tone": "inactive"
       },
       {
-        "text": " cargo-liner       "
+        "text": " ",
+        "tone": "suggestion"
+      },
+      {
+        "text": "cargo-liner       "
       },
       {
         "text": "handler           ",
@@ -455,7 +565,11 @@ export default {
         "tone": "inactive"
       },
       {
-        "text": " tool-based-ui     "
+        "text": " ",
+        "tone": "suggestion"
+      },
+      {
+        "text": "tool-based-ui     "
       },
       {
         "text": "demo              ",
@@ -483,7 +597,11 @@ export default {
         "tone": "inactive"
       },
       {
-        "text": " tool-based-ui     "
+        "text": " ",
+        "tone": "suggestion"
+      },
+      {
+        "text": "tool-based-ui     "
       },
       {
         "text": "trunk             ",
@@ -511,7 +629,11 @@ export default {
         "tone": "inactive"
       },
       {
-        "text": " cargo-liner       "
+        "text": " ",
+        "tone": "suggestion"
+      },
+      {
+        "text": "cargo-liner       "
       },
       {
         "text": "port              ",
@@ -539,7 +661,11 @@ export default {
         "tone": "inactive"
       },
       {
-        "text": " cargo-liner       "
+        "text": " ",
+        "tone": "suggestion"
+      },
+      {
+        "text": "cargo-liner       "
       },
       {
         "text": "port              ",
@@ -567,7 +693,11 @@ export default {
         "tone": "inactive"
       },
       {
-        "text": " tool-based-ui     "
+        "text": " ",
+        "tone": "suggestion"
+      },
+      {
+        "text": "tool-based-ui     "
       },
       {
         "text": "inspectors        ",
@@ -595,7 +725,11 @@ export default {
         "tone": "inactive"
       },
       {
-        "text": " tool-based-ui     "
+        "text": " ",
+        "tone": "suggestion"
+      },
+      {
+        "text": "tool-based-ui     "
       },
       {
         "text": "demo              ",
@@ -623,7 +757,11 @@ export default {
         "tone": "inactive"
       },
       {
-        "text": " tool-based-ui     "
+        "text": " ",
+        "tone": "suggestion"
+      },
+      {
+        "text": "tool-based-ui     "
       },
       {
         "text": "startup           ",
@@ -651,7 +789,11 @@ export default {
         "tone": "inactive"
       },
       {
-        "text": " tool-based-ui     "
+        "text": " ",
+        "tone": "suggestion"
+      },
+      {
+        "text": "tool-based-ui     "
       },
       {
         "text": "geometry-material ",
@@ -679,7 +821,11 @@ export default {
         "tone": "inactive"
       },
       {
-        "text": " tool-based-ui     "
+        "text": " ",
+        "tone": "suggestion"
+      },
+      {
+        "text": "tool-based-ui     "
       },
       {
         "text": "hana-migration    ",
@@ -707,7 +853,11 @@ export default {
         "tone": "inactive"
       },
       {
-        "text": " performance       "
+        "text": " ",
+        "tone": "suggestion"
+      },
+      {
+        "text": "performance       "
       },
       {
         "text": "metrics-gathering ",
@@ -735,7 +885,11 @@ export default {
         "tone": "inactive"
       },
       {
-        "text": " cargo-liner       "
+        "text": " ",
+        "tone": "suggestion"
+      },
+      {
+        "text": "cargo-liner       "
       },
       {
         "text": "handler           ",
@@ -763,7 +917,11 @@ export default {
         "tone": "inactive"
       },
       {
-        "text": " performance       "
+        "text": " ",
+        "tone": "suggestion"
+      },
+      {
+        "text": "performance       "
       },
       {
         "text": "metrics-gathering ",
@@ -791,7 +949,11 @@ export default {
         "tone": "inactive"
       },
       {
-        "text": " performance       "
+        "text": " ",
+        "tone": "suggestion"
+      },
+      {
+        "text": "performance       "
       },
       {
         "text": "benchmark         ",
@@ -819,7 +981,11 @@ export default {
         "tone": "inactive"
       },
       {
-        "text": " cargo-liner       "
+        "text": " ",
+        "tone": "suggestion"
+      },
+      {
+        "text": "cargo-liner       "
       },
       {
         "text": "tile              ",
@@ -847,7 +1013,11 @@ export default {
         "tone": "inactive"
       },
       {
-        "text": " tool-based-ui     "
+        "text": " ",
+        "tone": "suggestion"
+      },
+      {
+        "text": "tool-based-ui     "
       },
       {
         "text": "lfo               ",
@@ -875,7 +1045,11 @@ export default {
         "tone": "inactive"
       },
       {
-        "text": " tool-based-ui     "
+        "text": " ",
+        "tone": "suggestion"
+      },
+      {
+        "text": "tool-based-ui     "
       },
       {
         "text": "trunk             ",
@@ -903,7 +1077,11 @@ export default {
         "tone": "inactive"
       },
       {
-        "text": " tool-based-ui     "
+        "text": " ",
+        "tone": "suggestion"
+      },
+      {
+        "text": "tool-based-ui     "
       },
       {
         "text": "fastest           ",
@@ -931,7 +1109,11 @@ export default {
         "tone": "inactive"
       },
       {
-        "text": " tool-based-ui     "
+        "text": " ",
+        "tone": "suggestion"
+      },
+      {
+        "text": "tool-based-ui     "
       },
       {
         "text": "assembly          ",

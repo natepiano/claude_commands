@@ -4,6 +4,11 @@ queue priority: cables (the user's bump)
                                                    free 4.4 │ taken 16.6
 budget 21.0                                        ░░░░█████████████████
 
+Running
+   showrunner        unit              step    min used / grant
+   tool-based-ui     widget            nextest   0 █████▏░░░░░░ 5.1 / 11.1
+
+Queued
  # showrunner        unit              step    min need
  1 tool-based-ui     cables            mend     36 ██████▊ 6.8 ↑ ≤14.2 9:18
  2▸tool-based-ui     cables            nextest   6 ███████████▌ 11.5
@@ -12,9 +17,9 @@ budget 21.0                                        ░░░░█████�
  5 cargo-liner       berth             clippy   37 ██▉ 2.9
  6 tool-based-ui     lfo               nextest  35 ██████████▊ 10.8
  7 cargo-liner-style modules           doc      35 ███▌ 3.5
- 8 cargo-liner-style —                 nextest  33 █▊ 1.8
+ 8 cargo-liner-style cargo-liner-style nextest  33 █▊ 1.8
  9 performance       metrics-gathering mend     32 ███████▋ 7.6
-10 tool-based-ui     —                 clippy   31 ██████▊ 6.8
+10 tool-based-ui     hana              clippy   31 ██████▊ 6.8
 11 cargo-liner-style types             doc      31 ███▌ 3.5
 12 tool-based-ui     geometry-material nextest  30 █ 1.0
 13 tool-based-ui     trunk             doc      30 ████▍ 4.4

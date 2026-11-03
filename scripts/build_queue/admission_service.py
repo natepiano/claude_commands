@@ -23,6 +23,7 @@ from scripts.build_queue import admission_protocol as wire
 from scripts.build_queue import queue_snapshot
 from scripts.build_queue.queue_view import reason_phrase
 from scripts.lint import memory_admit as gate
+from scripts.build_queue.scope_activity import LiveBuildRun, ScopeActivityReader, ScopeProcesses
 from scripts.lint.build_shape import build_shape, recorded_build_shape
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.accounts import outage_alerts
@@ -777,8 +778,10 @@ class AdmissionServer:
         lifetimes = {episode: self.proc.lifetime(reservation_row(record),
             self._live(record.owner))
             for episode, record in self.reservations.items()}
-        processes = (self.proc.processes() if any(isinstance(lifetime, gate.LiveOwnerProcess)
-                     for lifetime in lifetimes.values()) else {})
+        processes = self.proc.processes()
+        activity = ScopeActivityReader(processes, self.proc.path,
+            tuple(LiveBuildRun(place.run.pid, place.run.start_time, place.since)
+                  for place in self.run_places.values()))
         memories: list[tuple[gate.Reservation, gate.StepMemory]] = []
         for episode, record in list(self.reservations.items()):
             if isinstance(record.finalization, dict) or not isinstance(record.ending, NotEnding):
@@ -789,8 +792,10 @@ class AdmissionServer:
                 if episode not in self.reservations:
                     continue
             row = reservation_row(record)
-            memory = self.readings.reservation(Path(record.path), row, datetime.fromtimestamp(now, UTC),
-                                               processes, self.proc.path, policy)
+            row["build_run"] = activity.run(record.owner.pid)
+            memory = (gate.GoneMemory() if isinstance(lifetimes[episode], gate.EndedStep) else
+                      self.readings.reservation(Path(record.path), row, datetime.fromtimestamp(now, UTC),
+                                                processes, self.proc.path, policy))
             if isinstance(memory, gate.GoneMemory):
                 try:
                     self._end(episode, record.ending if not isinstance(record.ending, NotEnding) else OwnerExited())
@@ -808,8 +813,32 @@ class AdmissionServer:
         readings = gate.QueueSnapshotReadings(processes, {}, host, pressure, self.recovery,
                                              self.readings.compilers(), policy=policy)
         ordered, priority = self._queue_order()
-        unowned = gate.unowned_slice_memory([item[0] for item in memories], processes, self.proc.path)
+        unowned = gate.unowned_slice_memory([item[0] for item in memories], processes, self.proc.path,
+                                           activity_reader=activity)
         inputs = gate.build_queue_inputs(ordered, memories, readings, self.override, now, priority, unowned)
+        represented = {(step.run.pid, step.run.start_time) for step in inputs.running
+                       if isinstance(step.run, LiveBuildRun)}
+        between: list[gate.RunningStep] = []
+        for place in self.run_places.values():
+            run = place.run
+            if (run.pid, run.start_time) in represented:
+                continue
+            identity = processes.get(run.pid)
+            if identity is None or identity.start != run.start_time:
+                continue
+            evidence = activity.scope({run.pid})
+            if not isinstance(evidence, ScopeProcesses):
+                continue
+            live = LiveBuildRun(run.pid, run.start_time, activity.started_at(run.pid) or place.since)
+            measured = gate.tree_memory(run.pid, run.start_time, processes, self.proc.path)
+            if isinstance(measured, gate.GoneMemory):
+                continue
+            memory = gate.UnownedSliceMemory(measured.bytes, swap_bytes=measured.swap_bytes,
+                                             activity=replace(evidence, run=live))
+            between.append(gate.RunningStep(evidence.session_id, evidence.session_name, "between steps",
+                                           evidence.folder, 0, memory, live, live.started_at))
+        if between:
+            inputs = replace(inputs, running=(*inputs.running, *between))
         limits = gate.resolve_admission_limits(host.total if isinstance(host, gate.HostMemory)
                                              else gate.UnknownHostTotal(), config)
         return inputs, limits

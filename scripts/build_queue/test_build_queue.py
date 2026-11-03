@@ -633,7 +633,7 @@ class QueueTests(unittest.TestCase):
         self.assertIn("style-types", text)
         self.assertNotIn("cargo-liner-style-types", text)
         self.assertEqual(text.count("nextest"), 1)
-        self.assertNotIn("clippy", text)
+        self.assertIn("clippy", text)
         self.labels_read.assert_called_once_with(["style-id", "style-id"], os.environ)
         self.assertNotIn("recorded-name", text)
 
@@ -720,7 +720,8 @@ class QueueTests(unittest.TestCase):
         self.assertIn("Free memory: free 23.1 GiB", text)
         self.assertNotIn("head-id", text)
         self.assertNotIn("follower-id", text)
-        self.assertNotIn("Running", self.render(view))
+        self.assertIn("\nRunning\n", self.render(view))
+        self.assertIn("\nQueued\n", self.render(view))
 
     def test_live_queue_pressure_reason_reaches_the_cli(self) -> None:
         write_process(self.fixture.proc, 100)
@@ -810,7 +811,11 @@ class QueueTests(unittest.TestCase):
         elapsed = time.perf_counter() - started
         self.assertEqual(len(waiting_rows(lines)), 10000)
         self.assertEqual(sum(plain([line]).startswith("●") for line in lines), 0)
-        self.assertEqual(sum("tree-9999" in plain([line]) for line in lines), 0)
+        running_rows, queued_rows = plain(lines).split("Running\n", 1)[1].split("Queued\n", 1)
+        for section, step in ((running_rows, "test"), (queued_rows, "check")):
+            row, = [row for row in section.splitlines() if "tree-9999" in row]
+            self.assertIn(step, row.split())
+        self.assertEqual(sum("test" in row for row in running_rows.splitlines()), 10000)
         self.assertLess(elapsed, 1., f"render took {elapsed:.6f} s")
         print(f"queue render: 20000 rows in {elapsed:.6f} s")
 
