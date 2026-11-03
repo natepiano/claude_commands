@@ -6,7 +6,7 @@ import json
 import os
 from pathlib import Path
 import unittest
-from typing import cast
+from typing import Literal, cast
 from unittest import mock
 from zoneinfo import ZoneInfo
 
@@ -17,6 +17,17 @@ from scripts.build_queue.admission_test_support import AdmissionFixture, GIB, NO
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_pressure_condition_variants_keep_their_meaning_through_the_codec(self) -> None:
+        conditions: tuple[gate.PressureConditionNotRecorded | Literal["full", "swap"], ...] = (
+            "full", "swap", gate.PressureConditionNotRecorded())
+        for condition in conditions:
+            with self.subTest(condition=condition):
+                pressure = gate.MemoryPressure(8, 15, 80, condition=condition)
+                reply = wait_reply(pressure)
+                reply = replace(reply, snapshot=replace(reply.snapshot,
+                    decision=replace(reply.snapshot.decision, pressure=pressure)))
+                self.assertEqual(wire.parse_reply(wire.encode_reply(reply)), reply)
+
     def test_every_request_round_trips_with_profiles_width_and_call_states(self) -> None:
         with AdmissionFixture() as fixture:
             request = fixture.request()

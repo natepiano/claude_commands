@@ -6,12 +6,15 @@ from contextlib import redirect_stderr
 from dataclasses import replace
 import io
 import os
+from pathlib import Path
 import sys
 import unittest
 from unittest import mock
+from zoneinfo import ZoneInfo
 
 from scripts.lint import memory_admit as gate
 from scripts.build_queue import admission_client as client, admission_protocol as wire
+from scripts.build_queue import queue_evidence
 from scripts.build_queue.admission_test_support import admitted_reply, wait_reply
 from scripts.build_queue.admission_test_support import (
     AdmissionFixture, Exchange, GIB, ScriptedTransport, TimedChunk, reply_bytes,
@@ -29,6 +32,31 @@ class ClientTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(client, "CLOCK", fixture.clock))
         _ = self.enterContext(mock.patch("scripts.build_queue.admission_client.socket.socket", side_effect=transport.socket))
         return transport
+
+    def test_main_service_pressure_snapshot_waits_then_admits_without_inventing_condition(self) -> None:
+        # Main aeb936809630c8a539613d4b0def9dce0db040c0 produced this reply through wire.encode_reply.
+        main_reply = (Path(__file__).with_name("fixtures") / "main_pressure_wait.json").read_bytes()
+        with AdmissionFixture() as fixture:
+            request = fixture.request()
+            transport = self.use_transport(fixture, Exchange(main_reply, reply_bytes(GRANTED)))
+            waits: list[wire.Wait] = []
+            result = client.admit(request, waits.append, lambda: request)
+            self.assertEqual(result, GRANTED)
+            self.assertEqual(transport.requests, [request])
+            self.assertEqual(len(waits), 1)
+            pressure = waits[0].snapshot.decision.pressure
+            assert isinstance(pressure, gate.MemoryPressure)
+            self.assertIsInstance(pressure.condition, gate.PressureConditionNotRecorded)
+            self.assertEqual((pressure.full_avg10, pressure.some_avg10, pressure.swap_used_percent), (8, 15, 80))
+            self.assertEqual(waits[0].reason, pressure)
+            self.assertEqual([step.measured.bytes for step in waits[0].snapshot.running
+                              if isinstance(step.measured, gate.MeasuredMemory)], [4 * GIB, GIB])
+            self.assertEqual(gate.pressure_text(pressure, waits[0].snapshot.policy),
+                             "memory pressure: condition not recorded by service; full avg10 8.0; "
+                             + "some avg10 15.0; swap 80.0% used")
+            self.assertEqual(queue_evidence.pressure_text(pressure, ZoneInfo("UTC"), waits[0].snapshot.policy),
+                             "memory pressure: full avg10 8.0%, some avg10 15.0%, swap used 80.0%; "
+                             + "condition not recorded by service")
 
     def test_hold_after_grant_releases_before_waiting_and_uses_a_new_episode(self) -> None:
         with AdmissionFixture() as fixture:
