@@ -1340,6 +1340,12 @@ def merge_checkpoint(args: GateArguments) -> int:
         raise GateRefused(str(error)) from error
     if refused := change_review.missing(commits):
         raise GateRefused("checkpoint commits without a Change-Review line: " + "; ".join(refused))
+    changes: list[change_review.PublicationChange] = []
+    if review_list is not None:
+        try:
+            changes = change_review.publication_changes(commits, production)
+        except (change_review.ChangeReviewError, OSError) as error:
+            raise GateRefused(f"{error}: the staff record is read before the merge") from error
     subject = f"Merge {args.unit} {args.phase} ({args.checkpoint}) into {args.merge_branch}"
     try:
         hold.wait_until_free()
@@ -1368,7 +1374,7 @@ def merge_checkpoint(args: GateArguments) -> int:
     notify_style(repo, str(args.merge_branch), checked_git(repo, "rev-parse", "HEAD"))
     print(f"Pushed {args.merge_branch}: {checked_git(repo, 'rev-parse', '--short', 'HEAD')}", flush=True)
     if review_list is not None:
-        record_changes(repo, review_list, production, commits, str(args.merge_branch))
+        record_changes(repo, review_list, production, changes, str(args.merge_branch))
     if args.promote:
         promote(args)
     return 0
@@ -1397,13 +1403,12 @@ def change_review_list(args: GateArguments) -> tuple[Path, Path | None]:
     return production, found
 
 
-def record_changes(repo: Path, review_list: Path, production: Path, commits: list[change_review.Commit],
+def record_changes(repo: Path, review_list: Path, production: Path, changes: list[change_review.PublicationChange],
                    merge_branch: str) -> None:
     """Add a row per visible change to the list, then name any landed merge still missing its rows."""
     merged = checked_git(repo, "rev-parse", f"--short={change_review.SHORT}", "HEAD")
     try:
-        rows = change_review.append_rows(review_list, change_review.visible(commits), change_review.today(), merged,
-                                         production, owners=change_review.visible_owners(commits, production))
+        rows = change_review.append_rows(review_list, changes, change_review.today(), merged, production)
         drifted = change_review.drift(repo, merge_branch, change_review.read(review_list), change_review.LANDED,
                                       change_review.foreign_units(production))
     except (change_review.ChangeReviewError, OSError) as error:

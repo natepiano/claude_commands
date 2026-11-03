@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import cast, override
 from unittest.mock import patch
 
-from scripts.production import change_review, change_routing, staff, unrouted_alert
+from scripts.production import change_routing, staff, unrouted_alert
 from scripts.production.staff_test_support import fixture_member
 
 
@@ -34,7 +34,7 @@ class UnroutedAlertTests(unittest.TestCase):
         self.config = self.root / "review_links.conf"
         source = Path(__file__).resolve().parents[2] / "config/review_links.conf"
         _ = self.config.write_text(source.read_text().replace("unrouted_alert_recipient=natedev", "unrouted_alert_recipient=alert-owner"))
-        self.row = {"#": "C8", "Change": "A routing conflict"}
+        self.row = {"#": "C8", "Change": "A broken producer"}
 
     def notify(self, reason: str = "conflict") -> None:
         unrouted_alert.notify(self.root / "links", "top", self.row, reason, ("one", "two"))
@@ -62,6 +62,7 @@ class UnroutedAlertTests(unittest.TestCase):
             self.assert_pending_alert_failure()
 
     def test_a_new_conflict_sends_once_and_its_record_survives_another_render(self) -> None:
+        self.row["Change"] = "A routing conflict"
         with patch.object(unrouted_alert, "send_message") as send:
             self.notify()
             self.notify()
@@ -153,27 +154,21 @@ class UnroutedAlertTests(unittest.TestCase):
         unit = fixture_member("unit", name="orphan", parent=runner.id)
         record = staff.snapshot()
         broken = replace(record, rows=tuple(replace(row, parent=None) if row.id == unit.id else row for row in record.rows))
-        return change_routing.StaffRouting(broken, {}, change_review), runner, unit
+        return change_routing.StaffRouting(broken, {}), runner, unit
 
-    def test_routed_rows_and_saved_conflicts_read_no_alert_record_and_send_nothing(self) -> None:
+    def test_routed_rows_and_saved_unrouted_rows_read_no_alert_record_and_send_nothing(self) -> None:
         router, runner, unit = self.orphan_router()
-        selection = change_routing.CheckpointSelection(Path("unused"), ())
-        with (patch.object(router, "selection", return_value=selection),
-              patch.object(router, "candidate_units", return_value=set[str]()),
-              patch.object(Path, "read_text", side_effect=AssertionError("no record read")),
+        with (patch.object(Path, "read_text", side_effect=AssertionError("no record read")),
               patch.object(unrouted_alert, "send_message") as send):
-            self.assertEqual(router.owner(self.row, "top").tab, runner.name)
-            with patch.object(router, "candidate_units", return_value={str(unit.id)}):
-                owner = router.owner(self.row | {"Verdict": "works"}, "top")
-                self.assertIsInstance(owner, change_routing.UnroutedChange)
+            self.assertEqual(router.owner(self.row, self.root / "change-review - top.md").tab, runner.name)
+            owner = router.owner(self.row | {"Verdict": "works", "Producer": str(unit.id)}, self.root / "change-review - top.md")
+            self.assertIsInstance(owner, change_routing.UnroutedChange)
         send.assert_not_called()
         self.assertFalse((self.root / "links").exists())
 
-    def test_a_failed_alert_does_not_change_the_conflicts_route(self) -> None:
+    def test_a_failed_alert_keeps_the_broken_producer_unrouted(self) -> None:
         router, _, unit = self.orphan_router()
-        with (patch.object(router, "selection", return_value=change_routing.CheckpointSelection(Path("unused"), ())),
-              patch.object(router, "candidate_units", return_value={str(unit.id)}),
-              patch.object(unrouted_alert, "send_message", side_effect=RuntimeError("not reached")), redirect_stderr(StringIO())):
-            owner = router.owner(self.row, "top")
+        with (patch.object(unrouted_alert, "send_message", side_effect=RuntimeError("not reached")), redirect_stderr(StringIO())):
+            owner = router.owner(self.row | {"Producer": str(unit.id)}, self.root / "change-review - top.md")
         self.assertIsInstance(owner, change_routing.UnroutedChange)
         self.assertEqual(owner.tab, "unrouted")

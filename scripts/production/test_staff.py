@@ -12,14 +12,14 @@ import stat
 import subprocess
 import sys
 import unittest
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from contextlib import chdir, redirect_stderr
 from dataclasses import FrozenInstanceError, replace
 from multiprocessing.connection import Connection
 from multiprocessing.process import BaseProcess
 from multiprocessing.synchronize import Barrier
 from pathlib import Path
-from typing import cast
+from typing import cast, override
 from unittest import mock
 
 from scripts.production import staff
@@ -29,6 +29,17 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 MISSING_ID = staff.StaffId("s00000000000")
+
+
+class CountedStaffRows(tuple[staff.StaffRow, ...]):
+    """Count full scans of the staff rows during repeated id lookups."""
+
+    scans: int = 0
+
+    @override
+    def __iter__(self) -> Iterator[staff.StaffRow]:
+        self.scans += 1
+        return super().__iter__()
 
 KILLED_WRITER = """import os, sys
 sys.platform = 'linux'
@@ -57,6 +68,53 @@ def concurrent_ensure(
 
 
 class NativeRuntimeIdentityTests(StaffTestCase):
+    def test_repeated_id_lookups_scan_the_staff_rows_at_most_once(self) -> None:
+        _, unit, _ = self.tree()
+        expected = tuple(replace(unit, id=staff.StaffId(fixture_runtime_id(f"indexed-{number}")))
+                         for number in range(400))
+        rows = CountedStaffRows(expected)
+        record = staff.StaffSnapshot(rows)
+        for number in range(200):
+            row = expected[number % 7]
+            self.assertIs(record.by_id(row.id), row)
+            self.assertIsNone(record.by_id(MISSING_ID))
+        self.assertLessEqual(rows.scans, 1)
+
+    def test_unit_lookup_keeps_exact_removed_worktrees_and_ignores_showrunners(self) -> None:
+        runner, unit, _ = self.tree()
+        location = self.root / "retired-unit"
+        unit = staff.set_worktree(unit.id, staff.RemovedWorktree("natedev", location))
+        record = staff.snapshot()
+        self.assertEqual(record.unit_by_worktree("natedev", location), unit)
+        self.assertIsNone(record.unit_by_worktree("mac", location))
+        self.assertIsNone(record.unit_by_worktree("natedev", location / "src"))
+        self.assertIsNone(record.by_worktree("natedev", location))
+        self.assertIsNone(record.unit_by_worktree("natedev", self.root))
+        self.assertEqual(record.by_id(runner.id), runner)
+
+    def test_a_present_worktree_wins_over_a_removed_worktree_in_either_order(self) -> None:
+        runner, unit, _ = self.tree()
+        location = self.root / "reused"
+        removed = replace(unit, worktree=staff.RemovedWorktree("natedev", location))
+        present = replace(unit, id=runner.id, worktree=staff.PresentWorktree("natedev", location))
+        for rows in ((removed, present), (present, removed)):
+            with self.subTest(rows=rows):
+                self.assertEqual(staff.StaffSnapshot(rows).unit_by_worktree("natedev", location), present)
+
+    def test_the_latest_removed_worktree_wins_for_a_reused_path(self) -> None:
+        runner, unit, _ = self.tree()
+        location = self.root / "reused"
+        older = replace(unit, worktree=staff.RemovedWorktree("natedev", location))
+        newer = replace(older, id=runner.id)
+        self.assertEqual(staff.StaffSnapshot((older, newer)).unit_by_worktree("natedev", location), newer)
+
+    def test_the_latest_present_worktree_wins_for_a_reused_path(self) -> None:
+        runner, unit, _ = self.tree()
+        location = self.root / "reused"
+        older = replace(unit, worktree=staff.PresentWorktree("natedev", location))
+        newer = replace(older, id=runner.id)
+        self.assertEqual(staff.StaffSnapshot((older, newer)).unit_by_worktree("natedev", location), newer)
+
     def test_new_members_use_only_the_native_id_supplied_by_the_backend(self) -> None:
         runner_id = "00000000-0000-4000-8000-000000000001"
         unit_id = "00000000-0000-4000-8000-000000000002"
