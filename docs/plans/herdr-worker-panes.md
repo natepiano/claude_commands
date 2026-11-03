@@ -1114,6 +1114,24 @@ It supports reruns and is deleted in Phase 18.
 Test a `/clear` during migration: resolve current ownership again, report unavailable evidence, and preserve fixed store keys.
 Make no unproved write and create no second row.
 
+### Phase 4p — A zombie app-server is not live  · status: done
+
+**Owner:** herdr-unit (sdlc, 2026-11-02; the user asked to resume two items this defect blocks).
+
+#### Work Order
+
+**Goal:** `codex_mesh.py` counts a zombie app-server as dead, and the launcher reaps each app-server it retires.
+
+**Spec:**
+1. `_pid_alive` returns False when `/proc/<pid>/stat` shows state `Z`. The EPERM rule stays.
+2. The launcher reaps each child app-server it retires; a pid that is not its child is ignored.
+
+**Files:** `scripts/agents/codex_mesh.py`, `scripts/agents/test_codex_mesh.py`.
+
+**Workers:** `1 writer`. Code only: Phase 45 and every worker thread keep running.
+
+**Acceptance gate:** one test for each item; `test_codex_mesh.py` passes; basedpyright 0/0 on both files. natedev merges the hash with `gm.sh`.
+
 ### Phase 4 — Member names come from the staff row  · status: todo
 
 **Owner:** models-unit (sdlc split, 2026-11-02 08:23).

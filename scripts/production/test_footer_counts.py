@@ -5,6 +5,8 @@ import contextlib
 import io
 import json
 import os
+import subprocess
+import re
 import sys
 import tempfile
 import unittest
@@ -23,6 +25,7 @@ import proposals_folder
 from scripts.production import showrunners
 import showrunner_tree
 from scripts.production import staff
+from scripts.production.test_change_routing import checkpoint_rows
 from scripts.statusline import counts_row
 from footer_counts import FooterCounts
 from scripts.production.staff_test_support import (
@@ -95,6 +98,8 @@ class FooterCountsTests(unittest.TestCase):
         _ = fixture_member("showrunner", name="fixture")
         _ = self.enterContext(mock.patch.object(Path, "home", return_value=self.root))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"NEXT_STATE_DIR": str(self.root / "next")})))
+        _ = self.enterContext(mock.patch.object(change_review, "LISTS", self.root))
+        _ = fixture_member("showrunner", name="production")
         # The doc's own line names the list; no live showrunner's list is looked up.
         _ = self.enterContext(mock.patch.object(change_review, "showrunner_of",
                                                 side_effect=change_review.ChangeReviewError("not running")))
@@ -121,6 +126,14 @@ class FooterCountsTests(unittest.TestCase):
         path = self.root / "production.md"
         _ = path.write_text("# Production\n\n" + "".join(f"{field}\n" for field in fields), encoding="utf-8")
         return path
+
+    def test_a_footer_count_uses_one_staff_snapshot_for_scope_and_routing(self) -> None:
+        listing = self.root / "change-review.md"
+        _ = listing.write_text(LIST, encoding="utf-8")
+        doc = self.doc(f"- **Change review:** `{listing}`")
+        record = staff.snapshot()
+        with mock.patch.object(staff, "snapshot", side_effect=[record]):
+            self.assertEqual(footer_counts.changes(doc), 2)
 
     def test_footer_counts_and_watches_questions_without_a_proposals_line(self) -> None:
         doc = self.root / "example-production.md"
@@ -293,7 +306,7 @@ class FooterCountsTests(unittest.TestCase):
         self.assertNotIn(folder / "by a child.md", footer_counts.sources(top))
 
     def test_each_production_counts_its_own_rows_of_the_roots_change_list(self) -> None:
-        listing = self.root / "change-review.md"
+        listing = self.root / "change-review - top.md"
         _ = listing.write_text(LIST.replace("| How to check |", "| How to check | Production |")
                                .replace("| --- | --- | --- |", "| --- | --- | --- | --- |")
                                .replace("| look |\n| C2", "| look | top |\n| C2").replace("| second | look |", "| second | look | kid |")
@@ -305,9 +318,108 @@ class FooterCountsTests(unittest.TestCase):
             _ = doc.write_text(f"# {doc.stem}\n", encoding="utf-8")
         self.tree = {"top": top, "kid": kid, "grandkid": grandkid}
         self.below = {"top": ["kid", "grandkid"]}
+        checkpoint_rows(self.root, self.tree, {listing: "top"})
         # A row without a Production cell is the root's; a child with no list line reads the root's list.
         self.assertEqual([footer_counts.changes(doc) for doc in (top, kid, grandkid)], [2, 1, 1])
         self.assertIn(listing, footer_counts.sources(kid))
+
+    def test_rows_without_checkpoints_count_for_the_list_showrunner_on_both_readers(self) -> None:
+        from scripts.review_links import change_browser, change_page
+        from scripts.production import change_review as page_review
+        from scripts.review_links.test_change_page import BrowserForms
+
+        listing = self.root / "change-review - top.md"
+        _ = listing.write_text("## To review\n\n| # | Change | Production | How to check |\n"
+                               + "| --- | --- | --- | --- |\n"
+                               + "| C1 | First | top | Read |\n| C2 | Second | kid | Read |\n"
+                               + "| C3 | Third | grandkid | Read |\n| C4 | Fourth | | Read |\n")
+        self.tree = {name: self.root / f"{name}-production.md" for name in ("top", "kid", "grandkid")}
+        self.below = {"top": ["kid", "grandkid"]}
+        for name, doc in self.tree.items():
+            _ = doc.write_text(f"# {name}\n- **Change review:** `{listing}`\n- **Showrunner checkout:** `{self.root}`\n")
+            _ = fixture_member("showrunner", name=name, doc=staff.LiveDoc("natedev", doc))
+        with mock.patch.object(page_review, "LISTS", self.root):
+            forms = BrowserForms()
+            forms.feed(change_browser.render(change_page.ReviewBrowser("secret"), change_page.DeliveryStatus(self.root)).decode())
+        counts = [footer_counts.changes(doc) for doc in self.tree.values()]
+        self.assertEqual(counts, [4, 0, 0])
+        self.assertEqual(counts, [forms.counts[name] for name in self.tree])
+
+    def test_unknown_units_in_independent_roots_share_the_pages_global_unrouted_count(self) -> None:
+        from scripts.review_links import change_browser, change_page
+        from scripts.production import change_review as page_review
+
+        self.tree = {name: self.root / f"{name}-production.md" for name in ("one", "two")}
+        listings = {self.root / f"change-review - {name}.md": name for name in self.tree}
+        for listing in listings:
+            _ = listing.write_text("## To review\n\n| # | Change |\n| --- | --- |\n| C1 | First |\n")
+        checkpoint_rows(self.root, self.tree, listings)
+        repo = self.root / "routing-repo"
+        for listing, name in listings.items():
+            previous = change_review.pending(listing)[0]["Merged"]
+            _ = subprocess.run(["git", "-C", str(repo), "commit", "--allow-empty", "-m",
+                                f"checkpoint(unknown-{name}): missing staff"], check=True, capture_output=True)
+            current = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
+                                     check=True, capture_output=True, text=True).stdout.strip()
+            _ = listing.write_text(listing.read_text().replace(previous, current))
+        with mock.patch.object(page_review, "LISTS", self.root):
+            browser = change_page.ReviewBrowser("token")
+            prepared = change_browser.prepare(browser, change_page.DeliveryStatus(self.root / "links"))
+        count = sum(item.waiting and item.tab == "unrouted" for item in prepared.changes)
+        self.assertEqual(count, 2)
+        self.assertEqual([footer_counts.unrouted_changes(doc) for doc in self.tree.values()], [count, count])
+
+    def test_a_new_git_ref_refreshes_the_cached_status_count_and_changes_its_tab(self) -> None:
+        listing = self.root / "change-review - top.md"
+        _ = listing.write_text("## To review\n\n| # | Change |\n| --- | --- |\n| C1 | First |\n")
+        docs = {name: self.root / f"{name}-production.md" for name in ("top", "kid")}
+        checkpoint_rows(self.root, docs, {listing: "top"})
+        repo = self.root / "routing-repo"
+
+        def git(*arguments: str) -> str:
+            return subprocess.run(["git", "-C", str(repo), *arguments], capture_output=True,
+                                  text=True, check=True).stdout.strip()
+
+        original = change_review.pending(listing)[0]["Merged"]
+        runner = staff.snapshot().by_path("top")
+        kid = staff.snapshot().by_path("kid")
+        assert runner is not None and kid is not None
+        _ = fixture_member("unit", name="kid-unit", parent=kid.id, worktree=staff.PresentWorktree("natedev", repo))
+        _ = git("checkout", "-b", "hidden")
+        _ = git("commit", "--allow-empty", "-m", "checkpoint(kid-unit): moves to kid")
+        hidden = git("rev-parse", "HEAD")
+        _ = git("checkout", "main")
+        _ = git("branch", "-D", "hidden")
+        _ = listing.write_text(listing.read_text().replace(original, hidden))
+        doc = docs["top"]
+        _ = doc.write_text(doc.read_text() + "\n> **Status: PRODUCTION — running**\n")
+        notifier = self.root / "notifier"
+        instance = notifier / "showrunner-top"
+        instance.mkdir(parents=True)
+        _ = (instance / "conf").write_text(f"TARGET=session:{runner.current_session}\nCHECK=zsh /x/check.sh {doc}\n")
+        environment = dict(os.environ) | {"HOME": str(self.root), "NOTIFIER_STATE_DIR": str(notifier),
+            "SHOWRUNNER_STATE_DIR": str(self.root / "showrunner"), "CHANGE_REVIEW_DIR": str(self.root),
+            "XDG_CACHE_HOME": str(self.root / "cache"), "REVIEW_LINKS_ROOT": str(self.root / "links")}
+        for folder in (self.root / "cache/change-review-history", self.root / "showrunner/counts", self.root / "links"):
+            folder.mkdir(parents=True, exist_ok=True)
+        statusline = Path(__file__).parents[1] / "statusline"
+
+        def read_status() -> str:
+            reply = subprocess.run(["/bin/sh", "-c", f'statusline="{statusline}"; . "$statusline/statusline.sh"'],
+                                   input=json.dumps({"session_id": runner.current_session}), capture_output=True,
+                                   text=True, check=True, env=environment, cwd=self.root)
+            return re.sub(r"\x1b\[[0-9;]*m", "", reply.stdout)
+
+        self.assertIn("For you: 1 change", read_status())
+        cache = self.root / "showrunner/counts/top"
+        began = cache.stat().st_mtime_ns
+        self.assertIn("For you: 1 change", read_status())
+        self.assertEqual(cache.stat().st_mtime_ns, began)
+        _ = git("branch", "visible", hidden)
+        self.assertNotIn("For you: 1 change", read_status())
+        self.assertGreater(cache.stat().st_mtime_ns, began)
+        with mock.patch.object(showrunners, "timer_docs", return_value=docs):
+            self.assertEqual([footer_counts.changes(doc) for doc in docs.values()], [0, 1])
 
     def test_the_proposal_count_leaves_out_approved_and_active_proposals(self) -> None:
         folder = self.root / "issues"

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read live key=value configuration and recover the newest valid committed value."""
+"""Read live configuration, complete missing default values, and recover invalid values from Git."""
 from __future__ import annotations
 
 from collections.abc import Callable, Generator, Iterator
@@ -77,17 +77,44 @@ class UnavailableValue:
 def value_origin(file: str | Path, key: str, convert: Callable[[str], Result]
                  ) -> UsableLiveValue[Result] | RecoveredValue[Result] | UnavailableValue:
     """Expose live validation without granting recovered values the same guarantee."""
+    return _resolve(file, key, convert, warn=False)
+
+
+class _MissingKey(ValueError):
+    """The file has no effective entry for the requested key."""
+
+
+def _resolve(file: str | Path, key: str, convert: Callable[[str], Result], *, warn: bool
+             ) -> UsableLiveValue[Result] | RecoveredValue[Result] | UnavailableValue:
+    """Read repository defaults before Git when a default file or key is absent."""
     source = path(file)
+    bad = "<missing>"
+    repository_allowed = False
     try:
         setting = _setting(_parse(source.read_text(encoding="utf-8")), key)
+        bad = setting.value
         return UsableLiveValue(_converted(setting, convert))
     except (OSError, UnicodeError, ValueError, ArithmeticError) as error:
-        reason = f"{source}: {key}: {error}"
+        repository_allowed = isinstance(error, (FileNotFoundError, _MissingKey))
+        reason = f"{source}: {key}={bad!r}: {error}"
+    if repository_allowed and isinstance(file, str) and "CONF_DIR" not in os.environ:
+        repository = _repository_path(file)
+        if repository != source:
+            try:
+                setting = _setting(_parse(repository.read_text(encoding="utf-8")), key)
+                return RecoveredValue(_converted(setting, convert), reason)
+            except (OSError, UnicodeError, ValueError, ArithmeticError):
+                pass
     for committed in _committed_files(source):
         try:
-            return RecoveredValue(_converted(_setting(_parse(committed), key), convert), reason)
+            value = _converted(_setting(_parse(committed), key), convert)
         except (ValueError, ArithmeticError):
             continue
+        if warn:
+            _warning(f"warning: {reason}")
+        return RecoveredValue(value, reason)
+    if warn:
+        _warning(f"warning: {reason}")
     return UnavailableValue(reason)
 
 
@@ -102,6 +129,11 @@ def path(file: str | Path) -> Path:
     if not file or Path(file).name != file or file.endswith(".conf"):
         raise Unusable(f"{file}: file: expected a configuration stem")
     return directory() / f"{file}.conf"
+
+
+def _repository_path(stem: str) -> Path:
+    """Return the repository configuration file for a validated stem."""
+    return Path(__file__).resolve().parents[2] / "config" / f"{stem}.conf"
 
 
 def _parse(source: str) -> dict[str, Setting]:
@@ -122,7 +154,7 @@ def _setting(settings: dict[str, Setting], key: str) -> Setting:
     for candidate in (f"{key}.{host}", key):
         if candidate in settings:
             return settings[candidate]
-    raise ValueError("key is missing")
+    raise _MissingKey("key is missing")
 
 
 def _limits(setting: Setting) -> None:
@@ -192,21 +224,10 @@ def _converted(setting: Setting, convert: Callable[[str], Result]) -> Result:
 
 
 def _read(file: str | Path, key: str, convert: Callable[[str], Result]) -> Result:
-    source = path(file)
-    bad = "<missing>"
-    try:
-        setting = _setting(_parse(source.read_text(encoding="utf-8")), key)
-        bad = setting.value
-        return _converted(setting, convert)
-    except (OSError, UnicodeError, ValueError) as error:
-        reason = str(error)
-    _warning(f"warning: {source}: {key}={bad!r}: {reason}")
-    for committed in _committed_files(source):
-        try:
-            return _converted(_setting(_parse(committed), key), convert)
-        except ValueError:
-            continue
-    raise Unusable(f"{source}: {key}={bad!r}: {reason}; no usable committed value")
+    result = _resolve(file, key, convert, warn=True)
+    if isinstance(result, UnavailableValue):
+        raise Unusable(f"{result.reason}; no usable committed value")
+    return result.value
 
 
 def text(file: str | Path, key: str) -> str:
@@ -231,11 +252,21 @@ def values(file: str | Path) -> dict[str, str]:
     try:
         contents = source.read_text(encoding="utf-8")
     except (OSError, UnicodeError) as error:
-        _warning(f"warning: {source}: keys: {error}")
-        for contents in _committed_files(source):
-            break
-        else:
-            raise Unusable(f"{source}: keys: {error}; no usable committed file") from error
+        contents = ""
+        recovered_from_repository = False
+        if isinstance(error, FileNotFoundError) and isinstance(file, str) and "CONF_DIR" not in os.environ:
+            try:
+                contents = _repository_path(file).read_text(encoding="utf-8")
+                recovered_from_repository = True
+            except (OSError, UnicodeError):
+                pass
+        if not recovered_from_repository:
+            for contents in _committed_files(source):
+                break
+            else:
+                _warning(f"warning: {source}: keys: {error}")
+                raise Unusable(f"{source}: keys: {error}; no usable committed file") from error
+            _warning(f"warning: {source}: keys: {error}")
     keys = _parse(contents)
     result: dict[str, str] = {}
     for key in keys:
