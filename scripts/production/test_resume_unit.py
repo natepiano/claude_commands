@@ -108,7 +108,7 @@ class ResumeUnitTests(unittest.TestCase):
         _ = self.staff.record_production("alpha", self.doc)
         row = unit_membership("alpha", "alpha-unit")
         row = staff.update_current_session(row.current_session, staff.StaffId(DIRECTOR))
-        _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.worktree))
+        _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.worktree), expected=row.worktree)
         unit_config.discard_parked(row.id)
         before = self.doc.read_bytes(), self.staff.staff_file.read_bytes(), git(self.checkout, "rev-parse", "HEAD")
         for flags in ((), ("--dry-run",)):
@@ -177,7 +177,7 @@ class ResumeUnitTests(unittest.TestCase):
         _ = self.staff.record_production("alpha", self.doc)
         row = unit_membership("alpha", "alpha-unit")
         row = staff.update_current_session(row.current_session, staff.StaffId(DIRECTOR))
-        _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.worktree))
+        _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.worktree), expected=row.worktree)
         self.retained_config()
 
     def retained_config(self, *, plan: str = "docs/plans/alpha.md", folder: Path | None = None) -> None:
@@ -233,7 +233,7 @@ class ResumeUnitTests(unittest.TestCase):
     def test_resume_unit_rerun(self) -> None:
         _ = self.staff.record_production("alpha", self.doc)
         row = unit_membership("alpha", "alpha-unit")
-        row = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.worktree))
+        row = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.worktree), expected=row.worktree)
         saved = unit_config.UnitConfig(unit_config.PlanFile(Path("docs/plans/alpha.md")),
             unit_config.AppPort(1), ("scripts",),
             unit_config.RetiredSession("2026-10-20", DIRECTOR,
@@ -472,7 +472,7 @@ class ResumeUnitTests(unittest.TestCase):
         source.symlink_to(self.doc)
         _ = self.staff.record_production("alpha", source)
         row = unit_membership("alpha", "alpha-unit")
-        _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.worktree))
+        _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.worktree), expected=row.worktree)
         wrapper = self.root / "resume-launch.py"
         # The inner launcher boundary supplies no live pane. Its public main and
         # staff step are real, including the inherited operation lock.

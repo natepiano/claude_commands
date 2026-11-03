@@ -103,7 +103,7 @@ class RetireUnitTests(unittest.TestCase):
 
     def prepared_retirement(self) -> staff.StaffRow:
         row = next(row for row in staff.find(kind="unit") if row.name == "alpha")
-        filled = staff.set_worktree(row.id, staff.PresentWorktree("natedev", self.worktree))
+        filled = staff.set_worktree(row.id, staff.PresentWorktree("natedev", self.worktree), expected=row.worktree)
         _ = unit_config.write(self.worktree, unit_config.UnitConfig(unit_config.PlanFile(Path("docs/plans/alpha.md")),
                                                                unit_config.AppPort(1), ("scripts",)))
         return filled
@@ -186,8 +186,10 @@ class RetireUnitTests(unittest.TestCase):
                         raise OSError("fixture interrupted after remove")
 
                     def field_then_stop(identity: staff.StaffId,
-                                        value: staff.PresentWorktree | staff.RemovedWorktree) -> staff.StaffRow:
-                        _ = field(identity, value)
+                                        value: staff.PresentWorktree | staff.RemovedWorktree, *,
+                                        expected: staff.PresentWorktree | staff.RemovedWorktree | staff.WorktreeUnfilled) -> staff.StaffRow:
+                        self.assertEqual(expected, row.worktree)
+                        _ = field(identity, value, expected=expected)
                         raise OSError("fixture interrupted after field")
 
                     def command_then_stop(argv: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
@@ -568,9 +570,10 @@ class RetireUnitTests(unittest.TestCase):
         runner, unit = self.staff_unit()
         original = staff.set_worktree
         for after in (False, True):
-            def interrupted(staff_id: staff.StaffId, value: staff.PresentWorktree | staff.RemovedWorktree) -> staff.StaffRow:
+            def interrupted(staff_id: staff.StaffId, value: staff.PresentWorktree | staff.RemovedWorktree, *,
+                            expected: staff.PresentWorktree | staff.RemovedWorktree | staff.WorktreeUnfilled) -> staff.StaffRow:
                 if after:
-                    _ = original(staff_id, value)
+                    _ = original(staff_id, value, expected=expected)
                 raise RuntimeError("stopped at staff retirement")
             with mock.patch.object(staff, "set_worktree", side_effect=interrupted):
                 with self.assertRaisesRegex(RuntimeError, "stopped at staff retirement"):

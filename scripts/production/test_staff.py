@@ -232,6 +232,40 @@ class DocumentLookupTests(StaffTestCase):
 
 
 class StaffTests(StaffTestCase):
+    def test_worktree_guard_changes_only_the_recorded_expected_location(self) -> None:
+        _, unit, _ = self.tree()
+        initial = staff.PresentWorktree("natedev", self.root / "initial")
+        settled = staff.RemovedWorktree("natedev", initial.path)
+        filled = staff.set_worktree(unit.id, initial, expected=unit.worktree)
+        changed = staff.set_worktree(unit.id, settled, expected=filled.worktree)
+        self.assertEqual(changed.worktree, settled)
+        before = self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns
+        self.assertEqual(staff.set_worktree(unit.id, settled, expected=initial), changed)
+        self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), before)
+        for expected in (initial, staff.WorktreeUnfilled(),
+                         staff.RemovedWorktree("mac", initial.path),
+                         staff.RemovedWorktree("natedev", self.root / "different")):
+            with self.subTest(expected=expected), self.assertRaises(staff.StaffRefused):
+                _ = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", self.root / "third"), expected=expected)
+            self.assertEqual(staff.by_id(unit.id), changed)
+            self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), before)
+
+    def test_remote_worktree_guard_transports_the_full_expected_location(self) -> None:
+        runner, _, _ = self.tree()
+        initial = staff.PresentWorktree("natedev", self.root / "initial")
+        unit = fixture_member("unit", name="remote-guard", parent=runner.id, worktree=initial)
+        settled = staff.PresentWorktree("mac", self.root / "settled")
+        with self.machine("mac"):
+            changed = staff.set_worktree(unit.id, settled, expected=initial)
+            self.assertEqual(changed.worktree, settled)
+            self.assert_refused(lambda: staff.set_worktree(unit.id,
+                staff.RemovedWorktree("mac", settled.path), expected=initial))
+        self.assertEqual(staff.by_id(unit.id), changed)
+        command = self.ssh_commands()[0]
+        for flag, value in (("--expected-state", "present"), ("--expected-machine", "natedev"),
+                            ("--expected-path", str(initial.path))):
+            self.assertEqual(command[command.index(flag) + 1], value)
+
     def test_restored_unit_survives_its_previous_pending_retirement(self) -> None:
         parent = fixture_member("showrunner", name="sdlc")
         location = staff.PresentWorktree("natedev", self.root / "models")
@@ -345,7 +379,7 @@ class StaffTests(StaffTestCase):
         self.assert_refused(lambda: fixture_member("unit", name="duplicate", parent=runner.id, worktree=location))
         self.assert_refused(lambda: fixture_member("unit", name="models", parent=runner.id,
                                                worktree=staff.PresentWorktree("natedev", self.root / "other")))
-        removed = staff.set_worktree(filled.id, staff.RemovedWorktree(location.machine, location.path))
+        removed = staff.set_worktree(filled.id, staff.RemovedWorktree(location.machine, location.path), expected=filled.worktree)
         self.assert_refused(lambda: fixture_member("unit", name="models", parent=runner.id, worktree=location))
         self.assertEqual(staff.by_id(removed.id), removed)
 
@@ -439,7 +473,7 @@ class StaffTests(StaffTestCase):
         runner, unit, _ = self.tree()
         other = fixture_member("unit", name="unfilled", parent=runner.id)
         location = staff.PresentWorktree("natedev", self.root / "filled")
-        _ = staff.set_worktree(unit.id, location)
+        _ = staff.set_worktree(unit.id, location, expected=unit.worktree)
         worker = fixture_worker("test", other.id)
         record = staff.snapshot()
         filled = record.by_id(unit.id)
@@ -470,19 +504,20 @@ class StaffTests(StaffTestCase):
         runner, unit, worker = self.tree()
         other = fixture_member("unit", name="other", parent=runner.id)
         path, doc = self.root / "worktree", self.root / "production.md"
-        _ = self.assert_rerun("set-worktree", unit.id, "--machine", "natedev", "--path", str(path), "--state", "present")
+        _ = self.assert_rerun("set-worktree", unit.id, "--machine", "natedev", "--path", str(path), "--state", "present",
+                              "--expected-state", "unfilled")
         _ = self.assert_rerun("set-doc", runner.id, "--machine", "natedev", "--path", str(doc), "--state", "live")
         before = self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns
-        _ = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", path))
+        _ = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", path), expected=unit.worktree)
         _ = staff.set_doc(runner.id, staff.LiveDoc("natedev", doc))
         self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), before)
-        self.assert_refused(lambda: staff.set_worktree(other.id, staff.PresentWorktree("natedev", path)))
+        self.assert_refused(lambda: staff.set_worktree(other.id, staff.PresentWorktree("natedev", path), expected=other.worktree))
         for wrong in (runner, worker):
-            self.assert_refused(lambda: staff.set_worktree(wrong.id, staff.PresentWorktree("natedev", path)))
+            self.assert_refused(lambda: staff.set_worktree(wrong.id, staff.PresentWorktree("natedev", path), expected=wrong.worktree))
         for wrong in (unit, worker):
             self.assert_refused(lambda: staff.set_doc(wrong.id, staff.LiveDoc("natedev", doc)))
-        _ = staff.set_worktree(unit.id, staff.RemovedWorktree("natedev", path))
-        claimed = staff.set_worktree(other.id, staff.PresentWorktree("natedev", path))
+        _ = staff.set_worktree(unit.id, staff.RemovedWorktree("natedev", path), expected=staff.PresentWorktree("natedev", path))
+        claimed = staff.set_worktree(other.id, staff.PresentWorktree("natedev", path), expected=other.worktree)
         self.assertEqual(staff.snapshot().by_worktree("natedev", path), claimed)
         wrapped = staff.set_doc(runner.id, staff.WrappedDoc("natedev", doc))
         self.assertEqual(staff.StaffRow.from_json(wrapped.to_json()), wrapped)
@@ -490,7 +525,7 @@ class StaffTests(StaffTestCase):
     def test_snapshot_finds_present_worktrees_by_machine_and_containing_path(self) -> None:
         runner, unit, _ = self.tree()
         path = self.root / "checkout"
-        _ = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", path))
+        _ = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", path), expected=unit.worktree)
         _ = staff.set_doc(runner.id, staff.LiveDoc("natedev", path / "production.md"))
         record = staff.snapshot()
         self.assertEqual(record.by_worktree("natedev", path), record.by_id(unit.id))
@@ -500,7 +535,7 @@ class StaffTests(StaffTestCase):
         self.assertEqual(record.by_doc("natedev", path / "production.md"), record.by_id(runner.id))
         self.assertIsNone(record.by_doc("mac", path / "production.md"))
         self.assertIsNone(record.by_doc("natedev", path / "other.md"))
-        _ = staff.set_worktree(unit.id, staff.RemovedWorktree("natedev", path))
+        _ = staff.set_worktree(unit.id, staff.RemovedWorktree("natedev", path), expected=staff.PresentWorktree("natedev", path))
         self.assertIsNone(staff.snapshot().by_worktree("natedev", path))
 
     def test_remote_setters_use_one_owner_write_and_preserve_the_other_field(self) -> None:
@@ -508,7 +543,7 @@ class StaffTests(StaffTestCase):
         path = self.root / "mac" / "worktree"
         with self.machine("mac"):
             self.assertNotIn("STAFF_FILE", os.environ)
-            changed = staff.set_worktree(unit.id, staff.PresentWorktree("mac", path))
+            changed = staff.set_worktree(unit.id, staff.PresentWorktree("mac", path), expected=unit.worktree)
             self.assertEqual(changed.worktree, staff.PresentWorktree("mac", path))
             changed_doc = staff.set_doc(runner.id, staff.LiveDoc("mac", path / "production.md"))
         commands = self.ssh_commands()
@@ -818,7 +853,7 @@ class StaffTests(StaffTestCase):
         self.assertIsNone(staff.by_path("sdlc/missing/impl1"))
         self.assert_refused(lambda: staff.retire(unit.id))
         location = staff.PresentWorktree("natedev", self.root / "models")
-        _ = staff.set_worktree(unit.id, location)
+        _ = staff.set_worktree(unit.id, location, expected=unit.worktree)
         staff.defer_retire((unit.id,))
         self.assertEqual(staff.retire_pending(), (unit.id,))
         self.assertEqual(staff.retire(worker.id), worker)
@@ -1025,23 +1060,23 @@ class StaffTests(StaffTestCase):
     def test_get_finds_a_member_by_its_worktree_root(self) -> None:
         _, unit, _ = self.tree()
         path = self.root / "checkout"
-        unit = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", path))
+        unit = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", path), expected=unit.worktree)
         found = self.cli("get", str(path), "--json")
         self.assertEqual(json.loads(found.stdout), unit.to_json())
 
     def test_get_finds_the_longest_worktree_for_an_inside_folder(self) -> None:
         runner, unit, _ = self.tree()
         path = self.root / "checkout"
-        _ = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", path))
+        _ = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", path), expected=unit.worktree)
         nested = fixture_member("unit", name="nested", parent=runner.id)
-        nested = staff.set_worktree(nested.id, staff.PresentWorktree("natedev", path / "nested"))
+        nested = staff.set_worktree(nested.id, staff.PresentWorktree("natedev", path / "nested"), expected=nested.worktree)
         found = self.cli("get", str(path / "nested/src"), "--json")
         self.assertEqual(json.loads(found.stdout), nested.to_json())
 
     def test_get_reports_an_unknown_worktree_path_as_not_found(self) -> None:
         _, unit, _ = self.tree()
         path = self.root / "checkout"
-        _ = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", path))
+        _ = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", path), expected=unit.worktree)
         missing = self.cli("get", str(self.root / "checkout-other"), code=1)
         self.assertIn("staff member not found", missing.stderr)
         self.assertEqual(missing.stdout, "")
@@ -1354,7 +1389,7 @@ class StaffTests(StaffTestCase):
     def test_pending_retirement_waits_for_workers_then_retires_units_before_showrunners(self) -> None:
         runner, unit, worker = self.tree()
         runner = staff.set_doc(runner.id, staff.LiveDoc("natedev", self.root / "sdlc.md"))
-        unit = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", self.root / "models"))
+        unit = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", self.root / "models"), expected=unit.worktree)
         child = fixture_member("showrunner", name="child", parent=runner.id)
         staff.defer_retire((runner.id, unit.id))
         original = self.staff_file.read_bytes()
@@ -1376,7 +1411,7 @@ class StaffTests(StaffTestCase):
     def test_pending_retirement_round_trips_over_mac_transport(self) -> None:
         runner, unit, worker = self.tree()
         runner = staff.set_doc(runner.id, staff.LiveDoc("natedev", self.root / "sdlc.md"))
-        unit = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", self.root / "models"))
+        unit = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", self.root / "models"), expected=unit.worktree)
         with self.machine("mac"):
             staff.defer_retire((runner.id, unit.id))
             self.assertEqual(staff.snapshot().pending_retire, tuple(sorted((runner.id, unit.id))))
