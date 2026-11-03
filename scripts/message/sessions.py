@@ -100,8 +100,6 @@ class RegistryRead:
 class SessionRetryPolicy:
     registry_reads: int
     registry_delay_seconds: float
-    resume_attempts: int
-    resume_delay_seconds: float
 
 
 def retry_policy() -> SessionRetryPolicy:
@@ -109,19 +107,13 @@ def retry_policy() -> SessionRetryPolicy:
     path = Path(__file__).resolve().parents[2] / "config/session_retries.toml"
     with path.open("rb") as source:
         values = cast(dict[str, object], tomllib.load(source))
-    counts: list[int] = []
-    for key in ("registry_reads", "resume_attempts"):
-        value = values[key]
-        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
-            raise ValueError(f"{path}: {key} must be a positive integer")
-        counts.append(value)
-    delays: list[float] = []
-    for key in ("registry_delay_seconds", "resume_delay_seconds"):
-        value = values[key]
-        if not isinstance(value, (int, float)) or isinstance(value, bool) or not 0 <= value < float("inf"):
-            raise ValueError(f"{path}: {key} must be finite and nonnegative")
-        delays.append(float(value))
-    return SessionRetryPolicy(counts[0], delays[0], counts[1], delays[1])
+    count = values["registry_reads"]
+    if not isinstance(count, int) or isinstance(count, bool) or count < 1:
+        raise ValueError(f"{path}: registry_reads must be a positive integer")
+    delay = values["registry_delay_seconds"]
+    if not isinstance(delay, (int, float)) or isinstance(delay, bool) or not 0 <= delay < float("inf"):
+        raise ValueError(f"{path}: registry_delay_seconds must be finite and nonnegative")
+    return SessionRetryPolicy(count, float(delay))
 
 
 @dataclass(frozen=True)
