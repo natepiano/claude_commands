@@ -199,11 +199,11 @@ HEARTBEAT_INTERVAL_SECS=60
 source "${SCRIPT_DIR}/../lib/conf.sh"
 COMPACT_ABOVE_TOKENS="$(conf_value direct UNIT_COMPACT_ABOVE_TOKENS)"
 
-source "${SCRIPT_DIR}/../agents/agents_config.sh"
+source "${SCRIPT_DIR}/../agents/models_config.sh"
 if ! agents_resolve "${TASK}"; then
   exit 1
 fi
-CODEX_MESH="${UNIT_CODEX_MESH:-$(_agents_registry_get direct.options codex_mesh)}"
+CODEX_MESH="${UNIT_CODEX_MESH:-$(_models_registry_get direct.options codex_mesh)}"
 if [[ "${AGENT_FAMILY}" == "codex" && "${CODEX_MESH}" == "1" ]]; then
   USE_CODEX_MESH=1
 else

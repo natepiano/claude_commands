@@ -3,15 +3,15 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-source "$SCRIPT_DIR/../lib/test_agents_registry.sh"
+source "$SCRIPT_DIR/../lib/test_models_registry.sh"
 SYNC_SCRIPT="$SCRIPT_DIR/sync_codex_catalog.sh"
 TEST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/sync-codex-catalog.XXXXXX")"
 # The unwritable-state-directory case chmods a directory read-only, and rm needs
 # it writable again to clear the tree.
 trap 'chmod -R u+rwx "$TEST_DIR" 2>/dev/null; rm -rf "$TEST_DIR"' EXIT
 
-AGENTS="$TEST_DIR/agents.conf"
-export AGENTS_CONFIG_PUBLISH=0
+AGENTS="$TEST_DIR/models.conf"
+export MODELS_CONFIG_PUBLISH=0
 CODEX_CONFIG="$TEST_DIR/config.toml"
 MODELS_CACHE="$TEST_DIR/models_cache.json"
 SYNC_STATE="$TEST_DIR/state/last_success"
@@ -42,7 +42,7 @@ fail() {
 
 run_sync() {
     PATH="$FAKE_BIN:$PATH" \
-    AGENTS_CONFIG_FILE="$AGENTS" \
+    MODELS_CONFIG_FILE="$AGENTS" \
     CODEX_CONFIG_FILE="$CODEX_CONFIG" \
     CODEX_MODELS_CACHE_FILE="$MODELS_CACHE" \
     CODEX_CATALOG_SYNC_STATE_FILE="${SYNC_STATE_OVERRIDE:-$SYNC_STATE}" \
@@ -367,9 +367,9 @@ run_sync >/dev/null 2>"$STDERR_FILE"
 stderr_text="$(<"$STDERR_FILE")"
 assert_contains "$stderr_text" "direct.impl is assigned to 'gpt-retired'" \
     "stale impl row warning did not name the row"
-assert_contains "$stderr_text" "/agent direct.impl <agent>[:<effort>]" \
+assert_contains "$stderr_text" "/default_models direct.impl <agent>[:<effort>]" \
     "stale row warning did not name the task reconfiguration command"
-assert_contains "$stderr_text" "/agent direct <family>" \
+assert_contains "$stderr_text" "/default_models direct <family>" \
     "stale row warning did not name the family reconfiguration command"
 assert_contains "$stderr_text" "direct.test is assigned to 'gpt-retired'" \
     "sync did not warn once for each stale assigned row"
@@ -410,7 +410,7 @@ assert_contains "$(<"$TEST_DIR/stdout")" "already running" \
 rmdir "$(dirname "$SYNC_STATE")/sync.lock"
 
 # A sandboxed caller can create nothing under the state directory. Reporting
-# that as a busy peer exits 0, and agents_config.sh then uses whatever stale
+# that as a busy peer exits 0, and models_config.sh then uses whatever stale
 # catalog is on disk with no warning -- so it has to be told apart from
 # contention and reported as the failure it is.
 readonly_state="$TEST_DIR/readonly-state"

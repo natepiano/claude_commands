@@ -583,9 +583,9 @@ def resolve_model(role: Role) -> tuple[str, str]:
                              'source "$1"; agents_resolve "design_roles.$2" || exit; ' +
                              '[[ "$AGENT_FAMILY" == codex ]] || exit 1; ' +
                              'printf "%s\\n%s\\n" "$AGENT_MODEL" "$AGENT_EFFORT"',
-                             'design-role-model', str(ROOT / 'scripts/agents/agents_config.sh'), role],
+                             'design-role-model', str(ROOT / 'scripts/agents/models_config.sh'), role],
                             capture_output=True, text=True, check=False, timeout=15,
-                            env={**os.environ, 'AGENTS_CONFIG_TIER_ONLY': '1'})
+                            env={**os.environ, 'MODELS_CONFIG_TIER_ONLY': '1'})
     values = result.stdout.strip().splitlines()
     if result.returncode or len(values) != 2 or not all(values):
         raise RoleRefused('invalid design-role model configuration: ' + result.stderr.strip())

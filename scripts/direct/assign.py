@@ -202,7 +202,7 @@ if [[ -n "$3" || -n "$4" ]]; then
  _agents_validate_pair "direct.$2" "$AGENT_FAMILY" "$pair" || exit 2
 fi
 printf '%s\\n' "$AGENT_FAMILY" "$AGENT_MODEL" "$AGENT_EFFORT" "${AGENT_SERVICE_TIER:-default}"
-''', "assign", str(SCRIPTS / "../agents/agents_config.sh"), role, args.model, args.effort], env, capture=True)
+''', "assign", str(SCRIPTS / "../agents/models_config.sh"), role, args.model, args.effort], env, capture=True)
     family, model, effort, tier = result.stdout.strip().splitlines()[-4:]
     if family != "codex":
         print("assign.sh: persistent unit workers require a Codex assignment", file=sys.stderr)
@@ -436,7 +436,7 @@ def claim_worker(dispatch: Dispatch) -> WorkerClaim:
             _ = dispatch.mesh_call("reopen", capture=True)
         dispatch.claim_follow()
         worker_lifecycle.WorkerStateFile(claim_path).publish(json.dumps({"pid": os.getpid(), "worker": dispatch.worker, "turn_id": ""}))
-        # Each turn runs at the caller's model:effort (agents.conf default or explicit override).
+        # Each turn runs at the caller's model:effort (models.conf default or explicit override).
         return WorkerClaim(identity_path, slot, dispatch.model, dispatch.effort)
 
 

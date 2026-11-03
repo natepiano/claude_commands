@@ -237,7 +237,7 @@ def state_copies(pass_: NotesPass) -> tuple[StateCopy, ...]:
         StateCopy(pass_.quota, "STATE", state_path(pass_.quota, "STATE")),
         StateCopy(pass_.five, "STATE", state_path(pass_.five, "STATE"), patterns=("*.notice",)),
         StateCopy(pass_.quota, "REGISTRY", state_path(pass_.quota, "REGISTRY")),
-        StateCopy(pass_.pacer, "AGENTS_CONF", state_path(pass_.pacer, "AGENTS_CONF")),
+        StateCopy(pass_.pacer, "MODELS_CONF", state_path(pass_.pacer, "MODELS_CONF")),
         StateCopy(import_module("scripts.accounts.worker_names"), "accounts_config_file",
                   state_path(import_module("scripts.accounts.worker_names"), "accounts_config_file", True), True),
         StateCopy(pass_.pacer, "STATE_FILE", state_path(pass_.pacer, "STATE_FILE")),
