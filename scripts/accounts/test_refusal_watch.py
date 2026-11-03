@@ -42,11 +42,10 @@ deliver_notice_jobs = quota_alert.deliver_and_record
 
 if TYPE_CHECKING:
     from scripts.shutdown.unit_staff_test_support import isolated_parents, unit_host
-    from scripts.shutdown import inventory, launch_permission, shutdown_record, restart_support, pane_record
+    from scripts.shutdown import inventory, shutdown_record, restart_support, pane_record
     from scripts.message import sessions
 else:
     from unit_staff_test_support import isolated_parents, unit_host
-    launch_permission = import_module("launch_permission")
     inventory = import_module("inventory")
     shutdown_record = import_module("shutdown_record")
     restart_support = import_module("restart_support")
@@ -107,7 +106,6 @@ class RefusalWatchTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        _ = self.enterContext(patch.object(launch_permission, "launch_permission", return_value=launch_permission.AllowedByShutdownState()))
         self.home = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         _ = self.enterContext(patch.object(pane_record, "RECORD_DIR", self.home / "herdr-panes"))
         _ = cast(object, self.enterContext(scratch_account_home(self.home, {
@@ -1421,6 +1419,26 @@ class RefusalWatchTests(unittest.TestCase):
                 self.assertEqual(len(lines), 1)
                 self.assertIn("roles.jsonl", lines[0])
 
+    def test_auto_id_is_kept_after_interrupted_consumption(self) -> None:
+        path = self.groups()
+        head = self.low_rule()
+        self.next_entries(head)
+        self.reading(SOURCE_LOGIN, 1)
+        with patch.object(next_moves, "write_next_moves", side_effect=OSError("interrupted consumption")):
+            with self.assertRaises(OSError):
+                _ = self.cli()
+        self.assertEqual(stored_group_labels(path)["units"], "claude2")
+        self.assertEqual(next_moves.read_next_moves(), (head,))
+        _ = accounts.set_group_account("units", "claude1", why="operator return", now=NOW)
+        code, _, error = self.cli()
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(next_moves.read_next_moves(), ())
+        self.assertEqual(stored_group_labels(path)["units"], "claude1")
+        history = [cast(dict[str, object], json.loads(line))
+                   for line in accounts.roles_history_file().read_text().splitlines()]
+        self.assertEqual([item["why"] for item in history], ["auto: units-low", "operator return"])
+
+
     def test_failed_consumption_cannot_replay_a_recorded_move_after_an_operator_returns_the_group(self) -> None:
         path = self.groups()
         entry = self.low_rule()
@@ -1445,28 +1463,6 @@ class RefusalWatchTests(unittest.TestCase):
                    for line in accounts.roles_history_file().read_text().splitlines()]
         self.assertEqual([saved["why"] for saved in history], ["auto: units-low", "operator return"])
 
-    def test_released_hold_does_not_change_the_auto_id_used_after_interrupted_consumption(self) -> None:
-        path = self.groups()
-        head = self.low_rule()
-        self.next_entries(head)
-        self.reading(SOURCE_LOGIN, 1)
-        released = launch_permission.ReleasedHold(label="claude2", then="stop",
-            requested_at=NOW.isoformat(), session_id="b1f5ca98-rest")
-        with (patch.object(launch_permission, "launch_permission",
-                           return_value=launch_permission.AllowedByShutdownState(released)),
-              patch.object(next_moves, "write_next_moves", side_effect=OSError("interrupted consumption"))):
-            with self.assertRaises(OSError):
-                _ = self.cli()
-        self.assertEqual(stored_group_labels(path)["units"], "claude2")
-        self.assertEqual(next_moves.read_next_moves(), (head,))
-        _ = accounts.set_group_account("units", "claude1", why="operator return", now=NOW)
-        code, _, error = self.cli()
-        self.assertEqual((code, error), (0, ""))
-        self.assertEqual(next_moves.read_next_moves(), ())
-        self.assertEqual(stored_group_labels(path)["units"], "claude1")
-        history = [cast(dict[str, object], json.loads(line))
-                   for line in accounts.roles_history_file().read_text().splitlines()]
-        self.assertEqual([item["why"] for item in history], ["auto: units-low", "operator return"])
 
     def test_failed_consumption_cannot_replay_a_recorded_move_when_role_history_becomes_malformed(self) -> None:
         path = self.groups()
@@ -1856,8 +1852,7 @@ class RefusalWatchTests(unittest.TestCase):
         _ = self.owner("unit", host="unit")
         self.next_entries(self.low_rule())
         self.reading(SOURCE_LOGIN, 1)
-        with patch.object(launch_permission, "launch_permission", side_effect=AssertionError("stale hold queried")):
-            _ = refusal_watch.run_auto_moves(NOW)
+        _ = refusal_watch.run_auto_moves(NOW)
         self.assertEqual(stored_group_labels(path)["units"], "claude2")
         self.assertEqual(next_moves.read_next_moves(), ())
         self.assertEqual(len(self.moves.calls), 1)
@@ -1873,8 +1868,7 @@ class RefusalWatchTests(unittest.TestCase):
                 self.reading(TARGET_LOGIN, 80)
                 if not committed:
                     _ = self.transcript(owner["session_id"])
-                with patch.object(launch_permission, "launch_permission", side_effect=AssertionError("stale hold queried")):
-                    _ = refusal_watch.run(NOW)
+                _ = refusal_watch.run(NOW)
                 self.assertEqual(len(self.moves.calls), 1)
 
     def test_automatic_low_rule_holds_at_two_percent_and_moves_at_one_with_one_transition(self) -> None:
@@ -1914,7 +1908,6 @@ class RefusalWatchTests(unittest.TestCase):
         _ = self.cli()
         self.assertEqual(stored_group_labels(path)["units"], "claude2")
         self.assertEqual(len(self.moves.calls), 1)
-
 
 
     def test_unavailable_head_is_reported_without_trying_a_later_valid_entry(self) -> None:
@@ -2037,8 +2030,6 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertIn("target clash", self.head_deliveries[0][0].text)
 
 
-
-
     def test_proof_moves_its_probe_without_changing_account_refusals_or_other_sessions_picker(self) -> None:
         _ = self.owner("probe")
         _ = self.owner("other")
@@ -2088,8 +2079,6 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertEqual(len(self.notifications), proof_notices + 1)
         _ = self.cli()
         self.assertEqual(len(self.notifications), proof_notices + 1)
-
-
 
 
     def test_transcript_refusal_writes_the_account_once_and_carries_its_window_and_reset(self) -> None:
@@ -2239,7 +2228,6 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertFalse(accounts.roles_history_file().exists())
         self.assertEqual(len(self.moves.calls), 2)
         self.assertTrue(all("weekly limit" in command.why for command in self.moves.calls))
-
 
 
     def test_hand_group_selection_without_live_members_is_reused_for_a_later_member(self) -> None:
@@ -2426,7 +2414,6 @@ class RefusalWatchTests(unittest.TestCase):
             _ = self.cli()
         self.assertEqual(prepare.call_count, 2)
         self.assertEqual(self.snapshot(), before)
-
 
 
     def test_five_hour_wait_holds_whole_group_without_reassigning_healthy_members(self) -> None:
@@ -3365,14 +3352,6 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertEqual(entries[0]["move_id"], entries[2]["move_id"])
         self.assertEqual(entries[1]["move_id"], entries[3]["move_id"])
         self.assertEqual(len(self.moves.calls), 2)
-
-
-
-
-
-
-
-
 
 
     def test_assumed_wait_overrides_only_its_decision_and_never_stored_usage(self) -> None:
