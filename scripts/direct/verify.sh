@@ -277,6 +277,15 @@ run() {
         if buildlog_step_compiles "$@"; then
             step_state on_natedev
         else
+            # A Mac step can release the token inside a lint pipeline.
+            # Read its shared mark before starting a local formatter.
+            if [[ -n "${TOKEN_WAIT_FILE:-}" && -e "${TOKEN_WAIT_FILE}.given_back" ]]; then
+                release_token || { status=$?; rm -f "$step_log"; return "$status"; }
+            fi
+            acquire_token local || { status=$?; rm -f "$step_log"; return "$status"; }
+            if (( TOKEN_WAITED > 0 )) && [[ -n "${TOKEN_WAIT_FILE:-}" ]]; then
+                printf '%s\n' "$TOKEN_WAITED" >> "$TOKEN_WAIT_FILE"
+            fi
             step_state local_noncompiling
         fi
         export BUILDLOG_TARGET=natedev
@@ -2577,6 +2586,7 @@ token_wait_superseded() {
 # the 3600 s hold already free a dead or stuck holder, and the queue above
 # drops a waiter whose verify.sh ended. Sets TOKEN_WAITED to the seconds it
 # waited.
+# The local argument disables remote routing for a local formatter.
 acquire_token() {
     TOKEN_WAITED=0
     [[ "${TOKEN_USED}" -eq 1 && "${TOKEN_HELD}" -eq 0 ]] || return 0
@@ -2636,10 +2646,10 @@ acquire_token() {
             TOKEN_WAITER_PID=""
             (( status != 4 )) || token_wait_orphaned
         fi
-        if [[ "$CMD" == test && -n "$MAC_LEAVE_SETTINGS" ]] \
+        if [[ "${1:-}" != local && "$CMD" == test && -n "$MAC_LEAVE_SETTINGS" ]] \
               && eval "$(ssh_retry_hook)" >/dev/null 2>&1; then
             try_reserved_target
-        elif [[ "$CMD" != test && "$STEP_RUNS_ON" != natedev_only ]] \
+        elif [[ "${1:-}" != local && "$CMD" != test && "$STEP_RUNS_ON" != natedev_only ]] \
               && eval "$(ssh_retry_hook)" >/dev/null 2>&1; then
             STEP_FORCE_MAC=1
             return "$LINT_LEFT_QUEUE_STATUS"
@@ -2770,9 +2780,8 @@ buildlog_exec() {
 }
 
 release_token() {
-    # A step that gave the token back and left for the Mac did so in run()'s
-    # subshell; its mark tells this shell the token is no longer held. A step
-    # killed as its acquire returned may hold it all the same, so free that.
+    # A subshell records its release for the parent shell.
+    # A killed acquisition can still hold the token, so release that token too.
     if [[ -n "${TOKEN_WAIT_FILE:-}" && -e "${TOKEN_WAIT_FILE}.given_back" ]]; then
         rm -f "${TOKEN_WAIT_FILE}.given_back"
         if [[ "${TOKEN_HELD}" -eq 1 ]]; then
@@ -2788,6 +2797,9 @@ release_token() {
     # new holder owns the token; the old step's result remains authoritative.
     (( release_status == 0 || release_status == 3 )) || return "$release_status"
     TOKEN_HELD=0
+    if [[ -n "${TOKEN_WAIT_FILE:-}" ]]; then
+        : > "${TOKEN_WAIT_FILE}.given_back"
+    fi
 }
 
 # One try for the token, with no wait. Status 0 when it is held. A call that
