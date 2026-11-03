@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Publish a change-review page: change_page.py --production DOC [--list L] C27 [C28 ...]."""
+"""Publish all change reviews, or retain an older selected-row link with --production DOC C27."""
 from __future__ import annotations
 
 import argparse
+import fcntl
+import hashlib
 import html
 import json
 import re
@@ -10,14 +12,17 @@ import secrets
 import subprocess
 import sys
 import tempfile
-from dataclasses import dataclass
+from collections.abc import Generator
+from contextlib import contextmanager
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import TypedDict, cast
+from typing import Literal, TypedDict, cast
 from urllib.parse import parse_qs, urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.production import change_review as change_review
-from scripts.production import showrunners, showrunner_tree
+from scripts.production import next_item, showrunners, showrunner_tree
+from scripts.lib import urgency
 from scripts.production.production_units import Refusal as Refusal, cell_value, production_field, unit_table
 from scripts.production.proposals_folder import owner_docs, slug_of
 from scripts.feature_log import feature_log
@@ -25,6 +30,19 @@ from scripts.review_links import review_link
 
 MANIFEST = ".review-link-changes.json"
 PAGE_NAME = "changes.html"
+BROWSER_MANIFEST = ".review-link-browser.json"
+DELIVERY_PREFIX = ".review-link-delivery-"
+
+
+class BrowserManifest(TypedDict):
+    token: str
+    initial: str
+
+
+@dataclass(frozen=True)
+class ReviewBrowser:
+    token: str
+    initial: str = ""
 
 
 class PageManifest(TypedDict):
@@ -32,6 +50,118 @@ class PageManifest(TypedDict):
     production: str
     rows: list[str]
     token: str
+
+
+class StoredDeliveryIntent(TypedDict):
+    attempt: str
+    state: Literal["pending", "failed"]
+
+
+class StoredValidationIntent(StoredDeliveryIntent):
+    feedback: str
+
+
+class StoredValidationRequested(TypedDict):
+    attempt: str
+    state: Literal["sent"]
+    feedback: str
+
+
+class StoredOpenQuestion(TypedDict):
+    question_id: str
+    text: str
+    delivery: StoredDeliveryIntent | None
+
+
+class StoredAnsweredQuestion(TypedDict):
+    question_id: str
+    text: str
+    answer: str
+
+
+class StoredDeliverySlots(TypedDict, total=False):
+    validation: StoredValidationIntent | StoredValidationRequested
+    verdict: StoredDeliveryIntent
+    question: StoredOpenQuestion | StoredAnsweredQuestion
+
+
+@dataclass(frozen=True)
+class NoDelivery:
+    """This delivery kind has no message that needs recovery."""
+
+
+@dataclass(frozen=True)
+class DeliveryIntent:
+    """One message attempt, without a second copy of a saved verdict."""
+
+    attempt: str
+    state: Literal["pending", "failed"]
+    kind: Literal["verdict", "validation", "question"]
+    feedback: str = ""
+
+
+@dataclass(frozen=True)
+class ValidationRequested:
+    """The showrunner owns validation after a delivered request."""
+
+    attempt: str
+    feedback: str
+
+
+@dataclass(frozen=True)
+class NoQuestion:
+    """The user has not asked a question about this row."""
+
+
+@dataclass(frozen=True)
+class OpenQuestion:
+    """The user waits for the showrunner's answer."""
+
+    question_id: str
+    text: str
+    delivery: DeliveryIntent | NoDelivery
+
+    @property
+    def awaiting_answer(self) -> bool:
+        """Only a delivered question transfers the row to the showrunner."""
+        return isinstance(self.delivery, NoDelivery)
+
+
+@dataclass(frozen=True)
+class AnsweredQuestion:
+    """The showrunner's answer returns the row to the user."""
+
+    question_id: str
+    text: str
+    answer: str
+
+
+@dataclass(frozen=True)
+class QuestionDelivery:
+    """One question and its message attempt share the same saved identity."""
+
+    question_id: str
+    text: str
+    attempt: str
+
+
+@dataclass(frozen=True)
+class DeliverySlots:
+    """Keep validation ownership and message attempts in one record."""
+
+    validation: DeliveryIntent | ValidationRequested | NoDelivery
+    verdict: DeliveryIntent | NoDelivery
+    question: NoQuestion | OpenQuestion | AnsweredQuestion = NoQuestion()
+
+    def selected(self, saved: bool) -> DeliveryIntent | NoDelivery:
+        intent = (self.verdict if saved else self.question.delivery
+                  if isinstance(self.question, OpenQuestion) else self.validation)
+        return intent if isinstance(intent, DeliveryIntent) else NoDelivery()
+
+    def updated(self, kind: Literal["verdict", "validation", "question"], intent: DeliveryIntent | NoDelivery) -> DeliverySlots:
+        if kind == "question":
+            return replace(self, question=replace(self.question, delivery=intent)) if isinstance(self.question, OpenQuestion) else self
+        return replace(self, verdict=intent) if kind == "verdict" else replace(self, validation=intent)
 
 
 @dataclass(frozen=True)
@@ -42,8 +172,298 @@ class ReviewPage:
     token: str
 
 
+@dataclass(frozen=True)
+class AssignedReviewPage(ReviewPage):
+    """The staff record supplies this row's current showrunner."""
+
+    showrunner_name: str
+
+
 class AnswerRefused(ValueError):
     """An invalid answer must not change the review record."""
+
+
+class FeatureLogFailed(RuntimeError):
+    """The feature log failed before the verdict could save."""
+
+
+@dataclass(frozen=True)
+class AnswerNotice:
+    row: str = ""
+    reason: str = ""
+    outcome: str = ""
+    feedback: str = ""
+
+
+NO_ANSWER_NOTICE = AnswerNotice()
+
+
+@dataclass(frozen=True)
+class MessageDelivery:
+    page: ReviewPage
+    row: str
+    recipients: tuple[str, ...]
+    message: str
+    attempt: str
+
+
+@dataclass(frozen=True)
+class NoMessageDelivery:
+    """A repeated question needs no additional message."""
+
+
+class DeliveryStatus:
+    """Own delivery intents and serialize conditional attempt updates."""
+
+    def __init__(self, root: Path) -> None:
+        self.root: Path = root
+        self.question_messages_in_flight: set[str] = set()
+
+    def read_view(self) -> DeliveryReadView:
+        return DeliveryReadView(self, frozenset(self.root.glob(DELIVERY_PREFIX + "*")))
+
+    @contextmanager
+    def locked(self) -> Generator[None, None, None]:
+        self.root.mkdir(parents=True, exist_ok=True)
+        with (self.root / ".review-link-delivery.lock").open("a+", encoding="utf-8") as stream:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+    def path(self, page: ReviewPage, row: str) -> Path:
+        identity = json.dumps([str(page.review_list.resolve()), row]).encode("utf-8")
+        return self.root / (DELIVERY_PREFIX + hashlib.sha256(identity).hexdigest())
+
+    def slots(self, page: ReviewPage, row: str) -> DeliverySlots:
+        try:
+            content = self.path(page, row).read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return DeliverySlots(NoDelivery(), NoDelivery())
+        try:
+            value = cast(object, json.loads(content))
+        except ValueError:
+            return DeliverySlots(NoDelivery(), DeliveryIntent("", "failed", "verdict"))
+        fields = cast(dict[str, object], value) if isinstance(value, dict) else {}
+        if "validation" in fields or "verdict" in fields or "question" in fields:
+            return DeliverySlots(self.decode_validation(fields.get("validation")),
+                                 self.decode_slot(fields.get("verdict"), "verdict"),
+                                 self.decode_question(fields.get("question")))
+        # Older records contain one intent or only validation feedback.
+        feedback = fields.get("feedback", "")
+        if not isinstance(feedback, str):
+            feedback = ""
+        attempt, state, kind = (fields.get(key) for key in ("attempt", "state", "kind"))
+        if isinstance(attempt, str) and state in ("pending", "failed") and kind in ("verdict", "validation"):
+            intent = DeliveryIntent(attempt, state, kind, feedback if kind == "validation" else "")
+        else:
+            intent = DeliveryIntent("", "failed", "validation" if "feedback" in fields else "verdict", feedback)
+        return DeliverySlots(NoDelivery(), NoDelivery()).updated(intent.kind, intent)
+
+    def decode_validation(self, value: object) -> DeliveryIntent | ValidationRequested | NoDelivery:
+        fields = cast(dict[str, object], value) if isinstance(value, dict) else {}
+        attempt, feedback = fields.get("attempt"), fields.get("feedback", "")
+        if fields.get("state") == "sent" and isinstance(attempt, str) and isinstance(feedback, str):
+            return ValidationRequested(attempt, feedback)
+        return self.decode_slot(fields, "validation")
+
+    def decode_question(self, value: object) -> NoQuestion | OpenQuestion | AnsweredQuestion:
+        fields = cast(dict[str, object], value) if isinstance(value, dict) else {}
+        text, question_id = fields.get("text"), fields.get("question_id")
+        if not isinstance(text, str) or not text.strip() or not isinstance(question_id, str) or not question_id:
+            return NoQuestion()
+        answer = fields.get("answer")
+        if isinstance(answer, str):
+            return AnsweredQuestion(question_id, text, answer)
+        return OpenQuestion(question_id, text, self.decode_slot(fields.get("delivery"), "question"))
+
+    def decode_slot(self, value: object, kind: Literal["verdict", "validation", "question"]) -> DeliveryIntent | NoDelivery:
+        if not isinstance(value, dict):
+            return NoDelivery()
+        fields = cast(dict[str, object], value)
+        attempt, state = fields.get("attempt"), fields.get("state")
+        feedback = fields.get("feedback", "") if kind == "validation" else ""
+        if not isinstance(attempt, str) or state not in ("pending", "failed") or not isinstance(feedback, str):
+            return NoDelivery()
+        return DeliveryIntent(attempt, state, kind, feedback)
+
+    def read(self, page: ReviewPage, row: str) -> DeliveryIntent | NoDelivery:
+        saved = any(item["#"] == row and item.get("Verdict") for item in change_review.review_rows(page.review_list))
+        return self.slots(page, row).selected(saved)
+
+    def write_slots(self, page: ReviewPage, row: str, slots: DeliverySlots) -> None:
+        """Write both slots while the caller holds the delivery lock."""
+        fields: StoredDeliverySlots = {}
+        if isinstance(slots.validation, DeliveryIntent):
+            fields["validation"] = {"attempt": slots.validation.attempt, "state": slots.validation.state,
+                                    "feedback": slots.validation.feedback}
+        elif isinstance(slots.validation, ValidationRequested):
+            fields["validation"] = {"attempt": slots.validation.attempt, "state": "sent",
+                                    "feedback": slots.validation.feedback}
+        if isinstance(slots.verdict, DeliveryIntent):
+            fields["verdict"] = {"attempt": slots.verdict.attempt, "state": slots.verdict.state}
+        question = slots.question
+        if isinstance(question, OpenQuestion):
+            fields["question"] = {"question_id": question.question_id, "text": question.text, "delivery": (
+                {"attempt": question.delivery.attempt, "state": question.delivery.state}
+                if isinstance(question.delivery, DeliveryIntent) else None)}
+        elif isinstance(question, AnsweredQuestion):
+            fields["question"] = {"question_id": question.question_id, "text": question.text, "answer": question.answer}
+        path = self.path(page, row)
+        if fields:
+            review_link.replace_file(path, (json.dumps(fields) + "\n").encode("utf-8"))
+        else:
+            path.unlink(missing_ok=True)
+
+    def failed(self, page: ReviewPage, row: str) -> bool:
+        intent = self.read(page, row)
+        return isinstance(intent, DeliveryIntent) and intent.state == "failed"
+
+    def begin(self, page: ReviewPage, row: str, kind: Literal["verdict", "validation"], feedback: str = "") -> str:
+        attempt = secrets.token_hex()
+        intent = DeliveryIntent(attempt, "pending", kind, feedback if kind == "validation" else "")
+        with self.locked():
+            self.write_slots(page, row, self.slots(page, row).updated(kind, intent))
+        return attempt
+
+    def record(self, delivery: MessageDelivery, failed: bool) -> None:
+        with self.locked():
+            self.question_messages_in_flight.discard(delivery.attempt)
+            slots = self.slots(delivery.page, delivery.row)
+            question_delivery = slots.question.delivery if isinstance(slots.question, OpenQuestion) else NoDelivery()
+            for current in (slots.validation, slots.verdict, question_delivery):
+                if isinstance(current, DeliveryIntent) and current.attempt == delivery.attempt:
+                    if failed:
+                        updated = slots.updated(current.kind, replace(current, state="failed"))
+                    elif current.kind == "validation":
+                        updated = replace(slots, validation=ValidationRequested(current.attempt, current.feedback))
+                    else:
+                        updated = slots.updated(current.kind, NoDelivery())
+                    self.write_slots(delivery.page, delivery.row, updated)
+                    return
+
+    def ask(self, page: ReviewPage, row: str, text: str) -> QuestionDelivery | NoDelivery:
+        """Save a new question without changing an existing open question."""
+        with self.locked():
+            slots = self.slots(page, row)
+            question = slots.question
+            if isinstance(question, OpenQuestion):
+                if question.text != text:
+                    raise AnswerRefused("this row already has an open question")
+                return NoDelivery()
+            intent = DeliveryIntent(secrets.token_hex(), "pending", "question")
+            question_id = secrets.token_hex(4)
+            self.write_slots(page, row, replace(slots, validation=NoDelivery(), question=OpenQuestion(question_id, text, intent)))
+            self.question_messages_in_flight.add(intent.attempt)
+            return QuestionDelivery(question_id, text, intent.attempt)
+
+    def retry_question(self, page: ReviewPage, row: str) -> QuestionDelivery:
+        """Retry the current question without creating or replacing a question."""
+        with self.locked():
+            slots = self.slots(page, row)
+            question = slots.question
+            if (not isinstance(question, OpenQuestion) or not isinstance(question.delivery, DeliveryIntent)
+                    or question.delivery.attempt in self.question_messages_in_flight):
+                raise AnswerRefused("this row has no question to send again")
+            intent = DeliveryIntent(secrets.token_hex(), "pending", "question")
+            self.write_slots(page, row, replace(slots, question=replace(question, delivery=intent)))
+            self.question_messages_in_flight.add(intent.attempt)
+            return QuestionDelivery(question.question_id, question.text, intent.attempt)
+
+    def answer_question(self, page: ReviewPage, row: str, question_id: str, text: str) -> bool:
+        """Save an answer once and preserve the delivery record's other slots."""
+        if not text.strip():
+            raise AnswerRefused("enter an answer")
+        text = text.strip()
+        with self.locked():
+            slots = self.slots(page, row)
+            question = slots.question
+            if isinstance(question, NoQuestion):
+                raise AnswerRefused("this row has no open question")
+            if question.question_id != question_id:
+                raise AnswerRefused("this question id does not match the current question")
+            if isinstance(question, AnsweredQuestion) and question.answer == text:
+                return False
+            if not isinstance(question, OpenQuestion):
+                raise AnswerRefused("this row has no open question")
+            record = next(item for item in answer_rows(page) if item["#"] == row)
+            if record.get("Verdict"):
+                raise AnswerRefused("this row already has a saved answer")
+            _ = row_production(page, record)
+            self.write_slots(page, row, replace(slots, question=AnsweredQuestion(question_id, question.text, text)))
+            return True
+
+
+@dataclass(frozen=True)
+class DeliveryReadView:
+    """One request scans record names once and reads only existing records."""
+
+    status: DeliveryStatus
+    paths: frozenset[Path]
+
+    def slots(self, page: ReviewPage, row: str) -> DeliverySlots:
+        if not self.paths or self.status.path(page, row) not in self.paths:
+            return DeliverySlots(NoDelivery(), NoDelivery())
+        return self.status.slots(page, row)
+
+
+def document(content: str) -> bytes:
+    return ('''<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Changes to review</title><style>
+:root{color-scheme:light dark;font:17px/1.55 system-ui,sans-serif}
+body{margin:0}main{max-width:680px;margin:auto;padding:40px 16px 64px}
+.id,h2{opacity:.7;font-size:14px}.kind{font-weight:600}
+h1{font-size:26px;line-height:1.25}h2{margin:28px 0 6px}p{white-space:pre-wrap}
+pre{white-space:pre-wrap;overflow-wrap:anywhere;border:1px solid #8886;border-radius:6px;padding:12px;font:14px/1.45 ui-monospace,monospace}
+section+section{border-top:1px solid #8886;margin-top:36px;padding-top:28px}
+form{margin-top:28px}label,input{display:block}input[type=text]{box-sizing:border-box;width:100%;font:inherit;margin:6px 0 12px}
+button{font:inherit;margin:0 8px 8px 0;padding:6px 12px}button[aria-pressed=true]{outline:2px solid currentColor}
+</style></head><body><main>''' + content + "</main></body></html>").encode("utf-8")
+
+
+def answer_notice(page: ReviewPage, body: str, reason: str) -> AnswerNotice:
+    fields = parse_qs(body, keep_blank_values=True)
+    row = fields.get("row", [""])[0]
+    outcome = fields.get("outcome", [""])[0]
+    if row not in page.rows:
+        row = ""
+    if outcome not in ("works", "not works", "validate", "feedback", "question"):
+        outcome = ""
+    return AnswerNotice(row, reason, outcome, fields.get("feedback", [""])[0])
+
+
+def answer_form(page: ReviewPage, notice: AnswerNotice) -> str:
+    """Render an answer without reading rows or queue state."""
+    row = notice.row if notice.row in page.rows else page.rows[0]
+    row_id = html.escape(row)
+    buttons: list[str] = []
+    for value, label in (("works", "Works"), ("not works", "Not works"),
+                         ("validate", "Validate yourself"), ("feedback", "Send feedback"), ("question", "Ask a question")):
+        selected = 'aria-pressed="true" ' if notice.outcome == value else ""
+        buttons.append(f'<button {selected}name="outcome" value="{value}">{label}</button>')
+    return f'''<form method="post">
+<input type="hidden" name="row" value="{row_id}">
+<input type="hidden" name="token" value="{html.escape(page.token)}">
+<label for="feedback-{row_id}">Feedback or question</label>
+<input id="feedback-{row_id}" name="feedback" type="text" value="{html.escape(notice.feedback, quote=True)}">
+<div>{"".join(buttons)}</div></form>'''
+
+
+def fallback_answer(page: ReviewPage, notice: AnswerNotice) -> bytes:
+    return document(f'<p role="alert">Not saved: {html.escape(notice.reason)}</p>' + answer_form(page, notice))
+
+
+def question_html(question: NoQuestion | OpenQuestion | AnsweredQuestion) -> str:
+    if isinstance(question, NoQuestion):
+        return ""
+    content = f'<h2>Question</h2><p>{html.escape(question.text)}</p>'
+    if isinstance(question, AnsweredQuestion):
+        content += f'<h2>Answer</h2><p>{html.escape(question.answer)}</p>'
+    else:
+        content += '<p>The showrunner will answer this</p>'
+    return content
 
 
 def page_at(root: Path, request_path: str) -> ReviewPage:
@@ -83,46 +503,96 @@ def shown_rows(page: ReviewPage) -> list[dict[str, str]]:
     return selected
 
 
-def render(page: ReviewPage) -> bytes:
+def answer_rows(page: ReviewPage) -> list[dict[str, str]]:
+    """Allow older unclassified rows when the browser supplied a signed row token."""
+    found = {row["#"]: row for row in change_review.review_rows(page.review_list)}
+    if any(row not in found for row in page.rows):
+        raise AnswerRefused("this change is no longer on the review list")
+    return [found[row] for row in page.rows]
+
+
+def render(page: ReviewPage, delivery: DeliveryStatus, notice: AnswerNotice = NO_ANSWER_NOTICE) -> bytes:
     sections: list[str] = []
+    saved = False
     for row in shown_rows(page):
         row_id = html.escape(row["#"])
         verdict = row.get("Verdict", "")
-        answer = (f'''<p role="status">Saved: {html.escape(verdict)}</p>
+        saved = saved or bool(verdict)
+        slots = delivery.slots(page, row["#"])
+        intent = slots.selected(bool(verdict))
+        question = slots.question
+        failure = False
+        pending = False
+        failed_feedback = ""
+        if isinstance(intent, DeliveryIntent):
+            failure = True
+            pending = intent.state == "pending"
+            failed_feedback = question.text if isinstance(question, OpenQuestion) else intent.feedback if not verdict else ""
+        warning = ("Not saved: " + notice.reason if notice.reason and notice.row == row["#"]
+                   else "The message may not have sent" if pending
+                   else "Saved, but the message did not send" if verdict and failure
+                   else "The question message did not send" if failure and isinstance(question, OpenQuestion)
+                   else "The validation message did not send" if failure else "")
+        alert = f'<p role="alert">{html.escape(warning)}</p>' if warning else ""
+        retry_outcome = "retry" if verdict or isinstance(question, OpenQuestion) else "validate"
+        retry_feedback = "" if isinstance(question, OpenQuestion) else failed_feedback
+        retry_label = ("Send saved answer again" if verdict else "Send question again"
+                       if isinstance(question, OpenQuestion) else "Send validation request again")
+        retry = (f'''
 <form method="post">
 <input type="hidden" name="row" value="{row_id}">
 <input type="hidden" name="token" value="{html.escape(page.token)}">
-<input type="hidden" name="feedback" value="">
-<button name="outcome" value="retry">Send saved answer again</button>
-</form>''' if verdict else f'''
-<form method="post">
-<input type="hidden" name="row" value="{row_id}">
-<input type="hidden" name="token" value="{html.escape(page.token)}">
-<label for="feedback-{row_id}">Other feedback</label>
-<input id="feedback-{row_id}" name="feedback" type="text">
-<div><button name="outcome" value="works">Works</button>
-<button name="outcome" value="not works">Not works</button>
-<button name="outcome" value="feedback">Send feedback</button></div>
-</form>''')
+<input type="hidden" name="feedback" value="{html.escape(retry_feedback, quote=True)}">
+<button name="outcome" value="{retry_outcome}">{retry_label}</button>
+</form>''' if failure else "")
+        form_notice = notice if notice.row == row["#"] else AnswerNotice(row["#"], feedback=failed_feedback)
+        answer = (f'<p role="status">Saved: {html.escape(verdict)}</p>' + retry if verdict
+                  else retry if isinstance(question, OpenQuestion) else answer_form(page, form_notice) + retry)
         proof_title = "Try it · What you should see" if row[change_review.KIND] == "See in action" else "Proof"
         sections.append(f'''<section id="{row_id}">
+{alert}
 <p class="kind">{html.escape(row[change_review.KIND])}</p>
 <div class="id">{row_id} · {html.escape(row.get("Merged", ""))}</div>
 <h1>{html.escape(row["Change"])}</h1>
 <h2>{proof_title}</h2><pre>{html.escape(row[change_review.CHECK])}</pre>
-{answer}</section>''')
-    return ('''<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Changes to review</title><style>
-:root{color-scheme:light dark;font:17px/1.55 system-ui,sans-serif}
-body{margin:0}main{max-width:680px;margin:auto;padding:40px 16px 64px}
-.id,h2{opacity:.7;font-size:14px}.kind{font-weight:600}
-h1{font-size:26px;line-height:1.25}h2{margin:28px 0 6px}p{white-space:pre-wrap}
-pre{white-space:pre-wrap;overflow-wrap:anywhere;border:1px solid #8886;border-radius:6px;padding:12px;font:14px/1.45 ui-monospace,monospace}
-section+section{border-top:1px solid #8886;margin-top:36px;padding-top:28px}
-form{margin-top:28px}label,input{display:block}input[type=text]{box-sizing:border-box;width:100%;font:inherit;margin:6px 0 12px}
-button{font:inherit;margin:0 8px 8px 0;padding:6px 12px}
-</style></head><body><main>''' + "".join(sections) + "</main></body></html>").encode("utf-8")
+{question_html(question)}{answer}</section>''')
+    if notice.reason and not notice.row:
+        sections.insert(0, f'<p role="alert">Not saved: {html.escape(notice.reason)}</p>')
+    queue = next_item.change_queue(page.production)
+    moved = urgency.ended(queue.name)
+    if saved or any(queue_key(page, row) in moved for row in page.rows):
+        sections.append(f'<p>{len(queue.entries)} changes left</p>')
+        if queue.entries:
+            sections.append(f'''<form method="post">
+<input type="hidden" name="token" value="{html.escape(page.token)}">
+<button name="outcome" value="next">Next</button></form>''')
+    return document("".join(sections))
+
+
+def queue_key(page: ReviewPage, row: str) -> str:
+    """Keep the current list's row IDs and qualify rows from an earlier list."""
+    if page.review_list.resolve() == change_review.scope_list(page.production).resolve():
+        return row
+    name = page.review_list.stem.removeprefix(change_review.PREFIX)
+    return f"{name}/{row}"
+
+
+def publish_next(page: ReviewPage, body: str) -> str:
+    fields = parse_qs(body, keep_blank_values=True, strict_parsing=True)
+    if (set(fields) != {"token", "outcome"} or fields.get("outcome") != ["next"]
+            or len(fields["token"]) != 1
+            or not secrets.compare_digest(fields["token"][0].encode("utf-8"), page.token.encode("utf-8"))):
+        raise AnswerRefused("use the Next control on this page")
+    queue = next_item.change_queue(page.production)
+    moved = urgency.ended(queue.name)
+    if not any(row.get("Verdict") or queue_key(page, row["#"]) in moved for row in shown_rows(page)):
+        raise AnswerRefused("answer a change first")
+    ordered = urgency.queue_order(queue.entries, queue.name)
+    if not ordered:
+        raise AnswerRefused("no changes remain")
+    name, separator, row = ordered[0].key.rpartition("/")
+    review_list = change_review.list_file(name) if separator else change_review.scope_list(page.production)
+    return publish(page.production, review_list, [row])
 
 
 def publish(production: Path, review_list: Path, rows: list[str]) -> str:
@@ -146,6 +616,8 @@ def publish(production: Path, review_list: Path, rows: list[str]) -> str:
 
 def showrunner(page: ReviewPage) -> str:
     """The record names the recipient, including when its production is offline."""
+    if isinstance(page, AssignedReviewPage):
+        return page.showrunner_name
     text = change_review.read(page.review_list)
     frontmatter = text.split("---", 2)
     if len(frontmatter) == 3:
@@ -217,6 +689,8 @@ def send_message(recipient: str, sender: str, message: str) -> None:
 
 def close_feature_log(page: ReviewPage, doc: Path, row_id: str, verdict: str) -> None:
     """Apply step one of CloseChangeReview before the verdict closes the row."""
+    list_name = page.review_list.stem.removeprefix(change_review.PREFIX)
+    review = row_id if list_name == "hana" else f"{list_name}/{row_id}"
     projects = {name for name, spec in feature_log.PROJECTS.items()
                 if spec.closes_by_change_review}
     lines = doc.read_text(encoding="utf-8").splitlines()
@@ -226,10 +700,8 @@ def close_feature_log(page: ReviewPage, doc: Path, row_id: str, verdict: str) ->
                              capture_output=True, text=True, check=True).stdout.strip()
     if project not in projects:
         return
-    list_name = page.review_list.stem.removeprefix(change_review.PREFIX)
-    review = row_id if list_name == "hana" else f"{list_name}/{row_id}"
     command = "add" if change_review.lands(verdict) else "drop"
-    arguments = ["--review", review]
+    arguments = ["--review", review, "--if-proposed"]
     if command == "drop":
         arguments.append(f"--verdict={verdict}")
     result = subprocess.run([sys.executable, script, command, *arguments],
@@ -252,36 +724,66 @@ def closeout_before_save(page: ReviewPage, doc: Path, row_id: str, verdict: str)
         try:
             send_message(showrunner(page), Path(__file__).stem, message)
         except RuntimeError as delivery_error:
-            raise RuntimeError(f"{message}\nNotification failed: {delivery_error}") from delivery_error
-        raise RuntimeError(message) from error
+            raise FeatureLogFailed(f"{message}\nNotification failed: {delivery_error}") from delivery_error
+        raise FeatureLogFailed(message) from error
 
 
-def submit(page: ReviewPage, body: str) -> None:
+def submit(page: ReviewPage, body: str, status: DeliveryStatus, *,
+           prepared: change_review.ChangeQueue | next_item.ReadChangeLists = next_item.READ_CHANGE_LISTS) -> MessageDelivery | NoMessageDelivery:
     fields = parse_qs(body, keep_blank_values=True, strict_parsing=True)
     if set(fields) != {"row", "token", "outcome", "feedback"} or any(len(values) != 1 for values in fields.values()):
         raise AnswerRefused("expected only row, token, outcome and feedback")
     row_id, token, outcome, feedback = (fields[key][0] for key in ("row", "token", "outcome", "feedback"))
     if row_id not in page.rows or not secrets.compare_digest(token.encode("utf-8"), page.token.encode("utf-8")):
         raise AnswerRefused("row or page token does not match this page")
-    if outcome not in ("works", "not works", "feedback", "retry") or "\n" in feedback or "\r" in feedback:
+    if (outcome not in ("works", "not works", "validate", "feedback", "question", "retry")
+            or feedback.splitlines() not in ([], [feedback])):
         raise AnswerRefused("choose an answer and use one line of feedback")
-    if outcome == "feedback" and not feedback.strip():
-        raise AnswerRefused("enter feedback")
+    if outcome in ("feedback", "question") and not feedback.strip():
+        raise AnswerRefused("enter a question" if outcome == "question" else "enter feedback")
     verdict = feedback.strip() if feedback.strip() else outcome
     if outcome in ("works", "not works") and feedback.strip():
         verdict = f"{outcome}: {feedback.strip()}"
-    row = next(row for row in shown_rows(page) if row["#"] == row_id)
+    rows = answer_rows(page) if isinstance(page, AssignedReviewPage) else shown_rows(page)
+    row = next(row for row in rows if row["#"] == row_id)
+    recipient = showrunner(page)
+    if outcome == "question" or (outcome == "retry" and not row.get("Verdict")):
+        if row.get("Verdict"):
+            raise AnswerRefused("this row already has a saved answer")
+        if outcome == "retry" and feedback:
+            raise AnswerRefused("retry requires no new feedback")
+        _ = row_production(page, row)
+        intent = (status.ask(page, row_id, feedback.strip()) if outcome == "question"
+                  else status.retry_question(page, row_id))
+        if isinstance(intent, NoDelivery):
+            return NoMessageDelivery()
+        message = (f"Change review {row_id}: the user asks a question\n"
+                   f"List: {page.review_list}\nProduction: {page.production}\n"
+                   f"Change: {row['Change']}\nQuestion id: {intent.question_id}\nQuestion: {intent.text}")
+        return MessageDelivery(page, row_id, (recipient,), message, intent.attempt)
+    if isinstance(status.slots(page, row_id).question, OpenQuestion):
+        raise AnswerRefused("this row has an open question")
+    if outcome == "validate":
+        if row.get("Verdict"):
+            raise AnswerRefused("this row already has a saved answer")
+        _ = row_production(page, row)
+        _ = next_item.move_to_end(next_item.CHANGE, page.production, key=queue_key(page, row_id), prepared=prepared)
+        attempt = status.begin(page, row_id, "validation", feedback)
+        message = (f"Change review {row_id}: the user asks you to validate this\n"
+                   f"List: {page.review_list}\nProduction: {page.production}\n"
+                   f"Change: {row['Change']}\nUser feedback: {feedback}")
+        return MessageDelivery(page, row_id, (recipient,), message, attempt)
     if outcome == "retry":
         if not row.get("Verdict") or feedback:
             raise AnswerRefused("retry requires a saved answer and no new feedback")
         verdict = row["Verdict"]
     if row.get("Verdict") and row["Verdict"] != verdict:
         raise AnswerRefused("this row already has a different saved answer")
-    recipient = showrunner(page)
     doc = row_production(page, row)
     unit = returning_unit(page, row) if verdict != "works" else recipient
     if not row.get("Verdict"):
         closeout_before_save(page, doc, row_id, verdict)
+    attempt = status.begin(page, row_id, "verdict")
     result = subprocess.run([sys.executable, str(Path(change_review.__file__)), "verdict",
                              "--production", str(page.production), "--list", str(page.review_list),
                              "--row", row_id, f"--verdict={verdict}"], capture_output=True, text=True, check=False)
@@ -291,28 +793,71 @@ def submit(page: ReviewPage, body: str) -> None:
                f"List: {page.review_list}\nProduction: {page.production}\n"
                f"Change: {row['Change']}\nMerged: {row.get('Merged', '')}\n"
                f"User feedback: {feedback if feedback.strip() else verdict}\n{result.stdout.strip()}")
+    return MessageDelivery(page, row_id, tuple(dict.fromkeys((unit, recipient))), message, attempt)
+
+
+def deliver(delivery: MessageDelivery | NoMessageDelivery, status: DeliveryStatus) -> None:
+    if isinstance(delivery, NoMessageDelivery):
+        return
     errors: list[str] = []
-    for target in dict.fromkeys((unit, recipient)):
+    for target in delivery.recipients:
         try:
-            send_message(target, Path(__file__).stem, message)
-        except RuntimeError as error:
+            send_message(target, Path(__file__).stem, delivery.message)
+        except (OSError, RuntimeError, subprocess.SubprocessError) as error:
             errors.append(f"{target}: {error}")
     if errors:
-        raise RuntimeError("Answer saved; delivery failed. Reload the page and select Send saved answer again. "
-                           + "; ".join(errors))
+        print(f"review-links delivery {delivery.row}: " + "; ".join(errors), file=sys.stderr)
+    status.record(delivery, bool(errors))
+
+
+def publish_browser(initial: str = "") -> str:
+    """Publish one all-list page without copying change records."""
+    with tempfile.TemporaryDirectory(prefix="review-browser-") as temporary:
+        source = Path(temporary) / PAGE_NAME
+        _ = source.write_text("<!doctype html><title>Changes to review</title>", encoding="utf-8")
+        url = review_link.snapshot([source], new=True)[0]
+    folder = review_link.review_root() / urlsplit(url).path.split("/")[1]
+    manifest: BrowserManifest = {"token": secrets.token_urlsafe(), "initial": initial}
+    review_link.replace_file(folder / BROWSER_MANIFEST, json.dumps(manifest).encode())
+    return url
 
 
 def main(arguments: list[str]) -> int:
+    if arguments and arguments[0] == "answer-question":
+        parser = argparse.ArgumentParser(description="Answer an open question about a change.")
+        _ = parser.add_argument("--production", required=True, type=Path)
+        _ = parser.add_argument("--list", required=True, type=Path)
+        _ = parser.add_argument("--row", required=True)
+        _ = parser.add_argument("--question", required=True)
+        _ = parser.add_argument("--text", required=True)
+        args = parser.parse_args(arguments[1:])
+        page = ReviewPage(cast(Path, args.list).expanduser(), cast(Path, args.production).expanduser(),
+                          (cast(str, args.row),), "")
+        try:
+            changed = DeliveryStatus(review_link.review_root()).answer_question(
+                page, page.rows[0], cast(str, args.question), cast(str, args.text))
+        except (OSError, ValueError, change_review.ChangeReviewError, Refusal, subprocess.SubprocessError) as error:
+            print(f"change page: {error}", file=sys.stderr)
+            return 1
+        print(f"Answered {page.rows[0]}" if changed else f"{page.rows[0]} already has this answer")
+        return 0
     parser = argparse.ArgumentParser(description=__doc__)
-    _ = parser.add_argument("rows", nargs="+")
-    _ = parser.add_argument("--production", type=Path, required=True)
+    _ = parser.add_argument("rows", nargs="*")
+    _ = parser.add_argument("--production", type=Path)
     _ = parser.add_argument("--list", type=Path)
     args = parser.parse_args(arguments)
-    production = cast(Path, args.production).expanduser()
+    rows = cast(list[str], args.rows)
+    production = cast(Path | None, args.production)
     review_list = cast(Path | None, args.list)
     try:
+        if not rows:
+            print(publish_browser())
+            return 0
+        if production is None:
+            raise ValueError("pass --production for an older selected-row link")
+        production = production.expanduser()
         path = review_list.expanduser() if review_list else change_review.production_list(str(production))
-        print(publish(production, path, cast(list[str], args.rows)))
+        print(publish(production, path, rows))
     except (OSError, ValueError, change_review.ChangeReviewError, subprocess.SubprocessError, Refusal) as error:
         print(f"change page: {error}", file=sys.stderr)
         return 1

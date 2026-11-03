@@ -3,10 +3,17 @@
 from __future__ import annotations
 
 import unittest
+from typing import override
+from scripts.build_queue.admission_test_support import caller_admission
 from scripts.direct import verify_lint_scope_test_support as support
 
 
 class VerifyLintScopeTests(support.VerifyLintScopeFixture):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        _ = caller_admission(self, self.root, self.environment)
+
     def test_check_rejects_malformed_tracked_toml_with_literal_brackets(self) -> None:
         tracked, untracked = self.toml_glob_neighbors(untracked_text="value = 2\n")
         before = untracked.read_bytes(), untracked.stat().st_mtime_ns
@@ -15,6 +22,12 @@ class VerifyLintScopeTests(support.VerifyLintScopeFixture):
         self.assertIn(tracked.name, result.stdout + result.stderr)
         self.assertIn("not properly formatted", result.stdout + result.stderr)
         self.assertEqual((untracked.read_bytes(), untracked.stat().st_mtime_ns), before)
+
+    def test_silent_taplo_check_failure_has_a_diagnostic(self) -> None:
+        self.write_shell(self.root / "bin/taplo", "exit 1\n")
+        result = self.invoke_workspace_taplo("--check")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("not properly formatted", result.stdout + result.stderr)
 
     def test_fix_formats_tracked_toml_with_literal_brackets_and_preserves_untracked_neighbor(self) -> None:
         tracked, untracked = self.toml_glob_neighbors(untracked_text="value=2\n")
@@ -43,8 +56,10 @@ class VerifyLintScopeTests(support.VerifyLintScopeFixture):
         for arguments in (("lint", "sample"), ("lint", "--workspace", "--check")):
             with self.subTest(arguments=arguments):
                 result = self.invoke_verify(*arguments, cwd=self.root / "src")
-                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertIn("not properly formatted", result.stdout + result.stderr)
+                diagnostics = (self.root / support.TAPLO_RESULTS_FILE).read_text(encoding="utf-8")
+                failure = result.stdout + result.stderr + "\nTaplo results:\n" + diagnostics
+                self.assertNotEqual(result.returncode, 0, failure)
+                self.assertIn("not properly formatted", result.stdout + result.stderr, failure)
 
     def test_fix_mode_formats_tracked_toml_and_preserves_untracked_unit_config(self) -> None:
         self.use_real_toml_tools()

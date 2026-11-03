@@ -4,11 +4,39 @@ from __future__ import annotations
 
 import unittest
 from scripts.direct import implement_launcher_test_support as support
+from scripts.lint.memory_test_support import commit_config_fixture
 from typing import cast
 import json
 
 
 class ImplementLauncherWorkerTests(support.ImplementLauncherFixture):
+    def test_worker_compaction_uses_the_private_config_instead_of_the_home_config(self) -> None:
+        _ = self.config_file.write_text(
+            self.config_file.read_text(encoding="utf-8").replace(
+                "UNIT_COMPACT_ABOVE_TOKENS=100000", "UNIT_COMPACT_ABOVE_TOKENS=20000"
+            ), encoding="utf-8",
+        )
+        home_config = self.root / ".claude/config/direct.conf"
+        _ = home_config.write_text("UNIT_COMPACT_ABOVE_TOKENS=999999\n", encoding="utf-8")
+        session_dir = self.start_phase("private-compaction-config")
+
+        first = self.mesh_launch(session_dir)
+
+        self.assertEqual(first.returncode, 0, first.stderr)
+        roster = cast(dict[str, object], json.loads(
+            (session_dir / "mesh_roster.json").read_text(encoding="utf-8")
+        ))
+        name = next(iter(roster))
+        self.set_mesh_context(session_dir, name, 20001)
+
+        result = self.mesh_launch(session_dir, to=name)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            (session_dir / "mesh_events.txt").read_text(encoding="utf-8").splitlines(),
+            ["compact", "can-follow", "follow"],
+        )
+
     def test_a_worker_left_with_a_live_turn_by_compaction_gets_no_follow_up(self) -> None:
         session_dir = self.start_phase("compact-still-live")
         first = self.mesh_launch(session_dir)
@@ -31,17 +59,52 @@ class ImplementLauncherWorkerTests(support.ImplementLauncherFixture):
     def test_compaction_threshold_must_be_configured_as_a_positive_integer(self) -> None:
         configured = self.config_file.read_text(encoding="utf-8")
         key = "UNIT_COMPACT_ABOVE_TOKENS"
+        commit_config_fixture(self.config_file)
+        for value in ("missing", "0", "zero", "1.5"):
+            with self.subTest(value=value):
+                _ = self.config_file.write_text(configured, encoding="utf-8")
+                session_dir = self.start_phase(f"threshold-recovery-{value}")
+                first = self.mesh_launch(session_dir)
+                self.assertEqual(first.returncode, 0, first.stderr)
+                roster = cast(dict[str, object], json.loads(
+                    (session_dir / "mesh_roster.json").read_text(encoding="utf-8")
+                ))
+                name = next(iter(roster))
+                self.set_mesh_context(session_dir, name, 100001)
+                replacement = "" if value == "missing" else f"{key}={value}\n"
+                _ = self.config_file.write_text(
+                    configured.replace(f"{key}=100000\n", replacement), encoding="utf-8"
+                )
+
+                result = self.mesh_launch(session_dir, to=name)
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("warning:", result.stderr)
+                self.assertIn(str(self.config_file), result.stderr)
+                self.assertIn(key, result.stderr)
+                self.assertEqual(
+                    (session_dir / "mesh_events.txt").read_text(encoding="utf-8").splitlines(),
+                    ["compact", "can-follow", "follow"],
+                )
+
+    def test_compaction_threshold_refuses_without_usable_history(self) -> None:
+        configured = self.config_file.read_text(encoding="utf-8")
+        key = "UNIT_COMPACT_ABOVE_TOKENS"
         without_key = "\n".join(
             line for line in configured.splitlines() if not line.startswith(f"{key}=")
         ) + "\n"
-        for label, config in (("missing", without_key), ("zero", without_key + f"{key}=0\n")):
-            with self.subTest(value=label):
-                _ = self.config_file.write_text(config, encoding="utf-8")
-                session_dir = self.start_phase(f"threshold-{label}")
+        for value in ("missing", "0", "zero", "1.5"):
+            with self.subTest(value=value):
+                damaged = without_key if value == "missing" else configured.replace(
+                    f"{key}=100000", f"{key}={value}"
+                )
+                _ = self.config_file.write_text(damaged, encoding="utf-8")
+                session_dir = self.start_phase(f"threshold-no-history-{value}")
 
                 result = self.mesh_launch(session_dir)
 
                 self.assertNotEqual(result.returncode, 0)
+                self.assertIn(str(self.config_file), result.stderr)
                 self.assertIn(key, result.stderr)
 
     def test_failed_compaction_is_reported_and_the_follow_up_still_runs(self) -> None:

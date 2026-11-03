@@ -1,5 +1,5 @@
 ---
-description: Set every running unit director's effort, on every production, and the effort new unit directors launch with.
+description: Set unit directors' effort levels.
 argument-hint: '<level> [--check]'
 ---
 

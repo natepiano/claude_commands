@@ -14,9 +14,9 @@ from scripts.build_queue.queue_fixture import (
 )
 from scripts.build_queue.queue_lines import json_form, plain, terminal_width, wrap
 from scripts.lint import memory_admit as gate
-from scripts.message.unit_labels import UnitLabels
 from scripts.lint.memory_test_support import fake_memory_readings
-from scripts.lint.test_memory_admit import write_memory_config
+from scripts.message.unit_labels import UnitLabels
+from scripts.build_queue.queue_fixture import write_memory_config
 
 
 class QueueViewTests(QueueFixtureTests):
@@ -25,7 +25,7 @@ class QueueViewTests(QueueFixtureTests):
         super().setUp()
         config = self.fixture.root / "lint.conf"
         write_memory_config(config)
-        _ = cast(object, self.enterContext(mock.patch.dict("os.environ", {"LINT_CONFIG_FILE": str(config)})))
+        _ = cast(object, self.enterContext(mock.patch.dict("os.environ", {"CONF_DIR": str(config.parent)})))
 
     def test_service_counts_unowned_scope_once_and_renders_the_held_heads_numbers(self) -> None:
         import os
@@ -93,11 +93,11 @@ class QueueViewTests(QueueFixtureTests):
                             for line in lines for span in line))
 
     def test_pressure_threshold_text_uses_the_policy_in_the_reading(self) -> None:
-        config = self.fixture.root / "policy.conf"
-        _ = config.write_text("[memory]\nfull_pressure_limit=9\nswap_used_limit=70\nsome_pressure_limit=12\nrecovery_start_seconds=45\n")
-        with mock.patch.dict("os.environ", {"LINT_CONFIG_FILE": str(config)}):
+        config = self.fixture.root / "lint.conf"
+        write_memory_config(config, full_pressure_limit="9", swap_used_limit="70", some_pressure_limit="12", recovery_start_seconds="45")
+        with mock.patch.dict("os.environ", {"CONF_DIR": str(config.parent)}):
             policy = gate.read_memory_config().policy
-            _ = config.write_text("[memory]\nfull_pressure_limit=3\nswap_used_limit=90\nsome_pressure_limit=30\n")
+            write_memory_config(config, full_pressure_limit="3", swap_used_limit="90", some_pressure_limit="30")
             model = self.fixture.model()
         model = replace(model, reading=replace(model.reading,
             explanation=replace(model.reading.explanation, policy=policy)))

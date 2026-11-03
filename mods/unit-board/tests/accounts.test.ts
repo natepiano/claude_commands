@@ -66,14 +66,14 @@ function readableFixture(): StoredAccountsStatus {
 // These literal rows specify the columns, role order, totals, and narrow facts.
 const TABLE_DRAWN_LINES: Record<number, readonly string[]> = {
   "140": [
-    "   account  left  role                         busy  shell  idle  total     resets    credits  enabled  read",
-    "●  aLpha     60%  showrunners, unit directors  1, 2   1, 0  0, 1   2, 3      14:00  unlimited  yes       45s",
-    "●  beta      20%  workers                         7            5     12  Sat 14:00     13,446            12m",
-    "●  Charlie    8%  workers                         0      0     1      1  Sun 14:00                        2h",
-    "●  Delta     25%  spare                                                     23 Oct                        3d",
+    "   account  left  role                         busy  shell  idle  total     resets    credits  enabled",
+    "●  aLpha     60%  showrunners, unit directors  1, 2   1, 0  0, 1   2, 3      14:00  unlimited  yes",
+    "●  beta      20%  workers                         7            5     12  Sat 14:00     13,446",
+    "●  Charlie    8%  workers                         0      0     1      1  Sun 14:00",
+    "●  Delta     25%  spare                                                     23 Oct",
     "●  Echo        —  showrunners, unit directors  0, 0   0, 0  0, 0   0, 0",
-    "●  Foxtrot   90%  spare                                                  Thu 14:00             yes        4m",
-    "●  Gamma     74%  workers                         1      1     2      4     24 Oct                        5m",
+    "●  Foxtrot   90%  spare                                                  Thu 14:00             yes",
+    "●  Gamma     74%  workers                         1      1     2      4     24 Oct",
     "   total                                         11      2     9     22",
     "",
     "Problems",
@@ -82,21 +82,21 @@ const TABLE_DRAWN_LINES: Record<number, readonly string[]> = {
   ],
   "100": [
     "   account  left  role                         busy  shell  idle  total",
-    "     resets    credits  enabled  read",
+    "     resets    credits  enabled",
     "●  aLpha     60%  showrunners, unit directors  1, 2   1, 0  0, 1   2, 3",
-    "      14:00  unlimited  yes       45s",
+    "      14:00  unlimited  yes",
     "●  beta      20%  workers                         7            5     12",
-    "  Sat 14:00     13,446            12m",
+    "  Sat 14:00     13,446",
     "●  Charlie    8%  workers                         0      0     1      1",
-    "  Sun 14:00                        2h",
+    "  Sun 14:00",
     "●  Delta     25%  spare",
-    "     23 Oct                        3d",
+    "     23 Oct",
     "●  Echo        —  showrunners, unit directors  0, 0   0, 0  0, 0   0, 0",
     "",
     "●  Foxtrot   90%  spare",
-    "  Thu 14:00             yes        4m",
+    "  Thu 14:00             yes",
     "●  Gamma     74%  workers                         1      1     2      4",
-    "     24 Oct                        5m",
+    "     24 Oct",
     "   total                                         11      2     9     22",
     "",
     "",
@@ -110,24 +110,23 @@ const TABLE_DRAWN_LINES: Record<number, readonly string[]> = {
     "● aLpha",
     "  60% left · role showrunners, unit directors · busy 1, 2",
     "  shell 1, 0 · idle 0, 1 · total 2, 3 · resets 14:00",
-    "  credits unlimited · enabled · read 45s ago",
+    "  credits unlimited · enabled",
     "● beta",
     "  20% left · role workers · busy 7 · idle 5 · total 12",
-    "  resets Sat 14:00 · credits 13,446 · read 12m ago",
+    "  resets Sat 14:00 · credits 13,446",
     "● Charlie",
     "  8% left · role workers · busy 0 · shell 0 · idle 1",
-    "  total 1 · resets Sun 14:00 · read 2h ago",
+    "  total 1 · resets Sun 14:00",
     "● Delta",
-    "  25% left · role spare · resets 23 Oct · read 3d ago",
+    "  25% left · role spare · resets 23 Oct",
     "● Echo",
     "  — left · role showrunners, unit directors · busy 0, 0",
     "  shell 0, 0 · idle 0, 0 · total 0, 0",
     "● Foxtrot",
     "  90% left · role spare · resets Thu 14:00 · enabled",
-    "  read 4m ago",
     "● Gamma",
     "  74% left · role workers · busy 1 · shell 1 · idle 2",
-    "  total 4 · resets 24 Oct · read 5m ago",
+    "  total 4 · resets 24 Oct",
     "total",
     "  busy 11 · shell 2 · idle 9 · total 22",
     "",
@@ -147,21 +146,18 @@ const TABLE_DRAWN_LINES: Record<number, readonly string[]> = {
     "  idle 0, 1 · total 2, 3",
     "  resets 14:00",
     "  credits unlimited · enabled",
-    "  read 45s ago",
     "● beta",
     "  20% left · role workers",
     "  busy 7 · idle 5 · total 12",
     "  resets Sat 14:00",
     "  credits 13,446",
-    "  read 12m ago",
     "● Charlie",
     "  8% left · role workers",
     "  busy 0 · shell 0 · idle 1",
     "  total 1 · resets Sun 14:00",
-    "  read 2h ago",
     "● Delta",
     "  25% left · role spare",
-    "  resets 23 Oct · read 3d ago",
+    "  resets 23 Oct",
     "● Echo",
     "  — left",
     "  role showrunners, unit",
@@ -171,12 +167,10 @@ const TABLE_DRAWN_LINES: Record<number, readonly string[]> = {
     "● Foxtrot",
     "  90% left · role spare",
     "  resets Thu 14:00 · enabled",
-    "  read 4m ago",
     "● Gamma",
     "  74% left · role workers",
     "  busy 1 · shell 1 · idle 2",
     "  total 4 · resets 24 Oct",
-    "  read 5m ago",
     "total",
     "  busy 11 · shell 2 · idle 9",
     "  total 22",
@@ -324,6 +318,56 @@ function hasSensitivePath(paths: readonly string[]) {
   return paths.some(path => /(?:\.claude\.json|auth\.json|id_token)/.test(path));
 }
 describe('accounts table', () => {
+  for (const columns of [140, 60, 30]) {
+    test(`${columns} cells: counts sum both machines and retain separate machine data`, async ($, on) => {
+      const fake = accountsHost(on);
+      const data = statusFixture();
+      data.accounts = [data.accounts[0]!, data.accounts[1]!];
+      data.accounts[0]!.role_counts_by_machine = {
+        natedev: { 'unit directors': { busy: 1, shell: 1, idle: 1, total: 3 },
+          showrunners: { busy: 1, shell: 0, idle: 1, total: 2 } },
+        mac: { 'unit directors': { busy: 2, shell: 1, idle: 0, total: 3 },
+          showrunners: { busy: 0, shell: 1, idle: 2, total: 3 } },
+      };
+      data.accounts[1]!.role_counts_by_machine = {
+        natedev: { workers: { busy: 2, shell: null, idle: 2, total: 4 } },
+        mac: { workers: { busy: 1, shell: null, idle: 0, total: 1 } },
+      };
+      const before = JSON.stringify(data);
+      fake.replace(data);
+      await $.command.run(command());
+      const ui = await $.ui.mount({ plugin: 'unit-board', requestId: 'accounts-board', component: 'Pane',
+        surface: 'terminal', props: { ...props, bodyColumns: columns } });
+      const tree = await ui.drawn();
+      const row = normalized(accountLines(tree, 'Low'));
+      for (const values of ['3, 1', '2, 1', '1, 3', '6, 5']) expect(row).toContain(values);
+      expect(accountDisplay(data.accounts[1]!).roleCounts).toEqual([
+        { kind: 'available', value: { busy: 3, shell: null, idle: 2, total: 5 } },
+      ]);
+      const lines = rowLines(tree);
+      if (columns === 140) expect(lines.find(line => line.trim().startsWith('total'))!.trim().replace(/\s+/g, ' '))
+        .toBe('total 7 3 6 16');
+      else expect(normalized(lines.slice(lines.indexOf('total')))).toContain('total busy 7 · shell 3 · idle 6');
+      expect(JSON.stringify(data)).toBe(before);
+    });
+  }
+
+  test('unavailable peer counts show the local counts and one problem', async ($, on) => {
+    const fake = accountsHost(on);
+    const data = statusFixture();
+    data.accounts = [data.accounts[1]!];
+    data.accounts[0]!.role_counts_by_machine = { mac: { workers: { busy: 2, shell: null, idle: 2, total: 4 } } };
+    data.problems = ['natedev unavailable: counts are mac only'];
+    fake.replace(data);
+    await $.command.run(command());
+    const ui = await mount($);
+    const text = drawnText(await ui.drawn());
+    expect(text.split(data.problems[0]!).length - 1).toBe(1);
+    expect(accountDisplay(data.accounts[0]!).roleCounts).toEqual([
+      { kind: 'available', value: { busy: 2, shell: null, idle: 2, total: 4 } },
+    ]);
+  });
+
   for (const surface of ['terminal', 'desktop'] as const) {
     for (const columns of [140, 100, 60, 30]) {
       test(`${surface}: exact table form at ${columns} cells keeps every fact and problem`, async ($, on) => {
@@ -349,7 +393,7 @@ describe('accounts table', () => {
           expect(labels.length).toBeGreaterThan(0);
           expect(labels.every(span => span.bold && span.color === 'default')).toBe(true);
         }
-        for (const heading of ['account', 'left', 'role', 'busy', 'shell', 'idle', 'total', 'resets', 'credits', 'enabled', 'read']) {
+        for (const heading of ['account', 'left', 'role', 'busy', 'shell', 'idle', 'total', 'resets', 'credits', 'enabled']) {
           const headings = spans.filter(span => span.bold && span.text.trim() === heading);
           expect(headings.length).toBe((columns <= 60 ? 0 : 1) + (heading === 'total' ? 1 : 0));
           expect(headings.every(span => span.bold && span.color === 'default')).toBe(true);
@@ -402,12 +446,10 @@ describe('accounts table', () => {
       const resetStart = columns === 140 ? 73 : 2;
       const creditStart = columns === 140 ? 84 : 13;
       const enabledStart = columns === 140 ? 95 : 24;
-      const readStart = columns === 140 ? 104 : 33;
       for (const [i, row] of detail.entries()) {
         expect(row.slice(resetStart, resetStart + 9).trim()).toBe(['14:00', 'Sat 14:00', 'Sun 14:00', '23 Oct', '', 'Thu 14:00', '24 Oct'][i]);
         expect(row.slice(creditStart, creditStart + 9).trim()).toBe(i === 0 ? 'unlimited' : i === 1 ? '13,446' : '');
         expect(row.slice(enabledStart, enabledStart + 7).trim()).toBe(i === 0 || i === 5 ? 'yes' : '');
-        expect(row.slice(readStart, readStart + 4).trim()).toBe(['45s', '12m', '2h', '3d', '', '4m', '5m'][i]);
       }
       await ui.unmount();
     }
@@ -427,10 +469,10 @@ describe('accounts table', () => {
       // Empty balances retain every column and the credit setting.
       if (columns === 60) {
         expect(normalized(accountLines(await ui.drawn(), 'aLpha'))).toBe(
-          '● aLpha 60% left · role showrunners, unit directors · busy 1, 2 shell 1, 0 · idle 0, 1 · total 2, 3 · resets 14:00 enabled · read 45s ago');
+          '● aLpha 60% left · role showrunners, unit directors · busy 1, 2 shell 1, 0 · idle 0, 1 · total 2, 3 · resets 14:00 enabled');
       } else {
-        expect(lines.slice(0, columns === 140 ? 1 : 2).join(' ').trim().split(/\s+/))
-          .toEqual(['account', 'left', 'role', 'busy', 'shell', 'idle', 'total', 'resets', 'credits', 'enabled', 'read']);
+        expect(lines.slice(0, lines.findIndex(line => line.startsWith('● '))).join(' ').trim().split(/\s+/))
+          .toEqual(['account', 'left', 'role', 'busy', 'shell', 'idle', 'total', 'resets', 'credits', 'enabled']);
       }
       if (columns === 60) expect(lines.join(' ')).not.toContain('credits');
       else expect(lines.join(' ')).toContain('credits');
@@ -469,7 +511,7 @@ describe('accounts table', () => {
     expect(textInColor(tree, 'inactive')).not.toContain('●');
     const ordinary = textInColor(tree, 'default');
     for (const fact of ['60%', '25%', '90%', '74%', '—',
-      'showrunners, unit directors', 'workers', 'spare', 'unlimited', '13,446', '14:00', '45s', '24 Oct']) {
+      'showrunners, unit directors', 'workers', 'spare', 'unlimited', '13,446', '14:00', '24 Oct']) {
       expect(ordinary).toContain(fact);
     }
   });
@@ -502,7 +544,7 @@ describe('accounts table', () => {
       fake.replace({ accounts: [account], problems: [] });
       await $.command.run(command());
       const rows = rowLines(await (await mount($)).drawn());
-      expect(rows[0]!.trim().split(/\s+/)).toEqual(['account', 'left', 'role', 'busy', 'shell', 'idle', 'total', 'resets', 'credits', 'enabled', 'read']);
+      expect(rows[0]!.trim().split(/\s+/)).toEqual(['account', 'left', 'role', 'busy', 'shell', 'idle', 'total', 'resets', 'credits', 'enabled']);
       expect(rows[1]!.split(expected)).toHaveLength(2);
     });
   }
@@ -516,7 +558,7 @@ describe('accounts table', () => {
     await $.command.run(command());
     const tree = await (await mount($)).drawn();
     expect(rowLines(tree)).toEqual([
-      "   account  left  role  busy  shell  idle  total  resets  credits  enabled  read",
+      "   account  left  role  busy  shell  idle  total  resets  credits  enabled",
       "●  Invalid     —                                                   yes",
       "●  Unknown     —",
       "●  Zero       0%                                                0",
@@ -526,23 +568,22 @@ describe('accounts table', () => {
     for (const missing of ['no reading', 'null', 'undefined', 'Problems']) expect(text).not.toContain(missing);
   });
 
-  for (const columns of [140, 100, 60, 30]) {
-    for (const [ageSeconds, expected] of [
-      [45.9, '45s'], [59.999, '59s'], [60, '1m'], [779.9, '12m'],
-      [3599.9, '59m'], [3600, '1h'], [10799.9, '2h'],
-      [86399.9, '23h'], [86400, '1d'], [345599.9, '3d'],
-    ] as const) {
-      test(`${columns} cells: read age floors ${ageSeconds}s to ${expected}`, async ($, on) => {
+  for (const surface of ['terminal', 'desktop'] as const) {
+    for (const columns of [140, 100, 60, 30]) {
+      test(`${surface}: ${columns} cells keep failed-read problems and the red dot without a read fact`, async ($, on) => {
         const fake = accountsHost(on);
-        const account = { ...statusFixture().accounts[0]!,
-          read_at: new Date(NOW - ageSeconds * 1000).toISOString() };
-        fake.replace({ accounts: [account], problems: [] });
+        const problem = 'Watch: usage unavailable; the usage read failed; last read attempted at 10:58';
+        fake.replace({ accounts: [{ ...statusFixture().accounts[1]!, read_at: '2026-10-01T10:58:00Z' }],
+          problems: [problem] });
         await $.command.run(command());
-        const ui = await $.ui.mount({ plugin: 'unit-board', requestId: 'accounts-board', component: 'Pane',
-          surface: 'terminal', props: { ...props, bodyColumns: columns } });
-        const lines = rowLines(await ui.drawn());
-        if (columns <= 60) expect(normalized(lines)).toContain(`read ${expected} ago`);
-        else expect(accountLines(await ui.drawn(), account.label).at(-1)?.trim().split(/\s+/).at(-1)).toBe(expected);
+        const ui = await $.ui.mount({ plugin: 'unit-board', requestId: 'accounts-board', component: 'Pane', surface,
+          props: { ...props, bodyColumns: columns } });
+        const tree = await ui.drawn();
+        const lines = rowLines(tree);
+        expect(textInColor(tree, 'error')).toBe('●');
+        expect(normalized(lines.slice(lines.indexOf('Problems') + 1))).toBe(`• ${problem}`);
+        expect(normalized(accountLines(tree, 'Watch'))).not.toMatch(/\bread\b|\bago\b/);
+        expect(lines.slice(0, lines.indexOf('Problems')).join(' ')).not.toMatch(/\bread\b/);
         for (const line of lines) expect(cellWidth(line)).toBeLessThanOrEqual(columns);
       });
     }
@@ -751,7 +792,7 @@ describe('accounts pane', () => {
   }
 
   for (const config of ['repository', 'override']) {
-    test(`${config} zone configuration formats resets and readings when the environment zone is unset`, async ($, on) => {
+    test(`${config} zone configuration formats resets when the environment zone is unset`, async ($, on) => {
       const environment = config === 'override' ? { USER_ZONE_CONF: '/test-zone.conf' } : {};
       const fake = accountsHost(on, [], environment);
       await $.session.start(start);
@@ -759,7 +800,7 @@ describe('accounts pane', () => {
       const ui = await mount($);
       const text = drawnText(await ui.drawn());
       expect(text.includes('03:00')).toBe(true);
-      expect(text.includes('1m')).toBe(true);
+      expect(text).not.toMatch(/\bread\b|\bago\b/);
       expect(fake.fs.includes(config === 'override' ? '/test-zone.conf' : `${HOME}/.claude/config/user_zone.conf`)).toBe(true);
       expect(fake.accountRuns()).toEqual([ARGV]);
     });
@@ -773,7 +814,7 @@ describe('accounts pane', () => {
     const ui = await mount($);
     const text = drawnText(await ui.drawn());
     expect(text.includes('14:00')).toBe(true);
-    expect(text.includes('1m')).toBe(true);
+    expect(text).not.toMatch(/\bread\b|\bago\b/);
   });
 
   test('an environment zone overrides the stored zone without reading its file', async ($, on) => {
@@ -783,7 +824,7 @@ describe('accounts pane', () => {
     const ui = await mount($);
     const text = drawnText(await ui.drawn());
     expect(text.includes('18:00')).toBe(true);
-    expect(text.includes('1m')).toBe(true);
+    expect(text).not.toMatch(/\bread\b|\bago\b/);
     expect(fake.fs.includes(`${HOME}/.claude/config/user_zone.conf`)).toBe(false);
   });
 

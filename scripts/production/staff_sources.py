@@ -180,7 +180,7 @@ def seed(*, dry_run: bool = False) -> None:
 
 
 # The source scan is shared by seed and the live handler. It never writes source records.
-LiveRole = Literal["showrunner", "unit", "impl", "test", "review", "fix", "astra-designer", "astra-reviewer"]
+LiveRole = Literal["showrunner", "unit", "worker", "impl", "test", "review", "fix", "astra-designer", "astra-reviewer"]
 
 
 @dataclass(frozen=True)
@@ -505,7 +505,11 @@ class _WorkerSources:
 
     def ledger_owner(self, path: Path, worker: workers.UnitWorker, fields: Mapping[str, object],
                      owner: WorkerOwner | None) -> tuple[str, WorkerOwner]:
-        current = self.record.by_id(staff.StaffId(_text(fields.get("staff_id")) or worker.name))
+        current = self.record.by_member_reference(_text(fields.get("staff_id")) or worker.name)
+        if current is None:
+            backend = worker.backend
+            session = backend.thread_id if isinstance(backend, workers.CodexThread) else backend.session_id
+            current = self.record.by_current_session(session)
         if current is not None and current.kind == "worker" and current.parent is not None:
             row = self.record.by_id(current.parent)
             if row is not None:
@@ -777,7 +781,11 @@ class _WorkerSources:
         roster = run / workers.ROSTER
         if roster.exists():
             for value in self.checked(roster).values():
-                entry = _object(value)
+                try:
+                    entry = _object(value)
+                except ValueError:
+                    # The roster reader reports this entry and continues with its siblings.
+                    continue
                 if entry.get("status") in ("starting", "running", "paused", "waiting_capacity"):
                     observe(entry)
         for path in sorted(run.glob("impl_worker_*.json")):
@@ -824,7 +832,16 @@ class _WorkerSources:
                 identity = self.backend(parent, name, entry)
                 if isinstance(identity, BackendUnavailable):
                     _problem(f"{path} worker {name}", "worker backend is unavailable")
-                self.add(WorkerObservation(name, parent, _role(_text(entry.get("role"))), identity))
+                role = _text(entry.get("role"))
+                if not role and entry.get("role") in (None, "") and isinstance(parent.match, staff.StaffRow) and isinstance(identity, dict):
+                    current = next((row for row in self.record.find(kind="worker", parent=parent.match.id)
+                                    if row.name == name and len(identity) == 1
+                                    and row.current_session in identity.values()), None)
+                    if current is not None:
+                        # Membership proves the worker kind, but not its opening role.
+                        self.add(WorkerObservation(name, parent, "worker", identity))
+                        continue
+                self.add(WorkerObservation(name, parent, _role(role), identity))
             except (ValueError, OSError, staff.StaffRefused, staff.StaffUnreadable) as error:
                 _problem(f"{path} worker {name}", error)
 
@@ -1437,9 +1454,9 @@ class RetirementPlan:
 
 
 def retirement_plan(scan: _FillSources, documents: tuple[FillDocument, ...],
-                    joined: _MemberSources, machine: str) -> RetirementPlan:
+                    joined: _MemberSources, machine: str, *, check_format: bool = True) -> RetirementPlan:
     """Prove retired facts once for fill and the native-id migration."""
-    from scripts.production.tidy_wrapped import WRAPPED
+    from scripts.production.production_units import WRAPPED
 
     owners: dict[str, WrappedFillDoc] = {}
     units: dict[tuple[str, str], RetiredFillUnit] = {}
@@ -1493,6 +1510,8 @@ def retirement_plan(scan: _FillSources, documents: tuple[FillDocument, ...],
                     if isinstance(selected, MemberFound) and not isinstance(selected.row.worktree, staff.WorktreeUnfilled) and selected.row.worktree != location:
                         raise ValueError(f"existing worktree {selected.row.worktree!r} conflicts with removed location {location!r}")
                     config = prepare_retirement(cells, joined, selected, slug, dependencies=scan.dependencies)
+                    repository = Path(_fill_git(document.path.parent, "rev-parse", "--show-toplevel"))
+                    config = replace(config, formatting=unit_config.repository_formatting(repository))
                     needs_publication = True
                     if isinstance(selected, MemberFound):
                         parked = unit_config.parked_path(selected.row.id)
@@ -1500,7 +1519,11 @@ def retirement_plan(scan: _FillSources, documents: tuple[FillDocument, ...],
                         current = unit_config.read_parked(selected.row.id, cleanup=False)
                         if isinstance(current, unit_config.UnitConfig) and current != config:
                             raise ValueError(f"{parked}: existing parked configuration conflicts with document facts")
-                        needs_publication = selected.row.worktree != location or current != config
+                        if isinstance(current, unit_config.UnitConfig) and isinstance(current.formatting, unit_config.RepositoryTaploConfig):
+                            config = replace(config, formatting=current.formatting)
+                        needs_publication = (selected.row.worktree != location
+                                             or isinstance(current, unit_config.ConfigMissing)
+                                             or (check_format and unit_config.parked_needs_write(selected.row.id, config)))
                     candidate = RetiredFillUnit(name, selected, location, config, f"{document.path}:{line}",
                                                needs_publication)
                     previous_unit = units.get(key)
@@ -1683,7 +1706,7 @@ def migration_retirements(record: staff.StaffSnapshot) -> tuple[RetirementPlan, 
 def _fill_retired(scan: _FillSources, documents: tuple[FillDocument, ...],
                   joined: _MemberSources, machine: str, *, dry_run: bool) -> int:
     """Repair retained facts; native additions belong to the one-time migration."""
-    plan = retirement_plan(scan, documents, joined, machine)
+    plan = retirement_plan(scan, documents, joined, machine, check_format=dry_run)
     owners, units = plan.owners, plan.units
     rejected_owners: set[str] = set()
     rejected_units: set[tuple[str, str]] = set()
@@ -1729,15 +1752,13 @@ def _fill_retired(scan: _FillSources, documents: tuple[FillDocument, ...],
                 if row.worktree != candidate.worktree:
                     row = staff.set_worktree(row.id, candidate.worktree)
                     changed = True
-                current = unit_config.read_parked(row.id, cleanup=False)
-                changed |= current != candidate.config
-                unit_config.write_parked(row.id, candidate.config)
+                publication = unit_config.write_parked(row.id, candidate.config)
+                changed |= isinstance(publication, unit_config.Published)
             except (OSError, ValueError, staff.StaffUnreadable, staff.StaffRefused) as error:
                 scan.problem(candidate.source, name, error)
     for problem in scan.problems:
         print(problem, file=sys.stderr)
-    if not changed:
-        print("unchanged")
+    print("changed" if changed else "unchanged")
     return 1 if scan.problems else 0
 
 
@@ -1847,7 +1868,7 @@ class _LiveFillSources(_FillSources):
         document = next(iter(documents.values()))
         common = _fill_git(document.path.parent, "rev-parse", "--path-format=absolute", "--git-common-dir")
         self.manifest.add(f"repository {common}")
-        from scripts.production.tidy_wrapped import WRAPPED
+        from scripts.production.production_units import WRAPPED
 
         if WRAPPED in document.text or re.search(r"(?im)^- \*\*Status:\*\*\s*wrapped\b", document.text):
             raise ValueError(f"{document.path}: production is wrapped")
@@ -1947,8 +1968,7 @@ def _fill_live(record: staff.StaffSnapshot, sources: _MemberSources,
     for row in record.find(kind="unit"):
         if isinstance(row.worktree, staff.RemovedWorktree):
             continue
-        # A filled row needs no table re-interpretation. Finish an interrupted
-        # row-then-file write only while that configuration is still missing.
+        # Existing files supply their values. The writer still checks their formatted bytes.
         unfilled = isinstance(row.worktree, staff.WorktreeUnfilled)
         if isinstance(row.worktree, staff.PresentWorktree) and row.worktree.machine != machine:
             continue
@@ -1957,7 +1977,13 @@ def _fill_live(record: staff.StaffSnapshot, sources: _MemberSources,
         try:
             if isinstance(row.worktree, staff.PresentWorktree):
                 dependencies(row.worktree.path / ".unit.toml")
-                if not isinstance(unit_config.read(row.worktree.path, cleanup=False), unit_config.ConfigMissing):
+                current = unit_config.read(row.worktree.path, cleanup=False)
+                if isinstance(current, unit_config.UnitConfig):
+                    if dry_run:
+                        changed |= unit_config.needs_write(row.worktree.path, current)
+                    else:
+                        publication = unit_config.write(row.worktree.path, current)
+                        changed |= isinstance(publication, unit_config.Published)
                     continue
             document = documents.get(row.parent) if row.parent is not None else None
             if document is None:
@@ -1987,11 +2013,14 @@ def _fill_live(record: staff.StaffSnapshot, sources: _MemberSources,
             current = unit_config.read(candidate.worktree.path, cleanup=False)
             if not isinstance(current, unit_config.ConfigMissing) and current != candidate.config:
                 raise ValueError("existing .unit.toml conflicts with the owning document")
-            if not dry_run:
+            if dry_run:
+                changed |= unit_config.needs_write(candidate.worktree.path, candidate.config)
+            else:
                 git_exclude.ensure_excluded(candidate.worktree.path, "/.unit.toml")
                 if unfilled:
                     _ = staff.set_worktree(row.id, candidate.worktree)
-                unit_config.write(candidate.worktree.path, candidate.config)
+                publication = unit_config.write(candidate.worktree.path, candidate.config)
+                changed |= isinstance(publication, unit_config.Published)
             changed |= unfilled or isinstance(current, unit_config.ConfigMissing)
         except (OSError, UnicodeError, ValueError, production_units.Refusal, staff.StaffUnreadable, staff.StaffRefused) as error:
             if unfilled:
@@ -2003,8 +2032,8 @@ def _fill_live(record: staff.StaffSnapshot, sources: _MemberSources,
             print(f"source {source}")
     for problem in (*scan.problems, *recovery_errors):
         print(problem, file=sys.stderr)
-    if not changed and not scan.problems and not recovery_errors:
-        print("unchanged")
+    if not scan.problems and not recovery_errors:
+        print("changed" if changed else "unchanged")
     return 1 if scan.problems or recovery_errors else 0
 
 

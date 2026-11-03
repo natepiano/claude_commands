@@ -18,6 +18,7 @@ import unittest
 from typing import cast
 from unittest import mock
 
+from scripts.lint.memory_test_support import write_config_fixture
 from scripts.lint import memory_admit as gate
 from scripts.lib import test_hang_guard
 from scripts.lib.atomic_file import write_text_atomic
@@ -580,9 +581,10 @@ class ServiceTests(unittest.TestCase):
                     result = fixture.server.run_pass()
                 self.assertEqual(run.call_count, 1)
                 inputs, limits = fixture.server.last_inputs, fixture.server.last_limits
+                policy = fixture.server.last_policy
                 assert isinstance(inputs, gate.QueueInputs)
                 assert isinstance(limits, gate.AdmissionLimits)
-                self.assertEqual(result, gate.admission_pass(inputs, inputs.now, limits, policy=gate.DEFAULT_ADMISSION_POLICY))
+                self.assertEqual(result, gate.admission_pass(inputs, inputs.now, limits, policy=policy))
                 starts = sorted((row for row in result.rows if isinstance(row.admission, gate.ProposedAdmission)),
                     key=lambda row: row.admission.rank if isinstance(row.admission, gate.ProposedAdmission) else -1)
                 committed = list(fixture.server.reservations.values())
@@ -597,8 +599,8 @@ class ServiceTests(unittest.TestCase):
                         assert isinstance(waiting, wire.Wait)
                         self.assertEqual(waiting.reason, row.reason)
                         self.assertEqual(waiting.text, queue_view.reason_phrase(row.reason,
-                            gate.queue_read_from(inputs, limits, policy=gate.DEFAULT_ADMISSION_POLICY).view.waiting))
-                expected = gate.queue_read_from(inputs, limits, policy=gate.DEFAULT_ADMISSION_POLICY)
+                            gate.queue_read_from(inputs, limits, policy=policy).view.waiting))
+                expected = gate.queue_read_from(inputs, limits, policy=policy)
                 with mock.patch.dict(os.environ, {"BUILDLOG_BUILD_BUDGET_GIB": "1"}):
                     self.assertEqual(fixture.server.handle_request(wire.ViewRequest()), [wire.ViewReply(expected)])
                     explained = fixture.server.handle_request(wire.ExplainRequest())[0]
@@ -694,7 +696,7 @@ class ServiceTests(unittest.TestCase):
     def test_running_and_idle_views_refresh_at_the_configured_interval(self) -> None:
         with AdmissionFixture() as fixture:
             config = fixture.root / "lint.conf"
-            _ = config.write_text("[memory]\nrunning_pass_seconds=3\n")
+            _ = write_config_fixture(config, "running_pass_seconds=3\n")
             request = fixture.request()
             request = replace(request, sidecar=str(fixture.scope(request.owner)))
             need = gate.TestPhaseNeed(2 * GIB, 5, 8, 8, "same_width")

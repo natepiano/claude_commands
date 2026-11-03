@@ -25,7 +25,8 @@ from scripts.build_queue.queue_fixture import (
 from scripts.build_queue.queue_lines import QueueLines, Span, json_form, plain, terminal_width
 from scripts.buildlog import store
 from scripts.lint import memory_admit
-from scripts.lint.test_memory_admit import write_memory_config
+from scripts.build_queue.queue_fixture import write_memory_config
+from scripts.lint.memory_test_support import commit_config_fixture
 from scripts.message import roster, unit_labels
 from scripts.message.unit_labels import UnitLabels, unit_labels_for
 from scripts.production import staff
@@ -55,7 +56,7 @@ class QueueTests(unittest.TestCase):
         self.labels_read = cast(LabelReadMock, self.enterContext(mock.patch.object(unit_labels, "unit_labels_for", return_value={})))
         config = self.root / "lint.conf"
         write_memory_config(config)
-        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"COLUMNS": "100", "LINT_CONFIG_FILE": str(config)})))
+        self.enterContext(mock.patch.dict(os.environ, {"COLUMNS": "100", "CONF_DIR": str(config.parent)}))
 
     @staticmethod
     def entry(session: str, name: str) -> tuple[str, UnitLabels]:
@@ -88,10 +89,12 @@ class QueueTests(unittest.TestCase):
         return status, output.getvalue(), errors.getvalue()
 
     def test_queue_command_warns_about_a_missing_key_once_per_process(self) -> None:
-        config = self.root / "policy.conf"
-        _ = config.write_text("[memory]\n")
+        config = self.root / "lint.conf"
+        write_memory_config(config)
+        commit_config_fixture(config)
+        write_memory_config(config, head_seconds=None)
         with AdmissionFixture() as admission:
-            with mock.patch.dict(os.environ, {"LINT_CONFIG_FILE": str(config)}):
+            with mock.patch.dict(os.environ, {"CONF_DIR": str(config.parent)}):
                 _ = admission.server.run_pass()
             with admission.serving(), \
                  mock.patch.object(memory_admit, "queue_read", side_effect=admission_client.view), \
@@ -101,7 +104,7 @@ class QueueTests(unittest.TestCase):
                 self.assertEqual(build_queue.main(), 0)
                 self.assertEqual(build_queue.main(), 0)
             self.assertEqual(errors.getvalue().count(
-                "memory admission: lint.conf [memory] head_seconds is missing; using 600\n"), 1)
+                "head_seconds='<missing>'"), 1)
 
     def snapshot(self, reading: memory_admit.QueueRead, *arguments: str) -> QueueLines:
         status, output, errors = self.invoke(reading, "--json", "--columns", "400", *arguments)

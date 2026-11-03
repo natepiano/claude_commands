@@ -56,7 +56,7 @@ import pane_record
 from scripts.production.staff import StaffId
 from scripts.production import staff, unit_config
 from scripts.production.rename_rerun_test_support import saved_fixture
-from scripts.lib import tunables
+from scripts.lib import conf
 from scripts.agents import worker_lifecycle
 
 DIRECTOR = "11111111-1111-1111-1111-111111111111"
@@ -97,14 +97,14 @@ class RetireUnitTests(unittest.TestCase):
 
     def limits(self, *, poll: str = "0.2", wait: str = "10", command: str = "900") -> Path:
         path = self.root / "production.conf"
-        _ = path.write_text(f"RETIRE_POLL_SECONDS={poll}\nRETIRE_TERM_WAIT_SECONDS={wait}\n"
-                            + f"RETIRE_COMMAND_TIMEOUT_SECONDS={command}\n")
+        _ = path.write_text(f"# range: 5e-324..\nRETIRE_POLL_SECONDS={poll}\n# range: 5e-324..\nRETIRE_TERM_WAIT_SECONDS={wait}\n"
+                            + f"# range: 5e-324..\nRETIRE_COMMAND_TIMEOUT_SECONDS={command}\n")
         return path
 
     def prepared_retirement(self) -> staff.StaffRow:
         row = next(row for row in staff.find(kind="unit") if row.name == "alpha")
         filled = staff.set_worktree(row.id, staff.PresentWorktree("natedev", self.worktree))
-        unit_config.write(self.worktree, unit_config.UnitConfig(unit_config.PlanFile(Path("docs/plans/alpha.md")),
+        _ = unit_config.write(self.worktree, unit_config.UnitConfig(unit_config.PlanFile(Path("docs/plans/alpha.md")),
                                                                unit_config.AppPort(1), ("scripts",)))
         return filled
 
@@ -177,7 +177,7 @@ class RetireUnitTests(unittest.TestCase):
                     self.marked = None
 
                     def parked_then_stop(unit: staff.StaffId, worktree: Path, facts: unit_config.RetiredSession) -> None:
-                        park(unit, worktree, facts)
+                        _ = park(unit, worktree, facts)
                         raise OSError("fixture interrupted after park")
 
                     def removed_then_stop(unit: retire_unit.Unit) -> list[str]:
@@ -233,13 +233,13 @@ class RetireUnitTests(unittest.TestCase):
 
     def test_retirement_commands_use_only_the_remaining_operation_budget(self) -> None:
         path = self.limits(command="900")
-        with (mock.patch.dict(os.environ, {"PRODUCTION_CONFIG": str(path)}),
+        with (mock.patch.dict(os.environ, {"CONF_DIR": str(Path(path).parent)}),
               mock.patch.object(time, "monotonic", return_value=100.0),
               worker_lifecycle.operation_deadline(deadline=100.25),
               mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as run):
             _ = RUN_COMMAND(["fixture-command"])
             self.assertEqual(run.call_args.kwargs["timeout"], 0.25)
-        with (mock.patch.dict(os.environ, {"PRODUCTION_CONFIG": str(path)}),
+        with (mock.patch.dict(os.environ, {"CONF_DIR": str(Path(path).parent)}),
               mock.patch.object(time, "monotonic", return_value=100.0),
               worker_lifecycle.operation_deadline(deadline=99.0),
               mock.patch.object(subprocess, "run") as run):
@@ -257,7 +257,7 @@ class RetireUnitTests(unittest.TestCase):
             sleeps.append(seconds)
             now += seconds
 
-        with (mock.patch.dict(os.environ, {"PRODUCTION_CONFIG": str(path)}),
+        with (mock.patch.dict(os.environ, {"CONF_DIR": str(Path(path).parent)}),
               mock.patch.object(time, "monotonic", side_effect=lambda: now),
               mock.patch.object(time, "sleep", side_effect=sleep),
               mock.patch.object(os, "kill") as send,
@@ -270,7 +270,7 @@ class RetireUnitTests(unittest.TestCase):
 
     def test_changed_command_timeout_is_read_at_each_use_without_reloading_the_module(self) -> None:
         path = self.limits(command="17")
-        with mock.patch.dict(os.environ, {"PRODUCTION_CONFIG": str(path)}), \
+        with mock.patch.dict(os.environ, {"CONF_DIR": str(Path(path).parent)}), \
                 mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as run:
             _ = RUN_COMMAND(["fixture-command"])
             self.assertEqual(run.call_args.kwargs["timeout"], 17)
@@ -280,7 +280,7 @@ class RetireUnitTests(unittest.TestCase):
 
     def test_changed_poll_and_term_wait_control_real_sigterm_loop_and_cap_the_last_sleep(self) -> None:
         path = self.limits()
-        with mock.patch.dict(os.environ, {"PRODUCTION_CONFIG": str(path)}):
+        with mock.patch.dict(os.environ, {"CONF_DIR": str(Path(path).parent)}):
             for poll, wait in ((0.3, 0.8), (0.7, 1.2)):
                 with self.subTest(poll=poll, wait=wait):
                     _ = self.limits(poll=str(poll), wait=str(wait))
@@ -297,7 +297,7 @@ class RetireUnitTests(unittest.TestCase):
 
     def test_an_explicit_shorter_wait_caps_the_configured_term_wait(self) -> None:
         path = self.limits(poll="1", wait="10")
-        with (mock.patch.dict(os.environ, {"PRODUCTION_CONFIG": str(path)}),
+        with (mock.patch.dict(os.environ, {"CONF_DIR": str(Path(path).parent)}),
               mock.patch.object(os, "kill"),
               mock.patch.object(retire_unit, "_alive", return_value=True),
               mock.patch.object(time, "monotonic", side_effect=[0, 0, 0.1]),
@@ -315,7 +315,7 @@ class RetireUnitTests(unittest.TestCase):
                     lines = path.read_text().splitlines()
                     _ = path.write_text("\n".join(line if not line.startswith(key + "=") else
                                                 (f"{key}={value}" if value is not None else "") for line in lines) + "\n")
-                    with mock.patch.dict(os.environ, {"PRODUCTION_CONFIG": str(path)}):
+                    with mock.patch.dict(os.environ, {"CONF_DIR": str(Path(path).parent)}):
                         code, output = self.retire()
                     self.assertEqual(code, 1, output)
                     self.assertIn(str(path), output)
@@ -325,8 +325,8 @@ class RetireUnitTests(unittest.TestCase):
                     self.assertEqual((self.doc.read_bytes(), self.staff.staff_file.read_bytes()), before)
 
     def test_a_missing_retirement_config_file_refuses_with_its_path_and_key(self) -> None:
-        path = self.root / "missing.conf"
-        with mock.patch.dict(os.environ, {"PRODUCTION_CONFIG": str(path)}), self.assertRaises(tunables.TunableUnusable) as error:
+        path = self.root / "absent" / "production.conf"
+        with mock.patch.dict(os.environ, {"CONF_DIR": str(Path(path).parent)}), self.assertRaises(conf.Unusable) as error:
             _ = RUN_COMMAND(["fixture-command"])
         self.assertIn(str(path), str(error.exception))
         self.assertIn("RETIRE_COMMAND_TIMEOUT_SECONDS", str(error.exception))
@@ -337,6 +337,8 @@ class RetireUnitTests(unittest.TestCase):
         self.staff.setUp()
         self.addCleanup(self.staff.doCleanups)
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        _ = self.limits()
+        self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(self.root)}))
         origin = self.root / "origin.git"
         _ = subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)], check=True)
         self.checkout = self.root / "checkout"
@@ -382,7 +384,7 @@ class RetireUnitTests(unittest.TestCase):
         parent = fixture_member("showrunner", name="alpha")
         self.unit_staff_id = fixture_member("unit", name="alpha", parent=parent.id, runtime_id=DIRECTOR,
                          worktree=staff.PresentWorktree("natedev", self.worktree)).id
-        unit_config.write(self.worktree, unit_config.UnitConfig(unit_config.PlanFile(Path("docs/plans/alpha.md")),
+        _ = unit_config.write(self.worktree, unit_config.UnitConfig(unit_config.PlanFile(Path("docs/plans/alpha.md")),
                                                                unit_config.AppPort(1), ("scripts",)))
         production = read_production(self.doc)
 

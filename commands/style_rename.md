@@ -1,5 +1,5 @@
 ---
-description: Rename a shared style file and rewrite see_also wikilinks across all style files so references still resolve.
+description: Rename a style file and its references.
 ---
 
 # Rename Style

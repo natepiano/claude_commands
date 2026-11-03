@@ -58,10 +58,12 @@ from test_support import ShutdownTestCase, ShutdownSendLeaf
 from user_zone import user_zone
 from user_action import REFUSED_BEFORE_SENDING, ActionRequired, NoActionRequired, first_line
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.message.repeat_guard_test_support import install_guard_test_budget
 
 
 def setUpModule() -> None:
     install_signal_pid_guard()
+    install_guard_test_budget()
 
 
 def stream(*events: dict[str, object]) -> str:

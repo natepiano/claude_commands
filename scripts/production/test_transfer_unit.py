@@ -50,7 +50,7 @@ class UnitTransferTests(UnitTransferFixture):
         parents = tuple(staff.set_doc(parent.id, staff.LiveDoc(
             "natedev", checkout / "docs/plans" / f"{parent.name}-production.md"))
             for parent, checkout in ((giving, self.giving), (receiving, self.receiving)))
-        unit_config.write(self.unit, unit_config.UnitConfig(
+        _ = unit_config.write(self.unit, unit_config.UnitConfig(
             unit_config.PlanFile(Path("docs/plans/alpha.md")), unit_config.AppPort(8123), ("review",)))
         path = self.unit / ".unit.toml"
         before = path.read_bytes(), path.stat().st_mtime_ns

@@ -1,5 +1,5 @@
 ---
-description: Bake PBR textures in Blender from a configuration file.
+description: Bake PBR textures in Blender.
 ---
 
 execute the following instructions:

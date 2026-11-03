@@ -1,5 +1,5 @@
 ---
-description: Move one unit of this production to another production. The unit keeps its session, worktree, branch and commits; it relaunches under the new showrunner.
+description: Transfer a unit between productions.
 argument-hint: "<unit> <to production doc>"
 ---
 

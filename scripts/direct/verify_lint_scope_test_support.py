@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
+
 import json
 import os
 from pathlib import Path
@@ -17,6 +19,7 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 VERIFY = Path(__file__).with_name("verify.sh")
 SCRIPTS = VERIFY.parent.parent
+TAPLO_RESULTS_FILE = "taplo-results.jsonl"
 
 
 def workspace_taplo_script(source: str) -> str:
@@ -288,7 +291,7 @@ class VerifyLintScopeFixture(unittest.TestCase):
             "BUILD_TARGETS_SCRIPT": str(targets),
             "VERIFY_ASSERTION_GUARD_SCRIPT": str(assertion_guard),
             "LINT_CONFIG_READER": str(SCRIPTS / "lint" / "lint_config.sh"),
-            "LINT_CONFIG_FILE": str(self.config),
+            "LINT_CONFIG_FILE": str(self.config), **config_environment(self.root),
         })
 
     def write_executable(self, path: Path, source: str) -> None:
@@ -305,9 +308,31 @@ class VerifyLintScopeFixture(unittest.TestCase):
             executable = shutil.which(name)
             if executable is None:
                 self.fail(f"fixture requires {name}")
+            source = f"import os, sys\nos.execv({executable!r}, [{executable!r}, *sys.argv[1:]])\n"
+            if name == "taplo":
+                results = self.root / TAPLO_RESULTS_FILE
+                _ = results.write_bytes(b"")
+                source = f"executable = {executable!r}\nresults = {str(results)!r}\n" + r'''
+import json
+from pathlib import Path
+import subprocess
+import sys
+
+result = subprocess.run([executable, *sys.argv[1:]], stderr=subprocess.PIPE, check=False)
+signal = -result.returncode if result.returncode < 0 else 0
+with Path(results).open("a", encoding="utf-8") as output:
+    output.write(json.dumps({
+        "args": sys.argv[1:],
+        "returncode": result.returncode,
+        "signal": signal,
+        "stderr": result.stderr.decode("utf-8", errors="backslashreplace"),
+    }) + "\n")
+sys.stderr.buffer.write(result.stderr)
+raise SystemExit(128 + signal if signal else result.returncode)
+'''
             self.write_executable(
                 self.root / "bin" / name,
-                f"import os, sys\nos.execv({executable!r}, [{executable!r}, *sys.argv[1:]])\n",
+                source,
             )
         shutil.rmtree(self.root / ".git")
         self.run_git("init", "--quiet", "--initial-branch=main")
@@ -347,10 +372,7 @@ class VerifyLintScopeFixture(unittest.TestCase):
         )
 
     def write_config(self, *, clippy: str) -> None:
-        _ = self.config.write_text(
-            f"mend=on\nfmt=on\nclippy={clippy}\ndoc=on\nsweep=off\n",
-            encoding="utf-8",
-        )
+        _ = write_config_fixture(self.config, f"mend=on\nfmt=on\nclippy={clippy}\ndoc=on\nsweep=off\n")
 
     def enable_cache(self) -> Path:
         session = self.root / "session"

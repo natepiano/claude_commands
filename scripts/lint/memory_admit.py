@@ -34,7 +34,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 
 from build_shape import BuildShape, NoBuildShape, build_shape, index_shapes, recorded_build_shape
 from atomic_file import write_text_atomic
-from config_values import config_values
+import conf
 
 
 from test_phase import (
@@ -96,13 +96,10 @@ FALLBACK = 12 * GIB
 # 111 natedev filtered single-test runs with no recompilation in the 14 days
 # to 2026-10-29 had anon p90 0.671 GiB and p95 0.784 GiB.
 FILTERED_FLOOR = GIB
-FALLBACK_TEST_PHASE_MARGIN = 1.2
 # On natedev, isolated hana nextest scopes had p90 anon / memory.peak 61%;
 # clippy had 65%, so 0.65 covers the measured p90 process-memory share.
 ANON_SHARE = 0.65
 HISTORY_DAYS = 14
-# Used only when neither the environment nor lint.conf supplies a valid budget.
-FALLBACK_BUILD_BUDGET_BYTES = 21 * GIB
 # Option C, 126 builds over 14 days to 2026-10-30: 1.314 covered every
 # replayed release step (including the 15.76 GiB incident).
 RELEASE_HEADROOM = 1.314
@@ -260,7 +257,7 @@ class TestPhaseNeed:
     width: int
     recorded_width: int
     form: TestPhaseNeedForm
-    margin: float = FALLBACK_TEST_PHASE_MARGIN
+    margin: float = field(default_factory=lambda: test_phase_margin())
 
 
 @dataclass(frozen=True)
@@ -1457,30 +1454,19 @@ def _positive_gib_bytes(raw: str) -> int | None:
     return None
 
 
-def _lint_config_path() -> str:
-    return os.path.expanduser(os.environ.get("LINT_CONFIG_FILE") or "~/.claude/config/lint.conf")
-
-
-@dataclass(frozen=True)
-class MissingValue:
-    pass
-
-
-@dataclass(frozen=True)
-class InvalidValue:
-    raw: str
-
-
-@dataclass(frozen=True)
-class ProgramSizeUnavailable:
-    pass
-
-
 @dataclass(frozen=True)
 class ConfigFallback:
-    key: str
-    found: MissingValue | InvalidValue
-    used: int | float | ProgramSizeUnavailable
+    diagnostic: str
+
+
+_warned_config_fallbacks: set[ConfigFallback] = set()
+
+
+def warn_config_fallbacks(fallbacks: tuple[ConfigFallback, ...]) -> None:
+    for fallback in fallbacks:
+        if fallback not in _warned_config_fallbacks:
+            _warned_config_fallbacks.add(fallback)
+            print(fallback.diagnostic, file=sys.stderr)
 
 
 @dataclass(frozen=True)
@@ -1488,168 +1474,120 @@ class MemoryConfig:
     policy: AdmissionPolicy
     test_phase_margin: float
     build_budget_bytes: int
-    fallbacks: tuple[ConfigFallback, ...]
-    running_pass_seconds: float = 5.0
-    waiting_pass_seconds: float = 1.0
-    wait_reply_seconds: float = 60.0
-    replay_retention_seconds: float = 86400.0
-    reconnect_seconds: float = 2.0
-    silence_seconds: float = 120.0
-    outage_notice_seconds: float = 60.0
-    source_check_seconds: float = 1.0
-    source_settle_seconds: float = 2.0
-    override_reconnect_seconds: float = 10.0
-    request_max_bytes: int = 1048576
-    program_first_peaks: Mapping[str, int] = field(default_factory=dict[str, int])
-    program_sample_seconds: float = 1.0
-    program_stop_seconds: float = 5.0
-    peak_wave_seconds: float = 60.0
-
-
-DEFAULT_MEMORY_CONFIG = MemoryConfig(DEFAULT_ADMISSION_POLICY, FALLBACK_TEST_PHASE_MARGIN,
-                                    FALLBACK_BUILD_BUDGET_BYTES, ())
+    running_pass_seconds: float
+    waiting_pass_seconds: float
+    wait_reply_seconds: float
+    replay_retention_seconds: float
+    reconnect_seconds: float
+    silence_seconds: float
+    outage_notice_seconds: float
+    source_check_seconds: float
+    source_settle_seconds: float
+    override_reconnect_seconds: float
+    request_max_bytes: int
+    program_first_peaks: Mapping[str, int]
+    program_sample_seconds: float
+    program_stop_seconds: float
+    peak_wave_seconds: float
+    fallbacks: tuple[ConfigFallback, ...] = field(default=(), compare=False)
 
 
 def _test_phase_margin_value(raw: object) -> float:
-    """Stored need records retain their independent validity boundary."""
+    """Use the live margin when an old record has no valid margin."""
     if isinstance(raw, bool) or not isinstance(raw, (str, int, float)):
-        return FALLBACK_TEST_PHASE_MARGIN
+        return test_phase_margin()
     try:
         value = float(raw)
     except (ValueError, OverflowError):
-        return FALLBACK_TEST_PHASE_MARGIN
-    return value if math.isfinite(value) and value >= 1.0 else FALLBACK_TEST_PHASE_MARGIN
+        return test_phase_margin()
+    return value if math.isfinite(value) and value >= 1.0 else test_phase_margin()
 
 
-def read_memory_config() -> MemoryConfig:
-    """Read all memory configuration once, without emitting checker diagnostics."""
-    values = config_values(_lint_config_path())
-    fallbacks: list[ConfigFallback] = []
+def test_phase_margin() -> float:
+    return conf.number("lint", "test_phase_margin")
 
-    def number(key: str, default: int | float, *, whole: bool = False, margin: bool = False) -> float:
-        raw = values.get(key)
-        try:
-            value = float(raw) if raw is not None else float("nan")
-            valid = math.isfinite(value) and (value >= 1 if margin else value > 0)
-            if valid and (not whole or value.is_integer()):
-                return value
-        except (ValueError, OverflowError):
-            pass
-        fallbacks.append(ConfigFallback(key, MissingValue() if raw is None else InvalidValue(raw), default))
-        return float(default)
 
-    timing = DEFAULT_ADMISSION_POLICY.timing
-    pressure = DEFAULT_ADMISSION_POLICY.pressure
-    hold = DEFAULT_ADMISSION_POLICY.peak_hold
-    configured_timing = AdmissionTiming(
-        int(number("ramp_seconds", timing.ramp_seconds, whole=True)),
-        int(number("head_seconds", timing.head_seconds, whole=True)),
-        int(number("strict_seconds", timing.strict_seconds, whole=True)),
-        int(number("backfill_seconds", timing.backfill_seconds, whole=True)),
-        int(number("recovery_start_seconds", timing.recovery_start_seconds, whole=True)),
-        int(number("recovery_window_seconds", timing.recovery_window_seconds, whole=True)))
-    configured_pressure = PressurePolicy(
-        number("full_pressure_limit", pressure.full_avg10_limit),
-        number("swap_used_limit", pressure.swap_used_limit),
-        number("some_pressure_limit", pressure.some_avg10_limit))
-    default_hold = int(number("peak_hold_seconds", hold.default_seconds, whole=True))
-    kinds = {key.removeprefix("peak_hold_seconds."): int(number(key, default_hold, whole=True))
-             for key in values if key.startswith("peak_hold_seconds.")}
-    defaults = DEFAULT_MEMORY_CONFIG
-    raw_budget = values.get("build_budget_gib")
-    budget = _positive_gib_bytes(raw_budget) if raw_budget is not None else None
-    if budget is None:
-        fallbacks.append(ConfigFallback("build_budget_gib", MissingValue() if raw_budget is None
-                                        else InvalidValue(raw_budget), defaults.build_budget_bytes / GIB))
-        budget = defaults.build_budget_bytes
-    config = MemoryConfig(AdmissionPolicy(configured_timing, configured_pressure, PeakHold(default_hold, kinds)),
-        number("test_phase_margin", defaults.test_phase_margin, margin=True),
-        budget, (),
-        number("running_pass_seconds", defaults.running_pass_seconds),
-        number("waiting_pass_seconds", defaults.waiting_pass_seconds),
-        number("wait_reply_seconds", defaults.wait_reply_seconds),
-        number("replay_retention_seconds", defaults.replay_retention_seconds),
-        number("reconnect_seconds", defaults.reconnect_seconds),
-        number("silence_seconds", defaults.silence_seconds),
-        number("outage_notice_seconds", defaults.outage_notice_seconds),
-        number("source_check_seconds", defaults.source_check_seconds),
-        number("source_settle_seconds", defaults.source_settle_seconds),
-        number("override_reconnect_seconds", defaults.override_reconnect_seconds),
-        int(number("request_max_bytes", defaults.request_max_bytes, whole=True)))
-    first_peaks: dict[str, int] = {}
-    for key, raw in values.items():
-        if key.startswith("program_first_peak_gib."):
-            size = _positive_gib_bytes(raw)
-            if size is None:
-                fallbacks.append(ConfigFallback(key, InvalidValue(raw), ProgramSizeUnavailable()))
-            else:
-                first_peaks[key.removeprefix("program_first_peak_gib.")] = size
+def build_budget_bytes() -> int:
+    """Read the environment override or the live configured build budget."""
+    environment_budget = _positive_gib_bytes(os.environ.get("BUILDLOG_BUILD_BUDGET_GIB", ""))
+    if environment_budget is not None:
+        return environment_budget
+    return max(1, int(conf.number("lint", "build_budget_gib") * GIB))
+
+
+def request_max_bytes() -> int:
+    return conf.whole("lint", "request_max_bytes")
+
+def running_pass_seconds() -> float:
+    return conf.number("lint", "running_pass_seconds")
+
+def waiting_pass_seconds() -> float:
+    return conf.number("lint", "waiting_pass_seconds")
+
+def wait_reply_seconds() -> float:
+    return conf.number("lint", "wait_reply_seconds")
+
+def replay_retention_seconds() -> float:
+    return conf.number("lint", "replay_retention_seconds")
+
+def reconnect_seconds() -> float:
+    return conf.number("lint", "reconnect_seconds")
+
+def silence_seconds() -> float:
+    return conf.number("lint", "silence_seconds")
+
+def outage_notice_seconds() -> float:
+    return conf.number("lint", "outage_notice_seconds")
+
+def source_check_seconds() -> float:
+    return conf.number("lint", "source_check_seconds")
+
+def source_settle_seconds() -> float:
+    return conf.number("lint", "source_settle_seconds")
+
+def override_reconnect_seconds() -> float:
+    return conf.number("lint", "override_reconnect_seconds")
+
+
+def read_memory_config(*, report: bool = True) -> MemoryConfig:
+    """Resolve the live configuration for one admission decision."""
+    with conf.diagnostics(report=report) as diagnostics:
+        values = conf.values("lint")
+        timing = AdmissionTiming(*(conf.whole("lint", key) for key in (
+            "ramp_seconds", "head_seconds", "strict_seconds", "backfill_seconds",
+            "recovery_start_seconds", "recovery_window_seconds")))
+        pressure = PressurePolicy(*(conf.number("lint", key) for key in (
+            "full_pressure_limit", "swap_used_limit", "some_pressure_limit")))
+        kinds = {key.removeprefix("peak_hold_seconds."): conf.whole("lint", key)
+                 for key in values if key.startswith("peak_hold_seconds.")}
+        first_peaks = {key.removeprefix("program_first_peak_gib."):
+                       max(1, int(conf.number("lint", key) * GIB))
+                       for key in values if key.startswith("program_first_peak_gib.")}
+        config = MemoryConfig(
+            policy=AdmissionPolicy(timing, pressure, PeakHold(conf.whole("lint", "peak_hold_seconds"), kinds)),
+            test_phase_margin=test_phase_margin(),
+            build_budget_bytes=max(1, int(conf.number("lint", "build_budget_gib") * GIB)),
+            running_pass_seconds=running_pass_seconds(), waiting_pass_seconds=waiting_pass_seconds(),
+            wait_reply_seconds=wait_reply_seconds(), replay_retention_seconds=replay_retention_seconds(),
+            reconnect_seconds=reconnect_seconds(), silence_seconds=silence_seconds(),
+            outage_notice_seconds=outage_notice_seconds(), source_check_seconds=source_check_seconds(),
+            source_settle_seconds=source_settle_seconds(), override_reconnect_seconds=override_reconnect_seconds(),
+            request_max_bytes=request_max_bytes(), program_first_peaks=first_peaks,
+            program_sample_seconds=conf.number("lint", "program_sample_seconds"),
+            program_stop_seconds=conf.number("lint", "program_stop_seconds"),
+            peak_wave_seconds=conf.number("lint", "peak_wave_seconds"))
     return replace(config, policy=replace(config.policy, timing=replace(config.policy.timing,
-                   fresh_test_seconds=config.running_pass_seconds)), program_first_peaks=first_peaks,
-                   program_sample_seconds=number("program_sample_seconds", defaults.program_sample_seconds),
-                   program_stop_seconds=number("program_stop_seconds", defaults.program_stop_seconds),
-                   peak_wave_seconds=number("peak_wave_seconds", defaults.peak_wave_seconds),
-                   fallbacks=tuple(fallbacks))
-
-
-_warned_config_fallbacks: set[ConfigFallback] = set()
+                   fresh_test_seconds=config.running_pass_seconds)),
+                   fallbacks=tuple(ConfigFallback(message) for message in dict.fromkeys(diagnostics)))
 
 
 def memory_config() -> MemoryConfig:
-    config = read_memory_config()
-    warn_config_fallbacks(config.fallbacks)
-    return config
-
-
-def warn_config_fallbacks(fallbacks: tuple[ConfigFallback, ...]) -> None:
-    for fallback in fallbacks:
-        if fallback in _warned_config_fallbacks:
-            continue
-        _warned_config_fallbacks.add(fallback)
-        found = ("is missing" if isinstance(fallback.found, MissingValue)
-                 else json.dumps(fallback.found.raw) + " is not valid")
-        action = ("program size unavailable; program refused" if isinstance(fallback.used, ProgramSizeUnavailable)
-                  else f"using {fallback.used:g}")
-        print(f"memory admission: lint.conf [memory] {fallback.key} {found}; {action}", file=sys.stderr)
+    return read_memory_config()
 
 
 def _configured_budget(config: MemoryConfig) -> int:
     environment_budget = _positive_gib_bytes(os.environ.get("BUILDLOG_BUILD_BUDGET_GIB", ""))
     return environment_budget if environment_budget is not None else config.build_budget_bytes
-
-
-def build_budget_bytes() -> int:
-    """Resolve the live budget: environment, lint.conf, then the fallback."""
-    environment_budget = _positive_gib_bytes(os.environ.get("BUILDLOG_BUILD_BUDGET_GIB", ""))
-    return environment_budget if environment_budget is not None else read_memory_config().build_budget_bytes
-
-
-def request_max_bytes() -> int:
-    return read_memory_config().request_max_bytes
-
-
-def reconnect_seconds() -> float:
-    return read_memory_config().reconnect_seconds
-
-
-def silence_seconds() -> float:
-    return read_memory_config().silence_seconds
-
-
-def outage_notice_seconds() -> float:
-    return read_memory_config().outage_notice_seconds
-
-
-def source_check_seconds() -> float:
-    return read_memory_config().source_check_seconds
-
-
-def source_settle_seconds() -> float:
-    return read_memory_config().source_settle_seconds
-
-
-def override_reconnect_seconds() -> float:
-    return read_memory_config().override_reconnect_seconds
 
 
 @dataclass(frozen=True)

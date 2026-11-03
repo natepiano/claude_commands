@@ -198,7 +198,7 @@ def launcher_environment(root: Path) -> dict[str, str]:
     environment.update(AGENTS_CONFIG_PUBLISH="0", HOME=str(root), XDG_CACHE_HOME=str(root / "cache"),
                        UNIT_WORKER_POLL_SECS="0.01", UNIT_WORKER_WAIT_ATTEMPTS="30000", UNIT_SYNC_WRITES="0",
                        TEST_LEGACY_LAUNCH="1", AGENTS_CONFIG_FILE=str(root / ".claude/config/agents.conf"),
-                       UNIT_HISTORY_DIR=str(root / "history"), UNIT_CONFIG=str(root / "direct.conf"),
+                       UNIT_HISTORY_DIR=str(root / "history"), CONF_DIR=str(root),
                        TZ="UTC", USER_ZONE="UTC")
     cache = root / "cache/claude/python3-3.11"
     cache.parent.mkdir(parents=True, exist_ok=True)
@@ -232,7 +232,7 @@ def invoke_recorder(arguments: Sequence[str], environment: Mapping[str, str],
     progress_history._config_digest.cache_clear()  # pyright: ignore[reportPrivateUsage]
     try:
         with (
-            patch.object(progress_history, "DEFAULT_CONFIG_PATH", home / ".claude/config/direct.conf"),
+            patch.dict(os.environ, {"CONF_DIR": environment.get("CONF_DIR", str(home / ".claude/config"))}),
             patch.object(progress_history, "DEFAULT_AGENTS_CONFIG_PATH", home / ".claude/config/agents.conf"),
             patch.object(user_zone, "CONF", Path(environment.get("USER_ZONE_CONF") or
                                                str(Path(user_zone.__file__).parents[2] / "config/user_zone.conf"))),

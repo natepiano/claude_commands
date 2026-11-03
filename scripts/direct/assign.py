@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import json
 import itertools
 import os
 import re
 import signal
+import shlex
 import socket
 import subprocess
 import sys
@@ -27,7 +29,7 @@ from scripts.direct import phase_reservation, workers
 from scripts.direct.worker_state import worker_claim_lock, worker_record_path
 from scripts.astra import design_roles
 from scripts.production import staff, worker_admission
-from scripts.lib import tunables, unit_runs
+from scripts.lib import conf, unit_runs
 from scripts.lint import style_review
 from scripts.usage.agents_log import LENSES
 
@@ -62,6 +64,7 @@ class Arguments(argparse.Namespace):
     prompt: str = ""
     cwd: str = ""
     lens: str = ""
+    diff: str = ""
     pass_number: int = 1
     image: list[str] = []
 
@@ -111,6 +114,7 @@ def parse_arguments() -> Arguments:
     _ = parser.add_argument("--prompt", required=True)
     _ = parser.add_argument("--cwd", default=str(Path.cwd()))
     _ = parser.add_argument("--lens", choices=LENSES, default="")
+    _ = parser.add_argument("--diff", default="", help="saved phase diff for the simplify lens")
     _ = parser.add_argument("--pass", dest="pass_number", type=int, default=1)
     _ = parser.add_argument("--image", action="append", default=[])
     args = parser.parse_args(namespace=Arguments())
@@ -127,6 +131,12 @@ def parse_arguments() -> Arguments:
         parser.error("--style-since requires a final-diff review")
     if args.style_until and not args.style_since:
         parser.error("--style-until requires --style-since")
+    if args.lens == "simplify" and (args.role != "review" or args.early_ready or args.style_since):
+        parser.error("simplify requires a broad review of the completed phase diff")
+    if args.lens == "simplify" and not args.diff:
+        parser.error("--diff is required with --lens simplify")
+    if args.diff and args.lens != "simplify":
+        parser.error("--diff requires --lens simplify")
     return args
 
 
@@ -404,14 +414,10 @@ def claim_worker(dispatch: Dispatch) -> WorkerClaim:
             refuse(f"{dispatch.worker}: TransferringRole; use its destination holder")
         if record.get("held_design_id"):
             refuse(f"{dispatch.worker}: held roles resume through design_roles.py")
-        config = Path(os.environ.get("UNIT_CONFIG", str(Path.home() / ".claude/config/direct.conf")))
         try:
-            raw_threshold = tunables.values(config).get("UNIT_COMPACT_ABOVE_TOKENS", "")
-        except tunables.TunableUnusable as error:
+            threshold = conf.whole("direct", "UNIT_COMPACT_ABOVE_TOKENS")
+        except conf.Unusable as error:
             refuse(str(error))
-        threshold = int(raw_threshold) if re.fullmatch(r"\d+", raw_threshold) else 0
-        if threshold <= 0:
-            refuse(f"UNIT_COMPACT_ABOVE_TOKENS in {config} must be a positive integer")
         context_tokens = record.get("context_tokens")
         if isinstance(context_tokens, int) and context_tokens > threshold:
             compact = dispatch.mesh_call("compact", capture=True, check=False)
@@ -630,6 +636,37 @@ def execute(dispatch: Dispatch, paths: list[str]) -> int:
     return settle_dispatch(dispatch, code, completed, shown, status, summary, reply)
 
 
+def execute_simplify(args: Arguments, run: Path, phase: str, cwd: Path, source_prompt: Path,
+                     env: dict[str, str]) -> int:
+    directory = phase_reservation.phase_directory(run, phase)
+    directory.mkdir(parents=True, exist_ok=True)
+    if conf.text("direct", "SIMPLIFY_LENS") == "off":
+        print("simplify: off")
+        return 0
+    if args.pass_number != 1:
+        print("simplify: skipped; broad review only")
+        return 0
+    prompt = source_prompt
+    env["UNIT_REVIEW_CACHE_FILE"] = ""
+    _ = env.pop("UNIT_REVIEW_FAILURE_REASON", None)
+    try:
+        diff = (cwd / Path(args.diff).expanduser()).resolve()
+        digest = hashlib.sha256(diff.read_bytes()).hexdigest()
+        cache = directory / "simplify"
+        cache.mkdir(exist_ok=True)
+        prompt = cache / f"prompt-{os.getpid()}.md"
+        standing = (conf.directory() / "review/simplify.md").read_text()
+        _ = prompt.write_text(f"/simplify {shlex.quote(str(diff))}\n\n"
+                              + standing + "\n\n" + source_prompt.read_text() + "\n")
+        env["UNIT_REVIEW_CACHE_FILE"] = str(cache / f"{digest}.json")
+    except OSError as error:
+        env["UNIT_REVIEW_FAILURE_REASON"] = f"unable to prepare the simplify review: {error}"
+    env["UNIT_REVIEW_SUMMARY_FILE"] = str(Path(args.summary).resolve()) if args.summary else ""
+    command = ["bash", str(SCRIPTS / "review.sh"), "--phase", phase, str(run), str(cwd),
+               str(prompt), "simplify", "simplify review", "reviewing the completed phase diff", "1", "simplify"]
+    os.execvpe(command[0], command, env)
+
+
 def main() -> int:
     args = parse_arguments()
     cwd, prompt = Path(args.cwd).expanduser().resolve(), Path(args.prompt).expanduser().resolve()
@@ -638,6 +675,8 @@ def main() -> int:
     paths = authorized_paths(args, cwd)
     env = dict(os.environ)
     run, phase = prepare_run(args, cwd, prompt, env)
+    if args.lens == "simplify":
+        return execute_simplify(args, run, phase, cwd, prompt, env)
     role = "impl" if args.role == "implement" else args.role
     check = [PYTHON, PROGRESS, "check-launch", "--session-dir", str(run), "--pass-kind", role,
              "--phase-id", phase, "--prompt-file", str(prompt), "--fix-cause", args.fix_cause]

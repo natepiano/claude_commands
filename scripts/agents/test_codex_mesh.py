@@ -18,6 +18,7 @@ from scripts.production.staff_test_support import fixture_runtime_id
 
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 from scripts.lib.signal_test_support import SignalPidGuard, install_signal_pid_guard
+from scripts.message.repeat_guard_test_support import install_guard_test_budget
 
 from scripts.lib.test_agents_registry import write_registry
 
@@ -459,6 +460,7 @@ def select_fixture_workers(home: Path, *, notes: Path) -> None:
 
 def setUpModule() -> None:
     install_signal_pid_guard()
+    install_guard_test_budget()
     # Registered first, checked last; unittest reports cleanup assertions as module errors.
     unittest.addModuleCleanup(assert_real_codex_unchanged)
     # codex_mesh and its callers share this imported module; fixture-side locks
@@ -1540,14 +1542,11 @@ class MeshCommandFixture(unittest.TestCase):
         return code, output.getvalue(), errors.getvalue()
 
     def write_pool_roster(self, entries: dict[str, object]) -> None:
-        # Follow reads this file concurrently. Match production's lock before
-        # truncating, so a terminal marker cannot look like lost ownership.
-        with (self.session_dir / codex_mesh.ROSTER_FILE).open("a+", encoding="utf-8") as handle:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-            _ = handle.seek(0)
-            _ = handle.truncate()
-            _ = handle.write(json.dumps(entries))
-            handle.flush()
+        # Follow reads this file concurrently. Take production's sidecar lock and
+        # replace the file atomically, so a reader never sees an empty roster.
+        roster = self.session_dir / codex_mesh.ROSTER_FILE
+        with worker_lifecycle.locked_state(roster):
+            atomic_file.write_text_atomic(roster, json.dumps(entries))
 
     @contextlib.contextmanager
     def expire_contended_lock(self, path: Path, seconds: float) -> Generator[None]:

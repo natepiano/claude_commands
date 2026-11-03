@@ -624,8 +624,7 @@ def _held(columns: list[str], rows: list[str], changes: list[Visible], merged: s
 def pending(path: Path) -> list[dict[str, str]]:
     """Each row still to review, as its cells by column name. Reads only."""
     lines = read(path).splitlines(keepends=True)
-    columns, first, end = _table(path, lines, SECTION)
-    return [dict(zip(columns, (_plain(cell) for cell in _cells(line)))) for line in lines[first:end]]
+    return _review_table(path, lines, SECTION)
 
 
 def scope_list(doc: Path) -> Path:
@@ -794,9 +793,25 @@ def visible_owners(commits: list[Commit], production: Path) -> list[Path]:
             for item in entries(commit.message) if isinstance(item, Visible)]
 
 
+def read_commit_parents(repo: Path, revisions: Iterable[str]) -> dict[str, tuple[str, ...]]:
+    """Read the parents of the requested commits in one Git command."""
+    requested = tuple(dict.fromkeys(revisions))
+    if not requested:
+        return {}
+    result = subprocess.run(["git", "-C", str(repo), "rev-list", "--no-walk", "--parents", "--stdin"],
+                            input="\n".join(requested) + "\n", capture_output=True, text=True, check=False)
+    if result.returncode:
+        raise ChangeReviewError(f"git rev-list --parents: {result.stderr.strip()}")
+    parents: dict[str, tuple[str, ...]] = {}
+    for line in result.stdout.splitlines():
+        sha, *ancestors = line.split()
+        parents[sha] = tuple(ancestors)
+    return parents
+
+
 def merge_commits(repo: Path, merge: str) -> list[Commit]:
     """The commits a merge brought in, without merges; none for a commit that is no merge."""
-    parents = _git(repo, "rev-list", "--parents", "-n", "1", merge).split()[1:]
+    parents = next(iter(read_commit_parents(repo, (merge,)).values()), ())
     if len(parents) < 2:
         return []
     records = _git(repo, "log", "--no-merges", "--format=%x1e%H%x1f%B", parents[1], f"^{parents[0]}", "--")
@@ -1076,13 +1091,36 @@ def record_verdict(path: Path, row: str, verdict: str, day: date,
 
 def review_rows(path: Path) -> list[dict[str, str]]:
     """Read pending and saved page answers from the authoritative list."""
-    lines = read(path).splitlines(keepends=True)
-    rows: list[dict[str, str]] = []
-    for section in (SECTION, REVIEWED):
-        columns, first, end = _table(path, lines, section)
-        rows.extend(dict(zip(columns, (_plain(cell) for cell in _cells(line))))
-                    for line in lines[first:end])
-    return rows
+    snapshot = review_snapshot(path)
+    return [*snapshot.pending, *snapshot.reviewed]
+
+
+def _review_table(path: Path, lines: list[str], section: str) -> list[dict[str, str]]:
+    """Decode one review table and refuse rows with missing or extra cells."""
+    columns, first, end = _table(path, lines, section)
+    result: list[dict[str, str]] = []
+    for line in lines[first:end]:
+        cells = _cells(line)
+        if len(cells) != len(columns):
+            raise ChangeReviewError(f"{path}: {cells[0]} has the wrong number of cells")
+        result.append(dict(zip(columns, map(_plain, cells))))
+    return result
+
+
+@dataclass(frozen=True)
+class ReviewListSnapshot:
+    """One list read, with its metadata and both review tables."""
+
+    text: str
+    pending: list[dict[str, str]]
+    reviewed: list[dict[str, str]]
+
+
+def review_snapshot(path: Path) -> ReviewListSnapshot:
+    text = read(path)
+    lines = text.splitlines(keepends=True)
+
+    return ReviewListSnapshot(text, _review_table(path, lines, SECTION), _review_table(path, lines, REVIEWED))
 
 
 def set_row_kind(path: Path, row: str, kind: str, production: Path) -> str:

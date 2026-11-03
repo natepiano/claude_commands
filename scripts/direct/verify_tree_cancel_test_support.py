@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
+from scripts.lint.memory_test_support import write_config_fixture
 
 import json
 import shlex
@@ -245,10 +246,10 @@ class VerifyTreeCancelFixture(VerifyTokenOwnershipFixture):
         self.write_tool(runner, MAC_RUNNER)
         self.write_tool(self.root / "stubs/ssh", 'print("free_gib=1000\\nhost=test-mac\\nrc=0")\n')
         settings = self.root / "mac-settings.conf"
-        _ = settings.write_text(f"offload=on\nlinux_only.{self.workspace.name}=\n")
-        targets = self.root / "targets.conf"
+        _ = write_config_fixture(settings, f"offload=on\nlinux_only.{self.workspace.name}=\n", template="mac_test")
+        targets = self.root / "build_targets.conf"
         order = "natedev,mac" if local_first else "mac,natedev"
         _ = targets.write_text(f"targets={order}\nkind.mac=ssh\nplatform.mac=macos\n"
                                + f"settings.mac={settings.name}\nkind.natedev=local\nplatform.natedev=linux\n")
-        return {"VERIFY_MAC_RUNNER": str(runner), "BUILD_TARGETS_CONFIG": str(targets),
-                "MAC_TEST_CONFIG": str(settings)}
+        return {"VERIFY_MAC_RUNNER": str(runner),
+                "MAC_TEST_CONFIG": str(settings), "CONF_DIR": str(Path(settings).parent)}

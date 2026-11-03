@@ -14,12 +14,17 @@ import sys
 import tempfile
 import threading
 import time
-from typing import BinaryIO, TypedDict, Unpack
+from typing import TYPE_CHECKING, BinaryIO, TypedDict, Unpack
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lint import memory_admit
 from scripts.build_queue import admission_client, admission_protocol as wire
 import uuid
+
+if TYPE_CHECKING:
+    from scripts.lib import conf
+else:
+    import conf
 
 
 @dataclass(frozen=True)
@@ -232,6 +237,7 @@ class QueuePlace:
     wave_at: float = 0.0
     status: int = 1
     program: ProgramNotStarted | StartedProgram = field(default_factory=ProgramNotStarted, init=False)
+    on_started: Callable[[], None] = no_hold_wait
     _samples: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
     def observe(self, peak_bytes: int, current_bytes: int) -> None:
@@ -284,6 +290,7 @@ class QueuePlace:
                     if process.poll() is not None and not self.sidecar.read_text().strip():
                         raise QueuePlaceRefused("the program exited before it published its memory scope")
                     time.sleep(memory_admit.read_memory_config().program_sample_seconds)
+            self.on_started()
         return process
 
     def _sample(self, tracking: ScopedProgram | ProgramTree, stopped: threading.Event) -> None:
@@ -353,11 +360,14 @@ def _stop_holder(number: int, _frame: object) -> None:
 def queue_place(program: str, repo: Path, *,
                 sizing: memory_admit.FixedCapSizing | memory_admit.HistoryPeakSizing | ConfiguredFirstPeak = CONFIGURED_FIRST_PEAK,
                 before_check: Callable[[], None] = no_hold_wait) -> Generator[QueuePlace]:
-    config = memory_admit.memory_config()
+    try:
+        config = memory_admit.memory_config()
+    except conf.Unusable as error:
+        raise QueuePlaceRefused(str(error)) from error
     if isinstance(sizing, ConfiguredFirstPeak):
         first = config.program_first_peaks.get(program)
         if first is None:
-            raise QueuePlaceRefused(f"no first peak for {program} in lint.conf [memory]")
+            raise QueuePlaceRefused(f"no first peak for {program} in lint.conf [memory]; {conf.path('lint')}: program_first_peak_gib.{program} is missing or invalid")
         sizing = memory_admit.HistoryPeakSizing(first, memory_admit.FirstProgramPeak(first), 0.0)
     profile: memory_admit.ProgramProfile | memory_admit.StepProfile = memory_admit.ProgramProfile(
         program, str(Path.home() / ".claude"), str(repo.resolve()), sizing)

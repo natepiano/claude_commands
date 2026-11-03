@@ -595,7 +595,7 @@ class AdmissionServer:
 
     def persist(self, config: gate.MemoryConfig | gate.ReadMemoryConfiguration = gate.READ_MEMORY_CONFIGURATION) -> None:
         now = self.clock.now()
-        resolved = gate.read_memory_config() if isinstance(config, gate.ReadMemoryConfiguration) else config
+        resolved = gate.read_memory_config(report=False) if isinstance(config, gate.ReadMemoryConfiguration) else config
         live_reservations = {record.reservation_id for record in self.reservations.values()}
         self.ledger = {key: replace(entry, ended_at=now)
                        if isinstance(entry.ended_at, LiveGrant)
@@ -780,7 +780,7 @@ class AdmissionServer:
         return inputs, limits
 
     def run_pass(self) -> gate.PassResult:
-        config = gate.read_memory_config()
+        config = gate.read_memory_config(report=False)
         policy = config.policy
         self.last_fallbacks = config.fallbacks
         inputs, limits = self._inputs(config)
@@ -1046,7 +1046,7 @@ class AdmissionServer:
                     updated = replace(updated, estimate_revision=record.estimate_revision + 1,
                                       test_phase_need=gate.NoTestPhaseNeed("not_recorded"))
                     if record.step == "nextest":
-                        self._queue_estimate(updated, gate.read_memory_config())
+                        self._queue_estimate(updated, gate.read_memory_config(report=False))
                     self.reservations[episode] = updated
             live = any(record.reservation_id == request.reservation for record in self.reservations.values())
             self.ledger[key] = ReplayEntry(wire.Ok(), LiveGrant() if live else self.clock.now(), request.reservation)

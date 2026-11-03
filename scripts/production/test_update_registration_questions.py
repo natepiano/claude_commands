@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import cast
 from unittest import mock
 
-from scripts.production.update_registration_test_support import RegistrationFixture, QuestionRegistration, registration, dailies_render, review
+from scripts.production.update_registration_test_support import RegistrationFixture, QuestionRegistration, registration, review
 
 from scripts.production.update_registration_test_support import setUpModule as setUpModule
 
@@ -32,7 +32,9 @@ class RegistrationTests(RegistrationFixture):
                 real_replace = os.replace
 
                 def stop(source: Path, destination: Path) -> None:
-                    if Path(destination) == path:
+                    target = Path(destination)
+                    if target == path or (action == "ask" and target.suffix == ".md"
+                                          and "record_type: question" in Path(source).read_text()):
                         raise OSError("question list replacement stopped")
                     real_replace(source, destination)
 
@@ -42,15 +44,16 @@ class RegistrationTests(RegistrationFixture):
                     self.assertEqual(failed.returncode, 2, failed.stdout + failed.stderr)
                     self.assertIn("question list replacement stopped", failed.stdout)
                     self.assertEqual(path.read_bytes(), before)
-                    self.assertEqual([item.text for item in dailies_render.read_outstanding(path)], ["Reminder", "unit question?"])
+                    self.assertEqual([item.text for item in self.read_items(path)], ["Reminder", "unit question?"])
                     if action == "ask":
                         entries = [cast(dict[str, object], json.loads(line)) for line in history.read_text().splitlines()]
                         self.assertEqual(sum(item["text"] == "new question?" for item in entries), 1)
                     retried = self.run_command(*command)
                 self.assertEqual(retried.returncode, 0, retried.stdout + retried.stderr)
-                saved = cast(list[dict[str, object]], json.loads(path.read_text()))
+                saved = self.open_rows()
                 unit_question = next(item for item in saved if item["text"] == "unit question?")
-                self.assertEqual((unit_question["question"], unit_question["asked_by"]), ("Keep the layout?", "alpha-unit"))
+                self.assertEqual((unit_question["question"], unit_question["asked_by"]),
+                                 ("Keep the layout?", self.fixture_staff_id("alpha-unit")))
                 if action == "ask":
                     self.assertEqual(sum(item["text"] == "new question?" for item in saved), 1)
                     entries = [cast(dict[str, object], json.loads(line)) for line in history.read_text().splitlines()]
@@ -80,7 +83,7 @@ class RegistrationTests(RegistrationFixture):
                 _ = self.run_ask("retry?", "Retry it?", "alpha-unit")
             self.assertEqual((path.read_bytes(), history.read_bytes()), before)
             _ = self.run_ask("retry?", "Retry it?", "alpha-unit")
-        self.assertEqual([item.text for item in dailies_render.read_outstanding(path)], ["Reminder", "retry?"])
+        self.assertEqual([item.text for item in self.read_items(path)], ["Reminder", "retry?"])
         entries = [cast(dict[str, object], json.loads(line)) for line in history.read_text().splitlines()]
         self.assertEqual([item["text"] for item in entries], ["Earlier registration", "retry?"])
 

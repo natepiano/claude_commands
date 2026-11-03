@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+
+
 import json
 import os
 import socket
@@ -14,6 +16,12 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, cast, override
 from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
+if TYPE_CHECKING:
+    from ..lint.memory_test_support import config_environment
+else:
+    from memory_test_support import config_environment
 
 import index
 import memory
@@ -34,7 +42,7 @@ END_UTC = "2026-10-05T07:30:00.000Z"
 
 def write_lint_config(root: Path, adjustment: int | str, *, include_adjustment: bool = True) -> Path:
     path = root / "lint.conf"
-    _ = path.write_text(f"build_oom_score_adj={adjustment}\n" if include_adjustment else "clippy=on\n")
+    _ = path.write_text(f"# whole: -1000..1000\nbuild_oom_score_adj={adjustment}\n" if include_adjustment else "clippy=on\n")
     return path
 
 
@@ -77,6 +85,8 @@ def snapshot(at: str, high: int, peak: int, *, ci: Record | None = None) -> Reco
 
 def setUpModule() -> None:
     """The times these tests expect are Pacific; the user's zone setting must not change them."""
+    fixture_root = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
+    unittest.enterModuleContext(patch.dict(os.environ, config_environment(fixture_root)))
     unittest.enterModuleContext(patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
 
 
@@ -97,6 +107,7 @@ class MemoryWindowTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.base = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.enterContext(patch.dict(os.environ, config_environment(self.base)))
         self.root = self.base / "buildlog"
         self.fake_bin = self.base / "bin"
         self.fake_bin.mkdir()

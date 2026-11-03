@@ -476,7 +476,7 @@ class TargetCommandTests(PrivateReleaseBroadcastTest):
     def setUp(self) -> None:
         super().setUp()
         self.enterContext(mock.patch.dict(os.environ, {
-            "BUILD_TARGETS_CONFIG": str(SCRIPT.parent.parent.parent / "config/build_targets.conf"),
+            "CONF_DIR": str(Path(SCRIPT.parent.parent.parent / "config/build_targets.conf").parent),
         }))
 
     def run_with_mac_stand_in(
@@ -484,8 +484,11 @@ class TargetCommandTests(PrivateReleaseBroadcastTest):
     ) -> tuple[int, str, str, list[list[str]]]:
         calls: list[list[str]] = []
         expected_script = SCRIPT.resolve().parent.parent / "mac_test/mac_test.py"
+        run = subprocess.run
 
         def command(argv: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+            if argv[:1] == ["git"]:
+                return run(argv, capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
             self.assertEqual(argv[:2], [sys.executable, str(expected_script)])
             self.assertTrue(options.get("capture_output"))
             self.assertTrue(options.get("text"))
@@ -622,25 +625,30 @@ class TargetCommandTests(PrivateReleaseBroadcastTest):
                 self.assert_no_natedev_record()
 
     def test_unknown_target_with_an_unreadable_config_names_the_reason(self) -> None:
-        missing = self.scratch / "missing-targets.conf"
-        incomplete = self.scratch / "incomplete-targets.conf"
+        missing = self.scratch / "missing" / "build_targets.conf"
+        missing.parent.mkdir()
+        incomplete = self.scratch / "incomplete" / "build_targets.conf"
+        incomplete.parent.mkdir()
         _ = incomplete.write_text("targets=mac\n", encoding="utf-8")
-        invalid_utf8 = self.scratch / "invalid-utf8-targets.conf"
+        invalid_utf8 = self.scratch / "invalid-utf8" / "build_targets.conf"
+        invalid_utf8.parent.mkdir()
         _ = invalid_utf8.write_bytes(b"\xff")
         for config, reason in (
-            (missing, f"targets: expected distinct target names in {missing}"),
+            (missing, f"{missing}: keys: [Errno 2] No such file or directory: {str(missing)!r}"),
             (incomplete, "kind.mac: expected local or ssh, got ''"),
-            (invalid_utf8, "'utf-8' codec can't decode byte 0xff in position 0: invalid start byte"),
+            (invalid_utf8, f"{invalid_utf8}: keys: 'utf-8' codec can't decode byte 0xff in position 0: invalid start byte"),
         ):
             for arguments in (["hold", "--for", "renderer checks"], ["release"]):
                 with self.subTest(config=config.name, action=arguments[0]), mock.patch.dict(
-                    os.environ, {"BUILD_TARGETS_CONFIG": str(config)},
+                    os.environ, {"CONF_DIR": str(Path(config).parent)},
                 ), mock.patch.object(build_hold, "holder_of") as holder_lookup:
                     status, output, errors, calls = self.run_with_mac_stand_in(
                         [*arguments, "--target", "missing", "--holder", "alice"])
                     self.assertEqual(status, 2)
-                    self.assertEqual(output, f"unknown target missing; the target config cannot be read: {reason}\n")
-                    self.assertEqual(errors, "")
+                    history_fault = config in (missing, invalid_utf8)
+                    suffix = "; no usable committed file" if history_fault else ""
+                    self.assertEqual(output, f"unknown target missing; the target config cannot be read: {reason}{suffix}\n")
+                    self.assertEqual(errors, f"warning: {reason}\n" if history_fault else "")
                     holder_lookup.assert_not_called()
                     self.assertEqual(calls, [])
                     self.assert_no_natedev_record()
@@ -2020,7 +2028,7 @@ class ImmediateReleaseTests(PrivateReleaseBroadcastTest):
         cycle["holders"]["holder"]["released_at"] = self.now.isoformat()
         cycle["release_started_at"] = self.now.isoformat()
         build_hold.save_cycle(cycle)
-        config = self.scratch / "targets.conf"
+        config = self.scratch / "build_targets.conf"
         _ = config.write_text("targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n")
         events: list[str] = []
 
@@ -2030,7 +2038,7 @@ class ImmediateReleaseTests(PrivateReleaseBroadcastTest):
             (self.scratch / "holders/holder").unlink()
             events.append("file removed")
 
-        with mock.patch.dict(os.environ, {"BUILD_TARGETS_CONFIG": str(config), "CLAUDE_CODE_SESSION_ID": "waiter"}), \
+        with mock.patch.dict(os.environ, {"CONF_DIR": str(Path(config).parent), "CLAUDE_CODE_SESSION_ID": "waiter"}), \
              mock.patch.object(build_hold, "socket_for") as lookup, \
              mock.patch.object(build_targets, "wait_clock", return_value=self.now), \
              mock.patch.object(build_targets, "wait_sleep", side_effect=remove_on_wait), \

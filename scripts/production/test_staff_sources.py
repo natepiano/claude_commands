@@ -25,6 +25,9 @@ from scripts.production import staff, staff_sources, unit_config, live_units, fa
 from scripts.production.staff_test_support import (
     SOURCES_SCRIPT, FixtureMachine, StaffTestCase, production_membership, unit_membership,
 )
+from scripts.production.unit_config_format_test_support import (
+    check_format, count_taplo, remove_assignment_spacing, require_taplo, write_aligning_config,
+)
 from scripts.shutdown import pane_record, remote
 import herdr
 from scripts.production import showrunners
@@ -36,6 +39,69 @@ from unit_lookup import ProductionMembers, live_unit_table, retired_units, unit_
 
 
 class StaffSourcesTests(StaffTestCase):
+    def assert_fill_formats_once(self, path: Path, *, retired: bool = False) -> None:
+        with count_taplo(self, self.root) as invocations:
+            code, output, errors = self.fill_result(retired=retired)
+            self.assertEqual((code, errors), (0, ""), output)
+            self.assertIn("changed", output.splitlines())
+            self.assertEqual(invocations.count(), 1)
+            remove_assignment_spacing(path)
+            code, output, errors = self.fill_result(retired=retired)
+            self.assertEqual((code, errors), (0, ""), output)
+            self.assertIn("changed", output.splitlines())
+            self.assertEqual(invocations.count(), 2)
+            before = path.read_bytes(), path.stat().st_mtime_ns
+            code, output, errors = self.fill_result(retired=retired)
+            self.assertEqual((code, output, errors), (0, "unchanged\n", ""))
+            self.assertEqual(invocations.count(), 3)
+            self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+
+    def test_live_fill_runs_taplo_once_for_publication_repair_and_rerun(self) -> None:
+        _ = self.fill_production("sdlc", "format-unit")
+        folder = self.source_root / "worktrees/format-unit"
+        _ = write_aligning_config(folder)
+        self.assert_fill_formats_once(folder / ".unit.toml")
+
+    def test_retired_fill_runs_taplo_once_for_publication_repair_and_rerun(self) -> None:
+        doc = self.retired_fill_production("sdlc", "format-unit")
+        _ = write_aligning_config(doc.parents[1])
+        row = unit_membership("sdlc", "format-unit")
+        self.assert_fill_formats_once(unit_config.parked_path(row.id), retired=True)
+
+    def test_fill_format_repair_recovers_before_and_after_replacement(self) -> None:
+        _ = require_taplo(self)
+        _ = self.fill_production("sdlc", "format-unit")
+        folder = self.source_root / "worktrees/format-unit"
+        _ = write_aligning_config(folder)
+        code, output, errors = self.fill_result()
+        self.assertEqual((code, errors), (0, ""), output)
+        source = folder / ".unit.toml"
+        expected = source.read_bytes()
+        replace_file = os.replace
+        for after in (False, True):
+            with self.subTest(after=after):
+                remove_assignment_spacing(source)
+
+                def interrupted(temporary: Path, destination: Path) -> None:
+                    if destination == source:
+                        if after:
+                            replace_file(temporary, destination)
+                        raise OSError("interrupted configuration replacement")
+                    replace_file(temporary, destination)
+
+                with mock.patch.object(os, "replace", side_effect=interrupted):
+                    code, output, errors = self.fill_result()
+                self.assertEqual(code, 1, output + errors)
+                self.assertIn("interrupted configuration replacement", errors)
+                code, output, errors = self.fill_result()
+                self.assertEqual((code, errors), (0, ""), output)
+                self.assertIn("unchanged" if after else "changed", output.splitlines())
+                self.assertEqual(source.read_bytes(), expected)
+                before = source.read_bytes(), source.stat().st_mtime_ns
+                code, output, errors = self.fill_result()
+                self.assertEqual((code, output, errors), (0, "unchanged\n", ""))
+                self.assertEqual((source.read_bytes(), source.stat().st_mtime_ns), before)
+
     @override
     def setUp(self) -> None:
         super().setUp()
@@ -56,6 +122,69 @@ class StaffSourcesTests(StaffTestCase):
         location = (staff.WrappedDoc("natedev", doc) if wrapped else staff.LiveDoc("natedev", doc))
         _ = staff.set_doc(owner.id, location)
         return doc
+
+    def test_fill_repairs_existing_config_format_and_second_rerun_preserves_files(self) -> None:
+        binary = require_taplo(self)
+        doc = self.fill_production("sdlc", "format-unit")
+        folder = self.source_root / "worktrees/format-unit"
+        _ = write_aligning_config(folder)
+        code, output, errors = self.fill_result()
+        self.assertEqual((code, errors), (0, ""), output)
+        source = folder / ".unit.toml"
+        value = unit_config.read(folder)
+        remove_assignment_spacing(source)
+        self.assertEqual(unit_config.read(folder), value)
+        wrong_format = check_format(binary, source, folder)
+        self.assertNotEqual(wrong_format.returncode, 0)
+        before = source.read_bytes()
+        paths = (self.staff_file, doc, folder / "taplo.toml", doc.parents[1] / ".git/info/exclude")
+        retained = [(path.read_bytes(), path.stat().st_mtime_ns) for path in paths]
+        code, output, errors = self.fill_result()
+        self.assertEqual((code, errors), (0, ""), output)
+        self.assertIn("changed", output.splitlines())
+        self.assertNotIn("unchanged", output.splitlines())
+        self.assertNotEqual(source.read_bytes(), before)
+        self.assertEqual(unit_config.read(folder), value)
+        result = check_format(binary, source, folder)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual([(path.read_bytes(), path.stat().st_mtime_ns) for path in paths], retained)
+        repaired = source.read_bytes(), source.stat().st_mtime_ns
+        code, output, errors = self.fill_result()
+        self.assertEqual((code, output, errors), (0, "unchanged\n", ""))
+        self.assertEqual((source.read_bytes(), source.stat().st_mtime_ns), repaired)
+        self.assertEqual([(path.read_bytes(), path.stat().st_mtime_ns) for path in paths], retained)
+
+    def test_retired_fill_repairs_format_with_the_repository_config_after_worktree_removal(self) -> None:
+        binary = require_taplo(self)
+        doc = self.retired_fill_production("sdlc", "format-unit")
+        repository = doc.parents[1]
+        _ = write_aligning_config(repository)
+        self.assertFalse((self.source_root / "worktrees/format-unit").exists())
+        row = unit_membership("sdlc", "format-unit")
+        code, output, errors = self.fill_result(retired=True)
+        self.assertEqual((code, errors), (0, ""), output)
+        parked = unit_config.parked_path(row.id)
+        value = unit_config.read_parked(row.id)
+        result = check_format(binary, parked, repository)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        remove_assignment_spacing(parked)
+        self.assertEqual(unit_config.read_parked(row.id), value)
+        before = parked.read_bytes()
+        paths = (self.staff_file, doc, repository / "taplo.toml", repository / ".git/info/exclude")
+        retained = [(path.read_bytes(), path.stat().st_mtime_ns) for path in paths]
+        code, output, errors = self.fill_result(retired=True)
+        self.assertEqual((code, errors), (0, ""), output)
+        self.assertIn("changed", output.splitlines())
+        self.assertNotIn("unchanged", output.splitlines())
+        self.assertNotEqual(parked.read_bytes(), before)
+        self.assertEqual(unit_config.read_parked(row.id), value)
+        result = check_format(binary, parked, repository)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        repaired = parked.read_bytes(), parked.stat().st_mtime_ns
+        code, output, errors = self.fill_result(retired=True)
+        self.assertEqual((code, output, errors), (0, "unchanged\n", ""))
+        self.assertEqual((parked.read_bytes(), parked.stat().st_mtime_ns), repaired)
+        self.assertEqual([(path.read_bytes(), path.stat().st_mtime_ns) for path in paths], retained)
 
     def test_retired_fill_ignores_temporary_worktree_documents_as_sources(self) -> None:
         doc = self.retired_fill_production("sdlc", "models-unit")
@@ -174,7 +303,7 @@ class StaffSourcesTests(StaffTestCase):
         write_text_atomic(doc, doc.read_text().split("## Units")[0])
         folder = self.source_root / "worktrees/fallback-unit"
         config = unit_config.UnitConfig(unit_config.StandbyPlan(), unit_config.NoAppPort(), ())
-        unit_config.write(folder, config)
+        _ = unit_config.write(folder, config)
         fallback = unit_membership("sdlc", "fallback-unit")
         session = self.session_record(fallback.id, "fallback-unit")
         value = cast(dict[str, object], json.loads(session.read_text()))
@@ -507,7 +636,7 @@ class StaffSourcesTests(StaffTestCase):
         for after in (False, True):
             def interrupted(identity: staff.StaffId, config: unit_config.UnitConfig) -> None:
                 if after:
-                    publisher(identity, config)
+                    _ = publisher(identity, config)
                 raise OSError("stopped at parked publication")
             with mock.patch.object(unit_config, "write_parked", side_effect=interrupted):
                 code, output, errors = self.fill_result(retired=True)
@@ -2261,6 +2390,131 @@ class NonLocalMemberReferenceTests(unittest.TestCase):
                 expected = (session_staff.MemberFound(unit) if reference == missing
                             else session_staff.NoSuchMember(selector))
                 self.assertEqual(found, expected)
+
+
+class LegacyWorkerSourceTests(StaffTestCase):
+    run_dir: Path = Path()
+
+    @property
+    def parent(self) -> staff.StaffRow:
+        row = staff.by_path("sdlc/models")
+        assert row is not None
+        return row
+
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        _ = self.production("sdlc", "models-unit")
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            staff_sources.seed()
+        parent = staff.by_path("sdlc/models")
+        owner = staff.by_path("sdlc")
+        assert parent is not None and owner is not None
+        _ = self.session_record(owner.current_session, owner.name)
+        _ = self.session_record(parent.current_session, "models-unit")
+        self.run_dir = self.worker_run("sdlc", "models-unit", parent.current_session)
+
+    def read_live(self) -> tuple[list[dict[str, object]], str]:
+        with redirect_stderr(io.StringIO()) as errors:
+            value = staff_sources.live()
+        return cast(list[dict[str, object]], value["members"]), errors.getvalue()
+
+    def test_roleless_roster_uses_exact_worker_membership_without_inventing_a_role(self) -> None:
+        worker = fixture_member("worker", name="review", parent=self.parent.id)
+        worker = staff.update_current_session(worker.id, staff.native_id(fixture_runtime_id("legacy-review-current")))
+        path = self.roster_worker(self.run_dir, worker.name, "", worker.current_session)
+        for omitted in (True, False):
+            with self.subTest(omitted=omitted):
+                data = cast(dict[str, dict[str, object]], json.loads(path.read_text()))
+                if omitted:
+                    _ = data[worker.name].pop("role", None)
+                else:
+                    data[worker.name]["role"] = ""
+                self.write_json(path, data)
+                before = self.staff_file.read_bytes(), path.read_bytes()
+                members, errors = self.read_live()
+                self.assertEqual(errors, "")
+                found = next(member for member in members if member["id"] == worker.id)
+                self.assertEqual(found["kind"], "worker")
+                self.assertEqual(found["role"], "worker")
+                self.assertEqual(found["name"], worker.name)
+                self.assertEqual(found["parent"], self.parent.id)
+                self.assertEqual(found["identity"], {"codex": worker.current_session})
+                self.assertEqual((self.staff_file.read_bytes(), path.read_bytes()), before)
+
+    def test_roleless_roster_rejects_missing_or_conflicting_membership_and_invalid_roles(self) -> None:
+        worker = fixture_member("worker", name="review", parent=self.parent.id)
+        other = fixture_member("unit", name="other", parent=self.parent.parent)
+        elsewhere = fixture_member("worker", name="elsewhere", parent=other.id)
+        cases = (
+            ("missing", "", fixture_runtime_id("missing-worker")),
+            (worker.name, "invalid-role", worker.current_session),
+            (worker.name, "", fixture_runtime_id("conflicting-worker")),
+            ("wrong-name", "", worker.current_session),
+            ("elsewhere", "", elsewhere.current_session),
+        )
+        for name, role, identity in cases:
+            with self.subTest(name=name, role=role, identity=identity):
+                self.write_json(self.run_dir / "mesh_roster.json", {})
+                path = self.roster_worker(self.run_dir, name, role, identity)
+                before = self.staff_file.read_bytes(), path.read_bytes()
+                members, errors = self.read_live()
+                self.assertFalse(any(member["kind"] == "worker" for member in members), members)
+                self.assertEqual(len(errors.splitlines()), 1, errors)
+                self.assertIn(f"{path} worker {name}:", errors)
+                self.assertIn("missing or invalid recorded worker role", errors)
+                self.assertEqual((self.staff_file.read_bytes(), path.read_bytes()), before)
+
+    def test_malformed_roster_entry_preserves_its_valid_sibling(self) -> None:
+        worker = fixture_member("worker", name="review", parent=self.parent.id)
+        path = self.roster_worker(self.run_dir, worker.name, "review", worker.current_session)
+        data = cast(dict[str, object], json.loads(path.read_text()))
+        write_text_atomic(path, json.dumps({"broken": [], **data}) + "\n")
+        before = self.staff_file.read_bytes(), path.read_bytes()
+        members, errors = self.read_live()
+        self.assertEqual(len(errors.splitlines()), 1, errors)
+        self.assertIn(f"{path} worker broken: expected a JSON object", errors)
+        found = next(member for member in members if member["id"] == worker.id)
+        self.assertEqual(found["role"], "review")
+        self.assertEqual(found["identity"], {"codex": worker.current_session})
+        self.assertEqual((self.staff_file.read_bytes(), path.read_bytes()), before)
+
+    def paused_legacy_ledger(self, identity: str) -> Path:
+        path = self.ledger_worker(self.run_dir, "sdlc", "former-models-unit", "review", "review",
+                                  identity, family="claude")
+        data = cast(dict[str, object], json.loads(path.read_text()))
+        entries = cast(dict[str, dict[str, object]], data["workers"])
+        entries["review"]["ownership"] = {"kind": "Paused"}
+        self.write_json(path, data)
+        self.write_json(self.run_dir / "mesh_roster.json", {})
+        return path
+
+    def test_paused_legacy_ledger_finds_renamed_parent_through_backend_current_session(self) -> None:
+        worker = fixture_member("worker", name="review", parent=self.parent.id)
+        worker = staff.update_current_session(worker.id, staff.native_id(fixture_runtime_id("legacy-ledger-current")))
+        path = self.paused_legacy_ledger(worker.current_session)
+        parent = staff.rename(self.parent.id, "renamed-models")
+        _ = self.session_record(worker.current_session, "review")
+        before = self.staff_file.read_bytes(), path.read_bytes()
+        members, errors = self.read_live()
+        self.assertEqual(errors, "")
+        found = next(member for member in members if member["id"] == worker.id)
+        self.assertEqual(found["parent"], parent.id)
+        self.assertEqual(found["identity"], {"claude": worker.current_session})
+        self.assertEqual(found["role"], "review")
+        self.assertEqual(next(member["name"] for member in members if member["id"] == parent.id), parent.name)
+        self.assertNotIn("staff_id", path.read_text())
+        self.assertEqual((self.staff_file.read_bytes(), path.read_bytes()), before)
+
+    def test_paused_legacy_ledger_without_native_membership_has_no_current_staff_parent(self) -> None:
+        identity = fixture_runtime_id("unregistered-legacy-ledger")
+        path = self.paused_legacy_ledger(identity)
+        _ = self.session_record(identity, "review")
+        before = self.staff_file.read_bytes(), path.read_bytes()
+        members, errors = self.read_live()
+        self.assertFalse(any(member["kind"] == "worker" for member in members), members)
+        self.assertIn(f"{path} worker review: worker ledger has no current staff parent", errors)
+        self.assertEqual((self.staff_file.read_bytes(), path.read_bytes()), before)
 
 
 if __name__ == "__main__":

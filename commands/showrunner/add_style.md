@@ -1,5 +1,5 @@
 ---
-description: Start or attach the repository's standing style production
+description: Start or attach a style production.
 argument-hint: "<parent production doc> [check] [--pilot <unit>[=<crate>,...]]"
 ---
 

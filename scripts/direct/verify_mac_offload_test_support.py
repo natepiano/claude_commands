@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
+
 import json
 import os
 import errno
@@ -196,6 +198,7 @@ class CargoMetadata(TypedDict):
 CARGO_STUB = r'''
 from __future__ import annotations
 
+
 import json
 import os
 from pathlib import Path
@@ -285,6 +288,7 @@ fi
 
 RUNNER_STUB = r'''
 from __future__ import annotations
+
 
 import json
 import os
@@ -738,9 +742,11 @@ class VerifyMacOffloadFixture(unittest.TestCase):
         # Admission must use this test's memory state, including pressure.
         pressure = self.root / "memory-pressure"
         _ = pressure.write_text("full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n")
+        _ = write_config_fixture(self.root / "lint.conf")
+        _ = write_config_fixture(self.root / "mac_test.conf")
         settings = self.root / "mac settings.conf"
-        _ = settings.write_text(f"offload=on\nlinux_only.{self.root.name}=\n")
-        config = self.root / "targets.conf"
+        _ = write_config_fixture(settings, f"offload=on\nlinux_only.{self.root.name}=\n", template="mac_test")
+        config = self.root / "build_targets.conf"
         _ = config.write_text("targets=mac,natedev\nkind.mac=ssh\nplatform.mac=macos\n"
                               + f"settings.mac={settings.name}\nkind.natedev=local\nplatform.natedev=linux\n")
         metadata: CargoMetadata = {
@@ -767,6 +773,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
         assertion_guard = self.root / "assertion-guard.py"
         self.write_executable(assertion_guard, "raise SystemExit(0)\n")
         self.environment = {
+            **config_environment(self.root),
             **{
                 name: value
                 for name, value in os.environ.items()
@@ -819,12 +826,12 @@ class VerifyMacOffloadFixture(unittest.TestCase):
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
             "MAC_TEST_STATE_DIR": str(self.root / "mac-state"),
             "MAC_IDLE_STATE_DIR": str(self.root / "mac-idle"),
-            "BUILD_TARGETS_CONFIG": str(config),
+
             "MAC_TEST_CONFIG": str(settings),
             "CLAUDE_CODE_SESSION_ID": "", "BUILD_TARGETS_NOW": "",
             "BUILD_TARGETS_POLL_S": "0.05",
             "LINT_CONFIG_READER": str(reader),
-            "LINT_CONFIG_FILE": str(reader),
+            "LINT_CONFIG_FILE": str(reader), "CONF_DIR": str(Path(reader).parent),
             "UNIT_RUN_DIR": str(self.board),
             "UNIT_TEAM_ROLE": "test",
             "VERIFY_MAC_RUNNER": str(self.runner),
@@ -858,15 +865,13 @@ class VerifyMacOffloadFixture(unittest.TestCase):
     def verify(
         self, *arguments: str, extra: dict[str, str] | None = None
     ) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            ["bash", str(VERIFY), *arguments],
-            cwd=self.root,
-            env={**self.environment, **(extra or {})},
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=TEST_HANG_GUARD_SECS,
-        )
+        process = self.start_verify(*arguments, extra=extra)
+        try:
+            output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+        except subprocess.TimeoutExpired:
+            self.stop_verify(process)
+            raise
+        return subprocess.CompletedProcess(process.args, process.wait(timeout=TEST_HANG_GUARD_SECS), output, errors)
 
     def start_verify(
         self, *arguments: str, extra: dict[str, str] | None = None

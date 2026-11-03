@@ -711,6 +711,35 @@ class RecordTests(unittest.TestCase):
         self.assertEqual((row["caller"], row["call_id"], row["step"]), ("verify-mac", CALL_ID, "nextest"))
         self.assertEqual((row["tree_key"], row["tree_changed"]), (sent_key, None))
 
+    def test_verify_linux_step_without_git_keeps_the_sent_key_target_and_call(self) -> None:
+        mirror = self.base / "linux-mirror"
+        mirror.mkdir()
+        sent_key = "b" * 64
+
+        result = self.record(
+            "step", "1", str(START), str(START + 1), "0", "", "", *NEXTEST,
+            cwd=mirror,
+            extra={"BUILDLOG_CALLER": "verify-linux", "BUILDLOG_CALL_ID": CALL_ID,
+                   "BUILDLOG_TARGET": "aws", "BUILDLOG_SENT_TREE_KEY": sent_key},
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        row = self.records()[-1]
+        self.assertEqual((row["caller"], row["target"], row["call_id"]), ("verify-linux", "aws", CALL_ID))
+        self.assertEqual((row["tree_key"], row["tree_changed"]), (sent_key, None))
+
+    def test_verify_linux_step_preserves_tree_verification_over_the_sent_key(self) -> None:
+        own_key = self.key(*NEXTEST)
+        sent_key = "b" * 64
+        for start_key, expected in ((own_key, (own_key, False)), ("0" * 64, (None, True))):
+            with self.subTest(start_key=start_key):
+                row = self.step(1, "0", "", "", NEXTEST, {
+                    "BUILDLOG_CALLER": "verify-linux", "BUILDLOG_TARGET": "aws",
+                    "BUILDLOG_TREE_START": start_key, "BUILDLOG_SENT_TREE_KEY": sent_key,
+                })
+
+                self.assertEqual((row["tree_key"], row["tree_changed"]), expected)
+
     def assert_unverified_mac_step_uses_sent_key(self) -> None:
         # The fallback must work where the preceding step's guard does not apply.
         mirror = self.base / "mirror-control"

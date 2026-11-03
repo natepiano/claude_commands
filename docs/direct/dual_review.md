@@ -8,15 +8,16 @@ Read at the point of use from `/unit:direct`. Defines `<DualReview/>`,
 completes, or when `<EarlyReviewArm/>` arms a reviewer.
 
 <TeamReview>
-A phase's broad review runs `adversary` and `contract` at once, plus `rerun`
-when <DualReview/> arms it. Each takes a distinct **lens**, named in its prompt;
-the unit director also performs the main review per <DualReview/>:
+A phase's broad review runs `adversary`, `contract`, and `simplify` together.
+It also runs `rerun` when <DualReview/> arms it.
+Each prompt names its lens. The director performs the main review under <DualReview/>.
 
 | Lens | Reads for |
 | --- | --- |
 | `adversary` | the failing case — the input that violates a stated invariant, the caller that was not updated, the state the new code cannot reach, the test that passes for the wrong reason |
 | `contract` | what the Work Order says, including every part no test covers, and anything built that it never asked for; then what the change reaches without naming — callers, consumers, public API, traits, registration, plugin wiring, invariants and transitions; and the repository's targets file (`docs/hana/targets.md` in hana), when present |
 | `rerun` | whether interrupted or failed work can finish when run again; lasting records, marks, locks, claims, state files, moved or deleted files, and lists of steps where one failure can stop later steps |
+| `simplify` | the complete phase diff, under the simplify instructions below |
 
 The `rerun` reviewer asks these questions for each lasting write or step list:
 
@@ -42,9 +43,30 @@ The `craft` lens remains off since 2026-10-04 (user: review trial ended).
 The `contract` reviewer also owns the phase style review under
 <ReviewPromptContract/>.
 
-Each lens uses the unit's own read-only reviewer. Dispatch with
+The Codex lenses use the unit's own read-only reviewer. Dispatch with
 `assign.sh --role review`; it resumes `review`, or `review2` when `review` is
 busy. Keep both threads across phases and plans. Writers keep their own roles.
+
+The `simplify` lens uses the fresh reviewer path in `review.sh`, with task `direct.simplify` and no worker address.
+It keeps `Agent` for four agents: reuse, simplification, efficiency, and altitude.
+This lens alone permits Claude subagents.
+`config/agents.conf` selects its model and effort.
+`assign.py` reads `SIMPLIFY_LENS=on|off` from `config/direct.conf` at each launch.
+It reads `config/review/simplify.md` at each new run.
+That file defines the report rules and the standing instructions.
+The launcher disables background tasks for `direct.simplify`.
+At each launch, the shared account picker selects a Claude account with room.
+The launcher prints its label on stderr and in the review log.
+No available quota, a Claude error, an empty report, or a busy run produces `error`; the phase continues under <DualReview/> step 6.
+`assign.py` replaces itself with `review.sh` after it prepares the prompt and diff digest.
+`review.sh` owns the launch lock, result files, and cache.
+Only `reviewed` results enter the cache; failed reviews run again on the same diff.
+Each failure sends an urgent message to `SIMPLIFY_FAILURE_TARGET` from `config/direct.conf`.
+The message names the unit, phase, and reason.
+`UNIT_REVIEW_PROOF=1` adds `PROOF, no action: ` before the failure message text and summary.
+`send.py` suppresses repeated messages for the same recipient, diff, and reason during `SIMPLIFY_FAILURE_REPEAT_MINUTES`.
+`SIMPLIFY_AGENT_COUNT` sets the required number of completed agents.
+A send failure prints its reason and preserves the review status.
 
 The worker is the address and the lens is the judgment. Pass the lens to
 `assign.sh`; its returned handle names the selected worker and summary. Each
@@ -58,7 +80,7 @@ applies to the `rerun` reviewer's attempt to build a rerun case.
 Findings come back in each dispatch's summary under `${PHASE_DIR}`. Every
 launch names its phase, lens and pass, so concurrent reviews keep separate
 files. The summary is the whole review result: <Synthesize/> reads every
-selected lens's summary, including `rerun` when armed, tags each finding
+selected lens's summary, including `simplify` and `rerun` when armed, tags each finding
 with the lens that caught it, and can tell two independent findings from
 one finding found twice.
 
@@ -68,7 +90,7 @@ the same few hunks.
 </TeamReview>
 
 <ReviewPromptContract>
-Every review prompt opens with:
+Every Codex review prompt opens with:
 
 ```
 You are the unit's code reviewer for <unit>, phase <N>. Edit nothing. Read
@@ -157,6 +179,9 @@ diff passed every review (user, 2026-10-28).
 Write one prompt per lens at
 `${PHASE_DIR}/review_prompt_${REVIEW_PASS}_<lens>.md`, each under
 <ReviewPromptContract/> with:
+
+For `simplify`, include the Work Order, phase paths, and any unit instructions relayed from the user.
+The remaining prompt contract applies to the Codex lenses.
 
 ```
 [the role-switch opening from <ReviewPromptContract/>]
@@ -275,10 +300,10 @@ final diff only.
    Use the completed diff for this decision even when `adversary` was armed
    early. All broad reviewers read the same review copy and final diff.
    Create each lens's prompt under <ReviewPromptContract/>.
-3. Launch each reviewer under <DispatchContract/>. Launch pass 1's lenses in
-   one message so they run at once: `adversary`, `contract`, and `rerun`
-   when armed. When the adversary is already armed, launch `contract` and,
-   when armed, `rerun`. Each call uses:
+3. Launch each reviewer under <DispatchContract/>.
+   Launch pass 1's `adversary`, `contract`, `simplify`, and armed `rerun` lenses in one message.
+   When the adversary is already armed, launch the other selected lenses together.
+   Each call uses:
 
    ```sh
    bash ~/.claude/scripts/direct/assign.sh --role review --lens <lens> \
@@ -286,6 +311,8 @@ final diff only.
      --session-dir "${SESSION_DIR}" --cwd "${WORKING_DIR}" \
      --prompt "${PHASE_DIR}/review_prompt_${REVIEW_PASS}_<lens>.md"
    ```
+
+   For `simplify`, also pass the required `--diff <saved phase diff path>`.
 
    A closure review omits `--lens` and uses `review_prompt_${REVIEW_PASS}.md`.
    Keep each dispatch handle. The allocator resumes `review`, then `review2`

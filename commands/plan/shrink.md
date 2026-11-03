@@ -1,5 +1,5 @@
 ---
-description: Rewrite completed plan phases into short as-built records; closeout mode shrinks one phase after its code commit.
+description: Reduce completed phases to as-built facts.
 ---
 
 # Plan Shrink

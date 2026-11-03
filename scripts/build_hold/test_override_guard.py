@@ -17,10 +17,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from unittest import mock
 
-import override_guard
 if TYPE_CHECKING:
+    from . import override_guard
     from ..lib import test_hang_guard
 else:
+    from scripts.build_hold import override_guard
     from scripts.lib import test_hang_guard
 
 
@@ -31,6 +32,8 @@ BASH = "/bin/bash"
 PYTHON_RELATIVE = "build_hold/build_hold.py"
 SHELL_RELATIVE = "direct/verify.sh"
 EXPECTED_VARIABLES = (
+    "ADMISSION_SOCKET",
+    "CONF_DIR",
     "BUILD_HOLD_DIR",
     "BUILD_HOLD_RELEASE_DIR",
     "MAC_TEST_STATE_DIR",

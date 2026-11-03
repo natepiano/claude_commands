@@ -106,7 +106,7 @@ exit "$CLEANUP_TEST_STATUS"
     ) -> subprocess.CompletedProcess[str]:
         request = offload.OffloadRequest(self.root, "hana", "cleanup-call", offload.NO_RESULT_FILE, words)
         config = offload.OffloadConfig(
-            enabled=True, host="unused-host", connect_timeout_s=6, probe_timeout_s=1,
+            enabled=True, connection=offload.SshConnectionSettings("unused-host", 6, 10), probe_timeout_s=1,
             unreachable_backoff_s=300, free_floor_gib=free_floor_gib,
             default_target_budget_gib="24", values={},
         )
@@ -296,7 +296,7 @@ class MacActivityShellTests(unittest.TestCase):
         with mock.patch.object(offload, "mirror_selector_script", return_value=marker) as selector:
             self.assertTrue(offload.leftover_check_script(HANA).startswith(marker))
             self.assertTrue(mac_test.mac_activity_script().startswith(marker))
-        self.assertEqual(selector.call_args_list, [mock.call(HANA), mock.call(offload.ALL_MIRRORS)])
+        self.assertEqual(selector.call_args_list, [mock.call(HANA, "mac", 1), mock.call(offload.ALL_MIRRORS)])
 
     def run_selector(
         self, shell: list[str], scope: offload.MirrorScope, responses: dict[str, tuple[int, str]],

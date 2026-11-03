@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import json
-import dailies_input
-import dailies_render
 import os
 import sqlite3
 import subprocess
@@ -16,6 +14,8 @@ from typing import TextIO, cast
 from unittest import mock
 from zoneinfo import ZoneInfo
 
+import dailies_input
+import dailies_render
 from production_units import read_production
 from dailies_render import LENGTHS
 from dailies_input import (BevyUpgradeUnavailable, Block, ClaudeNotRunning, Decision, FormWaiting,

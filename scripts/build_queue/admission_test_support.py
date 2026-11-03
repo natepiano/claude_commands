@@ -1,6 +1,8 @@
 """One private admission server, fake clock and fault boundary for service tests."""
 from __future__ import annotations
 
+from scripts.build_queue.queue_fixture import write_memory_config
+
 from collections import Counter
 from collections.abc import Callable, Generator
 from contextlib import ExitStack, contextmanager
@@ -311,7 +313,6 @@ class AdmissionFixture(ExitStack):
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"), "USER_ZONE": "UTC",
             "HOME": str(self.root)}
         self.enter_context(mock.patch.dict(os.environ, environment))
-        from scripts.build_queue.queue_fixture import write_memory_config
         if not (self.root / "lint.conf").exists():
             write_memory_config(self.root / "lint.conf")
         self.readings: PrivateReadings = PrivateReadings(self.root)
@@ -380,8 +381,7 @@ class AdmissionFixture(ExitStack):
             self.loop_access.release()
 
     def configure(self, **seconds: float) -> None:
-        _ = (self.root / "lint.conf").write_text("[memory]\n" +
-            "".join(f"{name}={value}\n" for name, value in seconds.items()))
+        write_memory_config(self.root / "lint.conf", **{name: str(value) for name, value in seconds.items()})
 
     def scope_events(self) -> ScopeEvents:
         events = ScopeEvents(self.server.epoll)

@@ -17,6 +17,7 @@ from unittest import mock
 from typing import cast, final, override
 
 import fake_fmt
+from style_child_test_support import style_cli_command
 import mechanical_classes
 import style_ledger
 import style_rules
@@ -118,7 +119,7 @@ class StandingCheckpointTests(unittest.TestCase):
         return result.stdout.strip()
 
     def cli(self, script: str, *args: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run([sys.executable, str(SCRIPTS / script), *args], cwd=self.unit,
+        return subprocess.run(style_cli_command(SCRIPTS / script, *args), cwd=self.unit,
                               env=self.env, capture_output=True, text=True, check=False)
 
     def rustfmt_calls(self) -> list[str]:

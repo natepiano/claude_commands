@@ -45,7 +45,7 @@ from typing import cast
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.production import completion_receipt, staff, staff_sources, unit_config
 from scripts.shutdown import remote
-from scripts.lib import tunables
+from scripts.lib import conf
 
 import add_unit
 import production_units
@@ -349,7 +349,7 @@ def resume(unit: RetiredUnit, record: staff.StaffSnapshot) -> int:
     if isinstance(member, staff_sources.NoSuchMember):
         raise Refused(f"{unit.name}: no retained staff row")
     if isinstance(unit.recovery, unit_config.UnitConfig):
-        unit_config.write_parked(member.row.id, unit.recovery)
+        _ = unit_config.write_parked(member.row.id, unit.recovery)
     make_worktree(unit)
     unit_config.restore(member.row.id, unit.worktree)
     row = staff.restore_unit(member.row.id, staff.PresentWorktree(remote.local_machine(), unit.worktree))
@@ -393,7 +393,7 @@ def _main(argv: list[str]) -> int:
         print(str(error))
         return 1
     except (Refused, retire_unit.Refused, production_units.Refusal, unit_names.BadName, ValueError,
-            tunables.TunableUnusable, subprocess.SubprocessError, OSError) as error:
+            conf.Unusable, subprocess.SubprocessError, OSError) as error:
         print(f"refused: {error}")
         return 1
 

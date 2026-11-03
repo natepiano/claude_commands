@@ -199,6 +199,8 @@ PushNotification (built-in) ── PreToolUse gate ── allowed only with that
 
 `escalate.py close` keeps a sent blocked hold until `send.py retire` succeeds; a failed cancellation still reports its error, and the next close retries it. A review refusal saves `review_held` with a pending `review_reason`. `due` retries forwarding that result until the relay succeeds, then clears the reason; it never resubmits the refused user push.
 
+Silence release discards saved `message.repeat_flood` pushes and records each discard in the push log. Other saved pushes keep their existing delivery rules.
+
 Silence extension stops the old end timer before replacing its saved timer; a failed stop leaves that record for a retry. Each end timer runs `off --timer <unit>`, which checks the saved timer under the silence lock: when a saved silence names another timer it does nothing and exits 0. A stray timer from an interrupted extension cannot end the replacement silence or post its kept pushes. With no saved silence, timer `off` releases leftover pushes, so rerunning the same command retries failed or interrupted delivery. Plain `off` still ends any silence. `silence.claim()` ends silence but leaves the kept-push file intact. `release()` serializes posts under the silence lock and removes each push only after it posts successfully. Failed and interrupted posts stay saved for a repeated `off`; callers skip pushes another release already delivered.
 
 ### Legacy holds and claims
@@ -238,8 +240,7 @@ The gate is a PreToolUse hook. Its `settings.json` entry has matcher `PushNotifi
   - `fingerprint(entry)` is the sha256 over the templates and every example's values and filled text.
   - `listing(entries)` gives one line per entry, sorted by id: the id in one column, then its purpose. `shown(entry)` gives the entry's purpose, its template with the `{placeholders}` (Title, Session, Action, body, as the phone lays them out) and its first example filled through `render_entry`. `review.py list` and `review.py show <id>` print them with no network and no reviewer; an unknown id prints `No template named <id>.` and the list, and exits 1. `/nate`, `/nate help` and `/nate usage` print the `adhoc`, `silence` and `show` lines and then `review.py list`; `/nate show <id>` prints `review.py show <id>` (user request, 2026-10-21).
   - `REVIEWED_FILE` and `catalog()`, which loads `push_catalog.ENTRIES` and checks for unique ids and named examples.
-- `scripts/notify/push_catalog.py` holds every fixed phone text, from scripts and from nixos, each with realistic examples. A comment says where the examples come from. Entry ids include `shutdown.*`, `quota.*`, `rust.*`, `sweep.disk_floor`, `codex.reset_ready`, `message.repeat_flood` and `nixos.{disk_low,gpu_stopped,ups_battery,ups_shutdown}`.
-- `message.repeat_flood`: sender `send-repeat-guard`, need `note`, values `sender`, `host`, `copies`, `receivers`; wording and its reviewed example live in the catalog.
+- `scripts/notify/push_catalog.py` holds every fixed phone text, from scripts and from nixos, each with realistic examples. A comment says where the examples come from. Entry ids include `shutdown.*`, `quota.*`, `rust.*`, `sweep.disk_floor`, `codex.reset_ready` and `nixos.{disk_low,gpu_stopped,ups_battery,ups_shutdown}`.
 - `nixos.gpu_stopped`: sender `gpu`, need `decision` (Pushover priority 1 through `send.py`), values `xid`, `meaning`, and `time` as `HH:MM <zone>` in the user's zone; wording lives in `push_catalog.py`. `scripts/notify/gpu_xid.py` owns the code-to-meaning table and CLI: `gpu_xid.py <code>` prints the meaning and exits 0; an unknown code exits 2.
 - `auto_mode.refused` (user approved 2026-10-21, need `decision`): title `{sender}: auto mode stopped {session}`, `Session: {session}`, Action `On {machine}, in the {session} pane, approve the prompt or add an allow rule`, then `Auto mode refused {action} in the {session} session.{waits_line}`, each refused command on its own line, `Approve: the work goes on now, and auto mode can stop it on {this} {noun} again.` and `Allow rule: the work goes on now, and auto mode lets {this} {noun} run from then on.{rule_line}`.
 - `session.needs_go` (user approved 2026-10-21, need `decision`): title `{sender}: {session} waits for your go`, `Session: {session}`, Action `On {machine}, in the {session} pane, type: {go}`, then `{why}.` and `Your go {does}.`
@@ -265,7 +266,31 @@ The gate is a PreToolUse hook. Its `settings.json` entry has matcher `PushNotifi
 
 `config/send_repeat_guard.conf` owns holding policy and notice deadlines. The caller has a fixed I/O-free 250 ms safety ceiling; it reads no configuration at import. Policy reads, state I/O, nonblocking locks and publication run inside an isolated checker. Errors, busy locks, corrupt state and timeout admit the message and print a diagnostic. Person and phone exemptions precede worker launch. Lock identity is independent of reloadable capacity; records and previews are bounded.
 
-Recipient counters and aggregate `(sender, literal text)` episodes expire after a full window without a copy. The sender record is the only notice outbox: one owner and phone entry per literal-repeat flood, across receivers, with no sender-wide owner cooldown. Each receiver-rate flood has only an owner entry. Completed entries stay through the active episode. Exit 0 with `SENT:` proves delivery; durable `QUEUED:` or `KEPT:` owns its queued copy. Abnormal termination, empty success and `SKIPPED:` are unknown and retry until confirmed or `notice_max_age_seconds` (86400 seconds) after notice creation. Unfinished entries survive episode expiry and keep an otherwise inactive sender record alive; completed entries expire with their episode. The bounded outbox never evicts unfinished notices to make room: at capacity, new attempts fail open. Notices disable expiring repeat claims: at-least-once phone delivery accepts a rare duplicate after a lost acknowledgement rather than losing an alert. The rate check counts each sender–receiver pair in its own fixed window. `receiver_rate_count` sets the threshold in config. Traffic to different receivers never adds up. A receiver that reaches the threshold gets one owner notice per active episode; the notice names that receiver and reports one session. Rate notices never hold delivery or alert the phone. Rate counters expire after receiver inactivity and each sender keeps at most `max_keys` of them. Saved sender-wide rate counters and their active rate outbox entries are retired on decode without a warning; literal counters and notices keep their existing rules.
+Recipient counters and aggregate `(sender, literal text)` episodes expire after a full window without a copy.
+The sender record holds one owner notice per literal-repeat flood across receivers.
+Each receiver-rate flood also has one owner notice.
+The guard sends no phone push.
+Reading saved state drops old phone notices, regardless of their delivery status.
+Completed owner notices stay through the active episode.
+Exit 0 with `SENT:` proves delivery; durable `QUEUED:` or `KEPT:` owns its queued copy.
+Abnormal termination, empty success and `SKIPPED:` remain unknown and retry until confirmed or the configured age limit.
+`notice_max_age_seconds` sets that limit to 86400 seconds after notice creation.
+Unfinished entries survive episode expiry and keep an inactive sender record alive.
+Completed entries expire with their episode.
+The bounded outbox never removes unfinished notices to make room.
+At capacity, new attempts admit delivery.
+Notices disable expiring repeat claims.
+Owner delivery can repeat after a lost acknowledgement.
+The rate check counts each sender–receiver pair in its own fixed window.
+`receiver_rate_count` sets the threshold in config.
+Traffic to different receivers never adds up.
+A receiver that reaches the threshold gets one owner notice per active episode.
+The notice names that receiver and reports one session.
+Rate notices never hold delivery.
+Rate counters expire after receiver inactivity.
+Each sender keeps at most `max_keys` rate counters.
+Decoding removes saved sender-wide rate counters and their active outbox entries without a warning.
+Literal counters and owner notices keep their existing rules.
 
 `--from user`, `--human` (also mesh send/steer/interrupt), phone destinations and the reserved `send-repeat-guard` sender bypass counting. Accounting ownership is chosen before forwarding: the originating send.py records its outcome, including failures; internal mesh/SSH calls suppress duplicate rows and return their canonical receiver when available. Standalone transports record themselves. All event writers share one JSONL append helper, with original text, canonical receiver, provenance and observed outcome. An accounting fault never disables delivery.
 
@@ -449,7 +474,9 @@ The user asked for this on 2026-10-23: each permission alert starts a root cause
 
 Registered alerts and delivery footer (2026-11-01):
 - Every posted push ends in `Sent by: <sender> · Template: <id>` on one line. Free text keeps `none (free text)`. The audit reads both this and historical two-line footers.
-- `mac.locked`, `github.keys_cold`, `build_hold.blocking` and `nixos.ups_power_back` carry the approved fixed wording. GitHub cold keys need no body. UPS battery and shutdown alerts also use their existing ids. UPS events without an approved template (including REPLBATT and NOCOMM) keep their existing free-text alerts.
+- `mac.locked`, `github.keys_cold`, `build_hold.blocking` and `nixos.ups_power_back` carry the approved fixed wording. GitHub cold keys need no body. UPS battery and shutdown alerts also use their existing ids.
+- `nixos.ups_replace_battery` asks the user to replace the worn UPS battery after REPLBATT.
+- `nixos.ups_no_contact` asks the user to check the UPS USB cable after NOCOMM.
 - `/alert_user` selects a fixed template first, else `alert.blocked` or `alert.decision`. These two use agent-written title, action and body: short and to the point, with live review like `nate.adhoc`.
 - For agent-written and free-text pushes, the push review receives every fixed template's id and purpose. When one fits, it withholds the draft under `use-registered-template:<id>`, including emergency drafts; it names the required id instead of rewriting around it. Fixed registered live reviews and catalog example reviews do not get this instruction; fixed registered texts still send as rendered and report review failures.
 - `send.py` gives `github.keys_cold` a shared `github.keys_cold:<machine>` key in its existing locked claim store. Every sender uses it. Under the claim lock, the warm-check record is saved before the key, so a sender crash before delivery cannot strand a claim without its check; a failed send releases the claim. A delivered event suppresses later sessions until the existing `github-warm-status` clear check retires it. The check survives phone expiry so a continuing cold spell cannot start a second event. Run the template on the machine with cold keys, forwarding delivery with `--machine natedev` on the Mac. No extra ledger or time window.

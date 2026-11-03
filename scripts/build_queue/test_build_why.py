@@ -23,7 +23,8 @@ from scripts.build_queue import build_why, head_facts
 from scripts.build_queue.queue_fixture import write_process, fixture_queue_read, write_recovery_fixture
 from scripts.build_queue.test_head_facts import bump_line, queue_time_line, token_gap_line, write_bumps, write_token_gaps
 from scripts.lint import memory_admit as gate
-from scripts.lint.test_memory_admit import write_memory_config
+from scripts.build_queue.queue_fixture import write_memory_config
+from scripts.lint.memory_test_support import commit_config_fixture
 from scripts.lib.user_zone import user_zone
 from scripts.message import roster, unit_labels
 
@@ -71,7 +72,7 @@ class BuildWhyTests(unittest.TestCase):
             "BUILDLOG_BUILD_BUDGET_GIB": "21",
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
             "USER_ZONE": "America/New_York",
-            "LINT_CONFIG_FILE": str(config),
+            "CONF_DIR": str(config.parent),
         }))
         _ = self.enterContext(mock.patch.object(gate, "queue_read", side_effect=lambda:
             fixture_queue_read(self.directory, gate.process_table(self.proc), NOW)))
@@ -580,11 +581,11 @@ class BuildWhyTests(unittest.TestCase):
                     self.assertIn("it refreshes on the next poll", text)
 
     def test_ramp_text_uses_the_explanations_policy_after_config_changes(self) -> None:
-        config = self.root / "policy.conf"
-        _ = config.write_text("[memory]\nramp_seconds=420\n")
-        with mock.patch.dict(os.environ, {"LINT_CONFIG_FILE": str(config)}):
+        config = self.root / "lint.conf"
+        write_memory_config(config, ramp_seconds="420")
+        with mock.patch.dict(os.environ, {"CONF_DIR": str(config.parent)}):
             policy = gate.read_memory_config().policy
-            _ = config.write_text("[memory]\nramp_seconds=60\n")
+            write_memory_config(config, ramp_seconds="60")
             reading = gate.queue_read()
         assert isinstance(reading, gate.QueueRead)
         explanation = replace(reading.explanation, policy=policy)
@@ -605,9 +606,9 @@ class BuildWhyTests(unittest.TestCase):
         self.assertNotIn("compiling", program)
 
     def test_old_sampler_peak_text_uses_the_kinds_hold_and_activity(self) -> None:
-        config = self.root / "policy.conf"
-        _ = config.write_text("[memory]\npeak_hold_seconds=1500\npeak_hold_seconds.merge-gate=180\n")
-        with mock.patch.dict(os.environ, {"LINT_CONFIG_FILE": str(config)}):
+        config = self.root / "lint.conf"
+        write_memory_config(config, peak_hold_seconds="1500", **{"peak_hold_seconds.merge-gate": "180"})
+        with mock.patch.dict(os.environ, {"CONF_DIR": str(config.parent)}):
             policy = gate.read_memory_config().policy
         peak = gate.PeakSoFar(8 * GIB, NOW - 60, NOW - 60, True)
         for kind, activity, minutes in (("check", "compiling", 25),
@@ -621,10 +622,12 @@ class BuildWhyTests(unittest.TestCase):
                     self.assertNotIn("25 min", text)
 
     def test_build_why_warns_about_a_bad_config_key_once_per_process(self) -> None:
-        config = self.root / "policy.conf"
-        _ = config.write_text("[memory]\nhead_seconds=abc\n")
+        config = self.root / "lint.conf"
+        write_memory_config(config)
+        commit_config_fixture(config)
+        write_memory_config(config, head_seconds="abc")
         with AdmissionFixture() as admission:
-            with mock.patch.dict(os.environ, {"LINT_CONFIG_FILE": str(config)}):
+            with mock.patch.dict(os.environ, {"CONF_DIR": str(config.parent)}):
                 _ = admission.server.run_pass()
             with admission.serving(), \
                  mock.patch.object(gate, "queue_read", side_effect=client.view), \
@@ -634,7 +637,7 @@ class BuildWhyTests(unittest.TestCase):
                 self.assertEqual(build_why.main(), 0)
                 self.assertEqual(build_why.main(), 0)
             self.assertEqual(errors.getvalue().count(
-                'memory admission: lint.conf [memory] head_seconds "abc" is not valid; using 600\n'), 1)
+                "head_seconds='abc'"), 1)
 
     def test_lifetime_charge_text_says_the_promise_holds_until_the_step_ends(self) -> None:
         text = build_why.charge_text(gate.LifetimePromise(16 * GIB), user_zone(), policy=gate.DEFAULT_ADMISSION_POLICY, step="nextest")

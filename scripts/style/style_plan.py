@@ -37,6 +37,7 @@ sys.path.insert(0, str(SCRIPTS / "production"))
 from process_failure import failure_detail
 import berth_board
 import coverage_report
+import bulk_rename
 import finding_sites
 import mechanical_classes
 from approved_renames import (BindingProof, AppliedInCode, AppliedCheck, ApprovedRename, BindingRename, Declarations, FileRename, Folder, InlineModule,
@@ -1338,7 +1339,8 @@ def format_output(command: list[str], root: Path, label: str) -> tuple[int, list
     Exit 0 passes whatever stderr holds (rustup info lines, config warnings). Exit 1 lists the files with a diff; an
     error line on stderr with it, such as a parse error, is a failure to run, and so is any other exit code."""
     try:
-        result = subprocess.run(command, cwd=root, capture_output=True, text=True, check=False)
+        result = (bulk_rename.cargo_output(root, command) if command and Path(command[0]).name == "cargo"
+                  else subprocess.run(command, cwd=root, capture_output=True, text=True, check=False))
     except OSError as error:
         raise style_ledger.CheckCouldNotRun(f"{label} could not run: {error}") from error
     error = FMT_ERROR.search(result.stderr) if result.returncode == 1 else None

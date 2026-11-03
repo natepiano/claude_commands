@@ -360,7 +360,7 @@ class AddUnitRestoreTests(AddUnitTestCase):
         recorded = self.root / "prior-session"
         _ = self.git("worktree", "add", str(worktree), "-b", "build-followups-alpha")
         _ = self.prepare_restored_worktree("alpha", recorded, branch="recorded-alpha")
-        unit_config.write(worktree, unit_config.UnitConfig(
+        _ = unit_config.write(worktree, unit_config.UnitConfig(
             unit_config.PlanFile(Path("docs/plans/given.md")), unit_config.NoAppPort(), ()))
         before = self.repository_state()
 

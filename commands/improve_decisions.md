@@ -1,5 +1,5 @@
 ---
-description: Dialog to improve ~/.claude/docs/decision_criteria.md — one change at a time, applied succinctly.
+description: Edit decision criteria with the user.
 argument-hint: [what to change, or blank to be asked]
 ---
 

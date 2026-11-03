@@ -1,5 +1,5 @@
 ---
-description: Direct phased work with phase checks, review, repair, smoke gates, as-built shrink, an as-built doc pass at the end of the run, approved follow-up capture, and one checkpoint per phase. Supports automatic loop, verbose gating, bounded auto windows, and single no-commit mode.
+description: Direct phases, reviews, and checkpoints.
 ---
 
 # Direct
@@ -122,6 +122,7 @@ it:
 | <PhaseEnd/> | `docs/direct/phase_end.md` | — |
 | <FinalGateCommit/>, <RunAsBuilt/>, <AsBuiltCommit/> | `docs/direct/final_gate_commit.md` | — |
 | <ProductionUnit/> | `docs/production_format.md` | — |
+| <FastTrack/> | `commands/unit/fast_track.md` | `/unit:fast_track` |
 
 Paths are under `~/.claude/`.
 
@@ -149,20 +150,23 @@ it. A failed compaction leaves the thread available for its own compaction.
 </LongLivedWorkers>
 
 <CoreContract>
-- Never create a worktree or modify unrelated files. The only branch the run may
-  create is the remote branch <PushCheckpoint/> pushes; never switch to an
-  existing branch.
+- Never modify unrelated files. The unit director may make a worktree, and its
+  branch, for its own workers. The unit's staff row keeps its one home worktree;
+  where a worker works stays in its run record, not in staff. The director
+  removes each worktree it made when that work ends. In the home worktree, the
+  only branch the run may create is the remote branch <PushCheckpoint/> pushes;
+  never switch to an existing branch.
 - The unit director does not write implementation code unless the user explicitly
-  asks. Exceptions: agreed doc-only/trivial post-review fixes.
+  asks, except <FastTrack/>. Exceptions: agreed doc-only/trivial post-review fixes.
 - `single` never commits. Loop and verbose modes create one
   <CheckpointCommit/> and one <ShrinkCommit/> per completed phase, plus the one
   <FinalGateCommit/> that closes verification and the one <AsBuiltCommit/> that
   carries the run's documentation. <PeriodicCI/> may add `ci(<plan-slug>): …`
-  commits for validation fixes and CI repairs. No other commit is allowed.
+  commits for validation fixes and CI repairs. No other commit is allowed except <FastTrack/>.
   Only <ShrinkCommit/> runs while workers edit, and it commits only the plan doc
   and an approved `${NEXT_ITEMS_PATH}` change.
 - Every commit the run makes is pushed by <PushCheckpoint/>, fast-forward only,
-  to the working branch's own name on origin, never to the default branch.
+  to the working branch's own name on origin, never to the default branch except <FastTrack/>.
   <PeriodicCI/> runs CI on it every fifth checkpoint of a plan with five or more
   phases.
 - A phase reservation is released only by the successful-checkpoint path in
@@ -559,7 +563,7 @@ launcher's own `landed` and `abandon` reach that phase's ledger.
 
 | Command | Purpose |
 | --- | --- |
-| `open --severity <blocker\|minor\|nit> --title <t> --file <p> [--line N] --caught-by <worker\|main\|both> [--lens <adversary\|contract\|craft\|ux\|rerun>[,…]] [--detail <d>]` | create an id; `--lens` names every lens that raised it, comma-separated; legacy `both` means `adversary,contract` |
+| `open --severity <blocker\|minor\|nit> --title <t> --file <p> [--line N] --caught-by <worker\|main\|both> [--lens <adversary\|contract\|craft\|ux\|rerun\|simplify>[,…]] [--detail <d>] [--held-for-decision]` | Create an id and record each lens. |
 | `status` | read the ledger for closure review |
 | `gate` | get `converged` or `dispatch`, plus batch and any advisory |
 | `dispatch --covers F001,F002,... --accepted-checks "<checks or none: reason>" [--keep F001=<regression\|broken\|gate\|ruling>:<evidence>]` | record the complete kept batch; repeat `--keep` per id from repair round 4 (the user, 2026-10-28) |
@@ -569,6 +573,7 @@ launcher's own `landed` and `abandon` reach that phase's ledger.
 | `exposure --proposal <P1\|P2> --basis "<text>" [--decision "<text>"]` | record trial exposure before the decision (the user, 2026-10-28) |
 | `abandon --reason <r> [--edits-landed]` | a dispatched repair died; reopen its batch |
 | `verdict --id F001 --state <accepted\|still_open\|reopened> [--evidence <e>]` | record closure evidence |
+| `decision --id F001 --answer <approved\|declined> --user-words "<answer>"` | Record the user's answer to a held item. This command applies no change. |
 
 `findings.py` owns batching and gating: the first round gates blockers and
 minors, later rounds gate blockers, nits never gate. It rejects a partial batch,
@@ -1291,16 +1296,20 @@ reporting anything about the round.
 </FixDispatch>
 
 <Synthesize>
-1. Merge every lens file's findings — `adversary`, `contract` — and
-   any <UXReview/> rows with the main review's, dedupe real issues, tag the
-   lens or reader that caught each — `--lens` on `open` — and discard refuted
-   findings with a concrete explanation. Several readers landing on one hunk is
-   one finding with several witnesses, not several findings; readers
-   disagreeing about that hunk is a reviewer disagreement, which
-   <DelegationResultFormat/> reports rather than resolves by majority.
+1. Merge the `adversary`, `contract`, `simplify`, armed `rerun`, UX, and main review findings.
+   Combine duplicate findings and record every contributing lens with `--lens`.
+   Record each simplify item; discard none.
+   Open behavior-preserving items within the phase as `minor --lens simplify`.
+   Add `--held-for-decision` for each behavior change or change outside the phase.
+   Include the proposed change, files, and reason in its detail.
+   Only the user can decide a held simplify item.
+   Record the user's answer with `decision --user-words`.
+   Explain each refuted finding from another lens.
+   Report reviewer disagreements under <DelegationResultFormat/>.
 2. Present <DelegationResultFormat/>. If the user is confused, apply
    <ExplainOnDemand/> before any choice.
-3. If every remaining issue is trivial — doc-only, an agreed rename, or a
+3. Codex fix workers apply every simplify repair.
+   For other lenses, if every remaining issue is trivial — doc-only, an agreed rename, or a
    small mechanical change whose one correct edit is evident from the finding
    itself, with no design judgment and no reviewer disputing the reading —
    the unit director applies them all directly,

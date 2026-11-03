@@ -442,7 +442,11 @@ def deliver(draft: review.Draft, keys_file: Path = KEYS_FILE,
 
 
 def post_kept(push: silence.KeptPush, keys_file: Path = KEYS_FILE, post: Post = http_post) -> int:
-    """Post a push kept during silence, exactly as it was kept."""
+    """Discard retired flood alerts. Post other pushes as silence kept them."""
+    if push["text_id"] == "message.repeat_flood":
+        log(push["source"], push["priority"], push["title"], push["message"],
+            "dropped: retired template message.repeat_flood")
+        return 0
     detail = ", ".join(part for part in ("kept during silence", push["detail"]) if part)
     return post_message(push["source"], push["priority"], push["title"], push["message"], keys_file, post, detail,
                         push["key"], push["text_id"])

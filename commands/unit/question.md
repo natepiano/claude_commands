@@ -1,5 +1,5 @@
 ---
-description: Put a question for the user on the production's open-questions list without showing it to them now; the answer comes back through the showrunner when the user asks for it.
+description: Queue a unit's user question for review.
 argument-hint: "<the question in full>"
 ---
 

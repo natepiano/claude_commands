@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from contextlib import ExitStack
 from datetime import UTC, datetime
-from dataclasses import fields, replace
+from dataclasses import replace
 import json
 import os
 from pathlib import Path
@@ -17,7 +17,7 @@ from zoneinfo import ZoneInfo
 
 from scripts.buildlog import store
 from scripts.lint import memory_admit as gate
-from scripts.lint.memory_test_support import fake_memory_readings
+from scripts.lint.memory_test_support import fake_memory_readings, write_config_fixture
 from scripts.message.unit_labels import UnitLabels
 from scripts.message import roster
 from scripts.build_queue import head_facts, queue_view
@@ -68,26 +68,21 @@ STEPS = (
 
 def write_memory_config(path: Path, **changes: str | None) -> None:
     """Write one complete, private memory configuration for admission consumers."""
-    timing, pressure = gate.DEFAULT_ADMISSION_POLICY.timing, gate.DEFAULT_ADMISSION_POLICY.pressure
-    values: dict[str, str | None] = {
-        "ramp_seconds": str(timing.ramp_seconds), "head_seconds": str(timing.head_seconds),
-        "strict_seconds": str(timing.strict_seconds), "backfill_seconds": str(timing.backfill_seconds),
-        "recovery_start_seconds": str(timing.recovery_start_seconds),
-        "recovery_window_seconds": str(timing.recovery_window_seconds),
-        "full_pressure_limit": str(pressure.full_avg10_limit),
-        "swap_used_limit": str(pressure.swap_used_limit),
-        "some_pressure_limit": str(pressure.some_avg10_limit),
-        "test_phase_margin": str(gate.FALLBACK_TEST_PHASE_MARGIN),
-        "peak_hold_seconds": str(gate.DEFAULT_ADMISSION_POLICY.peak_hold.default_seconds),
-    }
-    for field in fields(gate.DEFAULT_MEMORY_CONFIG):
-        value = cast(object, getattr(gate.DEFAULT_MEMORY_CONFIG, field.name))
-        if isinstance(value, (int, float)):
-            key = "build_budget_gib" if field.name == "build_budget_bytes" else field.name
-            values[key] = str(value / gate.GIB if field.name == "build_budget_bytes" else value)
-    values.update(changes)
-    _ = path.write_text("[memory]\n" + "".join(
-        f"{key}={value}\n" for key, value in values.items() if value is not None))
+    _ = write_config_fixture(path, template="lint")
+    lines = [line for line in path.read_text().splitlines()
+             if not line.startswith(("program_first_peak_gib.", "peak_hold_seconds."))]
+    for key, value in changes.items():
+        indices = [index for index, line in enumerate(lines) if line.partition("=")[0].strip() == key]
+        if indices:
+            index = indices[0]
+            if value is None:
+                del lines[index]
+            else:
+                lines[index] = f"{key}={value}"
+        elif value is not None:
+            form = "whole: 1.." if key.startswith("peak_hold_seconds.") else "range: 5e-324..1.6742321987285425e299"
+            lines.extend((f"# {form}", f"{key}={value}"))
+    _ = path.write_text("\n".join(lines) + "\n")
 
 
 def write_recovery_fixture(directory: Path, recovery: gate.RecoverySpacing) -> None:
@@ -273,7 +268,7 @@ class QueueFixture(ExitStack):
         self.enter_context(mock.patch.dict(os.environ, environment))
         config = self.root / "lint.conf"
         write_memory_config(config)
-        self.enter_context(mock.patch.dict(os.environ, {"LINT_CONFIG_FILE": str(config)}))
+        self.enter_context(mock.patch.dict(os.environ, {"CONF_DIR": str(config.parent)}))
         self.labels: dict[str, UnitLabels] = {}
         _ = self.enter_context(mock.patch.object(gate, "priority_labels", return_value=self.labels))
         _ = self.enter_context(mock.patch.object(roster, "roster",

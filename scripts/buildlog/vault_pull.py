@@ -134,8 +134,9 @@ def run(args: list[str], timeout: float) -> subprocess.CompletedProcess[str] | N
 
 def pull() -> PullOutcome:
     peer = sync.peer_name()
+    options = sync.ssh_options()
     pushed = run([
-        "git", "-C", str(LOCAL_VAULT), "-c", "core.sshCommand=" + shlex.join(["ssh", *sync.SSH_OPTIONS]),
+        "git", "-C", str(LOCAL_VAULT), "-c", "core.sshCommand=" + shlex.join(["ssh", *options]),
         "push", f"{peer}:rust/hanadocs", "refs/remotes/origin/main:refs/remotes/origin/main",
     ], COMMAND_TIMEOUT_S)
     if pushed is None:
@@ -150,7 +151,7 @@ def pull() -> PullOutcome:
         )):
             return MacUnreachable()
         return VaultCommandFailed(pushed.stderr.strip() or f"git push exited {pushed.returncode}")
-    result = run(["ssh", *sync.SSH_OPTIONS, peer, REMOTE_PULL], COMMAND_TIMEOUT_S)
+    result = run(["ssh", *options, peer, REMOTE_PULL], COMMAND_TIMEOUT_S)
     if result is None:
         return MacUnreachable()
     markers = [line.removeprefix("VAULT_OUTCOME=") for line in result.stdout.splitlines()

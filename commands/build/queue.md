@@ -1,5 +1,5 @@
 ---
-description: Show the build queue and an optional step card. Args - `[<position|session|folder>|mine|bump <position|session|folder>|clear|admit-head <why>|close]`.
+description: Show build queue positions and budget.
 ---
 
 Run `~/.claude/scripts/lib/py ~/.claude/scripts/build_queue/build_queue.py $ARGUMENTS`. Show its output in a `text` block.

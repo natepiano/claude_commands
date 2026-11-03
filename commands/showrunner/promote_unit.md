@@ -1,5 +1,5 @@
 ---
-description: Make a named running session a unit director under this showrunner — stop it, resume it in herdr as this production's unit, and hand it a unit plan.
+description: Promote a session to unit director.
 ---
 
 **Usage:** `/showrunner:promote_unit <session name> [unit plan]`. Run it in a showrunner session during `/showrunner:produce`, with that command's state (`PRODUCTION_DOC`, `CHECKOUT`, `MERGE_BRANCH`, `LOG`, `ZONE`, `PROMPT_FILE`).

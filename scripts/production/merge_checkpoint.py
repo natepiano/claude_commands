@@ -22,7 +22,8 @@ import tempfile
 import time
 import tomllib
 from collections.abc import Generator
-from contextlib import contextmanager, redirect_stdout
+from contextlib import ExitStack, contextmanager, redirect_stdout
+from contextvars import ContextVar
 from datetime import datetime
 from pathlib import Path, PurePath, PurePosixPath
 from typing import Literal, NamedTuple, TypedDict, cast
@@ -41,7 +42,7 @@ from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
 from scripts.lib.atomic_file import write_text_atomic  # noqa: E402
 import sessions  # noqa: E402
 from scripts.lib.process_failure import failure_detail  # noqa: E402
-from scripts.lib import tunables  # noqa: E402
+from scripts.lib import conf  # noqa: E402
 
 # /zone queues a change for the Mac while it is offline; a promotion's Mac pull sends it.
 ZONE_SCRIPT = Path(__file__).resolve().parents[1] / "lib/zone.py"
@@ -146,12 +147,22 @@ class AsBuiltCommit(NamedTuple):
     """A unit's closing commit: its as-built docs and the plan's deletion, after its last phase merged."""
 
 
+class SimplifyReviewMetrics(NamedTuple):
+    findings: str
+    minutes: str
+
+
+class NoSimplifyReview(NamedTuple):
+    pass
+
+
 class ReviewTrial(NamedTuple):
     ux_findings: str
     code_findings: str
     review_minutes: str
     ux_check_minutes: str
     ux_repair_minutes: str
+    simplify: SimplifyReviewMetrics | NoSimplifyReview
 
 
 class NoReviewTrial(NamedTuple):
@@ -224,6 +235,26 @@ def merge_lock(checkout: Path, slug: str) -> Generator[None]:
 
 def git(checkout: Path, *args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(["git", "-C", str(checkout), *args], capture_output=True, text=True, check=False)
+
+
+@contextmanager
+def main_push_lock(checkout: Path) -> Generator[None]:
+    """Serialize the final main fetch, merge-branch push and main promotion."""
+    common = good(git(checkout, "rev-parse", "--path-format=absolute", "--git-common-dir"), "push")
+    with (Path(common) / "main-push.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        started = time.monotonic()
+        try:
+            yield
+        finally:
+            seconds = time.monotonic() - started
+            try:
+                _ = lock.seek(0)
+                _ = lock.truncate()
+                _ = lock.write(json.dumps({"held_seconds": seconds}) + "\n")
+                lock.flush()
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
 
 
 def good(result: subprocess.CompletedProcess[str], step: str) -> str:
@@ -488,16 +519,23 @@ def checkpoint_step_record(checkout: Path, merge_head: str, step: str) -> Path:
 
 
 def record_changes(request: MergeRequest, commits: list[change_review.Commit], merge_head: str) -> None:
-    """Add one row per visible change to the production's list, then name any merge still missing rows."""
-    doc = change_review.list_path(request.production.doc)
+    record_publication_changes(request.production, commits, merge_head)
+
+
+def record_publication_changes(production: Production, commits: list[change_review.Commit], merge_head: str,
+                               *, report_unchanged: bool = True) -> None:
+    """Register each visible change and report merges with missing rows."""
+    doc = change_review.list_path(production.doc)
     if doc is None:
-        report("change review", "ok", "the production doc has no Change review line; no rows written")
+        if report_unchanged:
+            report("change review", "ok", "the production doc has no Change review line; no rows written")
         return
-    done = checkpoint_step_record(request.production.checkout, merge_head, "change-review")
+    done = checkpoint_step_record(production.checkout, merge_head, "change-review")
     if done.exists():
-        report("change review", "ok", "checkpoint changes already recorded")
+        if report_unchanged:
+            report("change review", "ok", "checkpoint changes already recorded")
         return
-    merged = good(git(request.production.checkout, "rev-parse", f"--short={change_review.SHORT}", merge_head), "push")
+    merged = good(git(production.checkout, "rev-parse", f"--short={change_review.SHORT}", merge_head), "push")
     try:
         # A stop after the list write but before the receipt must not add it twice.
         changes = change_review.visible(commits)
@@ -506,13 +544,13 @@ def record_changes(request: MergeRequest, commits: list[change_review.Commit], m
                 if any(sha.startswith(merged) or merged.startswith(sha)
                        for sha in cast(list[str], re.findall(r"\b[0-9a-f]{7,40}\b", row.get("Merged", ""))))}
         rows = [] if changes and all(item.change in held for item in changes) else change_review.append_rows(
-            doc, changes, datetime.now(request.production.zone).date(), merged, request.production.doc,
-            owners=change_review.visible_owners(commits, request.production.doc))
+            doc, changes, datetime.now(production.zone).date(), merged, production.doc,
+            owners=change_review.visible_owners(commits, production.doc))
         done.parent.mkdir(parents=True, exist_ok=True)
         done.touch()
-        drifted = change_review.drift(request.production.checkout, request.production.merge_branch,
+        drifted = change_review.drift(production.checkout, production.merge_branch,
                                       change_review.read(doc), change_review.LANDED,
-                                      change_review.foreign_units(request.production.doc))
+                                      change_review.foreign_units(production.doc))
     except (change_review.ChangeReviewError, OSError) as error:
         report("change review", "failed", f"{doc} not written: {error}; add its rows by hand")
         return
@@ -886,6 +924,14 @@ def push_git(production: Production, may_undo: bool) -> str:
     return tip
 
 
+def refresh_pushed_tip(production: Production, tip: str) -> str:
+    """Carry a main push made since an interrupted promotion into its merge branch."""
+    _ = good(git(production.checkout, "fetch", "origin", "main"), "push")
+    if git(production.checkout, "merge-base", "--is-ancestor", "origin/main", tip).returncode:
+        return push_git(production, False)
+    return tip
+
+
 def pushed_state(production: Production, checkpoint: str) -> PushedTip | NotYetPushed:
     checkout = production.checkout
     branch = production.merge_branch
@@ -964,13 +1010,9 @@ def remote_path(path: PurePosixPath) -> str:
 
 
 def pull_mac_checkout(mac: PurePosixPath, source: Path) -> None:
-    path = Path(os.environ.get("MERGE_CHECKPOINT_CONFIG", Path(__file__).resolve().parents[2] / "config/merge_checkpoint.conf"))
     try:
-        configured_tries = tunables.number(path, "MAC_PULL_TRIES", minimum=1, maximum=float("inf"))
-        if not configured_tries.is_integer():
-            raise ValueError("MAC_PULL_TRIES must be a positive integer")
-        tries = int(configured_tries)
-        retry_seconds = tunables.number(path, "MAC_PULL_RETRY_SECONDS", minimum=0, maximum=float("inf"))
+        tries = conf.whole("merge_checkpoint", "MAC_PULL_TRIES")
+        retry_seconds = conf.number("merge_checkpoint", "MAC_PULL_RETRY_SECONDS")
     except ValueError as error:
         raise Stop("promote", "failed", str(error), "repair the Mac pull configuration and rerun this checkpoint") from error
     remote = (f"cd {remote_path(mac)} && git pull --ff-only "
@@ -994,25 +1036,50 @@ def send_queued_zone() -> None:
         report("promote", "ok", line)
 
 
-def promote(request: MergeRequest | ChildHandoffRequest, tip: str) -> None:
-    if isinstance(request.promotion, production_doc.NoPromotion):
+def promotion_label(request: MergeRequest | ChildHandoffRequest) -> str:
+    return (f"{request.unit.name} phase {request.phase}" if isinstance(request, MergeRequest)
+            else f"{request.child.slug} style hand-off")
+
+
+def promote(request: MergeRequest | ChildHandoffRequest, tip: str, *, local_only: bool = False) -> None:
+    promote_targets(request.promotion, request.production.merge_branch, tip,
+                    source=request.production.checkout, label=promotion_label(request), local_only=local_only)
+
+
+def finish_promotion(request: MergeRequest | ChildHandoffRequest) -> None:
+    finish_promotion_targets(request.promotion, source=request.production.checkout,
+                             label=promotion_label(request))
+
+
+def promote_targets(promotion: production_doc.NoPromotion | production_doc.PromoteTo,
+                    branch: str, tip: str, *, source: Path, label: str, local_only: bool = False) -> None:
+    """Install a pushed tip at the production's local and Mac destinations."""
+    if isinstance(promotion, production_doc.NoPromotion):
         report("promote", "ok", "no promotion configured")
         return
-    label = (f"{request.unit.name} phase {request.phase}" if isinstance(request, MergeRequest)
-             else f"{request.child.slug} style hand-off")
-    for checkout in request.promotion.checkouts:
-        result = promote_local_checkout(checkout, request.production.merge_branch, tip)
+    for checkout in promotion.checkouts:
+        result = promote_local_checkout(checkout, branch, tip)
         already_at = isinstance(result, (PromotionAlreadyAtTip, PromotionOriginPushed)) or (
             isinstance(result, PromotionNotPushed) and result.already_at_tip)
         detail = f"{checkout} {'already at' if already_at else 'main at'} {tip}"
         if isinstance(result, PromotionNotPushed):
-            detail += "; main holds commits not on origin/" + request.production.merge_branch + " and was not pushed"
+            detail += "; main holds commits not on origin/" + branch + " and was not pushed"
         report("promote", "ok", detail)
+    if not local_only:
+        finish_promotion_targets(promotion, source=source, label=label)
+
+
+def finish_promotion_targets(promotion: production_doc.NoPromotion | production_doc.PromoteTo,
+                             *, source: Path, label: str) -> None:
+    """Announce local installs and pull the Mac after the main push lock is released."""
+    if isinstance(promotion, production_doc.NoPromotion):
+        return
+    for checkout in promotion.checkouts:
         into(checkout, "main", f"sessions on {os.uname().nodename} run the installed commands from it",
              f"the live gate of {label}")
-    if isinstance(request.promotion.mac, production_doc.MacCheckout):
-        mac = request.promotion.mac.path
-        source = request.promotion.checkouts[0] if request.promotion.checkouts else request.production.checkout
+    if isinstance(promotion.mac, production_doc.MacCheckout):
+        mac = promotion.mac.path
+        source = promotion.checkouts[0] if promotion.checkouts else source
         pull_mac_checkout(mac, source)
         report("promote", "ok", f"mac {mac} main pulled")
         send_queued_zone()
@@ -1022,12 +1089,15 @@ def promote(request: MergeRequest | ChildHandoffRequest, tip: str) -> None:
 
 def review_numbers(line: str) -> ReviewTrial:
     pattern = (r"review trial: ux (\d+) findings, code (\d+) findings, review-worker minutes ([\d.]+), "
-               r"ux check minutes ([\d.]+), ux repair minutes ([\d.]+)")
+               r"ux check minutes ([\d.]+), ux repair minutes ([\d.]+)"
+               r"(?:, simplify (\d+) findings, simplify minutes ([\d.]+))?")
     match = re.fullmatch(pattern, line.strip())
     if match is None:
         raise Refusal("--review-trial must read: review trial: ux <N> findings, code <N> findings, "
-                      + "review-worker minutes <M>, ux check minutes <U>, ux repair minutes <R>")
-    return ReviewTrial(*match.groups())
+                      + "review-worker minutes <M>, ux check minutes <U>, ux repair minutes <R>"
+                      + "[, simplify <N> findings, simplify minutes <S>]")
+    simplify = SimplifyReviewMetrics(match[6], match[7]) if match[6] is not None else NoSimplifyReview()
+    return ReviewTrial(match[1], match[2], match[3], match[4], match[5], simplify)
 
 
 def check_parallel(line: str | None) -> None:
@@ -1064,6 +1134,9 @@ def record(request: MergeRequest, merge_head: str, tests_green: str) -> None:
                    "--ux-findings", numbers.ux_findings, "--code-findings", numbers.code_findings,
                    "--review-minutes", numbers.review_minutes, "--ux-check-minutes", numbers.ux_check_minutes,
                    "--ux-repair-minutes", numbers.ux_repair_minutes]
+        if isinstance(numbers.simplify, SimplifyReviewMetrics):
+            command.extend(("--simplify-findings", numbers.simplify.findings,
+                            "--simplify-minutes", numbers.simplify.minutes))
         if request.excluded:
             command.extend(("--excluded", request.excluded))
         result = subprocess.run(command, cwd=request.production.checkout, capture_output=True, text=True, check=False)
@@ -1095,7 +1168,7 @@ def end_phase_scratch(request: MergeRequest) -> None:
         report("scratch", "ok", f"removed {len(removed)} folder(s) of {task}: " + ", ".join(map(str, removed)))
 
 
-def notify_style(checkout: Path, branch: str, tip: str) -> None:
+def notify_style(checkout: Path, branch: str, tip: str) -> bool:
     try:
         script = tool("style_sync.py", Path(__file__).resolve().parents[1] / "style/style_sync.py",
                       "MERGE_CHECKPOINT_STYLE_SYNC")
@@ -1108,8 +1181,10 @@ def notify_style(checkout: Path, branch: str, tip: str) -> None:
         if result.returncode or result.stdout.strip() or result.stderr.strip():
             detail = failure_detail(result)
             print("style sync: " + detail.replace("\n", "; "), flush=True)
+        return result.returncode == 0
     except (OSError, ValueError, subprocess.TimeoutExpired) as error:
         print("style sync: " + str(error).replace("\n", "; "), flush=True)
+        return False
 
 
 @contextmanager
@@ -1203,12 +1278,23 @@ class BumpGateRecord(TypedDict):
     log: str
 
 
+_held_record_locks: ContextVar[frozenset[Path]] = ContextVar("held_record_locks", default=frozenset())
+
+
 @contextmanager
 def record_lock(path: Path) -> Generator[None]:
+    held = _held_record_locks.get()
+    if path in held:
+        yield
+        return
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.with_name(path.name + ".lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        yield
+        token = _held_record_locks.set(held | {path})
+        try:
+            yield
+        finally:
+            _held_record_locks.reset(token)
 
 
 def read_record(path: Path) -> BumpGateRecord:
@@ -1275,7 +1361,7 @@ def complete_gate(path: Path, record: BumpGateRecord, result: Literal["green", "
 
 
 def start_gate(request: MergeRequest, paths: tuple[str, ...], merge_head: str, tip: str) -> None:
-    """Start at most one gate for this pushed tip, then let promotion continue."""
+    """Record and launch at most one gate for this tip, without delivering notices."""
     path = checkpoint_step_record(request.production.checkout, merge_head, "bump-gate")
     resume_delivery = False
     launch_failure = ""
@@ -1321,23 +1407,34 @@ def start_gate(request: MergeRequest, paths: tuple[str, ...], merge_head: str, t
                     save_record(path, record)
                 except OSError as error:
                     launch_failure = f"start failed: {error}"
-    # Completion and delivery take the same lock, after the launch lock is released.
+                    record["result"] = "red"
+                    record["detail"] = launch_failure
+                    save_record(path, record)
     if resume_delivery or launch_failure:
-        with Path(record["log"]).open("a", encoding="utf-8") as output, redirect_stdout(output):
-            if launch_failure:
-                print(launch_failure, flush=True)
-                complete_gate(path, record, "red", launch_failure)
-            else:
-                send_result(path, record)
+        if launch_failure:
+            with Path(record["log"]).open("a", encoding="utf-8") as output:
+                _ = output.write(launch_failure + "\n")
         report("bump gate", "failed" if launch_failure else "ok",
                f"{launch_failure or 'tip ' + tip + ' already ' + record['result']}; log {record['log']}")
         return
     report("bump gate", "ok", f"started pid {record['pid']} on pushed tip {tip}; log {record['log']}")
 
 
+def deliver_gate_result(request: MergeRequest, merge_head: str, tip: str) -> None:
+    """Retry completed notices only after the caller releases the main push lock."""
+    path = checkpoint_step_record(request.production.checkout, merge_head, "bump-gate")
+    if not path.exists():
+        return
+    record = read_record(path)
+    if record["tip"] != tip or record["result"] == "pending":
+        return
+    with Path(record["log"]).open("a", encoding="utf-8") as output, redirect_stdout(output):
+        send_result(path, record)
+
+
 def bump_gate_addresses(slug: str, unit: str) -> tuple[str, str]:
     """Resolve recipients through the production's current unit and showrunner lookup."""
-    import showrunners
+    from scripts.production import showrunners
     import unit_lookup
 
     unit_address = ""
@@ -1399,24 +1496,45 @@ def run(request: MergeRequest) -> int:
                 raise Stop("red", "failed", str(error),
                            "repair the test logging failure and send a new checkpoint") from error
         first_code_merge = isinstance(pushed, NotYetPushed) and isinstance(request.kind, CodeCheckpoint)
-        if isinstance(pushed, PushedTip):
-            tip = pushed.tip
-            report("push", "ok", f"{request.production.merge_branch} already pushed at {tip}")
-        elif isinstance(request.push, GitPush):
-            tip = push_git(request.production, not already)
-        else:
-            tip = push_validate(request.production,
-                                f"ci({request.production.slug}): format fixes after {request.unit.name} phase {request.phase}",
-                                not already, request.cancel_prior)
-        record_pushed_merges(request.production, merge_head, request.commit, tip, phase_id=request.phase,
-                             issue=str(request.unit.plan))
-        notify_style(request.production.checkout, request.production.merge_branch, tip)
-        record_changes(request, commits, merge_head)
-        into(request.production.checkout, request.production.merge_branch,
-             "the merge branch collects every unit's checkpoints", gate_names(request, first_code_merge))
-        if request.bump:
-            start_gate(request, paths, merge_head, tip)
-        promote(request, tip)
+        promotion_done = checkpoint_step_record(request.production.checkout, merge_head, "promotion")
+        tip = ""
+        try:
+            try:
+                with ExitStack() as gate_lock:
+                    if request.bump:
+                        path = checkpoint_step_record(request.production.checkout, merge_head, "bump-gate")
+                        _ = gate_lock.enter_context(record_lock(path))
+                    with main_push_lock(request.production.checkout):
+                        if isinstance(pushed, PushedTip):
+                            tip = pushed.tip
+                            if not promotion_done.exists():
+                                tip = refresh_pushed_tip(request.production, tip)
+                            report("push", "ok", f"{request.production.merge_branch} already pushed at {tip}")
+                        elif isinstance(request.push, GitPush):
+                            tip = push_git(request.production, not already)
+                        else:
+                            tip = push_validate(request.production,
+                                                f"ci({request.production.slug}): format fixes after {request.unit.name} phase {request.phase}",
+                                                not already, request.cancel_prior)
+                        if request.bump:
+                            start_gate(request, paths, merge_head, tip)
+                        gate_lock.close()
+                        promote(request, tip, local_only=True)
+            finally:
+                if tip:
+                    if request.bump:
+                        deliver_gate_result(request, merge_head, tip)
+                    into(request.production.checkout, request.production.merge_branch,
+                         "the merge branch collects every unit's checkpoints", gate_names(request, first_code_merge))
+            finish_promotion(request)
+        finally:
+            if tip:
+                record_pushed_merges(request.production, merge_head, request.commit, tip, phase_id=request.phase,
+                                     issue=str(request.unit.plan))
+                record_changes(request, commits, merge_head)
+                notify_published_style(request.production, merge_head, tip)
+        promotion_done.parent.mkdir(parents=True, exist_ok=True)
+        promotion_done.touch()
         record(request, merge_head, tests_green)
         end_phase_scratch(request)
         print(f"send {request.unit.name}: phase {request.phase} merged and pushed as {merge_head}; continue with the next step")
@@ -1597,9 +1715,33 @@ def promote_handoff(request: ChildHandoffRequest, merge_head: str, tip: str) -> 
         return
     done = checkpoint_step_record(request.production.checkout, merge_head, "handoff-promotion")
     if not done.exists():
-        promote(request, tip)
+        promote(request, tip, local_only=True)
+
+
+def finish_handoff_promotion(request: ChildHandoffRequest, merge_head: str) -> None:
+    done = checkpoint_step_record(request.production.checkout, merge_head, "handoff-promotion")
+    if isinstance(request.promotion, production_doc.PromoteTo) and not done.exists():
+        finish_promotion(request)
         done.parent.mkdir(parents=True, exist_ok=True)
         done.touch()
+
+
+def notify_published_style(production: Production, merge_head: str, tip: str) -> None:
+    """Notify style once for each published tip, including failed promotions."""
+    done = checkpoint_step_record(production.checkout, merge_head, "style-notice-" + tip)
+    if done.exists():
+        return
+    if notify_style(production.checkout, production.merge_branch, tip):
+        done.parent.mkdir(parents=True, exist_ok=True)
+        done.touch()
+
+
+def record_handoff_publication(request: ChildHandoffRequest, merge_head: str, tip: str) -> None:
+    record_pushed_merges(request.production, merge_head, request.checkpoint, tip,
+                         phase_id="", issue=f"{request.child.slug} hand-off")
+    record_publication_changes(request.production, change_review.merge_commits(request.production.checkout, merge_head),
+                               merge_head, report_unchanged=False)
+    notify_published_style(request.production, merge_head, tip)
 
 
 def record_handoff_completion(request: ChildHandoffRequest, merge_head: str, tip: str) -> None:
@@ -1619,9 +1761,15 @@ def run_handoff(request: ChildHandoffRequest) -> int:
         print(f"hand-off {checkpoint[:7]} already merged as {delivery.merge_head[:7]}", flush=True)
         pushed = pushed_state(request.production, checkpoint)
         tip = pushed.tip if isinstance(pushed, PushedTip) else delivery.merge_head
-        record_pushed_merges(request.production, delivery.merge_head, checkpoint, tip,
-                             phase_id="", issue=f"{request.child.slug} hand-off")
-        promote_handoff(request, delivery.merge_head, tip)
+        try:
+            with main_push_lock(checkout):
+                if isinstance(request.promotion, production_doc.PromoteTo) and not checkpoint_step_record(
+                        checkout, delivery.merge_head, "handoff-promotion").exists():
+                    tip = refresh_pushed_tip(request.production, tip)
+                promote_handoff(request, delivery.merge_head, tip)
+            finish_handoff_promotion(request, delivery.merge_head)
+        finally:
+            record_handoff_publication(request, delivery.merge_head, tip)
         record_handoff_completion(request, delivery.merge_head, tip)
         finish_handoff(request, delivery.merge_head)
         return 0
@@ -1654,18 +1802,22 @@ def run_handoff(request: ChildHandoffRequest) -> int:
             undo_unpushed_merge(request.production, merge_head)
             raise Stop("red", "failed", str(error), "repair the test logging failure and send a new checkpoint") from error
         pending_tests.unlink()
-    if isinstance(request.push, GitPush):
-        tip = push_git(request.production, isinstance(delivery, NotMerged))
-    else:
-        tip = push_validate(request.production,
-                            f"ci({request.production.slug}): format fixes after {request.child.slug} style hand-off",
-                            isinstance(delivery, NotMerged))
-    record_pushed_merges(request.production, merge_head, checkpoint, tip,
-                         phase_id="", issue=f"{request.child.slug} hand-off")
-    notify_style(checkout, branch, tip)
-    if isinstance(request.promotion, production_doc.NoPromotion):
-        promote(request, tip)
-    promote_handoff(request, merge_head, tip)
+    tip = ""
+    try:
+        with main_push_lock(checkout):
+            if isinstance(request.push, GitPush):
+                tip = push_git(request.production, isinstance(delivery, NotMerged))
+            else:
+                tip = push_validate(request.production,
+                                    f"ci({request.production.slug}): format fixes after {request.child.slug} style hand-off",
+                                    isinstance(delivery, NotMerged))
+            if isinstance(request.promotion, production_doc.NoPromotion):
+                promote(request, tip)
+            promote_handoff(request, merge_head, tip)
+        finish_handoff_promotion(request, merge_head)
+    finally:
+        if tip:
+            record_handoff_publication(request, merge_head, tip)
     record_handoff_completion(request, merge_head, tip)
     finish_handoff(request, merge_head)
     print(f"hand-off {checkpoint[:7]} merged as {merge_head[:7]}", flush=True)

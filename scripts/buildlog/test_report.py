@@ -18,6 +18,10 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict, cast, override
 from unittest import mock
+if TYPE_CHECKING:
+    from ..lint.memory_test_support import config_environment
+else:
+    from scripts.lint.memory_test_support import config_environment
 
 import disk
 import ci
@@ -269,7 +273,7 @@ class ReportTests(unittest.TestCase):
         point_root_at(self, self.root)
         for host in ("natedev", "Mac"):
             _ = refresh_machine_health(self, host, self.root, self.root)
-        self.enterContext(mock.patch.dict(os.environ, {"HOME": temporary}))
+        self.enterContext(mock.patch.dict(os.environ, {"HOME": temporary, **config_environment(Path(temporary))}))
         _ = self.enterContext(mock.patch.object(subprocess, "run"))
         _ = self.enterContext(mock.patch.object(ci, "gh_get"))
         self.records = []

@@ -1970,13 +1970,13 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 - `submit_opening_prompt` captures the recipient after input readiness, before typing. A recipient that changed by the time the turn appears gives `PromptNotSubmitted("prompt recipient changed during submission")`; each Enter retry first rechecks it (`"prompt recipient changed before Enter retry"`).
 - `restart._prompt_outcome` accepts a `PromptSubmitted` receipt only when its process equals the session's current registry process, under every progress kind; the attempt check while `restarting` stays, and a timer-only retry of the same process still reads its proof. Receipt saving stores the recipient the launcher captured and never samples the registry.
 - `prompt_in_input` takes the composer between the last two rule lines; every nonblank row after the closing rule must be wholly one enumerated footer phrase, else the bordered region is scrollback. The composer match allows a screen newline without a space only inside a word. The enumerated rows reject real Claude screens (labelled top rule; status-line, mode and agent rows), so Enter-only retries do not fire live; "Enter retries reach a real session's composer" replaces the phrase list with layout rules.
-- `restart_push(label, names, *, machine) -> tuple[RenderedPush, ...]` groups names greedily so each push keeps `stopped` ≤ 400 characters, message < 500 and title < 45, and every session is named; a name that alone exceeds the limits gets its own push, shortened to the longest fitting prefix plus a visible `…`; no names gives one `shutdown.restart_incomplete`. `restart.restart` and `settle.report_stop` send every push, and nothing raises through either.
-- `shutdown.restart_failed` catalog examples name one session each (`typical` "One session (organon-unit)", `many_long_names` "One session (build-followups-two-accounts-unit-director)"), approved under the user spec.
+- `restart_push(label, failures, *, machine)` returns one push with the failed session count. It never splits the list. Without known failures, it returns one `shutdown.restart_incomplete` push.
+- `shutdown.restart_failed` shows a retryable failure count, the machine and one retry command. Trust failures keep separate commands. Manual failures share one count push per machine. All changed examples require the normal text review.
 
 **Files:**
 - `scripts/herdr/herdr.py` — recipient identity and lookup, process-bound outcome, Enter-retry recheck, composer footer and wrap-aware match.
-- `scripts/shutdown/restart.py` — receipt read bound to the recipient process; `restart_push` splitting; `restart` sends each push.
-- `scripts/shutdown/settle.py` — `report_stop` sends each push.
+- `scripts/shutdown/restart.py` — process-bound receipts and one phone push per kind of fix in a restart problem.
+- `scripts/shutdown/restart_support.py` — `report_stop` uses the same fix groups and retains delivery marks.
 - `scripts/notify/push_catalog.py`, `scripts/notify/push_texts_reviewed.json` — named `shutdown.restart_failed` examples and their approvals.
 - `scripts/herdr/test_herdr.py`, `scripts/shutdown/test_restart.py`, `scripts/shutdown/test_settle.py`, `scripts/shutdown/test_shutdown_cli.py`, `scripts/notify/test_push_texts.py` — regressions through real receipt files, fake registry identities and fake panes.
 
@@ -3074,3 +3074,39 @@ User 2026-11-01: the role count of 68 workers counted idle workers too; asked fo
 natedev showrunner 2026-11-01 (C35, cef58b5c): prove each started-hold form that `next list` prints.
 
 **As-built:** `test_started_fixed_expired_and_no_pace_holds_list_exact_rows_without_state_changes` runs the real `next list` path on scratch state for a fixed hold with time left, a fixed hold that is over, and the 40-minute default with no pace history. Each case asserts the full line and unchanged hold state. The half-point line with a pace stays in `test_started_hold_row_is_shared_by_list_add_hold_reply_and_the_mac`. Tests only.
+
+### Phase 101q — /theme never blocks a promotion  · status: done · 378b778c
+
+natedev showrunner 2026-11-02: the user ran /theme at 09:06 EST; Claude Code wrote `theme` into live `~/.claude/settings.json`, and merge_gate refused every promotion because the tracked file differed from HEAD.
+
+**As-built:** `theme` joins the per-machine keys in `scripts/settings/settings_local_keys.sh` (with `model`, `effortLevel`, `modelSettings`, `extraKnownMarketplaces`). The clean filter strips it, the sidecar keeps it, and the smudge restores it. The committed `settings.json` has no `theme`. `test_settings_local_keys.py` fixtures give each machine a different theme and still clean to one blob.
+
+### Phase 101r — The Mac renews an expired Claude login by itself  · status: done · ef9480b6
+
+User 2026-11-02: "i want accounts renewal on the mac for sure". natedev renewed idle logins in its notes job's refusal-watch pass; the Mac ran only `agent_notes.py usage-only`, which never renewed.
+
+**As-built:** `agent_notes.py usage-only` (Mac launchd job, nixos `modules/darwin/account-usage.nix`) runs `refusal_watch.renew_expired_logins` as a dry run after it saves usage. When an account is due, it starts `agent_notes.py renew-logins` as a detached child (`start_new_session`) and returns: launchd runs one job instance, so the usage job never waits on a 120 s probe. `renew-logins` holds the `login-renewal` schedule lock and calls the same function, which keeps the hourly limit and `~/.local/state/accounts/login_renewals.json`. Two repair rounds (F001: the probe held the usage job, first by its lock, then by launchd's one instance). Style review PASS. Live proof: the Mac after promotion.
+
+### Phase 101s — The accounts board has no read column  · status: done · 9b161976
+
+User 2026-11-02: remove the `read` column; a reading that fails or is old shows in the problems, not in a permanent column.
+
+**As-built:** `mods/unit-board/hooks/accounts.tsx` drops the `read` column and the narrow `read … ago` fact. `accounts.py` status adds a problem line for a usage or credits reading older than the existing ten-minute limit and sets `read_ok` false for it; a reading saved after status starts counts as fresh (F001). `read_at` and `read_ok` stay in the JSON; cargo-handler colours its dot from `read_ok` (handler-unit Phase 61 drops its own read column). One repair round; style review PASS.
+
+### Phase 101t — `codex update` works through the codex alias on both machines  · status: done · 2f0877b2
+
+User 2026-11-02 "go", via natedev: the `codex` alias set a numbered `CODEX_HOME`, so `codex update` failed with "Could not detect the Codex installation method".
+
+**As-built:** `_exec_codex_account` in `scripts/accounts/accounts.py` sends a first argument of `update` to `_update_codex`, with no account check. It runs the local program with `CODEX_HOME=~/.codex`, attached to the terminal, then reads its version. Then it runs `CODEX_HOME="$HOME/.codex" "$HOME/.local/bin/codex" update >&2 && … --version` on `remote.other_machine()` over ssh (600 s limit; stderr discarded, so stdout holds only the version). It prints one version or failure line per machine; ssh 255 or a timeout prints `unreachable; run codex update there`. Exit 0 only when both machines updated. Two repair rounds (F001: update text could print as the version; F002: invalid stderr bytes raised a traceback). Style review PASS.
+
+### Phase 101u — The accounts board counts sessions on both machines  · status: done · 06901023
+
+User 2026-11-02 (via the Mac session): "the accounts board should show the counts for all configured machines for both Mac and for Nate Dev. If Mac is unavailable, it should show that."
+
+**As-built:** each status pass in `scripts/accounts/accounts.py` publishes this machine's per-account busy, shell, idle and total counts to `~/.local/state/accounts/session_counts.json` (`_publish_session_counts`), keyed by the machine alias. `_start_session_counts_fetch` starts a detached fetch of the other machine's file under a nonblocking lock, through `role_map.ssh_role_map(..., machine=)`, into `peer_session_counts.json`; the board read never waits on ssh. `_machine_role_counts` sums both machines into each count column and keeps them apart in the JSON field `role_counts_by_machine`. A missing, damaged, failed or older-than-ten-minutes copy adds one problem line, `<machine> unavailable: counts are <this machine> only`, and the board shows local counts. Legacy `~/.codex` sessions count, and numbered Codex homes count under `codex_home_label()`. The unit-board hook and types read the new field. Three findings closed in two repair rounds (F001 machine alias; F002 legacy `~/.codex` counts; F003 numbered-home label).
+
+### Phase 101v — Status reads stay read-only and test runs start no ssh  · status: done · cc347b39
+
+natedev 2026-11-02 (urgent): main was red from 101u (069010236): `test_role_map` and `test_refusal_watch`, 4 failures and 1 error.
+
+**As-built:** `_count_role_sessions` counts in memory and writes no file; `_session_counts_document` (was `_publish_session_counts`) builds the document that `session-counts-read` prints, and `_session_counts_file` is gone. `_machine_role_counts` takes the status `UsageSource` and starts the detached fetch only for `RefreshStaleUsage`, so `status --stored` reads only `peer_session_counts.json` and opens no lock. `test_role_map.py`, `test_refusal_watch.py` and `test_cutover_home.py` stub `_start_session_counts_fetch` for the whole module. New test `test_stored_status_starts_no_counts_fetch_and_writes_nothing`. 3251 tests in the accounts modules and their importers pass. No code review ran (urgent red-main repair; the director read the diff).
