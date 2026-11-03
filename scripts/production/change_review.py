@@ -88,7 +88,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import issues  # noqa: E402
 from production_units import Refusal, cell_value, production_field, unit_table  # noqa: E402
 from proposals_folder import owner_docs, scope_docs, slug_of  # noqa: E402
-from scripts.production import change_routing, staff
+from scripts.production import change_routing, staff, staff_sources, unit_lookup
 
 TRAILER = "Change-Review"
 LIST_HEADER = "- **Change review:**"
@@ -823,14 +823,30 @@ def unit_branches(docs: Iterable[Path]) -> dict[str, Path]:
     and its worktree's folder name, which a merge subject can carry.
     """
     found: dict[str, Path] = {}
+    try:
+        record = staff.snapshot()
+        sources = unit_lookup.member_sources()
+    except staff.StaffUnreadable as error:
+        print(f"change review: {error}", file=sys.stderr)
+        return found
     for doc in docs:
         try:
-            rows = unit_table(doc.read_text(encoding="utf-8").splitlines())
-        except (Refusal, OSError):
+            lines = doc.read_text(encoding="utf-8").splitlines()
+            rows = unit_table(lines)
+            slug = unit_lookup.production_slug_for_document(doc, record, sources)
+        except (Refusal, OSError, staff.StaffRefused) as error:
+            print(f"change review: {doc}: {error}", file=sys.stderr)
             continue
         for row in rows:
+            unit = cell_value(row.get("Unit", ""))
+            try:
+                folder_name = unit_lookup.plan_worktree(row, sources.member(
+                    staff_sources.UnitMember(slug, unit), record)).name
+            except (staff.StaffUnreadable, staff.StaffRefused) as error:
+                print(f"change review: {unit}: {error}", file=sys.stderr)
+                folder_name = ""
             names = (cell_value(row.get("Branch", "")), Path(cell_value(row.get("Plan", ""))).stem,
-                     cell_value(row.get("Unit", "")), Path(cell_value(row.get("Worktree", ""))).name)
+                     unit, folder_name)
             for name in names:
                 if name:
                     _ = found.setdefault(name, doc)
@@ -1314,7 +1330,7 @@ def foreign_units(production: Path) -> set[str]:
         docs = list(showrunners.timer_docs().values())
         root = showrunner_tree.root_of(slug_of(production))
         top = next((doc for doc in docs if slug_of(doc) == root), production)
-        return set(unit_branches(docs)) - set(unit_branches(owner_docs(top)))
+        return {name for name, doc in unit_branches(docs).items() if doc not in set(owner_docs(top))}
     except (OSError, ValueError, Refusal):
         return set()
 

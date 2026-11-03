@@ -20,6 +20,8 @@ from scripts.usage import collect, weights
 from scripts.usage.test_collect import FIXTURES as COLLECT_FIXTURES, MacStreamReport, REPOSITORY, SNAPSHOT_COMMIT_SCRIPT, SshBehavior
 from scripts.usage.test_outcomes import OutcomeFixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.production import staff
+from scripts.production.staff_test_support import fixture_member
 
 
 FIXTURES = Path(__file__).with_name("fixtures") / "report"
@@ -87,6 +89,24 @@ class ReportFixture(OutcomeFixture):
             shutil.rmtree(directory)
         _ = shutil.copytree(FIXTURES / "home", self.root, dirs_exist_ok=True)
         _ = shutil.copytree(FIXTURES / "production-docs", self.production_docs, dirs_exist_ok=True)
+        for document, members in (
+            (self.production_docs / "sample-production.md", (("Base", "/invented/build"),
+                                                            ("Deep", "/invented/build/component"))),
+            (self.production_docs / "other-production.md", (("Elsewhere", "/invented/elsewhere"),)),
+        ):
+            # The report fixtures use invented absolute paths in their usage records.
+            if not document.exists():
+                document = next(path for path in self.production_docs.glob("*.md")
+                                if members[0][0] in path.read_text())
+            owner = fixture_member("showrunner", name=document.stem,
+                                   doc=staff.LiveDoc("natedev", document))
+            lines = ["# Report fixture", "- **Showrunner checkout:** `/invented`", "## Units",
+                     "| Unit | Worktree | Plan |", "| --- | --- | --- |"]
+            for name, folder in members:
+                _ = fixture_member("unit", name=name, parent=owner.id,
+                                   worktree=staff.PresentWorktree("natedev", Path(folder)))
+                lines.append(f"| {name} | /stale/display | docs/plan.md |")
+            _ = document.write_text("\n".join(lines) + "\n")
         _ = self.commit("checkpoint(report-plan): phase 7 — First", "2026-10-10T21:37:00Z")
         _ = self.commit("checkpoint(report-plan): phase 7 — Second", "2026-10-10T21:38:00Z")
         _ = self.commit("checkpoint(other-plan): phase 7 — Unmapped", "2026-10-11T07:01:00Z")
@@ -467,12 +487,18 @@ raise SystemExit(result)
         self.assert_report("unit", "weighted", "--by", "unit")
         document = self.production_docs / "fixture-production.md"
         _ = document.write_text(document.read_text(encoding="utf-8").replace("| Deep |", "| Renamed |"), encoding="utf-8")
+        row = next(row for row in staff.find(kind="unit") if row.name == "Deep")
+        _ = staff.rename(row.id, "Renamed")
         self.assert_report("unit-renamed", "weighted", "--by", "unit")
 
     def test_unit_containment_does_not_match_a_neighbor_with_the_same_prefix(self) -> None:
         document = self.production_docs / "other-production.md"
-        _ = document.write_text("## Units\n\n| Unit | Worktree |\n| --- | --- |\n| Wrong | `/invented/loos` |\n",
+        _ = document.write_text("## Units\n\n| Unit | Worktree | Plan |\n| --- | --- | --- |\n| Wrong | `/invented/loos` | docs/plan.md |\n",
                                 encoding="utf-8")
+        owner = staff.snapshot().by_doc("natedev", document)
+        assert owner is not None
+        _ = fixture_member("unit", name="Wrong", parent=owner.id,
+                           worktree=staff.PresentWorktree("natedev", Path("/invented/loos")))
         self.assert_report("unit", "weighted", "--by", "unit")
 
     def test_reports_read_only_store_after_every_source_is_removed(self) -> None:
@@ -869,6 +895,32 @@ print(json.dumps(results))
         result = self.report("weighted")
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse(missing.exists())
+
+
+
+
+from scripts.production.staff_test_support import StaffTestCase, without_worktree_column
+from scripts.usage import usage_report
+
+
+class BranchUsageLocationTests(StaffTestCase):
+    def test_usage_attribution_uses_the_plan_worktree_without_the_worktree_column(self) -> None:
+        fixture = self.separated_unit_folders()
+        without_worktree_column(fixture.doc)
+        self.assertEqual(usage_report.document_units(fixture.doc),
+                         (usage_report.UnitWorktree("member-unit", fixture.worktree),))
+
+    def test_unfilled_unit_reports_its_fact_and_keeps_the_other_units(self) -> None:
+        fixture = self.separated_unit_folders()
+        from scripts.production.staff_test_support import fixture_member
+        _ = fixture_member("unit", name="unfilled", parent=fixture.runner.id)
+        _ = fixture.doc.write_text(fixture.doc.read_text() + "| unfilled-unit | /wrong | bad | /missing/plan.md | — |\n")
+        import io
+        from contextlib import redirect_stderr
+        with redirect_stderr(io.StringIO()) as errors:
+            rows = usage_report.document_units(fixture.doc)
+        self.assertEqual(rows, (usage_report.UnitWorktree("member-unit", fixture.worktree),))
+        self.assertIn("unfilled", errors.getvalue())
 
 
 if __name__ == "__main__":

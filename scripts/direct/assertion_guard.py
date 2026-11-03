@@ -1309,17 +1309,6 @@ class NoProductionBase:
     """No registered production provides a usable merge-branch base."""
 
 
-def worktree_path_matches(value: str, worktree: Path) -> bool:
-    """Compare absolute worktree paths, ignoring empty cells and retirement notes."""
-    if not value:
-        return False
-    try:
-        path = Path(value).expanduser()
-        return path.is_absolute() and path.resolve() == worktree
-    except (OSError, RuntimeError, ValueError):
-        return False
-
-
 def production_merge_branch(repo: Path) -> ProductionMergeBranch | NoProductionBase:
     """Match a Units worktree first, then its branch, across registered docs."""
     original_path = sys.path[:]
@@ -1327,7 +1316,7 @@ def production_merge_branch(repo: Path) -> ProductionMergeBranch | NoProductionB
         repository_root = Path(__file__).resolve().parents[2]
         sys.path.insert(0, str(repository_root))
         sys.path.insert(0, str(repository_root / "scripts" / "production"))
-        from scripts.production import production_units, showrunners
+        from scripts.production import production_units, staff, unit_lookup
     except ImportError:
         return NoProductionBase()
     finally:
@@ -1335,15 +1324,33 @@ def production_merge_branch(repo: Path) -> ProductionMergeBranch | NoProductionB
     worktree = Path(git(repo, "rev-parse", "--show-toplevel").strip()).resolve()
     branch = git(repo, "branch", "--show-current").strip()
     branch_match: ProductionMergeBranch | NoProductionBase = NoProductionBase()
-    for doc in dict.fromkeys(showrunners.timer_docs().values()):
+    try:
+        sources = unit_lookup.member_sources()
+        if not sources.productions:
+            return branch_match
+        record = staff.snapshot()
+    except staff.StaffUnreadable as error:
+        print(f"assertion_guard: {error}", file=sys.stderr)
+        return branch_match
+    documents = {source.timer.doc: source.document for source in sources.productions.values()}
+    for doc, text in documents.items():
         try:
-            lines = doc.read_text(encoding="utf-8").splitlines()
-            rows = [row for row in production_units.unit_table(lines) if not any(
-                re.search(r"(?:^|[\s(`])(?:retired|removed)\b",
-                          row.get(column, ""), re.IGNORECASE)
-                for column in ("Status", "Worktree"))]
-            worktree_matches = any(worktree_path_matches(
-                production_units.cell_value(row.get("Worktree", "")), worktree) for row in rows)
+            lines = text.splitlines()
+            slug = unit_lookup.production_slug_for_document(doc, record, sources)
+            rows: list[dict[str, str]] = []
+            worktree_matches = False
+            for row in production_units.unit_table(lines):
+                try:
+                    selected = sources.member(unit_lookup.UnitMember(
+                        slug, production_units.cell_value(row.get("Unit", ""))), record)
+                    location = unit_lookup.local_worktree(selected)
+                    if isinstance(location, staff.RemovedWorktree):
+                        continue
+                    branch_tree = unit_lookup.plan_worktree(row, selected)
+                    rows.append(row)
+                    worktree_matches |= branch_tree.resolve() == worktree
+                except (staff.StaffUnreadable, staff.StaffRefused) as error:
+                    print(f"assertion_guard: {error}", file=sys.stderr)
             branch_matches = bool(branch) and any(
                 production_units.cell_value(row.get("Branch", "")) == branch for row in rows)
             if worktree_matches or branch_matches:
@@ -1352,7 +1359,8 @@ def production_merge_branch(repo: Path) -> ProductionMergeBranch | NoProductionB
                     return match
                 if isinstance(branch_match, NoProductionBase):
                     branch_match = match
-        except (OSError, UnicodeError, production_units.Refusal):
+        except (OSError, UnicodeError, production_units.Refusal, staff.StaffRefused) as error:
+            print(f"assertion_guard: {error}", file=sys.stderr)
             continue
     return branch_match
 

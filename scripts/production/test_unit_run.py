@@ -11,6 +11,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import final, override
 
+from scripts.production import staff
+from scripts.production.staff_test_support import fixture_member, isolated_staff_file, recorded_showrunner, without_worktree_column
 from scripts.usage.collect import MAC_HOST
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -84,7 +86,11 @@ class UnitRunTests(unittest.TestCase):
             "UNIT_RUN_SSH_FAIL": "0",
             "CLAUDE_PYTHON": sys.executable,
         }
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", self.environment))
         self.write_production(str(self.worktree))
+        owner = recorded_showrunner("show", self.production)
+        _ = fixture_member("unit", name="review", parent=owner.id,
+                           worktree=staff.PresentWorktree("natedev", self.worktree))
 
     def write_production(self, worktree: str) -> None:
         # Another table must not provide the unit's Worktree cell.
@@ -134,6 +140,25 @@ class UnitRunTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertIn(json.dumps(MAC_HOST), calls[0])
 
+    def test_unfilled_staff_location_refuses_without_using_the_document_cell(self) -> None:
+        owner = next(row for row in staff.snapshot().find(kind="showrunner"))
+        _ = fixture_member("unit", name="unfilled", parent=owner.id)
+        _ = self.production.write_text(self.production.read_text().replace(UNIT, "unfilled-unit"))
+        _ = self.record(self.history, "table-decoy", str(self.worktree), 10)
+        result = self.run_script("--no-mac", unit="unfilled-unit")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("unfilled", result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_remote_staff_location_refuses_without_using_the_document_cell(self) -> None:
+        member = next(row for row in staff.snapshot().find(kind="unit"))
+        _ = staff.set_worktree(member.id, staff.PresentWorktree("mac", self.worktree))
+        _ = self.record(self.history, "table-decoy", str(self.worktree), 10)
+        result = self.run_script("--no-mac")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("mac", result.stderr)
+        self.assertEqual(result.stdout, "")
+
     def test_newest_start_wins_over_filename_and_file_modification_time(self) -> None:
         old = self.record(self.history, "zzz-old", str(self.worktree), 10)
         newest = self.record(self.history, "aaa-newest.session", str(self.worktree), 30.25)
@@ -148,10 +173,16 @@ class UnitRunTests(unittest.TestCase):
         _ = self.record(self.history, "elsewhere", str(self.root / "elsewhere"), 100)
         self.assert_match(self.run_script("--no-mac"), "matching", "natedev", 10)
 
-    def test_a_trailing_slash_in_the_worktree_cell_is_normalized(self) -> None:
-        self.write_production(str(self.worktree) + "/")
+    def test_a_stale_worktree_cell_does_not_change_the_staff_run(self) -> None:
+        self.write_production(str(self.root / "stale-cell"))
         _ = self.record(self.history, "matching", str(self.worktree), 10)
         self.assert_match(self.run_script("--no-mac"), "matching", "natedev", 10)
+
+    def test_run_uses_staff_when_the_worktree_column_is_absent(self) -> None:
+        without_worktree_column(self.production)
+        _ = self.record(self.history, "staff-run", str(self.worktree), 10)
+        _ = self.record(self.history, "decoy", "/other/table", 100)
+        self.assert_match(self.run_script("--no-mac"), "staff-run", "natedev", 10)
 
     def test_run_working_dir_is_normalized_without_resolving_the_filesystem(self) -> None:
         _ = self.record(self.history, "matching", str(self.worktree) + "/missing/../", 10)

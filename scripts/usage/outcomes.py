@@ -6,6 +6,7 @@ import math
 import re
 import sqlite3
 import subprocess
+import sys
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from enum import Enum
@@ -13,6 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import BinaryIO, Literal, cast
 
+from scripts.production import staff, staff_sources, unit_lookup, session_staff, production_units
 from scripts.accounts.worker_names import journal_entry
 from scripts.usage.rollouts import parse_timestamp
 from scripts.whoami import run_out
@@ -43,7 +45,8 @@ def cell_value(value: str) -> str:
     return quoted.group(1) if quoted else value.split(" — ", 1)[0].strip()
 
 
-def production_paths(path: Path) -> tuple[Path, ...]:
+def production_paths(path: Path, *,
+                     record: staff.StaffSnapshot | staff.StaffUnreadable | session_staff.ReadCurrentStaff = session_staff.ReadCurrentStaff.CURRENT) -> tuple[Path, ...]:
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
     except (OSError, UnicodeError):
@@ -55,36 +58,40 @@ def production_paths(path: Path) -> tuple[Path, ...]:
             if value:
                 paths.append(Path(value).expanduser())
     try:
-        units = lines.index("## Units")
-    except ValueError:
+        record = staff.snapshot() if isinstance(record, session_staff.ReadCurrentStaff) else record
+        if isinstance(record, staff.StaffUnreadable):
+            raise record
+        sources = unit_lookup.member_sources()
+        slug = unit_lookup.production_slug_for_document(path, record, sources)
+        rows = production_units.unit_table(lines)
+    except (OSError, staff.StaffRefused, production_units.Refusal) as error:
+        print(f"outcomes: {path}: {error}", file=sys.stderr)
         return tuple(paths)
-    headings: list[str] = []
-    for line in lines[units + 1:]:
-        if not line.startswith("|"):
-            if headings:
-                break
-            continue
-        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
-        if not headings:
-            headings = cells
-            continue
-        if all(set(cell) <= {"-", ":", " "} for cell in cells):
-            continue
-        if "Worktree" not in headings:
-            break
-        values = dict(zip(headings, cells, strict=False))
-        worktree = cell_value(values.get("Worktree", ""))
-        if worktree:
-            paths.append(Path(worktree).expanduser())
+    for row in rows:
+        try:
+            selected = sources.member(staff_sources.UnitMember(slug, cell_value(row.get("Unit", ""))), record)
+            location = unit_lookup.local_worktree(selected)
+            if isinstance(location, staff.RemovedWorktree):
+                continue
+            paths.append(unit_lookup.plan_worktree(row, selected))
+        except (staff.StaffUnreadable, staff.StaffRefused) as error:
+            print(f"outcomes: {path}: {error}", file=sys.stderr)
     return tuple(paths)
 
 
-def repositories(claude_repo: Path, production_docs: Path) -> tuple[Path, ...]:
+def repositories(claude_repo: Path, production_docs: Path, *,
+                 record: staff.StaffSnapshot | staff.StaffUnreadable | session_staff.ReadCurrentStaff = session_staff.ReadCurrentStaff.CURRENT) -> tuple[Path, ...]:
+    if isinstance(record, session_staff.ReadCurrentStaff):
+        try:
+            record = staff.snapshot()
+        except staff.StaffUnreadable as error:
+            print(f"outcomes: {error}", file=sys.stderr)
+            record = error
     candidates = [claude_repo]
     candidates.extend(
         path
         for document in sorted(production_docs.glob("*-production.md"))
-        for path in production_paths(document)
+        for path in production_paths(document, record=record)
     )
     unique: dict[str, Path] = {}
     for candidate in candidates:
@@ -347,14 +354,20 @@ def collect_checkpoints(db: sqlite3.Connection, claude_repo: Path, production_do
     state: LocalReadState = CompleteSourceRead()
     added = 0
     try:
+        try:
+            record = staff.snapshot()
+        except staff.StaffUnreadable as error:
+            print(f"outcomes: {error}", file=sys.stderr)
+            record = error
+            state = PartialSourceRead()
         candidates = (claude_repo, *(path for document in sorted(production_docs.glob("*-production.md"))
-                                     for path in production_paths(document)))
+                                     for path in production_paths(document, record=record)))
         # Repository discovery omits failures; retain them in this source's state.
         # A worktree removed after its merge is no failure: its commits stay in the shared repository.
         for candidate in candidates:
             if candidate.exists() and git_text(candidate, "rev-parse", "--git-common-dir") is None:
                 state = PartialSourceRead()
-        repos = repositories(claude_repo, production_docs)
+        repos = repositories(claude_repo, production_docs, record=record)
         if not repos:
             state = PartialSourceRead()
         for repo in repos:

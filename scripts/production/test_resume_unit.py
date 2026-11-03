@@ -3,6 +3,8 @@
 and the transcripts are files the test writes: no Claude starts."""
 from __future__ import annotations
 
+from scripts.production.staff_test_support import without_worktree_column
+
 from scripts.production.staff_test_support import fixture_member, fixture_runtime_id
 
 import io
@@ -55,6 +57,16 @@ def git(where: Path, *arguments: str) -> str:
 
 @final
 class ResumeUnitTests(unittest.TestCase):
+    def test_resume_restores_the_staff_location_without_a_worktree_column(self) -> None:
+        without_worktree_column(self.doc)
+        code, output = self.resume()
+        self.assertEqual(code, 0, output)
+        self.assertTrue((self.worktree / ".git").is_file())
+        self.assertEqual(git(self.worktree, "branch", "--show-current"), "alpha-branch")
+        row = unit_membership("alpha", "alpha-unit")
+        self.assertEqual(row.worktree, staff.PresentWorktree("natedev", self.worktree))
+
+
     staff: StaffTestCase = StaffTestCase()
     root: Path = Path()
     checkout: Path = Path()

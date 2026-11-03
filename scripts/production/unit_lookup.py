@@ -30,6 +30,7 @@ from scripts.production import staff, showrunners, session_staff, unit_config  #
 import unit_names  # noqa: E402
 from production_units import cell_value, order_unit_names  # noqa: E402
 from scripts.production.unit_table import unit_spellings  # noqa: E402
+from scripts.shutdown import remote
 from scripts.lib import unit_runs  # noqa: E402
 
 USAGE = "usage: unit_lookup.py list <production slug> | pane <production slug> <unit>"
@@ -62,6 +63,55 @@ from scripts.production.session_staff import (
     retained_unit_marks,
     session_staff_and_directors as session_staff_and_directors,
 )
+
+
+def production_slug_for_document(doc: Path, record: staff.StaffSnapshot, sources: MemberSources) -> str:
+    """Resolve a production through its registered document and fixed owner."""
+    owner = record.by_doc(remote.local_machine(), doc.resolve())
+    if owner is None or owner.kind != "showrunner":
+        raise staff.StaffUnreadable(f"{doc}: no showrunner staff row")
+    slugs = [slug for slug, row in sources.showrunner_members(record).items() if row.id == owner.id]
+    if len(slugs) == 1:
+        return slugs[0]
+    if not slugs and record.by_path(owner.name) == owner:
+        return owner.name
+    raise staff.StaffUnreadable(f"{doc}: no unique registered production")
+
+
+def local_worktree(selected: MemberFound | NoSuchMember) -> staff.PresentWorktree | staff.RemovedWorktree:
+    """Require a recorded local location without changing its lifecycle state."""
+    if isinstance(selected, NoSuchMember):
+        raise staff.StaffUnreadable(f"{selected.selector}: no matching staff member")
+    location = selected.row.worktree
+    if isinstance(location, staff.WorktreeUnfilled):
+        raise staff.StaffUnreadable(f"{selected.row.name}: staff worktree is unfilled")
+    if location.machine != remote.local_machine():
+        raise staff.StaffUnreadable(f"{selected.row.name}: staff worktree is on {location.machine}: {location.path}")
+    return location
+
+
+def plan_worktree(cells: dict[str, str], selected: MemberFound | NoSuchMember) -> Path:
+    """Read the branch worktree from the Plan folder, after checking staff ownership."""
+    location = local_worktree(selected)
+    if isinstance(location, staff.RemovedWorktree):
+        raise staff.StaffUnreadable(f"{cells.get('Unit', '')}: staff worktree is removed")
+    plan = cell_value(cells.get("Plan", ""))
+    if not plan or plan in ("—", "-", "standby", "permanent"):
+        raise staff.StaffUnreadable(f"{cells.get('Unit', '')}: Plan folder is unavailable")
+    path = Path(plan).expanduser()
+    if not path.is_absolute():
+        return location.path
+    from scripts.direct.phase_reservation import repository_root
+    try:
+        directory = path if path.is_dir() else path.parent
+        if not directory.is_dir():
+            raise staff.StaffUnreadable(f"{cells.get('Unit', '')}: Plan folder is missing: {directory}")
+        root = repository_root(directory)
+    except (OSError, UnicodeError) as error:
+        raise staff.StaffUnreadable(f"{cells.get('Unit', '')}: cannot read Plan folder: {error}") from error
+    if root is None:
+        raise staff.StaffUnreadable(f"{cells.get('Unit', '')}: Plan folder is outside Git: {path.parent}")
+    return root
 
 
 class ProductionMembers:

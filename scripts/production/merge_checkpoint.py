@@ -37,7 +37,7 @@ from production_units import Production, read_production
 from production_units import Refusal, cell_value, production_field, unit_table
 
 from scripts.direct import progress_history  # noqa: E402
-from scripts.production import production_doc  # noqa: E402
+from scripts.production import production_doc, staff, staff_sources, unit_lookup  # noqa: E402
 from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
 from scripts.lib.atomic_file import write_text_atomic  # noqa: E402
 import sessions  # noqa: E402
@@ -274,12 +274,15 @@ def listed_names(lines: list[str], field: str) -> frozenset[str]:
     return frozenset(name.strip() for name in names if name.strip())
 
 
-def parse_units(lines: list[str]) -> tuple[Unit, ...]:
+def parse_units(lines: list[str], production: Production, record: staff.StaffSnapshot,
+                requested_unit: str) -> tuple[Unit, ...]:
     result: list[Unit] = []
     for cells in unit_table(lines):
-        if not all(heading in cells for heading in ("Unit", "Plan", "Worktree", "Branch", "Owns")):
+        if cell_value(cells.get("Unit", "")) != requested_unit:
             continue
-        plan = Path(cell_value(cells["Plan"]).split(" ", 1)[0])
+        if not all(heading in cells for heading in ("Unit", "Branch", "Owns")):
+            continue
+        plan = Path(cell_value(cells.get("Plan", "")).split(" ", 1)[0])
         owns_cell = cells["Owns"]
         quoted = cast(list[str], re.findall(r"`([^`]+)`", owns_cell))
         plain = owns_cell.split(" — ", 1)[0]
@@ -297,7 +300,8 @@ def parse_units(lines: list[str]) -> tuple[Unit, ...]:
         else:
             owns = tuple(part.strip() for part in plain.split(",") if part.strip())
         result.append(Unit(cell_value(cells["Unit"]), plan,
-                           Path(cell_value(cells["Worktree"])).expanduser(), cell_value(cells["Branch"]), owns))
+                           unit_lookup.plan_worktree(cells, staff_sources.member(
+                               staff_sources.UnitMember(production.slug, cell_value(cells["Unit"])), record)), cell_value(cells["Branch"]), owns))
     return tuple(result)
 
 
@@ -352,8 +356,8 @@ def request_from(args: argparse.Namespace) -> MergeRequest:
     bump = user_bump(args)
     production = read_production(Path(cast(str, args.production)))
     lines = production.doc.read_text(encoding="utf-8").splitlines()
-    units = parse_units(lines)
     name = cast(str, args.unit)
+    units = parse_units(lines, production, staff.snapshot(), name)
     unit = next((candidate for candidate in units if candidate.name == name), None)
     if unit is None:
         raise Refusal(f"unit {name} not in production doc")
@@ -1692,7 +1696,7 @@ def acknowledge_handoff(request: ChildHandoffRequest, merge_head: str) -> None:
         ], capture_output=True, text=True, check=False, timeout=15)
         if result.returncode:
             raise Refusal(f"send.py: {failure_detail(result)}")
-    except (Refusal, OSError, ValueError, subprocess.TimeoutExpired) as error:
+    except (Refusal, staff.StaffRefused, OSError, ValueError, subprocess.TimeoutExpired) as error:
         print("hand-off acknowledgment: " + " ".join(str(error).splitlines()), flush=True)
 
 
@@ -1873,7 +1877,7 @@ def main() -> int:
                 return TREE_CHANGED_STATUS
             print("merge_checkpoint: " + " ".join(str(error).splitlines()), flush=True)
             return 1
-        except (Refusal, OSError, ValueError, subprocess.TimeoutExpired) as error:
+        except (Refusal, staff.StaffRefused, OSError, ValueError, subprocess.TimeoutExpired) as error:
             print("merge_checkpoint: " + " ".join(str(error).splitlines()), flush=True)
             return 1
     if cast(bool, args.root_self) or cast(str | None, args.checkpoint):
@@ -1884,7 +1888,7 @@ def main() -> int:
         request = request_from(args)
         with merge_lock(request.production.checkout, request.production.slug):
             return run(request)
-    except (Refusal, OSError, ValueError) as error:
+    except (Refusal, staff.StaffRefused, OSError, ValueError) as error:
         report("input", "failed", str(error))
         print(f"send {cast(str, args.unit)}: correct the checkpoint input and resend it")
         return 1

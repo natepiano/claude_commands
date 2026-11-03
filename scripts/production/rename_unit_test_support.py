@@ -91,7 +91,9 @@ class UnitRenameFixture(StaffTestCase):
         _ = shutil.copytree(self.fixture_snapshot, self.fixture_root)
         self.addCleanup(shutil.rmtree, self.fixture_root)
         self.bind_fixture(self.fixture_root)
-        bind_staff_fixture(self, self.env, {SLUG: ("alpha-unit", "mul_add-unit")})
+        bind_staff_fixture(self, self.env, {SLUG: ("alpha-unit", "mul_add-unit")},
+                           locations={(SLUG, "alpha-unit"): self.rust / "claude-demo-alpha",
+                                      (SLUG, "mul_add-unit"): self.rust / "claude-demo-mul-add"})
         # These modules also bind paths at import time; environment changes alone
         # do not isolate their journals, locks, or stall-watch state.
         for module, name, value in (

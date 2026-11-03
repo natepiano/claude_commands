@@ -52,7 +52,7 @@ from typing import TYPE_CHECKING, NamedTuple, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from scripts.production import staff, staff_sources, unit_config
+from scripts.production import session_staff, staff, staff_sources, unit_config
 from scripts.shutdown.remote import local_machine
 from scripts.lib import process_group, conf
 from scripts.issue_score.selection import UseConfiguredValue
@@ -139,12 +139,18 @@ class NoDirectorSession:
 
 
 @dataclass(frozen=True)
+class UnresolvedStaffMember:
+    """A caller has not supplied the unit's retained identity."""
+
+
+@dataclass(frozen=True)
 class Unit:
     production: Production
     name: str
     worktree: Path
     branch: str
     retired: bool
+    staff_member: staff.StaffRow | UnresolvedStaffMember = UnresolvedStaffMember()
 
 
 class MeshRun(NamedTuple):
@@ -197,7 +203,9 @@ def production_of(slug: str) -> Production:
     return read_production(checked.path)
 
 
-def find_unit(slug: str, given: str) -> Unit:
+def find_unit(slug: str, given: str, *,
+              record: staff.StaffSnapshot | session_staff.ReadCurrentStaff = session_staff.ReadCurrentStaff.CURRENT) -> Unit:
+    record = staff.snapshot() if isinstance(record, session_staff.ReadCurrentStaff) else record
     production = production_of(slug)
     rows = production_units.unit_table(production.doc.read_text(encoding="utf-8").splitlines())
     ids = [production_units.cell_value(row.get("Unit", "")) for row in rows]
@@ -206,9 +214,25 @@ def find_unit(slug: str, given: str) -> Unit:
     if len(matching) != 1:
         raise Refused(f"{name}: expected one Units row, found {len(matching)}")
     row = matching[0]
-    worktree = Path(production_units.cell_value(row.get("Worktree", ""))).expanduser()
+    selected = staff_sources.member(staff_sources.UnitMember(production.slug, name), record)
+    if isinstance(selected, staff_sources.NoSuchMember):
+        raise Refused(f"{production.slug}/{name}: no matching staff member")
+    location = unit_lookup.local_worktree(selected)
+    if isinstance(location, staff.RemovedWorktree):
+        if location.path.exists():
+            raise Refused(f"{name}: removed staff worktree still exists: {location.path}")
+        worktree = location.path
+    else:
+        plan_row = dict(row)
+        plan_row["Plan"] = re.sub(r"^\s*\(retired [^)]*\)\s*", "", row.get("Plan", ""))
+        try:
+            worktree = unit_lookup.plan_worktree(plan_row, selected)
+        except staff.StaffUnreadable:
+            if not production_units.plan_cell_is_retired(row.get("Plan", "")) or location.path.exists():
+                raise
+            worktree = location.path
     return Unit(production, name, worktree, production_units.cell_value(row.get("Branch", "")),
-                production_units.plan_cell_is_retired(row.get("Plan", "")))
+                production_units.plan_cell_is_retired(row.get("Plan", "")), selected.row)
 
 
 def _git(unit: Unit, *arguments: str, settings: conf.ConfigRead) -> subprocess.CompletedProcess[str]:
@@ -270,7 +294,8 @@ def plan_saved_branch(unit: Unit, saved: SavedBranch | NoSavedBranch = NO_SAVED_
     if isinstance(saved, NoSavedBranch):
         if not tip or _git(unit, "merge-base", "--is-ancestor", tip, unit.production.merge_branch, settings=settings).returncode == 0:
             return NoSavedBranch()
-        member = staff_sources.member(staff_sources.UnitMember(unit.production.slug, unit.name), staff.initial_snapshot())
+        member = (staff_sources.MemberFound(unit.staff_member) if isinstance(unit.staff_member, staff.StaffRow) else
+                  staff_sources.member(staff_sources.UnitMember(unit.production.slug, unit.name), staff.snapshot()))
         if not isinstance(member, staff_sources.MemberFound):
             raise Refused(f"{unit.name}: no staff id for the retired ref")
         saved = SavedBranch(f"refs/retired/{member.row.id}", tip)
@@ -970,7 +995,7 @@ def prepare_retirement(unit: Unit, row: staff.StaffRow, *, settings: conf.Config
     location = row.worktree
     if isinstance(location, staff.WorktreeUnfilled):
         raise Refused(f"{unit.name}: staff worktree is unfilled; run staff_sources.py fill")
-    if location.machine != local_machine() or location.path != unit.worktree:
+    if location.machine != local_machine():
         raise Refused(f"{unit.name}: staff worktree conflicts with {unit.worktree} on {local_machine()}")
     if unit.worktree.exists():
         actual = run(["git", "-C", str(unit.worktree), "branch", "--show-current"], settings=settings)
@@ -990,17 +1015,20 @@ def prepare_retirement(unit: Unit, row: staff.StaffRow, *, settings: conf.Config
         director.session_id, unit_config.RecordedStartFolder(director.resume_folder), unit_config.Branch(unit.branch))
 
 
-def retire(unit: Unit, wait_minutes: float, *, settings: conf.ConfigRead) -> int:
-    member = staff_sources.member(staff_sources.UnitMember(unit.production.slug, unit.name), staff.initial_snapshot())
+def retire(unit: Unit, wait_minutes: float, *, settings: conf.ConfigRead,
+           record: staff.StaffSnapshot | session_staff.ReadCurrentStaff = session_staff.ReadCurrentStaff.CURRENT) -> int:
+    record = staff.snapshot() if isinstance(record, session_staff.ReadCurrentStaff) else record
+    member = staff_sources.member(staff_sources.UnitMember(unit.production.slug, unit.name), record)
     if isinstance(member, staff_sources.NoSuchMember):
         raise Refused(f"{unit.name}: no staff row; run staff_sources.py fill")
+    location = unit_lookup.local_worktree(member)
     facts = prepare_retirement(unit, member.row, settings=settings)
     already_retired = isinstance(member.row.worktree, staff.RemovedWorktree)
     refused = refusals(unit, settings=settings)
     if refused:
         print("\n".join(f"refused: {reason}" for reason in refused))
         return 1
-    _ = unit_config.park(member.row.id, unit.worktree, facts)
+    _ = unit_config.park(member.row.id, location.path, facts)
     saved = preserve_branch(unit, settings=settings)
     pane = unit_move.unit_pane(unit_lookup.marked_unit(unit.production.slug, unit.name), unit.production.slug)
     if not isinstance(facts.start_folder, unit_config.RecordedStartFolder):
@@ -1056,7 +1084,7 @@ def retire(unit: Unit, wait_minutes: float, *, settings: conf.ConfigRead) -> int
     if workers:
         return 1
     if not failed:
-        _ = staff.set_worktree(member.row.id, staff.RemovedWorktree(local_machine(), unit.worktree))
+        _ = staff.set_worktree(member.row.id, staff.RemovedWorktree(local_machine(), location.path))
         print(f"{unit.name} already retired" if already_retired and not committed else f"{unit.name} retired")
     return 1 if failed else 0
 
@@ -1071,10 +1099,11 @@ def _main(argv: list[str], *, settings: conf.ConfigRead) -> int:
     options = parser.parse_args(argv)
     try:
         with worker_lifecycle.operation_deadline(timeout=settings.number("RETIRE_COMMAND_TIMEOUT_SECONDS")):
-            unit = find_unit(cast(str, options.slug), cast(str, options.unit))
+            record = staff.snapshot()
+            unit = find_unit(cast(str, options.slug), cast(str, options.unit), record=record)
             if cast(bool, options.dry_run):
                 return dry_run(unit, settings=settings)
-            return retire(unit, cast(float, options.wait_minutes), settings=settings)
+            return retire(unit, cast(float, options.wait_minutes), settings=settings, record=record)
     except (staff.StaffRefused, staff.StaffUnreadable):
         raise
     except (Refused, production_units.Refusal, unit_names.BadName, WorkerUnavailable, OSError,

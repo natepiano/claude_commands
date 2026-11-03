@@ -14,7 +14,7 @@ from typing import NamedTuple, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from scripts.production import staff, staff_sources, unit_config
+from scripts.production import session_staff, staff, staff_sources, unit_config
 from scripts.shutdown.remote import local_machine
 from scripts.lib.git_exclude import ExcludeRefused, ensure_excluded, require_untracked_ignored
 
@@ -118,22 +118,24 @@ def production_name(lines: list[str]) -> str:
     return name.value
 
 
-def units(lines: list[str], production: Production) -> tuple[UnitRow, ...]:
+def units(lines: list[str], production: Production, sources: unit_lookup.MemberSources, *,
+          record: staff.StaffSnapshot | session_staff.ReadCurrentStaff = session_staff.ReadCurrentStaff.CURRENT) -> tuple[UnitRow, ...]:
+    record = staff.snapshot() if isinstance(record, session_staff.ReadCurrentStaff) else record
     parsed: list[UnitRow] = []
-    permanent: list[str] = []
-    for cells in unit_table(lines):
-        row = {heading: cell_value(cell) for heading, cell in cells.items()}
-        if not all(heading in row for heading in ("Unit", "Plan", "Worktree", "Branch", "Port", "Owns")):
-            raise LifecycleStop("input", "failed", f"invalid Units row: {cells}")
-        if row["Plan"] == "permanent":
-            permanent.append(row["Unit"])
-            continue
-        plan = Path(row["Plan"]).expanduser()
-        parsed.append(UnitRow(row["Unit"], plan if plan.is_absolute() else production.checkout / plan,
-                              Path(row["Worktree"]).expanduser(), row["Branch"]))
+    rows = unit_table(lines)
+    permanent = [cell_value(cells["Unit"]) for cells in rows if cell_value(cells.get("Plan", "")) == "permanent"]
     if permanent:
         raise LifecycleStop("wrap", "held", "; ".join(
             f"permanent child {name}: transfer it before wrapping" for name in permanent))
+    for cells in rows:
+        row = {heading: cell_value(cell) for heading, cell in cells.items()}
+        if not all(heading in row for heading in ("Unit", "Plan", "Branch", "Port", "Owns")):
+            raise LifecycleStop("input", "failed", f"invalid Units row: {cells}")
+        location = unit_lookup.local_worktree(sources.member(
+            staff_sources.UnitMember(production.slug, row["Unit"]), record))
+        plan = Path(row["Plan"]).expanduser()
+        parsed.append(UnitRow(row["Unit"], plan if plan.is_absolute() else location.path / plan,
+                              location.path, row["Branch"]))
     return tuple(parsed)
 
 
@@ -185,13 +187,14 @@ def load(production: Production, lines: list[str], resume: bool, scratch: Path |
         marked = unit_lookup.marked_units(production.slug)
     except OSError as error:
         raise LifecycleStop("session", "failed", str(error)) from error
-    for unit in units(lines, production):
-        last: MergeEntry | NoMerge = history.last_code_for_unit(unit.name) if history else NoMerge()
+    for cells in unit_table(lines):
+        name = cell_value(cells["Unit"])
+        last: MergeEntry | NoMerge = history.last_code_for_unit(name) if history else NoMerge()
         detail = (f"phase {last.phase} at {last.merge_hash}" if isinstance(last, MergeEntry)
                   else "no code checkpoint")
-        report("last-merged", "ok", f"{unit.name}: {detail}")
-        found = marked.get(unit.name)
-        report("session", "ok", f"{unit.name}: " + (f"{found.place.session} live" if found is not None else "gone"))
+        report("last-merged", "ok", f"{name}: {detail}")
+        found = marked.get(name)
+        report("session", "ok", f"{name}: " + (f"{found.place.session} live" if found is not None else "gone"))
 
 
 def doc_path_in_checkout(production: Production, path: Path) -> str:
@@ -205,6 +208,7 @@ def open_production(production: Production, lines: list[str]) -> None:
     status = doc_status(lines)
     if isinstance(status, ProductionWrapped):
         raise LifecycleStop("open", "held", "production is already wrapped")
+    rows = unit_table(lines)
     state = checkout_ready(production)
     if isinstance(state, PlanPending):
         _ = checked(production.checkout, "branch", "switch", "-c", production.merge_branch)
@@ -218,13 +222,15 @@ def open_production(production: Production, lines: list[str]) -> None:
     if updated != lines:
         write_text_atomic(production.doc, "\n".join(updated) + "\n")
     report("doc", "ok", "running")
-    rows = units(updated, production)
     paths = [doc_path_in_checkout(production, production.doc)]
-    for unit in rows:
-        if unit.plan.exists():
-            paths.append(doc_path_in_checkout(production, unit.plan))
+    for cells in rows:
+        name = cell_value(cells["Unit"])
+        plan = Path(cell_value(cells["Plan"])).expanduser()
+        plan = plan if plan.is_absolute() else production.checkout / plan
+        if plan.exists():
+            paths.append(doc_path_in_checkout(production, plan))
         else:
-            report("plan", "ok", f"{unit.name}: no plan yet at {unit.plan}; not committed")
+            report("plan", "ok", f"{name}: no plan yet at {plan}; not committed")
     subject = f"production({production_name(updated)}): plans for {len(rows)} units"
     subjects = checked(production.checkout, "commit", "log", "--format=%s", production.merge_branch)
     committed_paths = checked(production.checkout, "commit", "ls-tree", "-r", "--name-only", "HEAD", "--", *paths)
@@ -545,19 +551,18 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
     status = doc_status(lines)
     if isinstance(status, ProductionPlanned):
         raise LifecycleStop("wrap", "held", "production must be running")
-    record = staff.initial_snapshot()
+    record = staff.snapshot()
     if isinstance(status, ProductionRunning):
         refuse_running_children(production.slug, record)
     state = checkout_ready(production)
     if isinstance(state, PlanPending):
         raise LifecycleStop("wrap", "held", "merge branch does not exist")
-    rows = units(lines, production)
     sources = unit_lookup.member_sources()
     productions = dict(sources.productions)
-    if production.slug not in productions:
-        productions[production.slug] = showrunners.ShowrunnerSource(
-            showrunners.Timer(production.slug, "session:unrecorded", production.doc, ""), "\n".join(lines))
+    productions[production.slug] = showrunners.ShowrunnerSource(
+        showrunners.Timer(production.slug, "session:unrecorded", production.doc, ""), "\n".join(lines))
     sources = replace(sources, productions=productions)
+    rows = units(lines, production, sources, record=record)
     runner = sources.member(staff_sources.ShowrunnerMember(production.slug), record)
     if isinstance(runner, staff_sources.NoSuchMember):
         raise LifecycleStop("staff", "held", "no showrunner staff row")
@@ -621,11 +626,11 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
             raise LifecycleStop("retire", "failed", remote.stderr.strip() or f"ls-remote exited {remote.returncode}")
     held = retire_wrap_rows(rows, record, members, runner) or held
     if isinstance(status, ProductionRunning):
+        release_edges(production.slug, record=record)
         notifier = Path.home() / ".claude/scripts/message/notifier.sh"
         # The update timer is the one record of the showrunner, so removing it unregisters it.
         _ = command("notifier", production.checkout, str(notifier), "remove", f"showrunner-{production.slug}")
         report("notifier", "ok", "update timer removed")
-        release_edges(production.slug, record=record)
         archived = command(
             "phase-notes",
             production.checkout,

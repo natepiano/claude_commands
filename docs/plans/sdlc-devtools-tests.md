@@ -659,7 +659,7 @@ Remaining gaps include shell command positions, executable Python aliases, and s
 
 **Gotchas:** a relative `CHECKOUT` must become absolute before any `cd`, or `--manifest-path` and the log paths break.
 
-### Phase 4s — Units rows take the worktree from staff  · status: todo
+### Phase 4s — Units rows take the worktree from staff  · status: done
 
 **Depends on:** Phase 4o
 
@@ -670,7 +670,7 @@ Source: the sdlc showrunner, 2026-11-02, from a 4o defect. The Units table's Wor
 **Goal:** every tool takes a unit's worktree from its staff row. A stale or absent Units Worktree cell changes no result.
 
 **Spec:**
-1. Each reader below takes the path from staff: one `staff.snapshot()` per command, then `staff_sources.member(staff_sources.UnitMember(<production slug>, <unit>), record)`, then `MemberFound.row.worktree`. A caller that already holds a staff row uses `session_staff.RowResolver.unit_worktree`. Give a function the production identity or the snapshot as an argument where it lacks one; resolve a production through its registered document, never from a file name.
+1. Each reader below takes the path from staff: one `staff.snapshot()` per reader pass, then `staff_sources.member(staff_sources.UnitMember(<production slug>, <unit>), record)`, then `MemberFound.row.worktree`. A caller that already holds a staff row uses `session_staff.RowResolver.unit_worktree`. Give a function the production identity or the snapshot as an argument where it lacks one; resolve a production through its registered document, never from a file name.
    - `merge_checkpoint.parse_units` (`merge_checkpoint.py:277-300`): drop the column requirement at line 280.
    - `retire_unit.find_unit` (`retire_unit.py:209`): no `Path("")`; keep `RemovedWorktree` recovery.
    - `transfer_unit.build` (`transfer_unit.py:153`): move the existing member lookup before the path checks; keep the source-then-destination lookup at line 164 for a transfer that staff already completed.
@@ -682,15 +682,19 @@ Source: the sdlc showrunner, 2026-11-02, from a 4o defect. The Units table's Wor
    - `units_table.style_ledger_paths` (`units_table.py:100`), `unit_run.main` (`unit_run.py:145`), `change_review.unit_branches` (`change_review.py:833`).
    - `assertion_guard.py:1344-1346`: match staff paths; exclude a retired unit by the `RemovedWorktree` type, not by words in the cell. A worktree match keeps its precedence over a branch match.
    - `style/unit_files.unit_worktrees` (`unit_files.py:41`), `usage/usage_report.document_units` (`usage_report.py:314`), `usage/outcomes.production_paths` (`outcomes.py:73-76`).
+1a. The staff worktree is the folder where the director runs. A unit's plan, branch and workers can be in another worktree (hana fastest: director in `/home/natepiano/rust/hana_catalyst-fastest`, plan in `/home/natepiano/worktrees/hana_catalyst-build-speed-tests`). A reader that works on the unit's branch takes the branch folder from the Plan cell. A relative Plan cell names a file in the staff worktree, so the staff worktree is the branch folder, with no Git call. An absolute Plan cell takes `git rev-parse --show-toplevel` of its folder. A unit whose plan is in another worktree carries an absolute Plan cell. Readers that take the branch folder: `merge_checkpoint`, `retire_unit`, `transfer_unit` Git checks, `assertion_guard`, `change_review`, `style/unit_files`, `usage/outcomes` and `units_table`. A reader that needs where the director runs takes the staff worktree: `promote_showrunner`, `add_unit` resume, `resume_unit` and `unit_run`. A missing Plan cell, or an absolute Plan folder outside Git, is an unavailable fact under item 3. Shared fixtures keep the director folder as the branch folder and a relative Plan, so existing assertions stay. Dedicated tests use an absolute Plan in a real Git folder that is not the director's folder. Source: the sdlc showrunner, 2026-11-03; relative-cell rule: devtools-unit, 2026-11-03.
 2. `resume_unit.find_unit` keeps its staff lookup and deletes the veto at line 120 that compares staff with the cell. `staff_check.py:237` deletes the document-path comparison and keeps the membership, parent, machine, linked-worktree and lifecycle checks.
 3. Unavailable facts keep their types: `NoSuchMember`, `staff.StaffUnreadable` (`StaffAbsent` included) and `staff.WorktreeUnfilled`. A command that changes state refuses with a message that names the fact. A read-only report names the fact and keeps the other units' rows. `RemovedWorktree` stays distinct from a missing fact. A path on another machine refuses local file operations. Never `Path("")`, `Path("—")` or `None` for a location; the `"—"` display value from `unit_lookup.py:182` never becomes a path.
-4. `staff_sources` reads the cell only at its legacy import boundary (`staff_sources.py:153`, `:1374-1386`, `:1451`, `:1542-1544`), and only when no current member exists. An existing member's typed location comes first.
+4. `staff_sources` reads the cell only at its legacy import boundary (`staff_sources.py:153`, `:1374-1386`, `:1451`, `:1542-1544`), and only when no current member has a typed location: it fills a `WorktreeUnfilled` member and a missing member. An existing typed location comes first, a location on another machine included, and an equal cell is accepted.
 5. The callers of `unit_lookup.live_unit_table` (`board_json`, `phase_table`, `waiting`, `unit_watchdog`, `style_plan`, `hierarchies/measure`) keep their code. Its projected `Worktree` field is not the document column and stays.
 6. Writers keep the column in this phase: `add_unit`, `rename_unit`, `rename`, `transfer_unit` and `style/add_style` still write it. Phase 4u removes it.
-7. Approved assertion changes, each with an `Assertion-Change:` line that keeps its ownership, retirement or path-validation guarantee: `test_staff_check.py:489` and `:529` (a staff path that differs from the cell now passes; a missing cell now passes), `test_add_unit.py:625` (the mismatch check moves to staff paths), `test_assertion_guard_revisions.py:1301` (retirement comes from `RemovedWorktree`), `test_unit_run.py:151` (no cell normalization).
+7. Approved assertion changes, each with an `Assertion-Change:` line that keeps its ownership, retirement or path-validation guarantee: `test_staff_check.py:489` and `:529` (a staff path that differs from the cell now passes; a missing cell now passes), `test_add_unit.py:625` (the mismatch check moves to staff paths), `test_assertion_guard_revisions.py:1301` (retirement comes from `RemovedWorktree`), `test_unit_run.py:151` (no cell normalization), `test_outcomes.py:243` (the fixture Plan is a real Git folder, because a missing absolute Plan folder is unavailable; the expected path is still the Plan's Git root).
 
 **Files:**
 - `scripts/production/merge_checkpoint.py` — reader.
+- `scripts/hooks/session-start-pane-record.py` — writes no pane record for a print-mode child launch, so a child never replaces the director's membership record.
+- `scripts/hooks/test_session_start_pane_record.py` — new; regression test for that rule.
+- `scripts/production/test_unit_lookup.py` — Plan folder resolution tests.
 - `scripts/production/retire_unit.py` — reader.
 - `scripts/production/transfer_unit.py` — reader.
 - `scripts/production/promote_showrunner.py` — reader.
@@ -710,7 +714,7 @@ Source: the sdlc showrunner, 2026-11-02, from a 4o defect. The Units table's Wor
 - `scripts/usage/outcomes.py` — reader.
 - `scripts/production/test_merge_checkpoint.py`, `merge_checkpoint_test_support.py` — moved staff path with no column; a stale cell is ignored; unavailable facts refuse.
 - `scripts/production/test_retire_unit.py`, `test_resume_unit.py`, `test_production_lifecycle.py`, `production_lifecycle_test_support.py` — staff location without the column; removed-location recovery; unfilled and unreadable facts refuse.
-- `scripts/production/test_add_unit.py`, `test_add_unit_resume.py`, `add_unit_test_support.py` — create and resume without the column; new admission; staff path collision.
+- `scripts/production/test_add_unit.py`, `test_add_unit_resume.py`, `test_add_unit_restore.py`, `add_unit_test_support.py` — create and resume without the column; new admission; staff path collision.
 - `scripts/production/test_rename_unit.py`, `test_rename_unit_state.py`, `rename_unit_test_support.py`, `test_rename.py`, `rename_test_support.py` — rename without the column; interrupted rename after a staff change. `rename_test_support.py:538` takes staff facts of its own, not from the cell.
 - `scripts/production/test_transfer_unit.py`, `transfer_unit_test_support.py` — staff moves before the document row.
 - `scripts/production/test_promote_showrunner.py` — staff path; unavailable or remote location refuses before launch.
@@ -730,6 +734,46 @@ Source: the sdlc showrunner, 2026-11-02, from a 4o defect. The Units table's Wor
 **Constraints from prior phases:** Phase 4o: `unit_move.py move-folder` updates the staff row only; the cell stays stale, which this phase makes harmless. Phase 4p: `update_registration.question_folder` resolves a relative path from the staff owner's document; unreadable ownership is not confirmed absence. Delegation Context → Ownership, Config reads and Test runs.
 
 **Acceptance gate:** each new test fails on the old reader and passes after the change. Each writer runs `python3 -m unittest` on the test files its prompt names. `basedpyright <the slot's files>` footer `0 errors, 0 warnings, 0 notes` for each slot. One director gate.
+
+### Phase 4v — Folder moves name what blocks them  · status: todo
+
+**Depends on:** Phase 4o
+
+Source: the sdlc showrunner, 2026-11-03. The devtools folder move refused with `unit_move: processes inside <folder>: <pids>`. The blocker was a real `codex app-server` (port 33335) and its idle-stop watcher, left running for 29 hours by a `scripts/agents/test_codex_mesh.py` fixture (run folder `/tmp/codex-mesh-test-1yxmd08g/run`, `CODEX_HOME` in the temp folder). The refusal was correct: the unit did not own that server. The refusal named only pids, and the test leaked a process.
+
+#### Work Order
+
+**Goal:** a folder move that meets a process the unit does not own refuses with a message that names each such process. No test leaves a real app-server or watcher running.
+
+**Spec:**
+1. `unit_move.py:1345`: the refusal names each unowned process: pid, its command (cut to one line), and the run folder of a mesh server or watcher when its record names one. Processes the unit owns (its run servers, watchers and launchers) keep their current stop path.
+2. Find the `test_codex_mesh.py` path that starts a real `codex app-server` (the fixture with `CODEX_HOME` under `codex-mesh-test-*/home/.codex`, the `project-review` reviewer, thread `thread-capacity-test`). Make it use the stub server, or stop the server and its watcher in cleanup that also runs on failure.
+3. A guard in that test class fails a test that leaves a live `codex app-server` or idle-stop watcher with its run folder under the test's temporary folder.
+4. Check before stop: move-folder checks every process in the folder (owned and unowned, `unit_move.py:812` arguments check included) before it stops any process. A refusal stops nothing. Source: the showrunner, 2026-11-03: the first move run printed `process 2236417: arguments changed` and `stopped app-server 2236059`, then refused.
+6. A live session picks its launch. `unit_move.folder_launch` (`unit_move.py:516-523`) counts every retained record whose `session_id` matches, ended ones included, and refuses on two. Case (records only, 2026-11-03): phases-unit `ee6d3351-30ca-427c-9ce7-fce82ba66155` has two records in `~/.local/state/herdr-panes/agents.json`, `wM:pK` (2026-10-31T21:53Z) and `wY:p7` (22:28Z), both `ended: true`, while its director runs live in a pane neither names. `herdr.py:2721` then finds no proving pane and prints `current pane is unknown; retained launches kept`. Fix: resolve the live member process to its pane first and take the record of that pane; with no record for the live pane, use the live pane and process. Each other match prints one anomaly line and does not block. Refuse only when two live panes prove the same conversation. Find the writer that sets `ended` and keeps the older record when the same session launches in a new pane; retire the superseded record there.
+5. One line per anomaly: `herdr.py:2938` prints `anomaly: <name> (Codex thread unknown); not blocking` four times for each of morty and recipes in one move run. Print each anomaly once per command.
+7. Repair the launch records once. A repair command rewrites each record's `session_id` from its staff row and removes each record that names no staff member (the two alpha-unit test records included). A rerun shows no change. Showrunner, 2026-11-03.
+8. The test that writes alpha-unit records uses its own temporary state folder. The record repair command (Spec 7) lives in `pane_launch.py`. A test proves the real `~/.local/state/herdr-panes` folder stays the same.
+9. `test_assertion_guard_revisions.py::test_large_diff_guard_call_uses_less_than_one_cpu_second` (`:982-994`, added by Phase 7, `7aed97d7b`) fails at 1.01-1.02 CPU seconds against its 1.0 limit at load 40. It also fails on the tree before Phase 4s. Keep its purpose: a guard call on a large diff stays cheap, and a slow (for example quadratic) comparison fails the test. Make the smallest change that does not fail under load: for example, compare the guard's CPU time with a fixed reference workload measured in the same test, so that contention slows both. Do not use wall time. Showrunner, 2026-11-03.
+
+**Files:**
+- `scripts/production/unit_move.py` — refusal text.
+- `scripts/production/test_unit_move.py` — a folder with an unowned process refuses and names its pid, command and run folder; owned processes still stop; a refusal stops no process.
+- `scripts/agents/test_codex_mesh.py` — no real app-server; leak guard.
+- `scripts/herdr/herdr.py` — one line per anomaly.
+- `scripts/herdr/test_herdr.py` — the anomaly prints once for a command that checks a process more than once.
+- `scripts/herdr/pane_launch.py` — retire the superseded record of a session that launches in a new pane.
+- `scripts/herdr/test_pane_launch.py` — a relaunch in a new pane leaves one record.
+- `scripts/direct/test_assertion_guard_revisions.py` — the CPU test keeps its purpose and passes under load.
+
+**Workers:** `1 writer`
+- `impl` — all eight files.
+
+**State:** none.
+
+**Constraints from prior phases:** herdr 6a (ETA 06:30) also writes `scripts/herdr/herdr.py` (its darwin `startup_processes` reader): keep the `herdr.py` change to the anomaly print, and merge origin/sdlc before the 4v gate. Source: the sdlc showrunner, 2026-11-03. Phase 4o: `unit_move.py move-folder` steps stop, worktree, staff, launch, run, resume. Never kill by pattern; stop a server through `codex_mesh.py stop --session-dir <run>`.
+
+**Acceptance gate:** the new unit_move test fails before the change and passes after. A test run of `test_codex_mesh.py` leaves no `codex app-server` or watcher whose run folder is under a `codex-mesh-test-` folder (check with `ps` after the run). `python3 -m unittest scripts/production/test_unit_move.py scripts/agents/test_codex_mesh.py`. `basedpyright` on the three files, footer `0 errors, 0 warnings, 0 notes`. One director gate.
 
 ### Phase 4u — Units tables have no Worktree column  · status: todo
 

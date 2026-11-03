@@ -19,6 +19,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from scripts.production import staff, staff_sources, unit_lookup, session_staff, production_units
 from scripts.usage import collect, outcomes, weights
 from scripts.lib.user_zone import user_zone_name
 from scripts.usage.rollouts import parse_timestamp
@@ -282,38 +283,29 @@ class UnitWorktree:
     worktree: Path
 
 
-def document_units(path: Path) -> tuple[UnitWorktree, ...]:
-    """The rows of one production doc's `## Units` table that name a unit and its worktree."""
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeError):
-        return ()
+def document_units(path: Path, *,
+                   record: staff.StaffSnapshot | session_staff.ReadCurrentStaff = session_staff.ReadCurrentStaff.CURRENT) -> tuple[UnitWorktree, ...]:
+    """Read branch worktrees and report unavailable unit facts."""
     found: list[UnitWorktree] = []
-    in_units = False
-    headings: list[str] = []
-    for line in lines:
-        if line.strip() == "## Units":
-            in_units = True
-            continue
-        if not in_units:
-            continue
-        if line.startswith("## "):
-            break
-        if not line.lstrip().startswith("|"):
-            if headings:
-                break
-            continue
-        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
-        if not headings:
-            headings = cells
-            continue
-        if all(set(cell) <= {"-", ":", " "} for cell in cells):
-            continue
-        row = dict(zip(headings, cells, strict=False))
+    try:
+        record = staff.snapshot() if isinstance(record, session_staff.ReadCurrentStaff) else record
+        lines = path.read_text(encoding="utf-8").splitlines()
+        sources = unit_lookup.member_sources()
+        slug = unit_lookup.production_slug_for_document(path, record, sources)
+        rows = production_units.unit_table(lines)
+    except (OSError, UnicodeError, production_units.Refusal, staff.StaffRefused) as error:
+        print(f"usage: {path}: {error}", file=sys.stderr)
+        return ()
+    for row in rows:
         unit = outcomes.cell_value(row.get("Unit", ""))
-        worktree = outcomes.cell_value(row.get("Worktree", ""))
-        if unit and worktree:
-            found.append(UnitWorktree(unit, Path(worktree).expanduser()))
+        try:
+            selected = sources.member(staff_sources.UnitMember(slug, unit), record)
+            location = unit_lookup.local_worktree(selected)
+            if isinstance(location, staff.RemovedWorktree):
+                continue
+            found.append(UnitWorktree(unit, unit_lookup.plan_worktree(row, selected)))
+        except (staff.StaffUnreadable, staff.StaffRefused) as error:
+            print(f"usage: {unit}: {error}", file=sys.stderr)
     return tuple(found)
 
 
@@ -323,8 +315,13 @@ def longest_first(worktrees: Iterable[UnitWorktree]) -> tuple[UnitWorktree, ...]
 
 
 def unit_worktrees(production_docs: Path) -> tuple[UnitWorktree, ...]:
+    try:
+        record = staff.snapshot()
+    except staff.StaffUnreadable as error:
+        print(f"usage: {error}", file=sys.stderr)
+        return ()
     return longest_first(row for document in sorted(production_docs.glob("*-production.md"))
-                         for row in document_units(document))
+                         for row in document_units(document, record=record))
 
 
 def register_report_functions(db: sqlite3.Connection, worktrees: tuple[UnitWorktree, ...]) -> None:

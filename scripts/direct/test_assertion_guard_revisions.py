@@ -1,6 +1,9 @@
 """Check assertion-guard behavior against real Git repositories."""
 from __future__ import annotations
 
+from scripts.production import staff
+from scripts.production.staff_test_support import unit_membership, without_worktree_column
+
 import os
 import resource
 import subprocess
@@ -1298,15 +1301,29 @@ class DivergedBases(NamedTuple):
 class ProductionBaseTests(SeededGitRepositoryFixture):
     repo: Path = Path()
 
+    def test_plan_worktree_selects_the_base_when_the_director_runs_elsewhere(self) -> None:
+        tip = self.refill_from_production("builds")
+        document = self.register_production("builds")
+        _ = document.write_text(document.read_text().replace("`README.md`", f"`{self.repo}/README.md`"))
+        without_worktree_column(document)
+        director = self.root / "director"
+        director.mkdir()
+        member = unit_membership("fixture", "fixture")
+        _ = staff.set_worktree(member.id, staff.PresentWorktree("natedev", director))
+        self.assertEqual(commit_bases(self.repo, (), staged=False)[0], tip)
+
+
     def test_retired_production_rows_never_win_over_live_rows(self) -> None:
         tip = self.refill_from_production("builds")
-        retired = self.register_production("unit", slug="retired")
+        retired = self.register_production("unit", slug="retired", status="retired")
         live = self.register_production("builds", slug="live")
         for column, marker in (("Status", "retired"), ("Status", "removed 2026-10-06"),
                                ("Worktree", "removed 2026-10-06")):
             worktree = str(self.repo) if column == "Status" else marker
             status = marker if column == "Status" else "active"
             _ = self.register_production("unit", slug="retired", worktree=worktree, status=status)
+            row = unit_membership("retired", "fixture")
+            _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.repo))
             for docs in ((retired, live), (live, retired)):
                 with self.subTest(column=column, marker=marker, docs=docs):
                     with patch.object(showrunners, "timer_docs", return_value=dict(enumerate(docs))):
@@ -1319,6 +1336,8 @@ class ProductionBaseTests(SeededGitRepositoryFixture):
 
         _ = self.register_production("builds", slug="live")
         _ = self.register_production("unit", slug="retired", worktree_commentary="— retired 2026-10-06")
+        row = unit_membership("retired", "fixture")
+        _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.repo))
         for docs in ((retired, live), (live, retired)):
             with self.subTest(commentary="retired worktree", docs=docs):
                 with patch.object(showrunners, "timer_docs", return_value=dict(enumerate(docs))):

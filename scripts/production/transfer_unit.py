@@ -150,14 +150,6 @@ def build(from_slug: str, given: str, to_doc: Path, scratch: Path) -> UnitTransf
     if _row(receiving.doc, unit) is not None:
         raise RenameRefused(f"{unit} is already in the {receiving.slug} Units table")
     branch = production_units.cell_value(row.get("Branch", ""))
-    worktree = Path(production_units.cell_value(row.get("Worktree", ""))).expanduser()
-    if not (worktree / ".git").is_file():
-        raise RenameRefused(f"{unit}: no linked worktree at {worktree} on this machine; a Mac unit is not moved")
-    if _common_dir(worktree) != _common_dir(receiving.checkout):
-        raise RenameRefused(f"{receiving.slug} is in another repository; version one keeps the worktree, so it "
-                            + "moves a unit only between productions of one repository")
-    if git(worktree, "branch", "--show-current") != branch:
-        raise RenameRefused(f"{worktree} is not on {branch}")
     record = staff.snapshot()
     member = staff_sources.member(staff_sources.UnitMember(giving.slug, unit), record)
     if isinstance(member, staff_sources.NoSuchMember):
@@ -166,6 +158,14 @@ def build(from_slug: str, given: str, to_doc: Path, scratch: Path) -> UnitTransf
     parent = staff_sources.member(staff_sources.ShowrunnerMember(receiving.slug), record)
     if isinstance(member, staff_sources.NoSuchMember) or isinstance(parent, staff_sources.NoSuchMember):
         raise staff.StaffRefused(f"{giving.slug}/{unit} to {receiving.slug}: no matching staff row")
+    worktree = unit_lookup.plan_worktree(row, member)
+    if not (worktree / ".git").is_file():
+        raise RenameRefused(f"{unit}: no linked worktree at {worktree} on this machine; a Mac unit is not moved")
+    if _common_dir(worktree) != _common_dir(receiving.checkout):
+        raise RenameRefused(f"{receiving.slug} is in another repository; version one keeps the worktree, so it "
+                            + "moves a unit only between productions of one repository")
+    if git(worktree, "branch", "--show-current") != branch:
+        raise RenameRefused(f"{worktree} is not on {branch}")
     return UnitTransfer(giving.slug, receiving.slug, unit, str(giving.doc), str(receiving.doc),
                         str(giving.checkout), str(receiving.checkout), giving.merge_branch,
                         receiving.merge_branch, branch, str(worktree), row.get("Plan", ""),

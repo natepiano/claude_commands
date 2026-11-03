@@ -70,6 +70,17 @@ class UnitLookupTests(unittest.TestCase):
     records: Path = Path()
     environment: dict[str, str] = {}
 
+    def test_missing_absolute_plan_folder_cannot_select_an_ancestor_checkout(self) -> None:
+        repository = self.root / "repository"
+        repository.mkdir()
+        _ = subprocess.run(["git", "init", str(repository)], check=True, capture_output=True,
+                           timeout=TEST_HANG_GUARD_SECS)
+        row = unit_membership("show", "alpha-unit")
+        row = staff.set_worktree(row.id, staff.PresentWorktree("natedev", repository))
+        cells = {"Unit": "alpha-unit", "Plan": str(repository / "removed/docs/plan.md")}
+        with self.assertRaisesRegex(staff.StaffUnreadable, "Plan folder is missing"):
+            _ = unit_lookup.plan_worktree(cells, unit_lookup.MemberFound(row))
+
     def test_retirement_follows_the_retained_worktree_mark_and_restore_clears_it(self) -> None:
         row = unit_membership("show", "marked-unit")
         location = staff.PresentWorktree("natedev", self.root / "not-on-disk")

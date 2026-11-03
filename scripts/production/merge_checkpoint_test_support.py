@@ -46,7 +46,7 @@ def invoke_checkpoint(arguments: list[str], environment: dict[str, str], cwd: Pa
 
     def run(command: list[str], *, capture_output: bool = False, text: bool = False,
             check: bool = False, timeout: float | None = None, env: dict[str, str] | None = None,
-            cwd: Path | str | None = None, stdout: int | None = None,
+            cwd: Path | str | None = None, stdin: int | None = None, stdout: int | None = None,
             stderr: int | None = None, input: str | None = None) -> subprocess.CompletedProcess[str]:
         child_env = dict(os.environ) if env is None else env
         child_cwd = Path.cwd() if cwd is None else Path(cwd)
@@ -66,7 +66,7 @@ def invoke_checkpoint(arguments: list[str], environment: dict[str, str], cwd: Pa
         if script == Path(progress_history.__file__):
             return invoke_recorder(args, child_env, child_cwd)
         return real_run(command, capture_output=capture_output, text=text, check=check,
-                        timeout=timeout, env=env, cwd=cwd, stdout=stdout, stderr=stderr, input=input)
+                        timeout=timeout, env=env, cwd=cwd, stdin=stdin, stdout=stdout, stderr=stderr, input=input)
 
     with mock.patch.object(subprocess, "run", run), mock.patch.object(
         change_review, "LISTS", Path(environment["HOME"]) / "rust/hanadocs/change-review",
@@ -356,6 +356,11 @@ class MergeCheckpointFixture(unittest.TestCase):
         with isolated_staff_file(Path(self.env["STAFF_FILE"]), self.env):
             _ = fixture_member("showrunner", name="example")
         self.production_doc()
+        with isolated_staff_file(Path(self.env["STAFF_FILE"]), self.env):
+            owner = fixture_member("showrunner", name="example", doc=staff.LiveDoc("natedev", self.doc))
+            for name, folder in (("alpha", self.unit), ("beta", self.other)):
+                _ = fixture_member("unit", name=name, parent=owner.id,
+                                   worktree=staff.PresentWorktree("natedev", folder))
 
     def git(self, *args: str, cwd: Path | None = None) -> str:
         result = subprocess.run(["git", *args], cwd=cwd or self.checkout,
@@ -376,6 +381,8 @@ class MergeCheckpointFixture(unittest.TestCase):
     def production_doc(self, *, owns_cell: str = SIMPLE_OWNS,
                        merge_tests_line: str | None = SIMPLE_MERGE_TESTS,
                        hub_files: bool = True, change_review: Path | None = None) -> None:
+        for folder in (self.unit, self.other):
+            (folder / "docs/plans").mkdir(parents=True, exist_ok=True)
         rows = [
             "# Production — example", "", "## Production Context", "",
             f"- **Repository:** `{self.checkout}`",

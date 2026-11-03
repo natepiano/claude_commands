@@ -18,6 +18,8 @@ from unittest.mock import patch
 
 from scripts.usage import collect, outcomes, usage_report
 from scripts.whoami import worker_usage
+from scripts.production import staff
+from scripts.production.staff_test_support import isolated_staff_file, fixture_member
 from scripts.usage.test_collect import (
     CollectorFixture, FIXTURES as COLLECT_FIXTURES, MacRun, MacStreamReport, SshBehavior,
 )
@@ -110,6 +112,8 @@ class OutcomeFixture(CollectorFixture):
         self.history = self.root / ".local/state/plan-delegate/runs"
         self.repository = self.root / "fixture-repository"
         self.production_docs = self.root / "production-docs"
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        _ = (self.root / "staff.json").write_text('{"schema": 2, "rows": []}\n')
         _ = self.git(self.repository, "init", "--quiet")
 
     def git(self, repository: Path, *arguments: str, at: str = "2026-10-10T21:40:00Z") -> str:
@@ -212,18 +216,32 @@ class ProductionPathsTests(unittest.TestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         document = Path(directory.name) / "sample-production.md"
+        branch_worktree = Path(directory.name) / "worktree"
+        result = subprocess.run(
+            ["git", "init", "--quiet", str(branch_worktree)],
+            capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        plan = branch_worktree / "docs" / "plan.md"
+        plan.parent.mkdir()
+        _ = plan.write_text("# Unit plan\n", encoding="utf-8")
         _ = document.write_text(
             "".join((
-                "# Production\n\n- **Repository:** `/repo/main`\n\n",
-                "## Units\n\n| Unit | Worktree |\n| --- | --- |\n",
-                "| a | `/repo/worktree` |\n",
+                "# Production\n\n- **Repository:** `/repo/main`\n",
+                "- **Showrunner checkout:** `/repo/main`\n\n",
+                "## Units\n\n| Unit | Worktree | Plan |\n| --- | --- | --- |\n",
+                f"| a | `/wrong/cell` | `{plan}` |\n",
             )),
             encoding="utf-8",
         )
-        self.assertEqual(
-            outcomes.production_paths(document),
-            (Path("/repo/main"), Path("/repo/worktree")),
-        )
+        with isolated_staff_file(Path(directory.name) / "staff.json", {}):
+            owner = fixture_member("showrunner", name="sample", doc=staff.LiveDoc("natedev", document))
+            _ = fixture_member("unit", name="a", parent=owner.id,
+                               worktree=staff.PresentWorktree("natedev", Path("/director")))
+            self.assertEqual(
+                outcomes.production_paths(document),
+                (Path("/repo/main"), branch_worktree),
+            )
 
 
 class OutcomeTests(OutcomeFixture):
@@ -579,7 +597,12 @@ class OutcomeTests(OutcomeFixture):
     def test_removed_worktree_named_by_production_doc_leaves_checkpoints_ready(self) -> None:
         commit_id = self.commit("checkpoint(fixture-plan): phase 6 — Outcomes")
         _ = (self.production_docs / "fixture-production.md").write_text(
-            f"## Units\n\n| Worktree |\n| --- |\n| `{self.root / 'removed-worktree'}` |\n", encoding="utf-8")
+            "## Units\n\n| Unit | Plan | Worktree |\n| --- | --- | --- |\n"
+            + f"| retired-unit | docs/plan.md | `{self.root / 'removed-worktree'}` |\n", encoding="utf-8")
+        owner = fixture_member("showrunner", name="fixture",
+                               doc=staff.LiveDoc("natedev", self.production_docs / "fixture-production.md"))
+        _ = fixture_member("unit", name="retired", parent=owner.id,
+                           worktree=staff.RemovedWorktree("natedev", self.root / "removed-worktree"))
         output = self.collect()
         self.assert_family_state(output, "natedev", "checkpoints", "ready")
         self.assertEqual({cast(str, row["commit_id"]) for row in self.rows("SELECT * FROM checkpoints")}, {commit_id})
@@ -1026,6 +1049,18 @@ class MacOutcomeTests(OutcomeFixture):
         self.assert_family_state(missing.output, "mac", "history", "missing")
         self.assertEqual(self.all_values(self.rows(query)), complete)
         self.assertEqual(len(self.rows("SELECT * FROM runs WHERE machine = 'mac'")), 1)
+
+
+
+
+from scripts.production.staff_test_support import StaffTestCase, without_worktree_column
+
+
+class BranchRepositoryLocationTests(StaffTestCase):
+    def test_repository_discovery_uses_the_plan_worktree_without_the_worktree_column(self) -> None:
+        fixture = self.separated_unit_folders()
+        without_worktree_column(fixture.doc)
+        self.assertEqual(outcomes.production_paths(fixture.doc), (fixture.doc.parents[1], fixture.worktree))
 
 
 if __name__ == "__main__":

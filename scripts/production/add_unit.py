@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, NamedTuple, TypedDict, cast, override
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from scripts.production import staff, staff_sources, unit_config
+from scripts.production import staff, unit_lookup, staff_sources, unit_config, session_staff
 from scripts.shutdown import remote
 from scripts.lib import git_exclude
 
@@ -33,7 +33,6 @@ import autocompact
 import rename_state
 from scripts.production import showrunners
 import sessions
-import unit_lookup
 import unit_names
 from production_units import Production, Refusal, cell_value, plan_cell_is_retired, read_production, unit_rows, unit_headings, unit_table
 
@@ -325,7 +324,9 @@ def stub_plan(production: Production, branch: str) -> Path:
         raise Refusal("production doc must be inside Showrunner checkout") from error
 
 
-def launch_request(args: argparse.Namespace) -> RequestedUnitLaunch:
+def launch_request(args: argparse.Namespace, *,
+                   record: staff.StaffSnapshot | session_staff.ReadCurrentStaff = session_staff.ReadCurrentStaff.CURRENT) -> RequestedUnitLaunch:
+    record = staff.initial_snapshot() if isinstance(record, session_staff.ReadCurrentStaff) else record
     production = read_production(Path(cast(str, args.production)))
     try:
         # A name given as its unit id would get the suffix twice: feature-log-unit-unit.
@@ -340,7 +341,7 @@ def launch_request(args: argparse.Namespace) -> RequestedUnitLaunch:
     attached = cast(str | None, getattr(args, "attach", None))
     if (not any((given_plan is not None, given_brief is not None, standby, permanent))
             and (resumed is not None or attached is not None)):
-        member = checked_unit_member(production, unit_names.unit_id(name), staff.initial_snapshot())
+        member = checked_unit_member(production, unit_names.unit_id(name), record)
         if not isinstance(member, staff_sources.MemberFound) or not isinstance(member.row.worktree, staff.PresentWorktree):
             raise Refusal(f"unit {name}: resume needs a filled present worktree")
         if member.row.worktree.machine != remote.local_machine():
@@ -444,7 +445,8 @@ def desired_row(request: UnitLaunch, headings: list[str]) -> str:
     return "| " + " | ".join(cells.get(heading, "—") for heading in headings) + " |"
 
 
-def row_is_present(request: RequestedUnitLaunch, lines: list[str]) -> NoUnitRow | ExistingUnitRow:
+def row_is_present(request: RequestedUnitLaunch, lines: list[str],
+                   record: staff.StaffSnapshot) -> NoUnitRow | ExistingUnitRow:
     # A restore creates no worktree or branch, so the naming pattern behind `request.worktree` and
     # `request.branch` neither reserves them against other rows nor has to match the unit's own row.
     restoring = isinstance(request.launch_kind, UnitRestoreLaunch)
@@ -460,12 +462,25 @@ def row_is_present(request: RequestedUnitLaunch, lines: list[str]) -> NoUnitRow 
                         and isinstance(request.session, ResumedSession)
                         and isinstance(request.session.handoff, ResumeStoppedSession)):
                     fields["Plan"] = cell_value(re.sub(r"^\s*\(retired [^)]*\)\s*", "", cells["Plan"]))
-                matching.append(ExistingUnitRow(fields["Plan"], fields["Worktree"], fields["Branch"],
+                member = staff_sources.member(
+                    staff_sources.UnitMember(request.production.slug, request.unit), record)
+                if isinstance(member, staff_sources.NoSuchMember) and isinstance(request.session, NewSession) and not restoring:
+                    worktree = request.worktree
+                else:
+                    worktree = unit_lookup.local_worktree(member).path
+                matching.append(ExistingUnitRow(fields["Plan"], str(worktree), fields["Branch"],
                                                 fields["Port"], fields["Owns"], state))
             except KeyError as error:
                 raise Refusal(f"unit {request.unit} has an invalid Units row") from error
-        elif not restoring and (fields.get("Worktree") == str(request.worktree)
-                                or fields.get("Branch") == request.branch):
+        elif not restoring:
+            other = staff_sources.member(staff_sources.UnitMember(request.production.slug, fields.get("Unit", "")), record)
+            if fields.get("Branch") == request.branch:
+                raise Refusal(f"branch or worktree for {request.unit} is already used in Units table")
+            if isinstance(other, staff_sources.NoSuchMember):
+                continue
+            location = unit_lookup.local_worktree(other)
+            if location.path != request.worktree:
+                continue
             raise Refusal(f"branch or worktree for {request.unit} is already used in Units table")
     if len(matching) > 1:
         raise Refusal(f"unit name {request.unit} is already taken in Units table")
@@ -553,7 +568,8 @@ def _is_excluded_standing_plan(production: Production, plan: Path) -> bool:
             and git(production, "check-ignore", "-q", "--", plan.as_posix(), check=False).returncode == 0)
 
 
-def preflight(request: RequestedUnitLaunch, selected: ClaudeLaunchAccount) -> ReadyToLaunch:
+def preflight(request: RequestedUnitLaunch, selected: ClaudeLaunchAccount, *,
+              record: staff.StaffSnapshot | session_staff.ReadCurrentStaff = session_staff.ReadCurrentStaff.CURRENT) -> ReadyToLaunch:
     from scripts.accounts.accounts import trust_command
     from scripts.herdr.herdr import Untrusted, UnreadableTrustFile, claude_trust, repository_trust_key
 
@@ -575,7 +591,8 @@ def preflight(request: RequestedUnitLaunch, selected: ClaudeLaunchAccount) -> Re
             raise Refusal(f"session {session_id} already runs as pid {observed.pid}; "
                           + f"to make it this unit, run add_unit with --attach {session_id}")
     production = request.production
-    member = checked_unit_member(production, request.unit, staff.initial_snapshot())
+    record = staff.initial_snapshot() if isinstance(record, session_staff.ReadCurrentStaff) else record
+    member = checked_unit_member(production, request.unit, record)
     branch = git(production, "branch", "--show-current").stdout.strip()
     if branch != production.merge_branch:
         raise Refusal(f"Showrunner checkout is not on {production.merge_branch}")
@@ -586,7 +603,7 @@ def preflight(request: RequestedUnitLaunch, selected: ClaudeLaunchAccount) -> Re
     except ValueError as error:
         raise Refusal("production doc must be inside Showrunner checkout") from error
     lines = production.doc.read_text(encoding="utf-8").splitlines()
-    existing = row_is_present(request, lines)
+    existing = row_is_present(request, lines, record)
     restoring = isinstance(request.launch_kind, UnitRestoreLaunch)
     plan_context: ProductionPlanRequired | ExistingConversationPlan = ProductionPlanRequired()
     if (not restoring and isinstance(existing, ExistingUnitRow)
@@ -605,7 +622,7 @@ def preflight(request: RequestedUnitLaunch, selected: ClaudeLaunchAccount) -> Re
                     and isinstance(request.session.handoff, ResumeStoppedSession)):
                 request = replace(request, launch_kind=ResumeInStartFolderLaunch())
             elif not resuming_opening:
-                raise Refusal(f"unit {request.unit} resumes in {request.session.cwd}; its Units row names {existing.worktree}")
+                raise Refusal(f"unit {request.unit} resumes in {request.session.cwd}; its staff row names {existing.worktree}")
         request = replace(request, worktree=Path(existing.worktree), branch=existing.branch)
     launch = UnitLaunch(
         production=request.production,
@@ -1358,7 +1375,11 @@ def scheduled_location(request: UnitLaunch, member: staff_sources.MemberFound | 
     location = member.row.worktree
     if location.machine != remote.local_machine() or location.path != request.worktree.resolve():
         raise Refusal(f"unit {request.unit_id}: scheduled restore worktree conflicts with staff row")
-    if not worktree_on_branch(request):
+    try:
+        present = worktree_on_branch(request)
+    except Refusal as error:
+        raise Refusal(f"unit {request.unit_id}: scheduled restore worktree conflicts with staff row: {error}") from error
+    if not present:
         raise Refusal(f"unit {request.unit_id}: scheduled restore worktree is missing")
     return location
 
@@ -1375,31 +1396,34 @@ class UnitMembershipPublished:
     row: staff.StaffRow
 
 
-def admit_unit(request: UnitLaunch) -> UnitAdmissionPending | UnitMembershipPublished:
+def admit_unit(request: UnitLaunch, *,
+               record: staff.StaffSnapshot | session_staff.ReadCurrentStaff = session_staff.ReadCurrentStaff.CURRENT) -> UnitAdmissionPending | UnitMembershipPublished:
     """Create the actual worktree before the row, then publish the checked config."""
+    record = staff.initial_snapshot() if isinstance(record, session_staff.ReadCurrentStaff) else record
     config = configuration_for(request)
     if isinstance(request.launch_kind, UnitRestoreLaunch):
-        member = staff_sources.member(staff_sources.ObservedUnit(request.unit_id), staff.initial_snapshot())
+        member = staff_sources.member(staff_sources.ObservedUnit(request.unit_id), record)
         location = scheduled_location(request, member)
     else:
         ensure_worktree(request)
         location = staff.PresentWorktree(remote.local_machine(), request.worktree.resolve())
     git_exclude.require_untracked_ignored(request.worktree, ".unit.toml", planned_pattern="/.unit.toml")
-    selected = checked_unit_member(request.production, request.unit_id, staff.initial_snapshot())
+    selected = checked_unit_member(request.production, request.unit_id, record)
     row = selected.row if isinstance(selected, staff_sources.MemberFound) else None
     if row is not None:
-        row = ensure_staff_unit(request.production, request.unit_id, worktree=location,
+        row = ensure_staff_unit(request.production, request.unit_id, worktree=location, record=record,
                                 runtime_id=request.session.session_id if isinstance(request.session, ResumedSession) else "")
     _ = unit_config.write(request.worktree, config)
     return UnitMembershipPublished(row) if row is not None else UnitAdmissionPending()
 
 
-def publish_unit(ready: ReadyToLaunch) -> UnitAdmissionPending | UnitMembershipPublished:
+def publish_unit(ready: ReadyToLaunch, *,
+                 record: staff.StaffSnapshot | session_staff.ReadCurrentStaff = session_staff.ReadCurrentStaff.CURRENT) -> UnitAdmissionPending | UnitMembershipPublished:
     """Admit the actual worktree before publishing its Units row."""
     request = ready.launch
     before = git(request.production, "rev-parse", request.production.merge_branch).stdout.strip()
     pending = opening_record(request.production, request.unit_id).parent.parent / "add-unit-admissions" / f"{request.unit_id}.base"
-    publication = admit_unit(request)
+    publication = admit_unit(request, record=record)
     if (not pending.exists() and not isinstance(request.launch_kind, (UnitRestoreLaunch, ResumeInStartFolderLaunch))
             and (isinstance(ready.row, NoUnitRow) or isinstance(ready.plan_transition, BriefToPlanTransition))
             and git(request.production, "-C", str(request.worktree), "rev-parse", "HEAD").stdout.strip() == before):
@@ -1440,9 +1464,10 @@ def checked_unit_member(production: Production, unit: str,
 
 def ensure_staff_unit(production: Production, unit: str, *,
                       worktree: staff.PresentWorktree | staff.WorktreeUnfilled = staff.WORKTREE_UNFILLED,
-                      runtime_id: str = "") -> staff.StaffRow:
+                      runtime_id: str = "",
+                      record: staff.StaffSnapshot | session_staff.ReadCurrentStaff = session_staff.ReadCurrentStaff.CURRENT) -> staff.StaffRow:
     """Admit a unit with its location; only resume_unit reactivates a removed row."""
-    record = staff.initial_snapshot()
+    record = staff.initial_snapshot() if isinstance(record, session_staff.ReadCurrentStaff) else record
     found = checked_unit_member(production, unit, record)
     if isinstance(found, staff_sources.MemberFound):
         if runtime_id and found.row.current_session != staff.native_id(runtime_id):
@@ -1484,7 +1509,8 @@ def _main(argv: list[str]) -> int:
     args = parser.parse_args(argv)
     import herdr
     try:
-        request = launch_request(args)
+        identity_record = staff.initial_snapshot()
+        request = launch_request(args, record=identity_record)
         explicit_autocompact = cast(str, args.autocompact)
         if (explicit_autocompact and isinstance(request.session, ResumedSession)
                 and isinstance(request.session.handoff, ResumeStoppedSession)
@@ -1512,7 +1538,7 @@ def _main(argv: list[str]) -> int:
         if isinstance(request.session, ResumedSession) and isinstance(request.session.handoff, AttachRunningSession):
             # Release the launch barrier before stopping the source process.
             with launch_permission.launch_barrier():
-                attach_ready = preflight(request, unit_account)
+                attach_ready = preflight(request, unit_account, record=identity_record)
             source = attach_ready.handoff
             if cast(bool, args.check):
                 return 0
@@ -1527,7 +1553,7 @@ def _main(argv: list[str]) -> int:
         with launch_permission.admitted_launch(named_claude_account(unit_account.label).login,
                 request.session.session_id if isinstance(request.session, ResumedSession) else "",
                 request.unit_id, lambda: None):
-            ready = preflight(request, unit_account)
+            ready = preflight(request, unit_account, record=identity_record)
             request = ready.launch
             if cast(bool, args.check):
                 return 0
@@ -1559,7 +1585,7 @@ def _main(argv: list[str]) -> int:
                 if isinstance(ready.plan_transition, BriefToPlanTransition):
                     raise Refusal(f"unit {request.identity.unit} runs its brief in session {marked_unit.unit.place.session}; "
                                   + f"end that session, then run {retry}")
-            _ = publish_unit(ready)
+            _ = publish_unit(ready, record=identity_record)
             if isinstance(stopped_tab, MarkedUnitFound):
                 place = stopped_tab.unit.place
                 try:

@@ -14,7 +14,7 @@ import tempfile
 from pathlib import Path
 from typing import ClassVar, Literal, cast, override
 from unittest import mock
-from collections.abc import Callable, Generator, Sequence
+from collections.abc import Callable, Generator, Sequence, Mapping
 from contextlib import AbstractContextManager, ExitStack, contextmanager
 from types import SimpleNamespace
 
@@ -492,7 +492,11 @@ def stop_at_staff_write(verb: Literal["rename", "move"], *, after: bool) -> Gene
         yield
 
 
-def bind_staff_fixture(case: StaffTestCase, environment: dict[str, str], members: dict[str, tuple[str, ...]]) -> None:
+EMPTY_LOCATIONS: Mapping[tuple[str, str], Path] = {}
+
+
+def bind_staff_fixture(case: StaffTestCase, environment: dict[str, str], members: dict[str, tuple[str, ...]],
+                       *, locations: Mapping[tuple[str, str], Path] = EMPTY_LOCATIONS) -> None:
     """Bind legacy source fixtures to the one staff fixture and seed their members."""
     case.staff_file = case.root / "state/staff/staff.json"
     environment.update(STAFF_FILE=str(case.staff_file), STAFF_TEST_OWNER_FILE=str(case.staff_file))
@@ -535,10 +539,9 @@ def bind_staff_fixture(case: StaffTestCase, environment: dict[str, str], members
             for unit in units:
                 name = unit_names.name(unit)
                 cells = cells_by_name[name]
-                tree = Path(production_units.cell_value(cells["Worktree"])).expanduser()
+                tree = locations[(slug, unit)]
                 _ = fixture_member("unit", name=name, parent=row.id,
-                                   worktree=(staff.PresentWorktree(remote.local_machine(), tree)
-                                             if tree.is_dir() else staff.WorktreeUnfilled()))
+                                   worktree=staff.PresentWorktree(remote.local_machine(), tree))
                 if not tree.is_dir():
                     continue
                 plan = production_units.cell_value(cells["Plan"])
@@ -592,7 +595,8 @@ class ProductionRenameFixture(StaffTestCase):
         self.addCleanup(shutil.rmtree, self.fixture_root)
         self.bind_fixture(self.fixture_root)
         self.old_tip = self.fixture_tip
-        bind_staff_fixture(self, self.env, {OLD: UNITS})
+        bind_staff_fixture(self, self.env, {OLD: UNITS},
+                           locations={(OLD, unit): self.worktrees / unit for unit in UNITS})
         production = next(row for row in staff.find(kind="showrunner") if row.name == OLD)
         _ = fixture_member("showrunner", name="child", parent=production.id)
 

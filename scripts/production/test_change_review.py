@@ -1058,6 +1058,9 @@ class ProductionMergeCommitsTest(unittest.TestCase):
         self.assertEqual([item.split()[0] for item in change_review.missing(commits)], [self.foreign[:8]])
 
 
+from scripts.production.staff_test_support import recorded_unit
+
+
 class RepositoryTest(unittest.TestCase):
     """A unit branch with its own checkpoints and a merge from the merge branch."""
 
@@ -1082,6 +1085,7 @@ class RepositoryTest(unittest.TestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.repo = Path(directory.name)
+        _ = self.enterContext(isolated_staff_file(self.repo / "staff.json", {}))
         _ = self.git("init", "-q", "-b", "merge")
         self.previous = self.commit("base.py", "checkpoint(u): base\n\nChange-Review: none — base")
         _ = self.git("checkout", "-q", "-b", "unit")
@@ -1209,6 +1213,7 @@ class RepositoryTest(unittest.TestCase):
                             + "| C3 | no hash | 2026-10-15 | x |\n\n"
                             + "## Reviewed\n\n| # | Change | Verdict | Date |\n| --- | --- | --- | --- |\n", encoding="utf-8")
         before = path.read_text(encoding="utf-8")
+        _ = recorded_unit("kid", "u-unit", self.repo, kid, plan="docs/u-plan.md")
         tree = change_review.Tree([top, kid])
         expected = ({"C1": "kid", "C2": "top"}, {"C3": "no merge hash"})
         self.assertEqual(change_review.backfill(path, tree, write=False), expected)
@@ -1246,8 +1251,23 @@ class RepositoryTest(unittest.TestCase):
         _ = top.write_text("## Units\n\n", encoding="utf-8")
         commits = [change_review.Commit("1", "checkpoint(u-plan): grid", f"checkpoint(u-plan): grid\n\n{SEE}", ()),
                    change_review.Commit("2", "checkpoint(own): grid", f"checkpoint(own): grid\n\n{SEE}", ())]
+        _ = recorded_unit("kid", "u-unit", self.repo, kid, plan="docs/u-plan.md")
         with mock.patch.object(change_review, "owner_docs", return_value=[top, kid]):
             self.assertEqual(change_review.visible_owners(commits, top), [top, kid])
+
+
+
+
+from scripts.production.staff_test_support import StaffTestCase, without_worktree_column
+
+
+class BranchOwnerLocationTests(StaffTestCase):
+    def test_checkpoint_folder_alias_uses_the_plan_worktree_without_the_worktree_column(self) -> None:
+        fixture = self.separated_unit_folders()
+        without_worktree_column(fixture.doc)
+        owners = change_review.unit_branches([fixture.doc])
+        self.assertEqual(owners[fixture.worktree.name], fixture.doc)
+        self.assertNotIn("director", owners)
 
 
 if __name__ == "__main__":
