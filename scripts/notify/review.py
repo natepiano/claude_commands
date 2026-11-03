@@ -653,9 +653,7 @@ def reviewer_environment() -> tuple[dict[str, str], str]:
     for key in ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "CLAUDE_CONFIG_DIR"):
         _ = environment.pop(key, None)
     selected = accounts.role_account("unit")
-    prepared = accounts.prepared_account(selected.label, resume=False)
-    if isinstance(prepared, accounts.AccountRefused):
-        raise accounts.AccountsError(prepared.reason)
+    prepared = accounts.prepare_claude_launch(selected.label, resume=False)
     for name in prepared.remove:
         _ = environment.pop(name, None)
     environment.update(prepared.variables)
