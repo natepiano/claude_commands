@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, BinaryIO, TypeVar, cast
 from urllib.parse import parse_qs, unquote, urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib import conf
 from scripts.production import change_routing
 from scripts.review_links import change_page, change_browser
 from scripts.review_links.review_link import private_name
@@ -32,11 +33,6 @@ else:
         """Keep override annotations usable on Python 3.11."""
         return method
 
-PORT = 8765
-RETENTION_SECONDS = 7 * 24 * 60 * 60
-SWEEP_SECONDS = 60 * 60
-TAILSCALE_CHECK_SECONDS = 60
-
 
 class TailscaleAddressLost(RuntimeError):
     """The server's bound address is no longer this machine's Tailscale address."""
@@ -44,12 +40,13 @@ class TailscaleAddressLost(RuntimeError):
 
 def tailscale_ip() -> str:
     result = subprocess.run(["tailscale", "ip", "-4"], capture_output=True,
-                            text=True, check=True, timeout=10)
+                            text=True, check=True, timeout=conf.read("review_links").number("tailscale_timeout_seconds"))
     return str(ipaddress.IPv4Address(result.stdout.strip()))
 
 
 def sweep_snapshots(root: Path, now: float) -> int:
     """Expire flat snapshots and legacy session snapshots without following symlinks."""
+    retention = conf.read("review_links").number("snapshot_retention_seconds")
     removed = 0
     if not root.exists():
         return removed
@@ -75,7 +72,7 @@ def sweep_snapshots(root: Path, now: float) -> int:
             try:
                 if folder.is_symlink() or not folder.is_dir():
                     continue
-                if folder.stat().st_mtime < now - RETENTION_SECONDS:
+                if folder.stat().st_mtime < now - retention:
                     shutil.rmtree(folder)
                     removed += 1
             except FileNotFoundError:
@@ -296,11 +293,12 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
 
 class ReviewLinksServer(ThreadingHTTPServer):
     def __init__(self, address: tuple[str, int], root: Path) -> None:
+        settings = conf.read("review_links")
         self.root: Path = root.resolve()
         self.bound_address: str = address[0]
         self.delivery_status: change_page.DeliveryStatus = change_page.DeliveryStatus(self.root)
-        self.next_tailscale_check: float = time.monotonic() + TAILSCALE_CHECK_SECONDS
-        self.next_sweep: float = time.monotonic() + SWEEP_SECONDS
+        self.next_tailscale_check: float = time.monotonic() + settings.number("tailscale_check_seconds")
+        self.next_sweep: float = time.monotonic() + settings.number("snapshot_sweep_seconds")
         _ = sweep_snapshots(self.root, time.time())
         super().__init__(address, ReviewLinksHandler)
         threading.Thread(target=change_page.recover_pending, args=(self.delivery_status,), daemon=True).start()
@@ -309,7 +307,8 @@ class ReviewLinksServer(ThreadingHTTPServer):
     def service_actions(self) -> None:
         now = time.monotonic()
         if now >= self.next_tailscale_check:
-            self.next_tailscale_check = now + TAILSCALE_CHECK_SECONDS
+            settings = conf.read("review_links")
+            self.next_tailscale_check = now + settings.number("tailscale_check_seconds")
             try:
                 address = tailscale_ip()
             except (OSError, ValueError, subprocess.SubprocessError) as error:
@@ -317,7 +316,8 @@ class ReviewLinksServer(ThreadingHTTPServer):
             if address != self.bound_address:
                 raise TailscaleAddressLost(f"tailscale address changed (was {self.bound_address}, now {address})")
         if time.monotonic() >= self.next_sweep:
-            self.next_sweep = time.monotonic() + SWEEP_SECONDS
+            settings = conf.read("review_links")
+            self.next_sweep = time.monotonic() + settings.number("snapshot_sweep_seconds")
             try:
                 _ = sweep_snapshots(self.root, time.time())
             except OSError as error:
@@ -326,7 +326,7 @@ class ReviewLinksServer(ThreadingHTTPServer):
 
 def main(arguments: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    _ = parser.add_argument("--port", type=int, default=PORT, help="test port; service uses 8765")
+    _ = parser.add_argument("--port", type=int, default=conf.read("review_links").whole("server_port"), help="override the configured server port")
     args = parser.parse_args(arguments)
     try:
         address = tailscale_ip()
