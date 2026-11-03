@@ -1778,6 +1778,7 @@ route_compiling_step() {
 }
 
 step_stopped_by_hold() {
+    (( status > 128 )) || return 1
     local admission=0
     env -u BUILDLOG_CALL_ID "$PY" "$STEP_RECORD_SCRIPT" stopped --call-id "$BUILDLOG_CALL_ID" \
         --consumed "$HOLD_WAIT_DIR/stops" || admission=$?

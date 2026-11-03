@@ -1338,7 +1338,7 @@ The user asked for a better name than `hanas`. The builds showrunner chose `hana
 
 **Acceptance:** the `hana_instances`, folder-audit and `mac_run` suites pass; basedpyright is clean on the changed Python files; `git grep -w hanas` finds no live use. The Mac runs `mac_run.sh`'s `stop-checkout` from its own `~/.claude` checkout, so the rename works there only after the Mac takes the same main.
 
-### Phase 49 — A hold that starts during a merge gate stops whole test modules, so the gate runs them again after the release  · status: todo
+### Phase 49 — A hold that starts during a merge gate stops whole test modules, so the gate runs them again after the release  · status: done
 
 #### Work Order
 
