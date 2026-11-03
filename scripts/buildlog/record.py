@@ -89,6 +89,12 @@ else:
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
 import memory_admit
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+if TYPE_CHECKING:
+    from ..aws_target.config import MeasurementUnavailable
+else:
+    from scripts.aws_target.config import MeasurementUnavailable
 import conf
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "build_targets"))
@@ -135,6 +141,34 @@ def configured_targets() -> tuple[str, ...]:
 def local_targets() -> tuple[str, ...]:
     return tuple(target.name for target in read_targets() if isinstance(target, LocalTarget))
 
+
+
+@dataclass(frozen=True)
+class LocalStepIdentity:
+    targets: tuple[str, ...]
+    hosts: tuple[str, ...]
+
+
+def local_step_identity(targets: tuple[str, ...] = ()) -> LocalStepIdentity:
+    configured = targets or local_targets()
+    hosts = tuple(dict.fromkeys(alias for name in configured for alias in target_hosts(name)))
+    return LocalStepIdentity(configured, hosts)
+
+
+NONLOCAL_STEP_CALLERS = ('verify-linux',)
+
+
+def is_local_step(target: object, host: object, caller: object, *,
+                  targets: tuple[str, ...] = (), hosts: tuple[str, ...] = ()) -> bool:
+    """Use explicit target identity before legacy host identity."""
+    if caller in NONLOCAL_STEP_CALLERS:
+        return False
+    identity = LocalStepIdentity(targets, hosts) if targets and hosts else local_step_identity(targets)
+    configured = targets or identity.targets
+    if target:
+        return target in configured
+    aliases = hosts or identity.hosts
+    return host in aliases
 
 def synchronized_hosts() -> tuple[str, ...]:
     values = sync_config()
@@ -1024,6 +1058,41 @@ def ssh_attempt(attempt: SshAttempt) -> None:
         "at": store.utc_iso(at),
     })
 
+
+
+@dataclass(frozen=True)
+class AttemptResult:
+    repo_identity: str
+    slot: int
+    outcome: str
+    completion: str
+    cleanup: str
+    unresolved_count: int | MeasurementUnavailable
+    evidence_at: float
+
+
+def read_attempt_results(target: str) -> tuple[AttemptResult, ...]:
+    """Read the latest repository slot results from host month files."""
+    latest: dict[tuple[str, int], AttemptResult] = {}
+    for path in sorted(store.root().glob('*/[0-9][0-9][0-9][0-9]-[0-9][0-9].jsonl')):
+        with path.open('rb') as handle:
+            fcntl.flock(handle, fcntl.LOCK_SH)
+            for row in store.whole_rows(handle, 0):
+                if row.get('kind') != 'ssh_attempt' or row.get('target') != target:
+                    continue
+                count = row.get('unresolved_count')
+                at = float(str(row.get('evidence_at')))
+                slot = int(str(row.get('slot')))
+                if not math.isfinite(at) or at < 0 or slot < 0:
+                    raise ValueError('invalid attempt evidence')
+                result = AttemptResult(str(row.get('repo_identity', 'unknown')), slot,
+                                       str(row.get('outcome', 'unavailable')), str(row.get('completion', 'missing')),
+                                       str(row.get('cleanup', 'unconfirmed')),
+                                       count if type(count) is int and count >= 0 else MeasurementUnavailable('process count is unavailable'), at)
+                key = result.repo_identity, result.slot
+                if key not in latest or latest[key].evidence_at <= at:
+                    latest[key] = result
+    return tuple(latest[key] for key in sorted(latest))
 
 def hold_event(args: list[str]) -> None:
     event, target, key, holder, reason, at = args[:6]

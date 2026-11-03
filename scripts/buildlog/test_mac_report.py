@@ -248,6 +248,29 @@ class MacReportTests(unittest.TestCase):
                         tree_key="linux-tree"))
         self.assertIn("Mac failures with a natedev pass of the same tree: 1 recorded", self.report())
 
+    def test_explicit_targets_override_host_aliases_and_legacy_mac_rows_keep_their_evidence(self) -> None:
+        self.write(
+            self.mac_call("mac-failed", "failed"),
+            step("mac-failed-step", started_at=START, call_id="mac-failed", host="Mac",
+                 target="mac", caller="verify-mac", step="nextest", status=1, tree_key="shared-tree"),
+            self.mac_call("aws", "", target="aws"),
+            step("aws-step", started_at=START, call_id="aws", host="natedev",
+                 target="aws", caller="verify-linux", step="nextest", status=0, tree_key="aws-tree"),
+            self.mac_call("local", "declined", "local_flag", target="natedev"),
+            step("local-step", started_at=START, call_id="local", host="Mac",
+                 target="natedev", caller="verify", step="nextest", status=0, tree_key="shared-tree"),
+            self.mac_call("legacy-mac"),
+            step("legacy-step", started_at=START, call_id="legacy-mac", host="Mac",
+                 caller="verify-mac", step="nextest", status=0, tree_key="legacy-tree"),
+        )
+        _ = index.update()
+        with closing(index.read_only()) as connection:
+            evidence = mac_report.read_test_tree_evidence(connection, START, END)
+        self.assertEqual(evidence.passing_natedev_trees,
+                         {mac_report.TestSelectionTree("hana", "test hana", "shared-tree")})
+        self.assertEqual(set(evidence.keyed_mac_calls), {"mac-failed", "legacy-mac"})
+        self.assertIn("Mac failures with a natedev pass of the same tree: 1 recorded", self.report())
+
     def record_sent_mac_step(self, call_id: str, sent_key: str) -> None:
         mirror = self.root.parent / "mac-mirror"
         mirror.mkdir()
