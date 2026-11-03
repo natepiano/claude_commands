@@ -99,8 +99,8 @@ Direct starts outside the desktop (`herdr_sessions.py start` and `resume`) refus
   1. Refuse outside the Mac desktop.
   2. Resolve the folder and validate the name.
   3. Pick the account with `accounts.account_for_unscoped_launch`. A `LegacyHomeLaunch` uses `~/.claude.json` and unsets the named-account variables. Otherwise the pane gets `named_account_environment(dir)`.
-  4. Check trust.
-  5. Take `launch_permission.launch_barrier()` and `launch_permission(...)` with `NewWorkLaunchPurpose`, or `RecordedSessionRestoreLaunchPurpose(session_id)` under `--restore`.
+  4. Check Claude folder trust. Print an anomaly if trust is absent or unreadable. Continue the launch.
+  5. Launch without a shutdown hold or admission claim.
   6. Run `start_server(agents, 90_000)`, and refuse when `server_environment` holds `CLAUDE_CODE_OAUTH_TOKEN` (or the named-account variables for a legacy home), since a new tab inherits it.
   7. Open a tab in a workspace with the tab name (`open_tab`). Refuse a supplied `--name` when an open tab already uses it. Otherwise, generate a name with `generated_session_name(<folder>, "1")`. Increase the suffix until the name is free.
   8. Run `start_agent` with `[--resume ID] -n <name>` and an `OpeningPrompt` from `--prompt-file`, else `NoOpeningPrompt`.
@@ -163,7 +163,7 @@ Before starting the agent, add_unit saves its exact opening, conversation id, ac
 
 `add_unit.main` does this:
 
-- It picks the account with `accounts.account_for_group_launch("unit", ...)`, checks it with `accounts.check`, and takes the launch barrier and permission (`RecordedSessionRestoreLaunchPurpose` for a restore). Then it runs `preflight`.
+- Select the account and run preflight. Launch without a shutdown hold or admission claim.
 - Every `--resume`, including restores, refuses in `preflight` before any stub, Units row, commit, worktree or tab is written when the shared session registry identifies a running session (naming its pid), or when registry or process identity is unreadable (naming the reason).
 - A plain `--resume` of an existing Units row, active or retired, continues its transcript without requiring a Production header in the row’s own plan document, so a condensed as-built remains usable; new units and attaches still require the header, and a resume with a different plan still refuses.
 - A plain `--resume` of a retired Units row may use `--cwd` outside its worktree: the raw Plan cell supplies the retired state, the row keeps its worktree and branch, and the launch creates neither and leaves the row for resume_unit to unmark; other cwd mismatches retain their refusal.
@@ -196,7 +196,7 @@ Before starting the agent, add_unit saves its exact opening, conversation id, ac
   - Ghostty and Zed hosts, and a Mac `terminal` host, restart into `SharedHerdrTab`. For a Ghostty or Mac `terminal` host, a live supervisor then runs `herdr session attach <shared>` in the same window; a Zed host, or one whose supervisor is gone, gets a new window unless a client is already attached.
 - **`_herdr_launch` steps.**
   1. Build the environment: a `MoveResumeAccount` takes `prepared_account(target, resume=True)` and refuses `AccountRefused`; a retained account takes `named_account_environment(config_dir)`.
-  2. Check trust (`_heal_folder_trust`, also before the dry-run preview). `herdr.heal_claude_trust(folder, target, sources, dry_run=)` returns `Trusted`, `TrustCopied(folder, account_file, source)`, `Untrusted` or `UnreadableTrustFile`. `accounts.trust_sources(target_dir, source_dir)` lists the session's own source account first, then every numbered account. A copy (`copy_claude_trust`, one key) prints `<name>: copied folder trust for <folder> from <label> to <target>`, and a dry run prints `would copy` and writes nothing. With no trusting account, `FolderNotTrusted` (an `OSError` carrying `command`) refuses the launch; the dry run prints the same `restart failed` line, and the record saves `trust_command` for the `shutdown.restart_untrusted` push.
+  2. Copy existing Claude folder trust from another account. An untrusted folder or unreadable trust file prints one anomaly line. The launch continues.
   3. Call `restore_server(name, 90_000, session_kind=...)`.
   4. Refuse when `server_environment` holds `CLAUDE_CODE_OAUTH_TOKEN` or a `prepared.remove` name.
   5. Refuse a live agent in the recorded pane. A recorded pane left at its shell is closed; one running a command is left open, with a printed line, because the session resumes in a new tab.

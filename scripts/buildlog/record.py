@@ -106,7 +106,15 @@ if TYPE_CHECKING:
     import sample
 
 
+class RecordedCall(Protocol):
+    call_id: str
+
+
 class AdmissionMetadata(Protocol):
+    Call: object
+    CallRecord: type[RecordedCall]
+
+    def parse_snapshot_value(self, value: object, schema: object) -> object: ...
     def test_threads(self, argv: list[str]) -> int | None: ...
     def recorded_repository_key(self, argv: list[str], cwd: str) -> str: ...
 
@@ -149,7 +157,6 @@ def configured_targets() -> tuple[str, ...]:
 
 def local_targets() -> tuple[str, ...]:
     return tuple(target.name for target in read_targets() if isinstance(target, LocalTarget))
-
 
 
 @dataclass(frozen=True)
@@ -343,7 +350,7 @@ def write_launch_line(record_data: Mapping[str, object]) -> bool:
     return True
 
 
-def pending_launches_root() -> Path:
+def pending_launch_root() -> Path:
     return store.root() / "pending-launches"
 
 
@@ -366,7 +373,7 @@ def _save_pending_record(path: Path, fields: Mapping[str, object], *, replace_ex
 
 
 def _pending_launch_path(row: LaunchStep) -> Path:
-    return pending_launches_root() / _launch_row_path(row).with_suffix(".json").name
+    return pending_launch_root() / _launch_row_path(row).with_suffix(".json").name
 
 
 def _save_pending_launch(row: LaunchStep) -> Path:
@@ -619,8 +626,9 @@ def test_phase_context(sampling_context: str, argv: list[str]) -> dict[str, obje
     fields = cast(dict[str, object], loaded)
     call = fields.get("call_id")
     if isinstance(call, dict):
-        recorded_call = memory_admit.parse_snapshot_value(cast(dict[str, object], call), memory_admit.Call)
-        fields["call_id"] = recorded_call.call_id if isinstance(recorded_call, memory_admit.CallRecord) else None
+        metadata = admission_metadata()
+        recorded_call = metadata.parse_snapshot_value(cast(dict[str, object], call), metadata.Call)
+        fields["call_id"] = recorded_call.call_id if isinstance(recorded_call, metadata.CallRecord) else None
     # Admission's parser returns the first width. Supplying nextest's environment
     # default last preserves an explicit flag, including a nonnumeric one.
     width_argv = argv
@@ -1070,7 +1078,6 @@ def ssh_attempt(attempt: SshAttempt) -> None:
         "id": f"{host}-{time.time_ns()}-{secrets.token_hex(4)}", "host": host,
         "at": store.utc_iso(at),
     })
-
 
 
 @dataclass(frozen=True)

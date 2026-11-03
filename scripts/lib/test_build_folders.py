@@ -12,7 +12,7 @@ import unittest
 from typing import cast, override
 from unittest import mock
 
-from scripts.lib import build_folders as folders, copy_record, scratch, unit_runs
+from scripts.lib import build_folders as folders, conf, copy_record, scratch, unit_runs
 
 
 class BuildFolderTests(unittest.TestCase):
@@ -194,9 +194,10 @@ assert not loaded, loaded
         self.assertEqual((destination / "exports.sh").read_text(), "export FIXTURE=1\n")
 
     def test_registered_task_uses_scratch_naming_record_and_task_cleanup(self) -> None:
+        settings = conf.read("scratch")
         with mock.patch.object(scratch, "target", wraps=scratch.target) as naming:
-            path = scratch.new("gate:folder-test", "checkout", False)
-        naming.assert_called_once_with("gate:folder-test", "checkout", False)
+            path = scratch.new("gate:folder-test", "checkout", False, scratch_settings=settings)
+        naming.assert_called_once_with("gate:folder-test", "checkout", False, scratch_settings=settings)
         self.assertEqual(path.parent, copy_record.root())
         self.assertTrue(path.name.startswith("gate-folder-test-checkout-"))
         record = scratch.task_of(path)

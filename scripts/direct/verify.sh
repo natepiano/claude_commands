@@ -6,13 +6,10 @@
 # `test` selects the package's test targets; examples are never test targets.
 # `build` builds one package's binaries, or one bin or example, so a smoke run
 # or live shot can launch it, and prints each binary's path.
-# `lint` runs clippy with --all-targets --all-features to match CI, and mend
-# also uses --all-targets. It checks TOML formatting with taplo at the workspace
-# root. `example` runs clippy on one named example while
-# iterating. `final` is the plan-final full gate, run by the unit director,
-# never by a phase worker. It checks all targets, including examples, then
-# runs nextest with --tests so no example is linked. No tests are lost:
-# the scan first refuses examples that hold a test or set test = true.
+# Lint checks all targets and features. Taplo checks workspace TOML files.
+# `example` checks one example. The director runs `final` with all targets.
+# `final` rejects examples with tests before nextest runs with --tests.
+# `build` prints binary paths for smoke checks.
 #
 # Package selection is always --workspace. Non-release check, test, final,
 # doc and build add workspace.metadata.dev.features to Work Order features.
@@ -39,11 +36,8 @@
 # changed during the run records nothing.
 # Records outlive worker sessions and are pruned after 14 days on each write.
 #
-# The lint stages — mend, fmt, clippy fix, fmt, clippy judgment — use
-# config/lint.conf (edit it with /lint_config). Taplo fmt --check always runs
-# at the workspace root. A gated-off check prints a SKIPPED line and exits 0.
-# Scope is never configurable. cargo check, cargo nextest and the checkpoint
-# rustdoc check are correctness gates and cannot be switched off.
+# Use config/lint.conf to select lint stages. Taplo always checks the workspace.
+# Check, test, and checkpoint rustdoc always run. Clippy judges before repairs.
 #
 # A worker session remembers passes. With UNIT_RUN_DIR or
 # UNIT_SESSION_DIR set, a `test` or `lint` that exits 0 is recorded in
@@ -3131,7 +3125,6 @@ case "$CMD" in
             fi
             exit "$lint_status"
         fi
-        # Order: mend, fmt, taplo, clippy fix, fmt, clippy judgment.
         # Cargo stages are gated by lint.conf; the Taplo check always runs.
         # mend passes --all-targets because it needs the test and example
         # targets to see every import and visibility site. It covers the
@@ -3213,24 +3206,26 @@ case "$CMD" in
         fi
         if lint_config_enabled clippy; then
             [[ "$PKG" != --workspace ]] || echo 'style-lint: clippy start'
-            clippy_tree_before="$(tree_key)"
-            for ((clippy_fix_pass=1; HOLD_LINT == 0 && clippy_fix_pass<=3; clippy_fix_pass++)); do
-                invoke_clippy_fix --workspace --all-targets --all-features --keep-going || true
-                fmt_cargo "${FMT_SCOPE[@]}"
-                clippy_tree_after="$(tree_key)"
-                if [[ -n "$clippy_tree_before" && "$clippy_tree_before" == "$clippy_tree_after" ]]; then
-                    break
-                fi
-                # An empty key cannot prove that the tree stopped changing.
-                if (( clippy_fix_pass == 3 )); then
-                    CLIPPY_FIX_LIMIT_REACHED=1
-                fi
-                clippy_tree_before="$clippy_tree_after"
+            for clippy_judgment in 1 2; do
+                start_tree_watch
+                clippy_status=0
+                invoke_clippy --workspace --all-targets --all-features --keep-going || clippy_status=$?
+                finish_tree_watch
+                (( clippy_status != 0 && clippy_judgment == 1 )) || break
+                clippy_tree_before="$(tree_key)"
+                for ((clippy_fix_pass=1; HOLD_LINT == 0 && clippy_fix_pass<=3; clippy_fix_pass++)); do
+                    invoke_clippy_fix --workspace --all-targets --all-features --keep-going || true
+                    fmt_cargo "${FMT_SCOPE[@]}"
+                    clippy_tree_after="$(tree_key)"
+                    if [[ -n "$clippy_tree_before" && "$clippy_tree_before" == "$clippy_tree_after" ]]; then
+                        break
+                    fi
+                    if (( clippy_fix_pass == 3 )); then
+                        CLIPPY_FIX_LIMIT_REACHED=1
+                    fi
+                    clippy_tree_before="$clippy_tree_after"
+                done
             done
-            start_tree_watch
-            clippy_status=0
-            invoke_clippy --workspace --all-targets --all-features --keep-going || clippy_status=$?
-            finish_tree_watch
             (( clippy_status == 0 )) || exit "$clippy_status"
             [[ "$PKG" != --workspace ]] || echo 'style-lint: clippy passed'
         else

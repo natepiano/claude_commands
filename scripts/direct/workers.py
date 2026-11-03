@@ -1315,7 +1315,7 @@ def resolve_live_unit_director(
     """
     from scripts.lib import unit_runs
     from scripts.production import session_staff, unit_lookup
-    from scripts.shutdown.launch_permission import shutdown_state_root
+    from scripts.shutdown.stop_results import shutdown_state_root
 
     director = unit_runs.director(run, dependencies=dependencies)
     for session in running:

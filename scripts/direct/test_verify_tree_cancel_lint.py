@@ -10,7 +10,7 @@ from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 class VerifyTreeCancelTests(VerifyTreeCancelFixture):
     def test_lint_rewrites_finish_without_cancelling(self) -> None:
         process = self.start_verify("lint", TEST_BLOCK_STAGE="clippy", TEST_FINISH="1",
-                                    TEST_REWRITE_STAGES="mend,fix,fmt")
+                                    TEST_REWRITE_STAGES="mend,fix,fmt", TEST_FAIL_FIRST_JUDGMENT="1")
         self.release_lint_rewrites(process)
         self.wait_for_running(self.control / "running", process)
         self.assert_resources_held()

@@ -9,19 +9,20 @@ from scripts.direct.verify_lint_scope_test_support import CARGO_STUB as CARGO_ST
 
 
 class VerifyLintScopeTests(support.VerifyLintScopeFixture):
-    def test_unchanged_tree_runs_one_fix_pass_before_judgment_without_rustdoc(self) -> None:
+    def test_clean_tree_runs_one_judgment_without_repairs_or_rustdoc(self) -> None:
         result = self.verify("lint", "--workspace")
-        self.assert_fix_and_judgment_calls()
+        self.assertEqual(self.calls("clippy"), [[
+            "--workspace", "--all-targets", "--all-features", "--keep-going", "--", "-D", "warnings",
+        ]])
         self.assertEqual(self.lint_stages(), [
             ["+nightly", "fmt", "--all"],
             ["clippy", *self.calls("clippy")[0]],
-            ["+nightly", "fmt", "--all"],
-            ["clippy", *self.calls("clippy")[1]],
         ])
         self.assertIn("style-lint: clippy start", result.stdout.splitlines())
         self.assertIn("style-lint: clippy passed", result.stdout.splitlines())
 
     def test_lint_matches_ci_and_preserves_other_stages(self) -> None:
+        self.environment["TEST_CLIPPY_STATUSES"] = "[101, 0]"
         _ = self.verify("lint", "sample")
         self.assert_workspace_taplo_check()
         self.assert_fix_and_judgment_calls()
