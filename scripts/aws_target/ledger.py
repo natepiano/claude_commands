@@ -525,6 +525,15 @@ class CostLedger:
         with self._locked() as state:
             return _charges(state, settings, now)
 
+    def permission_for_decision(self, decision: SpendingDecision) -> AdmissionPermission:
+        try:
+            with self._locked() as state:
+                if state.decision != _decision_record(decision):
+                    return PermissionUnavailable(decision.at, 'current decision has no durable publication')
+                return decode_permission(state.decision)
+        except (OSError, ValueError) as error:
+            return PermissionUnavailable(decision.at, str(error))
+
     def _decide(self, state: LedgerEvidence, settings_path: Path,
                 purpose: SpendingPurpose, now: int) -> SpendingDecision:
         evidence = GuardEvidence(purpose, (), CostEvidenceUnavailable("costs have not been validated"))
@@ -619,3 +628,63 @@ def spending_guard(settings_path: Path, directory: Path, purpose: SpendingPurpos
                    clock: Callable[[], float] = time.time,
                    notify: Callable[[LimitEvent], bool] = send_limit_event) -> SpendingDecision:
     return CostLedger(directory).guard(settings_path, purpose, int(clock()), notify, clock=clock)
+
+
+@dataclass(frozen=True)
+class PermissionAllowed:
+    at: int
+    evidence: dict[str, object]
+
+
+@dataclass(frozen=True)
+class PermissionRefused:
+    at: int
+    reason: str
+    evidence: dict[str, object]
+
+
+@dataclass(frozen=True)
+class PermissionUnavailable:
+    at: int
+    reason: str
+    evidence: dict[str, object] = field(default_factory=dict)
+
+
+AdmissionPermission = PermissionAllowed | PermissionRefused | PermissionUnavailable
+
+
+def permission_record(permission: AdmissionPermission) -> dict[str, object]:
+    """Encode a permission with the ledger's decision fields."""
+    if permission.evidence:
+        return permission.evidence
+    if isinstance(permission, PermissionAllowed):
+        return {}
+    return {'at': permission.at, 'purpose': 'admission',
+            'status': 'refused' if isinstance(permission, PermissionRefused) else 'unavailable',
+            'reason': permission.reason}
+
+
+def decode_permission(value: object) -> AdmissionPermission:
+    """Decode the ledger decision without inferring permission from absent costs."""
+    try:
+        row = _mapping(value)
+        at = _instant(row, 'at')
+        if row.get('purpose') != 'admission':
+            raise LedgerUnavailable('decision purpose is not admission')
+        status = row.get('status')
+        if status == 'unavailable':
+            return PermissionUnavailable(at, _text(row, 'reason'), row)
+        if status == 'refused':
+            return PermissionRefused(at, _text(row, 'reason'), row)
+        if status != 'allowed':
+            raise LedgerUnavailable('unknown permission state')
+        limits = _rows(row, 'limits')
+        if {r.get('key') for r in limits if r.get('origin') == 'live'} != {'daily_limit_usd', 'monthly_limit_usd'}:
+            raise LedgerUnavailable('live spending limits are missing')
+        _ = _instant(row, 'inventory_at')
+        _ = _instant(row, 'observation_at')
+        for key in ('daily_usd', 'monthly_usd', 'daily_limit_usd', 'monthly_limit_usd', 'reserve_usd'):
+            _ = money(_text(row, key))
+        return PermissionAllowed(at, row)
+    except (KeyError, TypeError, ValueError, ArithmeticError) as error:
+        return PermissionUnavailable(0, f'invalid decision evidence: {error}')
