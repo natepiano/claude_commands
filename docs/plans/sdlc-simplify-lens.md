@@ -203,7 +203,7 @@ The second live simplify run (2026-11-02, pass 1 through `review.sh`) raised 25 
 
 **Acceptance gate:** `python3 -m unittest discover -s scripts/direct -p test_findings.py` and `test_findings_simplify.py` pass; `basedpyright scripts/direct/findings.py scripts/direct/test_findings.py` reports 0 errors, 0 warnings, 0 notes.
 
-### Phase 4 — test_verify_doc.py leaves no lint sweep after it ends  · status: in progress
+### Phase 4 — test_verify_doc.py leaves no lint sweep after it ends  · status: done
 
 **Depends on:** Phase 3
 
