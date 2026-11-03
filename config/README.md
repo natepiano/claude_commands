@@ -110,7 +110,7 @@ The user completes deployment before target activation.
 `credentials_profile=build-scaler` names the user's AWS CLI profile. This file contains no credential.
 `kinds=test,check,doc` excludes lint. An empty `ci_repo` disables GitHub calls.
 
-`monthly_limit_usd=400` and `daily_limit_usd=20` contain the user's spending limits.
+`monthly_limit_usd=400` is the user's monthly spending limit (approved 2026-11-01). `daily_limit_usd=20` is derived (the monthly limit / 20) and waits for the user's approval at go-live.
 The AWS Budget must read `monthly_limit_usd`. Code must never raise either limit.
 The spending reserve is $3. The maximum drain time is 60 minutes.
 Each repository budget stays within the 32 GiB build budget.
