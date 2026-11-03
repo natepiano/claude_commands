@@ -645,8 +645,11 @@ class AddUnitTestCase(ShutdownTestCase):
         _ = self.git("commit", "-m", "prepare unit rows")
         _ = self.git("push", "origin", "build-followups")
         cells = production_units.unit_table(self.doc.read_text().splitlines())[0]
-        if not production_units.plan_cell_is_retired(cells["Plan"]):
-            _ = unit_membership(fixture_showrunner_name("build-followups", self.doc), cell_value(cells["Unit"]))
+        member = unit_membership(fixture_showrunner_name("build-followups", self.doc), cell_value(cells["Unit"]))
+        location = (staff.RemovedWorktree("natedev", self.root / "project-alpha")
+                    if production_units.plan_cell_is_retired(cells["Plan"])
+                    else staff.PresentWorktree("natedev", self.root / "project-alpha"))
+        _ = staff.set_worktree(member.id, location, expected=member.worktree)
 
     def assert_no_launch_change(self, document: str, head: str) -> None:
         self.assertEqual(self.doc.read_text(), document)
@@ -909,7 +912,7 @@ class AddUnitTestCase(ShutdownTestCase):
         ))
         self.assertEqual(request.unit, unit)
         self.assertIsInstance(request.launch_kind, add_unit.UnitRestoreLaunch)
-        self.assertIsInstance(add_unit.row_is_present(request, self.doc.read_text().splitlines()),
+        self.assertIsInstance(add_unit.row_is_present(request, self.doc.read_text().splitlines(), staff.snapshot()),
                               add_unit.ExistingUnitRow)
         before = self.doc.read_bytes()
         resumed = self.cli(unit, "--plan", "docs/plans/given.md")

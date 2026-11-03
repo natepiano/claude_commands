@@ -11,6 +11,7 @@ from pathlib import Path
 from scripts.production import change_review, change_routing, staff
 from scripts.production.proposals_folder import owner_docs
 from production_units import Refusal
+import unit_names
 from scripts.shutdown import remote
 
 
@@ -95,6 +96,10 @@ class ProducerHistory:
         name = names[0]
         if name.startswith(OLD_CHECKPOINT_PREFIX):
             unit_name = name.removeprefix(OLD_CHECKPOINT_PREFIX)
+            try:
+                unit_name = unit_names.name(unit_name)
+            except unit_names.BadName:
+                return UnmappedProducer(name)
             matches = [row.id for row in self.record.rows if row.kind == "unit" and row.name == unit_name]
             if len(matches) == 1:
                 return matches[0]

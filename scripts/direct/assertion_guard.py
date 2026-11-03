@@ -1316,7 +1316,7 @@ def production_merge_branch(repo: Path) -> ProductionMergeBranch | NoProductionB
         repository_root = Path(__file__).resolve().parents[2]
         sys.path.insert(0, str(repository_root))
         sys.path.insert(0, str(repository_root / "scripts" / "production"))
-        from scripts.production import session_staff, staff
+        from scripts.production import production_units, session_staff, staff, unit_lookup
         from scripts.shutdown import remote
     except ImportError:
         return NoProductionBase()
@@ -1324,17 +1324,57 @@ def production_merge_branch(repo: Path) -> ProductionMergeBranch | NoProductionB
         sys.path[:] = original_path
     worktree = Path(git(repo, "rev-parse", "--show-toplevel").strip()).resolve()
     try:
-        resolver = session_staff.RowResolver(staff.snapshot())
+        record = staff.snapshot()
+        resolver = session_staff.RowResolver(record)
         member = resolver.member_by_folder(remote.local_machine(), worktree)
-        if isinstance(member, session_staff.NoSuchMember):
-            return NoProductionBase()
-        branch = resolver.merge_branch(member.row)
-        if isinstance(branch, session_staff.Branch):
-            return ProductionMergeBranch(branch.name)
-        print(f"assertion_guard: {member.row.name}: {branch.reason}", file=sys.stderr)
+        if isinstance(member, session_staff.MemberFound):
+            resolved_branch = resolver.merge_branch(member.row)
+            if isinstance(resolved_branch, session_staff.Branch):
+                return ProductionMergeBranch(resolved_branch.name)
+            print(f"assertion_guard: {member.row.name}: {resolved_branch.reason}", file=sys.stderr)
     except (OSError, ValueError) as error:
         print(f"assertion_guard: {worktree}: {error}", file=sys.stderr)
-    return NoProductionBase()
+        return NoProductionBase()
+    branch = git(repo, "branch", "--show-current").strip()
+    branch_match: ProductionMergeBranch | NoProductionBase = NoProductionBase()
+    try:
+        sources = unit_lookup.member_sources()
+        if not sources.productions:
+            return branch_match
+    except staff.StaffUnreadable as error:
+        print(f"assertion_guard: {error}", file=sys.stderr)
+        return branch_match
+    documents = {source.timer.doc: source.document for source in sources.productions.values()}
+    for doc, text in documents.items():
+        try:
+            lines = text.splitlines()
+            slug = unit_lookup.production_slug_for_document(doc, record, sources)
+            rows: list[dict[str, str]] = []
+            worktree_matches = False
+            for row in production_units.unit_table(lines):
+                try:
+                    selected = sources.member(unit_lookup.UnitMember(
+                        slug, production_units.cell_value(row.get("Unit", ""))), record)
+                    location = unit_lookup.local_worktree(selected)
+                    if isinstance(location, staff.RemovedWorktree):
+                        continue
+                    branch_tree = unit_lookup.plan_worktree(row, selected)
+                    rows.append(row)
+                    worktree_matches |= branch_tree.resolve() == worktree
+                except (staff.StaffUnreadable, staff.StaffRefused) as error:
+                    print(f"assertion_guard: {error}", file=sys.stderr)
+            branch_matches = bool(branch) and any(
+                production_units.cell_value(row.get("Branch", "")) == branch for row in rows)
+            if worktree_matches or branch_matches:
+                match = ProductionMergeBranch(production_units.production_field(lines, "Merge branch"))
+                if worktree_matches:
+                    return match
+                if isinstance(branch_match, NoProductionBase):
+                    branch_match = match
+        except (OSError, UnicodeError, production_units.Refusal, staff.StaffRefused) as error:
+            print(f"assertion_guard: {error}", file=sys.stderr)
+            continue
+    return branch_match
 
 
 def production_base(repo: Path) -> ProductionBase | NoProductionBase:
