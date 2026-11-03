@@ -41,8 +41,8 @@ def restored_launch(argv: list[str], environment: dict[str, str]) -> tuple[list[
         return argv, environment
     entry = session_staff.record_membership(entry)
     restored = {**environment, **entry["environment"]}
-    if not parsed.has_prompt:
-        argv = [*argv, resume_message("the herdr server restarted")]
+    if not parsed.has_prompt and environment.get("RELAUNCH_PROMPT_DELIVERY") != "pane":
+        argv = [*argv, resume_message("you were stopped and resumed")]
     return argv, restored
 
 

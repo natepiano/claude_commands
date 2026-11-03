@@ -711,7 +711,11 @@ def resume_folder_session(row: staff.StaffRow, launch: FolderLaunch,
         pane_launch.finish_restore(path, entry, attempt, proof, close=client.close_tab_confirmed)
         return
     config = Path(entry["config_dir"])
+    from scripts.lib.resume_message import resume_message
+
     arguments = pane_record.resume_arguments(projected)
+    if pane_launch.agent_kind(projected) == "claude":
+        arguments.append(resume_message("the session folder moved"))
     environment = {key: value for key, value in entry["environment"].items()
                    if key not in {"STAFF_ID", "CODEX_THREAD_ID", "CLAUDE_CODE_SESSION_ID", "HERDR_TAB_ID"}}
     environment.update({"HERDR_PANE_ID": pane["pane_id"], "HERDR_WORKSPACE_ID": pane["workspace_id"]})
