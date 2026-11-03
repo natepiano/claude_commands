@@ -24,6 +24,7 @@ import pushover
 import review
 import reply_asks
 import push_texts
+import push_reference
 from push_test_support import registered_send
 from user_action import ActionRequired, NoActionRequired, SessionLine, first_line
 
@@ -1514,6 +1515,19 @@ class LocalReviewTests(unittest.TestCase):
     def hold_file(self) -> Path:
         digest = hashlib.sha256(self.draft.source.encode()).hexdigest()[:16]
         return self.root / "state/held" / (digest + ".json")
+
+    def test_question_reference_survives_rewrite_and_the_held_record(self) -> None:
+        reference = push_reference.QuestionReference(kind="question", path=str(self.root / "question.md"), since="2026-11-03T12:00")
+        self.draft = replace(self.draft, reference=reference)
+        held = self.held()
+        with mock.patch.object(review, "schedule"):
+            review.hold(held)
+        found = review.held_for(held.source)
+        self.assertIsInstance(found, review.LiveHold)
+        assert isinstance(found, review.LiveHold)
+        self.assertEqual(found.hold.draft.reference, reference)
+        self.assertEqual(found.hold.best_version.reference, reference)
+        self.assertEqual(review.draft_record(found.hold.best_version).get("reference"), reference)
 
     def test_hold_round_trip_uses_source_hash_and_schedules_due(self) -> None:
         held = self.held()
