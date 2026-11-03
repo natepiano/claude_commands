@@ -35,10 +35,12 @@ from build_hold_test_support import (
 )
 if TYPE_CHECKING:
     from ..direct import step_record
+    from ..build_queue import admission_protocol, admission_service
     from ..build_queue.admission_test_support import only_admitted
     from ..lib import test_hang_guard
 else:
     from scripts.direct import step_record
+    from scripts.build_queue import admission_protocol, admission_service
     from scripts.build_queue.admission_test_support import only_admitted
     from scripts.lib import test_hang_guard
 
@@ -2248,7 +2250,6 @@ class BuildAuditTests(IsolatedBuildHoldTest):
         with fixture.loop_turn():
             owner = fixture.fixture_owner(pid, start)
             _ = only_admitted(fixture.server.handle_request(fixture.request(owner=owner)))
-            _ = fixture.server.run_pass()
 
     def builds(self) -> tuple[build_hold.AuditedBuild, ...]:
         return build_hold.audit_builds(self.proc, build_hold.natedev_holds(self.holders).in_force)
@@ -2426,11 +2427,42 @@ class BuildAuditTests(IsolatedBuildHoldTest):
 
     def test_reused_pid_does_not_match_admission_or_new_parent(self) -> None:
         _ = self.process(10, "claude", start=400, environment={"CLAUDE_CODE_SESSION_ID": "new-parent"})
-        _ = self.process(20, "cargo", parent=10, start=200)
-        self.admission(20, "199")
-        build, = self.builds()
+        with self.admission_fixture.loop_turn():
+            _ = self.process(20, "cargo", parent=10, start=199)
+            self.admission(20, "199")
+            _ = self.process(20, "cargo", parent=10, start=200)
+            build, = self.builds()
         self.assertEqual(build.classification, "no_session")
         self.assertEqual(build.owner, build_hold.NoOwningSession())
+
+    def test_durable_grant_is_admitted_before_the_next_service_pass(self) -> None:
+        fixture = self.admission_fixture
+        with fixture.loop_turn():
+            _ = self.process(20, "bash", argv=("bash", "/scripts/direct/verify.sh"))
+            self.admission(20, "200")
+            _ = self.process(21, "cargo", parent=20, environment={"CLAUDE_CODE_SESSION_ID": "verified"})
+            view, = fixture.server.handle_request(admission_protocol.ViewRequest())
+            self.assertIsInstance(view, admission_protocol.ViewReply)
+            if isinstance(view, admission_protocol.ViewReply):
+                self.assertEqual(view.reading.explanation.decided_from.reservations, ())
+            build, = self.builds()
+        self.assertEqual(build.process.identity.pid, 21)
+        self.assertEqual(build.classification, "admitted")
+
+    def test_pid_reused_during_admission_read_is_discarded(self) -> None:
+        with self.admission_fixture.loop_turn():
+            _ = self.process(20, "cargo", environment={"CLAUDE_CODE_SESSION_ID": "verified"})
+            self.admission(20, "200")
+            read_state = admission_service.read_state
+
+            def read(directory: Path) -> admission_service.ServiceState:
+                state = read_state(directory)
+                _ = self.process(20, "cargo", start=201)
+                return state
+
+            with mock.patch.object(admission_service, "read_state", side_effect=read):
+                self.assertEqual(self.builds(), ())
+            self.assertEqual(build_hold.process_start_time(20, self.proc), "201")
 
     def test_pid_reused_during_environment_read_is_discarded(self) -> None:
         directory = self.process(10, "cargo", environment={"CLAUDE_CODE_SESSION_ID": "old"})

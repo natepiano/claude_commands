@@ -1356,3 +1356,55 @@ The user's rule stays: during a hold, no test of another session runs, and the e
 **Files:** `scripts/build_hold/hold_enforcer.py`, `scripts/build_hold/test_build_hold.py`, `scripts/production/test_merge_gate_holds.py`, `scripts/direct/verify.sh` (only `step_stopped_by_hold`) and its hold test.
 
 **Acceptance:** the build-hold and merge-gate hold suites pass after the cut-over hold ends; basedpyright is clean on the changed files. A gate run that a hold interrupts shows "stopped during a natedev hold; queued again" for each stopped module and no red from the hold.
+
+### Phase 50 — The Mac runs the floor sweep, and it never deletes a mirror target that a Mac test claim holds  · status: in progress
+
+Owner: builds-resources. Asked by verify-unit; builds approved 2026-11-03 14:05 EST as its own phase, merged first.
+
+**Why.** The Mac has 46 GiB free. The Mac test minimum is 100 GiB (`config/mac_test.conf` `free_floor_gib`), so every test step stays on natedev, and the Mac has run no test for 22 h. Today only natedev runs the floor sweep. The Mac has no floor job. On the Mac, `sweep.py` cannot see which targets are in use, because it reads `/proc`, and the Mac has none (`scripts/lint/sweep.py:744`).
+
+**Spec.**
+1. **One entry point.** `sweep.py --floor-only --host mac` runs the floor sweep for the Mac. verify-unit calls it over ssh (`ssh mac '~/.claude/scripts/lib/py ~/.claude/scripts/lint/sweep.py --floor-only --host mac'`) when Mac test admission declines for disk, then reads free space again. Use the existing floor sweep. Do not add a second sweeper.
+2. **One floor key.** On the Mac, the floor is one new key, `config/mac_test.conf` `sweep_floor_gib`, read at use through `conf.read`. The on-demand call and the timer use the same key. Its value must be at or above `free_floor_gib` (the Mac test minimum, 100); a lower or missing value refuses with one line. The committed value is 100 until the user approves a higher one (builds asked the user for 150 on 2026-11-03). Do not add a `sweep_free_floor_gib.mac` key. Natedev's floor stays `lint.conf` `sweep_free_floor_gib.natedev`.
+3. **The claim check without /proc.** The sweep never deletes a mirror target that a live Mac test claim holds. Find the claim record that `scripts/mac_test/offload.py` writes for a run on the Mac mirror (its slot, target and owner). A claim is live while its owner runs. A target that a live claim holds is busy. Where liveness cannot be read, treat the target as busy (fail closed).
+4. **The order stays the same.** Take only the shortfall, least recently used idle target first, as on natedev. On the Mac the roots are only those in item 7; `lint.conf` `sweep_floor_roots` stays natedev's. The Mac test mirror stays at `~/.local/state/mac-test/mirror` (the user, 2026-11-03: "yes ~/.local/state/mac-test/mirror can definitely be part of what we manage").
+5. **Output.** One line: the bytes removed, the free space before and after, and the number of busy targets skipped. Exit 0 when the floor is reached or no idle target remains; the caller reads the free space again.
+6. **No config value changes.** Every existing key and value stays the same.
+7. **The Mac roots (the user, 2026-11-03, verbatim):** "the mac cleanup needs to be cleaning up only things we have created - basically builds / mirrors whatever - in tmp - - and similarly builds/mirrors we/ve created in ~/rust - everytihng else is offlimits". The Mac sweep and timer roots are exactly three: our build output and mirrors under the Mac's tmp folders, our build output and mirrors under ~/rust, and `~/.local/state/mac-test/mirror`. They live in config (one key). Nothing else is a root. A test refuses any path outside them, also through a symlink or `..`. "Ours" means a folder that our tools made (a cargo target with our stamp, a mirror or copy record); a folder with no such mark is not touched.
+8. **A scheduled Mac floor run.** A nix-darwin job in `/etc/nixos/modules/darwin/` (on the branch `resources-mac-floor`, not main) calls the same entry point, like `modules/linux/disk-floor.nix` on natedev. Use the interval of disk-floor.nix. The natedev showrunner pushes nixos main.
+
+**Out of scope.** The verify call site (verify-unit Phase 25). The 150 GiB value until the user approves it. The build drive paths (the next phase).
+
+**Checks.**
+- Tests in `scripts/lint/test_sweep.py`:
+  1. a held mirror target is not deleted;
+  2. an unreadable claim is treated as busy;
+  3. the floor comes from `mac_test.conf` `sweep_floor_gib`, and a value below `free_floor_gib` or a missing value refuses with one line;
+  4. `--host mac` with no `/proc` still finds idle targets;
+  5. the order is least recently used first, and only the shortfall is removed.
+- basedpyright 0/0/0 on the changed files and their callers.
+- Read-only proof on the Mac: `ssh mac` runs the entry point with `--dry-run`. It prints the targets it would remove, and it deletes nothing.
+
+### Phase 51 — Build output moves to the /build drive, and every tool that reads build folders follows it  · status: in progress
+
+Owner: builds-resources. Asked by natedev (#35); builds approved. Code waits for the user's go.
+
+**Nix side (natedev, nixos branch build-drive 2b91f2c, not merged):** /build mount (LUKS 'build', nofail); ~/.cargo/config.toml build.build-dir = /build/cargo/{workspace-path-hash} (final binaries stay in target/); SCCACHE_DIR=/build/sccache; CI caches /build/hana-ci; tmpfiles make /build/cargo, /build/claude, /build/sccache.
+
+**Step 1 (now, read only):** the list of our tools that break or go blind after the switch.
+
+**Spec (after the user's go):**
+1. Path keys move /tmp/claude/{scratch,copies} and the gate/test clones to /build/claude. Config read at use.
+2. A /build sweeper root with a 20% floor. / keeps 300 GiB.
+3. Every ~/.claude script that reads target/ intermediates (deps/, build/, .fingerprint/, incremental/) reads cargo metadata build_directory.
+4. One fallback rule for all paths when /build is not mounted. No hard-coded paths. Nothing moves under a running session.
+
+### Phase 52 — The build hold audit classifies a reused pid and an admitted step correctly under load  · status: done
+
+Owner: builds-resources. Asked by builds 2026-11-03 15:00 EST; it held natest's merge.
+
+**Fault.** On origin/builds f91716183, scripts/build_hold/test_build_hold.py BuildAuditTests fails now and then under load (load 25-44, 1 red in 2 full runs): ERROR in test_reused_pid_does_not_match_admission_or_new_parent, and 'other_session' where 'admitted' was expected. Log: /tmp/claude-1000/-home-natepiano-worktrees-claude-natedev-builds/51505394-82db-43d3-a528-136f4ee38d7a/scratchpad/merge_92e8915_test.log.
+
+**Spec.** Find the cause in the code (pid identity and admission classification), and fix it there. Do not change the test's timing, add sleeps or retries, or widen a timeout. A pid match needs the same start time as the admission record. A step whose admission record matches it is 'admitted' even when the system is slow.
+
+**Checks.** A test that reproduces the fault without load (for example, a forced slow read or a stale /proc start time). test_build_hold.py and test_hold_enforcer.py pass. basedpyright 0/0/0 on the changed files and their callers.
