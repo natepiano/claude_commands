@@ -13,11 +13,11 @@ Review links let a session on natedev or on the Mac show files to the user in a 
 | `/etc/nixos/modules/common/review-links.nix` | The shared job `nate.jobs.review-links` for both machines. |
 | `/etc/nixos/modules/linux/review-links.nix` | The natedev restart settings and the firewall line. |
 
-Run the tests from the repository root with `python3 -m unittest discover -s scripts/review_links -p 'test_*.py'`. They need Python 3.11 or later.
+Run the tests from the repository root with `python3 -m unittest discover -s scripts/review_links -p 'test_*.py'`. They need Python 3.12 or later.
 
 The flow:
 
-1. The skill runs `~/.claude/scripts/lib/py ~/.claude/scripts/review_links/review_link.py <file>... [--new]` on the machine that has the files. `scripts/lib/py` finds Python 3.11 or later.
+1. The skill runs `~/.claude/scripts/lib/py ~/.claude/scripts/review_links/review_link.py <file>... [--new]` on the machine that has the files. `scripts/lib/py` finds Python 3.12 or later.
 2. The publisher checks every input, gets the host, writes the snapshot under the index lock and prints one URL per file.
 3. The skill fetches each URL with `curl` on the same machine. It gives only the links that return `200`, as clickable Markdown links that show the file name.
 4. The browser on the Mac gets the file from the server on that machine, over the tailnet.

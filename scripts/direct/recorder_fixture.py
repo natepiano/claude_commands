@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.lib.py_floor_test_support import cache_file_name
+
 from scripts.lib.process_group import send_process_group
 from scripts.lib import test_hang_guard
 
@@ -200,7 +202,7 @@ def launcher_environment(root: Path) -> dict[str, str]:
                        TEST_LEGACY_LAUNCH="1", AGENTS_CONFIG_FILE=str(root / ".claude/config/agents.conf"),
                        UNIT_HISTORY_DIR=str(root / "history"), CONF_DIR=str(root),
                        TZ="UTC", USER_ZONE="UTC")
-    cache = root / "cache/claude/python3-3.11"
+    cache = root / "cache/claude" / cache_file_name()
     cache.parent.mkdir(parents=True, exist_ok=True)
     _ = cache.write_text(sys.executable + "\n")
     for name in ("CLAUDE_PYTHON", "CODEX_THREAD_ID", "CLAUDE_CODE_SESSION_ID"):

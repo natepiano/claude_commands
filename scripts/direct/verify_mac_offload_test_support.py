@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.lib.py_floor_test_support import cache_file_name
+
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 import json
@@ -849,7 +851,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
             "TEST_REAL_RECORD": str(VERIFY.parent.parent / "buildlog" / "record.py"),
         }
 
-        cache = self.root / "cache/claude/python3-3.11"
+        cache = self.root / "cache/claude" / cache_file_name()
         cache.parent.mkdir(parents=True, exist_ok=True)
         _ = cache.write_text(sys.executable + "\n")
         _ = self.environment.pop("CLAUDE_PYTHON", None)
