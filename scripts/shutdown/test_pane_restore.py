@@ -1032,7 +1032,7 @@ class CodexPaneRestoreTests(FolderMoveFixture):
         self.assertNotIn("w1:p1", pane_record.read("agents"))
 
     def test_missing_pane_recovery_retires_its_source_before_the_next_folder_move(self) -> None:
-        from scripts.shutdown import stop_resume, folder_trust
+        from scripts.shutdown import stop_resume
 
         backend = self.folder_backend("claude", live=False)
         original = pane_record.read("agents")["w1:p1"]
@@ -1058,7 +1058,7 @@ class CodexPaneRestoreTests(FolderMoveFixture):
               mock.patch.object(stop_resume, "_start_session", side_effect=start),
               mock.patch.object(stop_resume, "_detach"),
               mock.patch.object(sessions, "process_start", return_value="fixture-start"),
-              mock.patch.object(folder_trust, "heal", return_value=herdr.Trusted(
+              mock.patch.object(herdr, "heal_claude_trust", return_value=herdr.Trusted(
                   self.old_folder, backend.config / ".claude.json", self.old_folder))):
             result = stop_resume.resume(self.owner.id, why="fixture recovery", restore_missing=True)
         self.assertIsInstance(result, stop_resume.ClaudeUp)
@@ -1122,7 +1122,7 @@ class CodexPaneRestoreTests(FolderMoveFixture):
         with (mock.patch.object(herdr, "Herdr", return_value=client),
               mock.patch.object(client, "agents", return_value=[]),
               mock.patch.object(client, "close_pane", side_effect=close),
-              mock.patch.object(restart, "_heal_folder_trust"),
+              mock.patch.object(restart, "_copy_claude_trust"),
               mock.patch.object(restart, "_prepare_resume_environment", return_value=herdr.PreparedAgentEnvironment(
                   self.old_folder, {})),
               mock.patch.object(herdr, "restore_server", return_value=herdr.ServerAdopted()),

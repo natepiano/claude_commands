@@ -60,7 +60,9 @@ Retirement, checkout moves, running-session attach and nix-shell healing use thi
 
 Watchdog recovery reads the unit's pane launch and live liveness. It keeps one notes pass of grace and resumes the same conversation on the launch account. The unit must not be retired, must have a worktree, and its run must not have finished. A unit with no run record is standing by and can recover. A queued recovery refuses a changed or ended launch. Shared resume creates a fresh tab when the pane is gone. Pending jobs prevent duplicate dispatch; unreadable live confirmation preserves their evidence. The watchdog excludes existing intentional stop records at or after the retained pane launch. It checks the record again before a queued recovery starts. An explicit later launch supersedes an older stop. It does not read account holds. Its outage state retains pending recovery jobs and first-seen times. The agent-notes job runs this check in its own process with the limits in `config/agent_notes.toml`. Shared resume supplies the restarted session’s prompt; the watchdog sends no messages to live sessions, showrunner notices or phone pushes. Record-driven restart still retries unconfirmed owner cleanup through `stop_resume.stop` before launching; a failed retry keeps the issue and a retry command.
 
-Record-driven restart, status, forget, account holds, and launch barriers remain available.
+Record-driven restart, status, and forget remain available. Launches do not take an account hold, admission claim, or global launch lock.
+
+Restart and shared resume copy existing Claude folder trust from another account. An untrusted folder or unreadable trust file prints one anomaly line. The launch continues.
 Recovery snapshots and their restore and status readers are deleted.
 `restart_support.py` owns the retained record-driven message, notifier, and status helpers.
 Inventory owns fresh session attribution.

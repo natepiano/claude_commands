@@ -39,8 +39,7 @@ from inventory import (
     parse_inventory,
 )
 import shutdown_record as recovery_store
-from launch_permission import RELEASED_HOLD_PREFIX, LaunchPurpose, NewWorkLaunchPurpose, RecordedSessionRestoreLaunchPurpose
-from shutdown_record import InvalidRecord, SessionShutdown, ShutdownContinuation, AccountOpen, HoldReleased, RequestOrigin, ShutdownFound, lookup_session, release_finished_account_hold, all_account_holds, all_session_records, parse_account_holds, parse_session_records, session_records
+from shutdown_record import InvalidRecord, SessionShutdown, ShutdownContinuation, all_account_holds, all_session_records, parse_account_holds, parse_session_records, session_records
 import remote
 from remote import other_machine, run_remote
 import restart_support
@@ -240,65 +239,6 @@ def _local_time(value: str) -> str:
     return parsed.astimezone(user_zone()).strftime(
         "%Y-%m-%d %H:%M:%S %Z"
     )
-
-
-def _shutdown_hold_time(value: str) -> str:
-    return datetime.fromisoformat(value).astimezone(
-        user_zone()
-    ).strftime("%Y-%m-%d %H:%M %Z")
-
-
-def _requester(origin: RequestOrigin) -> str:
-    match origin["kind"]:
-        case "session":
-            return f"requested by session {origin['session_id'][:8]}"
-        case "terminal":
-            return "requested in a terminal"
-
-
-def launch_blocked(selected: Account, purpose: LaunchPurpose) -> int:
-    """Permit recorded restorable progress, even while the account is held.
-
-    Stopped, already gone, process identity lost, restarting, restart failed
-    and manual restart permit restore. Other recorded progress blocks it.
-    Without a record, only the account hold decides, as for new work.
-    The restore purpose alone does not authorize a launch. A finished
-    account hold is removed and the launch permitted, with one
-    `released account hold: <JSON>` line."""
-    try:
-        _ = session_records(selected.login)
-        if isinstance(purpose, RecordedSessionRestoreLaunchPurpose):
-            found = lookup_session(selected.login, purpose.session_id)
-            if isinstance(found, ShutdownFound):
-                restoring = found.record
-                if restoring["progress"]["kind"] in {
-                    "stopped", "already gone", "process identity lost", "restarting",
-                    "restart failed", "manual restart",
-                }:
-                    return 1
-                hold_time = _shutdown_hold_time(restoring["requested_at"])
-                print(f"{restoring['session']['name']} is held by a shutdown (since {hold_time})")
-                return 0
-        outcome = release_finished_account_hold(selected.login)
-    except (InvalidRecord, OSError, ValueError) as error:
-        print(f"shutdown state unreadable: {error}", file=sys.stderr)
-        return 3
-    if isinstance(outcome, HoldReleased):
-        print(RELEASED_HOLD_PREFIX + json.dumps(outcome.hold, sort_keys=True))
-        return 1
-    if isinstance(outcome, AccountOpen):
-        return 1
-    hold_time = _shutdown_hold_time(outcome.hold["requested_at"])
-    print(f"{outcome.hold['label']} is held by a shutdown (since {hold_time}), {_requester(outcome.hold['requested_by'])}")
-    return 0
-
-
-def _unexpected_launch_blocked_error(error: Exception) -> int:
-    print(
-        f"shutdown state unreadable: {type(error).__name__}: {error}",
-        file=sys.stderr,
-    )
-    return 3
 
 
 def _record_line(record: SessionShutdown) -> str:
@@ -609,7 +549,7 @@ def main(arguments: list[str] | None = None) -> int:
     commands = parser.add_subparsers(
         dest="command",
         required=True,
-        metavar="{stop,resume,status,restart,forget,remote-control,launch-blocked}",
+        metavar="{stop,resume,status,restart,forget,remote-control}",
     )
     stop_command = commands.add_parser("stop", help="end one local tab's Claude; leave its workers alone")
     _ = stop_command.add_argument("session")
@@ -648,9 +588,6 @@ def main(arguments: list[str] | None = None) -> int:
     _ = restart.add_argument(
         "--no-alert", action="store_true", help=argparse.SUPPRESS
     )
-    launch_blocked_command = commands.add_parser("launch-blocked")
-    _ = launch_blocked_command.add_argument("account", nargs="?")
-    _ = launch_blocked_command.add_argument("--restart-of")
     up = commands.add_parser("up")
     _ = up.add_argument("account")
     _ = up.add_argument("--dry-run", action="store_true")
@@ -863,25 +800,6 @@ def _dispatch(options: CommandLine) -> int:
         if lines:
             print("\n".join(lines))
         return 0
-
-    if options.command == "launch-blocked":
-        try:
-            selected = _selected_account(options.account)
-        except (UnreadableAccount, UnknownAccountName) as error:
-            print(f"shutdown: {error}", file=sys.stderr)
-            return 2
-        except Exception as error:
-            return _unexpected_launch_blocked_error(error)
-        try:
-            purpose: LaunchPurpose = (
-                RecordedSessionRestoreLaunchPurpose(options.restart_of)
-                if options.restart_of is not None
-                else NewWorkLaunchPurpose()
-            )
-            return launch_blocked(selected, purpose)
-        except Exception as error:
-            return _unexpected_launch_blocked_error(error)
-
 
     if options.command == "up":
         if options.as_json:

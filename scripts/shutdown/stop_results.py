@@ -5,8 +5,15 @@ without importing an account consumer back into their own module.
 """
 from __future__ import annotations
 
+import os
+from pathlib import Path
 from dataclasses import dataclass, field
 from enum import StrEnum
+
+
+def shutdown_state_root() -> Path:
+    """Return the machine-local folder for shutdown records."""
+    return Path(os.environ.get("SHUTDOWN_STATE_DIR", str(Path.home() / ".local/state/shutdown")))
 
 
 @dataclass(frozen=True)
