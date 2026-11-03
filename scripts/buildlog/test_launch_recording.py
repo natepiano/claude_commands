@@ -380,16 +380,16 @@ class LaunchRecordingTests(unittest.TestCase):
         self.assertEqual(source.read_bytes(), original)
 
     def test_stop_after_pending_write_recovers_one_launch(self) -> None:
-        self.assert_pending_recovery(record.pending_launches_root(), RecordingStop.AFTER_PENDING_WRITE)
+        self.assert_pending_recovery(record.pending_launch_root(), RecordingStop.AFTER_PENDING_WRITE)
 
     def test_stop_after_publication_recovers_without_repeating_the_launch(self) -> None:
-        self.assert_pending_recovery(record.pending_launches_root(), RecordingStop.AFTER_PUBLICATION)
+        self.assert_pending_recovery(record.pending_launch_root(), RecordingStop.AFTER_PUBLICATION)
 
     def test_stop_before_pending_delete_recovers_without_repeating_the_launch(self) -> None:
-        self.assert_pending_recovery(record.pending_launches_root(), RecordingStop.BEFORE_PENDING_DELETE)
+        self.assert_pending_recovery(record.pending_launch_root(), RecordingStop.BEFORE_PENDING_DELETE)
 
     def test_failed_first_publication_keeps_the_launch_for_collection(self) -> None:
-        self.assert_pending_recovery(record.pending_launches_root(), RecordingStop.FAILED_FIRST_PUBLICATION)
+        self.assert_pending_recovery(record.pending_launch_root(), RecordingStop.FAILED_FIRST_PUBLICATION)
 
     def test_failed_publication_survives_shutdown_and_collects_both_starts_once(self) -> None:
         publish = record.write_launch_line
@@ -411,7 +411,7 @@ class LaunchRecordingTests(unittest.TestCase):
                     self.assertEqual(process.poll(), 0)
                     self.assertFalse(hana_shot.launch_state_path(port).exists())
 
-        pending = record.pending_launches_root()
+        pending = record.pending_launch_root()
         self.assertEqual(len(self.records()), 1)
         self.assertEqual(len(list(pending.glob("*"))), 1)
         self.assertEqual(launches.collect().added, 1)
