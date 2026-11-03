@@ -86,7 +86,7 @@ Do not wait for sdlc's exact keys. Print our definition, our number and sdlc's n
 #### As-built
 
 - `scripts/buildlog/moments.py` is the one place for build moments and the hana set:
-  - `MOMENTS` holds 6 fixed moments (herdr cgroup move, baloo off, hana opt-level 1, hana Bevy dylib, the floor sweep, Build rules 1). Moment 1 carries sdlc's week baseline; the floor sweep carries sdlc's clone repeat figures. Moment 2 is one new `MOMENTS` entry when its hash lands.
+  - `MOMENTS` holds 6 fixed moments (herdr cgroup move, baloo off, hana opt-level 1, hana Bevy dylib, the floor sweep, Build rules 1); Phase 3 adds a seventh. Moment 1 carries sdlc's week baseline; the floor sweep carries sdlc's clone repeat figures. Moment 2 is one new `MOMENTS` entry when its hash lands.
   - `HANA_CTE` is the one hana set: sdlc's `nat` predicate, with sessions and calls classified over each measured window, natedev only.
   - `MetricKey` names each metric; `RATE_ROWS` lists the rate rows.
   - `window_rates(connection, start, end, *, phases=())` makes one SQL population read and one Python pass for every row. A step with a NULL session or cwd counts in the totals but never pairs.
@@ -132,3 +132,43 @@ Do not wait for sdlc's exact keys. Print our definition, our number and sdlc's n
 - `scripts/buildlog/test_moments.py`, `scripts/buildlog/test_report.py`, `scripts/buildlog/test_memory_window.py`, `scripts/lint/test_invoke_scope.py` — tests
 
 **Gotchas:** earlyoom joins argv with spaces and no shell quotes, so only the text before the first space is the program. A journal that cannot be read is `unavailable`, never zero.
+
+### Phase 3 — The build report splits build rates at the queue test-phase charge  · status: done
+**Depends on:** Phase 1
+
+#### As-built
+
+- `MOMENTS` in `scripts/buildlog/moments.py` gains `BuildMoment(2026-10-31 20:36 UTC, "Queue test-phase charge (2a819dfd)", "all")`, 16:36 EDT, with no sdlc baseline. The showrunner set it when queue's test-phase charge and one decision pass reached main.
+- It is not Moment 2. Moment 2 stays phases-unit's prompt and lint change.
+- `buildlog moments` shows it as the newest section, with Build rules 1 (Moment 1) as its before window. Its after window is thin until a day of data exists.
+
+**Files:** `scripts/buildlog/moments.py`; `scripts/buildlog/test_moments.py` (the pinned moment order).
+
+### Phase 4 — /build:report names the hourly memory table  · status: done
+**Depends on:** Phase 1
+
+#### As-built
+
+- `commands/build/report.md` names `buildlog usage-hours [YYYY-MM-DD]` near its top. The line lists what the table holds: hourly build memory, process memory, file cache, build and CI CPU, disk traffic, lowest free disk and free pool tokens.
+- A second line tells the agent to run it for questions about memory, CPU or disk by hour, and to answer from its table in a few lines.
+- Source: the user's change review C682 (2026-11-02). The table is hard to read in the CLI; agents use it for analysis.
+
+**Files:** `commands/build/report.md`.
+
+### Phase 5 — The build report compares moments per phase, not per day  · status: done
+**Depends on:** Phase 1
+
+2026-11-03 (the user, through the builds showrunner): the machines ran much lighter after Build rules 1. A time comparison per day does not show whether matters improved. The report needs a comparison per a unit of work.
+
+#### As-built
+
+- The unit of work is the finished natedev hana phase (`WindowRates.phase_count`).
+- Each build moment's rate table leads with rows per phase: nextest, clippy, run hours, wait hours, failed nextest, nextest reruns, clone rebuilds, clone rebuild hours and fail-then-fail runs.
+- One row shows hana wait hours per hana run hour. It is unavailable when run hours are zero.
+- The per-day rows follow. Each cell suffix states its unit (`/phase`, `h /phase`, `/day`, `h /day`, `%`, `h wait / h run`). The header is `| Rate | Before | After | Change |`.
+- Under the table: `Hana phases finished: before N, after M.` and a note. The note says per-day rows follow load, per-phase counts do not, and per-phase hours still fall on a quieter machine.
+- `RateRow.formula` is `PerDay | Ratio`. One loop over `RATE_ROWS` computes every rate. Units `runs_per_phase` and `hours_per_phase` replace `per_phase`.
+- Both moment tables and the Moment 1 baseline table use `table()`, `rate_change()` and `rate_window_days()`. The baseline line reads `Hana phases finished in the baseline: N.`
+- Not added: rates per landed commit. A move of the note to one place per report is not made; the note stays under each table.
+
+**Files:** `scripts/buildlog/moments.py`, `scripts/buildlog/report.py`, `scripts/buildlog/test_moments.py`.
