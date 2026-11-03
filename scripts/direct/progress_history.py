@@ -26,13 +26,15 @@ from typing import Literal, NoReturn, TypedDict, cast
 
 if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.agents import worker_lifecycle  # noqa: E402
 from scripts.direct import phase_reservation, plan_history, recorder_state  # noqa: E402
 from scripts.direct.recorder_state import OPEN_PHASES_KEY as OPEN_PHASES_KEY  # noqa: E402
 from scripts.direct.tag_inventory import contract_table_paths  # noqa: E402
 from scripts.lib import unit_runs  # noqa: E402
 from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
-from scripts.production import production_doc  # noqa: E402
+from scripts.production import production_doc, session_staff, showrunners, staff  # noqa: E402
+from scripts.shutdown import remote  # noqa: E402
 
 
 SCHEMA_VERSION = 1
@@ -194,9 +196,8 @@ class FindingTally(TypedDict):
     reopened: int
 
 
-# direct.conf, whose digest a pass records. `UNIT_CONFIG` overrides the
+# direct.conf, whose digest a pass records. `CONF_DIR` overrides the
 # path so the tests read a fixture rather than the machine's live settings.
-DEFAULT_CONFIG_PATH = Path("~/.claude/config/direct.conf").expanduser()
 
 # A pass already records the agent identity it resolved to, so the digest covers
 # what that identity cannot: the assignment tables that produced it and the
@@ -275,8 +276,7 @@ def _contract_revision() -> ContractRevision:
 
 
 def _config_path() -> Path:
-    configured = os.environ.get("UNIT_CONFIG") or os.environ.get("PLAN_DELEGATE_CONFIG")
-    return Path(configured) if configured else DEFAULT_CONFIG_PATH
+    return Path(os.environ.get("CONF_DIR") or "~/.claude/config").expanduser() / "direct.conf"
 
 
 def _agents_config_path() -> Path:
@@ -415,7 +415,7 @@ def set_unit(session_dir: Path, production: str, unit: str) -> None:
            for value in (production, unit)):
         raise ValueError("invalid production or unit identity")
     with (session_dir / ".progress_history.lock").open("a+", encoding="utf-8") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        worker_lifecycle.acquire_flock(lock, mode=fcntl.LOCK_EX)
         state = _read_state(session_dir)
         state.update({"production": production, "unit": unit})
         _write_state(session_dir, state)
@@ -524,9 +524,10 @@ def _refresh_phase_table(session_dir: Path) -> None:
             Path(_string(state.get("working_dir"))),
             plan_doc,
         )
-        if "> **Production:" not in plan_path.read_text(encoding="utf-8"):
+        if isinstance(plan_history.plan_member(plan_path), session_staff.NoSuchMember):
             return
-    except (OSError, UnicodeError, SystemExit):
+    except (OSError, UnicodeError, SystemExit) as error:
+        print(f"phase table not written: {error}", file=sys.stderr)
         return
 
     command = [
@@ -549,6 +550,8 @@ def _refresh_phase_table(session_dir: Path) -> None:
         print(f"phase table not written: {error}", file=sys.stderr)
         return
     if result.returncode == 0:
+        if result.stderr:
+            print(result.stderr.rstrip(), file=sys.stderr)
         return
     reason = " ".join(result.stderr.split()) or f"exit status {result.returncode}"
     print(f"phase table not written: {reason}", file=sys.stderr)
@@ -3671,9 +3674,9 @@ def _current_worker_cells(
 def _worker_turn_windows(session_dir: Path, windows: list[StageWindow]) -> list[StageWindow]:
     """Current worker notes show accepted-turn telemetry; historical windows stay intact."""
     try:
-        roster = _json_object((session_dir / "mesh_roster.json").read_text(encoding="utf-8")) or {}
-    except OSError:
-        return windows
+        roster = worker_lifecycle.read_worker_state(session_dir / "mesh_roster.json")
+    except worker_lifecycle.WorkerStateUnreadable:
+        return [{**window, "worker": "unavailable"} for window in windows]
     from scripts.agents.codex_mesh import recorded_turn_settings
 
     slots: dict[str, str] = {}
@@ -5017,22 +5020,39 @@ class ProductionNotRecorded:
     reason: str
 
 
-def resolve_production_unit(state: Mapping[str, object]) -> ProductionUnitIdentity | ProductionNotRecorded:
-    """Read metadata only; never recover worker moves or take a run lock."""
+def resolve_production_unit(state: Mapping[str, object], *, resolver: session_staff.RowResolver | None = None) -> ProductionUnitIdentity | ProductionNotRecorded:
+    """Keep recorded history; resolve missing ownership from the current row."""
     production, unit = _string(state.get("production")), _string(state.get("unit"))
-    if not production or not unit:
-        worktree = Path(_string(state.get("working_dir")) or ".").expanduser()
-        plan = _string(state.get("project_plan_doc")) or _string(state.get("plan_doc"))
-        try:
-            content = (worktree / plan).read_text(encoding="utf-8") if plan else ""
-        except OSError:
-            content = ""
-        match = re.search(r'^> \*\*Production:(?: (.+?)\*\*|\*\* (.+?)) — unit `([^`]+)`;', content, re.MULTILINE)
-        if match:
-            production, unit = match.group(1) or match.group(2), match.group(3)
-    if not production or not unit:
-        return ProductionNotRecorded("run and plan have no production and unit identity")
-    return ProductionUnitIdentity(production, unit)
+    if production and unit:
+        return ProductionUnitIdentity(production, unit)
+    try:
+        resolver = resolver if resolver is not None else session_staff.RowResolver(staff.snapshot())
+        record = resolver.record
+        identity = _string(state.get("director_session"))
+        row = record.by_current_session(identity) if identity else None
+        if row is None:
+            folder = _string(state.get("working_dir"))
+            if folder:
+                member = resolver.member_by_folder(remote.local_machine(), Path(folder).expanduser().resolve())
+                row = member.row if isinstance(member, session_staff.MemberFound) else None
+        if row is None or row.kind != "unit":
+            plan = _string(state.get("project_plan_doc")) or _string(state.get("plan_doc"))
+            working_dir = _string(state.get("working_dir"))
+            if plan and working_dir:
+                try:
+                    # Read the artifact only to report a file failure.
+                    _ = (Path(working_dir).expanduser() / plan).read_text(encoding="utf-8")
+                except (OSError, UnicodeError) as error:
+                    return ProductionNotRecorded(f"phase plan cannot be read: {error}")
+            return ProductionNotRecorded("the run has no matching unit staff row")
+        parent = record.by_id(row.parent) if row.parent is not None else None
+        if parent is None:
+            return ProductionNotRecorded(f"{row.name}: the staff parent is unavailable")
+        timer = showrunners.timer_for(parent, record)
+        slug = timer.slug if isinstance(timer, showrunners.Timer) else parent.name
+        return ProductionUnitIdentity(production or slug, unit or row.name)
+    except (OSError, ValueError) as error:
+        return ProductionNotRecorded(str(error))
 
 
 @dataclass(frozen=True)
@@ -5125,27 +5145,11 @@ def _phase_production_name(production: str, working_dir: str) -> RecordedPhaseMe
 def _phase_plan_names(state: Mapping[str, object]) -> tuple[
     RecordedPhaseMetadata | PhaseMetadataNotRecorded, RecordedPhaseMetadata | PhaseMetadataNotRecorded
 ]:
-    working_dir = _string(state.get("working_dir"))
-    plan = _string(state.get("project_plan_doc")) or _string(state.get("plan_doc"))
-    if not working_dir or not plan:
-        missing = PhaseMetadataNotRecorded("phase has no working directory or plan document")
+    identity = resolve_production_unit(state)
+    if isinstance(identity, ProductionNotRecorded):
+        missing = PhaseMetadataNotRecorded(identity.reason)
         return missing, missing
-    try:
-        content = (Path(working_dir).expanduser() / plan).read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError) as error:
-        missing = PhaseMetadataNotRecorded(f"phase plan cannot be read: {error}")
-        return missing, missing
-    header = re.search(r'^> \*\*Production:(?:[ \t]+(.+?)\*\*([^\r\n]*)|\*\*[ \t]+([^\r\n]*))',
-                       content, re.MULTILINE)
-    if header is None:
-        missing = PhaseMetadataNotRecorded("phase plan has no production header")
-        return missing, missing
-    text = (header.group(1) + header.group(2)) if header.group(1) is not None else header.group(3)
-    production = re.split(r" — | \(", text, maxsplit=1)[0].strip()
-    unit = re.search(r'(?:^| — )unit[ \t]+(?:`([^`]+)`|([^,;\s]+))', text)
-    return (_phase_production_name(production, working_dir),
-            _recorded_phase_metadata((unit.group(1) or unit.group(2)).strip() if unit else "",
-                                     "phase plan header names no unit"))
+    return RecordedPhaseMetadata(identity.production), RecordedPhaseMetadata(identity.unit)
 
 
 def _phase_source_identity(state: Mapping[str, object]) -> PhaseSourceIdentity:
@@ -5157,6 +5161,8 @@ def _phase_source_identity(state: Mapping[str, object]) -> PhaseSourceIdentity:
             production = plan_production
         if isinstance(unit, PhaseMetadataNotRecorded):
             unit = plan_unit
+    if isinstance(production, RecordedPhaseMetadata):
+        production = _phase_production_name(production.value, _string(state.get("working_dir")))
     return PhaseSourceIdentity(production, unit, _phase_repository(_string(state.get("working_dir"))))
 
 
@@ -5449,17 +5455,17 @@ def _finish_external_wait(args: argparse.Namespace) -> None:
 
 
 def _showrunner_supplier(state: dict[str, object]) -> NamedSupplier | NoNamedSupplier:
-    identity = resolve_production_unit(state)
-    if isinstance(identity, ProductionNotRecorded):
-        return NoNamedSupplier(identity.reason)
-    from scripts.production import showrunners
-
     try:
-        address = showrunners.current_address(identity.production)
+        resolver = session_staff.RowResolver(staff.snapshot())
+        identity = resolve_production_unit(state, resolver=resolver)
+        if isinstance(identity, ProductionNotRecorded):
+            return NoNamedSupplier(identity.reason)
+        address = _supplier_address("showrunner:" + identity.production, resolver=resolver)
     except (OSError, ValueError) as error:
         return NoNamedSupplier(f"showrunner address unavailable: {error}")
-    # Keep the production alias, so a restart resolves its new socket on arrival.
-    return NamedSupplier("showrunner:" + identity.production) if address else NoNamedSupplier("production has no running showrunner address")
+    if isinstance(address, NoNamedSupplier):
+        return address
+    return NamedSupplier("showrunner:" + identity.production)
 
 
 def _supplier_fields(supplier: NamedSupplier | NoNamedSupplier) -> dict[str, object]:
@@ -5475,13 +5481,20 @@ def _turn_supplier(state: dict[str, object], reason: str) -> NamedSupplier | NoN
     return NamedSupplier(match[1]) if match else NoNamedSupplier("wait names no supplier address")
 
 
-def _supplier_address(identity: str) -> NamedSupplier | NoNamedSupplier:
+def _supplier_address(identity: str, *, resolver: session_staff.RowResolver | None = None) -> NamedSupplier | NoNamedSupplier:
     """Resolve the supplier alias at arrival, including a restarted showrunner."""
     if identity.startswith("showrunner:"):
-        from scripts.production import showrunners
+        from scripts.message import sessions
 
-        address = showrunners.current_address(identity.removeprefix("showrunner:"))
-        return NamedSupplier(address) if address else NoNamedSupplier("showrunner has no current address")
+        resolver = resolver if resolver is not None else session_staff.RowResolver(staff.snapshot())
+        production = identity.removeprefix("showrunner:")
+        records = {item["sessionId"]: item for item in sessions.live_sessions()}
+        for row in staff.active(resolver.record, "showrunner"):
+            timer = showrunners.timer_for(row, resolver.record)
+            slug = timer.slug if isinstance(timer, showrunners.Timer) else row.name
+            if slug == production and row.current_session in records:
+                return NamedSupplier("uds:" + records[row.current_session]["messagingSocketPath"])
+        return NoNamedSupplier("showrunner has no current address")
     if identity.startswith(("uds:/", "codex:")):
         return NamedSupplier(identity)
     if identity.startswith("worker:"):
@@ -6085,28 +6098,33 @@ class RecordedCodeFindings:
 
 
 CodeReviewEvidence = NoRecordedCodeReview | RecordedCodeFindings
+SEPARATE_TRIAL_LENSES = ("ux", "simplify")
 
 
-def _raised_code_findings(session_dir: Path, instance_id: str) -> CodeReviewEvidence:
-    """The code findings the phase's reviewers raised, from review.sh's turn records.
-
-    Sums `raised` over the phase's finished (`reviewed`) code-review turns, as
-    historical and current review records do. No record differs from a
-    recorded review that raised zero findings.
-    """
-    evidence: CodeReviewEvidence = NoRecordedCodeReview()
+def _phase_review_records(session_dir: Path, instance_id: str) -> Iterable[dict[str, object]]:
+    """Read the durable review records for one phase instance."""
     root = plan_history.history_root() / "review_turns" / session_dir.name
     for path in sorted(root.glob("*.json")):
         try:
             record = _object_dict(cast(object, json.loads(path.read_text(encoding="utf-8"))))
         except (OSError, ValueError):
             continue
-        if (
-            record is None
-            or _string(record.get("phase_instance_id")) != instance_id
-            or _string(record.get("status")) != "reviewed"
-            or _string(record.get("kind")) == "ux"
-        ):
+        if record is not None and _string(record.get("phase_instance_id")) == instance_id:
+            yield record
+
+
+def _is_code_review(record: dict[str, object]) -> bool:
+    return (
+        _string(record.get("kind")) not in SEPARATE_TRIAL_LENSES
+        and _string(record.get("lens")) not in SEPARATE_TRIAL_LENSES
+    )
+
+
+def _raised_findings(records: Iterable[dict[str, object]]) -> CodeReviewEvidence:
+    """Count findings from completed reviews."""
+    evidence: CodeReviewEvidence = NoRecordedCodeReview()
+    for record in records:
+        if _string(record.get("status")) != "reviewed":
             continue
         count = evidence.count if isinstance(evidence, RecordedCodeFindings) else 0
         evidence = RecordedCodeFindings(count + _integer(record.get("raised")))
@@ -6114,19 +6132,18 @@ def _raised_code_findings(session_dir: Path, instance_id: str) -> CodeReviewEvid
 
 
 def _review_trial(args: argparse.Namespace) -> None:
-    """Print one line: the phase's UX and code findings, and review time.
+    """Print the phase's findings and review minutes for the checkpoint notice.
 
-    It feeds the unit's checkpoint notice line, which the showrunner records with
-    review_regime.py. The phase is the one --phase-id names -- an open one, else
-    the latest this run started under that id -- or, without it, the one in
-    state, active or just closed by finish-phase. Only events stamped with its
-    instance count. The code number is what the reviewers raised, from the
-    phase's review turn records; a phase with none counts the code findings
-    the unit director opened. Review-worker
-    minutes are every worker's finished review passes, whatever their status, plus
-    the UX review activities. The screenshot check's own cost follows: its `UX
-    review` activities alone, then every fix pass of a round whose dispatched
-    batch covered a `ux` finding. All round to the nearest whole minute.
+    A named phase selects its open instance or its latest completed instance.
+    An unnamed command selects the current phase, including a completed phase.
+    Only events and review records for that instance count.
+    Completed reviews supply the code and simplify counts.
+    Without completed reviews, each count uses the findings that the director opened.
+    Review-worker minutes count finished review passes except `direct.simplify`, plus UX review activities.
+    Simplify minutes count its review records, including failed runs.
+    UX check minutes count `UX review` activities.
+    UX repair minutes count fix passes whose dispatched batch includes a UX finding.
+    Each time rounds to the nearest whole minute.
     """
     session_dir = _session_dir(args)
     state = _read_state(session_dir)
@@ -6157,6 +6174,7 @@ def _review_trial(args: argparse.Namespace) -> None:
     code_findings = 0
     review_seconds = 0
     ux_check_seconds = 0
+    simplify_findings = 0
     ux_finding_ids: set[str] = set()
     dispatched: list[dict[str, object]] = []
     fix_passes: list[dict[str, object]] = []
@@ -6169,12 +6187,15 @@ def _review_trial(args: argparse.Namespace) -> None:
             if "ux" in lenses:
                 ux_findings += 1
                 ux_finding_ids.add(_string(event.get("finding_id")))
-            if not lenses or lenses - {"ux"}:
+            if "simplify" in lenses:
+                simplify_findings += 1
+            if not lenses or lenses.difference(SEPARATE_TRIAL_LENSES):
                 code_findings += 1
         elif event_type == "finding_batch_dispatched":
             dispatched.append(event)
         elif event_type == "pass_finished" and _string(event.get("pass_kind")) == "review":
-            review_seconds += _integer(event.get("pass_elapsed_seconds"))
+            if _string(event.get("called_task")) != "direct.simplify":
+                review_seconds += _integer(event.get("pass_elapsed_seconds"))
         elif event_type == "pass_finished" and _string(event.get("pass_kind")) == "fix":
             fix_passes.append(event)
         elif (
@@ -6196,14 +6217,26 @@ def _review_trial(args: argparse.Namespace) -> None:
         for event in fix_passes
         if _integer(event.get("fix_pass")) in ux_rounds
     )
-    raised = _raised_code_findings(session_dir, instance_id)
+    records = list(_phase_review_records(session_dir, instance_id))
+    raised = _raised_findings(filter(_is_code_review, records))
     if isinstance(raised, RecordedCodeFindings):
         code_findings = raised.count
+    # Count the Claude run separately, including runs that report an error.
+    simplify_records = [record for record in records if _string(record.get("lens")) == "simplify"]
+    simplify_raised = _raised_findings(simplify_records)
+    simplify_seconds = sum(
+        max(0, int(_number(record.get("finished_at")) - _number(record.get("started_at"))))
+        for record in simplify_records
+    )
+    if isinstance(simplify_raised, RecordedCodeFindings):
+        simplify_findings = simplify_raised.count
+    simplify_line = (f", simplify {simplify_findings} findings, simplify minutes {(simplify_seconds + 30) // 60}"
+                     if simplify_records or simplify_findings else "")
     print(
         f"review trial: ux {ux_findings} findings, code {code_findings} findings, "
         + f"review-worker minutes {(review_seconds + 30) // 60}, "
         + f"ux check minutes {(ux_check_seconds + 30) // 60}, "
-        + f"ux repair minutes {(ux_repair_seconds + 30) // 60}"
+        + f"ux repair minutes {(ux_repair_seconds + 30) // 60}" + simplify_line
     )
 
 

@@ -30,8 +30,10 @@ import unit_runs  # noqa: E402
 import herdr  # noqa: E402
 import codex_daemon  # noqa: E402
 import process_table  # noqa: E402
+import sessions  # noqa: E402
 from scripts.astra import design_roles  # noqa: E402
 from scripts.production import staff
+from scripts.production import session_staff
 from scripts.lib import names  # noqa: E402
 from scripts.lib.names import JobKey  # noqa: E402
 if TYPE_CHECKING:
@@ -107,7 +109,7 @@ from scripts.message.unit_labels import (
 )
 
 
-# Compatibility for callers of the full roster’s mark discovery boundary.
+# Keep the discovery boundary for existing callers.
 _every_marked_unit = every_marked_unit
 
 @dataclass(frozen=True)
@@ -153,10 +155,10 @@ class NoClaudeSession:
 
 
 def sender_identity(environment: Mapping[str, str]) -> SenderIdentity:
-    """A Codex shell can inherit its launching Claude session's id."""
+    """Prefer the caller's thread; resolve Claude from its current process registry."""
     if thread_id := environment.get("CODEX_THREAD_ID", ""):
         return CodexThread(thread_id)
-    if session_id := environment.get("CLAUDE_CODE_SESSION_ID", ""):
+    if session_id := staff.runtime_id():
         return ClaudeSession(session_id)
     return NoSession()
 
@@ -853,11 +855,10 @@ def mesh_shown_name(session_dir: str, name: str, record: Mapping[str, object]) -
     director: DirectorRelationship = NoDirector()
     problems: list[str] = []
     records = _newest_sessions()
-    details = _raw_session_details(records, problems)
-    registered = _registered_showrunners(os.environ, problems)
-    places = (_production_places(records, details, registered,
-                                 _showrunner_ids(records, registered), set(), problems, record=staff.snapshot())
-              if registered else {})
+    membership = staff.initial_snapshot()
+    resolver = session_staff.RowResolver(membership)
+    places = _production_places(records, set(), problems,
+                                record=membership, resolver=resolver)
     place = places.get(unit_runs.director(run))
     if place is not None:
         showrunner, director = place.showrunner, UnderDirector(place.director.unit, "", "")
@@ -1307,17 +1308,20 @@ def _durable_roles(machine: str, claude: Mapping[str, RosterEntry], warnings: li
     return entries, threads
 
 
-def _herdr_codex_panes(machine: str) -> Roster:
+def _herdr_codex_panes(machine: str, productions: Iterable[str] = ()) -> Roster:
     """Interactive Codex panes have no messaging address; preserve partial reads."""
     entries: list[RosterEntry] = []
     problems: list[str] = []
     try:
         sessions = herdr.live_sessions()
-    except herdr.HerdrMissing:
-        # A machine without herdr has no herdr panes to list.
+    except herdr.HerdrMissing as error:
+        for production in productions:
+            _problem(problems, f"unit hosts for {production} were not read", error)
         return Roster(entries, problems)
     except herdr.HerdrFailure as error:
         _problem(problems, "herdr sessions", error)
+        for production in productions:
+            _problem(problems, f"unit hosts for {production} were not read", error)
         return Roster(entries, problems)
     processes = herdr.herdr_processes()
     cwds = {process.place: process.cwd for process in processes}
@@ -1336,7 +1340,7 @@ def _herdr_codex_panes(machine: str) -> Roster:
             process = codex_processes.get(herdr.HerdrPlace(name, pane))
             entries.append(RosterEntry(
                 machine=machine, kind="codex", role="freestanding",
-                name=f"herdr {name}:{pane}", status=agent["agent_status"],
+                name=f"herdr {name}:{pane}", status=str(agent["agent_status"]),
                 reach=CannotReceiveMessages("interactive Codex in a herdr pane"),
                 cwd=cwds.get(herdr.HerdrPlace(name, pane), ""),
                 showrunner=NoShowrunner(), director=NoDirector(), assignment=NotAWorker(),
@@ -1349,27 +1353,40 @@ def machine_name() -> str:
     return socket.gethostname().split(".", 1)[0]
 
 
-def _local_roster(environment: Mapping[str, str]) -> Roster:
+def _local_roster(environment: Mapping[str, str], *, membership: staff.StaffSnapshot | None = None,
+                  records: list[SessionRecord] | None = None) -> Roster:
     home_state = account.home_account_state()
     problems: list[str] = []
     warnings: list[str] = []
     machine = machine_name()
-    records = _newest_sessions()
+    running = sessions.running_sessions() if records is None else records
+    newest: dict[str, SessionRecord] = {}
+    for record in running:
+        _ = newest.setdefault(record["sessionId"], record)
+    records = list(newest.values())
     details = _raw_session_details(records, problems)
-    registered = _registered_showrunners(environment, problems)
-    runner_ids = _showrunner_ids(records, registered)
+    try:
+        if membership is None:
+            membership = staff.initial_snapshot()
+    except staff.StaffUnreadable as error:
+        _problem(problems, "staff membership", error)
+        membership = staff.StaffSnapshot(())
+    resolver = session_staff.RowResolver(membership)
+    registered = _registered_showrunners(
+        problems, membership=membership, resolver=resolver,
+        known_sessions={record["sessionId"]: record for record in records},
+    )
+    runner_ids = _showrunner_ids(records, registered, membership=membership)
     roots = unit_runs.run_roots(environment.get("ROSTER_RUN_ROOT"))
     runs = _live_runs(roots, {record["sessionId"] for record in records}, problems)
     workers = _ledger_workers(runs, records, problems)
     production_places: dict[str, _ProductionPlace] = {}
-    if registered:
-        try:
-            record = staff.snapshot()
-            production_places = _production_places(
-                records, details, registered, runner_ids, set(workers), problems, record=record
-            )
-        except staff.StaffUnreadable as error:
-            _problem(problems, "staff membership", error)
+    try:
+        production_places = _production_places(
+            records, set(workers), problems, record=membership, resolver=resolver
+        )
+    except staff.StaffUnreadable as error:
+        _problem(problems, "staff membership", error)
     claude = _claude_entries(
         machine, records, details, runner_ids, production_places, runs, workers,
         home_state=home_state, problems=problems,
@@ -1405,7 +1422,7 @@ def _local_roster(environment: Mapping[str, str]) -> Roster:
             for session in daemon
             if session.thread_id not in worker_threads
         )
-    interactive = _herdr_codex_panes(machine)
+    interactive = _herdr_codex_panes(machine, (runner["slug"] for runner in registered))
     problems.extend(interactive.problems)
     entries = [*claude.values(), *unit_workers, *codex_sessions, *interactive.entries]
     return Roster(entries, problems, warnings)
@@ -1450,14 +1467,15 @@ def peer_roster(environment: Mapping[str, str]) -> Roster:
 
 
 @role_map_command
-def roster(environment: Mapping[str, str], scope: RosterScope) -> Roster:
+def roster(environment: Mapping[str, str], scope: RosterScope, *,
+           membership: staff.StaffSnapshot | None = None, records: list[SessionRecord] | None = None) -> Roster:
     match scope:
         case ThisMachine():
-            return _local_roster(environment)
+            return _local_roster(environment, membership=membership, records=records)
         case AllMachines():
             with ThreadPoolExecutor(max_workers=2) as pool:
                 peer = pool.submit(peer_roster, environment)
-                local = _local_roster(environment)
+                local = _local_roster(environment, membership=membership, records=records)
                 other = peer.result()
             return Roster([*local.entries, *other.entries], [*local.problems, *other.problems],
                           [*local.warnings, *other.warnings])

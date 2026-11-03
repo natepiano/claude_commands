@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""List, attach, start or resume standalone Claude sessions, each a tab of the shared herdr session.
+"""List, attach, start or resume standalone Claude sessions in the shared herdr session.
 
-A standalone session opens in the shared session's `ad-hoc` workspace; nothing here starts a herdr
-session of its own (user, 2026-10-26).
+Each standalone session uses a workspace with its tab name.
+This module starts no separate herdr session.
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ from sessions import SessionRecord, UnreadableSessionRecord, live_session, read_
 
 sys.path.insert(0, str(SCRIPTS.parent))
 sys.path.insert(0, str(SCRIPTS / "production"))
-from scripts.production.showrunners import registered_showrunners  # noqa: E402
+from scripts.production.showrunners import registered_showrunners, require_complete  # noqa: E402
 
 from scripts.shutdown import launch_permission  # noqa: E402
 from scripts.accounts import accounts  # noqa: E402
@@ -33,7 +33,6 @@ from scripts.production import staff  # noqa: E402
 
 USAGE = "usage: herdr_sessions.py list [--on <host>] | sort-tabs | attach <name> | focus <name> | attach-remote <host> <name> | start [--name N] [--cwd D] [-- <claude args>] | resume <name> --session-id ID --cwd D [--config-dir D] [--restore] [--prompt-file P] [--attach] [-- <claude args>]"
 REMOTE_LIST_TIMEOUT = 15
-ADHOC_SPACE = "ad-hoc"
 
 
 @dataclass(frozen=True)
@@ -217,7 +216,7 @@ def _launch(verb: str, arguments: list[str]) -> int:
         if verb == "resume":
             claude_arguments.extend(["--resume", options.session_id])
         claude_arguments.extend(["-n", name])
-        launched = herdr.launch_agent(shared, ADHOC_SPACE, name, str(folder), pane_environment,
+        launched = herdr.launch_agent(shared, name, name, str(folder), pane_environment,
             kind="claude", agent=name, agent_arguments=claude_arguments, opening=opening, timeout_ms=90_000)
         if isinstance(launched, herdr.nix_env.Refused):
             raise herdr.HerdrFailure(launched.reason)
@@ -255,9 +254,13 @@ def claude_names() -> dict[str, str]:
     return {pane: record["name"] for pane, record in newest.items()}
 
 
-def unit_roles(client: herdr.Herdr, panes: list[herdr.PaneIdentity]) -> dict[str, str]:
+def unit_roles(client: herdr.Herdr, panes: list[herdr.PaneIdentity], *,
+               record: staff.StaffSnapshot) -> dict[str, str]:
     """Classify live unit panes using the same staff join as tab ordering."""
-    classifier = herdr.UnitTabClassifier(client.session, herdr.herdr_processes(), staff.initial_snapshot())
+    from scripts.production.session_labels import StaffLabels
+
+    classifier = herdr.UnitTabClassifier(
+        client.session, herdr.herdr_processes(membership=StaffLabels.for_record(record)), record)
     spaces: dict[str, str] = {}
     if any(classifier.has_unit_title(pane.get("label") or "") for pane in panes):
         for item in herdr.json_items(client.result("workspace", "list").get("workspaces"), "herdr workspace list"):
@@ -330,8 +333,10 @@ def _main(argv: list[str]) -> int:
         with herdr.pane_snapshot() as read_panes:
             panes = read_panes(shared)
             names = claude_names()
-            roles = unit_roles(herdr.Herdr(shared), panes)
-            showrunner_names = {runner["session"] for runner in registered_showrunners() if runner["session"]}
+            membership = staff.initial_snapshot()
+            roles = unit_roles(herdr.Herdr(shared), panes, record=membership)
+            showrunner_names = {runner["session"] for runner in require_complete(
+                registered_showrunners(membership=membership)) if runner["session"]}
             for row in panes:
                 pane = row["pane_id"]
                 claude = names.get(pane, "")

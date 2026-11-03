@@ -23,6 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.accounts.home_test_support import scratch_account_home
 from scripts.accounts import accounts, role_map
+from scripts.lib import atomic_file
 from scripts.accounts.nix_env_fake import fake_nix_loader, imports_with_nix_loader
 from scripts.accounts.nix_env_fake import installed_program
 from scripts.message import sessions
@@ -35,6 +36,10 @@ def file_state(path: Path) -> tuple[int, int, int, int, int, int]:
     """Return the file's identity and change times, without the access time a read can move."""
     status = path.stat()
     return (status.st_dev, status.st_ino, status.st_mode, status.st_size, status.st_mtime_ns, status.st_ctime_ns)
+
+
+def setUpModule() -> None:
+    _ = unittest.enterModuleContext(patch.object(accounts, "_start_session_counts_fetch", return_value=True))
 
 
 class HomeCutoverTests(unittest.TestCase):
@@ -55,6 +60,7 @@ class HomeCutoverTests(unittest.TestCase):
             "oauthAccount": {"emailAddress": "old@example.invalid"},
             "mcpServers": {"fixture": {}}, "projects": {"/project": {"hasTrustDialogAccepted": True}}}))
         self.assertEqual(accounts.setup("claude2"), [])
+        _ = (self.home / ".claude/.credentials.json").write_bytes(b"{}")
         _ = self.enterContext(patch.object(sessions, "live_sessions", return_value=[]))
         _ = self.enterContext(patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")))
         _ = self.enterContext(patch.object(Path, "read_bytes", return_value=b"claude\0--resume\0probe\0"))
@@ -108,6 +114,64 @@ class HomeCutoverTests(unittest.TestCase):
         self.assertFalse(status.is_set_up)
         self.assertIsInstance(accounts.prepared_account("claude2", resume=True), accounts.AccountRefused)
         self.assertTrue(any("missing" in problem for problem in accounts.check("claude2")))
+
+    def test_uncredentialed_home_identity_is_backed_up_without_moving_into_a_numbered_home(self) -> None:
+        (self.home / ".claude/.credentials.json").unlink()
+        seed_path = self.home / ".claude.json"
+        original = seed_path.read_text()
+        numbered = (self.home / ".claude2/.claude.json").read_text()
+        with redirect_stdout(io.StringIO()):
+            accounts.cutover_home("claude2")
+        seed = cast(dict[str, object], json.loads(seed_path.read_text()))
+        expected = cast(dict[str, object], json.loads(original))
+        del expected["oauthAccount"]
+        self.assertEqual(seed, expected)
+        self.assertEqual((self.home / ".claude2/.claude.json").read_text(), numbered)
+        backups = list(self.home.glob(".claude.json.identity-backup-*"))
+        self.assertEqual(len(backups), 1)
+        self.assertTrue(backups[0].read_text() == original)
+        self.assertEqual(backups[0].stat().st_mode & 0o777, 0o600)
+        self.assertFalse((self.home / ".local/state/accounts/cutover-home.json").exists())
+
+    def test_credential_file_prevents_orphan_cleanup_on_both_platforms(self) -> None:
+        seed_path = self.home / ".claude.json"
+        numbered_path = self.home / ".claude2/.claude.json"
+        _ = numbered_path.write_text('{"oauthAccount": {"accountUuid": "occupied"}}')
+        credentials = self.home / ".claude/.credentials.json"
+        before = {path: file_state(path) for path in (seed_path, numbered_path, credentials)}
+        for platform in ("linux", "darwin"):
+            with (self.subTest(platform=platform), patch.object(sys, "platform", platform),
+                  patch.object(accounts, "_mac_login_keychain_visible", side_effect=AssertionError("credential file comes first")) as visible,
+                  patch.object(accounts, "_mac_keychain_has_entry", return_value=False) as entry,
+                  redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO())):
+                self.assertNotEqual(accounts.main(["cutover-home", "claude2"]), 0)
+                self.assertEqual({path: file_state(path) for path in before}, before)
+                self.assertEqual(output.getvalue(), "")
+                visible.assert_not_called()
+                entry.assert_not_called()
+                self.assertEqual(list(self.home.glob(".claude.json.identity-backup-*")), [])
+                self.assertFalse((self.home / ".local/state/accounts/cutover-home.json").exists())
+
+    def test_orphan_cleanup_without_a_journal_reruns_unchanged_on_both_platforms(self) -> None:
+        (self.home / ".claude/.credentials.json").unlink()
+        seed_path = self.home / ".claude.json"
+        original = seed_path.read_text()
+        for platform in ("linux", "darwin"):
+            with (self.subTest(platform=platform), patch.object(sys, "platform", platform),
+                  patch.object(accounts, "_mac_login_keychain_visible", return_value=True),
+                  patch.object(accounts, "_mac_keychain_has_entry", return_value=False),
+                  redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors):
+                _ = seed_path.write_text(original)
+                self.assertEqual(accounts.main(["cutover-home", "claude2"]), 0)
+                self.assertNotIn("oauthAccount", cast(dict[str, object], json.loads(seed_path.read_text())))
+                self.assertFalse((self.home / ".local/state/accounts/cutover-home.json").exists())
+                before = {path: file_state(path) for path in self.home.rglob("*") if path.is_file()}
+                _ = output.seek(0)
+                _ = output.truncate(0)
+                self.assertEqual(accounts.main(["cutover-home", "claude2"]), 0)
+                self.assertEqual(output.getvalue(), "accounts: home account data is already clear\n")
+                self.assertEqual(errors.getvalue(), "")
+                self.assertEqual({path: file_state(path) for path in self.home.rglob("*") if path.is_file()}, before)
 
     def test_destination_identity_refuses_before_any_journal_or_move(self) -> None:
         target = self.home / ".claude2/.claude.json"
@@ -260,6 +324,7 @@ class HomeCutoverTests(unittest.TestCase):
         seed = cast(dict[str, object], json.loads(seed_path.read_text()))
         seed["oauthAccount"] = {"emailAddress": "next@example.invalid"}
         _ = seed_path.write_text(json.dumps(seed))
+        _ = (self.home / ".claude/.credentials.json").write_bytes(b"{}")
         accounts.cutover_home("claude3")
         self.assertEqual(accounts.resolve_history_label("default", "2026-01-01T00:00:00Z"),
                          account.ResolvedHistoryLabel("claude2"))
@@ -753,7 +818,7 @@ class CodexHomeCutoverTests(unittest.TestCase):
         self.assertIn("a test wrote ~/.codex/auth.json at 2026-10-29 01:14 UTC", lines[0])
         self.assertIn("delete ~/.codex/auth.json", lines[0])
         self.assertNotIn("cutover-home", lines[0])
-        self.assertNotIn("agents/codexN.md", lines[0])
+        self.assertNotIn("~/notes/codexN.md", lines[0])
         self.assertTrue((self.source / "auth.json").exists())
 
     def test_status_merges_ordinary_unnoted_legacy_codex_repairs_without_changing_launch_error(self) -> None:
@@ -766,23 +831,66 @@ class CodexHomeCutoverTests(unittest.TestCase):
         lines = [line for line in reading.notes if "~/.codex" in line]
         self.assertEqual(len(lines), 1)
         self.assertIn("this login has no account note", lines[0])
-        self.assertIn("add ~/rust/hanadocs/agents/codexN.md with login: codex-cutover@example.invalid", lines[0])
+        self.assertIn("add ~/notes/codexN.md with the login for ~/.codex", lines[0])
         self.assertIn("accounts.py cutover-home <codexN>", lines[0])
         self.assertEqual(accounts.unnoted_home_line(self.source, "codex-cutover@example.invalid"), original)
+
+    def test_status_repairs_a_conflicting_numbered_login_instead_of_recommending_cutover(self) -> None:
+        self.target.mkdir()
+        _ = (self.target / "auth.json").write_text("synthetic occupied identity")
+        target_before = file_state(self.target / "auth.json")
+        source_before = file_state(self.source / "auth.json")
+
+        def identity(home: Path) -> str:
+            return {self.source: "codex-cutover@example.invalid",
+                    self.target: "other@example.invalid"}.get(home, "")
+
+        with (patch.object(agent_accounts, "codex_email_on_disk", side_effect=identity),
+              patch.object(accounts, "_stored_usage", return_value={}),
+              patch.object(accounts, "is_test_login", return_value=False)):
+            reading = accounts.read_status(source=accounts.StoredUsageOnly())
+        expected = ("codex2: wrong sign-in; ~/.codex2 holds a different login from codex2; "
+            + f"stop what uses ~/.codex2, then run env CODEX_HOME={shlex.quote(str(self.target))} "
+            + "codex login to sign in as codex2")
+        self.assertEqual([line for line in reading.notes if line.startswith("codex2:")], [expected])
+        document = cast(accounts.StatusDocument, json.loads(accounts.render_status_json(reading)))
+        self.assertEqual([line for line in document["problems"] if line.startswith("codex2:")], [expected])
+        printed = next(line for line in reading.notes if line.startswith("codex2:"))
+        command = printed.split("then run ", 1)[1].removesuffix(" to sign in as codex2")
+        self.assertEqual(shlex.split(command), ["env", f"CODEX_HOME={self.target}", "codex", "login"])
+        binary = self.home / "login tools"
+        binary.mkdir()
+        program = binary / "codex"
+        _ = program.write_text('#!/bin/sh\nprintf \'%s\\n\' "$CODEX_HOME" "$@"\n')
+        program.chmod(0o700)
+        environment = {**os.environ, "PATH": f"{binary}{os.pathsep}{os.defpath}",
+            "CODEX_HOME": str(self.home / ".codex1")}
+        shell = "alias codex='exit 79'\n" + command
+        with subprocess.Popen(["/bin/sh", "-c", shell],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=environment) as process:
+            output, error = process.communicate()
+        self.assertEqual((process.returncode, output, error), (0, f"{self.target}\nlogin\n", ""))
+        for output in (accounts.render_status_table(reading), accounts.render_status_json(reading)):
+            self.assertNotIn("cutover-home codex2", output)
+            self.assertNotIn("codex-cutover@example.invalid", output)
+            self.assertNotIn("other@example.invalid", output)
+        self.assertEqual(file_state(self.target / "auth.json"), target_before)
+        self.assertEqual(file_state(self.source / "auth.json"), source_before)
+        self.assertFalse(self.journal.exists())
 
     def test_status_names_legacy_login_only_until_cutover_and_omits_signed_out_default_row(self) -> None:
         # This reserved address models a normal provider login for cutover.
         with (patch.object(accounts, "_stored_usage", return_value={}),
               patch.object(accounts, "is_test_login", return_value=False)):
             before = accounts.status_report()
-            self.assertIn("~/.codex still holds a login; run accounts.py cutover-home codex2", before)
+            self.assertIn("~/.codex still holds codex2's login; stop what uses ~/.codex (such as the ChatGPT app), then run accounts.py cutover-home codex2", before)
             self.assertEqual(self.run_cutover(), 0)
             after = accounts.status_report()
-            self.assertNotIn("~/.codex still holds a login", after)
+            self.assertNotIn("~/.codex still holds codex2's login", after)
             self.assertNotIn("~/.codex", [row.folder for row in accounts.codex_statuses(self.target)])
             self.assertIn("~/.codex2", after)
             self.assertEqual(self.run_cutover(undo=True), 0)
-            self.assertIn("~/.codex still holds a login; run accounts.py cutover-home codex2", accounts.status_report())
+            self.assertIn("~/.codex still holds codex2's login; stop what uses ~/.codex (such as the ChatGPT app), then run accounts.py cutover-home codex2", accounts.status_report())
 
 
 class CodexCutoverProcessListingTests(unittest.TestCase):
@@ -1026,7 +1134,8 @@ class MacHomeCutoverTests(unittest.TestCase):
         calls_before = tuple(self.keychain.calls)
         self.assertNotEqual(accounts.main(["cutover-home", "claude2"]), 0)
         self.assertTrue(self.snapshot() == before, "mismatch changed identity state")
-        self.assertEqual(tuple(self.keychain.calls), calls_before)
+        self.assertEqual(tuple(self.keychain.calls), (*calls_before,
+            ("security", "find-generic-password", "-s", "Claude Code-credentials")))
         self.assertEqual(self.deletes(), [])
         self.assertFalse((self.home / ".local/state/accounts/cutover-home.json").exists())
 
@@ -1081,6 +1190,48 @@ class MacHomeCutoverTests(unittest.TestCase):
         self.assertTrue(began <= datetime.fromisoformat(history[0]["at"]) <= ended)
         self.assertEqual(accounts.main(["cutover-home", "claude2"]), 0)
         self.assertEqual(len(self.deletes()), 1)
+
+    def test_completed_cutover_clears_later_uncredentialed_identity_without_changing_the_journal(self) -> None:
+        self.assertEqual(accounts.main(["cutover-home", "claude2"]), 0)
+        seed_path = self.home / ".claude.json"
+        seed = cast(dict[str, object], json.loads(seed_path.read_text()))
+        seed["oauthAccount"] = {"emailAddress": "synthetic-leftover@example.invalid", "accountUuid": "leftover-id"}
+        _ = seed_path.write_text(json.dumps(seed, indent=2) + "\n")
+        seed_path.chmod(0o640)
+        original = seed_path.read_text()
+        numbered = (self.home / ".claude2/.claude.json").read_bytes()
+        journal = self.home / ".local/state/accounts/cutover-home.json"
+        journal_before = journal.read_bytes()
+        self.assertEqual(accounts.main(["cutover-home", "claude2"]), 0)
+        del seed["oauthAccount"]
+        self.assertEqual(cast(object, json.loads(seed_path.read_text())), seed)
+        self.assertEqual(seed_path.stat().st_mode & 0o777, 0o640)
+        self.assertTrue((self.home / ".claude2/.claude.json").read_bytes() == numbered)
+        self.assertTrue(journal.read_bytes() == journal_before)
+        backups = list(self.home.glob(".claude.json.identity-backup-*"))
+        self.assertEqual(len(backups), 1)
+        self.assertTrue(backups[0].read_text() == original)
+        self.assertEqual(backups[0].stat().st_mode & 0o777, 0o600)
+        self.assertEqual(len(self.deletes()), 1)
+        self.assertNotIn("synthetic-leftover@example.invalid", self.output.getvalue() + self.errors.getvalue())
+        before = file_state(seed_path)
+        self.assertEqual(accounts.main(["cutover-home", "claude2"]), 0)
+        self.assertEqual(file_state(seed_path), before)
+        self.assertEqual(list(self.home.glob(".claude.json.identity-backup-*")), backups)
+
+    def test_leftover_identity_survives_failed_atomic_replacement_with_a_backup(self) -> None:
+        del self.keychain.entries["Claude Code-credentials"]
+        seed_path = self.home / ".claude.json"
+        original = seed_path.read_text()
+        with patch.object(atomic_file, "write_text_atomic", side_effect=OSError("synthetic interruption")):
+            self.assertNotEqual(accounts.main(["cutover-home", "claude2"]), 0)
+        self.assertTrue(seed_path.read_text() == original)
+        backups = list(self.home.glob(".claude.json.identity-backup-*"))
+        self.assertEqual(len(backups), 1)
+        self.assertTrue(backups[0].read_text() == original)
+        self.assertEqual(accounts.main(["cutover-home", "claude2"]), 0)
+        self.assertNotIn("oauthAccount", cast(dict[str, object], json.loads(seed_path.read_text())))
+        self.assertEqual(self.deletes(), [])
 
     def test_undo_restores_home_identity_and_explains_required_home_login(self) -> None:
         original = self.snapshot()

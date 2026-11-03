@@ -6,15 +6,22 @@ from __future__ import annotations
 import json
 import os
 import stat
-import subprocess
 import sys
 import time
 import tomllib
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from enum import Enum
+from importlib import import_module
 from pathlib import Path
 from typing import Literal, NotRequired, TypedDict, cast
+
+if __package__:
+    from .process_identity import process_start as process_start
+    from .relay_identity import RelayIdentity, live_relay_identity, relay_senders_directory
+else:
+    from process_identity import process_start as process_start
+    from relay_identity import RelayIdentity, live_relay_identity, relay_senders_directory
 
 
 # Claude's entrypoint for a print-mode run starts with this; an interactive session's is "cli".
@@ -36,6 +43,10 @@ class SessionRecord(TypedDict):
     # How Claude was started: "cli" for an interactive session, "sdk-cli" for a `claude -p` run.
     # Older records and callers may omit it; read_session normalizes absence to empty.
     entrypoint: NotRequired[str]
+    # The conversation's folder, for the exact staff-worktree join. Older records may omit it.
+    cwd: NotRequired[str]
+    # Older records omit status. The reader converts absence to an empty string.
+    status: NotRequired[str]
 
 
 @dataclass(frozen=True)
@@ -150,6 +161,8 @@ def parse_session(parsed: object) -> RegistryEntry:
     tmux = data.get("tmux")
     former = data.get("formerNames")
     entrypoint = data.get("entrypoint")
+    cwd = data.get("cwd")
+    status = data.get("status")
     if (
         not isinstance(pid, int)
         or isinstance(pid, bool)
@@ -172,6 +185,8 @@ def parse_session(parsed: object) -> RegistryEntry:
         formerNames=[name for name in cast(list[object], former) if isinstance(name, str)]
         if isinstance(former, list) else [],
         entrypoint=entrypoint if isinstance(entrypoint, str) else "",
+        cwd=cwd if isinstance(cwd, str) else "",
+        status=status if isinstance(status, str) else "",
     )
 
 
@@ -219,40 +234,18 @@ def remote_control(record: SessionRecord) -> Literal["active", "absent"]:
     return "absent"
 
 
-def process_start(pid: int) -> str | None:
-    """The process identity stored in session records, in this platform's native units."""
-    if sys.platform == "darwin":
-        # Claude writes procStart under this locale and zone; other text never matches.
-        try:
-            result = subprocess.run(
-                ("ps", "-o", "lstart=", "-p", str(pid)),
-                capture_output=True,
-                text=True,
-                timeout=5,
-                check=False,
-                env={**os.environ, "LC_ALL": "C", "TZ": "UTC"},
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            return None
-        started = result.stdout.strip()
-        return started if result.returncode == 0 and started else None
-    try:
-        # The kernel can truncate the process name inside a UTF-8 character.
-        _, separator, fields = Path(f"/proc/{pid}/stat").read_bytes().rpartition(b")")
-        if not separator:
-            return None
-        started = fields.split()[19].decode("ascii")
-        return started if started.isdigit() else None
-    except (OSError, IndexError, UnicodeDecodeError):
-        return None
+def headless_process(pid: int, entrypoint: str = "") -> bool:
+    """Exclude SDK and relay processes even before a session record exists."""
+    return (entrypoint.startswith(HEADLESS_ENTRYPOINT_PREFIX)
+            or isinstance(live_relay_identity(pid, relay_senders_directory()), RelayIdentity))
 
 
 def headless(record: SessionRecord) -> bool:
-    """A `claude -p` run, such as send.py's relay, which takes its sender's name for one message.
+    """A `claude -p` run, or a process identified by the relay launcher's PID record.
 
     It is no session: no roster lists it, and no name lookup finds it.
     """
-    return record.get("entrypoint", "").startswith(HEADLESS_ENTRYPOINT_PREFIX)
+    return headless_process(record["pid"], record.get("entrypoint", ""))
 
 
 def running_session(record: SessionRecord) -> bool:
@@ -396,8 +389,17 @@ def latest_transcript(session_id: str, projects: Path) -> Path | None:
     return transcripts[-1] if transcripts else None
 
 
+def member_target(target: str) -> str:
+    """Resolve a retained staff reference to its current conversation at delivery."""
+    if not target.startswith("session:"):
+        return target
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    resolve = cast(Callable[[str], str], import_module("scripts.production.staff").current_session_target)
+    return resolve(target)
+
+
 def main(argv: list[str]) -> int:
-    if len(argv) != 3 or argv[1] not in {"socket", "address", "id"} or not argv[2]:
+    if len(argv) != 3 or argv[1] not in {"socket", "member-socket", "address", "id"} or not argv[2]:
         print(
             "usage: sessions.py socket <session:id|name> | address <session:id|name> | id <pid|name>",
             file=sys.stderr,
@@ -405,6 +407,14 @@ def main(argv: list[str]) -> int:
         return 2
 
     command, target = argv[1:]
+    if command == "member-socket":
+        sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+        try:
+            target = member_target(target)
+        except (OSError, ValueError) as error:
+            print(f"sessions: staff target unavailable: {error}", file=sys.stderr)
+            return 3
+        command = "socket"
     registry = read_registry()
     unreadable = bool(registry.unreadable)
     records = (observation.record for observation in registry.entries)

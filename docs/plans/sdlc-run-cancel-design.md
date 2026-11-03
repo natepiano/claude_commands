@@ -95,6 +95,11 @@ and logs belong to their runs and were left in place.
 | Memory waiter or admitted step | `memory_gate.sh` calls `memory_admit.py check` using its shell pid (`scripts/lint/memory_gate.sh:192`, `scripts/lint/memory_gate.sh:218`). The admission lock protects `.waiting` and `.reservation` records (`scripts/lint/memory_admit.py:977`). | No stop-by-owner verb. `release <reservation> <status>` removes a reservation; it does not stop work or remove a live waiter (`scripts/lint/memory_admit.py:1241`, `scripts/lint/memory_admit.py:1294`). Normal cleanup drops a charge when its shell pid disappears, even if a child survives (`scripts/lint/memory_admit.py:737`). Deleting a live wait file alone lets its next check recreate it. | Waiter has pid/start and some session/folder fields. Reservation can carry `call_id`. Neither carries a required phase, round or mesh id. |
 | Board waiter and verify child/copy | Board wait files identify slot, command key, timestamp and pid. A local step starts a separate session and records its group and start identity (`scripts/direct/verify.sh:2515`). Verify can also route work to the Mac. | Existing board replacement returns 76 (`scripts/direct/verify.sh:2284`, `scripts/direct/verify.sh:2387`). Verify cleanup forwards signals and stops its copy watcher. This does not establish a durable stop across all remote children. | Board and verify call are indirect owners. Children need a common command-run link, including copies and retries. |
 
+`mesh_runs.py start` checks for a live twin before it applies `config/mesh_runs.conf` `LIVE_RUN_LIMIT` to the worker.
+At the limit, exit 4 starts nothing and names the live runs.
+Wait for a run's result, or put more files in one run.
+Exit 3 still means the caller is not a mesh worker; only that exit permits attached execution.
+
 A build hold is separate. Only removal of its holder file ends it
 (`scripts/build_hold/build_hold.py:732`). A hold can make verify wait or route
 again (`scripts/direct/verify.sh:2172`). It must not be translated into a phase

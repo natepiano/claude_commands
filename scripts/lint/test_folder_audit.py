@@ -25,6 +25,7 @@ else:
 import folder_audit
 import scratch
 import tmp_sweep
+from scripts.lib import copy_record
 
 DAY = 86_400
 
@@ -100,7 +101,7 @@ class FolderAuditTests(unittest.TestCase):
     def test_copies_root_keeps_an_old_open_phase_copy(self) -> None:
         import json
         copy = folder(self.temp / "copies" / "show-maker" / "21-gate", 30)
-        _ = (copy / scratch.RECORD).write_text(json.dumps({"task": "phase:maker-unit/21"}))
+        _ = (copy / copy_record.RECORD).write_text(json.dumps({"task": "phase:maker-unit/21"}))
         age(self.temp / "copies", 30)
         proc = self.root / "proc"
         proc.mkdir()

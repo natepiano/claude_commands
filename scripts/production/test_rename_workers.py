@@ -77,14 +77,15 @@ class ProductionRenameTests(support.ProductionRenameFixture):
         self.assertEqual(self.snapshot(), before)
         destination = self.root / "runs/after-move"
         self.write(destination / workers.STATE, json.dumps({"status": "active", "working_dir": str(new),
-            "plan_doc": "docs/plans/alpha-unit.md", "run_id": destination.name}))
+            "plan_doc": "docs/plans/alpha-unit.md", "production": NEW, "unit": "alpha-unit",
+            "run_id": destination.name}))
         with mock.patch.dict(os.environ, self.env):
             self.assertEqual(workers.adopt(run, destination, "w7"), "w7")
             target = workers.ledger_for_run(destination)
             self.assertEqual(target.path, workers.ledger_for_run(run).path)
             with target.locked() as ledger:
                 self.assertEqual(ledger.workers["w7"].backend,
-                                 workers.CodexThread("kept-thread", str(self.root / "codex-home")))
+                                 workers.CodexThread("057316c9-bc95-50de-b3fc-9010799ce6e7", str(self.root / "codex-home")))
 
     def test_repair_workers_fixes_old_moves_and_dry_run_and_second_run_change_nothing(self) -> None:
         self.prepare_unit_moves()

@@ -1,4 +1,4 @@
-"""Read agent-note frontmatter without account, quota or updater dependencies."""
+"""Read agent notes with the shared notes-folder configuration."""
 
 from __future__ import annotations
 
@@ -6,8 +6,11 @@ import re
 import os
 from dataclasses import dataclass
 from datetime import datetime
+from functools import cache
 from pathlib import Path
 from typing import Literal, Protocol
+
+from scripts.lib import conf
 
 AGENTS_DIR = Path.home() / "rust" / "hanadocs" / "agents"
 _INITIAL_AGENTS_DIR = AGENTS_DIR
@@ -45,10 +48,17 @@ def note_name(label: str) -> str:
     return f"{parsed.tool}{parsed.number}.md"
 
 
+@cache
+def _configured_notes_dir() -> Path:
+    return Path(conf.read("accounts").text("notes_directory")).expanduser()
+
+
 def notes_dir() -> Path:
     if "AGENT_NOTES_DIR" in os.environ:
         return Path(os.environ["AGENT_NOTES_DIR"])
-    return AGENTS_DIR if AGENTS_DIR != _INITIAL_AGENTS_DIR else Path.home() / "rust" / "hanadocs" / "agents"
+    if AGENTS_DIR != _INITIAL_AGENTS_DIR:
+        return AGENTS_DIR
+    return _configured_notes_dir()
 
 
 def note_path(label: str) -> Path:

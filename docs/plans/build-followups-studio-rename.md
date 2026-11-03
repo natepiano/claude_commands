@@ -104,7 +104,7 @@ Totals: 32 local and 34 origin branches, 28 worktrees.
 | `/etc/nixos` comments | 5 lines, 5 files | R 3 (two herdr.nix plan paths, nightly-review.nix "build-followups' permanent unit"); H 2 (agents.nix and cargo-config.toml provenance). Committed by natedev |
 | Memories (16 distinct files, shared across 5 config dirs) | 16 | R 2 live pointers (postmaster-trial-window names a plan path; screenshot-unit-owns-hana-shot names the branch); H 14 provenance |
 | Hanadocs phase notes `production_file` GitHub link | 16 | D: `phase_table.py refresh` after promotion |
-| Hanadocs `agents/*.md`, `agent sessions.md` (worktree paths) | 3 | D: next agent-notes refresh after the moves |
+| Hanadocs `agents/*.md` (worktree paths; `agent sessions.md` is deleted by snapshot-removal) | 3 | D: next agent-notes refresh after the moves |
 | Hanadocs change-review list rows, `archive/natedev/build-followups/` | 2 | H |
 | hana `docs/hana/tool-based-ui-production.md` (retired row, 13 checkouts) | 1 line | H |
 

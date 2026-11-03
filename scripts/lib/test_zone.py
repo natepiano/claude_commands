@@ -2,6 +2,7 @@
 """zone.py: resolve a place to a zone, write and push the setting, pull or queue the Mac, tell every session."""
 from __future__ import annotations
 
+import io
 import json
 import os
 import platform
@@ -9,12 +10,14 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import override
 from unittest import mock
 
 from scripts.lib import zone, user_zone
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 SCRIPT = Path(__file__).with_name("zone.py")
 CONF_TEXT = "# The zone every time shown to the user is written in.\nzone=America/New_York\n"
@@ -83,6 +86,7 @@ class SetTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        _ = self.enterContext(redirect_stdout(io.StringIO()))
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.checkout, origin, self.fakes = self.root / "checkout", self.root / "origin.git", self.root / "fakes"
         self.fakes.mkdir()
@@ -112,11 +116,11 @@ class SetTests(unittest.TestCase):
 
     def git(self, cwd: Path, *arguments: str) -> str:
         return subprocess.run(["git", *arguments], cwd=cwd, env=self.env, capture_output=True, text=True,
-                              check=True).stdout
+                              check=True, timeout=TEST_HANG_GUARD_SECS).stdout
 
     def run_zone(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run([sys.executable, str(SCRIPT), *arguments], env=self.env, capture_output=True,
-                              text=True, check=False, timeout=60)
+                              text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
 
     def log(self, name: str) -> list[list[str]]:
         path = self.fakes / name
@@ -136,7 +140,7 @@ class SetTests(unittest.TestCase):
         conf = (self.checkout / "config/user_zone.conf").read_text(encoding="utf-8")
         self.assertEqual(conf, CONF_TEXT.replace("America/New_York", "America/Curacao"))
         self.assertEqual(self.git(self.checkout, "log", "-1", "--format=%s", "origin/main").strip(),
-                         "user zone: America/Curacao (AST), set with /zone")
+                         "zone(America/Curacao): set with /zone (AST)")
         self.assertEqual(self.git(self.checkout, "status", "--short").strip(), "?? other.txt")
         (pull,) = self.log("ssh.log")
         self.assertIn(f"git pull -q --ff-only natedev:{self.checkout} main", pull[-1])
@@ -201,7 +205,7 @@ class SetTests(unittest.TestCase):
         self.assertEqual(self.git(self.checkout, "show", "origin/main:config/user_zone.conf"),
                          CONF_TEXT.replace("America/New_York", "America/Curacao"))
         self.assertEqual(self.git(self.checkout, "log", "-1", "--format=%s").strip(),
-                         "user zone: America/Curacao (AST), set with /zone")
+                         "zone(America/Curacao): set with /zone (AST)")
         self.assertNotIn("config/user_zone.conf", self.git(self.checkout, "status", "--short"))
 
     def test_the_same_zone_again_makes_no_commit(self) -> None:
@@ -210,6 +214,54 @@ class SetTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("was: the same; nothing to commit", result.stdout)
         self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), head)
+
+    def test_zone_publishes_a_previous_tune_commit_before_pulling_the_mac(self) -> None:
+        other = self.checkout / "config/example.conf"
+        _ = other.write_text("# range: 1..10\namount=3\n")
+        _ = self.git(self.checkout, "add", str(other))
+        _ = self.git(self.checkout, "commit", "-qm", "tune(example): amount 2 -> 3")
+        result = self.run_zone("set", "Curacao")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"),
+                         self.git(self.checkout, "rev-parse", "origin/main"))
+        self.assertEqual(self.git(self.checkout, "show", "origin/main:config/example.conf"),
+                         "# range: 1..10\namount=3\n")
+        self.assertIn("git pull -q --ff-only", self.log("ssh.log")[0][-1])
+
+    def test_zone_does_not_pull_the_mac_when_unrelated_local_work_prevents_the_push(self) -> None:
+        _ = self.git(self.checkout, "add", "other.txt")
+        _ = self.git(self.checkout, "commit", "-qm", "unrelated work")
+        remote = self.git(self.checkout, "rev-parse", "origin/main")
+        head = self.git(self.checkout, "rev-parse", "HEAD")
+        result = self.run_zone("set", "Curacao")
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("other commit", result.stderr)
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), head)
+        self.assertEqual(self.git(self.checkout, "rev-parse", "origin/main"), remote)
+        self.assertEqual(self.log("ssh.log"), [])
+        self.assertFalse(self.queued().exists())
+
+    def test_zone_retains_its_unlimited_git_and_120_second_ssh_limits(self) -> None:
+        original_run = subprocess.run
+        observed: dict[str, float | None] = {}
+
+        def run(command: list[str], *, capture_output: bool, text: bool, check: bool,
+                timeout: float | None = None) -> subprocess.CompletedProcess[str]:
+            if command[0] == "git":
+                operation = command[3]
+                if operation in ("fetch", "push"):
+                    observed[operation] = timeout
+            elif command[0] == self.env["ZONE_SSH"]:
+                observed["ssh"] = timeout
+            self.assertTrue(text)
+            return original_run(command, capture_output=capture_output, text=True, check=check, timeout=timeout)
+
+        with mock.patch.dict(os.environ, self.env, clear=True), \
+                mock.patch.object(user_zone, "CONF", self.checkout / "config/user_zone.conf"), \
+                mock.patch.object(subprocess, "run", side_effect=run):
+            status = zone.set_zone("Curacao")
+        self.assertEqual(status, 0)
+        self.assertEqual(observed, {"fetch": None, "push": None, "ssh": 120})
 
     def test_a_checkout_off_main_is_refused(self) -> None:
         _ = self.git(self.checkout, "switch", "-q", "-c", "work")

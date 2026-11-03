@@ -1,10 +1,13 @@
 ---
-description: Launch a team of expert agents to review a topic across multiple dimensions and cycles, recording findings and surfacing unresolved decisions.
+description: Review a topic through lenses in the invoking session.
 ---
 
 # Team Review
 
-**Purpose:** Launch a team of expert agents to analyze a topic from multiple dimensions across one or more refinement cycles. Mechanical findings are auto-recorded to a working doc; judgment-call findings accumulate as proposed user decisions that later cycles can add to, sharpen, or drop. After the final cycle, the surviving proposed decisions are surfaced through `/adhoc_review`.
+**Purpose:** Review a topic through expert lenses in the invoking session across one or more refinement cycles.
+Record mechanical findings in a working document.
+Retain proposed user decisions across cycles and refine them with each review.
+After the final cycle, present the remaining decisions through `/adhoc_review`.
 
 **Critical execution guards:**
 - The working doc established by `<EstablishWorkingDoc/>` is final for this workflow and for the `/adhoc_review` handoff. Do not ask where to record decisions again.
@@ -15,7 +18,11 @@ description: Launch a team of expert agents to review a topic across multiple di
 
 @~/.claude/docs/decision_criteria.md
 
-It is the authority on what reaches the user, and it applies to the review's own output the same way it applies to a phase's. This command adds only what is specific to a multi-cycle expert review: the `<IntentFirewall/>` classes, and the rule that an expert finding is *evidence for* a decision, never a decision already taken — several agents agreeing does not convert a judgment call into a settled one, and one agent objecting does not create a user decision out of something `<DecisionEconomy/>` already decides.
+Apply `<DecisionEconomy/>` to the review's findings.
+Use `<IntentFirewall/>` to classify findings across cycles.
+Treat each finding as evidence for a decision, not as a completed decision.
+Agreement across lenses does not settle a judgment call.
+An objection does not create a user decision when `<DecisionEconomy/>` already determines the result.
 
 When the topic is a design/plan/spec, the review is **bound to that design's stated intent**: by default it strengthens the design to achieve that intent and does *not* relitigate whether to pursue it. Challenges to the premise are quarantined, not run as the default mode — see `<IntentFirewall/>`. This exists because an unbound multi-cycle review will, given enough cycles, talk itself into "should this exist?" and bury the work that was actually asked for.
 
@@ -34,7 +41,7 @@ When the topic is a design/plan/spec, the review is **bound to that design's sta
 **STEP 3:** Execute <RunReviewCycles/>
 **STEP 4:** Execute <SurfaceDecisions/>
 
-`<RunReviewCycles/>` repeats `<LaunchExpertTeam/>`, `<SynthesizeFindings/>`, `<RecordMechanicalFindings/>`, and `<ReconcileProposedDecisions/>` once per cycle.
+`<RunReviewCycles/>` repeats `<ReviewLenses/>`, `<SynthesizeFindings/>`, `<RecordMechanicalFindings/>`, and `<ReconcileProposedDecisions/>` once per cycle.
 
 `<IntentFirewall/>` is established in STEP 1 and governs every cycle and the surfacing step whenever ${REVIEW_POSTURE} = `strengthen`.
 </ExecutionSteps>
@@ -81,7 +88,9 @@ Rules under **strengthen**:
 - A premise-challenge is admissible **only** with decisive, evidence-backed proof that the committed design *cannot* achieve ${REVIEW_INTENT} — a concrete correctness or feasibility defect, not a preference. The following are **not** admissible grounds and must be dropped on sight: "a simpler alternative exists," "the benefit is marginal/cosmetic," "the original motivating bug is already fixed," "it is more code / more risk," "the scope is large." Those are tradeoffs the *author* already weighed by committing to the intent — they are not the review's call.
 - At most **one** premise-challenge survives a cycle; merge any others into it. Label it `PREMISE-CHALLENGE`; never weave it through design-improvement findings.
 - A premise-challenge must **never** be presented as, or folded into, the recommendation for a design-improvement decision (no "defer" / "don't do it" recommendation attached to an in-intent item).
-- The orchestrator must not author agent prompts that ask "is this worth doing," "should we defer," or "is some other approach better than this whole one." If an agent volunteers such framing, down-weight it to a premise-challenge subject to the rule above — do not amplify it in the next cycle.
+- Keep each lens within the committed approach.
+  Treat questions about worth, deferral, or a different approach as premise-challenges under the rule above.
+  Do not increase their weight in the next cycle.
 
 If a premise-challenge looks decisive, do **not** silently act on it and do **not** let it consume the remaining cycles. Carry it to `<SurfaceDecisions/>` in its own flagged slot for the user to rule on.
 
@@ -90,33 +99,24 @@ Under ${REVIEW_POSTURE} = **open**: premise-challenges are first-class; this fir
 
 ---
 
-<LaunchExpertTeam>
-**Goal:** Launch parallel expert agents to analyze the topic from different dimensions.
+<ReviewLenses>
+**Goal:** Review the topic through distinct lenses.
 
-Launch **3-5 external CLI agents in parallel**, each with a distinct analytical lens, through `~/.claude/scripts/agents/agent_exec.sh` using the `team_review.expert` registry task and `readonly` mode. Readonly mode is the readonly review contract: codex uses `--sandbox read-only`; claude uses `--permission-mode plan`.
+The invoking session runs each lens itself, one after the other, in the chosen order.
 
-On the first cycle, create an absolute `${SESSION_DIR}` under `/tmp/claude/team_review/<uuid>/`. Set `${WORKING_DIR}` to the project root that contains the reviewed topic, normally the command session's current working directory; never use `~/.claude` unless it is itself the reviewed project. Before any agent launch:
+1. Choose 3–5 lenses for each cycle.
+2. On the first cycle, create an absolute `${SESSION_DIR}` under `/tmp/claude/team_review/<uuid>/` for the findings.
 
-1. Warm the agent-catalog freshness gate once by running `bash ~/.claude/scripts/agents/agent_admin.sh team_review` with Bash `dangerouslyDisableSandbox: true`. This must not run sandboxed: a sandboxed catalog sync cannot update the registry or freshness state, and its warn-and-continue behavior can leave every parallel launch attempting the same stale sync.
-2. Capture provenance once for the task by running `bash -c 'source ~/.claude/scripts/agents/agents_config.sh && agents_resolve_print team_review.expert' >> "${SESSION_DIR}/agent_provenance.txt"`.
-
-For each cycle's 1-based `${CYCLE_NUMBER}`, create `${WAVE_DIR}=${SESSION_DIR}/cycle${CYCLE_NUMBER}`. Write one absolute `${WAVE_DIR}/prompt_N.md` per lens; reserve `${WAVE_DIR}/findings_N.txt` and `${WAVE_DIR}/agent_N.log` for its output and log. Wave namespacing is mandatory because `<LaunchExpertTeam/>` runs once per cycle.
-
-External CLI agents inherit no session context. Every prompt file must be self-contained and include:
-
-0. The following charter preamble verbatim.
-1. `${REVIEW_TOPIC}`, `${REVIEW_INTENT}`, `${REVIEW_POSTURE}`, and the posture mandate below.
-2. Every relevant file as an explicit absolute path, plus enough code/design context to evaluate it.
-3. The agent's distinct analytical dimension.
-4. The complete finding schema below.
-
-Every agent prompt begins with this preamble verbatim:
+On the first cycle, run this preamble before the first lens.
 
 ```
 Before evaluating, Read ~/rust/nate_style/review-charter.md — its ranked values, hard rules, and finding schema govern every finding you return. Follow its style-guide loading rule when the subject is Rust.
 ```
 
-Choose dimensions appropriate to ${REVIEW_TOPIC}. When the subject is code or a design that shapes code, the charter's three gods — simple, fast, beautiful — and the two means that most often serve them in an API, ergonomics and type-system leverage, must each be covered by some agent's lens (one agent may cover two). Common dimensions include:
+Choose dimensions appropriate to `${REVIEW_TOPIC}`.
+For code and designs that shape code, cover simple, fast, beautiful, ergonomics, and type-system design.
+One lens can cover two dimensions.
+Common dimensions include:
 
 - **Correctness & Completeness** — Does the design correctly and completely achieve ${REVIEW_INTENT}? What's missing, what edge cases or gaps would stop it working as intended? (Whether the *approach itself* is correct is a premise-challenge — see `<IntentFirewall/>`.)
 - **Architecture & Design** — Given the committed approach, is the structure sound, are responsibilities well-separated, does it achieve ${REVIEW_INTENT} cleanly, and will it scale *within that approach*? A "simpler alternative" or "don't do this" is a premise-challenge — raise it only under `<IntentFirewall/>`, not as a default lens.
@@ -126,11 +126,11 @@ Choose dimensions appropriate to ${REVIEW_TOPIC}. When the subject is code or a 
 - **Performance** — What runtime cost does the design impose: allocation or clones at boundaries, dynamic dispatch where static works, per-call work that setup could amortize, per-frame churn (Bevy)? Per the charter, a recommendation that adds cost must name it; performance ceremony with no hot-path justification is equally a finding.
 - **User Impact & Ergonomics** — How does this affect the end user or developer experience? Is the API intuitive? Are error messages helpful?
 
-**Each agent prompt must include:**
-0. **The stated intent and the mandate.** Include ${REVIEW_INTENT} and ${REVIEW_POSTURE}. Under `strengthen`, state verbatim: _"This intent and approach are a given. Your job is to make the design correctly and robustly achieve it — not to decide whether to do it or to propose a different approach. Only if you have decisive proof the design cannot achieve the intent, raise exactly one finding labeled PREMISE-CHALLENGE (see firewall). 'A simpler alternative exists', 'marginal benefit', 'the original bug is already fixed', and 'more code/risk' are not grounds to challenge."_
-1. The ${REVIEW_TOPIC} and relevant context (file paths, code patterns, architectural decisions)
-2. Their specific analytical dimension
-3. Instruction to return findings as a structured list using the charter's finding schema:
+**For each lens:**
+
+Under `strengthen`, apply this mandate: _"This intent and approach are a given. Your job is to make the design correctly and robustly achieve it — not to decide whether to do it or to propose a different approach. Only if you have decisive proof the design cannot achieve the intent, raise exactly one finding labeled PREMISE-CHALLENGE (see firewall). 'A simpler alternative exists', 'marginal benefit', 'the original bug is already fixed', and 'more code/risk' are not grounds to challenge."_
+
+Use this finding schema:
    - **Title**: Brief name for the finding
    - **Where**: File paths + item names (or doc section) the finding is about
    - **Class**: `design-improvement` or `PREMISE-CHALLENGE` (omit for mechanical findings)
@@ -138,26 +138,23 @@ Choose dimensions appropriate to ${REVIEW_TOPIC}. When the subject is code or a 
    - **Impact**: Why it matters (severity: critical / important / minor)
    - **Recommendation**: Specific, actionable suggestion
 
-Each agent should read the explicit relevant files to ground its analysis in actual code/content.
+Read the relevant files once each cycle, before the first lens.
+Check each lens's findings against them.
 
-After all prompt files exist, issue all 3-5 Bash tool calls in the same assistant turn, each with `run_in_background: true` and `dangerouslyDisableSandbox: true`:
+1. Write `${SESSION_DIR}/cycle${CYCLE_NUMBER}_findings_N.txt` for lens N, after each lens, before the next lens.
+2. Write an explicit no-findings result when the lens finds no issue.
+3. Report any incomplete lens before synthesis.
 
-```bash
-bash ~/.claude/scripts/agents/agent_exec.sh team_review.expert readonly "${WORKING_DIR}" "${WAVE_DIR}/prompt_N.md" "${WAVE_DIR}/findings_N.txt" "${WAVE_DIR}/agent_N.log"
-```
-
-All working-directory, prompt, output, and log arguments must be absolute paths. Yield after starting the complete wave; task notifications signal completion. Do not poll. If a launch exits nonzero or its findings file is missing or empty, read that agent's `agent_N.log`, surface the error to the user, and decide whether to relaunch that one agent or proceed on the remaining findings — never silently treat a failed agent as an empty review. Synthesis, deduplication, firewall enforcement, and the decision walk remain in this command session.
-
-Accepted risk: Rust reviewers running the style loader through the charter are proven under codex readonly mode, but untested under claude `--permission-mode plan` with `--print`.
-</LaunchExpertTeam>
+Never treat an incomplete review as a no-findings result.
+</ReviewLenses>
 
 ---
 
 <SynthesizeFindings>
-**Goal:** Merge and deduplicate findings from all agents into a single ordered list.
+**Goal:** Merge and deduplicate the lens findings into one ordered list.
 
-1. After every task notification for the current wave arrives, read each `${WAVE_DIR}/findings_N.txt` and collect its findings
-2. Deduplicate — if multiple agents found the same issue, merge into one finding and note the consensus
+1. Read each `${SESSION_DIR}/cycle${CYCLE_NUMBER}_findings_N.txt` from the current cycle.
+2. Merge duplicate findings and note which lenses found the issue.
 3. Order by severity: critical first, then important, then minor
 4. Assign each finding a sequential number (F1, F2, F3...)
 5. Store as ${FINDINGS_LIST}
@@ -188,7 +185,7 @@ If the user picks `none` (case 3 only), ${WORKING_DOC} is unset and the accumula
 
 A finding is **auto-recorded** (no prompt) when its recommendation has a single correct outcome *and* does not change the plan's structure or its intended behavior. This covers both (a) mechanical fixes — typo, dead import, naming-consistency rename, formatting, a refactor with one valid result — and (b) **correctness/bug fixes** where the right fix is determined even if finding it took judgment (a compile break, a missing guard, a wrong read path, a stale doc reference). A finding becomes a **decision** carried into `<ReconcileProposedDecisions/>` *only* when it changes the plan's structure or the intended behavior — more than one valid answer, a new API/feature, or a scope/ordering change.
 
-When it is unclear which side a finding falls on, `<DecisionEconomy/>` breaks the tie, not caution: apply its test — if being wrong costs a one-line revert, record the call and state it in one line; if it costs lost work, a published artifact, or the wrong thing built, it is a decision. Its already-decided categories are auto-recorded here too, however many agents raised them: low-stakes and reversible, the premium experience option, its correctness-then-simplicity-then-speed ranking, and keeping API surface private until a real consumer exists. Cost of the work never promotes a finding to a decision.
+When the classification is unclear, apply the `<DecisionEconomy/>` test and its settled categories.
 
 Incorporate each mechanical finding into ${WORKING_DOC} where it belongs — fold it into the appropriate existing section, or collect it under a dedicated `## Mechanical (auto-recorded)` section when there is no natural home. Record finding id, title, recommendation, marked accepted. Skip any finding an earlier cycle already recorded. Do not edit source code — this records the decision in the doc; applying it to code is a separate step. If ${WORKING_DOC} is unset, list them inline in the conversation instead.
 </RecordMechanicalFindings>
@@ -198,13 +195,13 @@ Incorporate each mechanical finding into ${WORKING_DOC} where it belongs — fol
 <RunReviewCycles>
 **Goal:** Refine findings across ${ITERATIONS} cycles before surfacing anything to the user.
 
-Repeat for cycle `i` from 1 to ${ITERATIONS}:
+Repeat for `${CYCLE_NUMBER}` from 1 to `${ITERATIONS}`:
 
-1. Execute <LaunchExpertTeam/>. On cycle 2+, include the current ${WORKING_DOC} contents in every agent prompt — the recorded mechanical findings and the running **Proposed user decisions** — and instruct agents to build on them: confirm, sharpen, merge, refute, or supersede prior proposed decisions, and surface anything new. Under `strengthen`, hold every cycle to `<IntentFirewall/>`: build *within* ${REVIEW_INTENT}; do not author prompts that ask "is this worth it / should we defer / is another approach better," and do not let a premise-challenge grow cycle-over-cycle. (Under `open`, agents may argue an approach is unnecessary.)
+1. Execute <ReviewLenses/>. On cycle 2+, confirm, sharpen, merge, refute, or supersede earlier proposed decisions, and identify new findings.
 2. Execute <SynthesizeFindings/>.
 3. Execute <RecordMechanicalFindings/>.
 4. Execute <ReconcileProposedDecisions/>.
-5. Report one line: `Cycle ${i}/${ITERATIONS}: ${M} mechanical recorded, ${D} proposed decisions (${added} added, ${dropped} dropped this cycle).` Do not surface decisions for review yet.
+5. Report one line: `Cycle ${CYCLE_NUMBER}/${ITERATIONS}: ${M} mechanical recorded, ${D} proposed decisions (${added} added, ${dropped} dropped this cycle).` Do not surface decisions for review yet.
 
 Never invoke `/adhoc_review` inside the loop — surfacing happens once, after the final cycle.
 </RunReviewCycles>
@@ -224,11 +221,9 @@ For this cycle's judgment findings, reconcile against the existing entries:
 - **Contradicts or obsoletes** an existing entry → mark that entry `dropped` (or `superseded`) with a one-line reason. A later cycle marking an earlier proposed decision unnecessary is expected and allowed.
 
 Before the final surface step, apply `<DecisionEconomy/>` as the hard decision gate. Every entry still marked `proposed` must survive it:
-- **Record, do not surface:** anything `<DecisionEconomy/>` already decides — low-stakes and reversible, the premium user-or-developer experience option, a tie its correctness → simplicity/ergonomics → speed ranking settles, API surface with no current consumer — plus converged refinements, correctness fixes, implementation constraints, acceptance-test additions, and API clarifications that have one sensible in-intent outcome after review. Record the call and the risk it carries in one line in `${WORKING_DOC}`; a call the user never sees was taken from them, not made for them.
+- **Record, do not surface:** anything `<DecisionEconomy/>` already decides, plus converged refinements, correctness fixes, implementation constraints, acceptance-test additions, and API clarifications that have one sensible in-intent outcome after review. Record the call and the risk it carries in one line in `${WORKING_DOC}`; a call the user never sees was taken from them, not made for them.
 - **Surface:** only what cannot be cheaply undone — unresolved choices where the user must pick among plausible alternatives, approve a scope or behavior change, or accept a tradeoff the team could not settle, and where being wrong costs lost work, a published artifact, or the wrong thing built.
 - **Drop/supersede:** items made redundant by sharper later-cycle wording.
-
-Two failure modes this gate exists to stop, both specific to a multi-agent review. **Consensus is not promotion:** four lenses independently raising the same in-intent refinement makes it better evidenced, not more the user's call — it is still auto-recorded. **Volume is not significance:** a long `proposed` list at the end of a multi-cycle run means the gate was not applied, not that the design has many open questions.
 
 Only entries still `proposed` after this gate get surfaced; keep `dropped`/`superseded` ones in the doc with their reason so a future run does not relitigate them. If ${WORKING_DOC} is unset, hold this set in conversation instead.
 </ReconcileProposedDecisions>

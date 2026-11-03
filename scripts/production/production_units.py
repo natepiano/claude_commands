@@ -1,21 +1,18 @@
 #!/usr/bin/env python3
-"""Read a production doc's Units table and identify its live and retired units."""
+"""Read production fields and Units table cells without resolving staff membership."""
 from __future__ import annotations
 
 import re
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING, NamedTuple
+from typing import NamedTuple
+from dataclasses import dataclass
 from zoneinfo import ZoneInfo
 
 for directory in (Path(__file__).resolve().parent, Path(__file__).resolve().parents[2]):
     if str(directory) not in sys.path:
         sys.path.insert(0, str(directory))
-if TYPE_CHECKING:
-    import unit_lookup
-from scripts.production import showrunners  # noqa: E402
-from collections.abc import Iterable
-from scripts.production import staff
+from collections.abc import Callable, Iterable
 import unit_names
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
@@ -26,6 +23,9 @@ from scripts.production.unit_table import (
     Refusal as Refusal, cell_value as cell_value, unit_rows as unit_rows,
     row_cells as row_cells, unit_headings as unit_headings, unit_table as unit_table,
 )
+
+
+WRAPPED = "> **Status: PRODUCTION — wrapped.**"
 
 
 class Production(NamedTuple):
@@ -55,32 +55,6 @@ def worktree_is_linked(worktree: str) -> bool:
     return bool(worktree) and (Path(worktree) / ".git").is_file()
 
 
-class ProductionMembers:
-    """Recorded membership of a production, read once without probing live panes."""
-
-    def __init__(self, slug: str, *, record: staff.StaffSnapshot | None = None) -> None:
-        self._slug: str = slug
-        self._record: staff.StaffSnapshot | None = record
-        self._units: set[str] | None = None
-
-    def has(self, unit: str) -> bool:
-        """Whether the unit is a current staff child, including an offline child."""
-        if self._units is None:
-            record = self._record if self._record is not None else staff.snapshot()
-            import unit_lookup
-
-            sources = unit_lookup.member_sources()
-            members = unit_lookup.production_members(record, sources)
-            self._units = {row.name for row in members.get(showrunners.canonical_slug(self._slug), ())}
-        return unit_names.name(unit) in self._units
-
-
-def unit_is_retired(cells: dict[str, str], marks: ProductionMembers) -> bool:
-    """A unit is retired when it has no current row under this showrunner."""
-    unit = cell_value(cells.get("Unit", ""))
-    return not unit or not marks.has(unit)
-
-
 def order_unit_names(lines: list[str], names: Iterable[str], *, offline: Iterable[str] = ()) -> list[str]:
     """Keep document presentation order without letting it decide membership."""
     wanted = set(names)
@@ -97,67 +71,6 @@ def order_unit_names(lines: list[str], names: Iterable[str], *, offline: Iterabl
     except (Refusal, unit_names.BadName):
         pass
     return ordered + sorted(wanted)
-
-
-def unit_metadata(record: staff.StaffSnapshot, sources: unit_lookup.MemberSources, *,
-                  documents: dict[str, list[str]] | None = None) -> dict[staff.StaffId, dict[str, str]]:
-    """Bind document cells to staff identities, preferring the current parent's row."""
-    import unit_lookup
-
-    members = unit_lookup.production_members(record, sources)
-    documents = ({slug: source.document.splitlines() for slug, source in sources.productions.items()}
-                 | (documents or {}))
-    direct: dict[staff.StaffId, dict[str, str]] = {}
-    orphans: dict[str, list[tuple[str, dict[str, str]]]] = {}
-    for slug, lines in documents.items():
-        local = {row.name: row for row in members.get(slug, ())}
-        try:
-            rows = unit_table(lines)
-        except Refusal:
-            continue
-        for cells in rows:
-            try:
-                name = unit_names.name(cell_value(cells.get("Unit", "")))
-            except unit_names.BadName:
-                continue
-            if name in local:
-                direct[local[name].id] = cells
-            else:
-                orphans.setdefault(name, []).append((slug, cells))
-    units = record.find(kind="unit")
-    for row in units:
-        if row.id in direct:
-            continue
-        candidates = orphans.get(row.name, [])
-        if len(candidates) == 1 and sum(other.name == row.name for other in units) == 1:
-            direct[row.id] = candidates[0][1]
-            continue
-        parents = [slug for slug, rows in members.items() if row in rows]
-        production = ", ".join(parents) or str(row.parent)
-        reason = "ambiguous orphan rows" if len(candidates) > 1 else "no unique document binding"
-        print(f"production_units: {production}/{row.name}: metadata unavailable: {reason}", file=sys.stderr)
-    return direct
-
-
-def live_unit_table(lines: list[str], slug: str, *, record: staff.StaffSnapshot | None = None) -> list[dict[str, str]]:
-    """Staff members with metadata bound by identity; a table cannot change a parent."""
-    import unit_lookup
-
-    record = record if record is not None else staff.snapshot()
-    sources = unit_lookup.member_sources()
-    slug = showrunners.canonical_slug(slug)
-    members = unit_lookup.production_members(record, sources).get(slug, ())
-    metadata = unit_metadata(record, sources, documents={slug: lines})
-    rows = {unit_names.unit_id(row.name): {**metadata.get(row.id, {"Worktree": "—", "Plan": "—"}),
-                                          "Unit": metadata.get(row.id, {}).get("Unit", f"`{unit_names.unit_id(row.name)}`")}
-            for row in members}
-    return [rows[name] for name in order_unit_names(lines, rows)]
-
-
-def retired_units(lines: list[str], slug: str, *, record: staff.StaffSnapshot | None = None) -> set[str]:
-    """Document unit names that are no longer recorded under this showrunner."""
-    marks = ProductionMembers(slug, record=record)
-    return {cell_value(cells.get("Unit", "")) for cells in unit_table(lines) if unit_is_retired(cells, marks)} - {""}
 
 
 def production_field(lines: list[str], field: str) -> str:
@@ -190,3 +103,108 @@ def read_production(path: Path) -> Production:
         return Production(doc, slug, merge_branch, checkout, checkout / log, zone)
     except (OSError, UnicodeError, KeyError, ValueError) as error:
         raise Refusal(f"cannot read production doc: {error}") from error
+
+
+@dataclass(frozen=True)
+class DocumentSource:
+    machine: str
+    path: Path
+
+
+@dataclass(frozen=True)
+class DocumentUnavailable:
+    reason: str
+
+
+@dataclass(frozen=True)
+class UnitRowFound:
+    source: DocumentSource
+    cells: dict[str, str]
+    line: int
+    note: str = ""
+
+
+@dataclass(frozen=True)
+class UnitRowMissing:
+    reason: str
+    cell: str = ""
+
+
+@dataclass(frozen=True)
+class UnitRowAmbiguous:
+    reason: str
+
+
+@dataclass(frozen=True)
+class UnitSearchIncomplete:
+    reason: str
+    unavailable: tuple[DocumentSource, ...]
+    matches: tuple[UnitRowFound, ...] = ()
+
+
+def lookup_unit(name: str, parent: DocumentSource, documents: Iterable[DocumentSource],
+                load: Callable[[DocumentSource], str | DocumentUnavailable], *, established: bool = True,
+                aliases: Iterable[str] = (),
+                ) -> UnitRowFound | UnitRowMissing | UnitRowAmbiguous | UnitSearchIncomplete:
+    """Find a row in the parent document before searching other bound documents."""
+    wanted = {unit_names.name(name), *(unit_names.name(alias) for alias in aliases)}
+    rejected: list[tuple[str, str]] = []
+    unavailable: list[DocumentSource] = []
+    problems: list[str] = []
+
+    def search(source: DocumentSource) -> list[UnitRowFound]:
+        text = load(source)
+        label = f"{source.machine}:{source.path}"
+        if isinstance(text, DocumentUnavailable):
+            unavailable.append(source)
+            problems.append(f"{label}: {text.reason}")
+            return []
+        try:
+            lines = text.splitlines()
+            cells_list = unit_table(lines)
+            _, raw_rows = unit_rows(lines)
+        except Refusal as error:
+            unavailable.append(source)
+            problems.append(f"{label}: {error}")
+            return []
+        found: list[UnitRowFound] = []
+        start = lines.index("## Units")
+        for cells, raw in zip(cells_list, raw_rows, strict=True):
+            line = lines.index(raw, start) + 1
+            start = line
+            cell = cells.get("Unit", "")
+            try:
+                candidate = unit_names.name(cell_value(cell))
+            except unit_names.BadName as error:
+                rejected.append((cell, str(error)))
+                continue
+            if candidate in wanted:
+                found.append(UnitRowFound(source, cells, line))
+        return found
+
+    matches = search(parent)
+    if len(matches) == 1:
+        return matches[0]
+    if not matches and established:
+        visited = {parent}
+        for source in documents:
+            if source not in visited:
+                visited.add(source)
+                matches.extend(search(source))
+    if len(matches) > 1:
+        sources = ", ".join(f"{item.source.machine}:{item.source.path}" for item in matches)
+        return UnitRowAmbiguous(f"expected one Units row for {name}; found {len(matches)} in {sources}")
+    if unavailable:
+        if matches:
+            sources = ", ".join(f"{item.source.machine}:{item.source.path}" for item in matches)
+            problems.append(f"known matching Units row in {sources}")
+        return UnitSearchIncomplete("; ".join(problems), tuple(unavailable), tuple(matches))
+    if matches:
+        item = matches[0]
+        note = (f"{item.source.machine}:{item.source.path} is not the parent's document "
+                + f"({parent.machine}:{parent.path})")
+        return UnitRowFound(item.source, item.cells, item.line, note)
+    if rejected:
+        cell, reason = rejected[0]
+        return UnitRowMissing(f"invalid unit name {cell!r}: {reason}", cell)
+    return UnitRowMissing(f"expected one Units row for {name}; found 0")

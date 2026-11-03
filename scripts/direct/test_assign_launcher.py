@@ -1,6 +1,8 @@
 """Named assignment dispatches through the real recorder and loopback app-server."""
 from __future__ import annotations
 
+from scripts.lint.memory_test_support import config_environment, write_config_fixture
+
 from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
 
 from scripts.lib.test_agents_registry import write_registry
@@ -17,8 +19,11 @@ from typing import cast, final, override
 from unittest.mock import patch
 
 from scripts.agents import codex_mesh, test_codex_mesh as mesh_fixture
+from scripts.production.staff_test_support import fixture_runtime_id
 from scripts.direct import workers
 from scripts.direct.recorder_fixture import communicate_launcher, invoke_recorder
+from scripts.lint import style_review
+from scripts.lib.git_test_support import commit_repository
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -65,7 +70,7 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
         self.paths = self.session_dir.parent / "paths.txt"
         _ = self.paths.write_text("src/worker.py\ntests/test_worker.py\n")
         self.prompt = self.session_dir.parent / "assignment.txt"
-        _ = self.prompt.write_text("Phase 7 — Assignment core\nImplement the assigned change.\n")
+        self.write_phase_prompt("7", "Assignment core", "Implement the assigned change.")
         self.registry = self.session_dir.parent / "agents.conf"
         _ = write_registry(self.registry, {'codex.agents': {'gpt-kept-sol': 'low,medium,high,xhigh,max', 'gpt-other-sol': 'low,medium,high,xhigh,max'}, 'assignments': {'direct': 'codex'}, 'direct.codex': {'impl': 'gpt-kept-sol:high', 'test': 'gpt-kept-sol:high', 'fix': 'gpt-kept-sol:high', 'review': 'gpt-kept-sol:high'}})
         checkpoint = self.session_dir.parent / "catalog-current"
@@ -74,7 +79,7 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
             "UNIT_WORKERS_STATE": str(self.session_dir.parent / "unit-workers"),
             "UNIT_HISTORY_DIR": str(self.history),
             "UNIT_ACTIVE_DIR": str(self.session_dir.parent / "active"),
-            "UNIT_CONFIG": str(ROOT / "config/direct.conf"),
+            **config_environment(self.session_dir.parent),
             "AGENTS_CONFIG_FILE": str(self.registry), "AGENTS_CONFIG_PUBLISH": "0",
             "CODEX_CATALOG_SYNC_STATE_FILE": str(checkpoint),
             "NOTIFIER_SESSIONS_DIR": str(self.session_dir.parent / "sessions"),
@@ -115,6 +120,9 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
 
         self.server.respond = observe
 
+    def write_phase_prompt(self, phase: str, title: str, task: str = "Review the assigned change.") -> None:
+        _ = self.prompt.write_text(f"Phase {phase} — {title}\n{task}\n")
+
     def record(self, *arguments: str) -> None:
         result = invoke_recorder([arguments[0], "--session-dir", str(self.session_dir), *arguments[1:]],
                                  os.environ.copy(), self.project)
@@ -144,9 +152,51 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
     def assignment_records(self) -> dict[str, dict[str, object]]:
         return cast(dict[str, dict[str, object]], read_object(self.session_dir / codex_mesh.ROSTER_FILE))
 
+    def commit_project(self, message: str = "Initial fixture") -> None:
+        _ = subprocess.run(["git", "init", "-q"], cwd=self.project, check=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS)
+        _ = commit_repository(self.project, message)
+
+    def prepare_style_project(self) -> None:
+        self.commit_project()
+        config = self.session_dir.parent / "lint.conf"
+        _ = write_config_fixture(config, "style_review=on\n")
+        _ = cast(object, self.patches.enter_context(patch.dict(os.environ, {"LINT_CONFIG_FILE": str(config), "CONF_DIR": str(Path(config).parent)})))
+
     def events(self) -> list[dict[str, object]]:
         return [cast(dict[str, object], json.loads(line)) for line in
                 (self.history / "runs" / f"{self.session_dir.name}.jsonl").read_text().splitlines()]
+
+    def test_dispatch_has_a_durable_worker_row_before_submitting_work(self) -> None:
+        from scripts.production import staff
+        _ = self.successful()
+        self.assertIn("As your last act, write your summary to",
+                      (self.session_dir / "phases/7/dispatch_1_prompt.txt").read_text())
+        name = next(iter(self.assignment_records()))
+        rows = staff.snapshot().find(kind="worker", parent=staff.StaffId(os.environ["CODEX_THREAD_ID"]))
+        self.assertEqual([row.name for row in rows], [name])
+
+    def test_assignment_dispatch_uses_the_backend_thread_as_the_published_worker_id(self) -> None:
+        from scripts.production import staff
+        _ = self.successful()
+        records = self.assignment_records()
+        self.assertEqual(len(records), 1)
+        name, record = next(iter(records.items()))
+        thread = str(record["thread_id"])
+        row = staff.by_id(staff.StaffId(thread))
+        self.assertIsNotNone(row)
+        assert row is not None
+        self.assertEqual((row.id, row.name, row.parent), (thread, name, os.environ["CODEX_THREAD_ID"]))
+        self.assertTrue(self.claims)
+        self.assertTrue(all(str(entry["thread_id"]) == row.id for entry in self.claims))
+
+    def test_unreadable_staff_starts_no_worker(self) -> None:
+        record = Path(os.environ["STAFF_FILE"])
+        _ = record.write_text("{broken")
+        result = self.launch()
+        self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
+        self.assertIn("staff: impl: not opened:", result.stderr)
+        self.assertEqual(self.methods("thread/start"), [])
+        self.assertEqual(record.read_text(), "{broken")
 
     def test_rerun_review_dispatch_keeps_its_lens_and_read_only_thread(self) -> None:
         _ = self.successful("review", "--lens", "rerun", "--pass", "1")
@@ -154,6 +204,26 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
         self.assertEqual(cast(dict[str, object], starts[0]["params"])["sandbox"], "read-only")
         self.assertTrue((self.session_dir / "phases/7/review_status_rerun_1").exists())
         self.assertEqual(next(iter(self.assignment_records().values()))["role"], "review")
+
+    def test_recorder_ad_hoc_phase_dispatches_into_adhoc_directory(self) -> None:
+        self.record("start-phase", "--phase-id", "ad hoc", "--phase-title", "Ad hoc review")
+        self.write_phase_prompt("ad hoc", "Ad hoc review")
+        _ = self.successful("review", "--phase", "ad hoc")
+        phase = self.session_dir / "phases/adhoc"
+        self.assertEqual((phase / "review_status_1").read_text(), "done\n")
+        self.assertTrue((phase / "dispatch_1_prompt.txt").is_file())
+        self.assertTrue((phase / "review_summary_1.txt").read_text().strip())
+        self.assertFalse((self.session_dir / "phases/ad hoc").exists())
+        self.assertEqual(cast(dict[str, object], self.methods("thread/start")[0]["params"])["sandbox"], "read-only")
+        self.assertEqual(len(self.methods("turn/start")), 1)
+
+    def test_unsafe_phase_ids_are_refused_before_opening_a_thread(self) -> None:
+        for phase in (".", "..", "../escape", "nested/phase", "other phase"):
+            with self.subTest(phase=phase):
+                result = self.launch("review", "--phase", phase)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn("invalid phase id:", result.stderr)
+        self.assertEqual(self.methods("thread/start"), [])
 
     def test_missing_required_options_and_positionals_refuse_before_opening_a_thread(self) -> None:
         for options in ([], ["--prompt", str(self.prompt)], ["--role", "test"], ["test", str(self.prompt)]):
@@ -325,11 +395,15 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
 
     def test_review_assignments_resume_the_same_read_only_reviewer_across_phases(self) -> None:
         _ = self.successful("review", "--lens", "contract", "--pass", "1")
+        review_prompt = (self.session_dir / "phases/7/dispatch_1_prompt.txt").read_text()
+        self.assertIn("Return the complete review result in your final reply", review_prompt)
+        self.assertNotIn("write your summary to", review_prompt)
+        self.assertNotIn("review_summary_contract_1.txt", review_prompt)
         name, first = next(iter(self.assignment_records().items()))
         thread = first["thread_id"]
         self.record("finish-phase", "--phase-id", "7", "--status", "completed")
         self.record("start-phase", "--phase-id", "8", "--phase-title", "Next phase")
-        _ = self.prompt.write_text("Phase 8 — Next phase\nReview the next change.\n")
+        self.write_phase_prompt("8", "Next phase", "Review the next change.")
         _ = self.successful("review", "--phase", "8", "--lens", "contract", "--pass", "2")
         records = self.assignment_records()
         self.assertEqual(set(records), {name})
@@ -344,11 +418,82 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
             self.assertEqual(saved.workers[name].backend,
                              workers.CodexThread(str(thread), os.environ["CODEX_HOME"]))
 
+    def test_style_assignment_is_prepared_and_captured_through_assign_on_retry(self) -> None:
+        self.prepare_style_project()
+        _ = (self.project / "new.rs").write_text("fn first() {}\n")
+        original = self.server.respond
+        outcomes = ["Error", "Findings"]
+        prepared: list[Path] = []
+
+        @self.hang_guard.callback
+        def style_reply(request: dict[str, object]) -> list[dict[str, object]] | None:
+            frames = original(request)
+            if request.get("method") != "turn/start" or frames is None:
+                return frames
+            params = cast(dict[str, object], request["params"])
+            inputs = cast(list[dict[str, object]], params["input"])
+            prompt = str(inputs[0]["text"])
+            self.assertEqual(prompt.count("## Phase style review"), 1)
+            self.assertNotIn("write your summary to", prompt)
+            diff_line = next(line for line in prompt.splitlines() if line.startswith("- Diff "))
+            diff = Path(diff_line.split(": ", 1)[1])
+            self.assertIn("+fn ", diff.read_text())
+            prepared.append(diff)
+            report = ("1. minor: fixture finding at new.rs:1\n" + style_review.BEGIN +
+                      "\n| # | Rule | Result |\n| 1 | Fixture | Pass |\nStyle review: " +
+                      outcomes.pop(0) + "\n" + style_review.END)
+            frames.insert(-1, {"method": "item/completed", "params": {
+                "threadId": params["threadId"], "item": {"type": "agentMessage", "text": report}}})
+            return frames
+
+        self.server.respond = style_reply
+        phase = self.session_dir / "phases/7"
+        _ = self.successful("review", "--lens", "contract", "--style-since", "HEAD")
+        self.assertEqual(read_object(phase / "style_review_state.json")["state"], "owed")
+        name, record = next(iter(self.assignment_records().items()))
+        before = prepared[0].read_bytes()
+        _ = (self.project / "new.rs").write_text("fn second() {}\n")
+        _ = self.successful("review", "--to", name, "--pass", "2", "--style-since", "HEAD")
+        self.assertEqual(read_object(phase / "style_review_state.json")["state"], "complete")
+        self.assertIn("Style review: Findings", (phase / "phase_style_review.md").read_text())
+        self.assertIn("fixture finding", (phase / "review_summary_2.txt").read_text())
+        self.assertNotEqual(prepared[0].parent, prepared[1].parent)
+        self.assertEqual(prepared[0].read_bytes(), before)
+        self.assertIn("+fn second", prepared[1].read_text())
+        self.assertEqual(self.assignment_records()[name]["thread_id"], record["thread_id"])
+        self.assertEqual(len(self.methods("thread/start")), 1)
+        self.assertEqual(cast(dict[str, object], self.methods("turn/start")[-1]["params"])["sandboxPolicy"],
+                         {"type": "readOnly", "networkAccess": False})
+
+    def test_style_preparation_failure_through_assign_keeps_code_review_running(self) -> None:
+        self.prepare_style_project()
+        _ = self.successful("review", "--style-since", "missing-baseline")
+        phase = self.session_dir / "phases/7"
+        self.assertEqual(read_object(phase / "style_review_state.json")["state"], "owed")
+        self.assertIn("invalid baseline", (phase / "phase_style_review.md").read_text())
+        self.assertEqual((phase / "review_status_1").read_text().strip(), "done")
+        self.assertEqual(len(self.methods("turn/start")), 1)
+
+    def test_assign_style_range_excludes_other_work_in_flight(self) -> None:
+        self.prepare_style_project()
+        baseline = style_review.git(self.project, "rev-parse", "HEAD").stdout.decode().strip()
+        _ = (self.project / "included.txt").write_text("pinned addition\n")
+        self.commit_project("pinned range")
+        end = style_review.git(self.project, "rev-parse", "HEAD").stdout.decode().strip()
+        _ = (self.project / "included.txt").write_text("outside the range\n")
+        _ = (self.project / "untracked.rs").write_text("fn outside() {}\n")
+        _ = self.successful("review", "--style-since", baseline, "--style-until", end)
+        phase = self.session_dir / "phases/7"
+        state = read_object(phase / "style_review_state.json")
+        directory = Path(str(state["input_directory"]))
+        self.assertEqual(state["baseline"], baseline)
+        self.assertEqual(state["until"], end)
+        self.assertEqual((directory / "style-review-additions.txt").read_text(), "+pinned addition\n")
+        self.assertIn("- Rust change: no", (directory / "prompt.md").read_text())
+        self.assertIn(f"- Range: {baseline}..{end}", (directory / "prompt.md").read_text())
+
     def test_unit_reviews_reuse_their_reviewer_across_passes(self) -> None:
-        for arguments in (["init", "-q"], ["add", "plan.md"],
-                          ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
-                           "commit", "-qm", "Initial fixture"]):
-            _ = subprocess.run(["git", *arguments], cwd=self.project, check=True, capture_output=True)
+        self.commit_project()
         for pass_number in ("1", "2"):
             worker_option = ["--slot", "review"] if pass_number == "1" else ["--to", "project-review"]
             command = ["bash", str(ROOT / "scripts/direct/review.sh"), *worker_option, "--phase", "7",
@@ -393,7 +538,7 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
         _ = self.successful("review", "--lens", "contract", "--pass", "1")
         name, before = next(iter(self.assignment_records().items()))
         self.failing_method = "thread/resume"
-        self.next_thread_id = "replacement-implementation-thread"
+        self.next_thread_id = fixture_runtime_id("replacement-implementation-thread")
         _ = self.successful("implement", "--to", name)
         after = self.assignment_records()[name]
         self.assertNotEqual(after["thread_id"], before["thread_id"])
@@ -488,7 +633,7 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
 
     def test_two_implementation_workers_have_distinct_board_slot_keys(self) -> None:
         _ = self.successful("implement", "--new-worker", "impl")
-        self.next_thread_id = "second-implementation-thread"
+        self.next_thread_id = fixture_runtime_id("second-implementation-thread")
         _ = self.successful("implement", "--new-worker", "impl2")
         registrations = [line for line in (self.session_dir / "board.log").read_text().splitlines()
                          if "] register:" in line]
@@ -535,16 +680,18 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
         shutil.rmtree(self.history)
         shutil.rmtree(self.session_dir / "phases", ignore_errors=True)
         script, prepared = self.prepare_launcher()
-        director = "fresh-assignment-director"
-        transcript = Path.home() / ".claude/projects/assign-fixture" / f"{director}.jsonl"
+        director = os.environ["CODEX_THREAD_ID"]
+        transcript = Path.home() / ".codex/sessions" / f"rollout-{director}.jsonl"
         transcript.parent.mkdir(parents=True, exist_ok=True)
-        _ = transcript.write_text(json.dumps({"type": "assistant", "message": {"model": "fixture-director"},
-                                              "effort": "high"}) + "\n")
+        _ = transcript.write_text("\n".join(json.dumps(record) for record in (
+            {"type": "session_meta", "payload": {"id": director}},
+            {"type": "turn_context", "payload": {"model": "fixture-director", "effort": "high"}},
+        )) + "\n")
         self.addCleanup(transcript.unlink, missing_ok=True)
         environment = os.environ.copy()
         for key in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "UNIT_RUN_DIR", "UNIT_SESSION_DIR"):
             _ = environment.pop(key, None)
-        environment["CLAUDE_CODE_SESSION_ID"] = director
+        environment["CODEX_THREAD_ID"] = director
         with patch.dict(os.environ, environment, clear=True):
             result = self.launch(session=False, script=script)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -555,10 +702,11 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
         self.assertTrue(any(event.get("event_type") == "pass_finished" for event in self.events()))
 
     def test_default_session_uses_the_callers_marker_instead_of_starting_another_run(self) -> None:
-        marker = Path(os.environ["UNIT_ACTIVE_DIR"]) / "fixture-caller"
+        caller = os.environ["CODEX_THREAD_ID"]
+        marker = Path(os.environ["UNIT_ACTIVE_DIR"]) / caller
         marker.parent.mkdir(parents=True, exist_ok=True)
         _ = marker.write_text(str(self.session_dir))
-        with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "fixture-caller"}):
+        with patch.dict(os.environ, {"CODEX_THREAD_ID": caller}):
             result = self.launch(session=False)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.turn_starts, 1)
@@ -841,7 +989,7 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
         # The injected code changes only the ownership boundary. Real followers
         # submit input, write receipts, and settle actual loopback-server turns.
         _ = script.with_suffix(".py").write_text(
-            "import fcntl, json\nfrom pathlib import Path\nfrom scripts.direct import assign\n" +
+            "import fcntl, json\nfrom pathlib import Path\nfrom scripts.direct import assign\nfrom scripts.agents import worker_lifecycle\n" +
             f"boundary = {boundary!r}\nready = Path({str(ready)!r})\n" +
             f"trace = Path({str(trace)!r})\ndestination = Path({str(destination)!r})\n" +
             f"delivered = Path({str(delivered)!r})\n" +
@@ -854,20 +1002,18 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
             "    if adopted: return\n" +
             "    adopted = True\n" +
             "    destination.mkdir()\n" +
-            "    with (dispatch.run / 'mesh_roster.json').open('r+') as handle:\n" +
-            "        fcntl.flock(handle, fcntl.LOCK_EX)\n" +
-            "        roster = json.load(handle)\n" +
+            "    with worker_lifecycle.locked_state(dispatch.run / 'mesh_roster.json') as handle:\n" +
+            "        roster = handle.read_object()\n" +
             "        record = roster[dispatch.worker]\n" +
             "        (destination / 'mesh_roster.json').write_text(json.dumps({dispatch.worker: record.copy()}))\n" +
             "        record['adopted_to'] = str(destination)\n" +
             "        assign.codex_mesh.advance_worker_roster_revision(record)\n" +
-            "        handle.seek(0); json.dump(roster, handle); handle.truncate()\n" +
+            "        handle.publish(json.dumps(roster))\n" +
             "    if boundary == 'before_inbox':\n" +
             "        pending = dispatch.run / (dispatch.worker + '.pending.json')\n" +
-            "        with pending.open('r+') as handle:\n" +
-            "            fcntl.flock(handle, fcntl.LOCK_EX)\n" +
+            "        with worker_lifecycle.locked_state(pending) as handle:\n" +
             "            (destination / pending.name).write_text(handle.read())\n" +
-            "            handle.seek(0); json.dump({'messages': []}, handle); handle.truncate()\n" +
+            "            handle.publish(json.dumps(worker_lifecycle.empty_inbox()))\n" +
             "    with trace.open('a') as handle: handle.write(json.dumps({'adopted': True}) + '\\n')\n" +
             "def follow(dispatch, command, shown, log):\n" +
             "    global follow_count, active_dispatch\n" +
@@ -1010,7 +1156,7 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
         for arguments in (["init", "-q"], ["add", "plan.md"],
                           ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
                            "commit", "-qm", "Initial fixture"]):
-            _ = subprocess.run(["git", *arguments], cwd=self.project, check=True, capture_output=True)
+            _ = subprocess.run(["git", *arguments], cwd=self.project, check=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS)
 
         def review(option: str, name: str, pass_number: str) -> None:
             command = ["bash", str(ROOT / "scripts/direct/review.sh"), option, name, "--phase", "7",
@@ -1060,6 +1206,25 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
         self.assertLess(methods.index("thread/compact/start"),
                         max(index for index, method in enumerate(methods) if method == "turn/start"))
         self.assertEqual(self.turn_starts, 2)
+
+    def test_changed_compaction_config_takes_effect_on_the_next_assignment(self) -> None:
+        config = self.session_dir.parent / "direct.conf"
+        _ = write_config_fixture(config, "UNIT_COMPACT_ABOVE_TOKENS=300000 # keep this context\n")
+        with patch.dict(os.environ, {"CONF_DIR": str(Path(config).parent)}):
+            _ = self.successful()
+            name, record = next(iter(self.assignment_records().items()))
+            thread = record["thread_id"]
+            record["context_tokens"] = 200_000
+            self.write_pool_roster({name: record})
+            self.context_sizes = [200_000, 200_000]
+            _ = self.successful("implement", "--to", name)
+            self.assertEqual(len(self.methods("thread/compact/start")), 0)
+            _ = write_config_fixture(config, "UNIT_COMPACT_ABOVE_TOKENS=100000 # compact before the next turn\n")
+            _ = self.successful("implement", "--to", name)
+        self.assertEqual(len(self.methods("thread/compact/start")), 1)
+        self.assertEqual(self.assignment_records()[name]["thread_id"], thread)
+        self.assertEqual(len(self.methods("thread/start")), 1)
+        self.assertEqual(self.turn_starts, 3)
 
     def test_a_busy_named_worker_refuses_without_creating_another_dispatch_or_pass(self) -> None:
         _ = self.successful()

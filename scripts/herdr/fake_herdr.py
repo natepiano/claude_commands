@@ -9,6 +9,7 @@ the final response for subsequent calls.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
@@ -65,7 +66,7 @@ def option(arguments: list[str], name: str) -> str | None:
 def pane_agents(session: str) -> dict[str, bool]:
     """Read the fixture's surviving shells and agents, without consulting the real host."""
     root = os.environ.get("HERDR_PROC")
-    if sys.platform == "darwin" or os.environ.get("HERDR_PLATFORM") == "darwin" or not root or not Path(root).is_dir():
+    if not root or not Path(root).is_dir():
         return {}
     running: dict[str, bool] = {}
     for directory in Path(root).glob("[0-9]*"):
@@ -180,7 +181,11 @@ def execute(argv: list[str], previous: list[list[str]], outcomes: Path) -> int:
         _ = Path(file).write_text(text)
     stdout = response["stdout"]
     if argv[2:4] == ["pane", "list"] and response["code"] == 0:
-        history = [cast(PaneCommandOutcome, json.loads(line)) for line in outcomes.read_text().splitlines()] if outcomes.exists() else []
+        history: list[PaneCommandOutcome] = []
+        if outcomes.exists():
+            with outcomes.open() as recorded:
+                fcntl.flock(recorded, fcntl.LOCK_SH)
+                history = [cast(PaneCommandOutcome, json.loads(line)) for line in recorded]
         stdout = pane_list(stdout, argv[:2], history)
     _ = sys.stdout.write(stdout)
     _ = sys.stderr.write(response.get("stderr", ""))
@@ -189,8 +194,11 @@ def execute(argv: list[str], previous: list[list[str]], outcomes: Path) -> int:
 
 def main(argv: list[str]) -> int:
     log = Path(os.environ["FAKE_HERDR_LOG"])
-    previous = [cast(list[str], json.loads(line)) for line in log.read_text().splitlines()] if log.exists() else []
-    with log.open("a") as output:
+    # One transaction reserves the command's history index and publishes a whole line.
+    with log.open("a+") as output:
+        fcntl.flock(output, fcntl.LOCK_EX)
+        _ = output.seek(0)
+        previous = [cast(list[str], json.loads(line)) for line in output]
         _ = output.write(json.dumps(argv) + "\n")
     outcomes = log.with_name(log.name + ".agent-starts")
     code = execute(argv, previous, outcomes)
@@ -209,6 +217,7 @@ def main(argv: list[str]) -> int:
             except (ValueError, KeyError, TypeError):
                 pass
         with outcomes.open("a") as output:
+            fcntl.flock(output, fcntl.LOCK_EX)
             _ = output.write(json.dumps(outcome) + "\n")
     return code
 

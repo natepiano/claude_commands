@@ -1,5 +1,5 @@
 ---
-description: Report a running production's state to the executive producer (the user) — every unit and every open topic — at one of four lengths, gantt (default: the chart, with only what needs the user and what changed), simple, page or elaborate.
+description: Report production progress to the user.
 argument-hint: "[gantt|simple|page|elaborate] [default|ascii] [expand <child|all>]"
 ---
 
@@ -116,7 +116,7 @@ the user as the failure message. Correct the named input before reporting.
 When it prints `phase tables: unavailable — <reason>`, continue. Only a unit
 whose records could not be read takes its ETA from the saved status capture
 and needs `started` in its judgment. A dailies archives no notes: the
-agent-sessions snapshot timer prunes retired units' notes every 2 minutes.
+agent-notes job prunes retired units' notes on the schedule in `config/agent_notes.toml`.
 When it prints `bevy upgrade: unavailable — <reason>`, continue; the report
 carries the topic with that reason.
 

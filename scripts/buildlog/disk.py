@@ -14,6 +14,8 @@ from typing import NotRequired, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lint"))
 import sweep
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+import conf
 
 import store
 import filesystem
@@ -96,8 +98,8 @@ class InvalidFloor(ValueError):
 
 
 def read_floor() -> int | None:
-    config = os.path.expanduser(os.environ.get(sweep.CONFIG_ENV) or sweep.DEFAULT_CONFIG)
-    floor, key = sweep.floor_bytes(sweep.config_values(config), socket.gethostname())
+    config = str(conf.path("lint"))
+    floor, key = sweep.floor_bytes(conf.read(Path(config)).values(), socket.gethostname())
     if floor is None and key is not None:
         raise InvalidFloor(f"{key} in {config} must be a non-negative number of GiB")
     return floor

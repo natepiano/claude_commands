@@ -22,10 +22,10 @@ import fake_showrunner
 from scripts.production import fake_unit_host
 
 from scripts.herdr import fake_herdr
-from scripts.production import staff, showrunners
+from scripts.production import showrunners, staff
 from scripts.production.cli_fixture import invoke_cli
 from scripts.production.rename_test_support import bind_staff_fixture
-from scripts.production.staff_test_support import StaffTestCase, unit_membership
+from scripts.production.staff_test_support import fixture_member, StaffTestCase, unit_membership
 from scripts.lib.atomic_file import write_text_atomic
 import transfer_unit
 import retire_unit
@@ -34,9 +34,9 @@ import progress_history
 import tidy_wrapped
 import stall_watch
 from rename_state import RenameRefused
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 # load 136 on natedev, 2026-10-29
-TEST_HANG_GUARD_SECS = 300
 
 SCRIPT = Path(__file__).with_name("transfer_unit.py")
 
@@ -78,15 +78,15 @@ class UnitTransferFixture(StaffTestCase):
         self.bind_fixture(self.fixture_root)
         bind_staff_fixture(self, self.env, {"demo": ("alpha-unit", "beta-unit"), "other": ("gamma-unit",)})
         row = unit_membership("demo", "alpha-unit")
-        self.pane("w1:p1", session_id="sid-alpha", environment={
-            "SHOWRUNNER_UNIT": "demo", "SHOWRUNNER_UNIT_ID": "alpha-unit", "STAFF_ID": row.id,
+        self.pane("w1:p1", session_id="5ad615f2-4e04-5121-a102-9d6b2e2a6eb3", environment={
+            "SHOWRUNNER_UNIT": "demo", "SHOWRUNNER_UNIT_ID": "alpha-unit", "CLAUDE_CODE_SESSION_ID": row.id,
         })
         self.write(self.root / "state/notifier/showrunner-other/conf",
-                   "TARGET=session:other-showrunner\nCHECK=" + shlex.join(["zsh", "/scripts/production_check.sh",
+                   "TARGET=session:cc9c5b71-6f71-5499-a4bb-e6ad5d02930d\nCHECK=" + shlex.join(["zsh", "/scripts/production_check.sh",
                    str(self.receiving / "docs/plans/other-production.md")]) + "\n")
         self.showrunner_addresses = {slug: self.running_showrunner(slug, session_id)
-                                     for slug, session_id in (("demo", "test-showrunner"),
-                                                               ("other", "other-showrunner"))}
+                                     for slug, session_id in (("demo", "8f83b18e-2d35-5935-a408-9f483d34afff"),
+                                                               ("other", "cc9c5b71-6f71-5499-a4bb-e6ad5d02930d"))}
         for module, name, value in (
             (showrunners, "NOTIFIER_STATE_DIR", self.root / "state/notifier"),
             (showrunners, "SHOWRUNNER_STATE_DIR", self.root / "state/showrunner"),
@@ -182,7 +182,7 @@ class UnitTransferFixture(StaffTestCase):
         _ = self.git("worktree", "add", "-b", "demo-alpha", str(self.unit), "demo")
         _ = self.git("push", "origin", "demo-alpha")
         self.write(self.root / "state/notifier/showrunner-demo/conf",
-                   "EVERY=15\nTARGET=session:test-showrunner\nCHECK="
+                   "EVERY=15\nTARGET=session:8f83b18e-2d35-5935-a408-9f483d34afff\nCHECK="
                    + shlex.join(["zsh", "/scripts/production_check.sh",
                                  str(self.giving / "docs/plans/demo-production.md")]) + "\n")
         self.write(self.stall_path("demo", "alpha-unit"), '{"stretch": 17}\n')
@@ -211,7 +211,7 @@ class UnitTransferFixture(StaffTestCase):
         self.write(self.root / f"state/notifier/showrunner-{slug}/conf",
                    f"TARGET=session:{slug}-showrunner\nCHECK=" + shlex.join([
                        "zsh", "/scripts/production_check.sh", str(doc)]) + "\n")
-        _ = staff.ensure("showrunner", name=slug)
+        _ = fixture_member("showrunner", name=slug)
         return doc
 
     def add_transfer_unit(self, stem: str) -> None:
@@ -244,9 +244,12 @@ class UnitTransferFixture(StaffTestCase):
     def seed_record(self) -> Path:
         """A prior shutdown record and a command log that exposes any forbidden stop or restart."""
         home = self.root / "home"
+        owners = [row for row in staff.find(kind="unit") if row.name == "alpha"]
+        self.assertEqual(len(owners), 1)
         saved = fake_unit_host.stopped_record(home / ".claude", self.unit,
             doc=self.giving / "docs/plans/demo-production.md", host_session="demo-alpha",
-            branch="demo-alpha", plan=self.unit / "docs/plans/alpha.md")
+            branch="demo-alpha", plan=self.unit / "docs/plans/alpha.md",
+            runtime_id=owners[0].current_session)
         script = ("import json, sys; sys.path.insert(0, sys.argv[1]); import shutdown_record; "
                   + "assert shutdown_record.create_session(json.loads(sys.stdin.read()))")
         created = subprocess.run([sys.executable, "-c", script, str(SCRIPT.parents[1] / "shutdown")],
@@ -267,7 +270,7 @@ class UnitTransferFixture(StaffTestCase):
         fake_unit_host.write(self.env, [
             fake_unit_host.HostedUnit("old", "w3:p3Y", {"SHOWRUNNER_UNIT": "demo", "SHOWRUNNER_UNIT_ID": "alpha-unit"}),
             fake_unit_host.HostedUnit("moved", "w4:p1", {"SHOWRUNNER_UNIT": "other", "SHOWRUNNER_UNIT_ID": "alpha-unit"})])
-        held = fake_showrunner.write_session(self.root / "state/sessions", "alpha", "sid-alpha")
+        held = fake_showrunner.write_session(self.root / "state/sessions", "alpha", "5ad615f2-4e04-5121-a102-9d6b2e2a6eb3")
         self.addCleanup(held.close)
         fake_unit_host.place_process(self.env, os.getpid(), "w4:p1")
         fake_unit_host.process(self.env, 991030, 991000, ["python3", "-m", "unittest"],
@@ -382,7 +385,7 @@ class UnitTransferFixture(StaffTestCase):
             "SHOWRUNNER_UNIT": "demo", "SHOWRUNNER_UNIT_ID": "alpha-unit",
         }, label="alpha")])
         pid = self.live_pid()
-        socket = fake_showrunner.write_session(self.root / "state/sessions", "alpha", "sid-alpha", pid)
+        socket = fake_showrunner.write_session(self.root / "state/sessions", "alpha", "5ad615f2-4e04-5121-a102-9d6b2e2a6eb3", pid)
         self.addCleanup(socket.close)
         fake_unit_host.place_process(self.env, pid, "w1:p1")
         self.configure_tab_move()

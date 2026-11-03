@@ -19,14 +19,35 @@ of three immutable named tuples:
 | `Refused(reason)` | Loading, approval, decoding, or nix shell proof failed. |
 
 It searches the start directory and then its parents. Resolved `.envrc` files
-under `~/rust`, `~/worktrees`, and `~/.claude*` are approved with
+under the default trusted roots `~/rust`, `~/worktrees`, and `~/.claude*` are approved with
 `direnv allow <envrc>`. Linked worktrees outside those roots are also approved
 when their `.git`, `commondir`, and `gitdir` back pointer prove registration by
 a repository under a trusted root, using file reads alone. This covers
 style-sync lint snapshots made with `git worktree add` under `/tmp/claude/session`;
-clones and forged links still require explicit approval. Files elsewhere require existing explicit approval;
+forged links still require explicit approval.
+
+Copies registered by `copies.py` under the configured scratch copies root
+(normally `/tmp/claude/copies/<pair>/<copy>`) also qualify when `.envrc` is a
+regular file, not a symlink, at the copy's top level. `registered_copy` uses
+`copy_record.copy_folder` to prove that location and `copy_record.read_record` to
+require a readable `copy_record.Registered` record. Its `source_path` must resolve
+to a directory under a trusted root. Git resolves `.envrc` at the record's
+`source_commit` and hashes the copy's file with `hash-object --no-filters`;
+approval requires equal blob hashes. Both git commands run in the trusted
+source repository with no `GIT_*` variables in their environment, so the copy supplies no git configuration or filters.
+Missing, malformed, unreadable or mismatching evidence requires explicit
+approval; an unregistered clone or a copied record outside the copies root
+does not qualify. `scripts/lib/copy_record.py` owns the copy locations and record
+reader using only the standard library, so importing it does not reach scratch
+or herdr. It is imported only when checking a copy, preserving the helper's
+cheap startup.
+
+This rule checks only `.envrc`. Files it loads, including `flake.nix`, are not
+checked and may differ from the source commit.
+
+Files elsewhere require existing explicit approval;
 a blocked-file refusal names the `direnv allow <path>` command. Each direnv
-command has a 600-second timeout. `direnv export json` runs in the requested
+command uses `command_timeout_seconds`, which starts at 600 seconds. `direnv export json` runs in the requested
 directory with the supplied base environment. Strings replace variables;
 JSON null removes them. Failures retain direnv's last stderr line. The proof
 failure is `nix_env: <dir>: .envrc loaded but no nix shell (IN_NIX_SHELL unset)`.
@@ -50,16 +71,17 @@ resolver before calling `exec`.
 | Path | Integration |
 | --- | --- |
 | `herdr/herdr.py` | `launch_agent` checks `ensure(cwd, base_env)` before `open_tab`. It returns `AgentLaunched(pane, outcome)` or a typed `Refused`; refusal creates no pane and starts no agent. |
-| `production/add_unit.py` | New units, resumes, renames, transfers, watchdog recovery and account moves use `launch_agent`. |
+| `production/add_unit.py` | Unit launches use `launch_agent`. Account moves and watchdog recovery use the shared stop and resume path. |
 | `production/add_showrunner.py` | Child showrunners use `launch_agent`. |
-| `shutdown/restart.py` | Claude restarts and Codex snapshot restores prepare the saved cwd and account environment before `restore_server` can open a desktop window, then use `launch_prepared_agent`. A refusal leaves the snapshot available and opens no window or tab. |
+| `shutdown/restart.py` | Record-driven restarts prepare the saved cwd and account environment before `restore_server`, then use `launch_prepared_agent`. Refusal retains the record. |
+| `shutdown/stop_resume.py` | Shared resume runs the account exec command in the session's pane. The exec path prepares the launch shell. |
 | `shutdown/pane_restore.py` | Saved Claude panes use `launch_agent` before replacing their old tab. |
 | `herdr/herdr_sessions.py` | Standalone starts and resumes use `launch_agent`. |
 | `berth_fix/launch.sh` | Proves the worktree before opening a window; both window and current-terminal starts use `nix_env.py exec`. Worktree approval failure is fatal. |
 | `agents/agent_bg.sh` | Proves the cwd while making worker settings, passes the loaded env through settings for the long-lived background daemon, and starts the CLI through `exec`. |
 | `agents/agent_exec.sh` | Claude print runs use `exec` after changing to their requested directory. |
 | `agents/codex_mesh.py` | The shared Codex app-server calls `ensure(worktree, environment)` and starts Codex directly with the loaded env. Protected account, run, temporary-directory and held-role values come from the caller. `Refused` logs the helper's line, remembers the failed shell, and falls back to the caller env so other workers keep their shared server. The recorded pid is the server's pid. |
-| `accounts/accounts.py` | `exec` calls `launch_shell_environment(cwd)` for every Claude and Codex label. That guard dynamically loads `nix_env` and calls `ensure(cwd, os.environ)`, puts the caller's HOME back, and exits 1 with the helper's reason on `Refused`. |
+| `accounts/accounts.py` | Normal `exec` launches call `launch_shell_environment(cwd)`. It calls `ensure`, restores the caller's HOME, and refuses an unusable shell. `codex update` bypasses account launch. |
 | `cli_agent/cli_agent.sh` | Interactive and command Claude launches use `exec` in the caller's directory. |
 | `notify/review.py` | Loads the current directory's env before the Claude reviewer starts; refusal returns an unreviewed result. |
 | `make_a_worktree/direnv_allow.sh` | Thin, silent-on-success `ensure` call; failure retains the helper's stderr and exit status. `commands/make_a_worktree.md` requires stopping on failure. |
@@ -150,12 +172,12 @@ and no restart is pending.
 
 `~/.local/state/nix-heal/state.lock` excludes overlapping sweeps.
 `state.json` reserves a restart before shutdown starts, preserving the pid and
-start time. A session id gets at most one restart in 60 minutes, including
-failed attempts. A pending stop retains this reservation across holds. Immediately
+start time. The `restart_interval_seconds` setting starts at 60 minutes.
+A session id gets at most one restart in that interval, including failed attempts. A pending stop retains this reservation across holds. Immediately
 before relaunch it becomes a durable `launching` reservation; the saved login,
 cwd, config directory and original process identity remain in the journal.
-The restart command has a 1320-second budget: two 600-second direnv budgets,
-herdr's 90 seconds, and 30 seconds for overhead. A timeout, nonzero result or
+The relaunch budget equals twice `command_timeout_seconds`, plus `relaunch_launch_seconds` and `relaunch_confirmation_seconds`.
+The initial budget is 1320 seconds: two 600-second commands, 90 seconds for launch, and 30 seconds for confirmation. A timeout, nonzero result or
 failure to start retains the reservation and sends the blocked push. The timer
 never repeats an unconfirmed launch, including after an interrupted sweep.
 Even exit 0 keeps the reservation until a live replacement has the same session,
@@ -196,3 +218,20 @@ The showrunner still owns the bare `claude` and `codex` PATH wrappers in
 `/etc/nixos`; each must call this helper with the real absolute executable.
 Accounts-unit owns `accounts.py exec`, which calls `launch_shell_environment`;
 the scan recognizes that function as a guard.
+
+
+## Configuration
+
+The helper and the healer read `config/nix_env.conf` through `scripts/lib/conf.py` when each operation needs a setting.
+`command_timeout_seconds` limits direnv commands and Git proof commands.
+`trusted_home_folders` and `trusted_home_prefix` select folders that permit automatic approval.
+`heal_state_directory` selects the healer journal folder.
+Each sweep keeps its lock, state, and log in the folder selected for that operation.
+The next sweep reads the folder setting again.
+`session_directory_glob` selects session folders below the home folder.
+`restart_interval_seconds` controls repeated restarts.
+`relaunch_launch_seconds` allows herdr to launch the replacement.
+`relaunch_confirmation_seconds` allows command start and record confirmation.
+Twice `command_timeout_seconds` plus these two settings sets the relaunch budget.
+`alert_timeout_seconds` limits alert commands.
+All configured values match the previous code values.

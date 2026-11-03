@@ -18,7 +18,7 @@ import unittest
 from unittest import mock
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, cast, override
 from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -29,17 +29,10 @@ import bevy_upgrade
 import upstream
 from scripts.production import showrunners
 from cli_fixture import invoke_cli
-
-# load 136 on natedev, 2026-10-29
-TEST_HANG_GUARD_SECS = 300
-
 if TYPE_CHECKING:
-    from typing import override
+    from ..lib import test_hang_guard
 else:
-    def override(method: object) -> object:
-        """The checker marker is an identity decorator on Python 3.11."""
-        return method
-
+    from scripts.lib import test_hang_guard
 
 SCRIPT = Path(__file__).with_name("bevy_upgrade.py")
 REGISTRY = "registry+https://github.com/rust-lang/crates.io-index"
@@ -299,7 +292,7 @@ class CliFixture(unittest.TestCase):
         if explicit_production:
             command.extend(["--production", str(self.doc)])
         result = subprocess.run(command + list(arguments), cwd=self.checkout, env=self.env,
-                                capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS, check=False)
+                                capture_output=True, text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
         return result
 
 

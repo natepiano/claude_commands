@@ -150,21 +150,23 @@ class RenameStateTests(unittest.TestCase):
         self.assertEqual(state["units"], [{"unit": "new-unit", "phase": "2"}])
         self.assertEqual(state["next"], ["merge new-unit once demo-new is green", "keep the per-unit gate",
                                          "old-unitary stays"])
-        self.assertEqual(state["open_for_user"], ["answer new-unit", {"text": "new-unit asks",
-                                                                      "question": "Does new-unit ship?"}])
+        self.assertEqual(state["open_for_user"], ["answer new-unit", {"text": "old-unit asks",
+                                                                      "question": "Does old-unit ship?"}])
         self.assertEqual(rename_state.rename_scratch("old-unit", "new-unit", self.scratch, words), [])
 
     def test_outstanding_takes_the_same_words_as_open_for_user(self) -> None:
         path = self.root / "outstanding" / "demo.json"
         path.parent.mkdir()
-        _ = path.write_text(json.dumps([{"since": "2026-10-21T09:00", "text": "old-unit asks",
+        _ = path.write_text(json.dumps([{"since": "2026-10-21T09:00", "text": "Review old-unit"},
+                                        {"since": "2026-10-21T09:00", "text": "old-unit asks",
                                          "question": "Does old-unit ship?", "reviewed": "Ship old-unit?"}]))
         with unittest.mock.patch.object(tidy_wrapped, "STATE_DIR", self.root):
             self.assertTrue(rename_state.rename_outstanding("demo", (("old-unit", "new-unit"),)))
             self.assertFalse(rename_state.rename_outstanding("demo", (("old-unit", "new-unit"),)))
-        self.assertEqual(json.loads(path.read_text(encoding="utf-8")), [{
-            "since": "2026-10-21T09:00", "text": "new-unit asks", "question": "Does new-unit ship?",
-            "reviewed": "Ship new-unit?"}])
+        self.assertEqual(json.loads(path.read_text(encoding="utf-8")), [
+            {"since": "2026-10-21T09:00", "text": "Review new-unit"},
+            {"since": "2026-10-21T09:00", "text": "old-unit asks", "question": "Does old-unit ship?",
+             "reviewed": "Ship old-unit?"}])
 
     def test_unparsable_json_is_refused_by_file_name(self) -> None:
         path = self.scratch / "dailies_input_state" / "eta_seen.json"
@@ -176,7 +178,8 @@ class RenameStateTests(unittest.TestCase):
     def test_outstanding_rename_keeps_answered_jsonl_records_unchanged(self) -> None:
         path = self.root / "outstanding/demo.json"
         path.parent.mkdir()
-        _ = path.write_text(json.dumps([{"text": "old-unit asks", "question": "Ship old-unit?"}]))
+        _ = path.write_text(json.dumps([{"text": "Review old-unit"},
+                                        {"text": "old-unit asks", "question": "Ship old-unit?"}]))
         answered = path.with_suffix(".answered.jsonl")
         _ = answered.write_text("".join(json.dumps({"text": text, "asked_by": "old-unit"}) + "\n"
                                         for text in ("first answer", "second answer")))
@@ -184,7 +187,8 @@ class RenameStateTests(unittest.TestCase):
         with unittest.mock.patch.object(tidy_wrapped, "STATE_DIR", self.root):
             self.assertTrue(rename_state.rename_outstanding("demo", (("old-unit", "new-unit"),)))
             self.assertFalse(rename_state.rename_outstanding("demo", (("old-unit", "new-unit"),)))
-        self.assertEqual(json.loads(path.read_text()), [{"text": "new-unit asks", "question": "Ship new-unit?"}])
+        self.assertEqual(json.loads(path.read_text()), [{"text": "Review new-unit"},
+                                                       {"text": "old-unit asks", "question": "Ship old-unit?"}])
         self.assertEqual(answered.read_bytes(), before)
 
 

@@ -18,9 +18,10 @@ from unittest import mock
 from scripts.lib import names
 from scripts.lib.test_names import NAMES_TOML
 
-from scripts.production.update_registration_test_support import RegistrationFixture, registration, dailies_render, review, read_production, TEST_HANG_GUARD_SECS
+from scripts.production.update_registration_test_support import RegistrationFixture, registration, dailies_render, review, read_production
 
 from scripts.production.update_registration_test_support import setUpModule as setUpModule
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 class RegistrationTests(RegistrationFixture):
@@ -30,9 +31,9 @@ class RegistrationTests(RegistrationFixture):
             printed = self.run_ask("alpha-unit: keep the old key binding?", full, "alpha-unit")
         self.assertIn("filed question: " + full + " Reviewed.", printed)
         self.assertNotIn("reviewed question:", printed)
-        rows = cast(list[dict[str, str]], json.loads(self.outstanding().read_text()))
+        rows = self.open_rows()
         self.assertEqual([(row["text"], row["asked_by"], row["question"]) for row in rows],
-                         [("alpha-unit: keep the old key binding?", "alpha-unit", full)])
+                         [("alpha-unit: keep the old key binding?", self.fixture_staff_id("alpha-unit"), full)])
         self.assertEqual(rows[0]["reviewed"], full + " Reviewed.")
         history = self.outstanding().with_suffix(".history.jsonl").read_text()
         self.assertIn("alpha-unit: keep the old key binding?", history)
@@ -57,17 +58,19 @@ class RegistrationTests(RegistrationFixture):
             _ = self.run_ask("retry?", "Retry it?", "alpha-unit")
         state = self.question_state(["Reminder"])
         kept = self.run_questions(state)
-        self.assertIn("questions: kept — retry?: asked by alpha-unit", kept)
-        rows = cast(list[dict[str, str]], json.loads(self.outstanding().read_text()))
+        self.assertIn(f"questions: kept — retry?: asked by {self.fixture_staff_id('alpha-unit')}", kept)
+        rows = self.open_rows()
         self.assertEqual([row["text"] for row in rows], ["Reminder", "retry?"])
-        self.assertEqual(rows[1]["asked_by"], "alpha-unit")
+        self.assertEqual(rows[1]["asked_by"], self.fixture_staff_id("alpha-unit"))
         # A rewrite that names the item keeps its asker too.
         _ = self.run_questions(self.question_state(["Reminder", "retry?"]))
-        self.assertEqual(cast(list[dict[str, str]], json.loads(self.outstanding().read_text()))[1]["asked_by"], "alpha-unit")
+        self.assertEqual(self.open_rows()[1]["asked_by"], self.fixture_staff_id("alpha-unit"))
         answered = self.run_command("answer", "--item", "retry?")
-        self.assertEqual(answered.stdout.splitlines(), ["relay: to alpha-unit", "answer: ok — example: retry?"],
+        self.assertEqual(answered.stdout.splitlines(),
+                         [f"relay: to alpha-unit (staff {self.fixture_staff_id('alpha-unit')})",
+                          "answer: ok — example: retry?"],
                          answered.stdout + answered.stderr)
-        self.assertEqual([row["text"] for row in cast(list[dict[str, str]], json.loads(self.outstanding().read_text()))],
+        self.assertEqual([row["text"] for row in self.open_rows()],
                          ["Reminder"])
         reminder = self.run_command("answer", "--item", "Reminder")
         self.assertEqual(reminder.stdout.splitlines()[0], "relay: none; the item belongs to this production")
@@ -84,15 +87,16 @@ class RegistrationTests(RegistrationFixture):
 
     def test_answer_rerun_prefers_the_exact_answer_over_another_open_items_prefix(self) -> None:
         self.write_open_for("example", {"since": "2026-10-06T08:00", "text": "retry", "question": "Retry it?",
-                                        "asked_by": "alpha-unit"},
+                                        "asked_by": self.fixture_staff_id("alpha-unit")},
                             {"since": "2026-10-06T08:00", "text": "retry later", "question": "Retry later?",
-                             "asked_by": "beta-unit"})
+                             "asked_by": self.fixture_staff_id("beta-unit")})
         path = self.outstanding()
+        record = self.question_record_path("retry")
         real_replace = os.replace
 
         def stop(source: Path, destination: Path) -> None:
             real_replace(source, destination)
-            if Path(destination) == path:
+            if Path(destination) == record:
                 raise KeyboardInterrupt
 
         with mock.patch.object(os, "replace", side_effect=stop), self.assertRaises(KeyboardInterrupt):
@@ -104,18 +108,19 @@ class RegistrationTests(RegistrationFixture):
         self.assertIn("relay: to alpha-unit", repeated.stdout)
         self.assertNotIn("relay: to beta-unit", repeated.stdout)
         self.assertEqual(path.read_bytes(), before)
-        self.assertEqual([item.text for item in dailies_render.read_outstanding(path)], ["retry later"])
+        self.assertEqual([item.text for item in self.read_items(path)], ["retry later"])
 
     def test_answer_rerun_matches_the_saved_full_question_after_a_stopped_rewrite(self) -> None:
         question = "Should we preserve the older shortcut?"
         self.write_open_for("example", {"since": "2026-10-06T08:00", "text": "shortcut decision",
-                                        "question": question, "asked_by": "alpha-unit"})
+                                        "question": question, "asked_by": self.fixture_staff_id("alpha-unit")})
         path = self.outstanding()
+        record = self.question_record_path("shortcut decision")
         real_replace = os.replace
 
         def stop(source: Path, destination: Path) -> None:
             real_replace(source, destination)
-            if Path(destination) == path:
+            if Path(destination) == record:
                 raise KeyboardInterrupt
 
         with mock.patch.object(os, "replace", side_effect=stop), self.assertRaises(KeyboardInterrupt):
@@ -124,24 +129,27 @@ class RegistrationTests(RegistrationFixture):
         self.assertEqual(repeated.returncode, 0, repeated.stdout + repeated.stderr)
         self.assertIn("already answered", repeated.stdout)
         self.assertIn("relay: to alpha-unit", repeated.stdout)
-        self.assertEqual(dailies_render.read_outstanding(path), [])
+        self.assertEqual(self.read_items(path), [])
         saved = cast(dict[str, object], json.loads(path.with_suffix(".answered.jsonl").read_text()))
         self.assertEqual(saved["question"], question)
 
     def check_answer_write_interruption(self, *, after_replace: bool) -> None:
         self.write_open_for("example", {"since": "2026-10-06T08:00", "text": "retry?", "question": "Retry it?",
-                                        "asked_by": "alpha-unit"},
+                                        "asked_by": self.fixture_staff_id("alpha-unit")},
                             {"since": "2026-10-06T08:00", "text": "Reminder"})
         path = self.outstanding()
         before = path.read_bytes()
+        record = self.question_record_path("retry?")
+        record_before = record.read_bytes()
         answered_path = path.with_suffix(".answered.jsonl")
         real_replace = os.replace
 
         def stop(source: Path, destination: Path) -> None:
-            if Path(destination) == path:
+            if Path(destination) == record:
                 records = [cast(dict[str, object], json.loads(line))
                            for line in answered_path.read_text().splitlines()]
-                self.assertEqual([(item["text"], item["asked_by"]) for item in records], [("retry?", "alpha-unit")])
+                self.assertEqual([(item["text"], item["asked_by"]) for item in records],
+                                 [("retry?", self.fixture_staff_id("alpha-unit"))])
                 if after_replace:
                     real_replace(source, destination)
                 raise KeyboardInterrupt
@@ -150,24 +158,25 @@ class RegistrationTests(RegistrationFixture):
         with mock.patch.object(os, "replace", side_effect=stop), self.assertRaises(KeyboardInterrupt):
             _ = self.run_command("answer", "--item", "retry?")
         if after_replace:
-            self.assertEqual([item.text for item in dailies_render.read_outstanding(path)], ["Reminder"])
+            self.assertEqual([item.text for item in self.read_items(path)], ["Reminder"])
         else:
             self.assertEqual(path.read_bytes(), before)
+            self.assertEqual(record.read_bytes(), record_before)
         repeated = self.run_command("answer", "--item", "retry?")
         self.assertEqual(repeated.returncode, 0, repeated.stdout + repeated.stderr)
         self.assertIn("relay: to alpha-unit", repeated.stdout)
         self.assertEqual("already answered" in repeated.stdout, after_replace)
-        self.assertEqual([item.text for item in dailies_render.read_outstanding(path)], ["Reminder"])
+        self.assertEqual([item.text for item in self.read_items(path)], ["Reminder"])
         records = [cast(dict[str, object], json.loads(line)) for line in answered_path.read_text().splitlines()]
         self.assertEqual(len(records), 1)
         self.assertEqual((records[0]["slug"], records[0]["text"], records[0]["asked_by"]),
-                         ("example", "retry?", "alpha-unit"))
+                         ("example", "retry?", self.fixture_staff_id("alpha-unit")))
 
     def test_answered_record_expiry_and_legacy_asker_preserve_replay_rules(self) -> None:
         path = self.outstanding().with_suffix(".answered.jsonl")
         now = datetime.now(timezone.utc)
         records: list[dict[str, str]] = [
-            {"time": (now - timedelta(hours=49)).isoformat(), "slug": "example", "text": "expired?", "asked_by": "alpha-unit"},
+            {"time": (now - timedelta(hours=49)).isoformat(), "slug": "example", "text": "expired?", "asked_by": self.fixture_staff_id("alpha-unit")},
             {"time": (now - timedelta(hours=1)).isoformat(), "slug": "example", "text": "legacy?"},
         ]
         _ = path.write_text("".join(json.dumps(item) + "\n" for item in records))
@@ -187,7 +196,8 @@ class RegistrationTests(RegistrationFixture):
         path = self.outstanding().with_suffix(".answered.jsonl")
         stamp = datetime.now(timezone.utc).isoformat()
         records = [{"time": stamp, "slug": "example", "text": text, "asked_by": asker}
-                   for text, asker in (("retry", "alpha-unit"), ("retry later", "showrunner"))]
+                   for text, asker in (("retry", self.fixture_staff_id("alpha-unit")),
+                                       ("retry later", self.fixture_staff_id("showrunner")))]
         _ = path.write_text("".join(json.dumps(item) + "\n" for item in records))
         exact = self.run_command("answer", "--item", "retry")
         self.assertEqual(exact.returncode, 0, exact.stdout + exact.stderr)
@@ -201,18 +211,18 @@ class RegistrationTests(RegistrationFixture):
         journal = path.with_suffix(".answered.jsonl")
         stamp = datetime.now(timezone.utc).isoformat()
         self.write_open_for("example", {"since": "2026-10-06T08:00", "text": "retry",
-                                        "question": "Retry now?", "asked_by": "alpha-unit"})
+                                        "question": "Retry now?", "asked_by": self.fixture_staff_id("alpha-unit")})
         _ = journal.write_text(json.dumps({"time": stamp, "slug": "example", "text": "retry",
-                                          "asked_by": "beta-unit"}) + "\n")
+                                          "asked_by": self.fixture_staff_id("beta-unit")}) + "\n")
         opened = self.run_command("answer", "--item", "retry")
         self.assertEqual(opened.returncode, 0, opened.stdout + opened.stderr)
         self.assertIn("relay: to alpha-unit", opened.stdout)
         self.assertNotIn("already answered", opened.stdout)
 
         self.write_open_for("example", {"since": "2026-10-06T08:00", "text": "retry later",
-                                        "question": "Retry later?", "asked_by": "alpha-unit"})
+                                        "question": "Retry later?", "asked_by": self.fixture_staff_id("alpha-unit")})
         records = [{"time": stamp, "slug": "example", "text": "retry", "asked_by": asker}
-                   for asker in ("alpha-unit", "beta-unit")]
+                   for asker in (self.fixture_staff_id("alpha-unit"), self.fixture_staff_id("beta-unit"))]
         _ = journal.write_text("".join(json.dumps(saved) + "\n" for saved in records))
         before = path.read_bytes(), journal.read_bytes()
         ambiguous = self.run_command("answer", "--item", "retry")
@@ -221,7 +231,7 @@ class RegistrationTests(RegistrationFixture):
         self.assertEqual((path.read_bytes(), journal.read_bytes()), before)
 
         _ = journal.write_text(json.dumps({"time": stamp, "slug": "example", "text": "retry yesterday",
-                                          "asked_by": "beta-unit"}) + "\n")
+                                          "asked_by": self.fixture_staff_id("beta-unit")}) + "\n")
         partial = self.run_command("answer", "--item", "retry")
         self.assertEqual(partial.returncode, 0, partial.stdout + partial.stderr)
         self.assertIn("relay: to alpha-unit", partial.stdout)
@@ -252,7 +262,8 @@ class RegistrationTests(RegistrationFixture):
                                     "asked_by": "top-unit"})
         answered = self.run_command("answer", "--item", "merge today?")
         self.assertEqual(answered.stdout.splitlines(),
-                         ["relay: to the showrunner of kid, for kid-unit", "answer: ok — kid: merge today?"],
+                         [f"relay: to the showrunner of kid, for kid-unit (staff {self.fixture_staff_id('kid-unit', 'kid')})",
+                          "answer: ok — kid: merge today?"],
                          answered.stdout + answered.stderr)
         self.assertEqual(json.loads(self.outstanding().with_name("kid.json").read_text()), [])
         self.assertEqual(self.run_command("answer", "--item", "ship it?").returncode, 2)
@@ -276,7 +287,7 @@ class RegistrationTests(RegistrationFixture):
             self.assertIn("relay: to the showrunner of kid, for coordinator", result.stdout)
         self.assertIn("already answered", repeated.stdout)
         saved = cast(dict[str, object], json.loads(self.outstanding().with_name("kid.answered.jsonl").read_text()))
-        self.assertEqual(saved["asked_by"], "showrunner")
+        self.assertEqual(saved["asked_by"], self.fixture_staff_id("showrunner", "kid"))
 
     def test_below_production_answer_keeps_a_relay_when_names_cannot_be_read(self) -> None:
         with mock.patch.dict(os.environ, self.env):
@@ -287,7 +298,7 @@ class RegistrationTests(RegistrationFixture):
 
     def test_answer_waits_for_the_lists_lock(self) -> None:
         self.write_open_for("example", {"since": "2026-10-06T08:00", "text": "retry?", "question": "Retry it?",
-                                        "asked_by": "alpha-unit"})
+                                        "asked_by": self.fixture_staff_id("alpha-unit")})
         lock = self.outstanding().with_suffix(".lock")
         holder = subprocess.Popen([sys.executable, "-c", (
             "import fcntl, sys\n"
@@ -325,7 +336,10 @@ class RegistrationTests(RegistrationFixture):
         self.assertEqual(contended, [lock], "answer must acquire the held list lock before changing it")
 
     def test_the_reader_refuses_an_asker_without_a_question(self) -> None:
-        _ = self.outstanding().write_text(json.dumps([{"since": "2026-10-06T08:00", "text": "x", "asked_by": "alpha-unit"}]))
+        self.timer("example")
+        self.write_open_for("example", {"since": "2026-10-06T08:00", "text": "Choose the layout",
+                                        "question": "Keep this layout?", "asked_by": "alpha-unit"})
+        _ = self.outstanding().write_text(json.dumps([{"since": "2026-10-06T08:00", "text": "x", "asked_by": self.fixture_staff_id("alpha-unit")}]))
         with self.assertRaisesRegex(dailies_render.InputError, "question required"):
             _ = dailies_render.read_outstanding(self.outstanding())
 

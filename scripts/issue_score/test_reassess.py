@@ -8,16 +8,16 @@ from dataclasses import asdict
 from pathlib import Path
 import tempfile
 from typing import cast, override
-import unittest
 from unittest import mock
 
+from scripts.issue_score.test_config import ConfiguredTestCase
 from scripts.issue_score import client, decide, evaluate, questions, records, score_issues, vault
 from scripts.issue_score.test_decide import choice_answer, score_answer
 
 FIXTURES = Path(__file__).with_name("fixtures")
 
 
-class ReassessmentFixture(unittest.TestCase):
+class ReassessmentFixture(ConfiguredTestCase):
     root: Path = Path()
     issues: Path = Path()
     state: Path = Path()
@@ -27,6 +27,7 @@ class ReassessmentFixture(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        super().setUp()
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.issues = self.root / "vault" / "issues"
         self.issues.mkdir(parents=True)
@@ -76,11 +77,11 @@ class ReassessmentFixture(unittest.TestCase):
         area = client.parse_response(area, area_questions)
         return {
             "issue_path": str(path), "content_hash": score_issues.content_hash(issue, areas, self.definitions),
-            "question_set_version": questions.QUESTION_SET_VERSION, "model": questions.MODEL,
+            "question_set_version": questions.QUESTION_SET_VERSION, "model": questions.model(),
             "answers": {"main": main, "area": area},
             "payloads": {
-                "main": {"model": questions.MODEL, "state": state, "questions": questions.main_questions()},
-                "area": {"model": questions.MODEL, "state": {**state, "areas": areas}, "questions": area_questions},
+                "main": {"model": questions.model(), "state": state, "questions": questions.main_questions()},
+                "area": {"model": questions.model(), "state": {**state, "areas": areas}, "questions": area_questions},
             },
             "decided_fields": {name: asdict(decision) for name, decision in
                                decide.decide_answers(main["answers"], area["answers"]).items()},
@@ -323,7 +324,7 @@ class ReassessTests(ReassessmentFixture):
             for name in ("area", "area_reverse"):
                 row["answers"]["area"]["answers"][name] = choice_answer({"rendering": .95, "tooling": .05})
             row["decided_fields"] = {field: {"value": "stale", "certainty": "sure", "confidence": 1.}
-                                      for field in questions.THRESHOLDS}
+                                      for field in questions.thresholds()}
         raw[1]["answers"]["main"]["answers"]["goal_reverse"] = choice_answer({
             "ship_hana": .3, "find_collaborators": .4, "seek_investors": .2, "business_viability": .1})
         raw[2]["answers"]["main"]["answers"]["impact"] = score_answer({"0": .3, "1": 0., "2": 0., "3": 0., "4": .7})

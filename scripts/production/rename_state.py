@@ -184,7 +184,7 @@ def _reword_lists(value: object, words: Words) -> bool:
     state = cast(JsonObject, value)
     changed = _reword_items(state.get("merges_held"), (), words)
     changed = _reword_items(state.get("next"), (), words) | changed
-    return _reword_items(state.get("open_for_user"), ("text", "question"), words) | changed
+    return _reword_reminders(state.get("open_for_user"), words) | changed
 
 
 def _rename_showrunner_state(value: object, words: Words) -> bool:
@@ -202,12 +202,26 @@ def reword_showrunner_lists(path: Path, words: Words) -> bool:
         raise RenameRefused(str(error)) from error
 
 
+def _reword_reminders(value: object, words: Words) -> bool:
+    """Reword reminders without changing questions or their fixed asker references."""
+    if not isinstance(value, list):
+        return False
+    reminders: list[object] = [cast(object, entry) for entry in cast(list[object], value)
+                 if not isinstance(entry, dict) or "question" not in entry]
+    changed = _reword_items(reminders, ("text",), words)
+    replacements = iter(reminders)
+    entries = cast(list[object], value)
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict) or "question" not in entry:
+            entries[index] = next(replacements)
+    return changed
+
+
 def rename_outstanding(slug: str, words: Words) -> bool:
-    """Reword OUTSTANDING as `open_for_user` is reworded, so the next `questions` run finds each item
-    stored and asks no new review."""
+    """Reword reminder text; question records remain unchanged during a rename."""
     path = tidy_wrapped.outstanding_path(slug)
     try:
-        return _rename_json(path, lambda value: _reword_items(value, ("text", "question", "reviewed"), words))
+        return _rename_json(path, lambda value: _reword_reminders(value, words))
     except (OSError, ValueError) as error:
         raise RenameRefused(str(error)) from error
 

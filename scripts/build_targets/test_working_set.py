@@ -149,7 +149,7 @@ class WorkingSetTests(unittest.TestCase):
             "scripts/direct/verify_saved.py",
             "scripts/lint/nextest_budget.py",
             "scripts/lint/scope.py",
-            "scripts/lint/config_values.py",
+            "scripts/lib/conf.py",
             "scripts/hooks/pre-tool-use-checkpoint-doc-gate.py",
             "scripts/buildlog/test_port_lint.py",
             "scripts/buildlog/test_mac_idle.py",

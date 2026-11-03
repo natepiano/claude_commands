@@ -71,23 +71,53 @@ def commas: tostring | explode | reverse | to_entries
   | map(if .key > 0 and .key % 3 == 0 then [44, .value] else [.value] end)
   | flatten | reverse | implode;
 
-# STAFF_ID is an identity key, never a role. Without it, use StaffLabels.environment's
-# unique normalized registry-name fallback (unit_names.name); an unknown id must
-# not fall through to a different member. Staff rows alone name roles and parents.
+# Match StaffLabels.environment: identity, timer target, exact local worktree,
+# then the unique normalized name. An unknown explicit id never falls through.
+def staff_location($field; $kind; $states):
+  if has($field) then .kind == $kind and
+    (.[$field] | type == "object" and keys == ["machine", "path", "state"]
+     and (.machine | type) == "string" and .machine != "" and (.machine | trim) == .machine
+     and (.path | type) == "string" and (.path | startswith("/"))
+     and (.state as $state | $states | index($state)) != null)
+  else true end;
+
 def staff_rows:
   try ($ARGS.named.staff // "" | fromjson
-       | select(.schema == 1 and (.rows | type) == "array") | .rows
+       | select((.schema == 1 or .schema == 2) and (.rows | type) == "array") | .rows
        | select(all(.[]; (.id | type) == "string" and (.name | type) == "string"
-                    and (.kind == "showrunner" or .kind == "unit" or .kind == "worker"))))
+                    and (.kind == "showrunner" or .kind == "unit" or .kind == "worker")
+                    and staff_location("worktree"; "unit"; ["present", "removed"])
+                    and staff_location("doc"; "showrunner"; ["live", "wrapped"]))))
   catch [];
 
-def assignment($rows; $name):
-  ($ENV.STAFF_ID // "") as $id
-  | (if $id != "" then [$rows[] | select(.id == $id)]
-     else ($name // "" | if test("^[A-Za-z0-9][A-Za-z0-9_-]*$")
-                         then sub("[-_]unit$"; "") else "" end) as $short
-       | [$rows[] | select((.kind == "unit" or .kind == "showrunner") and .name == $short)]
-     end)
+# The notifier's CHECK is shell-quoted argv, parsed as shlex.split does for the
+# script and document tokens. Nothing in the command is evaluated or executed.
+def shell_words:
+  "(?:[^\\s'\"\\\\]|\\\\.|'[^']*'|\"(?:[^\"\\\\]|\\\\.)*\")+" as $word
+  | if test("^\\s*(?:" + $word + "\\s*)*$") then [scan($word)
+   | gsub("'(?<single>[^']*)'|\"(?<double>(?:[^\"\\\\]|\\\\.)*)\"|\\\\(?<escaped>.)";
+          .single // (if .double != null then (.double | gsub("\\\\(?<c>[\\\\\"$`])"; .c))
+                      else .escaped end))] else [] end;
+
+def timer_owners($rows; $session_id; $machine):
+  [$ARGS.named | to_entries[] | select(.key | startswith("timer_"))
+   | (.key | ltrimstr("timer_")) as $slug
+   | (.value | split("\n") | map(select(contains("=")) | split("=")
+                                 | {key: .[0], value: (.[1:] | join("="))}) | from_entries) as $conf
+   | select($session_id != "" and $conf.TARGET == "session:" + $session_id)
+   | ($conf.CHECK // "" | shell_words) as $check
+   | ([$check | to_entries[] | select(.value | split("/") | last == "production_check.sh") | .key][0]) as $index
+   | (if $index != null then $check[$index + 1] else null end) as $doc
+   | select(($doc | type) == "string" and ($doc | startswith("/")))
+   | [$rows[] | select(.kind == "showrunner" and .doc.state == "live"
+                      and .doc.machine == $machine and .doc.path == $doc)] as $owners
+   | (if ($owners | length) > 0 then $owners
+      else [$rows[] | select(.kind == "showrunner" and .name == $slug)] end)
+   | select(length == 1) | .[0]];
+
+def assignment($rows; $name; $session_id; $cwd):
+  ($session_id // $ENV.CODEX_THREAD_ID // $ENV.CLAUDE_CODE_SESSION_ID // "") as $id
+  | [$rows[] | select((.current_session // .id) == $id)]
   | if length == 1 then .[0] else null end;
 
 def remaining($window):
@@ -152,12 +182,12 @@ def usage($config; $label; $window; $fmt):
    | if type == "object" and $session_id != "" and .sessionId == $session_id then .name else null end
    | if type == "string" and . != "" then . else null end) as $session_name
 | (staff_rows // []) as $rows
-| assignment($rows; $session_name) as $assignment
+| ((.workspace.current_dir // .cwd // "") | if . == "" then $pwd else . end) as $d
+| assignment($rows; $session_name; $session_id; $d) as $assignment
 | (if $assignment.kind == "unit" then
      [$rows[] | select(.id == $assignment.parent and .kind == "showrunner")]
      | if length == 1 then .[0].name else null end
    else null end) as $showrunner_name
-| ((.workspace.current_dir // .cwd // "") | if . == "" then $pwd else . end) as $d
 # Trailing slashes stripped first, so "/etc/nixos/" gives "/etc/nixos"; "/" stays "/".
 | ($d | sub("(?<=.)/+$"; "")) as $full
 | ($ENV.HOME // "" | sub("/+$"; "")) as $home

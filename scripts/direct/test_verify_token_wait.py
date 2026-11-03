@@ -90,7 +90,7 @@ trap observe_token_wait DEBUG
             "BUILD_TARGETS_SCRIPT": str(targets), "VERIFY_MAC_RUNNER": str(runner),
             "TEST_ROUTE_EVENTS": str(self.root / "route-events"),
             "TEST_MAC_EVENTS": str(self.root / "mac-events"),
-            "MAC_TEST_CONFIG": str(self.root / "mac-settings"), "TEST_MAC_ALLOWED": "1",
+            "MAC_TEST_CONFIG": str(self.root / "mac-settings"), "CONF_DIR": str(Path(self.root / "mac-settings").parent), "TEST_MAC_ALLOWED": "1",
         })
         result = self.verify(self.environment)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

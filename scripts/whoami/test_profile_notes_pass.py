@@ -19,6 +19,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.test_agents_registry import write_registry
+from scripts.accounts.home_test_support import scratch_accounts_config
 
 from scripts.whoami import profile_notes_pass as profile
 
@@ -69,6 +70,7 @@ class ProfileNotesPassTests(unittest.TestCase):
             "SHOWRUNNERS_CONFIG": str(self.home / "showrunners.json"),
             "USER_ZONE": "UTC", "PYTHONDONTWRITEBYTECODE": "1",
         }, clear=True))
+        _ = self.enterContext(scratch_accounts_config())
         _ = write_registry(self.home / "agents.conf")
         pass_ = profile.load_pass()
         # Modules may already be imported by another suite. Replace only input paths.

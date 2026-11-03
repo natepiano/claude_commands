@@ -6,11 +6,14 @@ import io
 import os
 import runpy
 import signal
+import shutil
 import subprocess
+from subprocess import run as run_git
 import tempfile
 import time
 import unittest
-from datetime import timedelta
+from datetime import datetime, timedelta
+from dataclasses import replace
 from contextlib import contextmanager, redirect_stdout
 from collections.abc import Generator
 from pathlib import Path
@@ -23,11 +26,15 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+GIT: str = shutil.which("git") or "git"
+
 from scripts.accounts import accounts, next_moves, outage_alerts, refusal_watch, role_map, unit_watchdog
 from scripts.accounts import test_refusal_watch as fixtures
 from scripts.production import showrunners, staff
-from scripts.production.staff_test_support import isolated_staff_file, showrunner_relationship, unit_membership
+from scripts.shutdown.remote import local_machine
+from scripts.production.staff_test_support import isolated_staff_file, showrunner_relationship, unit_membership, recorded_unit
 from scripts.shutdown import folder_trust, stop_resume
+from scripts.shutdown import pane_record as hook_pane_record
 from scripts.notify.push_texts import RenderedPush
 
 if TYPE_CHECKING:
@@ -103,12 +110,13 @@ class UnitWatchdogTests(unittest.TestCase):
         self.pending = []
         self.finish_jobs = True
         _ = self.enterContext(patch.object(pane_record, "RECORD_DIR", self.home / "panes"))
+        _ = self.enterContext(patch.object(hook_pane_record, "RECORD_DIR", self.home / "panes"))
         _ = self.enterContext(patch.object(stop_resume, "resume", side_effect=self.resume))
         _ = self.enterContext(patch.object(sessions, "session_liveness", side_effect=self.session_liveness))
         _ = self.enterContext(patch.object(unit_lookup, "runs_dir", return_value=self.runs))
         _ = self.enterContext(patch.object(unit_lookup, "every_marked_unit", side_effect=self.marked))
-        _ = self.enterContext(patch.object(showrunners, "registered_showrunners", return_value=[
-            showrunners.Showrunner(session="fixture-showrunner", socket="/fixture.sock", slug="fixture", zone="UTC", doc=str(self.doc))]))
+        _ = self.enterContext(patch.object(showrunners, "registered_showrunners", return_value=showrunners.ShowrunnerDiscovery([
+            showrunners.Showrunner(session="fixture-showrunner", socket="/fixture.sock", slug="fixture", zone="UTC", doc=str(self.doc))])))
         _ = self.enterContext(patch.object(showrunners, "tell", side_effect=self.tell))
         _ = self.enterContext(patch.object(quota_alert, "tell_user", return_value=quota_alert.PushSent()))
         _ = self.enterContext(patch.object(subprocess, "run", side_effect=self.command))
@@ -132,11 +140,12 @@ class UnitWatchdogTests(unittest.TestCase):
         rows = ["# Fixture", "- **Production slug:** fixture", "## Units", "| Unit | Plan | Worktree |", "| --- | --- | --- |"]
         for name in self.units:
             member = unit_membership("fixture", name)
-            if name in self.retired:
-                _ = staff.retire(member.id)
             tree = self.home / name
+            _ = recorded_unit("fixture", name, tree, self.doc, plan="docs/plan.md")
+            if name in self.retired:
+                _ = staff.set_worktree(member.id, staff.RemovedWorktree(local_machine(), tree), expected=member.worktree)
             tree.mkdir(exist_ok=True)
-            _ = (tree / ".git").write_text("gitdir: scratch\n")
+            _ = run_git([GIT, "init", "-b", "fixture", str(tree)], check=True, capture_output=True)
             events: list[dict[str, object]] = [{"event_type": "run_started", "working_dir": str(tree), "run_started_at": 1}]
             if name in self.finished:
                 events.append({"event_type": "run_finished"})
@@ -156,10 +165,6 @@ class UnitWatchdogTests(unittest.TestCase):
         pane_record.write("shared", entry)
         identity = accounts.account_identity(accounts.account_dir(label))
         assert isinstance(identity, agent_accounts.NumberedAccount)
-        shutdown_record.write_snapshot(shutdown_record.RecoverySnapshot(machine="natedev", login=identity.login, label=label,
-            taken_at=NOW.isoformat(), sessions=[shutdown_record.SnapshotClaudeSession(agent="claude", session=item,
-                workers=[], timers=[], last_seen=NOW.isoformat(), state="unresolved", crash="host gone")
-                for item in self.units.values() if item.get("config_dir") == str(accounts.account_dir(label))]))
         return owner
 
     def marked(self) -> unit_lookup.MarkedProductions:
@@ -180,7 +185,7 @@ class UnitWatchdogTests(unittest.TestCase):
         owner["config_dir"] = str(accounts.account_dir(label))
         self.die(identity)
         self.fixture.live.append(sessions.SessionRecord(pid=owner["pid"], sessionId=identity, name=owner["name"],
-            messagingSocketPath="/fixture.sock", updatedAt=1, tmux="", formerNames=[]))
+            procStart=owner["proc_start"], messagingSocketPath="/fixture.sock", updatedAt=1, tmux="", formerNames=[]))
 
     def tell(self, _slug: str, _key: str, text: str) -> str:
         self.notices.append(text)
@@ -196,6 +201,8 @@ class UnitWatchdogTests(unittest.TestCase):
         return stop_resume.ClaudeUp(identity, identity, to)
 
     def command(self, argv: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+        if argv[0] == "git":
+            return run_git([GIT, *argv[1:]], capture_output=True, text=True, check=False)
         self.assertIn("--recover", argv)
         self.assertLessEqual(cast(float, options["timeout"]), 5)
         self.assertIn("--no-block", argv)
@@ -219,6 +226,28 @@ class UnitWatchdogTests(unittest.TestCase):
         self.commands.clear()
         failure = unit_watchdog._restart(source.label, source.session["session_id"], source.identity)  # pyright: ignore[reportPrivateUsage]
         return failure, self.commands
+
+    def test_partial_discovery_keeps_unobserved_recovery_and_checks_healthy_units(self) -> None:
+        _ = self.add_unit("alpha")
+        self.die("alpha")
+        _ = self.pass_at(0)
+        saved = unit_watchdog._read_state()  # pyright: ignore[reportPrivateUsage]
+        saved["missing"] = unit_watchdog.DownOutage(
+            first_seen=NOW.isoformat(), alert_context=unit_watchdog.RecoveryOwner(production="missing", unit="beta"),
+            job=unit_watchdog.RecoveryJob(result=str(self.home / "pending-result"), started=NOW.isoformat(), source="fixture"))
+        unit_watchdog._write_state(saved)  # pyright: ignore[reportPrivateUsage]
+        runner = showrunners.Showrunner(session="fixture-showrunner", socket="/fixture.sock", slug="fixture",
+                                       zone="UTC", doc=str(self.doc))
+        partial = showrunners.ShowrunnerDiscovery([runner], (
+            showrunners.ShowrunnerLookupFailure("missing", "fixture lookup unavailable"),))
+        with patch.object(showrunners, "registered_showrunners", return_value=partial):
+            with self.assertRaisesRegex(OSError, "fixture lookup unavailable"):
+                _ = self.pass_at(2)
+        current = unit_watchdog._read_state()  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(current["missing"], saved["missing"])
+        self.assertIn("job", current["alpha"], "the healthy production must still start recovery")
+        self.complete_jobs()
+        self.assertEqual(len(self.commands), 1)
 
     def test_interrupted_cleanup_resumes_without_sending_notices_to_live_sessions(self) -> None:
         for name in ("alpha", "beta", "gamma"):
@@ -315,30 +344,43 @@ class UnitWatchdogTests(unittest.TestCase):
 
     def test_explicit_resume_after_public_stop_allows_recovery_of_a_later_crash(self) -> None:
         owner = self.add_unit("alpha")
+        member = unit_membership("fixture", "alpha")
+        record = staff.StaffSnapshot(tuple(
+            replace(row, id=staff.StaffId(owner["session_id"]),
+                    current_session=staff.StaffId(owner["session_id"])) if row.id == member.id else row
+            for row in staff.snapshot().rows))
 
-        def start(tab: herdr.TabSession, entry: pane_record.PaneLaunch, label: str, message: str) -> None:
+        def start(tab: herdr.TabSession, entry: pane_record.PaneLaunch, label: str, message: str) -> sessions.LiveSessionProcess:
             self.assertIn("maintenance", message)
             self.assertEqual((tab.pane_id, entry["session_id"], label), ("alpha", "alpha", "claude4"))
             environment = {**entry["environment"], "HERDR_ENV": "1", "HERDR_SESSION": "shared",
                            "HERDR_PANE_ID": tab.pane_id, "CLAUDE_CONFIG_DIR": entry["config_dir"]}
             payload = json.dumps({"session_id": "alpha", "cwd": owner["cwd"]})
-            with (patch.dict(os.environ, environment, clear=True),
+            with (patch.dict(os.environ, environment),
+                  patch.object(os, "getppid", return_value=owner["pid"]),
+                  patch.object(staff, "runtime_id", return_value=owner["session_id"]),
                   patch.object(sys, "stdin", io.StringIO(payload)),
-                  patch.object(pane_record, "claude_arguments", return_value=stop_resume.resume_arguments(entry))):
+                  patch.object(hook_pane_record, "claude_arguments", return_value=stop_resume.resume_arguments(entry))):
                 with self.assertRaises(SystemExit) as exited:
                     _ = runpy.run_path(str(stop_resume.SCRIPTS / "hooks/session-start-pane-record.py"), run_name="__main__")
                 self.assertEqual(exited.exception.code, 0)
             self.revive("alpha", label)
+            return sessions.LiveSessionProcess(owner["pid"])
 
         config = accounts.account_dir("claude4")
         with self.stop_process_leaves():
             self.assertEqual(stop_resume.stop("alpha"), stop_resume.Stopped("alpha", owner["pid"]))
             self.assertTrue(pane_record.read("shared")["alpha"].get("ended", False))
             with (patch.object(stop_resume, "_start_session", side_effect=start),
+                  patch.object(herdr.Herdr, "retitle", return_value=False) as retitle,
+                  patch.object(staff, "initial_snapshot", return_value=record),
                   patch.object(stop_resume, "_detach"), patch("unit_runs.held", return_value=[]),
                   patch.object(folder_trust, "heal", return_value=herdr.Trusted(
                       Path(owner["cwd"]), config / ".claude.json", Path(owner["cwd"])))):
                 result = self.shared_resume("alpha", why="maintenance complete")
+                row = record.by_current_session(owner["session_id"])
+                assert row is not None
+                retitle.assert_called_once_with("alpha", row.name)
         self.assertIsInstance(result, stop_resume.ClaudeUp)
         entry = pane_record.read("shared")["alpha"]
         self.assertFalse(entry.get("ended", False))
@@ -356,8 +398,7 @@ class UnitWatchdogTests(unittest.TestCase):
         for path in (self.home / "shutdown").rglob("*.json"):
             path.unlink()
         self.die("alpha")
-        with (patch.object(shutdown_record, "all_session_records", side_effect=AssertionError("no record read")),
-              patch.object(shutdown_record, "all_snapshots", side_effect=AssertionError("no snapshot read")),
+        with (patch.object(shutdown_record, "all_session_records", return_value=[]),
               patch.object(shutdown_record, "lookup_account_hold", side_effect=AssertionError("no hold read"))):
             _ = self.pass_at(0)
             self.assertEqual(self.commands, [])
@@ -383,8 +424,7 @@ class UnitWatchdogTests(unittest.TestCase):
         _ = self.add_unit("alpha")
         self.refused.add("claude4")
         self.die("alpha")
-        with (patch.object(shutdown_record, "all_session_records", side_effect=AssertionError("no record read")),
-              patch.object(shutdown_record, "all_snapshots", side_effect=AssertionError("no snapshot read")),
+        with (patch.object(shutdown_record, "all_session_records", return_value=[]),
               patch.object(quota_alert, "tell_user", return_value=quota_alert.PushSent()) as phone):
             for minute in (0, 2, 4, 6, 8):
                 _ = self.pass_at(minute)
@@ -498,6 +538,77 @@ class UnitWatchdogTests(unittest.TestCase):
         self.assertEqual(len(launches), 1)
         self.assertEqual(launches[0][launches[0].index("--to") + 1], "claude2")
 
+
+    def intentional_stop_record(self, owner: inventory.Session, *, scope: str = "session") -> shutdown_record.SessionShutdown:
+        launch = pane_record.read("shared")[owner["session_id"]]
+        at = (datetime.fromisoformat(launch["written_at"]) + timedelta(seconds=1)).isoformat()
+        saved = shutdown_record.SessionShutdown(login="four@example.invalid", label="claude4", machine="natedev",
+            requested_at=at, request_id="stop-" + owner["session_id"],
+            requested_by=shutdown_record.FromTerminal(kind="terminal"),
+            hold="account" if scope == "account" else "session", then="stop", force="now", alerts="none", probe=False,
+            session=owner, workers=[], timers=[], settle_message=shutdown_record.SettleMessageNotSent(kind="not sent"),
+            where=shutdown_record.WhereNotSaid(kind="not said"), progress=shutdown_record.SessionStopped(kind="stopped", at=at),
+            stop_issues=[], trail=[])
+        self.assertTrue(shutdown_record.create_session(saved))
+        return saved
+
+    def test_existing_intentional_stop_records_exclude_unended_launches(self) -> None:
+        for scope in ("session", "account"):
+            owner = self.add_unit(scope)
+            _ = self.intentional_stop_record(owner, scope=scope)
+            self.die(scope)
+        for minute in (0, 2, 4):
+            _ = self.pass_at(minute)
+        self.assertEqual(self.commands, [])
+        self.assertEqual(self.pending, [])
+        self.assertEqual(self.notices, [])
+
+    def test_latest_stop_wins_across_accounts(self) -> None:
+        owner = self.add_unit("alpha")
+        saved = self.intentional_stop_record(owner)
+        launch = pane_record.read("shared")["alpha"]
+        earlier = (datetime.fromisoformat(launch["written_at"]) - timedelta(seconds=1)).isoformat()
+        older: shutdown_record.SessionShutdown = {**saved, "login": "main@example.invalid", "label": "claude1",
+            "request_id": "old-stop", "requested_at": earlier,
+            "progress": shutdown_record.SessionStopped(kind="stopped", at=earlier)}
+        self.assertTrue(shutdown_record.create_session(older))
+        self.die("alpha")
+        for minute in (0, 2, 4):
+            _ = self.pass_at(minute)
+        self.assertEqual(self.commands, [])
+        self.assertEqual(self.pending, [])
+        self.assertEqual(self.notices, [])
+
+    def test_a_manual_restart_command_does_not_cancel_an_intentional_stop(self) -> None:
+        owner = self.add_unit("alpha")
+        saved = self.intentional_stop_record(owner)
+        def manual_restart(current: shutdown_record.SessionShutdown) -> None:
+            current["progress"] = shutdown_record.SessionNeedsManualRestart(kind="manual restart", command="claude --resume alpha")
+        _ = shutdown_record.update_session(saved["login"], "alpha", manual_restart)
+        self.die("alpha")
+        for minute in (0, 2, 4):
+            _ = self.pass_at(minute)
+        self.assertEqual(self.commands, [])
+        self.assertEqual(self.pending, [])
+        self.assertEqual(self.notices, [])
+
+    def test_queued_recovery_refuses_a_later_intentional_stop_record(self) -> None:
+        source = self.queued_unit()
+        _ = self.intentional_stop_record(self.units["alpha"])
+        failure, launches = self.recover_queued(source)
+        self.assertTrue(failure)
+        self.assertEqual(launches, [])
+
+    def test_an_explicit_new_launch_supersedes_an_older_stop_record(self) -> None:
+        owner = self.add_unit("alpha")
+        saved = self.intentional_stop_record(owner)
+        entry = pane_record.read("shared")["alpha"]
+        entry["written_at"] = (datetime.fromisoformat(saved["requested_at"]) + timedelta(seconds=1)).isoformat()
+        pane_record.write("shared", entry)
+        self.die("alpha")
+        for minute in (0, 2, 4):
+            _ = self.pass_at(minute)
+        self.assertEqual(self.commands, [["resume", "alpha", "--to", "claude4", "--only", "alpha"]])
 
     def test_queued_recovery_refuses_a_changed_or_ended_pane_launch(self) -> None:
         source = self.queued_unit()
@@ -971,9 +1082,6 @@ class UnitWatchdogTests(unittest.TestCase):
 
     def test_folder_lost_after_dispatch_keeps_outage_context_and_retries_its_alert(self) -> None:
         saved = self.moved_outage()
-        # An empty legacy snapshot cannot hide the unit's pane launch.
-        shutdown_record.write_snapshot(shutdown_record.RecoverySnapshot(machine="natedev", login=saved["login"],
-            label=saved["label"], taken_at=NOW.isoformat(), sessions=[]))
         _ = self.pass_at(0)
         _ = self.pass_at(2)
         self.assertEqual(len(self.pending), 1)
@@ -1066,8 +1174,12 @@ class UnitWatchdogTests(unittest.TestCase):
         assert current is not None
         self.assertNotIn("restore_alerted", current)
 
-    def test_slow_snapshot_probe_preserves_a_new_watchdog_alert(self) -> None:
+    def test_slow_record_probe_preserves_a_new_watchdog_alert(self) -> None:
         beta = self.add_unit("beta")
+        saved = self.intentional_stop_record(beta)
+        def restart_after_stop(current: shutdown_record.SessionShutdown) -> None:
+            current["then"] = "restart"
+        _ = shutdown_record.update_session(saved["login"], "beta", restart_after_stop)
         _ = self.add_unit("alpha")
         self.die("beta")
         self.finish_jobs = False
@@ -1171,12 +1283,6 @@ class UnitWatchdogTests(unittest.TestCase):
             clock[0] += 10
             self.revive("alpha", "claude2")
             _ = self.pass_at(16)
-            # The live snapshot pass provides recovery for the next outage.
-            seen_at = (NOW + timedelta(minutes=16)).isoformat()
-            shutdown_record.write_snapshot(shutdown_record.RecoverySnapshot(machine="natedev", login="main@example.invalid",
-                label="claude2", taken_at=seen_at, sessions=[shutdown_record.SnapshotClaudeSession(agent="claude",
-                    session=self.units["alpha"], workers=[], timers=[], last_seen=seen_at,
-                    state="unresolved", crash="agent exited")]))
             self.die("alpha")
             for minute in (18, 20, 26):
                 _ = self.pass_at(minute)
@@ -1267,8 +1373,6 @@ class UnitWatchdogTests(unittest.TestCase):
 
     def test_worker_delivery_survives_a_later_retained_missing_folder(self) -> None:
         saved = self.moved_outage()
-        shutdown_record.write_snapshot(shutdown_record.RecoverySnapshot(machine="natedev", login=saved["login"],
-            label=saved["label"], taken_at=NOW.isoformat(), sessions=[]))
         _ = self.pass_at(0)
         _ = self.pass_at(2)
         with patch.object(quota_alert, "tell_user", return_value=quota_alert.PushSent()) as phone:
@@ -1310,8 +1414,6 @@ class UnitWatchdogTests(unittest.TestCase):
 
     def test_failed_worker_delivery_allows_one_move_alert_after_retained_failure(self) -> None:
         saved = self.moved_outage()
-        shutdown_record.write_snapshot(shutdown_record.RecoverySnapshot(machine="natedev", login=saved["login"],
-            label=saved["label"], taken_at=NOW.isoformat(), sessions=[]))
         _ = self.pass_at(0)
         _ = self.pass_at(2)
         with patch.object(quota_alert, "tell_user", return_value=quota_alert.PushFailed("delivery failed")) as worker_phone:
@@ -1405,7 +1507,8 @@ class UnitWatchdogTests(unittest.TestCase):
         _ = self.pass_at(0)
         elapsed = [0.0]
         def slow(argv: list[str], **options: object) -> subprocess.CompletedProcess[str]:
-            elapsed[0] += cast(float, options["timeout"])
+            if argv[0] != "git":
+                elapsed[0] += cast(float, options["timeout"])
             return self.command(argv, **options)
         with (patch.object(time, "monotonic", side_effect=lambda: elapsed[0]),
               patch.object(subprocess, "run", side_effect=slow)):
@@ -1422,11 +1525,12 @@ class UnitWatchdogTests(unittest.TestCase):
         self.finish_jobs = False
         _ = self.pass_at(0)
         _ = self.pass_at(2)
-        snapshot = shutdown_record.read_snapshot("four@example.invalid")
-        assert not isinstance(snapshot, shutdown_record.NoRecoverySnapshot)
-        entry = snapshot["sessions"][0]
-        assert entry["agent"] == "claude"
-        saved = shutdown_record.materialize_snapshot(snapshot, entry)
+        saved = shutdown_record.SessionShutdown(login="four@example.invalid", label="claude4", machine="natedev",
+            requested_at=NOW.isoformat(), request_id="stale-restart", requested_by=shutdown_record.FromTerminal(kind="terminal"),
+            hold="session", then="restart", force="now", alerts="none", probe=False, session=owner, workers=[], timers=[],
+            settle_message=shutdown_record.SettleMessageNotSent(kind="not sent"), where=shutdown_record.WhereNotSaid(kind="not said"),
+            progress=shutdown_record.SessionStopped(kind="stopped", at=NOW.isoformat()), stop_issues=[], trail=[])
+        self.assertTrue(shutdown_record.create_session(saved))
         def interrupted(current: shutdown_record.SessionShutdown) -> None:
             prior = current["progress"]
             assert prior["kind"] != "restarting"

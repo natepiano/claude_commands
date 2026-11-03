@@ -15,8 +15,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
 
 import session_pane
+from scripts.message.relay_identity import relay_session_name
 from unit_lookup import Place
 from scripts.hooks import hook_dispatch
+from scripts.lib import test_hang_guard
 from scripts.hooks.conversation_pause_test_support import (
     ASK_AGAIN, IDLE_NOTICE, NO_CONTEXT, NOW, OTHER_ANSWER_CONTEXT, PAUSE_CONTEXT,
     QUESTION, RETURN_SCHEDULE, SESSION, SETTINGS, ConversationPauseFixture,
@@ -66,6 +68,36 @@ class ConversationPauseRegistrationTests(unittest.TestCase):
 
 
 class ConversationPauseTests(ConversationPauseFixture):
+    def test_session_lookup_hang_escapes_product_timeout_recovery(self) -> None:
+        blocked = self.root / "blocked_lookup.py"
+        _ = blocked.write_text("import signal\nsignal.pause()\n")
+        blocked.chmod(0o755)
+        lookup = self.root / "lookup.py"
+        _ = lookup.write_text(
+            "import conversation_pause\nconversation_pause._session_lookup('session-1')\n"
+        )
+        with (
+            patch.object(conversation_pause, "sessions_command", return_value=[str(blocked)]),
+            patch.object(test_hang_guard, "TEST_HANG_GUARD_SECS", 1),
+            self.assertRaisesRegex(
+                test_hang_guard.FixtureHang,
+                r"synchronous fixture hang guard expired.*blocked_lookup\.py",
+            ),
+        ):
+            _ = self.invoke([sys.executable, str(lookup)], env=self.environment)
+
+    def test_relay_wrappers_keep_the_scheduled_sender_and_return_question(self) -> None:
+        for sender, expected in (("stall-watch", conversation_pause.PromptSource.SCHEDULED),
+                                 ("unit-abc", conversation_pause.PromptSource.SCHEDULED),
+                                 ("natedev", conversation_pause.PromptSource.PEER)):
+            with self.subTest(sender=sender):
+                prompt = cross_session(relay_session_name(sender), "update")
+                self.assertIs(conversation_pause.prompt_source(prompt, lambda: frozenset({"unit-abc"}), tuple),
+                              expected)
+                self.assertFalse(conversation_pause.is_return_question(prompt))
+        self.assertTrue(conversation_pause.is_return_question(
+            cross_session(relay_session_name(conversation_pause.WATCHER), QUESTION)))
+
     def test_prompt_source_rows(self) -> None:
         def unexpected_sender_read() -> frozenset[str]:
             self.fail("sender files were read for a non-cross-session prompt")
