@@ -13,7 +13,7 @@ import subprocess
 import sys
 import unittest
 from collections.abc import Callable
-from contextlib import redirect_stderr
+from contextlib import chdir, redirect_stderr
 from dataclasses import FrozenInstanceError, replace
 from multiprocessing.connection import Connection
 from multiprocessing.process import BaseProcess
@@ -148,6 +148,87 @@ class NativeRuntimeIdentityTests(StaffTestCase):
             _ = staff.update_current_session(worker.id, unit.id)
         self.assertEqual(self.staff_file.read_bytes(), before)
         self.assertEqual(staff.by_id(worker.id), worker)
+
+
+class DocumentLookupTests(StaffTestCase):
+    def git(self, checkout: Path, *arguments: str) -> None:
+        result = subprocess.run(["git", *arguments], cwd=checkout, capture_output=True,
+                                text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def checkouts(self) -> tuple[Path, Path, Path]:
+        main = self.root / "main"
+        main.mkdir()
+        self.git(main, "init", "-b", "main")
+        self.git(main, "config", "user.name", "Document Test")
+        self.git(main, "config", "user.email", "document@example.invalid")
+        document = main / "docs/plans/example-production.md"
+        document.parent.mkdir(parents=True)
+        _ = document.write_text("# Example production\n")
+        self.git(main, "add", ".")
+        self.git(main, "commit", "-m", "Add production document")
+        owner = self.root / "owner-checkout"
+        unit = self.root / "unit-checkout"
+        self.git(main, "worktree", "add", "-b", "owner", str(owner))
+        self.git(main, "worktree", "add", "-b", "unit", str(unit))
+        return main, owner, unit
+
+    def test_document_lookup_joins_checkouts_without_an_external_command(self) -> None:
+        main, owner, unit = self.checkouts()
+        relative = Path("docs/plans/example-production.md")
+        runner = fixture_member("showrunner", name="example", doc=staff.LiveDoc("natedev", owner / relative))
+        git_file = unit / ".git"
+        git_directory = Path(git_file.read_text().removeprefix("gitdir: ").strip())
+        _ = git_file.write_text(f"gitdir: {os.path.relpath(git_directory, unit)}\n")
+        separate = self.root / "separate-repository"
+        separate.mkdir()
+        self.git(separate, "init", "-b", "main")
+        (separate / relative).parent.mkdir(parents=True)
+        _ = (separate / relative).write_text((main / relative).read_text())
+        record = staff.snapshot()
+        before = self.staff_file.read_bytes()
+        with mock.patch.object(subprocess, "run", side_effect=AssertionError("No external command expected")):
+            self.assertEqual(record.by_doc("natedev", main / relative), runner)
+            self.assertEqual(record.by_doc("natedev", unit / relative), runner)
+            with chdir(unit):
+                self.assertEqual(record.by_doc("natedev", relative), runner)
+            self.assertIsNone(record.by_doc("mac", unit / relative))
+            self.assertIsNone(record.by_doc("natedev", unit / "docs/other-production.md"))
+            self.assertIsNone(record.by_doc("natedev", separate / relative))
+        self.assertEqual(self.staff_file.read_bytes(), before)
+
+    def test_document_outside_git_matches_only_its_exact_path(self) -> None:
+        document = self.root / "outside/example-production.md"
+        document.parent.mkdir()
+        _ = document.write_text("# Example production\n")
+        copy = self.root / "another/example-production.md"
+        copy.parent.mkdir()
+        _ = copy.write_text(document.read_text())
+        runner = fixture_member("showrunner", name="example", doc=staff.LiveDoc("natedev", document))
+        record = staff.snapshot()
+        with mock.patch.object(subprocess, "run", side_effect=AssertionError("No external command expected")):
+            self.assertEqual(record.by_doc("natedev", document), runner)
+            self.assertIsNone(record.by_doc("natedev", copy))
+
+    def test_document_lookup_refuses_multiple_repository_matches(self) -> None:
+        main, owner, unit = self.checkouts()
+        relative = Path("docs/plans/example-production.md")
+        _ = fixture_member("showrunner", name="first", doc=staff.LiveDoc("natedev", main / relative))
+        _ = fixture_member("showrunner", name="second", doc=staff.LiveDoc("natedev", owner / relative))
+        record = staff.snapshot()
+        before = self.staff_file.read_bytes()
+        with self.assertRaises(staff.StaffRefused):
+            _ = record.by_doc("natedev", unit / relative)
+        self.assertEqual(self.staff_file.read_bytes(), before)
+
+    def test_exact_document_match_wins_over_a_repository_match(self) -> None:
+        main, owner, unit = self.checkouts()
+        relative = Path("docs/plans/example-production.md")
+        _ = fixture_member("showrunner", name="first", doc=staff.LiveDoc("natedev", main / relative))
+        exact = fixture_member("showrunner", name="second", doc=staff.LiveDoc("natedev", owner / relative))
+        record = staff.snapshot()
+        self.assertEqual(record.by_doc("natedev", owner / relative), exact)
+        self.assertIsNone(record.by_doc("natedev", unit / "docs/other-production.md"))
 
 
 class StaffTests(StaffTestCase):
