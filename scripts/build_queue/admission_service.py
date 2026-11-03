@@ -433,8 +433,8 @@ class AdmissionServer:
                     or isinstance(watch, ScopeWatch) and watch.episode not in self.reservations):
                 self._unwatch(descriptor)
 
-    def _ordered_waiters(self) -> list[tuple[Path, gate.Waiter]]:
-        return sorted(((self.state_dir / gate.waiter_owner(waiting.row), waiting.row.copy())
+    def _ordered_waiters(self) -> list[tuple[Path, gate.RankedWaiter]]:
+        return sorted(((self.state_dir / gate.waiter_owner(waiting.row), gate.rank_waiter(waiting.row, gate.NormalOrder()))
                        for waiting in self.waiters.values()), key=lambda item: gate.waiter_order(item[1]))
 
     def _override_pending_reconnect(self) -> bool:
@@ -460,7 +460,7 @@ class AdmissionServer:
         profile, identity = request.profile, request.identity
         row: gate.Waiter = {
             "pid": request.owner.pid, "start_time": request.owner.start_time,
-            "need": profile.peak.bytes, "since": place.since, "priority_rank": place.priority_rank,
+            "need": profile.peak.bytes, "since": place.since,
             "session_id": identity.session_id, "session_name": identity.name,
             "step": identity.step, "folder": identity.folder,
             "estimated_at": profile.estimated_at or self.clock.now(),

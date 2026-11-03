@@ -15,7 +15,7 @@ it changes, and say so in one line.
 
 ## Steps
 
-1. **Top priority at once.** The user can type `/build:queue bump <unit>` in the showrunner session. For a specific reason, run `~/.claude/scripts/lib/py ~/.claude/scripts/lint/memory_admit.py priority set --unit <unit> --why "<what>"`; a second urgent request replaces the live priority at once. Make the work the whole production's top priority.
+1. **Top priority at once.** The user can type `/build:queue bump <unit>` in the showrunner session. For a specific reason, run `~/.claude/scripts/lib/py ~/.claude/scripts/lint/memory_admit.py priority set --unit=<unit> --why "<what>"`; use a real unit label from the local roster. An unknown unit or the no-unit display placeholder returns `build queue: unknown unit <unit>; the queue priority did not change` on stdout with exit 3; the pane shows that line. A second urgent request replaces the live priority at once. Make the work the whole production's top priority.
    Log it in `LOG` as `bump: <unit> <what>`. Tell every other unit director in
    one line: the bumped unit's merge goes first, and a build hold may come. Do
    not wait for the next update tick.

@@ -1,6 +1,6 @@
 #1 of 32 · tool-based-ui · cables · work-pan · mend · 7.6 GiB
 Folder /tmp/tree. Waited 36 min (since 10:10). Likely start ~10:47.
-queue priority: cables (the user's bump)
+queue priority: cables (captured priority)
 
 Next? Yes, it is first. It starts when the checks below pass.
 
@@ -11,4 +11,4 @@ Waits on
   ✗ memory pressure: full avg10 7.7 now; starts below 5.0
 
 Likely start ~10:47: 1st in line at 44 steps an hour, an estimate.
-  Each step moved up ahead of it adds about 1 min.
+  Each queue-priority step ahead of it adds about 1 min.

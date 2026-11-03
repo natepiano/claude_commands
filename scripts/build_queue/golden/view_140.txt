@@ -1,6 +1,6 @@
 Build queue · 10:46
 
-queue priority: cables (the user's bump)
+queue priority: cables (captured priority)
                                                    free 4.4 │ taken 16.6
 budget 21.0                                        ░░░░█████████████████
 

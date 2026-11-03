@@ -416,10 +416,10 @@ def bump_remainder(facts: HeadFacts) -> str:
 
 def priority_text(priority: gate.QueuePriority | gate.NoQueuePriority) -> str:
     return ("" if isinstance(priority, gate.NoQueuePriority) else
-            f"queue priority: {priority['unit']} (the user's bump)")
+            f"queue priority: {priority['unit']} ({priority['why']})")
 
 
-def order_text(facts: HeadFacts, zone: ZoneInfo) -> str:
+def order_rule(facts: HeadFacts, zone: ZoneInfo) -> str:
     if not facts.has_priority:
         text = "no head priority: younger steps that fit may start"
     elif isinstance(facts.order, gate.WindowNotStarted):
@@ -429,7 +429,11 @@ def order_text(facts: HeadFacts, zone: ZoneInfo) -> str:
         minutes, seconds = divmod(remaining, 60)
         text = gate.window_clause(facts.order, facts.budget, facts.head_need, zone)
         text += f" ({minutes} min {seconds} s left)"
-    return "; ".join(filter(None, [priority_text(facts.priority), text]))
+    return text
+
+
+def order_text(facts: HeadFacts, zone: ZoneInfo) -> str:
+    return "; ".join(filter(None, [priority_text(facts.priority), order_rule(facts, zone)]))
 
 
 def cargo_token_lines(facts: HeadFacts, zone: ZoneInfo, labels: Mapping[str, unit_labels.UnitLabels]) -> list[str]:
@@ -520,7 +524,7 @@ def move_identity(step: gate.WaitingStep | gate.RunningStep) -> MoveIdentity:
 def waiting_moves(facts: HeadFacts | gate.TokenWaitersOnly | gate.NoWaiter, step: gate.WaitingStep,
                   row: gate.Waiter) -> tuple[BumpRecord, ...]:
     if (not isinstance(facts, HeadFacts) or isinstance(facts.bumps, BumpsUnavailable)
-            or row.get("priority_rank", 1) != 0):
+            or not isinstance(gate.waiter_priority(row), gate.PriorityUnit)):
         return ()
     return tuple(record for record in facts.moves_by_step.get(move_identity(step), ())
                  if record.at >= step.since)

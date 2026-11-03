@@ -764,11 +764,33 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual([row["pid"] for _, row in inputs.ordered], [request.owner.pid for request in requests])
             self.assertEqual(fixture.server.places, places)
             for _, row in inputs.ordered:
-                self.assertEqual(row.get("priority_rank"), 1)
+                self.assertEqual(gate.waiter_priority(row), gate.NormalOrder())
                 self.assertNotIn("head_since", row)
                 self.assertNotIn("head_state", row)
             for forbidden in ('"head_since"', '"head_state"', '"bump_until"', '"bump_ends_at"'):
                 self.assertNotIn(forbidden, fixture.state_text())
+
+    def test_snapshot_ranking_keeps_priority_then_run_place_then_pid_order(self) -> None:
+        with AdmissionFixture() as fixture:
+            fixture.free(0)
+            joined = fixture.clock.now() - 600
+            first = fixture.request(since=joined)
+            tied = fixture.request(since=joined)
+            younger = fixture.request(since=joined + 1)
+            for request in (younger, tied, first):
+                _ = fixture.server.handle_request(request)
+            inputs = fixture.server.last_inputs
+            assert isinstance(inputs, gate.QueueInputs)
+            self.assertEqual([row["pid"] for _, row in inputs.ordered],
+                             [first.owner.pid, tied.owner.pid, younger.owner.pid])
+            rows = {row["pid"]: row for _, row in inputs.ordered}
+            self.assertEqual([rows[request.owner.pid]["since"] for request in (first, tied, younger)],
+                             [joined, joined, joined + 1])
+            priority = gate.rank_waiter(rows[younger.owner.pid], gate.PriorityUnit("urgent"))
+            ranked = sorted([rows[tied.owner.pid], priority, rows[first.owner.pid]], key=gate.waiter_order)
+            self.assertEqual([row["pid"] for row in ranked],
+                             [younger.owner.pid, first.owner.pid, tied.owner.pid])
+            self.assertEqual(priority["since"], younger.since)
 
     def test_two_episodes_of_one_step_reuse_its_first_place(self) -> None:
         with AdmissionFixture() as fixture:

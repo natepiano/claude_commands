@@ -1195,7 +1195,7 @@ Tests: `scripts/lint/test_memory_admit.py`: a large dev build with 1 to 9 earlie
 
 **Ruled out:** Full-log duplicate scans for new priority transitions; head-room reservations for token waiters.
 
-### Phase 42 — Bump and token-wait edges: one bad intent, the pane's session, unit names, card text and type shapes  · status: todo
+### Phase 42 — Bump and token-wait edges: one bad intent, the pane's session, unit names, card text and type shapes  · status: done
 **Depends on:** Phase 41
 
 **Approved:** item 7 of the production rules (Phase 26 cold review, 2026-10-31). Builds showrunner 2026-10-31: card text as recommended.
