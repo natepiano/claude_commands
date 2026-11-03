@@ -24,6 +24,7 @@ NATEDEV = {
 MAC = {
     "enabledPlugins": {"rust-analyzer-lsp@claude-plugins-official": False},
     "theme": "dark",
+    "voice": {"enabled": True, "mode": "hold"},
     "hooks": {"SessionStart": [
         {"matcher": "startup", "hooks": [{"type": "command", "command": "shared.py"}]},
         {"matcher": "*", "hooks": [

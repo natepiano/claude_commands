@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Literal, NotRequired, ParamSpec, TypeVar, TypedDict, cast
 
 from scripts.accounts import worker_names
+from scripts.lib import conf
 from scripts.lib.user_zone import user_zone
 
 ROLE_MAP_HOST = "natedev"
@@ -312,8 +313,8 @@ class RemoteCommandRefused(OSError):
 def ssh_role_map(arguments: tuple[str, ...], *, machine: str = ROLE_MAP_HOST) -> str:
     """Only transport boundary; callers never invoke remote account launches."""
     command = "python3 ~/.claude/scripts/accounts/accounts.py " + shlex.join(arguments)
-    result = subprocess.run(("ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
-                             machine, command), capture_output=True, text=True, timeout=20)
+    result = subprocess.run(("ssh", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={conf.whole("accounts", "role_map_connect_timeout_seconds")}",
+                             machine, command), capture_output=True, text=True, timeout=conf.whole("accounts", "role_map_timeout_seconds"))
     if result.returncode:
         message = next((line.strip() for line in reversed(result.stderr.splitlines()) if line.strip()),
                        "remote role map command failed")

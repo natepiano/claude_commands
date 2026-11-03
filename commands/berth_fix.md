@@ -83,7 +83,7 @@ Two attempts without resolution: start an attempts log in the cargo-liner memory
 </Reproduce>
 
 <Fix>
-- `/rust_style` immediately before editing Rust.
+- This fixer has no style reviewer; follow `/rust_style` before editing Rust.
 - Fix the cause in `crates/cargo-berth`. A reporter-side change or a hook-wrapper change is a workaround, not a fix.
 - `cargo nextest run` and `cargo +nightly fmt`; background the build.
 </Fix>

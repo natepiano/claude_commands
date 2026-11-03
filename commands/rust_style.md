@@ -1,8 +1,8 @@
 ---
-description: Read the style guide before Rust edits.
+description: Standalone Rust writers load the guide before editing.
 ---
 
-Load the Rust style guide before writing Rust code.
+Standalone Rust writers load the style guide before editing Rust.
 
 Run this exact command with Bash:
 ```bash
