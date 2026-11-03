@@ -73,7 +73,7 @@ The target is built and disabled. `offload=off`, and `targets=mac,natedev` does 
   Prepared parameters and their fingerprint retain `NotificationEmail`. `setup-start` uses that prepared value.
 - `deploy.py prepare` writes the CloudFormation parameters, priced inventory and preflight evidence locally, with no AWS command. `apply` and `setup_start` run only at the user's terminal. They create the monthly Budget (emails at 50, 80 and 100 percent, a stop action at 100 percent) before any chargeable resource.
 - `cloudformation.json` defines the Spot instance, the root volume and the retained data volume. Shutdown behavior is `stop`, IMDSv2 is required and inbound is UDP 41641 only. The scaler IAM policy allows start and stop on the one instance, the needed describe calls and `ce:GetCostAndUsage`.
-- `nixos.patch` adds host `aws-build` and the natedev `aws-target` user unit, stopped by default. It is on `/etc/nixos` main as commit 78746da. natedev was rebuilt on `/etc/nixos` 10353a9 (2026-11-03): `aws-target.service` is installed and disabled. The box is not built.
+- `nixos.patch` adds host `aws-build` and the natedev `aws-target` user unit, stopped by default. It is on `/etc/nixos` main as commit 78746da. natedev was rebuilt on `/etc/nixos` 10353a9 (2026-11-03): `aws-target.service` is installed and disabled. `/etc/nixos` main 25966d8 adds sccache (one shared module with natedev), mold, natedev's cargo config and cargo-tile to `hosts/aws-build.nix`. The box is not built.
 
 ## Invariants
 
