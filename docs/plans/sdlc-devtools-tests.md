@@ -644,6 +644,33 @@ Remaining gaps include shell command positions, executable Python aliases, and s
 
 **Ruled out:** refusing every open-phase move — the user (via Morty, 2026-11-02) accepts a stop and resume.
 
+### Phase 4t — Smoke launch builds in its checkout  · status: done
+
+**Depends on:** none
+
+Source: the sdlc showrunner, 2026-11-03. `scripts/production/smoke_launch.sh` runs its two cargo calls from the caller's folder. Cargo reads `.cargo/config.toml` from the current folder, so Hana's vendored bevy patches are lost. The build takes crates.io `bevy_render`, fails on `ScreenshotSystems`, rewrites the checkout's `Cargo.lock` and reports a false `SMOKE FAILED` (hana, 23:14 EST, 72d2c08da9).
+
+#### Work Order
+
+**Goal:** a smoke launch builds Hana with the checkout's own cargo configuration, from any caller folder.
+
+**Spec:**
+1. `smoke_launch.sh` runs `cargo build` (line 50) and `cargo metadata` (line 52) with the current folder at `"$CHECKOUT"`, in a subshell, so the caller's folder does not change. `--manifest-path` stays.
+2. Log text, exit codes and every other step stay as they are.
+
+**Files:**
+- `scripts/production/smoke_launch.sh` — source.
+- `scripts/production/test_smoke_launch.py` — new regression test.
+- `scripts/lib/git_test_support.py` — `commit_repository` takes an `env` mapping, so the test commits with its own Git identity.
+
+**Workers:** `1 writer` — `test` (as a writer) owns the three files.
+
+**State:** none.
+
+**Constraints from prior phases:** Phase 7e: the process-group kill in `cleanup` keeps its pid check through `process_group.py`.
+
+**Acceptance gate:** `test_smoke_launch.py` runs `smoke_launch.sh` from a folder outside a scratch Git checkout, with fake `direnv`, `cargo` and `uname` on `PATH` that record their current folder. Both cargo calls record the checkout, and the test fails on the unchanged script. `python3 -m unittest scripts/production/test_smoke_launch.py` passes. `basedpyright scripts/production/test_smoke_launch.py` footer `0 errors, 0 warnings, 0 notes`. One director gate.
+
 ### Phase 4q — The folder move uses its owners' readers  · status: todo
 
 **Depends on:** Phase 4o
