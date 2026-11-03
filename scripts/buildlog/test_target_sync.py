@@ -46,6 +46,8 @@ class TargetSyncTests(unittest.TestCase):
             + "sync.connect_timeout_s=3\nsync.reach_timeout_s=7\nsync.rsync_timeout_s=11\n"
             + "sync.hosts.mac=Mac,Nates-MacBook-Pro-2023\nsync.hosts.aws=aws-build\n"
             + "sync.hosts.natedev=natedev\n"
+            + "# whole: 0..10\nvault.lock_retries=5\n"
+            + "# range: 0..5\nvault.lock_retry_delay_s=3\n"
         )
         point_root_at(self, self.root)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
