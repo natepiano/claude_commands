@@ -670,14 +670,15 @@ def _parent_kinds(kind: Kind) -> tuple[Kind, ...]:
     return () if kind == "agent" else ("unit", "showrunner") if kind == "worker" else ("showrunner",)
 
 
-def _validate(rows: list[StaffRow]) -> None:
+def _validate(rows: list[StaffRow], unknown_rows: Sequence[dict[str, object]] = ()) -> None:
     """Check the complete proposed graph before any bytes are replaced."""
     indexed: dict[StaffId, StaffRow] = {}
-    sessions: set[StaffId] = set()
+    unknown = {cast(str, row["id"]) for row in unknown_rows}
+    sessions = {cast(str, row.get("current_session", row["id"])) for row in unknown_rows}
     names: set[tuple[Kind, StaffId | None, str]] = set()
     worktrees: set[tuple[str, Path]] = set()
     for row in rows:
-        if row.id in indexed:
+        if row.id in indexed or row.id in unknown:
             raise StaffRefused(f"duplicate staff id: {row.id}")
         indexed[row.id] = row
         if not _valid_id(row.current_session):
@@ -707,10 +708,9 @@ def _validate(rows: list[StaffRow]) -> None:
             raise StaffRefused(f"{row.kind} name already exists: {row.name}")
         names.add(key)
     for row in rows:
-        if row.parent is None:
-            if row.kind not in ("showrunner", "agent"):
-                raise StaffRefused(f"{row.kind} {row.name} requires a parent")
-        else:
+        if row.parent is None and row.kind not in ("showrunner", "agent"):
+            raise StaffRefused(f"{row.kind} {row.name} requires a parent")
+        if row.parent is not None and row.parent not in unknown:
             parent = indexed.get(row.parent)
             allowed = _parent_kinds(row.kind)
             if parent is None or parent.kind not in allowed:
@@ -724,7 +724,7 @@ def _validate(rows: list[StaffRow]) -> None:
             if current.id in chain:
                 raise StaffRefused(f"staff parent loop at {current.name}")
             chain.add(current.id)
-            if current.parent is None:
+            if current.parent is None or current.parent in unknown:
                 break
             current = indexed[current.parent]
         checked.update(chain)
@@ -740,9 +740,17 @@ def _decode(text: str) -> object:
 def _rows(value: object) -> list[StaffRow]:
     if not isinstance(value, list):
         raise StaffUnreadable("staff rows must be a list")
-    rows = [StaffRow.from_json(item) for item in cast(list[object], value)]
+    rows: list[StaffRow] = []
+    unknown: list[dict[str, object]] = []
+    for item in cast(list[object], value):
+        fields = cast(dict[str, object], item) if isinstance(item, dict) else dict[str, object]()
+        if isinstance(fields.get("kind"), str) and fields["kind"] not in _KINDS:
+            unknown.append(fields)
+            print(f"staff anomaly: row {fields.get('id')}: unknown kind {fields['kind']}; skipped", file=sys.stderr)
+            continue
+        rows.append(StaffRow.from_json(cast(object, item)))
     try:
-        _validate(rows)
+        _validate(rows, unknown)
     except StaffRefused as error:
         raise StaffUnreadable(str(error)) from error
     return sorted(rows, key=lambda row: row.id)
@@ -914,12 +922,13 @@ def _location_paths(row: StaffRow) -> tuple[Path, ...]:
 
 
 def _store(rows: list[StaffRow], pending: set[StaffId]) -> None:
-    document: dict[str, object] = {"schema": 2, "rows": [row.to_json() for row in rows]}
+    retained = cast(dict[str, object], _decode(_file().read_text(encoding="utf-8"))) if _file().exists() else {}
+    unknown = [row for row in cast(list[dict[str, object]], retained.get("rows", [])) if row["kind"] not in _KINDS]
+    _validate(rows, unknown)
+    document: dict[str, object] = {"schema": 2, "rows": [row.to_json() for row in rows] + unknown}
     if pending:
         document["pending_retire"] = sorted(pending)
-    content = json.dumps(document,
-                         indent=2, sort_keys=True) + "\n"
-    atomic_file.write_text_atomic(_file(), content)
+    atomic_file.write_text_atomic(_file(), json.dumps(document, indent=2, sort_keys=True) + "\n")
 
 
 def _record_transaction(edit: Callable[[list[StaffRow], set[StaffId]], _Result]) -> _Result:
@@ -941,7 +950,6 @@ def _record_transaction(edit: Callable[[list[StaffRow], set[StaffId]], _Result])
                         for location in _location_paths(row):
                             if _under_test_root(location):
                                 raise StaffRefused(f"test-root path cannot enter the real staff record: {location}")
-            _validate(proposed)
             proposed.sort(key=lambda row: row.id)
             if original.schema == 2 and original.current_sessions_recorded and proposed == list(original.rows) and pending == set(original.pending_retire):
                 # A prior replace may have succeeded before its folder sync failed.
@@ -1424,8 +1432,7 @@ def _paths(rows: list[StaffRow]) -> dict[StaffId, str]:
     for row in rows:
         chain: list[str] = [row.name]
         member = row
-        while member.kind not in ("showrunner", "agent"):
-            assert member.parent is not None
+        while member.kind not in ("showrunner", "agent") and member.parent is not None and member.parent in indexed:
             member = indexed[member.parent]
             chain.append(member.name)
         paths[row.id] = "/".join(reversed(chain))
