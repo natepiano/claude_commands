@@ -183,14 +183,18 @@ The build queue reads process memory every ten seconds while open.
   The columns are the access mark, `account`, `left`, `role`, `busy`, `shell`, `idle`, `total`, `resets`, `credits`, and `enabled`.
   The table omits the `read` and `in use` columns.
   Account labels are bold, and numbers align to the right.
-  Role counts follow the order of the displayed roles.
+  Each role has a separate row with its own counts.
+  The first row shows all account values.
+  Later rows show only the role and its counts.
   The view sums the available entries in `role_counts_by_machine` without changing their separate JSON representation.
   A totals row sums the known activity counts.
   Codex shell counts remain unknown; they do not become zero.
   The access mark uses `read_ok`: success for a recent usable reading, and error otherwise.
   Low allowance uses error below 10 percent and warning below 25 percent.
   Tables use the widest cell or header, with two spaces between columns.
-  A wide table uses one row per account; narrower panes use two rows or labeled facts.
+  A wide table uses one row per role.
+  Narrower panes split the columns or use labeled facts.
+  The labeled facts repeat no account values for later roles.
   The narrow form breaks between complete facts and keeps each drawn line within the pane.
   Times use the resolved user zone.
   Problems follow the table as wrapped warning bullets.
