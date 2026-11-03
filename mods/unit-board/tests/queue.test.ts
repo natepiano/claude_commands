@@ -10,7 +10,7 @@ import { CWD, drawnText, inspectDrawing, NOW, SESSION, sessionFixture } from './
 const HOME = '/test-home';
 const ARGV = [`${HOME}/.claude/scripts/lib/py`, `${HOME}/.claude/scripts/build_queue/build_queue.py`];
 const READ = [...ARGV, '--json', '--columns', '100', '--you', SESSION];
-const PRIORITY_ARGV = ['env', `CLAUDE_CODE_SESSION_ID=${SESSION}`, `${HOME}/.claude/scripts/lib/py`, `${HOME}/.claude/scripts/lint/memory_admit.py`, 'priority', 'set', '--unit=berth', '--why', "the user's bump"];
+const PRIORITY_ARGV = [`${HOME}/.claude/scripts/lib/py`, `${HOME}/.claude/scripts/build_queue/build_queue.py`, 'bump', 'berth'];
 const command = (args = ''): CommandRunInput => ({ command: 'build:queue', args,
   origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 170 } });
 const start = { cwd: CWD, surface: null, isInteractive: false } as const;
@@ -18,7 +18,7 @@ const turn: TurnCompleteInput = { answer: 'finished', reason: 'answer', duration
   isAborted: false, turnId: 'queue-turn' };
 const HEAD = 'Build queue 10:46:12 · 1 running · 1 waiting · #1 waits on memory pressure, budget';
 const BUMP = 'queue priority set for berth: first step now #1';
-const USAGE = 'build queue: use /build:queue bump <unit>';
+const USAGE = 'build queue: use /build:queue bump <position|session|folder>';
 
 function snapshot(): QueueLines {
   return {
@@ -40,6 +40,13 @@ function snapshot(): QueueLines {
       [{ text: 'Memory in GiB. starts: an estimate at the last hour\'s pace, 44 steps an hour.', tone: 'warning' }],
     ],
   };
+}
+
+function selectedPage(): QueueLines {
+  const data = snapshot();
+  data.lines.push([], [{ text: '#4 of 32 · cargo-liner · berth · clippy · 2.9 GiB', bold: true }],
+    [{ text: 'Next? No. 3 steps are ahead of it: 2 moved up, 1 joined earlier.' }]);
+  return data;
 }
 
 /** The kit returns a semantic tree and never paints the host's viewport. */
@@ -98,7 +105,7 @@ function queueHost(on: On, environment: Record<string, string> = {}) {
   });
   on('process.run', async (_$, e) => {
     processes.push([...e.argv]);
-    if (e.argv.includes('priority')) {
+    if (e.argv.includes('bump')) {
       return { value: { exitCode: bumpFailure ? 2 : bumpRefusal ? 3 : 0,
         stdout: bumpFailure ? 'PRIVATE stdout' : bumpRefusal || BUMP + '\n',
         stderr: bumpFailure ? 'PRIVATE stderr' : '',
@@ -139,6 +146,43 @@ async function mount($: Engine, surface: 'terminal' | 'desktop' = 'terminal', co
 }
 
 describe('build queue pane', () => {
+  test('queue mutations supply the session and reads omit process options', async () => {
+    type Hook = (services: EngineInterface, event: CommandRunInput) => Promise<unknown>;
+    const hooks = new Map<string, Hook>();
+    const collect = (event: string, ...args: unknown[]) => {
+      const filter = args.length > 1 ? args[0] as { command?: string } : {};
+      hooks.set(filter.command ? `${event}:${filter.command}` : event, args.at(-1) as Hook);
+      return { catch: () => {} };
+    };
+    register(collect as On, {});
+    const calls: unknown[][] = [];
+    let state: Record<string, QueuePaneState> = {};
+    const services = {
+      session: sessionFixture,
+      env: { get: async () => HOME },
+      ui: { open: async () => ({}) },
+      clock: { every: () => ({ cancel: () => {} }) },
+      state: {
+        get: async () => ({ value: state }),
+        set: async (_key: unknown, value: typeof state) => { state = value; },
+      },
+      process: { run: async (...args: unknown[]) => {
+        calls.push(args);
+        const argv = args[0] as string[];
+        return { exitCode: 0, stdout: argv.includes('bump') ? BUMP : JSON.stringify(snapshot()),
+          stderr: '', isStdoutTruncated: false, isStderrTruncated: false };
+      } },
+    } as unknown as EngineInterface;
+    const run = hooks.get('command.run:build:queue')!;
+    await run(services, command());
+    expect(calls[0]).toEqual([READ]);
+    calls.length = 0;
+    await run(services, command('bump 2'));
+    expect(calls[0]).toEqual([[...ARGV, 'bump', '2'],
+      { env: { CLAUDE_CODE_SESSION_ID: SESSION } }]);
+    expect(calls[1]).toEqual([READ]);
+  });
+
   test('open is intercepted, stores loading before the JSON run and enables Escape', async ($, on) => {
     const fake = queueHost(on);
     await $.session.start(start);
@@ -276,23 +320,26 @@ describe('build queue pane', () => {
     expect(fake.processes).toEqual([READ]);
   });
 
-  test('a selector opens a card, survives timer refresh and reload, and a bare command restores the view', async ($, on) => {
+  test('a selector keeps the card below the queue through timer refresh and reload', async ($, on) => {
     const fake = queueHost(on);
-    const data = snapshot();
-    data.lines = [[{ text: '#4 of 32 · cargo-liner · berth · clippy · 2.9 GiB', tone: 'default', bold: true }],
-      [{ text: 'Next? No. 3 steps are ahead of it: 2 moved up, 1 joined earlier.', tone: 'default', bold: false }]];
+    const data = selectedPage();
+    const page = data.lines.map(line => line.map(span => span.text).join(''));
     fake.replace(data);
     expect(await $.command.run(command('4'))).toEqual({ text: 'Build queue opened.' });
     const ui = await mount($);
+    expect(inspectDrawing(await ui.drawn()).lines).toEqual(page);
     expect(drawnText(await ui.drawn())).toContain('Next? No. 3 steps are ahead');
     expect(fake.processes).toEqual([[...READ, '4']]);
     expect(fake.writes.at(-1)).toEqual({ kind: 'queue', data, selection: { kind: 'card', selector: '4' } });
     await fake.clock.advance(10_000);
+    expect(inspectDrawing(await ui.drawn()).lines).toEqual(page);
     await $.session.start(start);
+    expect(inspectDrawing(await ui.drawn()).lines).toEqual(page);
     expect(fake.processes).toEqual([[...READ, '4'], [...READ, '4'], [...READ, '4']]);
+    fake.replace(snapshot());
     await $.command.run(command());
     expect(fake.processes.at(-1)).toEqual(READ);
-    expect(fake.writes.at(-1)).toEqual({ kind: 'queue', data, selection: { kind: 'view' } });
+    expect(fake.writes.at(-1)).toEqual({ kind: 'queue', data: snapshot(), selection: { kind: 'view' } });
   });
 
   test('a session or folder selector stays one process argument', async ($, on) => {
@@ -437,6 +484,27 @@ describe('build queue pane', () => {
   }
 
   for (const mode of ['exit', 'json', 'shape', 'truncated', 'throw'] as const) {
+    test(`${mode} failed refresh keeps the full queue and selected card until recovery`, async ($, on) => {
+      const fake = queueHost(on);
+      const data = selectedPage();
+      fake.replace(data);
+      await $.command.run(command('4'));
+      const ui = await mount($);
+      const page = inspectDrawing(await ui.drawn()).lines;
+      expect(page[0]).toBe(HEAD);
+      expect(page.at(-2)).toContain('#4 of 32');
+      fake.failNext(mode);
+      await fake.clock.advance(10_000);
+      expect(inspectDrawing(await ui.drawn()).lines).toEqual(page);
+      expect(fake.writes.at(-1)).toEqual({ kind: 'queue', data, selection: { kind: 'card', selector: '4' } });
+      const refreshed = selectedPage();
+      refreshed.lines[refreshed.lines.length - 1] = [{ text: 'Next? Yes. It starts at the next check.' }];
+      fake.replace(refreshed);
+      await fake.clock.advance(10_000);
+      expect(inspectDrawing(await ui.drawn()).lines).toEqual(refreshed.lines.map(line => line.map(span => span.text).join('')));
+      expect(fake.processes).toEqual([[...READ, '4'], [...READ, '4'], [...READ, '4']]);
+    });
+
     test(`${mode} failure shows a fixed reason and recovers on the next tick`, async ($, on) => {
       const fake = queueHost(on);
       fake.failNext(mode);
@@ -569,7 +637,7 @@ describe('build queue pane', () => {
     fake.refuseBump(refusal);
     expect(await $.command.run(command('bump not-a-roster-unit'))).toEqual({ text: refusal });
     expect(fake.processes).toEqual([READ,
-      PRIORITY_ARGV.map(argument => argument === '--unit=berth' ? '--unit=not-a-roster-unit' : argument), READ]);
+      PRIORITY_ARGV.map(argument => argument === 'berth' ? 'not-a-roster-unit' : argument), READ]);
     expect(fake.opened).toEqual(['build-queue']);
     expect(fake.escaped).toEqual([]);
   });
@@ -629,19 +697,19 @@ describe('build queue pane', () => {
             },
           },
           process: { run: async (argv: string[]) => ({
-            exitCode: argv.includes('priority') && result === 'refusal' ? 3 : 0,
-            stdout: argv.includes('priority') ? (result === 'refusal' ? refusal : BUMP) : JSON.stringify(snapshot()),
+            exitCode: argv.includes('bump') && result === 'refusal' ? 3 : 0,
+            stdout: argv.includes('bump') ? (result === 'refusal' ? refusal : BUMP) : JSON.stringify(snapshot()),
             stderr: '', isStdoutTruncated: false, isStderrTruncated: false,
           }) },
         } as unknown as EngineInterface;
         const run = hooks.get('command.run:build:queue')!;
         await run(services, command());
         remaining = failedWrites;
-        expect(await run(services, command('bump berth'))).toEqual({ text: result === 'refusal' ? refusal : BUMP });
-        expect(failures).toBe(failedWrites);
-        if (failedWrites === 1) {
-          expect(state['build-queue']).toEqual({ kind: 'failed', reason: 'Build queue could not be read.', selection: { kind: 'view' } });
+        for (let attempt = 0; attempt < failedWrites; attempt++) {
+          expect(await run(services, command('bump berth'))).toEqual({ text: result === 'refusal' ? refusal : BUMP });
         }
+        expect(failures).toBe(failedWrites);
+        expect(state['build-queue']).toEqual({ kind: 'queue', data: snapshot(), selection: { kind: 'view' } });
       });
     }
   }

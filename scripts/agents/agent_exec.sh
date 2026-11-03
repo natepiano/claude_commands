@@ -4,7 +4,7 @@ set -euo pipefail
 
 # python3 goes through the repo shim, which picks an interpreter by VERSION
 # rather than by path: the python3 on PATH is Apple 3.9 on the Mac, and this
-# repo needs >= 3.11.
+# repo needs >= 3.12.
 PY="${HOME}/.claude/scripts/lib/py"
 
 agents_exec_print_argv() {
@@ -52,7 +52,7 @@ agents_exec_main() {
     esac
 
     script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    source "$script_dir/agents_config.sh"
+    source "$script_dir/models_config.sh"
     agents_resolve "$task"
     if [[ "$task" == direct.simplify ]]; then
         [[ "$mode" == readonly ]] || return 2

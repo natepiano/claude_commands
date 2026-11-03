@@ -29,9 +29,11 @@ import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 if TYPE_CHECKING:
+    from ..lib import build_folders
     from ..aws_target import ledger
     from ..build_targets.target_config import SshTarget, is_aws_target
 else:
+    from scripts.lib import build_folders
     from scripts.build_targets.target_config import SshTarget, is_aws_target
 
 
@@ -121,8 +123,8 @@ def prepare_shell(root: Path, cache: Path, selector: str, timeout_s: float) -> S
         if exports.is_file() and exports_are_valid(exports):
             return ShellEnvironment(key, exports, destination / 'inputs')
         if not destination.exists():
-            with tempfile.TemporaryDirectory(prefix=f'.{key}.', dir=cache) as stage_text:
-                stage = Path(stage_text)
+            with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(
+                    build_folders.FOLDER_PREFIXES["linux-cache-stage"].format(owner=key), build_folders.ExplicitBuildParent(cache))) as stage:
                 inputs = stage / 'inputs'
                 inputs.mkdir()
                 for path in shell_inputs(root):
@@ -632,8 +634,9 @@ def execute_slot(mirror: Path, values: dict[str, str], repository: str, verb: st
                + '\n'.join(parity) + '\n'
                + f'export {assignments}\n')
     print(f'linux_runner: mirror={mirror} shell_key={shell.key}', flush=True)
-    with tempfile.TemporaryDirectory(prefix='.linux-step-', dir=mirror) as step_directory:
-        started = Path(step_directory) / 'started'
+    with build_folders.temporary_build_folder(build_folders.UniqueBuildFolder(
+            build_folders.FOLDER_PREFIXES["linux-step"], build_folders.ExplicitBuildParent(mirror))) as step_directory:
+        started = step_directory / 'started'
         command += (f': > {shlex.quote(str(started))} || exit 75\n'
                     + f'exec "$HOME/.claude/scripts/lint/lint" {shlex.join([verb, *words])}')
         completed = subprocess.run(['bash', '-c', command], cwd=mirror, check=False)

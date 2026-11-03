@@ -17,10 +17,10 @@ class VerifyTreeCancelTests(VerifyTreeCancelFixture):
         memory = Path(self.environment["BUILDLOG_MEMINFO"])
         _ = memory.write_text("MemAvailable: 0 kB\n")
         admission = self.root / "buildlog/admission"
-        admission.mkdir(parents=True)
+        admission.mkdir(parents=True, exist_ok=True)
         process = self.start_verify("test", BUILDLOG_MEM_POLL_S="1", TEST_MEMORY_CHANGE_EVENT="1")
         lock = self.board / "locks/cargo.d"
-        wait_until(lambda: (bool(list(admission.glob("*.waiting"))) and not lock.exists())
+        wait_until(lambda: (bool(self.admission.server.waiters) and not lock.exists())
                    or process.poll() is not None, admission, timeout=TEST_HANG_GUARD_SECS, processes=(process,))
         self.assertIsNone(process.poll(), "verify never entered memory admission")
         # The queue prunes live PIDs whose argv does not identify a verifier.
@@ -52,8 +52,8 @@ class VerifyTreeCancelTests(VerifyTreeCancelFixture):
         self.assertEqual(sorted(waiters.iterdir()), [peer_entry], "cancel left its reacquisition entry")
         self.assertEqual((lock / "holder_pid").read_text(), str(holder.pid), "cancel released a peer's claim")
         self.assertIsNone(holder.poll(), "cancel killed its peer")
-        self.assertEqual(list(admission.glob("*.reservation")), [])
-        self.assertEqual(list(admission.glob("*.waiting")), [])
+        self.assertEqual(self.admission.server.reservations, {})
+        self.assertEqual(self.admission.server.waiters, {})
         self.assertEqual(list((self.root / "verify-steps").glob("*.json")), [])
         self.assert_no_cache_verdict()
         self.assertEqual([args for args in self.cargo_calls() if args[:2] == ["nextest", "run"]], [])

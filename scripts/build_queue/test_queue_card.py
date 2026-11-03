@@ -81,7 +81,8 @@ class QueueCardTests(QueueFixtureTests):
         model = self.fixture.model()
         for position in (1, 4):
             with self.subTest(position=position):
-                self.assertEqual(plain(queue_card.render_card(model, [position], 100)) + "\n",
+                page = [*queue_view.render_view(model, 100), (), *queue_card.render_card(model, [position], 100)]
+                self.assertEqual(plain(page) + "\n",
                                  (GOLDEN / f"card_{position}.txt").read_text())
 
     def test_first_card_answers_next_and_shares_all_head_checks(self) -> None:

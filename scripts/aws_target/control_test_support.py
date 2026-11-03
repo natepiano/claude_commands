@@ -9,11 +9,11 @@ import json
 import os
 from pathlib import Path
 import subprocess
-import time
 from typing import cast, override
 from unittest import mock
 
 from scripts.aws_target import ledger, remote
+from scripts.build_queue import queue_snapshot
 from scripts.mac_test import mac_test
 from scripts.aws_target.ledger_test_support import CostFixture, instant
 from scripts.lint import memory_admit
@@ -142,7 +142,6 @@ class ControlFixture(CostFixture):
             [(self.queue_directory / f"{row['pid']}.waiting", memory_admit.rank_waiter(row, memory_admit.NormalOrder()))
              for row in rows], (), (),
             memory_admit.HostMemory(1024**3, 1024**3), memory_admit.NoPressureHold(),
-            memory_admit.NoRecoverySpacing(), memory_admit.NoHeadAdmissionOverride(), float(self.clock.now))
-        with mock.patch.object(time, "time", return_value=self.clock.now - age):
-            memory_admit.write_queue_snapshot(self.queue_directory, inputs, memory_admit.DEFAULT_ADMISSION_POLICY)
-        self.assertIsInstance(memory_admit.read_queue_snapshot(self.queue_directory), memory_admit.QueueSnapshot)
+            memory_admit.NoRecoverySpacing(), memory_admit.NoHeadAdmissionOverride(), float(self.clock.now - age))
+        queue_snapshot.write_queue_snapshot(self.queue_directory, inputs, memory_admit.DEFAULT_ADMISSION_POLICY)
+        self.assertIsInstance(queue_snapshot.read_queue_snapshot(self.queue_directory), queue_snapshot.QueueSnapshot)

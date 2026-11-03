@@ -190,7 +190,8 @@ if TYPE_CHECKING:
     from ..notify import review
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
-    import tmp_sweep
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from scripts.lint import tmp_sweep
     import scratch
     from atomic_file import write_text_atomic
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "buildlog"))
@@ -2263,7 +2264,7 @@ def _finite_number(value: object) -> TypeGuard[int | float]:
 
 
 def target_deletes_path() -> Path:
-    return floor_record_path().with_name("target-deletes.json")
+    return tmp_sweep.state_dir() / tmp_sweep.TARGET_DELETES_NAME
 
 
 def read_target_deletes(path: Path, now: float) -> dict[str, float]:

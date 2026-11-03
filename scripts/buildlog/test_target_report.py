@@ -30,6 +30,8 @@ class TargetReportTests(unittest.TestCase):
             + "kind.natedev=local\nplatform.natedev=linux\n"
             + "sync.hosts.mac=Mac,Nates-MacBook-Pro-2023\nsync.hosts.aws=aws-build\n"
             + "sync.hosts.natedev=natedev\n"
+            + "# whole: 0..10\nvault.lock_retries=5\n"
+            + "# range: 0..5\nvault.lock_retry_delay_s=3\n"
         )
         _ = (self.root.parent / "mac.conf").write_text("host=fake-mac\nci_repo=\n")
         point_root_at(self, self.root)
@@ -127,6 +129,8 @@ class TargetReportTests(unittest.TestCase):
             "targets=laptop,builder\nkind.laptop=ssh\nplatform.laptop=macos\nsettings.laptop=mac.conf\n"
             + "kind.builder=local\nplatform.builder=linux\n"
             + "sync.hosts.laptop=Mac\nsync.hosts.builder=natedev\n"
+            + "# whole: 0..10\nvault.lock_retries=5\n"
+            + "# range: 0..5\nvault.lock_retry_delay_s=3\n"
         )
         self.write(
             call("remote", target="laptop", mac="passed", mac_s=5),

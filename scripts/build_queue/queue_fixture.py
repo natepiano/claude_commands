@@ -17,8 +17,9 @@ from zoneinfo import ZoneInfo
 
 from scripts.buildlog import store
 from scripts.lint import memory_admit as gate
-from scripts.lint.memory_test_support import fake_memory_readings
+from scripts.lint.memory_test_support import fake_memory_readings, write_config_fixture
 from scripts.message.unit_labels import UnitLabels
+from scripts.message import roster
 from scripts.build_queue import head_facts, queue_view
 from scripts.build_queue.queue_lines import Line, plain
 
@@ -62,6 +63,39 @@ STEPS = (
     ("tool-based-ui", "fastest", "hana_catalyst-build-speed-tests-test", "clippy", 6.8, 1, "/tmp/fastest"),
     ("tool-based-ui", "assembly", "hana_catalyst-assembly-impl", "clippy", 6.8, 0, "/tmp/assembly"),
 )
+
+
+
+def write_memory_config(path: Path, **changes: str | None) -> None:
+    """Write one complete, private memory configuration for admission consumers."""
+    _ = write_config_fixture(path, template="lint")
+    lines = [line for line in path.read_text().splitlines()
+             if not line.startswith(("program_first_peak_gib.", "peak_hold_seconds."))]
+    for key, value in changes.items():
+        indices = [index for index, line in enumerate(lines) if line.partition("=")[0].strip() == key]
+        if indices:
+            index = indices[0]
+            if value is None:
+                del lines[index]
+            else:
+                lines[index] = f"{key}={value}"
+        elif value is not None:
+            form = "whole: 1.." if key.startswith("peak_hold_seconds.") else "range: 5e-324..1.6742321987285425e299"
+            lines.extend((f"# {form}", f"{key}={value}"))
+    _ = path.write_text("\n".join(lines) + "\n")
+
+
+def write_recovery_fixture(directory: Path, recovery: gate.RecoverySpacing) -> None:
+    """Write legacy recovery input for the import reader and pure projections."""
+    value: dict[str, object]
+    if isinstance(recovery, gate.PressureHoldRecorded):
+        value = {"state": "held"}
+    elif isinstance(recovery, gate.RecoveryStarts):
+        value = {"state": "recovering", "ends_at": recovery.ends_at, "next_start_at": recovery.next_start_at}
+    else:
+        (directory / "pressure-recovery").unlink(missing_ok=True)
+        return
+    _ = (directory / "pressure-recovery").write_text(json.dumps(value))
 
 
 def write_lines(path: Path, lines: Sequence[bytes], *, tail: bytes = b"") -> None:
@@ -187,6 +221,36 @@ def with_waiting_process(reading: gate.QueueRead, step: gate.WaitingStep, start:
 
 
 
+def fixture_queue_inputs(directory: Path, processes: dict[int, gate.ProcessIdentity], now: float,
+                         policy: gate.AdmissionPolicy) -> gate.QueueInputs:
+    """Read captured fixture rows through the import readers and the shared builder."""
+    try:
+        host = gate.read_meminfo(Path(os.environ["BUILDLOG_MEMINFO"]))
+    except (OSError, ValueError):
+        host = gate.ReadingUnavailable()
+    rows: list[tuple[Path, gate.Waiter]] = []
+    for path in directory.glob("*.waiting"):
+        try:
+            rows.append((path, gate.read_waiter(path)))
+        except (OSError, ValueError, TypeError):
+            continue
+    ordered, priority = gate.resolve_queue_order(directory, rows)
+    reservations = [(row, gate.reservation_memory(path, row, datetime.fromtimestamp(now, UTC),
+                     processes, Path(os.environ["BUILDLOG_PROC"]), policy))
+                    for path, row in sorted(gate.reservation_rows(directory), key=lambda item: item[0])]
+    readings = gate.QueueSnapshotReadings(processes, {}, host=host,
+        pressure=gate.read_pressure(host if isinstance(host, gate.HostMemory) else gate.HostMemory(0, gate.UnknownHostTotal()), policy=policy), recovery=gate.read_recovery(directory),
+        compilers=gate.sccache_memory(), policy=policy)
+    return gate.build_queue_inputs(ordered, reservations, readings, gate.read_head_override(directory), now, priority)
+
+
+def fixture_queue_read(directory: Path, processes: dict[int, gate.ProcessIdentity], now: float) -> gate.QueueRead:
+    config = gate.read_memory_config()
+    inputs = fixture_queue_inputs(directory, processes, now, config.policy)
+    total = inputs.host.total if isinstance(inputs.host, gate.HostMemory) else gate.UnknownHostTotal()
+    return gate.queue_read_from(inputs, gate.resolve_admission_limits(total, config), config.policy)
+
+
 class QueueFixture(ExitStack):
     """Private files for every renderer, card and CLI fixture consumer."""
 
@@ -203,8 +267,13 @@ class QueueFixture(ExitStack):
                             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
                             "BUILDLOG_BUILD_BUDGET_GIB": "21", "USER_ZONE": "America/New_York"})
         self.enter_context(mock.patch.dict(os.environ, environment))
+        config = self.root / "lint.conf"
+        write_memory_config(config)
+        self.enter_context(mock.patch.dict(os.environ, {"CONF_DIR": str(config.parent)}))
         self.labels: dict[str, UnitLabels] = {}
         _ = self.enter_context(mock.patch.object(gate, "priority_labels", return_value=self.labels))
+        _ = self.enter_context(mock.patch.object(roster, "roster",
+            side_effect=AssertionError("a queue fixture must not read the live roster")))
         self.paths: list[Path] = []
         self.moves: list[bytes] = []
         self.reservation: Path = self.directory / "900-900.reservation"
@@ -243,7 +312,10 @@ class QueueFixture(ExitStack):
         self.write_json(self.reservation, {"pid": 900, "start_time": "900", "need": need,
             "admitted_at": store.utc_iso(NOW - 25), "repo": "hana", "worktree": "/tmp/widget",
             "sidecar": "", "session_id": "id-widget", "session_name": "widget-enhancements-title",
-            "step": "nextest", "folder": "/tmp/widget"})
+            "step": "nextest", "folder": "/tmp/widget",
+            "queue_waiter": {"pid": 900, "start_time": "900", "need": need, "since": NOW - 25,
+                "session_id": "id-widget", "session_name": "widget-enhancements-title",
+                "step": "nextest", "folder": "/tmp/widget"}})
 
     def write_waiter(self, row: dict[str, object]) -> Path:
         pid = int(str(row["pid"]))
@@ -275,10 +347,10 @@ class QueueFixture(ExitStack):
 
     def inputs(self, policy: gate.AdmissionPolicy) -> gate.QueueInputs:
         """Resolve the fixed 10:46 queue once, including raw pressure."""
-        return gate.gather_queue_inputs(self.directory, gate.process_table(self.proc), NOW, policy=policy)
+        return fixture_queue_inputs(self.directory, gate.process_table(self.proc), NOW, policy)
 
     def read(self) -> gate.QueueRead:
-        return gate.read_queue_pass(self.directory, gate.process_table(self.proc), NOW)
+        return fixture_queue_read(self.directory, gate.process_table(self.proc), NOW)
 
     def model(self) -> queue_view.QueueModel:
         reading = self.read()

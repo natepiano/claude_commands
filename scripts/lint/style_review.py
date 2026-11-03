@@ -8,13 +8,13 @@ import os
 import re
 import subprocess
 import sys
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from string import Template
 from typing import Literal, cast, final
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib import build_folders
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.agents import worker_lifecycle
 from scripts.message import sessions
@@ -177,7 +177,8 @@ def start(root: Path, baseline: str, phase_dir: Path, prompt: Path, pass_name: s
         parent = phase_dir.resolve() / "style"
         parent.mkdir(parents=True, exist_ok=True)
         safe_name = re.sub(r"[^A-Za-z0-9_.-]", "", pass_name) or "pass"
-        directory = Path(tempfile.mkdtemp(prefix=f"{safe_name}-", dir=parent))
+        directory = build_folders.create_build_folder(build_folders.UniqueBuildFolder(
+            build_folders.FOLDER_PREFIXES["style-review"].format(owner=safe_name), build_folders.ExplicitBuildParent(parent)))
         write_text_atomic(directory / "owner.json", json.dumps({
             "pid": pid, "started": started, "dispatch": pass_name,
         }))

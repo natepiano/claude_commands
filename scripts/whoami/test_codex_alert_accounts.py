@@ -17,7 +17,7 @@ from typing import Literal, cast, override
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.lib.test_agents_registry import registry_text, write_registry
+from scripts.lib.test_models_registry import registry_text, write_registry
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -26,7 +26,7 @@ import quota_alert
 from scripts.whoami import agent_accounts
 from scripts.whoami.agent_accounts import CodexHomeSource, Quota, Report
 from scripts.accounts import accounts, moves, next_moves, refusals, role_map
-from scripts.lib import agents_registry
+from scripts.lib import models_registry
 from scripts.production import showrunners
 from scripts.whoami import usage_store
 from push_texts import RenderedPush, catalog, render_entry
@@ -38,7 +38,7 @@ CURRENT_READING_AGE = timedelta()
 
 def registry_view() -> str:
     """Read the shared registry containing the alert's edits."""
-    return agents_registry.registry_text(quota_alert.REGISTRY)
+    return models_registry.registry_text(quota_alert.REGISTRY)
 
 
 def reset_registry(text: str) -> None:
@@ -74,7 +74,7 @@ class CodexAccountAlertTests(unittest.TestCase):
         config = self.root / "showrunners.json"
         _ = config.write_text(json.dumps({"threshold_percent": 1, "repeat_minutes": 30,
             "stall_minutes": 5, "faults_to": "director", "always": ["director"]}))
-        registry = self.root / "agents.conf"
+        registry = self.root / "models.conf"
         _ = write_registry(registry, base_text=REGISTRY)
         _ = self.enterContext(patch.object(quota_alert, "CONFIG", config))
         _ = self.enterContext(patch.object(quota_alert, "STATE", self.root / "alerts.json"))

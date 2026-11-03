@@ -10,7 +10,7 @@ from typing import cast
 from unittest import mock
 from zoneinfo import ZoneInfo
 
-from scripts.build_queue import head_facts
+from scripts.build_queue import admission_client, head_facts
 from scripts.build_queue.queue_fixture import (
     AdmissionLogTests, bump_line as bump_line, head_reading, queue_read_fixture as queue_read_fixture,
     queue_time_line as queue_time_line, token_gap_line as token_gap_line,
@@ -209,7 +209,8 @@ class HeadFactsTests(AdmissionLogTests):
     def test_reader_consumes_the_locked_decisions_without_another_read_or_order_calculation(self) -> None:
         reading = head_reading(fields={"since": NOW - 9000, "priority_since": NOW - 50})
         write_bumps(NOW, [bump_line(NOW - 800), bump_line(NOW - 5)])
-        with mock.patch.object(gate, "locked_queue_read", side_effect=AssertionError("one locked pass")), \
+        with mock.patch.object(gate, "queue_read", side_effect=AssertionError("one service reading")), \
+             mock.patch.object(admission_client, "view", side_effect=AssertionError("one service reading")), \
              mock.patch.object(gate, "head_window", side_effect=AssertionError("admission owns windows")), \
              mock.patch.object(gate, "head_priority", side_effect=AssertionError("admission owns priority")), \
              mock.patch.object(gate, "waiter_order", side_effect=AssertionError("admission owns order")), \

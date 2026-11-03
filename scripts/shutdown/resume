@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# resume <name>: resume a unit or showrunner by its short name; see shutdown.py resume.
+set -euo pipefail
+here="$(dirname "$(readlink -f "$0")")"
+exec "$HOME/.claude/scripts/lib/py" -B "$here/shutdown.py" resume "$@"

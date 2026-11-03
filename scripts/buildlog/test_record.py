@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from functools import cached_property
 import gzip
 import json
 import os
@@ -13,12 +14,15 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, BinaryIO, cast, override
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 if TYPE_CHECKING:
     from ..lib.socket_test_support import short_socket_directory
@@ -31,9 +35,11 @@ import store
 from cgroup_test_support import CPU, IO_LINES, save_scope_counters, write_cgroup
 
 if TYPE_CHECKING:
+    from ..build_queue.admission_test_support import AdmissionFixture, caller_admission
     from ..direct.test_verify_untested_examples import FIXED_RUSTC, rust_tool_path
     from ..lint.memory_test_support import fake_memory_readings
 else:
+    from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
     from scripts.direct.test_verify_untested_examples import FIXED_RUSTC, rust_tool_path
     from scripts.lint.memory_test_support import fake_memory_readings
 from test_index import point_root_at
@@ -118,6 +124,12 @@ class RecordTests(unittest.TestCase):
         self.repo.mkdir()
         _ = self.git("init", "-q", "-b", "main", cwd=self.repo)
         _ = self.git("commit", "-q", "--allow-empty", "-m", "first", cwd=self.repo)
+        _ = self.admission
+        self.enterContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
+
+    @cached_property
+    def admission(self) -> AdmissionFixture:
+        return caller_admission(self, self.base, self.environment())
 
     def environment(self, **extra: str) -> dict[str, str]:
         environment = {
@@ -141,11 +153,13 @@ class RecordTests(unittest.TestCase):
         environment["GIT_AUTHOR_NAME"] = environment["GIT_COMMITTER_NAME"] = "test"
         environment["GIT_AUTHOR_EMAIL"] = environment["GIT_COMMITTER_EMAIL"] = "test@example.com"
         environment.update(extra)
+        if "BUILDLOG_MEMINFO" in extra:
+            self.admission.readings.host_path = Path(extra["BUILDLOG_MEMINFO"])
         return environment
 
     def git(self, *args: str, cwd: Path) -> str:
         result = subprocess.run(
-            ["git", *args], cwd=cwd, env=self.environment(), capture_output=True, text=True, check=True
+            ["git", *args], cwd=cwd, env=self.environment(), capture_output=True, text=True, check=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS
         )
         return result.stdout.strip()
 
@@ -387,14 +401,14 @@ class RecordTests(unittest.TestCase):
                 self.assertTrue(readable, "memory wait message did not arrive")
                 first_message = cast(str, process.stderr.readline())
                 self.assertIn("waiting for memory since ", first_message)
-                time.sleep(1.1)
+                _ = threading.Event().wait(1.1)
                 _ = meminfo.write_text("MemAvailable: 12582912 kB\n")
                 output, remaining_errors = process.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
                 errors = first_message + remaining_errors
             finally:
                 if process.poll() is None:
                     process.kill()
-                    _ = process.communicate()
+                    _ = process.communicate(timeout=3)
         self.assertEqual(process.returncode, 0, errors)
         self.assertIn("step", output)
         self.assertEqual(errors.count("waiting for memory since "), 1)
@@ -462,6 +476,26 @@ class RecordTests(unittest.TestCase):
     def test_memory_admission_does_not_count_a_slow_read_above_floor(self) -> None:
         meminfo = self.base / "meminfo-fifo"
         os.mkfifo(meminfo)
+        opened = threading.Event()
+        read_text = Path.read_text
+
+        def bounded_fifo_read(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+            if path != meminfo:
+                return read_text(path, encoding=encoding, errors=errors)
+            descriptor = os.open(path, os.O_RDWR | os.O_NONBLOCK)
+            try:
+                opened.set()
+                if not select.select([descriptor], [], [], 5)[0]:
+                    raise TimeoutError("the meminfo FIFO received no sample within 5 seconds")
+                value = os.read(descriptor, 4096).decode()
+                sample_path = self.base / "fifo-sample"
+                _ = sample_path.write_text(value)
+                self.admission.readings.host_path = sample_path
+                return value
+            finally:
+                os.close(descriptor)
+
+        _ = self.enterContext(mock.patch.object(Path, "read_text", autospec=True, side_effect=bounded_fifo_read))
         command = 'source "$1"; SECONDS=0; printf "ready\\n"; buildlog_wait_for_memory; printf "%s\\n" "$BUILDLOG_MEM_WAIT_S"'
         process = subprocess.Popen(
             ["bash", "-c", command, "bash", str(SCRIPT.parent.parent / "lint" / "invoke.sh")],
@@ -470,15 +504,20 @@ class RecordTests(unittest.TestCase):
         )
         try:
             assert process.stdout is not None
+            self.assertTrue(select.select([process.stdout], [], [], 5)[0], "the shell did not start within 5 seconds")
             self.assertEqual(process.stdout.readline(), "ready\n")
-            time.sleep(1.1)
-            with meminfo.open("w") as writer:
-                _ = writer.write("MemAvailable: 12582912 kB\n")
+            self.assertTrue(opened.wait(5), "the private server did not read the FIFO within 5 seconds")
+            _ = threading.Event().wait(1.1)
+            descriptor = os.open(meminfo, os.O_WRONLY | os.O_NONBLOCK)
+            try:
+                _ = os.write(descriptor, b"MemAvailable: 12582912 kB\n")
+            finally:
+                os.close(descriptor)
             output, errors = process.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
         finally:
             if process.poll() is None:
                 process.kill()
-                _ = process.communicate()
+                _ = process.communicate(timeout=3)
         self.assertEqual(process.returncode, 0, errors)
         self.assertEqual(errors, "")
         self.assertEqual(output.strip(), "0")
@@ -548,7 +587,7 @@ class RecordTests(unittest.TestCase):
             first_message = cast(str, process.stderr.readline())
             self.assertIn("waiting for memory since ", first_message)
             self.assertFalse(marker.exists())
-            time.sleep(1.1)
+            _ = threading.Event().wait(1.1)
             released_at = time.time()
             _ = meminfo.write_text("MemAvailable: 12582912 kB\n")
             output, remaining_errors = process.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
@@ -556,7 +595,7 @@ class RecordTests(unittest.TestCase):
         finally:
             if process.poll() is None:
                 process.kill()
-                _ = process.communicate()
+                _ = process.communicate(timeout=3)
         self.assertEqual(process.returncode, 0, errors)
         self.assertIn("step", output)
         self.assertRegex(output, r"wait=[1-9][0-9]*")

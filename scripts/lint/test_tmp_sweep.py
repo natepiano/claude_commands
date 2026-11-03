@@ -9,7 +9,6 @@ import fcntl
 import json
 import os
 import subprocess
-import sys
 import tempfile
 import time
 import unittest
@@ -17,23 +16,14 @@ from collections.abc import Generator, Iterator
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, cast, override
+from typing import cast, override
 from unittest import mock
 
-import tmp_sweep
-if TYPE_CHECKING:
-    from ..lib import test_hang_guard
-else:
-    from scripts.lib import test_hang_guard
-if TYPE_CHECKING:
-    from ..lib import scratch
-    from ..message import sessions
-else:
-    import scratch  # on the path once tmp_sweep has put scripts/lib there
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
-    import sessions
+from scripts.lint import tmp_sweep
+from scripts.lib import build_folders, copy_record, scratch, test_hang_guard
+from scripts.message import sessions
 
-from scripts.lib import conf, copy_record
+from scripts.lib import conf
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 DAY = 86_400
@@ -142,6 +132,23 @@ class TmpSweepCase(unittest.TestCase):
 
 class CopyTests(TmpSweepCase):
     now: float = 0.0
+
+    def test_private_root_never_selects_the_live_copies_authority(self) -> None:
+        authority_root = self.tmp.parent / "authority copies"
+        with mock.patch.object(copy_record, "copies_root", return_value=authority_root) as authority:
+            roots = tmp_sweep.default_roots(str(self.tmp), (), (), (), (), (), ())
+        self.assertEqual(roots.copies, (str(self.tmp / "copies"),))
+        self.assertNotIn(str(authority_root), roots.all())
+        authority.assert_not_called()
+
+    def test_default_root_reads_the_current_copies_authority(self) -> None:
+        for name in ("first copies", "second copies"):
+            authority_root = self.tmp.parent / name
+            with mock.patch.object(copy_record, "copies_root", return_value=authority_root) as authority:
+                roots = tmp_sweep.default_roots(run_roots=(), session_roots=(), temp_roots=(),
+                                               scratch_roots=(), wide_roots=(), session_temp_roots=())
+            self.assertEqual(roots.copies, (str(authority_root),))
+            authority.assert_called_once_with()
 
     def copy(self, name: str, **fields: object) -> Path:
         path = self.tmp / "copies" / "show-maker" / name
@@ -567,6 +574,19 @@ class ProcessUseTests(TmpSweepCase):
 
 
 class ScratchRootTests(TmpSweepCase):
+    def test_common_task_folder_keeps_live_ownership_and_expires_through_the_sweep(self) -> None:
+        with mock.patch.dict(os.environ, {copy_record.ROOT_ENV: str(self.tmp / "scratch"),
+                                           "STAFF_FILE": str(self.tmp / "staff.json")}):
+            live = scratch.new(scratch.until_task(self.now + DAY), "build")
+            due = scratch.new(scratch.until_task(self.now - 60), "build")
+            _ = write(live / "Cargo.toml")
+            _ = write(due / "Cargo.toml")
+            result = self.sweep()
+        self.assertTrue(live.is_dir())
+        self.assertFalse(due.exists())
+        self.assertIn(str(live), result.kept[tmp_sweep.TASK_OPEN])
+        self.assertIn(str(due), [entry["path"] for entry in result.deleted])
+
     def test_a_task_folder_stays_while_its_task_is_open_and_goes_when_its_time_passes(self) -> None:
         scratch_root = self.tmp / "scratch"
         run = write(scratch_root / "run-x-gate-abc123" / "a").parent
@@ -593,6 +613,21 @@ class ScratchRootTests(TmpSweepCase):
 
 
 class TempParentTests(TmpSweepCase):
+    def test_common_session_owner_keeps_its_root_and_sweeps_only_idle_entries(self) -> None:
+        session_parent = self.tmp / "session"
+        owner = build_folders.create_build_folder(build_folders.StableOwnerFolder(
+            LIVE_SESSION, build_folders.ExplicitBuildParent(session_parent), mode=0o700))
+        idle = build_folders.create_build_folder(build_folders.UniqueBuildFolder(
+            "tmp", build_folders.ExplicitBuildParent(owner)))
+        recent = build_folders.create_build_folder(build_folders.UniqueBuildFolder(
+            "tmp", build_folders.ExplicitBuildParent(owner)))
+        _ = write(idle / "output")
+        self.recent(write(recent / "output"))
+        _ = self.sweep()
+        self.assertTrue(owner.is_dir())
+        self.assertFalse(idle.exists())
+        self.assertTrue(recent.is_dir())
+
     def test_entries_in_a_live_sessions_temp_root_and_a_run_temp_go_after_4_h(self) -> None:
         live_root = self.tmp / "session" / LIVE_SESSION
         idle = write(live_root / ".tmpAb12Cd" / "a").parent
@@ -626,6 +661,31 @@ class TempParentTests(TmpSweepCase):
 
 
 class TempFolderTests(TmpSweepCase):
+    def test_every_common_prefix_keeps_its_sweep_classification(self) -> None:
+        pairs: list[tuple[str, Path, Path]] = []
+        parents: list[str] = []
+        for kind, template in build_folders.FOLDER_PREFIXES.items():
+            parent = self.tmp.parent / "common-prefixes" / kind
+            parent.mkdir(parents=True)
+            parents.append(str(parent))
+            prefix = template.format(owner="123")
+            allocated = build_folders.create_build_folder(build_folders.UniqueBuildFolder(
+                prefix, build_folders.ExplicitBuildParent(parent)))
+            previous = parent / (prefix + "Ab12Cd")
+            previous.mkdir()
+            _ = write(allocated / "Cargo.toml")
+            _ = write(previous / "Cargo.toml")
+            pairs.append((kind, previous, allocated))
+        roots = tmp_sweep.default_roots(str(self.tmp.parent / "plain"), (), (), tuple(parents), (),
+                                       tuple(parents), session_temp_roots=())
+        _ = tmp_sweep.sweep(False, roots, self.now, str(self.proc))
+        for kind, previous, allocated in pairs:
+            with self.subTest(kind=kind):
+                self.assertEqual(allocated.exists(), previous.exists(),
+                                 "the common suffix must retain the cleanup classification")
+                if kind in ("verify-copy", "verify-hold"):
+                    self.assertFalse(allocated.exists(), "ended verify runs must release their folders")
+
     def test_only_an_idle_unused_tempfile_folder_in_a_temp_folder_goes(self) -> None:
         temp = self.tmp.parent / "temp"
         idle = write(temp / ".tmpAb12Cd" / "Cargo.toml").parent
@@ -715,6 +775,29 @@ class TempFolderTests(TmpSweepCase):
         later = tmp_sweep.sweep(False, roots, time.time() + 8 * DAY, str(self.proc))
         self.assertEqual([entry["path"] for entry in later.deleted], [str(old_name)])
         self.assertTrue(copy.is_dir())
+
+    def test_common_verify_suffix_keeps_live_runs_and_removes_ended_runs(self) -> None:
+        made = time.time() - 100
+        fake_start(self.proc, 20, made - 50, "bash", "/private/scripts/direct/verify.sh", "test")
+        for prefix in ("verify-hold.", "verify-copy."):
+            with self.subTest(prefix=prefix):
+                parent = self.tmp.parent / prefix
+                live = write(parent / (prefix + "20.a1b_2c3d") / "output").parent
+                ended = write(parent / (prefix + "21.a1b_2c3d") / "output").parent
+                unnamed = write(parent / (prefix + "a1b_2c3d") / "output").parent
+                for path in (live, ended, unnamed):
+                    os.utime(path, (made, made))
+                roots = tmp_sweep.default_roots(str(self.tmp.parent / "plain"), (), (), (str(parent),), (),
+                                               (str(parent),), session_temp_roots=())
+                soon = tmp_sweep.sweep(False, roots, time.time() + 60, str(self.proc))
+                self.assertEqual([entry["path"] for entry in soon.deleted], [str(ended)])
+                self.assertEqual(soon.kept[tmp_sweep.VERIFY_RUNS], [str(live)])
+                self.assertEqual(soon.kept[tmp_sweep.RECENT], [str(unnamed)])
+                self.assertTrue((live / "output").is_file())
+                self.assertFalse(ended.exists())
+                later = tmp_sweep.sweep(False, roots, time.time() + 8 * DAY, str(self.proc))
+                self.assertEqual([entry["path"] for entry in later.deleted], [str(unnamed)])
+                self.assertTrue((live / "output").is_file())
 
     def test_ps_elapsed_time_reads_in_seconds(self) -> None:
         self.assertEqual(tmp_sweep.elapsed_seconds("05:07"), 307)

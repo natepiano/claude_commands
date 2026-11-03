@@ -1,6 +1,7 @@
 """Private workspace seeds and real process trees for verify cancellation tests."""
 from __future__ import annotations
 
+from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
 from scripts.lint.memory_test_support import write_config_fixture
 
 import json
@@ -101,6 +102,7 @@ signal.pause()
 
 
 class VerifyTreeCancelFixture(VerifyTokenOwnershipFixture):
+    admission: AdmissionFixture = cast(AdmissionFixture, cast(object, None))
     workspace: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     control: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     board: Path  # pyright: ignore[reportUninitializedInstanceVariable]
@@ -151,6 +153,7 @@ class VerifyTreeCancelFixture(VerifyTokenOwnershipFixture):
         self.workspace = self.root / "workspace"
         self.control = self.root / "control"
         self.board = self.root / "board"
+        self.admission = caller_admission(self, self.root, self.environment)
 
     def release_lint_rewrites(self, process: subprocess.Popen[str]) -> None:
         # Formatting runs before clippy fix, then runs again without rewriting.
@@ -204,16 +207,15 @@ class VerifyTreeCancelFixture(VerifyTokenOwnershipFixture):
 
     def assert_resources_held(self) -> None:
         self.assertTrue((self.board / "locks/cargo.d").is_dir(), "test did not take the cargo token")
-        self.assertTrue(list((self.root / "buildlog/admission").glob("*.reservation")),
+        self.assertTrue(self.admission.server.reservations,
                         "test did not take memory admission")
 
     def assert_resources_released(self) -> None:
         self.assertFalse((self.board / "locks/cargo.d").exists(), "cancel kept the token")
         self.assertEqual(list((self.board / "token_waiters").glob("*")), [], "cancel kept its queue place")
-        admission = self.root / "buildlog/admission"
-        reservations = [(path.name, path.read_text()) for path in admission.glob("*.reservation")]
+        reservations = list(self.admission.server.reservations)
         self.assertEqual(reservations, [], "cancel kept memory admission")
-        self.assertEqual(list(admission.glob("*.waiting")), [], "cancel kept a memory queue place")
+        self.assertEqual(self.admission.server.waiters, {}, "cancel kept a memory queue place")
         self.assertEqual(list((self.root / "verify-steps").glob("*.json")), [], "cancel kept its active step")
         pid = int((self.control / "descendant.pid").read_text())
         state = subprocess.run(["ps", "-p", str(pid), "-o", "stat="],

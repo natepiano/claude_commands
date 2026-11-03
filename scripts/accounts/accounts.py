@@ -3397,7 +3397,7 @@ class SessionMoveRefused:
     reason: str
 
 
-SessionMoveOutcome = stop_results.ClaudeUp | stop_results.MoveHandedOff | stop_results.ResumePending | SessionMoveRefused
+SessionMoveOutcome = stop_results.ClaudeUp | stop_results.MoveHandedOff | stop_results.ResumePending | stop_results.RunningOnAnotherAccount | SessionMoveRefused
 
 
 class SessionBatchMove(Protocol):
@@ -3432,7 +3432,8 @@ def move_sessions(ids: tuple[str, ...], target: str, *, why: str, account_config
     batch = cast(SessionBatchMove, import_module("scripts.shutdown.stop_resume").move_sessions)
     results = batch(eligible, checked.destination.label, why=why)
     for identity, result in zip(eligible, results):
-        if isinstance(result, (stop_results.ClaudeUp, stop_results.MoveHandedOff, stop_results.ResumePending)):
+        if isinstance(result, (stop_results.ClaudeUp, stop_results.MoveHandedOff, stop_results.ResumePending,
+                               stop_results.RunningOnAnotherAccount)):
             outcomes[identity] = result
         else:
             reason = ("session has no tab on this machine" if isinstance(result, stop_results.SessionNotFound)
@@ -3444,6 +3445,8 @@ def move_sessions(ids: tuple[str, ...], target: str, *, why: str, account_config
 def move_result_line(result: SessionMoveOutcome) -> str:
     if isinstance(result, SessionMoveRefused):
         return f"{result.session_id}: not moved: {result.reason}"
+    if isinstance(result, stop_results.RunningOnAnotherAccount):
+        return f"{result.session_id}: not moved: {stop_results.resume_failure_reason(result)}"
 
     if isinstance(result, stop_results.ResumePending):
         return f"{result.session_id}: stopped, resume pending: {next(iter(result.reason.splitlines()), 'unknown error')}"
@@ -3559,11 +3562,12 @@ def _move_output(results: tuple[SessionMoveOutcome, ...],
     stderr = ""
     for result in results:
         line = move_result_line(result) + ("; " + "; ".join(notices) if notices else "") + "\n"
-        if isinstance(result, (SessionMoveRefused, stop_results.ResumePending)):
+        if isinstance(result, (SessionMoveRefused, stop_results.ResumePending, stop_results.RunningOnAnotherAccount)):
             stderr += line
         else:
             stdout += line
-    return stdout, stderr, int(any(isinstance(item, (SessionMoveRefused, stop_results.ResumePending)) for item in results))
+    return stdout, stderr, int(any(isinstance(item, (SessionMoveRefused, stop_results.ResumePending,
+                                                   stop_results.RunningOnAnotherAccount)) for item in results))
 
 
 @role_map.role_map_command
@@ -4624,7 +4628,7 @@ def _status_row_cells(row: StatusRow, zone: tzinfo, checked_at: datetime, *, acc
     reset = row.resets_at
     credits = row.credits
     read = row.read_at
-    role_cell = ", ".join(row.roles) if row.roles else NO_VALUE if row.tool == "codex" else ""
+    role_cell = row.roles[0] if row.roles else NO_VALUE if row.tool == "codex" else ""
     if isinstance(weekly, WeeklyNotReadSince):
         weekly_cell = f"not read since {weekly.read_at.astimezone(zone):%H:%M}"
         if isinstance(weekly.reason, agent_accounts.StaleTokenSkip):
@@ -4852,7 +4856,12 @@ def _read_failure_problem(row: StatusRow, zone: tzinfo,
 
 def render_status_table(reading: StatusReading, *, account_config: conf.ConfigRead | ReadCurrentAccountSettings = CURRENT_ACCOUNT_SETTINGS) -> str:
     account_config = read_account_settings(account_config)
-    return "\n".join([_render_table([_status_row_cells(row, reading.zone, reading.checked_at, account_config=account_config) for row in reading.rows]), "",
+    rows: list[tuple[str, ...]] = []
+    for row in reading.rows:
+        cells = _status_row_cells(row, reading.zone, reading.checked_at, account_config=account_config)
+        rows.append(cells)
+        rows.extend(tuple(role if index == 2 else "" for index in range(len(cells))) for role in row.roles[1:])
+    return "\n".join([_render_table(rows), "",
         *reading.notes, *reading.detail_lines])
 
 

@@ -3,9 +3,9 @@
 
 set -euo pipefail
 
-AGENTS_CONFIG_FILE="${AGENTS_CONFIG_FILE:-$HOME/.claude/config/agents.conf}"
+MODELS_CONFIG_FILE="${MODELS_CONFIG_FILE:-$HOME/.claude/config/models.conf}"
 # Source shared registry I/O without recursively triggering this sync.
-AGENTS_CONFIG_TIER_ONLY=1 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/agents_config.sh"
+MODELS_CONFIG_TIER_ONLY=1 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/models_config.sh"
 CODEX_CONFIG_FILE="${CODEX_CONFIG_FILE:-$HOME/.codex/config.toml}"
 CODEX_MODELS_CACHE_FILE="${CODEX_MODELS_CACHE_FILE:-$HOME/.codex/models_cache.json}"
 CODEX_CATALOG_SYNC_STATE_FILE="${CODEX_CATALOG_SYNC_STATE_FILE:-$HOME/.local/state/codex-agent-catalog-sync/last_success}"
@@ -27,11 +27,11 @@ fail() {
 }
 
 # One writer at a time. The sync is triggered implicitly by anything that sources
-# agents_config.sh, so a stale freshness gate fires it once per caller -- and a
+# models_config.sh, so a stale freshness gate fires it once per caller -- and a
 # worker phase sources it three times at once. `mv` is atomic, so no reader
 # ever sees a torn file, but concurrent syncs still do identical work three times
 # over, and the last to finish writes a copy it read before the others started:
-# a row changed by `/agent` inside that window is silently reverted.
+# a row changed by `/default_models` inside that window is silently reverted.
 LOCK_DIR="$(dirname "$CODEX_CATALOG_SYNC_STATE_FILE")/sync.lock"
 
 release_lock() {
@@ -39,7 +39,7 @@ release_lock() {
     return 0
 }
 
-# The state file is the freshness gate agents_config.sh reads: it re-runs the
+# The state file is the freshness gate models_config.sh reads: it re-runs the
 # sync while the Codex config or the model cache is newer than it. Closing that
 # gate on a run that could not read some model's efforts would record a partial
 # answer as the settled one, so an incomplete run leaves the gate open and the
@@ -182,15 +182,15 @@ warn_missing_claude_aliases() {
 }
 
 command -v jq >/dev/null || fail "jq is required"
-[[ -f "$AGENTS_CONFIG_FILE" ]] || fail "agent registry not found: $AGENTS_CONFIG_FILE"
+[[ -f "$MODELS_CONFIG_FILE" ]] || fail "agent registry not found: $MODELS_CONFIG_FILE"
 [[ -f "$CODEX_CONFIG_FILE" ]] || fail "Codex config not found: $CODEX_CONFIG_FILE"
 # Every query below uses the same complete snapshot, even if Codex rewrites the
 # live file between queries. Only the shared reader opens/parses that file.
 cache_reader="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)"
 cache_text="$("$cache_reader/py" "$cache_reader/codex_models_cache.py" "$CODEX_MODELS_CACHE_FILE")" || exit 1
-REGISTRY_VIEW="$(mktemp "${AGENTS_CONFIG_FILE}.view.XXXXXX")"
-agents_registry_text > "$REGISTRY_VIEW"
-AGENTS_REGISTRY_BASE="$(cat "$REGISTRY_VIEW")"
+REGISTRY_VIEW="$(mktemp "${MODELS_CONFIG_FILE}.view.XXXXXX")"
+models_registry_text > "$REGISTRY_VIEW"
+MODELS_REGISTRY_BASE="$(cat "$REGISTRY_VIEW")"
 trap 'rm -f "$REGISTRY_VIEW"; release_lock' EXIT
 
 codex_model="$({
@@ -396,7 +396,7 @@ while IFS=$'\t' read -r task pair; do
         continue
     fi
 
-    echo "WARNING: $task is assigned to '$assigned_agent', which is gone from the codex catalog — re-point it: /agent $task <agent>[:<effort>], or switch the family: /agent ${task%%.*} <family>" >&2
+    echo "WARNING: $task is assigned to '$assigned_agent', which is gone from the codex catalog — re-point it: /default_models $task <agent>[:<effort>], or switch the family: /default_models ${task%%.*} <family>" >&2
     if ! old_row="$(previous_catalog_row "$assigned_agent")"; then
         fail "cannot preserve assigned Codex agent '$assigned_agent': no previous [codex.agents] row exists"
     fi
@@ -405,7 +405,7 @@ done <<< "$assigned_rows"
 
 warn_missing_claude_aliases
 
-tmp_file="$(mktemp "${AGENTS_CONFIG_FILE}.XXXXXX")"
+tmp_file="$(mktemp "${MODELS_CONFIG_FILE}.XXXXXX")"
 cleanup() {
     rm -f "$tmp_file" "$REGISTRY_VIEW"
     release_lock
@@ -446,11 +446,11 @@ while IFS= read -r line || [[ -n "$line" ]]; do
     printf '%s\n' "$line" >> "$tmp_file"
 done < "$REGISTRY_VIEW"
 
-[[ "$saw_codex_agents" == true ]] || fail "[codex.agents] section not found in $AGENTS_CONFIG_FILE"
+[[ "$saw_codex_agents" == true ]] || fail "[codex.agents] section not found in $MODELS_CONFIG_FILE"
 
 # Keep models/efforts seen on another machine and never downgrade a family.
-merged_file="$(mktemp "${AGENTS_CONFIG_FILE}.XXXXXX")"
-if ! "$AGENTS_CONFIG_DIR/../lib/py" "$AGENTS_CONFIG_DIR/../lib/agents_registry.py" catalog \
+merged_file="$(mktemp "${MODELS_CONFIG_FILE}.XXXXXX")"
+if ! "$MODELS_CONFIG_DIR/../lib/py" "$MODELS_CONFIG_DIR/../lib/models_registry.py" catalog \
     --before "$REGISTRY_VIEW" --after "$tmp_file" > "$merged_file"; then
     rm -f "$merged_file"
     fail "cannot merge Codex catalog additions"
@@ -470,7 +470,7 @@ done
 if [[ "$catalog_current" == true ]]; then
     if [[ "$CHECK_ONLY" == false ]]; then
         # A prior sync may have stopped after writing but before publication.
-        agents_registry_store "$tmp_file" "add Codex catalog models and efforts" additive-catalog
+        models_registry_store "$tmp_file" "add Codex catalog models and efforts" additive-catalog
         checkpoint_sync_state
     fi
     echo "Codex agent catalog is current."
@@ -478,12 +478,12 @@ if [[ "$catalog_current" == true ]]; then
 fi
 
 if [[ "$CHECK_ONLY" == true ]]; then
-    echo "Codex agent catalog is stale: $AGENTS_CONFIG_FILE" >&2
+    echo "Codex agent catalog is stale: $MODELS_CONFIG_FILE" >&2
     exit 1
 fi
 
-agents_registry_store "$tmp_file" "add Codex catalog models and efforts" additive-catalog
+models_registry_store "$tmp_file" "add Codex catalog models and efforts" additive-catalog
 rm -f "$REGISTRY_VIEW"
 trap release_lock EXIT
 checkpoint_sync_state
-echo "Updated Codex agent catalog: $AGENTS_CONFIG_FILE"
+echo "Updated Codex agent catalog: $MODELS_CONFIG_FILE"

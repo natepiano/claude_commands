@@ -52,6 +52,12 @@ def render_card(model: QueueModel, matches: Sequence[int], columns: int) -> list
             add((Span(priority),))
         add()
         checks = step_checks(model, position)
+        if isinstance(checks, gate.HeadExplanation) and checks.decision.state == "hold":
+            add((Span(f"Free {checks.free.available / gate.GIB:.1f} GiB; "
+                + f"reserve {checks.free.reserve / gate.GIB:.1f} GiB; need {checks.free.need / gate.GIB:.1f} GiB."),))
+        for running in model.reading.view.running:
+            if isinstance(running.measured, gate.UnownedSliceMemory):
+                add((Span(f"{running.measured.owner}: {running.measured.bytes / gate.GIB:.1f} GiB (unowned)."),))
         if isinstance(step.reason, gate.TokenWaitingWaiter):
             add((Span("Next? No. It is waiting for the cargo token.", bold=True),))
         elif (isinstance(step.reason, gate.ReadyForAdmission)
@@ -71,9 +77,12 @@ def render_card(model: QueueModel, matches: Sequence[int], columns: int) -> list
                 ahead = waiting[place - 1]
                 row = model.reading.ordered[place - 1][1]
                 priority_order = gate.waiter_priority(row)
-                later = ahead.since > step.since
-                minutes = age(step.since, ahead.since) if later else age(ahead.since, step.since)
-                detail = f"joined {clock(model, ahead.since)}, {minutes} min {'after' if later else 'before'} it"
+                order_since = row.get("order_since", ahead.since)
+                step_row = model.reading.ordered[position - 1][1]
+                step_order_since = step_row.get("order_since", step.since)
+                later = order_since > step_order_since
+                minutes = age(step_order_since, order_since) if later else age(order_since, step_order_since)
+                detail = f"joined {clock(model, order_since)}, {minutes} min {'after' if later else 'before'} it"
                 if isinstance(priority_order, gate.PriorityUnit):
                     detail += f"; {priority_order.unit} (queue priority)"
                 add((Span(f"  #{place} "), Span("↑  " if is_moved(model, place) else "   "),

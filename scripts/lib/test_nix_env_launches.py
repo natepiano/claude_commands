@@ -151,11 +151,13 @@ class HerdrLaunchTests(NixFixture):
             branch="fixture", worktree=self.root / "unused-checkout", plan=add_unit.Standby(),
             port=add_unit.OmittedCell(), owns=add_unit.OmittedCell(), session=add_unit.ResumedSession("sid", self.work),
             launch_kind=add_unit.NewWorkLaunch(), timeout=1)
-        with isolated_staff_file(self.root / "staff.json", self.env):
+        errors = io.StringIO()
+        with isolated_staff_file(self.root / "staff.json", self.env), redirect_stderr(errors):
             member = unit_membership("child", "unit")
             member = staff.set_worktree(member.id, staff.PresentWorktree(local_machine(), request.worktree), expected=member.worktree)
             self.refusal(lambda: add_unit.launch_session(request, add_unit.DirectorAgent("opus", add_unit.DefaultEffort()),
                 "resume", accounts.NamedAccount("claude3", self.home / ".claude3")))
+        self.assertIn("launch names: sid (worker): no staff row; saved name retained", errors.getvalue())
 
     def test_add_showrunner_uses_requested_cwd_before_opening(self) -> None:
         self.refusal(lambda: add_showrunner.launch(self.production(), "opus", "high", None, self.work,
@@ -291,7 +293,7 @@ class ShellLaunchTests(NixFixture):
     def setUp(self) -> None:
         super().setUp()
         self.scripts = self.home / ".claude/scripts"
-        for relative in ("agents/agent_exec.sh", "agents/agent_bg.sh", "cli_agent/cli_agent.sh", "berth_fix/launch.sh", "make_a_worktree/direnv_allow.sh", "lib/nix_env.py"):
+        for relative in ("agents/agent_exec.sh", "agents/agent_bg.sh", "cli_agent/cli_agent.sh", "berth_fix/launch.sh", "make_a_worktree/direnv_allow.sh", "lib/nix_env.py", "lib/conf.py"):
             destination = self.scripts / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
             _ = shutil.copyfile(ROOT / "scripts" / relative, destination)
@@ -299,7 +301,7 @@ class ShellLaunchTests(NixFixture):
         _ = py.write_text('#!/bin/sh\nexec ' + sys.executable + ' "$@"\n')
         py.chmod(0o755)
         _ = (self.scripts / "agents/claude_account.sh").write_text('claude_launch_environment() { return 0; }\n')
-        _ = (self.scripts / "agents/agents_config.sh").write_text('''agents_resolve() { AGENT_FAMILY=claude; }
+        _ = (self.scripts / "agents/models_config.sh").write_text('''agents_resolve() { AGENT_FAMILY=claude; }
 agents_claude_args() { echo '--model fixture'; }
 ''')
         self.started = self.root / "started.jsonl"

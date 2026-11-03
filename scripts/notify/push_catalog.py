@@ -9,6 +9,9 @@ from push_texts import ActionTemplate, NoActionNeeded, PushExample, PushText, Se
 
 
 ENTRIES = (
+    PushText("build_admission.down", "build-admission", "note", "Build admission service is down",
+        NoActionNeeded(), "build admission service is down; builds wait",
+        (PushExample("down", {}),), purpose="The service has not answered for two minutes."),
     PushText("vault.stopped", "buildlog", "note", "Mac vault copy is not updating",
         ActionTemplate("{action}"),
         "The hourly job that updates the hanadocs vault on the Mac skipped it. {reason} It tries again each hour and sends no more alerts until an update works. Until then, the Mac copy stays out of date.",

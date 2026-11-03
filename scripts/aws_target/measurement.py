@@ -138,9 +138,7 @@ def read_charges(settings_path: Path, directory: Path, now: int,
 
 def number(value: object) -> Decimal:
     if isinstance(value, int | float | str) and not isinstance(value, bool):
-        result = Decimal(str(value))
-        if result.is_finite():
-            return result
+        return conf.decimal(str(value))
     raise ValueError('expected a finite number')
 
 

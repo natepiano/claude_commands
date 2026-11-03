@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+from scripts.build_queue.admission_test_support import caller_admission
+from scripts.build_queue import admission_protocol as wire
+from scripts.lib.py_floor_test_support import cache_file_name
+
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 import json
@@ -679,6 +683,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
             self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
             self.build_fixture()
         self.addCleanup(self.assert_nothing_outlives)
+        _ = caller_admission(self, self.root, self.environment)
 
     def fixture_paths(self) -> None:
         self.home = self.root / "home"
@@ -849,7 +854,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
             "TEST_REAL_RECORD": str(VERIFY.parent.parent / "buildlog" / "record.py"),
         }
 
-        cache = self.root / "cache/claude/python3-3.11"
+        cache = self.root / "cache/claude" / cache_file_name()
         cache.parent.mkdir(parents=True, exist_ok=True)
         _ = cache.write_text(sys.executable + "\n")
         _ = self.environment.pop("CLAUDE_PYTHON", None)
@@ -865,15 +870,13 @@ class VerifyMacOffloadFixture(unittest.TestCase):
     def verify(
         self, *arguments: str, extra: dict[str, str] | None = None
     ) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            ["bash", str(VERIFY), *arguments],
-            cwd=self.root,
-            env={**self.environment, **(extra or {})},
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=TEST_HANG_GUARD_SECS,
-        )
+        process = self.start_verify(*arguments, extra=extra)
+        try:
+            output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+        except subprocess.TimeoutExpired:
+            self.stop_verify(process)
+            raise
+        return subprocess.CompletedProcess(process.args, process.wait(timeout=TEST_HANG_GUARD_SECS), output, errors)
 
     def start_verify(
         self, *arguments: str, extra: dict[str, str] | None = None
@@ -961,6 +964,7 @@ class VerifyMacOffloadFixture(unittest.TestCase):
         library.unlink()
         library.mkdir()
         self.write_executable(library / "py", ROUTING_CLOCK_SHIM)
+        _ = shutil.copy2(VERIFY.parent.parent / "lib/build_folders.py", library / "build_folders.py")
         self.environment["TEST_ROUTING_CLOCK"] = str(clock)
         return clock
 
@@ -1134,6 +1138,13 @@ class VerifyMacOffloadFixture(unittest.TestCase):
         finally:
             for descriptor in descriptors:
                 os.close(descriptor)
+
+    def wait_for_memory_wait(self, process: subprocess.Popen[str]) -> None:
+        """Wait for a held reply from this fixture's service."""
+        admission = caller_admission(self, self.root, self.environment)
+        self.wait_until(lambda: any(isinstance(waiting.last_reply, wire.Wait)
+                                   for waiting in admission.server.waiters.values()),
+                        "the admission wait", (process,))
 
     def hold_memory(self) -> Path:
         """Keep natedev's memory gate holding until the returned meminfo is rewritten."""
