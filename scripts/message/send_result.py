@@ -4,8 +4,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-Outcome = Literal["sent", "skipped", "queued", "failed", "refused", "held", "replaced", "kept"]
-EXIT: dict[Outcome, int] = {"sent": 0, "skipped": 0, "queued": 1, "failed": 3, "refused": 2, "held": 4, "replaced": 0, "kept": 0}
+Outcome = Literal["sent", "skipped", "queued", "failed", "refused", "held", "replaced", "kept", "pending"]
+EXIT: dict[Outcome, int] = {"sent": 0, "skipped": 0, "queued": 1, "failed": 3, "refused": 2, "held": 4, "replaced": 0, "kept": 0, "pending": 5}
 OUTCOME_HEADERS: dict[str, Outcome] = {outcome.upper(): outcome for outcome in EXIT}
 
 

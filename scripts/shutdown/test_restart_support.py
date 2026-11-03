@@ -76,7 +76,7 @@ class SendOutcomeTests(unittest.TestCase):
                 self.assertEqual(settle.send_message("fixture", "summary", "message"), expected)
 
     def test_confirmed_send_failures_raise_without_recording_delivery(self) -> None:
-        for code, header in ((3, "FAILED"), (2, "REFUSED"), (4, "HELD")):
+        for code, header in ((3, "FAILED"), (2, "REFUSED"), (4, "HELD"), (5, "PENDING")):
             with self.subTest(header=header), patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], code, header + ": unavailable", "")):
                 with self.assertRaisesRegex(RuntimeError, header + ": unavailable"):
                     _ = settle.send_message("fixture", "summary", "message")

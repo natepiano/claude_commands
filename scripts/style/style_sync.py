@@ -95,7 +95,7 @@ def notify(repo_dir: Path, branch: str, tip: str) -> None:
             match outcome.header.outcome:
                 case "sent" | "skipped" | "kept" | "replaced":
                     return
-                case "queued" | "failed" | "refused" | "held":
+                case "queued" | "failed" | "refused" | "held" | "pending":
                     pass
         raise Refusal(f"send.py: {failure_detail(sent)}")
     except (Refusal, OSError, ValueError, subprocess.TimeoutExpired) as error:
