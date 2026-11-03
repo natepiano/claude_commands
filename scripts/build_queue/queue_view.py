@@ -105,7 +105,7 @@ def is_moved(model: QueueModel, position: int) -> bool:
 
 
 def has_move_priority(model: QueueModel, position: int) -> bool:
-    return isinstance(gate.waiter_priority(model.reading.ordered[position - 1][1]), gate.PriorityUnit)
+    return model.reading.ordered[position - 1][1].get("priority_rank", 1) == 0
 
 
 def pressure_check(pressure: gate.Pressure, model: QueueModel) -> tuple[bool, str]:

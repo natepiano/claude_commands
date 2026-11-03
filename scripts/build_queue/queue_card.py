@@ -6,7 +6,7 @@ from collections.abc import Sequence
 from scripts.build_queue import head_facts
 from scripts.build_queue.queue_lines import Line, Span, age, wrap
 from scripts.build_queue.queue_view import (QueueModel, check_line, check_lines, clock, estimate_minutes,
-    eligible_head_position, has_move_priority, is_moved, name_spans, name_text, shown_waiters, reason_phrase, start_text, step_checks, step_labels)
+    eligible_head_position, has_move_priority, is_moved, name_spans, name_text, shown_waiters, reason_phrase, start_text, step_checks, step_labels, waiting_moves)
 from scripts.lint import memory_admit as gate
 
 
@@ -28,7 +28,7 @@ def order_check(model: QueueModel, position: int) -> Line:
     if isinstance(reason, gate.BehindOlderFit):
         return check_line(False, "queue order      " + reason_phrase(reason, model.reading.view.waiting))
     if isinstance(reason, gate.BehindHead) and isinstance(model.facts, head_facts.HeadFacts):
-        return check_line(False, f"#{eligible_head_position(model.reading.view.waiting)}'s turn      " + head_facts.order_rule(model.facts, model.zone))
+        return check_line(False, f"#{eligible_head_position(model.reading.view.waiting)}'s turn      " + head_facts.order_text(model.facts, model.zone))
     return check_line(True, "queue order")
 
 
@@ -61,27 +61,24 @@ def render_card(model: QueueModel, matches: Sequence[int], columns: int) -> list
             add((Span("Next? Yes, it is first. It starts when the checks below pass.", bold=True),))
         else:
             moved = sum(has_move_priority(model, place) for place in range(1, position))
-            priority = model.reading.explanation.priority
-            unit = priority["unit"] if not isinstance(priority, gate.NoQueuePriority) else ""
-            add((Span(f"Next? No. {position - 1} steps are ahead of it: {moved} of {unit} (queue priority), "
-                      + f"{position - 1 - moved} joined earlier." if moved else
-                      f"Next? No. {position - 1} steps are ahead of it; they joined earlier.", bold=True),))
+            add((Span(f"Next? No. {position - 1} steps are ahead of it: {moved} moved up, "
+                      + f"{position - 1 - moved} joined earlier.", bold=True),))
         if position > 1:
             for place in range(1, min(position, 6)):
                 ahead = waiting[place - 1]
-                row = model.reading.ordered[place - 1][1]
-                priority_order = gate.waiter_priority(row)
-                later = ahead.since > step.since
-                minutes = age(step.since, ahead.since) if later else age(ahead.since, step.since)
-                detail = f"joined {clock(model, ahead.since)}, {minutes} min {'after' if later else 'before'} it"
-                if isinstance(priority_order, gate.PriorityUnit):
-                    detail += f"; {priority_order.unit} (queue priority)"
+                records = waiting_moves(model, place)
+                if records:
+                    detail = head_facts.move_text(records, model.zone, model.labels)
+                else:
+                    later = ahead.since > step.since
+                    minutes = age(step.since, ahead.since) if later else age(ahead.since, step.since)
+                    detail = f"joined {clock(model, ahead.since)}, {minutes} min {'after' if later else 'before'} it"
                 add((Span(f"  #{place} "), Span("↑  " if is_moved(model, place) else "   "),
                      *name_spans(ahead, model.labels), Span(f" {ahead.step}  {detail}")), 6)
             if position > 6:
                 add((Span(f"  and {position - 6} more"),))
             joined = 1 + sum(other.since < step.since for other in waiting)
-            add((Span("  Queue-priority steps go first, then the longest wait. It joined "
+            add((Span("  Moved-up steps go first, then the longest wait. It joined "
                       + f"{ordinal(joined)} of the steps waiting now."),))
         add()
         add((Span("Waits on", bold=True),))
@@ -98,7 +95,7 @@ def render_card(model: QueueModel, matches: Sequence[int], columns: int) -> list
             if isinstance(pace, head_facts.RecordedPace):
                 add((Span(f"Likely start {start_text(model, position, clock_time=True)}: {ordinal(position)} in line "
                           + f"at {pace.steps} steps an hour, an estimate."),))
-            add((Span(f"  Each queue-priority step ahead of it adds about {estimate_minutes(model, 1)} min."),))
+            add((Span(f"  Each step moved up ahead of it adds about {estimate_minutes(model, 1)} min."),))
     return lines
 
 

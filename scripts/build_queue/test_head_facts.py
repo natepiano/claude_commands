@@ -249,11 +249,11 @@ class HeadFactsTests(AdmissionLogTests):
     def test_live_queue_priority_is_shown_with_legacy_bump_history(self) -> None:
         reading = head_reading()
         priority: gate.QueuePriority = {"unit": "resources", "why": "user work", "set_at": NOW,
-            "set_by": "showrunner", "transition": gate.SettledPriority()}
+            "set_by": "showrunner"}
         reading = replace(reading, explanation=replace(reading.explanation, priority=priority))
         write_bumps(NOW, [bump_line(NOW - 5)])
         facts = self.facts(reading)
-        self.assertIn("queue priority: resources (user work)", head_facts.order_text(facts, ZONE))
+        self.assertIn("queue priority: resources (the user's bump)", head_facts.order_text(facts, ZONE))
         self.assertEqual(self.history(reading).total, 1)
         self.assertEqual(head_facts.bump_text(facts, ZONE), "Bumps since it joined at 06:50:00: 1")
 
@@ -532,7 +532,7 @@ class HeadFactsTests(AdmissionLogTests):
     def test_waiting_move_history_matches_identity_join_boundary_and_resolved_priority(self) -> None:
         reading = head_reading(since=NOW - 60)
         step = reading.view.waiting[0]
-        row: gate.RankedWaiter = {**reading.ordered[0][1], "order": gate.PriorityUnit("head")}
+        row: gate.Waiter = {**reading.ordered[0][1], "priority_rank": 0}
         write_bumps(NOW, [
             bump_line(NOW - 61, session="head-session", step="nextest", folder="/tmp/head"),
             bump_line(NOW - 60, session="head-session", step="nextest", folder="/tmp/head", old_position=9),

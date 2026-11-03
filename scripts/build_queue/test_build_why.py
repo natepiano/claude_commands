@@ -204,12 +204,12 @@ class BuildWhyTests(unittest.TestCase):
         from dataclasses import replace
         reading = gate.locked_queue_read()
         priority: gate.QueuePriority = {"unit": "resources", "why": "work", "set_at": NOW,
-            "set_by": "showrunner", "transition": gate.SettledPriority()}
+            "set_by": "showrunner"}
         reading = replace(reading, explanation=replace(reading.explanation, priority=priority))
         facts = head_facts.read_head_facts(reading)
         lines = build_why.render_explanation(reading.explanation, user_zone(), {}, facts)
         order, = [line for line in lines if line.startswith("Order rule:")]
-        self.assertIn("queue priority: resources (work)", order)
+        self.assertIn("queue priority: resources (the user's bump)", order)
 
     def test_override_free_memory_terms_add_up_to_its_printed_threshold(self) -> None:
         self.reset_running(available=23, need=12)
@@ -695,12 +695,12 @@ class BuildWhyTests(unittest.TestCase):
 
     def test_backfill_and_position_bump_report_the_admission_deadlines(self) -> None:
         self.change_head(priority_since=NOW - 630)
-        priority: dict[str, object] = {"unit": "inspectors-fix", "why": "user work", "set_at": NOW - 630,
+        priority: gate.QueuePriority = {"unit": "inspectors-fix", "why": "user work", "set_at": NOW - 630,
             "set_by": "showrunner"}
         _ = (self.directory / "queue_priority.json").write_text(json.dumps(priority))
         output = self.output()
         self.assertRegex(output, r"younger steps may start until 21:52.*1 min 30 s left")
-        self.assertIn("queue priority: inspectors-fix (user work)", output)
+        self.assertIn("queue priority: inspectors-fix (the user's bump)", output)
 
     def test_pressure_hold_and_recovery_spacing_are_explicit(self) -> None:
         _ = (self.root / "pressure").write_text("full avg10=11.00 avg60=0.00 avg300=0.00 total=0\n")

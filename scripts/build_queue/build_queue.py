@@ -46,7 +46,7 @@ def main() -> int:
             print("build queue: use /build:queue bump <unit>")
             return 3
         try:
-            memory_admit.run_priority(["set", f"--unit={sys.argv[2]}", "--why", "the user's bump"])
+            memory_admit.run_priority(["set", "--unit", sys.argv[2], "--why", "the user's bump"])
         except SystemExit as stopped:
             return stopped.code if isinstance(stopped.code, int) else 1
         except (OSError, ValueError) as error:

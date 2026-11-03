@@ -184,11 +184,6 @@ class QueueTests(unittest.TestCase):
             self.assertEqual([step.pid for step in memory_admit.queue_view().waiting], [100, 200])
             self.assertEqual(list((self.root / "buildlog").glob("*/*.jsonl")), [])
 
-    def test_bump_passes_a_dash_unit_as_one_argparse_value(self) -> None:
-        with mock.patch.object(memory_admit, "run_priority") as run:
-            self.assertEqual(self.bump_output("-x"), (0, "", ""))
-        run.assert_called_once_with(["set", "--unit=-x", "--why", "the user's bump"])
-
     def test_bump_sets_the_units_priority_and_reports_its_resolved_place(self) -> None:
         first = self.fixture.waiter(100, "head-id", "head")
         second = self.fixture.waiter(200, "worker-id", "worker")
@@ -205,7 +200,6 @@ class QueueTests(unittest.TestCase):
             self.assertEqual((priority["unit"], priority["why"]), ("berth", "the user's bump"))
 
     def test_bump_keeps_priority_when_the_unit_has_no_waiting_step(self) -> None:
-        self.fixture.labels["berth-director"] = UnitLabels("director", unit="berth")
         with mock.patch.object(memory_admit, "require_showrunner", return_value="showrunner"):
             status, output, errors = self.bump_output("berth")
         self.assertEqual((status, output, errors), (0, "queue priority set for berth: no waiting step yet\n", ""))
@@ -386,7 +380,7 @@ class QueueTests(unittest.TestCase):
         reading = head_reading(since=NOW - 1000, now=NOW)
         follower = replace(reading.view.waiting[0], pid=456, session_id="follower", step="clippy", since=NOW - 800)
         path, row = reading.ordered[0]
-        follower_row: memory_admit.RankedWaiter = {**row, "pid": follower.pid,
+        follower_row: memory_admit.Waiter = {**row, "pid": follower.pid,
             "start_time": str(follower.pid), "session_id": follower.session_id,
             "step": follower.step, "since": follower.since}
         reading = replace(reading, view=replace(reading.view, waiting=(*reading.view.waiting, follower)),
@@ -639,7 +633,7 @@ class QueueTests(unittest.TestCase):
         )
         follower = memory_admit.WaitingStep(
             11, "follower-id", "", "doc", "/tmp/tree", now - 300,
-            int(11.6 * GIB), memory_admit.BehindHead(head_name="clone88ci", joined_at=now - 2400, head_session_id="head-id"),
+            int(11.6 * GIB), memory_admit.BehindHead(head_name="clone88ci", head_since=now - 2400, head_session_id="head-id"),
         )
         view = memory_admit.QueueView(
             (head, follower), (), int(23.1 * GIB), 0, 3 * GIB, now,

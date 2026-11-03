@@ -1,15 +1,13 @@
 #4 of 32 · tool-based-ui · hana-migration · mend · 7.6 GiB
 Folder /tmp/hana_catalyst-hana-migration. Waited 39 min (since 10:07). Likely start ~10:51.
-queue priority: cables (captured priority)
+queue priority: cables (the user's bump)
 
-Next? No. 3 steps are ahead of it: 3 of cables (queue priority), 0 joined earlier.
-  #1 ↑  tool-based-ui · cables · work-pan mend  joined 10:10, 3 min after it; cables (queue
-      priority)
-  #2 ↑  tool-based-ui · cables · work-lead nextest  joined 10:40, 32 min after it; cables (queue
-      priority)
-  #3 ↑  tool-based-ui · cables · work-lead nextest  joined 10:40, 32 min after it; cables (queue
-      priority)
-  Queue-priority steps go first, then the longest wait. It joined 1st of the steps waiting now.
+Next? No. 3 steps are ahead of it: 3 moved up, 0 joined earlier.
+  #1 ↑  tool-based-ui · cables · work-pan mend  joined 10:10, 3 min after it
+  #2 ↑  tool-based-ui · cables · work-lead nextest  from #27 by work-lead at 10:40; from #1 by
+      work-lead at 10:46
+  #3 ↑  tool-based-ui · cables · work-lead nextest  from #27 by work-lead at 10:40
+  Moved-up steps go first, then the longest wait. It joined 1st of the steps waiting now.
 
 Waits on
   ✓ queue order
@@ -18,4 +16,4 @@ Waits on
   ✗ memory pressure: full avg10 7.7 now; starts below 5.0
 
 Likely start ~10:51: 4th in line at 44 steps an hour, an estimate.
-  Each queue-priority step ahead of it adds about 1 min.
+  Each step moved up ahead of it adds about 1 min.

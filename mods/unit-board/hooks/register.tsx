@@ -254,10 +254,8 @@ function accountsPaneCalls($: EngineInterface): TablePaneCalls<AccountsReady, Ac
 async function queueRun($: EngineInterface, args: string[], isOpen = () => true) {
   const home = await $.env.get('HOME');
   if (!home || !isOpen()) throw new Error('Build queue could not be read.');
-  const invocation = [`${home}/.claude/scripts/lib/py`,
-    `${home}/.claude/scripts/${args[0] === "priority" ? "lint/memory_admit.py" : "build_queue/build_queue.py"}`, ...args];
-  const result = await $.process.run(args[0] === 'priority'
-    ? ['env', `CLAUDE_CODE_SESSION_ID=${await $.session.id()}`, ...invocation] : invocation);
+  const result = await $.process.run([`${home}/.claude/scripts/lib/py`,
+    `${home}/.claude/scripts/${args[0] === "priority" ? "lint/memory_admit.py" : "build_queue/build_queue.py"}`, ...args]);
   if (!isOpen()) throw new Error('Build queue could not be read.');
   if (args[0] === 'priority' && result.exitCode === 3 && !result.isStdoutTruncated) {
     const refusal = result.stdout.trim();
@@ -418,7 +416,7 @@ export const register: Register = on => {
       if (words.length !== 2) return { text: 'build queue: use /build:queue bump <unit>' };
       let line: string;
       try {
-        const output = await queueRun($, ['priority', 'set', `--unit=${words[1]}`, '--why', "the user's bump"]);
+        const output = await queueRun($, ['priority', 'set', '--unit', words[1], '--why', "the user's bump"]);
         line = output.trim();
         if (!line || /[\r\n]/.test(line)) throw new Error('Invalid bump result.');
       } catch { return { text: 'Build queue could not be read.' }; }
