@@ -52,6 +52,9 @@ A check stays only if it prevents a catastrophe:
 2. A second operation on the same row runs at the same time (one lock for each row).
 3. A second copy of a running session would start.
 4. Uncommitted work would be deleted.
+5. A signal, keystroke or pane close would reach a process that is not the target (a reused pid, another conversation, a pane with other live work).
+
+Bad input (an unknown or unclear name, a session on the other machine) is an error message, not a refusal.
 
 Anything else unexpected prints one anomaly line and the operation continues.
 
