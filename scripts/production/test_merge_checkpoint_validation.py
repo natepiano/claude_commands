@@ -104,7 +104,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertEqual(result.process.returncode, 1)
         self.assert_stopped_before_merge(result, "held", "checkpoint(alpha): grid fades: no Change-Review line")
         self.assertIn(sha[:change_review.SHORT], result.process.stdout)
-        self.assertIn("a plain commit, not a merge: the gate does not read merge commits", result.process.stdout)
+        self.assertIn("a plain commit, not a merge: a merge may carry only `Change-Review: none` lines", result.process.stdout)
         self.assertIn(change_review.COVERS, result.process.stdout)
     def test_a_merge_adds_a_row_per_visible_change_to_the_named_list(self) -> None:
         review = self.root / "change-review.md"
