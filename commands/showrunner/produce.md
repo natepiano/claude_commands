@@ -1058,7 +1058,7 @@ on it, with `--need decision`: the user wants a text for every rebuild needed (u
 | Need | When |
 | --- | --- |
 | `blocked` (priority 2; repeats every 5 min until the user taps Acknowledge) | Work has stopped, and only the user can restart it: a block under <Dependencies/> rule 6, after steps 1–2, carrying the exact action; a cold gpg-agent stopping every push (the user runs `github-warmup`). Send once per block. |
-| `decision` (priority 1) | The user is needed, but nothing has stopped: a product decision only they can make while units have other work; main's CI red after <PromoteMain/>; a block still open an hour after they acknowledged it. That last one says what changed, never the same text again. |
+| `decision` (priority 0; 1 only with an in-window `--due`, per `config/send.conf`) | Ask for a product decision while units have other work. Report main's red CI after <PromoteMain/>. Report a block still open one hour after acknowledgement, with the changed facts. |
 | `note` (priority 0) | A unit's whole plan finished and merged; before/after shots ready for the user's review. |
 
 Never sent: dailies, ETAs, routine merges, green CI, flakes rerun, and hardware

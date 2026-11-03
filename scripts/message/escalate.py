@@ -37,6 +37,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "production"))
 from scripts.lib.process_failure import failure_detail
 from scripts.production.showrunners import load_settings
 from scripts.production import staff
+from scripts.message import send_budget
 if TYPE_CHECKING:
     from ..whoami.agent_accounts import (KnownCodexAccount, UnknownCodexAccount, StoredCodexAccount,
                                         codex_account, workers_home)
@@ -467,7 +468,7 @@ def deliver(held: HeldMessage, key: str) -> str:
     command = [sys.executable, str(SEND), "--to", "user", "--from", JOB, "--key", user_key(key), "--summary", held.summary,
                "--need", held.need, *clearing, *action_args, "--text", held.text]
     done = subprocess.run(command, capture_output=True, text=True, check=False,
-                          timeout=review.user_send_seconds() + 15)
+                          timeout=send_budget.user_seconds(review.user_send_seconds()))
     return "" if done.returncode == 0 else " ".join((done.stdout or done.stderr).split()) or f"exit {done.returncode}"
 
 
@@ -484,7 +485,7 @@ def forward_review_hold(held: HeldMessage, reason: str, entry_key: str) -> list[
             done = subprocess.run([sys.executable, str(SEND), "--to", relay["recipient"], "--from", JOB,
                                    "--key", relay["key"], "--summary", "Relayed push needs revision",
                                    "--text", f"Your relayed push {held.summary!r} was not sent. {reason} Revise and resend it."],
-                                  capture_output=True, text=True, check=False, timeout=40)
+                                  capture_output=True, text=True, check=False, timeout=send_budget.seconds())
             if done.returncode not in (0, 1):
                 errors.append(f"{relay['recipient']}: {failure_detail(done)}")
         except (OSError, subprocess.TimeoutExpired) as error:

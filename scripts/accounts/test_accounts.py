@@ -43,7 +43,7 @@ from scripts.lib import atomic_file, conf
 from scripts.production import showrunners
 from scripts.shutdown import remote
 from scripts.agents import codex_mesh
-from scripts.message import roster
+from scripts.message import roster, sessions
 from scripts.accounts import moves, worker_names
 from scripts.whoami import account, note_file
 from scripts.whoami import agent_accounts
@@ -6884,7 +6884,7 @@ finally:
                 ])
 
     def test_workers_swap_uses_saved_launcher_session_name_when_roster_cannot_name_it(self) -> None:
-        records = self.home / ".claude/sessions"
+        records = sessions.sessions_dir()
         records.mkdir(parents=True, exist_ok=True)
         _ = (records / "321.json").write_text(json.dumps({
             "pid": 321, "sessionId": "launching-director", "name": "saved launching director",
@@ -6925,7 +6925,7 @@ finally:
                     self.assertEqual(self.role_files(), before)
 
     def test_workers_swap_uses_saved_holder_name_when_roster_cannot_list_it(self) -> None:
-        records = self.home / ".claude/sessions"
+        records = sessions.sessions_dir()
         records.mkdir(parents=True, exist_ok=True)
         _ = (records / "321.json").write_text(json.dumps({
             "pid": 321, "sessionId": "missing-holder", "name": "saved director",

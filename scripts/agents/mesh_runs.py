@@ -68,6 +68,7 @@ from scripts.agents import codex_mesh
 from scripts.buildlog import treekey
 from scripts.lib import conf, unit_runs
 from scripts.message import repeat_guard
+from scripts.message import send_budget
 
 # Exit status of `start` when the caller is not a mesh worker: run the command attached.
 NOT_A_MESH_WORKER = 3
@@ -93,7 +94,6 @@ ORPHAN_VERDICT = ("FAIL (no exit status): the run's supervisor process is gone, 
 # Where run folders and their active markers live; tests point this at a temporary folder.
 RUN_ROOTS: tuple[Path, ...] = unit_runs.run_roots()
 SEND_SCRIPT = codex_mesh.SEND_SCRIPT
-SEND_TIMEOUT_SECS = 120
 FORWARDED_SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
 # On natedev the command runs in a scope in builds.slice, beside the steps scripts/lint/invoke.sh
 # places there, so its compiles take the builds' memory limit and CPU weight, below the sessions.
@@ -452,7 +452,7 @@ def send_to_director(session_id: str, summary: str, text: str) -> bool:
         sent = subprocess.run(
             [sys.executable, str(SEND_SCRIPT), "--to", f"session:{session_id}", "--from", "mesh-runs",
              "--summary", summary, "--text", text],
-            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=SEND_TIMEOUT_SECS, check=False,
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=send_budget.seconds(), check=False,
         )
     except (OSError, subprocess.SubprocessError) as exc:
         print(f"mesh_runs: could not tell session {session_id}: {exc}", file=sys.stderr)

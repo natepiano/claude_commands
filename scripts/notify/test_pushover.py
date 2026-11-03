@@ -364,6 +364,11 @@ class PushoverTests(unittest.TestCase):
         self.assertEqual((code, form), (2, {}))
         self.assert_log("2", "title", "body", "refused before sending: priority 2 requires --action")
 
+    def test_normal_priority_decision_still_requires_an_action(self) -> None:
+        code, form = self.run_send(["--priority", "1", "--no-action", "title", "body"])
+        self.assertEqual((code, form), (2, {}))
+        self.assert_log("0", "title", "body", "refused before sending: priority 1 requires --action")
+
     def test_cut_keeps_the_action_line_and_cuts_only_the_body(self) -> None:
         body = "B" * (pushover.MESSAGE_MAX + 20)
         _, form = self.run_send(["--action", "restart the service", "title", body])
@@ -468,7 +473,7 @@ class PushoverTests(unittest.TestCase):
         self.assert_footer(sent[0], "hana", "auto_mode.refused")
 
     def draft(self, *, answerable: bool = False) -> review.Draft:
-        return review.Draft("writer", "1", "Build stopped", ActionRequired("Choose in the natedev terminal."),
+        return review.Draft("writer", "0", "Build stopped", ActionRequired("Choose in the natedev terminal."),
                             "Choose whether to retry the build.", answerable)
 
     def arguments(self, *, answerable: bool = False) -> list[str]:
@@ -491,7 +496,7 @@ class PushoverTests(unittest.TestCase):
         read.assert_called_once_with(draft, revision=False)
         self.assertEqual(form["title"], [version.title])
         self.assertEqual(form["message"], [footed(first_line(version.action) + "\n" + version.body, draft.source)])
-        self.assertEqual(form["priority"], ["1"])
+        self.assertEqual(form["priority"], ["0"])
         self.assertIn("pushover: sent as rewritten:\n" + version.title + "\n" +
                       first_line(version.action) + "\n" + version.body + "\n", output.getvalue())
         self.assertEqual(self.reviews()[0]["verdict"], "rewrite")

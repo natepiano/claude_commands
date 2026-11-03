@@ -499,9 +499,6 @@ class InventoryTests(ShutdownTestCase):
         _notifier_context: object = self.enterContext(
             patch.object(showrunners, "NOTIFIER_STATE_DIR", self.notifier)
         )
-        _sessions_context: object = self.enterContext(
-            patch.object(showrunners, "SESSIONS_DIR", self.records)
-        )
         _live_context: object = self.enterContext(
             patch.object(sessions, "live_session", return_value=True)
         )
