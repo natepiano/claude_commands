@@ -177,6 +177,15 @@ class Unit(NamedTuple):
     owns: tuple[str, ...]
 
 
+class OtherUnit(NamedTuple):
+    name: str
+    plan: Path
+    branch: str
+    owns: tuple[str, ...]
+    cells: dict[str, str]
+    member: staff_sources.MemberFound | staff_sources.NoSuchMember
+
+
 class MergeRequest(NamedTuple):
     production: Production
     unit: Unit
@@ -189,7 +198,7 @@ class MergeRequest(NamedTuple):
     merge_tests: tuple[tuple[str, ...], ...]
     flakes: frozenset[str]
     flaky_tests: frozenset[str]
-    units: tuple[Unit, ...]
+    units: tuple[Unit | OtherUnit, ...]
     lines: tuple[str, ...]
     scratch: Path
     trailer: tuple[str, ...]
@@ -275,11 +284,9 @@ def listed_names(lines: list[str], field: str) -> frozenset[str]:
 
 
 def parse_units(lines: list[str], production: Production, record: staff.StaffSnapshot,
-                requested_unit: str) -> tuple[Unit, ...]:
-    result: list[Unit] = []
+                requested_unit: str) -> tuple[Unit | OtherUnit, ...]:
+    result: list[Unit | OtherUnit] = []
     for cells in unit_table(lines):
-        if cell_value(cells.get("Unit", "")) != requested_unit:
-            continue
         if not all(heading in cells for heading in ("Unit", "Branch", "Owns")):
             continue
         plan = Path(cell_value(cells.get("Plan", "")).split(" ", 1)[0])
@@ -299,9 +306,13 @@ def parse_units(lines: list[str], production: Production, record: staff.StaffSna
             owns = tuple(owned)
         else:
             owns = tuple(part.strip() for part in plain.split(",") if part.strip())
-        result.append(Unit(cell_value(cells["Unit"]), plan,
-                           unit_lookup.plan_worktree(cells, staff_sources.member(
-                               staff_sources.UnitMember(production.slug, cell_value(cells["Unit"])), record)), cell_value(cells["Branch"]), owns))
+        name = cell_value(cells["Unit"])
+        member = staff_sources.member(staff_sources.UnitMember(production.slug, name), record)
+        branch = cell_value(cells["Branch"])
+        if name == requested_unit:
+            result.append(Unit(name, plan, unit_lookup.plan_worktree(cells, member), branch, owns))
+        else:
+            result.append(OtherUnit(name, plan, branch, owns, cells, member))
     return tuple(result)
 
 
@@ -358,7 +369,7 @@ def request_from(args: argparse.Namespace) -> MergeRequest:
     lines = production.doc.read_text(encoding="utf-8").splitlines()
     name = cast(str, args.unit)
     units = parse_units(lines, production, staff.snapshot(), name)
-    unit = next((candidate for candidate in units if candidate.name == name), None)
+    unit = next((candidate for candidate in units if isinstance(candidate, Unit) and candidate.name == name), None)
     if unit is None:
         raise Refusal(f"unit {name} not in production doc")
     push_field = production_doc.optional_field(lines, "Push")
@@ -677,8 +688,13 @@ def other_units(request: MergeRequest, paths: tuple[str, ...]) -> None:
         diff = git(request.production.checkout, "diff", "--name-only",
                    f"{request.production.merge_branch}...{unit.branch}")
         branch_paths: set[str] = set(diff.stdout.splitlines()) if diff.returncode == 0 else set()
-        status = git(unit.worktree, "status", "--short")
-        worktree_paths = {line[3:] for line in status.stdout.splitlines() if len(line) >= 4}
+        worktree_paths: set[str] = set()
+        try:
+            worktree = unit.worktree if isinstance(unit, Unit) else unit_lookup.plan_worktree(unit.cells, unit.member)
+            status = git(worktree, "status", "--short")
+            worktree_paths = {line[3:] for line in status.stdout.splitlines() if len(line) >= 4}
+        except (staff.StaffUnreadable, staff.StaffRefused) as error:
+            report("other units", "unavailable", f"{unit.name}: {error}")
         overlap = sorted(set(paths) & (branch_paths | worktree_paths))
         report("other units", "ok", f"{unit.name}: {', '.join(overlap) if overlap else 'no overlap'}")
     if len(request.units) == 1:

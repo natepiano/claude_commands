@@ -8,7 +8,7 @@ import os
 import sqlite3
 import tempfile
 import unittest
-from contextlib import closing, redirect_stdout
+from contextlib import AbstractContextManager, closing, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import cast, final, override
@@ -16,6 +16,9 @@ from unittest import mock
 
 from scripts.usage import collect, usage_report, waste_watch
 from scripts.production import showrunners
+from scripts.production.staff_test_support import (
+    fixture_unit_location, isolated_source_readers, isolated_staff_file, recorded_showrunner, source_environment,
+)
 from scripts.usage.test_collect import FAILING_WATCH, CollectorFixture
 
 
@@ -61,8 +64,14 @@ class WasteWatchTests(unittest.TestCase):
         showrunner_doc = self.root / "elsewhere/watch-production.md"
         showrunner_doc.parent.mkdir()
         _ = showrunner_doc.write_text(
-            "# Watch\n\n## Units\n\n| Unit | Worktree |\n| --- | --- |\n"
-            + f"| alpha | `{self.worktree}` |\n", encoding="utf-8")
+            "# Watch\n\n## Units\n\n| Unit | Worktree | Plan |\n| --- | --- | --- |\n"
+            + f"| alpha | `{self.worktree}` | docs/alpha.md |\n", encoding="utf-8")
+        environment = source_environment(self.root / "staff-sources")
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", environment))
+        _ = self.enterContext(cast(AbstractContextManager[object], mock.patch.dict(os.environ, environment)))
+        _ = self.enterContext(isolated_source_readers())
+        owner = recorded_showrunner("watch", showrunner_doc)
+        _ = fixture_unit_location(owner, "alpha", self.worktree)
         self.lookup = waste_watch.ShowrunnersFound((waste_watch.Showrunner(
             "watch", ADDRESS, usage_report.document_units(showrunner_doc)),))
         self.lookups = 0
@@ -292,6 +301,15 @@ class WasteWatchTests(unittest.TestCase):
 
 @final
 class CollectorWatchTests(CollectorFixture):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        environment = source_environment(self.root / "staff-sources")
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", environment))
+        _ = self.enterContext(cast(AbstractContextManager[object], mock.patch.dict(os.environ, environment)))
+        _ = self.enterContext(isolated_source_readers())
+        _ = (self.root / "staff.json").write_text('{"schema": 2, "rows": []}\n')
+
     def test_a_good_pass_runs_the_watch_with_its_store_and_production_docs(self) -> None:
         result = self.cli_with_watch('import sys\nprint("watched", *sys.argv[1:])\n'
                                      + 'print("watch note", file=sys.stderr)\n')

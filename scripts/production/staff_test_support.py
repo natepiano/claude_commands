@@ -157,6 +157,14 @@ def recorded_showrunner(name: str, doc: Path, parent: str = "") -> staff.StaffRo
     return staff.set_doc(row.id, staff.LiveDoc("natedev", doc))
 
 
+def fixture_unit_location(owner: staff.StaffRow, unit: str, location: Path) -> staff.StaffRow:
+    """Record a canonical unit and its explicit local location without changing files."""
+    from scripts.production import unit_names
+
+    row = fixture_member("unit", name=unit_names.name(unit), parent=owner.id)
+    return staff.set_worktree(row.id, staff.PresentWorktree("natedev", location), expected=row.worktree)
+
+
 def recorded_unit(showrunner: str, unit: str, worktree: Path, doc: Path, *,
                   plan: str = "standby") -> staff.StaffRow:
     """Record private unit locations and configuration through the shared fixture writers."""

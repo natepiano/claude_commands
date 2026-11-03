@@ -14,6 +14,7 @@ from typing import cast, override
 from scripts.direct import verify_lint_scope_test_support as support
 from scripts.direct import assertion_guard_test_support as guard_support
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.production.staff_test_support import isolated_staff_file
 
 
 class VerifyLintGuardKeyTests(support.VerifyLintScopeFixture):
@@ -363,7 +364,8 @@ run_once cargo nextest run -E "package(sample) & test(native_rate)"
         registry.repo = self.root
         registry.notifier_dir = self.root / "notifier"
         registry.notifier_dir.mkdir()
-        _ = registry.register_production("builds", branch="feature")
+        with isolated_staff_file(self.root / "staff.json", self.environment):
+            _ = registry.register_production("builds", branch="feature")
         self.environment["NOTIFIER_STATE_DIR"] = str(registry.notifier_dir)
         self.cache_passing_lint()
 
