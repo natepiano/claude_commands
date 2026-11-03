@@ -1281,20 +1281,42 @@ The Phase 26 checkpoint did not name two narrowed assertions; this phase's check
 
 ### Phase 45 — Hanas and the folder audit read their settings through the one config reader  · status: done
 
-**Approved:** the user via morty and the builds showrunner, 2026-11-02 ~21:00 EST: "Resume resources-unit's configuration work to replace hard-coded settings. Preserve existing values unless nate approves a value change."
+#### As-built
+
+- Hard-coded settings in this unit's files (108) are config keys read through `scripts/lib/conf.py` at use, with their old values: `hanas.conf`, `lint.conf`, `production.conf`, new `hana_shot.conf` and `scratch.conf`. `config/README.md` lists each key.
+- One key per value: `sweep.py` takes state and build-log folders from `tmp_sweep.state_dir()` and `buildlog/store.root()`; `tmp_sweep.wide_idle_seconds()` and the folder audit share `folder_remove_after_seconds`; the audit walks with `scratch.conf` `repo_skip` and keeps the configured `visible_root`; `smoke_launch.sh` reads `hana_shot.conf` `refused_port` and `host`; `mac_run.sh` reads `mac_test.conf` `connect_timeout_s`, rounded up for ssh; holder messages use the first `sweep_message_path_widths` entry; `hold_floor(floor, dry_run)` reads roots and lock from config.
+- Hot paths read each setting once per call (scratch repository scan, `Brp` instance, Hana polls, folder scans, dep-info scan).
+- Standalone `hana_shot.py` loads its libraries without `PYTHONPATH`. A config read failure in `scratch.holds()` keeps an active hold. `mac_run.sh` gives `scp` the raw remote path and `ssh` the quoted one.
+- Tests use `CONF_DIR`; `memory_test_support.write_config_fixture` keeps existing keys and adds the given ones.
+
+**Files:**
+- `scripts/hanas/hanas.py`, `scripts/lint/folder_audit.py`, `scripts/lint/sweep.py`, `scripts/lint/tmp_sweep.py`, `scripts/lib/scratch.py`, `scripts/hana_shot/hana_shot.py`, `scripts/production/mac_run.sh`, `scripts/production/smoke_launch.sh` — config reads.
+- `config/*.conf`, `config/README.md`, `docs/as-built/build-memory-admission.md`, `build-targets.md`, `hana-test-windows.md` — keys and docs.
+- Their tests, plus fixture fixes in `test_verify_mac_fallback.py`, `test_offload.py`, `test_linux_runner.py` and merge repairs in `test_build_why.py`, `test_queue_card.py`, `test_merge_gate_suites_resources.py`.
+
+**Gotchas:** a test fixture that writes a partial `.conf` must start from the full template; `write_config_fixture` merges. A shell-quoted path is wrong for `scp`'s SFTP destination. `mac_test` allows fractional seconds but ssh `ConnectTimeout` needs a whole number.
+
+**Ruled out:** value changes (none without the user); `conf.read` (devtools 4r not landed); edits to `memory_admit.py` (queue-unit's; it keeps its own `LINT_SWEEP_STATE_DIR` default).
+
+### Phase 46 — Each shared config key has a test that proves its reader uses it  · status: todo
+
+**Approved:** the builds showrunner, 2026-11-02 23:55 EST: put the six regression tests in the next phase as a current follow-up. They are part of the configuration work the user released.
+
+**Depends on:** Phase 45.
 
 #### Work Order
 
-**Goal:** Every setting in this unit's files comes from config through `scripts/lib/conf.py`. No value changes.
+**Goal:** Each of the six shared-key reads from Phase 45 has a regression test that fails without the read. No source or config change.
 
-**Spec:**
+**Spec:** one test per read. Each test sets a value in its own `CONF_DIR` that differs from the default:
 
-1. `scripts/hanas/hanas.py` `read_config` reads `config/hanas.conf` through `conf.py` (`conf.number`/`conf.whole`/`conf.words`, or `conf.read(file)` if devtools Phase 4r is on main first). The `scripts.lint.config_values` call and the `HANAS_CONFIG` path override go; `CONF_DIR` selects another config folder.
-2. `scripts/lint/folder_audit.py` `ClonePolicy` reads `hanas.conf` `clone_max_hours` and `mac_test.conf` `free_floor_gib` through `conf.py`. The `HANAS_CONFIG`/`MAC_TEST_CONFIG` overrides go. `REMOVE_AFTER_SECONDS`, `DEFAULT_STATE_DIR` and any other tunable in the file move to config with their current values. `rust_roots.txt` stays a list file.
-3. Any other hard-coded tunable in a file this unit owns (scripts/hanas, scripts/lint/folder_audit.py, scripts/lint/sweep.py, scripts/lib/scratch.py, Test Hana and clone code from Phases 43-44) moves to its config file with the same value. scripts/lint/memory_admit.py is queue-unit's: do not edit it. List each moved setting (file, name, value, new key).
-4. A new key goes in the file's `.conf` with its current value and a one-line comment, and in `config/README.md` where that file lists its keys.
-5. Tests set `CONF_DIR` to a temporary folder with the needed `.conf` files, not `HANAS_CONFIG` or `MAC_TEST_CONFIG`. No test writes a fixed value that config owns; it reads it or sets it in its own temporary config.
+1. `scripts/lint/tmp_sweep.py` `wide_idle_seconds()` uses `lint.conf` `folder_remove_after_seconds`.
+2. `scripts/lint/folder_audit.py` keeps the configured `scratch.conf` `visible_root` under the Rust folder.
+3. `scripts/lint/folder_audit.py` skips the names in `scratch.conf` `repo_skip`.
+4. `scripts/production/smoke_launch.sh` uses `hana_shot.conf` `refused_port` and `host`.
+5. `scripts/production/mac_run.sh` uses `mac_test.conf` `connect_timeout_s` and rounds a fraction up.
+6. `scripts/lint/sweep.py` holder messages use the first `lint.conf` `sweep_message_path_widths` entry.
 
-**Acceptance:** `scripts/hanas` tests, `scripts/lint/test_folder_audit.py`, `test_sweep.py`, `scripts/lib/test_scratch.py`, `test_conf.py` and basedpyright on changed Python files pass; `git grep -n 'HANAS_CONFIG\|MAC_TEST_CONFIG\|config_values' -- scripts/hanas scripts/lint/folder_audit.py` is empty; every value in the moved-settings list equals its old value.
+**Acceptance:** each new test fails when its read goes back to the old fixed value; `test_tmp_sweep`, `test_folder_audit`, `test_mac_run`, `test_sweep` and basedpyright on the changed test files pass.
 
-**Workers:** `1 writer + 1 tester` — `sweep-impl` writes the source, conf and docs; `sweep-test` writes the tests.
+**Workers:** `1 tester` — `sweep-test`.
