@@ -1380,6 +1380,46 @@ class RepositoryTest(unittest.TestCase):
         self.assertEqual(len(refused), 1)
         self.assertIn("checkpoint(u): grid: no Change-Review line", refused[0])
 
+    def test_incoming_merge_trailers_refuse_but_reviewed_history_stays_excluded(self) -> None:
+        _ = self.commit("a.py", "plain change")
+        _ = self.git("checkout", "-qb", "side")
+        _ = self.commit("b.md", "side change")
+        _ = self.git("checkout", "-q", "unit")
+        for trailer in (SEE, change_review.COVERS + ": malformed"):
+            _ = self.git("merge", "-q", "--no-ff", "-m", "Merge side\n\n" + trailer, "side")
+            with self.assertRaisesRegex(change_review.ChangeReviewError, "Put the lines on a plain commit after the merge"):
+                _ = change_review.unit_commits(self.repo, "HEAD", self.previous, "merge")
+            _ = self.git("reset", "--hard", "HEAD^1")
+        _ = self.git("merge", "-q", "--no-ff", "-m", "Merge side\n\n" + SEE, "side")
+        merged = self.git("rev-parse", "HEAD")
+        _ = self.git("update-ref", "refs/remotes/origin/merge", merged)
+        plain = self.commit("repair.py", "checkpoint(u): repair\n\n" + SEE)
+        self.assertEqual([commit.sha for commit in change_review.unit_commits(self.repo, plain, self.previous, "merge")], [plain])
+
+    def test_incoming_merge_with_a_none_line_is_left_out(self) -> None:
+        plain = self.commit("a.py", "plain change")
+        _ = self.git("checkout", "-qb", "side")
+        side = self.commit("b.md", "side change")
+        _ = self.git("checkout", "-q", "unit")
+        _ = self.git("merge", "-q", "--no-ff", "-m", "checkpoint(u): merge",
+                     "-m", "Change-Review: none — merge only", "side")
+        commits = change_review.unit_commits(self.repo, "HEAD", self.previous, "merge")
+        self.assertEqual({commit.sha for commit in commits}, {plain, side})
+
+    def test_drift_leaves_out_a_visible_merge_line_but_keeps_a_plain_checkpoint(self) -> None:
+        _ = self.commit("a.py", "plain change")
+        _ = self.git("checkout", "-qb", "side")
+        _ = self.commit("b.md", "side change")
+        _ = self.git("checkout", "-q", "unit")
+        _ = self.git("merge", "-q", "--no-ff", "-m", "checkpoint(u): merge\n\n" + SEE, "side")
+        _ = self.merged("unit", "Merge unit")
+        self.assertEqual(change_review.drift(self.repo, "merge", LIST, "2026-10-01"), [])
+        _ = self.git("checkout", "-q", "unit")
+        _ = self.commit("c.py", "checkpoint(u): grid\n\n" + SEE)
+        short = self.merged("unit", "Merge grid")
+        self.assertEqual(change_review.drift(self.repo, "merge", LIST, "2026-10-01"),
+                         [f"{short}: 1 visible change(s) and no row in the list"])
+
     def test_a_later_checkpoint_covers_one_pushed_without_its_line(self) -> None:
         early = self.commit("a.py", "checkpoint(u): grid")
         self.assertEqual(len(change_review.missing(change_review.unit_commits(self.repo, "HEAD", self.previous, "merge"))), 1)

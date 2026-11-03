@@ -284,6 +284,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
         result = self.run_gate(checkpoint=checkpoint)
         self.assert_refused_before_gate(result)
         self.assertIn("checkpoint(fixture): grid fades: no Change-Review line", result.stderr)
+        self.assertIn(change_review.HELD_NEXT_STEP, result.stderr)
 
     def test_a_green_merge_adds_one_row_per_visible_change_to_the_named_list(self) -> None:
         review, doc = self.review_list()

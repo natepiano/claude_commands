@@ -23,9 +23,9 @@ the session (a terminal, a showrunner session, a unit session or any Claude sess
 shield`. A line with another number of parts, or an empty part, is refused. `Change-Review: none —
 <why nothing visible changes>` names a change the user cannot see. A checkpoint that changes only
 Markdown needs none. A later checkpoint covers a pushed checkpoint that missed its line. It carries
-the lines and `Change-Review-Covers: <hash>`. The later checkpoint must be a plain commit because
-the merge gate does not read merge commits. The merge gate refuses a unit's checkpoint without its
-line, then adds one row per visible line under the list's "## To review":
+the lines and `Change-Review-Covers: <hash>`. The later checkpoint must be a plain commit, not a merge:
+a merge may carry only `Change-Review: none` lines. The merge gate refuses a unit's checkpoint without
+its line, then adds one row per visible line under the list's "## To review":
 the next C number, the push date and the merged hash, the How to check cell `<how to try it> You
 see: <what you see>`, and "not yet" when the table has an "On the Mac build" column. `add` writes one
 row for a change no checkpoint line carries; `edit` rewrites one row still to review in place and keeps
@@ -95,6 +95,9 @@ from scripts.shutdown import remote
 
 TRAILER = "Change-Review"
 COVERS = f"{TRAILER}-Covers"
+HELD_NEXT_STEP = (f"commit a checkpoint (a plain commit, not a merge: a merge may carry only `{TRAILER}: none` lines) "
+                  + f"whose {TRAILER} lines describe the change and that names each "
+                  + f"listed commit in a `{COVERS}: <hash>` line, push it, and send its hash")
 LIST_HEADER = "- **Change review:**"
 SECTION = "## To review"
 REVIEWED = "## Reviewed"
@@ -221,6 +224,15 @@ def problem(subject: str, message: str, files: tuple[str, ...]) -> str:
     return ""
 
 
+def merge_review_problem(message: str, *, is_merge: bool) -> str:
+    """Merge messages allow only review lines that parse as Invisible."""
+    if is_merge and (any(not isinstance(item, Invisible) for item in entries(message))
+                     or re.search(rf"^{COVERS}:", message, re.MULTILINE)):
+        return (f"Merge commits cannot carry visible {TRAILER} or {COVERS} lines. "
+                + "Put the lines on a plain commit after the merge")
+    return ""
+
+
 def _git(repo: Path, *arguments: str) -> str:
     result = subprocess.run(["git", "-C", str(repo), *arguments], capture_output=True, text=True, check=False)
     if result.returncode:
@@ -271,10 +283,19 @@ def unit_commits(repo: Path, checkpoint: str, previous: str, merge_branch: str,
                  productions: Callable[[], Iterable[Path]] = registered_productions) -> list[Commit]:
     """The unit's commits, excluding origin merge branches that already write review rows."""
     excluded = list(dict.fromkeys([f"origin/{merge_branch}", *reviewed_merge_refs(repo, productions)]))
-    records = _git(repo, "log", "--no-merges", "--format=%H %ct", checkpoint, f"^{previous}",
-                   *(f"^{ref}" for ref in excluded), "--").splitlines()
-    return [Commit(sha, *_described(repo, sha)) for sha, stamp in (record.split() for record in records)
-            if int(stamp) >= checked_from]
+    records = _git(repo, "log", "-z", "--format=%H %ct %P%n%B", checkpoint, f"^{previous}",
+                   *(f"^{ref}" for ref in excluded), "--").split("\0")
+    commits: list[Commit] = []
+    for record in filter(str.strip, records):
+        header, message = record.split("\n", 1)
+        sha, stamp, *parents = header.split()
+        if int(stamp) < checked_from:
+            continue
+        if len(parents) < 2:
+            commits.append(Commit(sha, message.partition("\n")[0], message, _files(repo, sha)))
+        elif reason := merge_review_problem(message, is_merge=True):
+            raise ChangeReviewError(f"{sha[:SHORT]}: {reason}. Make the merge again without the lines")
+    return commits
 
 
 def missing(commits: list[Commit]) -> list[str]:
@@ -1456,8 +1477,11 @@ def _changes(text: str) -> set[str]:
 
 def _described(repo: Path, sha: str) -> tuple[str, str, tuple[str, ...]]:
     message = _git(repo, "show", "-s", "--format=%B", sha)
-    files = tuple(_git(repo, "diff-tree", "--no-commit-id", "--name-only", "-r", sha).split())
-    return message.split("\n", 1)[0], message, files
+    return message.partition("\n")[0], message, _files(repo, sha)
+
+
+def _files(repo: Path, sha: str) -> tuple[str, ...]:
+    return tuple(_git(repo, "diff-tree", "--no-commit-id", "--name-only", "-r", sha).split())
 
 
 class CommandLine(argparse.Namespace):

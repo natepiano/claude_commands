@@ -1415,7 +1415,7 @@ def _nearest_remote_base(repo: Path) -> str:
     raise GuardError("cannot determine branch base; set VERIFY_ASSERTION_BASE (or --base)")
 
 
-def _pending_merge_bases(repo: Path) -> tuple[str, ...]:
+def pending_merge_bases(repo: Path) -> tuple[str, ...]:
     merge_head = repo / git(repo, "rev-parse", "--git-path", "MERGE_HEAD").strip()
     try:
         merging = merge_head.read_text(encoding="ascii").splitlines()
@@ -1449,7 +1449,7 @@ def commit_bases(repo: Path, selected_bases: tuple[str, ...] = ("HEAD",), *,
                          f"{base}..{head or 'HEAD'}").splitlines():
             parents.update(dict.fromkeys(merge.split()[2:]))
     if staged:
-        parents.update(dict.fromkeys(_pending_merge_bases(repo)))
+        parents.update(dict.fromkeys(pending_merge_bases(repo)))
     candidates = list(dict.fromkeys([*bases, *parents]))
     independent = set(git(repo, "merge-base", "--independent", *candidates).split())
     if selected_bases:
@@ -1819,6 +1819,17 @@ def run(arguments: list[str]) -> int:
                          for base in bases)
     rulings = read_rulings(args.rulings, messages)
     blocking = 0
+    for (path, test), why in list(rulings.items()):
+        if test.endswith("*"):
+            matches = {(finding.source.path, finding.test) for finding in shared
+                       if finding.kind == "test removed" and finding.source.path == path
+                       and finding.test.startswith(test[:-1])}
+            del rulings[path, test]
+            if not matches:
+                print(f"Assertion-Change: {path}::{test} — {why} — matched no removed test")
+                blocking += 1
+            for key in matches:
+                _ = rulings.setdefault(key, why)
     for finding in aggregate_test_removals(shared):
         why = rulings.get((finding.source.path, finding.test), "")
         prefix = "note: " if finding.kind == "changed" else ""

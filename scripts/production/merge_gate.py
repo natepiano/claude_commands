@@ -1367,7 +1367,8 @@ def merge_checkpoint(args: GateArguments) -> int:
     except change_review.ChangeReviewError as error:
         raise GateRefused(str(error)) from error
     if refused := change_review.missing(commits):
-        raise GateRefused("checkpoint commits without a Change-Review line: " + "; ".join(refused))
+        raise GateRefused(f"checkpoint commits without a {change_review.TRAILER} line: "
+                          + "; ".join(refused) + "; " + change_review.HELD_NEXT_STEP)
     changes: list[change_review.PublicationChange] = []
     if review_list is not None:
         try:
