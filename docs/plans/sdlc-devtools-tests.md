@@ -629,31 +629,17 @@ Remaining gaps include shell command positions, executable Python aliases, and s
 
 ### Phase 4o — A unit folder moves at an open phase  · status: done
 
-Source: the user via morty and sdlc, 2026-11-02 18:4x. herdr-unit agreed 18:5x: devtools-unit owns `scripts/production/unit_move.py` and its tests for this phase; herdr-unit's 4g later extends `test_unit_move.py`.
+#### As-built
 
-#### Work Order
+- `unit_move.py move-folder --unit <staff id> --to <path>` moves a unit folder while its phase is open. It stops the unit's own processes through the shutdown path: its Claude session, its run's codex app-server and watch shell, and its workers.
+- The move record keeps each session's and worker's prior state (`sessions`, `FolderWorker` with its original cwd). After the move, only what was running resumes; each worker resumes on its same thread in its own cwd.
+- A rerun recovers a worker whose resume launcher died (`_recover_worker_claim`, proved by start time and exact argv), refuses a running worker with no proved live launcher (`_worker_launcher_live`), and accepts a worker that finished.
+- Any other process inside the folder refuses the move before any session stops or any file changes.
+- Tests: `test_unit_move.py` (running and paused unit, running and paused worker, foreign process with and without an open phase, dead launcher rerun, finished worker).
 
-**Goal:** `unit_move.py move-folder` moves a unit's folder while a run phase is open, and every session returns to the state it had before the move.
+**Gotchas:** `unit_move` imports bare `pane_record`; a test patches both `pane_record` module objects.
 
-**Spec:**
-1. `_folder_boundary` (`unit_move.py:693`) no longer refuses an open phase. At an open phase, `move-folder` stops the unit session and pauses the run's Codex workers through the shutdown path (`scripts/agents/codex_mesh.py` pause, `scripts/shutdown/`). It then moves the folder and updates the staff row, the launch folder and the run record.
-2. Before the stop, record each session's prior state: running or paused. After the move, resume only the sessions that were running. A paused unit and paused workers stay paused. Each worker keeps its thread.
-3. The unit's own processes (its session, its run's Codex host and watch shell, its workers) are allowed. Any other process inside the folder still refuses, as now.
-4. A rerun after a full move prints `unchanged` and exits 0. A rerun after an interrupted move finishes the remaining steps.
-
-**Files:**
-- `scripts/production/unit_move.py` — the open-phase move and the prior-state restore.
-- `scripts/production/test_unit_move.py` — one test for each case in items 1-4.
-
-**Workers:** `1 writer + 1 tester`.
-- `impl2` — `scripts/production/unit_move.py`.
-- `test` — `scripts/production/test_unit_move.py` (after 4k's tests are done).
-
-**State:** each session's prior state, kept in the folder-move record until the move ends.
-
-**Constraints from prior phases:** herdr-unit 4g builds its interruption tests on this phase's `test_unit_move.py`.
-
-**Acceptance gate:** one test each: a running unit resumes, a paused unit stays paused, a running worker resumes on its same thread, a paused worker stays paused (herdr-unit 4o Work Order, 2026-11-02); the existing `test_unit_move.py` tests pass; tests also show: a paused unit stays paused; paused workers stay paused; a process that is not the unit's own refuses; a rerun prints `unchanged` and exits 0. basedpyright 0/0/0 on changed files and every caller module; `test_unit_move.py` green in its own `discover` run; full merged-tree gate green.
+**Ruled out:** refusing every open-phase move — the user (via Morty, 2026-11-02) accepts a stop and resume.
 
 ### Phase 4q — The folder move uses its owners' readers  · status: todo
 
@@ -676,6 +662,8 @@ Source: Phase 4o review (simplify lens), 2026-11-02. Each item removes a copy th
 8. `progress_history` exposes one call that returns the run states for a history file; `move_run` (`progress_history.py:499`) and `unit_move.folder_runs` use it.
 9. A worker process that exits between the liveness check and its argument read in `pause_folder_workers`, or just after `Popen` in the resume path, reads as exited; the move goes on. Add a regression test for each read.
 10. Each `codex_mesh` import in `unit_move` comes after the early exits, so a move whose runs have no mesh imports no `codex_mesh`.
+11. Copy removals from the Phase 4o review (sdlc showrunner ruling, 2026-11-02; where two copies differ, keep the owner's rule): the move starts workers through the unit's resume message, as `stop_resume.py:337` and `restart.py:2246` do, and starts no worker itself; one worker resume path keeps the `codex_seats` "was working" rule; one `codex_mesh.pause_run` serves `unit_move` and `rename_unit.py:909`, in place of the `Namespace` call and the subprocess call; `codex_mesh` owns "unpause an idle worker" for a run and its idle workers, and `unit_move` writes no roster status; `has_mesh` comes from the mesh files only; the move record always holds `sessions`, and the legacy branch goes.
+12. For each of these, first find why the code is as it is: two folder scans (`unit_move.py:736, 1237`) — is the second needed?; does `codex_mesh` lock the app-server start, so all workers can start before one wait loop?; does anything read `launcher_command` of a worker that is not running (else list Codex seats only for runs with a running worker)?; why the unlocked first roster read (can all runs be checked under the locks before any write)?; can a run state folder have another name, and who writes it (else read the run's own state file first)? Where the answer shows no behavior difference, make the change. Where a real difference stays, the director files it with /unit:question in plain words and the change waits for the user's answer.
 
 **Files:**
 - `scripts/production/unit_move.py`, `scripts/direct/workers.py`, `scripts/production/rename_unit.py`, `scripts/production/retire_unit.py`, `scripts/agents/codex_mesh.py`, `scripts/lib/resume_message.py`, `scripts/shutdown/inventory.py`, `scripts/direct/progress_history.py`, `scripts/herdr/herdr.py` — source.
