@@ -294,7 +294,7 @@ def collect() -> LaunchCounts:
             counts.update(file_counts)
             unresolved += file_unresolved
             added += count
-        for path in sorted(record.pending_launches_root().glob("*.json")):
+        for path in sorted(record.pending_launch_root().glob("*.json")):
             try:
                 published = record.finish_pending_launch(path)
                 counts[LaunchOutcome.RECORDED] += 1
