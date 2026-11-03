@@ -160,8 +160,9 @@ def move_cwd(unit: str, old: Path, new: Path, record: "staff.StaffSnapshot") -> 
                 owner = record.by_member_reference(entry["session_id"])
                 if owner is None or owner.id != unit:
                     continue
-                if entry["cwd"] not in (str(old), str(new)):
-                    raise ValueError(f"{unit}: retained launch has a different working folder")
+                if entry.get("cwd") not in (str(old), str(new)):
+                    print(f"{unit}: retained launch has a different working folder; skipped", file=sys.stderr)
+                    continue
                 if entry["cwd"] != str(new):
                     entry["cwd"] = str(new)
                     changed = True

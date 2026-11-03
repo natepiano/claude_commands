@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Send the user one Pushover alert: the one way any session reaches their phone.
 
-  pushover.py [--priority 0|1|2] [--due ISO8601] [--source NAME] [--key KEY] (--action TEXT | --no-action) TITLE MESSAGE
+  pushover.py --text-id ID --value KEY=VALUE ... [--due ISO8601] [--source NAME] [--key KEY]
   pushover.py cancel [--source NAME] KEY     stop the emergency push sent with --key KEY
 
 Priority 0 is a normal notification, 1 high (sounds in Pushover's quiet hours),
@@ -19,7 +19,7 @@ user). Nothing here prints them. (user, 2026-10-05) Each LOG_FILE JSON line
 holds the local time, source, priority, posted title and message, and outcome.
 
 Every posted push ends with one line after review: "Sent by: <sender> · Template: <text id>",
-or "Sent by: <sender> · Template: none (free text)" for a push with no --text-id. The
+or "Sent by: <sender> · Template: none (free text)" for a legacy kept push. The
 sender is the source; "send.py in hana" shows as "hana". A long body is cut so that last line
 always fits. A push with no sender is refused and nothing is posted.
 
@@ -28,7 +28,7 @@ not posted: it prints "pushover: kept: silence until ..." and exits 0, and
 `silence.py off` posts it later. A kept push with the same --key from the same
 --source replaces the older kept one.
 
-Messages without --action or --no-action are refused before sending. Exit 0
+New pushes require a registered template before review, credentials, claims, or posting. Exit 0
 sent or kept, 1 Pushover refused it or could not be reached, 2 refused before sending,
 usage, or keys missing; 4 an existing claim is busy, 5 replaced, 6 not sent after failed review. Registry and emergency pushes still send.
 """
@@ -75,7 +75,7 @@ SOURCE_MAX = 80
 # send.py's default_sender: the Claude session that ran send.py follows this prefix.
 SESSION_SOURCE = "send.py in "
 FREE_TEXT = "none (free text)"
-USAGE = "usage: pushover.py [--priority 0|1|2] [--source NAME] [--key KEY] [--answerable] (--action TEXT | --no-action) TITLE MESSAGE"
+USAGE = "usage: pushover.py --text-id ID --value KEY=VALUE ... [--due ISO8601] [--source NAME] [--key KEY]"
 CANCEL_USAGE = "usage: pushover.py cancel [--source NAME] KEY"
 
 
@@ -93,6 +93,7 @@ class Reply(TypedDict, total=False):
 
 
 class ReviewedPushRecord(review.MessageRecord):
+    reviewed: NotRequired[bool]
     held: NotRequired[bool]
     text_id: NotRequired[str]
     failed_rules: NotRequired[list[str]]
@@ -320,9 +321,15 @@ def refuse(source: str, priority: str, title: str, message: str, reason: str) ->
 
 
 def send(argv: list[str], keys_file: Path = KEYS_FILE, post: Post = http_post) -> int:
+    if "--text-id" not in argv:
+        print("pushover: " + push_texts.TEMPLATE_REQUIRED, file=sys.stderr)
+        return 2
     arguments = parse(argv)
     if arguments is None:
         print(USAGE, file=sys.stderr)
+        return 2
+    if not arguments["text_id"]:
+        print("pushover: " + push_texts.TEMPLATE_REQUIRED, file=sys.stderr)
         return 2
     priority = arguments["priority"]
     source = arguments["source"] if arguments["source"] is not None else parent_source()
@@ -388,7 +395,7 @@ def send(argv: list[str], keys_file: Path = KEYS_FILE, post: Post = http_post) -
     send_anyway = rejected and not template_required and (priority == "2" or registered_text)
     if send_anyway:
         detail = "sent despite failed review: " + ", ".join(outcome.failed_rules if isinstance(outcome, (review.Failed, review.Withheld)) else [])
-    record: ReviewedPushRecord = {**review.message_record(version)}
+    record: ReviewedPushRecord = {**review.message_record(version), "reviewed": not isinstance(outcome, review.Unreviewed)}
     if arguments["text_id"]:
         record["text_id"] = arguments["text_id"]
     if rejected:

@@ -22,21 +22,21 @@ description: Read agent message rules and delivery.
 
 Load `/message_style` before the first message to the user in a session.
 
-Message the user with `send.py --to user --summary "<title>" --text "<message>" --action "<what the user does>"`, or `--no-action` when nothing is needed. Action flags go only with `--to user`. `--need decision` and `--need blocked` require `--action`; emergency (`--need blocked`) is only for an action the user must take now because work cannot continue. A `--need blocked` push also takes `--clears-when "<command that exits 0 when fixed>"`, such as `--clears-when github-warm-status`: send.py cancels the push when that command exits 0. Without it, send.py refuses the push (`REFUSED`, exit 2).
+Message the user with `~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py --to user --text-id ID --value KEY=VALUE`. Use `decision.choices` for choices, `alert.blocked` for emergencies, and `nate.adhoc` for notes without an action. Each template supplies its need and action. Emergency pushes also need `--clears-when "<check>"`. A decision uses normal priority unless its explicit-offset `--due` falls inside the configured window. Use a specific registered template when one fits. Run `review.py show ID` for its values. For `decision.choices`, pass `choices` as a JSON list of objects with `label` and `effect`. Also supply `sender`, `title`, `session`, `machine`, `situation`, `recommended_choice`, and `recommendation_reason`.
 
 ### Outcomes and recovery
 
 - `SENT: <how>` (exit 0) means delivered; `SKIPPED: <why>` (exit 0) means acknowledged or inside the repeat window. `QUEUED: <why>` (exit 1) keeps a Claude message for later delivery; it has not arrived.
 - `SENT: to the user, rewritten:` (exit 0) shows exactly what the user received on the following lines.
-- `HELD: not sent, failed review: <rules>` (exit 4): revise and resend. No PushNotification fallback is allowed; this push never goes out on expiry. Emergency blocked pushes and registered script pushes are sent despite review failure, named in `SENT` and the review log.
-- `REPLACED: <why>` (exit 0): a newer version replaced this push, and that version carries the message; nothing was sent. No PushNotification fallback.
-- `REFUSED: <why>` (exit 2): fix the action flags, or add `--clears-when`, as the line says and send again. No PushNotification fallback.
-- `not sent: probe sessions never push to the phone` (exit 0): this session was started with `accounts.py exec --probe`; nothing was sent. No PushNotification fallback.
+- `HELD: not sent, failed review: <rules>` (exit 4): revise and resend. No other phone path is allowed; this push never goes out on expiry. Emergency blocked pushes and registered script pushes are sent despite review failure, named in `SENT` and the review log.
+- `REPLACED: <why>` (exit 0): a newer version replaced this push, and that version carries the message; nothing was sent. Use no other phone path.
+- `REFUSED: <why>` (exit 2): fix the action flags, or add `--clears-when`, as the line says and send again. Use no other phone path.
+- `not sent: probe sessions never push to the phone` (exit 0): this session was started with `accounts.py exec --probe`; nothing was sent. Use no other phone path.
 - `send.py: <name> cannot take messages (<reason>); contact its unit director <director> or wait` (exit 2): a worker between turns is resumed only by its unit director; contact that director or wait. With no director running, the reason says so and has no contact tail.
 - `send.py: <name> cannot take messages (no messaging socket); wait for it to open its messaging socket, then read the roster again and send again` (exit 2): that Claude session has not opened its messaging socket yet; follow the line.
 - `send.py: <name> matches <N> sessions:` (exit 2) lists their addresses; send again with one listed address.
 - `send.py: no roster session has address <address>` (exit 2): the address is stale or its worker is between turns; read the roster again.
-- `FAILED: <why>` (exit 3): for a send to the user, use PushNotification only with the printed `fallback text:` (reviewed, or `--need blocked`). If the line says the push was never reviewed, bring it to the user in your reply or resend once the failure is fixed. Between sessions: no fallback; report the failure.
+- `FAILED: <why>` (exit 3): report the failure. Repair the registered send before another attempt.
 - `send.py: absence of <name> here is not proven; use an address or --machine` (exit 2): this machine's roster had problems, so the other machine was not asked and nothing was sent; send again with an address or `--machine HOST`.
 - With `--machine HOST`, recipient refusals and ambiguous-name errors there return as `FAILED: ssh <host>: <reason>` (exit 3); recover from the reason as for that refusal here.
 - `broadcast: <unit> matches more than one unit director:` (exit 2) lists addresses, including matches across machines; nothing was delivered. Send again with `--of <one listed address>` before `--workers`.

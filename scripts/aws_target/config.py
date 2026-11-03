@@ -1,7 +1,7 @@
 """Require live, validated settings before permitting AWS spending."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
 from pathlib import Path
 from typing import Literal, TypeVar
@@ -200,6 +200,27 @@ def read_control_settings(path: Path | conf.ConfigRead) -> ControlSettings:
 
 
 @dataclass(frozen=True)
+class BudgetNotificationAddress:
+    value: str = field(repr=False)
+
+
+def read_budget_notification_address(path: Path) -> BudgetNotificationAddress:
+    """Read the Budget address from a private file outside the public repository."""
+    key = 'notification_email_file'
+    address_path = Path(_live(conf.read(path), key, str)).expanduser()
+    try:
+        address_path = address_path.resolve()
+        if address_path.is_relative_to(Path(__file__).resolve().parents[2]):
+            raise ValueError(f'{key}: {address_path}: the address file must stay outside the public repository')
+        address = address_path.read_text(encoding='utf-8').strip()
+    except (OSError, UnicodeError, RuntimeError):
+        raise ValueError(f'{key}: {address_path}: cannot read the private address file') from None
+    if not address or '@' not in address or any(character.isspace() for character in address):
+        raise ValueError(f'{key}: {address_path}: expected one address without internal whitespace')
+    return BudgetNotificationAddress(address)
+
+
+@dataclass(frozen=True)
 class DeploymentSettings:
     region: str
     profile: str
@@ -211,7 +232,6 @@ class DeploymentSettings:
     availability_zone: str
     vpc_id: str
     subnet_id: str
-    notification_email: str
     existing_data_volume_id: str
     root_device_name: str
     root_volume_gib: int
@@ -251,9 +271,6 @@ def read_deployment_settings(path: Path) -> DeploymentSettings:
     instance_type = text('instance_type')
     if region not in ('us-east-1', 'us-east-2') or not zone.startswith(region):
         raise ValueError('select a supported region and its availability zone')
-    email = text('notification_email')
-    if '@' not in email or any(character.isspace() for character in email):
-        raise ValueError('notification_email: expected one email address')
     owner = text('ami_owner_id')
     if len(owner) != 12 or not owner.isdecimal():
         raise ValueError('ami_owner_id: expected a twelve-digit account ID')
@@ -273,7 +290,7 @@ def read_deployment_settings(path: Path) -> DeploymentSettings:
         template = path.parent / template
     return DeploymentSettings(region, text('deployment_profile'), text('stack_name'), instance_type,
                               text('ami_id'), owner, text('nixos_release'), zone, text('vpc_id'),
-                              text('subnet_id'), email, settings.values()['existing_data_volume_id'],
+                              text('subnet_id'), settings.values()['existing_data_volume_id'],
                               text('root_device_name'), whole('root_volume_gib'), whole('data_volume_gib'),
                               whole('data_volume_iops'), whole('data_volume_throughput'),
                               positive_money('spot_max_usd_per_hour'), low, high, stop,

@@ -12,6 +12,7 @@ import shlex
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import Mapping, Callable, Generator, Sequence
 from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
@@ -32,8 +33,8 @@ from scripts.shutdown import remote  # noqa: E402
 OWNER_MACHINE = "natedev"
 OPERATION_LOCK_TIMEOUT_SECONDS = 30.0
 StaffId = NewType("StaffId", str)
-Kind = Literal["showrunner", "unit", "worker"]
-_KINDS: tuple[Kind, ...] = ("showrunner", "unit", "worker")
+Kind = Literal["showrunner", "unit", "worker", "agent"]
+_KINDS: tuple[Kind, ...] = ("showrunner", "unit", "worker", "agent")
 def native_id(value: str) -> StaffId:
     """Validate an identity supplied by Claude or Codex, without assigning one."""
     try:
@@ -230,7 +231,7 @@ def _row_locations(kind: str, fields: dict[str, object]) -> tuple[PresentWorktre
     for key in ("worktree", "doc"):
         if key not in fields:
             continue
-        if kind != ("unit" if key == "worktree" else "showrunner"):
+        if kind not in ("agent", "unit" if key == "worktree" else "showrunner"):
             raise StaffUnreadable(f"{kind} cannot hold {key}")
         raw = fields[key]
         if not isinstance(raw, dict):
@@ -518,8 +519,12 @@ class SeedInput:
         return cls(tuple(members), tuple(retire))
 
 
+def _default_file() -> Path:
+    return Path.home() / ".local/state/staff/staff.json"
+
+
 def _file() -> Path:
-    return Path(os.environ.get("STAFF_FILE") or Path.home() / ".local/state/staff/staff.json").expanduser()
+    return Path(os.environ.get("STAFF_FILE") or _default_file()).expanduser()
 
 
 def folder_move_path(unit: StaffId) -> Path:
@@ -535,15 +540,53 @@ def _is_owner() -> bool:
 
 def operation_fds() -> tuple[int, ...]:
     """Descriptors a nested tool must preserve with subprocess pass_fds."""
-    try:
-        return (int(os.environ["STAFF_OPERATION_FD"]),) if _joined_operation(_file().parent / "operation.lock") else ()
-    except (KeyError, ValueError):
-        return ()
+    result: list[int] = []
+    if _joined_operation(_file().parent / "operation.lock"):
+        result.append(int(os.environ["STAFF_OPERATION_FD"]))
+    for variable in os.environ:
+        if variable.startswith("STAFF_ROW_FD_"):
+            path = _file().parent / "rows" / f"{variable.removeprefix('STAFF_ROW_FD_')}.lock"
+            if _joined_operation(path, variable):
+                result.append(int(os.environ[variable]))
+    return tuple(result)
 
 
-def _joined_operation(path: Path) -> bool:
+@contextmanager
+def row_operation(reference: str) -> Generator[None]:
+    """Lock one staff row across lifecycle commands and inherited children."""
+    record = initial_snapshot()
+    row = record.by_member_reference(reference)
+    if row is None:
+        matches = [item for item in record.rows if item.name == reference]
+        row = matches[0] if len(matches) == 1 else None
+    if row is None:
+        yield
+        return
+    variable = "STAFF_ROW_FD_" + str(row.id)
+    path = _file().parent / "rows" / f"{row.id}.lock"
+    if _joined_operation(path, variable):
+        yield
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise StaffRefused(f"{row.name}: another operation holds this row") from error
+        previous = os.environ.get(variable)
+        os.environ[variable] = str(lock.fileno())
+        try:
+            yield
+        finally:
+            if previous is None:
+                _ = os.environ.pop(variable, None)
+            else:
+                os.environ[variable] = previous
+
+
+def _joined_operation(path: Path, variable: str = "STAFF_OPERATION_FD") -> bool:
     try:
-        descriptor = int(os.environ["STAFF_OPERATION_FD"])
+        descriptor = int(os.environ[variable])
         opened, target = os.fstat(descriptor), path.stat()
         if (opened.st_dev, opened.st_ino) != (target.st_dev, target.st_ino):
             return False
@@ -624,7 +667,7 @@ def operation() -> AbstractContextManager[None]:
 
 
 def _parent_kinds(kind: Kind) -> tuple[Kind, ...]:
-    return ("unit", "showrunner") if kind == "worker" else ("showrunner",)
+    return () if kind == "agent" else ("unit", "showrunner") if kind == "worker" else ("showrunner",)
 
 
 def _validate(rows: list[StaffRow]) -> None:
@@ -642,9 +685,9 @@ def _validate(rows: list[StaffRow]) -> None:
         if row.current_session in sessions:
             raise StaffRefused(f"duplicate current session: {row.current_session}")
         sessions.add(row.current_session)
-        if row.kind != "unit" and not isinstance(row.worktree, WorktreeUnfilled):
+        if row.kind not in ("unit", "agent") and not isinstance(row.worktree, WorktreeUnfilled):
             raise StaffRefused(f"{row.kind} cannot hold worktree")
-        if row.kind != "showrunner" and not isinstance(row.doc, DocUnfilled):
+        if row.kind not in ("showrunner", "agent") and not isinstance(row.doc, DocUnfilled):
             raise StaffRefused(f"{row.kind} cannot hold doc")
         if isinstance(row.worktree, PresentWorktree):
             location = (row.worktree.machine, row.worktree.path)
@@ -665,7 +708,7 @@ def _validate(rows: list[StaffRow]) -> None:
         names.add(key)
     for row in rows:
         if row.parent is None:
-            if row.kind != "showrunner":
+            if row.kind not in ("showrunner", "agent"):
                 raise StaffRefused(f"{row.kind} {row.name} requires a parent")
         else:
             parent = indexed.get(row.parent)
@@ -812,8 +855,9 @@ def _row_by_path(rows: Sequence[StaffRow], names: str) -> StaffRow | None:
     parts = names.split("/")
     if not all(parts) or len(parts) > len(_KINDS):
         return None
-    # A showrunner starts its own path even when attached to another showrunner.
-    row = next((row for row in rows if row.kind == "showrunner" and row.name == parts[0]), None)
+    # A root kind starts its own path.
+    roots = [row for row in rows if row.kind in ("showrunner", "agent") and row.name == parts[0]]
+    row = roots[0] if len(roots) == 1 else None
     for name in parts[1:]:
         if row is None:
             return None
@@ -857,6 +901,18 @@ def find(*, kind: Kind | None = None, parent: StaffId | None = None) -> list[Sta
     return snapshot().find(kind=kind, parent=parent)
 
 
+def _under_test_root(path: Path) -> bool:
+    """Identify temporary locations before a write to the real staff record."""
+    resolved = path.expanduser().resolve()
+    return any(resolved.is_relative_to(root.resolve())
+               for root in (Path(tempfile.gettempdir()), Path("/tmp"), Path("/dev/shm")))
+
+
+def _location_paths(row: StaffRow) -> tuple[Path, ...]:
+    return tuple(location.path for location in (row.doc, row.worktree)
+                 if isinstance(location, (LiveDoc, WrappedDoc, PresentWorktree, RemovedWorktree)))
+
+
 def _store(rows: list[StaffRow], pending: set[StaffId]) -> None:
     document: dict[str, object] = {"schema": 2, "rows": [row.to_json() for row in rows]}
     if pending:
@@ -878,6 +934,13 @@ def _record_transaction(edit: Callable[[list[StaffRow], set[StaffId]], _Result])
             proposed = list(original.rows)
             pending = set(original.pending_retire)
             result = edit(proposed, pending)
+            if path.resolve() == _default_file().resolve():
+                previous = {row.id: row for row in original.rows}
+                for row in proposed:
+                    if previous.get(row.id) != row:
+                        for location in _location_paths(row):
+                            if _under_test_root(location):
+                                raise StaffRefused(f"test-root path cannot enter the real staff record: {location}")
             _validate(proposed)
             proposed.sort(key=lambda row: row.id)
             if original.schema == 2 and original.current_sessions_recorded and proposed == list(original.rows) and pending == set(original.pending_retire):
@@ -908,9 +971,9 @@ def _ensure_row(rows: list[StaffRow], kind: Kind, name: str, parent: StaffId | N
                 worktree: PresentWorktree | RemovedWorktree | WorktreeUnfilled = WORKTREE_UNFILLED,
                 doc: LiveDoc | WrappedDoc | DocUnfilled = DOC_UNFILLED,
                 runtime_id: str = "") -> StaffRow:
-    if kind != "unit" and not isinstance(worktree, WorktreeUnfilled):
+    if kind not in ("unit", "agent") and not isinstance(worktree, WorktreeUnfilled):
         raise StaffRefused(f"{kind} cannot hold worktree")
-    if kind != "showrunner" and not isinstance(doc, DocUnfilled):
+    if kind not in ("showrunner", "agent") and not isinstance(doc, DocUnfilled):
         raise StaffRefused(f"{kind} cannot hold doc")
     existing = next((row for row in rows
                      if (row.kind, row.name, row.parent) == (kind, name, parent)), None)
@@ -984,7 +1047,8 @@ def update_current_session(old_session: StaffId, new_session: StaffId) -> StaffR
         changed = replace(old, current_session=new_session)
         rows[rows.index(old)] = changed
         return changed
-    return _transaction(edit)
+    with row_operation(old_session):
+        return _transaction(edit)
 
 
 def promote_unit(identity: StaffId, *, name: str, parent: StaffId, doc: LiveDoc) -> StaffRow:
@@ -1100,8 +1164,8 @@ def set_worktree(unit: StaffId, worktree: PresentWorktree | RemovedWorktree, *,
 
     def edit(rows: list[StaffRow]) -> StaffRow:
         row = _required(rows, unit)
-        if row.kind != "unit":
-            raise StaffRefused("set-worktree requires a unit")
+        if row.kind not in ("unit", "agent"):
+            raise StaffRefused("set-worktree requires a unit or agent")
         if row.worktree == worktree:
             return row
         if row.worktree != expected:
@@ -1121,8 +1185,8 @@ def set_doc(showrunner: StaffId, doc: LiveDoc | WrappedDoc) -> StaffRow:
 
     def edit(rows: list[StaffRow]) -> StaffRow:
         row = _required(rows, showrunner)
-        if row.kind != "showrunner":
-            raise StaffRefused("set-doc requires a showrunner")
+        if row.kind not in ("showrunner", "agent"):
+            raise StaffRefused("set-doc requires a showrunner or agent")
         changed = replace(row, doc=doc)
         rows[rows.index(row)] = changed
         return changed
@@ -1157,6 +1221,54 @@ def retire(staff_id: StaffId) -> StaffRow | None:
 
     require_stopped(staff_id)
     return _transaction(lambda rows: _retire_row(rows, staff_id))
+
+
+@dataclass(frozen=True)
+class FixtureRemoved:
+    """The stopped fixture tree no longer exists in the staff record."""
+
+    row: StaffRow
+
+
+@dataclass(frozen=True)
+class FixtureAlreadyAbsent:
+    """The staff record already has no selected fixture."""
+
+
+def _remove_test_fixture(staff_id: StaffId) -> FixtureRemoved | FixtureAlreadyAbsent:  # pyright: ignore[reportUnusedFunction]
+    """Remove a stopped fixture tree whose locations name test folders."""
+    if not _is_owner():
+        raise StaffRefused("remove the fixture on the staff owner machine")
+    record = snapshot()
+    row = record.by_id(staff_id)
+    if row is None:
+        return FixtureAlreadyAbsent()
+    selected = {row.id: row}
+    while True:
+        children = {candidate.id: candidate for candidate in record.rows
+                    if candidate.parent in selected and candidate.id not in selected}
+        if not children:
+            break
+        selected.update(children)
+    from scripts.message import sessions
+
+    for candidate in selected.values():
+        locations = _location_paths(candidate)
+        if not locations or not all(_under_test_root(path) for path in locations):
+            raise StaffRefused(f"{candidate.id}: the location is not under a test root")
+        observed = sessions.session_liveness(candidate.current_session)
+        if not isinstance(observed, sessions.SessionNotLive):
+            raise StaffRefused(f"{candidate.id}: the fixture conversation is live or unreadable")
+
+    def edit(rows: list[StaffRow]) -> FixtureRemoved:
+        if any(_row_by_id(rows, identity) != expected for identity, expected in selected.items()):
+            raise StaffRefused(f"{staff_id}: the fixture changed before removal")
+        if any(candidate.parent in selected and candidate.id not in selected for candidate in rows):
+            raise StaffRefused(f"{staff_id}: the fixture gained a member before removal")
+        rows[:] = [candidate for candidate in rows if candidate.id not in selected]
+        return FixtureRemoved(row)
+
+    return _transaction(edit)
 
 
 def _retire_row(rows: list[StaffRow], staff_id: StaffId) -> StaffRow | None:
@@ -1260,10 +1372,10 @@ def apply_seed(seed_input: SeedInput) -> StaffSnapshot:
                 row = _required(rows, entry.match)
                 if row.kind != entry.kind:
                     raise StaffRefused(f"seed member has the wrong kind: {row.id}")
-            elif entry.kind == "showrunner":
-                row = next((row for row in rows if row.kind == "showrunner" and row.name == entry.name), None)
+            elif entry.kind in ("showrunner", "agent"):
+                row = next((row for row in rows if row.kind == entry.kind and row.name == entry.name), None)
                 if row is None:
-                    row = _ensure_row(rows, "showrunner", entry.name, None, runtime_id=entry.runtime_id)
+                    row = _ensure_row(rows, entry.kind, entry.name, None, runtime_id=entry.runtime_id)
             else:
                 if not isinstance(entry.parent, SeedParent):
                     raise StaffRefused(f"a new seed {entry.kind} requires its parent")
@@ -1312,7 +1424,7 @@ def _paths(rows: list[StaffRow]) -> dict[StaffId, str]:
     for row in rows:
         chain: list[str] = [row.name]
         member = row
-        while member.kind != "showrunner":
+        while member.kind not in ("showrunner", "agent"):
             assert member.parent is not None
             member = indexed[member.parent]
             chain.append(member.name)

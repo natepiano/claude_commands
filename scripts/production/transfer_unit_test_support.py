@@ -22,7 +22,7 @@ import fake_showrunner
 from scripts.production import fake_unit_host
 
 from scripts.herdr import fake_herdr
-from scripts.production import showrunners, staff
+from scripts.production import showrunners
 from scripts.production.cli_fixture import invoke_cli
 from scripts.production.rename_test_support import bind_staff_fixture
 from scripts.production.staff_test_support import fixture_member, StaffTestCase, unit_membership
@@ -76,7 +76,10 @@ class UnitTransferFixture(StaffTestCase):
         _ = shutil.copytree(self.snapshot, self.fixture_root)
         self.addCleanup(shutil.rmtree, self.fixture_root)
         self.bind_fixture(self.fixture_root)
-        bind_staff_fixture(self, self.env, {"demo": ("alpha-unit", "beta-unit"), "other": ("gamma-unit",)})
+        bind_staff_fixture(self, self.env, {"demo": ("alpha-unit", "beta-unit"), "other": ("gamma-unit",)},
+                           locations={("demo", "alpha-unit"): self.unit,
+                                      ("demo", "beta-unit"): self.rust / "claude-demo-beta",
+                                      ("other", "gamma-unit"): self.root / "absent-gamma"})
         row = unit_membership("demo", "alpha-unit")
         self.pane("w1:p1", session_id="5ad615f2-4e04-5121-a102-9d6b2e2a6eb3", environment={
             "SHOWRUNNER_UNIT": "demo", "SHOWRUNNER_UNIT_ID": "alpha-unit", "CLAUDE_CODE_SESSION_ID": row.id,
@@ -240,20 +243,7 @@ class UnitTransferFixture(StaffTestCase):
         self.assertIn(text, result.stderr)
 
     def seed_record(self) -> Path:
-        """A prior shutdown record and a command log that exposes any forbidden stop or restart."""
-        home = self.root / "home"
-        owners = [row for row in staff.find(kind="unit") if row.name == "alpha"]
-        self.assertEqual(len(owners), 1)
-        saved = fake_unit_host.stopped_record(home / ".claude", self.unit,
-            doc=self.giving / "docs/plans/demo-production.md", host_session="demo-alpha",
-            branch="demo-alpha", plan=self.unit / "docs/plans/alpha.md",
-            runtime_id=owners[0].current_session)
-        script = ("import json, sys; sys.path.insert(0, sys.argv[1]); import shutdown_record; "
-                  + "assert shutdown_record.create_session(json.loads(sys.stdin.read()))")
-        created = subprocess.run([sys.executable, "-c", script, str(SCRIPT.parents[1] / "shutdown")],
-                                 input=json.dumps(saved), env=self.env, capture_output=True, text=True,
-                                 check=False, timeout=TEST_HANG_GUARD_SECS)
-        self.assertEqual(created.returncode, 0, created.stderr)
+        """Record stop and restart commands for the transfer tests."""
         log = self.root / "shutdown-calls.jsonl"
         stub = self.root / "fake_shutdown.py"
         self.write(stub, "import json, os, sys\nwith open(os.environ['RENAME_UNIT_SHUTDOWN_LOG'], 'a') as log:\n"

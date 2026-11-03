@@ -10,7 +10,7 @@ import shlex
 import socket
 import sys
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from enum import StrEnum
 from types import ModuleType
 from pathlib import Path
@@ -26,42 +26,21 @@ import shutdown
 import sessions
 from unit_staff_test_support import isolated_parents
 from scripts.production.staff_test_support import isolated_staff_file, showrunner_relationship
-from shutdown_record import SessionShutdown
 
 
 class ShutdownSendLeaf(StrEnum):
     DELIVER_MESSAGE = "restart_support._deliver_message"
-    RETIRE_SHUTDOWN_MESSAGES = "restart_support.retire_shutdown_messages"
-    RESTART_RETIRE = "restart._retire"
-    RESUME_CODEX_WORKERS = "restart._send_worker_resume"
     RUN_REMOTE = "remote.run_remote"
     LAUNCH_REMOTE_CONTROL_FIXER = "remote_control.launch_fixer"
-    RUN_NOTIFIER = "restart_support.run_notifier"
 
 
-# Keep real functions before any test installs guards, including nested proof cases.
-_REAL_RESTART_RETIRE = restart._retire  # pyright: ignore[reportPrivateUsage]
 _REAL_LEAF_BINDINGS: dict[ShutdownSendLeaf, tuple[tuple[ModuleType, str, object], ...]] = {
     ShutdownSendLeaf.DELIVER_MESSAGE: (
         (restart_support, "_deliver_message", restart_support._deliver_message),  # pyright: ignore[reportPrivateUsage]
     ),
-    ShutdownSendLeaf.RETIRE_SHUTDOWN_MESSAGES: (
-        (restart_support, "retire_shutdown_messages", restart_support.retire_shutdown_messages),
-    ),
-    ShutdownSendLeaf.RESTART_RETIRE: ((restart, "_retire", _REAL_RESTART_RETIRE),),
-    ShutdownSendLeaf.RESUME_CODEX_WORKERS: (
-        (restart, "_send_worker_resume", restart._send_worker_resume),  # pyright: ignore[reportPrivateUsage]
-    ),
-    ShutdownSendLeaf.RUN_REMOTE: (
-        (remote, "run_remote", remote.run_remote),
-        (restart_support, "run_remote", remote.run_remote),
-        (restart, "run_remote", remote.run_remote),
-        (shutdown, "run_remote", remote.run_remote),
-    ),
-    ShutdownSendLeaf.LAUNCH_REMOTE_CONTROL_FIXER: (
-        (remote_control, "launch_fixer", remote_control.launch_fixer),
-    ),
-    ShutdownSendLeaf.RUN_NOTIFIER: ((restart_support, "run_notifier", restart_support.run_notifier),),
+    ShutdownSendLeaf.RUN_REMOTE: ((remote, "run_remote", remote.run_remote),
+                                  (shutdown, "run_remote", shutdown.run_remote)),
+    ShutdownSendLeaf.LAUNCH_REMOTE_CONTROL_FIXER: ((remote_control, "launch_fixer", remote_control.launch_fixer),),
 }
 
 
@@ -97,8 +76,9 @@ class ShutdownTestCase(unittest.TestCase):
     def setUp(self) -> None:
         super().setUp()
         _ = self.enterContext(redirect_stdout(io.StringIO()))
+        _ = self.enterContext(redirect_stderr(io.StringIO()))
         _ = self.enterContext(isolated_parents())
-        faulthandler.dump_traceback_later(TEST_TIME_LIMIT_SECONDS, exit=True)
+        faulthandler.dump_traceback_later(TEST_TIME_LIMIT_SECONDS, exit=True, file=2)
         self.addCleanup(faulthandler.cancel_dump_traceback_later)
         registry = Path(self.enterContext(tempfile.TemporaryDirectory())) / "sessions"
         _ = self.enterContext(isolated_staff_file(registry.parent / "staff.json", {}))
@@ -115,11 +95,7 @@ class ShutdownTestCase(unittest.TestCase):
         self.addCleanup(self._fail_send_leaf_hits)
         stubs: dict[ShutdownSendLeaf, object] = {
             ShutdownSendLeaf.DELIVER_MESSAGE: self._block_deliver_message,
-            ShutdownSendLeaf.RETIRE_SHUTDOWN_MESSAGES: self._block_retire_shutdown_messages,
-            ShutdownSendLeaf.RESTART_RETIRE: self._block_restart_retire,
-            ShutdownSendLeaf.RESUME_CODEX_WORKERS: self._block_worker_resume,
             ShutdownSendLeaf.RUN_REMOTE: self._block_run_remote,
-            ShutdownSendLeaf.RUN_NOTIFIER: self._block_run_notifier,
             ShutdownSendLeaf.LAUNCH_REMOTE_CONTROL_FIXER: self._block_launch_remote_control,
         }
         for leaf, bindings in _REAL_LEAF_BINDINGS.items():
@@ -152,22 +128,6 @@ class ShutdownTestCase(unittest.TestCase):
         del command, text
         self._reached_send_leaf(ShutdownSendLeaf.DELIVER_MESSAGE, recipient)
 
-    def _block_retire_shutdown_messages(self, login: str, session_id: str) -> Never:
-        del login
-        self._reached_send_leaf(
-            ShutdownSendLeaf.RETIRE_SHUTDOWN_MESSAGES, f"session:{session_id}"
-        )
-
-    def _block_restart_retire(
-        self, record: SessionShutdown, *, dry_run: bool
-    ) -> None:
-        if dry_run:
-            _REAL_RESTART_RETIRE(record, dry_run=True)
-            return
-        self._reached_send_leaf(
-            ShutdownSendLeaf.RESTART_RETIRE,
-            f"session:{record['session']['session_id']}",
-        )
 
     def _block_run_remote(
         self,
@@ -181,13 +141,6 @@ class ShutdownTestCase(unittest.TestCase):
             f"{remote.other_machine()}: shutdown.py {shlex.join(args)}",
         )
 
-    def _block_worker_resume(self, record: SessionShutdown) -> None:
-        if record["session"]["kind"] == "unit" and record.get("codex_seats"):
-            self._reached_send_leaf(
-                ShutdownSendLeaf.RESUME_CODEX_WORKERS,
-                f"session:{record['session']['session_id']}",
-            )
-
 
     def _block_launch_remote_control(
         self, session_id: str, pid: int, proc_start: str, who: str,
@@ -195,7 +148,3 @@ class ShutdownTestCase(unittest.TestCase):
     ) -> Never:
         del pid, proc_start, who, session
         self._reached_send_leaf(ShutdownSendLeaf.LAUNCH_REMOTE_CONTROL_FIXER, f"session:{session_id}")
-
-    def _block_run_notifier(self, verb: str, instance: str) -> Never:
-        del verb
-        self._reached_send_leaf(ShutdownSendLeaf.RUN_NOTIFIER, f"notifier {instance}")

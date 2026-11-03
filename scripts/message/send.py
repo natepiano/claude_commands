@@ -8,8 +8,6 @@ every message follows are /message (~/.claude/commands/message.md).
           [--from NAME] [--summary TEXT] [--key KEY [--repeat-minutes N]]
           [--here | --machine HOST] [--codex --session-dir DIR] [--timeout SECONDS]
           (--text TEXT | --file PATH | stdin)
-  send.py --to user --summary TITLE [--need note|decision|blocked]
-          (--action TEXT | --no-action) ...                              the user
   send.py --to user --text-id ID --value KEY=VALUE ...    a registered push; --help lists
                                                           the ones a session or script sends
   send.py ack KEY       later sends with KEY are skipped
@@ -43,7 +41,7 @@ Only the configured Morty ID adds `Authority: morty (speaks for the user)`.
 Queues and SSH forwarding retain the original sender ID.
 `--here` checks only this machine. `--machine` runs this script on HOST over ssh.
 
-`--to user` reaches the user wherever they are; `--summary` is the title. `--need`
+`--to user` requires a registered `--text-id`. The template supplies the title and action. `--need`
 says what they must do: `note` nothing, `decision` decide while work goes on,
 `blocked` act before work can go on, repeated until they acknowledge it. How
 it reaches them is `user()`'s business: no caller names the channel.
@@ -205,6 +203,8 @@ NEEDS_GO_HELD = ("not sent: this push asks the user to type a go. Send it with t
                  + NEEDS_GO_CALL)
 # Registered pushes a session or script sends with --text-id; `send.py --help` lists them.
 SESSION_TEMPLATES = {
+    "decision.choices": "a decision with structured choices and a recommendation; see review.py show decision.choices.",
+    "review_watch.acknowledge": "a reminder to acknowledge a review report; see review.py show review_watch.acknowledge.",
     AUTO_MODE_TEXT: "auto mode refused a command and the session waits for the user. " + AUTO_MODE_CALL,
     PAID_CREDITS_TEXT: ("an account now spends paid credits; a script with no Claude session names itself with --from. "
                         + PAID_CREDITS_CALL),
@@ -463,10 +463,13 @@ class FailedPush:
     reviewed: bool = False
     need: Need = "note"
     held: bool = False
+    text_id: str = ""
+    sender: str = ""
 
     @property
     def fallback_allowed(self) -> bool:
-        return (self.reviewed and not self.held) or self.need == "blocked"
+        return (self.reviewed and not self.held and self.need == "blocked"
+                and any(entry.id == self.text_id for entry in push_texts.catalog()))
 
     @property
     def message(self) -> str:
@@ -475,13 +478,8 @@ class FailedPush:
 
     @property
     def text(self) -> str:
-        line = " ".join((self.title + " — " + first_line(self.action, split_session(self.body)[0])).split())
-        if len(line) <= 200:
-            return line
-        shortened = line[:199]
-        if not line[199].isspace() and " " in shortened:
-            shortened = shortened.rsplit(" ", 1)[0]
-        return shortened.rstrip() + "…"
+        return (f"Title: {self.title}\n{self.message}\n\n"
+                + f"Sent by: {self.sender} · Template: {self.text_id}")
 
 
 @dataclass(frozen=True)
@@ -501,6 +499,8 @@ class ReviewedPushRecord(TypedDict):
     held_source: NotRequired[str]
     held_identity: NotRequired[str]
     held_machine: NotRequired[str]
+    text_id: NotRequired[str]
+    sender: NotRequired[str]
 
 
 class FailedPushRecord(ReviewedPushRecord):
@@ -516,15 +516,15 @@ class FailedPushTransportRecord(ReviewedPushRecord):
     need: Need
 
 
-UNREVIEWED_FALLBACK = ("This push was never reviewed, so it cannot go out as a fallback. "
-    "Bring it to the user in your reply, or resend it with send.py once the failure is fixed.")
+UNREVIEWED_FALLBACK = ("Only a reviewed blocked push with a registered template can use a fallback. "
+    "Use send.py with a registered template after you repair the delivery failure.")
 
 
 HELD_FALLBACK = "This push was not sent because it failed review. Revise it and resend it with send.py; no fallback is allowed."
 
 
 def failure_detail(reason: str, failed: FailedPush) -> str:
-    if failed.held and failed.need != "blocked":
+    if failed.held:
         return reason.partition(" fallback text:")[0] + " " + HELD_FALLBACK
     reason = reason.partition(" fallback text:")[0].partition(" " + UNREVIEWED_FALLBACK)[0]
     return reason + (" fallback text:\n" + failed.text if failed.fallback_allowed else " " + UNREVIEWED_FALLBACK)
@@ -2042,14 +2042,16 @@ def reviewed_failure(stdout: str, original: FailedPush, *,
             hold: RevisionHold = (HeldRevision(source, identity, machine)
                                   if isinstance(source, str) and source and isinstance(identity, str) and identity
                                   else NO_HELD_REVISION)
-            reviewed = record.get("reviewed") is True if remote_record else True
+            reviewed = record.get("reviewed") is True if remote_record else record.get("reviewed") is not False
             need = record.get("need") if remote_record else original.need
             if need not in ("note", "decision", "blocked"):
                 need = original.need
             session = record.get("session")
             if isinstance(session, str):
                 body = session_prefix(SessionLine(session)) + body
-            return FailedPush(title, action, body, hold, reviewed=reviewed, need=need, held=record.get("held") is True)
+            return FailedPush(title, action, body, hold, reviewed=reviewed, need=need, held=record.get("held") is True,
+                              text_id=as_str(record.get("text_id")) or original.text_id,
+                              sender=as_str(record.get("sender")) or original.sender)
         return original
     return original
 
@@ -2062,14 +2064,14 @@ def user(message: Message, need: Need, action: UserAction, timeout: float, *, an
                *(["--answerable"] if answerable else []), *action_arguments(action), message.summary, message.text]
     if text_id:
         command = [sys.executable, str(USER_CHANNEL), "--priority", selected_priority, "--source", message.sender, *key,
-                   "--text-id", text_id]
+                   "--text-id", text_id, *(["--answerable"] if answerable else [])]
         for value in values:
             command.extend(["--value", value])
     if due:
         command[2:2] = ["--due", due]
     code, out, err = run(command, "", timeout)
     if code == 6:
-        failed = reviewed_failure(out, FailedPush(message.summary, action, message.text, need=need, held=True))
+        failed = reviewed_failure(out, FailedPush(message.summary, action, message.text, need=need, held=True, text_id=text_id, sender=message.sender))
         return Result("held", "not sent, failed review: " + (err.removeprefix("pushover: not sent: ").strip() or "review failed"), failed)
     if code == 5:
         return Result("replaced", "a newer version replaced this push; nothing was sent")
@@ -2095,7 +2097,7 @@ def user(message: Message, need: Need, action: UserAction, timeout: float, *, an
     why = one_line(err or out) or ("timed out" if code is None else f"exit {code}")
     if code == 2 and f"{REFUSED_BEFORE_SENDING}:" in err:
         return Result("refused", why)
-    failed = reviewed_failure(out, FailedPush(message.summary, action, message.text, need=need))
+    failed = reviewed_failure(out, FailedPush(message.summary, action, message.text, need=need, text_id=text_id, sender=message.sender))
     return Result("failed", failure_detail(f"the user was not reached: {why}", failed), failed)
 
 
@@ -2217,7 +2219,7 @@ def remote(message: Message, host: str, options: Options) -> Result:
     if message.to == USER and "send.py: failed push JSON: " in err:
         if isinstance(options.action, NoUserRecipient):
             raise AssertionError("a user message must state its action")
-        failure = reviewed_failure(err, FailedPush(message.summary, options.action, message.text, need=options.need),
+        failure = reviewed_failure(err, FailedPush(message.summary, options.action, message.text, need=options.need, text_id=options.text_id, sender=message.sender),
                                    prefix="send.py: failed push JSON: ", machine=host, remote_record=True)
     outcome = send_outcome(code, out)
     if isinstance(outcome, UnconfirmedSendOutcome):
@@ -2235,12 +2237,12 @@ def remote(message: Message, host: str, options: Options) -> Result:
 # ---------------------------------------------------------------------------
 
 
-def user_failure(message: Message, action: MessageUserAction, result: Result, need: Need) -> Result:
+def user_failure(message: Message, action: MessageUserAction, result: Result, need: Need, text_id: str = "") -> Result:
     if isinstance(action, NoUserRecipient):
         raise AssertionError("a user message must state its action")
     failed = result.failure
     if isinstance(failed, NoFailedPush):
-        failed = FailedPush(message.summary, action, message.text, need=need)
+        failed = FailedPush(message.summary, action, message.text, need=need, text_id=text_id, sender=message.sender)
     result = Result("held" if failed.held else "failed", failure_detail(result.detail, failed), failed)
     try:
         pid = os.environ.get("CLAUDE_PID", "")
@@ -2252,7 +2254,8 @@ def user_failure(message: Message, action: MessageUserAction, result: Result, ne
             entry: FailedPushRecord = {"time": time.time(), "title": failed.title,
                 "action": failed.action.text if isinstance(failed.action, ActionRequired) else None,
                 "body": failed.body, "message": failed.message, "fallback": failed.text,
-                "reviewed": failed.reviewed, "need": failed.need, "held": failed.held}
+                "reviewed": failed.reviewed, "need": failed.need, "held": failed.held,
+                "text_id": failed.text_id, "sender": failed.sender}
             if isinstance(failed.hold, HeldRevision):
                 entry["held_source"] = failed.hold.source
                 entry["held_identity"] = failed.hold.identity
@@ -2717,6 +2720,8 @@ def delivered_text(message: Message, entry_id: str) -> str:
 def send(options: Options) -> Result:
     import roster
 
+    if options.to == USER and not options.text_id:
+        return Result("refused", push_texts.TEMPLATE_REQUIRED)
     if options.to == USER:
         options = options._replace(timeout=max(options.timeout, review.user_send_seconds()))
     if options.text_id == AUTO_MODE_TEXT:
@@ -2889,7 +2894,7 @@ def send(options: Options) -> Result:
         record_emergency(Emergency(key=key, sender=sender, check=options.clears_when, machine=posted_on,
                                    sent=started.isoformat(), expires=(started + emergency_lifetime()).isoformat()))
     if message.to == USER and (result.outcome == "failed" or (result.outcome == "held" and isinstance(result.failure, FailedPush))):
-        result = user_failure(message, options.action, result, options.need)
+        result = user_failure(message, options.action, result, options.need, options.text_id)
     if not options.no_accounting:
         log(message, result, started, log_route)
     if options.report_recipient:
@@ -2901,7 +2906,7 @@ def repeat_notice_owner(sender: str) -> str:
     """Follow staff parents to the sender's showrunner."""
     membership = staff.snapshot()
     member = resolve_staff_recipient(sender, membership)
-    if isinstance(member, NoStaffRecipient):
+    if isinstance(member, NoStaffRecipient) or isinstance(member, staff.StaffRow) and member.kind == "agent":
         return rca.owner_address("")
     if isinstance(member, RecipientLookupFailed):
         usage_error(member.reason)
@@ -2955,6 +2960,11 @@ def attempt_repeat_notice(state: repeat_guard.SenderState, notice: repeat_guard.
 
 
 def main(argv: list[str]) -> int:
+    user_target = "--to=user" in argv or any(left == "--to" and right == USER for left, right in zip(argv, argv[1:]))
+    has_template = "--text-id" in argv or any(value.startswith("--text-id=") and value != "--text-id=" for value in argv)
+    if user_target and not has_template and argv[:1] != ["retire"]:
+        print("REFUSED: " + push_texts.TEMPLATE_REQUIRED)
+        return EXIT["refused"]
     match argv:
         case ["repeat-notices"]:
             repeat_guard.drain(Path(os.environ.get("SEND_REPEAT_STATE", str(STATE / "repeats"))), attempt_repeat_notice, now().timestamp(),
@@ -3018,7 +3028,8 @@ def main(argv: list[str]) -> int:
                 failed = result.failure
                 record: FailedPushTransportRecord = {"title": failed.title,
                     "action": failed.action.text if isinstance(failed.action, ActionRequired) else None,
-                    "body": failed.body, "reviewed": failed.reviewed, "need": failed.need, "held": failed.held}
+                    "body": failed.body, "reviewed": failed.reviewed, "need": failed.need, "held": failed.held,
+                    "text_id": failed.text_id, "sender": failed.sender}
                 if isinstance(failed.hold, HeldRevision):
                     record["held_source"] = failed.hold.source
                     record["held_identity"] = failed.hold.identity
