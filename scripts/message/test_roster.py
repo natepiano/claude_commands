@@ -1412,6 +1412,14 @@ class RosterTests(unittest.TestCase):
         )
         self.assertNotIn("contract reviewer", entries)
 
+    def test_the_roster_recognizes_the_simplify_status_writer(self) -> None:
+        from scripts.lib.atomic_file import write_text_atomic
+
+        write_text_atomic(self.director_run / "review_status_adversary", "reviewing\n")
+        with mock.patch.object(os, "readlink", return_value="/review/cwd"):
+            entries = self._entries()
+        self.assertEqual(entries["adversary reviewer"].status, "running")
+
     def test_review_status_in_a_phase_directory_finds_its_reviewer(self) -> None:
         phase = self.director_run / "phases" / "4"
         phase.mkdir(parents=True)
