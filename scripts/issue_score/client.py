@@ -21,11 +21,30 @@ from urllib.request import Request, urlopen
 from uuid import uuid4
 import zlib
 
-from .questions import BUDGET_USD, INPUT_USD_PER_MILLION, MODEL, Question
+from scripts.lib import conf
+from .selection import UseConfiguredValue
 
-ENDPOINT = "https://api.typesafe.ai/v1/systemone"
-SPEND_LEDGER = Path.home() / ".local/state/issue-score/spend.jsonl"
-MAX_ATTEMPTS = 5
+from . import questions as policy
+from .questions import Question
+
+def endpoint() -> str:
+    return conf.text("issue_score", "endpoint")
+
+
+def spend_ledger() -> Path:
+    return Path(conf.text("issue_score", "spend_ledger")).expanduser()
+
+
+def max_attempts() -> int:
+    return conf.whole("issue_score", "max_attempts")
+
+
+def request_timeout() -> float:
+    return conf.number("issue_score", "request_timeout")
+
+
+def retry_backoff_base() -> float:
+    return conf.number("issue_score", "retry_backoff_base")
 
 
 class TypeSafeError(RuntimeError):
@@ -215,8 +234,8 @@ def _reserve(path: Path, maximum_cost: float) -> Generator[str]:
     with _ledger_lock(path):
         pending = _pending(pending_path)
         spent = _spent(path)
-        if spent >= BUDGET_USD or spent + sum(pending.values()) + maximum_cost > BUDGET_USD:
-            raise BudgetExceeded(f"TypeSafe spend would exceed the ${BUDGET_USD:.2f} budget")
+        if spent >= policy.budget_usd() or spent + sum(pending.values()) + maximum_cost > policy.budget_usd():
+            raise BudgetExceeded(f"TypeSafe spend would exceed the ${policy.budget_usd():.2f} budget")
         pending[reservation] = maximum_cost
         _write_pending(pending_path, pending)
     try:
@@ -229,7 +248,7 @@ def _reserve(path: Path, maximum_cost: float) -> Generator[str]:
 
 
 def _record_usage(path: Path, model: str, usage: Usage) -> None:
-    cost = usage["input_tokens"] * INPUT_USD_PER_MILLION / 1_000_000
+    cost = usage["input_tokens"] * policy.input_usd_per_million() / 1_000_000
     with _ledger_lock(path):
         with path.open("a", encoding="utf-8") as handle:
             _ = handle.write(json.dumps({"at": datetime.now(timezone.utc).isoformat(), "model": model, "input_tokens": usage["input_tokens"], "cost_usd": cost}) + "\n")
@@ -249,11 +268,13 @@ def _retry_delay(header: str, attempt: int) -> float:
                 return max(0.0, (date - datetime.now(timezone.utc)).total_seconds())
             except (ValueError, TypeError, OverflowError):
                 pass
-    return float(2.0 ** attempt)
+    return float(retry_backoff_base() ** attempt)
 
 
-def system_one(state: Mapping[str, object], questions: Mapping[str, Question], model: str = MODEL,
-               *, ledger_path: Path = SPEND_LEDGER) -> Response:
+def system_one(state: Mapping[str, object], questions: Mapping[str, Question], model: str | UseConfiguredValue = UseConfiguredValue.CURRENT,
+               *, ledger_path: Path | UseConfiguredValue = UseConfiguredValue.CURRENT) -> Response:
+    model = policy.model() if isinstance(model, UseConfiguredValue) else model
+    ledger_path = spend_ledger() if isinstance(ledger_path, UseConfiguredValue) else ledger_path
     key = os.environ.get("TYPESAFE_API_KEY", "")
     if not key:
         raise TypeSafeError("TYPESAFE_API_KEY not set: run under with-typesafe")
@@ -264,18 +285,18 @@ def system_one(state: Mapping[str, object], questions: Mapping[str, Question], m
     # Each question sees the state independently. UTF-8 bytes conservatively
     # bound text tokens; include framing headroom before reserving spend.
     token_bound = (len(encoded) + 4096) * max(1, len(questions))
-    maximum_cost = token_bound * INPUT_USD_PER_MILLION / 1_000_000
-    request = Request(ENDPOINT, data=gzip.compress(encoded), method="POST", headers={
+    maximum_cost = token_bound * policy.input_usd_per_million() / 1_000_000
+    request = Request(endpoint(), data=gzip.compress(encoded), method="POST", headers={
         "Authorization": f"Bearer {key}", "Content-Type": "application/json",
         "Content-Encoding": "gzip", "Accept-Encoding": "gzip",
     })
     with _reserve(ledger_path, maximum_cost):
-        for attempt in range(MAX_ATTEMPTS):
+        for attempt in range(max_attempts()):
             with _ledger_lock(ledger_path):
-                if _spent(ledger_path) >= BUDGET_USD:
-                    raise BudgetExceeded(f"TypeSafe spend reached the ${BUDGET_USD:.2f} budget")
+                if _spent(ledger_path) >= policy.budget_usd():
+                    raise BudgetExceeded(f"TypeSafe spend reached the ${policy.budget_usd():.2f} budget")
             try:
-                with cast(HTTPResponse, urlopen(request, timeout=120)) as response:
+                with cast(HTTPResponse, urlopen(request, timeout=request_timeout())) as response:
                     body = response.read()
                     if response.headers.get("Content-Encoding", "").lower() == "gzip":
                         body = gzip.decompress(body)
@@ -290,7 +311,7 @@ def system_one(state: Mapping[str, object], questions: Mapping[str, Question], m
                     except (OSError, EOFError, zlib.error):
                         error_body = b"unreadable body"
                 body_text = error_body.decode("utf-8", errors="replace").replace(key, "[redacted]")
-                if error.code in (429, 529) and attempt + 1 < MAX_ATTEMPTS:
+                if error.code in (429, 529) and attempt + 1 < max_attempts():
                     time.sleep(_retry_delay(error.headers.get("Retry-After", ""), attempt))
                     continue
                 raise TypeSafeError(f"TypeSafe HTTP {error.code}: {body_text}") from None

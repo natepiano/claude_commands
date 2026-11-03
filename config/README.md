@@ -94,7 +94,7 @@ the Mac. An empty `ci_repo` disables CI calls. `CONF_DIR` selects the fixture fo
 
 This file defines the disabled AWS SSH target. `offload=off` prevents work.
 The active target list remains `targets=mac,natedev` in `build_targets.conf`.
-Phase 9 requires the user's deployment steps before target activation.
+The user completes deployment before target activation.
 
 `host=aws-build` names the Tailscale SSH host. `instance_id` and `region` remain empty before deployment.
 `credentials_profile=build-scaler` names the user's AWS CLI profile. This file contains no credential.
@@ -145,6 +145,25 @@ Each pending event stores its retry deadline and delivery owner.
 A separate delivery lock prevents concurrent sends.
 A later guard retries an unconfirmed delivery after its deadline with the same message key.
 Confirmed delivery prevents further attempts.
+
+`aws_target.py tick`, `start`, and `stop` serialize lifecycle actions under `controller.lock`.
+`controller.json` retains instance evidence, action intent, capacity retry time, and the drain deadline.
+`instance_type=m7a.4xlarge` selects the Spot price history.
+`tick_interval_s=30` sets the planned timer interval. This phase enables no timer.
+`aws_timeout_s=30` bounds each AWS command. `snapshot_max_age_s=60` bounds queue evidence.
+The controller reads only the saved admission snapshot and excludes rows that left for a local execution slot.
+`permission_ttl_s=90` bounds remote spending permission.
+The controller transfers admission evidence through Tailscale SSH, separately from buildlog synchronization.
+`remote_state_directory` stores the admission envelope, boot binding, idle evidence, and interruption record on the target.
+The envelope identifies its version, target, purpose, instance generation, decision time, and expiry.
+The runner requires a current allowed decision before shell evaluation and execution.
+A new boot invalidates the previous permission until the controller publishes current evidence.
+`interruption_poll_s=5` sets the IMDSv2 interruption interval. `imds_timeout_s=2` bounds each metadata request.
+The remote agent records interruption before it signals active process groups.
+The runner reports `aws_interrupted=<generation>` after interruption. The sender retains this evidence and the original queue time.
+`idle_stop_minutes` controls the remote idle stop. `drain_max_minutes` bounds a controlled drain without resetting its deadline.
+Confirmed stopping, stopped, or terminated evidence releases only unchanged claims captured for that target and generation.
+A retained `.linux-run.json` marker includes boot identity. Recovery preserves new processes that reuse an earlier PID.
 
 The SSH, retry, storage, slot, hold and claim settings apply when each command reads this file.
 Block and claim settings use the same units as `mac_test.conf`.

@@ -5,6 +5,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Literal, NotRequired, TypedDict
 
+from scripts.lib import conf
+
 
 @dataclass(frozen=True)
 class Supported:
@@ -29,35 +31,63 @@ class ReportOnly:
 ThresholdOutcome = Supported | MinimumGap | Unsupported | ReportOnly
 
 QUESTION_SET_VERSION = "5"
-MODEL = "jev-1.14.0"
-BUDGET_USD = 20.0
-INPUT_USD_PER_MILLION = 0.042
-# Complete version-3 tuning run: 20261027T104743.153330Z-3b227095 (N=317).
-THRESHOLDS: dict[str, ThresholdOutcome] = {
-    "backlog_goal": Supported(0.40),
-    "backlog_alignment": Supported(0.40),
-    "backlog_impact": Supported(0.40),
-    "backlog_urgency": ReportOnly(),
-    "backlog_effort": ReportOnly(),
-    "category": Supported(0.90),
-    # 62 areas, run 20261029T155801.891126Z-3015dbcf:
-    # plain averaged gap: tune 21% to user, 24.6% taken-wrong;
-    # held-out 19% to user, 25.3% taken-wrong. User confirms every value.
-    "area": MinimumGap(0.3),
-}
+
+
+def model() -> str:
+    return conf.text("issue_score", "model")
+
+
+def budget_usd() -> float:
+    return conf.number("issue_score", "budget_usd")
+
+
+def input_usd_per_million() -> float:
+    return conf.number("issue_score", "input_usd_per_million")
+
+
+def thresholds() -> dict[str, ThresholdOutcome]:
+    # Policy kinds stay in code; the configured numbers can change at use.
+    return {
+        "backlog_goal": Supported(conf.number("issue_score", "threshold.backlog_goal")),
+        "backlog_alignment": Supported(conf.number("issue_score", "threshold.backlog_alignment")),
+        "backlog_impact": Supported(conf.number("issue_score", "threshold.backlog_impact")),
+        "backlog_urgency": ReportOnly(),
+        "backlog_effort": ReportOnly(),
+        "category": Supported(conf.number("issue_score", "threshold.category")),
+        "area": MinimumGap(conf.number("issue_score", "threshold.area")),
+    }
+
+
 # The user's per-field verdict, including the area decision (2026-10-30):
 # Jev proposes these fields; the agent proposes every other field.
 JEV_FIELDS: frozenset[str] = frozenset({"backlog_goal", "backlog_impact", "backlog_alignment", "area"})
 
-ERROR_TARGETS = {field: 0.1 for field in (
-    "backlog_goal", "category", "area", "backlog_impact", "backlog_alignment",
-)}
+
+def error_targets() -> dict[str, float]:
+    return {field: conf.number("issue_score", f"error_target.{field}") for field in (
+        "backlog_goal", "category", "area", "backlog_impact", "backlog_alignment",
+    )}
+
+
 RISK_THRESHOLDS = tuple(percent / 100 for percent in range(40, 100, 5))
 RISK_GAPS = tuple(percent / 100 for percent in range(0, 100, 5))
-EVIDENCE_PRESENT = 0.7
-EVIDENCE_ABSENT = 0.3
-SPLIT_PROBABILITY = 0.25
-BODY_CHARACTER_LIMIT = 24_000
+
+
+def evidence_present() -> float:
+    return conf.number("issue_score", "evidence_present")
+
+
+def evidence_absent() -> float:
+    return conf.number("issue_score", "evidence_absent")
+
+
+def split_probability() -> float:
+    return conf.number("issue_score", "split_probability")
+
+
+def body_character_limit() -> int:
+    return conf.whole("issue_score", "body_character_limit")
+
 
 # README summaries; legacy project names remain the vault's identifiers.
 PROJECT_ABOUT = {

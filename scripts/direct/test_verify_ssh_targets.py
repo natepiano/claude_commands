@@ -114,6 +114,8 @@ def capture(arguments, deadline=offload.NO_COMMAND_TIME_LIMIT):
         actions.append("reachability")
         return offload.CommandOutput(0, "", "")
     actions.append("probe")
+    if mode == "probe-interrupted":
+        return offload.CommandOutput(75, "aws_interrupted=fixture-generation\n", "")
     if mode == "probe-leftovers":
         return offload.CommandOutput(255, "", "host unavailable")
     if mode == "disk":
@@ -141,6 +143,9 @@ def stream(arguments):
     if mode in ("run-refusal", "after-probe"):
         wire, status = "linux_startup=unresolved\n", 75
         (root / (request.target + ".marker")).touch()
+    elif mode in ("interrupted", "other-generation"):
+        generation = "fixture-generation" if mode == "interrupted" else "old-generation"
+        wire, status = "aws_interrupted=" + generation + "\n", 255
     elif mode == "lost":
         wire, status = "connection lost\n", 255
     else:
@@ -628,6 +633,73 @@ steps_path.write_text(json.dumps(steps))
         self.assertEqual(attempt["repo_identity"], "https://example.com/team/hana")
         self.assertEqual(self.routing_record()["target"], "natedev")
         self.assertEqual(first.read_text().strip(), "100.25")
+
+    def test_probe_interruption_preserves_the_attempt_and_original_queue_timestamp(self) -> None:
+        self.configure("aws,natedev")
+        state = self.home / ".local/state/build-targets/aws"
+        _ = (state / "controller.json").write_text(json.dumps({"generation": "fixture-generation"}))
+        first = self.root / "first-wait"
+        _ = first.write_text("100.25\n")
+        result = self.verify("test", "sample", "--no-cache", extra={
+            "TEST_SSH_MODES": '{"aws":"probe-interrupted"}', "BUILDLOG_MEM_WAIT_SINCE": "100.25",
+            "BUILDLOG_MEM_WAIT_FIRST_FILE": str(first)})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        event, = self.ssh_events()
+        self.assertEqual(event["result_type"], "InterruptedTargetRun")
+        attempt, = self.attempts()
+        self.assertEqual((attempt["target"], attempt["outcome"], attempt["queued_at"]), ("aws", "lost", 100.25))
+        self.assertEqual(first.read_text().strip(), "100.25")
+        self.assertEqual(len(self.local_runs()), 1)
+
+    def test_interruption_preserves_queue_age_and_records_local_state_before_compilation(self) -> None:
+        self.configure("aws,natedev")
+        state = self.home / ".local/state/build-targets/aws"
+        _ = (state / "controller.json").write_text(json.dumps({"generation": "fixture-generation"}))
+        first = self.root / "first-wait"
+        _ = first.write_text("100.25\n")
+        cargo = self.bin_directory / "cargo"
+        original = self.bin_directory / "cargo-original"
+        _ = cargo.rename(original)
+        self.write_executable(cargo, r'''
+import json
+import os
+from pathlib import Path
+import sys
+
+sys.path.insert(0, os.environ["TEST_SOURCE_REPO"])
+if sys.argv[1:3] == ["nextest", "run"]:
+    from scripts.direct import step_record
+    record = json.loads(step_record.record_path(os.environ["BUILDLOG_CALL_ID"]).read_text())
+    path = Path(os.environ["TEST_RUNNER_STATE"]) / "local-step.json"
+    path.write_text(json.dumps(record))
+os.execv(str(Path(__file__).with_name("cargo-original")), [str(Path(__file__).with_name("cargo-original")), *sys.argv[1:]])
+''')
+        result = self.verify("test", "sample", "--no-cache", extra={
+            "TEST_SSH_MODES": '{"aws":"interrupted"}', "BUILDLOG_MEM_WAIT_SINCE": "100.25",
+            "BUILDLOG_MEM_WAIT_FIRST_FILE": str(first)})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        event, = self.ssh_events()
+        self.assertEqual(event["result_type"], "InterruptedTargetRun")
+        attempt, = self.attempts()
+        self.assertEqual((attempt["target"], attempt["slot"], attempt["outcome"], attempt["queued_at"]),
+                         ("aws", 1, "lost", 100.25))
+        local = cast(dict[str, object], json.loads((self.runner_state / "local-step.json").read_text()))
+        self.assertEqual(local["state"], "on_natedev")
+        self.assertEqual(local["selected_target"], "natedev")
+        self.assertEqual(first.read_text().strip(), "100.25")
+        self.assertEqual(len(self.local_runs()), 1)
+
+    def test_interruption_from_another_generation_remains_an_unconfirmed_loss(self) -> None:
+        self.configure("aws,natedev")
+        state = self.home / ".local/state/build-targets/aws"
+        _ = (state / "controller.json").write_text(json.dumps({"generation": "fixture-generation"}))
+        result = self.verify("check", "sample", "--no-cache", extra={
+            "TEST_SSH_MODES": '{"aws":"other-generation"}'})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        event, = self.ssh_events()
+        self.assertEqual(event["result_type"], "LostMacRun")
+        attempt, = self.attempts()
+        self.assertEqual(attempt["outcome"], "lost")
 
     def test_local_only_request_never_reserves_or_runs_linux_work(self) -> None:
         self.configure("aws,natedev")
