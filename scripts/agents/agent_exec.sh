@@ -52,7 +52,7 @@ agents_exec_main() {
     esac
 
     script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    source "$script_dir/agents_config.sh"
+    source "$script_dir/models_config.sh"
     agents_resolve "$task"
     if [[ "$task" == direct.simplify ]]; then
         [[ "$mode" == readonly ]] || return 2

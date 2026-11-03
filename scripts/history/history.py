@@ -112,13 +112,13 @@ def _clean_label(label: str) -> str:
 
 
 def _clean_task(task: str) -> str:
-    """A task name without its skill prefix, so it matches agents.conf keys.
+    """A task name without its skill prefix, so it matches models.conf keys.
 
     The ledger holds both `delegate.fix` and bare `fix` (21) for one task, and
     only the bare name matches a config key.
 
     Task and kind are the same four words -- impl, test, fix, review -- and the
-    stored logs say so directly. `agents.conf` once carried five delegate keys
+    stored logs say so directly. `models.conf` once carried five delegate keys
     where two named the work and three named how hard an agent to send
     (`architect`, `mechanical`, `escalation`), so one field answered two
     questions and neither could be read off a name. On 2026-08-30 the tier axis
