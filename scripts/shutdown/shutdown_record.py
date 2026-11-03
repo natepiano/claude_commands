@@ -24,11 +24,11 @@ from typing import Literal, NotRequired, Protocol, TypedDict, cast, overload
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from scripts.shutdown.stop_results import shutdown_state_root
 from session_types import Session, parse_session
 from session_types import (
     TimerRestore as TimerRestore,
 )
-from launch_permission import launch_barrier, shutdown_state_root
 
 for dependency in ("lib", "whoami"):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / dependency))
@@ -1530,33 +1530,32 @@ def _progress_step(record: SessionShutdown, at: str) -> ProgressStep:
 
 
 def create_session(record: SessionShutdown) -> bool:
-    """Create one session record while excluding competing launch decisions."""
+    """Create one session record under its store lock."""
     checked = _session_shutdown(record, "record")
     if not checked["trail"]:
         checked["trail"].append(_progress_step(
             checked, checked["progress"].get("at", checked["requested_at"])))
-    with launch_barrier():
-        with _session_store_lock(checked["login"], create=True) as directory:
-            existing = _session_records_in_directory(directory, checked["login"])
-            previous = next((item for item in existing
-                             if item["session"]["session_id"] == checked["session"]["session_id"]), None)
-            if previous is not None:
-                if not finished_stop_request(previous):
-                    return False
-                history = directory / "history"
-                _ = _record_directory(history, create=True)
-                old = directory / "sessions" / _session_filename(previous["session"]["session_id"])
-                target = history / f"{previous['requested_at']}-{previous['request_id']}-{old.name}"
-                # A repeated request id must not replace its earlier history either.
-                while _lstat(target) is not None:
-                    target = target.with_name("old-" + target.name)
-                os.replace(old, target)
-            sessions = directory / "sessions"
-            _ = _record_directory(sessions, create=True)
-            path = sessions / _session_filename(checked["session"]["session_id"])
-            if _regular_record(path):
-                raise InvalidRecord(f"{path} is used by a different session id")
-            _write_record(path, checked)
+    with _session_store_lock(checked["login"], create=True) as directory:
+        existing = _session_records_in_directory(directory, checked["login"])
+        previous = next((item for item in existing
+                         if item["session"]["session_id"] == checked["session"]["session_id"]), None)
+        if previous is not None:
+            if not finished_stop_request(previous):
+                return False
+            history = directory / "history"
+            _ = _record_directory(history, create=True)
+            old = directory / "sessions" / _session_filename(previous["session"]["session_id"])
+            target = history / f"{previous['requested_at']}-{previous['request_id']}-{old.name}"
+            # A repeated request id must not replace its earlier history either.
+            while _lstat(target) is not None:
+                target = target.with_name("old-" + target.name)
+            os.replace(old, target)
+        sessions = directory / "sessions"
+        _ = _record_directory(sessions, create=True)
+        path = sessions / _session_filename(checked["session"]["session_id"])
+        if _regular_record(path):
+            raise InvalidRecord(f"{path} is used by a different session id")
+        _write_record(path, checked)
     return True
 
 
@@ -1836,15 +1835,14 @@ def all_account_holds() -> list[AccountHold]:
 
 
 def set_account_hold(hold: AccountHold) -> None:
-    """Persist the account-wide launch hold under the launch barrier."""
+    """Persist the account request under its store lock."""
     checked = _account_hold(hold, "hold")
-    with launch_barrier():
-        with _session_store_lock(checked["login"], create=True) as directory:
-            path = directory / "hold.json"
-            if _regular_record(path):
-                existing = _account_hold(_read_json(path), str(path))
-                _check_account(checked["login"], existing["login"], path)
-            _write_record(path, checked)
+    with _session_store_lock(checked["login"], create=True) as directory:
+        path = directory / "hold.json"
+        if _regular_record(path):
+            existing = _account_hold(_read_json(path), str(path))
+            _check_account(checked["login"], existing["login"], path)
+        _write_record(path, checked)
 
 
 def _hold_request_ids(hold: AccountHold) -> set[str]:
@@ -1891,25 +1889,24 @@ def register_account_hold_request(hold: AccountHold, *, account_wide: bool, expi
     login, request_id = checked["login"], checked["request_id"]
     pid = os.getpid()
     started = registration_process_start(pid)
-    with launch_barrier():
-        with _session_store_lock(login, create=True) as directory:
-            path = directory / "hold.json"
-            if _regular_record(path):
-                checked = _account_hold(_read_json(path), str(path))
-                _check_account(login, checked["login"], path)
-            elif not account_wide:
-                return
-            requests = _hold_request_ids(checked)
-            requests.update(saved["request_id"] for saved in _session_records_in_directory(directory, login))
-            requests.add(request_id)
-            pending = _registering_request_ids(checked)
-            pending.add(request_id)
-            checked["request_ids"] = sorted(requests)
-            checked["registering_request_ids"] = sorted(pending)
-            checked.setdefault("registration_owners", {})[request_id] = RegistrationOwner(pid=pid, proc_start=started)
-            if expires_at:
-                checked.setdefault("registration_deadlines", {})[request_id] = expires_at
-            _write_record(path, checked)
+    with _session_store_lock(login, create=True) as directory:
+        path = directory / "hold.json"
+        if _regular_record(path):
+            checked = _account_hold(_read_json(path), str(path))
+            _check_account(login, checked["login"], path)
+        elif not account_wide:
+            return
+        requests = _hold_request_ids(checked)
+        requests.update(saved["request_id"] for saved in _session_records_in_directory(directory, login))
+        requests.add(request_id)
+        pending = _registering_request_ids(checked)
+        pending.add(request_id)
+        checked["request_ids"] = sorted(requests)
+        checked["registering_request_ids"] = sorted(pending)
+        checked.setdefault("registration_owners", {})[request_id] = RegistrationOwner(pid=pid, proc_start=started)
+        if expires_at:
+            checked.setdefault("registration_deadlines", {})[request_id] = expires_at
+        _write_record(path, checked)
 
 
 def complete_account_hold_registration(login: str, request_id: str) -> None:

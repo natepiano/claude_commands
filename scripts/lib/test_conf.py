@@ -172,6 +172,40 @@ class ConfTests(unittest.TestCase):
                 self.assertEqual(reader(conf.read("example"), "amount"), expected)
             self.assertEqual(len(warning.getvalue().splitlines()), 1)
 
+    def test_reader_warnings_use_the_diagnostics_context(self) -> None:
+        for recovery in (False, True):
+            with self.subTest(recovery=recovery):
+                if recovery:
+                    self.history()
+                    self.commit("# whole: 1..4\ncount=3\n")
+                self.write("# whole: 1..4\ncount=broken\n")
+                with redirect_stderr(io.StringIO()) as stderr, conf.diagnostics(report=False) as warnings:
+                    if recovery:
+                        self.assertEqual(conf.read("example").whole("count"), 3)
+                    else:
+                        with self.assertRaises(conf.Unusable):
+                            _ = conf.read("example").whole("count")
+                self.assertEqual(stderr.getvalue(), "")
+                self.assertEqual(len(warnings), 1)
+                self.assertIn("count='broken'", warnings[0])
+
+    def test_map_warnings_use_the_diagnostics_context(self) -> None:
+        for recovery in (False, True):
+            with self.subTest(recovery=recovery):
+                if recovery:
+                    self.history()
+                    self.commit("host=mac\n")
+                    self.path.unlink()
+                with redirect_stderr(io.StringIO()) as stderr, conf.diagnostics(report=False) as warnings:
+                    if recovery:
+                        self.assertEqual(conf.read("example").values(), {"host": "mac"})
+                    else:
+                        with self.assertRaises(conf.Unusable):
+                            _ = conf.read("example").values()
+                self.assertEqual(stderr.getvalue(), "")
+                self.assertEqual(len(warnings), 1)
+                self.assertIn("keys:", warnings[0])
+
     def test_sections_are_skipped_and_the_first_value_wins(self) -> None:
         self.write("# note\n[values]\n# whole: ..\n LIMIT = 12 # first\n[another]\nLIMIT=99\nignored\n")
         self.assertEqual(conf.read("example").whole("LIMIT"), 12)

@@ -947,22 +947,14 @@ class AccountsTests(unittest.TestCase):
         _ = path.write_text(json.dumps({"units": label}))
 
     def test_exec_claude_uses_default_home_and_removes_inherited_account_settings(self) -> None:
-        from scripts.shutdown import launch_permission
 
         arguments = ["--resume", "conversation id", "--", "quoted argument"]
         for tty, probe in ((False, False), (True, False), (False, True)):
-            with (self.subTest(tty=tty, probe=probe),
-                  patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.root / "inherited"),
+            with (self.subTest(tty=tty, probe=probe), patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.root / "inherited"),
                       "CLAUDE_CODE_REMOTE_MEMORY_DIR": str(self.root / "inherited-memory"),
                       "CLAUDE_CODE_OAUTH_TOKEN": "fixture-token", "KEEP": "yes",
                       "SHUTDOWN_STATE_DIR": str(self.root / "shutdown"),
-                      "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions")}),
-                  patch.object(accounts, "prepared_account") as prepare,
-                  patch.object(launch_permission, "launch_permission", return_value=launch_permission.AllowedByShutdownState()),
-                  patch.object(subprocess, "run", side_effect=AssertionError("unexpected subprocess")),
-                  patch.object(subprocess, "Popen", side_effect=AssertionError("unexpected subprocess")),
-                  patch.object(sys.stdin, "isatty", return_value=tty),
-                  patch.object(os, "execvpe") as launch):
+                      "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions")}), patch.object(accounts, "prepared_account") as prepare, patch.object(subprocess, "run", side_effect=AssertionError("unexpected subprocess")), patch.object(subprocess, "Popen", side_effect=AssertionError("unexpected subprocess")), patch.object(sys.stdin, "isatty", return_value=tty), patch.object(os, "execvpe") as launch):
                 self.assertEqual(self.run_cli("exec", *(["--probe"] if probe else []),
                                               "claude", *arguments), (0, "", ""))
                 prepare.assert_not_called()

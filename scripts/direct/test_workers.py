@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from scripts.lib.test_agents_registry import write_registry
+from scripts.lib.test_models_registry import write_registry
 from scripts.lib.atomic_file import write_bytes_atomic
 
 import contextlib
@@ -472,7 +472,7 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
         self.patches.enter_context(patch.dict(os.environ, {
             "UNIT_WORKERS_STATE": str(self.session_dir.parent / "unit-workers"),
             "NOTIFIER_STATE_DIR": str(self.session_dir.parent / "notifier"),
-            "AGENTS_CONFIG_FILE": str(write_registry(self.session_dir / "registry.conf", {
+            "MODELS_CONFIG_FILE": str(write_registry(self.session_dir / "registry.conf", {
                 "direct.codex": dict.fromkeys(("impl", "test", "fix", "review"), "gpt-kept-sol:xhigh"),
             })),
         }))
@@ -543,7 +543,7 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
         checkpoint = self.session_dir.parent / "catalog-current"
         checkpoint.touch()
         self.patches.enter_context(patch.dict(os.environ, {
-            "AGENTS_CONFIG_FILE": str(registry),
+            "MODELS_CONFIG_FILE": str(registry),
             "CODEX_CATALOG_SYNC_STATE_FILE": str(checkpoint),
         }))
 
@@ -1018,7 +1018,7 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
         self.configure_new_worker()
         self.assertEqual(self.resolve(self.session_dir), "impl")
         self.complete_assignment("impl")
-        registry = Path(os.environ["AGENTS_CONFIG_FILE"])
+        registry = Path(os.environ["MODELS_CONFIG_FILE"])
         _ = write_registry(registry, {"direct.codex": {"impl": "gpt-kept-sol:high"}},
                            base_text=registry.read_text())
         self.assertEqual(self.resolve(self.session_dir), "impl")

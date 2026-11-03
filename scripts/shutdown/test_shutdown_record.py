@@ -22,7 +22,6 @@ from unittest.mock import Mock, patch
 from test_support import ShutdownTestCase
 import inventory
 import shutdown_record as shutdown_store
-from launch_permission import launch_barrier
 
 
 # Hang guard: natedev reached load 136 on 2026-10-29; scheduling delays are not failures.
@@ -996,7 +995,6 @@ class SessionRecordTests(ShutdownTestCase):
 
         self.assertEqual(shutdown_store.all_account_holds(), [explicit, legacy, later])
         self.assertEqual(shutdown_store.session_records(old["login"]), [])
-        self.assertTrue((self.directory.parent / "launch.lock").is_file())
 
     def test_all_account_holds_missing_root_is_empty(self) -> None:
         self.assertEqual(shutdown_store.all_account_holds(), [])
@@ -1061,33 +1059,6 @@ class SessionRecordTests(ShutdownTestCase):
                 with self.assertRaises(shutdown_store.InvalidRecord):
                     _ = shutdown_store.parse_account_holds(json.dumps([hold]))
 
-    def test_session_records_create_and_hold_wait_for_the_launch_barrier(self) -> None:
-        for operation in ("session", "hold"):
-            with self.subTest(operation=operation):
-                done = threading.Event()
-                failures: list[BaseException] = []
-
-                def create() -> None:
-                    try:
-                        if operation == "session":
-                            self.assertTrue(shutdown_store.create_session(session_shutdown()))
-                        else:
-                            shutdown_store.set_account_hold(account_hold())
-                    except BaseException as error:
-                        failures.append(error)
-                    finally:
-                        done.set()
-
-                blocked = threading.Event()
-                with launch_barrier(), observe_lock_contention(blocked):
-                    worker = threading.Thread(target=create)
-                    worker.start()
-                    self.assertTrue(blocked.wait(HANG_GUARD_SECONDS))
-                    self.assertFalse(done.is_set())
-                worker.join(HANG_GUARD_SECONDS)
-                self.assertFalse(worker.is_alive())
-                self.assertEqual(failures, [])
-                self.assertTrue(done.is_set())
 
     def test_session_records_unsafe_ids_stay_inside_the_sessions_directory(self) -> None:
         for session_id, filename in (("../outside/\0:*", "..-outside----.json"), ("safe.ID_2-3", "safe.ID_2-3.json")):

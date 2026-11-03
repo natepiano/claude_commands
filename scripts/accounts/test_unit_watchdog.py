@@ -33,12 +33,12 @@ from scripts.accounts import test_refusal_watch as fixtures
 from scripts.production import showrunners, staff
 from scripts.shutdown.remote import local_machine
 from scripts.production.staff_test_support import isolated_staff_file, showrunner_relationship, unit_membership, recorded_unit
-from scripts.shutdown import folder_trust, stop_resume
+from scripts.shutdown import stop_resume
 from scripts.shutdown import pane_record as hook_pane_record
 from scripts.notify.push_texts import RenderedPush
 
 if TYPE_CHECKING:
-    from scripts.shutdown import shutdown_record, inventory, launch_permission, restart, restart_support, pane_record
+    from scripts.shutdown import shutdown_record, inventory, restart, restart_support, pane_record
     from scripts.herdr import herdr
     from scripts.message import sessions
     from scripts.production import unit_lookup
@@ -50,7 +50,6 @@ else:
     herdr = import_module("herdr")
     inventory = import_module("inventory")
     sessions = import_module("sessions")
-    launch_permission = import_module("launch_permission")
     unit_lookup = import_module("unit_lookup")
 import quota_alert
 from scripts.whoami import agent_accounts
@@ -191,9 +190,8 @@ class UnitWatchdogTests(unittest.TestCase):
         self.notices.append(text)
         return "told fixture"
 
-    def resume(self, identity: str, *, why: str, to: str, restore_missing: bool) -> stop_resume.ClaudeUp | stop_resume.ResumeFailed:
+    def resume(self, identity: str, *, why: str, to: str) -> stop_resume.ClaudeUp | stop_resume.ResumeFailed:
         self.assertEqual(why, "unit watchdog recovery")
-        self.assertTrue(restore_missing)
         self.commands.append(["resume", identity, "--to", to, "--only", identity])
         if to in self.refused:
             return stop_resume.ResumeFailed(identity, "fixture refused")
@@ -379,7 +377,7 @@ class UnitWatchdogTests(unittest.TestCase):
                   patch.object(herdr.Herdr, "retitle", return_value=False) as retitle,
                   patch.object(staff, "initial_snapshot", return_value=record),
                   patch.object(stop_resume, "_detach"), patch("unit_runs.held", return_value=[]),
-                  patch.object(folder_trust, "heal", return_value=herdr.Trusted(
+                  patch.object(herdr, "heal_claude_trust", return_value=herdr.Trusted(
                       Path(owner["cwd"]), config / ".claude.json", Path(owner["cwd"])))):
                 result = self.shared_resume("alpha", why="maintenance complete")
                 row = record.by_current_session(owner["session_id"])
@@ -640,7 +638,7 @@ class UnitWatchdogTests(unittest.TestCase):
             failure, launches = self.recover_queued(source)
         self.assertEqual(failure, "")
         self.assertEqual(len(launches), 1)
-        resume.assert_called_once_with("alpha", why="unit watchdog recovery", to="claude4", restore_missing=True)
+        resume.assert_called_once_with("alpha", why="unit watchdog recovery", to="claude4")
 
 
     def test_several_units_read_run_records_once_per_pass(self) -> None:
@@ -849,8 +847,7 @@ class UnitWatchdogTests(unittest.TestCase):
     def test_obsolete_account_hold_does_not_discard_recovery_evidence_or_retry(self) -> None:
         _, result = self.finished_recovery()
         _ = self.hold("claude4", terminal=True)
-        with (patch.object(unit_watchdog, "_live_account", return_value="") as live,
-              patch.object(launch_permission, "launch_permission", return_value=launch_permission.BlockedByShutdown("terminal stop"))):
+        with (patch.object(unit_watchdog, "_live_account", return_value="") as live):
             lines = self.pass_at(3)
         self.assertEqual(live.call_count, 2)
         self.assertFalse(result.exists())
@@ -1030,9 +1027,8 @@ class UnitWatchdogTests(unittest.TestCase):
         _ = self.add_unit("held")
         _ = self.hold("claude4", terminal=True)
         self.die("held")
-        with patch.object(launch_permission, "launch_permission", return_value=launch_permission.BlockedByShutdown("terminal stop")):
-            for minute in (0, 2, 4):
-                _ = self.pass_at(minute)
+        for minute in (0, 2, 4):
+            _ = self.pass_at(minute)
         self.assertEqual(len(self.commands), 1)
         self.assertEqual(self.notices, [])
 
@@ -1118,13 +1114,7 @@ class UnitWatchdogTests(unittest.TestCase):
         self.assertTrue(any("no longer exists" in line for line in lines))
 
     def fail_moved_restart(self, saved: shutdown_record.SessionShutdown) -> None:
-        with (patch.object(restart, "_retire"),
-              patch.object(restart, "_live_session_ids", return_value=frozenset()),
-              patch.object(restart, "_owner_liveness", return_value=restart.SessionNotLive()),
-              patch.object(restart, "_session_liveness", return_value=restart.SessionNotLive()),
-              patch.object(launch_permission, "launch_permission", return_value=launch_permission.AllowedByShutdownState()),
-              patch.object(restart, "_launch_session", side_effect=OSError("both accounts refused")) as launch,
-              redirect_stdout(io.StringIO())):
+        with (patch.object(restart, "_retire"), patch.object(restart, "_live_session_ids", return_value=frozenset()), patch.object(restart, "_owner_liveness", return_value=restart.SessionNotLive()), patch.object(restart, "_session_liveness", return_value=restart.SessionNotLive()), patch.object(restart, "_launch_session", side_effect=OSError("both accounts refused")) as launch, redirect_stdout(io.StringIO())):
             _ = restart.relaunch_session(saved, dry_run=False, desktop_state=restart.DesktopLaunchState())
         self.assertEqual(launch.call_count, 2)
 

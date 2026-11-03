@@ -12,8 +12,8 @@ The command restores the saved account, environment, and folder.
 A closed tab uses the existing restore path.
 A herdr server restore resumes the saved conversation without a generated prompt.
 The target pane refuses resume: type `/exit`, then run `resume <name>` from another pane.
-A session already running on the target account prints an already-running line and returns status 0.
-A session running on another account refuses resume without stopping.
+A running session prints `unchanged` with its current account and returns status 0.
+Resume does not stop or move a running session.
 An unknown name returns status 1 with close local unit and showrunner names when available.
 An ambiguous name returns status 1 with its matching members.
 A remote member returns status 1 with its machine name.

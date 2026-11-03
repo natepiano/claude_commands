@@ -31,7 +31,7 @@ An untrusted session folder refuses before any stub, Units row, or worktree is
 written. Show the refusal's `Run:` command; the user runs it on the launch
 account (in the main checkout for a new worktree), accepts the trust prompt,
 types `/exit`, then retries this command.
-The unit director launch takes its model and effort from `/agent production.director`.
+The unit director launch takes its model and effort from `/default_models production.director`.
 For a standby unit, send its work when assigned, set the Units row's Plan cell
 to the plan path, and commit that doc on the merge branch without pushing it (it
 goes out with your next merge push). Nothing else marks the unit as working: it

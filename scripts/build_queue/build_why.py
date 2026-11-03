@@ -5,17 +5,15 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from datetime import datetime
-import io
 import os
 from pathlib import Path
 import sys
-from contextlib import redirect_stderr
 from typing import assert_never
 from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from scripts.build_queue import build_queue, head_facts
+from scripts.build_queue import build_queue, head_facts, admission_protocol
 from scripts.lint import memory_admit as gate
 from scripts.lib.user_zone import user_zone
 from scripts.lib.terminal_cells import terminal_width
@@ -125,7 +123,7 @@ def need_text(source: gate.RecordedNeed | gate.NeedSourceNotRecorded) -> str:
     elif source.source == "cap":
         text = "memory cap: program not recorded"
     else:
-        assert_never(source.source)
+        text = f"{source.source}: basis not recorded"
     text += f", last {source.history_days} days"
     if source.scope == "filtered":
         text += f", filtered tests ({source.package}, {len(source.filters)} filters)"
@@ -271,24 +269,21 @@ def render_explanation(explanation: gate.QueueExplanation, zone: ZoneInfo,
 
 
 def main() -> int:
-    _ = gate.memory_config()
     try:
-        # A damaged recovery record must not turn the one-line failure protocol into a traceback.
-        with redirect_stderr(io.StringIO()):
-            reading = gate.queue_read()
-            if isinstance(reading, gate.QueueBusy):
-                print("queue busy; try again")
-                return 0
-            explanation = reading.explanation
-            facts = head_facts.read_head_facts(reading)
-            session_ids = [row.step.session_id for row in explanation.running]
-            if isinstance(explanation.head, gate.HeadExplanation):
-                session_ids.append(explanation.head.waiter.session_id)
-            session_ids.extend(head_facts.session_ids(facts))
-            labels = unit_labels.unit_labels_for(session_ids, os.environ)
-            lines = render_explanation(explanation, user_zone(), labels, facts)
-    except Exception:
-        print("build-why: the admission state could not be read.")
+        reading = gate.queue_read()
+        explanation = reading.explanation
+        facts = head_facts.read_head_facts(reading)
+        session_ids = [row.step.session_id for row in explanation.running]
+        if isinstance(explanation.head, gate.HeadExplanation):
+            session_ids.append(explanation.head.waiter.session_id)
+        session_ids.extend(head_facts.session_ids(facts))
+        labels = unit_labels.unit_labels_for(session_ids, os.environ)
+        lines = render_explanation(explanation, user_zone(), labels, facts)
+    except admission_protocol.AdmissionUnavailable as error:
+        print(f"build queue: admission service unavailable: {error.reason}", file=sys.stderr)
+        return 2
+    except (OSError, ValueError):
+        print("build-why: the admission state could not be read.", file=sys.stderr)
         return 2
     print("\n".join(lines))
     return 0

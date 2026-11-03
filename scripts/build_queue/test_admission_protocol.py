@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 
 from scripts.lint import memory_admit as gate
 from scripts.build_queue import admission_protocol as wire, build_why
+from scripts.build_queue.admission_test_support import admitted_reply, wait_reply
 from scripts.build_queue.admission_test_support import AdmissionFixture, GIB, NOW
 
 
@@ -28,9 +29,11 @@ class ProtocolTests(unittest.TestCase):
                 wire.ReleaseRequest("release", "/tmp/stem", 137),
                 wire.WidthRequest("width", "/tmp/stem", 4), wire.ViewRequest(),
                 wire.ExplainRequest(), wire.MineRequest("session"),
-                wire.AdmitHeadRequest("head", "urgent", "actor")]
-            for width in (wire.RequestedTestWidth(3), wire.UnspecifiedTestWidth(), wire.NoTestWidth()):
-                for call in (wire.CallRecord("a-call"), wire.NoCallRecord()):
+                wire.AdmitHeadRequest("head", "urgent", "actor"),
+                wire.PrioritySetRequest("priority", "queue-unit", "urgent", "actor"),
+                wire.PriorityClearRequest("clear", "actor"), wire.TokenWaitRequest("token", "stem")]
+            for width in (gate.RequestedTestWidth(3), gate.UnspecifiedTestWidth(), gate.NoTestWidth()):
+                for call in (gate.CallRecord("a-call"), gate.NoCallRecord()):
                     requests.append(replace(request, test_width=width, call=call))
             for value in requests:
                 with self.subTest(request=value):
@@ -49,8 +52,8 @@ class ProtocolTests(unittest.TestCase):
             assert isinstance(limits, gate.AdmissionLimits)
             reading = gate.queue_read_from(inputs, limits, policy=gate.DEFAULT_ADMISSION_POLICY)
             replies: tuple[wire.Reply, ...] = (
-                wire.Wait(gate.EstimateExpired(NOW - gate.DEFAULT_ADMISSION_POLICY.timing.head_seconds), 1, "head", "estimate expired"),
-                wire.Admitted("stem", GIB, "future-source", "stem.max", "stem.wave"),
+                wait_reply(gate.EstimateExpired(NOW - gate.DEFAULT_ADMISSION_POLICY.timing.head_seconds), 1, "head", "estimate expired"),
+                admitted_reply("stem", GIB, "future-source", "stem.max", "stem.wave"),
                 wire.LaunchAdmitted(GIB, "future-source"), wire.Refused("no"), wire.Ok(),
                 wire.ViewReply(reading), wire.ExplainReply(reading.explanation), wire.MineReply(reading))
             for reply in replies:
@@ -65,8 +68,8 @@ class ProtocolTests(unittest.TestCase):
     def test_admit_and_launch_have_distinct_outcomes(self) -> None:
         with AdmissionFixture() as fixture:
             admit, launch = fixture.request(), fixture.launch()
-            held = wire.Wait(gate.ReadyForAdmission(), 1, "head", "ready")
-            admitted = wire.Admitted("stem", GIB, "arbitrary source", "stem.max", "stem.wave")
+            held = wait_reply(gate.ReadyForAdmission(), 1, "head", "ready")
+            admitted = admitted_reply("stem", GIB, "arbitrary source", "stem.max", "stem.wave")
             launched = wire.LaunchAdmitted(GIB, "arbitrary source")
             self.assertEqual(wire.parse_reply(wire.encode_reply(admitted), admit), admitted)
             self.assertEqual(wire.parse_reply(wire.encode_reply(launched), launch), launched)
