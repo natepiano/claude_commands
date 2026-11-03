@@ -10,18 +10,20 @@ from typing import cast, override
 import unittest
 from unittest import mock
 
+from scripts.issue_score.test_config import ConfiguredTestCase
 from scripts.issue_score import blind as preference
 from scripts.issue_score import evaluate, questions, records, score_issues
 from scripts.issue_score import test_evaluate as support
 
 
-class BlindTests(unittest.TestCase):
+class BlindTests(ConfiguredTestCase):
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
         self.fixture: support.CompareTests = support.CompareTests()
 
     @override
     def setUp(self) -> None:
+        super().setUp()
         self.fixture.setUp()
         self.addCleanup(self.fixture.doCleanups)
 
@@ -58,6 +60,15 @@ class BlindTests(unittest.TestCase):
         return (cast(records.BlindSheet, json.loads(files.sheet_path.read_text())),
                 cast(records.BlindKey, json.loads(files.key_path.read_text())))
 
+    def test_default_sample_count_changes_on_the_next_blind_sheet(self) -> None:
+        run_id = self.disagreements()
+        path = self.configuration(blind_sample_count="2")
+        first = preference.blind(run_id, issues_dir=self.fixture.issues, state_dir=self.fixture.state)
+        self.assertEqual(len(self.read(first)[0]["items"]), 2)
+        self.change_configuration(path, blind_sample_count="3")
+        second = preference.blind(run_id, issues_dir=self.fixture.issues, state_dir=self.fixture.state)
+        self.assertEqual(len(self.read(second)[0]["items"]), 3)
+
     def test_seed_reproduces_assignments_without_disclosing_the_key_in_the_sheet(self) -> None:
         run = self.disagreements()
         files = self.blind(run)
@@ -85,7 +96,7 @@ class BlindTests(unittest.TestCase):
         sheet, key = self.read(self.blind(self.disagreements()))
         self.assertEqual(len(sheet["items"]), 20)
         counts = Counter(item["field"] for item in sheet["items"])
-        self.assertEqual(set(counts), set(questions.THRESHOLDS))
+        self.assertEqual(set(counts), set(questions.thresholds()))
         self.assertLessEqual(max(counts.values()) - min(counts.values()), 1)
         self.assertEqual(len({entry["issue_path"] for entry in key["entries"]}), 20)
         for entry in key["entries"]:
@@ -121,7 +132,7 @@ class BlindTests(unittest.TestCase):
                 with self.subTest(seed=seed, count=count):
                     sheet, key = self.read(self.blind("overlapping-fields", count=count, seed=seed))
                     self.assertEqual(len(sheet["items"]), count)
-                    self.assertEqual({item["field"] for item in sheet["items"]}, set(questions.THRESHOLDS))
+                    self.assertEqual({item["field"] for item in sheet["items"]}, set(questions.thresholds()))
                     self.assertEqual(len({entry["issue_path"] for entry in key["entries"]}), count)
                     category = [entry for entry in key["entries"] if entry["field"] == "category"]
                     self.assertEqual([entry["issue_path"] for entry in category], [str(paths[0])])
@@ -139,7 +150,7 @@ class BlindTests(unittest.TestCase):
         _ = files.sheet_path.write_text(json.dumps(sheet))
         result = preference.blind_score(files.sheet_path)
         self.assertEqual(result.unanswered, 7)
-        self.assertEqual(set(result.counts), set(questions.THRESHOLDS))
+        self.assertEqual(set(result.counts), set(questions.thresholds()))
         for field, tally in result.counts.items():
             with self.subTest(field=field):
                 self.assertEqual((tally.jev, tally.vault, tally.same), (1, 1, 1))

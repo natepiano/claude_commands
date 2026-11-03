@@ -3123,6 +3123,11 @@ natedev 2026-11-02: the hard-coded values proposal, phase 3 (user approved 2026-
 
 **As-built:** `config/accounts.conf` holds one commented key per accounts tunable (timeouts, intervals, ages, counts, the nixos and notes path roots), each with its old value; the code reads each key at use through `scripts/lib/conf.py` with no fallback literal. Owner loops (refusal watch placement and pick) read the usage age once and pass it down. `scripts/whoami/note_file.py` resolves the notes folder as `AGENT_NOTES_DIR`, then the `AGENTS_DIR` override, then `notes_directory`, read once per process (`functools.cache`); `new_account.py` and the missing-note repair steps in `accounts.py` use that one helper. Tests run on a scratch `CONF_DIR` copy (`scratch_accounts_config` in `scripts/accounts/home_test_support.py`); caller test fixtures that clear `CONF_DIR` (herdr sessions, account move, send, codex mesh, profile notes pass) enter it too. `docs/accounts.md` names the file and says a change needs no build, and a new process for a notes-folder change.
 
+### Phase 101z — Accounts config reads work in temp-home tests  · status: done · 046009a3b
+**Depends on:** Phase 101w (order only).
+
+**As-built:** `scripts/lib/conf.py` resolves a value from the live file, then, for the default `~/.claude/config` only, the repository's `config/<stem>.conf` when the file or key is absent, then Git recovery. `CONF_DIR` stays authoritative: a missing value there still refuses. Invalid present values keep Git recovery. `value_origin`, the typed readers and `values` share `_resolve` and `_repository_path`. `scripts/lib/test_conf.py` covers each case. Full merge gate passed; merged to main 4da324700.
+
 ### Phase 101y — A new settings key on one machine never blocks promotion  · status: todo
 **Depends on:** Phase 101x (order only; both edit `scripts/settings/settings_local_keys.sh`).
 
