@@ -307,7 +307,7 @@ class QuestionStaff:
                 raise RegistrationFailure("ask", f"{unit} is not a unit of {production.slug}")
             return row
         selector = session_staff.UnitMember(production.slug, unit)
-        found = session_staff.unit_match(selector, self.record, parent=parent)
+        found = session_staff.unit_match(selector, self.record, parent=session_staff.RequiredParent(parent))
         if isinstance(found, session_staff.NoSuchMember):
             raise RegistrationFailure("ask", f"{unit} is not a unit of {production.slug}")
         return found.row

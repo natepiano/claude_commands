@@ -26,10 +26,10 @@ import showrunner_tree
 
 class ShowrunnerParentTests(StaffTestCase):
     def members(self) -> tuple[staff.StaffRow, staff.StaffRow]:
-        _ = self.production("sdlc", workspace="tools")
-        _ = self.production("parent", workspace="umbrella")
-        child = fixture_member("showrunner", name="tools")
-        parent = fixture_member("showrunner", name="umbrella")
+        child_doc = self.production("sdlc", workspace="tools")
+        parent_doc = self.production("parent", workspace="umbrella")
+        child = fixture_member("showrunner", name="tools", doc=staff.LiveDoc("natedev", child_doc))
+        parent = fixture_member("showrunner", name="umbrella", doc=staff.LiveDoc("natedev", parent_doc))
         with staff.operation():
             pass
         return child, parent
@@ -42,7 +42,7 @@ class ShowrunnerParentTests(StaffTestCase):
         child, parent = self.members()
         script = Path(showrunners.__file__)
         _ = self.script(script, "attach", "sdlc", "parent")
-        self.assertEqual(staff.snapshot().by_id(child.id), staff.StaffRow(child.id, "showrunner", "tools", parent.id, current_session=child.id))
+        self.assertEqual(staff.snapshot().by_id(child.id), staff.StaffRow(child.id, "showrunner", "tools", parent.id, current_session=child.id, doc=child.doc))
         source = Path(os.environ["SHOWRUNNER_STATE_DIR"]) / "sdlc/parent"
         self.assertEqual(source.read_text(), "parent\n")
         _ = self.script(script, "detach", "sdlc")
@@ -67,7 +67,7 @@ class ShowrunnerParentTests(StaffTestCase):
                     self.assertIn("done", finished.getvalue())
                     notices.assert_not_called()
                     self.assertEqual(self.source_files(), expected)
-                    self.assertEqual(staff.snapshot().by_id(child.id), staff.StaffRow(child.id, "showrunner", "tools", parent.id, current_session=child.id))
+                    self.assertEqual(staff.snapshot().by_id(child.id), staff.StaffRow(child.id, "showrunner", "tools", parent.id, current_session=child.id, doc=child.doc))
 
     def test_detach_rerun(self) -> None:
         child, parent = self.members()
@@ -136,12 +136,12 @@ class ShowrunnerParentTests(StaffTestCase):
                 self.assertEqual(set(cast(dict[str, str], notices.call_args.args[0])), {"sdlc", "parent"})
                 self.assertFalse(pending.exists())
                 self.assertEqual(staff.snapshot().by_id(child.id),
-                                 staff.StaffRow(child.id, "showrunner", "tools", parent.id if action == "attach" else None, current_session=child.id))
+                                 staff.StaffRow(child.id, "showrunner", "tools", parent.id if action == "attach" else None, current_session=child.id, doc=child.doc))
 
     def test_release_uses_the_capture_after_edges_have_been_removed(self) -> None:
         child_row, parent_row = self.members()
-        _ = self.production("leaf")
-        _ = fixture_member("showrunner", name="leaf", parent=child_row.id)
+        leaf_doc = self.production("leaf")
+        _ = fixture_member("showrunner", name="leaf", parent=child_row.id, doc=staff.LiveDoc("natedev", leaf_doc))
         _ = staff.move(child_row.id, parent_row.id)
         state = Path(os.environ["SHOWRUNNER_STATE_DIR"])
         for child, parent in (("sdlc", "parent"), ("leaf", "sdlc")):
@@ -158,8 +158,8 @@ class ShowrunnerParentTests(StaffTestCase):
 
     def test_release_retry_preserves_edges_attached_after_capture(self) -> None:
         child_row, parent_row = self.members()
-        _ = self.production("leaf")
-        leaf_row = fixture_member("showrunner", name="leaf", parent=child_row.id)
+        leaf_doc = self.production("leaf")
+        leaf_row = fixture_member("showrunner", name="leaf", parent=child_row.id, doc=staff.LiveDoc("natedev", leaf_doc))
         _ = staff.move(child_row.id, parent_row.id)
         state = Path(os.environ["SHOWRUNNER_STATE_DIR"])
         original = {"sdlc": "parent", "leaf": "sdlc"}
