@@ -408,7 +408,7 @@ Delivery failures, restarts, and failed ledger writes preserve the event and dup
 
 **Ruled out:** Querying charges by local accounting-day bounds — Cost Explorer reports UTC days.
 
-### Phase 10 — Print the interruption marker once  · status: todo
+### Phase 10 — Print the interruption marker once  · status: done
 **Depends on:** Phase 9
 
 #### Work Order
