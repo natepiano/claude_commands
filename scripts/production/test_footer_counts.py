@@ -5,8 +5,6 @@ import contextlib
 import io
 import json
 import os
-import subprocess
-import re
 import sys
 import tempfile
 import unittest
@@ -25,7 +23,7 @@ import proposals_folder
 from scripts.production import showrunners
 import showrunner_tree
 from scripts.production import staff
-from scripts.production.test_change_routing import checkpoint_rows
+from scripts.production.test_change_review import producer_rows
 from scripts.statusline import counts_row
 from footer_counts import FooterCounts
 from scripts.production.staff_test_support import (
@@ -134,6 +132,18 @@ class FooterCountsTests(unittest.TestCase):
         record = staff.snapshot()
         with mock.patch.object(staff, "snapshot", side_effect=[record]):
             self.assertEqual(footer_counts.changes(doc), 2)
+
+    def test_one_count_read_routes_once_with_the_supplied_staff_snapshot(self) -> None:
+        listing = self.root / "change-review.md"
+        _ = listing.write_text(LIST, encoding="utf-8")
+        doc = self.doc(f"- **Change review:** `{listing}`")
+        record = staff.snapshot()
+        with (mock.patch.object(change_review, "routed_review_entries", wraps=change_review.routed_review_entries) as routed,
+              mock.patch.object(staff, "snapshot", side_effect=AssertionError("use the supplied snapshot"))):
+            counts = footer_counts.read_counts(doc, record=record)
+        self.assertEqual(counts.changes, 2)
+        self.assertEqual(counts.unrouted, 0)
+        routed.assert_called_once_with(listing, doc, record=record)
 
     def test_footer_counts_and_watches_questions_without_a_proposals_line(self) -> None:
         doc = self.root / "example-production.md"
@@ -318,12 +328,42 @@ class FooterCountsTests(unittest.TestCase):
             _ = doc.write_text(f"# {doc.stem}\n", encoding="utf-8")
         self.tree = {"top": top, "kid": kid, "grandkid": grandkid}
         self.below = {"top": ["kid", "grandkid"]}
-        checkpoint_rows(self.root, self.tree, {listing: "top"})
+        producer_rows(self.root, self.tree, {listing: "top"})
         # A row without a Production cell is the root's; a child with no list line reads the root's list.
         self.assertEqual([footer_counts.changes(doc) for doc in (top, kid, grandkid)], [2, 1, 1])
         self.assertIn(listing, footer_counts.sources(kid))
 
-    def test_rows_without_checkpoints_count_for_the_list_showrunner_on_both_readers(self) -> None:
+    def test_a_missing_alert_setting_keeps_footer_and_next_routing_available(self) -> None:
+        from scripts.production import change_routing, unrouted_alert
+
+        _ = self.enterContext(mock.patch.object(change_routing, "LISTS", self.root))
+
+        config = self.root / "config"
+        config.mkdir()
+        _ = (config / "review_links.conf").write_text("unrouted_alert_recipient=top\n")
+        self.enterContext(mock.patch.dict(os.environ, {"CONF_DIR": str(config)}))
+        listing = self.root / "change-review - top.md"
+        doc = self.root / "top-production.md"
+        _ = doc.write_text(f"# Top\n- **Change review:** `{listing}`\n")
+        self.tree = {"top": doc}
+        top = fixture_member("showrunner", name="top", doc=staff.LiveDoc("natedev", doc))
+        one = fixture_member("unit", name="one", parent=top.id)
+        _ = listing.write_text(LIST.replace("| How to check |", "| How to check | Producer |")
+            .replace("| --- | --- | --- |", "| --- | --- | --- | --- |")
+            .replace("| look |", f"| look | {one.id} |"))
+        snapshot = staff.snapshot()
+        from dataclasses import replace
+        broken = replace(snapshot, rows=tuple(replace(row, parent=None) if row.id == one.id else row
+                                               for row in snapshot.rows))
+        with (mock.patch.object(staff, "snapshot", return_value=broken),
+              mock.patch.object(unrouted_alert, "send_message") as send, contextlib.redirect_stderr(io.StringIO()) as errors):
+            self.assertEqual(footer_counts.changes(doc), 0)
+            self.assertEqual(footer_counts.unrouted_changes(doc), 2)
+            self.assertEqual(change_review.scoped_review_entries(listing, doc), [])
+        send.assert_not_called()
+        self.assertIn("review-links unrouted alert:", errors.getvalue())
+
+    def test_rows_without_producers_count_for_the_list_showrunner_on_both_readers(self) -> None:
         from scripts.review_links import change_browser, change_page
         from scripts.production import change_review as page_review
         from scripts.review_links.test_change_page import BrowserForms
@@ -345,7 +385,7 @@ class FooterCountsTests(unittest.TestCase):
         self.assertEqual(counts, [4, 0, 0])
         self.assertEqual(counts, [forms.counts[name] for name in self.tree])
 
-    def test_unknown_units_in_independent_roots_share_the_pages_global_unrouted_count(self) -> None:
+    def test_rows_without_producers_in_independent_lists_stay_with_their_showrunners(self) -> None:
         from scripts.review_links import change_browser, change_page
         from scripts.production import change_review as page_review
 
@@ -353,73 +393,13 @@ class FooterCountsTests(unittest.TestCase):
         listings = {self.root / f"change-review - {name}.md": name for name in self.tree}
         for listing in listings:
             _ = listing.write_text("## To review\n\n| # | Change |\n| --- | --- |\n| C1 | First |\n")
-        checkpoint_rows(self.root, self.tree, listings)
-        repo = self.root / "routing-repo"
-        for listing, name in listings.items():
-            previous = change_review.pending(listing)[0]["Merged"]
-            _ = subprocess.run(["git", "-C", str(repo), "commit", "--allow-empty", "-m",
-                                f"checkpoint(unknown-{name}): missing staff"], check=True, capture_output=True)
-            current = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
-                                     check=True, capture_output=True, text=True).stdout.strip()
-            _ = listing.write_text(listing.read_text().replace(previous, current))
+        producer_rows(self.root, self.tree, listings, selected_rows={})
         with mock.patch.object(page_review, "LISTS", self.root):
             browser = change_page.ReviewBrowser("token")
             prepared = change_browser.prepare(browser, change_page.DeliveryStatus(self.root / "links"))
         count = sum(item.waiting and item.tab == "unrouted" for item in prepared.changes)
-        self.assertEqual(count, 2)
+        self.assertEqual(count, 0)
         self.assertEqual([footer_counts.unrouted_changes(doc) for doc in self.tree.values()], [count, count])
-
-    def test_a_new_git_ref_refreshes_the_cached_status_count_and_changes_its_tab(self) -> None:
-        listing = self.root / "change-review - top.md"
-        _ = listing.write_text("## To review\n\n| # | Change |\n| --- | --- |\n| C1 | First |\n")
-        docs = {name: self.root / f"{name}-production.md" for name in ("top", "kid")}
-        checkpoint_rows(self.root, docs, {listing: "top"})
-        repo = self.root / "routing-repo"
-
-        def git(*arguments: str) -> str:
-            return subprocess.run(["git", "-C", str(repo), *arguments], capture_output=True,
-                                  text=True, check=True).stdout.strip()
-
-        original = change_review.pending(listing)[0]["Merged"]
-        runner = staff.snapshot().by_path("top")
-        kid = staff.snapshot().by_path("kid")
-        assert runner is not None and kid is not None
-        _ = fixture_member("unit", name="kid-unit", parent=kid.id, worktree=staff.PresentWorktree("natedev", repo))
-        _ = git("checkout", "-b", "hidden")
-        _ = git("commit", "--allow-empty", "-m", "checkpoint(kid-unit): moves to kid")
-        hidden = git("rev-parse", "HEAD")
-        _ = git("checkout", "main")
-        _ = git("branch", "-D", "hidden")
-        _ = listing.write_text(listing.read_text().replace(original, hidden))
-        doc = docs["top"]
-        _ = doc.write_text(doc.read_text() + "\n> **Status: PRODUCTION — running**\n")
-        notifier = self.root / "notifier"
-        instance = notifier / "showrunner-top"
-        instance.mkdir(parents=True)
-        _ = (instance / "conf").write_text(f"TARGET=session:{runner.current_session}\nCHECK=zsh /x/check.sh {doc}\n")
-        environment = dict(os.environ) | {"HOME": str(self.root), "NOTIFIER_STATE_DIR": str(notifier),
-            "SHOWRUNNER_STATE_DIR": str(self.root / "showrunner"), "CHANGE_REVIEW_DIR": str(self.root),
-            "XDG_CACHE_HOME": str(self.root / "cache"), "REVIEW_LINKS_ROOT": str(self.root / "links")}
-        for folder in (self.root / "cache/change-review-history", self.root / "showrunner/counts", self.root / "links"):
-            folder.mkdir(parents=True, exist_ok=True)
-        statusline = Path(__file__).parents[1] / "statusline"
-
-        def read_status() -> str:
-            reply = subprocess.run(["/bin/sh", "-c", f'statusline="{statusline}"; . "$statusline/statusline.sh"'],
-                                   input=json.dumps({"session_id": runner.current_session}), capture_output=True,
-                                   text=True, check=True, env=environment, cwd=self.root)
-            return re.sub(r"\x1b\[[0-9;]*m", "", reply.stdout)
-
-        self.assertIn("For you: 1 change", read_status())
-        cache = self.root / "showrunner/counts/top"
-        began = cache.stat().st_mtime_ns
-        self.assertIn("For you: 1 change", read_status())
-        self.assertEqual(cache.stat().st_mtime_ns, began)
-        _ = git("branch", "visible", hidden)
-        self.assertNotIn("For you: 1 change", read_status())
-        self.assertGreater(cache.stat().st_mtime_ns, began)
-        with mock.patch.object(showrunners, "timer_docs", return_value=docs):
-            self.assertEqual([footer_counts.changes(doc) for doc in docs.values()], [0, 1])
 
     def test_the_proposal_count_leaves_out_approved_and_active_proposals(self) -> None:
         folder = self.root / "issues"

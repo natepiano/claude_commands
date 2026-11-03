@@ -1674,7 +1674,7 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
         workers.pause_unit("demo", "builders")
         new = old.with_name("moved-repository")
         _ = old.rename(new)
-        _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", new))
+        _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", new), expected=row.worktree)
         destination = self.next_run("after-worktree-move")
         state = json_object(destination / workers.STATE)
         state.update({"working_dir": str(new), "plan_doc": str(new / "plan.md")})
@@ -1703,7 +1703,7 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
         original_home = os.environ["CODEX_HOME"]
         new = old.with_name("moved-repository")
         _ = old.rename(new)
-        _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", new))
+        _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", new), expected=row.worktree)
         with patch.dict(os.environ, {"UNIT_RUN_ROOT": str(self.session_dir.parent)}):
             found = workers.find_moved_unit_runs((workers.UnitWorktree("demo", "builders", new, "new-branch"),), ())
             self.assertEqual(len(found.moves), 1)

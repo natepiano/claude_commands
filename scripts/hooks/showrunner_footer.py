@@ -173,5 +173,8 @@ def counts_line(productions: list[Production], questions: int) -> str | None:
     # The counts read the production scripts, which import this module, so this one imports late.
     import footer_counts
 
-    counts = footer_counts.total([footer_counts.read_counts(production.doc) for production in productions])
+    from scripts.production import staff
+
+    record = staff.snapshot()
+    counts = footer_counts.total([footer_counts.read_counts(production.doc, record=record) for production in productions])
     return footer_counts.counts_line(counts._replace(questions=questions))

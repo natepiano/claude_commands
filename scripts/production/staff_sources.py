@@ -1359,12 +1359,9 @@ def _fill_config(cells: dict[str, str]) -> unit_config.UnitConfig:
         raise ValueError("missing Plan cell")
     plan = (unit_config.StandbyPlan() if plan_text == "standby" else
             unit_config.PermanentPlan() if plan_text == "permanent" else unit_config.PlanFile(Path(plan_text)))
-    port_text = production_units.cell_value(cells.get("Port", ""))
-    port: unit_config.AppPort | unit_config.NoAppPort = unit_config.NoAppPort()
-    if port_text and port_text not in ("—", "-", "none"):
-        if not port_text.isdigit():
-            raise ValueError("invalid Port cell")
-        port = unit_config.AppPort(int(port_text))
+    if "Port" not in cells:
+        raise ValueError("Units row has no Port column")
+    port = unit_config.parse_port_cell(cells["Port"])
     unit = production_units.cell_value(cells.get("Unit", ""))
     duties = ("nightly-review",) if unit_names.unit_id(unit) == nightly_unit else ()
     return unit_config.UnitConfig(plan, port, duties)
@@ -1788,7 +1785,7 @@ def _fill_retired(scan: _FillSources, documents: tuple[FillDocument, ...],
                     continue
                 row = selected.row
                 if row.worktree != candidate.worktree:
-                    row = staff.set_worktree(row.id, candidate.worktree)
+                    row = staff.set_worktree(row.id, candidate.worktree, expected=row.worktree)
                     changed = True
                 publication = unit_config.write_parked(row.id, candidate.config)
                 changed |= isinstance(publication, unit_config.Published)
@@ -1825,6 +1822,9 @@ class _LiveFillSources(_FillSources):
             if sessions.running_session(item.record)
         }
         self.row_sessions: dict[staff.StaffId, list[sessions.RegistryObservation]] = {}
+        self.director_folders: dict[staff.StaffId, set[str]] = {}
+        self.director_names: dict[staff.StaffId, set[str]] = {}
+        self.document_cache: dict[production_units.DocumentSource, str | production_units.DocumentUnavailable] = {}
         # Use the same id-first join as every other membership reader.
         for launch in sources.launches:
             owner = record.by_member_reference(launch["session_id"])
@@ -1842,6 +1842,14 @@ class _LiveFillSources(_FillSources):
                 continue
             if isinstance(found, MemberFound):
                 self.row_sessions.setdefault(found.row.id, []).append(self.running[identity])
+                if launch["cwd"]:
+                    self.director_folders.setdefault(found.row.id, set()).add(launch["cwd"])
+                previous_name = environment.get("SHOWRUNNER_UNIT_ID", "")
+                try:
+                    previous_name = unit_names.name(previous_name)
+                except unit_names.BadName:
+                    continue
+                self.director_names.setdefault(found.row.id, set()).add(previous_name)
         self.timers: dict[staff.StaffId, list[showrunners.ShowrunnerSource]] = {}
         self.timer_errors: dict[staff.StaffId, str] = {}
 
@@ -1866,7 +1874,9 @@ class _LiveFillSources(_FillSources):
             except (OSError, UnicodeError):
                 target = ""
             timer = showrunners.Timer(slug, target, conf, "")
-            found = timer_owner(slug, showrunners.ShowrunnerSource(timer, ""))
+            owner = record.by_member_reference(target.removeprefix("session:"))
+            found = (MemberFound(owner) if owner is not None and owner.kind == "showrunner"
+                     else timer_owner(slug, showrunners.ShowrunnerSource(timer, "")))
             if not isinstance(found, MemberFound):
                 continue
             attempted: list[Path] = []
@@ -1880,7 +1890,9 @@ class _LiveFillSources(_FillSources):
             except (OSError, UnicodeError, KeyError, ValueError) as error:
                 self.timer_errors[found.row.id] = f"{attempted[-1]}: {error}"
             else:
-                self.timers.setdefault(found.row.id, []).append(recovered)
+                document_owner = timer_owner(slug, recovered)
+                if isinstance(document_owner, MemberFound):
+                    self.timers.setdefault(document_owner.row.id, []).append(recovered)
         for slug, source in sources.productions.items():
             found = timer_owner(slug, source)
             if isinstance(found, MemberFound):
@@ -1888,6 +1900,19 @@ class _LiveFillSources(_FillSources):
                 session = self.running.get(found.row.current_session)
                 if session is not None:
                     self.row_sessions.setdefault(found.row.id, []).append(session)
+
+    def load_document(self, source: production_units.DocumentSource) -> str | production_units.DocumentUnavailable:
+        if source not in self.document_cache:
+            try:
+                if source.machine != _fill_machine():
+                    raise ValueError("remote production document requires peer evidence")
+                if not self.source_allowed(source.path):
+                    raise ValueError("scratch production document is not evidence")
+                self.dependencies(source.path)
+                self.document_cache[source] = source.path.read_text(encoding="utf-8")
+            except (OSError, UnicodeError, ValueError) as error:
+                self.document_cache[source] = production_units.DocumentUnavailable(str(error))
+        return self.document_cache[source]
 
     def document_for(self, row: staff.StaffRow) -> FillDocument:
         candidates = self.timers.get(row.id, [])
@@ -1899,8 +1924,9 @@ class _LiveFillSources(_FillSources):
         for source in candidates:
             pointer = FillDocument(source.timer.doc, source.document, str(source.timer.doc))
             location = _fill_doc_location(pointer, _fill_machine())
-            self.dependencies(location.path)
-            text = location.path.read_text(encoding="utf-8")
+            text = self.load_document(production_units.DocumentSource(location.machine, location.path))
+            if isinstance(text, production_units.DocumentUnavailable):
+                raise ValueError(text.reason)
             document = FillDocument(location.path, text, str(location.path))
             # Validate the actual checkout's fields, rather than an older copy's Units table.
             if _fill_doc_location(document, _fill_machine()).path != location.path:
@@ -1918,17 +1944,33 @@ class _LiveFillSources(_FillSources):
         return document
 
     def session_worktree(self, row: staff.StaffRow, machine: str) -> staff.PresentWorktree:
-        folders = {item.details.get("cwd", "") for item in self.row_sessions.get(row.id, [])}
-        folders.discard("")
-        if not folders:
+        folders = self.director_folders.get(row.id, set()) - {""}
+        roots: set[Path] = set()
+        for folder in folders:
+            path = Path(folder).expanduser()
+            if not path.is_absolute():
+                continue
+            try:
+                roots.add(Path(_fill_git(path, "rev-parse", "--show-toplevel")))
+            except (OSError, ValueError):
+                continue
+        if len(roots) > 1:
+            raise ValueError("director launches disagree on the working folder: " + ", ".join(map(str, sorted(roots))))
+        if roots:
+            return staff.PresentWorktree(machine, next(iter(roots)))
+        # A native session can recover an existing configuration, but cannot create one from its current folder.
+        current = {item.details.get("cwd", "") for item in self.row_sessions.get(row.id, [])} - {""}
+        if not current:
             raise ValueError("no verified live session supplies its working folder")
-        if len(folders) != 1:
-            raise ValueError("live sessions disagree on the working folder: " + ", ".join(sorted(folders)))
-        folder = Path(next(iter(folders))).expanduser()
+        if len(current) != 1:
+            raise ValueError("live sessions disagree on the working folder: " + ", ".join(sorted(current)))
+        folder = Path(next(iter(current))).expanduser()
         if not folder.is_absolute():
             raise ValueError("live session working folder is not absolute")
-        # A session may work in a subfolder of its unit's worktree.
         root = Path(_fill_git(folder, "rev-parse", "--show-toplevel"))
+        self.dependencies(root / ".unit.toml")
+        if row.kind == "unit" and isinstance(unit_config.read(root, cleanup=False), unit_config.ConfigMissing):
+            raise ValueError("no verified director launch supplies its unit worktree")
         return staff.PresentWorktree(machine, root)
 
     def session_unit(self, row: staff.StaffRow, machine: str, source: str) -> _LiveUnitFill:
@@ -1937,46 +1979,23 @@ class _LiveFillSources(_FillSources):
         return _LiveUnitFill(row, location, unit_config.read(location.path, cleanup=False), source)
 
     def unit_for(self, row: staff.StaffRow, document: FillDocument, machine: str) -> _LiveUnitFill | _RetiredUnitDeferred:
-        joined = _MemberSources({document.slug: showrunners.ShowrunnerSource(
-            showrunners.Timer(document.slug, self.sources.productions[document.slug].timer.target
-                              if document.slug in self.sources.productions else "session:unrecorded",
-                              document.path, ""), document.text)}, self.sources.launches)
-        lines = document.text.splitlines()
-        owner = self.record.by_id(row.parent) if row.parent is not None else None
-        record = self.record
-        if owner is not None and isinstance(owner.doc, staff.DocUnfilled):
-            location = staff.LiveDoc(machine, document.path)
-            record = replace(record, rows=tuple(replace(item, doc=location) if item.id == owner.id else item
-                                                 for item in record.rows))
-        try:
-            cells_list = production_units.unit_table(lines)
-            _, raw_rows = production_units.unit_rows(lines)
-        except production_units.Refusal as table_error:
-            try:
-                return self.session_unit(row, machine, str(document.path))
-            except (OSError, UnicodeError, ValueError) as session_error:
-                raise ValueError(f"{document.path}: {table_error}; {session_error}") from session_error
-        matches: list[tuple[dict[str, str], int]] = []
-        start = lines.index("## Units")
-        for cells, raw in zip(cells_list, raw_rows, strict=True):
-            line = lines.index(raw, start) + 1
-            start = line
-            try:
-                selected = joined.member(UnitMember(document.slug, production_units.cell_value(cells.get("Unit", ""))),
-                                         record)
-            except (ValueError, staff.StaffUnreadable):
-                continue  # A stale table name with no staff identity is not a fill target.
-            if isinstance(selected, MemberFound) and selected.row.id == row.id:
-                matches.append((cells, line))
-        if len(matches) > 1:
-            raise ValueError(f"{document.path}: several Units rows identify {row.name}")
-        if not matches:
+        parent = production_units.DocumentSource(machine, document.path)
+        documents = tuple(production_units.DocumentSource(item.doc.machine, item.doc.path)
+                          for item in self.record.find(kind="showrunner")
+                          if not isinstance(item.doc, staff.DocUnfilled))
+        selected = production_units.lookup_unit(row.name, parent, documents, self.load_document,
+                                                aliases=self.director_names.get(row.id, ()))
+        if isinstance(selected, production_units.UnitRowMissing):
             return self.session_unit(row, machine, str(document.path))
-        cells, line = matches[0]
+        if not isinstance(selected, production_units.UnitRowFound):
+            raise ValueError(selected.reason)
+        cells, line = selected.cells, selected.line
+        if selected.note:
+            print(f"note {row.id} {row.name}: {selected.note}")
         if production_units.plan_cell_is_retired(cells.get("Plan", "")):
             return _RetiredUnitDeferred()
         try:
-            location = _fill_worktree(cells, machine)
+            location = _fill_worktree(cells, selected.source.machine)
         except (OSError, ValueError) as error:
             try:
                 location = self.session_worktree(row, machine)
@@ -1986,7 +2005,7 @@ class _LiveFillSources(_FillSources):
             config = _fill_config(cells)
         except ValueError as error:
             config = unit_config.ConfigMissing(str(error))
-        return _LiveUnitFill(row, location, config, f"{document.path}:{line}")
+        return _LiveUnitFill(row, location, config, f"{selected.source.path}:{line}")
 
 
 def _fill_live(record: staff.StaffSnapshot, sources: _MemberSources,
@@ -2036,13 +2055,10 @@ def _fill_live(record: staff.StaffSnapshot, sources: _MemberSources,
                     continue
             document = documents.get(row.parent) if row.parent is not None else None
             if document is None:
-                try:
-                    candidate = scan.session_unit(row, machine, row.id)
-                except (OSError, UnicodeError, ValueError) as session_error:
-                    reason = doc_errors.get(row.parent, "") if row.parent is not None else ""
-                    raise ValueError(f"{reason}; {session_error}" if reason else str(session_error)) from session_error
-            else:
-                candidate = scan.unit_for(row, document, machine)
+                reason = (doc_errors.get(row.parent, "parent production document is unavailable")
+                          if row.parent is not None else "unit has no parent production document")
+                raise ValueError(reason)
+            candidate = scan.unit_for(row, document, machine)
             if isinstance(candidate, _RetiredUnitDeferred):
                 continue
             if not unfilled and row.worktree != candidate.worktree:
@@ -2053,7 +2069,7 @@ def _fill_live(record: staff.StaffSnapshot, sources: _MemberSources,
             if isinstance(candidate.config, unit_config.ConfigMissing):
                 if unfilled:
                     if not dry_run:
-                        _ = staff.set_worktree(row.id, candidate.worktree)
+                        _ = staff.set_worktree(row.id, candidate.worktree, expected=row.worktree)
                     changed = True
                     print(f"configuration {row.id} {row.name}: {candidate.config.reason}")
                 else:
@@ -2067,7 +2083,7 @@ def _fill_live(record: staff.StaffSnapshot, sources: _MemberSources,
             else:
                 git_exclude.ensure_excluded(candidate.worktree.path, "/.unit.toml")
                 if unfilled:
-                    _ = staff.set_worktree(row.id, candidate.worktree)
+                    _ = staff.set_worktree(row.id, candidate.worktree, expected=row.worktree)
                 publication = unit_config.write(candidate.worktree.path, candidate.config)
                 changed |= isinstance(publication, unit_config.Published)
             changed |= unfilled or isinstance(current, unit_config.ConfigMissing)

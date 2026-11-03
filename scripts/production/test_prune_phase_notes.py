@@ -61,7 +61,7 @@ class PrunePhaseNotesTests(unittest.TestCase):
         )), encoding="utf-8")
         self.timer(slug, doc)
         unit = unit_membership(slug, "alpha-unit")
-        _ = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", alpha))
+        _ = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", alpha), expected=unit.worktree)
         return doc
 
     def timer(self, slug: str, doc: Path) -> None:

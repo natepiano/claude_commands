@@ -538,14 +538,13 @@ def record_publication_changes(production: Production, commits: list[change_revi
     merged = good(git(production.checkout, "rev-parse", f"--short={change_review.SHORT}", merge_head), "push")
     try:
         # A stop after the list write but before the receipt must not add it twice.
-        changes = change_review.visible(commits)
+        changes = change_review.publication_changes(commits, production.doc)
         existing = change_review.pending(doc) if doc.exists() else []
         held = {row["Change"] for row in existing
                 if any(sha.startswith(merged) or merged.startswith(sha)
-                       for sha in cast(list[str], re.findall(r"\b[0-9a-f]{7,40}\b", row.get("Merged", ""))))}
-        rows = [] if changes and all(item.change in held for item in changes) else change_review.append_rows(
-            doc, changes, datetime.now(production.zone).date(), merged, production.doc,
-            owners=change_review.visible_owners(commits, production.doc))
+                       for sha in cast(list[str], change_review._HASH.findall(row.get("Merged", ""))))}  # pyright: ignore[reportPrivateUsage]
+        rows = [] if changes and all(change.item.change in held for change in changes) else change_review.append_rows(
+            doc, changes, datetime.now(production.zone).date(), merged, production.doc)
         done.parent.mkdir(parents=True, exist_ok=True)
         done.touch()
         drifted = change_review.drift(production.checkout, production.merge_branch,
@@ -1010,9 +1009,10 @@ def remote_path(path: PurePosixPath) -> str:
 
 
 def pull_mac_checkout(mac: PurePosixPath, source: Path) -> None:
+    settings_read = conf.read('merge_checkpoint')
     try:
-        tries = conf.whole("merge_checkpoint", "MAC_PULL_TRIES")
-        retry_seconds = conf.number("merge_checkpoint", "MAC_PULL_RETRY_SECONDS")
+        tries = settings_read.whole("MAC_PULL_TRIES")
+        retry_seconds = settings_read.number("MAC_PULL_RETRY_SECONDS")
     except ValueError as error:
         raise Stop("promote", "failed", str(error), "repair the Mac pull configuration and rerun this checkpoint") from error
     remote = (f"cd {remote_path(mac)} && git pull --ff-only "

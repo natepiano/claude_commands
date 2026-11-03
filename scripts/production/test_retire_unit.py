@@ -56,6 +56,7 @@ import pane_record
 from scripts.production.staff import StaffId
 from scripts.production import staff, unit_config
 from scripts.production.rename_rerun_test_support import saved_fixture
+from scripts.issue_score.selection import UseConfiguredValue
 from scripts.lib import conf
 from scripts.agents import worker_lifecycle
 
@@ -103,7 +104,7 @@ class RetireUnitTests(unittest.TestCase):
 
     def prepared_retirement(self) -> staff.StaffRow:
         row = next(row for row in staff.find(kind="unit") if row.name == "alpha")
-        filled = staff.set_worktree(row.id, staff.PresentWorktree("natedev", self.worktree))
+        filled = staff.set_worktree(row.id, staff.PresentWorktree("natedev", self.worktree), expected=row.worktree)
         _ = unit_config.write(self.worktree, unit_config.UnitConfig(unit_config.PlanFile(Path("docs/plans/alpha.md")),
                                                                unit_config.AppPort(1), ("scripts",)))
         return filled
@@ -180,18 +181,22 @@ class RetireUnitTests(unittest.TestCase):
                         _ = park(unit, worktree, facts)
                         raise OSError("fixture interrupted after park")
 
-                    def removed_then_stop(unit: retire_unit.Unit) -> list[str]:
-                        errors = remove(unit)
+                    def removed_then_stop(unit: retire_unit.Unit, *,
+                                          settings: conf.ConfigRead) -> list[str]:
+                        errors = remove(unit, settings=settings)
                         self.assertEqual(errors, [])
                         raise OSError("fixture interrupted after remove")
 
                     def field_then_stop(identity: staff.StaffId,
-                                        value: staff.PresentWorktree | staff.RemovedWorktree) -> staff.StaffRow:
-                        _ = field(identity, value)
+                                        value: staff.PresentWorktree | staff.RemovedWorktree, *,
+                                        expected: staff.PresentWorktree | staff.RemovedWorktree | staff.WorktreeUnfilled) -> staff.StaffRow:
+                        self.assertEqual(expected, row.worktree)
+                        _ = field(identity, value, expected=expected)
                         raise OSError("fixture interrupted after field")
 
-                    def command_then_stop(argv: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
-                        result = self.fake_run(argv, cwd)
+                    def command_then_stop(argv: list[str], cwd: Path | None = None, *,
+                                          settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> subprocess.CompletedProcess[str]:
+                        result = self.fake_run(argv, cwd, settings=settings)
                         operation = argv[3:] if argv[:1] == ["git"] else []
                         stopped = (boundary == "worktree" and operation[:2] == ["worktree", "remove"]
                                    or boundary == "branch" and operation[:2] == ["branch", "-D"])
@@ -230,6 +235,39 @@ class RetireUnitTests(unittest.TestCase):
                     self.assertEqual(code, 0, output)
                     self.assertEqual(len(output.splitlines()), 1)
                     self.assertEqual((self.calls, self.staff.staff_file.read_bytes(), self.doc.read_bytes()), (calls, data, doc))
+
+    def test_one_retirement_shares_settings_through_validation_and_cleanup(self) -> None:
+        with mock.patch.object(conf, "read", wraps=conf.read) as reads:
+            code, output = self.retire()
+        self.assertEqual(code, 0, output)
+        self.assertEqual([call.args[0] for call in reads.call_args_list if call.args[0] == "production"],
+                         ["production"])
+        self.assertFalse(self.worktree.exists())
+
+    def test_external_command_reads_current_settings_for_the_named_request(self) -> None:
+        with mock.patch.object(conf, "read", wraps=conf.read) as reads:
+            result = RUN_COMMAND([sys.executable, "-c", "print('fixture command')"],
+                                 settings=UseConfiguredValue.CURRENT)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "fixture command\n")
+        reads.assert_called_once_with("production")
+
+    def test_external_termination_reads_current_settings_for_the_named_request(self) -> None:
+        with (mock.patch.object(conf, "read", wraps=conf.read) as reads,
+              mock.patch.object(os, "kill") as send,
+              mock.patch.object(retire_unit, "_alive", return_value=False)):
+            left = retire_unit.terminate([1234], {1234: "fixture"}, settings=UseConfiguredValue.CURRENT)
+        self.assertEqual(left, [])
+        send.assert_called_once_with(1234, signal.SIGTERM)
+        reads.assert_called_once_with("production")
+
+    def test_sigterm_wait_reads_the_retirement_settings_once(self) -> None:
+        with (mock.patch.object(conf, "read", wraps=conf.read) as reads,
+              mock.patch.object(os, "kill") as send,
+              mock.patch.object(retire_unit, "_alive", return_value=False)):
+            self.assertEqual(retire_unit.terminate([1234], {1234: "fixture"}), [])
+        send.assert_called_once_with(1234, signal.SIGTERM)
+        reads.assert_called_once_with("production")
 
     def test_retirement_commands_use_only_the_remaining_operation_budget(self) -> None:
         path = self.limits(command="900")
@@ -452,8 +490,10 @@ class RetireUnitTests(unittest.TestCase):
         folder.mkdir(parents=True, exist_ok=True)
         _ = (folder / f"{DIRECTOR}.jsonl").write_text(json.dumps({"entrypoint": "cli", "cwd": str(cwd)}) + "\n")
 
-    def fake_run(self, argv: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+    def fake_run(self, argv: list[str], cwd: Path | None = None, *,
+                 settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> subprocess.CompletedProcess[str]:
         """Git runs for real; every other command is recorded and answered."""
+        del settings
         if argv[0] == "git":
             return subprocess.run(argv, cwd=cwd, capture_output=True, text=True, check=False)
         call = [Path(argv[1]).name, *argv[2:]] if argv[0] == sys.executable else argv
@@ -568,9 +608,10 @@ class RetireUnitTests(unittest.TestCase):
         runner, unit = self.staff_unit()
         original = staff.set_worktree
         for after in (False, True):
-            def interrupted(staff_id: staff.StaffId, value: staff.PresentWorktree | staff.RemovedWorktree) -> staff.StaffRow:
+            def interrupted(staff_id: staff.StaffId, value: staff.PresentWorktree | staff.RemovedWorktree, *,
+                            expected: staff.PresentWorktree | staff.RemovedWorktree | staff.WorktreeUnfilled) -> staff.StaffRow:
                 if after:
-                    _ = original(staff_id, value)
+                    _ = original(staff_id, value, expected=expected)
                 raise RuntimeError("stopped at staff retirement")
             with mock.patch.object(staff, "set_worktree", side_effect=interrupted):
                 with self.assertRaisesRegex(RuntimeError, "stopped at staff retirement"):
@@ -897,8 +938,9 @@ class RetireUnitTests(unittest.TestCase):
     def test_unconfirmed_saved_ref_keeps_the_note_branch_and_worktree(self) -> None:
         ref, tip = self.unmerged_work()
         before = self.doc.read_bytes()
-        def unconfirmed(argv: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
-            result = self.fake_run(argv, cwd)
+        def unconfirmed(argv: list[str], cwd: Path | None = None, *,
+                        settings: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> subprocess.CompletedProcess[str]:
+            result = self.fake_run(argv, cwd, settings=settings)
             if "ls-remote" in argv and ref in argv and result.returncode == 0:
                 return subprocess.CompletedProcess(argv, 0, "", "")
             return result
@@ -931,19 +973,19 @@ class RetireUnitTests(unittest.TestCase):
             with self.subTest(stdout=stdout, stderr=stderr):
                 with mock.patch.object(retire_unit, "run", return_value=subprocess.CompletedProcess(
                         ["cargo-berth"], 5, stdout, stderr)):
-                    self.assertEqual(retire_unit.stop_rest(unit, found), [])
+                    self.assertEqual(retire_unit.stop_rest(unit, found, settings=conf.read("production")), [])
         with mock.patch.object(retire_unit, "run", return_value=subprocess.CompletedProcess(
                 ["cargo-berth"], 5, "", "reservation could not be released")):
-            self.assertTrue(any("reservation-1" in line for line in retire_unit.stop_rest(unit, found)))
+            self.assertTrue(any("reservation-1" in line for line in retire_unit.stop_rest(unit, found, settings=conf.read("production"))))
 
     def test_final_stop_check_excludes_only_the_units_exact_pane_shell(self) -> None:
         self.claude = []
         pane = PaneShellFixture(self, self.worktree, self.root / "pane-proc", live=False, slug="alpha")
         pane.stopped()
         unit = retire_unit.find_unit("alpha", "alpha")
-        self.assertEqual(retire_unit.final_stop_check(unit, frozenset()), [])
+        self.assertEqual(retire_unit.final_stop_check(unit, frozenset(), settings=conf.read("production")), [])
         pane.add_occupant(991551, unit="beta-unit")
-        left = retire_unit.final_stop_check(unit, frozenset())
+        left = retire_unit.final_stop_check(unit, frozenset(), settings=conf.read("production"))
         self.assertTrue(any("991551" in line for line in left), left)
         self.assertFalse(any(f"process {pane.shell}," in line for line in left), left)
 
@@ -964,7 +1006,7 @@ class RetireUnitTests(unittest.TestCase):
         unit = retire_unit.find_unit("alpha", "alpha")
         with (mock.patch.object(process_group, "send_process_group") as send,
               mock.patch.object(retire_unit, "_alive", return_value=False)):
-            self.assertEqual(retire_unit.stop_orphan(unit, child.pid, DIRECTOR), [])
+            self.assertEqual(retire_unit.stop_orphan(unit, child.pid, DIRECTOR, settings=conf.read("production")), [])
         send.assert_called_once_with(child.pid, signal.SIGTERM)
         self.assertIsNone(child.poll(), "the test patches the signal; the child still runs")
 
@@ -975,7 +1017,7 @@ class RetireUnitTests(unittest.TestCase):
                 child = self.orphan_child(session_id)
                 self.claude = [session(DIRECTOR, "alpha", 4101)] if live_owner else []
                 with mock.patch.object(process_group, "send_process_group") as send:
-                    left = retire_unit.stop_orphan(unit, child.pid, DIRECTOR)
+                    left = retire_unit.stop_orphan(unit, child.pid, DIRECTOR, settings=conf.read("production"))
                 send.assert_not_called()
                 self.assertEqual(len(left), 1, left)
                 for detail in (f"unowned process {child.pid}, parent ", "command ", "start ", str(self.worktree)):
@@ -988,7 +1030,7 @@ class RetireUnitTests(unittest.TestCase):
         birth = retire_unit.proc_start(child.pid)
         with (mock.patch.object(retire_unit, "proc_start", side_effect=[birth, birth, birth, "reused"]),
               mock.patch.object(process_group, "send_process_group") as send):
-            left = retire_unit.stop_orphan(unit, child.pid, DIRECTOR)
+            left = retire_unit.stop_orphan(unit, child.pid, DIRECTOR, settings=conf.read("production"))
         send.assert_not_called()
         self.assertTrue(any("identity changed before signal" in line for line in left), left)
 
@@ -1007,7 +1049,7 @@ class RetireUnitTests(unittest.TestCase):
                     with (mock.patch.object(retire_unit, "terminate", return_value=[]) as signals,
                           mock.patch.object(retire_unit, "_alive", return_value=True)):
                         remaining = retire_unit.gather(unit)
-                        left = retire_unit.stop_rest(unit, remaining)
+                        left = retire_unit.stop_rest(unit, remaining, settings=conf.read("production"))
                     self.assertTrue(any("991551" in line for line in left), left)
                     self.assertFalse(any(991551 in call.args[0] for call in signals.call_args_list), "cwd is no stop authority")
                     self.assertEqual(self.doc.read_bytes(), before)
@@ -1032,7 +1074,7 @@ class RetireUnitTests(unittest.TestCase):
         found = retire_unit.Found((), (), (), (), (), (991551,))
         with (mock.patch.object(unit_move, "processes_inside", return_value=[]),
               mock.patch.object(retire_unit, "terminate", return_value=[]) as signals):
-            self.assertEqual(retire_unit.stop_rest(unit, found), [])
+            self.assertEqual(retire_unit.stop_rest(unit, found, settings=conf.read("production")), [])
         self.assertFalse(any(991551 in call.args[0] for call in signals.call_args_list))
 
     def test_refuses_uncommitted_work_and_an_unmerged_checkpoint_and_changes_nothing(self) -> None:

@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, cast
 
@@ -23,8 +24,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import herdr  # noqa: E402
 import pane_launch  # noqa: E402
 import pane_record  # noqa: E402
+from scripts.shutdown.launch_names import LaunchNames
 import sessions  # noqa: E402
-from scripts.production import session_staff, staff, staff_sources  # noqa: E402
+from scripts.production import staff, staff_sources  # noqa: E402
 from scripts.whoami.account import named_account_environment  # noqa: E402
 
 START_TIMEOUT_MS = 90_000
@@ -69,16 +71,29 @@ def skip_reason(pane: herdr.TabSession, entry: pane_record.PaneLaunch | None, li
     return ""
 
 
-def _resume(session: str, client: herdr.Herdr, pane: herdr.TabSession, entry: pane_record.PaneLaunch) -> None:
+@dataclass(frozen=True)
+class ResolvedResume:
+    """The saved publication and its current member identity for a restore."""
+
+    original: pane_record.PaneLaunch
+    proof: pane_launch.VerifiedResume
+
+
+def _resume(session: str, client: herdr.Herdr, pane: herdr.TabSession,
+            launch: pane_record.PaneLaunch | ResolvedResume) -> None:
+    if isinstance(launch, ResolvedResume):
+        original, proof = launch.original, launch.proof
+    else:
+        original = launch
+        proof = pane_launch.VerifiedResume(launch, frozenset({launch["session_id"]}))
+    entry = proof.expected
     if not isinstance(client.pane_activity(pane.pane_id), herdr.PaneAtShell):
         raise herdr.HerdrFailure("the pane runs a program")
-    original = entry
-    entry = session_staff.record_membership(pane_record.resume_launch(original))
     kind = pane_launch.agent_kind(entry)
     account = ({"CODEX_HOME": entry["config_dir"]} if kind == "codex"
                else named_account_environment(Path(entry["config_dir"])))
     environment = {**entry["environment"], **account}
-    title = pane.label or entry["name"]
+    title = entry["name"] or pane.label
     launched = herdr.launch_agent(session, pane.workspace, title, entry["cwd"], environment, kind,
         pane_record.resume_arguments(entry), herdr.NoOpeningPrompt(), START_TIMEOUT_MS, agent=title)
     if isinstance(launched, herdr.nix_env.Refused):
@@ -93,15 +108,16 @@ def _resume(session: str, client: herdr.Herdr, pane: herdr.TabSession, entry: pa
         pane_launch.finish_restore(path, original, attempt, pane_launch.FailedResume(), close=client.close_tab_confirmed)
         raise
     # Ordering the tabs keeps each pane's id (herdr review, 2026-10-19).
-    proof = pane_launch.VerifiedResume(entry, frozenset({original["session_id"], entry["session_id"]}))
     pane_launch.finish_restore(path, original, attempt, proof, close=client.close_tab_confirmed)
 
 
 def restore(session: str, *, dry_run: bool) -> int:
     client = herdr.Herdr(session)
+    names = LaunchNames.read()
     try:
-        for note in herdr.repair_retained_launches(staff.initial_snapshot(), pane_record.record_directory(), dry_run=dry_run):
-            print(note)
+        if isinstance(names.record, staff.StaffSnapshot):
+            for note in herdr.repair_retained_launches(names.record, pane_record.record_directory(), dry_run=dry_run):
+                print(note)
     except (herdr.HerdrFailure, OSError, ValueError) as error:
         print(f"pane_restore: retained launch repair failed: {error}", file=sys.stderr)
         return 1
@@ -117,20 +133,24 @@ def restore(session: str, *, dry_run: bool) -> int:
     for pane in client.tab_sessions():
         saved = entries.get(pane.pane_id)
         try:
-            entry = pane_record.resume_launch(saved) if saved is not None else None
+            entry = names.resume(saved) if saved is not None else None
+            if entry is not None:
+                entry["environment"] = names.environment(entry)
+            label = entry["name"] if entry is not None and entry["name"] else pane.label
             reason = skip_reason(pane, entry, live)
             if entry is None or reason:
                 if reason:
-                    print(f"{pane.pane_id} {pane.label}: left as it is: {reason}")
+                    print(f"{pane.pane_id} {label}: left as it is: {reason}")
                 continue
             if dry_run:
-                print(f"{pane.pane_id} {pane.label}: resume {entry['session_id']} on {entry['config_dir']}")
+                print(f"{pane.pane_id} {label}: resume {entry['session_id']} on {entry['config_dir']}")
                 continue
             if saved is None:
                 raise ValueError(f"{pane.pane_id}: original launch is unavailable")
-            _resume(session, client, pane, saved)
+            with herdr.restore_staff(names.tab_record, labels=names.labels):
+                _resume(session, client, pane, ResolvedResume(saved, names.resume_proof(saved, entry)))
             live.add(entry["session_id"])
-            print(f"{pane.pane_id} {pane.label}: resumed {entry['session_id']}")
+            print(f"{pane.pane_id} {label}: resumed {entry['session_id']}")
         except (herdr.HerdrFailure, OSError, ValueError) as error:
             failures += 1
             print(f"{pane.pane_id} {pane.label}: not resumed: {error}", file=sys.stderr)

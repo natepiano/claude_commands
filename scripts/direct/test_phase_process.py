@@ -630,6 +630,14 @@ class TrialProcessTests(unittest.TestCase):
 
 
 class PhaseProcessTests(unittest.TestCase):
+    def test_ad_hoc_reviews_do_not_launch_external_reviewers(self) -> None:
+        commands = Path(__file__).resolve().parents[2] / "commands"
+        for name in ("module_review", "team_review", "api_review"):
+            with self.subTest(command=name):
+                text = (commands / f"{name}.md").read_text(encoding="utf-8")
+                for launch in ("agent_exec", "claude --print", "claude -p"):
+                    self.assertNotIn(launch, text, f"{name} must review in the invoking session")
+
     def test_wall_steps_share_overlap_and_preserve_director_gaps(self) -> None:
         events = (*phase_events(), event("activity_started", 40, instance="gate", step="verification"),
                   event("activity_finished", 80, instance="gate", step="verification"),

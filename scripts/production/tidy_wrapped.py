@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import production_units
+from scripts.production import staff
 from proposals_folder import issues_folder
 
 if TYPE_CHECKING:
@@ -61,8 +62,11 @@ def tidy(slug: str, document: Path | None = None, *, identities: QuestionStaff |
     paths = owned_paths(slug)
     if document is not None and can_hold_questions(document):
         identities = identities if identities is not None else QuestionStaff.read()
-        if isinstance(question_folder(document, identities), QuestionFolder):
-            close_questions(document, identities)
+        try:
+            if isinstance(question_folder(document, identities), QuestionFolder):
+                close_questions(document, identities)
+        except staff.StaffRefused as error:
+            raise TidyRefused(str(error)) from error
     removed: list[Path] = []
     for path in paths:
         if path.is_dir() and not path.is_symlink():

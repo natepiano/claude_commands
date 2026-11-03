@@ -496,7 +496,7 @@ class BoardJsonTests(unittest.TestCase):
         second_parent = next(row for row in staff.find(kind="showrunner") if row.name == second.slug)
         other = self.unit_member(second.slug)
         _ = staff.rename(other.id, "unrelated")
-        _ = staff.set_worktree(other.id, staff.RemovedWorktree("natedev", second.worktree))
+        _ = staff.set_worktree(other.id, staff.RemovedWorktree("natedev", second.worktree), expected=other.worktree)
         moved = staff.move(unit.id, second_parent.id)
         self.staff_launch(moved, moved.id, pane="newer")
 

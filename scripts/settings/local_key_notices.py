@@ -13,6 +13,7 @@ from typing import Literal, cast
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.message import send_result
 
 NoticeStatus = Literal["pending", "accepted"]
 NoticeHistory = dict[str, dict[str, NoticeStatus]]
@@ -61,7 +62,7 @@ def record(root: Path, machine: str, keys: list[str]) -> None:
 def deliver(root: Path, machine: str) -> None:
     """Retry pending notices with the same sender identity."""
     # The clean filter does not import the sender or resolve its configuration.
-    from scripts.message.send import TIMEOUT, OutcomeHeader, parse_outcome
+    from scripts.message.send import TIMEOUT
 
     path = root / LEDGER
     if not path.exists():
@@ -73,7 +74,7 @@ def deliver(root: Path, machine: str) -> None:
         pending = [key for key, status in notices.items() if status == "pending"]
     if not pending:
         return
-    destination = conf.text("settings", "local_key_notice_to")
+    destination = conf.read("settings").text("local_key_notice_to")
     for key in pending:
         identity = hashlib.sha256(json.dumps([machine, key]).encode()).hexdigest()
         command = [str(root / "scripts/lib/py"), str(root / "scripts/message/send.py"),
@@ -84,8 +85,9 @@ def deliver(root: Path, machine: str) -> None:
         try:
             sent = subprocess.run(command, input="", text=True, capture_output=True,
                                   check=False, timeout=TIMEOUT + 40)
-            outcome = parse_outcome(sent.stdout)
-            accepted = isinstance(outcome, OutcomeHeader) and outcome.outcome in {"sent", "skipped", "queued"}
+            outcome = send_result.send_outcome(sent.returncode, sent.stdout)
+            accepted = (isinstance(outcome, send_result.ConfirmedSendOutcome)
+                        and outcome.header.outcome in {"sent", "skipped", "queued"})
         except (OSError, subprocess.TimeoutExpired):
             pass
         if accepted:

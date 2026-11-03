@@ -81,7 +81,7 @@ class PushAuditTest(unittest.TestCase):
         for name, plan in units:
             row = recorded_unit(owner.name, name, self.home / slug / name, doc, plan=plan)
             if plan.startswith("retired"):
-                _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.home / slug / name))
+                _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.home / slug / name), expected=row.worktree)
 
     def save(self, path: Path, records: Sequence[JsonRecord]) -> None:
         _ = path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")

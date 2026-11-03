@@ -141,7 +141,7 @@ class RowUnitReadingTests(unittest.TestCase):
         tree = self.root / "old-prefix-renderer"
         unit = recorded_unit("old-owner", "renderer", tree, doc)
         _ = staff.move(unit.id, destination.id)
-        _ = staff.set_worktree(unit.id, staff.RemovedWorktree("natedev", tree))
+        _ = staff.set_worktree(unit.id, staff.RemovedWorktree("natedev", tree), expected=unit.worktree)
         history = self.root / "history"
         history.mkdir()
         path = history / "retired.jsonl"

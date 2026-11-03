@@ -37,6 +37,7 @@ from relay_identity import relay_session_name
 from relay_test_support import write_relay_record
 from scripts.lib import names
 from scripts.production import staff
+from scripts.message import send_result
 from scripts.message.recipient_test_support import staff_child_command
 from scripts.lib.test_names import fixture_names
 import rca
@@ -272,7 +273,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         acknowledged = send.acknowledged_skip_reason("shutdown-fixture", "2026-10-30T12:00:00+00:00")
         self.assertEqual(acknowledged, "key 'shutdown-fixture' acknowledged at 2026-10-30T12:00:00+00:00; `send.py reopen` to resume")
         window = "key 'shutdown-fixture' last sent to Unit at 2026-10-30T12:00:00+00:00, inside its 60-minute window"
-        cases: tuple[tuple[str, send.Outcome, str, str, bool], ...] = (
+        cases: tuple[tuple[str, send_result.Outcome, str, str, bool], ...] = (
             ("SENT: to the user\n", "sent", "to the user", "", False),
             ("SKIPPED: " + window + "\n", "skipped", window, "", False),
             ("SKIPPED: " + acknowledged + "\n", "skipped", acknowledged, "", True),
@@ -288,14 +289,52 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         )
         for output, outcome, detail, payload, is_acknowledged in cases:
             with self.subTest(output=output):
-                parsed = send.parse_outcome(output)
-                self.assertIsInstance(parsed, send.OutcomeHeader)
-                assert isinstance(parsed, send.OutcomeHeader)
+                parsed = send_result.parse_outcome(output)
+                self.assertIsInstance(parsed, send_result.OutcomeHeader)
+                assert isinstance(parsed, send_result.OutcomeHeader)
                 self.assertEqual((parsed.outcome, parsed.detail, parsed.payload), (outcome, detail, payload))
                 self.assertEqual(send.is_acknowledged_skip(parsed.detail), is_acknowledged)
         for output in ("", "reviewing draft\nunknown: still working\n", "sent: not a protocol header\n"):
             with self.subTest(output=output):
-                self.assertIsInstance(send.parse_outcome(output), send.NoOutcomeHeader)
+                self.assertIsInstance(send_result.parse_outcome(output), send_result.NoOutcomeHeader)
+
+    def test_send_outcome_confirms_each_header_with_its_documented_exit(self) -> None:
+        for header, code, outcome in (("SENT", 0, "sent"), ("SKIPPED", 0, "skipped"),
+                                      ("QUEUED", 1, "queued"), ("FAILED", 3, "failed"),
+                                      ("REFUSED", 2, "refused"), ("HELD", 4, "held"),
+                                      ("REPLACED", 0, "replaced"), ("KEPT", 0, "kept"), ("PENDING", 5, "pending")):
+            with self.subTest(header=header):
+                result = send_result.send_outcome(code, header + ": fixture\nbody\n")
+                self.assertIsInstance(result, send_result.ConfirmedSendOutcome)
+                assert isinstance(result, send_result.ConfirmedSendOutcome)
+                self.assertEqual((result.header.outcome, result.header.detail, result.header.payload), (outcome, "fixture", "body"))
+
+    def test_send_outcome_uses_the_first_header_after_diagnostics(self) -> None:
+        result = send_result.send_outcome(1, "checking recipient\nQUEUED: offline\nsaved body\n")
+        self.assertIsInstance(result, send_result.ConfirmedSendOutcome)
+        assert isinstance(result, send_result.ConfirmedSendOutcome)
+        self.assertEqual((result.header.outcome, result.header.detail, result.header.payload), ("queued", "offline", "saved body"))
+
+    def test_send_outcome_does_not_replace_the_first_result_with_payload_text(self) -> None:
+        output = "FAILED: transport failed\nQUEUED: quoted earlier result\n"
+        result = send_result.send_outcome(3, output)
+        self.assertIsInstance(result, send_result.ConfirmedSendOutcome)
+        assert isinstance(result, send_result.ConfirmedSendOutcome)
+        self.assertEqual(result.header.outcome, "failed")
+        self.assertEqual(result.header.payload, "QUEUED: quoted earlier result")
+        self.assertIsInstance(send_result.send_outcome(1, output), send_result.UnconfirmedSendOutcome)
+
+    def test_send_outcome_requires_a_header_and_matching_exit(self) -> None:
+        for code, output in ((0, ""), (1, ""), (0, "sent: lowercase"), (0, "finished"),
+                             (0, "QUEUED: offline"), (1, "SENT: delivered"), (3, "SKIPPED: duplicate"),
+                             (0, "FAILED: unavailable"), (2, "HELD: review"), (0, "PENDING: active"), (1, "PENDING: active")):
+            with self.subTest(code=code, output=output):
+                self.assertIsInstance(send_result.send_outcome(code, output), send_result.UnconfirmedSendOutcome)
+
+    def test_send_outcome_does_not_confirm_an_interrupted_process(self) -> None:
+        for code in (None, -9, -15):
+            with self.subTest(code=code):
+                self.assertIsInstance(send_result.send_outcome(code, "SENT: apparent delivery"), send_result.UnconfirmedSendOutcome)
 
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
@@ -644,9 +683,10 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         self.staff_rows.clear()
         self.staff_rows["fixed"] = staff.StaffRow(staff.StaffId("fixed"), "unit", "resources", None,
                                                 current_session=staff.StaffId("new-session"))
-        result = send.send(local_options(["--to", "session:fixed", "--from", "test", "--text", "hello"]))
+        result = send.send(local_options(["--to", "session:fixed", "--from", "test", "--text", "hello", "--key", "fixed-id"]))
         self.assertEqual(result.outcome, "sent")
         self.assertEqual(self.relayed[0].to, f"uds:{self.root / 'new-session.sock'}")
+        self.assertEqual(set(self.claims("fixed-id")), {"staff:fixed"})
 
     def test_duplicate_staff_paths_refuse_without_delivery_or_queue(self) -> None:
         parent = staff.StaffRow(staff.StaffId("runner"), "showrunner", "builds", None,
@@ -678,9 +718,10 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         entry = self.claude_row("free-session", "morty")
         self.staff_rows.clear()
         with mock.patch.object(roster, "roster", return_value=roster.Roster([entry], [])):
-            result = send.send(local_options(["--to", "morty", "--text", "hello"]))
+            result = send.send(local_options(["--to", "morty", "--text", "hello", "--key", "nonstaff-name"]))
         self.assertEqual(result.outcome, "sent")
         self.assertEqual(self.relayed[0].to, f"uds:{self.root / 'free-session.sock'}")
+        self.assertEqual(set(self.claims("nonstaff-name")), {"morty"})
 
     def test_nonstaff_explicit_addresses_keep_their_transport(self) -> None:
         entry = self.daemon_row("free-thread")
@@ -688,14 +729,16 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         self.staff_rows.clear()
         with mock.patch.object(roster, "roster", return_value=roster.Roster([entry], [])), \
                 mock.patch.object(codex_daemon, "queue", return_value=codex_daemon.Queued()) as queue:
-            result = send.send(local_options(["--to", "codex:free-thread", "--text", "hello"]))
+            result = send.send(local_options(["--to", "codex:free-thread", "--text", "hello", "--key", "codex-address"]))
         self.assertEqual(result.outcome, "sent")
         self.assertEqual(queue.call_args.args[1], "free-thread")
+        self.assertEqual(set(self.claims("codex-address")), {"codex:free-thread"})
         for target in ("session:free-session", f"uds:{self.root / 'free-session.sock'}"):
             with self.subTest(target=target):
-                result = send.send(local_options(["--to", target, "--text", "hello"]))
+                result = send.send(local_options(["--to", target, "--text", "hello", "--key", target]))
                 self.assertEqual(result.outcome, "sent")
                 self.assertEqual(self.relayed[-1].to, f"uds:{self.root / 'free-session.sock'}")
+                self.assertEqual(set(self.claims(target)), {target})
 
     def test_old_staff_socket_delivers_to_the_current_session(self) -> None:
         self.session("old-session", "old label")
@@ -703,9 +746,10 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         self.staff_rows = {"old-session": staff.StaffRow(
             staff.StaffId("old-session"), "unit", "resources", None,
             current_session=staff.StaffId("new-session"))}
-        result = send.send(local_options(["--to", f"uds:{self.root / 'old-session.sock'}", "--text", "hello"]))
+        result = send.send(local_options(["--to", f"uds:{self.root / 'old-session.sock'}", "--text", "hello", "--key", "old-socket"]))
         self.assertEqual(result.outcome, "sent")
         self.assertEqual([message.to for message in self.relayed], [f"uds:{self.root / 'new-session.sock'}"])
+        self.assertEqual(set(self.claims("old-socket")), {"staff:old-session"})
 
     def test_nonstaff_repeat_notice_uses_the_default_owner(self) -> None:
         self.staff_rows.clear()
@@ -730,11 +774,12 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         self.session("resources-current", "transport")
         self.staff_member("resources-current", "resources")
         record = staff.StaffSnapshot(tuple(self.staff_rows.values()))
+        records = sessions.running_sessions()
         with mock.patch.object(staff, "snapshot", return_value=record) as snapshots, \
                 mock.patch.object(roster, "roster", return_value=roster.Roster([], [])) as transport:
             self.assertEqual(send.send(local_options(["--to", "resources-unit", "--text", "hello"])).outcome, "sent")
         snapshots.assert_called_once_with()
-        transport.assert_called_once_with(os.environ, roster.ThisMachine(), membership=record)
+        transport.assert_called_once_with(os.environ, roster.ThisMachine(), membership=record, records=records)
 
     def daemon_owner(self) -> codex_daemon.CodexDaemon:
         home = self.root / ".codex2"
@@ -788,8 +833,10 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         return send.send(local_options(["--to", "bogus", "--from", "test", *args]))
 
     def test_repeat_guard_holds_the_third_delivery_and_logs_each_held_copy(self) -> None:
-        outcomes = [self.send("--text", "Morty stopped at 02:00 EDT, pid 100").outcome
-                    for _ in range(5)]
+        with mock.patch.object(repeat_guard, "check", wraps=repeat_guard.check) as guard:
+            outcomes = [self.send("--text", "Morty stopped at 02:00 EDT, pid 100").outcome
+                        for _ in range(5)]
+        self.assertEqual([cast(repeat_guard.Attempt, call.args[1]).receiver for call in guard.call_args_list], ["staff:bogus"] * 5)
         self.assertEqual(outcomes, ["sent", "sent", "held", "held", "held"])
         self.assertEqual(len(self.relayed), 2)
         self.assertEqual([row["outcome"] for row in self.log()], outcomes)
@@ -1264,6 +1311,510 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         with mock.patch.object(send, "now", return_value=later):
             self.assertEqual(self.send("--key", "k", "--repeat-minutes", "30", "--text", "four").outcome, "sent")
         self.assertEqual([entry["outcome"] for entry in self.log()], ["sent", "skipped", "sent", "sent"])
+        self.assertEqual(set(self.claims("k")), {"staff:bogus", "staff:other"})
+
+    def claims(self, key: str) -> dict[str, str]:
+        states = cast(send.KeyStates, json.loads((self.root / "keys.json").read_text()))
+        return states.get(key, {"last": {}})["last"]
+
+    def test_keyed_staff_recipient_restart_preserves_repeat_window(self) -> None:
+        self.session("before", "resources")
+        member = staff.StaffRow(staff.StaffId("fixed"), "unit", "resources", None,
+                                current_session=staff.StaffId("before"))
+        self.staff_rows = {"fixed": member}
+        options = local_options(["--to", "fixed", "--key", "settings-result", "--repeat-minutes", "120",
+                                 "--text", "The local key needs attention."])
+        started = send.now()
+        with (mock.patch.object(send, "now", return_value=started),
+              mock.patch.object(sessions, "read_registry", wraps=sessions.read_registry) as discovery):
+            self.assertEqual(send.send(options).outcome, "sent")
+        self.assertGreater(discovery.call_count, 1)
+        caller_record = self.root / "caller-completion.json"
+        self.assertFalse(caller_record.exists())
+        self.session("after", "resources")
+        self.staff_rows = {"fixed": replace(member, current_session=staff.StaffId("after"))}
+        (self.root / "sessions/before.json").unlink()
+        (self.root / "before.sock").unlink()
+        with (mock.patch.object(send, "now", return_value=started + timedelta(minutes=1)),
+              mock.patch.object(sessions, "read_registry", wraps=sessions.read_registry) as discovery):
+            self.assertEqual(send.send(options).outcome, "skipped")
+        discovery.assert_called_once_with()
+        self.assertEqual(len(self.relayed), 1)
+        self.assertEqual(self.relayed[0].to, f"uds:{self.root / 'before.sock'}")
+        self.assertEqual(self.claims("settings-result"), {"staff:fixed": started.isoformat()})
+        self.assertFalse(caller_record.exists())
+        self.assertEqual([row["to"] for row in self.log()], ["session:before", "session:after"])
+
+    def test_nonstaff_recipient_name_restart_preserves_repeat_window(self) -> None:
+        options = local_options(["--to", "morty", "--key", "notice", "--repeat-minutes", "30", "--text", "Notice"])
+        started = send.now()
+        for index, identity in enumerate(("before", "after")):
+            entry = self.claude_row(identity, "morty")
+            self.staff_rows.clear()
+            with (mock.patch.object(roster, "roster", return_value=roster.Roster([entry], [])),
+                  mock.patch.object(send, "now", return_value=started + timedelta(minutes=index))):
+                self.assertEqual(send.send(options).outcome, "sent" if index == 0 else "skipped")
+            (self.root / "sessions" / f"{identity}.json").unlink()
+        self.assertEqual(len(self.relayed), 1)
+        self.assertEqual(self.claims("notice"), {"morty": started.isoformat()})
+
+    def test_staff_aliases_share_one_repeat_window(self) -> None:
+        self.session("current", "transport label")
+        runner = staff.StaffRow(staff.StaffId("runner"), "showrunner", "builds", None,
+                               current_session=staff.StaffId("runner"))
+        member = staff.StaffRow(staff.StaffId("fixed"), "unit", "resources", runner.id,
+                               current_session=staff.StaffId("current"))
+        self.staff_rows = {row.id: row for row in (runner, member)}
+        started = send.now()
+        targets = ("resources", "fixed", "resources-unit", "builds/resources-unit", "session:fixed",
+                   "session:current", "codex:current", f"uds:{self.root / 'current.sock'}")
+        with mock.patch.object(send, "now", return_value=started):
+            for index, target in enumerate(targets):
+                with self.subTest(target=target):
+                    result = send.send(local_options(["--to", target, "--key", "notice",
+                                                      "--repeat-minutes", "30", "--text", "Notice"]))
+                    self.assertEqual(result.outcome, "sent" if index == 0 else "skipped")
+        self.assertEqual(len(self.relayed), 1)
+        self.assertEqual(self.claims("notice"), {"staff:fixed": started.isoformat()})
+
+    def test_nonstaff_explicit_addresses_keep_separate_repeat_windows(self) -> None:
+        self.session("one", "one")
+        self.session("two", "two")
+        entries = [self.daemon_row(identity) for identity in ("thread-one", "thread-two")]
+        self.staff_rows.clear()
+        targets = ("session:one", "session:two", f"uds:{self.root / 'one.sock'}",
+                   f"uds:{self.root / 'two.sock'}", "codex:thread-one", "codex:thread-two")
+        started = send.now()
+        with (mock.patch.object(roster, "roster", return_value=roster.Roster(entries, [])),
+              mock.patch.object(codex_daemon, "queue", return_value=codex_daemon.Queued()) as queue,
+              mock.patch.object(send, "now", return_value=started)):
+            for target in targets:
+                key = target.split(":", 1)[0]
+                options = local_options(["--to", target, "--key", key, "--repeat-minutes", "30", "--text", target])
+                with self.subTest(target=target):
+                    self.assertEqual(send.send(options).outcome, "sent")
+                    self.assertEqual(send.send(options).outcome, "skipped")
+                    self.assertEqual(self.claims(key)[target], started.isoformat())
+            for prefix in ("session", "uds", "codex"):
+                self.assertEqual(self.claims(prefix), {target: started.isoformat() for target in targets
+                                                     if target.startswith(prefix + ":")})
+        self.assertEqual(len(self.relayed), 4)
+        self.assertEqual(queue.call_count, 2)
+
+    def test_legacy_transport_claim_preserves_its_timestamp_after_migration(self) -> None:
+        self.session("current", "resources")
+        self.staff_rows = {"fixed": staff.StaffRow(staff.StaffId("fixed"), "unit", "resources", None,
+                                                  current_session=staff.StaffId("current"))}
+        started = send.now()
+        socket_address = f"uds:{self.root / 'current.sock'}"
+        unrelated = "session:unrelated"
+        for newest in ("staff:fixed", "session:current", socket_address):
+            with self.subTest(newest=newest):
+                last = {alias: (started - timedelta(minutes=5)).isoformat()
+                        for alias in ("staff:fixed", "session:current", socket_address, unrelated)}
+                last[newest] = started.isoformat()
+                path = self.root / "keys.json"
+                _ = path.write_text(json.dumps({"notice": {"last": last}}))
+                before = path.read_bytes()
+                with mock.patch.object(send, "now", return_value=started + timedelta(minutes=29)):
+                    self.assertEqual(send.send(local_options(["--to", "fixed", "--key", "notice",
+                                     "--repeat-minutes", "30", "--text", "Notice"])).outcome, "skipped")
+                self.assertEqual(self.claims("notice"), last)
+                self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(self.relayed, [])
+        with mock.patch.object(send, "now", return_value=started + timedelta(minutes=31)):
+            self.assertEqual(send.send(local_options(["--to", "fixed", "--key", "notice",
+                             "--repeat-minutes", "30", "--text", "Notice"])).outcome, "sent")
+        self.assertEqual(self.claims("notice"), {**last, "staff:fixed": (started + timedelta(minutes=31)).isoformat()})
+
+    def test_pending_repeat_retains_a_settings_notice_until_a_retry_delivers(self) -> None:
+        from scripts.settings import local_key_notices as notices
+
+        self.session("recipient", "recipient")
+        _ = (self.root / "config/settings.conf").write_text("local_key_notice_to=recipient\n")
+        notices.record(self.root, "fixture", ["firstKey"])
+        outcomes: list[str] = []
+        ledger = self.root / notices.LEDGER
+        started = send.now()
+
+        def invoke(arguments: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            result = send.send(local_options(arguments[2:]))
+            outcomes.append(result.outcome)
+            return subprocess.CompletedProcess(arguments, send_result.EXIT[result.outcome],
+                                               result.outcome.upper() + ": " + result.detail, "")
+
+        def overlap(message: send.Message, timeout: float) -> send.Result:
+            del message, timeout
+            with mock.patch.object(send, "now", return_value=started + timedelta(seconds=1)):
+                notices.deliver(self.root, "fixture")
+            self.assertEqual(outcomes, ["pending"])
+            self.assertEqual(notices.read_history(ledger)["fixture"]["firstKey"], "pending")
+            self.assertEqual(self.relayed, [])
+            return send.Result("failed", "The first delivery failed.")
+
+        with (mock.patch.object(subprocess, "run", side_effect=invoke),
+              mock.patch.object(send, "now", return_value=started), redirect_stderr(io.StringIO())):
+            with mock.patch.object(send, "relay", overlap):
+                notices.deliver(self.root, "fixture")
+            self.assertEqual(outcomes, ["pending", "failed"])
+            self.assertEqual(notices.read_history(ledger)["fixture"]["firstKey"], "pending")
+            with mock.patch.object(send, "now", return_value=started + timedelta(seconds=2)):
+                notices.deliver(self.root, "fixture")
+            self.assertEqual(outcomes, ["pending", "failed", "sent"])
+            self.assertEqual(notices.read_history(ledger)["fixture"]["firstKey"], "accepted")
+            notices.deliver(self.root, "fixture")
+        self.assertEqual(len(self.relayed), 1)
+        key = self.relayed[0].key
+        assert key is not None
+        with mock.patch.object(send, "now", return_value=started + timedelta(seconds=3)):
+            self.assertEqual(self.send("--to", "recipient", "--key", key, "--repeat-minutes", "30",
+                                       "--text", "The settings notice.").outcome, "skipped")
+        self.assertEqual(len(self.relayed), 1)
+
+    def test_pending_remote_result_releases_the_originating_claim(self) -> None:
+        options = send.parse(["--machine", "fixture", "--to", "session:recipient", "--from", "test",
+                              "--key", "pending-remote", "--repeat-minutes", "30", "--text", "Notice"])
+        with mock.patch.object(send, "run", return_value=(5, "PENDING: remote delivery is active", "")):
+            self.assertEqual(send.send(options).outcome, "pending")
+        self.assertEqual(self.claims("pending-remote"), {})
+
+    def test_pending_claim_blocks_only_until_the_delivery_timeout(self) -> None:
+        self.session("recipient", "Recipient")
+        started = send.now()
+        for key in ("notice", "github.keys_cold:fixture"):
+            with self.subTest(key=key):
+                delivered = len(self.relayed)
+                options = local_options(["--to", "recipient", "--key", key,
+                                         "--repeat-minutes", str(timedelta.max.days * 1440),
+                                         "--text", f"Notice for {key}"])
+                with (mock.patch.object(send, "now", return_value=started),
+                      mock.patch.object(send, "relay", side_effect=KeyboardInterrupt)):
+                    with self.assertRaises(KeyboardInterrupt):
+                        _ = send.send(options)
+                before = (self.root / "keys.json").read_bytes()
+                with mock.patch.object(send, "now", return_value=started + timedelta(seconds=send.TIMEOUT - 1)):
+                    self.assertEqual(send.send(options).outcome, "pending")
+                self.assertEqual((self.root / "keys.json").read_bytes(), before)
+                self.assertEqual(len(self.relayed), delivered)
+                with mock.patch.object(send, "now", return_value=started + timedelta(seconds=send.TIMEOUT + 1)):
+                    self.assertEqual(send.send(options).outcome, "sent")
+                self.assertEqual(self.claims(key), {"staff:recipient": (started + timedelta(seconds=send.TIMEOUT + 1)).isoformat()})
+                with mock.patch.object(send, "now", return_value=started + timedelta(seconds=send.TIMEOUT * 2 + 2)):
+                    self.assertEqual(send.send(options).outcome, "skipped")
+                self.assertEqual(len(self.relayed), delivered + 1)
+        self.assertEqual(len(self.relayed), 2)
+
+    def test_pending_claim_uses_the_first_senders_effective_delivery_limit(self) -> None:
+        self.session("recipient", "Recipient")
+        started = send.now()
+        for target, transport, limit in (("recipient", "relay", 120), ("user", "user", 205)):
+            with self.subTest(target=target):
+                options = local_options(["--to", target, "--key", f"limit-{target}", "--timeout", "120",
+                                         "--repeat-minutes", "30", "--text", f"Notice for {target}",
+                                         *(["--summary", "Delivery limit", "--no-action"] if target == "user" else [])])
+                retry = options._replace(timeout=1)
+
+                def overlap(*arguments: object, **keywords: object) -> send.Result:
+                    del arguments, keywords
+                    before = (self.root / "keys.json").read_bytes()
+                    with mock.patch.object(send, "now", return_value=started + timedelta(seconds=41)):
+                        self.assertEqual(send.send(retry).outcome, "pending")
+                    self.assertEqual((self.root / "keys.json").read_bytes(), before)
+                    with (mock.patch.object(send, "now", return_value=started + timedelta(seconds=limit - 1)),
+                          mock.patch.object(send, transport) as blocked):
+                        self.assertEqual(send.send(retry).outcome, "pending")
+                        blocked.assert_not_called()
+                    with (mock.patch.object(send, "now", return_value=started + timedelta(seconds=limit + 1)),
+                          mock.patch.object(send, transport, return_value=send.Result("sent", "fixture accepted")) as delivered):
+                        self.assertEqual(send.send(retry).outcome, "sent")
+                        delivered.assert_called_once()
+                    return send.Result("failed", "The first delivery failed.")
+
+                with (mock.patch.object(review, "user_send_seconds", return_value=205),
+                      mock.patch.object(send, "now", return_value=started),
+                      mock.patch.object(send, transport, side_effect=overlap) as first):
+                    self.assertEqual(send.send(options).outcome, "failed")
+                    first.assert_called_once()
+                with mock.patch.object(send, "now", return_value=started + timedelta(seconds=limit + 2)):
+                    self.assertEqual(send.send(options).outcome, "skipped")
+
+    def test_legacy_pending_timestamp_uses_the_default_delivery_limit(self) -> None:
+        self.session("recipient", "Recipient")
+        started = send.now()
+        path = self.root / "keys.json"
+        state = {"last": {"staff:recipient": started.isoformat()},
+                 "pending": {"staff:recipient": started.isoformat()}}
+        _ = path.write_text(json.dumps({"notice": state}))
+        before = path.read_bytes()
+        options = local_options(["--to", "recipient", "--key", "notice", "--repeat-minutes", "30", "--text", "Notice"])
+        with mock.patch.object(send, "now", return_value=started + timedelta(seconds=send.TIMEOUT - 1)):
+            self.assertEqual(send.send(options).outcome, "pending")
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(self.relayed, [])
+        with mock.patch.object(send, "now", return_value=started + timedelta(seconds=send.TIMEOUT + 1)):
+            self.assertEqual(send.send(options).outcome, "sent")
+        self.assertEqual(len(self.relayed), 1)
+
+    def test_failed_stable_claim_does_not_clear_a_later_attempt(self) -> None:
+        self.session("before", "resources")
+        member = staff.StaffRow(staff.StaffId("fixed"), "unit", "resources", None,
+                               current_session=staff.StaffId("before"))
+        self.staff_rows = {"fixed": member}
+        started = send.now()
+        options = local_options(["--to", "fixed", "--key", "notice", "--repeat-minutes", "30", "--text", "Notice"])
+        def overlap(message: send.Message, timeout: float) -> send.Result:
+            del message, timeout
+            self.session("after", "resources")
+            self.staff_rows = {"fixed": replace(member, current_session=staff.StaffId("after"))}
+            with (mock.patch.object(send, "now", return_value=started + timedelta(minutes=31)),
+                  mock.patch.object(send, "relay", return_value=send.Result("sent", "later delivery"))):
+                self.assertEqual(send.send(options).outcome, "sent")
+            return send.Result("failed", "earlier delivery failed")
+        with mock.patch.object(send, "now", return_value=started), mock.patch.object(send, "relay", overlap):
+            self.assertEqual(send.send(options).outcome, "failed")
+        with mock.patch.object(send, "now", return_value=started + timedelta(minutes=32)):
+            self.assertEqual(send.send(options).outcome, "skipped")
+        self.assertEqual(self.claims("notice"), {"staff:fixed": (started + timedelta(minutes=31)).isoformat()})
+
+    def test_failed_send_can_retry_after_a_socket_retry_skips_its_claim(self) -> None:
+        self.session("recipient", "Recipient")
+        self.staff_rows.clear()
+        started = send.now()
+        address = f"uds:{self.root / 'recipient.sock'}"
+        options = local_options(["--to", "session:recipient", "--key", "notice",
+                                 "--repeat-minutes", "30", "--text", "Notice"])
+
+        def overlap(message: send.Message, timeout: float) -> send.Result:
+            del message, timeout
+            with mock.patch.object(send, "now", return_value=started + timedelta(seconds=1)):
+                self.assertEqual(send.send(options._replace(selection=send.RosterLookup(address))).outcome, "pending")
+            self.assertEqual(self.claims("notice"), {"session:recipient": started.isoformat()})
+            return send.Result("failed", "The first delivery failed.")
+
+        with mock.patch.object(send, "now", return_value=started), mock.patch.object(send, "relay", overlap):
+            self.assertEqual(send.send(options).outcome, "failed")
+        self.assertEqual(self.claims("notice"), {})
+        self.assertEqual(self.relayed, [])
+        with mock.patch.object(send, "now", return_value=started + timedelta(seconds=2)):
+            self.assertEqual(send.send(options._replace(selection=send.RosterLookup(address))).outcome, "sent")
+        self.assertEqual(len(self.relayed), 1)
+        self.assertEqual(self.claims("notice"), {address: (started + timedelta(seconds=2)).isoformat()})
+
+    def test_failed_claim_keeps_another_recipients_claim_at_the_same_timestamp(self) -> None:
+        self.session("first", "First")
+        self.session("second", "Second")
+        started = send.now()
+        options = local_options(["--to", "first", "--key", "notice", "--repeat-minutes", "30", "--text", "Notice"])
+
+        def overlap(message: send.Message, timeout: float) -> send.Result:
+            del message, timeout
+            with mock.patch.object(send, "relay", self.relay):
+                self.assertEqual(send.send(options._replace(selection=send.RosterLookup("second"))).outcome, "sent")
+            return send.Result("failed", "The first recipient is unavailable.")
+
+        with mock.patch.object(send, "now", return_value=started), mock.patch.object(send, "relay", overlap):
+            self.assertEqual(send.send(options).outcome, "failed")
+        self.assertEqual(self.claims("notice"), {"staff:second": started.isoformat()})
+        self.assertEqual(send.send(options._replace(selection=send.RosterLookup("second"))).outcome, "skipped")
+        self.assertEqual(len(self.relayed), 1)
+
+    def test_name_retry_does_not_remove_an_explicit_recipients_window(self) -> None:
+        entry = self.claude_row("recipient", "morty")
+        self.staff_rows.clear()
+        started = send.now()
+        options = local_options(["--to", "session:recipient", "--key", "notice", "--repeat-minutes", "30", "--text", "Notice"])
+        with (mock.patch.object(send, "now", return_value=started),
+              mock.patch.object(roster, "roster", return_value=roster.Roster([entry], []))):
+            self.assertEqual(send.send(options).outcome, "sent")
+            self.assertEqual(send.send(options._replace(selection=send.RosterLookup("morty"))).outcome, "skipped")
+            self.assertEqual(send.send(options).outcome, "skipped")
+        self.assertEqual(self.claims("notice"), {"session:recipient": started.isoformat()})
+        self.assertEqual(len(self.relayed), 1)
+
+    def test_failed_alias_claim_keeps_an_older_successful_name_claim(self) -> None:
+        entry = self.claude_row("recipient", "morty")
+        self.staff_rows.clear()
+        started = send.now()
+        options = local_options(["--to", "morty", "--key", "notice", "--repeat-minutes", "30", "--text", "Notice"])
+
+        def overlap(message: send.Message, timeout: float) -> send.Result:
+            del message, timeout
+            before = (self.root / "keys.json").read_bytes()
+            self.assertEqual(send.send(options).outcome, "pending")
+            self.assertEqual((self.root / "keys.json").read_bytes(), before)
+            return send.Result("failed", "The alias delivery failed.")
+
+        with mock.patch.object(roster, "roster", return_value=roster.Roster([entry], [])):
+            with mock.patch.object(send, "now", return_value=started):
+                self.assertEqual(send.send(options).outcome, "sent")
+            with (mock.patch.object(send, "now", return_value=started + timedelta(seconds=1)),
+                  mock.patch.object(send, "relay", overlap)):
+                self.assertEqual(send.send(options._replace(selection=send.RosterLookup("session:recipient"))).outcome, "failed")
+            self.assertEqual(send.send(options).outcome, "skipped")
+        self.assertEqual(self.claims("notice"), {"morty": started.isoformat()})
+        self.assertEqual(len(self.relayed), 1)
+
+    def test_queued_staff_message_reaches_its_new_session_once(self) -> None:
+        self.session("before", "resources")
+        member = staff.StaffRow(staff.StaffId("fixed"), "unit", "resources", None,
+                               current_session=staff.StaffId("before"))
+        self.staff_rows = {"fixed": member}
+        started = send.now()
+        options = local_options(["--to", "fixed", "--key", "notice", "--repeat-minutes", "120", "--text", "Queued notice"])
+        self.outcome = send.Result("queued", "relay unavailable")
+        with mock.patch.object(send, "now", return_value=started):
+            self.assertEqual(send.send(options).outcome, "queued")
+            self.session("other", "Other")
+            self.assertEqual(send.send(options._replace(selection=send.RosterLookup("other"), text="Other notice")).outcome, "queued")
+        self.session("after", "resources")
+        other = self.staff_rows["other"]
+        self.staff_rows = {"fixed": replace(member, current_session=staff.StaffId("after")), "other": other}
+        (self.root / "sessions/before.json").unlink()
+        (self.root / "before.sock").unlink()
+        self.outcome = send.Result("sent", "delivered")
+        with mock.patch.object(send, "now", return_value=started + timedelta(minutes=1)):
+            self.assertEqual(send.send(options).outcome, "skipped")
+        damaged = send.queue_path("session-damaged")
+        _ = damaged.write_bytes(b"\xff\xfe\n")
+        delivered = send.pending("session:after")
+        self.assertEqual(delivered.count("Queued notice"), 1)
+        self.assertNotIn("Other notice", delivered)
+        self.assertEqual(send.pending("session:after"), "")
+        self.assertEqual(send.pending("session:other").count("Other notice"), 1)
+        self.assertEqual(send.pending("session:before"), "")
+        self.assertEqual(send.read_queue(send.queue_path("session-before")), [])
+        self.assertEqual(damaged.read_bytes(), b"\xff\xfe\n")
+        self.assertEqual(len(self.relayed), 2)
+        self.assertEqual(self.claims("notice"), {"staff:fixed": started.isoformat(), "staff:other": started.isoformat()})
+
+    def test_expired_staff_retry_replaces_the_previous_sessions_queued_body(self) -> None:
+        self.session("before", "resources")
+        member = staff.StaffRow(staff.StaffId("fixed"), "unit", "resources", None,
+                               current_session=staff.StaffId("before"))
+        self.staff_rows = {"fixed": member}
+        started = send.now()
+        options = local_options(["--to", "fixed", "--key", "notice", "--repeat-minutes", "30", "--text", "Older body"])
+        self.outcome = send.Result("queued", "relay unavailable")
+        with mock.patch.object(send, "now", return_value=started):
+            self.assertEqual(send.send(options).outcome, "queued")
+        self.session("after", "resources")
+        self.staff_rows = {"fixed": replace(member, current_session=staff.StaffId("after"))}
+        (self.root / "sessions/before.json").unlink()
+        (self.root / "before.sock").unlink()
+        other = send.StableRecipient("staff:other")
+        for target in ("session:before", "session:after"):
+            for key, body in (("notice", "Other recipient"), ("unrelated", "Unrelated key"), (None, "Unkeyed body")):
+                send.enqueue(send.Message(target, "Sender", "", body, key), "unavailable", started, recipient=other)
+        paths = [send.queue_path("session-before"), send.queue_path("session-after")]
+        preserved = {path: [entry for entry in send.read_queue(path) if entry.get("stable_recipient") == other.value]
+                     for path in paths}
+        with mock.patch.object(send, "now", return_value=started + timedelta(minutes=31)):
+            self.assertEqual(send.send(options._replace(text="Newer body")).outcome, "queued")
+        queued = [entry for path in paths for entry in send.read_queue(path)
+                  if entry.get("stable_recipient") == "staff:fixed"]
+        self.assertEqual([entry["text"] for entry in queued], ["Newer body"])
+        for path in paths:
+            self.assertEqual([entry for entry in send.read_queue(path) if entry.get("stable_recipient") == other.value],
+                             preserved[path])
+        delivered = send.pending("session:after")
+        self.assertEqual(delivered.count("Queued message "), 1)
+        self.assertIn("Newer body", delivered)
+        self.assertNotIn("Older body", delivered)
+        self.assertEqual(send.pending("session:after"), "")
+        for path in paths:
+            self.assertEqual(send.read_queue(path), preserved[path])
+
+    def test_pending_returns_the_newest_copy_after_interrupted_queue_replacement(self) -> None:
+        self.session("before", "resources")
+        member = staff.StaffRow(staff.StaffId("fixed"), "unit", "resources", None,
+                               current_session=staff.StaffId("before"))
+        self.staff_rows = {"fixed": member}
+        started = send.now()
+        stable = send.StableRecipient("staff:fixed")
+        send.enqueue(send.Message("session:before", "Sender", "", "Older body", "notice"),
+                     "unavailable", started, recipient=stable)
+        self.session("after", "resources")
+        self.staff_rows = {"fixed": replace(member, current_session=staff.StaffId("after"))}
+        (self.root / "sessions/before.json").unlink()
+        (self.root / "before.sock").unlink()
+        with mock.patch.object(send, "_rewrite_queue", side_effect=OSError("Interrupted removal")):
+            with self.assertRaisesRegex(OSError, "Interrupted removal"):
+                send.enqueue(send.Message("session:after", "Sender", "", "Newer body", "notice"),
+                             "unavailable", started + timedelta(minutes=31), recipient=stable)
+        self.assertEqual([entry["text"] for entry in send.read_queue(send.queue_path("session-before"))], ["Older body"])
+        self.assertEqual([entry["text"] for entry in send.read_queue(send.queue_path("session-after"))], ["Newer body"])
+        delivered = send.pending("session:after")
+        self.assertEqual(delivered.count("Queued message "), 1)
+        self.assertIn("Newer body", delivered)
+        self.assertNotIn("Older body", delivered)
+        self.assertEqual(send.pending("session:after"), "")
+        self.assertEqual(send.read_queue(send.queue_path("session-before")), [])
+
+    def test_pending_keeps_every_queue_when_a_selected_name_queue_has_invalid_utf8(self) -> None:
+        self.session("recipient", "Recipient")
+        send.enqueue(send.Message("session:recipient", "Sender", "", "Kept body", "notice"),
+                     "unavailable", send.now())
+        session_queue = send.queue_path("session-recipient")
+        name_queue = send.queue_path("Recipient")
+        _ = name_queue.write_bytes(b"\xff")
+        before = {path: path.read_bytes() for path in (session_queue, name_queue)}
+        with self.assertRaises(UnicodeDecodeError):
+            _ = send.pending("session:recipient")
+        self.assertEqual({path: path.read_bytes() for path in before}, before)
+        self.assertEqual([entry["text"] for entry in send.read_queue(session_queue)], ["Kept body"])
+
+    def test_queue_cleanup_preserves_other_owners_and_legacy_entries_in_other_files(self) -> None:
+        self.session("recipient", "Recipient")
+        started = send.now()
+        target = "session:recipient"
+        stable = send.StableRecipient("staff:recipient")
+        send.enqueue(send.Message(target, "Sender", "", "Other body", "notice"),
+                     "unavailable", started, recipient=send.StableRecipient("staff:other"))
+        for address in (target, "session:previous"):
+            send.enqueue(send.Message(address, "Sender", "", "Legacy body", "notice"), "unavailable", started)
+        previous = send.queue_path("session-previous")
+        before = send.read_queue(previous)
+        send.enqueue(send.Message(target, "Sender", "", "Current body", "notice"),
+                     "unavailable", started, recipient=stable)
+        self.assertEqual(send.read_queue(previous), before)
+        self.assertEqual([entry["text"] for entry in send.read_queue(send.queue_path("session-recipient"))],
+                         ["Other body", "Current body"])
+        self.assertEqual(send.remove_queued_key(target, "notice", recipient=stable), 1)
+        self.assertEqual(send.read_queue(previous), before)
+        self.assertEqual([entry["text"] for entry in send.read_queue(send.queue_path("session-recipient"))], ["Other body"])
+
+    def test_delivered_staff_retry_removes_its_queued_copy_from_the_previous_session(self) -> None:
+        self.session("before", "resources")
+        member = staff.StaffRow(staff.StaffId("fixed"), "unit", "resources", None,
+                               current_session=staff.StaffId("before"))
+        self.staff_rows = {"fixed": member}
+        started = send.now()
+        options = local_options(["--to", "fixed", "--key", "notice", "--repeat-minutes", "30", "--text", "Queued notice"])
+        self.outcome = send.Result("queued", "relay unavailable")
+        with mock.patch.object(send, "now", return_value=started):
+            self.assertEqual(send.send(options).outcome, "queued")
+        self.session("after", "resources")
+        self.staff_rows = {"fixed": replace(member, current_session=staff.StaffId("after"))}
+        (self.root / "sessions/before.json").unlink()
+        (self.root / "before.sock").unlink()
+        self.outcome = send.Result("sent", "delivered")
+        with mock.patch.object(send, "now", return_value=started + timedelta(minutes=31)):
+            self.assertEqual(send.send(options).outcome, "sent")
+        self.assertEqual(self.relayed[-1].to, f"uds:{self.root / 'after.sock'}")
+        self.assertEqual(send.pending("session:after"), "")
+        self.assertEqual(send.pending("session:before"), "")
+        self.assertEqual(len(self.relayed), 2)
+
+    def test_flood_guard_counts_a_staff_recipient_across_session_restarts(self) -> None:
+        outcomes: list[str] = []
+        for identity in ("first", "second", "third"):
+            self.session(identity, "resources")
+            self.staff_rows = {"fixed": staff.StaffRow(staff.StaffId("fixed"), "unit", "resources", None,
+                                                      current_session=staff.StaffId(identity))}
+            outcomes.append(send.send(local_options(["--to", "fixed", "--from", "sender", "--text", "Notice"])).outcome)
+        self.assertEqual(outcomes, ["sent", "sent", "held"])
+        self.assertEqual(len(self.relayed), 2)
+        self.assertEqual([row["to"] for row in self.log()], ["session:first", "session:second", "session:third"])
 
     def test_a_failed_keyed_session_send_retries_but_a_delivered_send_keeps_its_window(self) -> None:
         self.session("recipient", "Recipient")
@@ -1280,6 +1831,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
             self.assertEqual(send.send(options).outcome, "skipped")
         self.assertEqual([message.text for message in self.relayed], [options.text, options.text])
         self.assertEqual([entry["outcome"] for entry in self.log()], ["failed", "sent", "skipped"])
+        self.assertEqual(self.claims("result"), {"staff:recipient": (started + timedelta(seconds=1)).isoformat()})
 
     def test_a_queued_keyed_session_send_keeps_one_copy_and_its_window(self) -> None:
         self.session("recipient", "Recipient")
@@ -1295,6 +1847,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         self.assertEqual(len(self.relayed), 1)
         self.assertEqual(send.pending("session:recipient").count("The unit is back."), 1)
         self.assertEqual(send.pending("session:recipient"), "")
+        self.assertEqual(self.claims("result"), {"staff:recipient": started.isoformat()})
 
     def test_a_failed_send_does_not_clear_a_later_runs_window(self) -> None:
         self.session("bogus", "bogus")
@@ -1312,6 +1865,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
         with mock.patch.object(send, "now", return_value=started + timedelta(minutes=32)):
             self.assertEqual(send.send(options).outcome, "skipped")
         self.assertEqual([entry["outcome"] for entry in self.log()], ["sent", "failed", "skipped"])
+        self.assertEqual(self.claims("result"), {"staff:bogus": (started + timedelta(minutes=31)).isoformat()})
 
     def test_github_cold_keys_share_one_claim_until_warm_even_after_phone_expiry(self) -> None:
         def options(sender: str, machine: str = "natedev") -> send.Options:
@@ -1338,7 +1892,7 @@ class SendTests(RecipientStaffFixture, ShutdownTestCase):
             with self.assertRaises(KeyboardInterrupt):
                 _ = send.send(options)
         with mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")) as channel:
-            self.assertEqual(send.send(options).outcome, "skipped")
+            self.assertEqual(send.send(options).outcome, "pending")
             channel.assert_not_called()
             with mock.patch.object(send, "check_exit", return_value=0):
                 self.assertEqual(send.clear_check()[0], 0)
@@ -1779,10 +2333,11 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         address = f"uds:{self.root / 'recipient.sock'}"
         self.outcome = send.Result("queued", "relay timed out")
         enqueue = send.enqueue
-        def leave(message: send.Message, reason: str, at: datetime) -> None:
+        def leave(message: send.Message, reason: str, at: datetime, *,
+                  recipient: send.StableRecipient | send.TransportQueueOwner = send.TRANSPORT_QUEUE_OWNER) -> None:
             self.assertEqual(message.to, "session:recipient")
             (self.root / "sessions/recipient.json").unlink()
-            enqueue(message, reason, at)
+            enqueue(message, reason, at, recipient=recipient)
         with mock.patch.object(send, "enqueue", leave):
             result = send.send(local_options(["--to", address, "--from", "survey", "--text", "reply"]))
         self.assertEqual(result.outcome, "queued")
@@ -3517,11 +4072,42 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         message = send.Message("user", "script", "title", "body", None)
         with mock.patch.object(send, "run", return_value=(4, "SENT: earlier\nHELD: current\n1. Which build?\n", "")) as run:
             result = send.remote(message, "natedev", options)
-        self.assertEqual(result, send.Result("sent", "on natedev: earlier\nHELD: current\n1. Which build?"))
+        self.assertEqual(result, send.Result("failed", "ssh natedev: SENT: earlier HELD: current 1. Which build?"))
         self.assertNotIn("--answerable", cast(list[str], run.call_args.args[0])[-1])
         with mock.patch.dict(os.environ, {"CLAUDE_PID": ""}), mock.patch.object(send, "run", return_value=(1, "", "post failed")):
             _ = send.send(local_options(self.user_arguments("--from", "script")))
         self.assertFalse(self.failure_marker().exists())
+
+    def test_remote_preserves_each_confirmed_outcome_and_its_payload(self) -> None:
+        options = send.parse(self.user_arguments("--machine", "natedev"))
+        message = send.Message("user", "script", "title", "body", None)
+        cases: tuple[tuple[send_result.Outcome, int], ...] = (
+            ("sent", 0), ("skipped", 0), ("kept", 0), ("replaced", 0),
+            ("queued", 1), ("failed", 3), ("refused", 2), ("held", 4))
+        for outcome, code in cases:
+            with self.subTest(outcome=outcome), mock.patch.object(send, "run", return_value=(
+                    code, outcome.upper() + ": detail\nSENT: quoted payload\n", "SEND_RECIPIENT: session:fixture\n")):
+                result = send.remote(message, "natedev", options)
+            self.assertEqual(result, send.Result(outcome, "on natedev: detail\nSENT: quoted payload",
+                                                 send.NO_FAILED_PUSH, "session:fixture"))
+
+    def test_remote_requires_a_matching_exit_and_preserves_failure_metadata(self) -> None:
+        options = send.parse(self.user_arguments("--machine", "natedev"))
+        message = send.Message("user", "script", "title", "body", None)
+        record: send.FailedPushTransportRecord = {"reviewed": True, "need": "note", "title": "Choice",
+                                                 "action": "Choose retry.", "body": "The build stopped."}
+        for code, output in ((4, "SENT: earlier\nHELD: current\n1. Which build?\n"),
+                             (1, "SENT: apparent delivery"), (0, "QUEUED: offline"), (0, ""),
+                             (None, "SENT: interrupted")):
+            with self.subTest(code=code, output=output), mock.patch.object(send, "run", return_value=(
+                    code, output, "send.py: failed push JSON: " + json.dumps(record))):
+                result = send.remote(message, "natedev", options)
+            self.assertEqual(result.outcome, "failed")
+            self.assertIn("ssh natedev:", result.detail)
+            self.assertIsInstance(result.failure, send.FailedPush)
+            assert isinstance(result.failure, send.FailedPush)
+            self.assertEqual(result.failure.action, ActionRequired("Choose retry."))
+            self.assertEqual(result.failure.body, record["body"])
 
     def test_fallback_is_one_line_and_truncates_at_a_word_boundary(self) -> None:
         """F001: the built-in push has only a short message."""
@@ -3659,7 +4245,9 @@ class PeerSendTests(RecipientStaffFixture, ShutdownTestCase):
         _ = self.enterContext(mock.patch.object(codex_daemon, "queue", side_effect=self.daemon))
         _ = self.enterContext(mock.patch.object(send, "user", side_effect=AssertionError("never reach a real user channel")))
 
-    def read_local(self, _environment: object, scope: roster.RosterScope, *, membership: staff.StaffSnapshot) -> roster.Roster:
+    def read_local(self, _environment: object, scope: roster.RosterScope, *, membership: staff.StaffSnapshot,
+                   records: list[sessions.SessionRecord]) -> roster.Roster:
+        del records
         self.assertEqual(scope, roster.ThisMachine())
         self.assertEqual(membership, staff.StaffSnapshot(tuple(self.staff_rows.values())))
         return self.local
@@ -3704,11 +4292,11 @@ class PeerSendTests(RecipientStaffFixture, ShutdownTestCase):
         calls = [cast(list[str], call["args"]) for call in self.ssh_calls()]
         return [shlex.split(call[-1]) for call in calls if "send.py" in call[-1]]
 
-    def run_main(self, to: str, *options: str) -> tuple[int, str, str]:
+    def run_main(self, to: str, *options: str, text: str = "fixture text") -> tuple[int, str, str]:
         output, errors = io.StringIO(), io.StringIO()
         with redirect_stdout(output), redirect_stderr(errors):
             try:
-                status = send.main(["--to", to, "--from", "fixture sender", *options, "--text", "fixture text"])
+                status = send.main(["--to", to, "--from", "fixture sender", *options, "--text", text])
             except SystemExit as error:
                 status = int(cast(int, error.code))
         return status, output.getvalue(), errors.getvalue()
@@ -3786,9 +4374,9 @@ class PeerSendTests(RecipientStaffFixture, ShutdownTestCase):
             _ = (self.root / "sessions/local.json").write_text(json.dumps({
                 "pid": os.getpid(), "sessionId": "local", "name": "local transport", "updatedAt": 1,
                 "messagingSocketPath": address.removeprefix("uds:")}))
-            for target, flags in (("remote", ["--here"]), (address, []), (address, ["--machine", "mac"])):
+            for index, (target, flags) in enumerate((("remote", ["--here"]), (address, []), (address, ["--machine", "mac"]))):
                 with self.subTest(target=target):
-                    status, output, errors = self.run_main(target, *flags)
+                    status, output, errors = self.run_main(target, *flags, text=f"Routing case {index}")
                     self.assertEqual((status, errors), (0, ""), output)
         self.assertEqual(self.ssh_calls(), [])
         self.assertEqual(len(self.relayed), 3)

@@ -32,7 +32,7 @@ import process_group
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.process_failure import failure_detail
-from scripts.message.send import OutcomeHeader, parse_outcome
+from scripts.message import send_result
 from scripts.whoami import note_file
 
 from scripts.lib import agents_registry  # noqa: E402
@@ -1514,12 +1514,16 @@ def relay(recipient: str, text: str, key: str | None) -> str | None:
                               check=False)
     except (subprocess.TimeoutExpired, OSError) as error:
         return str(error)
-    if done.returncode == 0:
-        return None
-    # send.py's QUEUED outcome keeps its own header: refusal_watch treats a queued copy as delivered.
-    outcome = parse_outcome(done.stdout)
-    if done.returncode == 1 and isinstance(outcome, OutcomeHeader) and outcome.outcome == "queued":
-        return " ".join(f"QUEUED: {outcome.detail}".split())
+    outcome = send_result.send_outcome(done.returncode, done.stdout)
+    if isinstance(outcome, send_result.ConfirmedSendOutcome):
+        match outcome.header.outcome:
+            case "sent" | "skipped" | "replaced" | "kept":
+                return None
+            case "queued":
+                # refusal_watch accepts a queued copy through this header.
+                return " ".join(f"QUEUED: {outcome.header.detail}".split())
+            case "failed" | "refused" | "held" | "pending":
+                pass
     return " ".join(failure_detail(done).split())
 
 
@@ -1549,8 +1553,13 @@ def tell_user(push: RenderedPush) -> PushDelivery:
                               check=False)
     except (subprocess.TimeoutExpired, OSError) as error:
         return PushFailed(str(error))
-    if done.returncode == 0:
-        return PushSent()
+    outcome = send_result.send_outcome(done.returncode, done.stdout)
+    if isinstance(outcome, send_result.ConfirmedSendOutcome):
+        match outcome.header.outcome:
+            case "sent" | "skipped" | "kept" | "replaced":
+                return PushSent()
+            case "queued" | "failed" | "refused" | "held" | "pending":
+                pass
     return PushFailed(" ".join(failure_detail(done).split()))
 
 

@@ -195,8 +195,8 @@ class GitRepositoryFixture(unittest.TestCase):
         if not removed:
             for previous in staff.initial_snapshot().find(kind="unit"):
                 if previous.id != member.id and previous.worktree == tree:
-                    _ = staff.set_worktree(previous.id, staff.RemovedWorktree("natedev", location))
-        _ = staff.set_worktree(member.id, tree)
+                    _ = staff.set_worktree(previous.id, staff.RemovedWorktree("natedev", location), expected=previous.worktree)
+        _ = staff.set_worktree(member.id, tree, expected=member.worktree)
         return doc
 
 

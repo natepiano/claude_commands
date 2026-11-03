@@ -276,9 +276,10 @@ State:
   the list when `open_for_user` leaves it out; it leaves only through `answer`.
   User, 2026-10-28: "i asked it to add it to your question list not to bring
   it directly to my attention".
-  File every held simplify finding with `/showrunner:question`, led by the owning unit.
+  A held item goes to the user only when it touches money, safety, product behavior the user sees, or an act that cannot be undone.
+  File only those with `/showrunner:question`, led by the owning unit.
   Include its finding id, phase, files, proposed change, and ledger location.
-  Only the user can decide it. This rule overrides the showrunner's design authority for these items.
+  The director settles every other held item under DecisionEconomy and states the call in one line (user, 2026-11-02).
   After approval, send the owning unit a `next` item or a phase.
   After either answer, require the unit to record `findings.py decision` with the user's words.
   A change waiting for the user's check is never an open question: it goes on
@@ -716,10 +717,10 @@ returns it to its unit.
 2. **Move the row.** Run `/change_review` verdict with the row and the user's
    words. It moves the row to `## Reviewed` with the verdict and date. A landed
    row's Change cell may link the printed note.
-3. **Return it.** A row that returns goes to the unit that made it: send the
-   row, the change and the verdict. The merge commit its Merged cell names
-   gives the checkpoint, and so the unit. The fix comes back as a new row, with
-   a new proposal where step 1 applies.
+3. **Return it.** Send it to the unit that the row's Producer cell names.
+   Send the row, change and verdict.
+   The fix returns as a new row.
+   Add a new proposal where step 1 applies.
 </CloseChangeReview>
 
 ---
