@@ -15,7 +15,7 @@ import threading
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 from pathlib import Path
-from typing import TYPE_CHECKING, BinaryIO, TypeVar, cast
+from typing import BinaryIO, cast, override
 from urllib.parse import parse_qs, unquote, urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -23,15 +23,6 @@ from scripts.lib import conf
 from scripts.production import change_routing
 from scripts.review_links import change_page, change_browser
 from scripts.review_links.review_link import private_name
-
-if TYPE_CHECKING:
-    from typing import override
-else:
-    OverriddenMethod = TypeVar("OverriddenMethod")
-
-    def override(method: OverriddenMethod) -> OverriddenMethod:
-        """Keep override annotations usable on Python 3.11."""
-        return method
 
 
 class TailscaleAddressLost(RuntimeError):

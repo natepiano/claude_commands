@@ -18,18 +18,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 
-from typing import TYPE_CHECKING, cast
-
-
-if TYPE_CHECKING:
-    from typing import override
-else:
-    from typing import TypeVar
-
-    OverriddenMethod = TypeVar("OverriddenMethod")
-
-    def override(method: OverriddenMethod) -> OverriddenMethod:
-        return method
+from typing import cast, override
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 

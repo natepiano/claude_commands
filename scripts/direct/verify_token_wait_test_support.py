@@ -1,6 +1,8 @@
 """Independent tools, state and process cleanup for verify token tests."""
 from __future__ import annotations
 
+from scripts.lib.py_floor_test_support import cache_file_name
+
 from scripts.lint.memory_test_support import config_environment
 
 import json
@@ -164,7 +166,7 @@ esac
         _ = pressure.write_text("full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n")
         # Interpreter selection is independent of token ownership. Seed the
         # shim's normal cache once rather than rediscovering Python per test.
-        interpreter = self.root / "cache" / "claude" / "python3-3.11"
+        interpreter = self.root / "cache" / "claude" / cache_file_name()
         interpreter.parent.mkdir()
         _ = interpreter.write_text(sys.executable + "\n")
         memory_event = self.root / "memory-event.py"
