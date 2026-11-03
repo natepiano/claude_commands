@@ -872,6 +872,38 @@ class RecordTests(unittest.TestCase):
         self.assertEqual(call_record["token_wait_s"], 4)
         self.assertEqual(call_record["wait_s"], 9)
 
+    def test_ssh_attempts_keep_each_target_and_outcome_after_local_fallback(self) -> None:
+        for target, outcome, completion in (
+            ("aws", "failed", "confirmed"),
+            ("aws", "lost", "missing"),
+            ("spare", "declined", "missing"),
+            ("aws", "no_tests", "confirmed"),
+        ):
+            recorder.ssh_attempt({
+                "call_id": CALL_ID, "target": target,
+                "repo_identity": "github.com/example/hana",
+                "queued_at": START, "departed_at": START + 100, "slot": 2,
+                "outcome": outcome, "completion": completion,
+                "cleanup": "unconfirmed", "unresolved_count": 2,
+                "evidence_at": START + 150,
+            })
+        result = self.record(
+            "call", "ran", "0", "0", "100", "10", "", "0", "110", "test", "hana",
+            extra={"BUILDLOG_CALL_ID": CALL_ID, "BUILDLOG_TARGET": "natedev"},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = self.records()
+        attempts = [row for row in rows if row["kind"] == "ssh_attempt"]
+        self.assertEqual([(row["target"], row["outcome"]) for row in attempts],
+                         [("aws", "failed"), ("aws", "lost"), ("spare", "declined"), ("aws", "no_tests")])
+        for row in attempts:
+            self.assertEqual((row["call_id"], row["queued_at"], row["departed_at"], row["slot"]),
+                             (CALL_ID, START, START + 100, 2))
+            self.assertEqual((row["cleanup"], row["unresolved_count"], row["evidence_at"]),
+                             ("unconfirmed", 2, START + 150))
+        final = next(row for row in rows if row["kind"] == "call")
+        self.assertEqual(final["target"], "natedev")
+
     def test_call_records_zero_token_wait_when_value_is_invalid(self) -> None:
         for value in ("", "abc"):
             with self.subTest(value=value):

@@ -47,6 +47,9 @@ class SshRunnerEvent(TypedDict):
     result_type: str
     clock: str
     holder: str
+    remote_output: str
+    remote_status: int
+    interruption_generation: str
 
 
 class MacWaitRegistration(TypedDict):
@@ -60,9 +63,10 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import shlex
 import sys
 import time
-from contextlib import redirect_stdout
+from contextlib import nullcontext, redirect_stdout
 from unittest import mock
 
 source = Path(os.environ["TEST_SOURCE_REPO"])
@@ -85,6 +89,8 @@ initial = mac_test.read_claims(mac_test.state_paths(request.target))
 before = {claim.path: claim.record for claim in initial}
 reserved = bool(args.claim_owner_pid and any(claim.record["pid"] == args.claim_owner_pid for claim in initial))
 same_path = False
+remote_output = ""
+remote_status = 0
 
 def complete(arguments, attempt):
     global same_path
@@ -139,6 +145,7 @@ def copy_source(*arguments):
     return offload.CopiedTree(offload.KnownTreeKey("sent-tree"))
 
 def stream(arguments):
+    global remote_output, remote_status
     actions.append("run")
     if mode in ("run-refusal", "after-probe"):
         wire, status = "linux_startup=unresolved\n", 75
@@ -146,11 +153,43 @@ def stream(arguments):
     elif mode in ("interrupted", "other-generation"):
         generation = "fixture-generation" if mode == "interrupted" else "old-generation"
         wire, status = "aws_interrupted=" + generation + "\n", 255
+    elif mode == "runner-sigterm":
+        import linux_runner
+        from scripts.aws_target.runner_test_support import interrupt_runner, seed_runner_permission
+
+        now = int(time.time())
+        permission_directory = seed_runner_permission(Path.home(), config.source, now, "fixture-boot")
+        values = offload.runner_values(offload.read_config(config.source), request.target)
+        command = shlex.split(arguments[-1])
+        mirror = Path.home() / command[command.index("--mirror") + 1]
+        mirror.mkdir(parents=True, exist_ok=True)
+        exports = root / "shell-exports"
+        shell = linux_runner.ShellEnvironment("fixture-shell", exports, root)
+
+        def interrupted_child(argv, **options):
+            assert argv[:2] == ["bash", "-c"], argv
+            step, = mirror.glob(".linux-step-*")
+            (step / "started").touch()
+            interrupt_runner(permission_directory, now)
+            return subprocess.CompletedProcess(argv, 143)
+
+        output = io.StringIO()
+        with mock.patch.object(linux_runner, "boot_identity", return_value="fixture-boot"), \
+             mock.patch.object(linux_runner, "slot_run", return_value=nullcontext()), \
+             mock.patch.object(linux_runner, "prepare_shell", return_value=shell), \
+             mock.patch.object(linux_runner, "trim_build_folder", return_value=0), \
+             mock.patch.object(subprocess, "run", side_effect=interrupted_child), \
+             redirect_stdout(output):
+            status = linux_runner.run(mirror, values, request.package, request.verb,
+                                      request.nextest_words, request.call_id, "sent-tree")
+        wire = output.getvalue()
     elif mode == "lost":
         wire, status = "connection lost\n", 255
     else:
         status = 42 if mode == "failed" else 4 if mode == "no-tests" else 0
         wire = "mac_exit=" + str(status) + "\nmac_cleanup=0\n"
+
+    remote_output, remote_status = wire, status
 
     class Remote:
         stdout = io.StringIO(wire)
@@ -183,6 +222,8 @@ event = dict(target=request.target, owner=args.claim_owner_pid, slot=controller.
              reserved=reserved, same_path=same_path, queued_at=os.environ.get("BUILDLOG_MEM_WAIT_SINCE", ""),
              memory_reservation=os.environ.get("BUILDLOG_MEM_RESERVATION", ""), actions=actions, mode=mode,
              result_type=type(result).__name__,
+             remote_output=remote_output, remote_status=remote_status,
+             interruption_generation=result.generation if isinstance(result, offload.InterruptedTargetRun) else "",
              holder=type(result.holder).__name__ if isinstance(result, offload.BusyMacDecline) else "",
              clock=Path(os.environ["TEST_ROUTING_CLOCK"]).read_text() if os.environ.get("TEST_ROUTING_CLOCK") else "")
 with (root / "ssh-events.jsonl").open("a") as output:
@@ -700,6 +741,27 @@ os.execv(str(Path(__file__).with_name("cargo-original")), [str(Path(__file__).wi
         self.assertEqual(event["result_type"], "LostMacRun")
         attempt, = self.attempts()
         self.assertEqual(attempt["outcome"], "lost")
+
+    def test_sigterm_runner_output_preserves_the_sender_interruption_result(self) -> None:
+        self.configure("aws,natedev")
+        state = self.home / ".local/state/build-targets/aws"
+        _ = (state / "controller.json").write_text(json.dumps({"generation": "fixture-generation"}))
+
+        result = self.verify("test", "sample", "--no-cache", extra={
+            "TEST_SSH_MODES": '{"aws":"runner-sigterm"}', "BUILDLOG_MEM_WAIT_SINCE": "100.25",
+        })
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        event, = self.ssh_events()
+        self.assertEqual(event["result_type"], "InterruptedTargetRun", json.dumps(event))
+        self.assertEqual(event["interruption_generation"], "fixture-generation")
+        self.assertEqual(event["remote_status"], 143)
+        lines = event["remote_output"].splitlines()
+        self.assertEqual([line for line in lines if line.startswith("aws_interrupted=")],
+                         ["aws_interrupted=fixture-generation"])
+        attempt, = self.attempts()
+        self.assertEqual((attempt["target"], attempt["outcome"], attempt["queued_at"]), ("aws", "lost", 100.25))
+        self.assertEqual(len(self.local_runs()), 1)
 
     def test_local_only_request_never_reserves_or_runs_linux_work(self) -> None:
         self.configure("aws,natedev")

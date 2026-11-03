@@ -234,3 +234,17 @@ For active process redesigns, as we are currently undergoing with promotions and
 **Constraints from prior phases:** set at Phase 5's checkpoint.
 
 **Acceptance gate:** every number in `## Effect` names the command that produced it and matches a rerun; the test recount agrees with each root, exposure and closure call; each window meets the sample minimums or is marked reported, not judged; each adopted change has a verdict of pass, fail or inconclusive; each failed change's question is sent to the showrunner.
+
+### Phase 8 — Ad hoc review commands review in the invoking session  · status: done
+
+The user, 2026-11-02 19:4x EST, relayed by the sdlc showrunner, on `/module_review`, `/team_review` and `/api_review`: "yes they should just run inside their own session"; "they are adhoc and not part of the standard process - i invoke them at will at this time". Since d3421f80d (2026-07-13), each command launches fresh one-shot reviewers through `agent_exec.sh`. This phase runs before Phase 7, which waits for its sample.
+
+#### As-built
+
+- `commands/module_review.md`, `commands/team_review.md` and `commands/api_review.md` launch nothing through `agent_exec.sh`. The invoking session runs each lens itself, one after the other, and writes each lens's findings under `${SESSION_DIR}` before the next lens. The lens prompts, findings formats, merge, dedupe, adversary and validation steps stay.
+- Each command loads its preamble once and reads each file once per pass or cycle. `/team_review` points to `<DecisionEconomy/>` for the settled categories, and `/api_review` uses the charter's finding schema.
+- The registry tasks `module_review.reviewer`, `module_review.validation`, `team_review.expert`, `api_review.reviewer` and `api_review.adversary` and their assignments are gone from `config/agents.conf` and `scripts/lib/test_agents_registry.conf`. The `teamreview` alias in `scripts/agents/agent_admin.sh` is gone. Registry and quota-alert tests use `design_roles` and `cli` as sample keys.
+- `scripts/direct/test_phase_process.py` fails when any of the three commands names `agent_exec`, `claude --print` or `claude -p`.
+- `scripts/agents/agent_exec.sh` and the phase review path did not change.
+
+**Files:** the three commands; `commands/agent.md`; `config/agents.conf`; `docs/as-built/agent-registry.md`; `docs/direct_footprint_review.md`; `scripts/agents/agent_admin.sh`; `scripts/direct/test_phase_process.py`; `scripts/lib/test_agents_registry.conf`, `scripts/lib/test_agents_registry_fixture.py`; `scripts/whoami/quota_alert_test_support.py` and ten `scripts/whoami/test_*` files.
