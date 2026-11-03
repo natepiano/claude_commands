@@ -8,7 +8,7 @@ Every unit director on this machine, whatever its production, is found by its ho
 `/effort <level>` through the host's typing interface, never C-c or Escape; typing
 while it is mid-turn is fine. A pane showing a form, prompt or menu, or a draft in its input line,
 is skipped and reported. The registry's `production.director` row keeps its model and takes the
-level, through agent_admin.sh and its shared-registry publisher, before anything is typed. `--check` sends nothing and changes nothing.
+level, through default_models.sh and its shared-registry publisher, before anything is typed. `--check` sends nothing and changes nothing.
 """
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ AGENTS = Path(__file__).resolve().parents[1] / "agents"
 ROW = "production.director"
 USAGE = "usage: unit_effort.py <level> [--check]"
 READ_ROW = ('source "$1" && agents_resolve production.director && printf "%s\\n%s\\n%s\\n" '
-            + '"$AGENT_MODEL" "$AGENT_EFFORT" "$(_agents_registry_get "$AGENT_FAMILY.agents" "$AGENT_MODEL")"')
+            + '"$AGENT_MODEL" "$AGENT_EFFORT" "$(_models_registry_get "$AGENT_FAMILY.agents" "$AGENT_MODEL")"')
 # How many lines up from the bottom a form is looked for when no input box is on screen.
 BOTTOM_LINES = 25
 SGR = re.compile(r"\x1b\[([0-9;:]*)m")
@@ -58,7 +58,7 @@ class Cell(NamedTuple):
 
 def director_row() -> DirectorRow:
     """The unit director launch row now. Raises OSError when the registry cannot resolve it."""
-    done = subprocess.run(["bash", "-c", READ_ROW, "_", str(AGENTS / "agents_config.sh")],
+    done = subprocess.run(["bash", "-c", READ_ROW, "_", str(AGENTS / "models_config.sh")],
                           capture_output=True, text=True, check=False)
     values = done.stdout.splitlines()
     if done.returncode != 0 or len(values) != 3 or not values[0]:
@@ -70,12 +70,12 @@ def director_row() -> DirectorRow:
 
 def set_row(model: str, level: str) -> str:
     """Publish the shared launch row at `<model>:<level>`; empty on success, else why not."""
-    done = subprocess.run(["bash", str(AGENTS / "agent_admin.sh"), ROW, f"{model}:{level}"],
+    done = subprocess.run(["bash", str(AGENTS / "default_models.sh"), ROW, f"{model}:{level}"],
                           capture_output=True, text=True, check=False)
     if done.returncode == 0:
         return ""
     errors = [line for line in done.stderr.splitlines() if line.startswith("ERROR:")]
-    return errors[0] if errors else f"agent_admin.sh exit {done.returncode}"
+    return errors[0] if errors else f"default_models.sh exit {done.returncode}"
 
 
 def _sgr(parameters: str, dim: bool, inverse: bool) -> tuple[bool, bool]:

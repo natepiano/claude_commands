@@ -251,7 +251,7 @@ fi
 # cargo token and filed into its session. Hand the worker its worker variables
 # through settings, empty when unset (every reader treats empty as unset), and
 # keep them off the launch below so a daemon it starts carries none.
-WORKER_ENV_NAMES=(UNIT_RUN_DIR UNIT_TEAM_ROLE AGENTS_CONFIG_FILE)
+WORKER_ENV_NAMES=(UNIT_RUN_DIR UNIT_TEAM_ROLE MODELS_CONFIG_FILE)
 worker_settings="$("$PY" - "$WORKING_DIR" "$NIX_ENV_LIB" "${WORKER_ENV_NAMES[@]}" <<'PY'
 import json
 import os
@@ -291,7 +291,7 @@ if [[ -n "${EFFORT}" ]]; then
 fi
 
 banner="$(cd "${WORKING_DIR}" \
-            && env -u UNIT_RUN_DIR -u UNIT_TEAM_ROLE -u AGENTS_CONFIG_FILE \
+            && env -u UNIT_RUN_DIR -u UNIT_TEAM_ROLE -u MODELS_CONFIG_FILE \
                    -u UNIT_RESOLVES_ROUND -u AGENT_BG_WORKERS \
                    "${PY}" "$NIX_ENV_LIB/nix_env.py" exec "${CLAUDE_BIN}" "${launch_args[@]}" \
             2>&1 || true)"

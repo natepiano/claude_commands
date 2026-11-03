@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from scripts.lib.test_agents_registry import write_registry
+from scripts.lib.test_models_registry import write_registry
 
 import json
 import os
@@ -628,14 +628,14 @@ atomic_file.os.replace = interrupted_replace
             session=add_unit.NewSession(), launch_kind=add_unit.NewWorkLaunch(), timeout=1.0,
         )
         before = self.git("status", "--porcelain", "--untracked-files=all"), self.git("show-ref"), self.doc.read_text()
-        agent_config = self.root / "agents.conf"
+        agent_config = self.root / "models.conf"
         _ = write_registry(agent_config, {'assignments': {'production': 'claude'}, 'production.claude': {'director': 'opus:xhigh'}, 'claude.agents': {'opus': 'low,medium,high,xhigh'}})
         catalog_sync = self.root / "catalog-synced"
         catalog_sync.touch()
 
         with (
             mock.patch.dict(os.environ, {
-                "AGENTS_CONFIG_FILE": str(agent_config), "CODEX_CATALOG_SYNC_STATE_FILE": str(catalog_sync),
+                "MODELS_CONFIG_FILE": str(agent_config), "CODEX_CATALOG_SYNC_STATE_FILE": str(catalog_sync),
                 "CODEX_CONFIG_FILE": str(self.root / "codex.toml"), "CODEX_MODELS_CACHE_FILE": str(self.root / "models.json"),
             }),
             mock.patch.object(herdr, "claude_trust", return_value=herdr.Trusted(

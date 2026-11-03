@@ -22,8 +22,8 @@ from unittest.mock import patch
 # Initialize dependencies before invoke_cli swaps HOME. The recorder currently
 # imports user_zone eagerly; its production integrations remain real children.
 from scripts.direct import progress_history
-from scripts.lib import user_zone
-from scripts.lib.test_agents_registry import ExactRows, registry_text, write_registry
+from scripts.lib import models_registry, user_zone
+from scripts.lib.test_models_registry import ExactRows, registry_text, write_registry
 from scripts.production.cli_fixture import invoke_cli
 
 
@@ -119,7 +119,7 @@ class LauncherFixture(unittest.TestCase):
                            check=True, capture_output=True, text=True)
         self.config_file = self.root / "direct.conf"
         _ = self.config_file.write_text("\n".join(configuration), encoding="utf-8")
-        registry_file = self.root / ".claude/config/agents.conf"
+        registry_file = self.root / ".claude/config/models.conf"
         registry_file.parent.mkdir(parents=True)
         _ = write_registry(registry_file, base_text=registry)
         self.prompt_file = self.root / prompt_name
@@ -168,15 +168,15 @@ def prepare_launcher_runtime(root: Path) -> tuple[Path, Path, Path]:
     direct, agents, lib = (root / "scripts" / name for name in ("direct", "agents", "lib"))
     for directory in (direct, agents, lib, root / "scripts/production"):
         directory.mkdir(parents=True)
-    for name in ("py", "process_group.py", "atomic_file.py", "user_zone.py", "unit_runs.py", "agents_registry.py", "codex_models_cache.py",
-                 "build_folders.py"):
+    for name in ("py", "process_group.py", "atomic_file.py", "user_zone.py", "unit_runs.py", "models_registry.py", "process_failure.py",
+                 "codex_models_cache.py", "build_folders.py"):
         _ = shutil.copy2(source / "lib" / name, lib / name)
     home_lib = root / ".claude/scripts/lib"
     home_lib.mkdir(parents=True, exist_ok=True)
     for name in ("py", "process_group.py"):
         _ = shutil.copy2(source / "lib" / name, home_lib / name)
     _ = shutil.copy2(source / "production/production_doc.py", root / "scripts/production/production_doc.py")
-    for name in ("agents_config.sh", "heartbeat.sh", "heartbeat_watch.sh", "worker_lifecycle.py"):
+    for name in ("models_config.sh", "heartbeat.sh", "heartbeat_watch.sh", "worker_lifecycle.py"):
         _ = shutil.copy2(source / "agents" / name, agents / name)
     for name in ("implement.sh", "worker_name.sh", "worker_state.py", "progress_history.py", "plan_history.py",
                  "phase_reservation.py", "recorder_state.py", "findings.py", "board.sh"):
@@ -198,9 +198,9 @@ def configure_launcher_fixture(launcher: Path) -> None:
 def launcher_environment(root: Path) -> dict[str, str]:
     """Isolate registry writes, Python discovery and worker identity for launchers."""
     environment = os.environ.copy()
-    environment.update(AGENTS_CONFIG_PUBLISH="0", HOME=str(root), XDG_CACHE_HOME=str(root / "cache"),
+    environment.update(MODELS_CONFIG_PUBLISH="0", HOME=str(root), XDG_CACHE_HOME=str(root / "cache"),
                        UNIT_WORKER_POLL_SECS="0.01", UNIT_WORKER_WAIT_ATTEMPTS="30000", UNIT_SYNC_WRITES="0",
-                       TEST_LEGACY_LAUNCH="1", AGENTS_CONFIG_FILE=str(root / ".claude/config/agents.conf"),
+                       TEST_LEGACY_LAUNCH="1", MODELS_CONFIG_FILE=str(root / ".claude/config/models.conf"),
                        UNIT_HISTORY_DIR=str(root / "history"), CONF_DIR=str(root),
                        TZ="UTC", USER_ZONE="UTC")
     cache = root / "cache/claude" / cache_file_name()
@@ -236,7 +236,7 @@ def invoke_recorder(arguments: Sequence[str], environment: Mapping[str, str],
     try:
         with (
             patch.dict(os.environ, {"CONF_DIR": environment.get("CONF_DIR", str(home / ".claude/config"))}),
-            patch.object(progress_history, "DEFAULT_AGENTS_CONFIG_PATH", home / ".claude/config/agents.conf"),
+            patch.object(models_registry, "DEFAULT_PATH", home / ".claude/config/models.conf"),
             patch.object(user_zone, "CONF", Path(environment.get("USER_ZONE_CONF") or
                                                str(Path(user_zone.__file__).parents[2] / "config/user_zone.conf"))),
         ):

@@ -30,7 +30,7 @@ from scripts.agents import worker_lifecycle  # noqa: E402
 from scripts.direct import phase_reservation, plan_history, recorder_state  # noqa: E402
 from scripts.direct.recorder_state import OPEN_PHASES_KEY as OPEN_PHASES_KEY  # noqa: E402
 from scripts.direct.tag_inventory import contract_table_paths  # noqa: E402
-from scripts.lib import unit_runs  # noqa: E402
+from scripts.lib import models_registry, unit_runs  # noqa: E402
 from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
 from scripts.production import production_doc, session_staff, showrunners, staff  # noqa: E402
@@ -205,10 +205,9 @@ class FindingTally(TypedDict):
 # later query group passes by the configuration in force, which is what makes a
 # comparison survive interleaved runs and a conf edited between them.
 CONFIG_DIGEST_LENGTH = 12
-# agents_config.sh reads the same env override, so a launcher resolving against
+# models_config.sh reads the same env override, so a launcher resolving against
 # one table can never be stamped with the digest of another.
-AGENTS_CONFIG_ENV = "AGENTS_CONFIG_FILE"
-DEFAULT_AGENTS_CONFIG_PATH = Path("~/.claude/config/agents.conf").expanduser()
+DEFAULT_MODELS_CONFIG_PATH = models_registry.DEFAULT_PATH
 
 
 class ContractFileHash(TypedDict):
@@ -279,9 +278,8 @@ def _config_path() -> Path:
     return Path(os.environ.get("CONF_DIR") or "~/.claude/config").expanduser() / "direct.conf"
 
 
-def _agents_config_path() -> Path:
-    configured = os.environ.get(AGENTS_CONFIG_ENV)
-    return Path(configured) if configured else DEFAULT_AGENTS_CONFIG_PATH
+def _models_config_path() -> Path:
+    return models_registry.registry_path()
 
 
 @cache
@@ -295,7 +293,7 @@ def _config_digest() -> str:
     name a configuration this process never saw and group unlike passes under it.
     """
     contents: list[bytes] = []
-    for path in (_agents_config_path(), _config_path()):
+    for path in (_models_config_path(), _config_path()):
         try:
             contents.append(path.read_bytes())
         except OSError:
@@ -1682,7 +1680,7 @@ def _resolve_worker_agent(task: str) -> AgentIdentity:
     waiting for it would be a poll. Resolving through the same bash entry point
     the launcher uses gives the Worker cell the same answer with no race.
     """
-    resolver = Path(__file__).resolve().parent.parent / "agents" / "agents_config.sh"
+    resolver = Path(__file__).resolve().parent.parent / "agents" / "models_config.sh"
     unknown = AgentIdentity(family="", model="", effort="", session_id="")
     if not resolver.is_file():
         return unknown

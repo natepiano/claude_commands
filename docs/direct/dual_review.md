@@ -50,7 +50,7 @@ busy. Keep both threads across phases and plans. Writers keep their own roles.
 The `simplify` lens uses the fresh reviewer path in `review.sh`, with task `direct.simplify` and no worker address.
 It keeps `Agent` for the agents in `SIMPLIFY_AGENTS`.
 This lens alone permits Claude subagents.
-`config/agents.conf` selects its model and effort.
+`config/models.conf` selects its model and effort.
 `assign.py` reads `SIMPLIFY_LENS=on|off` from `config/direct.conf` at each launch.
 The review launcher reads `config/review/simplify.md` after it obtains the lock.
 That file defines the report rules and the standing instructions.
