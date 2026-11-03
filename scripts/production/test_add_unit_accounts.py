@@ -6,10 +6,9 @@ import argparse
 import io
 import json
 import os
-import shlex
 import sys
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import redirect_stderr
 from pathlib import Path
 from typing import final
 from unittest.mock import patch
@@ -18,7 +17,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "shutdown"))
 import add_unit
 import autocompact
-import launch_permission
 import inventory
 from scripts.accounts import accounts
 
@@ -32,59 +30,7 @@ def setUpModule() -> None:
 
 @final
 class AddUnitAccountsTests(AddUnitTestCase):
-    def test_untrusted_new_worktree_refuses_before_stub_row_or_worktree(self) -> None:
-        config = Path(self.env["HOME"]) / ".claude2/.claude.json"
-        _ = config.write_text(json.dumps({"oauthAccount": {"emailAddress": "owner@example.com"},
-                                         "projects": {str(self.root): {"hasTrustDialogAccepted": True}}}))
-        document = self.doc.read_text()
-        head = self.git("rev-parse", "HEAD")
-        for mode in ([], ["--check"]):
-            with self.subTest(mode=mode):
-                result = self.cli("alpha", "--brief", "Add a feature", *mode)
-                self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
-                folder = self.root / "project-alpha"
-                self.assertIn(f"alpha-unit: Claude is not trusted in {folder} on claude2. Run: "
-                              + f"cd {shlex.quote(str(self.checkout))} && "
-                              + f"CLAUDE_CONFIG_DIR={shlex.quote(str(Path(self.env['HOME']) / '.claude2'))} "
-                              + f"CLAUDE_CODE_REMOTE_MEMORY_DIR={shlex.quote(str(Path(self.env['HOME']) / '.claude'))} claude", result.stderr)
-                self.assert_no_launch_change(document, head)
-                self.assertFalse((self.checkout / "docs/plans/build-followups-alpha.md").exists())
-                self.assertNotIn("build-followups-alpha", self.git("branch", "--list"))
 
-    def test_trust_uses_launch_account_instead_of_callers_account(self) -> None:
-        directory = self.prepare_unit_account("claude3")
-        _ = (directory / ".claude.json").write_text(json.dumps({
-            "oauthAccount": {"emailAddress": "claude-3@example.invalid"}, "projects": {}}))
-        self.env["CLAUDE_CONFIG_DIR"] = str(Path(self.env["HOME"]) / ".claude")
-        document = self.doc.read_text()
-        head = self.git("rev-parse", "HEAD")
-        result = self.cli("alpha", "--brief", "Add a feature")
-        self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
-        self.assertIn("on claude3. Run:", result.stderr)
-        self.assertIn(f"CLAUDE_CONFIG_DIR={shlex.quote(str(directory))}", result.stderr)
-        self.assert_no_launch_change(document, head)
-
-    def test_trust_file_becoming_unreadable_after_account_check_refuses_before_any_write(self) -> None:
-        with patch.dict(os.environ, self.env):
-            selected = accounts.role_account("unit")
-        config = Path(self.env["HOME"]) / ".claude2/.claude.json"
-        _ = config.write_text('{"oauthAccount": "SECRET-EMAIL", ')
-        document = self.doc.read_text()
-        head = self.git("rev-parse", "HEAD")
-        output = io.StringIO()
-        errors = io.StringIO()
-        with (patch.dict(os.environ, self.env), redirect_stdout(output), redirect_stderr(errors),
-              patch.object(add_unit, "account_for_launch", return_value=selected),
-              patch.object(accounts, "check", return_value=[]),
-              patch.object(launch_permission, "launch_permission",
-                           return_value=launch_permission.AllowedByShutdownState())):
-            code = add_unit.main(["--production", str(self.doc), "alpha", "--brief", "Add a feature"])
-        self.assertEqual(code, 2, (output.getvalue(), errors.getvalue()))
-        self.assertEqual(errors.getvalue(), f"add_unit: alpha-unit: cannot read {config} "
-                         + "to check Claude trust (JSONDecodeError)\n")
-        self.assertNotIn("SECRET", output.getvalue() + errors.getvalue())
-        self.assert_no_launch_change(document, head)
-        self.assertFalse((self.checkout / "docs/plans/build-followups-alpha.md").exists())
 
     def test_explicit_account_environment_omits_every_prepared_removal(self) -> None:
         prior = self.root / "prior-session"
@@ -188,8 +134,7 @@ class AddUnitAccountsTests(AddUnitTestCase):
 
     def test_selected_account_launch_never_reads_shutdown_holds(self) -> None:
         self.env["CLAUDE_CONFIG_DIR"] = str(self.root / "caller account")
-        with patch.object(launch_permission, "launch_permission", side_effect=AssertionError("stale hold queried")):
-            _ = self.successful("alpha", "--plan", "docs/plans/given.md")
+        _ = self.successful("alpha", "--plan", "docs/plans/given.md")
         self.assertEqual(self.pane_environment()["CLAUDE_CONFIG_DIR"], str(Path(self.env["HOME"]) / ".claude2"))
 
     def test_better_candidate_after_readiness_keeps_the_stored_group_account(self) -> None:

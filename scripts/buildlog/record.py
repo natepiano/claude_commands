@@ -19,7 +19,7 @@ port_lint.py writes its own call records through write_call() here.
       From invoke.sh's run(), before every step: print the tree key
       (treekey.py) of the worktree the step would be recorded under, or
       nothing.
-  record.py test-phase-context RESERVATION ARGV...
+  record.py test-phase-context SAMPLING_CONTEXT ARGV...
       Before release, print the reservation's repository and filter metadata
       with the actual post-share argv's test width. The sampler adds its window.
   record.py call OUTCOME STATUS CACHED WAIT WALL BUILD SAVED ELAPSED VERB [ARG...]
@@ -140,7 +140,6 @@ def configured_targets() -> tuple[str, ...]:
 
 def local_targets() -> tuple[str, ...]:
     return tuple(target.name for target in read_targets() if isinstance(target, LocalTarget))
-
 
 
 @dataclass(frozen=True)
@@ -334,7 +333,7 @@ def write_launch_line(record_data: Mapping[str, object]) -> bool:
     return True
 
 
-def pending_launches_root() -> Path:
+def pending_launch_root() -> Path:
     return store.root() / "pending-launches"
 
 
@@ -357,7 +356,7 @@ def _save_pending_record(path: Path, fields: Mapping[str, object], *, replace_ex
 
 
 def _pending_launch_path(row: LaunchStep) -> Path:
-    return pending_launches_root() / _launch_row_path(row).with_suffix(".json").name
+    return pending_launch_root() / _launch_row_path(row).with_suffix(".json").name
 
 
 def _save_pending_launch(row: LaunchStep) -> Path:
@@ -602,12 +601,16 @@ def pending_steps_root() -> Path:
     return store.root() / "pending-steps"
 
 
-def test_phase_context(reservation: Path, argv: list[str]) -> dict[str, object]:
+def test_phase_context(sampling_context: str, argv: list[str]) -> dict[str, object]:
     """Copy admission's selection, using the argv that actually runs for its width."""
-    loaded = cast(object, json.loads(reservation.read_text()))
+    loaded = cast(object, json.loads(sampling_context))
     if not isinstance(loaded, dict):
-        raise ValueError("test-phase reservation is not an object")
+        raise ValueError("test-phase sampling context is not an object")
     fields = cast(dict[str, object], loaded)
+    call = fields.get("call_id")
+    if isinstance(call, dict):
+        recorded_call = memory_admit.parse_snapshot_value(cast(dict[str, object], call), memory_admit.Call)
+        fields["call_id"] = recorded_call.call_id if isinstance(recorded_call, memory_admit.CallRecord) else None
     # Admission's parser returns the first width. Supplying nextest's environment
     # default last preserves an explicit flag, including a nonnumeric one.
     width_argv = argv
@@ -1059,7 +1062,6 @@ def ssh_attempt(attempt: SshAttempt) -> None:
     })
 
 
-
 @dataclass(frozen=True)
 class AttemptResult:
     repo_identity: str
@@ -1287,7 +1289,7 @@ def main(argv: list[str]) -> int:
             if found:
                 print(found)
         elif command == "test-phase-context":
-            print(json.dumps(test_phase_context(Path(rest[0]), rest[1:]), separators=(",", ":")))
+            print(json.dumps(test_phase_context(rest[0], rest[1:]), separators=(",", ":")))
         elif command == "hold-event":
             hold_event(rest)
         elif command == "hold-build":

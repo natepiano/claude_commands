@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import faulthandler
+import io
 import os
 import tempfile
 import shlex
 import socket
 import sys
 import unittest
+from contextlib import redirect_stdout
 from enum import StrEnum
 from types import ModuleType
 from pathlib import Path
@@ -94,6 +96,7 @@ class ShutdownTestCase(unittest.TestCase):
     @override
     def setUp(self) -> None:
         super().setUp()
+        _ = self.enterContext(redirect_stdout(io.StringIO()))
         _ = self.enterContext(isolated_parents())
         faulthandler.dump_traceback_later(TEST_TIME_LIMIT_SECONDS, exit=True)
         self.addCleanup(faulthandler.cancel_dump_traceback_later)

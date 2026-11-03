@@ -110,7 +110,7 @@ store. `unit-history` is the only one.
   assignment off the data instead of reconstructing it.
 - **`task` and `stage` say the same thing for a worker pass**, so group on one
   or the other, not both, unless a second skill is in the window. Worker tasks
-  are the four kinds — `impl`, `test`, `fix`, `review` — and `agents.conf` holds
+  are the four kinds — `impl`, `test`, `fix`, `review` — and `models.conf` holds
   one row per kind. It used to hold five keys where three (`architect`,
   `mechanical`, `escalation`) named an agent tier rather than a job, and on
   2026-08-30 the tier axis was removed and 6141 stored events were rewritten to

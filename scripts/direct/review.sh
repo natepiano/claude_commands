@@ -187,7 +187,7 @@ fi
 
 # python3 goes through the repo shim, which picks an interpreter by VERSION
 # rather than by path: the python3 on PATH is Apple 3.9 on the Mac, and this
-# repo needs >= 3.11.
+# repo needs >= 3.12.
 PY="${SCRIPT_DIR}/../lib/py"
 MESH_SESSION_DIR="${SESSION_DIR}"
 MESH_CLAIMED=0
@@ -649,7 +649,7 @@ if [[ -n "${STYLE_SINCE}" ]]; then
 fi
 
 # shellcheck source=/dev/null
-source "${SCRIPT_DIR}/../agents/agents_config.sh"
+source "${SCRIPT_DIR}/../agents/models_config.sh"
 if [[ "${TASK}" == direct.simplify && "$(_agents_live_family direct simplify)" != claude ]]; then
   review_error "direct.simplify requires a Claude assignment"
   write_review_status error
@@ -669,9 +669,9 @@ fi
 # shellcheck disable=SC2153  # agents_resolve sets AGENT_MODEL.
 DURABLE_WORKER_MODEL="${AGENT_MODEL}"
 if [[ -n "${NEW_SLOT}" ]]; then
-  IMPLEMENTATION_PAIR="$(_agents_registry_get "direct.${AGENT_FAMILY}" implementation)"
+  IMPLEMENTATION_PAIR="$(_models_registry_get "direct.${AGENT_FAMILY}" implementation)"
   if [[ -z "${IMPLEMENTATION_PAIR}" ]]; then
-    IMPLEMENTATION_PAIR="$(_agents_registry_get "direct.${AGENT_FAMILY}" impl)"
+    IMPLEMENTATION_PAIR="$(_models_registry_get "direct.${AGENT_FAMILY}" impl)"
   fi
   if [[ -z "${IMPLEMENTATION_PAIR}" ]]; then
     echo "ERROR: cannot record review worker ${REVIEW_WORKER}: no implementation model is configured." >&2
@@ -684,7 +684,7 @@ TREE_BASELINE_READY=0
 TURN_IMAGE_ARGS=()
 
 if [[ -n "${REVIEW_WORKER}" ]]; then
-  CODEX_MESH="${UNIT_CODEX_MESH:-$(_agents_registry_get direct.options codex_mesh)}"
+  CODEX_MESH="${UNIT_CODEX_MESH:-$(_models_registry_get direct.options codex_mesh)}"
   if [[ "${AGENT_FAMILY}" != "codex" || "${CODEX_MESH}" != "1" ]]; then
     echo "ERROR: review worker ${REVIEW_WORKER} requires the Codex mesh." >&2
     exit 2

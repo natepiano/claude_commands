@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Literal, cast
 import rust_release
 import store
 import sync
+import conf
 
 if TYPE_CHECKING:
     from ..notify import push_texts
@@ -64,13 +65,18 @@ class MacUnreachable:
 
 
 @dataclass(frozen=True)
+class VaultLocked:
+    detail: str
+
+
+@dataclass(frozen=True)
 class VaultCommandFailed:
     detail: str
 
 
-PullStop = TrackedFilesChanged | NotOnMain | HistoryDiverged | UntrackedWouldBeOverwritten | MacUnreachable | VaultCommandFailed
+PullStop = TrackedFilesChanged | NotOnMain | HistoryDiverged | UntrackedWouldBeOverwritten | MacUnreachable | VaultLocked | VaultCommandFailed
 PullOutcome = Pulled | Current | PullStop
-StopCause = Literal["tracked_files_changed", "not_on_main", "history_diverged", "untracked_would_be_overwritten", "mac_unreachable", "command_failed"]
+StopCause = Literal["tracked_files_changed", "not_on_main", "history_diverged", "untracked_would_be_overwritten", "mac_unreachable", "vault_locked", "command_failed"]
 
 
 @dataclass(frozen=True)
@@ -88,6 +94,7 @@ class OpenOutage:
     cause: StopCause
     since: float
     alerted: bool
+    detail: str
 
 
 @dataclass(frozen=True)
@@ -113,16 +120,23 @@ git -C rust/hanadocs merge-base --is-ancestor HEAD refs/remotes/origin/main
 ancestor=$?
 [ "$ancestor" = 0 ] || { [ "$ancestor" = 1 ] && outcome diverged; outcome failed; }
 count=$(git -C rust/hanadocs rev-list --count HEAD..refs/remotes/origin/main) || outcome failed
-merged=$(git -C rust/hanadocs merge --ff-only --no-overwrite-ignore refs/remotes/origin/main 2>&1)
-result=$?
-if [ "$result" != 0 ]; then
+retries_left=${vault_lock_retries:-0}
+while :; do
+  merged=$(git -C rust/hanadocs merge --ff-only --no-overwrite-ignore refs/remotes/origin/main 2>&1)
+  result=$?
+  [ "$result" != 0 ] || break
   printf '%s\\n' "$merged" >&2
   case "$merged" in
+    *"index.lock"*"File exists"*|*"File exists"*"index.lock"*)
+      [ "$retries_left" -gt 0 ] || outcome locked
+      retries_left=$((retries_left - 1))
+      sleep "$vault_lock_retry_delay_s" || outcome failed
+      ;;
     *"untracked working tree files would be overwritten"*) outcome untracked ;;
     *"Not possible to fast-forward"*|*"not possible to fast-forward"*) outcome diverged ;;
     *) outcome failed ;;
   esac
-fi
+done
 outcome "pulled:$count"
 """
 
@@ -151,7 +165,14 @@ def pull() -> PullOutcome:
         )):
             return MacUnreachable()
         return VaultCommandFailed(pushed.stderr.strip() or f"git push exited {pushed.returncode}")
-    result = run(["ssh", *options, peer, REMOTE_PULL], COMMAND_TIMEOUT_S)
+    settings = conf.read("build_targets")
+    retries = settings.whole("vault.lock_retries")
+    delay = settings.number("vault.lock_retry_delay_s")
+    remote = (
+        f"vault_lock_retries={shlex.quote(str(retries))}\n"
+        + f"vault_lock_retry_delay_s={shlex.quote(str(delay))}\n" + REMOTE_PULL
+    )
+    result = run(["ssh", *options, peer, remote], COMMAND_TIMEOUT_S)
     if result is None:
         return MacUnreachable()
     markers = [line.removeprefix("VAULT_OUTCOME=") for line in result.stdout.splitlines()
@@ -164,6 +185,8 @@ def pull() -> PullOutcome:
                 return NotOnMain()
             case "diverged":
                 return HistoryDiverged()
+            case "locked":
+                return VaultLocked(result.stderr.strip())
             case "untracked":
                 return UntrackedWouldBeOverwritten()
             case value if value.startswith("pulled:"):
@@ -202,8 +225,9 @@ def read_state() -> VaultState:
     if isinstance(raw_outage, dict):
         outage = cast(dict[str, object], raw_outage)
         cause, since, alerted = outage.get("cause"), timestamp(outage.get("since")), outage.get("alerted")
-        if cause in ("tracked_files_changed", "not_on_main", "history_diverged", "untracked_would_be_overwritten", "mac_unreachable", "command_failed") and isinstance(since, float) and isinstance(alerted, bool):
-            return VaultState(last_good, OpenOutage(cause, since, alerted))
+        if cause in ("tracked_files_changed", "not_on_main", "history_diverged", "untracked_would_be_overwritten", "mac_unreachable", "vault_locked", "command_failed") and isinstance(since, float) and isinstance(alerted, bool):
+            detail = outage.get("detail", "")
+            return VaultState(last_good, OpenOutage(cause, since, alerted, detail if isinstance(detail, str) else ""))
     return VaultState(last_good, NoOutage())
 
 
@@ -213,7 +237,7 @@ def write_state(state: VaultState) -> None:
     outage = state.outage
     data = {
         "last_good": state.last_good.at if isinstance(state.last_good, LastGoodPull) else None,
-        "outage": {"cause": outage.cause, "since": outage.since, "alerted": outage.alerted} if isinstance(outage, OpenOutage) else None,
+        "outage": {"cause": outage.cause, "since": outage.since, "alerted": outage.alerted, "detail": outage.detail} if isinstance(outage, OpenOutage) else None,
     }
     partial = path.with_name(path.name + ".tmp")
     _ = partial.write_text(json.dumps(data) + "\n")
@@ -232,8 +256,10 @@ def stop_details(outcome: PullStop) -> tuple[StopCause, str, str]:
             return "untracked_would_be_overwritten", "An update would replace a file on the Mac that git does not track.", "In a terminal on the Mac, move the untracked file that blocks the hanadocs update out of ~/rust/hanadocs. Run git -C ~/rust/hanadocs merge --ff-only origin/main to see its name."
         case MacUnreachable():
             return "mac_unreachable", "natedev could not reach the Mac for more than 24 hours.", "Wake the Mac and connect it to the network."
+        case VaultLocked():
+            return "vault_locked", "Another git process held ~/rust/hanadocs/.git/index.lock on the Mac for every try.", "In a terminal on the Mac, check that no git process uses ~/rust/hanadocs; if none does, remove ~/rust/hanadocs/.git/index.lock."
         case VaultCommandFailed():
-            return "command_failed", "The update failed with an error the job does not know.", "In the Claude session named natedev, ask it to read the vault update error in the hourly log."
+            return "command_failed", "The update failed with an error the job does not know.", f"On natedev, read the detail in {state_path()}, or run journalctl --user -u buildlog.service | grep 'buildlog vault'."
 
 
 def vault() -> int:
@@ -260,8 +286,9 @@ def _vault_locked() -> int:
             print(f"buildlog vault: pulled {outcome.commits} commits" if isinstance(outcome, Pulled) else "buildlog vault: current")
             return 0
         cause, reason, action = stop_details(outcome)
+        detail = outcome.detail if isinstance(outcome, (VaultCommandFailed, VaultLocked)) else reason
         previous = state.outage
-        outage = OpenOutage(cause, previous.since, previous.alerted) if isinstance(previous, OpenOutage) else OpenOutage(cause, now, False)
+        outage = OpenOutage(cause, previous.since, previous.alerted, detail) if isinstance(previous, OpenOutage) else OpenOutage(cause, now, False, detail)
         last_good = state.last_good.at if isinstance(state.last_good, LastGoodPull) else outage.since
         sleeping = isinstance(outcome, MacUnreachable) and now - last_good <= UNREACHABLE_GRACE_S
         # Save before sending: a send failure must retry without losing the outage's start.
@@ -269,14 +296,14 @@ def _vault_locked() -> int:
         if not outage.alerted and not sleeping:
             # A note's send key has no permanent deduplication window. Commit the
             # alert before sending, so a later save failure cannot repeat it.
-            write_state(VaultState(state.last_good, OpenOutage(cause, outage.since, True)))
+            write_state(VaultState(state.last_good, OpenOutage(cause, outage.since, True, detail)))
             try:
                 sent = rust_release.send_release_text(push_texts.render(PUSH_TEXT_ID, reason=reason, action=action))
             except (OSError, subprocess.SubprocessError):
                 sent = False
             if not sent:
                 write_state(VaultState(state.last_good, outage))
-        description = outcome.detail if isinstance(outcome, VaultCommandFailed) else reason
+        description = " ".join(detail.splitlines())
         if sleeping:
             description = "Mac unreachable; the next hour retries"
         print("buildlog vault: stopped: " + description)

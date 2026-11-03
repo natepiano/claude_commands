@@ -4,15 +4,19 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 from pathlib import Path
 from contextlib import redirect_stdout
 from decimal import Decimal
 import io
 import time
-from typing import TYPE_CHECKING, TypedDict, cast, override
+from typing import TYPE_CHECKING, Callable, TypedDict, cast, override
 import unittest
 from unittest import mock
 
+from scripts.build_queue.admission_test_support import AdmissionFixture, caller_admission
+from scripts.build_queue import admission_protocol as wire
+from scripts.build_queue.admission_service import WaitingAdmission
 from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, GIT_STUB
 from scripts.direct import verify_doc_test_support as doc_support
 from scripts.build_targets import test_ssh_eligibility as eligibility_support
@@ -231,6 +235,8 @@ raise SystemExit(offload.write_result(result, request.result, request.last_decli
 
 
 class VerifySshTargetsTests(VerifyMacOffloadFixture):
+    admission: AdmissionFixture  # pyright: ignore[reportUninitializedInstanceVariable]
+
     @override
     def setUp(self) -> None:
         super().setUp()
@@ -241,6 +247,7 @@ class VerifySshTargetsTests(VerifyMacOffloadFixture):
             "wanted=ls-files", 'wanted=remote\nif has "$@"; then printf "https://example.com/team/hana.git\\n"; exit 0; fi\nwanted=ls-files'))
         _ = (self.root / ".git/config").write_text('[remote "origin"]\nurl=https://example.com/team/hana.git\n')
         self.configure("mac,natedev,aws")
+        self.admission = caller_admission(self, self.root, self.environment)
 
     def configure(self, order: str) -> None:
         _ = (self.root / "build_targets.conf").write_text(
@@ -293,6 +300,18 @@ if count == 2 and os.environ["TEST_ADVANCE_CLOCK"] == "1":
 if count >= 3:
     Path(os.environ["BUILDLOG_MEMINFO"]).write_text("MemAvailable: 268435456 kB\n")
 ''')
+
+        deliver = cast(Callable[[WaitingAdmission, wire.Reply], None], getattr(self.admission.server, "_deliver"))
+
+        def observe_wait(waiting: WaitingAdmission, reply: wire.Reply) -> None:
+            deliver(waiting, reply)
+            if isinstance(reply, wire.Wait):
+                _ = subprocess.run([str(self.bin_directory / "sleep"), "5"],
+                    env=self.environment, check=True, timeout=3)
+
+        # Run the leave hook before the next memory event advances the fixture.
+        self.admission.configure(waiting_pass_seconds=0.05, wait_reply_seconds=10, running_pass_seconds=5)
+        _ = self.enterContext(mock.patch.object(self.admission.server, "_deliver", side_effect=observe_wait))
 
     def retain_slots(self, capacity: int = 2) -> list[Path]:
         _ = write_config_fixture(self.root / "aws_target.conf",
@@ -475,7 +494,42 @@ printf 'free_gib=1000\\nhost=test-mac\\nrc=0\\n'
     def test_retained_slots_stay_owned_when_retry_cannot_confirm_cleanup(self) -> None:
         self.configure("natedev,aws,spare")
         claims = self.retain_slots()
-        self.release_memory_after_polls()
+        _ = self.hold_memory()
+        pressure = Path(self.environment["BUILDLOG_MEMORY_PRESSURE"])
+        _ = pressure.write_text("some avg10=100 avg60=0 avg300=0 total=0\n"
+                                + "full avg10=100 avg60=0 avg300=0 total=0\n")
+        before_attempt = r'''
+steps_path = root / "memory-steps.json"
+steps = json.loads(steps_path.read_text()) if steps_path.exists() else []
+if request.target == "aws":
+    assert steps == [], steps
+    steps.append("aws_attempt")
+else:
+    assert request.target == "spare", request.target
+    assert steps == ["aws_attempt", "aws_cleanup_failed"], steps
+    prior = json.loads((root / "ssh-events.jsonl").read_text().splitlines()[-1])
+    assert prior["target"] == "aws" and "cleanup" in prior["actions"], prior
+    assert prior["holder"] == "LostRunLeftovers", prior
+    steps.append("spare_retry")
+steps_path.write_text(json.dumps(steps))
+'''
+        after_attempt = r'''
+if request.target == "aws":
+    assert isinstance(result, offload.BusyMacDecline), result
+    assert isinstance(result.holder, offload.LostRunLeftovers), result
+    assert "cleanup" in actions and "run" not in actions, actions
+    steps.append("aws_cleanup_failed")
+else:
+    assert isinstance(result, offload.PassedOnTarget), result
+    steps.append("spare_completed")
+    Path(os.environ["BUILDLOG_MEMINFO"]).write_text("MemAvailable: 268435456 kB\n")
+    Path(os.environ["BUILDLOG_MEMORY_PRESSURE"]).write_text(
+        "some avg10=0 avg60=0 avg300=0 total=0\nfull avg10=0 avg60=0 avg300=0 total=0\n")
+steps_path.write_text(json.dumps(steps))
+'''
+        self.write_executable(self.runner, SSH_RUNNER.replace(
+            "started = time.monotonic()", before_attempt + "\nstarted = time.monotonic()").replace(
+            "offload.persist_attempt(request, result,", after_attempt + "\noffload.persist_attempt(request, result,"))
         result = self.verify("test", "sample", "--no-cache", extra={
             "TEST_SSH_MODES": '{"aws":"retained-leftovers"}', "BUILDLOG_MEM_WAIT_SINCE": "100.25"})
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -489,6 +543,8 @@ printf 'free_gib=1000\\nhost=test-mac\\nrc=0\\n'
         self.assertTrue(all(path.exists() for path in claims))
         self.assertEqual(first["queued_at"], second["queued_at"])
         self.assertFalse((self.home / ".local/state/build-targets/aws/unreachable_until").exists())
+        self.assertEqual(json.loads((self.runner_state / "memory-steps.json").read_text()),
+                         ["aws_attempt", "aws_cleanup_failed", "spare_retry", "spare_completed"])
 
     def test_permanent_mac_refusal_leaves_no_memory_retry_candidate(self) -> None:
         self.configure("mac,natedev")

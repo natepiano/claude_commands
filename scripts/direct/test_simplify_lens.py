@@ -20,7 +20,7 @@ from scripts.direct.recorder_fixture import communicate_launcher, invoke_recorde
 from scripts.direct.wait_for_test_state import wait_for_file, wait_until
 from scripts.lib.nix_env_test_support import NixFixture, ROOT
 from scripts.lib.git_test_support import commit_repository
-from scripts.lib.test_agents_registry import write_registry
+from scripts.lib.test_models_registry import write_registry
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 from scripts.production.staff_test_support import fixture_runtime_id
@@ -41,8 +41,8 @@ class SimplifyDispatchTests(NixFixture):
         _ = (self.home / ".claude.json").write_text(json.dumps({
             "oauthAccount": {"emailAddress": "fixture@example.invalid"},
         }))
-        registry = write_registry(self.root / "agents.conf", base_text=(ROOT / "config/agents.conf").read_text())
-        self.env.update({"AGENTS_CONFIG_FILE": str(registry), "AGENTS_CONFIG_PUBLISH": "0",
+        registry = write_registry(self.root / "models.conf", base_text=(ROOT / "config/models.conf").read_text())
+        self.env.update({"MODELS_CONFIG_FILE": str(registry), "MODELS_CONFIG_PUBLISH": "0",
                          "CODEX_CATALOG_SYNC_STATE_FILE": str(registry), "USAGE_STATE_DIR": str(self.root / "usage")})
         self.env.update(config_environment(self.root))
         # The fixture sets the lens itself; the live config may switch it off.
@@ -445,7 +445,7 @@ os.execv({sys.executable!r}, [{sys.executable!r}, *sys.argv[1:]])
         self.assertFalse(self.calls.exists())
 
     def test_the_shared_launcher_refuses_a_codex_assignment_for_simplify(self) -> None:
-        registry = Path(self.env["AGENTS_CONFIG_FILE"])
+        registry = Path(self.env["MODELS_CONFIG_FILE"])
         _ = write_registry(registry, {"assignments": {"direct.simplify": "codex"},
                                       "direct.codex": {"simplify": "sol:high"}}, base_text=registry.read_text())
 

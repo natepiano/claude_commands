@@ -1,6 +1,9 @@
 """Judge real Git trees with fake Cargo, without changing the caller's index."""
 from __future__ import annotations
 
+from scripts.build_queue.admission_test_support import caller_admission
+from scripts.lib.py_floor_test_support import cache_file_name
+
 from scripts.lint.memory_test_support import config_environment, write_config_fixture
 
 import json
@@ -104,6 +107,7 @@ class VerifyDocFixture(unittest.TestCase):
         if "fixture_seed" not in type(self).__dict__ or not self.fixture_seed.exists():
             self.root = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="verify-doc-test-")))
             self.build_fixture()
+            _ = caller_admission(self, self.root, self.environment)
             return
         self.root = self.fixture_root
         _ = shutil.copytree(self.fixture_seed, self.root, symlinks=True)
@@ -113,6 +117,7 @@ class VerifyDocFixture(unittest.TestCase):
         self.events = self.root / "cargo-events.jsonl"
         self.config = self.root / "lint.conf"
         self.environment = self.fixture_environment.copy()
+        _ = caller_admission(self, self.root, self.environment)
 
     def build_fixture(self) -> None:
         self.repo = self.root / "workspace"
@@ -178,7 +183,7 @@ class VerifyDocFixture(unittest.TestCase):
         })
         # These are doc-policy tests, not interpreter-discovery tests. Exercise
         # the real shim's cache hit instead of revalidating Python every call.
-        cache = self.root / "cache/claude/python3-3.11"
+        cache = self.root / "cache/claude" / cache_file_name()
         cache.parent.mkdir()
         _ = cache.write_text(sys.executable + "\n", encoding="utf-8")
         _ = self.environment.pop("CLAUDE_PYTHON", None)

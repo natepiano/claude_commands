@@ -16,10 +16,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.production import staff
+from scripts.production.staff_test_support import fixture_member, fixture_runtime_id, isolated_staff_file, recorded_unit
 
 
 HOOKS = Path(__file__).resolve().parent
 SESSION = "wait-director"
+SHOWRUNNER_SESSION = fixture_runtime_id("wait-showrunner")
 STOP = "stop-direct-continue.py"
 PROMPT = "user-prompt-submit-conversation-pause.py"
 
@@ -33,7 +36,7 @@ class DirectorWaitFixture:
 
     def call(self, hook: str, fields: dict[str, object], at: int) -> None:
         result = subprocess.run(
-            [sys.executable, str(HOOKS / hook)],
+            [sys.executable, str(self.root / "session_lookup.py"), str(HOOKS / hook)],
             input=json.dumps({"session_id": SESSION, **fields}), text=True,
             capture_output=True, check=True, timeout=TEST_HANG_GUARD_SECS,
             env={**self.environment, "UNIT_NOW_EPOCH": str(at)}, cwd=self.root,
@@ -82,7 +85,12 @@ def director_wait_fixture() -> Generator[DirectorWaitFixture]:
         document = root / "wait-production.md"
         _ = document.write_text("Fixture production\n")
         _ = (notifier / "conf").write_text(
-            f"TARGET=session:showrunner-id\nCHECK=zsh /scripts/production_check.sh {document}\n")
+            f"TARGET=session:{SHOWRUNNER_SESSION}\nCHECK=zsh /scripts/production_check.sh {document}\n")
+        staff_environment: dict[str, str] = {}
+        resources.enter_context(isolated_staff_file(root / "staff.json", staff_environment))
+        _ = fixture_member("showrunner", name="expected-showrunner",
+                           runtime_id=SHOWRUNNER_SESSION, doc=staff.LiveDoc("natedev", document))
+        _ = recorded_unit("expected-showrunner", "fixture-unit", root, document, plan="plan.md")
         sessions = root / "sessions"
         sessions.mkdir()
         for index, name in enumerate(("expected-showrunner", "claude-build-followups-other", "claude-one", "claude-two", "postmaster")):
@@ -90,11 +98,29 @@ def director_wait_fixture() -> Generator[DirectorWaitFixture]:
             address = str(root / f"socket-{index}")
             connection.bind(address)
             _ = (sessions / (f"{os.getpid()}.json" if index == 0 else f"peer-{index}.json")).write_text(json.dumps(
-                {"pid": os.getpid(), "sessionId": "showrunner-id" if index == 0 else f"peer-{index}",
+                {"pid": os.getpid(), "sessionId": SHOWRUNNER_SESSION if index == 0 else f"peer-{index}",
                  "name": name, "messagingSocketPath": address, "updatedAt": 1, "tmux": "", "formerNames": []}))
         _ = (root / "current_socket").write_text("/fixture/showrunner/socket")
         session_lookup = root / "session_lookup.py"
-        _ = session_lookup.write_text(f"from pathlib import Path\nprint(Path({str(root / 'current_socket')!r}).read_text())\n")
+        _ = session_lookup.write_text("\n".join((
+            "import runpy, sys",
+            "from pathlib import Path",
+            f"sys.path.insert(0, {str(HOOKS.parents[1])!r})",
+            f"sys.path.insert(0, {str(HOOKS)!r})",
+            "from scripts.message import sessions",
+            "from unittest.mock import patch",
+            "read_sessions = sessions.live_sessions",
+            "def fixture_sessions():",
+            "    records = read_sessions()",
+            "    for record in records:",
+            f"        if record['sessionId'] == {SHOWRUNNER_SESSION!r}:",
+            f"            record['messagingSocketPath'] = Path({str(root / 'current_socket')!r}).read_text()",
+            "    return records",
+            "sys.argv = sys.argv[1:]",
+            "with patch.object(sessions, 'live_sessions', side_effect=fixture_sessions):",
+            "    runpy.run_path(sys.argv[0], run_name='__main__')",
+            "",
+        )))
         environment = {
             "PATH": os.environ.get("PATH", ""), "HOME": str(root), "XDG_STATE_HOME": str(root / "state"),
             "UNIT_ACTIVE_DIR": str(active), "UNIT_HISTORY_DIR": str(root / "history"), "UNIT_SYNC_WRITES": "0",
@@ -105,6 +131,7 @@ def director_wait_fixture() -> Generator[DirectorWaitFixture]:
             "CONVERSATION_PAUSE_NOTIFIER": false_command, "AUTO_SILENCE_COMMAND": true_command,
             "CONVERSATION_PAUSE_HOOK_BUDGET": "25",
             "SHOWRUNNERS_SESSIONS": str(session_lookup), "NOTIFIER_SESSIONS_DIR": str(sessions),
+            "STAFF_FILE": staff_environment["STAFF_FILE"], "HERDR_BIN": "/nonexistent/herdr",
         }
         yield DirectorWaitFixture(root, run, history, environment)
 
@@ -217,7 +244,7 @@ class DirectorTurnWaitHookTests(unittest.TestCase):
             replies.mkdir(parents=True)
             record: dict[str, object] = {
                 "at_ms": 1020000, "socket": "uds:" + supplier_socket,
-                "name": "renamed-showrunner", "session_id": "showrunner-id",
+                "name": "renamed-showrunner", "session_id": SHOWRUNNER_SESSION,
                 "senders": ["another-director", "director"], "body": reply,
                 # This director is the second intended recipient. The reply's
                 # filename counter and each forward's suffix are independent.

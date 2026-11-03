@@ -87,7 +87,6 @@ def setUpModule() -> None:
     _ = unittest.enterModuleContext(patch.object(role_map, "is_role_map_host", return_value=True))
 
 
-
 def accounts_reader_calls(source: str) -> dict[str, set[str]]:
     """Collect each method called on the accounts configuration."""
     readers: dict[str, set[str]] = {}
@@ -947,22 +946,14 @@ class AccountsTests(unittest.TestCase):
         _ = path.write_text(json.dumps({"units": label}))
 
     def test_exec_claude_uses_default_home_and_removes_inherited_account_settings(self) -> None:
-        from scripts.shutdown import launch_permission
 
         arguments = ["--resume", "conversation id", "--", "quoted argument"]
         for tty, probe in ((False, False), (True, False), (False, True)):
-            with (self.subTest(tty=tty, probe=probe),
-                  patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.root / "inherited"),
+            with (self.subTest(tty=tty, probe=probe), patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.root / "inherited"),
                       "CLAUDE_CODE_REMOTE_MEMORY_DIR": str(self.root / "inherited-memory"),
                       "CLAUDE_CODE_OAUTH_TOKEN": "fixture-token", "KEEP": "yes",
                       "SHUTDOWN_STATE_DIR": str(self.root / "shutdown"),
-                      "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions")}),
-                  patch.object(accounts, "prepared_account") as prepare,
-                  patch.object(launch_permission, "launch_permission", return_value=launch_permission.AllowedByShutdownState()),
-                  patch.object(subprocess, "run", side_effect=AssertionError("unexpected subprocess")),
-                  patch.object(subprocess, "Popen", side_effect=AssertionError("unexpected subprocess")),
-                  patch.object(sys.stdin, "isatty", return_value=tty),
-                  patch.object(os, "execvpe") as launch):
+                      "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions")}), patch.object(accounts, "prepared_account") as prepare, patch.object(subprocess, "run", side_effect=AssertionError("unexpected subprocess")), patch.object(subprocess, "Popen", side_effect=AssertionError("unexpected subprocess")), patch.object(sys.stdin, "isatty", return_value=tty), patch.object(os, "execvpe") as launch):
                 self.assertEqual(self.run_cli("exec", *(["--probe"] if probe else []),
                                               "claude", *arguments), (0, "", ""))
                 prepare.assert_not_called()
@@ -1840,7 +1831,6 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual(accounts.account_identity(accounts.account_dir("claude3")), agent_accounts.NumberedAccount("claude2", self.home / ".claude3", "main@example.invalid"))
 
 
-
     def prepare_swap(self, *, shared_default_login: bool = False) -> accounts.SwapInventory:
         self.login_directory("claude2", "main@example.invalid", default=True)
         self.login_directory(
@@ -1882,28 +1872,6 @@ class AccountsTests(unittest.TestCase):
         with patch.object(subprocess, "run", side_effect=shutdown):
             result = self.run_cli("swap", "unit", label, *(["--dry-run"] if dry_run else []))
         return result, commands
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
     def test_burn_keeps_historical_account_identity_after_logout_or_another_login(self) -> None:
@@ -5347,8 +5315,11 @@ finally:
         _ = groups.write_text('{"showrunners": "claude2", "units": "claude2"}')
         code, output, error = self.run_cli("status", "--stored")
         self.assertEqual((code, error), (0, ""))
-        row = next(line for line in output.splitlines() if "| claude2 " in line)
-        self.assertEqual([cell.strip() for cell in row.split("|")][3], "units, showrunners")
+        lines = output.splitlines()
+        index = next(index for index, line in enumerate(lines) if "| claude2 " in line)
+        self.assertEqual([cell.strip() for cell in lines[index].strip("|").split("|")][2], "units")
+        self.assertEqual([cell.strip() for cell in lines[index + 1].strip("|").split("|")],
+                         ["", "", "showrunners", "", "", "", "", ""])
 
     def json_status_fixture(self) -> tuple[datetime, datetime]:
         self.login_directory("claude2", "main@example.invalid")
@@ -6501,8 +6472,6 @@ finally:
         self.assertFalse(hasattr(accounts, "HOME"))
 
 
-
-
     def test_unknown_role_is_refused_by_every_role_command(self) -> None:
         for arguments in (
             ("role", "unknown"),
@@ -6518,12 +6487,6 @@ finally:
                     stderr,
                     "accounts: unknown is not a role; only unit, showrunner and workers are supported\n",
                 )
-
-
-
-
-
-
 
 
     def workers_fixture(self) -> tuple[Path, Path]:
@@ -8337,6 +8300,25 @@ class SharedStatusDocumentTests(unittest.TestCase):
         status = cast(dict[str, object], json.loads(accounts.render_status_json(self.reading(row))))
         self.assertEqual(status["problems"], ["Fixture problem."])
         return cast(list[dict[str, object]], status["accounts"])[0]
+
+    def test_multiple_roles_have_separate_rows_without_repeated_account_cells(self) -> None:
+        row = replace(self.row(), roles=("units", "showrunners"),
+                      role_counts=(accounts.RoleSessionCounts(1, 1, 1), accounts.RoleSessionCounts(1, 0, 1)))
+        reading = self.reading(row)
+        table = accounts.render_status_table(reading)
+        cells = [tuple(cell.strip() for cell in line.strip("|").split("|"))
+                 for line in table.split("\n\n", 1)[0].splitlines()[2:]]
+        self.assertEqual(len(cells), 2)
+        first_role = replace(row, roles=("units",), role_counts=row.role_counts[:1])
+        single = accounts.render_status_table(self.reading(first_role))
+        self.assertEqual(cells[0], tuple(cell.strip() for cell in single.splitlines()[2].strip("|").split("|")))
+        self.assertEqual(cells[1], ("", "", "showrunners", "", "", "", "", ""))
+        document = cast(accounts.StatusDocument, json.loads(accounts.render_status_json(reading)))
+        self.assertEqual(len(document["accounts"]), 1)
+        self.assertEqual(document["accounts"][0]["roles"], ["units", "showrunners"])
+        self.assertEqual(document["accounts"][0]["role_counts"], [
+            {"busy": 1, "shell": 1, "idle": 1, "total": 3},
+            {"busy": 1, "shell": 0, "idle": 1, "total": 2}])
 
     def test_usage_failure_timing_names_the_last_attempt_without_promising_a_retry(self) -> None:
         now = datetime(2026, 11, 1, 12, tzinfo=timezone.utc)

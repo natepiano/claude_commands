@@ -90,7 +90,7 @@ from scripts.lib.atomic_file import AtomicDurabilityUnconfirmed, write_text_atom
 from scripts.agents import worker_lifecycle
 
 NO_LOCK_DEADLINE = worker_lifecycle.NO_LOCK_DEADLINE
-from scripts.lib import nix_env, process_group, unit_runs
+from scripts.lib import build_folders, nix_env, process_group, unit_runs
 from scripts.lib.probe_session import PROBE_ENV
 from scripts.production import worker_admission, staff
 from scripts.production.worker_admission import WorkerStartAllowed
@@ -3081,9 +3081,9 @@ def _server_environment(session_dir: str, workers_home: Path) -> dict[str, str]:
 def _set_run(environment: dict[str, str], run: str) -> None:
     """Name the run, and point TMPDIR into its folder so test temp folders end with the run."""
     environment["UNIT_RUN_DIR"] = run
-    temp = Path(run) / "tmp"
     try:
-        temp.mkdir(parents=True, exist_ok=True)
+        temp = build_folders.create_build_folder(build_folders.StableOwnerFolder(
+            unit_runs.RUN_TEMP_NAME, build_folders.ExplicitBuildParent(Path(run))))
     except OSError:
         return
     environment["TMPDIR"] = str(temp)
@@ -6133,8 +6133,8 @@ def _turn_service_tier(client: Client, args: argparse.Namespace) -> str:
         record = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name)) if session_dir else {}
         task = _as_str(record.get("task"))
         resolved = subprocess.run(
-            ["bash", "-c", 'AGENTS_CONFIG_TIER_ONLY=1; source "$1"; agents_turn_service_tier "$2"',
-             "codex-mesh-tier", str(Path(__file__).with_name("agents_config.sh")), task or "delegate"],
+            ["bash", "-c", 'MODELS_CONFIG_TIER_ONLY=1; source "$1"; agents_turn_service_tier "$2"',
+             "codex-mesh-tier", str(Path(__file__).with_name("models_config.sh")), task or "delegate"],
             capture_output=True, text=True, timeout=5,
         )
         if resolved.returncode:
@@ -6171,7 +6171,7 @@ if [[ -n "$3" || -n "$4" ]]; then
  _agents_validate_pair "$2" "$AGENT_FAMILY" "$pair" || exit 2
 fi
 printf '%s\\n' "$AGENT_MODEL" "$AGENT_EFFORT"
-''', "mesh-turn", str(Path(__file__).with_name("agents_config.sh")), task, model, effort,
+''', "mesh-turn", str(Path(__file__).with_name("models_config.sh")), task, model, effort,
     ], capture_output=True, text=True, timeout=30)
     if resolved.returncode:
         raise SystemExit(resolved.stderr.strip() or "cannot resolve turn model and effort")
@@ -6963,7 +6963,7 @@ def _open_admitted_worker(session_dir: str, role: str, admitted: WorkerStartAllo
         with worker_lifecycle.lock_worker(session_dir, name):
             command = ['bash', '-c',
                        'source "$1"; agents_resolve "direct.$2" || exit; printf "%s\\n" "$AGENT_FAMILY" "$AGENT_MODEL" "$AGENT_EFFORT" "${AGENT_SERVICE_TIER:-default}"', 'workers',
-                       str(Path(__file__).with_name("agents_config.sh")), role]
+                       str(Path(__file__).with_name("models_config.sh")), role]
             resolved = subprocess.run(command, capture_output=True, text=True, check=False, timeout=30)
             fields = resolved.stdout.strip().split()
             if resolved.returncode or len(fields) != 4:

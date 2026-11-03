@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'mac_test'))
 from scripts.aws_target import ledger, measurement, remote
 from scripts.aws_target.config import ControlSettings, money, offload_enabled, read_control_settings, read_settings, service_loop
+from scripts.build_queue import queue_snapshot
 from scripts.build_targets.target_config import SshTarget, is_aws_target
 from scripts.lib import conf
 from scripts.lib.atomic_file import write_text_atomic
@@ -159,8 +160,8 @@ class Controller:
         return result
 
     def _queued(self, settings: ControlSettings, now: int, configuration: conf.ConfigRead) -> int:
-        snapshot = memory_admit.read_queue_snapshot(self.queue_directory)
-        if (not isinstance(snapshot, memory_admit.QueueSnapshot)
+        snapshot = queue_snapshot.read_queue_snapshot(self.queue_directory)
+        if (not isinstance(snapshot, queue_snapshot.QueueSnapshot)
                 or not 0 <= now - snapshot.written_at <= settings.snapshot_max_age_s
                 or isinstance(snapshot.inputs.host, memory_admit.ReadingUnavailable)):
             return 0

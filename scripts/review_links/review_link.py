@@ -19,9 +19,7 @@ from typing import cast
 from urllib.parse import quote
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.lib import atomic_file
-
-PORT = 8765
+from scripts.lib import atomic_file, conf
 
 
 def private_name(name: str) -> bool:
@@ -42,7 +40,7 @@ def link_host() -> str:
     if override := os.environ.get("REVIEW_LINKS_HOST"):
         return override.rstrip(".")
     result = subprocess.run(["tailscale", "ip", "-4"],
-                            capture_output=True, text=True, check=True, timeout=10)
+                            capture_output=True, text=True, check=True, timeout=conf.read("review_links").number("tailscale_timeout_seconds"))
     return str(ipaddress.IPv4Address(result.stdout.strip()))
 
 
@@ -114,6 +112,11 @@ def read_snapshot_index(root: Path) -> dict[str, str]:
 
 def snapshot(files: list[Path], name: str = "review", *, new: bool = False) -> list[str]:
     """Refresh a source set's short URLs; new requests a separate snapshot."""
+    return snapshot_at(review_root(), files, name, new=new)
+
+
+def snapshot_at(root: Path, files: list[Path], name: str = "review", *, new: bool = False) -> list[str]:
+    """Publish files under the root selected for this operation."""
     _ = name
     if not files:
         raise ValueError("name at least one file")
@@ -137,8 +140,10 @@ def snapshot(files: list[Path], name: str = "review", *, new: bool = False) -> l
             output_sources[folded] = file
             contents[output] = content
         destinations.append(destination)
+    settings = conf.read("review_links")
+    allocation_tries = settings.whole("snapshot_allocation_tries")
+    port = settings.whole("server_port")
     host = link_host()
-    root = review_root()
     root.mkdir(parents=True, exist_ok=True)
     with (root / ".index.lock").open("a") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
@@ -148,7 +153,7 @@ def snapshot(files: list[Path], name: str = "review", *, new: bool = False) -> l
         if reuse:
             folder = root / index[source_set]
         else:
-            for _ in range(10):
+            for _ in range(allocation_tries):
                 folder = root / "".join(secrets.choice(ascii_lowercase + digits) for _ in range(6))
                 try:
                     folder.mkdir()
@@ -156,7 +161,7 @@ def snapshot(files: list[Path], name: str = "review", *, new: bool = False) -> l
                     continue
                 break
             else:
-                raise FileExistsError("could not allocate a snapshot id after 10 tries")
+                raise FileExistsError(f"could not allocate a snapshot id after {allocation_tries} tries")
         try:
             for output, content in contents.items():
                 atomic_file.write_bytes_atomic(folder / output, content, mode=0o600)
@@ -170,7 +175,7 @@ def snapshot(files: list[Path], name: str = "review", *, new: bool = False) -> l
             if not reuse:
                 shutil.rmtree(folder)
             raise
-    return [f"http://{host}:{PORT}/{quote((folder / output).relative_to(root).as_posix())}"
+    return [f"http://{host}:{port}/{quote((folder / output).relative_to(root).as_posix())}"
             for output in destinations]
 
 

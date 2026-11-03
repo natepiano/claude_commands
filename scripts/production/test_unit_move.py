@@ -448,6 +448,9 @@ class UnitFolderMoveTests(FolderMoveFixture):
         self.assertEqual(command[resume + 1], self.owner.current_session)
         self.assertNotEqual(command[resume + 1], self.owner.id)
         self.assertEqual(command[command.index("exec") + 1], backend.config.name.removeprefix("."))
+        if kind == "claude":
+            self.assertIn("the session folder moved", command[-1])
+            self.assertNotIn("the herdr server restarted", command[-1])
         self.assertEqual(backend.cwd, self.new_folder)
         self.assertEqual(backend.startup_observations, startup_delay_polls + 1)
         self.assertFalse(backend.startup_pending)
@@ -694,11 +697,7 @@ class UnitFolderMoveTests(FolderMoveFixture):
             backend.live = True
             return subprocess.CompletedProcess(command, 0, "", "")
 
-        with (mock.patch.object(herdr, "Herdr", client_type),
-              mock.patch.object(herdr, "open_tab", return_value="w1:p1") as opened,
-              mock.patch.object(client_type, "start_command", side_effect=start),
-              mock.patch.object(client_type, "result", side_effect=backend.result),
-              mock.patch("scripts.shutdown.launch_permission.claim_launch_pane")):
+        with (mock.patch.object(herdr, "Herdr", client_type), mock.patch.object(herdr, "open_tab", return_value="w1:p1") as opened, mock.patch.object(client_type, "start_command", side_effect=start), mock.patch.object(client_type, "result", side_effect=backend.result)):
             launched = herdr.launch_prepared_agent("agents", herdr.NewTab("production", "kept-name"),
                 herdr.PreparedAgentEnvironment(self.old_folder, {"CODEX_HOME": str(backend.config)}),
                 "codex", ["resume", self.owner.current_session], herdr.NoOpeningPrompt(), 1000,

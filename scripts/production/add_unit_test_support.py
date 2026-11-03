@@ -7,7 +7,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from scripts.lib.test_agents_registry import write_registry
+from scripts.lib.test_models_registry import write_registry
 
 from scripts.lib import names
 from scripts.lib.test_names import fixture_names
@@ -217,7 +217,7 @@ class AddUnitTestCase(ShutdownTestCase):
             command = self.bin / name
             _ = command.write_text(STUB, encoding="utf-8")
             _ = command.chmod(0o755)
-        self.agent_config = self.root / "agents.conf"
+        self.agent_config = self.root / "models.conf"
         self.pause_state = self.root / "conversation-pause"
         codex_config = self.root / "codex.toml"
         codex_cache = self.root / "models.json"
@@ -233,7 +233,7 @@ class AddUnitTestCase(ShutdownTestCase):
                     "CONVERSATION_PAUSE_STATE_DIR": str(self.pause_state),
                     "SHUTDOWN_STATE_DIR": str(self.root / "shutdown"),
                     "AGENT_NOTES_DIR": str(notes),
-                    "AGENTS_CONFIG_FILE": str(self.agent_config),
+                    "MODELS_CONFIG_FILE": str(self.agent_config),
                     "CODEX_CONFIG_FILE": str(codex_config),
                     "CODEX_MODELS_CACHE_FILE": str(codex_cache),
                     "CODEX_CATALOG_SYNC_STATE_FILE": str(sync_state)}
@@ -747,23 +747,6 @@ class AddUnitTestCase(ShutdownTestCase):
                 return git_run(command, cwd=cwd, capture_output=True, text=True, check=False)
             if "show-options" in command:
                 return subprocess.CompletedProcess(command, 0, "", "")
-            if "launch-blocked" in command:
-                live = (
-                    Path(self.env["SHUTDOWN_STATE_DIR"])
-                    / "owner@example.com"
-                    / "record.json"
-                ).exists()
-                return subprocess.CompletedProcess(
-                    command,
-                    0 if live else 1,
-                    (
-                        "claude2 is held by a shutdown "
-                        + "(since 2026-10-09 14:49 PDT)\n"
-                        if live
-                        else ""
-                    ),
-                    "",
-                )
             commands.append(command)
             return subprocess.CompletedProcess(command, 0, "", "")
 

@@ -1,7 +1,7 @@
 """Tests for git_filters_retire: a retired clean filter leaves no stale index entry and no driver."""
 from __future__ import annotations
 
-from scripts.lib.test_agents_registry import registry_text
+from scripts.lib.test_models_registry import registry_text
 
 import os
 import shutil

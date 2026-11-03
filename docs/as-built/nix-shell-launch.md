@@ -19,7 +19,7 @@ of three immutable named tuples:
 | `Refused(reason)` | Loading, approval, decoding, or nix shell proof failed. |
 
 It searches the start directory and then its parents. Resolved `.envrc` files
-under `~/rust`, `~/worktrees`, and `~/.claude*` are approved with
+under the default trusted roots `~/rust`, `~/worktrees`, and `~/.claude*` are approved with
 `direnv allow <envrc>`. Linked worktrees outside those roots are also approved
 when their `.git`, `commondir`, and `gitdir` back pointer prove registration by
 a repository under a trusted root, using file reads alone. This covers
@@ -47,7 +47,7 @@ checked and may differ from the source commit.
 
 Files elsewhere require existing explicit approval;
 a blocked-file refusal names the `direnv allow <path>` command. Each direnv
-command has a 600-second timeout. `direnv export json` runs in the requested
+command uses `command_timeout_seconds`, which starts at 600 seconds. `direnv export json` runs in the requested
 directory with the supplied base environment. Strings replace variables;
 JSON null removes them. Failures retain direnv's last stderr line. The proof
 failure is `nix_env: <dir>: .envrc loaded but no nix shell (IN_NIX_SHELL unset)`.
@@ -172,12 +172,12 @@ and no restart is pending.
 
 `~/.local/state/nix-heal/state.lock` excludes overlapping sweeps.
 `state.json` reserves a restart before shutdown starts, preserving the pid and
-start time. A session id gets at most one restart in 60 minutes, including
-failed attempts. A pending stop retains this reservation across holds. Immediately
+start time. The `restart_interval_seconds` setting starts at 60 minutes.
+A session id gets at most one restart in that interval, including failed attempts. A pending stop retains this reservation across holds. Immediately
 before relaunch it becomes a durable `launching` reservation; the saved login,
 cwd, config directory and original process identity remain in the journal.
-The restart command has a 1320-second budget: two 600-second direnv budgets,
-herdr's 90 seconds, and 30 seconds for overhead. A timeout, nonzero result or
+The relaunch budget equals twice `command_timeout_seconds`, plus `relaunch_launch_seconds` and `relaunch_confirmation_seconds`.
+The initial budget is 1320 seconds: two 600-second commands, 90 seconds for launch, and 30 seconds for confirmation. A timeout, nonzero result or
 failure to start retains the reservation and sends the blocked push. The timer
 never repeats an unconfirmed launch, including after an interrupted sweep.
 Even exit 0 keeps the reservation until a live replacement has the same session,
@@ -218,3 +218,20 @@ The showrunner still owns the bare `claude` and `codex` PATH wrappers in
 `/etc/nixos`; each must call this helper with the real absolute executable.
 Accounts-unit owns `accounts.py exec`, which calls `launch_shell_environment`;
 the scan recognizes that function as a guard.
+
+
+## Configuration
+
+The helper and the healer read `config/nix_env.conf` through `scripts/lib/conf.py` when each operation needs a setting.
+`command_timeout_seconds` limits direnv commands and Git proof commands.
+`trusted_home_folders` and `trusted_home_prefix` select folders that permit automatic approval.
+`heal_state_directory` selects the healer journal folder.
+Each sweep keeps its lock, state, and log in the folder selected for that operation.
+The next sweep reads the folder setting again.
+`session_directory_glob` selects session folders below the home folder.
+`restart_interval_seconds` controls repeated restarts.
+`relaunch_launch_seconds` allows herdr to launch the replacement.
+`relaunch_confirmation_seconds` allows command start and record confirmation.
+Twice `command_timeout_seconds` plus these two settings sets the relaunch budget.
+`alert_timeout_seconds` limits alert commands.
+All configured values match the previous code values.
