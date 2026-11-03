@@ -60,7 +60,7 @@ if stage == "clippy" and os.environ.get("TEST_FAIL_FIRST_JUDGMENT") == "1":
     judgment = root / "first-judgment"
     if not judgment.exists():
         judgment.touch()
-        raise SystemExit(1)
+        raise SystemExit(101)
 if stage in os.environ.get("TEST_REWRITE_STAGES", "").split(","):
     marker = root / (stage + ".rewritten")
     if not marker.exists():
