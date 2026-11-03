@@ -39,7 +39,7 @@ class ConfiguredTestCase(unittest.TestCase):
 
     def change_configuration(self, path: Path, **changes: str) -> None:
         """Change the private settings through the shared configuration writer."""
-        values = {**(conf.values(path) if path.exists() else {}), **changes}
+        values = {**(conf.read(path).values() if path.exists() else {}), **changes}
         _ = write_config_fixture(path, "\n".join(f"{key}={value}" for key, value in values.items()))
         lines = path.read_text(encoding="utf-8").splitlines()
         for key, value in values.items():
@@ -59,9 +59,10 @@ def patch_thresholds(**policies: questions.ThresholdOutcome) -> Generator[None]:
 
 class ConfigurationTests(ConfiguredTestCase):
     def test_each_shipped_key_reads_without_recovery_and_has_a_valid_limit(self) -> None:
+        scoring_config = conf.read('issue_score')
         path = CONFIG_DIR / "issue_score.conf"
         lines = path.read_text(encoding="utf-8").splitlines()
-        settings = conf.values(path)
+        settings = conf.read(path).values()
         self.assertTrue(settings)
         for key, value in settings.items():
             with self.subTest(key=key):
@@ -73,15 +74,15 @@ class ConfigurationTests(ConfiguredTestCase):
                 with redirect_stderr(warnings):
                     conf.check(path, key, value)
                     if limit.startswith("# whole:"):
-                        self.assertEqual(conf.whole("issue_score", key), int(value))
+                        self.assertEqual(scoring_config.whole(key), int(value))
                     elif limit.startswith("# range:"):
-                        self.assertEqual(conf.number("issue_score", key), float(value))
+                        self.assertEqual(scoring_config.number(key), float(value))
                     else:
-                        self.assertEqual(conf.text("issue_score", key), value)
+                        self.assertEqual(scoring_config.text(key), value)
                 self.assertEqual(warnings.getvalue(), "")
 
     def test_shipped_values_match_the_values_before_the_config_move(self) -> None:
-        self.assertEqual(conf.values(CONFIG_DIR / "issue_score.conf"), {
+        self.assertEqual(conf.read(CONFIG_DIR / "issue_score.conf").values(), {
             "workers": "8", "model": "jev-1.14.0", "budget_usd": "20.0",
             "input_usd_per_million": "0.042",
             "threshold.backlog_goal": "0.40", "threshold.backlog_alignment": "0.40",
@@ -139,7 +140,7 @@ class ConfigurationTests(ConfiguredTestCase):
                 questions.MinimumGap(.51) if field == "area" else questions.Supported(.51),
             )
             readers[f"error_target.{field}"] = (lambda field=field: questions.error_targets()[field], "0.2", .2)
-        self.assertEqual(set(readers), set(conf.values(CONFIG_DIR / "issue_score.conf")))
+        self.assertEqual(set(readers), set(conf.read(CONFIG_DIR / "issue_score.conf").values()))
         for key, (read, replacement, expected) in readers.items():
             with self.subTest(key=key):
                 path = self.configuration()

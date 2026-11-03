@@ -413,7 +413,7 @@ def claim_worker(dispatch: Dispatch) -> WorkerClaim:
         if record.get("held_design_id"):
             refuse(f"{dispatch.worker}: held roles resume through design_roles.py")
         try:
-            threshold = conf.whole("direct", "UNIT_COMPACT_ABOVE_TOKENS")
+            threshold = conf.read("direct").whole("UNIT_COMPACT_ABOVE_TOKENS")
         except conf.Unusable as error:
             refuse(str(error))
         context_tokens = record.get("context_tokens")
@@ -636,7 +636,7 @@ def execute(dispatch: Dispatch, paths: list[str]) -> int:
 
 def execute_simplify(args: Arguments, run: Path, phase: str, cwd: Path, source_prompt: Path,
                      env: dict[str, str]) -> int:
-    if conf.text("direct", "SIMPLIFY_LENS") == "off":
+    if conf.read("direct").text("SIMPLIFY_LENS") == "off":
         print("simplify: off")
         return 0
     if args.pass_number != 1:

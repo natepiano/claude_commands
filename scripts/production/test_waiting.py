@@ -272,7 +272,7 @@ class WaitingTests(unittest.TestCase):
         _ = write_timer(self.root / "notifier", "example", owner.id, "", self.doc)
         for unit, folder, plan in ((ALPHA, self.alpha, "alpha"), (BETA, self.beta, "beta")):
             row = unit_membership("showrunner-example", unit)
-            _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", folder))
+            _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", folder), expected=row.worktree)
             if folder.exists():
                 write_text_atomic(folder / ".unit.toml", f'plan = "docs/{plan}.md"\nresponsibilities = []\n')
 
@@ -318,7 +318,7 @@ class WaitingTests(unittest.TestCase):
 
     def test_named_unit_refuses_retired_row(self) -> None:
         _ = staff.set_worktree(unit_membership("showrunner-example", ALPHA).id,
-                               staff.RemovedWorktree(local_machine(), self.alpha))
+                               staff.RemovedWorktree(local_machine(), self.alpha), expected=unit_membership("showrunner-example", ALPHA).worktree)
         content = self.doc.read_text(encoding="utf-8")
         self.write(self.doc, content.replace("`docs/alpha.md`", "(retired by the user)", 1))
         production = production_units.read_production(self.doc)
@@ -755,7 +755,7 @@ runpy.run_path(sys.argv[0], run_name='__main__')
 
     def test_waits_hide_retired_waiting_unit_but_keep_live_wait_on_it(self) -> None:
         _ = staff.set_worktree(unit_membership("showrunner-example", ALPHA).id,
-                               staff.RemovedWorktree(local_machine(), self.alpha))
+                               staff.RemovedWorktree(local_machine(), self.alpha), expected=unit_membership("showrunner-example", ALPHA).worktree)
         content = self.doc.read_text(encoding="utf-8")
         self.write(self.doc, content.replace("`docs/alpha.md`", "retired after completion", 1))
         now = datetime.now(ZoneInfo("America/Los_Angeles"))

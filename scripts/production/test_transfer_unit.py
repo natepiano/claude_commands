@@ -56,7 +56,7 @@ class UnitTransferTests(UnitTransferFixture):
 
     def test_transfer_changes_only_parent_and_preserves_locations_and_config_bytes(self) -> None:
         row = next(row for row in staff.find(kind="unit") if row.name == "alpha")
-        row = staff.set_worktree(row.id, staff.PresentWorktree("natedev", self.unit))
+        row = staff.set_worktree(row.id, staff.PresentWorktree("natedev", self.unit), expected=row.worktree)
         receiving = next(row for row in staff.find(kind="showrunner") if row.name == "other")
         assert row.parent is not None
         giving = staff.by_id(row.parent)

@@ -78,7 +78,7 @@ class RecordedDirectorAdmissionTests(StaffTestCase):
         run = self.root / "run"
         run.mkdir()
         _ = (run / unit_runs.DIRECTOR_FILE).write_text(unit.id + "\n")
-        _ = staff.set_worktree(unit.id, staff.RemovedWorktree("natedev", self.root / "gone"))
+        _ = staff.set_worktree(unit.id, staff.RemovedWorktree("natedev", self.root / "gone"), expected=unit.worktree)
         before = self.staff_file.read_bytes()
         for caller in ("s0123456789ab", worker.current_session):
             with self.subTest(caller=caller), mock.patch.object(staff, "runtime_id", return_value=caller):
@@ -160,7 +160,7 @@ class WorkerAdmissionTests(StaffTestCase):
 
     def test_refused_permission_starts_nothing_and_changes_no_row(self) -> None:
         _, unit, _ = self.tree()
-        _ = staff.set_worktree(unit.id, staff.RemovedWorktree("natedev", self.root / "gone"))
+        _ = staff.set_worktree(unit.id, staff.RemovedWorktree("natedev", self.root / "gone"), expected=unit.worktree)
         before = self.staff_file.read_bytes()
         with mock.patch.object(staff, "runtime_id", return_value=unit.id):
             with self.assertRaisesRegex(worker_admission.AdmissionRefused, r"^staff: test: not opened:.*retired"):

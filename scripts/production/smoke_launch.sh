@@ -15,6 +15,7 @@ CHECKOUT="${1:?Usage: smoke_launch.sh <checkout> <sha> <log> [port]}"
 SHA="${2:?Usage: smoke_launch.sh <checkout> <sha> <log> [port]}"
 LOG="${3:?Usage: smoke_launch.sh <checkout> <sha> <log> [port]}"
 PORT="${4:-15790}"
+CHECKOUT="$(cd "$CHECKOUT" && pwd)"
 READY_SECONDS=300
 EXIT_SECONDS=30
 
@@ -46,10 +47,12 @@ brp() {
 }
 brp rpc.discover >/dev/null 2>&1 && fail "port $PORT already answers BRP"
 
+checkout_cargo() ( cd "$CHECKOUT" && direnv exec "$CHECKOUT" cargo "$@" )
+
 log "build: cargo build -p hana at $CHECKOUT ($SHA)"
-direnv exec "$CHECKOUT" cargo build --manifest-path "$CHECKOUT/Cargo.toml" -p hana --bin hana >>"$LOG" 2>&1 \
+checkout_cargo build --manifest-path "$CHECKOUT/Cargo.toml" -p hana --bin hana >>"$LOG" 2>&1 \
     || fail "cargo build -p hana"
-TARGET_DIR="$(direnv exec "$CHECKOUT" cargo metadata --no-deps --format-version 1 \
+TARGET_DIR="$(checkout_cargo metadata --no-deps --format-version 1 \
     --manifest-path "$CHECKOUT/Cargo.toml" 2>>"$LOG" | jq -r .target_directory)"
 BIN="$TARGET_DIR/debug/hana"
 [[ -x "$BIN" ]] || fail "no binary at $BIN"

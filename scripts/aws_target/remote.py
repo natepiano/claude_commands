@@ -164,7 +164,7 @@ class ImdsClient:
 def write_bootstrap_settings(source: Path, destination: Path) -> None:
     """Bind public lifecycle settings to this instance without granting admission."""
     identity = ledger.mapping(cast(object, json.loads(
-        ImdsClient(conf.number(source, 'imds_timeout_s')).read('dynamic/instance-identity/document'))))
+        ImdsClient(conf.read(source).number('imds_timeout_s')).read('dynamic/instance-identity/document'))))
     instance_id, region = ledger.text(identity, 'instanceId'), ledger.text(identity, 'region')
     if not re.fullmatch(r'i-[0-9a-f]+', instance_id) or not re.fullmatch(r'[a-z0-9-]+', region):
         raise ValueError('IMDS returned an invalid instance identity')

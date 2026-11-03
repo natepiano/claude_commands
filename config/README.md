@@ -2,18 +2,28 @@
 
 ## Live values
 
-Python callers read key=value settings through `scripts/lib/conf.py`; bash callers
-can source `scripts/lib/conf.sh` and call `conf_value <file> <key>`. The file name
-is its stem. Reads use `~/.claude/config` on every call; `CONF_DIR` selects a test
-fixture folder and installed scripts refuse it. The first key wins, with a
-`key.<short-host>` value taking precedence over `key`. A `# range: A..B` or
-`# one of: a, b, c` comment directly above the key sets its limits. On a missing
-or invalid value, the reader warns and uses the newest valid committed value
-under that revision's limits; with no usable history it raises `conf.Unusable`.
+Python callers use `scripts/lib/conf.py`. Each `conf.read(file)` reads and parses
+one file once. Its `ConfigRead` supplies `text`, `number`, `whole`, `words` and
+`values` for one pass. A new `conf.read` sees the next file change.
+Do not retain a `ConfigRead` between passes.
+
+Bash callers source `scripts/lib/conf.sh` and call `conf_value <file> <key>`.
+The file name is its stem. Reads use `~/.claude/config`.
+`CONF_DIR` selects a test folder. Installed scripts refuse that override.
+The first key wins. A `key.<short-host>` value takes precedence over `key`.
+A comment directly above a key sets its limits: `# whole: A..B`,
+`# range: A..B` or `# one of: a, b, c`.
+
+The reader resolves a missing or invalid key when the caller uses it.
+An absent default file or key can use the repository value when `CONF_DIR` is unset.
+Otherwise, the reader warns and uses the newest valid committed value under that revision's limits.
+With no usable value, it raises `conf.Unusable`.
+`ConfigRead.origin(key, convert)` distinguishes a usable live value, a recovered value and an unavailable value without a warning.
+
 Only the user approves a value change. A session asks the user and runs `/tune`
-on the user's go, with the user's words; `/tune` publishes the one config file
-and pulls the Mac without a test or release cycle. Moving an unchanged value
-from code to config needs no approval and does not use `/tune`.
+on approval, with the user's words. `/tune` publishes the config file and pulls
+the Mac without a test or release cycle. Moving an unchanged value from code
+to config needs no approval and does not use `/tune`.
 
 ## bake_textures_example.json
 
@@ -106,7 +116,7 @@ The spending reserve is $3. The maximum drain time is 60 minutes.
 Each repository budget stays within the 32 GiB build budget.
 The fixed and hourly costs are estimates from the design's queue replay.
 
-The spending guard requires usable live spending settings through `conf.value_origin`.
+The spending guard requires usable live spending settings through `ConfigRead.origin`.
 A missing or malformed live limit refuses spending, even when committed history supplies a usable value.
 `daily_limit_usd` and `monthly_limit_usd` include `limit_reserve_usd` when the guard compares costs.
 Equality refuses deployment, starts and new admission. `limit_action=drain` rejects new work.

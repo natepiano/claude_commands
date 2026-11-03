@@ -253,8 +253,8 @@ class DeploymentTests(CostFixture):
         requests = ledger.rows(compute, 'compute_requests')
         self.assertEqual(len(requests), 1)
         self.assertEqual(requests[0]['at'], start)
-        self.assertEqual(requests[0]['stack'], conf.text(self.settings, 'stack_name'))
-        self.assertEqual(requests[0]['region'], conf.text(self.settings, 'region'))
+        self.assertEqual(requests[0]['stack'], conf.read(self.settings).text('stack_name'))
+        self.assertEqual(requests[0]['region'], conf.read(self.settings).text('region'))
         self.assertEqual(ledger.mapping(requests[0]['resolution'])['outcome'], 'unconfirmed')
 
     def test_compute_timeout_keeps_exact_instance_costs_until_preparation_recovers(self) -> None:
@@ -399,7 +399,7 @@ class DeploymentTests(CostFixture):
         self.assertNotIn('credentials', (self.bundle / 'parameters.json').read_text())
         self.assertEqual(gzip.decompress(base64.b64decode(prepared.parameters['Bootstrap'])).decode(),
                          (self.bundle / 'bootstrap.sh').read_text())
-        self.assertEqual(conf.text(self.settings, 'offload'), 'off')
+        self.assertEqual(conf.read(self.settings).text('offload'), 'off')
 
     def test_apply_guards_foundation_before_compute_and_preserves_identity_on_rerun(self) -> None:
         subject = self.deployment()
@@ -476,7 +476,7 @@ class DeploymentTests(CostFixture):
         starts = self.commands('start-instances')
         self.assertEqual(len(starts), 1)
         self.assertEqual(cast(dict[str, object], starts[0]['decision'])['purpose'], 'deployment')
-        self.assertEqual(conf.text(self.settings, 'offload'), 'off')
+        self.assertEqual(conf.read(self.settings).text('offload'), 'off')
         self.assertFalse((self.state / 'admission.json').exists())
         self.assertEqual(ledger.CostLedger(self.state).read_snapshot().observations[-1].state, 'pending')
 
@@ -555,8 +555,8 @@ class DeploymentTests(CostFixture):
 
     def test_repository_defaults_leave_control_and_exchange_inactive(self) -> None:
         root = Path(__file__).resolve().parents[2]
-        self.assertEqual(conf.text(root / 'config/aws_target.conf', 'offload'), 'off')
-        self.assertNotIn('aws', conf.text(root / 'config/build_targets.conf', 'targets').split(','))
+        self.assertEqual(conf.read(root / 'config/aws_target.conf').text('offload'), 'off')
+        self.assertNotIn('aws', conf.read(root / 'config/build_targets.conf').text('targets').split(','))
 
     def refuse_command(self, arguments: Sequence[str], *, capture_output: bool, text: bool,
                        timeout: float, check: bool) -> subprocess.CompletedProcess[str]:
@@ -589,7 +589,7 @@ class DeploymentTests(CostFixture):
             if isinstance(status, sync.SyncStatus):
                 self.assertTrue(status.ok)
         self.assertTrue(commands)
-        self.assertEqual(conf.text(self.settings, 'offload'), 'off')
+        self.assertEqual(conf.read(self.settings).text('offload'), 'off')
         self.assertEqual(self.commands(), [])
 
     def test_service_command_and_repeated_ticks_share_charge_recovery_across_utc_midnight(self) -> None:
@@ -633,7 +633,7 @@ class DeploymentTests(CostFixture):
         self.assertNotIn('mkfs', configuration)
         remote_settings = self.root / 'remote.conf'
         _ = remote_settings.write_text(deploy.remote_configuration(self.settings))
-        self.assertEqual(conf.text(self.settings, 'offload'), 'off')
+        self.assertEqual(conf.read(self.settings).text('offload'), 'off')
         self.assertTrue(read_control_settings(remote_settings).enabled)
         stops: list[int] = []
         directory = self.root / 'remote'
@@ -696,7 +696,7 @@ class DeploymentTests(CostFixture):
             self.assertFalse(capture_output)
             self.assertTrue(text)
             self.assertFalse(check)
-            self.assertEqual(timeout, conf.number(self.settings, 'controller_tick_timeout_s'))
+            self.assertEqual(timeout, conf.read(self.settings).number('controller_tick_timeout_s'))
             self.assertEqual(os.environ['AWS_SHARED_CREDENTIALS_FILE'], str(self.credentials))
             calls.append(list(arguments))
             self.replace('tick_interval_s', str(7 * len(calls)))
@@ -820,7 +820,7 @@ class DeploymentTests(CostFixture):
         _ = subject.prepare()
         decision = ledger.mapping(remote.read_record(self.bundle / 'preflight.json')['decision'])
         self.assertGreater(float(ledger.text(decision, 'daily_usd')), 0.01)
-        self.assertEqual(conf.text(self.settings, 'offload'), 'off')
+        self.assertEqual(conf.read(self.settings).text('offload'), 'off')
 
     def test_resource_requests_write_no_unused_intent_record(self) -> None:
         subject = self.deployment()
@@ -846,7 +846,7 @@ class DeploymentTests(CostFixture):
         requests: list[str] = []
 
         def reply(request: Request, *, timeout: float) -> BytesIO:
-            self.assertEqual(timeout, conf.number(source, 'imds_timeout_s'))
+            self.assertEqual(timeout, conf.read(source).number('imds_timeout_s'))
             requests.append(request.full_url)
             if request.get_method() == 'PUT':
                 return BytesIO(b'fixture-token')
@@ -905,16 +905,16 @@ class DeploymentTests(CostFixture):
         self.replace('offload', 'on')
         calls: list[int] = []
         delays: list[float] = []
-        number = conf.number
+        number = conf.ConfigRead.number
         def action() -> None:
             calls.append(len(calls))
             if len(calls) == 3:
                 self.replace('offload', 'off')
-        def interval(path: str | Path, key: str) -> float:
+        def interval(settings: conf.ConfigRead, key: str) -> float:
             if len(calls) == 2:
                 raise ValueError('bad live interval')
-            return number(path, key)
-        with mock.patch.object(conf, 'number', interval):
+            return number(settings, key)
+        with mock.patch.object(conf.ConfigRead, 'number', interval):
             deploy_service_loop = aws_config.service_loop
             deploy_service_loop(self.settings, 'tick_interval_s', action, pause=delays.append)
         self.assertEqual(len(calls), 3)
@@ -924,7 +924,7 @@ class DeploymentTests(CostFixture):
         self.replace('offload', 'on')
         calls: list[str] = []
         delays: list[float] = []
-        with mock.patch.object(conf, 'number', side_effect=ValueError('bad initial interval')):
+        with mock.patch.object(conf.ConfigRead, 'number', side_effect=ValueError('bad initial interval')):
             with self.assertRaisesRegex(ValueError, 'bad initial interval'):
                 aws_config.service_loop(self.settings, 'tick_interval_s', lambda: calls.append('tick'), pause=delays.append)
         self.assertEqual(calls, [])

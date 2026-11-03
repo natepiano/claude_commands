@@ -31,6 +31,7 @@ if PRODUCTION_DIR not in sys.path:
     sys.path.insert(0, PRODUCTION_DIR)
 from scripts.production.issues import Issue as ProposalIssue
 from scripts.production.proposals_table import proposal_score
+from scripts.lib import conf
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 FIXTURES = Path(__file__).with_name("fixtures")
@@ -792,9 +793,10 @@ class ScoreIssuesTests(ConfiguredTestCase):
         expected_workers = 8
 
         def concurrent_replay(state: Mapping[str, object], request_questions: Mapping[str, questions.Question],
-                              model: str, *, ledger_path: Path) -> client.Response:
+                              model: str, *, ledger_path: Path,
+                              scoring_config: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> client.Response:
             nonlocal active, peak
-            _ = model, ledger_path
+            del model, ledger_path, scoring_config
             with lock:
                 active += 1
                 peak = max(peak, active)
@@ -949,8 +951,9 @@ class ScoreIssuesTests(ConfiguredTestCase):
         requests: list[tuple[str, bool]] = []
 
         def budget_replay(state: Mapping[str, object], request_questions: Mapping[str, questions.Question],
-                          model: str, *, ledger_path: Path) -> client.Response:
-            _ = model, ledger_path
+                          model: str, *, ledger_path: Path,
+                              scoring_config: conf.ConfigRead | UseConfiguredValue = UseConfiguredValue.CURRENT) -> client.Response:
+            del model, ledger_path, scoring_config
             title = cast(questions.IssueDescription, state["issue"])["title"]
             area_request = "areas" in state
             requests.append((title, area_request))

@@ -431,7 +431,7 @@ class RosterTests(unittest.TestCase):
         wanted = ["17e44ec4-3e24-5ae1-b10d-5cf30de9455b", "acd50bad-5afa-5d3d-b155-3766b7d113e0"]
         labels = roster.unit_labels_for(wanted, self.environment)
         old = unit_membership("alpha", "retired-unit")
-        _ = staff.set_worktree(old.id, staff.RemovedWorktree("natedev", self.root / "retired"))
+        _ = staff.set_worktree(old.id, staff.RemovedWorktree("natedev", self.root / "retired"), expected=old.worktree)
         historical = showrunner_relationship("wrapped")
         _ = staff.set_doc(historical.id, staff.WrappedDoc("natedev", self.root / "wrapped-production.md"))
         self.assertEqual(self._entries(), before)
@@ -1783,7 +1783,7 @@ class RosterTests(unittest.TestCase):
 
     def test_unreadable_herdr_fallback_places_director_but_never_ledger_worker_by_cwd(self) -> None:
         owner = unit_membership("alpha", "unit-one")
-        _ = staff.set_worktree(owner.id, staff.PresentWorktree(roster.remote.local_machine(), self.home / "projects/unit-one"))
+        _ = staff.set_worktree(owner.id, staff.PresentWorktree(roster.remote.local_machine(), self.home / "projects/unit-one"), expected=owner.worktree)
         _ = self.production_doc.write_text("# Production without a Units table\n")
         worker_path = self.sessions / "worker.json"
         worker = cast(dict[str, object], json.loads(worker_path.read_text(encoding="utf-8")))

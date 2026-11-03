@@ -76,8 +76,8 @@ def positive_seconds(value: str) -> int:
 T = TypeVar('T')
 
 
-def _live(path: Path, key: str, convert: Callable[[str], T]) -> T:
-    result = conf.value_origin(path, key, convert)
+def _live(settings: conf.ConfigRead, key: str, convert: Callable[[str], T]) -> T:
+    result = settings.origin(key, convert)
     if not isinstance(result, conf.UsableLiveValue):
         raise ValueError(f'{key}: {result.reason}; live input is unavailable')
     return result.value
@@ -86,29 +86,30 @@ def _live(path: Path, key: str, convert: Callable[[str], T]) -> T:
 def service_loop(settings_path: Path, interval: str, action: Callable[[], object], *,
                  pause: Callable[[float], object] = time.sleep) -> None:
     """Repeat enabled work and retain the last usable interval after a read failure."""
-    if not offload_enabled(settings_path):
+    if not offload_enabled(conf.read(settings_path)):
         return
-    delay = conf.number(settings_path, interval)
-    while offload_enabled(settings_path):
+    delay = conf.read(settings_path).number(interval)
+    while offload_enabled(conf.read(settings_path)):
         try:
             try:
                 _ = action()
             finally:
-                delay = conf.number(settings_path, interval)
+                delay = conf.read(settings_path).number(interval)
         except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
             print(f'aws_service: {error}', file=sys.stderr)
-        if not offload_enabled(settings_path):
+        if not offload_enabled(conf.read(settings_path)):
             return
         _ = pause(delay)
 
 
-def read_settings(path: Path) -> SpendingSettings:
+def read_settings(path: Path | conf.ConfigRead) -> SpendingSettings:
     """Refuse recovered spending data while preserving ordinary configuration recovery."""
+    settings = conf.read(path) if isinstance(path, Path) else path
     limits: list[LimitSettingEvidence] = []
     errors: list[str] = []
 
     def amount(key: str) -> Decimal:
-        origin = conf.value_origin(path, key, money)
+        origin = settings.origin(key, money)
         state = "live" if isinstance(origin, conf.UsableLiveValue) else "recovered" if isinstance(origin, conf.RecoveredValue) else "unavailable"
         reason = "" if isinstance(origin, conf.UsableLiveValue) else origin.reason
         if key in ("daily_limit_usd", "monthly_limit_usd"):
@@ -132,13 +133,13 @@ def read_settings(path: Path) -> SpendingSettings:
 
     def live_text(key: str) -> str:
         try:
-            return _live(path, key, str)
+            return _live(settings, key, str)
         except ValueError as error:
             raise SpendingConfigurationUnavailable(str(error), tuple(limits)) from error
 
     def seconds(key: str) -> int:
         try:
-            return _live(path, key, positive_seconds)
+            return _live(settings, key, positive_seconds)
         except ValueError as error:
             raise SpendingConfigurationUnavailable(str(error), tuple(limits)) from error
 
@@ -177,26 +178,27 @@ class ControlSettings:
     remote_state_directory: str
 
 
-def offload_enabled(path: Path) -> bool:
-    return conf.text(path, 'offload') == 'on'
+def offload_enabled(settings: conf.ConfigRead) -> bool:
+    return settings.text('offload') == 'on'
 
 
-def read_control_settings(path: Path) -> ControlSettings:
-    values = conf.values(path)
-    enabled = offload_enabled(path)
+def read_control_settings(path: Path | conf.ConfigRead) -> ControlSettings:
+    settings = conf.read(path) if isinstance(path, Path) else path
+    values = settings.values()
+    enabled = offload_enabled(settings)
     def required(key: str) -> str:
-        value = conf.text(path, key)
+        value = settings.text(key)
         if not value.strip():
             raise ValueError(f'{key}: expected nonempty text')
         return value
     return ControlSettings(enabled, required('instance_type'), required('region') if enabled else values.get('region', ''),
                            required('instance_id') if enabled else values.get('instance_id', ''),
-                           required('credentials_profile'), conf.number(path, 'start_after_wait_s'),
-                           conf.whole(path, 'start_min_waiting'), conf.number(path, 'capacity_backoff_s'),
-                           conf.number(path, 'drain_max_minutes'), conf.number(path, 'idle_stop_minutes'),
-                           conf.number(path, 'tick_interval_s'), conf.number(path, 'aws_timeout_s'),
-                           conf.number(path, 'snapshot_max_age_s'), conf.number(path, 'permission_ttl_s'),
-                           conf.number(path, 'interruption_poll_s'), conf.number(path, 'imds_timeout_s'),
+                           required('credentials_profile'), settings.number('start_after_wait_s'),
+                           settings.whole('start_min_waiting'), settings.number('capacity_backoff_s'),
+                           settings.number('drain_max_minutes'), settings.number('idle_stop_minutes'),
+                           settings.number('tick_interval_s'), settings.number('aws_timeout_s'),
+                           settings.number('snapshot_max_age_s'), settings.number('permission_ttl_s'),
+                           settings.number('interruption_poll_s'), settings.number('imds_timeout_s'),
                            required('remote_state_directory'))
 
 
@@ -234,14 +236,15 @@ class DeploymentSettings:
 
 def read_deployment_settings(path: Path) -> DeploymentSettings:
     """Require current deployment inputs before preparing any resource request."""
+    settings = conf.read(path)
     def text(key: str) -> str:
-        return _live(path, key, str)
+        return _live(settings, key, str)
 
     def whole(key: str) -> int:
-        return _live(path, key, positive_seconds)
+        return _live(settings, key, positive_seconds)
 
     def positive_money(key: str) -> Decimal:
-        value = _live(path, key, money)
+        value = _live(settings, key, money)
         if value <= 0:
             raise ValueError(f'{key}: live positive price is required')
         return value
@@ -273,7 +276,7 @@ def read_deployment_settings(path: Path) -> DeploymentSettings:
         template = path.parent / template
     return DeploymentSettings(region, text('deployment_profile'), text('stack_name'), instance_type,
                               text('ami_id'), owner, text('nixos_release'), zone, text('vpc_id'),
-                              text('subnet_id'), email, conf.values(path)['existing_data_volume_id'],
+                              text('subnet_id'), email, settings.values()['existing_data_volume_id'],
                               text('root_device_name'), whole('root_volume_gib'), whole('data_volume_gib'),
                               whole('data_volume_iops'), whole('data_volume_throughput'),
                               positive_money('spot_max_usd_per_hour'), low, high, stop,
@@ -282,9 +285,10 @@ def read_deployment_settings(path: Path) -> DeploymentSettings:
 
 
 def deployment_price(path: Path, now: int) -> tuple[int, Decimal]:
-    settings = read_settings(path)
-    at = _live(path, 'deployment_price_at', positive_seconds)
-    price = _live(path, 'deployment_price_usd_per_hour', money)
+    configuration = conf.read(path)
+    settings = read_settings(configuration)
+    at = _live(configuration, 'deployment_price_at', positive_seconds)
+    price = _live(configuration, 'deployment_price_usd_per_hour', money)
     if price <= 0 or not 0 <= now - at <= settings.price_max_age_seconds:
         raise ValueError('deployment requires a fresh public price recorded in live configuration')
     return at, price

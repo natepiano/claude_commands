@@ -73,10 +73,10 @@ class UnitLookupTests(unittest.TestCase):
     def test_retirement_follows_the_retained_worktree_mark_and_restore_clears_it(self) -> None:
         row = unit_membership("show", "marked-unit")
         location = staff.PresentWorktree("natedev", self.root / "not-on-disk")
-        row = staff.set_worktree(row.id, location)
+        row = staff.set_worktree(row.id, location, expected=row.worktree)
         cells = {"Unit": "marked-unit", "Plan": "retired in an old document", "Worktree": "/stale"}
         self.assertFalse(unit_lookup.unit_is_retired(cells, unit_lookup.ProductionMembers("show")))
-        removed = staff.set_worktree(row.id, staff.RemovedWorktree(location.machine, location.path))
+        removed = staff.set_worktree(row.id, staff.RemovedWorktree(location.machine, location.path), expected=row.worktree)
         cells["Plan"] = "docs/live-looking-plan.md"
         self.assertTrue(unit_lookup.unit_is_retired(cells, unit_lookup.ProductionMembers("show")))
         self.assertEqual(staff.by_id(row.id), removed)
@@ -88,7 +88,7 @@ class UnitLookupTests(unittest.TestCase):
         live = unit_membership("current", "live-unit")
         retired = unit_membership("current", "retired-unit")
         historical = unit_membership("wrapped", "historical-unit")
-        _ = staff.set_worktree(retired.id, staff.RemovedWorktree("natedev", self.root / "retired"))
+        _ = staff.set_worktree(retired.id, staff.RemovedWorktree("natedev", self.root / "retired"), expected=retired.worktree)
         assert historical.parent is not None
         _ = staff.set_doc(historical.parent, staff.WrappedDoc("natedev", self.root / "archive.md"))
         record = staff.snapshot()
@@ -100,7 +100,7 @@ class UnitLookupTests(unittest.TestCase):
     def test_retired_pane_marks_are_left_out_while_live_siblings_and_retained_identity_stay(self) -> None:
         retired = unit_membership("show", "retired-unit")
         live = unit_membership("show", "live-unit")
-        retired = staff.set_worktree(retired.id, staff.RemovedWorktree("natedev", self.root / "retired"))
+        retired = staff.set_worktree(retired.id, staff.RemovedWorktree("natedev", self.root / "retired"), expected=retired.worktree)
         record = staff.snapshot()
         sources = unit_lookup.MemberSources({}, ())
         for durable_id in (retired.id, ""):
@@ -154,7 +154,7 @@ class UnitLookupTests(unittest.TestCase):
 
     def test_retained_unit_cleanup_lookup_keeps_a_live_director_after_active_membership_excludes_it(self) -> None:
         row = unit_membership("show", "retired-unit")
-        _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.root / "removed"))
+        _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.root / "removed"), expected=row.worktree)
         fake_unit_host.write(self.environment, [marked("director", "w1:p1", "retired-unit", CODEX_THREAD_ID=row.id)])
         self.claude("director", "w1:p1", session_id=row.id)
         record = staff.snapshot()
@@ -168,7 +168,7 @@ class UnitLookupTests(unittest.TestCase):
 
     def test_retained_unit_cleanup_lookup_keeps_unknown_session_evidence(self) -> None:
         row = unit_membership("show", "retired-unit")
-        _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.root / "removed"))
+        _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.root / "removed"), expected=row.worktree)
         fake_unit_host.write(self.environment, [marked("director", "w1:p1", "retired-unit", CODEX_THREAD_ID=row.id)])
         self.claude("director", "w1:p1", session_id=row.id)
         _ = (self.records / "broken.json").write_text("{")
@@ -180,7 +180,7 @@ class UnitLookupTests(unittest.TestCase):
 
     def test_retained_unit_cleanup_lookup_still_refuses_duplicate_live_holders(self) -> None:
         row = unit_membership("show", "retired-unit")
-        _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.root / "removed"))
+        _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.root / "removed"), expected=row.worktree)
         fake_unit_host.write(self.environment, [
             marked("first", "w1:p1", "retired-unit", CODEX_THREAD_ID=row.id),
             marked("second", "w2:p1", "retired-unit", CODEX_THREAD_ID=row.id),
@@ -193,7 +193,7 @@ class UnitLookupTests(unittest.TestCase):
 
     def test_retired_names_are_explicitly_listed_while_active_membership_excludes_the_retained_row(self) -> None:
         retired = unit_membership("show", "retired-unit")
-        _ = staff.set_worktree(retired.id, staff.RemovedWorktree("natedev", self.root / "retired"))
+        _ = staff.set_worktree(retired.id, staff.RemovedWorktree("natedev", self.root / "retired"), expected=retired.worktree)
         lines = ["## Units", "| Unit | Plan | Worktree | Branch | Port | Owns |",
                  "| --- | --- | --- | --- | --- | --- |",
                  "| retired-unit | old.md | /missing | old | — | scripts |"]
@@ -204,10 +204,10 @@ class UnitLookupTests(unittest.TestCase):
     def test_removed_same_name_does_not_make_an_active_units_orphan_metadata_ambiguous(self) -> None:
         live = unit_membership("receiving", "alpha-unit")
         old = unit_membership("former", "alpha-unit")
-        _ = staff.set_worktree(old.id, staff.RemovedWorktree("natedev", self.root / "old"))
+        _ = staff.set_worktree(old.id, staff.RemovedWorktree("natedev", self.root / "old"), expected=old.worktree)
         worktree = Path("/live")
         cells = {"Unit": "alpha", "Plan": str(worktree / "plan.md"), "Worktree": "`/live`", "Branch": "alpha"}
-        _ = staff.set_worktree(live.id, staff.PresentWorktree("natedev", worktree))
+        _ = staff.set_worktree(live.id, staff.PresentWorktree("natedev", worktree), expected=live.worktree)
         doc = self.root / "receiving-production.md"
         write_text_atomic(doc, "# Receiving production\n")
         owner = showrunner_relationship("receiving")
@@ -443,7 +443,7 @@ print(observed.row.id)
         from scripts.shutdown import pane_record
 
         owner = unit_membership("show", "alpha-unit")
-        _ = staff.set_worktree(owner.id, staff.PresentWorktree(remote.local_machine(), self.root))
+        _ = staff.set_worktree(owner.id, staff.PresentWorktree(remote.local_machine(), self.root), expected=owner.worktree)
         fake_unit_host.write(self.environment, [HostedUnit("agents", "w4:p1", {})])
         self.claude("organon", "w4:p1", session_id=owner.id)
         raw = cast(dict[str, object], json.loads((self.records / "organon-1.json").read_text()))

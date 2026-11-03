@@ -43,6 +43,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import pane_launch
+from scripts.lib.atomic_file import write_text_atomic
 from scripts.message import sessions as runtime_sessions
 from scripts.production import staff
 
@@ -63,6 +64,49 @@ _PLATFORM = sys.platform
 NO_ENVIRONMENT_REMOVALS: frozenset[str] = frozenset()
 _NO_WORKSPACE_FILTER: frozenset[str] = frozenset()
 SHARED_SESSION = "agents"
+
+
+@dataclass(frozen=True)
+class ReadStaffAtUse:
+    """A standalone tab operation reads the current staff record."""
+
+
+@dataclass(frozen=True)
+class RestoreStaff:
+    """The restore operation shares its staff record and session labels."""
+
+    record: staff.StaffSnapshot
+    labels: StaffLabels | StaffLabelsRead
+
+
+_RESTORE_STAFF: ContextVar[RestoreStaff | ReadStaffAtUse] = ContextVar(
+    "restore_staff", default=ReadStaffAtUse())
+
+
+@contextmanager
+def restore_staff(record: staff.StaffSnapshot, *, labels: StaffLabels | StaffLabelsRead = StaffLabelsRead.UNAVAILABLE) -> Generator[None]:
+    """Share the restore snapshot with every tab operation in this context."""
+    token = _RESTORE_STAFF.set(RestoreStaff(record, labels))
+    try:
+        yield
+    finally:
+        _RESTORE_STAFF.reset(token)
+
+
+def _tab_staff() -> staff.StaffSnapshot:
+    record = _RESTORE_STAFF.get()
+    return staff.initial_snapshot() if isinstance(record, ReadStaffAtUse) else record.record
+
+
+def _tab_labels(record: staff.StaffSnapshot) -> StaffLabels | StaffLabelsRead:
+    from scripts.production.session_labels import StaffLabels
+
+    operation = _RESTORE_STAFF.get()
+    if isinstance(operation, RestoreStaff) and operation.record is record:
+        return operation.labels
+    return StaffLabels.for_record(record)
+
+
 # The slice of the pane scopes. A pane shell in its own scope keeps the agent load out of the server's cgroup.
 PANE_SLICE = "app-agents.slice"
 # The transient server unit gets CPU first and keeps its memory out of swap under the pane load.
@@ -1436,12 +1480,9 @@ class Herdr:
         for row in rows:
             tab = json_text(row.get("tab_id"), "herdr pane tab id")
             panes_of.setdefault(tab, []).append(json_text(row.get("pane_id"), "herdr pane id"))
-        from scripts.production import staff
-        from scripts.production.session_labels import StaffLabels
-
-        membership = staff.initial_snapshot() if record is None else record
+        membership = _tab_staff() if record is None else record
         classifier = UnitTabClassifier(
-            self.session, herdr_processes(membership=StaffLabels.for_record(membership)), membership)
+            self.session, herdr_processes(membership=_tab_labels(membership)), membership)
         unit_director_titles = {
             json_text(tab.get("label"), "herdr tab label") for tab in tabs
             if isinstance(classifier.classify(
@@ -1474,11 +1515,9 @@ class Herdr:
     def sort_tabs(self, *, workspace_names: Set[str] = _NO_WORKSPACE_FILTER,
                   record: staff.StaffSnapshot | None = None) -> WorkspacesKeptForSplitTabs:
         """Sort selected workspaces (all by default) by the tab rule; save and return split workspaces kept."""
-        from scripts.production import staff
-
         kept: list[str] = []
         with _LayoutLock(self.session):
-            membership = staff.initial_snapshot() if record is None else record
+            membership = _tab_staff() if record is None else record
             for space in self.live_layout():
                 if workspace_names and space.label not in workspace_names:
                     continue
@@ -2158,19 +2197,19 @@ def claude_trust_keys(folder: Path) -> tuple[Path, ...]:
 
 
 def copy_claude_trust(folder: Path, source: Path, target: Path) -> Trusted | Untrusted | UnreadableTrustFile:
-    """Give the target account file the source account's trust for this folder, and nothing more.
-
-    The target gains only the one key the source already trusts. The file is replaced in one step,
-    so Claude never reads half of it; every other value in it stays as it was.
-    """
+    """Copy only the source account's trust for this folder into the private target file."""
     present = claude_trust(folder, target)
-    if not isinstance(present, Untrusted):
+    if not (isinstance(present, Untrusted)
+            or isinstance(present, UnreadableTrustFile) and present.error_class == "FileNotFoundError"):
         return present
     granted = claude_trust(folder, source)
     if not isinstance(granted, Trusted):
         return granted
     try:
-        raw = cast(object, json.loads(target.read_text(encoding="utf-8")))
+        try:
+            raw = cast(object, json.loads(target.read_text(encoding="utf-8")))
+        except FileNotFoundError:
+            raw = {}
         if not isinstance(raw, dict):
             raise ValueError()
         settings = cast(dict[str, object], raw)
@@ -2181,11 +2220,9 @@ def copy_claude_trust(folder: Path, source: Path, target: Path) -> Trusted | Unt
         if not isinstance(entry, dict):
             raise ValueError()
         cast(dict[str, object], entry)["hasTrustDialogAccepted"] = True
-        staged = target.with_name(f".{target.name}.trust-{os.getpid()}")
-        descriptor = os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
-            json.dump(settings, output, indent=2)
-        os.replace(staged, target)
+        if target.exists():
+            target.chmod(0o600)
+        write_text_atomic(target, json.dumps(settings, indent=2), new_file_mode=0o600)
     except (OSError, UnicodeError, ValueError) as error:
         return UnreadableTrustFile(folder, target, type(error).__name__)
     return Trusted(folder, target, granted.project_key)
@@ -3959,7 +3996,8 @@ def agent_base_environment(environment: dict[str, str], unset_environment: froze
                 or key in {"ANTHROPIC_API_KEY", "SHELL", "TMUX", "TMUX_PANE", "SHUTDOWN_PARENT_LAUNCH_CLAIM"}):
             del base_env[key]
     base_env.update(environment)
-    _ = base_env.pop("STAFF_ID", None)
+    for identity in ("STAFF_ID", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID"):
+        _ = base_env.pop(identity, None)
     for key in unset_environment:
         _ = base_env.pop(key, None)
     return child_environment(base_env)
@@ -3972,7 +4010,8 @@ def prepare_agent_environment(cwd: str, environment: dict[str, str],
     if isinstance(loaded, nix_env.Refused):
         return loaded
     launch_environment = {key: value for key, value in loaded.env.items()
-                          if key not in unset_environment and key != "STAFF_ID"}
+                          if key not in unset_environment
+                          and key not in ("STAFF_ID", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID")}
     return PreparedAgentEnvironment(Path(cwd).resolve(), launch_environment,
                                     unset_environment | (os.environ.keys() - launch_environment.keys()))
 

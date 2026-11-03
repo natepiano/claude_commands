@@ -296,7 +296,7 @@ def suggestion(
 def configured_packages(repository: offload.RepositoryIdentity) -> frozenset[str]:
     if isinstance(repository, offload.UnknownRepository):
         return frozenset()
-    values = conf.values("mac_test")
+    values = conf.read("mac_test").values()
     return frozenset(offload.comma_values(values.get(f"linux_only.{repository.name}", "")))
 
 

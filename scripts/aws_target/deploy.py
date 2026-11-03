@@ -382,7 +382,7 @@ def bootstrap_configuration(path: Path, remote_settings: str) -> str:
     text = settings.bootstrap_template_path.read_text()
     inputs = {
         'INPUT': base,
-        'IDLE_STOP_SECONDS': f"{conf.number(path, 'idle_stop_minutes') * 60:g}",
+        'IDLE_STOP_SECONDS': f"{conf.read(path).number('idle_stop_minutes') * 60:g}",
         'DATA_VOLUME_WAIT_SECONDS': str(settings.timeout_s),
         'SCRIPTS_SOURCE_URL_JSON': nix_string(settings.scripts_source_url),
         'SCRIPTS_SOURCE_SHA256_JSON': nix_string(settings.scripts_source_sha256),

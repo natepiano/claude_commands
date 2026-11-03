@@ -19,6 +19,7 @@ from typing import Literal, cast
 from zoneinfo import ZoneInfo
 
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib import conf
 from scripts.aws_target.config import (
     LimitSettingEvidence, MeasurementUnavailable, SpendingConfigurationUnavailable, SpendingSettings, money, offload_enabled, read_settings,
 )
@@ -717,9 +718,10 @@ class CostLedger:
     def refresh_charges(self, settings_path: Path, now: int,
                         fetch: Callable[[int, int], Decimal]) -> ChargeRead | MeasurementUnavailable:
         """Recover the newest saved reply before another scheduled query."""
-        if not offload_enabled(settings_path):
+        configuration = conf.read(settings_path)
+        if not offload_enabled(configuration):
             return MeasurementUnavailable('disabled')
-        settings = read_settings(settings_path)
+        settings = read_settings(configuration)
         day = charge_period_day(now)
         start, end = period_bounds(day, ZoneInfo('UTC'))
         with self._locked() as state:
