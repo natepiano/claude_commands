@@ -29,12 +29,12 @@ import time
 import tomllib
 from contextlib import contextmanager
 from contextvars import ContextVar
-from functools import cache
+from functools import cache, cached_property
 from dataclasses import dataclass, field
 from enum import Enum, StrEnum
 from datetime import datetime, timezone
 from pathlib import Path
-from collections.abc import Callable, Generator, Sequence, Set
+from collections.abc import Callable, Generator, Iterable, Sequence, Set
 from typing import TYPE_CHECKING, Literal, NamedTuple, NotRequired, TypedDict, TypeVar, cast, override
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
@@ -779,6 +779,7 @@ class PaneRunning:
 @dataclass(frozen=True)
 class AgentProcessIdentity:
     pid: int
+    # Linux uses clock ticks. Darwin uses UTC epoch seconds from ps lstart.
     start_ticks: int
 
 
@@ -1808,6 +1809,7 @@ class Herdr:
         commands: list[str] = []
         agent_present = False
         identities: list[AgentProcessIdentity] = []
+        agent_pids: list[int] = []
         for value in json_items(info.get("foreground_processes"), "startup foreground processes"):
             process = json_object(value, "startup foreground process")
             commands.append(json_text(process.get("name"), "startup process name"))
@@ -1817,12 +1819,17 @@ class Herdr:
                 agent_present = True
                 pid = process.get("pid")
                 if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0:
+                    agent_pids.append(pid)
+        if agent_pids:
+            try:
+                reader = _startup_process_reader(timeout)
+                for pid in agent_pids:
                     try:
-                        stat = (_proc_root() / str(pid) / "stat").read_text().rsplit(")", 1)[1].split()
-                        if stat[0] != "Z":
-                            identities.append(AgentProcessIdentity(pid, int(stat[19])))
-                    except (OSError, ValueError, IndexError):
+                        identities.append(reader.identity(pid))
+                    except (_StartupProcessGone, HerdrFailure, OSError, ValueError, IndexError):
                         pass
+            except (HerdrFailure, OSError, ValueError, subprocess.SubprocessError):
+                pass
         activity = AgentProcessPresent(tuple(identities)) if agent_present else PaneAtShell() if foreground == shell else PaneRunning(tuple(commands))
         return PaneStartupObservation(PaneShell(cast(int, shell)), activity)
 
@@ -3011,24 +3018,115 @@ def is_codex_process(arguments: list[str]) -> bool:
     return _is_agent_process(arguments, "codex")
 
 
+class _StartupProcessGone(Exception):
+    """The process has exited or is absent from the process snapshot."""
+
+
+class _LinuxStartupProcesses:
+    """Read startup facts from Linux process files."""
+
+    def __init__(self) -> None:
+        self.root: Path = _proc_root()
+
+    def identity(self, pid: int) -> AgentProcessIdentity:
+        stat = (self.root / str(pid) / "stat").read_text().rsplit(")", 1)[1].split()
+        if stat[0] == "Z":
+            raise _StartupProcessGone(f"process {pid}: exited")
+        return AgentProcessIdentity(pid, int(stat[19]))
+
+    def arguments(self, pid: int) -> list[str]:
+        return _process_arguments(self.root / str(pid))
+
+    def children(self, pid: int) -> Iterable[int]:
+        # Each thread has its own child list.
+        for task in sorted((self.root / str(pid) / "task").iterdir(), key=lambda task: int(task.name)):
+            for child in (task / "children").read_text().split():
+                yield int(child)
+
+    def foreground(self, pid: int) -> int:
+        stat = (self.root / str(pid) / "stat").read_text().rsplit(")", 1)[1].split()
+        return int(stat[5])
+
+
+class _DarwinStartupProcesses:
+    """Share process tables within one startup observation."""
+
+    def __init__(self, timeout: float) -> None:
+        self.timeout: float = timeout
+        result = run_program([os.environ.get("HERDR_PS", "ps"), "-axo", "pid=,ppid=,state=,lstart="],
+                             timeout=timeout,
+                             environment={**os.environ, "LC_ALL": "C", "TZ": "UTC"})
+        require_success(result, "startup process identities")
+        self.starts: dict[int, tuple[str, str]] = {}
+        self.children_by_parent: dict[int, list[int]] = {}
+        for line in result.stdout.splitlines():
+            fields = line.split(maxsplit=3)
+            if len(fields) != 4 or not all(field.isdecimal() for field in fields[:2]):
+                raise HerdrFailure("startup process identities are unreadable")
+            pid = int(fields[0])
+            if pid <= 0 or pid in self.starts:
+                raise HerdrFailure("startup process identities are ambiguous")
+            self.starts[pid] = (fields[2], fields[3])
+            self.children_by_parent.setdefault(int(fields[1]), []).append(pid)
+
+    def identity(self, pid: int) -> AgentProcessIdentity:
+        if pid not in self.starts or self.starts[pid][0].startswith("Z"):
+            raise _StartupProcessGone(f"process {pid}: exited")
+        started = _darwin_start_time(self.starts[pid][1])
+        return AgentProcessIdentity(pid, int(started.timestamp()))
+
+    @cached_property
+    def processes(self) -> dict[int, _UserProcess]:
+        return {process.pid: process for process in _darwin_processes(timeout=self.timeout)}
+
+    def arguments(self, pid: int) -> list[str]:
+        if pid not in self.processes:
+            result = run_program([os.environ.get("HERDR_PS", "ps"), "-o", "command=", "-p", str(pid)],
+                                 timeout=self.timeout)
+            try:
+                _require_darwin_process_read(result, pid, f"startup process {pid} command")
+            except _DarwinProcessGone as error:
+                raise _StartupProcessGone(str(error)) from error
+            return result.stdout.split()
+        arguments = self.processes[pid].arguments
+        if isinstance(arguments, UnreadableProcessArguments):
+            raise HerdrFailure(arguments.reason)
+        return list(arguments.argv)
+
+    def children(self, pid: int) -> Iterable[int]:
+        return self.children_by_parent.get(pid, [])
+
+    def foreground(self, pid: int) -> int:
+        result = run_program([os.environ.get("HERDR_PS", "ps"), "-o", "tpgid=", "-p", str(pid)],
+                             timeout=self.timeout)
+        _require_darwin_process_read(result, pid, f"startup shell {pid} foreground")
+        return int(result.stdout.strip())
+
+
+def _startup_process_reader(timeout: float = PROGRAM_TIMEOUT_SECONDS) -> _LinuxStartupProcesses | _DarwinStartupProcesses:
+    return _DarwinStartupProcesses(timeout) if _platform() == "darwin" else _LinuxStartupProcesses()
+
+
 def _startup_processes(shell: PaneShell, kind: str, tracked: set[AgentProcessIdentity]) -> AgentProcessPresent | PaneAtShell | PaneRunning | PaneProcessesUnreadable:
     """Keep identified processes across exec and parent changes; inspect every thread."""
-    root = _proc_root()
+    try:
+        reader = _startup_process_reader()
+    except (HerdrFailure, OSError, ValueError, subprocess.SubprocessError):
+        return PaneProcessesUnreadable()
     commands: list[str] = []
     pending: list[tuple[int, bool]] = [(shell.pid, False)]
     live: set[AgentProcessIdentity] = set()
     unreadable = False
     for identity in tuple(tracked):
         try:
-            stat = (root / str(identity.pid) / "stat").read_text().rsplit(")", 1)[1].split()
-            if stat[0] == "Z" or int(stat[19]) != identity.start_ticks:
+            if reader.identity(identity.pid) != identity:
                 tracked.remove(identity)
             else:
                 live.add(identity)
                 pending.append((identity.pid, True))
-        except FileNotFoundError:
+        except (_StartupProcessGone, FileNotFoundError):
             tracked.remove(identity)
-        except (OSError, ValueError, IndexError):
+        except (HerdrFailure, OSError, ValueError, IndexError, subprocess.SubprocessError):
             unreadable = True
     visited: set[int] = set()
     while pending:
@@ -3037,25 +3135,21 @@ def _startup_processes(shell: PaneShell, kind: str, tracked: set[AgentProcessIde
             continue
         visited.add(pid)
         try:
-            process = root / str(pid)
             if pid != shell.pid:
-                stat = (process / "stat").read_text().rsplit(")", 1)[1].split()
-                if stat[0] == "Z":
-                    continue
+                identity = reader.identity(pid)
                 if not belongs_to_agent:
-                    arguments = _process_arguments(process)
+                    arguments = reader.arguments(pid)
                     belongs_to_agent = _is_agent_process(arguments, kind)
                     if not belongs_to_agent:
                         commands.append(arguments[0] if arguments else str(pid))
                 if belongs_to_agent:
-                    identity = AgentProcessIdentity(pid, int(stat[19]))
                     tracked.add(identity)
                     live.add(identity)
-            # children is per-thread, not the entire process's child list.
-            for task in (process / "task").iterdir():
-                children = (task / "children").read_text().split()
-                pending.extend((int(child), belongs_to_agent) for child in children)
-        except (OSError, ValueError, IndexError):
+            for child in reader.children(pid):
+                pending.append((child, belongs_to_agent))
+        except _StartupProcessGone:
+            continue
+        except (HerdrFailure, OSError, ValueError, IndexError, subprocess.SubprocessError):
             unreadable = True
     if live:
         return AgentProcessPresent(tuple(live))
@@ -3063,9 +3157,8 @@ def _startup_processes(shell: PaneShell, kind: str, tracked: set[AgentProcessIde
         return PaneProcessesUnreadable()
     try:
         # Read foreground ownership after walking the tree, not before launch.
-        shell_stat = (root / str(shell.pid) / "stat").read_text().rsplit(")", 1)[1].split()
-        foreground = int(shell_stat[5])
-    except (OSError, ValueError, IndexError):
+        foreground = reader.foreground(shell.pid)
+    except (HerdrFailure, OSError, ValueError, IndexError, subprocess.SubprocessError):
         return PaneProcessesUnreadable()
     if not commands and foreground == shell.pid:
         return PaneAtShell()
@@ -3137,6 +3230,14 @@ class DarwinProcessIdentity(NamedTuple):
 
     started: str
     terminal: int
+
+
+def _darwin_start_time(started: str) -> datetime:
+    """Decode the UTC birth time that ps reads in the C locale."""
+    try:
+        return datetime.strptime(started, "%a %b %d %H:%M:%S %Y").replace(tzinfo=timezone.utc)
+    except ValueError as error:
+        raise HerdrFailure("process start time is unreadable") from error
 
 
 def darwin_process_identity(pid: int) -> DarwinProcessIdentity:
@@ -3597,14 +3698,14 @@ def _darwin_process_parents() -> dict[int, int]:
     return parents
 
 
-def _darwin_processes(*, complete: bool = False) -> list[_UserProcess]:
+def _darwin_processes(*, complete: bool = False, timeout: float = PROGRAM_TIMEOUT_SECONDS) -> list[_UserProcess]:
     result = run_program([os.environ.get("HERDR_PS", "ps"), "-U", str(os.getuid()),
-                          "-o", "pid=,ppid=,uid=,comm="])
+                          "-o", "pid=,ppid=,uid=,comm="], timeout=timeout)
     require_success(result, "user processes")
     # Both fields can contain spaces. Separate batched columns retain an unambiguous
     # executable boundary and keep unreadable or changed argv as an explicit state.
     command_result = run_program([os.environ.get("HERDR_PS", "ps"), "-U", str(os.getuid()),
-                                  "-o", "pid=,command="])
+                                  "-o", "pid=,command="], timeout=timeout)
     require_success(command_result, "user process arguments")
     commands: dict[int, str] = {}
     for line in command_result.stdout.splitlines():
@@ -3626,7 +3727,7 @@ def _darwin_processes(*, complete: bool = False) -> list[_UserProcess]:
         executable = fields[3].rstrip()
         if pid not in commands:
             try:
-                current = run_program([os.environ.get("HERDR_PS", "ps"), "-o", "command=", "-p", str(pid)], timeout=5)
+                current = run_program([os.environ.get("HERDR_PS", "ps"), "-o", "command=", "-p", str(pid)], timeout=timeout)
                 _require_darwin_process_read(current, pid, f"process {pid} command")
             except _DarwinProcessGone:
                 continue
