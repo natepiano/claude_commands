@@ -7,9 +7,80 @@ import subprocess
 from contextlib import redirect_stderr
 from unittest import mock
 
-from scripts.production import staff, unit_lookup
+from scripts.production import production_units, staff, unit_lookup
 from scripts.production.unit_table import cell_value
 from scripts.production.staff_test_support import StaffTestCase, fixture_member
+
+
+class UnitRowLookupTests(StaffTestCase):
+    def test_parent_match_accepts_a_suffix_beside_a_bad_neighbor_cell(self) -> None:
+        parent = production_units.DocumentSource("natedev", self.root / "parent.md")
+        other = production_units.DocumentSource("mac", self.root / "other.md")
+        text = "## Units\n\n| Unit | Port |\n| --- | --- |\n| bad unit | 8999 |\n| `web-unit` | `15733` (note) |\n"
+
+        def load(source: production_units.DocumentSource) -> str:
+            self.assertEqual(source, parent)
+            return text
+
+        result = production_units.lookup_unit("web", parent, (parent, other), load)
+        self.assertIsInstance(result, production_units.UnitRowFound)
+        assert isinstance(result, production_units.UnitRowFound)
+        self.assertEqual(result.source, parent)
+        self.assertEqual(result.cells["Port"], "`15733` (note)")
+        self.assertEqual(result.note, "")
+
+    def test_unique_fallback_match_has_its_source_and_note(self) -> None:
+        parent = production_units.DocumentSource("natedev", self.root / "parent.md")
+        other = production_units.DocumentSource("mac", self.root / "other.md")
+        documents = {parent: "## Units\n\n| Unit | Port |\n| --- | --- |\n",
+                     other: "## Units\n\n| Unit | Port |\n| --- | --- |\n| web | 15733 |\n"}
+        result = production_units.lookup_unit("web-unit", parent, (parent, other, other), documents.__getitem__)
+        self.assertIsInstance(result, production_units.UnitRowFound)
+        assert isinstance(result, production_units.UnitRowFound)
+        self.assertEqual(result.source, other)
+        self.assertEqual(result.cells["Port"], "15733")
+        self.assertIn(f"mac:{other.path}", result.note)
+        self.assertIn("parent", result.note)
+
+    def test_two_fallback_matches_name_both_sources(self) -> None:
+        parent = production_units.DocumentSource("natedev", self.root / "parent.md")
+        first = production_units.DocumentSource("natedev", self.root / "first.md")
+        second = production_units.DocumentSource("mac", self.root / "second.md")
+        header = "## Units\n\n| Unit | Port |\n| --- | --- |\n"
+        documents = {parent: header, first: header + "| web | 15733 |\n", second: header + "| web-unit | 15733 |\n"}
+        result = production_units.lookup_unit("web", parent, (first, second), documents.__getitem__)
+        self.assertIsInstance(result, production_units.UnitRowAmbiguous)
+        assert isinstance(result, production_units.UnitRowAmbiguous)
+        for source in (first, second):
+            self.assertIn(f"{source.machine}:{source.path}", result.reason)
+
+    def test_unavailable_document_keeps_a_single_fallback_match_incomplete(self) -> None:
+        parent = production_units.DocumentSource("natedev", self.root / "parent.md")
+        matched = production_units.DocumentSource("natedev", self.root / "matched.md")
+        missing = production_units.DocumentSource("mac", self.root / "missing.md")
+        header = "## Units\n\n| Unit | Port |\n| --- | --- |\n"
+        documents: dict[production_units.DocumentSource, str | production_units.DocumentUnavailable] = {
+            parent: header, matched: header + "| web-unit | 15733 |\n",
+            missing: production_units.DocumentUnavailable("fixture host is unavailable"),
+        }
+        result = production_units.lookup_unit("web", parent, (matched, missing), documents.__getitem__)
+        self.assertIsInstance(result, production_units.UnitSearchIncomplete)
+        assert isinstance(result, production_units.UnitSearchIncomplete)
+        self.assertEqual(result.unavailable, (missing,))
+        self.assertIn("fixture host is unavailable", result.reason)
+        self.assertIn(str(missing.path), result.reason)
+
+    def test_new_unit_does_not_take_another_productions_matching_row(self) -> None:
+        parent = production_units.DocumentSource("natedev", self.root / "parent.md")
+        other = production_units.DocumentSource("natedev", self.root / "other.md")
+        header = "## Units\n\n| Unit | Port |\n| --- | --- |\n"
+
+        def load(source: production_units.DocumentSource) -> str:
+            self.assertEqual(source, parent)
+            return header
+
+        result = production_units.lookup_unit("web", parent, (other,), load, established=False)
+        self.assertIsInstance(result, production_units.UnitRowMissing)
 
 
 class RowProductionMetadataTests(StaffTestCase):
@@ -67,7 +138,7 @@ class RowProductionMetadataTests(StaffTestCase):
     def test_missing_worktree_evidence_keeps_the_member_and_names_the_problem(self) -> None:
         fixture = self.row_production()
         missing = self.root / "unreadable-worktree"
-        _ = staff.set_worktree(fixture.unit.id, staff.PresentWorktree("natedev", missing))
+        _ = staff.set_worktree(fixture.unit.id, staff.PresentWorktree("natedev", missing), expected=fixture.unit.worktree)
         errors = io.StringIO()
         with redirect_stderr(errors):
             rows = unit_lookup.live_unit_table(fixture.doc.read_text().splitlines(), fixture.slug,

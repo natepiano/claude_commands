@@ -152,7 +152,7 @@ class UnitRunTests(unittest.TestCase):
 
     def test_remote_staff_location_refuses_without_using_the_document_cell(self) -> None:
         member = next(row for row in staff.snapshot().find(kind="unit"))
-        _ = staff.set_worktree(member.id, staff.PresentWorktree("mac", self.worktree))
+        _ = staff.set_worktree(member.id, staff.PresentWorktree("mac", self.worktree), expected=member.worktree)
         _ = self.record(self.history, "table-decoy", str(self.worktree), 10)
         result = self.run_script("--no-mac")
         self.assertEqual(result.returncode, 1)

@@ -153,7 +153,7 @@ class HerdrLaunchTests(NixFixture):
             launch_kind=add_unit.NewWorkLaunch(), timeout=1)
         with isolated_staff_file(self.root / "staff.json", self.env):
             member = unit_membership("child", "unit")
-            member = staff.set_worktree(member.id, staff.PresentWorktree(local_machine(), request.worktree))
+            member = staff.set_worktree(member.id, staff.PresentWorktree(local_machine(), request.worktree), expected=member.worktree)
             self.refusal(lambda: add_unit.launch_session(request, add_unit.DirectorAgent("opus", add_unit.DefaultEffort()),
                 "resume", accounts.NamedAccount("claude3", self.home / ".claude3")))
 

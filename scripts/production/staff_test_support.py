@@ -162,7 +162,7 @@ def recorded_unit(showrunner: str, unit: str, worktree: Path, doc: Path, *,
     """Record private unit locations and configuration through the shared fixture writers."""
     _ = recorded_showrunner(showrunner, doc)
     row = unit_membership(showrunner, unit)
-    row = staff.set_worktree(row.id, staff.PresentWorktree("natedev", worktree))
+    row = staff.set_worktree(row.id, staff.PresentWorktree("natedev", worktree), expected=row.worktree)
     worktree.mkdir(parents=True, exist_ok=True)
     if not (worktree / ".git").exists():
         _ = run_fixture_git([FIXTURE_GIT, "init", "-b", "fixture", str(worktree)],
@@ -580,7 +580,7 @@ class StaffTestCase(unittest.TestCase):
         _ = fixture.doc.write_text(text)
         director = self.source_root / "director"
         director.mkdir()
-        _ = staff.set_worktree(fixture.unit.id, staff.PresentWorktree("natedev", director))
+        _ = staff.set_worktree(fixture.unit.id, staff.PresentWorktree("natedev", director), expected=fixture.unit.worktree)
         return fixture
 
     def retired_fill_production(self, slug: str, *units: str, wrapped: bool = False) -> Path:

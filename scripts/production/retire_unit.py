@@ -1084,7 +1084,8 @@ def retire(unit: Unit, wait_minutes: float, *, settings: conf.ConfigRead,
     if workers:
         return 1
     if not failed:
-        _ = staff.set_worktree(member.row.id, staff.RemovedWorktree(local_machine(), location.path))
+        _ = staff.set_worktree(member.row.id, staff.RemovedWorktree(local_machine(), location.path),
+                               expected=member.row.worktree)
         print(f"{unit.name} already retired" if already_retired and not committed else f"{unit.name} retired")
     return 1 if failed else 0
 

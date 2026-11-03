@@ -863,12 +863,12 @@ class AddUnitRestoreTests(AddUnitTestCase):
         self.assertEqual(self.opened()[1], SHARED)
         self.assertEqual(self.opened()[7], str(prior))
         self.assertIn(["--session", SHARED, "tab", "rename", "w1:t1",
-                       recorded_session], self.herdr_calls())
-        self.assertIn(["--session", SHARED, "pane", "rename", "w1:p1", recorded_session], self.herdr_calls())
+                       "alpha"], self.herdr_calls())
+        self.assertIn(["--session", SHARED, "pane", "rename", "w1:p1", "alpha"], self.herdr_calls())
         claude = self.agent_arguments()
         prompt = self.opening_prompt()
-        self.assertEqual(claude[claude.index("--remote-control") + 1], recorded_session)
-        self.assertEqual(claude[claude.index("-n") + 1], recorded_session)
+        self.assertEqual(claude[claude.index("--remote-control") + 1], "alpha")
+        self.assertEqual(claude[claude.index("-n") + 1], "alpha")
         self.assertNotIn("claude", claude)
         self.assertIn("You are now alpha-unit in production build-followups", prompt)
         self.assertTrue(prompt.endswith(restart_note), prompt)
@@ -909,7 +909,7 @@ class AddUnitRestoreTests(AddUnitTestCase):
                             worktree=self.root / "project-designers").replace("| designers-unit |", "| `designers` |")
         self.commit_prepared_row(row)
         member = unit_membership(fixture_showrunner_name("build-followups", self.doc), "designers")
-        _ = staff.set_worktree(member.id, staff.PresentWorktree("natedev", self.root / "project-designers"))
+        _ = staff.set_worktree(member.id, staff.PresentWorktree("natedev", self.root / "project-designers"), expected=member.worktree)
         request = add_unit.launch_request(argparse.Namespace(
             production=str(self.doc), name="designers", plan="docs/plans/given.md", brief=None,
             standby=False, permanent=False, port=None, owns=None, timeout=90.0, check=False,

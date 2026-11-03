@@ -16,6 +16,7 @@ import time
 from collections.abc import Mapping, Callable, Generator, Sequence
 from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass, field, replace
+from functools import cached_property
 from importlib import import_module
 from pathlib import Path
 from typing import Literal, NewType, Protocol, TypeVar, cast
@@ -330,8 +331,12 @@ class StaffSnapshot:
     schema: int = field(default=2, compare=False)
     current_sessions_recorded: bool = field(default=True, compare=False)
 
+    @cached_property
+    def rows_by_id(self) -> dict[StaffId, StaffRow]:
+        return {row.id: row for row in self.rows}
+
     def by_id(self, staff_id: StaffId) -> StaffRow | None:
-        return _row_by_id(self.rows, staff_id)
+        return self.rows_by_id.get(staff_id)
 
     def by_current_session(self, session_id: str) -> StaffRow | None:
         return next((row for row in self.rows if row.current_session == session_id), None)
@@ -347,6 +352,14 @@ class StaffSnapshot:
         matches = [row for row in self.rows if isinstance(row.worktree, PresentWorktree)
                    and row.worktree.machine == machine and path.is_relative_to(row.worktree.path)]
         return max(matches, key=lambda row: len(cast(PresentWorktree, row.worktree).path.parts), default=None)
+
+    def unit_by_worktree(self, machine: str, path: Path) -> StaffRow | None:
+        """A path that a live unit holds belongs to that unit; the newest row wins within each state."""
+        matches = [row for row in reversed(self.rows) if row.kind == "unit"
+                   and isinstance(row.worktree, (PresentWorktree, RemovedWorktree))
+                   and row.worktree.machine == machine and row.worktree.path == path]
+        return next((row for row in matches if isinstance(row.worktree, PresentWorktree)),
+                    next(iter(matches), None))
 
     def by_doc(self, machine: str, path: Path) -> StaffRow | None:
         document = path.absolute()
@@ -1075,16 +1088,24 @@ def move(staff_id: StaffId, new_parent: StaffId | None) -> StaffRow:
     return _transaction(edit)
 
 
-def set_worktree(unit: StaffId, worktree: PresentWorktree | RemovedWorktree) -> StaffRow:
+def set_worktree(unit: StaffId, worktree: PresentWorktree | RemovedWorktree, *,
+                 expected: PresentWorktree | RemovedWorktree | WorktreeUnfilled) -> StaffRow:
     """Set one unit's worktree through the existing owner transaction."""
     if not _is_owner():
+        previous = (["--expected-state", "unfilled"] if isinstance(expected, WorktreeUnfilled) else
+                    ["--expected-state", "present" if isinstance(expected, PresentWorktree) else "removed",
+                     "--expected-machine", expected.machine, "--expected-path", str(expected.path)])
         return _remote_row(["set-worktree", unit, "--machine", worktree.machine, "--path", str(worktree.path),
-                            "--state", "present" if isinstance(worktree, PresentWorktree) else "removed"])
+                            "--state", "present" if isinstance(worktree, PresentWorktree) else "removed", *previous])
 
     def edit(rows: list[StaffRow]) -> StaffRow:
         row = _required(rows, unit)
         if row.kind != "unit":
             raise StaffRefused("set-worktree requires a unit")
+        if row.worktree == worktree:
+            return row
+        if row.worktree != expected:
+            raise StaffRefused(f"{unit}: worktree differs from the expected value {expected!r}; found {row.worktree!r}")
         changed = replace(row, worktree=worktree)
         rows[rows.index(row)] = changed
         return changed
@@ -1322,6 +1343,9 @@ class _Arguments(argparse.Namespace):
     machine: str = ""
     path: str = ""
     state: str = ""
+    expected_state: str = ""
+    expected_machine: str = ""
+    expected_path: str = ""
     worktree: list[str] | None = None
     doc: list[str] | None = None
 
@@ -1382,6 +1406,10 @@ def _parser() -> argparse.ArgumentParser:
         _ = location_parser.add_argument("--machine", required=True)
         _ = location_parser.add_argument("--path", required=True)
         _ = location_parser.add_argument("--state", required=True, choices=states)
+        if command == "set-worktree":
+            _ = location_parser.add_argument("--expected-state", required=True, choices=("unfilled", "present", "removed"))
+            _ = location_parser.add_argument("--expected-machine", default="")
+            _ = location_parser.add_argument("--expected-path", default="")
         location_parsers.append(location_parser)
     for verb in (*location_parsers, show, get, add, restore_parser, rename_parser, move_parser, retire_parser, apply_parser, defer_parser, pending_parser):
         _ = verb.add_argument("--json", action="store_true")
@@ -1402,7 +1430,11 @@ def _mutate(arguments: _Arguments) -> StaffRow | StaffSnapshot | tuple[StaffId, 
     if arguments.verb == "set-worktree":
         worktree = (PresentWorktree(arguments.machine, Path(arguments.path)) if arguments.state == "present"
                     else RemovedWorktree(arguments.machine, Path(arguments.path)))
-        return set_worktree(StaffId(arguments.target), worktree)
+        expected = (WorktreeUnfilled() if arguments.expected_state == "unfilled" else
+                    PresentWorktree(arguments.expected_machine, Path(arguments.expected_path))
+                    if arguments.expected_state == "present" else
+                    RemovedWorktree(arguments.expected_machine, Path(arguments.expected_path)))
+        return set_worktree(StaffId(arguments.target), worktree, expected=expected)
     if arguments.verb == "set-doc":
         doc = (LiveDoc(arguments.machine, Path(arguments.path)) if arguments.state == "live"
                else WrappedDoc(arguments.machine, Path(arguments.path)))

@@ -84,9 +84,9 @@ def prepared_replacement(path: Path, content: str | bytes, *, mode: int) -> Gene
         yield temporary
 
 
-def write_text_atomic(path: Path, text: str) -> None:
-    """Publish whole text; distinguish refusal from visible, unconfirmed replacement."""
-    _write_atomic(path, text)
+def write_text_atomic(path: Path, text: str, *, new_file_mode: int | None = None) -> None:
+    """Publish complete text; preserve existing permissions or use the supplied mode for a new file."""
+    _write_atomic(path, text, new_file_mode=new_file_mode)
 
 
 def write_bytes_atomic(path: Path, data: bytes, *, mode: int | None = None) -> None:
@@ -94,7 +94,8 @@ def write_bytes_atomic(path: Path, data: bytes, *, mode: int | None = None) -> N
     _write_atomic(path, data, mode=mode)
 
 
-def _write_atomic(path: Path, content: str | bytes, *, mode: int | None = None) -> None:
+def _write_atomic(path: Path, content: str | bytes, *, mode: int | None = None,
+                  new_file_mode: int | None = None) -> None:
     """Own the single replacement boundary for text and binary evidence."""
     replaced = False
     try:
@@ -103,6 +104,8 @@ def _write_atomic(path: Path, content: str | bytes, *, mode: int | None = None) 
                 temporary.chmod(mode)
             elif path.exists():
                 temporary.chmod(path.stat().st_mode)
+            elif new_file_mode is not None:
+                temporary.chmod(new_file_mode)
             else:
                 mask = os.umask(0)
                 _ = os.umask(mask)

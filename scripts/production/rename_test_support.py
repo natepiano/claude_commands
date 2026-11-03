@@ -748,7 +748,7 @@ class ProductionRenameFixture(StaffTestCase):
             destination = self.unit_worktree(OLD, unit)
             _ = self.git("worktree", "move", str(old), str(destination))
             row = unit_membership(OLD, unit)
-            _ = staff.set_worktree(row.id, staff.PresentWorktree(remote.local_machine(), destination))
+            _ = staff.set_worktree(row.id, staff.PresentWorktree(remote.local_machine(), destination), expected=row.worktree)
             text = text.replace(f"`{old}`", f"`{destination}`")
             _ = self.git("push", "origin", f"old-{unit}")
         self.write(self.doc, text)

@@ -65,7 +65,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         _ = self.doc.write_text(self.doc.read_text().replace("| `alpha-unit`", rows + "| `alpha-unit`"))
         with isolated_staff_file(Path(self.env["STAFF_FILE"]), self.env):
             row = unit_membership("example", "retired-unit")
-            _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.root / "removed"))
+            _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.root / "removed"), expected=row.worktree)
             _ = unit_membership("example", "standby-unit")
         result = self.run_checkpoint(checkpoint)
         self.assertEqual(result.process.returncode, 0, result.process.stdout + result.process.stderr)
@@ -83,7 +83,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         director.mkdir()
         with isolated_staff_file(Path(self.env["STAFF_FILE"]), self.env):
             row = unit_membership("example", "alpha-unit")
-            _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", director))
+            _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", director), expected=row.worktree)
         result = self.run_checkpoint(checkpoint)
         self.assertEqual(result.process.returncode, 0, result.process.stdout + result.process.stderr)
         self.assertEqual(self.git("rev-parse", "HEAD^2"), checkpoint)

@@ -88,7 +88,7 @@ def commit_all(path: Path) -> None:
 class PromoteShowrunnerTests(unittest.TestCase):
     def test_remote_director_location_refuses_before_the_unit_stops(self) -> None:
         row = self.staff_unit()
-        _ = staff.set_worktree(row.id, staff.PresentWorktree("mac", self.worktree))
+        _ = staff.set_worktree(row.id, staff.PresentWorktree("mac", self.worktree), expected=row.worktree)
         before = self.parent_doc.read_bytes(), self.child_doc.read_bytes()
         code, output, errors = self.run_main()
         self.assertNotEqual(code, 0, output + errors)

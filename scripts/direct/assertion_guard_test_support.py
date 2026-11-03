@@ -186,7 +186,7 @@ class GitRepositoryFixture(unittest.TestCase):
         location = (staff.RemovedWorktree("natedev", folder)
                     if status.startswith(("retired", "removed")) or isinstance(member.worktree, staff.RemovedWorktree)
                     else staff.PresentWorktree("natedev", folder))
-        _ = staff.set_worktree(member.id, location)
+        _ = staff.set_worktree(member.id, location, expected=member.worktree)
         return doc
 
 

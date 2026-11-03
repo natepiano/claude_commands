@@ -198,13 +198,16 @@ def launch(child: Production, model: str, effort: str, resume: str | None, cwd: 
     arguments = ["--model", model, "--effort", effort]
     if resuming:
         arguments.extend(["--resume", session_id])
-    arguments.extend(["--remote-control", child.slug, "-n", child.slug, "--settings", '{"disableAgentView": true}'])
+    from scripts.shutdown.launch_names import LaunchNames
+
+    name = LaunchNames.read().name(session_id, child.slug)
+    arguments.extend(["--remote-control", name, "-n", name, "--settings", '{"disableAgentView": true}'])
     environment = {"ENABLE_TOOL_SEARCH": "true"}
     environment.update(named_account_environment(selected.dir))
     host = herdr.shared_session()
     _ = herdr.start_server(host, 90_000)
-    launched = herdr.launch_agent(host, showrunners.herdr_space(child.slug, str(child.doc)), child.slug, str(cwd),
-        environment, kind="claude", agent=child.slug, agent_arguments=arguments,
+    launched = herdr.launch_agent(host, showrunners.herdr_space(child.slug, str(child.doc)), name, str(cwd),
+        environment, kind="claude", agent=name, agent_arguments=arguments,
         opening=herdr.OpeningPrompt(prompt, transcript,
             before_prompt if before_prompt is not None else
             lambda observed: ensure_staff_showrunner(child, runtime_id=observed.session_id)), timeout_ms=90_000)

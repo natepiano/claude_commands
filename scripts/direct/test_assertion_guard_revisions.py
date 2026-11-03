@@ -1309,7 +1309,7 @@ class ProductionBaseTests(SeededGitRepositoryFixture):
         director = self.root / "director"
         director.mkdir()
         member = unit_membership("fixture", "fixture")
-        _ = staff.set_worktree(member.id, staff.PresentWorktree("natedev", director))
+        _ = staff.set_worktree(member.id, staff.PresentWorktree("natedev", director), expected=member.worktree)
         self.assertEqual(commit_bases(self.repo, (), staged=False)[0], tip)
 
 
@@ -1323,7 +1323,7 @@ class ProductionBaseTests(SeededGitRepositoryFixture):
             status = marker if column == "Status" else "active"
             _ = self.register_production("unit", slug="retired", worktree=worktree, status=status)
             row = unit_membership("retired", "fixture")
-            _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.repo))
+            _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.repo), expected=row.worktree)
             for docs in ((retired, live), (live, retired)):
                 with self.subTest(column=column, marker=marker, docs=docs):
                     with patch.object(showrunners, "timer_docs", return_value=dict(enumerate(docs))):
@@ -1337,7 +1337,7 @@ class ProductionBaseTests(SeededGitRepositoryFixture):
         _ = self.register_production("builds", slug="live")
         _ = self.register_production("unit", slug="retired", worktree_commentary="— retired 2026-10-06")
         row = unit_membership("retired", "fixture")
-        _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.repo))
+        _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.repo), expected=row.worktree)
         for docs in ((retired, live), (live, retired)):
             with self.subTest(commentary="retired worktree", docs=docs):
                 with patch.object(showrunners, "timer_docs", return_value=dict(enumerate(docs))):

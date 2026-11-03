@@ -614,7 +614,8 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
             retire_reservations(unit.worktree)
             _ = checked(production.checkout, "retire", "worktree", "remove", str(unit.worktree))
             report("retire", "ok", f"removed {unit.name} worktree")
-        _ = staff.set_worktree(item.member.id, staff.RemovedWorktree(local_machine(), unit.worktree))
+        _ = staff.set_worktree(item.member.id, staff.RemovedWorktree(local_machine(), unit.worktree),
+                               expected=item.member.worktree)
         if git(production.checkout, "show-ref", "--verify", "--quiet", f"refs/heads/{unit.branch}").returncode == 0:
             _ = checked(production.checkout, "retire", "branch", "-d", unit.branch)
             report("retire", "ok", f"deleted local {unit.branch}")

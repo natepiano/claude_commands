@@ -607,7 +607,7 @@ class ProductionRenameTests(support.ProductionRenameFixture):
         self.write(self.new_doc, self.new_doc.read_text().replace(
             str(self.unit_worktree(OLD, "beta-unit")), str(self.unit_worktree(NEW, "alpha-unit"))))
         beta = next(row for row in staff.find(kind="unit") if row.name == "beta")
-        _ = staff.set_worktree(beta.id, staff.RemovedWorktree("natedev", self.unit_worktree(NEW, "alpha-unit")))
+        _ = staff.set_worktree(beta.id, staff.RemovedWorktree("natedev", self.unit_worktree(NEW, "alpha-unit")), expected=beta.worktree)
         before = self.snapshot()
         fixed = self.run_command("repair-workers", NEW)
         self.assert_success(fixed)

@@ -78,7 +78,7 @@ class StaffCheckTests(StaffTestCase):
         folder = self.source_root / "worktrees/models-unit"
         write_text_atomic(folder / ".unit.toml", 'plan = "standby"\nresponsibilities = []\n')
         runner = staff.set_doc(runner.id, staff.LiveDoc("natedev", doc))
-        unit = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", folder))
+        unit = staff.set_worktree(unit.id, staff.PresentWorktree("natedev", folder), expected=unit.worktree)
         live = (
             staff_check.LiveStaffSession(101, "claude:" + runner.id, runner.id),
             staff_check.LiveStaffSession(102, "claude:" + unit.id, unit.id, str(folder)),
@@ -495,7 +495,7 @@ class StaffCheckTests(StaffTestCase):
         elsewhere = self.root / "other-checkout"
         _ = self.fixture_git(self.fixture.folder, "worktree", "move",
                              str(self.fixture.folder), str(elsewhere))
-        _ = staff.set_worktree(self.fixture.unit.id, staff.PresentWorktree("natedev", elsewhere))
+        _ = staff.set_worktree(self.fixture.unit.id, staff.PresentWorktree("natedev", elsewhere), expected=self.fixture.unit.worktree)
         self.assertEqual(self.check(), (0, "checked 3 rows; 0 wrong\n"))
 
     def test_resumed_session_in_an_external_folder_keeps_its_valid_ownership(self) -> None:
@@ -505,13 +505,13 @@ class StaffCheckTests(StaffTestCase):
         self.assertEqual(self.check(evidence), (0, "checked 3 rows; 0 wrong\n"))
 
     def test_removed_worktree_is_valid_for_an_offline_retained_unit(self) -> None:
-        _ = staff.set_worktree(self.fixture.unit.id, staff.RemovedWorktree("natedev", self.fixture.folder))
+        _ = staff.set_worktree(self.fixture.unit.id, staff.RemovedWorktree("natedev", self.fixture.folder), expected=self.fixture.unit.worktree)
         shutil.rmtree(self.fixture.folder)
         evidence = replace(self.fixture.evidence, sessions=self.fixture.live[:1], workers=staff_sources.WorkerEvidence((), {}, ()))
         self.assertEqual(self.check(evidence), (0, "checked 3 rows; 0 wrong\n"))
 
     def test_live_session_on_a_removed_worktree_is_listed(self) -> None:
-        _ = staff.set_worktree(self.fixture.unit.id, staff.RemovedWorktree("natedev", self.fixture.folder))
+        _ = staff.set_worktree(self.fixture.unit.id, staff.RemovedWorktree("natedev", self.fixture.folder), expected=self.fixture.unit.worktree)
         _ = self.assert_wrong(self.fixture.unit, "live session is attached to a retired row")
 
     def test_missing_showrunner_document_is_listed(self) -> None:
@@ -525,7 +525,7 @@ class StaffCheckTests(StaffTestCase):
         _ = self.assert_wrong(self.fixture.runner, "production doc belongs elsewhere: timer names")
 
     def test_remote_worktree_is_reported_as_uncertain_instead_of_inferred(self) -> None:
-        _ = staff.set_worktree(self.fixture.unit.id, staff.PresentWorktree("mac", self.fixture.folder))
+        _ = staff.set_worktree(self.fixture.unit.id, staff.PresentWorktree("mac", self.fixture.folder), expected=self.fixture.unit.worktree)
         _ = self.assert_wrong(self.fixture.unit, "uncertain: worktree is on mac")
 
     def test_unfilled_worktree_is_listed(self) -> None:
@@ -537,7 +537,7 @@ class StaffCheckTests(StaffTestCase):
         folder = self.root / "former-name-unit"
         _ = self.fixture_git(self.fixture.folder, "worktree", "add", "-b", "former-name", str(folder))
         _ = (folder / ".unit.toml").write_text('plan = "standby"\nresponsibilities = []\n')
-        stale = staff.set_worktree(stale.id, staff.PresentWorktree("natedev", folder))
+        stale = staff.set_worktree(stale.id, staff.PresentWorktree("natedev", folder), expected=stale.worktree)
         code, output = self.check()
         self.assertEqual(code, 0, output)
         self.assertNotIn(f"{self.fixture.unit.id} {self.fixture.unit.name}:", output)

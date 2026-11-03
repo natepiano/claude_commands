@@ -1491,7 +1491,7 @@ def move_folder(unit: staff.StaffId, destination: Path) -> None:
                 atomic_file.sync_folder(move.old.parent)
                 atomic_file.sync_folder(move.new.parent)
             elif step == "staff":
-                _ = staff.set_worktree(unit, staff.PresentWorktree(row.worktree.machine, move.new))
+                _ = staff.set_worktree(unit, staff.PresentWorktree(row.worktree.machine, move.new), expected=row.worktree)
             elif step == "launch":
                 pane_record.move_cwd(unit, move.old, move.new, record)
             elif step == "run":

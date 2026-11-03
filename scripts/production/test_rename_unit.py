@@ -41,7 +41,7 @@ class UnitRenameTests(UnitRenameFixture):
     def test_worktree_rename_updates_a_removed_location_without_reactivating_its_row(self) -> None:
         row = next(row for row in staff.find(kind="unit") if row.name == "alpha")
         source, destination = self.rust / "claude-demo-alpha", self.rust / "claude-demo-gamma"
-        _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", source))
+        _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", source), expected=row.worktree)
         self.assert_ok(self.rename("apply"))
         retained = staff.by_id(row.id)
         assert retained is not None
@@ -55,7 +55,7 @@ class UnitRenameTests(UnitRenameFixture):
         row = next(row for row in staff.find(kind="unit") if row.name == "alpha")
         source = self.rust / "claude-demo-alpha"
         destination = self.rust / "claude-demo-gamma"
-        _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", source))
+        _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", source), expected=row.worktree)
         config = unit_config.UnitConfig(unit_config.PlanFile(Path("docs/plans/alpha.md")),
                                         unit_config.AppPort(8123), ("nightly",))
         _ = unit_config.write(source, config)
@@ -90,6 +90,51 @@ class UnitRenameTests(UnitRenameFixture):
         verified = self.rename('verify')
         self.assert_ok(verified)
         self.assertEqual(verified.stderr.splitlines(), [f'warning: {bad}: missing or invalid repository'])
+
+    def test_retry_after_git_move_refuses_a_third_staff_worktree(self) -> None:
+        row = next(row for row in staff.find(kind="unit") if row.name == "alpha")
+        source = self.rust / "claude-demo-alpha"
+        destination = self.rust / "claude-demo-gamma"
+        with mock.patch.object(staff, "set_worktree", side_effect=OSError("stopped after Git move")):
+            interrupted = self.rename("apply")
+        self.assertNotEqual(interrupted.returncode, 0, interrupted.stderr)
+        self.assertFalse(source.exists())
+        self.assertTrue(destination.exists())
+        current = staff.by_id(row.id)
+        assert current is not None
+        third = staff.PresentWorktree("natedev", self.root / "third-worktree")
+        changed = staff.set_worktree(row.id, third, expected=current.worktree)
+        before = self.staff_file.read_bytes()
+        refused = self.rename("apply")
+        self.assertNotEqual(refused.returncode, 0, refused.stdout + refused.stderr)
+        self.assertIn("worktree", refused.stderr)
+        self.assertEqual(staff.by_id(row.id), changed)
+        self.assertEqual(self.staff_file.read_bytes(), before)
+
+    def test_retry_after_staff_publication_keeps_the_settled_worktree(self) -> None:
+        row = next(row for row in staff.find(kind="unit") if row.name == "alpha")
+        destination = staff.PresentWorktree("natedev", self.rust / "claude-demo-gamma")
+        publish = staff.set_worktree
+
+        def interrupted(identity: staff.StaffId, value: staff.PresentWorktree | staff.RemovedWorktree, *,
+                        expected: staff.PresentWorktree | staff.RemovedWorktree | staff.WorktreeUnfilled) -> staff.StaffRow:
+            self.assertEqual(expected, row.worktree)
+            _ = publish(identity, value, expected=expected)
+            raise OSError("stopped after staff publication")
+
+        with mock.patch.object(staff, "set_worktree", side_effect=interrupted):
+            stopped = self.rename("apply")
+        self.assertNotEqual(stopped.returncode, 0, stopped.stderr)
+        current = staff.by_id(row.id)
+        assert current is not None
+        self.assertEqual(current.worktree, destination)
+        self.assert_ok(self.rename("apply"))
+        current = staff.by_id(row.id)
+        assert current is not None
+        self.assertEqual(current.worktree, destination)
+        before = final_files(self.root)
+        self.assert_ok(self.rename("apply"))
+        self.assertEqual(final_files(self.root), before)
 
     def test_rename_unit_preserves_staff_and_worker_identity(self) -> None:
         row = next(row for row in staff.snapshot().find(kind="unit") if row.name == "alpha")

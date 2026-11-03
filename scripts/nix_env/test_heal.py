@@ -303,7 +303,8 @@ class HealTests(NixFixture):
     def test_unconfirmed_alert_result_remains_retryable(self) -> None:
         heal.STATE_DIR.mkdir()
         for code, output in ((0, ""), (0, "unrelated output"), (0, "QUEUED: inconsistent exit"),
-                             (1, "SENT: inconsistent exit"), (2, "REFUSED: action required"), (4, "HELD: review")):
+                             (1, "SENT: inconsistent exit"), (2, "REFUSED: action required"), (4, "HELD: review"),
+                             (5, "PENDING: active")):
             with self.subTest(code=code, output=output):
                 history = heal.new_history()
                 with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], code, output, "")) as run:
