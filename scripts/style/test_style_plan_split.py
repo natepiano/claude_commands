@@ -6,6 +6,7 @@ import io
 import signal
 import sqlite3
 import subprocess
+from subprocess import run as run_git
 import sys
 import tempfile
 import time
@@ -24,7 +25,7 @@ import approved_renames
 import declarations
 import style_plan
 from scripts.production import showrunners
-from scripts.production.staff_test_support import isolated_staff_file, production_membership
+from scripts.production.staff_test_support import isolated_staff_file, production_membership, recorded_unit
 from scripts.build_hold import build_hold
 from scripts.build_queue import queue_place
 import live_units
@@ -526,9 +527,18 @@ class RefillRecordingTests(unittest.TestCase):
                                       + "| Unit | Plan | Worktree | Branch |\n| --- | --- | --- | --- |\n"
                                       + "| feature-unit | feature.md | /tmp/claude/feature | feature |\n"
                                       + "| retired-names-unit | retired | /tmp/claude/retired | retired |\n")
+            worktree = Path(folder) / "feature"
+            _ = subprocess.run(["git", "init", "-b", "feature", str(worktree)], check=True, capture_output=True)
+            _ = recorded_unit("production", "feature-unit", worktree, production, plan="feature.md")
+            def no_child(command: list[str], *, capture_output: bool, text: bool,
+                         check: bool) -> subprocess.CompletedProcess[str]:
+                if command[0] == "git":
+                    return run_git(command, capture_output=capture_output, text=text, check=check)
+                raise AssertionError("no child for an empty production")
+
             output, errors = io.StringIO(), io.StringIO()
             with (mock.patch.object(unit_lookup, "marked_units", return_value={}),
-                  mock.patch.object(subprocess, "run", side_effect=AssertionError("no child for an empty production")),
+                  mock.patch.object(subprocess, "run", side_effect=no_child),
                   redirect_stdout(output), redirect_stderr(errors)):
                 code = style_plan.main(["split-all", "--production", str(production)])
             self.assertEqual((code, output.getvalue(), errors.getvalue()), (0, "no style units\n", ""))
@@ -556,16 +566,19 @@ class RefillRecordingTests(unittest.TestCase):
                 worktree = root / unit
                 plan = worktree / "docs/retained-plan.md"
                 plan.parent.mkdir(parents=True)
-                _ = (worktree / ".git").write_text("gitdir: unused-child-fixture\n")
+                _ = subprocess.run(["git", "init", "-b", unit, str(worktree)], check=True, capture_output=True)
                 _ = plan.write_text("# Standing unit\n")
                 rows.append(f"| {unit} | docs/retained-plan.md | {worktree} | {unit} |")
             _ = production.write_text("# Production\n\n## Units\n\n"
                                       + "| Unit | Plan | Worktree | Branch |\n| --- | --- | --- | --- |\n"
                                       + "\n".join(rows) + "\n")
             completed: list[str] = []
-            production_membership("production", "names-unit", "types-unit", "values-unit")
+            for unit in ("names-unit", "types-unit", "values-unit"):
+                _ = recorded_unit("production", unit, root / unit, production, plan="docs/retained-plan.md")
 
             def child(command: list[str], *, capture_output: bool, text: bool, check: bool) -> subprocess.CompletedProcess[str]:
+                if command[0] == "git":
+                    return run_git(command, capture_output=capture_output, text=text, check=check)
                 self.assertEqual(command[:8], ["systemd-run", "--user", "--scope", "--slice=builds.slice", "nice", "-n", "19", sys.executable])
                 self.assertTrue(capture_output and text)
                 self.assertFalse(check)

@@ -42,7 +42,7 @@ GIT_FILTERS_LABEL="com.natemccoy.claude-settings-git-refresh"
 # against clean_hash below.
 git_filters_refresh_path() (
     local repo_root="$1" clean_script="$2" path="$3" driver="$4"
-    local clean_hash index_entry index_hash index_stage index_path raw_hash checked_input
+    local clean_hash index_entry index_hash index_stage index_path raw_hash checked_input index_mode working_mode
 
     [[ -f "$repo_root/$path" ]] || return 0
     [[ -x "$repo_root/$clean_script" ]] || return 0
@@ -66,7 +66,16 @@ git_filters_refresh_path() (
     while read -r _ _ index_stage _; do
         [[ "$index_stage" == 0 ]] || return 0
     done <<<"$index_entry"
-    read -r _ index_hash _ <<<"$index_entry"
+    read -r index_mode index_hash _ <<<"$index_entry"
+
+    # Preserve mode changes when Git tracks the executable bit.
+    if [[ "$(git -C "$repo_root" config --bool core.filemode)" != false ]]; then
+        working_mode=100644
+        if [[ -n "$(find "$repo_root/$path" -prune -perm -100 -print)" ]]; then
+            working_mode=100755
+        fi
+        [[ "$working_mode" == "$index_mode" ]] || return 0
+    fi
 
     # A real change to the filtered content — leave it showing.
     [[ "$clean_hash" == "$index_hash" ]] || return 0

@@ -20,6 +20,22 @@ from scripts.production.unit_config_format_test_support import (
 
 
 class UnitConfigTests(UnitConfigFixture):
+    def test_remote_configuration_fields_preserve_retirement_and_reject_invalid_values(self) -> None:
+        fields: dict[str, object] = {
+            "plan": "docs/plans/worker.md", "port": 8123,
+            "responsibilities": ["nightly-review", "build-check"],
+            "retired": {"date": "2026-10-31", "session": "session-before-retire",
+                        "folder": str(self.worktree), "branch": "feature/worker"},
+        }
+        self.assertEqual(config.decode(fields), replace(self.config(), retired=self.retirement()))
+        for key, invalid in (("port", True), ("responsibilities", "nightly-review"),
+                             ("retired", {"session": "session-before-retire"})):
+            with self.subTest(key=key):
+                with self.assertRaises(config.ConfigRefused):
+                    _ = config.decode({**fields, key: invalid})
+        self.assertFalse(self.source.exists())
+        self.assertFalse(self.parked.exists())
+
     def test_launcher_subprocess_fake_does_not_replace_taplo_for_live_or_parked_writes(self) -> None:
         binary = require_taplo(self)
         _ = write_aligning_config(self.worktree)
